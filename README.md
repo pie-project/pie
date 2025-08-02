@@ -1,49 +1,18 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://pie-project.org/images/pie-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="https://pie-project.org/images/pie-light.svg">
-    <img alt="Pie: Programmable serving system for emerging LLM applications"
-         src="https://pie-project.org/images/pie-light.svg"
-         width="30%">
-    <p></p>
-  </picture>
 
-[Getting started] | [Learn] | [Documentation] | [Contributing]
-</div>
+# PIE
 
-[Pie] is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
+PIE is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
 
----
-
-[pie]: https://pie-project.org/
-[Getting Started]: https://pie-project.org/learn/get-started
-[Learn]: https://pie-project.org/learn
-[Documentation]: https://pie-project.org/learn#learn-use
-[Contributing]: CONTRIBUTING.md
 
 
 ## Getting Started
 
 ### 1. Prerequisites
 
-- **Configure a Backend:**  
-  Navigate to a backend directory and follow its `README.md` for setup:
-  - [Python Backend](backend/backend-python/README.md)
-  - [C++ Backend](backend/backend-cuda/README.md)
+
+### Installing flashinfer
 
 
-
-# Installing flashinfer
-```
-# Set target CUDA architectures
-export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
-# Build AOT kernels. Will produce AOT kernels in aot-ops/
-python -m flashinfer.aot
-# Build AOT wheel
-python -m build --no-isolation --wheel
-# Install AOT wheel
-python -m pip install dist/flashinfer-*.whl
-```
 
 
 - **Add Wasm Target:**  
