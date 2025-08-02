@@ -62,7 +62,8 @@ pie --help
 
 ### Step 3: Download and Register LLMs
 
-Next, download the models used in our examples and benchmarks. The following commands will download the models from Hugging Face and register them with PIE.
+Next, download the models used in our examples and benchmarks.
+Download all the models will quite a bit of time and ~30 GB of disk space.
 
 ```bash
 pie model add "llama-3.2-1b-instruct"
@@ -102,7 +103,8 @@ After completing the setup, you can run this simple check to ensure everything i
 1.  **Start the PIE Engine** Launch the engine with the example configuration file. This will start the backend services and open the interactive PIE shell.
 
     ```bash
-    pie start --config ./pie-cli/example_config.toml
+    cd pie-cli
+    pie start --config example_config.toml
     ```
 
     Wait for the confirmation message before proceeding:
@@ -114,7 +116,7 @@ After completing the setup, you can run this simple check to ensure everything i
 2.  **Run an Inferlet** From within the PIE shell (`pie>`), run the `text_completion.wasm` inferlet with a sample prompt.
 
     ```bash
-    pie> run ./example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?" --max-tokens 256
+    pie> run ../example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?" --max-tokens 256
     ```
 
     If the setup is correct, you will see the inferlet launch and produce output, similar to this:
