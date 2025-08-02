@@ -18,24 +18,22 @@
     The following script clones the FlashInfer repository and builds it. **Important:** Before running, replace `"8.6"` in the `export TORCH_CUDA_ARCH_LIST` line with the compute capability you found in the previous step.
 
     ```bash
+    pip install torch # Ensure you have the PyTorch installed
+    
     # Clone the repository and its submodules
-    git clone [https://github.com/flashinfer-ai/flashinfer.git](https://github.com/flashinfer-ai/flashinfer.git) --recursive
+    git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
     cd flashinfer
 
     # IMPORTANT: Set your target CUDA architecture below
     export TORCH_CUDA_ARCH_LIST="8.6" # Replace "8.6" with your compute_cap value
 
-    # Build the Ahead-of-Time (AOT) kernels
+    # Build the Ahead-of-Time (AOT) kernels. This will take some time (~5-10 minutes).
     python -m flashinfer.aot
 
     # Build the wheel package
-    python -m build --no-isolation --wheel
+    python -m pip install --no-build-isolation --verbose .
 
-    # Install the compiled wheel
-    pip install dist/flashinfer-*.whl
-
-    # Return to the previous directory
-    cd ..
+    cd ../
     ```
 
 ### Step 2: Compile Protobuf Definitions
