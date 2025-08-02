@@ -46,6 +46,7 @@ The PIE engine relies on a Python-based backend for inference.
 ### Step 2: Install the PIE Command-Line Interface (CLI)
 
 The `pie-cli` is the primary tool for managing the PIE system.
+If you don't have Rust installed, please follow the [Rust installation guide](https://www.rust-lang.org/tools/install).
 
 ```bash
 cd pie-cli
@@ -64,9 +65,9 @@ pie --help
 Next, download the models used in our examples and benchmarks. The following commands will download the models from Hugging Face and register them with PIE.
 
 ```bash
-pie model add "meta-llama/Llama-3.2-1B-Instruct"
-pie model add "meta-llama/Llama-3.2-3B-Instruct"
-pie model add "meta-llama/Llama-3.1-8B-Instruct"
+pie model add "llama-3.2-1b-instruct"
+pie model add "llama-3.2-3b-Instruct"
+pie model add "llama-3.1-8b-Instruct"
 ```
 
 You can list all registered models to confirm they were added correctly:
