@@ -1,69 +1,134 @@
+# PIE: A Programmable Serving System for Emerging LLM Applications
 
-# PIE
+This repository contains the artifact for the SOSP 2025 paper, "PIE: A Programmable Serving System for Emerging LLM Applications."
 
-PIE is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
+**PIE** is a novel LLM serving system that empowers users to write and serve *inferlets* - a lightweight, user-defined programs that controls the LLM inference process end-to-end. 
 
+-----
 
+## Repository Structure
 
-## Getting Started
+This artifact is composed of several key components:
 
-### 1. Prerequisites
+* `pie`: The main implementation of PIE's application and control layers.
+* `pie-cli`: A command-line interface for interacting with PIE.
+* `backend`: PIE's inference layer, implemented in Python using PyTorch.
+* `inferlet`: A Rust crate to simplify writing new inferlets.
+* `example-apps`: A collection of example inferlets used in our evaluation.
+* `benchmarks`: Scripts to reproduce the performance benchmarks from the paper.
+* `client`: A Python client library for programmatic interaction with PIE.
 
+-----
 
-### Installing flashinfer
+## Prerequisites
 
+Before you begin, please ensure your system meets the following requirements:
 
+* **GPU:** NVIDIA GPU (Ampere architecture or newer).
+* **CUDA:** CUDA Toolkit `12.6` or later.
+* **OS:** Linux (Ubuntu 22.04 or later is recommended).
+* **Rust:** [Rust Toolchain](https://www.rust-lang.org/tools/install) `1.80` or later.
+* **Python:** [Python](https://www.python.org/downloads/) `3.11` or later.
 
+-----
 
-- **Add Wasm Target:**  
-  Install the WebAssembly target for Rust:
+## Installation & Setup
 
-  ```bash
-  rustup target add wasm32-wasip2
-  ```
-  This is required to compile Rust-based inferlets in the `example-apps` directory.
+Follow these steps to install all components of the PIE system.
 
+### Step 1: Install Core Python Components (Backend & Client)
 
-### 2. Build
+The PIE engine relies on a Python-based backend for inference and uses a Python client for communication.
 
-Build the **PIE CLI** and the example inferlets.
+1.  **Install PIE Torch Backend:** Follow the instructions in [backend/README.md](./backend/README.md) to set up the inference engine.
+2.  **Install PIE Python Client:** Follow the instructions in [client/python/README.md](client/python/README.md) to install the client library.
 
-- **Build the PIE CLI:**  
-  From the repository root, run:
+### Step 2: Install the PIE Command-Line Interface (CLI)
 
-  ```bash
-  cd pie-cli && cargo install --path .
-  ```
+The `pie-cli` is the primary tool for managing the PIE system.
 
-- **Build the Examples:**  
+```bash
+cd pie-cli
+cargo install --path .
+cd ..
+```
 
-  ```bash
-  cd example-apps && cargo build --target wasm32-wasip2 --release
-  ```
+Verify the installation by checking the help message:
 
+```bash
+pie --help
+```
 
+### Step 3: Download and Register LLMs
 
-### 3. Run an Inferlet
+Next, download the models used in our examples and benchmarks. The following commands will download the models from Hugging Face and register them with PIE.
 
-Download a model, start the engine, and run an inferlet.
+```bash
+pie model add "meta-llama/Llama-3.2-1B-Instruct"
+pie model add "meta-llama/Llama-3.2-3B-Instruct"
+pie model add "meta-llama/Llama-3.1-8B-Instruct"
+```
 
-1. **Download a Model:**  
-   Use the PIE CLI to add a model from the [model index](https://github.com/pie-project/model-index):
+You can list all registered models to confirm they were added correctly:
 
-   ```bash
-   pie model add "llama-3.2-1b-instruct"
-   ```
+```bash
+pie model list
+```
 
-2. **Start the Engine:**  
-   Launch the PIE engine with an example configuration. This opens the interactive PIE shell:
+### Step 4: Compile Example Inferlets
 
-   ```bash
-   pie start --config ./pie-cli/example_config.yaml
-   ```
+The example applications must be compiled from Rust into WebAssembly.
 
-3. **Run an Inferlet:**  
-   From within the PIE shell, execute a compiled inferlet:
+1.  **Add the `wasm32-wasip2` target to your Rust toolchain:**
+    ```bash
+    rustup target add wasm32-wasip2
+    ```
+2.  **Compile the inferlets:**
+    ```bash
+    cd example-apps
+    cargo build --target wasm32-wasip2 --release
+    cd ..
+    ```
 
-   ```bash
-   pie> run ./example-apps/target/wasm32-wasip2/release/simple_decoding.wasm
-   ```
+The compiled `*.wasm` files will be located in the `example-apps/target/wasm32-wasip2/release/` directory.
+
+-----
+
+## Sanity Check
+
+After completing the setup, you can run this simple check to ensure everything is working correctly.
+
+1.  **Start the PIE Engine** Launch the engine with the example configuration file. This will start the backend services and open the interactive PIE shell.
+
+    ```bash
+    pie start --config ./pie-cli/example_config.toml
+    ```
+
+    Wait for the confirmation message before proceeding:
+
+    ```
+    INFO pie::model: Backend service started
+    ```
+
+2.  **Run an Inferlet** From within the PIE shell (`pie>`), run the `text_completion.wasm` inferlet with a sample prompt.
+
+    ```bash
+    pie> run ./example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?" --max-tokens 256
+    ```
+
+    If the setup is correct, you will see the inferlet launch and produce output, similar to this:
+
+    ```
+    ✅ Inferlet launched with ID: 812ad8ac-bbed-4e22-ab13-3dd77c8aa122
+    pie> [Inst 812ad8ac] Output: "The capital of France is Paris." (total elapsed: 60.022073ms)
+    [Inst 812ad8ac] Per token latency: 7.506236ms
+    [Inferlet 812ad8ac-bbed-4e22-ab13-3dd77c8aa122] Terminated. Reason: instance normally finished
+    ```
+
+-----
+
+## Next Steps: Running the Benchmarks
+
+Now that the system is installed and verified, you can proceed to reproduce the performance results from our paper.
+
+Please visit [`benchmarks/README.md`](benchmarks/README.md) for detailed instructions.
