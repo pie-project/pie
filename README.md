@@ -2,7 +2,7 @@
 
 This repository contains the artifact for the SOSP 2025 paper, "PIE: A Programmable Serving System for Emerging LLM Applications."
 
-**PIE** is a novel LLM serving system that empowers users to write and serve *inferlets* - a lightweight, user-defined programs that controls the LLM inference process end-to-end. 
+PIE is a novel serving system for LLMs that enables users to write and deploy *inferlets*—lightweight, user-defined programs that control the LLM inference process from end to end.
 
 -----
 
@@ -12,7 +12,7 @@ This artifact is composed of several key components:
 
 * `pie`: The main implementation of PIE's application and control layers.
 * `pie-cli`: A command-line interface for interacting with PIE.
-* `backend`: PIE's inference layer, implemented in Python using PyTorch.
+* `backend`: PIE's inference layer, implemented in Python.
 * `inferlet`: A Rust crate to simplify writing new inferlets.
 * `example-apps`: A collection of example inferlets used in our evaluation.
 * `benchmarks`: Scripts to reproduce the performance benchmarks from the paper.
@@ -38,9 +38,9 @@ Follow these steps to install all components of the PIE system.
 
 ### Step 1: Install Core Python Components (Backend & Client)
 
-The PIE engine relies on a Python-based backend for inference and uses a Python client for communication.
+The PIE engine relies on a Python-based backend for inference.
 
-1.  **Install PIE Torch Backend:** Follow the instructions in [backend/README.md](./backend/README.md) to set up the inference engine.
+1.  **Install PIE Torch Backend:** Follow the instructions in [backend/README.md](./backend/backend-python/README.md) to set up the inference engine.
 2.  **Install PIE Python Client:** Follow the instructions in [client/python/README.md](client/python/README.md) to install the client library.
 
 ### Step 2: Install the PIE Command-Line Interface (CLI)
