@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Union
 
 import numpy as np
-import numba
 import torch
 
 from l4m_pb2 import (  # pylint: disable=no-name-in-module

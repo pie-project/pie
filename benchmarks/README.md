@@ -18,16 +18,11 @@ Please follow these steps in order to set up the required dependencies and compo
 
 ### Step 1: Install System Dependencies
 
-You'll need Docker, the NVIDIA Container Toolkit, and the Rust toolchain.
+You'll need Docker, the NVIDIA Container Toolkit.
 
 1.  **Install Docker:** Follow the official installation guide for your OS.
 2.  **Install NVIDIA Container Toolkit:** This allows Docker containers to access the GPU.
     * <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html>
-3.  **Install Rust & WASM target:** Our system components ("inferlets") are written in Rust and compiled to WASM.
-    ```bash
-    # Add the required compilation target
-    rustup target add wasm32-wasip2
-    ```
 
 ### Step 2: Install Python Dependencies
 
@@ -41,7 +36,7 @@ pip install -r requirements.txt
 
 We pre-download models to ensure consistency and avoid issues with gated access from Hugging Face.
 
-1.  **Install and Login to [Hugging Face CLI](https://huggingface.co/):** You'll need an access token.
+1.  **Install and Login to [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/main/en/guides/cli):** You'll need an access token.
     ```bash
     huggingface-cli login
     ```
@@ -70,10 +65,12 @@ Before running the full benchmark suite, let's verify that all components are wo
 
 1.  **Start the PIE system:** We'll use the default evaluation configuration.
     ```bash
-    pie start --config ../pie-cli/example_config.toml
+    cd ../pie-cli
+    pie start --config ./example_config.toml
     ```
 2.  **Verify vLLM and SGLang Docker containers:** These scripts will pull the Docker images (this may take some time) and start the baseline servers.
     ```bash
+    chmod +x run_vllm.sh run_sglang.sh
     ./run_vllm.sh
     ./run_sglang.sh
     ```
@@ -143,6 +140,7 @@ This should complete without errors with an output something like this, and gene
 # Throughput:             105.12 requests/second
 # --------------------------
 ```
+Note that the very first run may take longer.
 
 ### Reproducing Paper Results
 
