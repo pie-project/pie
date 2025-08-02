@@ -66,8 +66,8 @@ Next, download the models used in our examples and benchmarks. The following com
 
 ```bash
 pie model add "llama-3.2-1b-instruct"
-pie model add "llama-3.2-3b-Instruct"
-pie model add "llama-3.1-8b-Instruct"
+pie model add "llama-3.2-3b-instruct"
+pie model add "llama-3.1-8b-instruct"
 ```
 
 You can list all registered models to confirm they were added correctly:
