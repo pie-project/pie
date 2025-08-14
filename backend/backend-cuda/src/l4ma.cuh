@@ -158,7 +158,7 @@ template <typename T>
 class RMSNorm : public Module<T> {
 public:
     explicit RMSNorm(const L4maConfig& config);
-    
+
     // Unchanged: This layer does not use a workspace buffer.
     void forward(T* output,
                  const T* input,
@@ -240,7 +240,7 @@ public:
 
     void forward(ProfileScope profiler,
                  L4maBuffer<T>& buffer,
-                 T* hidden_states, 
+                 T* hidden_states,
                  T* kv_cache_k,
                  T* kv_cache_v);
 

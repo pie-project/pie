@@ -39,24 +39,23 @@ struct Dist {
     std::vector<int32_t> token_ids;
 };
 
-
 // The actual implementation of the Server is hidden in this struct.
 struct Model::ModelImpl {
 
     std::unique_ptr<L4maForCausalLM<__nv_bfloat16>> model;
     std::unique_ptr<L4maBuffer<__nv_bfloat16>> buffer;
     std::unique_ptr<L4maKVCache<__nv_bfloat16>> kv_cache;
-    
+
 
     // --- State Management ---
     std::map<uint32_t, Block> blocks;
     std::map<uint32_t, TextEmbed> embeds;
     std::map<uint32_t, Dist> dists;
-    
+
     // Configuration
     int32_t kv_page_size;
     int32_t dist_size;
-    
+
     // stream
     cudaStream_t stream;
 
@@ -72,7 +71,7 @@ struct Model::ModelImpl {
     std::vector<Model::SampleTopKResult> handle_sample_top_k(const std::vector<Model::SampleTopKCommand>& commands);
 };
 
-namespace { 
+namespace {
 
 template<typename T>
 std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config, const ModelMetadata& metadata) {
@@ -125,7 +124,7 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
             }
         }
     }
-    
+
     std::cout << "\nSuccessfully loaded " << loaded_keys.size() << " expected weights." << std::endl;
 
     return model_ptr;
@@ -204,7 +203,9 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
 
         for (int32_t i = 0; i < num_new_tokens; ++i) {
             kv_batch_indices_host.push_back(batch_idx);
-            kv_positions_host.push_back(total_ctx_tokens - num_new_tokens + i);
+            // When there's no prior context, positions should start from 0 for new tokens.
+            int32_t pos = (total_ctx_tokens > 0) ? (static_cast<int32_t>(total_ctx_tokens) - num_new_tokens + i) : i;
+            kv_positions_host.push_back(pos);
         }
 
         std::vector<uint32_t> inp_pos_ids_for_mask;
@@ -223,10 +224,10 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
                 uint32_t tgt_block_offset = token_abs_pos % kv_page_size;
 
                 // // print tgt_block_idx and tgt_block_offset for debugging
-                // std::cout << "Processing token: " << embed.token_id 
-                //           << ", position: " << embed.position_id 
+                // std::cout << "Processing token: " << embed.token_id
+                //           << ", position: " << embed.position_id
                 //           << ", token_abs_pos: " << token_abs_pos
-                //           << ", target block index: " << tgt_block_idx 
+                //           << ", target block index: " << tgt_block_idx
                 //           << ", target block offset: " << tgt_block_offset << std::endl;
 
                 if (tgt_block_idx < cmd.context_block_ids.size()) {
@@ -285,7 +286,7 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     }
 
     scope.record("preproc");
-    
+
 
     // // print all host vectors for debugging
     // std::cout << "kv_page_indices_host: ";
@@ -333,6 +334,8 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     // --- 2. Allocate and Plan L4maBuffer ---
     size_t num_total_new_tokens = new_token_ids_host.size();
 
+
+    // Empty vectors are now allowed by StackAllocator::allocate_and_copy_async (returning zero-sized tensors).
 
     buffer->plan(
         stream, new_token_ids_host, new_position_ids_host,
@@ -403,63 +406,63 @@ void Model::ModelImpl::handle_copy_block(const std::vector<Model::CopyBlockComma
         // Find source and destination blocks
         auto src_it = blocks.find(cmd.source_block_id);
         auto dst_it = blocks.find(cmd.destination_block_id);
-        
+
         if (src_it == blocks.end()) {
             std::cerr << "Warning: Source block not found: " << cmd.source_block_id << std::endl;
             continue;
         }
-        
+
         if (dst_it == blocks.end()) {
             std::cerr << "Warning: Destination block not found: " << cmd.destination_block_id << std::endl;
             continue;
         }
-        
+
         Block& src_block = src_it->second;
         Block& dst_block = dst_it->second;
-        
+
         // Validate bounds
         if (cmd.source_start + cmd.length > src_block.occupancy.size() ||
             cmd.destination_start + cmd.length > dst_block.occupancy.size()) {
-            std::cerr << "Warning: Copy operation out of bounds for blocks " 
+            std::cerr << "Warning: Copy operation out of bounds for blocks "
                       << cmd.source_block_id << " -> " << cmd.destination_block_id << std::endl;
             continue;
         }
-        
+
         // Copy occupancy and position_ids (CPU-side arrays)
         std::copy(
             src_block.occupancy.begin() + cmd.source_start,
             src_block.occupancy.begin() + cmd.source_start + cmd.length,
             dst_block.occupancy.begin() + cmd.destination_start
         );
-        
+
         std::copy(
             src_block.position_ids.begin() + cmd.source_start,
             src_block.position_ids.begin() + cmd.source_start + cmd.length,
             dst_block.position_ids.begin() + cmd.destination_start
         );
-        
+
         // Copy KV cache data (GPU-side) for each layer
         size_t num_layers = model->get_config().num_layers;
         size_t num_kv_heads = model->get_config().num_key_value_heads;
         size_t head_size = model->get_config().head_size;
-        
+
         // Calculate the number of elements per token position in the KV cache
         size_t elements_per_token = num_kv_heads * head_size;
         size_t bytes_per_token = elements_per_token * sizeof(__nv_bfloat16);
-        
+
         for (size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
             auto [k_cache_ptr, v_cache_ptr] = kv_cache->get_layer_pointers(layer_idx);
-            
+
             // Calculate source and destination offsets within the layer
             // Each block contains kv_page_size tokens, and we need to copy a range within blocks
             size_t src_token_offset = cmd.source_block_id * kv_page_size + cmd.source_start;
             size_t dst_token_offset = cmd.destination_block_id * kv_page_size + cmd.destination_start;
-            
+
             size_t src_element_offset = src_token_offset * elements_per_token;
             size_t dst_element_offset = dst_token_offset * elements_per_token;
-            
+
             size_t copy_size_bytes = cmd.length * bytes_per_token;
-            
+
             // Copy K cache
             cudaMemcpy(
                 k_cache_ptr + dst_element_offset,
@@ -467,7 +470,7 @@ void Model::ModelImpl::handle_copy_block(const std::vector<Model::CopyBlockComma
                 copy_size_bytes,
                 cudaMemcpyDeviceToDevice
             );
-            
+
             // Copy V cache
             cudaMemcpy(
                 v_cache_ptr + dst_element_offset,
@@ -501,7 +504,7 @@ std::vector<Model::SampleTopKResult> Model::ModelImpl::handle_sample_top_k(const
         }
 
         const auto& dist = it->second;
-        
+
         // Create pairs for sorting from the entire stored distribution.
         std::vector<std::pair<float, int32_t>> sorted_pairs;
         sorted_pairs.reserve(dist.probabilities.size());
@@ -511,7 +514,7 @@ std::vector<Model::SampleTopKResult> Model::ModelImpl::handle_sample_top_k(const
                 dist.token_ids[i]
             });
         }
-        
+
         // Sort pairs in descending order based on probability.
         std::sort(sorted_pairs.begin(), sorted_pairs.end(), [](const auto& a, const auto& b) {
             return a.first > b.first;
@@ -519,7 +522,7 @@ std::vector<Model::SampleTopKResult> Model::ModelImpl::handle_sample_top_k(const
 
         // Determine how many results to return (k).
         uint32_t k = (cmd.k > 0 && cmd.k < sorted_pairs.size()) ? cmd.k : sorted_pairs.size();
-        
+
         // Populate result from the top k sorted pairs.
         res.probabilities.reserve(k);
         res.token_ids.reserve(k);
@@ -533,11 +536,82 @@ std::vector<Model::SampleTopKResult> Model::ModelImpl::handle_sample_top_k(const
     return results;
 }
 
+// ForwardText (batched implementation aggregating all items into single embed/fill/sample passes)
+std::vector<std::vector<Model::Distribution>> Model::handle_forward_text(const std::vector<ForwardTextCommand>& commands) {
+    std::vector<std::vector<Model::Distribution>> results(commands.size());
+    if (commands.empty()) return results;
+
+    // 1. Allocate embedding IDs for every token across all items (single static counter)
+    static uint32_t next_embed_id = 2'000'000; // reserved ephemeral id space
+    std::vector<EmbedTextCommand> all_embed_cmds;
+    all_embed_cmds.reserve([&](){ size_t s=0; for (auto& c:commands) s+=c.token_ids.size(); return s;}());
+
+    // Per-item token embedding ids for mapping output indices -> embedding ids
+    std::vector<std::vector<uint32_t>> per_item_embed_ids(commands.size());
+    for (size_t item_idx = 0; item_idx < commands.size(); ++item_idx) {
+        const auto& cmd = commands[item_idx];
+        per_item_embed_ids[item_idx].reserve(cmd.token_ids.size());
+        for (size_t t = 0; t < cmd.token_ids.size(); ++t) {
+            uint32_t emb_id = next_embed_id++;
+            per_item_embed_ids[item_idx].push_back(emb_id);
+            all_embed_cmds.push_back({emb_id, cmd.token_ids[t], cmd.position_ids[t]});
+        }
+    }
+    pimpl->handle_embed_text(all_embed_cmds);
+
+    // 2. Build all FillBlockCommands (one per ForwardText item) and gather output embedding ids
+    std::vector<FillBlockCommand> fill_cmds;
+    fill_cmds.reserve(commands.size());
+    std::vector<std::vector<uint32_t>> per_item_output_embed_ids(commands.size());
+    size_t total_requested_dists = 0;
+    for (size_t item_idx = 0; item_idx < commands.size(); ++item_idx) {
+        const auto& cmd = commands[item_idx];
+        const auto& embed_ids = per_item_embed_ids[item_idx];
+        auto& out_embed_ids = per_item_output_embed_ids[item_idx];
+        out_embed_ids.reserve(cmd.output_indices.size());
+        for (auto out_idx : cmd.output_indices) {
+            if (out_idx < embed_ids.size()) out_embed_ids.push_back(embed_ids[out_idx]);
+        }
+        total_requested_dists += out_embed_ids.size();
+        fill_cmds.push_back(FillBlockCommand{cmd.kv_page_last_len, cmd.kv_page_ids, embed_ids, out_embed_ids});
+    }
+
+    // NOTE: BRLE masks (cmd.brle_masks) are currently ignored; existing fill_block builds causal masks internally.
+    // A future enhancement would decode and integrate them into custom_masks_host inside handle_fill_block.
+
+    // 3. Single batched fill_block
+    if (!fill_cmds.empty()) {
+        pimpl->handle_fill_block(fill_cmds);
+    }
+
+    // 4. Collect sample commands for all requested output embeddings
+    std::vector<SampleTopKCommand> sample_cmds;
+    sample_cmds.reserve(total_requested_dists);
+    for (auto& out_ids : per_item_output_embed_ids) {
+        for (auto eid : out_ids) sample_cmds.push_back({eid, (uint32_t)pimpl->dist_size});
+    }
+    auto sample_results = pimpl->handle_sample_top_k(sample_cmds);
+
+    // 5. Reconstruct per-item distributions from flattened sample_results
+    size_t cursor = 0;
+    for (size_t item_idx = 0; item_idx < commands.size(); ++item_idx) {
+        auto& out_ids = per_item_output_embed_ids[item_idx];
+        auto& item_out = results[item_idx];
+        item_out.reserve(out_ids.size());
+        for (size_t j = 0; j < out_ids.size(); ++j) {
+            if (cursor >= sample_results.size()) break; // safety
+            auto& sr = sample_results[cursor++];
+            item_out.push_back(Model::Distribution{sr.token_ids, sr.probabilities});
+        }
+    }
+    return results;
+}
+
 // --- Public Interface Implementation ---
 
 Model::Model(const AppConfig& config,const ModelMetadata& out_metadata)
     : pimpl(std::make_unique<ModelImpl>()) {
-    
+
     std::cout << "Starting service..." << std::endl;
     // Load the model and store it in the implementation object
     pimpl->model = load_model_internal<__nv_bfloat16>(config, out_metadata);
@@ -545,7 +619,7 @@ Model::Model(const AppConfig& config,const ModelMetadata& out_metadata)
 
     // Initialize the L4maBuffer with the model's configuration
     size_t buffer_workspace_size = L4maBuffer<__nv_bfloat16>::get_workspace_size(
-        pimpl->model->get_config(), 
+        pimpl->model->get_config(),
         4096, // number of new tokens
         4096, // batch size
         4096, // number of old tokens
@@ -553,12 +627,12 @@ Model::Model(const AppConfig& config,const ModelMetadata& out_metadata)
     );
 
     size_t kv_cache_workspace_size = L4maKVCache<__nv_bfloat16>::get_workspace_size(
-        pimpl->model->get_config(), 
-        config.max_num_kv_pages, 
+        pimpl->model->get_config(),
+        config.max_num_kv_pages,
         config.kv_page_size
     );
 
-    // print out the workspace sizes (in MB) 
+    // print out the workspace sizes (in MB)
     std::cout << "Buffer workspace size: " << (buffer_workspace_size / (1024 * 1024)) << " MB" << std::endl;
     std::cout << "KV Cache workspace size: " << (kv_cache_workspace_size / (1024 * 1024)) << " MB" << std::endl;
 

@@ -1,0 +1,32 @@
+# Sample CUDA backend config
+host = "127.0.0.1"
+port = 8080
+enable_auth = false
+auth_secret = "hello"
+verbose = true
+log = "pie_cuda.log"
+batching_strategy = "adaptive"
+batching_strategy_k = 8
+batching_strategy_t = 16
+
+[[backend]]
+backend_type = "cxx"
+exec_path = "../backend/backend-cuda/build/bin/pie_cuda_be"
+model = "llama-3.2-1b-instruct"
+# GPU selection
+device = "cuda:0"
+# Numerical precision
+dtype = "bfloat16"  # options likely: bfloat16, float16, float32
+# KV cache paging
+kv_page_size = 16
+# Distribution size (?) retained from python example
+dist_size = 64
+# Resource limits
+max_num_kv_pages = 14000
+max_num_embeds = 50000
+
+# Notes:
+# - Ensure the CUDA backend binary is built: (cd ../backend/backend-cuda && make -j)
+# - Weights expected under: <cache_dir>/models/<model>. (Override cache_dir via CLI or config if needed.)
+# - Launch controller: cargo run -- --config example_cuda_config.toml
+# - Adjust dtype for your GPU capabilities if needed.
