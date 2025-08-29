@@ -6,7 +6,7 @@
 #include <string>
 #include <algorithm>
 #include <cstdint>
-#include <vector> 
+#include <vector>
 
 inline size_t align_up(size_t size, size_t alignment) {
     return (size + alignment - 1) & ~(alignment - 1);
@@ -15,10 +15,10 @@ inline size_t align_up(size_t size, size_t alignment) {
 class StackAllocator {
 public:
     explicit StackAllocator(size_t total_size_bytes)
-        : buffer_(total_size_bytes), 
+        : buffer_(total_size_bytes),
           offset_(0) {
         // Pre-allocate capacity to avoid frequent std::vector reallocations
-        offset_stack_.reserve(256); 
+        offset_stack_.reserve(256);
     }
 
     StackAllocator(const StackAllocator&) = delete;
@@ -40,7 +40,7 @@ public:
     template<typename T>
     Tensor<T> allocate(size_t count = 1) {
         constexpr size_t alignment = std::max(alignof(T), (size_t)256);
-        
+
         // **FIX**: Store the current offset before this allocation.
         offset_stack_.push_back(offset_);
 
@@ -53,7 +53,7 @@ public:
         }
 
         offset_ = aligned_offset + bytes_to_alloc;
-        
+
         return Tensor<T>(buffer_, aligned_offset, count);
     }
 
@@ -63,15 +63,13 @@ public:
     template<typename T>
     Tensor<T> allocate_and_copy_async(const std::vector<T>& host_vector, cudaStream_t stream) {
         if (host_vector.empty()) {
-            throw std::runtime_error("empty vector provided to StackAllocator::allocate_and_copy_async.");
-
-            // exit program
-            //std::exit(EXIT_FAILURE);
+            // Gracefully return a zero-sized tensor without consuming allocator state.
+            return Tensor<T>(buffer_, offset_, 0);
         }
 
         size_t count = host_vector.size();
         constexpr size_t alignment = std::max(alignof(T), (size_t)256);
-        
+
         // **FIX**: Store the current offset before this allocation.
         offset_stack_.push_back(offset_);
 
@@ -120,10 +118,10 @@ public:
             if (tensor.size() == 0) return;
             throw std::runtime_error("StackAllocator deallocation error: Unbalanced deallocation call.");
         }
-        
+
         // The offset to restore to is the one we saved before this block was allocated.
         size_t previous_offset = offset_stack_.back();
-        
+
         // Sanity Check: Ensure the tensor being freed was indeed at the top of the stack.
         // This check is now robust because it uses the true current offset.
         uint8_t* start_ptr = reinterpret_cast<uint8_t*>(tensor.data());

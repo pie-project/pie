@@ -44,7 +44,7 @@ std::map<int, std::vector<uint8_t>> load_merge_rules(const std::filesystem::path
 
         std::string::size_type pos = line.find(' ');
         if (pos == std::string::npos) throw std::runtime_error("Error on line " + std::to_string(line_number) + ": expected 2 parts, but found 1.");
-        
+
         std::string b64_token = line.substr(0, pos);
         std::string rank_str = line.substr(pos + 1);
 
@@ -61,7 +61,7 @@ ModelMetadata parse_model_metadata(const std::filesystem::path& metadata_path) {
     if (!std::filesystem::exists(metadata_path)) {
         throw std::runtime_error("Metadata file not found at: " + metadata_path.string());
     }
-    
+
     const auto metadata_dir = metadata_path.parent_path();
 
     toml::table tbl;
@@ -81,7 +81,7 @@ ModelMetadata parse_model_metadata(const std::filesystem::path& metadata_path) {
         }
         return node;
     };
-    
+
     // --- Parse top-level keys ---
     metadata.name = get_required(tbl, "name", "top-level").value_or("");
     metadata.description = get_required(tbl, "description", "top-level").value_or("");
@@ -95,7 +95,7 @@ ModelMetadata parse_model_metadata(const std::filesystem::path& metadata_path) {
     // --- Parse Architecture ---
     auto arch_data = get_required(tbl, "architecture", "top-level").as_table();
     auto rope_data = get_required(*arch_data, "rope", "architecture").as_table();
-    
+
     metadata.architecture = {
         .type = get_required(*arch_data, "type", "architecture").value_or(""),
         .num_layers = get_required(*arch_data, "num_layers", "architecture").value_or(0),
@@ -117,7 +117,7 @@ ModelMetadata parse_model_metadata(const std::filesystem::path& metadata_path) {
     auto tokenizer_data = get_required(tbl, "tokenizer", "top-level").as_table();
     std::string vocab_file = get_required(*tokenizer_data, "vocabulary_file", "tokenizer").value_or("");
     auto vocab_full_path = metadata_dir / metadata.name / vocab_file;
-    
+
     metadata.tokenizer.type = get_required(*tokenizer_data, "type", "tokenizer").value_or("");
     metadata.tokenizer.split_regex = get_required(*tokenizer_data, "split_regex", "tokenizer").value_or("");
     metadata.tokenizer.merge_table = load_merge_rules(vocab_full_path);
@@ -303,7 +303,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
 
     // Initializing the models
     Model model(config, metadata);
-    
+
     // The run() method contains the main application loop.
     model.run();
 
@@ -327,12 +327,12 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     std::cerr << "[ZMQ Server Thread] Invalid handshake message." << std::endl;
                     continue;
                 }
-                
+
                 handshake::Response hs_res;
                 for(const auto& p : protocols) {
                     hs_res.add_protocols(p);
                 }
-                
+
                 zmq::message_t response_payload(hs_res.ByteSizeLong());
                 hs_res.SerializeToArray(response_payload.data(), response_payload.size());
 
@@ -342,13 +342,13 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                 connected_clients[client_identity] = true;
                 continue;
             }
-            
+
             // Handle requests from existing clients
             if (multipart_msg.size() != 3) {
                 std::cerr << "[ZMQ Server Thread] Invalid message format from known client." << std::endl;
                 continue;
             }
-            
+
             const int protocol_idx = *static_cast<const uint8_t*>(multipart_msg[1].data());
             if (protocol_idx < 0 || protocol_idx >= protocols.size()) {
                 std::cerr << "[ZMQ Server Thread] Invalid protocol index: " << protocol_idx << std::endl;
@@ -360,7 +360,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
             if (protocol == "l4m") {
                 l4m::Request request;
                 request.ParseFromString(payload_str);
-                
+
                 bool needs_response = false;
                 l4m::Response response;
                 response.set_correlation_id(request.correlation_id());
@@ -373,7 +373,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     info->set_kv_page_size(config.kv_page_size);
                     info->set_num_available_kv_pages(config.max_num_kv_pages);
                     info->set_num_available_embeddings(config.max_num_embeds);
-                    
+
                     auto* tokenizer_info = info->mutable_tokenizer();
                     auto* merge_table_proto = tokenizer_info->mutable_merge_table();
                     auto* special_tokens_proto = tokenizer_info->mutable_special_tokens();
@@ -382,7 +382,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
 
                     // The protobuf `bytes` type corresponds to `std::string` in C++.
                     for (const auto& [rank, token_bytes] : metadata.tokenizer.merge_table) {
-                        (*merge_table_proto)[static_cast<uint32_t>(rank)] = 
+                        (*merge_table_proto)[static_cast<uint32_t>(rank)] =
                             std::string(token_bytes.begin(), token_bytes.end());
                     }
 
@@ -449,6 +449,38 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     needs_response = true;
                     auto* proto_response = response.mutable_batch_sync();
 
+                } else if (request.has_forward_text()) {
+                    needs_response = true;
+                    const auto& batch_req = request.forward_text();
+                    std::vector<Model::ForwardTextCommand> cmds;
+                    cmds.reserve(batch_req.items_size());
+                    for (const auto& item : batch_req.items()) {
+                        Model::ForwardTextCommand c {
+                            item.kv_page_last_len(),
+                            {item.kv_page_ids().begin(), item.kv_page_ids().end()},
+                            {item.token_ids().begin(), item.token_ids().end()},
+                            {item.position_ids().begin(), item.position_ids().end()},
+                            {},
+                            {item.output_indices().begin(), item.output_indices().end()}
+                        };
+                        // capture BRLE masks
+                        c.brle_masks.reserve(item.mask_size());
+                        for (const auto& m : item.mask()) {
+                            c.brle_masks.push_back({m.buffer().begin(), m.buffer().end()});
+                        }
+                        cmds.push_back(std::move(c));
+                    }
+                    auto results = model.handle_forward_text(cmds);
+                    auto* forward_resp = response.mutable_forward_text();
+                    for (auto& item_res : results) {
+                        auto* item_proto = forward_resp->add_items();
+                        for (auto& dist : item_res) {
+                            auto* dist_proto = item_proto->add_distributions();
+                            dist_proto->mutable_ids()->Add(dist.token_ids.begin(), dist.token_ids.end());
+                            dist_proto->mutable_probs()->Add(dist.probabilities.begin(), dist.probabilities.end());
+                        }
+                    }
+
                 } else if (request.has_mask_block()) {
                     //std::cout << "[ZMQ Server Thread] Handling BatchMaskBlock request." << std::endl;
                     std::vector<Model::MaskBlockCommand> commands;
@@ -491,7 +523,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                 } else if (request.has_sample_top_k_request()) {
                     //std::cout << "[ZMQ Server Thread] Handling BatchSampleTopKRequest request." << std::endl;
                     needs_response = true;
-                    
+
                     std::vector<Model::SampleTopKCommand> commands;
                     commands.reserve(request.sample_top_k_request().items_size());
                     for (const auto& item : request.sample_top_k_request().items()) {
@@ -530,7 +562,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                 router.send(multipart_msg[1], zmq::send_flags::sndmore);
                 router.send(zmq::buffer(pong_res.SerializeAsString()), zmq::send_flags::none);
             }
-            
+
         } catch (const zmq::error_t& e) {
             if (e.num() == ETERM) {
                 std::cout << "[ZMQ Server Thread] Context terminated, shutting down." << std::endl;
@@ -556,7 +588,7 @@ int main(int argc, char* argv[]) {
     AppConfig cli_config;
     std::optional<std::string> config_filepath_opt;
     std::optional<std::string> cache_dir_opt;
-    
+
     app.add_option("--config", config_filepath_opt, "Path to a TOML configuration file.")->check(CLI::ExistingFile);
     app.add_option("--host", cli_config.host, "The hostname to bind to.");
     app.add_option("--port", cli_config.port, "The port number to listen on.");
@@ -592,7 +624,7 @@ int main(int argc, char* argv[]) {
         final_config.port = app.count("--port") > 0 ? cli_config.port : config_from_file["port"].value_or(final_config.port);
         final_config.controller_host = app.count("--controller_host") > 0 ? cli_config.controller_host : config_from_file["controller_host"].value_or(final_config.controller_host);
         final_config.controller_port = app.count("--controller_port") > 0 ? cli_config.controller_port : config_from_file["controller_port"].value_or(final_config.controller_port);
-        
+
         if (app.count("--model") > 0) final_config.model_name = cli_config.model_name;
         else if (auto node = config_from_file["model"]; node.is_string()) final_config.model_name = node.as_string()->get();
 
@@ -618,7 +650,7 @@ int main(int argc, char* argv[]) {
         // --- 4. Start Services ---
         zmq::context_t context(1);
         zmq::socket_t router(context, zmq::socket_type::router);
-        
+
         std::string service_endpoint;
         std::string service_endpoint_public;
 
@@ -647,7 +679,7 @@ int main(int argc, char* argv[]) {
         router.close();
         context.close();
 
-        
+
     } catch (const std::exception& e) {
         std::cerr << "An error occurred: " << e.what() << std::endl;
         return 1;

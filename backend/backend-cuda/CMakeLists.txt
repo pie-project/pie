@@ -2,6 +2,19 @@
 # first-class language.
 cmake_minimum_required(VERSION 3.23)
 
+# --- CUDA compiler auto-detection (runs before project() so it can take effect) ---
+# If the user didn't set CMAKE_CUDA_COMPILER / CUDACXX but nvcc exists at a common path,
+# set it explicitly to avoid configuration failures on systems where CMake can't locate CUDA.
+if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED CUDACXX)
+  if(EXISTS "/usr/local/cuda/bin/nvcc")
+    set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc" CACHE FILEPATH "Path to nvcc compiler" FORCE)
+    message(STATUS "Auto-detected nvcc at /usr/local/cuda/bin/nvcc")
+  elseif(DEFINED ENV{CUDA_HOME} AND EXISTS "$ENV{CUDA_HOME}/bin/nvcc")
+    set(CMAKE_CUDA_COMPILER "$ENV{CUDA_HOME}/bin/nvcc" CACHE FILEPATH "Path to nvcc compiler" FORCE)
+    message(STATUS "Auto-detected nvcc at $ENV{CUDA_HOME}/bin/nvcc")
+  endif()
+endif()
+
 # Detect CUDA architecture
 include(cmake/DetectCudaArchitecture.cmake)
 detect_cuda_architectures()
@@ -102,17 +115,32 @@ protobuf_generate(
 
 # -----
 
-# Define the main executable target
+# ----
+# Define a static library for the common CUDA kernels
+add_library(
+  cuda_common_kernels STATIC
+  src/common.cu
+  src/tensor.cu
+  src/model.cu
+)
 
+target_include_directories(
+  cuda_common_kernels
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${flashinfer_SOURCE_DIR}/include
+          ${flashinfer_SOURCE_DIR}/src/generated)
+
+target_link_libraries(cuda_common_kernels INTERFACE zstd)
+
+# Define the main executable target
 add_executable(
   pie_cuda_be
   src/main.cpp
-  # src/ztensor.cpp
-  src/l4ma.cu src/model.cu src/common.cu src/tensor.cu
-  # src/l4ma.cu
-  # src/bpe.cpp
-  # src/common.cu
+  src/l4ma.cu
 )
+
+# Link the main executable against the common kernels library
+target_link_libraries(pie_cuda_be PRIVATE cuda_common_kernels)
+
 
 # Set compiler flags and options for the target These flags are applied
 # specifically to 'cuda_app'. This mirrors the 'cxxflags' from your ninja file.
@@ -134,7 +162,7 @@ target_compile_options(
 target_include_directories(
   pie_cuda_be
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${flashinfer_SOURCE_DIR}/include
-          ${flashinfer_SOURCE_DIR}/src/generated)
+          ${flashinfer_SOURCE_DIR}/src/generated ${zstd_SOURCE_DIR}/lib)
 
 target_link_libraries(
   pie_cuda_be
@@ -165,3 +193,6 @@ add_custom_target(
   COMMENT "Running pie_cuda_be...")
 
 # --- End of CMakeLists.txt ---
+
+add_subdirectory(tests)
+

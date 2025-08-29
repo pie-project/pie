@@ -16,102 +16,7 @@
 #include "flashinfer/vec_dtypes.cuh"
 
 #include "flashinfer_ops.cuh"
-
-
-// --- Helper CUDA Kernels (Unchanged) ---
-template <typename T>
-__global__ void add_residual_kernel(T* x, const T* residual, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        x[idx] = x[idx] + residual[idx];
-    }
-}
-
-__device__ __forceinline__ float silu(const float &val) {
-    return val / (1.0f + __expf(-val));
-}
-
-template <typename T, float (*Activation)(const float&)>
-__global__ void act_and_mul_kernel(
-    T* __restrict__ out,
-    const T* __restrict__ input1,
-    const T* __restrict__ input2,
-    const int d
-) {
-    // Each thread processes one element at a time, with vectorization
-    constexpr uint32_t vec_size = 16 / sizeof(T);
-
-    // The block index corresponds to the token index in the batch
-    const int64_t token_idx = blockIdx.x;
-    // The thread index within the block
-    const int64_t thread_idx = threadIdx.x;
-    // The total number of threads in the block
-    const int64_t stride = blockDim.x;
-
-    // Calculate the base offset for the current token for each input
-    const int64_t token_offset = token_idx * d;
-
-    // Main loop for vectorized processing
-    // Each thread processes multiple elements in a strided pattern
-    #pragma unroll 1
-    for (uint32_t idx = thread_idx; idx < d / vec_size; idx += stride) {
-        flashinfer::vec_t<float, vec_size> x_vec, y_vec, out_vec;
-
-        // Load data from the two separate input tensors
-        x_vec.cast_load(input1 + token_offset + idx * vec_size);
-        y_vec.cast_load(input2 + token_offset + idx * vec_size);
-
-        // Apply activation to the first vector and multiply element-wise
-        #pragma unroll
-        for (uint32_t i = 0; i < vec_size; ++i) {
-            out_vec[i] = Activation(x_vec[i]) * y_vec[i];
-        }
-
-        // Store the result back to the output tensor
-        out_vec.cast_store(out + token_offset + idx * vec_size);
-    }
-
-    // Handle remaining elements that don't fit into a full vector
-    const int64_t remaining_offset = (d / vec_size) * vec_size;
-    #pragma unroll 1
-    for (int64_t idx = thread_idx + remaining_offset; idx < d; idx += stride) {
-        // Load single elements from each input tensor
-        float x = static_cast<float>(__ldg(input1 + token_offset + idx));
-        float y = static_cast<float>(__ldg(input2 + token_offset + idx));
-        // Compute and store the result
-        out[token_offset + idx] = static_cast<T>(Activation(x) * y);
-    }
-}
-
-
-
-// Host-side function to launch the silu_and_mul kernel
-template <typename T>
-void silu_and_mul(
-    T* out_ptr,
-    const T* in1_ptr, // Pointer to the first input tensor
-    const T* in2_ptr, // Pointer to the second input tensor
-    int num_tokens,   // Batch size or number of tokens
-    int d,            // The hidden dimension size
-    cudaStream_t stream
-) {
-    // Vector size depends on the data type (e.g., 8 for half, 4 for float)
-    constexpr uint32_t vec_size = 16 / sizeof(T);
-    
-    // Each block processes one token
-    dim3 grid_dim(num_tokens);
-    // Number of threads per block, capped at 256 for efficiency
-    // We choose a block size that is a power of two and related to the problem size
-    uint32_t block_dim = std::min(static_cast<uint32_t>(d / vec_size), 256U);
-    if (block_dim == 0) { // Ensure at least one thread block if d is small
-        block_dim = std::min(static_cast<uint32_t>(d), 256U);
-    }
-
-    // Launch the kernel with a standard execution configuration
-    act_and_mul_kernel<T, silu><<<grid_dim, block_dim, 0, stream>>>(
-        out_ptr, in1_ptr, in2_ptr, d
-    );
-}
+#include "kernels.cuh"  // extracted primitive kernels & launchers
 
 std::vector<uint8_t> packbits_little(const std::vector<bool>& data) {
     // Calculate the number of bytes needed, padding with zeros for the last byte if necessary.
@@ -246,7 +151,7 @@ void L4maBuffer<T>::plan(
     this->stream = strm;
     this->num_tokens = input_ids_host.size();
     this->batch_size = kv_page_indptr_host.empty() ? 0 : kv_page_indptr_host.size() - 1;
-    
+
     std::vector<uint8_t> packed_custom_mask_host = packbits_little(custom_masks_host);
 
     allocator_->reset();
@@ -383,9 +288,9 @@ L4maModel<T>::L4maModel(const L4maConfig& config)
 
 template <typename T>
 L4maForCausalLM<T>::L4maForCausalLM(const L4maConfig& config)
-    : config_(config), 
+    : config_(config),
       model_(config) {
-    
+
 }
 
 // --- KV Cache and Workspace Management (REFACTORED) ---
@@ -465,7 +370,7 @@ std::map<std::string, Tensor<T>*> L4maForCausalLM<T>::get_parameters() {
     for (auto const& [key, val] : model_.get_parameters()) {
         params["model." + key] = val;
     }
-    
+
     return params;
 }
 
@@ -475,7 +380,7 @@ void RMSNorm<T>::forward(
     const T* input,
     int num_tokens,
     cudaStream_t stream) {
-    
+
     uint32_t d = config_.hidden_size;
 
     flashinfer::norm::RMSNorm<T>(
@@ -490,7 +395,7 @@ template <typename T>
 void L4maMlp<T>::forward(
     ProfileScope profiler,
     L4maBuffer<T>& buffer,
-    T* output, 
+    T* output,
     const T* x
 ) {
     const int hidden_size = config_.hidden_size;
@@ -513,11 +418,11 @@ void L4maMlp<T>::forward(
     // 3. SwiGLU activation (gate * silu(up))
     // We can reuse the gate_proj_out_ptr buffer for the output of SwiGLU
     silu_and_mul<T>(
-        up_proj_out.data(), 
-        gate_proj_out.data(), 
-        up_proj_out.data(), 
-        buffer.num_tokens, 
-        intermediate_size, 
+        up_proj_out.data(),
+        gate_proj_out.data(),
+        up_proj_out.data(),
+        buffer.num_tokens,
+        intermediate_size,
         buffer.stream
     );
     profiler.record("silu_and_mul");
@@ -553,7 +458,7 @@ void L4maAttention<T>::forward(
 
     const size_t q_proj_count = (size_t)num_tokens * num_query_heads * head_size;
     const size_t kv_proj_count = (size_t)num_tokens * num_key_value_heads * head_size;
-    
+
     // 1. Allocate buffers from the stack allocator
     Tensor<T> q_proj = buffer.template allocate<T>(q_proj_count);
     Tensor<T> k_proj = buffer.template allocate<T>(kv_proj_count);
@@ -573,8 +478,8 @@ void L4maAttention<T>::forward(
         num_key_value_heads, buffer.page_size, head_size, batch_size,
         flashinfer::QKVLayout::kNHD,
         kv_cache_k, kv_cache_v,
-        buffer.kv_page_indices.data(), 
-        buffer.kv_page_indptr.data(), 
+        buffer.kv_page_indices.data(),
+        buffer.kv_page_indptr.data(),
         buffer.kv_last_page_lens.data()
     );
     profiler.record("kv_page_create");
@@ -604,7 +509,7 @@ void L4maAttention<T>::forward(
     profiler.record("append_kv_cache");
 
     // Reuse a buffer for the attention output before the final projection
-    T* o_proj_input_ptr = q_proj.data(); 
+    T* o_proj_input_ptr = q_proj.data();
     flashinfer::BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(
         &buffer.prefill_handler, q_proj.data(), buffer.qo_indptr.data(),
         nullptr, paged_kv, o_proj_input_ptr, nullptr, num_query_heads,
@@ -623,7 +528,7 @@ void L4maAttention<T>::forward(
     // 5. Final output projection
     gemm_cublasLt<T>(buffer.ltHandle, buffer.stream, o_proj_input_ptr, o_proj_weights_.data(), nullptr, attn_output, num_tokens, hidden_size, num_query_heads * head_size, cublas_workspace.data(), cublas_workspace_size, false, true);
     profiler.record("o_projection");
-    
+
     // 6. Deallocate buffers in reverse order
     buffer.deallocate(cublas_workspace);
     buffer.deallocate(v_proj);
@@ -650,7 +555,7 @@ void L4maDecoderLayer<T>::forward(
 
     Tensor<T> attn_output = buffer.template allocate<T>(hidden_size_elements);
 
-    self_attn_.forward(profiler.scope("self_attn"), buffer, attn_output.data(), 
+    self_attn_.forward(profiler.scope("self_attn"), buffer, attn_output.data(),
                        normed_input.data() , kv_cache_k, kv_cache_v);
 
     //logger.record("self_attn", buffer.stream);
@@ -680,7 +585,7 @@ void L4maDecoderLayer<T>::forward(
     add_residual_kernel<<<(hidden_size_elements + 255) / 256, 256, 0, buffer.stream>>>(
         hidden_states, mlp_output.data(), hidden_size_elements);
     profiler.record("mlp_residual_add");
-    
+
     // Deallocate MLP buffers
     buffer.deallocate(mlp_output);
     buffer.deallocate(normed_mlp_input);
@@ -695,7 +600,7 @@ void L4maModel<T>::forward(
 ) {
     const int num_tokens = buffer.num_tokens;
     const size_t hidden_size_elements = (size_t)num_tokens * config_.hidden_size;
-    
+
     // Allocate a working buffer for the layers. The layers will operate in-place on this buffer.
     Tensor<T> working_hidden_buffer = buffer.template allocate<T>(hidden_size_elements);
 
@@ -705,7 +610,7 @@ void L4maModel<T>::forward(
         buffer.input_ids.data(),
         buffer.num_tokens,
         working_hidden_buffer.data(), // Embeddings are written to the allocated working buffer
-        config_.hidden_size, 
+        config_.hidden_size,
         buffer.stream
     );
     profiler.record("embedding_lookup");
@@ -736,7 +641,7 @@ void L4maModel<T>::forward(
 template <typename T>
 std::pair<std::vector<float>, std::vector<int32_t>> L4maForCausalLM<T>::forward(
     ProfileScope profiler,
-    L4maBuffer<T>& buffer, 
+    L4maBuffer<T>& buffer,
     L4maKVCache<T>& kv_cache
 ) {
 
@@ -841,7 +746,7 @@ std::pair<std::vector<float>, std::vector<int32_t>> L4maForCausalLM<T>::forward(
     // 6. Copy final results back to the host.
     std::vector<float> final_logits_val_host = final_logits_val.to_vector();
     std::vector<int32_t> final_logits_indices_host = final_logits_indices.to_vector();
-    
+
     // 7. DEALLOCATE ALL BUFFERS IN REVERSE ORDER (LIFO)
 
 

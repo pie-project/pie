@@ -1,0 +1,1 @@
+// Removed: superseded by test_act_and_mul_full.cu which includes full implementation.
