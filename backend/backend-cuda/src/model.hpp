@@ -55,7 +55,7 @@ public:
         uint32_t block_id;
         std::vector<bool> mask;
     };
-    
+
     // Corresponds to l4m.CopyBlock
     struct CopyBlockCommand {
         uint32_t source_block_id;
@@ -83,6 +83,24 @@ public:
         std::vector<float> probabilities;
     };
 
+    // Corresponds to l4m.ForwardText
+    struct ForwardTextCommand {
+        uint32_t kv_page_last_len;
+        std::vector<uint32_t> kv_page_ids;
+        std::vector<uint32_t> token_ids;
+        std::vector<uint32_t> position_ids;
+        std::vector<std::vector<uint32_t>> brle_masks; // raw BRLE buffers per token
+        std::vector<uint32_t> output_indices; // indices within token_ids to produce distributions for
+    };
+
+    struct Distribution {
+        std::vector<uint32_t> token_ids;
+        std::vector<float> probabilities;
+    };
+
+    // ForwardText handler: returns a vector of items, each item containing a vector of distributions
+    std::vector<std::vector<Distribution>> handle_forward_text(const std::vector<ForwardTextCommand>& commands);
+
     // --- Core Class Methods ---
 
     Model(const AppConfig& config, const ModelMetadata& out_metadata);
@@ -98,7 +116,7 @@ public:
     void handle_mask_block(const std::vector<MaskBlockCommand>& commands);
     void handle_copy_block(const std::vector<CopyBlockCommand>& commands);
     void handle_decode_token_distribution(const std::vector<DecodeTokenDistributionCommand>& commands);
-    
+
     std::vector<SampleTopKResult> handle_sample_top_k(const std::vector<SampleTopKCommand>& commands);
 
 

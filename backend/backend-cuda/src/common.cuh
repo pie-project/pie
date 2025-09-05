@@ -75,16 +75,6 @@ void embed(
  * @param topk_tokens_storage Output device vector for storing top-k token IDs.
  * @param stream The CUDA stream for the operation.
  */
-template<typename T>
-void topk_scatter(
-    T* logits,
-    const thrust::device_vector<size_t>& logit_indices_dev,
-    const thrust::device_vector<uint32_t>& dest_embed_ids_dev,
-    size_t vocab_size,
-    size_t k,
-    thrust::device_vector<T>& topk_probs_storage,
-    thrust::device_vector<int32_t>& topk_tokens_storage,
-    cudaStream_t stream);
 
 // template <typename T>
 // void gemm_cublasLt2(cublasLtHandle_t ltHandle, cudaStream_t stream, const T *A, const T *B, T *C,

@@ -474,7 +474,7 @@ void gemm_cublasLt(cublasLtHandle_t ltHandle,
     {
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, cuda_dtype, k, m, k));
     }
-    
+
     // C has dimensions (n, m)
     CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, cuda_dtype, n, m, n));
 
@@ -566,5 +566,3 @@ void multiply_bf16_cublas(cublasHandle_t handle,
                               CUDA_R_32F,
                               CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
-
-
