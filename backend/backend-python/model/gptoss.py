@@ -135,8 +135,8 @@ def create_fusion_map(model: nn.Module):
         elif isinstance(module, GPTOSSExperts):
             # Handle gate_up_proj weights (MXFP4 format)
             target_gate_up = f"{name}.gate_up_proj"
-            blocks_gate_up = f"{name}.gate_up_proj.blocks"
-            scales_gate_up = f"{name}.gate_up_proj.scales"
+            blocks_gate_up = f"{name}.gate_up_proj_blocks"
+            scales_gate_up = f"{name}.gate_up_proj_scales"
             fusion_map[target_gate_up] = {
                 "sources": [blocks_gate_up, scales_gate_up],
                 "dim": None,
@@ -145,8 +145,8 @@ def create_fusion_map(model: nn.Module):
 
             # Handle down_proj weights (MXFP4 format)
             target_down = f"{name}.down_proj"
-            blocks_down = f"{name}.down_proj.blocks"
-            scales_down = f"{name}.down_proj.scales"
+            blocks_down = f"{name}.down_proj_blocks"
+            scales_down = f"{name}.down_proj_scales"
             fusion_map[target_down] = {
                 "sources": [blocks_down, scales_down],
                 "dim": None,
@@ -428,10 +428,6 @@ class GPTOSSAttention(nn.Module):
             )
         )
 
-        self.norm = GPTOSSRMSNorm(
-            config.hidden_size, device=torch.device(config.device)
-        )
-
         qkv_dim = config.head_size * (
             config.num_query_heads + 2 * config.num_key_value_heads
         )
@@ -476,9 +472,7 @@ class GPTOSSAttention(nn.Module):
         """Forward pass through the attention module."""
         n, _ = hidden_states.size()
 
-        # Pre-attention norm
-        t = self.norm(hidden_states)
-        qkv_states = self.qkv_proj(t)
+        qkv_states = self.qkv_proj(hidden_states)
 
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
@@ -526,7 +520,7 @@ class GPTOSSAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         # Residual connection
-        return hidden_states + attn_output
+        return attn_output
 
 
 class GPTOSSRouter(nn.Module):
@@ -646,30 +640,24 @@ class GPTOSSMlp(nn.Module):
         """Initialize the GPT OSS MLP layer."""
         super().__init__()
         self.config = config
-
-        self.norm = GPTOSSRMSNorm(
-            config.hidden_size, device=torch.device(config.device)
-        )
         self.router = GPTOSSRouter(config)
         self.experts = GPTOSSExperts(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the MLP layer."""
-        t = self.norm(x)
-
         # Router determines expert selection and weights
-        router_scores, router_indices = self.router(t)
+        router_scores, router_indices = self.router(x)
 
         # Extract the weights for selected experts
         expert_weights = torch.gather(router_scores, 1, router_indices)
 
         # Forward through experts
-        t = self.experts(t, router_indices)
+        t = self.experts(x, router_indices)
 
         # Weighted sum of experts
         t = torch.einsum("bec,be->bc", t, expert_weights)
 
-        return x + t
+        return t
 
 
 class GPTOSSDecoderLayer(nn.Module):
@@ -679,9 +667,14 @@ class GPTOSSDecoderLayer(nn.Module):
         """Initialize the GPT OSS decoder layer."""
         super().__init__()
         self.layer_idx = layer_idx
+        self.input_layernorm = GPTOSSRMSNorm(
+            config.hidden_size, device=torch.device(config.device)
+        )
         self.self_attn = GPTOSSAttention(config, layer_idx)
         self.mlp = GPTOSSMlp(config)
-
+        self.post_attention_layernorm = GPTOSSRMSNorm(
+            config.hidden_size, device=torch.device(config.device)
+        )
     def forward(
         self,
         wrapper,
@@ -696,6 +689,10 @@ class GPTOSSDecoderLayer(nn.Module):
         adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the decoder layer."""
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
         hidden_states = self.self_attn(
             wrapper=wrapper,
@@ -710,8 +707,14 @@ class GPTOSSDecoderLayer(nn.Module):
             adapter_subpass=adapter_subpass,
         )
 
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
         # MLP
         hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
 
         return hidden_states
 
