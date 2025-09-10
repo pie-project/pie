@@ -1,6 +1,7 @@
 """GPT OSS Large Language Model Architecture"""
 
 from __future__ import annotations
+from typing import List, Dict
 
 import math
 import torch
@@ -11,16 +12,97 @@ import flashinfer as ops
 from adapter import AdapterSubpass
 
 from config.gptoss import GPTOSSArch
+from config.common import TensorLoader
 
 VERSION = "0.1.0"
+
+# MXFP4 conversion constants (from official GPT-OSS implementation)
+FP4_VALUES = [
+    +0.0,
+    +0.5,
+    +1.0,
+    +1.5,
+    +2.0,
+    +3.0,
+    +4.0,
+    +6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+
+def convert_mxfp4_to_bf16(
+    blocks: torch.Tensor,
+    scales: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    rows_per_chunk: int = 16384 * 512,
+) -> torch.Tensor:
+    """
+    Convert MXFP4 format tensors (blocks and scales) to bfloat16 format.
+
+    This implementation is based on the official GPT-OSS weights.py implementation.
+
+    Args:
+        blocks: The packed FP4 values tensor (uint8)
+        scales: The block scales tensor
+        dtype: Target dtype for conversion (default: torch.bfloat16)
+        rows_per_chunk: Number of rows to process per chunk for memory efficiency
+
+    Returns:
+        Converted tensor in the target dtype
+    """
+    # Convert scales to int32 and subtract bias (from official implementation)
+    scales = scales.to(torch.int32) - 127
+
+    assert (
+        blocks.shape[:-1] == scales.shape
+    ), f"{blocks.shape=} does not match {scales.shape=}"
+
+    lut = torch.tensor(FP4_VALUES, dtype=dtype, device=blocks.device)
+
+    *prefix_shape, G, B = blocks.shape
+    rows_total = math.prod(prefix_shape) * G
+
+    blocks = blocks.reshape(rows_total, B)
+    scales = scales.reshape(rows_total, 1)
+
+    out = torch.empty(rows_total, B * 2, dtype=dtype, device=blocks.device)
+
+    for r0 in range(0, rows_total, rows_per_chunk):
+        r1 = min(r0 + rows_per_chunk, rows_total)
+
+        blk = blocks[r0:r1]
+        exp = scales[r0:r1]
+
+        # nibble indices -> int64
+        idx_lo = (blk & 0x0F).to(torch.long)
+        idx_hi = (blk >> 4).to(torch.long)
+
+        sub = out[r0:r1]
+        sub[:, 0::2] = lut[idx_lo]
+        sub[:, 1::2] = lut[idx_hi]
+
+        torch.ldexp(sub, exp, out=sub)
+        del idx_lo, idx_hi, blk, exp
+
+    return out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
 
 
 def create_fusion_map(model: nn.Module):
     """
-    Analyzes the model and creates a map for fusing weights.
+    Analyzes the model and creates a map for fusing weights and handling MXFP4 tensors.
 
     Returns:
-        A dictionary mapping {fused_tensor_name: {"sources": [source_names], "dim": cat_dim}}.
+        A dictionary mapping {fused_tensor_name: {"sources": [source_names], "dim": cat_dim, "type": type}}.
+        For MXFP4 tensors, type is "mxfp4" and sources contains [blocks_name, scales_name].
+        For fusion tensors, type is "fusion" and sources contains the tensors to concatenate.
+        For regular tensors, type is "regular" and sources contains the single tensor name.
     """
     fusion_map = {}
     for name, module in model.named_modules():
@@ -33,7 +115,7 @@ def create_fusion_map(model: nn.Module):
                 f"{name}.k_proj.weight",
                 f"{name}.v_proj.weight",
             ]
-            fusion_map[target_w] = {"sources": sources_w, "dim": 0}
+            fusion_map[target_w] = {"sources": sources_w, "dim": 0, "type": "fusion"}
 
             # Handle biases if they exist
             if module.qkv_proj.bias is not None:
@@ -43,9 +125,139 @@ def create_fusion_map(model: nn.Module):
                     f"{name}.k_proj.bias",
                     f"{name}.v_proj.bias",
                 ]
-                fusion_map[target_b] = {"sources": sources_b, "dim": 0}
+                fusion_map[target_b] = {
+                    "sources": sources_b,
+                    "dim": 0,
+                    "type": "fusion",
+                }
+
+        # --- Rule for GPTOSSExperts MXFP4 Weights ---
+        elif isinstance(module, GPTOSSExperts):
+            # Handle gate_up_proj weights (MXFP4 format)
+            target_gate_up = f"{name}.gate_up_proj"
+            blocks_gate_up = f"{name}.gate_up_proj.blocks"
+            scales_gate_up = f"{name}.gate_up_proj.scales"
+            fusion_map[target_gate_up] = {
+                "sources": [blocks_gate_up, scales_gate_up],
+                "dim": None,
+                "type": "mxfp4",
+            }
+
+            # Handle down_proj weights (MXFP4 format)
+            target_down = f"{name}.down_proj"
+            blocks_down = f"{name}.down_proj.blocks"
+            scales_down = f"{name}.down_proj.scales"
+            fusion_map[target_down] = {
+                "sources": [blocks_down, scales_down],
+                "dim": None,
+                "type": "mxfp4",
+            }
+
+            # Biases are regular tensors (not MXFP4)
+            # No special handling needed for biases
 
     return fusion_map
+
+
+class GPTOSSTensorLoader(TensorLoader):
+    """
+    TensorLoader implementation for GPT-OSS models.
+
+    Handles fusion of QKV projections and conversion of MXFP4 MLP weights
+    to bfloat16 format based on the model architecture.
+    """
+
+    def __init__(self, model: nn.Module):
+        """
+        Initialize the tensor loader with a model instance.
+
+        Args:
+            model: The GPT-OSS model instance
+        """
+        self.model = model
+        self._fusion_map = create_fusion_map(model)
+
+        # Create reverse mapping for quick lookup
+        self._source_to_target = {
+            source: target
+            for target, details in self._fusion_map.items()
+            for source in details["sources"]
+        }
+
+    def query(self, runtime_tensor_name: str) -> List[str]:
+        """
+        Query which checkpoint tensors are needed for a given runtime tensor.
+
+        Args:
+            runtime_tensor_name: Name of the tensor in the runtime model
+
+        Returns:
+            List of checkpoint tensor names needed to construct the runtime tensor
+        """
+        if runtime_tensor_name in self._fusion_map:
+            # This tensor requires special handling (fusion or MXFP4 conversion)
+            return self._fusion_map[runtime_tensor_name]["sources"]
+        else:
+            # This is a regular tensor, return itself
+            return [runtime_tensor_name]
+
+    def load(
+        self, runtime_tensor_name: str, checkpoint_tensors: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Load and transform checkpoint tensors into the runtime tensor.
+
+        Args:
+            runtime_tensor_name: Name of the tensor in the runtime model
+            checkpoint_tensors: Dictionary mapping checkpoint tensor names to their loaded tensors
+
+        Returns:
+            The constructed runtime tensor
+        """
+        if runtime_tensor_name in self._fusion_map:
+            fusion_info = self._fusion_map[runtime_tensor_name]
+            tensor_type = fusion_info["type"]
+            source_names = fusion_info["sources"]
+
+            if tensor_type == "fusion":
+                # Handle QKV fusion - concatenate the source tensors
+                concat_dim = fusion_info["dim"]
+                source_tensors = [checkpoint_tensors[name] for name in source_names]
+                return torch.cat(source_tensors, dim=concat_dim)
+
+            elif tensor_type == "mxfp4":
+                # Handle MXFP4 conversion - convert blocks and scales to bfloat16
+                if len(source_names) != 2:
+                    raise ValueError(
+                        f"MXFP4 tensor {runtime_tensor_name} must have exactly 2 sources "
+                        f"(blocks and scales), got {len(source_names)}: {source_names}"
+                    )
+
+                blocks_name, scales_name = source_names
+                if blocks_name not in checkpoint_tensors:
+                    raise KeyError(
+                        f"Blocks tensor '{blocks_name}' not found in checkpoint tensors"
+                    )
+                if scales_name not in checkpoint_tensors:
+                    raise KeyError(
+                        f"Scales tensor '{scales_name}' not found in checkpoint tensors"
+                    )
+
+                blocks = checkpoint_tensors[blocks_name]
+                scales = checkpoint_tensors[scales_name]
+
+                # Convert MXFP4 to bfloat16 using our conversion function
+                return convert_mxfp4_to_bf16(blocks, scales, dtype=torch.bfloat16)
+
+            else:
+                raise ValueError(f"Unknown tensor type: {tensor_type}")
+        else:
+            # This is a regular tensor, return it directly
+            if runtime_tensor_name not in checkpoint_tensors:
+                raise KeyError(
+                    f"Tensor '{runtime_tensor_name}' not found in checkpoint tensors"
+                )
+            return checkpoint_tensors[runtime_tensor_name]
 
 
 class GPTOSSRMSNorm(nn.Module):

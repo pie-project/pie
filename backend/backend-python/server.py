@@ -20,6 +20,7 @@ from websockets.sync.client import connect
 
 from config.common import ModelInfo
 from handler import Handler
+from model.gptoss import GPTOSSForCausalLM, GPTOSSTensorLoader
 from model.l4ma import L4maForCausalLM, L4maTensorLoader
 from model.qwen3 import Qwen3ForCausalLM, Qwen3TensorLoader
 from message import (
@@ -118,12 +119,18 @@ def load_model(config: dict):
     model_info = ModelInfo.load_from_file(str(metadata_path), model_device, model_dtype)
 
     # Instantiate model and create tensor loader based on architecture
-    if model_info.architecture.type.lower() == "qwen3":
-        model = Qwen3ForCausalLM(model_info.architecture)
-        tensor_loader = Qwen3TensorLoader(model)
-    else:
-        model = L4maForCausalLM(model_info.architecture)
-        tensor_loader = L4maTensorLoader(model)
+    match model_info.architecture.type.lower():
+        case "qwen3":
+            model = Qwen3ForCausalLM(model_info.architecture)
+            tensor_loader = Qwen3TensorLoader(model)
+        case "l4ma":
+            model = L4maForCausalLM(model_info.architecture)
+            tensor_loader = L4maTensorLoader(model)
+        case "gptoss":
+            model = GPTOSSForCausalLM(model_info.architecture)
+            tensor_loader = GPTOSSTensorLoader(model)
+        case _:
+            raise ValueError(f"Unsupported architecture type: {model_info.architecture.type}")
 
     # Prepare for loading
     model_state_keys = set(model.state_dict().keys())
