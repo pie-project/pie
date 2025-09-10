@@ -40,6 +40,7 @@ FP4_VALUES = [
 def convert_mxfp4_to_bf16(
     blocks: torch.Tensor,
     scales: torch.Tensor,
+    target_device: str,
     dtype: torch.dtype = torch.bfloat16,
     rows_per_chunk: int = 16384 * 512,
 ) -> torch.Tensor:
@@ -64,15 +65,15 @@ def convert_mxfp4_to_bf16(
         blocks.shape[:-1] == scales.shape
     ), f"{blocks.shape=} does not match {scales.shape=}"
 
-    lut = torch.tensor(FP4_VALUES, dtype=dtype, device=blocks.device)
+    lut = torch.tensor(FP4_VALUES, dtype=dtype, device=target_device)
 
     *prefix_shape, G, B = blocks.shape
     rows_total = math.prod(prefix_shape) * G
 
-    blocks = blocks.reshape(rows_total, B)
-    scales = scales.reshape(rows_total, 1)
+    blocks = blocks.reshape(rows_total, B).to(target_device)
+    scales = scales.reshape(rows_total, 1).to(target_device)
 
-    out = torch.empty(rows_total, B * 2, dtype=dtype, device=blocks.device)
+    out = torch.empty(rows_total, B * 2, dtype=dtype, device=target_device)
 
     for r0 in range(0, rows_total, rows_per_chunk):
         r1 = min(r0 + rows_per_chunk, rows_total)
@@ -167,7 +168,7 @@ class GPTOSSTensorLoader(TensorLoader):
     to bfloat16 format based on the model architecture.
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: GPTOSSForCausalLM):
         """
         Initialize the tensor loader with a model instance.
 
@@ -247,7 +248,7 @@ class GPTOSSTensorLoader(TensorLoader):
                 scales = checkpoint_tensors[scales_name]
 
                 # Convert MXFP4 to bfloat16 using our conversion function
-                return convert_mxfp4_to_bf16(blocks, scales, dtype=torch.bfloat16)
+                return convert_mxfp4_to_bf16(blocks, scales, dtype=torch.bfloat16, target_device=self.model.config.device)
 
             else:
                 raise ValueError(f"Unknown tensor type: {tensor_type}")
@@ -490,13 +491,10 @@ class GPTOSSAttention(nn.Module):
 
         # Reshape for multi-head attention
         query_states = query_states.view(
-            -1,
-            self.num_key_value_heads,
-            self.num_attention_heads // self.num_key_value_heads,
-            self.head_dim,
+            n, self.num_attention_heads, self.head_dim
         )
-        key_states = key_states.view(-1, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(-1, self.num_key_value_heads, self.head_dim)
+        key_states = key_states.view(n, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(n, self.num_key_value_heads, self.head_dim)
 
         # Apply rotary embedding
         query_states, key_states = self.rope(query_states, key_states)

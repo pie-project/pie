@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 import message
-from adapter import CmaesAdapter, AdapterSubpass
+from adapter import AdapterSubpass
 import flashinfer as ops
 
 from config.common import ModelInfo
