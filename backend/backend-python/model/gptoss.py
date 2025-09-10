@@ -248,7 +248,12 @@ class GPTOSSTensorLoader(TensorLoader):
                 scales = checkpoint_tensors[scales_name]
 
                 # Convert MXFP4 to bfloat16 using our conversion function
-                return convert_mxfp4_to_bf16(blocks, scales, dtype=torch.bfloat16, target_device=self.model.config.device)
+                return convert_mxfp4_to_bf16(
+                    blocks,
+                    scales,
+                    dtype=torch.bfloat16,
+                    target_device=self.model.config.device,
+                )
 
             else:
                 raise ValueError(f"Unknown tensor type: {tensor_type}")
@@ -296,7 +301,7 @@ def _apply_rotary_emb(
     return torch.cat((o1, o2), dim=-1)
 
 
-class RotaryEmbedding(nn.Module):
+class GPTOSSRotaryEmbedding(nn.Module):
     """Rotary Position Embedding with YaRN scaling support."""
 
     def __init__(
@@ -319,6 +324,13 @@ class RotaryEmbedding(nn.Module):
         self.ntk_alpha = ntk_alpha
         self.ntk_beta = ntk_beta
         self.device = device
+
+        # Cache for cos/sin values to avoid recomputation
+        self._cos_sin_cache = {}
+        self._max_cached_position = 0
+
+        # Pre-compute and cache concentration and inv_freq since they're constant
+        self._concentration, self._inv_freq = self._compute_concentration_and_inv_freq()
 
     def _compute_concentration_and_inv_freq(self) -> tuple[float, torch.Tensor]:
         """See YaRN paper: https://arxiv.org/abs/2309.00071"""
@@ -360,31 +372,74 @@ class RotaryEmbedding(nn.Module):
 
         return concentration, inv_freq
 
-    def _compute_cos_sin(self, num_tokens: int):
-        """Compute cosine and sine values for rotary embedding."""
-        concentration, inv_freq = self._compute_concentration_and_inv_freq()
-        t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        cos = freqs.cos() * concentration
-        sin = freqs.sin() * concentration
+    def _get_cos_sin_for_positions(self, position_ids: torch.Tensor):
+        """Get cosine and sine values for specific position IDs with caching."""
+        # Convert position_ids to a hashable key for caching
+        position_ids = position_ids.to(dtype=torch.int64, device=self.device)
+        max_pos = position_ids.max().item()
+
+        # Check if we need to extend our cache
+        if max_pos > self._max_cached_position:
+            # Extend cache to cover new positions
+            new_positions = torch.arange(
+                self._max_cached_position + 1,
+                max_pos + 1,
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+            if len(new_positions) > 0:
+                freqs = torch.einsum("i,j->ij", new_positions, self._inv_freq)
+                cos_new = freqs.cos() * self._concentration
+                sin_new = freqs.sin() * self._concentration
+
+                # Store in cache
+                for i, pos in enumerate(new_positions):
+                    pos_key = int(pos.item())
+                    self._cos_sin_cache[pos_key] = (cos_new[i], sin_new[i])
+
+                self._max_cached_position = max_pos
+
+        # Retrieve cached values for the requested positions
+        cos_list = []
+        sin_list = []
+        for pos in position_ids:
+            pos_key = pos.item()
+            if pos_key in self._cos_sin_cache:
+                cos_val, sin_val = self._cos_sin_cache[pos_key]
+                cos_list.append(cos_val)
+                sin_list.append(sin_val)
+            else:
+                # Fallback for position 0 or negative positions
+                pos_float = torch.tensor(
+                    pos_key, dtype=torch.float32, device=self.device
+                )
+                freqs = torch.einsum("j->j", pos_float * self._inv_freq)
+                cos_val = freqs.cos() * self._concentration
+                sin_val = freqs.sin() * self._concentration
+                cos_list.append(cos_val)
+                sin_list.append(sin_val)
+
+        cos = torch.stack(cos_list, dim=0)
+        sin = torch.stack(sin_list, dim=0)
         return cos, sin
 
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
+        position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply rotary embedding to query and key tensors."""
-        num_tokens = query.shape[0]
-        cos, sin = self._compute_cos_sin(num_tokens)
+        """Apply rotary embedding to query and key tensors using position IDs."""
+        cos, sin = self._get_cos_sin_for_positions(position_ids)
 
         query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_dim)
+        query = query.view(position_ids.shape[0], -1, self.head_dim)
         query = _apply_rotary_emb(query, cos, sin)
         query = query.reshape(query_shape)
 
         key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_dim)
+        key = key.view(position_ids.shape[0], -1, self.head_dim)
         key = _apply_rotary_emb(key, cos, sin)
         key = key.reshape(key_shape)
         return query, key
@@ -446,7 +501,7 @@ class GPTOSSAttention(nn.Module):
         )
         self.sm_scale = 1 / math.sqrt(config.head_size)
 
-        self.rope = RotaryEmbedding(
+        self.rope = GPTOSSRotaryEmbedding(
             config.head_size,
             int(config.rope_theta),
             torch.float32,
@@ -461,7 +516,7 @@ class GPTOSSAttention(nn.Module):
         self,
         wrapper,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,  # pylint: disable=unused-argument
+        position_ids: torch.Tensor,
         kv_cache_at_layer: torch.Tensor,
         kv_page_indices: torch.Tensor,
         kv_page_indptr: torch.Tensor,
@@ -490,14 +545,12 @@ class GPTOSSAttention(nn.Module):
             )
 
         # Reshape for multi-head attention
-        query_states = query_states.view(
-            n, self.num_attention_heads, self.head_dim
-        )
+        query_states = query_states.view(n, self.num_attention_heads, self.head_dim)
         key_states = key_states.view(n, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(n, self.num_key_value_heads, self.head_dim)
 
         # Apply rotary embedding
-        query_states, key_states = self.rope(query_states, key_states)
+        query_states, key_states = self.rope(query_states, key_states, position_ids)
 
         # Use FlashInfer for efficient attention computation
         ops.append_paged_kv_cache(
@@ -673,6 +726,7 @@ class GPTOSSDecoderLayer(nn.Module):
         self.post_attention_layernorm = GPTOSSRMSNorm(
             config.hidden_size, device=torch.device(config.device)
         )
+
     def forward(
         self,
         wrapper,
