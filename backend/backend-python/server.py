@@ -21,6 +21,7 @@ from websockets.sync.client import connect
 from config.common import ModelInfo
 from handler import Handler
 from model.l4ma import L4maForCausalLM, L4maTensorLoader
+from model.qwen3 import Qwen3ForCausalLM, Qwen3TensorLoader
 from message import (
     EmbedImageRequest,
     ForwardPassRequest,
@@ -32,7 +33,6 @@ from message import (
     UploadAdapterRequest,
     DownloadAdapterRequest,
 )
-from model.qwen3 import Qwen3ForCausalLM, Qwen3TensorLoader
 
 
 class HandlerId(enum.Enum):

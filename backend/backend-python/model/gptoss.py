@@ -48,7 +48,7 @@ def create_fusion_map(model: nn.Module):
     return fusion_map
 
 
-class RMSNorm(nn.Module):
+class GPTOSSRMSNorm(nn.Module):
     """RMS Normalization layer."""
 
     def __init__(
@@ -57,7 +57,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.num_features = num_features
         self.eps = eps
-        self.scale = nn.Parameter(
+        self.weight = nn.Parameter(
             torch.ones(num_features, device=device, dtype=torch.float32)
         )
 
@@ -66,7 +66,7 @@ class RMSNorm(nn.Module):
         assert x.shape[-1] == self.num_features
         t, dtype = x.float(), x.dtype
         t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + self.eps)
-        return (t * self.scale).to(dtype)
+        return (t * self.weight).to(dtype)
 
 
 def _apply_rotary_emb(
@@ -212,11 +212,13 @@ class GPTOSSAttention(nn.Module):
             torch.empty(
                 config.num_query_heads,
                 device=torch.device(config.device),
-                dtype=getattr(torch, config.dtype),
+                dtype=config.dtype,
             )
         )
 
-        self.norm = RMSNorm(config.hidden_size, device=torch.device(config.device))
+        self.norm = GPTOSSRMSNorm(
+            config.hidden_size, device=torch.device(config.device)
+        )
 
         qkv_dim = config.head_size * (
             config.num_query_heads + 2 * config.num_key_value_heads
@@ -225,13 +227,13 @@ class GPTOSSAttention(nn.Module):
             config.hidden_size,
             qkv_dim,
             device=torch.device(config.device),
-            dtype=getattr(torch, config.dtype),
+            dtype=config.dtype,
         )
         self.o_proj = nn.Linear(
             config.head_size * config.num_query_heads,
             config.hidden_size,
             device=torch.device(config.device),
-            dtype=getattr(torch, config.dtype),
+            dtype=config.dtype,
         )
         self.sm_scale = 1 / math.sqrt(config.head_size)
 
@@ -315,28 +317,61 @@ class GPTOSSAttention(nn.Module):
         return hidden_states + attn_output
 
 
-class GPTOSSMlp(nn.Module):
-    """GPT OSS MLP layer with Mixture of Experts."""
+class GPTOSSRouter(nn.Module):
+    """GPT OSS Router for selecting top-k experts."""
 
     def __init__(self, config: GPTOSSArch):
-        """Initialize the GPT OSS MLP layer."""
+        """Initialize the GPT OSS Router."""
+        super().__init__()
+        self.experts_per_token = config.experts_per_token
+        self.num_experts = config.num_experts
+        self.hidden_size = config.hidden_size
+
+        self.weight = nn.Parameter(
+            torch.empty(
+                config.num_experts,
+                config.hidden_size,
+                device=torch.device(config.device),
+                dtype=config.dtype,
+            )
+        )
+        self.bias = nn.Parameter(
+            torch.empty(
+                config.num_experts,
+                device=torch.device(config.device),
+                dtype=config.dtype,
+            )
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass through the router."""
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        router_logits = torch.nn.functional.linear(  # pylint: disable=not-callable
+            hidden_states, self.weight, self.bias
+        )
+        router_top_value, router_indices = torch.topk(
+            router_logits, self.experts_per_token, dim=-1, sorted=True
+        )
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1)
+        router_scores = torch.zeros_like(router_logits).scatter_(
+            1, router_indices, router_top_value
+        )
+        return router_scores, router_indices
+
+
+class GPTOSSExperts(nn.Module):
+    """GPT OSS Experts layer containing the actual expert parameters."""
+
+    def __init__(self, config: GPTOSSArch):
+        """Initialize the GPT OSS Experts layer."""
         super().__init__()
         self.config = config
         self.num_experts = config.num_experts
-        self.experts_per_token = config.experts_per_token
         self.swiglu_limit = config.swiglu_limit
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        self.norm = RMSNorm(config.hidden_size, device=torch.device(config.device))
-        self.gate = nn.Linear(
-            config.hidden_size,
-            config.num_experts,
-            device=torch.device(config.device),
-            dtype=getattr(torch, config.dtype),
-        )
-
         assert config.intermediate_size % self.world_size == 0
-        self.mlp1_weight = nn.Parameter(
+        self.gate_up_proj = nn.Parameter(
             torch.empty(
                 (
                     config.num_experts,
@@ -344,17 +379,17 @@ class GPTOSSMlp(nn.Module):
                     config.hidden_size,
                 ),
                 device=torch.device(config.device),
-                dtype=getattr(torch, config.dtype),
+                dtype=config.dtype,
             )
         )
-        self.mlp1_bias = nn.Parameter(
+        self.gate_up_proj_bias = nn.Parameter(
             torch.empty(
                 (config.num_experts, config.intermediate_size * 2 // self.world_size),
                 device=torch.device(config.device),
-                dtype=getattr(torch, config.dtype),
+                dtype=config.dtype,
             )
         )
-        self.mlp2_weight = nn.Parameter(
+        self.down_proj = nn.Parameter(
             torch.empty(
                 (
                     config.num_experts,
@@ -362,38 +397,62 @@ class GPTOSSMlp(nn.Module):
                     config.intermediate_size // self.world_size,
                 ),
                 device=torch.device(config.device),
-                dtype=getattr(torch, config.dtype),
+                dtype=config.dtype,
             )
         )
-        self.mlp2_bias = nn.Parameter(
+        self.down_proj_bias = nn.Parameter(
             torch.empty(
                 (config.num_experts, config.hidden_size),
                 device=torch.device(config.device),
-                dtype=getattr(torch, config.dtype),
+                dtype=config.dtype,
             )
         )
+
+    def forward(self, t: torch.Tensor, expert_indices: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the experts."""
+        # Gate and Up projection
+        gate_up_proj = self.gate_up_proj[expert_indices, ...]
+        gate_up_proj_bias = self.gate_up_proj_bias[expert_indices, ...]
+        t = torch.einsum("beck,bk->bec", gate_up_proj, t) + gate_up_proj_bias
+        t = swiglu(t, limit=self.swiglu_limit)
+
+        # Down projection
+        down_proj = self.down_proj[expert_indices, ...]
+        down_proj_bias = self.down_proj_bias[expert_indices, ...]
+        t = torch.einsum("beck,bek->bec", down_proj, t)
+        if self.world_size > 1:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t += down_proj_bias
+
+        return t
+
+
+class GPTOSSMlp(nn.Module):
+    """GPT OSS MLP layer with Mixture of Experts."""
+
+    def __init__(self, config: GPTOSSArch):
+        """Initialize the GPT OSS MLP layer."""
+        super().__init__()
+        self.config = config
+
+        self.norm = GPTOSSRMSNorm(
+            config.hidden_size, device=torch.device(config.device)
+        )
+        self.router = GPTOSSRouter(config)
+        self.experts = GPTOSSExperts(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the MLP layer."""
         t = self.norm(x)
-        g = self.gate(t)
-        experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
-        expert_weights = torch.nn.functional.softmax(experts.values, dim=1)
-        expert_indices = experts.indices
 
-        # MLP #1
-        mlp1_weight = self.mlp1_weight[expert_indices, ...]
-        mlp1_bias = self.mlp1_bias[expert_indices, ...]
-        t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
-        t = swiglu(t, limit=self.swiglu_limit)
+        # Router determines expert selection and weights
+        router_scores, router_indices = self.router(t)
 
-        # MLP #2
-        mlp2_weight = self.mlp2_weight[expert_indices, ...]
-        mlp2_bias = self.mlp2_bias[expert_indices, ...]
-        t = torch.einsum("beck,bek->bec", mlp2_weight, t)
-        if self.world_size > 1:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        t += mlp2_bias
+        # Extract the weights for selected experts
+        expert_weights = torch.gather(router_scores, 1, router_indices)
+
+        # Forward through experts
+        t = self.experts(t, router_indices)
 
         # Weighted sum of experts
         t = torch.einsum("bec,be->bc", t, expert_weights)
@@ -458,7 +517,7 @@ class GPTOSSModel(nn.Module):
             config.hidden_size,
             padding_idx=0,
             device=torch.device(config.device),
-            dtype=getattr(torch, config.dtype),
+            dtype=config.dtype,
         )
         self.layers = nn.ModuleList(
             [
@@ -466,7 +525,7 @@ class GPTOSSModel(nn.Module):
                 for layer_idx in range(config.num_layers)
             ]
         )
-        self.norm = RMSNorm(
+        self.norm = GPTOSSRMSNorm(
             config.hidden_size,
             device=torch.device(config.device),
         )
@@ -569,7 +628,7 @@ class GPTOSSForCausalLM(nn.Module):
             config.vocab_size,
             bias=False,
             device=torch.device(config.device),
-            dtype=getattr(torch, config.dtype),
+            dtype=config.dtype,
         )
 
     def forward(self):

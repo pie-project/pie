@@ -78,7 +78,7 @@ class CommonArch:
 
     # Fields that will be set by the backend config file
     device: str
-    dtype: str
+    dtype: torch.dtype
 
 
 @dataclass
@@ -96,7 +96,9 @@ class ModelInfo:
     stop_tokens: list[str]
 
     @staticmethod
-    def load_from_file(cfg_file_path: str, device: str, dtype: str) -> "ModelInfo":
+    def load_from_file(
+        cfg_file_path: str, device: str, dtype: torch.dtype
+    ) -> "ModelInfo":
         """
         Parses a dictionary (from loaded TOML data) into the ModelMetadata struct,
         with improved and informative error handling.
