@@ -30,7 +30,7 @@ def create_fusion_map(model: nn.Module):
                 f"{name}.k_proj.weight",
                 f"{name}.v_proj.weight",
             ]
-            fusion_map[target_w] = {"sources": sources_w, "dim": 0}
+            fusion_map[target_w] = {"sources": sources_w, "dim": 0, "op": "fusion"}
 
             # Handle biases if they exist
             if module.qkv_proj.bias is not None:
@@ -40,19 +40,19 @@ def create_fusion_map(model: nn.Module):
                     f"{name}.k_proj.bias",
                     f"{name}.v_proj.bias",
                 ]
-                fusion_map[target_b] = {"sources": sources_b, "dim": 0}
+                fusion_map[target_b] = {"sources": sources_b, "dim": 0, "op": "fusion"}
 
         # --- Rule for Qwen3Mlp Gate/Up Fusion ---
         elif isinstance(module, Qwen3Mlp):
             # Handle weights
             target_w = f"{name}.gate_up_proj.weight"
             sources_w = [f"{name}.gate_proj.weight", f"{name}.up_proj.weight"]
-            fusion_map[target_w] = {"sources": sources_w, "dim": 0}
+            fusion_map[target_w] = {"sources": sources_w, "dim": 0, "op": "fusion"}
 
             # Handle biases (Qwen3 uses bias in MLP layers)
             target_b = f"{name}.gate_up_proj.bias"
             sources_b = [f"{name}.gate_proj.bias", f"{name}.up_proj.bias"]
-            fusion_map[target_b] = {"sources": sources_b, "dim": 0}
+            fusion_map[target_b] = {"sources": sources_b, "dim": 0, "op": "fusion"}
 
     return fusion_map
 

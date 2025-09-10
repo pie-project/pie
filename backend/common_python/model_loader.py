@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import sys
+import math
 from pathlib import Path
-from typing import Callable, Tuple
+from typing import Callable, Iterable, Tuple
 
 import torch
 import ztensor
@@ -105,12 +106,26 @@ def load_model(
                             param.copy_(tensor_data, non_blocking=True)
                         loaded_keys.add(name)
 
-        for target_name, details in fusion_map.items():
+        for target_name, details in tqdm(
+            fusion_map.items(), desc="Fusing tensors", unit="tensors"
+        ):
             source_names = details["sources"]
             if all(s in pending_fusion_tensors for s in source_names):
-                tensors_to_fuse = [pending_fusion_tensors[s] for s in source_names]
-                fused_tensor = torch.cat(tensors_to_fuse, dim=details["dim"])
                 param = model.state_dict()[target_name]
+                if details["op"] == "fusion":
+                    tensors_to_fuse = [pending_fusion_tensors[s] for s in source_names]
+                    fused_tensor = torch.cat(tensors_to_fuse, dim=details["dim"])
+                elif details["op"] == "dequantize_mxfp4":
+                    blocks, scales = [pending_fusion_tensors[s] for s in source_names]
+                    fused_tensor = dequantize_from_mxfp4(
+                        blocks,
+                        scales,
+                        fp4_values=details["fp4_values"],
+                        dtype=torch.bfloat16,
+                        device=param.device,
+                    )
+                else:
+                    raise ValueError(f"Unknown fusion operation: {details['op']}")
                 if fused_tensor.shape != param.shape:
                     print(
                         f"    Warning: Shape mismatch for fused tensor '{target_name}'. Skipping."
@@ -154,6 +169,61 @@ def load_model(
             file=sys.stderr,
         )
         raise SystemExit(1) from exc
+
+
+def dequantize_from_mxfp4(
+    blocks: torch.Tensor,
+    scales: torch.Tensor,
+    fp4_values: Iterable[float],
+    device: str,
+    dtype: torch.dtype,
+    rows_per_chunk: int = 2**23,
+) -> torch.Tensor:
+    """
+    Convert MXFP4 format tensors (blocks and scales) to bfloat16 format.
+
+    Args:
+        blocks: The packed FP4 values tensor (uint8)
+        scales: The block scales tensor
+        dtype: Target dtype for conversion (default: torch.bfloat16)
+        rows_per_chunk: Number of rows to process per chunk for memory efficiency
+
+    Returns:
+        Converted tensor in the target dtype
+    """
+    scales = scales.to(torch.int32) - 127
+
+    assert (
+        blocks.shape[:-1] == scales.shape
+    ), f"{blocks.shape=} does not match {scales.shape=}"
+
+    lut = torch.tensor(fp4_values, dtype=dtype, device=device)
+
+    *prefix_shape, g, b = blocks.shape
+    rows_total = math.prod(prefix_shape) * g
+
+    blocks = blocks.reshape(rows_total, b).to(device)
+    scales = scales.reshape(rows_total, 1).to(device)
+
+    out = torch.empty(rows_total, b * 2, dtype=dtype, device=device)
+
+    for r0 in range(0, rows_total, rows_per_chunk):
+        r1 = min(r0 + rows_per_chunk, rows_total)
+
+        blk = blocks[r0:r1]
+        exp = scales[r0:r1]
+
+        idx_lo = (blk & 0x0F).to(torch.long)
+        idx_hi = (blk >> 4).to(torch.long)
+
+        sub = out[r0:r1]
+        sub[:, 0::2] = lut[idx_lo]
+        sub[:, 1::2] = lut[idx_hi]
+
+        torch.ldexp(sub, exp, out=sub)
+        del idx_lo, idx_hi, blk, exp
+
+    return out.reshape(*prefix_shape, g, b * 2).view(*prefix_shape, g * b * 2)
 
 
 __all__ = ["load_model"]

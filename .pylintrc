@@ -4,7 +4,11 @@
 
 # Add same paths to sys.path as the linter scripts provide via PYTHONPATH
 # This matches: ROOT:ROOT/backend/backend-python:ROOT/backend/common_python
-init-hook = 'import sys, os; [sys.path.insert(0, os.path.join(os.getcwd(), path)) for path in [".", "backend/backend-python", "backend/common_python"]]'
+# Cannot use list comprehension because some Pylint versions do not support it
+init-hook = 'import sys, os; 
+    sys.path.insert(0, os.getcwd()); 
+    sys.path.insert(0, os.path.join(os.getcwd(), "backend/backend-python")); 
+    sys.path.insert(0, os.path.join(os.getcwd(), "backend/common_python"))'
 
 [TYPECHECK]
 # Don't complain that flashinfer isn't installed

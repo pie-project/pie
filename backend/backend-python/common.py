@@ -17,7 +17,7 @@ repo_utils.setup_pie_imports()
 from config.common import ModelInfo, TensorLoader
 from config.l4ma import L4maArch
 from config.qwen3 import Qwen3Arch
-from config.gptoss import GPTOSSArch
+from config.gptoss import GptOssArch
 from model_loader import load_model
 from server_common import build_config, print_config, start_service
 from handler_common import Handler

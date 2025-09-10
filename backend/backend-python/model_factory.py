@@ -18,7 +18,7 @@ from common import (
     ModelInfo,
     L4maArch,
     Qwen3Arch,
-    GPTOSSArch,
+    GptOssArch,
 )
 
 # Import model components from common_python (base classes)
@@ -31,7 +31,7 @@ from common_model.l4ma import (
 from model.l4ma_flashinfer import FlashInferL4maBackend
 from model.qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 from model.gptoss import (
-    GPTOSSForCausalLM,
+    GptOssForCausalLM,
     create_fusion_map as create_gptoss_fusion_map,
 )
 
@@ -59,8 +59,8 @@ def create_model_and_fusion_map(model_info: ModelInfo):
         return model, fusion_map
 
     if arch_type == "gptoss":
-        gptoss_arch = GPTOSSArch(**model_info.architecture.__dict__)
-        model = GPTOSSForCausalLM(gptoss_arch)
+        gptoss_arch = GptOssArch(**model_info.architecture.__dict__)
+        model = GptOssForCausalLM(gptoss_arch)
         fusion_map = create_gptoss_fusion_map(model)
         return model, fusion_map
 

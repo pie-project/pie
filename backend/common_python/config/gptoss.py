@@ -11,7 +11,7 @@ from .common import (
 
 
 @dataclass
-class GPTOSSArch(CommonArch):
+class GptOssArch(CommonArch):
     """GPT OSS specific architecture configuration."""
 
     # MoE configuration
@@ -30,7 +30,7 @@ class GPTOSSArch(CommonArch):
     swiglu_limit: float
 
     @staticmethod
-    def from_config(cfg: ModelConfig) -> "GPTOSSArch":
+    def from_config(cfg: ModelConfig) -> "GptOssArch":
         """Parse GPT OSS-specific architecture configuration."""
         # Get common architecture fields
         common_arch_dict = cfg.get_common_arch_dict()
@@ -58,7 +58,7 @@ class GPTOSSArch(CommonArch):
         sliding_window = cfg.get_required_key(arch_dict, "sliding_window")
         swiglu_limit = cfg.get_required_key(arch_dict, "swiglu_limit")
 
-        return GPTOSSArch(
+        return GptOssArch(
             # Common fields
             **common_arch_dict,
             # GPT OSS-specific fields

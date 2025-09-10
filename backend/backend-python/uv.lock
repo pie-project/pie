@@ -679,6 +679,7 @@ name = "pie-backend"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "einops", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "fire", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "msgpack", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "msgspec", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -714,6 +715,7 @@ macos = [
 
 [package.metadata]
 requires-dist = [
+    { name = "einops", specifier = ">=0.8.1" },
     { name = "fire", specifier = ">=0.6" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux' and extra == 'cuda'", specifier = ">=0.3.1" },
     { name = "msgpack", specifier = ">=0.5" },
