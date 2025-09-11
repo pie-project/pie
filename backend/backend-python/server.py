@@ -1,5 +1,6 @@
 # pylint: disable-all
 # type: ignore
+# Ignoring checks for pylint and pyright since we are actively working on this file
 
 import enum
 import os

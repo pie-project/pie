@@ -108,7 +108,7 @@ jobs:
           printf '  %s\n' "${TARGETS[@]}"
 
           # run pylint via uv (as in your script)
-          uv run --project backend/backend-python --with pylint pylint --disable=R "${TARGETS[@]}"
+          uv run --project backend/backend-python --with pylint --with torch pylint --disable=R "${TARGETS[@]}"
 
       - name: Run Pyright on predefined files + changed files outside those dirs
         shell: bash
@@ -146,4 +146,4 @@ jobs:
           echo "Running pyright on the following files:"
           printf '  %s\n' "${TARGETS[@]}"
 
-          uv run --project backend/backend-python --with pyright pyright "${TARGETS[@]}"
+          uv run --project backend/backend-python --with pyright --with torch pyright "${TARGETS[@]}"
