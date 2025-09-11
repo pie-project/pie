@@ -504,7 +504,7 @@ class GPTOSSAttention(nn.Module):
             device=torch.device(config.device),
             dtype=config.dtype,
         )
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
 
         self.rope = GPTOSSRotaryEmbedding(
             config.head_size,
@@ -527,14 +527,14 @@ class GPTOSSAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Extract keys and values from FlashInfer's paged KV cache format.
-        
+
         Args:
             kv_cache_at_layer: Paged KV cache tensor [num_pages, 2, page_size, num_kv_heads, head_dim]
             kv_page_indices: Page indices for each batch
             kv_page_indptr: Pointer to start of each batch's pages
             kv_last_page_lens: Length of the last page for each batch
             batch_idx: Which batch to extract (default 0 for single batch)
-            
+
         Returns:
             Tuple of (keys, values) tensors with shape [seq_len, num_kv_heads, head_dim]
         """
@@ -543,19 +543,23 @@ class GPTOSSAttention(nn.Module):
         page_end = kv_page_indptr[batch_idx + 1].item()
         batch_page_indices = kv_page_indices[page_start:page_end]
         last_page_len = kv_last_page_lens[batch_idx].item()
-        
+
         # Collect keys and values from all pages
         keys_list = []
         values_list = []
-        
+
         for i, page_idx in enumerate(batch_page_indices):
             page_idx_int = int(page_idx.item())
-            
+
             # Extract K and V from this page (layout: [num_pages, 2, page_size, num_kv_heads, head_dim])
             # Index 0 is keys, index 1 is values
-            k_page = kv_cache_at_layer[page_idx_int, 0]  # [page_size, num_kv_heads, head_dim]
-            v_page = kv_cache_at_layer[page_idx_int, 1]  # [page_size, num_kv_heads, head_dim]
-            
+            k_page = kv_cache_at_layer[
+                page_idx_int, 0
+            ]  # [page_size, num_kv_heads, head_dim]
+            v_page = kv_cache_at_layer[
+                page_idx_int, 1
+            ]  # [page_size, num_kv_heads, head_dim]
+
             if i == len(batch_page_indices) - 1:  # Last page
                 # Only use the valid tokens in the last page
                 keys_list.append(k_page[:last_page_len])
@@ -564,36 +568,48 @@ class GPTOSSAttention(nn.Module):
                 # Use the full page
                 keys_list.append(k_page)
                 values_list.append(v_page)
-        
+
         # Concatenate all pages to get the full sequence
         if keys_list:
             keys = torch.cat(keys_list, dim=0)  # [seq_len, num_kv_heads, head_dim]
             values = torch.cat(values_list, dim=0)  # [seq_len, num_kv_heads, head_dim]
         else:
             # Empty cache
-            keys = torch.empty(0, self.num_key_value_heads, self.head_dim, 
-                             device=kv_cache_at_layer.device, dtype=kv_cache_at_layer.dtype)
-            values = torch.empty(0, self.num_key_value_heads, self.head_dim,
-                               device=kv_cache_at_layer.device, dtype=kv_cache_at_layer.dtype)
-        
+            keys = torch.empty(
+                0,
+                self.num_key_value_heads,
+                self.head_dim,
+                device=kv_cache_at_layer.device,
+                dtype=kv_cache_at_layer.dtype,
+            )
+            values = torch.empty(
+                0,
+                self.num_key_value_heads,
+                self.head_dim,
+                device=kv_cache_at_layer.device,
+                dtype=kv_cache_at_layer.dtype,
+            )
+
         return keys, values
 
     def _repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
-        Equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). 
-        The hidden states go from (batch, num_key_value_heads, seqlen, head_dim) 
+        Equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
+        The hidden states go from (batch, num_key_value_heads, seqlen, head_dim)
         to (batch, num_attention_heads, seqlen, head_dim)
         """
         batch, num_key_value_heads, slen, head_dim = hidden_states.shape
         if n_rep == 1:
             return hidden_states
-        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        hidden_states = hidden_states[:, :, None, :, :].expand(
+            batch, num_key_value_heads, n_rep, slen, head_dim
+        )
         return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
     def _pytorch_attention_with_sinks(
         self,
         query: torch.Tensor,  # [n, num_q_heads, head_dim]
-        key: torch.Tensor,    # [seq_len, num_kv_heads, head_dim] or [batch_size * seq_len, num_kv_heads, head_dim]
+        key: torch.Tensor,  # [seq_len, num_kv_heads, head_dim] or [batch_size * seq_len, num_kv_heads, head_dim]
         value: torch.Tensor,  # [seq_len, num_kv_heads, head_dim] or [batch_size * seq_len, num_kv_heads, head_dim]
         position_ids: torch.Tensor,  # [n]
         use_sliding_window: bool = False,
@@ -602,112 +618,145 @@ class GPTOSSAttention(nn.Module):
         """
         Compute attention using PyTorch with attention sinks support.
         Based on the reference implementation.
-        
+
         Args:
             query: Query tensor [n, num_q_heads, head_dim]
-            key: Key tensor [seq_len, num_kv_heads, head_dim] 
+            key: Key tensor [seq_len, num_kv_heads, head_dim]
             value: Value tensor [seq_len, num_kv_heads, head_dim]
             position_ids: Position IDs for current tokens [n]
             use_sliding_window: Whether to apply sliding window attention
-            
+
         Returns:
             Attention output [n, num_q_heads, head_dim]
         """
         n, num_q_heads, head_dim = query.shape
         seq_len, num_kv_heads, _ = key.shape
-        
+
         # Determine batch size from the input tensors
         # Current format: query [n, num_q_heads, head_dim], key/value [seq_len, num_kv_heads, head_dim]
         # Target format: [batch, num_heads, seq_len, head_dim]
-        
+
         # Handle all batch sizes uniformly
         # key and value are [batch_size * seq_len, num_kv_heads, head_dim]
         # We need to reshape them to [batch_size, num_kv_heads, seq_len, head_dim]
         total_seq_len = key.shape[0]
         seq_len_per_batch = total_seq_len // num_batches
-        
+
         # Reshape key and value to proper batch format
         key = key.reshape(num_batches, seq_len_per_batch, num_kv_heads, head_dim)
         key = key.transpose(1, 2)  # [batch_size, num_kv_heads, seq_len, head_dim]
-        
+
         value = value.reshape(num_batches, seq_len_per_batch, num_kv_heads, head_dim)
         value = value.transpose(1, 2)  # [batch_size, num_kv_heads, seq_len, head_dim]
-        
+
         # For query, we assume it's distributed across batches
         # query is [n, num_q_heads, head_dim] where n might be batch_size * tokens_per_batch
         tokens_per_batch = n // num_batches
         query = query.reshape(num_batches, tokens_per_batch, num_q_heads, head_dim)
-        query = query.transpose(1, 2)  # [batch_size, num_q_heads, tokens_per_batch, head_dim]
-        
+        query = query.transpose(
+            1, 2
+        )  # [batch_size, num_q_heads, tokens_per_batch, head_dim]
+
         batch_size = num_batches
         seq_len = seq_len_per_batch
         n = tokens_per_batch
-        
+
         # Handle grouped query attention by repeating KV heads - exactly like reference
-        key_states = self._repeat_kv(key, self.num_key_value_groups)      # [batch_size, num_q_heads, seq_len, head_dim]
-        value_states = self._repeat_kv(value, self.num_key_value_groups)  # [batch_size, num_q_heads, seq_len, head_dim]
-        
+        key_states = self._repeat_kv(
+            key, self.num_key_value_groups
+        )  # [batch_size, num_q_heads, seq_len, head_dim]
+        value_states = self._repeat_kv(
+            value, self.num_key_value_groups
+        )  # [batch_size, num_q_heads, seq_len, head_dim]
+
         # Compute attention weights - exactly like reference
-        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * self.scaling  # [batch_size, num_q_heads, n, seq_len]
-        
+        attn_weights = (
+            torch.matmul(query, key_states.transpose(2, 3)) * self.scaling
+        )  # [batch_size, num_q_heads, n, seq_len]
+
         # Apply sliding window attention if needed (critical for GPT OSS alternating attention)
         attention_mask = None
         if use_sliding_window and self.sliding_window > 0 and seq_len > 0:
             # Create sliding window mask
             # For each query position, mask out keys that are too far in the past
             query_positions = position_ids.unsqueeze(1)  # [n, 1]
-            
+
             # Key positions in cache: they have absolute positions from 0 to seq_len-1
             # But we need to know their actual positions relative to the current sequence
             # The cached keys represent positions from (current_pos - seq_len) to (current_pos - 1)
-            current_pos = position_ids.max().item()  # Current position of the last query token
-            key_start_pos = current_pos - seq_len + 1  # Starting position of first cached key
-            key_positions = torch.arange(key_start_pos, current_pos + 1, device=query.device)[:seq_len].unsqueeze(0)  # [1, seq_len]
-            
+            current_pos = (
+                position_ids.max().item()
+            )  # Current position of the last query token
+            key_start_pos = (
+                current_pos - seq_len + 1
+            )  # Starting position of first cached key
+            key_positions = torch.arange(
+                key_start_pos, current_pos + 1, device=query.device
+            )[:seq_len].unsqueeze(
+                0
+            )  # [1, seq_len]
+
             # Sliding window: can only attend to keys within sliding_window distance
             distances = query_positions - key_positions  # [n, seq_len]
-            sliding_mask = distances > self.sliding_window  # [n, seq_len] - True where we should mask
-            
+            sliding_mask = (
+                distances > self.sliding_window
+            )  # [n, seq_len] - True where we should mask
+
             # Convert to attention mask format
-            sliding_mask = sliding_mask.masked_fill(sliding_mask, float('-inf'))
-            attention_mask = sliding_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, n, seq_len]
-        
+            sliding_mask = sliding_mask.masked_fill(sliding_mask, float("-inf"))
+            attention_mask = sliding_mask.unsqueeze(0).unsqueeze(
+                0
+            )  # [1, 1, n, seq_len]
+
         # Apply attention mask
         if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
-        
+
         # Add attention sinks - exactly like reference
-        sinks = self.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)  # [batch_size, num_q_heads, n, 1]
-        combined_logits = torch.cat([attn_weights, sinks], dim=-1)  # [batch_size, num_q_heads, n, seq_len + 1]
-        
+        sinks = self.sinks.reshape(1, -1, 1, 1).expand(
+            query.shape[0], -1, query.shape[-2], -1
+        )  # [batch_size, num_q_heads, n, 1]
+        combined_logits = torch.cat(
+            [attn_weights, sinks], dim=-1
+        )  # [batch_size, num_q_heads, n, seq_len + 1]
+
         # Prevent overflow - exactly like reference
-        combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
-        
+        combined_logits = (
+            combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        )
+
         # Apply softmax - exactly like reference
         probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
-        
+
         # Drop sinks - exactly like reference
         scores = probs[..., :-1]  # [batch_size, num_q_heads, n, seq_len]
-        
+
         # Apply dropout - exactly like reference
         attn_weights = nn.functional.dropout(scores, p=0.0, training=self.training)
-        
+
         # Compute attention output - exactly like reference
-        attn_output = torch.matmul(attn_weights, value_states)  # [batch_size, num_q_heads, n, head_dim]
-        
+        attn_output = torch.matmul(
+            attn_weights, value_states
+        )  # [batch_size, num_q_heads, n, head_dim]
+
         # Reshape back - handle all batch sizes uniformly
-        attn_output = attn_output.transpose(1, 2).contiguous()  # [batch_size, n, num_q_heads, head_dim]
-        
+        attn_output = attn_output.transpose(
+            1, 2
+        ).contiguous()  # [batch_size, n, num_q_heads, head_dim]
+
         # Reshape back to concatenated format for compatibility
-        original_n = attn_output.shape[0] * attn_output.shape[1]  # batch_size * tokens_per_batch
-        attn_output = attn_output.reshape(original_n, num_q_heads, head_dim)  # [original_n, num_q_heads, head_dim]
-        
+        original_n = (
+            attn_output.shape[0] * attn_output.shape[1]
+        )  # batch_size * tokens_per_batch
+        attn_output = attn_output.reshape(
+            original_n, num_q_heads, head_dim
+        )  # [original_n, num_q_heads, head_dim]
+
         return attn_output
 
     def forward(
         self,
-        wrapper,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         kv_cache_at_layer: torch.Tensor,
@@ -717,7 +766,6 @@ class GPTOSSAttention(nn.Module):
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
         adapter_subpass: AdapterSubpass | None,
-        print_sums: bool,
     ) -> torch.Tensor:
         """Forward pass through the attention module."""
         n, _ = hidden_states.size()
@@ -727,14 +775,6 @@ class GPTOSSAttention(nn.Module):
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
         )
-
-        # if print_sums:
-        #     tensor_sum = query_states.sum().item()
-        #     print(f"Sum after query states: {tensor_sum:.6f}")
-        #     tensor_sum = key_states.sum().item()
-        #     print(f"Sum after key states: {tensor_sum:.6f}")
-        #     tensor_sum = value_states.sum().item()
-        #     print(f"Sum after value states: {tensor_sum:.6f}")
 
         # apply adapters if provided
         if adapter_subpass is not None:
@@ -754,12 +794,6 @@ class GPTOSSAttention(nn.Module):
         # Apply rotary embedding
         query_states, key_states = self.rope(query_states, key_states, position_ids)
 
-        # if print_sums:
-        #     tensor_sum = query_states.sum().item()
-        #     print(f"Sum after RoPE query states: {tensor_sum:.6f}")
-        #     tensor_sum = key_states.sum().item()
-        #     print(f"Sum after RoPE key states: {tensor_sum:.6f}")
-
         # Store current KV states in FlashInfer cache for future use
         ops.append_paged_kv_cache(
             append_key=key_states,
@@ -776,12 +810,12 @@ class GPTOSSAttention(nn.Module):
         # Extract all KV cache (including newly added tokens) for PyTorch attention
         # Handle all batch sizes uniformly
         num_batches = len(kv_last_page_lens)
-        
+
         # Extract each batch and find max length
         all_keys = []
         all_values = []
         max_seq_len = 0
-        
+
         for batch_idx in range(num_batches):
             keys, values = self._extract_kv_from_paged_cache(
                 kv_cache_at_layer[self.layer_idx],
@@ -793,7 +827,7 @@ class GPTOSSAttention(nn.Module):
             all_keys.append(keys)
             all_values.append(values)
             max_seq_len = max(max_seq_len, keys.shape[0])
-        
+
         # Pad all sequences to max length
         padded_keys = []
         padded_values = []
@@ -801,38 +835,41 @@ class GPTOSSAttention(nn.Module):
             if keys.shape[0] < max_seq_len:
                 # Pad with zeros
                 pad_len = max_seq_len - keys.shape[0]
-                key_padding = torch.zeros(pad_len, keys.shape[1], keys.shape[2], 
-                                        device=keys.device, dtype=keys.dtype)
-                value_padding = torch.zeros(pad_len, values.shape[1], values.shape[2], 
-                                          device=values.device, dtype=values.dtype)
+                key_padding = torch.zeros(
+                    pad_len,
+                    keys.shape[1],
+                    keys.shape[2],
+                    device=keys.device,
+                    dtype=keys.dtype,
+                )
+                value_padding = torch.zeros(
+                    pad_len,
+                    values.shape[1],
+                    values.shape[2],
+                    device=values.device,
+                    dtype=values.dtype,
+                )
                 keys = torch.cat([keys, key_padding], dim=0)
                 values = torch.cat([values, value_padding], dim=0)
             padded_keys.append(keys)
             padded_values.append(values)
-        
+
         # Stack into batch dimension: [batch_size, seq_len, num_kv_heads, head_dim]
         cached_keys = torch.stack(padded_keys, dim=0)
         cached_values = torch.stack(padded_values, dim=0)
-        
+
         # Reshape to [batch_size * seq_len, num_kv_heads, head_dim] for compatibility
         batch_size, seq_len = cached_keys.shape[:2]
-        cached_keys = cached_keys.reshape(batch_size * seq_len, cached_keys.shape[2], cached_keys.shape[3])
-        cached_values = cached_values.reshape(batch_size * seq_len, cached_values.shape[2], cached_values.shape[3])
-
-        if print_sums:
-            tensor_sum = query_states.sum().item()
-            print(f"Sum after query states: {tensor_sum:.6f}")
-            print(f"Shape of query states: {query_states.shape}")
-            tensor_sum = cached_keys.sum().item()
-            print(f"Sum after cached keys: {tensor_sum:.6f}")
-            print(f"Shape of cached keys: {cached_keys.shape}")
-            tensor_sum = cached_values.sum().item()
-            print(f"Sum after cached values: {tensor_sum:.6f}")
-            print(f"Shape of cached values: {cached_values.shape}")
+        cached_keys = cached_keys.reshape(
+            batch_size * seq_len, cached_keys.shape[2], cached_keys.shape[3]
+        )
+        cached_values = cached_values.reshape(
+            batch_size * seq_len, cached_values.shape[2], cached_values.shape[3]
+        )
 
         # Determine if we should use sliding window attention
         # Even layers use sliding window, odd layers use full attention
-        use_sliding_window = (self.layer_idx % 2 == 0)
+        use_sliding_window = self.layer_idx % 2 == 0
 
         # Compute attention using PyTorch with attention sinks
         # Pass the number of batches for proper handling
@@ -844,18 +881,9 @@ class GPTOSSAttention(nn.Module):
             use_sliding_window=use_sliding_window,
             num_batches=num_batches,
         )
-        
+
         attn_output = attn_output.reshape(n, -1)
-
-        if print_sums:
-            tensor_sum = attn_output.sum().item()
-            print(f"Sum after attention output: {tensor_sum:.6f}")
-
         attn_output = self.o_proj(attn_output)
-
-        if print_sums:
-            tensor_sum = attn_output.sum().item()
-            print(f"Sum after o_proj: {tensor_sum:.6f}")
 
         return attn_output
 
@@ -1015,8 +1043,6 @@ class GPTOSSDecoderLayer(nn.Module):
 
     def forward(
         self,
-        wrapper_full,
-        wrapper_sliding,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         kv_cache_at_layer: torch.Tensor,
@@ -1026,23 +1052,14 @@ class GPTOSSDecoderLayer(nn.Module):
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
         adapter_subpass: AdapterSubpass | None,
-        print_sums: bool,
     ) -> torch.Tensor:
         """Forward pass through the decoder layer."""
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-        if print_sums:
-            tensor_sum = hidden_states.sum().item()
-            print(f"Sum after input layernorm: {tensor_sum:.6f}")
-
-        # Select the appropriate wrapper based on this layer's attention pattern
-        # Even layers use sliding window, odd layers use full attention
-        wrapper = wrapper_sliding if self.layer_idx % 2 == 0 else wrapper_full
 
         # Self Attention
         hidden_states = self.self_attn(
-            wrapper=wrapper,
             hidden_states=hidden_states,
             position_ids=position_ids,
             kv_cache_at_layer=kv_cache_at_layer,
@@ -1052,48 +1069,26 @@ class GPTOSSDecoderLayer(nn.Module):
             batch_indices=batch_indices,
             batch_positions=batch_positions,
             adapter_subpass=adapter_subpass,
-            print_sums=print_sums,
         )
 
         hidden_states = residual + hidden_states
-
-        if print_sums:
-            tensor_sum = hidden_states.sum().item()
-            print(f"Sum after attention residual: {tensor_sum:.6f}")
-
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        if print_sums:
-            tensor_sum = hidden_states.sum().item()
-            print(f"Sum after post attention layernorm: {tensor_sum:.6f}")
-
         # MLP
         hidden_states = self.mlp(hidden_states)
-
-        if print_sums:
-            tensor_sum = hidden_states.sum().item()
-            print(f"Sum after MLP: {tensor_sum:.6f}")
-            tensor_sum = residual.sum().item()
-            print(f"Sum after MLP of the residual: {tensor_sum:.6f}")
-
         hidden_states = residual + hidden_states
-
-        if print_sums:
-            tensor_sum = hidden_states.sum().item()
-            print(f"Sum after MLP residual: {tensor_sum:.6f}")
 
         return hidden_states
 
 
 class GPTOSSModel(nn.Module):
-    """GPT OSS model with FlashInfer support."""
+    """GPT OSS model with PyTorch attention and attention sinks."""
 
     def __init__(self, config: GPTOSSArch):
         """Initialize the GPT OSS model."""
         super().__init__()
         self.config = config
-        self.print_sums = False
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
@@ -1113,31 +1108,6 @@ class GPTOSSModel(nn.Module):
             device=torch.device(config.device),
         )
 
-        self.workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=torch.device(config.device)
-        )
-
-        # Create separate wrappers for full attention and sliding window attention
-        self.wrapper_decode_full = ops.BatchDecodeWithPagedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
-        )
-        self.wrapper_append_full = ops.BatchPrefillWithPagedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
-        )
-
-        # Create additional workspace buffer for sliding window wrappers
-        self.workspace_buffer_sliding = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=torch.device(config.device)
-        )
-        self.wrapper_decode_sliding = ops.BatchDecodeWithPagedKVCacheWrapper(
-            self.workspace_buffer_sliding, "NHD"
-        )
-        self.wrapper_append_sliding = ops.BatchPrefillWithPagedKVCacheWrapper(
-            self.workspace_buffer_sliding, "NHD"
-        )
-
-        self.round = 0
-
     def forward(
         self,
         input_embeds: torch.Tensor,
@@ -1152,18 +1122,6 @@ class GPTOSSModel(nn.Module):
         adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the GPT OSS model."""
-
-        if self.round == 1:
-            self.print_sums = True
-        else:
-            self.print_sums = False
-        self.round += 1
-
-        if self.print_sums:
-            tensor_sum = input_embeds.sum().item()
-            print(f"Shape of token embedding: {input_embeds.shape}")
-            print(f"Sum of token embedding: {tensor_sum:.6f}")
-
         hidden_states = input_embeds
         n, _ = hidden_states.size()
 
@@ -1175,82 +1133,8 @@ class GPTOSSModel(nn.Module):
             nnz=n,
         )
 
-        # Plan both full attention and sliding window wrappers
-        if single_token_inference_mode:
-            # Plan full attention wrapper (no sliding window)
-            self.wrapper_decode_full.plan(
-                indptr=kv_page_indptr,
-                indices=kv_page_indices,
-                last_page_len=kv_last_page_lens,
-                num_qo_heads=self.config.num_query_heads,
-                num_kv_heads=self.config.num_key_value_heads,
-                head_dim=self.config.head_size,
-                page_size=page_size,
-                pos_encoding_mode="NONE",
-                q_data_type=self.config.dtype,
-                window_left=-1,  # Full attention
-            )
-
-            # Plan sliding window wrapper
-            self.wrapper_decode_sliding.plan(
-                indptr=kv_page_indptr,
-                indices=kv_page_indices,
-                last_page_len=kv_last_page_lens,
-                num_qo_heads=self.config.num_query_heads,
-                num_kv_heads=self.config.num_key_value_heads,
-                head_dim=self.config.head_size,
-                page_size=page_size,
-                pos_encoding_mode="NONE",
-                q_data_type=self.config.dtype,
-                window_left=self.config.sliding_window,  # Sliding window attention
-            )
-
-        else:
-            # Plan full attention wrapper (no sliding window)
-            self.wrapper_append_full.plan(
-                qo_indptr=qo_indptr,
-                paged_kv_indptr=kv_page_indptr,
-                paged_kv_indices=kv_page_indices,
-                paged_kv_last_page_len=kv_last_page_lens,
-                num_qo_heads=self.config.num_query_heads,
-                num_kv_heads=self.config.num_key_value_heads,
-                head_dim_qk=self.config.head_size,
-                page_size=page_size,
-                custom_mask=custom_mask,
-                q_data_type=self.config.dtype,
-                window_left=-1,  # Full attention
-            )
-
-            # Plan sliding window wrapper
-            self.wrapper_append_sliding.plan(
-                qo_indptr=qo_indptr,
-                paged_kv_indptr=kv_page_indptr,
-                paged_kv_indices=kv_page_indices,
-                paged_kv_last_page_len=kv_last_page_lens,
-                num_qo_heads=self.config.num_query_heads,
-                num_kv_heads=self.config.num_key_value_heads,
-                head_dim_qk=self.config.head_size,
-                page_size=page_size,
-                custom_mask=custom_mask,
-                q_data_type=self.config.dtype,
-                window_left=self.config.sliding_window,  # Sliding window attention
-            )
-
-        # Select the appropriate wrappers based on inference mode
-        if single_token_inference_mode:
-            wrapper_full = self.wrapper_decode_full
-            wrapper_sliding = self.wrapper_decode_sliding
-        else:
-            wrapper_full = self.wrapper_append_full
-            wrapper_sliding = self.wrapper_append_sliding
-
         for decoder_layer in self.layers:
-            if self.print_sums:
-                print(f"Layer {decoder_layer.layer_idx}")
-
             layer_outputs = decoder_layer(
-                wrapper_full=wrapper_full,
-                wrapper_sliding=wrapper_sliding,
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 kv_cache_at_layer=kv_cache_at_layer,
@@ -1260,23 +1144,11 @@ class GPTOSSModel(nn.Module):
                 batch_indices=batch_indices,
                 batch_positions=batch_positions,
                 adapter_subpass=adapter_subpass,
-                print_sums=self.print_sums,
             )
 
             hidden_states = layer_outputs
 
-            if self.print_sums:
-                tensor_sum = hidden_states.sum().item()
-                print(f"Sum after layer {decoder_layer.layer_idx}: {tensor_sum:.6f}")
-                print()
-
         hidden_states = self.norm(hidden_states)
-
-        if self.print_sums:
-            tensor_sum = hidden_states.sum().item()
-            print(f"Sum after final layer norm: {tensor_sum:.6f}")
-
-        self.print_sums = False
 
         return hidden_states
 
