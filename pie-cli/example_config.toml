@@ -10,7 +10,7 @@ log = "pie.log"
 [[backend]]
 backend_type = "python"
 exec_path = "../backend/backend-python/server.py"
-model = "qwen-3-0.6b"
+model = "gpt-oss-20b"
 device = "cuda:0"
 dtype = "bfloat16"
 kv_page_size = 16

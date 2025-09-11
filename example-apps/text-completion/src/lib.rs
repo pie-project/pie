@@ -61,9 +61,11 @@ async fn main() -> Result<(), String> {
     let tokenizer = model.get_tokenizer();
     let mut ctx = model.create_context();
 
-    ctx.fill_system("You are a helpful, respectful and honest assistant.");
-    ctx.fill_user(&prompt);
+    // ctx.fill_system("You are a helpful, respectful and honest assistant.");
+    // ctx.fill_user(&prompt);
 
+    ctx.fill("<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nReasoning: medium\n<|end|><|start|>user<|message|>Where is the capital of France?<|end|><|start|>assistant");
+    
     let final_text = ctx
         .generate_until(Sampler::top_p(0.6, 0.95), max_num_outputs as usize)
         .await;

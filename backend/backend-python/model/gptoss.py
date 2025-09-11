@@ -786,6 +786,7 @@ class GPTOSSModel(nn.Module):
         """Initialize the GPT OSS model."""
         super().__init__()
         self.config = config
+        self.print_sums = True
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
@@ -842,6 +843,12 @@ class GPTOSSModel(nn.Module):
         adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the GPT OSS model."""
+
+        if self.print_sums:
+            tensor_sum = input_embeds.sum().item()
+            print(f"Shape of token embedding: {input_embeds.shape}")
+            print(f"Sum of token embedding: {tensor_sum:.6f}")
+
         hidden_states = input_embeds
         n, _ = hidden_states.size()
 
@@ -939,7 +946,13 @@ class GPTOSSModel(nn.Module):
 
             hidden_states = layer_outputs
 
+            if self.print_sums:
+                tensor_sum = hidden_states.sum().item()
+                print(f"Sum after layer {decoder_layer.layer_idx}: {tensor_sum:.6f}")
+
         hidden_states = self.norm(hidden_states)
+
+        self.print_sums = False
 
         return hidden_states
 

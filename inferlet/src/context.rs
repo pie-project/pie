@@ -232,6 +232,7 @@ impl Context {
 
     pub fn fill(&mut self, text: &str) {
         let new_token_ids = self.tokenizer.tokenize(text);
+        println!("new_token_ids: {:?}", new_token_ids);
         self.fill_tokens(new_token_ids);
     }
 
