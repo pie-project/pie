@@ -13,7 +13,6 @@ import msgspec
 import torch
 import ztensor
 import zmq
-from msgspec import structs
 from platformdirs import user_cache_dir
 from tqdm import tqdm
 from websockets.sync.client import connect
@@ -130,15 +129,17 @@ def load_model(config: dict):
             model = GPTOSSForCausalLM(model_info.architecture)
             tensor_loader = GPTOSSTensorLoader(model)
         case _:
-            raise ValueError(f"Unsupported architecture type: {model_info.architecture.type}")
+            raise ValueError(
+                f"Unsupported architecture type: {model_info.architecture.type}"
+            )
 
     # Prepare for loading
     model_state_keys = set(model.state_dict().keys())
     loaded_keys = set()
-    
+
     # Track which checkpoint file each tensor comes from
     checkpoint_tensor_to_file = {}
-    
+
     # First pass: scan all checkpoint files to build tensor-to-file mapping
     print("Scanning checkpoint files...")
     try:
@@ -156,51 +157,63 @@ def load_model(config: dict):
 
         # Second pass: process all runtime tensors using the tensor loader
         print("\nProcessing runtime tensors...")
-        
-        for runtime_tensor_name in tqdm(model_state_keys, desc="Processing tensors", unit="tensors"):
+
+        for runtime_tensor_name in tqdm(
+            model_state_keys, desc="Processing tensors", unit="tensors"
+        ):
             if runtime_tensor_name in loaded_keys:
                 continue  # Skip already loaded tensors
-                
+
             # Query which checkpoint tensors are needed
             required_checkpoint_tensors = tensor_loader.query(runtime_tensor_name)
-            
+
             # Load required checkpoint tensors on demand
             available_tensors = {}
             missing_tensors = []
-            
+
             for checkpoint_name in required_checkpoint_tensors:
                 if checkpoint_name not in checkpoint_tensor_to_file:
                     missing_tensors.append(checkpoint_name)
                     continue
-                
+
                 try:
                     checkpoint_file_path = checkpoint_tensor_to_file[checkpoint_name]
                     with ztensor.Reader(str(checkpoint_file_path)) as reader:
-                        available_tensors[checkpoint_name] = reader.read_tensor(checkpoint_name, to="torch")
+                        available_tensors[checkpoint_name] = reader.read_tensor(
+                            checkpoint_name, to="torch"
+                        )
                 except Exception as e:
-                    print(f"    Error loading checkpoint tensor '{checkpoint_name}': {e}")
+                    print(
+                        f"    Error loading checkpoint tensor '{checkpoint_name}': {e}"
+                    )
                     missing_tensors.append(checkpoint_name)
-            
+
             if missing_tensors:
                 # Weight tying for lm_head.weight is handled separately
                 if runtime_tensor_name != "lm_head.weight":
-                    print(f"    Warning: Missing checkpoint tensors for '{runtime_tensor_name}': {missing_tensors}")
+                    print(
+                        f"    Warning: Missing checkpoint tensors for '{runtime_tensor_name}': {missing_tensors}"
+                    )
                 continue
-            
+
             # Load the runtime tensor using the tensor loader
             try:
-                runtime_tensor = tensor_loader.load(runtime_tensor_name, available_tensors)
+                runtime_tensor = tensor_loader.load(
+                    runtime_tensor_name, available_tensors
+                )
                 param = model.state_dict()[runtime_tensor_name]
-                
+
                 if runtime_tensor.shape != param.shape:
-                    print(f"    Warning: Shape mismatch for tensor '{runtime_tensor_name}'. "
-                          f"Expected {param.shape}, got {runtime_tensor.shape}. Skipping.")
+                    print(
+                        f"    Warning: Shape mismatch for tensor '{runtime_tensor_name}'. "
+                        f"Expected {param.shape}, got {runtime_tensor.shape}. Skipping."
+                    )
                     continue
-                    
+
                 with torch.no_grad():
                     param.copy_(runtime_tensor, non_blocking=True)
                 loaded_keys.add(runtime_tensor_name)
-                
+
             except Exception as e:
                 print(f"    Error loading tensor '{runtime_tensor_name}': {e}")
                 continue
