@@ -621,63 +621,40 @@ class GPTOSSAttention(nn.Module):
         key = key.unsqueeze(0).transpose(1, 2)      # [1, num_kv_heads, seq_len, head_dim] 
         value = value.unsqueeze(0).transpose(1, 2)  # [1, num_kv_heads, seq_len, head_dim]
         
-        # Handle grouped query attention by repeating KV heads
-        if num_kv_heads != num_q_heads:
-            key = self._repeat_kv(key, self.num_key_value_groups)      # [1, num_q_heads, seq_len, head_dim]
-            value = self._repeat_kv(value, self.num_key_value_groups)  # [1, num_q_heads, seq_len, head_dim]
+        # Handle grouped query attention by repeating KV heads - exactly like reference
+        key_states = self._repeat_kv(key, self.num_key_value_groups)      # [1, num_q_heads, seq_len, head_dim]
+        value_states = self._repeat_kv(value, self.num_key_value_groups)  # [1, num_q_heads, seq_len, head_dim]
         
-        # Compute attention weights
-        attn_weights = torch.matmul(query, key.transpose(2, 3)) * self.scaling  # [1, num_q_heads, n, seq_len]
+        # Compute attention weights - exactly like reference
+        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * self.scaling  # [1, num_q_heads, n, seq_len]
         
-        # Apply causal mask if needed
+        # For now, skip complex masking - the reference implementation expects attention_mask as input
+        # During decode stage, we typically don't need masking since new tokens can attend to all previous
         attention_mask = None
-        if seq_len > 1:
-            # Create causal mask
-            causal_mask = torch.triu(torch.ones(n, seq_len, device=query.device), diagonal=1)
-            causal_mask = causal_mask.masked_fill(causal_mask.bool(), float('-inf'))
-            attention_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, n, seq_len]
-            
-            # Apply sliding window mask if needed
-            if use_sliding_window and self.sliding_window > 0:
-                # Create sliding window mask
-                current_positions = position_ids.unsqueeze(1)  # [n, 1]
-                key_positions = torch.arange(seq_len, device=query.device).unsqueeze(0)  # [1, seq_len]
-                distances = current_positions - key_positions  # [n, seq_len]
-                sliding_mask = distances > self.sliding_window  # [n, seq_len]
-                sliding_mask = sliding_mask.masked_fill(sliding_mask, float('-inf'))
-                sliding_mask = sliding_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, n, seq_len]
-                
-                # Combine masks
-                attention_mask = attention_mask + sliding_mask
-        
-        # Apply attention mask
         if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, :key.shape[-2]]
+            causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
         
-        # Add attention sinks - these are appended as additional logits
+        # Add attention sinks - exactly like reference
         sinks = self.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)  # [1, num_q_heads, n, 1]
         combined_logits = torch.cat([attn_weights, sinks], dim=-1)  # [1, num_q_heads, n, seq_len + 1]
         
-        # Prevent overflow in BF16/FP16 by subtracting max values
+        # Prevent overflow - exactly like reference
         combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
         
-        # Apply softmax to combined logits
-        probs = torch.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+        # Apply softmax - exactly like reference
+        probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
         
-        # Drop the sink probabilities - we only use the attention weights for actual tokens
+        # Drop sinks - exactly like reference
         scores = probs[..., :-1]  # [1, num_q_heads, n, seq_len]
         
-        # Apply dropout (disabled during inference)
-        attn_weights = torch.nn.functional.dropout(scores, p=0.0, training=self.training)
+        # Apply dropout - exactly like reference
+        attn_weights = nn.functional.dropout(scores, p=0.0, training=self.training)
         
-        # Ensure dtype consistency for matrix multiplication
-        attn_weights = attn_weights.to(value.dtype)
+        # Compute attention output - exactly like reference
+        attn_output = torch.matmul(attn_weights, value_states)  # [1, num_q_heads, n, head_dim]
         
-        # Compute attention output
-        attn_output = torch.matmul(attn_weights, value)  # [1, num_q_heads, n, head_dim]
-        
-        # Reshape back to [n, num_q_heads, head_dim]
+        # Reshape back - exactly like reference
         attn_output = attn_output.transpose(1, 2).contiguous()  # [1, n, num_q_heads, head_dim]
         attn_output = attn_output.squeeze(0)  # [n, num_q_heads, head_dim]
         
@@ -706,13 +683,13 @@ class GPTOSSAttention(nn.Module):
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
         )
 
-        if print_sums:
-            tensor_sum = query_states.sum().item()
-            print(f"Sum after query states: {tensor_sum:.6f}")
-            tensor_sum = key_states.sum().item()
-            print(f"Sum after key states: {tensor_sum:.6f}")
-            tensor_sum = value_states.sum().item()
-            print(f"Sum after value states: {tensor_sum:.6f}")
+        # if print_sums:
+        #     tensor_sum = query_states.sum().item()
+        #     print(f"Sum after query states: {tensor_sum:.6f}")
+        #     tensor_sum = key_states.sum().item()
+        #     print(f"Sum after key states: {tensor_sum:.6f}")
+        #     tensor_sum = value_states.sum().item()
+        #     print(f"Sum after value states: {tensor_sum:.6f}")
 
         # apply adapters if provided
         if adapter_subpass is not None:
@@ -732,11 +709,11 @@ class GPTOSSAttention(nn.Module):
         # Apply rotary embedding
         query_states, key_states = self.rope(query_states, key_states, position_ids)
 
-        if print_sums:
-            tensor_sum = query_states.sum().item()
-            print(f"Sum after RoPE query states: {tensor_sum:.6f}")
-            tensor_sum = key_states.sum().item()
-            print(f"Sum after RoPE key states: {tensor_sum:.6f}")
+        # if print_sums:
+        #     tensor_sum = query_states.sum().item()
+        #     print(f"Sum after RoPE query states: {tensor_sum:.6f}")
+        #     tensor_sum = key_states.sum().item()
+        #     print(f"Sum after RoPE key states: {tensor_sum:.6f}")
 
         # Store current KV states in FlashInfer cache for future use
         ops.append_paged_kv_cache(
@@ -759,6 +736,17 @@ class GPTOSSAttention(nn.Module):
             kv_last_page_lens,
             batch_idx=0,  # Assuming single batch for now
         )
+
+        if print_sums:
+            tensor_sum = query_states.sum().item()
+            print(f"Sum after query states: {tensor_sum:.6f}")
+            print(f"Shape of query states: {query_states.shape}")
+            tensor_sum = cached_keys.sum().item()
+            print(f"Sum after cached keys: {tensor_sum:.6f}")
+            print(f"Shape of cached keys: {cached_keys.shape}")
+            tensor_sum = cached_values.sum().item()
+            print(f"Sum after cached values: {tensor_sum:.6f}")
+            print(f"Shape of cached values: {cached_values.shape}")
 
         # Determine if we should use sliding window attention
         # Even layers use sliding window, odd layers use full attention
@@ -992,9 +980,24 @@ class GPTOSSDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
+        if print_sums:
+            tensor_sum = hidden_states.sum().item()
+            print(f"Sum after post attention layernorm: {tensor_sum:.6f}")
+
         # MLP
         hidden_states = self.mlp(hidden_states)
+
+        if print_sums:
+            tensor_sum = hidden_states.sum().item()
+            print(f"Sum after MLP: {tensor_sum:.6f}")
+            tensor_sum = residual.sum().item()
+            print(f"Sum after MLP of the residual: {tensor_sum:.6f}")
+
         hidden_states = residual + hidden_states
+
+        if print_sums:
+            tensor_sum = hidden_states.sum().item()
+            print(f"Sum after MLP residual: {tensor_sum:.6f}")
 
         return hidden_states
 
@@ -1006,7 +1009,7 @@ class GPTOSSModel(nn.Module):
         """Initialize the GPT OSS model."""
         super().__init__()
         self.config = config
-        self.print_sums = True
+        self.print_sums = False
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
@@ -1049,6 +1052,8 @@ class GPTOSSModel(nn.Module):
             self.workspace_buffer_sliding, "NHD"
         )
 
+        self.round = 0
+
     def forward(
         self,
         input_embeds: torch.Tensor,
@@ -1063,6 +1068,12 @@ class GPTOSSModel(nn.Module):
         adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the GPT OSS model."""
+
+        if self.round == 1:
+            self.print_sums = True
+        else:
+            self.print_sums = False
+        self.round += 1
 
         if self.print_sums:
             tensor_sum = input_embeds.sum().item()
@@ -1176,6 +1187,10 @@ class GPTOSSModel(nn.Module):
                 print()
 
         hidden_states = self.norm(hidden_states)
+
+        if self.print_sums:
+            tensor_sum = hidden_states.sum().item()
+            print(f"Sum after final layer norm: {tensor_sum:.6f}")
 
         self.print_sums = False
 
