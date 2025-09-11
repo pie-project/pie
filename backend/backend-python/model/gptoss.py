@@ -467,7 +467,8 @@ class GPTOSSAttention(nn.Module):
         self.head_dim = config.head_size
         self.num_attention_heads = config.num_query_heads
         self.num_key_value_heads = config.num_key_value_heads
-        # Only apply sliding window to every other layer
+        # Apply sliding window to even layers (0, 2, 4, ...), full attention to odd layers (1, 3, 5, ...)
+        # This follows the GPT-OSS alternating attention pattern
         self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
 
         # Define the output sizes for Q, K, and V for clarity
@@ -729,7 +730,8 @@ class GPTOSSDecoderLayer(nn.Module):
 
     def forward(
         self,
-        wrapper,
+        wrapper_full,
+        wrapper_sliding,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         kv_cache_at_layer: torch.Tensor,
@@ -744,6 +746,10 @@ class GPTOSSDecoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
+
+        # Select the appropriate wrapper based on this layer's attention pattern
+        # Even layers (0, 2, 4, ...) use sliding window, odd layers (1, 3, 5, ...) use full attention
+        wrapper = wrapper_sliding if self.layer_idx % 2 == 0 else wrapper_full
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -800,11 +806,24 @@ class GPTOSSModel(nn.Module):
         self.workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=torch.device(config.device)
         )
-        self.wrapper_decode = ops.BatchDecodeWithPagedKVCacheWrapper(
+
+        # Create separate wrappers for full attention and sliding window attention
+        self.wrapper_decode_full = ops.BatchDecodeWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
         )
-        self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(
+        self.wrapper_append_full = ops.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
+        )
+
+        # Create additional workspace buffer for sliding window wrappers
+        self.workspace_buffer_sliding = torch.empty(
+            128 * 1024 * 1024, dtype=torch.uint8, device=torch.device(config.device)
+        )
+        self.wrapper_decode_sliding = ops.BatchDecodeWithPagedKVCacheWrapper(
+            self.workspace_buffer_sliding, "NHD"
+        )
+        self.wrapper_append_sliding = ops.BatchPrefillWithPagedKVCacheWrapper(
+            self.workspace_buffer_sliding, "NHD"
         )
 
     def forward(
@@ -832,9 +851,10 @@ class GPTOSSModel(nn.Module):
             nnz=n,
         )
 
-        # check if its decoding (qo_indptr is )
+        # Plan both full attention and sliding window wrappers
         if single_token_inference_mode:
-            self.wrapper_decode.plan(
+            # Plan full attention wrapper (no sliding window)
+            self.wrapper_decode_full.plan(
                 indptr=kv_page_indptr,
                 indices=kv_page_indices,
                 last_page_len=kv_last_page_lens,
@@ -844,10 +864,26 @@ class GPTOSSModel(nn.Module):
                 page_size=page_size,
                 pos_encoding_mode="NONE",
                 q_data_type=self.config.dtype,
+                window_left=-1,  # Full attention
             )
-            wrapper = self.wrapper_decode
+
+            # Plan sliding window wrapper
+            self.wrapper_decode_sliding.plan(
+                indptr=kv_page_indptr,
+                indices=kv_page_indices,
+                last_page_len=kv_last_page_lens,
+                num_qo_heads=self.config.num_query_heads,
+                num_kv_heads=self.config.num_key_value_heads,
+                head_dim=self.config.head_size,
+                page_size=page_size,
+                pos_encoding_mode="NONE",
+                q_data_type=self.config.dtype,
+                window_left=self.config.sliding_window,  # Sliding window attention
+            )
+
         else:
-            self.wrapper_append.plan(
+            # Plan full attention wrapper (no sliding window)
+            self.wrapper_append_full.plan(
                 qo_indptr=qo_indptr,
                 paged_kv_indptr=kv_page_indptr,
                 paged_kv_indices=kv_page_indices,
@@ -858,12 +894,36 @@ class GPTOSSModel(nn.Module):
                 page_size=page_size,
                 custom_mask=custom_mask,
                 q_data_type=self.config.dtype,
+                window_left=-1,  # Full attention
             )
-            wrapper = self.wrapper_append
+
+            # Plan sliding window wrapper
+            self.wrapper_append_sliding.plan(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=kv_page_indptr,
+                paged_kv_indices=kv_page_indices,
+                paged_kv_last_page_len=kv_last_page_lens,
+                num_qo_heads=self.config.num_query_heads,
+                num_kv_heads=self.config.num_key_value_heads,
+                head_dim_qk=self.config.head_size,
+                page_size=page_size,
+                custom_mask=custom_mask,
+                q_data_type=self.config.dtype,
+                window_left=self.config.sliding_window,  # Sliding window attention
+            )
+
+        # Select the appropriate wrappers based on inference mode
+        if single_token_inference_mode:
+            wrapper_full = self.wrapper_decode_full
+            wrapper_sliding = self.wrapper_decode_sliding
+        else:
+            wrapper_full = self.wrapper_append_full
+            wrapper_sliding = self.wrapper_append_sliding
 
         for decoder_layer in self.layers:
             layer_outputs = decoder_layer(
-                wrapper=wrapper,
+                wrapper_full=wrapper_full,
+                wrapper_sliding=wrapper_sliding,
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 kv_cache_at_layer=kv_cache_at_layer,
