@@ -113,8 +113,7 @@ jobs:
       - name: Run Pyright on predefined files + changed files outside those dirs
         shell: bash
         env:
-          UV_NO_SYNC: 1
-          UV_OFFLINE: 1
+          PYTHONPATH: backend/backend-python
         run: |
           set -euo pipefail
           shopt -s nullglob
