@@ -351,7 +351,9 @@ def run_zmq_server(socket, handler):
     exception occurs.
     """
     # --- MODIFICATION: Set heartbeat timeout and initialize timer ---
-    HEARTBEAT_TIMEOUT = 7  # seconds
+    # Temporarily set to 60 seconds as a temporary fix to avoid the backend exiting
+    # during FlashInfer JIT compilation.
+    HEARTBEAT_TIMEOUT = 60  # seconds
     last_heartbeat_time = time.monotonic()
 
     # --- CORRECTION: Keys should be integer values of the enums ---
