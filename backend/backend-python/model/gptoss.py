@@ -593,10 +593,11 @@ class GPTOSSAttention(nn.Module):
     def _pytorch_attention_with_sinks(
         self,
         query: torch.Tensor,  # [n, num_q_heads, head_dim]
-        key: torch.Tensor,    # [seq_len, num_kv_heads, head_dim]
-        value: torch.Tensor,  # [seq_len, num_kv_heads, head_dim]
+        key: torch.Tensor,    # [seq_len, num_kv_heads, head_dim] or [batch_size * seq_len, num_kv_heads, head_dim]
+        value: torch.Tensor,  # [seq_len, num_kv_heads, head_dim] or [batch_size * seq_len, num_kv_heads, head_dim]
         position_ids: torch.Tensor,  # [n]
         use_sliding_window: bool = False,
+        num_batches: int = 1,
     ) -> torch.Tensor:
         """
         Compute attention using PyTorch with attention sinks support.
@@ -615,29 +616,70 @@ class GPTOSSAttention(nn.Module):
         n, num_q_heads, head_dim = query.shape
         seq_len, num_kv_heads, _ = key.shape
         
-        # Reshape to match reference implementation format: [batch, num_heads, seq_len, head_dim]
-        batch_size = 1  # We assume batch size 1 for now
-        query = query.unsqueeze(0).transpose(1, 2)  # [1, num_q_heads, n, head_dim]
-        key = key.unsqueeze(0).transpose(1, 2)      # [1, num_kv_heads, seq_len, head_dim] 
-        value = value.unsqueeze(0).transpose(1, 2)  # [1, num_kv_heads, seq_len, head_dim]
+        # Determine batch size from the input tensors
+        # Current format: query [n, num_q_heads, head_dim], key/value [seq_len, num_kv_heads, head_dim]
+        # Target format: [batch, num_heads, seq_len, head_dim]
+        
+        # Handle all batch sizes uniformly
+        # key and value are [batch_size * seq_len, num_kv_heads, head_dim]
+        # We need to reshape them to [batch_size, num_kv_heads, seq_len, head_dim]
+        total_seq_len = key.shape[0]
+        seq_len_per_batch = total_seq_len // num_batches
+        
+        # Reshape key and value to proper batch format
+        key = key.reshape(num_batches, seq_len_per_batch, num_kv_heads, head_dim)
+        key = key.transpose(1, 2)  # [batch_size, num_kv_heads, seq_len, head_dim]
+        
+        value = value.reshape(num_batches, seq_len_per_batch, num_kv_heads, head_dim)
+        value = value.transpose(1, 2)  # [batch_size, num_kv_heads, seq_len, head_dim]
+        
+        # For query, we assume it's distributed across batches
+        # query is [n, num_q_heads, head_dim] where n might be batch_size * tokens_per_batch
+        tokens_per_batch = n // num_batches
+        query = query.reshape(num_batches, tokens_per_batch, num_q_heads, head_dim)
+        query = query.transpose(1, 2)  # [batch_size, num_q_heads, tokens_per_batch, head_dim]
+        
+        batch_size = num_batches
+        seq_len = seq_len_per_batch
+        n = tokens_per_batch
         
         # Handle grouped query attention by repeating KV heads - exactly like reference
-        key_states = self._repeat_kv(key, self.num_key_value_groups)      # [1, num_q_heads, seq_len, head_dim]
-        value_states = self._repeat_kv(value, self.num_key_value_groups)  # [1, num_q_heads, seq_len, head_dim]
+        key_states = self._repeat_kv(key, self.num_key_value_groups)      # [batch_size, num_q_heads, seq_len, head_dim]
+        value_states = self._repeat_kv(value, self.num_key_value_groups)  # [batch_size, num_q_heads, seq_len, head_dim]
         
         # Compute attention weights - exactly like reference
-        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * self.scaling  # [1, num_q_heads, n, seq_len]
+        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * self.scaling  # [batch_size, num_q_heads, n, seq_len]
         
-        # For now, skip complex masking - the reference implementation expects attention_mask as input
-        # During decode stage, we typically don't need masking since new tokens can attend to all previous
+        # Apply sliding window attention if needed (critical for GPT OSS alternating attention)
         attention_mask = None
+        if use_sliding_window and self.sliding_window > 0 and seq_len > 0:
+            # Create sliding window mask
+            # For each query position, mask out keys that are too far in the past
+            query_positions = position_ids.unsqueeze(1)  # [n, 1]
+            
+            # Key positions in cache: they have absolute positions from 0 to seq_len-1
+            # But we need to know their actual positions relative to the current sequence
+            # The cached keys represent positions from (current_pos - seq_len) to (current_pos - 1)
+            current_pos = position_ids.max().item()  # Current position of the last query token
+            key_start_pos = current_pos - seq_len + 1  # Starting position of first cached key
+            key_positions = torch.arange(key_start_pos, current_pos + 1, device=query.device)[:seq_len].unsqueeze(0)  # [1, seq_len]
+            
+            # Sliding window: can only attend to keys within sliding_window distance
+            distances = query_positions - key_positions  # [n, seq_len]
+            sliding_mask = distances > self.sliding_window  # [n, seq_len] - True where we should mask
+            
+            # Convert to attention mask format
+            sliding_mask = sliding_mask.masked_fill(sliding_mask, float('-inf'))
+            attention_mask = sliding_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, n, seq_len]
+        
+        # Apply attention mask
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
         
         # Add attention sinks - exactly like reference
-        sinks = self.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)  # [1, num_q_heads, n, 1]
-        combined_logits = torch.cat([attn_weights, sinks], dim=-1)  # [1, num_q_heads, n, seq_len + 1]
+        sinks = self.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)  # [batch_size, num_q_heads, n, 1]
+        combined_logits = torch.cat([attn_weights, sinks], dim=-1)  # [batch_size, num_q_heads, n, seq_len + 1]
         
         # Prevent overflow - exactly like reference
         combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
@@ -646,17 +688,20 @@ class GPTOSSAttention(nn.Module):
         probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
         
         # Drop sinks - exactly like reference
-        scores = probs[..., :-1]  # [1, num_q_heads, n, seq_len]
+        scores = probs[..., :-1]  # [batch_size, num_q_heads, n, seq_len]
         
         # Apply dropout - exactly like reference
         attn_weights = nn.functional.dropout(scores, p=0.0, training=self.training)
         
         # Compute attention output - exactly like reference
-        attn_output = torch.matmul(attn_weights, value_states)  # [1, num_q_heads, n, head_dim]
+        attn_output = torch.matmul(attn_weights, value_states)  # [batch_size, num_q_heads, n, head_dim]
         
-        # Reshape back - exactly like reference
-        attn_output = attn_output.transpose(1, 2).contiguous()  # [1, n, num_q_heads, head_dim]
-        attn_output = attn_output.squeeze(0)  # [n, num_q_heads, head_dim]
+        # Reshape back - handle all batch sizes uniformly
+        attn_output = attn_output.transpose(1, 2).contiguous()  # [batch_size, n, num_q_heads, head_dim]
+        
+        # Reshape back to concatenated format for compatibility
+        original_n = attn_output.shape[0] * attn_output.shape[1]  # batch_size * tokens_per_batch
+        attn_output = attn_output.reshape(original_n, num_q_heads, head_dim)  # [original_n, num_q_heads, head_dim]
         
         return attn_output
 
@@ -729,13 +774,50 @@ class GPTOSSAttention(nn.Module):
         )
 
         # Extract all KV cache (including newly added tokens) for PyTorch attention
-        cached_keys, cached_values = self._extract_kv_from_paged_cache(
-            kv_cache_at_layer[self.layer_idx],
-            kv_page_indices,
-            kv_page_indptr,
-            kv_last_page_lens,
-            batch_idx=0,  # Assuming single batch for now
-        )
+        # Handle all batch sizes uniformly
+        num_batches = len(kv_last_page_lens)
+        
+        # Extract each batch and find max length
+        all_keys = []
+        all_values = []
+        max_seq_len = 0
+        
+        for batch_idx in range(num_batches):
+            keys, values = self._extract_kv_from_paged_cache(
+                kv_cache_at_layer[self.layer_idx],
+                kv_page_indices,
+                kv_page_indptr,
+                kv_last_page_lens,
+                batch_idx=batch_idx,
+            )
+            all_keys.append(keys)
+            all_values.append(values)
+            max_seq_len = max(max_seq_len, keys.shape[0])
+        
+        # Pad all sequences to max length
+        padded_keys = []
+        padded_values = []
+        for keys, values in zip(all_keys, all_values):
+            if keys.shape[0] < max_seq_len:
+                # Pad with zeros
+                pad_len = max_seq_len - keys.shape[0]
+                key_padding = torch.zeros(pad_len, keys.shape[1], keys.shape[2], 
+                                        device=keys.device, dtype=keys.dtype)
+                value_padding = torch.zeros(pad_len, values.shape[1], values.shape[2], 
+                                          device=values.device, dtype=values.dtype)
+                keys = torch.cat([keys, key_padding], dim=0)
+                values = torch.cat([values, value_padding], dim=0)
+            padded_keys.append(keys)
+            padded_values.append(values)
+        
+        # Stack into batch dimension: [batch_size, seq_len, num_kv_heads, head_dim]
+        cached_keys = torch.stack(padded_keys, dim=0)
+        cached_values = torch.stack(padded_values, dim=0)
+        
+        # Reshape to [batch_size * seq_len, num_kv_heads, head_dim] for compatibility
+        batch_size, seq_len = cached_keys.shape[:2]
+        cached_keys = cached_keys.reshape(batch_size * seq_len, cached_keys.shape[2], cached_keys.shape[3])
+        cached_values = cached_values.reshape(batch_size * seq_len, cached_values.shape[2], cached_values.shape[3])
 
         if print_sums:
             tensor_sum = query_states.sum().item()
@@ -753,12 +835,14 @@ class GPTOSSAttention(nn.Module):
         use_sliding_window = (self.layer_idx % 2 == 0)
 
         # Compute attention using PyTorch with attention sinks
+        # Pass the number of batches for proper handling
         attn_output = self._pytorch_attention_with_sinks(
             query_states,
             cached_keys,
             cached_values,
             position_ids,
             use_sliding_window=use_sliding_window,
+            num_batches=num_batches,
         )
         
         attn_output = attn_output.reshape(n, -1)
