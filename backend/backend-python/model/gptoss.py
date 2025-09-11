@@ -67,13 +67,13 @@ def convert_mxfp4_to_bf16(
 
     lut = torch.tensor(FP4_VALUES, dtype=dtype, device=target_device)
 
-    *prefix_shape, G, B = blocks.shape
-    rows_total = math.prod(prefix_shape) * G
+    *prefix_shape, g, b = blocks.shape
+    rows_total = math.prod(prefix_shape) * g
 
-    blocks = blocks.reshape(rows_total, B).to(target_device)
+    blocks = blocks.reshape(rows_total, b).to(target_device)
     scales = scales.reshape(rows_total, 1).to(target_device)
 
-    out = torch.empty(rows_total, B * 2, dtype=dtype, device=target_device)
+    out = torch.empty(rows_total, b * 2, dtype=dtype, device=target_device)
 
     for r0 in range(0, rows_total, rows_per_chunk):
         r1 = min(r0 + rows_per_chunk, rows_total)
@@ -92,7 +92,7 @@ def convert_mxfp4_to_bf16(
         torch.ldexp(sub, exp, out=sub)
         del idx_lo, idx_hi, blk, exp
 
-    return out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
+    return out.reshape(*prefix_shape, g, b * 2).view(*prefix_shape, g * b * 2)
 
 
 def create_fusion_map(model: nn.Module):
@@ -100,7 +100,9 @@ def create_fusion_map(model: nn.Module):
     Analyzes the model and creates a map for fusing weights and handling MXFP4 tensors.
 
     Returns:
-        A dictionary mapping {fused_tensor_name: {"sources": [source_names], "dim": cat_dim, "type": type}}.
+        A dictionary mapping {
+            fused_tensor_name: {"sources": [source_names], "dim": cat_dim, "type": type}
+        }.
         For MXFP4 tensors, type is "mxfp4" and sources contains [blocks_name, scales_name].
         For fusion tensors, type is "fusion" and sources contains the tensors to concatenate.
         For regular tensors, type is "regular" and sources contains the single tensor name.
@@ -467,7 +469,7 @@ class GPTOSSAttention(nn.Module):
         self.head_dim = config.head_size
         self.num_attention_heads = config.num_query_heads
         self.num_key_value_heads = config.num_key_value_heads
-        # Apply sliding window to even layers (0, 2, 4, ...), full attention to odd layers (1, 3, 5, ...)
+        # Apply sliding window to even layers and full attention to odd layers
         # This follows the GPT-OSS alternating attention pattern
         self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
 
@@ -748,7 +750,7 @@ class GPTOSSDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Select the appropriate wrapper based on this layer's attention pattern
-        # Even layers (0, 2, 4, ...) use sliding window, odd layers (1, 3, 5, ...) use full attention
+        # Even layers use sliding window, odd layers use full attention
         wrapper = wrapper_sliding if self.layer_idx % 2 == 0 else wrapper_full
 
         # Self Attention
@@ -964,61 +966,3 @@ class GPTOSSForCausalLM(nn.Module):
         'torch.nn.modules.module' so must be overridden in child class.
         """
         raise NotImplementedError("Should not be called")
-
-
-class GPTOSSTokenGenerator:
-    """Token generator for GPT OSS model (adapted from original implementation)."""
-
-    @torch.inference_mode()
-    def __init__(self, model: GPTOSSForCausalLM):
-        self.model = model
-
-    @torch.inference_mode()
-    def generate(
-        self,
-        prompt_tokens: list[int],
-        stop_tokens: list[int],
-        temperature: float = 1.0,
-        max_tokens: int = 0,
-        return_logprobs: bool = False,
-    ):
-        """Generate tokens from the model."""
-        tokens = list(prompt_tokens)
-        num_generated_tokens = 0
-        device = self.model.config.device
-
-        while max_tokens == 0 or num_generated_tokens < max_tokens:
-            # Create dummy inputs for the forward pass - this would need to be
-            # properly implemented based on how the project handles tokenization
-            input_ids = torch.as_tensor(tokens, dtype=torch.int32, device=device)
-
-            # This is a simplified version - the actual implementation would need
-            # to properly handle the model forward pass with all required inputs
-            # like kv_cache, position_ids, etc.
-            with torch.no_grad():
-                # Get embeddings
-                input_embeds = self.model.model.embed_tokens(input_ids)
-
-                # This is where you'd need to implement the proper forward pass
-                # with all the required FlashInfer components
-                # For now, we'll use a placeholder
-                logits = self.model.lm_head(input_embeds[-1:])  # Only last token
-
-            if temperature == 0.0:
-                predicted_token = torch.argmax(logits, dim=-1).item()
-            else:
-                probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
-                predicted_token = torch.multinomial(probs, num_samples=1).item()
-
-            tokens.append(int(predicted_token))
-            num_generated_tokens += 1
-
-            if return_logprobs:
-                logprobs = torch.log_softmax(logits, dim=-1)
-                selected_logprobs = logprobs[0, int(predicted_token)].item()
-                yield predicted_token, selected_logprobs
-            else:
-                yield predicted_token
-
-            if predicted_token in stop_tokens:
-                break
