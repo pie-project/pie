@@ -14,86 +14,9 @@ from adapter import AdapterSubpass
 
 from config.gptoss import GPTOSSArch
 from config.common import TensorLoader
+from .utils import convert_mxfp4_to_bf16, extract_kv_from_paged_cache
 
 VERSION = "0.1.0"
-
-# MXFP4 conversion constants (from official GPT-OSS implementation)
-FP4_VALUES = [
-    +0.0,
-    +0.5,
-    +1.0,
-    +1.5,
-    +2.0,
-    +3.0,
-    +4.0,
-    +6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-]
-
-
-def convert_mxfp4_to_bf16(
-    blocks: torch.Tensor,
-    scales: torch.Tensor,
-    target_device: str,
-    dtype: torch.dtype = torch.bfloat16,
-    rows_per_chunk: int = 16384 * 512,
-) -> torch.Tensor:
-    """
-    Convert MXFP4 format tensors (blocks and scales) to bfloat16 format.
-
-    This implementation is based on the official GPT-OSS weights.py implementation.
-
-    Args:
-        blocks: The packed FP4 values tensor (uint8)
-        scales: The block scales tensor
-        dtype: Target dtype for conversion (default: torch.bfloat16)
-        rows_per_chunk: Number of rows to process per chunk for memory efficiency
-
-    Returns:
-        Converted tensor in the target dtype
-    """
-    # Convert scales to int32 and subtract bias (from official implementation)
-    scales = scales.to(torch.int32) - 127
-
-    assert (
-        blocks.shape[:-1] == scales.shape
-    ), f"{blocks.shape=} does not match {scales.shape=}"
-
-    lut = torch.tensor(FP4_VALUES, dtype=dtype, device=target_device)
-
-    *prefix_shape, g, b = blocks.shape
-    rows_total = math.prod(prefix_shape) * g
-
-    blocks = blocks.reshape(rows_total, b).to(target_device)
-    scales = scales.reshape(rows_total, 1).to(target_device)
-
-    out = torch.empty(rows_total, b * 2, dtype=dtype, device=target_device)
-
-    for r0 in range(0, rows_total, rows_per_chunk):
-        r1 = min(r0 + rows_per_chunk, rows_total)
-
-        blk = blocks[r0:r1]
-        exp = scales[r0:r1]
-
-        # nibble indices -> int64
-        idx_lo = (blk & 0x0F).to(torch.long)
-        idx_hi = (blk >> 4).to(torch.long)
-
-        sub = out[r0:r1]
-        sub[:, 0::2] = lut[idx_lo]
-        sub[:, 1::2] = lut[idx_hi]
-
-        torch.ldexp(sub, exp, out=sub)
-        del idx_lo, idx_hi, blk, exp
-
-    return out.reshape(*prefix_shape, g, b * 2).view(*prefix_shape, g * b * 2)
 
 
 def create_fusion_map(model: nn.Module):
@@ -517,95 +440,6 @@ class GPTOSSAttention(nn.Module):
             device=torch.device(config.device),
         )
 
-    def _extract_kv_from_paged_cache(
-        self,
-        kv_cache_at_layer: torch.Tensor,
-        kv_page_indices: torch.Tensor,
-        kv_page_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        batch_idx: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Extract keys and values from FlashInfer's paged KV cache format.
-
-        Args:
-            kv_cache_at_layer: Paged KV cache tensor [num_pages, 2, page_size, num_kv_heads, head_dim]
-            kv_page_indices: Page indices for each batch
-            kv_page_indptr: Pointer to start of each batch's pages
-            kv_last_page_lens: Length of the last page for each batch
-            batch_idx: Which batch to extract (default 0 for single batch)
-
-        Returns:
-            Tuple of (keys, values) tensors with shape [seq_len, num_kv_heads, head_dim]
-        """
-        # Get the page information for this batch
-        page_start = kv_page_indptr[batch_idx].item()
-        page_end = kv_page_indptr[batch_idx + 1].item()
-        batch_page_indices = kv_page_indices[page_start:page_end]
-        last_page_len = kv_last_page_lens[batch_idx].item()
-
-        # Collect keys and values from all pages
-        keys_list = []
-        values_list = []
-
-        for i, page_idx in enumerate(batch_page_indices):
-            page_idx_int = int(page_idx.item())
-
-            # Extract K and V from this page (layout: [num_pages, 2, page_size, num_kv_heads, head_dim])
-            # Index 0 is keys, index 1 is values
-            k_page = kv_cache_at_layer[
-                page_idx_int, 0
-            ]  # [page_size, num_kv_heads, head_dim]
-            v_page = kv_cache_at_layer[
-                page_idx_int, 1
-            ]  # [page_size, num_kv_heads, head_dim]
-
-            if i == len(batch_page_indices) - 1:  # Last page
-                # Only use the valid tokens in the last page
-                keys_list.append(k_page[:last_page_len])
-                values_list.append(v_page[:last_page_len])
-            else:
-                # Use the full page
-                keys_list.append(k_page)
-                values_list.append(v_page)
-
-        # Concatenate all pages to get the full sequence
-        if keys_list:
-            keys = torch.cat(keys_list, dim=0)  # [seq_len, num_kv_heads, head_dim]
-            values = torch.cat(values_list, dim=0)  # [seq_len, num_kv_heads, head_dim]
-        else:
-            # Empty cache
-            keys = torch.empty(
-                0,
-                self.num_key_value_heads,
-                self.head_dim,
-                device=kv_cache_at_layer.device,
-                dtype=kv_cache_at_layer.dtype,
-            )
-            values = torch.empty(
-                0,
-                self.num_key_value_heads,
-                self.head_dim,
-                device=kv_cache_at_layer.device,
-                dtype=kv_cache_at_layer.dtype,
-            )
-
-        return keys, values
-
-    def _repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-        """
-        Equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
-        The hidden states go from (batch, num_key_value_heads, seqlen, head_dim)
-        to (batch, num_attention_heads, seqlen, head_dim)
-        """
-        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-        if n_rep == 1:
-            return hidden_states
-        hidden_states = hidden_states[:, :, None, :, :].expand(
-            batch, num_key_value_heads, n_rep, slen, head_dim
-        )
-        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
     def _pytorch_attention_with_sinks(
         self,
         query: torch.Tensor,  # [n, num_q_heads, head_dim]
@@ -662,11 +496,11 @@ class GPTOSSAttention(nn.Module):
         n = tokens_per_batch
 
         # Handle grouped query attention by repeating KV heads - exactly like reference
-        key_states = self._repeat_kv(
-            key, self.num_key_value_groups
+        key_states = torch.repeat_interleave(
+            key, self.num_key_value_groups, dim=1
         )  # [batch_size, num_q_heads, seq_len, head_dim]
-        value_states = self._repeat_kv(
-            value, self.num_key_value_groups
+        value_states = torch.repeat_interleave(
+            value, self.num_key_value_groups, dim=1
         )  # [batch_size, num_q_heads, seq_len, head_dim]
 
         # Compute attention weights - exactly like reference
@@ -817,12 +651,14 @@ class GPTOSSAttention(nn.Module):
         max_seq_len = 0
 
         for batch_idx in range(num_batches):
-            keys, values = self._extract_kv_from_paged_cache(
+            keys, values = extract_kv_from_paged_cache(
                 kv_cache_at_layer[self.layer_idx],
                 kv_page_indices,
                 kv_page_indptr,
                 kv_last_page_lens,
                 batch_idx=batch_idx,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
             )
             all_keys.append(keys)
             all_values.append(values)
