@@ -57,9 +57,6 @@ jobs:
       - name: Run Pylint on predefined files + changed files outside those dirs
         shell: bash
         env:
-          # keep uv offline/safe as in your scripts
-          UV_NO_SYNC: 1
-          UV_OFFLINE: 1
           PYTHONPATH: backend/backend-python
         run: |
           set -euo pipefail
@@ -111,7 +108,7 @@ jobs:
           printf '  %s\n' "${TARGETS[@]}"
 
           # run pylint via uv (as in your script)
-          uv --project backend/backend-python run pylint --disable=R "${TARGETS[@]}"
+          uv run --project backend/backend-python --with pylint pylint --disable=R "${TARGETS[@]}"
 
       - name: Run Pyright on predefined files + changed files outside those dirs
         shell: bash
@@ -149,4 +146,4 @@ jobs:
           echo "Running pyright on the following files:"
           printf '  %s\n' "${TARGETS[@]}"
 
-          uv --project backend/backend-python run pyright "${TARGETS[@]}"
+          uv run --project backend/backend-python --with pyright pyright "${TARGETS[@]}"

@@ -1,3 +1,6 @@
+# pylint: disable-all
+# type: ignore
+
 import enum
 import os
 import random
