@@ -1,12 +1,12 @@
 """Qwen 3 Large Language Model Architecture (Qwen3)"""
 
 from __future__ import annotations
-from typing import List, Dict, Optional
+from typing import Optional
 
 import torch
 from torch import nn
 
-from common import AdapterSubpass, TensorLoader, Qwen3Arch
+from common import AdapterSubpass, Qwen3Arch
 import flashinfer as ops
 
 VERSION = "0.1.0"
@@ -55,81 +55,6 @@ def create_fusion_map(model: nn.Module):
             fusion_map[target_b] = {"sources": sources_b, "dim": 0, "op": "fusion"}
 
     return fusion_map
-
-
-class Qwen3TensorLoader(TensorLoader):
-    """
-    TensorLoader implementation for Qwen3 models.
-
-    Handles fusion of QKV projections and gate/up projections based on the
-    model architecture.
-    """
-
-    def __init__(self, model: nn.Module):
-        """
-        Initialize the tensor loader with a model instance.
-
-        Args:
-            model: The Qwen3 model instance
-        """
-        self.model = model
-        self._fusion_map = create_fusion_map(model)
-
-        # Create reverse mapping for quick lookup
-        self._source_to_target = {
-            source: target
-            for target, details in self._fusion_map.items()
-            for source in details["sources"]
-        }
-
-    def query(self, runtime_tensor_name: str) -> List[str]:
-        """
-        Query which checkpoint tensors are needed for a given runtime tensor.
-
-        Args:
-            runtime_tensor_name: Name of the tensor in the runtime model
-
-        Returns:
-            List of checkpoint tensor names needed to construct the runtime tensor
-        """
-        if runtime_tensor_name in self._fusion_map:
-            # This is a fusion target, return its source tensors
-            return self._fusion_map[runtime_tensor_name]["sources"]
-        else:
-            # This is a regular tensor, return itself
-            return [runtime_tensor_name]
-
-    def load(
-        self, runtime_tensor_name: str, checkpoint_tensors: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """
-        Load and transform checkpoint tensors into the runtime tensor.
-
-        Args:
-            runtime_tensor_name: Name of the tensor in the runtime model
-            checkpoint_tensors: Dictionary mapping checkpoint tensor names to their loaded tensors
-
-        Returns:
-            The constructed runtime tensor
-        """
-        if runtime_tensor_name in self._fusion_map:
-            # This is a fusion target, concatenate the source tensors
-            fusion_info = self._fusion_map[runtime_tensor_name]
-            source_names = fusion_info["sources"]
-            concat_dim = fusion_info["dim"]
-
-            # Get all source tensors in order
-            source_tensors = [checkpoint_tensors[name] for name in source_names]
-
-            # Concatenate along the specified dimension
-            return torch.cat(source_tensors, dim=concat_dim)
-        else:
-            # This is a regular tensor, return it directly
-            if runtime_tensor_name not in checkpoint_tensors:
-                raise KeyError(
-                    f"Tensor '{runtime_tensor_name}' not found in checkpoint tensors"
-                )
-            return checkpoint_tensors[runtime_tensor_name]
 
 
 class Qwen3Mlp(nn.Module):
@@ -499,7 +424,6 @@ class Qwen3ForCausalLM(nn.Module):
 
 __all__ = [
     "create_fusion_map",
-    "Qwen3TensorLoader",
     "Qwen3Mlp",
     "Qwen3Attention",
     "Qwen3DecoderLayer",

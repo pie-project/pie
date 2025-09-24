@@ -6,47 +6,9 @@ This module provides shared functionality for different model architectures.
 import os
 import tomllib
 import base64
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Optional, Dict, List
+from typing import Any, Optional
 import torch
-
-
-class TensorLoader(ABC):
-    """
-    Abstract base class for loading model tensors from checkpoint files.
-
-    This class provides a general interface for tensor loading that can handle
-    various transformations including fusion of multiple tensors and format
-    conversions (e.g., quantized to bfloat16).
-    """
-
-    @abstractmethod
-    def query(self, runtime_tensor_name: str) -> List[str]:
-        """
-        Query which checkpoint tensors are needed for a given runtime tensor.
-
-        Args:
-            runtime_tensor_name: Name of the tensor in the runtime model
-
-        Returns:
-            List of checkpoint tensor names needed to construct the runtime tensor
-        """
-
-    @abstractmethod
-    def load(
-        self, runtime_tensor_name: str, checkpoint_tensors: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """
-        Load and transform checkpoint tensors into the runtime tensor.
-
-        Args:
-            runtime_tensor_name: Name of the tensor in the runtime model
-            checkpoint_tensors: Dictionary mapping checkpoint tensor names to their loaded tensors
-
-        Returns:
-            The constructed runtime tensor
-        """
 
 
 @dataclass
