@@ -77,6 +77,18 @@ pub struct StartArgs {
     /// Enable verbose console logging.
     #[arg(long, short)]
     pub verbose: bool,
+    /// Run in daemon mode (non-interactive).
+    #[arg(long)]
+    pub daemon: bool,
+    /// Enable request/response recording for Metal backend.
+    #[arg(long)]
+    pub record: bool,
+    /// Path to the recording file for Metal backend requests/responses.
+    #[arg(long, value_parser = expand_tilde)]
+    pub record_file: Option<PathBuf>,
+    /// Enable detailed backend debugging (only supported by Metal backend).
+    #[arg(long)]
+    pub debug_backend: bool,
 }
 
 /// Helper for clap to expand `~` in path arguments.
@@ -160,8 +172,12 @@ async fn main() -> Result<()> {
             // 2. Initialize logging based on the config and get the file-writer guard
             let _guard = init_logging(&engine_config)?;
 
-            // 3. Start the interactive session, passing both configs
-            start_interactive_session(engine_config, backend_configs).await?;
+            // 3. Start the session (interactive or daemon mode)
+            if args.daemon {
+                start_daemon_session(&args, engine_config, backend_configs).await?;
+            } else {
+                start_interactive_session(&args, engine_config, backend_configs).await?;
+            }
         }
         Commands::Model(cmd) => {
             // Model commands don't start the engine, so they can use a simple logger
@@ -210,6 +226,7 @@ impl Helper for MyHelper {}
 
 /// Starts the engine and drops into a client command-prompt session.
 async fn start_interactive_session(
+    args: &StartArgs,
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
 ) -> Result<()> {
@@ -240,10 +257,26 @@ async fn start_interactive_session(
     let history_path = get_pie_home()?.join(".pie_history");
     let _ = rl.load_history(&history_path);
 
-    // 4. Launch all configured backend services
+    // 4. Setup recording environment and clear previous files
+    let (recording_env, recording_file_path) = setup_recording_environment(args, &backend_configs)?;
+    clear_previous_recording_files(args)?;
+
+    // 5. Launch all configured backend services
     let mut backend_processes = Vec::new();
     if !backend_configs.is_empty() {
         println!("🚀 Launching backend services...");
+
+        // Display recording status
+        if args.record {
+            let file_path = recording_file_path.as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/tmp/metal_server_req_res.jsonl".to_string());
+            println!("📹 Recording enabled - requests/responses will be saved to: {}", file_path);
+        }
+        if args.debug_backend {
+            println!("🔍 Backend debugging enabled - debug logs will be saved to: /tmp/metal_server_debug.log");
+        }
+
         init_secret(&client_config.auth_secret);
         let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
 
@@ -291,6 +324,11 @@ async fn start_interactive_session(
                 }
                 cmd.arg(format!("--{}", key))
                     .arg(value.to_string().trim_matches('"').to_string());
+            }
+
+            // Set recording environment variables for the backend process
+            for (key, value) in &recording_env {
+                cmd.env(key, value);
             }
 
             // Make sure the backend process is a process group leader.
@@ -452,6 +490,194 @@ async fn start_interactive_session(
 
     let _ = shutdown_tx.send(());
     server_handle.await?;
+
+    // Display recording file locations if recording was enabled
+    if args.record || args.debug_backend {
+        println!("\n📁 Recording files:");
+        if args.record {
+            let file_path = recording_file_path.as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/tmp/metal_server_req_res.jsonl".to_string());
+            println!("   📹 Requests/Responses: {}", file_path);
+        }
+        if args.debug_backend {
+            println!("   🔍 Debug logs: /tmp/metal_server_debug.log");
+        }
+    }
+
+    println!("✅ Shutdown complete.");
+
+    Ok(())
+}
+
+/// Starts the engine and backend services in daemon mode (non-interactive).
+async fn start_daemon_session(
+    args: &StartArgs,
+    engine_config: EngineConfig,
+    backend_configs: Vec<toml::Value>,
+) -> Result<()> {
+    // 1. Initialize engine configuration
+    let client_config = ClientConfig {
+        host: engine_config.host.clone(),
+        port: engine_config.port,
+        auth_secret: engine_config.auth_secret.clone(),
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    // 2. Start the main PIE engine server in a background task
+    println!("🚀 Starting PIE engine in daemon mode...");
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = pie::run_server(engine_config, shutdown_rx).await {
+            eprintln!("\n[Engine Error] Engine failed: {}", e);
+        }
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    println!("✅ Engine started.");
+
+    // 3. Setup recording environment and clear previous files
+    let (recording_env, recording_file_path) = setup_recording_environment(args, &backend_configs)?;
+    clear_previous_recording_files(args)?;
+
+    // 4. Launch all configured backend services
+    let mut backend_processes = Vec::new();
+    if !backend_configs.is_empty() {
+        println!("🚀 Launching backend services...");
+
+        // Display recording status
+        if args.record {
+            let file_path = recording_file_path.as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/tmp/metal_server_req_res.jsonl".to_string());
+            println!("📹 Recording enabled - requests/responses will be saved to: {}", file_path);
+        }
+        if args.debug_backend {
+            println!("🔍 Backend debugging enabled - debug logs will be saved to: /tmp/metal_server_debug.log");
+        }
+
+        init_secret(&client_config.auth_secret);
+        let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
+
+        for backend_config in &backend_configs {
+            let backend_table = backend_config
+                .as_table()
+                .context("Each [[backend]] entry in config.toml must be a table.")?;
+            let backend_type = backend_table
+                .get("backend_type")
+                .and_then(|v| v.as_str())
+                .context("`backend_type` is missing or not a string.")?;
+            let exec_path = backend_table
+                .get("exec_path")
+                .and_then(|v| v.as_str())
+                .context("`exec_path` is missing or not a string.")?;
+
+            let mut cmd = if backend_type == "python" {
+                let mut cmd = TokioCommand::new("uv");
+                cmd.arg("--project");
+                cmd.arg("../backend/backend-python");
+                cmd.arg("run");
+                cmd.arg("python");
+                cmd.arg("-u");
+                cmd.arg(exec_path);
+                cmd
+            } else {
+                TokioCommand::new(exec_path)
+            };
+
+            let random_port: u16 = rand::rng().random_range(49152..=65535);
+            cmd.arg("--host")
+                .arg("localhost")
+                .arg("--port")
+                .arg(random_port.to_string())
+                .arg("--controller_host")
+                .arg(&client_config.host)
+                .arg("--controller_port")
+                .arg(client_config.port.to_string())
+                .arg("--auth_token")
+                .arg(&auth_token);
+
+            for (key, value) in backend_table {
+                if key == "backend_type" || key == "exec_path" {
+                    continue;
+                }
+                cmd.arg(format!("--{}", key))
+                    .arg(value.to_string().trim_matches('"').to_string());
+            }
+
+            // Set recording environment variables for the backend process
+            for (key, value) in &recording_env {
+                cmd.env(key, value);
+            }
+
+            // Process group setup (same as interactive mode)
+            unsafe {
+                cmd.pre_exec(|| {
+                    nix::unistd::setsid()?;
+                    #[cfg(target_os = "linux")]
+                    {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+
+            println!("- Spawning backend: {}", exec_path);
+            let child = cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .with_context(|| format!("Failed to spawn backend process: '{}'", exec_path))?;
+
+            // In daemon mode, we'll just capture the output but not stream it to console
+            // to avoid cluttering. It will still go to logs if configured.
+
+            backend_processes.push(child);
+        }
+    }
+
+    println!("✅ PIE daemon started successfully.");
+    println!("   Engine: http://{}:{}", client_config.host, client_config.port);
+    println!("   Press Ctrl+C to shutdown gracefully.");
+
+    // 4. Wait for shutdown signal (Ctrl+C)
+    tokio::signal::ctrl_c().await?;
+    println!("\n📡 Shutdown signal received, shutting down gracefully...");
+
+    // 5. Begin graceful shutdown
+    // Terminate backend processes
+    for mut child in backend_processes {
+        if let Some(pid) = child.id() {
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+            println!("- Terminating backend process group with PID: {}", pid);
+
+            if let Err(e) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM) {
+                eprintln!("  Failed to send SIGTERM to process group {}: {}", pid, e);
+            }
+        }
+
+        if let Err(e) = child.wait().await {
+            eprintln!("  Error while waiting for backend process to exit: {}", e);
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+    server_handle.await?;
+
+    // Display recording file locations if recording was enabled
+    if args.record || args.debug_backend {
+        println!("\n📁 Recording files:");
+        if args.record {
+            let file_path = recording_file_path.as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/tmp/metal_server_req_res.jsonl".to_string());
+            println!("   📹 Requests/Responses: {}", file_path);
+        }
+        if args.debug_backend {
+            println!("   🔍 Debug logs: /tmp/metal_server_debug.log");
+        }
+    }
+
     println!("✅ Shutdown complete.");
 
     Ok(())
@@ -826,4 +1052,132 @@ fn init_logging(config: &EngineConfig) -> Result<Option<WorkerGuard>> {
         .init();
 
     Ok(guard)
+}
+
+fn setup_recording_environment(
+    args: &StartArgs,
+    backend_configs: &[toml::Value],
+) -> Result<(std::collections::HashMap<String, String>, Option<PathBuf>)> {
+    use std::collections::HashMap;
+
+    let mut env_vars = HashMap::new();
+    let mut recording_file_path = None;
+
+    // Validate backend type support for debugging and recording
+    if args.debug_backend || args.record {
+        validate_backend_support(args, backend_configs)?;
+    }
+
+    if args.record {
+        // Enable request/response recording
+        env_vars.insert("METAL_RECORD_REQ_RES".to_string(), "1".to_string());
+
+        // Set recording file path
+        let record_file = args.record_file.clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp/metal_server_req_res.jsonl"));
+
+        env_vars.insert("METAL_RECORD_FILE".to_string(), record_file.to_string_lossy().to_string());
+        recording_file_path = Some(record_file);
+    }
+
+    if args.debug_backend {
+        // Enable Metal backend debugging
+        env_vars.insert("METAL_DEBUG_HANDLER".to_string(), "1".to_string());
+
+        let debug_file = PathBuf::from("/tmp/metal_server_debug.log");
+        env_vars.insert("METAL_DEBUG_LOG_FILE".to_string(), debug_file.to_string_lossy().to_string());
+    }
+
+    Ok((env_vars, recording_file_path))
+}
+
+fn validate_backend_support(args: &StartArgs, backend_configs: &[toml::Value]) -> Result<()> {
+    // Check if any backends are configured
+    if backend_configs.is_empty() {
+        if args.debug_backend {
+            return Err(anyhow::anyhow!(
+                "❌ --debug-backend requires at least one backend to be configured"
+            ));
+        }
+        if args.record {
+            return Err(anyhow::anyhow!(
+                "❌ --record requires at least one backend to be configured"
+            ));
+        }
+        return Ok(());
+    }
+
+    // Validate that all configured backends support the requested features
+    for backend_config in backend_configs {
+        let backend_table = backend_config
+            .as_table()
+            .context("Backend configuration must be a table")?;
+
+        let backend_type = backend_table
+            .get("backend_type")
+            .and_then(|v| v.as_str())
+            .context("backend_type is missing or not a string")?;
+
+        match backend_type {
+            "metal" => {
+                // Metal backend supports both recording and debugging
+                continue;
+            }
+            "python" => {
+                // Python backend currently doesn't support debugging
+                if args.debug_backend {
+                    return Err(anyhow::anyhow!(
+                        "❌ --debug-backend is not supported by Python backend\n\
+                         💡 Debug functionality is currently only available for Metal backend"
+                    ));
+                }
+                // Python backend might support recording in the future, but not implemented yet
+                if args.record {
+                    return Err(anyhow::anyhow!(
+                        "❌ --record is not supported by Python backend\n\
+                         💡 Recording functionality is currently only available for Metal backend"
+                    ));
+                }
+            }
+            other => {
+                // Unknown backend type
+                if args.debug_backend {
+                    return Err(anyhow::anyhow!(
+                        "❌ --debug-backend is not supported by '{}' backend\n\
+                         💡 Debug functionality is currently only available for Metal backend", other
+                    ));
+                }
+                if args.record {
+                    return Err(anyhow::anyhow!(
+                        "❌ --record is not supported by '{}' backend\n\
+                         💡 Recording functionality is currently only available for Metal backend", other
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn clear_previous_recording_files(args: &StartArgs) -> Result<()> {
+    if args.record {
+        let record_file = args.record_file.clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp/metal_server_req_res.jsonl"));
+
+        if record_file.exists() {
+            std::fs::remove_file(&record_file)
+                .with_context(|| format!("Failed to clear previous recording file: {:?}", record_file))?;
+        }
+    }
+
+    if args.debug_backend {
+        let debug_file = PathBuf::from("/tmp/metal_server_debug.log");
+        if debug_file.exists() {
+            std::fs::remove_file(&debug_file)
+                .with_context(|| format!("Failed to clear previous debug file: {:?}", debug_file))?;
+        }
+    }
+
+    Ok(())
 }

@@ -1,0 +1,20 @@
+# Metal backend configuration
+host = "127.0.0.1"
+port = 8080
+enable_auth = false
+auth_secret = "hello"
+verbose = true
+log = "pie.log"
+
+[[backend]]
+backend_type = "metal"
+exec_path = "../backend/backend-metal/src/start_metal_server.sh"
+model = "llama-3.2-1b-instruct"
+device = "mps"
+dtype = "bfloat16"
+kv_page_size = 16
+max_dist_size = 32
+max_num_kv_pages = 1024
+max_num_embeds = 128
+max_num_adapters = 32
+max_adapter_rank = 8

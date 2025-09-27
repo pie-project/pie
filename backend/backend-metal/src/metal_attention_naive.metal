@@ -3,18 +3,18 @@ using namespace metal;
 
 /**
  * Naive Attention Implementation - Baseline for Performance Comparison
- * 
+ *
  * This kernel implements standard attention with O(n²) memory complexity
  * to establish a baseline for measuring optimization benefits.
- * 
+ *
  * Algorithm:
  * 1. Compute full attention matrix S = Q @ K^T [O(n²) memory]
  * 2. Apply softmax to entire matrix [stores full matrix]
  * 3. Compute output O = S @ V [O(n²) memory reads]
- * 
+ *
  * Memory Complexity: O(n²) for attention matrix storage
  * Compute Complexity: O(n²·d) same as optimized version
- * 
+ *
  * Purpose: Prove that optimized version achieves same result with O(n) memory
  */
 
@@ -22,9 +22,9 @@ using namespace metal;
 #define MAX_HEAD_DIM 256
 #define TGP_SIZE 128
 
-// Memory analysis: 
+// Memory analysis:
 // - attention_matrix: MAX_PARTITION_SIZE * 4 bytes = 1KB per partition
-// - query/key/value caches: MAX_HEAD_DIM * 2 bytes each = 1.5KB total  
+// - query/key/value caches: MAX_HEAD_DIM * 2 bytes each = 1.5KB total
 // - Total per partition: ~2.5KB << 32KB limit
 
 // Same parameter structure as optimized kernel for fair comparison
@@ -78,7 +78,7 @@ kernel void naive_attention_bf16_kernel(
 
     // Find sequence information
     int seq_id = 0;
-    while (seq_id < 100 && qo_indptr[seq_id + 1] <= int(qo_idx)) { seq_id++; }
+    while (qo_indptr[seq_id + 1] <= int(qo_idx)) { seq_id++; }
     int kv_start_page_pos = kv_page_indptr[seq_id];
     int kv_end_page_pos = kv_page_indptr[seq_id + 1];
     int num_pages = kv_end_page_pos - kv_start_page_pos;
@@ -93,7 +93,7 @@ kernel void naive_attention_bf16_kernel(
     // *** DEVICE MEMORY: Full O(n²) attention matrix storage ***
     // Each query token stores its full attention row: qo_idx * total_kv_len
     device float* my_attention_row = attention_matrix_storage + qo_idx * total_kv_len;
-    
+
     // Threadgroup memory for partitioned processing (fits in 32KB)
     threadgroup float attention_partition[MAX_PARTITION_SIZE];
     threadgroup half q_cache[MAX_HEAD_DIM];
@@ -101,7 +101,7 @@ kernel void naive_attention_bf16_kernel(
     threadgroup float temp_reduce[TGP_SIZE];
 
     const int num_heads = num_query_heads;
-    
+
     // Initialize output to zero
     for (int d = tid_in_tgp; d < head_dim; d += TGP_SIZE) {
         output[qo_idx * head_dim + d] = 0.0h;
@@ -119,7 +119,7 @@ kernel void naive_attention_bf16_kernel(
         // *** PHASE 1: COMPUTE AND STORE FULL ATTENTION MATRIX (O(n²) STORAGE) ***
         // Process attention matrix in partitions that fit in threadgroup memory
         int num_partitions = (total_kv_len + MAX_PARTITION_SIZE - 1) / MAX_PARTITION_SIZE;
-        
+
         for (int partition = 0; partition < num_partitions; partition++) {
             int partition_start = partition * MAX_PARTITION_SIZE;
             int partition_end = min(partition_start + MAX_PARTITION_SIZE, total_kv_len);
@@ -128,7 +128,7 @@ kernel void naive_attention_bf16_kernel(
             // Compute attention scores for this partition
             for (int k_local = tid_in_tgp; k_local < partition_size; k_local += TGP_SIZE) {
                 int k_idx = partition_start + k_local;
-                
+
                 // Load key for position k_idx
                 int page_offset = k_idx / page_size;
                 int in_page_offset = k_idx % page_size;
@@ -136,7 +136,7 @@ kernel void naive_attention_bf16_kernel(
                     attention_partition[k_local] = -INFINITY;
                     continue;
                 }
-                
+
                 int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
                 int kv_head = h / max(1, num_query_heads / num_kv_heads);
                 uint k_base_addr = page_idx * page_size * kv_head_dim + in_page_offset * kv_head_dim + kv_head * head_size;
@@ -170,7 +170,7 @@ kernel void naive_attention_bf16_kernel(
         // Reduce to find global max
         temp_reduce[tid_in_tgp] = max_val;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        
+
         for (uint s = TGP_SIZE / 2; s > 0; s >>= 1) {
             if (tid_in_tgp < s) {
                 temp_reduce[tid_in_tgp] = max(temp_reduce[tid_in_tgp], temp_reduce[tid_in_tgp + s]);
@@ -191,7 +191,7 @@ kernel void naive_attention_bf16_kernel(
         // Reduce sum
         temp_reduce[tid_in_tgp] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        
+
         for (uint s = TGP_SIZE / 2; s > 0; s >>= 1) {
             if (tid_in_tgp < s) {
                 temp_reduce[tid_in_tgp] += temp_reduce[tid_in_tgp + s];
@@ -219,13 +219,13 @@ kernel void naive_attention_bf16_kernel(
                 int page_offset = k_idx / page_size;
                 int in_page_offset = k_idx % page_size;
                 if (page_offset >= num_pages) continue;
-                
+
                 int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
                 int kv_head = h / max(1, num_query_heads / num_kv_heads);
                 uint v_base_addr = page_idx * page_size * kv_head_dim + in_page_offset * kv_head_dim + kv_head * head_size;
 
                 half v_val = paged_v_cache[v_base_addr + d];
-                
+
                 // *** READ FROM O(n²) ATTENTION MATRIX STORAGE ***
                 output_val += my_attention_row[k_idx] * float(v_val);
             }
@@ -237,7 +237,7 @@ kernel void naive_attention_bf16_kernel(
 }
 
 /**
- * F32 variant for comparison  
+ * F32 variant for comparison
  */
 kernel void naive_attention_f32_kernel(
     device const float* q_input [[buffer(0)]],
@@ -270,7 +270,7 @@ kernel void naive_attention_f32_kernel(
     if (head_size > MAX_HEAD_DIM) return;
 
     int seq_id = 0;
-    while (seq_id < 100 && qo_indptr[seq_id + 1] <= int(qo_idx)) { seq_id++; }
+    while (qo_indptr[seq_id + 1] <= int(qo_idx)) { seq_id++; }
     int kv_start_page_pos = kv_page_indptr[seq_id];
     int kv_end_page_pos = kv_page_indptr[seq_id + 1];
     int num_pages = kv_end_page_pos - kv_start_page_pos;
@@ -284,8 +284,8 @@ kernel void naive_attention_f32_kernel(
 
     // *** DEVICE MEMORY: Full O(n²) attention matrix storage ***
     device float* my_attention_row = attention_matrix_storage + qo_idx * total_kv_len;
-    
-    // Threadgroup memory for partitioned processing  
+
+    // Threadgroup memory for partitioned processing
     threadgroup float attention_partition[MAX_PARTITION_SIZE];
     threadgroup float q_cache[MAX_HEAD_DIM];
     threadgroup float k_cache[MAX_HEAD_DIM];

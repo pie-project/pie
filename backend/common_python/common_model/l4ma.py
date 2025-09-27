@@ -10,7 +10,7 @@ from typing import Sequence, Optional
 import torch
 from torch import nn
 
-from debug_utils import is_tensor_debug_enabled, checkpoint_validation
+from debug_utils import is_tensor_debug_enabled
 
 # Safe import of adapter functionality
 from adapter_import_utils import AdapterSubpass
@@ -92,38 +92,14 @@ class L4maMlp(nn.Module):
         down_proj = self._down_projection(interim)
         return down_proj
 
-    @checkpoint_validation(
-        checkpoint_name="l4ma_mlp_forward",
-        capture_tensors=True,
-        include_metadata=True,
-        tolerance=1e-5,
-        backend_comparison=None,
-        performance_monitoring=True,
-    )
     def _gate_up_projection(self, x):
         """Gate/Up projection for Metal GEMM kernel comparison."""
         return self.gate_up_proj(x)
 
-    @checkpoint_validation(
-        checkpoint_name="l4ma_mlp_activation",
-        capture_tensors=True,
-        include_metadata=True,
-        tolerance=1e-5,
-        backend_comparison=None,
-        performance_monitoring=True,
-    )
     def _silu_activation(self, gate_proj, up_proj):
         """SiLU activation for Metal activation kernel comparison."""
         return self.act_fn(gate_proj) * up_proj
 
-    @checkpoint_validation(
-        checkpoint_name="l4ma_mlp_down_proj",
-        capture_tensors=True,
-        include_metadata=True,
-        tolerance=1e-5,
-        backend_comparison=None,
-        performance_monitoring=True,
-    )
     def _down_projection(self, interim):
         """Down projection for Metal GEMM kernel comparison."""
         return self.down_proj(interim)
@@ -381,14 +357,6 @@ class L4maDecoderLayer(nn.Module):
             dtype=config.dtype,
         )
 
-    @checkpoint_validation(
-        checkpoint_name="l4ma_decoder_layer_forward",
-        capture_tensors=True,
-        include_metadata=True,
-        tolerance=1e-5,
-        backend_comparison=None,
-        performance_monitoring=True,
-    )
     def forward(
         self,
         runtime: L4maForwardContext,
@@ -578,26 +546,10 @@ class L4maDecoderLayer(nn.Module):
 
         return hidden_states
 
-    @checkpoint_validation(
-        checkpoint_name="l4ma_input_norm",
-        capture_tensors=True,
-        include_metadata=True,
-        tolerance=1e-5,
-        backend_comparison=None,
-        performance_monitoring=True,
-    )
     def _input_normalization(self, hidden_states):
         """Input RMSNorm for Metal normalization kernel comparison."""
         return self.input_layernorm(hidden_states)
 
-    @checkpoint_validation(
-        checkpoint_name="l4ma_post_attention_norm",
-        capture_tensors=True,
-        include_metadata=True,
-        tolerance=1e-5,
-        backend_comparison=None,
-        performance_monitoring=True,
-    )
     def _post_attention_normalization(self, hidden_states):
         """Post-attention RMSNorm for Metal normalization kernel comparison."""
         return self.post_attention_layernorm(hidden_states)
@@ -631,14 +583,6 @@ class L4maModel(nn.Module):
             dtype=config.dtype,
         )
 
-    @checkpoint_validation(
-        checkpoint_name="l4ma_model_forward",
-        capture_tensors=True,
-        include_metadata=True,
-        tolerance=1e-5,
-        backend_comparison=None,
-        performance_monitoring=True,
-    )
     def forward(
         self,
         # input

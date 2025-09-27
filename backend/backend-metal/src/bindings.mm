@@ -7,6 +7,8 @@
 #include <vector>
 #include <stdexcept>
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 
 namespace py = pybind11;
 
@@ -15,6 +17,31 @@ private:
     id<MTLDevice> device;
     id<MTLLibrary> library;
     id<MTLCommandQueue> commandQueue;
+
+    enum class TensorDType {
+        Float32,
+        BFloat16,
+    };
+
+    static inline float bf16_to_float(uint16_t value) {
+        uint32_t tmp = static_cast<uint32_t>(value) << 16;
+        float result;
+        std::memcpy(&result, &tmp, sizeof(float));
+        return result;
+    }
+
+    static inline uint16_t float_to_fp16(float value) {
+        __fp16 half = static_cast<__fp16>(value);
+        uint16_t bits;
+        std::memcpy(&bits, &half, sizeof(uint16_t));
+        return bits;
+    }
+
+    static inline float fp16_to_float(uint16_t value) {
+        __fp16 half;
+        std::memcpy(&half, &value, sizeof(uint16_t));
+        return static_cast<float>(half);
+    }
 
     // Helper function to validate and convert numpy arrays to float32
     py::array_t<float> validate_and_convert_to_float32(py::array input, const std::string& name) {
@@ -170,34 +197,44 @@ public:
     }
 
     py::array_t<float> execute_attention_with_kv_cache(
-        py::array_t<float> query, py::array_t<float> kv_cache,
+        py::array query, py::array kv_cache,
         py::array_t<int> kv_page_indices, py::array_t<int> kv_page_indptr, py::array_t<int> kv_last_page_lens,
+        py::array_t<int> qo_indptr,
         int num_query_heads = 32, int num_kv_heads = 32, int head_size = 128, int page_size = 16) {
         @autoreleasepool {
-            // Use the actual paged attention kernel with real L4MA KV cache layout
-            NSString *kernelName = @"batch_prefill_attention_unified_f32_simdgroup_kernel";
-            id<MTLFunction> kernelFunction = [library newFunctionWithName:kernelName];
+            auto q_buf = query.request();
+            auto kv_buf = kv_cache.request();
+            auto kv_indices_buf = kv_page_indices.request();
+            auto kv_indptr_buf = kv_page_indptr.request();
+            auto kv_lens_buf = kv_last_page_lens.request();
+            auto qo_indptr_buf = qo_indptr.request();
 
-            // TODO: We need to use bf16 if the input is bf16 - for now we assume f32
-            if (!kernelFunction) {
-                // Try half precision version if f32 not found
-                kernelName = @"batch_prefill_attention_unified_bf16_simdgroup_kernel";
-                kernelFunction = [library newFunctionWithName:kernelName];
+            TensorDType tensor_dtype;
+            if (q_buf.format == py::format_descriptor<float>::format()) {
+                tensor_dtype = TensorDType::Float32;
+            } else if (q_buf.format == py::format_descriptor<uint16_t>::format()) {
+                tensor_dtype = TensorDType::BFloat16;
+            } else {
+                throw std::runtime_error("Unsupported query dtype for attention kernel: " + std::string(q_buf.format));
             }
+
+            if ((tensor_dtype == TensorDType::Float32 && kv_buf.format != py::format_descriptor<float>::format()) ||
+                (tensor_dtype == TensorDType::BFloat16 && kv_buf.format != py::format_descriptor<uint16_t>::format())) {
+                throw std::runtime_error("KV cache dtype mismatch with query dtype");
+            }
+
+            NSString *kernelName = nil;
+            if (tensor_dtype == TensorDType::BFloat16) {
+                kernelName = @"batch_prefill_attention_unified_bf16_simdgroup_kernel";
+            } else {
+                kernelName = @"batch_prefill_attention_unified_f32_simdgroup_kernel";
+            }
+
+            id<MTLFunction> kernelFunction = [library newFunctionWithName:kernelName];
 
             if (!kernelFunction) {
                 throw std::runtime_error("Production attention kernel not found");
             }
-
-            // Convert inputs to proper format and validate
-            py::array_t<float> q_f32 = validate_and_convert_to_float32(query, "query");
-            py::array_t<float> kv_f32 = validate_and_convert_to_float32(kv_cache, "kv_cache");
-
-            auto q_buf = q_f32.request();
-            auto kv_buf = kv_f32.request();
-            auto kv_indices_buf = kv_page_indices.request();
-            auto kv_indptr_buf = kv_page_indptr.request();
-            auto kv_lens_buf = kv_last_page_lens.request();
 
             // Validate query shape - expect [batch*seq, num_heads, head_size] or [batch*seq, num_heads * head_size]
             if (q_buf.ndim < 2 || q_buf.ndim > 3) {
@@ -257,13 +294,29 @@ public:
                 throw std::runtime_error("Failed to create attention pipeline state");
             }
 
-            // Create output tensor with same shape as query
-            auto result = py::array_t<float>({static_cast<py::ssize_t>(batch_seq_len), static_cast<py::ssize_t>(query_dim)});
+            std::vector<py::ssize_t> result_shape = {static_cast<py::ssize_t>(batch_seq_len), static_cast<py::ssize_t>(query_dim)};
+            py::array_t<float> result(result_shape);
             auto result_buf = result.request();
 
-            // Create Metal buffers using actual L4MA data layout
-            size_t query_size = batch_seq_len * query_dim * sizeof(float);
-            id<MTLBuffer> qBuffer = [device newBufferWithBytes:q_buf.ptr length:query_size options:MTLResourceStorageModeShared];
+            size_t total_elements = static_cast<size_t>(batch_seq_len) * static_cast<size_t>(query_dim);
+
+            const void* query_src_ptr = q_buf.ptr;
+            size_t query_element_size = sizeof(float);
+            std::vector<uint16_t> query_fp16_storage;
+
+            if (tensor_dtype == TensorDType::BFloat16) {
+                const uint16_t* q_bf16_ptr = static_cast<const uint16_t*>(q_buf.ptr);
+                query_fp16_storage.resize(total_elements);
+                for (size_t i = 0; i < total_elements; ++i) {
+                    float val = bf16_to_float(q_bf16_ptr[i]);
+                    query_fp16_storage[i] = MetalKernelExecutor::float_to_fp16(val);
+                }
+                query_src_ptr = query_fp16_storage.data();
+                query_element_size = sizeof(uint16_t);
+            }
+
+            size_t query_size = total_elements * query_element_size;
+            id<MTLBuffer> qBuffer = [device newBufferWithBytes:query_src_ptr length:query_size options:MTLResourceStorageModeShared];
             id<MTLBuffer> outputBuffer = [device newBufferWithLength:query_size options:MTLResourceStorageModeShared];
             id<MTLBuffer> paramsBuffer = [device newBufferWithBytes:&params length:sizeof(Params) options:MTLResourceStorageModeShared];
 
@@ -274,12 +327,13 @@ public:
 
             py::ssize_t num_pages = kv_buf.shape[0];
             py::ssize_t elements_per_page = kv_buf.shape[2] * kv_buf.shape[3] * kv_buf.shape[4];
+            size_t kv_elements_per_cache = static_cast<size_t>(num_pages) * static_cast<size_t>(elements_per_page);
 
-            size_t kv_elements_per_cache = static_cast<size_t>(num_pages) *
-                                            static_cast<size_t>(elements_per_page);
-            size_t single_cache_size = kv_elements_per_cache * sizeof(float);
+            size_t kv_element_size = tensor_dtype == TensorDType::Float32 ? sizeof(float) : sizeof(uint16_t);
+            size_t single_cache_size = kv_elements_per_cache * kv_element_size;
 
-            const float* kv_data = static_cast<const float*>(kv_buf.ptr);
+            std::vector<uint16_t> k_fp16_storage;
+            std::vector<uint16_t> v_fp16_storage;
 
             id<MTLBuffer> kCacheBuffer = [device newBufferWithLength:single_cache_size options:MTLResourceStorageModeShared];
             id<MTLBuffer> vCacheBuffer = [device newBufferWithLength:single_cache_size options:MTLResourceStorageModeShared];
@@ -295,10 +349,10 @@ public:
                 throw std::runtime_error("Failed to create Metal buffers for KV cache attention");
             }
 
-            float* k_dest = static_cast<float*>([kCacheBuffer contents]);
-            float* v_dest = static_cast<float*>([vCacheBuffer contents]);
+            void* k_dest_raw = [kCacheBuffer contents];
+            void* v_dest_raw = [vCacheBuffer contents];
 
-            if (!k_dest || !v_dest) {
+            if (!k_dest_raw || !v_dest_raw) {
                 [qBuffer release];
                 [kCacheBuffer release];
                 [vCacheBuffer release];
@@ -311,10 +365,32 @@ public:
 
             size_t page_stride = static_cast<size_t>(elements_per_page);
             size_t interleaved_stride = page_stride * 2;  // account for combined K/V dimension
-            for (py::ssize_t page = 0; page < num_pages; ++page) {
-                const float* page_base = kv_data + static_cast<size_t>(page) * interleaved_stride;
-                memcpy(k_dest + static_cast<size_t>(page) * page_stride, page_base, page_stride * sizeof(float));
-                memcpy(v_dest + static_cast<size_t>(page) * page_stride, page_base + page_stride, page_stride * sizeof(float));
+            if (tensor_dtype == TensorDType::Float32) {
+                const float* kv_data = static_cast<const float*>(kv_buf.ptr);
+                float* k_dest = static_cast<float*>(k_dest_raw);
+                float* v_dest = static_cast<float*>(v_dest_raw);
+                for (py::ssize_t page = 0; page < num_pages; ++page) {
+                    const float* page_base = kv_data + static_cast<size_t>(page) * interleaved_stride;
+                    std::memcpy(k_dest + static_cast<size_t>(page) * page_stride, page_base, page_stride * sizeof(float));
+                    std::memcpy(v_dest + static_cast<size_t>(page) * page_stride, page_base + page_stride, page_stride * sizeof(float));
+                }
+            } else {
+                const uint16_t* kv_data = static_cast<const uint16_t*>(kv_buf.ptr);
+                k_fp16_storage.resize(kv_elements_per_cache);
+                v_fp16_storage.resize(kv_elements_per_cache);
+                for (py::ssize_t page = 0; page < num_pages; ++page) {
+                    const uint16_t* page_base = kv_data + static_cast<size_t>(page) * interleaved_stride;
+                    uint16_t* k_dest_vec = k_fp16_storage.data() + static_cast<size_t>(page) * page_stride;
+                    uint16_t* v_dest_vec = v_fp16_storage.data() + static_cast<size_t>(page) * page_stride;
+                    for (size_t idx = 0; idx < page_stride; ++idx) {
+                        float k_val = bf16_to_float(page_base[idx]);
+                        float v_val = bf16_to_float(page_base[idx + page_stride]);
+                        k_dest_vec[idx] = MetalKernelExecutor::float_to_fp16(k_val);
+                        v_dest_vec[idx] = MetalKernelExecutor::float_to_fp16(v_val);
+                    }
+                }
+                std::memcpy(k_dest_raw, k_fp16_storage.data(), single_cache_size);
+                std::memcpy(v_dest_raw, v_fp16_storage.data(), single_cache_size);
             }
 
             // Use actual L4MA page indices
@@ -328,10 +404,9 @@ public:
                                                                      length:kv_lens_buf.size * sizeof(int)
                                                                     options:MTLResourceStorageModeShared];
 
-            // Create QO indptr (simple case for debug framework)
-            std::vector<int> qo_indptr = {0, static_cast<int>(batch_seq_len)};
-            id<MTLBuffer> qoIndptrBuffer = [device newBufferWithBytes:qo_indptr.data()
-                                                               length:qo_indptr.size() * sizeof(int)
+            // Use the real QO indptr from input
+            id<MTLBuffer> qoIndptrBuffer = [device newBufferWithBytes:qo_indptr_buf.ptr
+                                                               length:qo_indptr_buf.size * sizeof(int)
                                                               options:MTLResourceStorageModeShared];
 
             // Execute the kernel with actual L4MA layout
@@ -362,19 +437,19 @@ public:
             [commandBuffer waitUntilCompleted];
 
             // Copy result back
-            memcpy(result_buf.ptr, [outputBuffer contents], query_size);
-
-            // Debug: capture kernel metadata for investigation
-            if (debugBuffer) {
-                float* debug_ptr = static_cast<float*>([debugBuffer contents]);
-                if (debug_ptr != nullptr) {
-                    py::print("[MetalAttentionDebug] scale=", debug_ptr[0],
-                              " head_dim=", debug_ptr[1],
-                              " page_size=", debug_ptr[2],
-                              " num_qo=", debug_ptr[3],
-                              " total_kv_len=", debug_ptr[4],
-                              " last_page_len=", debug_ptr[6]);
+            if (tensor_dtype == TensorDType::Float32) {
+                std::memcpy(result_buf.ptr, [outputBuffer contents], total_elements * sizeof(float));
+            } else {
+                const uint16_t* src = static_cast<const uint16_t*>([outputBuffer contents]);
+                float* dst = static_cast<float*>(result_buf.ptr);
+                for (size_t i = 0; i < total_elements; ++i) {
+                    dst[i] = MetalKernelExecutor::fp16_to_float(src[i]);
                 }
+            }
+
+            // Debug buffer cleanup (debug prints removed)
+            if (debugBuffer) {
+                // No debug output needed in production
             }
 
             // Cleanup

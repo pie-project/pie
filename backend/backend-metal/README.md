@@ -1,6 +1,6 @@
 # PIE Metal Backend
 
-Metal-based computation backend for the PIE debugging framework.
+Metal-based computation backend for PIE inference acceleration.
 
 ## Build Requirements
 
@@ -28,18 +28,18 @@ python3 -c "import metal_bindings; print('Success!')"
 - `build/lib/pie_metal_kernels.metallib` - Compiled Metal kernels
 - `build/lib/metal_bindings.cpython-*.so` - Python bindings module
 
-## Integration with Debug Framework
+## Usage
 
-The `CompilationEngine` will automatically detect and build this backend:
+The Metal backend provides accelerated inference for L4MA models:
 
 ```python
-from debug_framework.services.compilation_engine import CompilationEngine
+from metal_backend import MetalBackend
+from l4ma_runtime import MetalL4maBackend
 
-engine = CompilationEngine("/tmp/output")
-result = engine.compile_plugin({
-    "name": "metal_kernels",
-    "backend_dir": "/backend/backend-metal",
-    "backend_type": "metal"
-})
+# Initialize Metal backend
+metal_backend = MetalBackend(model_metadata={"architecture": arch_dict})
+if metal_backend.initialize():
+    runtime = MetalL4maBackend(metal_backend=metal_backend)
+    # Use with your L4MA model
 ```
 

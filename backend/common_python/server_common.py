@@ -9,6 +9,7 @@ reusing this shared infrastructure.
 from __future__ import annotations
 
 import enum
+import logging
 import os
 import random
 import struct
@@ -18,7 +19,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Type
+from typing import Any, Dict, Type, Optional
 
 import msgpack
 import msgspec
@@ -134,13 +135,56 @@ def start_service(
         device=config["device"],
     )
 
+    # Configure backend logging
+    log_level = os.environ.get("PIE_BACKEND_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
+    )
+    logger = logging.getLogger("pie.backend")
+
     context = zmq.Context()
     socket = context.socket(zmq.ROUTER)
     socket.bind(real_endpoint)
 
-    threading.Thread(target=run_zmq_server, args=(socket, handler), daemon=True).start()
+    # Heartbeat timeout can be configured via env; default remains 60s
+    # But disable heartbeat when not registered with controller (standalone mode)
+    heartbeat_timeout_env = os.environ.get("PIE_HEARTBEAT_TIMEOUT")
+    heartbeat_timeout: Optional[int] = None
+
+    if not register_with_controller:
+        # Standalone mode - no controller to send heartbeats, so disable timeout
+        heartbeat_timeout = None
+        logger.info("Standalone mode: heartbeat timeout disabled")
+    elif heartbeat_timeout_env:
+        try:
+            heartbeat_timeout = int(heartbeat_timeout_env)
+        except ValueError:
+            logger.warning(
+                "Invalid PIE_HEARTBEAT_TIMEOUT value '%s'; using default.",
+                heartbeat_timeout_env,
+            )
+            heartbeat_timeout = 60  # Use default on parse error
+    else:
+        # Default heartbeat timeout when registered with controller
+        heartbeat_timeout = 60
+        logger.info("Controller registration enabled: heartbeat timeout set to 60s")
+
+    # Stop event for graceful shutdown instead of os._exit
+    stop_event = threading.Event()
+
+    server_thread = threading.Thread(
+        target=run_zmq_server,
+        args=(socket, handler, stop_event),
+        kwargs={"heartbeat_timeout": heartbeat_timeout},
+        daemon=True,
+        name="ZMQServer",
+    )
+    server_thread.start()
 
     if register_with_controller:
+        # Give ZMQ server time to start listening before registering
+        time.sleep(0.1)
         threading.Thread(
             target=register,
             args=(config, endpoint),
@@ -148,14 +192,20 @@ def start_service(
         ).start()
 
     try:
-        while True:
-            time.sleep(1)
+        logger.info("Backend service started at %s", real_endpoint)
+        while not stop_event.is_set():
+            time.sleep(0.25)
     except KeyboardInterrupt:
-        print("\nShutting down server...")
+        logger.info("KeyboardInterrupt received. Initiating shutdown...")
+        stop_event.set()
     finally:
+        try:
+            socket.setsockopt(zmq.LINGER, 0)
+        except Exception:
+            pass
         socket.close()
         context.term()
-        print("Server shutdown complete.")
+        logger.info("Server shutdown complete.")
 
 
 def register(config: Dict[str, Any], endpoint: str) -> None:
@@ -212,15 +262,24 @@ def register(config: Dict[str, Any], endpoint: str) -> None:
         os._exit(1)
 
 
-def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
+def run_zmq_server(
+    socket: zmq.Socket,
+    handler: Any,
+    stop_event: threading.Event,
+    *,
+    heartbeat_timeout: Optional[int] = None,
+) -> None:
     """Core ZMQ service loop dispatching requests to the handler.
 
     Exits the program if a heartbeat is not received for 60 seconds or if any
     exception occurs.
     """
-    # Heartbeat timeout and timer setup (60 seconds for FlashInfer JIT compilation)
-    heartbeat_timeout = 60  # seconds
+    logger = logging.getLogger("pie.backend")
+    # Heartbeat timeout and timer setup (default 60 seconds, None means disabled)
+    hb_timeout = heartbeat_timeout  # Can be None (disabled) or int (seconds)
     last_heartbeat_time = time.monotonic()
+    # Track last activity (any request) to avoid false positives while busy
+    last_activity_time = last_heartbeat_time
 
     msgpack_encoder = msgspec.msgpack.Encoder()
     decoders = {
@@ -243,14 +302,29 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
     poller.register(socket, zmq.POLLIN)
 
     try:
-        while True:
-            # Check for heartbeat timeout before waiting for a message
-            if time.monotonic() - last_heartbeat_time > heartbeat_timeout:
-                print(
-                    f"[!] Heartbeat timeout after {heartbeat_timeout}s, exiting",
-                    file=sys.stderr,
-                )
-                os._exit(1)  # Use os._exit for immediate termination from a thread
+        hb_status = "disabled" if hb_timeout is None else f"{hb_timeout}s"
+        logger.info(
+            "ZMQ server loop starting (heartbeat timeout: %s)", hb_status
+        )
+        while not stop_event.is_set():
+            # Check for heartbeat timeout before waiting for a message (if enabled)
+            if hb_timeout is not None:
+                now = time.monotonic()
+                last_check = max(last_heartbeat_time, last_activity_time)
+                if now - last_check > hb_timeout:
+                    logger.error(
+                        "[!] Heartbeat timeout after %ss (last_heartbeat=%.3fs, last_activity=%.3fs). Shutting down.",
+                        hb_timeout,
+                        now - last_heartbeat_time,
+                        now - last_activity_time,
+                    )
+                    # Graceful shutdown: stop server loop and allow outer finally to clean up
+                    try:
+                        socket.setsockopt(zmq.LINGER, 0)
+                    except Exception:
+                        pass
+                    stop_event.set()
+                    return
 
             # Poll for 1 second to remain responsive to the heartbeat check
             events = dict(poller.poll(timeout=1000))
@@ -272,23 +346,26 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
                 handler_id = struct.unpack(">I", handler_id_bytes)[0]
                 reqs = [decoders[handler_id].decode(m) for m in message[3:]]
             except (struct.error, KeyError, msgspec.DecodeError) as exc:
-                print(
-                    f"[!] Error decoding request header or payload: {exc}",
-                    file=sys.stderr,
-                )
+                logger.exception("[!] Error decoding request header or payload: %s", exc)
                 continue
 
             if not reqs:
-                print("[!] Received empty request body", file=sys.stderr)
+                logger.warning("[!] Received empty request body")
                 continue
 
             resps = []
+            last_activity_time = time.monotonic()
+            start = last_activity_time
+            logger.debug(
+                "Dispatching handler_id=%d with %d request(s)", handler_id, len(reqs)
+            )
             match handler_id:
                 case HandlerId.HANDSHAKE.value:
                     resps = handler.handshake(reqs)
                 case HandlerId.HEARTBEAT.value:
                     # Update heartbeat timer when heartbeat is received
                     last_heartbeat_time = time.monotonic()
+                    logger.debug("Heartbeat received and acknowledged")
                     resps = handler.heartbeat(reqs)
                 case HandlerId.QUERY.value:
                     resps = handler.query(reqs)
@@ -305,21 +382,35 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
                 case HandlerId.DOWNLOAD_HANDLER.value:
                     resps = handler.download_handler(reqs)
                 case _:
-                    print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
+                    logger.error("[!] Unknown handler ID: %d", handler_id)
+
+            duration = time.monotonic() - start
+            if duration > 5.0:
+                logger.warning(
+                    "Handler %d processing took %.3fs (possible long-running op)",
+                    handler_id,
+                    duration,
+                )
 
             if resps:
                 response_msg = [client_identity, corr_id_bytes, handler_id_bytes] + [
                     msgpack_encoder.encode(r) for r in resps
                 ]
                 socket.send_multipart(response_msg)
+                logger.debug(
+                    "Sent response for handler_id=%d (%.3fs)", handler_id, duration
+                )
 
     except (zmq.ZMQError, OSError, ValueError, RuntimeError, KeyError) as exc:
-        print(
-            f"\n[!!!] Unhandled error occurred in the ZMQ server loop: {exc}",
-            file=sys.stderr,
+        logger.exception(
+            "\n[!!!] Unhandled error occurred in the ZMQ server loop: %s", exc
         )
-        traceback.print_exc()
-        os._exit(1)
+        try:
+            socket.setsockopt(zmq.LINGER, 0)
+        except Exception:
+            pass
+        stop_event.set()
+        return
 
 
 __all__ = [

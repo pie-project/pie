@@ -1,0 +1,55 @@
+{
+  "prompts": {
+    "short": [
+      "The capital of France is",
+      "Two plus two equals",
+      "The color of snow is",
+      "Water boils at 100",
+      "The first letter is",
+      "Could you please"
+    ],
+    "medium": [
+      "In the field of artificial intelligence, machine learning has become increasingly important for solving complex problems that traditional programming approaches cannot handle effectively. The most common approach is",
+      "The quick brown fox jumps over the lazy dog while the sun sets behind the mountains, creating a beautiful silhouette against the orange and purple sky. This scene is",
+      "Climate change represents one of the most significant challenges facing humanity in the 21st century, requiring coordinated global action across governments, businesses, and individuals. The solution requires"
+    ],
+    "long": [
+      "The concept of artificial general intelligence (AGI) has captivated researchers, technologists, and the general public for decades. Unlike narrow AI systems that excel at specific tasks such as image recognition, natural language processing, or game playing, AGI would possess the ability to understand, learn, and apply intelligence across a wide range of domains at a level comparable to human cognitive abilities. The pursuit of AGI represents both tremendous opportunities and significant risks for humanity. On one hand, such systems could help solve complex global challenges including climate change, disease, poverty, and scientific discovery. On the other hand, the development of superintelligent systems raises important questions about safety, control, alignment with human values, and the potential for unintended consequences. Many leading AI researchers emphasize the importance of ensuring that AGI development proceeds carefully, with robust safety measures and extensive testing to minimize risks while maximizing benefits for all of humanity. The key challenge is"
+    ],
+    "very_long": [
+      "The history of computing spans several millennia, beginning with ancient mechanical calculating devices and evolving into the sophisticated digital systems we rely on today. Early computational tools included the abacus, developed around 2000 BCE, which enabled merchants and mathematicians to perform basic arithmetic operations efficiently. The concept of programmable machines emerged much later, with Charles Babbage's Analytical Engine in the 1830s representing a crucial milestone in computational theory. Ada Lovelace, working with Babbage, wrote what many consider the first computer algorithm, demonstrating remarkable foresight about the potential applications of such machines beyond pure calculation.\n\nThe 20th century witnessed explosive growth in computing technology, driven by wartime needs, scientific research, and commercial applications. The Electronic Numerical Integrator and Computer (ENIAC), completed in 1945, represented one of the first general-purpose electronic digital computers. Weighing over 27 tons and occupying 1,800 square feet, ENIAC could perform calculations thousands of times faster than mechanical calculators, despite consuming enormous amounts of electricity and requiring frequent maintenance.\n\nThe invention of the transistor in 1947 revolutionized computing by replacing bulky vacuum tubes with smaller, more reliable, and energy-efficient components. This breakthrough enabled the development of increasingly compact and powerful computers throughout the 1950s and 1960s. The integrated circuit, introduced in the late 1950s, further accelerated miniaturization by combining multiple transistors on a single semiconductor chip.\n\nPersonal computing emerged in the 1970s and 1980s, making computational power accessible to individuals and small businesses. Companies like Apple, IBM, and Microsoft played pivotal roles in popularizing personal computers and developing user-friendly operating systems and software applications. The graphical user interface, pioneered by researchers at Xerox PARC and later commercialized by Apple and Microsoft, transformed how people interacted with computers.\n\nThe development of the Internet and World Wide Web in the late 20th century connected computers globally, creating unprecedented opportunities for communication, collaboration, and information sharing. This connectivity enabled the emergence of new business models, social platforms, and digital services that have fundamentally transformed modern society.\n\nToday, computing continues to evolve rapidly with advances in artificial intelligence, quantum computing, edge computing, and distributed systems. Mobile devices have become ubiquitous, providing computational capabilities that exceed those of room-sized computers from previous decades. Cloud computing has democratized access to powerful computational resources, enabling startups and individuals to leverage enterprise-grade infrastructure without massive capital investments.\n\nLooking toward the future, emerging technologies such as neuromorphic computing, bio-computing, and quantum systems promise to unlock new computational paradigms that could solve currently intractable problems in science, medicine, and engineering. The ongoing development of artificial general intelligence represents perhaps the most ambitious goal in computing, potentially leading to systems that can match or exceed human cognitive abilities across all domains. The ultimate goal is"
+    ],
+    "special": [
+      "🚀 Emojis and Unicode: café naïve résumé 中文 العربية. The first symbol is",
+      "Code snippet: def fibonacci(n): return n if n <= 1 else fibonacci(n-1) + fibonacci(n-2). This function returns",
+      "Mixed: The year 2024 has 366 days. π ≈ 3.14159. E = mc². The answer is",
+      "Numbers and symbols: 1,234,567.89 + $100.00 = €95.50 @ 15:30:45. The time shows",
+      "JSON-like: {\"name\": \"test\", \"value\": [1, 2, 3], \"active\": true}. This represents"
+    ]
+  },
+  "expected_tokens": {
+    "short_range": [3, 25],
+    "medium_range": [20, 120],
+    "long_range": [100, 600],
+    "very_long_range": [500, 1200],
+    "special_range": [5, 50]
+  },
+  "validation": {
+    "geography": ["Paris", "France", "capital", "city", "country"],
+    "math": ["4", "four", "equals", "=", "answer", "result"],
+    "colors": ["white", "snow", "color", "light", "pure"],
+    "science": ["degrees", "Celsius", "temperature", "boiling", "point"],
+    "alphabet": ["A", "a", "letter", "first", "beginning"],
+    "learning": ["deep", "neural", "supervised", "unsupervised", "machine"],
+    "aesthetics": ["beautiful", "scenic", "stunning", "peaceful", "lovely"],
+    "cooperation": ["global", "international", "collective", "coordinated", "unified"],
+    "challenges": ["ensuring", "achieving", "developing", "creating", "establishing"],
+    "future": ["to", "creating", "developing", "achieving", "building"],
+    "symbols": ["🚀", "emoji", "rocket", "Unicode", "symbol"],
+    "programming": ["a", "the", "an", "value", "number"],
+    "answers": ["4", "3.14", "true", "correct", "yes"],
+    "time": ["15", "3", "PM", "afternoon", "hour"],
+    "data": ["a", "an", "object", "structure", "JSON"],
+    "general": ["the", "and", "or", "is", "are", "in", "on", "at", "to", "for"]
+  }
+}
