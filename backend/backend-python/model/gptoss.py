@@ -318,6 +318,9 @@ class GptOssAttention(nn.Module):
 
         self.rope = rope
 
+    def _ceil_div(self, a: int, b: int) -> int:
+        return -(-a // b)
+
     def _attend_one_page(
         self,
         query: torch.Tensor,
@@ -379,22 +382,37 @@ class GptOssAttention(nn.Module):
         for batch_idx in range(batch_num):
             q_start = qo_indptr[batch_idx]
             q_end = qo_indptr[batch_idx + 1]
-
-            kv_page_start = kv_page_indptr[batch_idx]
-            kv_page_end = kv_page_indptr[batch_idx + 1]
-
             query_len = int(q_end - q_start)
+
+            kv_page_start = int(kv_page_indptr[batch_idx])
+            kv_page_end = int(kv_page_indptr[batch_idx + 1])
+            kv_last_page_len = kv_last_page_lens[batch_idx]
+
             seq_len = int(
-                (kv_page_end - kv_page_start - 1) * kv_page_size
-                + kv_last_page_lens[batch_idx]
+                (kv_page_end - kv_page_start - 1) * kv_page_size + kv_last_page_len
             )
+
             mask_len = seq_len * query_len
+            mask = attention_mask[mask_offset : mask_offset + mask_len].view(
+                query_len, seq_len
+            )
+            mask_offset += mask_len
+
+            # If this attention layer uses a sliding window, we keep only the last
+            # few pages of the KV cache and the corresponding mask.
+            if self.sliding_window != 0:
+                attn_page_cnt = 1 + self._ceil_div(
+                    self.sliding_window - kv_last_page_len, kv_page_size
+                )
+                kv_page_start = max(kv_page_start, kv_page_end - attn_page_cnt)
+
+                seq_len = int(
+                    (kv_page_end - kv_page_start - 1) * kv_page_size + kv_last_page_len
+                )
+
+                mask = mask[:, -seq_len:]
 
             query = queries[q_start:q_end, :] * self.scaling
-
-            mask = attention_mask[mask_offset : mask_offset + mask_len]
-            mask = mask.view(query_len, seq_len)
-            mask_offset += mask_len
 
             sum_exp = torch.zeros(
                 self.num_attention_heads,
@@ -463,12 +481,8 @@ class GptOssAttention(nn.Module):
             kv_page_idx_idx = kv_page_end - 1
 
             kv_page_idx = kv_page_indices[kv_page_idx_idx]
-            paged_keys = kv_cache_at_layer[kv_page_idx, 0][
-                : kv_last_page_lens[batch_idx]
-            ]
-            paged_values = kv_cache_at_layer[kv_page_idx, 1][
-                : kv_last_page_lens[batch_idx]
-            ]
+            paged_keys = kv_cache_at_layer[kv_page_idx, 0][:kv_last_page_len]
+            paged_values = kv_cache_at_layer[kv_page_idx, 1][:kv_last_page_len]
 
             paged_keys = torch.repeat_interleave(
                 paged_keys, self.num_key_value_groups, dim=1
@@ -479,7 +493,7 @@ class GptOssAttention(nn.Module):
 
             paged_mask_offset = page_cnt * kv_page_size
             paged_mask = mask[:, paged_mask_offset : paged_mask_offset + kv_page_size][
-                ..., : kv_last_page_lens[batch_idx]
+                ..., :kv_last_page_len
             ]
             paged_mask = paged_mask.unsqueeze(0)
 
@@ -811,8 +825,7 @@ class GptOssModel(nn.Module):
             config.hidden_size,
             device=config.device,
         )
-
-        self.round = 0
+        self.sliding_window = config.sliding_window
 
     def forward(
         self,
@@ -849,6 +862,8 @@ class GptOssModel(nn.Module):
         full_mask = custom_mask
         window_mask = custom_mask.clone()
 
+        # For window attention layers, set the mask to 0 for positions that are
+        # outside the sliding window.
         mask_offset = 0
         for batch_idx in range(batch_num):
             q_start = qo_indptr[batch_idx]
@@ -871,7 +886,9 @@ class GptOssModel(nn.Module):
 
             pos_id = position_ids[q_start:q_end]
             for q_idx in range(query_len):
-                mask[q_idx, : max(0, int(pos_id[q_idx]) - 127)] = 0
+                mask[
+                    q_idx, : max(0, int(pos_id[q_idx]) - (self.sliding_window - 1))
+                ] = 0
 
         full_mask = torch.where(
             full_mask,
