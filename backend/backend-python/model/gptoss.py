@@ -8,6 +8,7 @@ from itertools import islice
 import torch
 from torch import nn
 import flashinfer as ops
+import flashinfer.rope
 from adapter import AdapterSubpass
 from config.gptoss import GptOssArch
 from einops import einsum, rearrange
@@ -165,6 +166,7 @@ class GptOssRotaryEmbedding(nn.Module):
         ntk_alpha: float = 1.0,
         ntk_beta: float = 32.0,
         device: torch.device | None = None,
+        max_position_id: int = 131072,
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
@@ -175,27 +177,13 @@ class GptOssRotaryEmbedding(nn.Module):
         self.ntk_alpha = ntk_alpha
         self.ntk_beta = ntk_beta
         self.device = device
+        self.max_position_id = max_position_id
 
-        # Cache for cos/sin values to avoid recomputation
-        self._cos_sin_cache = {}
-        self._max_cached_position = 0
-
-        # Pre-compute and cache concentration and inv_freq since they're constant
+        # Pre-compute concentration and inv_freq since they're constant
         self._concentration, self._inv_freq = self._compute_concentration_and_inv_freq()
 
-    def _apply_rotary_emb(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply rotary embedding to input tensor."""
-        cos = cos.unsqueeze(-2).to(x.dtype)
-        sin = sin.unsqueeze(-2).to(x.dtype)
-        x1, x2 = torch.chunk(x, 2, dim=-1)
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-        return torch.cat((o1, o2), dim=-1)
+        # Pre-compute the full cos/sin cache for all positions up to max_position_id
+        self._cos_sin_cache = self._precompute_cos_sin_cache()
 
     def _compute_concentration_and_inv_freq(self) -> tuple[float, torch.Tensor]:
         """See YaRN paper: https://arxiv.org/abs/2309.00071"""
@@ -237,57 +225,27 @@ class GptOssRotaryEmbedding(nn.Module):
 
         return concentration, inv_freq
 
-    def _get_cos_sin_for_positions(self, position_ids: torch.Tensor):
-        """Get cosine and sine values for specific position IDs with caching."""
-        position_ids = position_ids.to(dtype=torch.int64, device=self.device)
-        max_pos = position_ids.max().item()
+    def _precompute_cos_sin_cache(self) -> torch.Tensor:
+        """Pre-compute cos/sin cache for all positions up to max_position_id."""
+        # Create position indices
+        position_ids = torch.arange(
+            self.max_position_id, dtype=torch.float32, device=self.device
+        )
 
-        # Check if we need to extend our cache and extend it
-        if max_pos > self._max_cached_position:
-            new_max_pos = max(max_pos, 2 * self._max_cached_position)
+        # Compute frequencies for all positions
+        freqs = torch.einsum("i,j->ij", position_ids, self._inv_freq)
 
-            new_positions = torch.arange(
-                self._max_cached_position + 1,
-                new_max_pos + 1,
-                dtype=torch.float32,
-                device=self.device,
-            )
+        # Compute cos and sin values with concentration
+        cos_cache = freqs.cos() * self._concentration
+        sin_cache = freqs.sin() * self._concentration
 
-            if len(new_positions) > 0:
-                freqs = torch.einsum("i,j->ij", new_positions, self._inv_freq)
-                cos_new = freqs.cos() * self._concentration
-                sin_new = freqs.sin() * self._concentration
+        # Concatenate cos and sin for FlashInfer format
+        # Shape: [max_position_id, head_dim] where head_dim contains
+        # [cos_0, cos_1, ..., sin_0, sin_1, ...]
+        cos_sin_cache = torch.cat([cos_cache, sin_cache], dim=-1)
 
-                # Store in cache
-                for i, pos in enumerate(new_positions):
-                    pos_key = int(pos.item())
-                    self._cos_sin_cache[pos_key] = (cos_new[i], sin_new[i])
-
-                self._max_cached_position = new_max_pos
-
-        # Retrieve cached values for the requested positions
-        cos_list = []
-        sin_list = []
-        for pos in position_ids:
-            pos_key = pos.item()
-            if pos_key in self._cos_sin_cache:
-                cos_val, sin_val = self._cos_sin_cache[pos_key]
-                cos_list.append(cos_val)
-                sin_list.append(sin_val)
-            else:
-                # Fallback for position 0 or negative positions
-                pos_float = torch.tensor(
-                    pos_key, dtype=torch.float32, device=self.device
-                )
-                freqs = torch.einsum("j->j", pos_float * self._inv_freq)
-                cos_val = freqs.cos() * self._concentration
-                sin_val = freqs.sin() * self._concentration
-                cos_list.append(cos_val)
-                sin_list.append(sin_val)
-
-        cos = torch.stack(cos_list, dim=0)
-        sin = torch.stack(sin_list, dim=0)
-        return cos, sin
+        # Ensure float32 precision for numerical accuracy
+        return cos_sin_cache.to(torch.float32)
 
     def forward(
         self,
@@ -296,10 +254,15 @@ class GptOssRotaryEmbedding(nn.Module):
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply rotary embedding to query and key tensors using position IDs."""
-        cos, sin = self._get_cos_sin_for_positions(position_ids)
-
-        query = self._apply_rotary_emb(query, cos, sin)
-        key = self._apply_rotary_emb(key, cos, sin)
+        # Use FlashInfer's optimized RoPE function with pre-computed cache
+        flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(
+            positions=position_ids.to(torch.int32),
+            query=query,
+            key=key,
+            head_size=self.head_dim,
+            cos_sin_cache=self._cos_sin_cache,
+            is_neox=True,  # GPT-OSS uses Neox-style RoPE
+        )
 
         return query, key
 
@@ -768,6 +731,7 @@ class GptOssDecoderLayer(nn.Module):
             ntk_alpha=config.rope_ntk_alpha,
             ntk_beta=config.rope_ntk_beta,
             device=torch.device(config.device),
+            max_position_id=131072,
         )
         self.self_attn = GptOssAttention(config, layer_idx, self.rope)
         self.mlp = GptOssMlp(config)
