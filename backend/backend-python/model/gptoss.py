@@ -8,7 +8,6 @@ from itertools import islice
 import torch
 from torch import nn
 import flashinfer as ops
-import flashinfer.rope
 from adapter import AdapterSubpass
 from config.gptoss import GptOssArch
 from einops import einsum, rearrange
@@ -255,7 +254,7 @@ class GptOssRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply rotary embedding to query and key tensors using position IDs."""
         # Use FlashInfer's optimized RoPE function with pre-computed cache
-        flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(
+        ops.apply_rope_with_cos_sin_cache_inplace(
             positions=position_ids.to(torch.int32),
             query=query,
             key=key,
@@ -386,7 +385,7 @@ class GptOssAttention(nn.Module):
 
             kv_page_start = int(kv_page_indptr[batch_idx])
             kv_page_end = int(kv_page_indptr[batch_idx + 1])
-            kv_last_page_len = kv_last_page_lens[batch_idx]
+            kv_last_page_len = int(kv_last_page_lens[batch_idx])
 
             seq_len = int(
                 (kv_page_end - kv_page_start - 1) * kv_page_size + kv_last_page_len
