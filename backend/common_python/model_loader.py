@@ -121,7 +121,7 @@ def load_model(
                         blocks,
                         scales,
                         fp4_values=details["fp4_values"],
-                        dtype=torch.bfloat16,
+                        dtype=param.dtype,
                         device=param.device,
                     )
                 else:
@@ -177,7 +177,6 @@ def dequantize_from_mxfp4(
     fp4_values: Iterable[float],
     device: str,
     dtype: torch.dtype,
-    rows_per_chunk: int = 2**23,
 ) -> torch.Tensor:
     """
     Convert MXFP4 format tensors (blocks and scales) to bfloat16 format.
@@ -186,7 +185,6 @@ def dequantize_from_mxfp4(
         blocks: The packed FP4 values tensor (uint8)
         scales: The block scales tensor
         dtype: Target dtype for conversion (default: torch.bfloat16)
-        rows_per_chunk: Number of rows to process per chunk for memory efficiency
 
     Returns:
         Converted tensor in the target dtype
@@ -205,23 +203,16 @@ def dequantize_from_mxfp4(
     blocks = blocks.reshape(rows_total, b).to(device)
     scales = scales.reshape(rows_total, 1).to(device)
 
+    # Extract low and high 4-bit indices
+    idx_lo = (blocks & 0x0F).to(torch.long)
+    idx_hi = (blocks >> 4).to(torch.long)
+
+    # Create output tensor and populate
     out = torch.empty(rows_total, b * 2, dtype=dtype, device=device)
+    out[:, 0::2] = lut[idx_lo]  # Low 4-bit values at even indices
+    out[:, 1::2] = lut[idx_hi]  # High 4-bit values at odd indices
 
-    for r0 in range(0, rows_total, rows_per_chunk):
-        r1 = min(r0 + rows_per_chunk, rows_total)
-
-        blk = blocks[r0:r1]
-        exp = scales[r0:r1]
-
-        idx_lo = (blk & 0x0F).to(torch.long)
-        idx_hi = (blk >> 4).to(torch.long)
-
-        sub = out[r0:r1]
-        sub[:, 0::2] = lut[idx_lo]
-        sub[:, 1::2] = lut[idx_hi]
-
-        torch.ldexp(sub, exp, out=sub)
-        del idx_lo, idx_hi, blk, exp
+    torch.ldexp(out, scales, out=out)
 
     return out.reshape(*prefix_shape, g, b * 2).view(*prefix_shape, g * b * 2)
 
