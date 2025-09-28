@@ -32,7 +32,9 @@ class HandshakeResponse(msgspec.Struct, gc=False):
     prompt_template_type: str
     prompt_stop_tokens: list[str]
     kv_page_size: int
+    max_batch_tokens: int
     resources: dict[int, int]  # Use built-in list and tuple
+    tokenizer_num_vocab: int
     tokenizer_merge_table: dict[int, bytes]
     tokenizer_special_tokens: dict[str, int]
     tokenizer_split_regex: str

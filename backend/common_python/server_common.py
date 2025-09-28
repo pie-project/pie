@@ -128,6 +128,7 @@ def start_service(
         max_dist_size=config["max_dist_size"],
         max_num_kv_pages=config["max_num_kv_pages"],
         max_num_embeds=config["max_num_embeds"],
+        max_batch_tokens=config["max_batch_tokens"],
         max_num_adapters=config["max_num_adapters"],
         max_adapter_rank=config["max_adapter_rank"],
         dtype=getattr(torch, config["dtype"]),

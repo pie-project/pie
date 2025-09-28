@@ -16,7 +16,7 @@ class Tokenizer:
     """Struct for tokenizer configuration."""
 
     type: str
-    num_vocab:int
+    num_vocab: int
     merge_table: dict[int, bytes]
     split_regex: str
     special_tokens: dict[str, int]

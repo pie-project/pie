@@ -34,6 +34,7 @@ class Handler:
         max_dist_size: int,
         max_num_kv_pages: int,
         max_num_embeds: int,
+        max_batch_tokens: int,
         max_num_adapters: int,
         max_adapter_rank: int,
         dtype: torch.dtype,
@@ -49,6 +50,7 @@ class Handler:
         self.max_dist_size = max_dist_size
         self.max_num_kv_pages = max_num_kv_pages
         self.max_num_embeds = max_num_embeds
+        self.max_batch_tokens = max_batch_tokens
         self.max_num_adapters = max_num_adapters
         self.max_adapter_rank = max_adapter_rank
         self.dtype = dtype
@@ -121,11 +123,13 @@ class Handler:
                 prompt_template_type=self.model_info.template_type,
                 prompt_stop_tokens=self.model_info.stop_tokens,
                 kv_page_size=self.kv_page_size,
+                max_batch_tokens=self.max_batch_tokens,
                 resources={
                     0: self.max_num_kv_pages,
                     1: self.max_num_embeds,
                     2: self.max_num_adapters,
                 },
+                tokenizer_num_vocab=self.model_info.tokenizer.num_vocab,
                 tokenizer_merge_table=self.model_info.tokenizer.merge_table,
                 tokenizer_special_tokens=self.model_info.tokenizer.special_tokens,
                 tokenizer_split_regex=self.model_info.tokenizer.split_regex,

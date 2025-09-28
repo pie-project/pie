@@ -26,6 +26,7 @@ def main(
     max_dist_size: int = 64,
     max_num_kv_pages: int = 1024,
     max_num_embeds: int = 128,
+    max_batch_tokens: int = 10240,
     max_num_adapters: int = 48,
     max_adapter_rank: int = 8,
     device: str = "cuda:0",
@@ -47,6 +48,7 @@ def main(
         max_dist_size: Maximum distance for embeddings.
         max_num_kv_pages: Maximum number of pages in the key-value cache.
         max_num_embeds: Maximum number of embeddings to store.
+        max_batch_tokens: Maximum number of tokens in a batch.
         max_num_adapters: Maximum number of adapters that can be loaded.
         max_adapter_rank: Maximum rank for any loaded adapter.
         device: The device to run the model on (e.g., 'cuda:0' or 'cpu').
@@ -64,6 +66,7 @@ def main(
         max_dist_size=max_dist_size,
         max_num_kv_pages=max_num_kv_pages,
         max_num_embeds=max_num_embeds,
+        max_batch_tokens=max_batch_tokens,
         max_num_adapters=max_num_adapters,
         max_adapter_rank=max_adapter_rank,
         device=device,
