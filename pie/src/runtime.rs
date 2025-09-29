@@ -585,9 +585,9 @@ impl Runtime {
                 .await
                 .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
 
-            // Attempt to call “run”
+            // Attempt to call "run"
             let (_, run_export) = instance
-                .get_export(&mut store, None, "pie:inferlet/run")
+                .get_export(&mut store, None, "inferlet:core/run")
                 .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
 
             let (_, run_func_export) = instance
