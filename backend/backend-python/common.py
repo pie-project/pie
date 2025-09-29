@@ -16,6 +16,7 @@ repo_utils.setup_pie_imports()
 # pylint: disable=wrong-import-position,wrong-import-order  # Must come after repo_utils setup
 from config.common import ModelInfo
 from config.l4ma import L4maArch
+from config.qwen2 import Qwen2Arch
 from config.qwen3 import Qwen3Arch
 from config.gptoss import GptOssArch
 from model_loader import load_model

@@ -7,7 +7,6 @@ ROOT="$(dirname "$(dirname "${BASH_SOURCE[0]}")")"
 export PYTHONPATH="${ROOT}:${PYTHONPATH}"
 
 uvx black --check \
-    ${ROOT}/pie/__init__.py \
     ${ROOT}/backend/backend-python/__init__.py \
     ${ROOT}/backend/backend-python/adapter.py \
     ${ROOT}/backend/backend-python/backend_ops.py \

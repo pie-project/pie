@@ -11,7 +11,6 @@ PYTHONPATH=${ROOT}:${ROOT}/backend/backend-python:${ROOT}/backend/common_python 
     --project ${ROOT}/backend/backend-python \
     --with pylint \
     pylint --disable=R \
-    ${ROOT}/pie/__init__.py \
     ${ROOT}/backend/backend-python/__init__.py \
     ${ROOT}/backend/backend-python/adapter.py \
     ${ROOT}/backend/backend-python/backend_ops.py \

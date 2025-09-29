@@ -85,6 +85,12 @@ class ModelInfo:
                 from .l4ma import L4maArch  # pylint: disable=import-outside-toplevel
 
                 arch = L4maArch.from_config(cfg)
+            case "qwen2":
+                from .qwen2 import (  # pylint: disable=import-outside-toplevel
+                    Qwen2Arch,
+                )
+
+                arch = Qwen2Arch.from_config(cfg)
             case "qwen3":
                 from .qwen3 import (  # pylint: disable=import-outside-toplevel
                     Qwen3Arch,
