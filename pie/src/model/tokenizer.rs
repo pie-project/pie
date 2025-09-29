@@ -121,16 +121,10 @@ impl BytePairEncoder {
 
         // Then, convert the bytes to a UTF-8 string.
         // Using `from_utf8_lossy` would silently replace invalid sequences with
-        // the Unicode replacement character;
-        let mut decoded_string = String::from_utf8_lossy(&*decoded_bytes).to_string();
-
-        if self.escape_non_printable {
-            let decoded_bytes = unescape_non_printable(&decoded_string).unwrap();
-            decoded_string = String::from_utf8_lossy(&*decoded_bytes).to_string();
-        }
-
-        Ok(decoded_string)
+        // the Unicode replacement character
+        Ok(String::from_utf8_lossy(&*decoded_bytes).to_string())
     }
+
     fn decode_bytes(&self, tokens: &[Rank]) -> Result<Vec<u8>, DecodeKeyError> {
         let mut ret = Vec::with_capacity(tokens.len() * 2);
         for &token in tokens {
@@ -141,7 +135,16 @@ impl BytePairEncoder {
                     .get(&token)
                     .ok_or(DecodeKeyError { token })?,
             };
-            ret.extend(token_bytes);
+
+            let is_special = self.special_tokens_decoder.contains_key(&token);
+
+            if !is_special && self.escape_non_printable {
+                let decoded_string = String::from_utf8_lossy(token_bytes);
+                let decoded_bytes = unescape_non_printable(&decoded_string).unwrap();
+                ret.extend(&decoded_bytes);
+            } else {
+                ret.extend(token_bytes);
+            }
         }
         Ok(ret)
     }
@@ -149,16 +152,7 @@ impl BytePairEncoder {
     pub fn encode(&self, text: &str, allowed_special: &HashSet<&str>) -> Vec<Rank> {
         let mut ret = vec![];
 
-        let escaped_text = escape_non_printable(text.as_bytes());
-
-        let text = if self.escape_non_printable {
-            &escaped_text
-        } else {
-            text
-        };
-
         let mut start = 0;
-        let mut last_piece_token_len = 0;
         loop {
             let mut next_special;
             let mut start_find = start;
@@ -177,14 +171,18 @@ impl BytePairEncoder {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             for mat in self.regex.find_iter(&text[start..end]) {
-                let piece = mat.unwrap().as_str().as_bytes();
+                let mut piece = mat.unwrap().as_str().as_bytes();
+
+                let escaped_piece = escape_non_printable(piece);
+                if self.escape_non_printable {
+                    piece = escaped_piece.as_bytes();
+                }
+
                 if let Some(token) = self.encoder.get(piece) {
-                    last_piece_token_len = 1;
                     ret.push(*token);
                     continue;
                 }
                 let tokens = byte_pair_encode(piece, &self.encoder);
-                last_piece_token_len = tokens.len();
                 ret.extend(&tokens);
             }
 
@@ -195,7 +193,6 @@ impl BytePairEncoder {
                     let token = self.special_tokens_encoder[piece];
                     ret.push(token);
                     start = m.end();
-                    last_piece_token_len = 0;
                 }
                 None => break,
             }
@@ -383,49 +380,3 @@ pub fn unescape_non_printable(s: &str) -> Option<Vec<u8>> {
     }
     Some(out)
 }
-
-//
-// pub fn empty_tokenizer() -> BytePairEncoder {
-//     // Create an empty encoder with no merge rules and no special tokens
-//     BytePairEncoder::new(
-//         HashMap::new(),
-//         HashMap::new(),
-//         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-//     )
-// }
-//
-// // https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py
-// pub fn llama3_tokenizer(path: &str) -> Result<BytePairEncoder, Box<dyn std::error::Error>> {
-//     // Example usage
-//     let mergeable_ranks = load_merge_rules(path)?;
-//     let special_tokens = vec![
-//         "<|begin_of_text|>",
-//         "<|end_of_text|>",
-//         "<|reserved_special_token_0|>",
-//         "<|reserved_special_token_1|>",
-//         "<|reserved_special_token_2|>",
-//         "<|reserved_special_token_3|>",
-//         "<|start_header_id|>",
-//         "<|end_header_id|>",
-//         "<|reserved_special_token_4|>",
-//         "<|eot_id|>",
-//     ];
-//     let pattern = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-//
-//     let num_base_tokens = mergeable_ranks.len() as Rank;
-//
-//     let special_tokens_encoder: HashMap<String, Rank> = special_tokens
-//         .into_iter()
-//         .enumerate()
-//         .map(|(i, s)| (s.to_string(), num_base_tokens + i as Rank))
-//         .collect();
-//
-//     let encoder = BytePairEncoder::new(mergeable_ranks, special_tokens_encoder, pattern);
-//     // [9906, 11, 856, 5679, 374, 19369]
-//     // encode text
-//     //let text = "Hello, my dog is cute";
-//     //let tokens = encoder.encode_with_special_tokens(text);
-//     //println!("Encoded tokens: {:?}", tokens);
-//
-//     Ok(encoder)
-// }
