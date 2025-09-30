@@ -13,6 +13,7 @@ import os
 import random
 import struct
 import sys
+import queue
 import threading
 import time
 import traceback
@@ -139,18 +140,59 @@ def start_service(
     socket = context.socket(zmq.ROUTER)
     socket.bind(real_endpoint)
 
-    threading.Thread(target=run_zmq_server, args=(socket, handler), daemon=True).start()
+    heartbeat_request_queue = queue.Queue()
+    work_request_queue = queue.Queue()
+    response_queue = queue.Queue()
+
+    # Thread Structure:
+    #
+    # +-----------------------------+
+    # |     zmq_listen_thread       |  <-- Receives requests (ZMQ socket)
+    # +-----------------------------+
+    #   |                         |
+    #   | (heartbeat req queue)   | (work req queue)
+    #   v                         v
+    # +------------------+    +---------------+
+    # | heartbeat_thread |    | worker_thread |
+    # +------------------+    +---------------+
+    #           |                |
+    #           +-------+--------+
+    #                   | (response queue)
+    #                   v
+    # +-----------------------------+
+    # |    zmq_response_thread      |  --> Sends responses (ZMQ socket)
+    # +-----------------------------+
+
+    threading.Thread(
+        target=heartbeat_thread,
+        args=(heartbeat_request_queue, response_queue, handler),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=worker_thread,
+        args=(work_request_queue, response_queue, handler),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=zmq_response_thread, args=(response_queue, socket), daemon=True
+    ).start()
+    threading.Thread(
+        target=zmq_listen_thread,
+        args=(heartbeat_request_queue, work_request_queue, socket),
+        daemon=True,
+    ).start()
 
     if register_with_controller:
         threading.Thread(
-            target=register,
+            target=register_thread,
             args=(config, endpoint),
             daemon=True,
         ).start()
 
     try:
+        # Block forever until receiving keyboard interrupt
         while True:
-            time.sleep(1)
+            threading.Event().wait()
     except KeyboardInterrupt:
         print("\nShutting down server...")
     finally:
@@ -159,7 +201,7 @@ def start_service(
         print("Server shutdown complete.")
 
 
-def register(config: Dict[str, Any], endpoint: str) -> None:
+def register_thread(config: Dict[str, Any], endpoint: str) -> None:
     """Register this service with the controller."""
 
     controller_addr = f"ws://{config['controller_host']}:{config['controller_port']}"
@@ -213,17 +255,118 @@ def register(config: Dict[str, Any], endpoint: str) -> None:
         os._exit(1)
 
 
-def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
-    """Core ZMQ service loop dispatching requests to the handler.
+def heartbeat_thread(
+    heartbeat_request_queue: queue.Queue, response_queue: queue.Queue, handler: Any
+) -> None:
+    """Heartbeat thread that responds to heartbeat requests to the controller. And if no
+    heartbeat is received for the timeout period, terminates the program."""
 
-    Exits the program if a heartbeat is not received for 60 seconds or if any
-    exception occurs.
-    """
-    # Heartbeat timeout and timer setup (60 seconds for FlashInfer JIT compilation)
-    heartbeat_timeout = 60  # seconds
+    heartbeat_timeout = 15
     last_heartbeat_time = time.monotonic()
 
+    try:
+        while True:
+            time.sleep(1)
+
+            if time.monotonic() - last_heartbeat_time > heartbeat_timeout:
+                print(
+                    f"[!] Heartbeat timeout after {heartbeat_timeout}s, exiting",
+                    file=sys.stderr,
+                )
+                os._exit(1)
+
+            if heartbeat_request_queue.empty():
+                continue
+
+            while not heartbeat_request_queue.empty():
+                client_identity, corr_id_bytes, handler_id_bytes, reqs = (
+                    heartbeat_request_queue.get()
+                )
+                resps = handler.heartbeat(reqs)
+                response_queue.put(
+                    (client_identity, corr_id_bytes, handler_id_bytes, resps)
+                )
+
+            last_heartbeat_time = time.monotonic()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        terminate(f"Unhandled error occurred in the heartbeat thread: {exc}")
+
+
+def worker_thread(
+    work_request_queue: queue.Queue, response_queue: queue.Queue, handler: Any
+) -> None:
+    """Worker thread that processes incoming requests from the controller."""
+
+    try:
+        while True:
+            client_identity, corr_id_bytes, handler_id_bytes, handler_id, reqs = (
+                work_request_queue.get()
+            )
+
+            resps = []
+            match handler_id:
+                case HandlerId.HANDSHAKE.value:
+                    resps = handler.handshake(reqs)
+                case HandlerId.QUERY.value:
+                    resps = handler.query(reqs)
+                case HandlerId.FORWARD_PASS.value:
+                    resps = handler.forward_pass(reqs)
+                case HandlerId.EMBED_IMAGE.value:
+                    handler.embed_image(reqs)
+                case HandlerId.INITIALIZE_ADAPTER.value:
+                    handler.initialize_adapter(reqs)
+                case HandlerId.UPDATE_ADAPTER.value:
+                    handler.update_adapter(reqs)
+                case HandlerId.UPLOAD_HANDLER.value:
+                    handler.upload_handler(reqs)
+                case HandlerId.DOWNLOAD_HANDLER.value:
+                    resps = handler.download_handler(reqs)
+                case HandlerId.HEARTBEAT.value:
+                    raise RuntimeError(
+                        "Heartbeat should not be handled by the worker thread"
+                    )
+                case _:
+                    print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
+
+            if resps:
+                response_queue.put(
+                    (client_identity, corr_id_bytes, handler_id_bytes, resps)
+                )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        terminate(f"Unhandled error occurred in the worker thread: {exc}")
+
+
+def zmq_response_thread(response_queue: queue.Queue, socket: zmq.Socket) -> None:
+    """Thread that sends responses to the controller."""
+
     msgpack_encoder = msgspec.msgpack.Encoder()
+    try:
+        while True:
+            client_identity, corr_id_bytes, handler_id_bytes, resps = (
+                response_queue.get()
+            )
+            response_msg = [client_identity, corr_id_bytes, handler_id_bytes] + [
+                msgpack_encoder.encode(r) for r in resps
+            ]
+            socket.send_multipart(response_msg)
+    except zmq.error.ZMQError as exc:
+        # Terminate the thread if the context is terminated or the socket is not valid
+        # This is a normal shutdown scenario initiated by `start_service`
+        if exc.errno in {zmq.ETERM, zmq.ENOTSOCK}:
+            return
+        terminate(f"Unhandled error occurred in the ZMQ response thread: {exc}")
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        terminate(f"Unhandled error occurred in the ZMQ response thread: {exc}")
+
+
+def zmq_listen_thread(
+    heartbeat_request_queue: queue.Queue,
+    work_request_queue: queue.Queue,
+    socket: zmq.Socket,
+) -> None:
+    """Thread that listens for incoming requests from the controller and
+    dispatches them to the appropriate handler."""
+
     decoders = {
         HandlerId.HANDSHAKE.value: msgspec.msgpack.Decoder(HandshakeRequest),
         HandlerId.HEARTBEAT.value: msgspec.msgpack.Decoder(HeartbeatRequest),
@@ -240,26 +383,10 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
         ),
     }
 
-    poller = zmq.Poller()
-    poller.register(socket, zmq.POLLIN)
-
     try:
         while True:
-            # Check for heartbeat timeout before waiting for a message
-            if time.monotonic() - last_heartbeat_time > heartbeat_timeout:
-                print(
-                    f"[!] Heartbeat timeout after {heartbeat_timeout}s, exiting",
-                    file=sys.stderr,
-                )
-                os._exit(1)  # Use os._exit for immediate termination from a thread
-
-            # Poll for 1 second to remain responsive to the heartbeat check
-            events = dict(poller.poll(timeout=1000))
-            if socket in events:
-                message = socket.recv_multipart()
-            else:
-                # Poller timed out, loop again to re-check the heartbeat timer
-                continue
+            # Block until a message is received
+            message = socket.recv_multipart()
 
             if len(message) < 3:
                 print(f"[!] Received invalid message: {message}", file=sys.stderr)
@@ -267,9 +394,8 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
 
             client_identity, corr_id_bytes, handler_id_bytes = message[:3]
             try:
-                _ = struct.unpack(">I", corr_id_bytes)[
-                    0
-                ]  # corr_id extracted but not used
+                # corr_id extracted but not used
+                _ = struct.unpack(">I", corr_id_bytes)[0]
                 handler_id = struct.unpack(">I", handler_id_bytes)[0]
                 reqs = [decoders[handler_id].decode(m) for m in message[3:]]
             except (struct.error, KeyError, msgspec.DecodeError) as exc:
@@ -283,44 +409,31 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
                 print("[!] Received empty request body", file=sys.stderr)
                 continue
 
-            resps = []
-            match handler_id:
-                case HandlerId.HANDSHAKE.value:
-                    resps = handler.handshake(reqs)
-                case HandlerId.HEARTBEAT.value:
-                    # Update heartbeat timer when heartbeat is received
-                    last_heartbeat_time = time.monotonic()
-                    resps = handler.heartbeat(reqs)
-                case HandlerId.QUERY.value:
-                    resps = handler.query(reqs)
-                case HandlerId.FORWARD_PASS.value:
-                    resps = handler.forward_pass(reqs)
-                case HandlerId.EMBED_IMAGE.value:
-                    handler.embed_image(reqs)
-                case HandlerId.INITIALIZE_ADAPTER.value:
-                    handler.initialize_adapter(reqs)
-                case HandlerId.UPDATE_ADAPTER.value:
-                    handler.update_adapter(reqs)
-                case HandlerId.UPLOAD_HANDLER.value:
-                    handler.upload_handler(reqs)
-                case HandlerId.DOWNLOAD_HANDLER.value:
-                    resps = handler.download_handler(reqs)
-                case _:
-                    print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
+            # Dispatch the heartbeat request to the heartbeat thread and all other requests
+            # to the worker thread
+            if handler_id == HandlerId.HEARTBEAT.value:
+                heartbeat_request_queue.put(
+                    (client_identity, corr_id_bytes, handler_id_bytes, reqs)
+                )
+            else:
+                work_request_queue.put(
+                    (client_identity, corr_id_bytes, handler_id_bytes, handler_id, reqs)
+                )
+    except zmq.error.ZMQError as exc:
+        # Terminate the thread if the context is terminated or the socket is not valid
+        # This is a normal shutdown scenario initiated by `start_service`
+        if exc.errno in {zmq.ETERM, zmq.ENOTSOCK}:
+            return
+        terminate(f"Unhandled error occurred in the ZMQ listen loop: {exc}")
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        terminate(f"Unhandled error occurred in the ZMQ listen loop: {exc}")
 
-            if resps:
-                response_msg = [client_identity, corr_id_bytes, handler_id_bytes] + [
-                    msgpack_encoder.encode(r) for r in resps
-                ]
-                socket.send_multipart(response_msg)
 
-    except (zmq.ZMQError, OSError, ValueError, RuntimeError, KeyError) as exc:
-        print(
-            f"\n[!!!] Unhandled error occurred in the ZMQ server loop: {exc}",
-            file=sys.stderr,
-        )
-        traceback.print_exc()
-        os._exit(1)
+def terminate(msg: str) -> None:
+    """Terminate the program with a message."""
+    print(f"\n[!!!] {msg}", file=sys.stderr)
+    traceback.print_exc()
+    os._exit(1)
 
 
 __all__ = [
@@ -329,7 +442,11 @@ __all__ = [
     "build_config",
     "print_config",
     "resolve_cache_dir",
-    "run_zmq_server",
+    "zmq_listen_thread",
+    "zmq_response_thread",
+    "worker_thread",
+    "heartbeat_thread",
+    "register_thread",
     "start_service",
-    "register",
+    "terminate",
 ]
