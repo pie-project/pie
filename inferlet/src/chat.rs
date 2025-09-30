@@ -102,7 +102,17 @@ impl ChatFormatter {
     }
 
     /// Renders the entire conversation into a single formatted string prompt.
-    pub fn render(&self, template: &str, add_generation_prompt: bool) -> String {
-        minijinja::render!(template, messages => self.messages, add_generation_prompt => add_generation_prompt)
+    pub fn render(
+        &self,
+        template: &str,
+        add_generation_prompt: bool,
+        begin_of_sequence: bool,
+    ) -> String {
+        minijinja::render!(
+            template,
+            messages => self.messages,
+            add_generation_prompt => add_generation_prompt,
+            begin_of_sequence => begin_of_sequence,
+        )
     }
 }

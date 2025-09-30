@@ -1,11 +1,11 @@
 use crate::adapter::SetAdapter;
 use crate::brle::Brle;
 use crate::drafter::Drafter;
-use crate::zo::SetAdapterSeed;
 use crate::forward::{Distribution, Forward, KvPage};
 use crate::sampler::Sample;
 use crate::stop_condition::StopCondition;
-use crate::{ChatFormatter, Model, Queue, Sampler, Tokenizer, sampler, stop_condition};
+use crate::zo::SetAdapterSeed;
+use crate::{ChatFormatter, Model, Queue, Sampler, Tokenizer};
 use futures::future::join_all;
 use std::cmp::Ordering;
 use std::mem;
@@ -31,6 +31,8 @@ pub struct Context {
 
     pub adapter_ptr: Option<u32>,
     pub adapter_random_seed: Option<i64>,
+
+    pub begin_of_sequence: bool,
 }
 
 impl Context {
@@ -53,6 +55,7 @@ impl Context {
             kv_page_size,
             adapter_ptr: None,
             adapter_random_seed: None,
+            begin_of_sequence: true,
         }
     }
 
@@ -104,6 +107,7 @@ impl Context {
             kv_page_size,
             adapter_ptr: None,
             adapter_random_seed: None,
+            begin_of_sequence: false,
         }
     }
 
@@ -216,6 +220,7 @@ impl Context {
             kv_page_size: self.kv_page_size,
             adapter_ptr: self.adapter_ptr,
             adapter_random_seed: self.adapter_random_seed,
+            begin_of_sequence: self.begin_of_sequence,
         }
     }
 
@@ -234,13 +239,15 @@ impl Context {
             self.token_mask_pending
                 .push(self.token_mask_current.clone())
         }
+        self.begin_of_sequence = false;
     }
 
     pub fn fill_token(&mut self, new_token_id: u32) {
         self.token_ids_pending.push(new_token_id);
         self.token_mask_current.append(false);
         self.token_mask_pending
-            .push(self.token_mask_current.clone())
+            .push(self.token_mask_current.clone());
+        self.begin_of_sequence = false;
     }
 
     pub fn fill_system(&mut self, text: &str) {
@@ -402,9 +409,12 @@ impl Context {
 
     fn flush_chat_messages2(&mut self, add_generation_prompt: bool) {
         if self.formatter.has_messages() {
-            let p = self
-                .formatter
-                .render(&self.model.get_prompt_template(), add_generation_prompt);
+            let p = self.formatter.render(
+                &self.model.get_prompt_template(),
+                add_generation_prompt,
+                self.begin_of_sequence,
+            );
+            self.begin_of_sequence = false;
             self.formatter.clear();
             self.fill(&p);
         }
@@ -740,7 +750,7 @@ impl Context {
             let next_dists = join_all(next_dist_futures).await;
 
             let mut next_beams = Vec::new();
-            for ((mut beam, generated, score), next_dist) in beams.into_iter().zip(next_dists) {
+            for ((beam, generated, score), next_dist) in beams.into_iter().zip(next_dists) {
                 // print out the distributions
                 //println!("dist: {:?}", &next_dist.ids);
                 //println!("probs: {:?}", &next_dist.probs);
