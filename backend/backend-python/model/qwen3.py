@@ -23,7 +23,6 @@ def create_fusion_map(model: nn.Module):
     for name, module in model.named_modules():
         # --- Rule for Qwen3Attention QKV Fusion ---
         if isinstance(module, Qwen3Attention):
-            # Handle weights
             target_w = f"{name}.qkv_proj.weight"
             sources_w = [
                 f"{name}.q_proj.weight",
@@ -32,27 +31,11 @@ def create_fusion_map(model: nn.Module):
             ]
             fusion_map[target_w] = {"sources": sources_w, "dim": 0, "op": "fusion"}
 
-            # Handle biases if they exist
-            if module.qkv_proj.bias is not None:
-                target_b = f"{name}.qkv_proj.bias"
-                sources_b = [
-                    f"{name}.q_proj.bias",
-                    f"{name}.k_proj.bias",
-                    f"{name}.v_proj.bias",
-                ]
-                fusion_map[target_b] = {"sources": sources_b, "dim": 0, "op": "fusion"}
-
         # --- Rule for Qwen3Mlp Gate/Up Fusion ---
         elif isinstance(module, Qwen3Mlp):
-            # Handle weights
             target_w = f"{name}.gate_up_proj.weight"
             sources_w = [f"{name}.gate_proj.weight", f"{name}.up_proj.weight"]
             fusion_map[target_w] = {"sources": sources_w, "dim": 0, "op": "fusion"}
-
-            # Handle biases (Qwen3 uses bias in MLP layers)
-            target_b = f"{name}.gate_up_proj.bias"
-            sources_b = [f"{name}.gate_proj.bias", f"{name}.up_proj.bias"]
-            fusion_map[target_b] = {"sources": sources_b, "dim": 0, "op": "fusion"}
 
     return fusion_map
 
@@ -105,13 +88,10 @@ class Qwen3Attention(nn.Module):
         self.k_size = config.num_key_value_heads * config.head_size
         self.v_size = config.num_key_value_heads * config.head_size
 
-        # Qwen3 uses attention_bias for QKV projections
-        attention_bias = getattr(config, "attention_bias", False)
-
         self.qkv_proj = nn.Linear(
             config.hidden_size,
             self.q_size + self.k_size + self.v_size,
-            bias=attention_bias,
+            bias=False,
             device=config.device,
             dtype=config.dtype,
         )
