@@ -2,8 +2,8 @@
 # type: ignore
 # Ignoring checks for pylint and pyright since we are actively working on this file
 
+from typing import Optional
 import fire
-
 from common import (
     build_config,
     print_config,
@@ -22,11 +22,12 @@ def main(
     cache_dir: str = None,
     kv_page_size: int = 16,
     max_dist_size: int = 64,
-    max_num_kv_pages: int = 1024,
     max_num_embeds: int = 128,
     max_batch_tokens: int = 10240,
     max_num_adapters: int = 48,
     max_adapter_rank: int = 8,
+    max_num_kv_pages: Optional[int] = None,
+    gpu_mem_headroom: Optional[float] = None,
     device: str = "cuda:0",
     dtype: str = "bfloat16",
 ):
@@ -62,11 +63,12 @@ def main(
         cache_dir=cache_dir,
         kv_page_size=kv_page_size,
         max_dist_size=max_dist_size,
-        max_num_kv_pages=max_num_kv_pages,
         max_num_embeds=max_num_embeds,
         max_batch_tokens=max_batch_tokens,
         max_num_adapters=max_num_adapters,
         max_adapter_rank=max_adapter_rank,
+        max_num_kv_pages=max_num_kv_pages,
+        gpu_mem_headroom=gpu_mem_headroom,
         device=device,
         dtype=dtype,
     )

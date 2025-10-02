@@ -20,3 +20,4 @@ max_num_kv_pages = 10240
 max_num_embeds = 128
 max_num_adapters = 32
 max_adapter_rank = 8
+gpu_mem_headroom = 10.0

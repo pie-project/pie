@@ -17,7 +17,6 @@ import queue
 import threading
 import time
 import traceback
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Type
 
@@ -55,31 +54,6 @@ class HandlerId(enum.Enum):
     DOWNLOAD_HANDLER = 8
 
 
-@dataclass
-class ServerConfig:
-    """Lightweight view of server configuration options."""
-
-    model: str
-    host: str
-    port: int
-    controller_host: str
-    controller_port: int
-    auth_token: str | None
-    cache_dir: str | None
-    kv_page_size: int
-    max_dist_size: int
-    max_num_kv_pages: int
-    max_num_embeds: int
-    max_num_adapters: int
-    max_adapter_rank: int
-    device: str
-    dtype: str
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert configuration to dictionary."""
-        return self.__dict__.copy()
-
-
 def resolve_cache_dir(cache_dir: str | None) -> str:
     """Resolve the cache directory using CLI arg > env var > default."""
 
@@ -88,9 +62,24 @@ def resolve_cache_dir(cache_dir: str | None) -> str:
 
 def build_config(**kwargs: Any) -> Dict[str, Any]:
     """Normalize server configuration dictionary and resolve cache directory."""
+    config = {k: v for k, v in kwargs.items() if v is not None}
 
-    config = dict(kwargs)
+    # Resolve the cache directory
     config["cache_dir"] = resolve_cache_dir(config.get("cache_dir"))
+
+    # Check that either `max_num_kv_pages` or `gpu_mem_headroom` is set
+    if "max_num_kv_pages" not in config and "gpu_mem_headroom" not in config:
+        terminate(
+            "Config must contain either 'max_num_kv_pages' or 'gpu_mem_headroom'."
+        )
+
+    # Check that if `gpu_mem_headroom` is set, then CUDA must be available
+    if "gpu_mem_headroom" in config:
+        if not torch.cuda.is_available():
+            terminate("'gpu_mem_headroom' is set but CUDA is not available.")
+        if "cuda" not in config["device"]:
+            terminate("'gpu_mem_headroom' is set but device is not a CUDA device.")
+
     return config
 
 
@@ -121,15 +110,6 @@ def start_service(
 
     handler = handler_cls(
         config=config,
-        kv_page_size=config["kv_page_size"],
-        max_dist_size=config["max_dist_size"],
-        max_num_kv_pages=config["max_num_kv_pages"],
-        max_num_embeds=config["max_num_embeds"],
-        max_batch_tokens=config["max_batch_tokens"],
-        max_num_adapters=config["max_num_adapters"],
-        max_adapter_rank=config["max_adapter_rank"],
-        dtype=getattr(torch, config["dtype"]),
-        device=config["device"],
     )
 
     context = zmq.Context()
@@ -427,14 +407,13 @@ def zmq_listen_thread(
 
 def terminate(msg: str) -> None:
     """Terminate the program with a message."""
-    print(f"\n[!!!] {msg}", file=sys.stderr)
+    print(f"\n[!!!] {msg} Terminating.", file=sys.stderr)
     traceback.print_exc()
     os._exit(1)
 
 
 __all__ = [
     "HandlerId",
-    "ServerConfig",
     "build_config",
     "print_config",
     "resolve_cache_dir",

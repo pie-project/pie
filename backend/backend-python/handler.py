@@ -7,7 +7,6 @@ It instantiates the common Handler class with FlashInfer operations.
 
 from common import Handler
 from backend_ops import FlashInferOps
-import torch
 
 
 class PythonHandler(Handler):
@@ -16,15 +15,6 @@ class PythonHandler(Handler):
     def __init__(
         self,
         config: dict,
-        kv_page_size: int,
-        max_dist_size: int,
-        max_num_kv_pages: int,
-        max_num_embeds: int,
-        max_batch_tokens: int,
-        max_num_adapters: int,
-        max_adapter_rank: int,
-        dtype: torch.dtype,
-        device: str,
     ):
         """Initialize Python handler with FlashInfer operations."""
 
@@ -35,15 +25,6 @@ class PythonHandler(Handler):
         super().__init__(
             config=config,
             ops=flashinfer_ops,
-            kv_page_size=kv_page_size,
-            max_dist_size=max_dist_size,
-            max_num_kv_pages=max_num_kv_pages,
-            max_num_embeds=max_num_embeds,
-            max_batch_tokens=max_batch_tokens,
-            max_num_adapters=max_num_adapters,
-            max_adapter_rank=max_adapter_rank,
-            dtype=dtype,
-            device=device,
         )
 
         print("✅ PythonHandler initialized with FlashInfer backend")

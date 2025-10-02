@@ -28,15 +28,6 @@ class Handler:
         self,
         config: dict,
         ops,  # Backend operations (FlashInferOps, MetalOps, etc.)
-        kv_page_size: int,
-        max_dist_size: int,
-        max_num_kv_pages: int,
-        max_num_embeds: int,
-        max_batch_tokens: int,
-        max_num_adapters: int,
-        max_adapter_rank: int,
-        dtype: torch.dtype,
-        device: str,
     ):
         """TODO: Add method docstring."""
         self.adapters = {}
@@ -48,65 +39,75 @@ class Handler:
         from model_factory import create_model_and_fusion_map
 
         self.model_info = load_model_info(config)
-        self.kv_page_size = kv_page_size
-        self.max_dist_size = max_dist_size
-        self.max_num_kv_pages = max_num_kv_pages
-        self.max_num_embeds = max_num_embeds
-        self.max_batch_tokens = max_batch_tokens
-        self.max_num_adapters = max_num_adapters
-        self.max_adapter_rank = max_adapter_rank
-        self.dtype = dtype
-        self.device = device
-        self.logits_dtype = dtype
+        self.kv_page_size = config["kv_page_size"]
+        self.max_dist_size = config["max_dist_size"]
+        self.max_num_embeds = config["max_num_embeds"]
+        self.max_batch_tokens = config["max_batch_tokens"]
+        self.max_num_adapters = config["max_num_adapters"]
+        self.max_adapter_rank = config["max_adapter_rank"]
+        self.dtype = getattr(torch, config["dtype"])
+        self.device = config["device"]
+        self.logits_dtype = getattr(torch, config["dtype"])
 
-        # Allocate big contiguous tensors first before loading the model,
+        # If `gpu_mem_headroom` is set by the user, then we will cap the KV
+        # cache size so that there is some percentage of GPU memory left over
+        # after loading the model and allocating the KV cache.
+        if "gpu_mem_headroom" in config:
+            adaptive_kv_cache_size = True
+        else:
+            adaptive_kv_cache_size = False
+
+        # If the KV cache size is fixed, then we allocate the KV cache,
+        # which are big contiguous tensors, before loading the model,
         # since during model loading, many temporary tensors are created,
         # which may lead to fragmentation and out-of-memory errors if big
         # tensors are not allocated up front.
-        self.kv_cache_at_layer = [
-            torch.zeros(
-                (
-                    max_num_kv_pages,
-                    2,
-                    kv_page_size,
-                    self.model_info.architecture.num_key_value_heads,
-                    self.model_info.architecture.head_size,
-                ),
-                dtype=dtype,
-                device=device,
-            )
-            for _ in range(self.model_info.architecture.num_layers)
-        ]
+        if not adaptive_kv_cache_size:
+            self.max_num_kv_pages = config["max_num_kv_pages"]
+            self.kv_cache_at_layer = [
+                torch.zeros(
+                    (
+                        self.max_num_kv_pages,
+                        2,
+                        self.kv_page_size,
+                        self.model_info.architecture.num_key_value_heads,
+                        self.model_info.architecture.head_size,
+                    ),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                for _ in range(self.model_info.architecture.num_layers)
+            ]
 
         self.embeds = torch.empty(
-            (max_num_embeds, self.model_info.architecture.hidden_size),
-            device=device,
-            dtype=dtype,
+            (self.max_num_embeds, self.model_info.architecture.hidden_size),
+            device=self.device,
+            dtype=self.dtype,
         )
 
         self.adapter_at_layer = [
             (
                 torch.zeros(
                     (
-                        max_num_adapters,
-                        max_adapter_rank * 3,
+                        self.max_num_adapters,
+                        self.max_adapter_rank * 3,
                         self.model_info.architecture.hidden_size,
                     ),
-                    dtype=dtype,
-                    device=device,
+                    dtype=self.dtype,
+                    device=self.device,
                 ),
                 torch.zeros(
                     (
-                        max_num_adapters,
+                        self.max_num_adapters,
                         self.model_info.architecture.head_size
                         * (
                             self.model_info.architecture.num_query_heads
                             + self.model_info.architecture.num_key_value_heads * 2
                         ),
-                        max_adapter_rank,
+                        self.max_adapter_rank,
                     ),
-                    dtype=dtype,
-                    device=device,
+                    dtype=self.dtype,
+                    device=self.device,
                 ),
             )
             for _ in range(self.model_info.architecture.num_layers)
@@ -117,6 +118,67 @@ class Handler:
             self.model_info,
             create_model_and_fusion_map,
         )
+
+        # If `gpu_mem_headroom` is set by the user, then we have to allocate the KV
+        # cache at the end and dynamically calculate the number of KV pages based on
+        # the available GPU memory.
+        if adaptive_kv_cache_size:
+            # Calculate the available GPU memory for the KV cache after accounting for
+            # the reserved GPU memory specified through `gpu_mem_headroom`.
+            free_gpu_mem_bytes, total_gpu_mem_bytes = torch.cuda.mem_get_info(
+                self.device
+            )
+            used_gpu_mem_bytes = total_gpu_mem_bytes - free_gpu_mem_bytes
+            reserved_gpu_mem_percentage = config["gpu_mem_headroom"]
+            useable_gpu_mem_bytes = total_gpu_mem_bytes * (
+                1 - (reserved_gpu_mem_percentage / 100)
+            )
+            available_kv_cache_bytes = useable_gpu_mem_bytes - used_gpu_mem_bytes
+
+            if available_kv_cache_bytes <= 0:
+                raise ValueError(
+                    "Not enough GPU memory available to allocate the KV cache. "
+                    "Please decrease 'gpu_mem_headroom'."
+                )
+
+            # Calculate the number of KV pages based on the available GPU memory.
+            self.max_num_kv_pages = int(
+                available_kv_cache_bytes
+                / (
+                    self.kv_page_size
+                    * 2
+                    * self.model_info.architecture.num_key_value_heads
+                    * self.model_info.architecture.head_size
+                    * self.model_info.architecture.num_layers
+                    * self.dtype.itemsize
+                )
+            )
+
+            # If the user also specified "max_num_kv_pages", then we will use the
+            # smaller of the two values.
+            if "max_num_kv_pages" in config:
+                if self.max_num_kv_pages > config["max_num_kv_pages"]:
+                    self.max_num_kv_pages = config["max_num_kv_pages"]
+                elif self.max_num_kv_pages < config["max_num_kv_pages"]:
+                    print(
+                        f"'max_num_kv_pages' is reduced to {self.max_num_kv_pages} "
+                        "to respect 'gpu_mem_headroom'."
+                    )
+
+            self.kv_cache_at_layer = [
+                torch.zeros(
+                    (
+                        self.max_num_kv_pages,
+                        2,
+                        self.kv_page_size,
+                        self.model_info.architecture.num_key_value_heads,
+                        self.model_info.architecture.head_size,
+                    ),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                for _ in range(self.model_info.architecture.num_layers)
+            ]
 
         self.inter_fill_time = time.time()
 
