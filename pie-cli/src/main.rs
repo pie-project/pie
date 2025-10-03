@@ -8,7 +8,6 @@ use pie::{
     Config as EngineConfig,
     auth::{create_jwt, init_secret},
     client::{self, Client},
-    server,
 };
 use rand::{Rng, distr::Alphanumeric};
 use reqwest::Client as HttpClient;
@@ -20,7 +19,6 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Helper}; // The Helper trait is still needed
 use serde::Deserialize;
 use std::sync::Arc;
-use std::time::Duration;
 use std::{
     env,
     fs::{self},
@@ -28,7 +26,7 @@ use std::{
     path::PathBuf,
     process::Stdio, // MODIFIED: Added for process spawning
 };
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
@@ -50,7 +48,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Start the PIE engine and enter an interactive session.
-    Start(StartArgs),
+    Serve(ServeArgs),
     #[command(subcommand)]
     /// Manage local models.
     Model(ModelCommands),
@@ -58,7 +56,7 @@ enum Commands {
 
 #[derive(Args, Debug)]
 /// Arguments for starting the PIE engine.
-pub struct StartArgs {
+pub struct ServeArgs {
     /// Path to a custom TOML configuration file.
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -84,9 +82,9 @@ fn expand_tilde(s: &str) -> Result<PathBuf, std::convert::Infallible> {
     Ok(PathBuf::from(shellexpand::tilde(s).as_ref()))
 }
 
-#[derive(Parser, Debug)] // Changed from `Args` to `Parser`
-/// Arguments to submit an inferlet (Wasm program) to the engine.
-pub struct RunArgs {
+#[derive(Parser, Debug)]
+/// Arguments to submit an inferlet (Wasm program) to the engine in the shell.
+pub struct ShellRunArgs {
     /// Path to the .wasm inferlet file.
     #[arg(value_parser = expand_tilde)]
     pub wasm_path: PathBuf,
@@ -105,7 +103,6 @@ pub enum ModelCommands {
     List,
     Add(AddModelArgs),
     Remove(RemoveModelArgs),
-    Serve(ModelServeArgs),
 }
 #[derive(Args, Debug)]
 pub struct AddModelArgs {
@@ -114,13 +111,6 @@ pub struct AddModelArgs {
 #[derive(Args, Debug)]
 pub struct RemoveModelArgs {
     pub model_name: String,
-}
-#[derive(Args, Debug)]
-pub struct ModelServeArgs {
-    pub model_name: String,
-    /// Port to serve the model on
-    #[arg(long, default_value = "8080")]
-    pub port: u16,
 }
 
 // Helper struct for parsing the TOML config file
@@ -153,7 +143,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start(args) => {
+        Commands::Serve(args) => {
             // MODIFIED: Build both engine and backend configs.
             let (engine_config, backend_configs) = build_configs(&args)?;
 
@@ -469,7 +459,7 @@ async fn handle_interactive_command(
             // Prepend a dummy command name so clap can parse the args slice.
             let clap_args = std::iter::once("run").chain(args.iter().copied());
 
-            match RunArgs::try_parse_from(clap_args) {
+            match ShellRunArgs::try_parse_from(clap_args) {
                 Ok(run_args) => {
                     if let Err(e) = handle_run(run_args, client_config, printer).await {
                         // Use the printer to avoid corrupting the prompt.
@@ -512,12 +502,12 @@ async fn handle_interactive_command(
 
 /// Connects to the engine and executes a Wasm inferlet.
 async fn handle_run(
-    args: RunArgs,
+    args: ShellRunArgs,
     client_config: &ClientConfig,
     printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
 ) -> Result<()> {
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
-    let mut client = match Client::connect(&url).await {
+    let client = match Client::connect(&url).await {
         Ok(c) => c,
         Err(_) => {
             return Err(anyhow!(
@@ -680,9 +670,6 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
                 anyhow::bail!("Model '{}' not found locally.", args.model_name);
             }
         }
-        ModelCommands::Serve(_args) => {
-            return Err(anyhow!("`model serve` is not yet implemented."));
-        }
     }
     Ok(())
 }
@@ -693,7 +680,7 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
 
 /// Merges config from file and CLI args to create the final EngineConfig.
 // MODIFIED: Renamed to build_configs and now returns backend configs as well.
-fn build_configs(args: &StartArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
+fn build_configs(args: &ServeArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
     let file_config: ConfigFile = if let Some(path) = &args.config {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file at {:?}", path))?;
