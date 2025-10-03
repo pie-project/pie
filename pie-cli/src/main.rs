@@ -210,15 +210,16 @@ async fn start_interactive_session(
         auth_secret: engine_config.auth_secret.clone(),
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
 
-    // 2. Start the main PIE engine server in a background task
-    println!("🚀 Starting PIE engine in background...");
+    // 2. Start the main PIE engine server
+    println!("🚀 Starting PIE engine...");
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = pie::run_server(engine_config, shutdown_rx).await {
+        if let Err(e) = pie::run_server(engine_config, ready_tx, shutdown_rx).await {
             eprintln!("\n[Engine Error] Engine failed: {}", e);
         }
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    ready_rx.await.unwrap();
     println!("✅ Engine started.");
 
     // 3. Initialize the interactive prompt with highlighting and an external printer
