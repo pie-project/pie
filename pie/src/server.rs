@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::mem;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
@@ -134,6 +135,13 @@ pub enum ClientMessage {
         service_type: String,
         service_name: String,
     },
+
+    #[serde(rename = "wait_backend_change")]
+    WaitBackendChange {
+        corr_id: u32,
+        cur_num_attached_backends: Option<u32>,
+        cur_num_detached_backends: Option<u32>,
+    },
 }
 
 /// Messages from server -> client
@@ -167,7 +175,15 @@ pub enum ServerMessage {
 
     #[serde(rename = "server_event")]
     ServerEvent { message: String },
+
+    #[serde(rename = "backend_change")]
+    BackendChange {
+        corr_id: u32,
+        num_attached: u32,
+        num_rejected: u32,
+    },
 }
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum EventCode {
     Message = 0,
@@ -224,6 +240,9 @@ struct ServerState {
     client_id_pool: Mutex<IdPool<ClientId>>,
     clients: DashMap<ClientId, JoinHandle<()>>,
     instance_chans: DashMap<InstanceId, mpsc::Sender<ClientCommand>>,
+    backend_attached_count: AtomicU32,
+    backend_rejected_count: AtomicU32,
+    backend_notify: tokio::sync::Notify,
 }
 
 pub struct Server {
@@ -238,6 +257,9 @@ impl Server {
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
             instance_chans: DashMap::new(),
+            backend_attached_count: AtomicU32::new(0),
+            backend_rejected_count: AtomicU32::new(0),
+            backend_notify: tokio::sync::Notify::new(),
         });
 
         let listener_loop = task::spawn(Self::listener_loop(addr.to_string(), state.clone()));
@@ -470,6 +492,18 @@ impl Client {
                         chunk_index,
                         total_chunks,
                         chunk_data,
+                    )
+                    .await;
+                }
+                ClientMessage::WaitBackendChange {
+                    corr_id,
+                    cur_num_attached_backends,
+                    cur_num_detached_backends,
+                } => {
+                    self.handle_wait_backend_change(
+                        corr_id,
+                        cur_num_attached_backends,
+                        cur_num_detached_backends,
                     )
                     .await;
                 }
@@ -810,19 +844,35 @@ impl Client {
                         model::register_model(service_name, service_id);
                         self.send_response(corr_id, true, "Model service registered".into())
                             .await;
+                        self.state
+                            .backend_attached_count
+                            .fetch_add(1, Ordering::SeqCst);
+                        self.state.backend_notify.notify_waiters();
                     } else {
                         self.send_response(corr_id, false, "Failed to register model".into())
                             .await;
+                        self.state
+                            .backend_rejected_count
+                            .fetch_add(1, Ordering::SeqCst);
+                        self.state.backend_notify.notify_waiters();
                     }
                 }
                 Err(_) => {
                     self.send_response(corr_id, false, "Failed to attach to model backend".into())
-                        .await
+                        .await;
+                    self.state
+                        .backend_rejected_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.state.backend_notify.notify_waiters();
                 }
             },
             other => {
                 self.send_response(corr_id, false, format!("Unknown service type: {other}"))
-                    .await
+                    .await;
+                self.state
+                    .backend_rejected_count
+                    .fetch_add(1, Ordering::SeqCst);
+                self.state.backend_notify.notify_waiters();
             }
         }
     }
@@ -928,7 +978,7 @@ impl Client {
     }
 
     /// Handles an internal command to send a blob to the connected client.
-    async fn handle_send_blob(&mut self, inst_id: InstanceId, data:Bytes) {
+    async fn handle_send_blob(&mut self, inst_id: InstanceId, data: Bytes) {
         if !self.authenticated {
             return;
         }
@@ -946,6 +996,46 @@ impl Client {
                 chunk_data: chunk.to_vec(),
             })
             .await;
+        }
+    }
+
+    async fn handle_wait_backend_change(
+        &mut self,
+        corr_id: u32,
+        cur_num_attached_backends: Option<u32>,
+        cur_num_detached_backends: Option<u32>,
+    ) {
+        if !self.authenticated {
+            self.send_response(corr_id, false, "Not authenticated".into())
+                .await;
+            return;
+        }
+
+        loop {
+            // IMPORTANT: Create the notified future BEFORE checking the condition
+            // to avoid race condition where notification happens between check and wait
+            let notified = self.state.backend_notify.notified();
+
+            let num_attached = self.state.backend_attached_count.load(Ordering::SeqCst);
+            let num_rejected = self.state.backend_rejected_count.load(Ordering::SeqCst);
+
+            // Check if values have changed from what client knows
+            let attached_changed = cur_num_attached_backends.map_or(true, |v| v != num_attached);
+            let rejected_changed = cur_num_detached_backends.map_or(true, |v| v != num_rejected);
+
+            if attached_changed || rejected_changed {
+                // Return new values to client
+                self.send(ServerMessage::BackendChange {
+                    corr_id,
+                    num_attached,
+                    num_rejected,
+                })
+                .await;
+                return;
+            }
+
+            // Wait for notification of backend changes
+            notified.await;
         }
     }
 
