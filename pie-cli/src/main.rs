@@ -27,9 +27,10 @@ use std::{
     process::Stdio, // MODIFIED: Added for process spawning
 };
 use tokio::io::BufReader;
-use tokio::process::Command as TokioCommand;
+use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::Mutex;
-use tokio::sync::oneshot;
+use tokio::sync::oneshot::{self, Sender};
+use tokio::task::JoinHandle;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -144,14 +145,21 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Serve(args) => {
-            // MODIFIED: Build both engine and backend configs.
+            // 1. Build both engine and backend configs.
             let (engine_config, backend_configs) = build_configs(&args)?;
 
             // 2. Initialize logging based on the config and get the file-writer guard
             let _guard = init_logging(&engine_config)?;
 
-            // 3. Start the interactive session, passing both configs
-            start_interactive_session(engine_config, backend_configs).await?;
+            // 3. Start the engine and backend services
+            let (shutdown_tx, server_handle, backend_processes, client_config) =
+                start_engine_and_backend(engine_config, backend_configs).await?;
+
+            // 4. Start the interactive session, passing both configs
+            start_interactive_session(client_config).await?;
+
+            // 5. Terminate the engine and backend services
+            terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
         }
         Commands::Model(cmd) => {
             // Model commands don't start the engine, so they can use a simple logger
@@ -198,11 +206,10 @@ impl Validator for MyHelper {
 // Finally, we implement the `Helper` marker trait itself.
 impl Helper for MyHelper {}
 
-/// Starts the engine and drops into a client command-prompt session.
-async fn start_interactive_session(
+async fn start_engine_and_backend(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
-) -> Result<()> {
+) -> Result<(Sender<()>, JoinHandle<()>, Vec<Child>, ClientConfig)> {
     // 1. Initialize engine and client configurations
     let client_config = ClientConfig {
         host: engine_config.host.clone(),
@@ -221,16 +228,7 @@ async fn start_interactive_session(
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     println!("✅ Engine started.");
 
-    // 3. Initialize the interactive prompt with highlighting and an external printer
-    println!("Entering interactive session. Type 'help' for commands or use ↑/↓ for history.");
-    let mut rl = Editor::new()?;
-    rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
-    let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
-        Arc::new(Mutex::new(rl.create_external_printer()?));
-    let history_path = get_pie_home()?.join(".pie_history");
-    let _ = rl.load_history(&history_path);
-
-    // 4. Launch all configured backend services
+    // 3. Launch all configured backend services
     let mut backend_processes = Vec::new();
     if !backend_configs.is_empty() {
         println!("🚀 Launching backend services...");
@@ -320,8 +318,6 @@ async fn start_interactive_session(
                 .take()
                 .context("Could not capture stderr from backend process.")?;
 
-            // Clone the Arc for the new task.
-            let printer_stdout = Arc::clone(&printer);
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut reader = BufReader::new(stdout);
@@ -332,22 +328,18 @@ async fn start_interactive_session(
                         Ok(n) => {
                             // We've received `n` bytes. Convert to a string (lossily) and print.
                             let output = String::from_utf8_lossy(&buffer[..n]);
-                            let mut p = printer_stdout.lock().await;
                             // Use `print!` to avoid adding an extra newline
-                            p.print(format!("[Backend] {}", output)).unwrap();
+                            print!("[Backend] {}", output);
                         }
                         Err(e) => {
                             // Handle read error, e.g., print it and break
-                            let mut p = printer_stdout.lock().await;
-                            p.print(format!("[Backend Read Error] {}", e)).unwrap();
+                            eprint!("[Backend Read Error] {}", e);
                             break;
                         }
                     }
                 }
             });
 
-            // Clone the Arc again for the stderr task.
-            let printer_stderr = Arc::clone(&printer);
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut reader = BufReader::new(stderr);
@@ -357,12 +349,10 @@ async fn start_interactive_session(
                         Ok(0) => break,
                         Ok(n) => {
                             let output = String::from_utf8_lossy(&buffer[..n]);
-                            let mut p = printer_stderr.lock().await;
-                            p.print(format!("[Backend] {}", output)).unwrap();
+                            print!("[Backend] {}", output);
                         }
                         Err(e) => {
-                            let mut p = printer_stderr.lock().await;
-                            p.print(format!("[Backend Read Error] {}", e)).unwrap();
+                            eprint!("[Backend Read Error] {}", e);
                             break;
                         }
                     }
@@ -373,7 +363,20 @@ async fn start_interactive_session(
         }
     }
 
-    // 5. Start the main interactive loop
+    Ok((shutdown_tx, server_handle, backend_processes, client_config))
+}
+
+/// Starts the engine and drops into a client command-prompt session.
+async fn start_interactive_session(client_config: ClientConfig) -> Result<()> {
+    println!("Entering interactive session. Type 'help' for commands or use ↑/↓ for history.");
+    let mut rl = Editor::new()?;
+    rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
+    let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
+        Arc::new(Mutex::new(rl.create_external_printer()?));
+    let history_path = get_pie_home()?.join(".pie_history");
+    let _ = rl.load_history(&history_path);
+
+    // The main interactive loop
     loop {
         match rl.readline("pie> ") {
             Ok(line) => {
@@ -415,12 +418,19 @@ async fn start_interactive_session(
         }
     }
 
-    // 6. Begin graceful shutdown
     println!("Shutting down services...");
     if let Err(err) = rl.save_history(&history_path) {
         eprintln!("Warning: Failed to save command history: {}", err);
     }
 
+    Ok(())
+}
+
+async fn terminate_engine_and_backend(
+    backend_processes: Vec<Child>,
+    shutdown_tx: oneshot::Sender<()>,
+    server_handle: tokio::task::JoinHandle<()>,
+) -> Result<()> {
     // Iterate through the child processes, signal them, and wait for them to exit.
     for mut child in backend_processes {
         // <-- Make `child` mutable to call .wait()
