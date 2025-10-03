@@ -3,10 +3,10 @@ use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
+mod api;
 pub mod auth;
 pub mod client;
 mod instance;
-mod api;
 mod kvs;
 mod messaging;
 mod model;
@@ -39,7 +39,11 @@ pub struct Config {
 ///
 /// This async function sets up all the engine's services and listens for a shutdown
 /// signal to terminate gracefully.
-pub async fn run_server(config: Config, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
+pub async fn run_server(
+    config: Config,
+    ready_tx: oneshot::Sender<()>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> Result<()> {
     // Ensure the cache directory exists
     fs::create_dir_all(&config.cache_dir).with_context(|| {
         let err_msg = format!(
@@ -77,6 +81,7 @@ pub async fn run_server(config: Config, mut shutdown_rx: oneshot::Receiver<()>) 
     install_service("messaging-user2inst", messaging_user2inst);
 
     tracing::info!("✅ PIE runtime started successfully on {}", server_url);
+    ready_tx.send(()).unwrap();
 
     // Wait for either a Ctrl+C signal or the shutdown signal from the parent task
     tokio::select! {
