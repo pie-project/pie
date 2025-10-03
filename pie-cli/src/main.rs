@@ -15,6 +15,7 @@ use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
+use rustyline::history::FileHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Helper}; // The Helper trait is still needed
 use serde::Deserialize;
@@ -27,9 +28,10 @@ use std::{
     process::Stdio, // MODIFIED: Added for process spawning
 };
 use tokio::io::BufReader;
-use tokio::process::Command as TokioCommand;
+use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::Mutex;
-use tokio::sync::oneshot;
+use tokio::sync::oneshot::{self, Sender};
+use tokio::task::JoinHandle;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -47,7 +49,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start the PIE engine and enter an interactive session.
+    /// Start the Pie engine and enter an interactive session.
     Serve(ServeArgs),
     #[command(subcommand)]
     /// Manage local models.
@@ -87,7 +89,7 @@ fn expand_tilde(s: &str) -> Result<PathBuf, std::convert::Infallible> {
 pub struct ShellRunArgs {
     /// Path to the .wasm inferlet file.
     #[arg(value_parser = expand_tilde)]
-    pub wasm_path: PathBuf,
+    pub inferlet_path: PathBuf,
 
     /// Run the inferlet in the background and print its instance ID.
     #[arg(long, short)]
@@ -144,14 +146,19 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Serve(args) => {
-            // MODIFIED: Build both engine and backend configs.
-            let (engine_config, backend_configs) = build_configs(&args)?;
+            let (engine_config, backend_configs) = build_configs(
+                args.config,
+                args.no_auth,
+                args.host,
+                args.port,
+                args.verbose,
+                args.log,
+            )?;
 
-            // 2. Initialize logging based on the config and get the file-writer guard
+            // Initialize logging based on the config and get the file-writer guard
             let _guard = init_logging(&engine_config)?;
 
-            // 3. Start the interactive session, passing both configs
-            start_interactive_session(engine_config, backend_configs).await?;
+            handle_serve_command(engine_config, backend_configs).await?;
         }
         Commands::Model(cmd) => {
             // Model commands don't start the engine, so they can use a simple logger
@@ -198,280 +205,28 @@ impl Validator for MyHelper {
 // Finally, we implement the `Helper` marker trait itself.
 impl Helper for MyHelper {}
 
-/// Starts the engine and drops into a client command-prompt session.
-async fn start_interactive_session(
+/// Handles the `pie serve` command.
+async fn handle_serve_command(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
 ) -> Result<()> {
-    // 1. Initialize engine and client configurations
-    let client_config = ClientConfig {
-        host: engine_config.host.clone(),
-        port: engine_config.port,
-        auth_secret: engine_config.auth_secret.clone(),
-    };
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let (ready_tx, ready_rx) = oneshot::channel();
+    let (rl, printer) = create_editor_and_printer().await?;
 
-    // 2. Start the main PIE engine server
-    println!("🚀 Starting PIE engine...");
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = pie::run_server(engine_config, ready_tx, shutdown_rx).await {
-            eprintln!("\n[Engine Error] Engine failed: {}", e);
-        }
-    });
-    ready_rx.await.unwrap();
-    println!("✅ Engine started.");
+    // Start the engine and backend services
+    let (shutdown_tx, server_handle, backend_processes, client_config) =
+        start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
 
-    // 3. Initialize the interactive prompt with highlighting and an external printer
-    println!("Entering interactive session. Type 'help' for commands or use ↑/↓ for history.");
-    let mut rl = Editor::new()?;
-    rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
-    let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
-        Arc::new(Mutex::new(rl.create_external_printer()?));
-    let history_path = get_pie_home()?.join(".pie_history");
-    let _ = rl.load_history(&history_path);
+    // Start the interactive session, passing both configs
+    run_shell(client_config, rl, printer).await?;
 
-    // 4. Launch all configured backend services
-    let mut backend_processes = Vec::new();
-    if !backend_configs.is_empty() {
-        println!("🚀 Launching backend services...");
-        init_secret(&client_config.auth_secret);
-        let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
-
-        for backend_config in &backend_configs {
-            let backend_table = backend_config
-                .as_table()
-                .context("Each [[backend]] entry in config.toml must be a table.")?;
-            let backend_type = backend_table
-                .get("backend_type")
-                .and_then(|v| v.as_str())
-                .context("`backend_type` is missing or not a string.")?;
-            let exec_path = backend_table
-                .get("exec_path")
-                .and_then(|v| v.as_str())
-                .context("`exec_path` is missing or not a string.")?;
-
-            let mut cmd = if backend_type == "python" {
-                let mut cmd = TokioCommand::new("uv");
-                cmd.arg("--project");
-                cmd.arg("../backend/backend-python");
-                cmd.arg("run");
-                cmd.arg("python");
-                cmd.arg("-u");
-                cmd.arg(exec_path);
-                cmd
-            } else {
-                TokioCommand::new(exec_path)
-            };
-
-            let random_port: u16 = rand::rng().random_range(49152..=65535);
-            cmd.arg("--host")
-                .arg("localhost")
-                .arg("--port")
-                .arg(random_port.to_string())
-                .arg("--controller_host")
-                .arg(&client_config.host)
-                .arg("--controller_port")
-                .arg(client_config.port.to_string())
-                .arg("--auth_token")
-                .arg(&auth_token);
-
-            for (key, value) in backend_table {
-                if key == "backend_type" || key == "exec_path" {
-                    continue;
-                }
-                cmd.arg(format!("--{}", key))
-                    .arg(value.to_string().trim_matches('"').to_string());
-            }
-
-            // Make sure the backend process is a process group leader.
-            unsafe {
-                cmd.pre_exec(|| {
-                    nix::unistd::setsid()?;
-
-                    // On Linux, ask the kernel to send SIGKILL to this process when
-                    // the parent (the Rust program) dies. This handles accidental termination.
-                    #[cfg(target_os = "linux")]
-                    {
-                        // libc::PR_SET_PDEATHSIG is the raw constant for this operation.
-                        // SIGKILL is a non-catchable, non-ignorable signal.
-                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
-                            // If prctl fails, return an error from the closure.
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    Ok(())
-                });
-            }
-
-            println!("- Spawning backend: {}", exec_path);
-            let mut child = cmd
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .with_context(|| format!("Failed to spawn backend process: '{}'", exec_path))?;
-
-            // Stream backend output using the external printer to avoid corrupting the prompt
-            let stdout = child
-                .stdout
-                .take()
-                .context("Could not capture stdout from backend process.")?;
-            let stderr = child
-                .stderr
-                .take()
-                .context("Could not capture stderr from backend process.")?;
-
-            // Clone the Arc for the new task.
-            let printer_stdout = Arc::clone(&printer);
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut reader = BufReader::new(stdout);
-                let mut buffer = [0; 1024]; // Read in 1KB chunks
-                loop {
-                    match reader.read(&mut buffer).await {
-                        Ok(0) => break, // EOF, the child process has closed its stdout
-                        Ok(n) => {
-                            // We've received `n` bytes. Convert to a string (lossily) and print.
-                            let output = String::from_utf8_lossy(&buffer[..n]);
-                            let mut p = printer_stdout.lock().await;
-                            // Use `print!` to avoid adding an extra newline
-                            p.print(format!("[Backend] {}", output)).unwrap();
-                        }
-                        Err(e) => {
-                            // Handle read error, e.g., print it and break
-                            let mut p = printer_stdout.lock().await;
-                            p.print(format!("[Backend Read Error] {}", e)).unwrap();
-                            break;
-                        }
-                    }
-                }
-            });
-
-            // Clone the Arc again for the stderr task.
-            let printer_stderr = Arc::clone(&printer);
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut reader = BufReader::new(stderr);
-                let mut buffer = [0; 1024];
-                loop {
-                    match reader.read(&mut buffer).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let output = String::from_utf8_lossy(&buffer[..n]);
-                            let mut p = printer_stderr.lock().await;
-                            p.print(format!("[Backend] {}", output)).unwrap();
-                        }
-                        Err(e) => {
-                            let mut p = printer_stderr.lock().await;
-                            p.print(format!("[Backend Read Error] {}", e)).unwrap();
-                            break;
-                        }
-                    }
-                }
-            });
-
-            backend_processes.push(child);
-        }
-    }
-
-    let backend_query_client = connect_and_authenticate(&client_config).await?;
-    
-    // Query the number of attached and rejected backends.
-    let (mut num_attached, mut num_rejected) = backend_query_client.wait_backend_change(None, None).await?;
-    
-    // If no backends are attached or rejected, wait for a change.
-    while (num_attached as usize) < backend_processes.len() && num_rejected == 0 {
-        (num_attached, num_rejected) = backend_query_client.wait_backend_change(Some(num_attached), Some(num_rejected)).await?;
-    }
-    
-    // We expect no backends to be rejected and the number of attached backends
-    // to match the number of backend processes.
-    if (num_attached as usize) != backend_processes.len() || num_rejected != 0 {
-        anyhow::bail!(
-            "Unexpected backend state: {} backend(s) attached, {} backend(s) rejected",
-            num_attached,
-            num_rejected
-        );
-    }
-
-    std::mem::drop(backend_query_client);
-    
-    // 5. Start the main interactive loop
-    loop {
-        match rl.readline("pie> ") {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                let parts: Vec<String> = match shlex::split(&line) {
-                    Some(parts) => parts,
-                    None => {
-                        eprintln!("Error: Mismatched quotes in command.");
-                        continue;
-                    }
-                };
-                if parts.is_empty() {
-                    continue;
-                }
-
-                // FIX: Pass the printer to the command handler.
-                match handle_interactive_command(
-                    &parts[0],
-                    &parts[1..].iter().map(AsRef::as_ref).collect::<Vec<_>>(),
-                    &client_config,
-                    &printer,
-                )
-                .await
-                {
-                    Ok(should_exit) if should_exit => break,
-                    Ok(_) => (),
-                    Err(e) => eprintln!("Error: {}", e),
-                }
-            }
-            Err(ReadlineError::Interrupted) => println!("(To exit, type 'exit' or press Ctrl-D)"),
-            Err(ReadlineError::Eof) => {
-                println!("Exiting...");
-                break;
-            }
-            Err(err) => {
-                eprintln!("Error reading line: {}", err);
-                break;
-            }
-        }
-    }
-
-    // 6. Begin graceful shutdown
-    println!("Shutting down services...");
-    if let Err(err) = rl.save_history(&history_path) {
-        eprintln!("Warning: Failed to save command history: {}", err);
-    }
-
-    // Iterate through the child processes, signal them, and wait for them to exit.
-    for mut child in backend_processes {
-        // <-- Make `child` mutable to call .wait()
-        if let Some(pid) = child.id() {
-            let pgid = nix::unistd::Pid::from_raw(pid as i32);
-            println!("- Terminating backend process group with PID: {}", pid);
-
-            // Send SIGTERM to the entire process group.
-            if let Err(e) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM) {
-                eprintln!("  Failed to send SIGTERM to process group {}: {}", pid, e);
-            }
-        }
-
-        // This prevents the main program from exiting before cleanup is complete.
-        if let Err(e) = child.wait().await {
-            eprintln!("  Error while waiting for backend process to exit: {}", e);
-        }
-    }
-
-    let _ = shutdown_tx.send(());
-    server_handle.await?;
-    println!("✅ Shutdown complete.");
+    // Terminate the engine and backend services
+    terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
 
     Ok(())
 }
 
-/// Parses and executes commands entered in the interactive session.
-async fn handle_interactive_command(
+/// Parses and executes commands in the shell.
+async fn handle_shell_command(
     command: &str,
     args: &[&str],
     client_config: &ClientConfig,
@@ -484,7 +239,15 @@ async fn handle_interactive_command(
 
             match ShellRunArgs::try_parse_from(clap_args) {
                 Ok(run_args) => {
-                    if let Err(e) = handle_run(run_args, client_config, printer).await {
+                    if let Err(e) = run_inferlet(
+                        client_config,
+                        run_args.inferlet_path,
+                        run_args.arguments,
+                        run_args.detach,
+                        printer,
+                    )
+                    .await
+                    {
                         // Use the printer to avoid corrupting the prompt.
                         let mut p = printer.lock().await;
                         p.print(format!("Error running inferlet: {e}")).unwrap();
@@ -523,79 +286,7 @@ async fn handle_interactive_command(
     Ok(false)
 }
 
-/// Connects to the engine and authenticates the client.
-async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
-    let url = format!("ws://{}:{}", client_config.host, client_config.port);
-    let client = match Client::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => {
-            anyhow::bail!("Could not connect to engine at {}. Is it running?", url);
-        }
-    };
-
-    let token = create_jwt("default", pie::auth::Role::User)?;
-    client.authenticate(&token).await?;
-    Ok(client)
-}
-
-/// Connects to the engine and executes a Wasm inferlet.
-async fn handle_run(
-    args: ShellRunArgs,
-    client_config: &ClientConfig,
-    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
-) -> Result<()> {
-    let client = connect_and_authenticate(client_config).await?;
-
-    let wasm_blob = fs::read(&args.wasm_path)
-        .with_context(|| format!("Failed to read Wasm file at {:?}", args.wasm_path))?;
-    let hash = client::hash_blob(&wasm_blob);
-    println!("Inferlet hash: {}", hash);
-
-    if !client.program_exists(&hash).await? {
-        client.upload_program(&wasm_blob).await?;
-        println!("✅ Inferlet upload successful.");
-    }
-
-    let arguments = args.arguments.clone();
-    let mut instance = client.launch_instance(&hash, arguments).await?;
-    println!("✅ Inferlet launched with ID: {}", instance.id());
-
-    if !args.detach {
-        let instance_id = instance.id().to_string();
-
-        // FIX: Clone the Arc<Mutex<...>> for the new task.
-        let printer_clone = Arc::clone(printer);
-        tokio::spawn(async move {
-            while let Ok(event) = instance.recv().await {
-                match event {
-                    // Handle events that have a specific code and a text message.
-                    InstanceEvent::Event { code, message } => {
-                        // Determine if this event signals the end of the instance's execution.
-                        // Any event other than a simple 'Message' is considered a final state.
-                        let is_terminated = !matches!(code, EventCode::Message);
-
-                        // Format the output string.
-                        // Using the Debug representation of `code` is a clean way to get its name (e.g., "Completed").
-                        let output = format!("[Inferlet {}] {:?}: {}", instance_id, code, message);
-
-                        // Lock the printer, print the message, and then immediately release the lock.
-                        printer_clone.lock().await.print(output).unwrap();
-
-                        // If the instance's execution is finished, break out of the loop.
-                        if is_terminated {
-                            break;
-                        }
-                    }
-                    // If we receive a raw data blob, we'll ignore it and wait for the next event.
-                    InstanceEvent::Blob(_) => continue,
-                }
-            }
-            // No more "Press Enter" message needed!
-        });
-    }
-    Ok(())
-}
-
+/// Handles the `pie model` command.
 async fn handle_model_command(command: ModelCommands) -> Result<()> {
     match command {
         ModelCommands::List => {
@@ -704,10 +395,15 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
 // SECTION: Helpers
 //================================================================================//
 
-/// Merges config from file and CLI args to create the final EngineConfig.
-// MODIFIED: Renamed to build_configs and now returns backend configs as well.
-fn build_configs(args: &ServeArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
-    let file_config: ConfigFile = if let Some(path) = &args.config {
+fn build_configs(
+    config_path: Option<PathBuf>,
+    no_auth: bool,
+    host: Option<String>,
+    port: Option<u16>,
+    verbose: bool,
+    log: Option<PathBuf>,
+) -> Result<(EngineConfig, Vec<toml::Value>)> {
+    let cfg_file: ConfigFile = if let Some(path) = &config_path {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file at {:?}", path))?;
         toml::from_str(&content)?
@@ -715,12 +411,12 @@ fn build_configs(args: &ServeArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
         ConfigFile::default()
     };
 
-    let enable_auth = if args.no_auth {
+    let enable_auth = if no_auth {
         false
     } else {
-        file_config.enable_auth.unwrap_or(true)
+        cfg_file.enable_auth.unwrap_or(true)
     };
-    let auth_secret = file_config.auth_secret.unwrap_or_else(|| {
+    let auth_secret = cfg_file.auth_secret.unwrap_or_else(|| {
         rand::rng()
             .sample_iter(&Alphanumeric)
             .take(32)
@@ -729,23 +425,22 @@ fn build_configs(args: &ServeArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
     });
 
     let engine_config = EngineConfig {
-        host: args
-            .host
+        host: host
             .clone()
-            .or(file_config.host)
+            .or(cfg_file.host)
             .unwrap_or_else(|| "127.0.0.1".to_string()),
-        port: args.port.or(file_config.port).unwrap_or(8080),
+        port: port.or(cfg_file.port).unwrap_or(8080),
         enable_auth,
         auth_secret,
-        cache_dir: file_config
+        cache_dir: cfg_file
             .cache_dir
             .unwrap_or_else(|| get_pie_home().unwrap().join("programs")),
-        verbose: args.verbose || file_config.verbose.unwrap_or(false),
-        log: args.log.clone().or(file_config.log),
+        verbose: verbose || cfg_file.verbose.unwrap_or(false),
+        log: log.clone().or(cfg_file.log),
     };
 
     // Return both the engine config and the backend configs
-    Ok((engine_config, file_config.backend))
+    Ok((engine_config, cfg_file.backend))
 }
 
 fn get_pie_home() -> Result<PathBuf> {
@@ -756,6 +451,12 @@ fn get_pie_home() -> Result<PathBuf> {
             .map(|p| p.join("pie"))
             .ok_or_else(|| anyhow!("Failed to find home dir"))
     }
+}
+
+fn get_shell_history_path() -> Result<PathBuf> {
+    let pie_home = get_pie_home()?;
+    let history_path = pie_home.join(".pie_history");
+    Ok(history_path)
 }
 
 async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>> {
@@ -839,4 +540,390 @@ fn init_logging(config: &EngineConfig) -> Result<Option<WorkerGuard>> {
         .init();
 
     Ok(guard)
+}
+
+async fn start_engine_and_backend(
+    engine_config: EngineConfig,
+    backend_configs: Vec<toml::Value>,
+    printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<(Sender<()>, JoinHandle<()>, Vec<Child>, ClientConfig)> {
+    // Initialize engine and client configurations
+    let client_config = ClientConfig {
+        host: engine_config.host.clone(),
+        port: engine_config.port,
+        auth_secret: engine_config.auth_secret.clone(),
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    // Start the main PIE engine server
+    println!("🚀 Starting PIE engine...");
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = pie::run_server(engine_config, ready_tx, shutdown_rx).await {
+            eprintln!("\n[Engine Error] Engine failed: {}", e);
+        }
+    });
+    ready_rx.await.unwrap();
+    println!("✅ Engine started.");
+
+    // Launch all configured backend services
+    let mut backend_processes = Vec::new();
+    if !backend_configs.is_empty() {
+        println!("🚀 Launching backend services...");
+        init_secret(&client_config.auth_secret);
+        let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
+
+        for backend_config in &backend_configs {
+            let backend_table = backend_config
+                .as_table()
+                .context("Each [[backend]] entry in config.toml must be a table.")?;
+            let backend_type = backend_table
+                .get("backend_type")
+                .and_then(|v| v.as_str())
+                .context("`backend_type` is missing or not a string.")?;
+            let exec_path = backend_table
+                .get("exec_path")
+                .and_then(|v| v.as_str())
+                .context("`exec_path` is missing or not a string.")?;
+
+            let mut cmd = if backend_type == "python" {
+                let mut cmd = TokioCommand::new("uv");
+                cmd.arg("--project");
+                cmd.arg("../backend/backend-python");
+                cmd.arg("run");
+                cmd.arg("python");
+                cmd.arg("-u");
+                cmd.arg(exec_path);
+                cmd
+            } else {
+                TokioCommand::new(exec_path)
+            };
+
+            let random_port: u16 = rand::rng().random_range(49152..=65535);
+            cmd.arg("--host")
+                .arg("localhost")
+                .arg("--port")
+                .arg(random_port.to_string())
+                .arg("--controller_host")
+                .arg(&client_config.host)
+                .arg("--controller_port")
+                .arg(client_config.port.to_string())
+                .arg("--auth_token")
+                .arg(&auth_token);
+
+            for (key, value) in backend_table {
+                if key == "backend_type" || key == "exec_path" {
+                    continue;
+                }
+                cmd.arg(format!("--{}", key))
+                    .arg(value.to_string().trim_matches('"').to_string());
+            }
+
+            // Make sure the backend process is a process group leader.
+            unsafe {
+                cmd.pre_exec(|| {
+                    nix::unistd::setsid()?;
+
+                    // On Linux, ask the kernel to send SIGKILL to this process when
+                    // the parent (the Rust program) dies. This handles accidental termination.
+                    #[cfg(target_os = "linux")]
+                    {
+                        // libc::PR_SET_PDEATHSIG is the raw constant for this operation.
+                        // SIGKILL is a non-catchable, non-ignorable signal.
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                            // If prctl fails, return an error from the closure.
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+
+            println!("- Spawning backend: {}", exec_path);
+            let mut child = cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .with_context(|| format!("Failed to spawn backend process: '{}'", exec_path))?;
+
+            // Stream backend output using the external printer to avoid corrupting the prompt
+            let stdout = child
+                .stdout
+                .take()
+                .context("Could not capture stdout from backend process.")?;
+            let stderr = child
+                .stderr
+                .take()
+                .context("Could not capture stderr from backend process.")?;
+
+            let printer_clone = Arc::clone(&printer);
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = BufReader::new(stdout);
+                let mut buffer = [0; 1024]; // Read in 1KB chunks
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) => break, // EOF, the child process has closed its stdout
+                        Ok(n) => {
+                            // We've received `n` bytes. Convert to a string (lossily) and print.
+                            let output = String::from_utf8_lossy(&buffer[..n]);
+                            // Use `print!` to avoid adding an extra newline
+                            printer_clone
+                                .lock()
+                                .await
+                                .print(format!("[Backend] {}", output))
+                                .unwrap();
+                        }
+                        Err(e) => {
+                            // Handle read error, e.g., print it and break
+                            printer_clone
+                                .lock()
+                                .await
+                                .print(format!("[Backend Read Error] {}", e))
+                                .unwrap();
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let printer_clone = Arc::clone(&printer);
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = BufReader::new(stderr);
+                let mut buffer = [0; 1024];
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let output = String::from_utf8_lossy(&buffer[..n]);
+                            printer_clone
+                                .lock()
+                                .await
+                                .print(format!("[Backend] {}", output))
+                                .unwrap();
+                        }
+                        Err(e) => {
+                            printer_clone
+                                .lock()
+                                .await
+                                .print(format!("[Backend Read Error] {}", e))
+                                .unwrap();
+                            break;
+                        }
+                    }
+                }
+            });
+
+            backend_processes.push(child);
+        }
+    }
+
+    wait_for_backend_ready(&client_config, backend_processes.len()).await?;
+
+    Ok((shutdown_tx, server_handle, backend_processes, client_config))
+}
+
+async fn create_editor_and_printer() -> Result<(
+    Editor<MyHelper, FileHistory>,
+    Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+)> {
+    let mut rl = Editor::new()?;
+    rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
+    let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
+        Arc::new(Mutex::new(rl.create_external_printer()?));
+    let history_path = get_shell_history_path()?;
+    let _ = rl.load_history(&history_path);
+
+    Ok((rl, printer))
+}
+
+/// Runs the interactive shell.
+async fn run_shell(
+    client_config: ClientConfig,
+    mut rl: Editor<MyHelper, FileHistory>,
+    printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<()> {
+    println!("Entering interactive session. Type 'help' for commands or use ↑/↓ for history.");
+
+    // The main interactive loop
+    loop {
+        match rl.readline("pie> ") {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+                let parts: Vec<String> = match shlex::split(&line) {
+                    Some(parts) => parts,
+                    None => {
+                        eprintln!("Error: Mismatched quotes in command.");
+                        continue;
+                    }
+                };
+                if parts.is_empty() {
+                    continue;
+                }
+
+                match handle_shell_command(
+                    &parts[0],
+                    &parts[1..].iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+                    &client_config,
+                    &printer,
+                )
+                .await
+                {
+                    Ok(should_exit) if should_exit => break,
+                    Ok(_) => (),
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            }
+            Err(ReadlineError::Interrupted) => println!("(To exit, type 'exit' or press Ctrl-D)"),
+            Err(ReadlineError::Eof) => {
+                println!("Exiting...");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error reading line: {}", err);
+                break;
+            }
+        }
+    }
+
+    println!("Shutting down services...");
+    if let Err(err) = rl.save_history(&get_shell_history_path()?) {
+        eprintln!("Warning: Failed to save command history: {}", err);
+    }
+
+    Ok(())
+}
+
+/// Runs the inferlet.
+async fn run_inferlet(
+    client_config: &ClientConfig,
+    inferlet_path: PathBuf,
+    arguments: Vec<String>,
+    detach: bool,
+    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+
+    let inferlet_blob = fs::read(&inferlet_path)
+        .with_context(|| format!("Failed to read Wasm file at {:?}", inferlet_path))?;
+    let hash = client::hash_blob(&inferlet_blob);
+    println!("Inferlet hash: {}", hash);
+
+    if !client.program_exists(&hash).await? {
+        client.upload_program(&inferlet_blob).await?;
+        println!("✅ Inferlet upload successful.");
+    }
+
+    let mut instance = client.launch_instance(&hash, arguments).await?;
+    println!("✅ Inferlet launched with ID: {}", instance.id());
+
+    if !detach {
+        let instance_id = instance.id().to_string();
+
+        let printer_clone = Arc::clone(printer);
+        tokio::spawn(async move {
+            while let Ok(event) = instance.recv().await {
+                match event {
+                    // Handle events that have a specific code and a text message.
+                    InstanceEvent::Event { code, message } => {
+                        // Determine if this event signals the end of the instance's execution.
+                        // Any event other than a simple 'Message' is considered a final state.
+                        let is_terminated = !matches!(code, EventCode::Message);
+
+                        // Format the output string.
+                        // Using the Debug representation of `code` is a clean way to get its name (e.g., "Completed").
+                        let output = format!("[Inferlet {}] {:?}: {}", instance_id, code, message);
+
+                        // Lock the printer, print the message, and then immediately release the lock.
+                        printer_clone.lock().await.print(output).unwrap();
+
+                        // If the instance's execution is finished, break out of the loop.
+                        if is_terminated {
+                            break;
+                        }
+                    }
+                    // If we receive a raw data blob, we'll ignore it and wait for the next event.
+                    InstanceEvent::Blob(_) => continue,
+                }
+            }
+            // No more "Press Enter" message needed!
+        });
+    }
+
+    Ok(())
+}
+
+/// Terminates the engine and backend processes.
+async fn terminate_engine_and_backend(
+    backend_processes: Vec<Child>,
+    shutdown_tx: oneshot::Sender<()>,
+    server_handle: tokio::task::JoinHandle<()>,
+) -> Result<()> {
+    // Iterate through the child processes, signal them, and wait for them to exit.
+    for mut child in backend_processes {
+        if let Some(pid) = child.id() {
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+            println!("- Terminating backend process group with PID: {}", pid);
+
+            // Send SIGTERM to the entire process group.
+            if let Err(e) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM) {
+                eprintln!("  Failed to send SIGTERM to process group {}: {}", pid, e);
+            }
+        }
+
+        // This prevents the main program from exiting before cleanup is complete.
+        if let Err(e) = child.wait().await {
+            eprintln!("  Error while waiting for backend process to exit: {}", e);
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+    server_handle.await?;
+    println!("✅ Shutdown complete.");
+
+    Ok(())
+}
+
+/// Connects to the engine and authenticates the client.
+async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
+    let url = format!("ws://{}:{}", client_config.host, client_config.port);
+    let client = match Client::connect(&url).await {
+        Ok(c) => c,
+        Err(_) => {
+            anyhow::bail!("Could not connect to engine at {}. Is it running?", url);
+        }
+    };
+
+    let token = create_jwt("default", pie::auth::Role::User)?;
+    client.authenticate(&token).await?;
+    Ok(client)
+}
+
+/// Waits for all backend processes to be attached.
+async fn wait_for_backend_ready(client_config: &ClientConfig, num_backends: usize) -> Result<()> {
+    let backend_query_client = connect_and_authenticate(&client_config).await?;
+
+    // Query the number of attached and rejected backends.
+    let (mut num_attached, mut num_rejected) =
+        backend_query_client.wait_backend_change(None, None).await?;
+
+    // If backends have not all been attached, wait for them to be attached.
+    while (num_attached as usize) < num_backends && num_rejected == 0 {
+        (num_attached, num_rejected) = backend_query_client
+            .wait_backend_change(Some(num_attached), Some(num_rejected))
+            .await?;
+    }
+
+    // We expect no backends to be rejected and the number of attached backends
+    // to match the number of backend processes.
+    if (num_attached as usize) != num_backends || num_rejected != 0 {
+        anyhow::bail!(
+            "Unexpected backend state: {} backend(s) attached, {} backend(s) rejected",
+            num_attached,
+            num_rejected
+        );
+    }
+
+    Ok(())
 }
