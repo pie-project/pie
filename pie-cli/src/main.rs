@@ -15,6 +15,7 @@ use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
+use rustyline::history::FileHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Helper}; // The Helper trait is still needed
 use serde::Deserialize;
@@ -151,17 +152,20 @@ async fn main() -> Result<()> {
             // 2. Initialize logging based on the config and get the file-writer guard
             let _guard = init_logging(&engine_config)?;
 
-            // 3. Start the engine and backend services
-            let (shutdown_tx, server_handle, backend_processes, client_config) =
-                start_engine_and_backend(engine_config, backend_configs).await?;
+            // 3. Create the editor and printer.
+            let (rl, printer) = create_editor_and_printer().await?;
 
-            // 4. Wait for the backend to be attached.
+            // 4. Start the engine and backend services
+            let (shutdown_tx, server_handle, backend_processes, client_config) =
+                start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
+
+            // 5. Wait for the backend to be attached.
             wait_for_backend_change(&client_config).await?;
 
-            // 5. Start the interactive session, passing both configs
-            start_interactive_session(client_config).await?;
+            // 6. Start the interactive session, passing both configs
+            start_interactive_session(client_config, rl, printer).await?;
 
-            // 6. Terminate the engine and backend services
+            // 7. Terminate the engine and backend services
             terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
         }
         Commands::Model(cmd) => {
@@ -209,9 +213,24 @@ impl Validator for MyHelper {
 // Finally, we implement the `Helper` marker trait itself.
 impl Helper for MyHelper {}
 
+async fn create_editor_and_printer() -> Result<(
+    Editor<MyHelper, FileHistory>,
+    Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+)> {
+    let mut rl = Editor::new()?;
+    rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
+    let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
+        Arc::new(Mutex::new(rl.create_external_printer()?));
+    let history_path = get_pie_home()?.join(".pie_history");
+    let _ = rl.load_history(&history_path);
+
+    Ok((rl, printer))
+}
+
 async fn start_engine_and_backend(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
+    printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
 ) -> Result<(Sender<()>, JoinHandle<()>, Vec<Child>, ClientConfig)> {
     // 1. Initialize engine and client configurations
     let client_config = ClientConfig {
@@ -322,6 +341,7 @@ async fn start_engine_and_backend(
                 .take()
                 .context("Could not capture stderr from backend process.")?;
 
+            let printer_clone = Arc::clone(&printer);
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut reader = BufReader::new(stdout);
@@ -332,18 +352,21 @@ async fn start_engine_and_backend(
                         Ok(n) => {
                             // We've received `n` bytes. Convert to a string (lossily) and print.
                             let output = String::from_utf8_lossy(&buffer[..n]);
+                            let mut p = printer_clone.lock().await;
                             // Use `print!` to avoid adding an extra newline
-                            print!("[Backend] {}", output);
+                            p.print(format!("[Backend] {}", output)).unwrap();
                         }
                         Err(e) => {
                             // Handle read error, e.g., print it and break
-                            eprint!("[Backend Read Error] {}", e);
+                            let mut p = printer_clone.lock().await;
+                            p.print(format!("[Backend Read Error] {}", e)).unwrap();
                             break;
                         }
                     }
                 }
             });
 
+            let printer_clone = Arc::clone(&printer);
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut reader = BufReader::new(stderr);
@@ -353,10 +376,12 @@ async fn start_engine_and_backend(
                         Ok(0) => break,
                         Ok(n) => {
                             let output = String::from_utf8_lossy(&buffer[..n]);
-                            print!("[Backend] {}", output);
+                            let mut p = printer_clone.lock().await;
+                            p.print(format!("[Backend] {}", output)).unwrap();
                         }
                         Err(e) => {
-                            eprint!("[Backend Read Error] {}", e);
+                            let mut p = printer_clone.lock().await;
+                            p.print(format!("[Backend Read Error] {}", e)).unwrap();
                             break;
                         }
                     }
@@ -394,14 +419,17 @@ async fn wait_for_backend_change(client_config: &ClientConfig) -> Result<()> {
 }
 
 /// Starts the engine and drops into a client command-prompt session.
-async fn start_interactive_session(client_config: ClientConfig) -> Result<()> {
-    println!("Entering interactive session. Type 'help' for commands or use ↑/↓ for history.");
-    let mut rl = Editor::new()?;
-    rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
-    let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
-        Arc::new(Mutex::new(rl.create_external_printer()?));
-    let history_path = get_pie_home()?.join(".pie_history");
-    let _ = rl.load_history(&history_path);
+async fn start_interactive_session(
+    client_config: ClientConfig,
+    mut rl: Editor<MyHelper, FileHistory>,
+    printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<()> {
+    let mut p = printer.lock().await;
+    p.print(
+        "Entering interactive session. Type 'help' for commands or use ↑/↓ for history."
+            .to_string(),
+    )
+    .unwrap();
 
     // The main interactive loop
     loop {
@@ -419,7 +447,6 @@ async fn start_interactive_session(client_config: ClientConfig) -> Result<()> {
                     continue;
                 }
 
-                // FIX: Pass the printer to the command handler.
                 match handle_interactive_command(
                     &parts[0],
                     &parts[1..].iter().map(AsRef::as_ref).collect::<Vec<_>>(),
@@ -446,6 +473,7 @@ async fn start_interactive_session(client_config: ClientConfig) -> Result<()> {
     }
 
     println!("Shutting down services...");
+    let history_path = get_pie_home()?.join(".pie_history");
     if let Err(err) = rl.save_history(&history_path) {
         eprintln!("Warning: Failed to save command history: {}", err);
     }
