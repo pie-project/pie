@@ -323,12 +323,12 @@ impl Client {
         cur_num_attached_backends: Option<u32>,
         cur_num_detached_backends: Option<u32>,
     ) -> Result<(u32, u32)> {
+        let corr_id = self.inner.corr_id_pool.lock().await.acquire()?;
         let msg = ClientMessage::WaitBackendChange {
-            corr_id: 0,
+            corr_id,
             cur_num_attached_backends,
             cur_num_detached_backends,
         };
-        let corr_id = self.inner.corr_id_pool.lock().await.acquire()?;
         let (tx, rx) = oneshot::channel();
         self.inner.backend_change_waiters.insert(corr_id, tx);
         self.inner
