@@ -155,10 +155,13 @@ async fn main() -> Result<()> {
             let (shutdown_tx, server_handle, backend_processes, client_config) =
                 start_engine_and_backend(engine_config, backend_configs).await?;
 
-            // 4. Start the interactive session, passing both configs
+            // 4. Wait for the backend to be attached.
+            wait_for_backend_change(&client_config).await?;
+
+            // 5. Start the interactive session, passing both configs
             start_interactive_session(client_config).await?;
 
-            // 5. Terminate the engine and backend services
+            // 6. Terminate the engine and backend services
             terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
         }
         Commands::Model(cmd) => {
@@ -367,6 +370,29 @@ async fn start_engine_and_backend(
     Ok((shutdown_tx, server_handle, backend_processes, client_config))
 }
 
+async fn wait_for_backend_change(client_config: &ClientConfig) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+
+    // Query the number of attached and rejected backends.
+    let (mut num_attached, mut num_rejected) = client.wait_backend_change(None, None).await?;
+
+    // If no backends are attached or rejected, wait for a change.
+    while num_attached == 0 && num_rejected == 0 {
+        (num_attached, num_rejected) = client.wait_backend_change(Some(0), Some(0)).await?;
+    }
+
+    // We expect exactly one backend to be attached and no backends to be rejected.
+    if num_attached != 1 || num_rejected != 0 {
+        anyhow::bail!(
+            "Unexpected backend state: {} backend(s) attached, {} backend(s) rejected",
+            num_attached,
+            num_rejected
+        );
+    }
+
+    Ok(())
+}
+
 /// Starts the engine and drops into a client command-prompt session.
 async fn start_interactive_session(client_config: ClientConfig) -> Result<()> {
     println!("Entering interactive session. Type 'help' for commands or use ↑/↓ for history.");
@@ -511,25 +537,28 @@ async fn handle_interactive_command(
     Ok(false)
 }
 
+/// Connects to the engine and authenticates the client.
+async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
+    let url = format!("ws://{}:{}", client_config.host, client_config.port);
+    let client = match Client::connect(&url).await {
+        Ok(c) => c,
+        Err(_) => {
+            anyhow::bail!("Could not connect to engine at {}. Is it running?", url);
+        }
+    };
+
+    let token = create_jwt("default", pie::auth::Role::User)?;
+    client.authenticate(&token).await?;
+    Ok(client)
+}
+
 /// Connects to the engine and executes a Wasm inferlet.
 async fn handle_run(
     args: ShellRunArgs,
     client_config: &ClientConfig,
     printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
 ) -> Result<()> {
-    let url = format!("ws://{}:{}", client_config.host, client_config.port);
-    let client = match Client::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => {
-            return Err(anyhow!(
-                "Could not connect to engine at {}. Is it running?",
-                url
-            ));
-        }
-    };
-
-    let token = create_jwt("default", pie::auth::Role::User)?;
-    client.authenticate(&token).await?;
+    let client = connect_and_authenticate(client_config).await?;
 
     let wasm_blob = fs::read(&args.wasm_path)
         .with_context(|| format!("Failed to read Wasm file at {:?}", args.wasm_path))?;
