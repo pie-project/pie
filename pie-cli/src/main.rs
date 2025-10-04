@@ -206,12 +206,19 @@ async fn main() -> Result<()> {
             wait_for_backend_change(&client_config).await?;
 
             // 6. Run the inferlet
-            run_inferlet(&client_config, args.inferlet, args.arguments, false, &printer).await?;
+            run_inferlet(
+                &client_config,
+                args.inferlet,
+                args.arguments,
+                false,
+                &printer,
+            )
+            .await?;
 
-            // DEBUG
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            // 7. Wait for the inferlet to finish.
+            wait_for_instance_finish(&client_config).await?;
 
-            // 7. Terminate the engine and backend services
+            // 8. Terminate the engine and backend services
             terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
         }
         Commands::Model(cmd) => {
@@ -464,18 +471,67 @@ async fn wait_for_backend_change(client_config: &ClientConfig) -> Result<()> {
     Ok(())
 }
 
+async fn wait_for_instance_finish(client_config: &ClientConfig) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+
+    // Query the number of attached, detached, and rejected instances.
+    let (mut num_attached, mut num_detached, mut num_rejected) =
+        client.wait_instance_change(None, None, None).await?;
+
+    // If no instances are attached, detached, or rejected, wait for a change.
+    while num_attached == 0 && num_detached == 0 && num_rejected == 0 {
+        (num_attached, num_detached, num_rejected) = client
+            .wait_instance_change(Some(0), Some(0), Some(0))
+            .await?;
+    }
+
+    // We expect either the inferlet was launched successfully (num_attached == 1)
+    // or the inferlet was already terminated (num_attached == 0 && num_detached == 1).
+    if !((num_attached == 1 && num_detached == 0 && num_rejected == 0)
+        || (num_attached == 1 && num_detached == 1 && num_rejected == 0))
+    {
+        anyhow::bail!(
+            "Unexpected instance state: {} instance(s) attached, {} instance(s) detached, {} instance(s) rejected",
+            num_attached,
+            num_detached,
+            num_rejected
+        );
+    }
+
+    // If the inferlet was just started, wait for it to finish.
+    while num_attached == 1 && num_detached == 0 && num_rejected == 0 {
+        (num_attached, num_detached, num_rejected) = client
+            .wait_instance_change(Some(1), Some(0), Some(0))
+            .await?;
+    }
+
+    // Check that the inferlet was terminated.
+    if !(num_attached == 1 && num_detached == 1 && num_rejected == 0) {
+        anyhow::bail!(
+            "Unexpected instance state: {} instance(s) attached, {} instance(s) detached, {} instance(s) rejected",
+            num_attached,
+            num_detached,
+            num_rejected
+        );
+    }
+
+    Ok(())
+}
+
 /// Starts the engine and drops into a client command-prompt session.
 async fn start_interactive_session(
     client_config: ClientConfig,
     mut rl: Editor<MyHelper, FileHistory>,
     printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
 ) -> Result<()> {
-    let mut p = printer.lock().await;
-    p.print(
-        "Entering interactive session. Type 'help' for commands or use ↑/↓ for history."
-            .to_string(),
-    )
-    .unwrap();
+    {
+        let mut p = printer.lock().await;
+        p.print(
+            "Entering interactive session. Type 'help' for commands or use ↑/↓ for history."
+                .to_string(),
+        )
+        .unwrap();
+    }
 
     // The main interactive loop
     loop {
