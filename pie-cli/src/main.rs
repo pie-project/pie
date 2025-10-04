@@ -49,8 +49,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start the PIE engine and enter an interactive session.
+    /// Start the Pie engine and enter an interactive session.
     Serve(ServeArgs),
+    /// Run an inferlet with a one-shot Pie engine.
+    Run(RunArgs),
     #[command(subcommand)]
     /// Manage local models.
     Model(ModelCommands),
@@ -79,6 +81,24 @@ pub struct ServeArgs {
     pub verbose: bool,
 }
 
+#[derive(Args, Debug)]
+/// Arguments to submit an inferlet (Wasm program) to the engine in the shell.
+pub struct RunArgs {
+    /// Path to the .wasm inferlet file.
+    #[arg(long, short, value_parser = expand_tilde)]
+    pub inferlet: PathBuf,
+    /// Path to a custom TOML configuration file.
+    #[arg(long, short)]
+    pub config: Option<PathBuf>,
+    /// Accept arguments after `--` and pass them to the Wasm program.
+    /// A log file to write to.
+    #[arg(long)]
+    pub log: Option<PathBuf>,
+    /// Arguments to pass to the inferlet after `--`.
+    #[arg(last = true)]
+    pub arguments: Vec<String>,
+}
+
 /// Helper for clap to expand `~` in path arguments.
 fn expand_tilde(s: &str) -> Result<PathBuf, std::convert::Infallible> {
     Ok(PathBuf::from(shellexpand::tilde(s).as_ref()))
@@ -89,7 +109,7 @@ fn expand_tilde(s: &str) -> Result<PathBuf, std::convert::Infallible> {
 pub struct ShellRunArgs {
     /// Path to the .wasm inferlet file.
     #[arg(value_parser = expand_tilde)]
-    pub wasm_path: PathBuf,
+    pub inferlet_path: PathBuf,
 
     /// Run the inferlet in the background and print its instance ID.
     #[arg(long, short)]
@@ -147,7 +167,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Serve(args) => {
             // 1. Build both engine and backend configs.
-            let (engine_config, backend_configs) = build_configs(&args)?;
+            let (engine_config, backend_configs) = build_configs_for_serve(&args)?;
 
             // 2. Initialize logging based on the config and get the file-writer guard
             let _guard = init_logging(&engine_config)?;
@@ -164,6 +184,32 @@ async fn main() -> Result<()> {
 
             // 6. Start the interactive session, passing both configs
             start_interactive_session(client_config, rl, printer).await?;
+
+            // 7. Terminate the engine and backend services
+            terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
+        }
+        Commands::Run(args) => {
+            // 1. Build both engine and backend configs.
+            let (engine_config, backend_configs) = build_configs_for_run(&args)?;
+
+            // 2. Initialize logging based on the config and get the file-writer guard
+            let _guard = init_logging(&engine_config)?;
+
+            // 3. Create the editor and printer.
+            let (rl, printer) = create_editor_and_printer().await?;
+
+            // 4. Start the engine and backend services
+            let (shutdown_tx, server_handle, backend_processes, client_config) =
+                start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
+
+            // 5. Wait for the backend to be attached.
+            wait_for_backend_change(&client_config).await?;
+
+            // 6. Run the inferlet
+            run_inferlet(&client_config, args.inferlet, args.arguments, false, &printer).await?;
+
+            // DEBUG
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
             // 7. Terminate the engine and backend services
             terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
@@ -526,7 +572,7 @@ async fn handle_interactive_command(
 
             match ShellRunArgs::try_parse_from(clap_args) {
                 Ok(run_args) => {
-                    if let Err(e) = handle_run(run_args, client_config, printer).await {
+                    if let Err(e) = handle_shell_run(run_args, client_config, printer).await {
                         // Use the printer to avoid corrupting the prompt.
                         let mut p = printer.lock().await;
                         p.print(format!("Error running inferlet: {e}")).unwrap();
@@ -580,29 +626,29 @@ async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client
     Ok(client)
 }
 
-/// Connects to the engine and executes a Wasm inferlet.
-async fn handle_run(
-    args: ShellRunArgs,
+async fn run_inferlet(
     client_config: &ClientConfig,
+    inferlet_path: PathBuf,
+    arguments: Vec<String>,
+    detach: bool,
     printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
 ) -> Result<()> {
     let client = connect_and_authenticate(client_config).await?;
 
-    let wasm_blob = fs::read(&args.wasm_path)
-        .with_context(|| format!("Failed to read Wasm file at {:?}", args.wasm_path))?;
-    let hash = client::hash_blob(&wasm_blob);
+    let inferlet_blob = fs::read(&inferlet_path)
+        .with_context(|| format!("Failed to read Wasm file at {:?}", inferlet_path))?;
+    let hash = client::hash_blob(&inferlet_blob);
     println!("Inferlet hash: {}", hash);
 
     if !client.program_exists(&hash).await? {
-        client.upload_program(&wasm_blob).await?;
+        client.upload_program(&inferlet_blob).await?;
         println!("✅ Inferlet upload successful.");
     }
 
-    let arguments = args.arguments.clone();
     let mut instance = client.launch_instance(&hash, arguments).await?;
     println!("✅ Inferlet launched with ID: {}", instance.id());
 
-    if !args.detach {
+    if !detach {
         let instance_id = instance.id().to_string();
 
         // FIX: Clone the Arc<Mutex<...>> for the new task.
@@ -635,6 +681,24 @@ async fn handle_run(
             // No more "Press Enter" message needed!
         });
     }
+
+    Ok(())
+}
+
+/// Connects to the engine and executes a Wasm inferlet.
+async fn handle_shell_run(
+    args: ShellRunArgs,
+    client_config: &ClientConfig,
+    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<()> {
+    run_inferlet(
+        client_config,
+        args.inferlet_path,
+        args.arguments,
+        args.detach,
+        printer,
+    )
+    .await?;
     Ok(())
 }
 
@@ -748,7 +812,7 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
 
 /// Merges config from file and CLI args to create the final EngineConfig.
 // MODIFIED: Renamed to build_configs and now returns backend configs as well.
-fn build_configs(args: &ServeArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
+fn build_configs_for_serve(args: &ServeArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
     let file_config: ConfigFile = if let Some(path) = &args.config {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file at {:?}", path))?;
@@ -783,6 +847,39 @@ fn build_configs(args: &ServeArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
             .cache_dir
             .unwrap_or_else(|| get_pie_home().unwrap().join("programs")),
         verbose: args.verbose || file_config.verbose.unwrap_or(false),
+        log: args.log.clone().or(file_config.log),
+    };
+
+    // Return both the engine config and the backend configs
+    Ok((engine_config, file_config.backend))
+}
+
+fn build_configs_for_run(args: &RunArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
+    let file_config: ConfigFile = if let Some(path) = &args.config {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file at {:?}", path))?;
+        toml::from_str(&content)?
+    } else {
+        ConfigFile::default()
+    };
+
+    let auth_secret = file_config.auth_secret.unwrap_or_else(|| {
+        rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect()
+    });
+
+    let engine_config = EngineConfig {
+        host: "127.0.0.1".to_string(),
+        port: 8080,
+        enable_auth: true,
+        auth_secret,
+        cache_dir: file_config
+            .cache_dir
+            .unwrap_or_else(|| get_pie_home().unwrap().join("programs")),
+        verbose: false,
         log: args.log.clone().or(file_config.log),
     };
 
