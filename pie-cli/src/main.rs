@@ -51,6 +51,8 @@ struct Cli {
 enum Commands {
     /// Start the Pie engine and enter an interactive session.
     Serve(ServeArgs),
+    /// Run an inferlet with a one-shot Pie engine.
+    Run(RunArgs),
     #[command(subcommand)]
     /// Manage local models.
     Model(ModelCommands),
@@ -77,6 +79,24 @@ pub struct ServeArgs {
     /// Enable verbose console logging.
     #[arg(long, short)]
     pub verbose: bool,
+}
+
+#[derive(Args, Debug)]
+/// Arguments to submit an inferlet (Wasm program) to the engine in the shell.
+pub struct RunArgs {
+    /// Path to the .wasm inferlet file.
+    #[arg(long, short, value_parser = expand_tilde)]
+    pub inferlet: PathBuf,
+    /// Path to a custom TOML configuration file.
+    #[arg(long, short)]
+    pub config: Option<PathBuf>,
+    /// Accept arguments after `--` and pass them to the Wasm program.
+    /// A log file to write to.
+    #[arg(long)]
+    pub log: Option<PathBuf>,
+    /// Arguments to pass to the inferlet after `--`.
+    #[arg(last = true)]
+    pub arguments: Vec<String>,
 }
 
 /// Helper for clap to expand `~` in path arguments.
@@ -160,6 +180,22 @@ async fn main() -> Result<()> {
 
             handle_serve_command(engine_config, backend_configs).await?;
         }
+        Commands::Run(args) => {
+            // Build both engine and backend configs.
+            let (engine_config, backend_configs) =
+                build_configs(args.config, false, None, None, false, args.log)?;
+
+            // Initialize logging based on the config and get the file-writer guard
+            let _guard = init_logging(&engine_config)?;
+
+            handle_run_command(
+                engine_config,
+                backend_configs,
+                args.inferlet,
+                args.arguments,
+            )
+            .await?;
+        }
         Commands::Model(cmd) => {
             // Model commands don't start the engine, so they can use a simple logger
             let subscriber = FmtSubscriber::builder()
@@ -222,6 +258,28 @@ async fn handle_serve_command(
     // Terminate the engine and backend services
     terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
 
+    Ok(())
+}
+
+/// Handles the `pie run` command.
+async fn handle_run_command(
+    engine_config: EngineConfig,
+    backend_configs: Vec<toml::Value>,
+    inferlet_path: PathBuf,
+    arguments: Vec<String>,
+) -> Result<()> {
+    let (_rl, printer) = create_editor_and_printer().await?;
+
+    // Start the engine and backend services
+    let (shutdown_tx, server_handle, backend_processes, client_config) =
+        start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
+
+    // Run the inferlet
+    run_inferlet(&client_config, inferlet_path, arguments, false, &printer).await?;
+    wait_for_instance_finish(&client_config).await?;
+
+    // Terminate the engine and backend services
+    terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
     Ok(())
 }
 
@@ -921,6 +979,54 @@ async fn wait_for_backend_ready(client_config: &ClientConfig, num_backends: usiz
         anyhow::bail!(
             "Unexpected backend state: {} backend(s) attached, {} backend(s) rejected",
             num_attached,
+            num_rejected
+        );
+    }
+
+    Ok(())
+}
+
+/// Waits for the instance to finish.
+async fn wait_for_instance_finish(client_config: &ClientConfig) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+
+    // Query the number of attached, detached, and rejected instances.
+    let (mut num_attached, mut num_detached, mut num_rejected) =
+        client.wait_instance_change(None, None, None).await?;
+
+    // If no instances are attached, detached, or rejected, wait for a change.
+    while num_attached == 0 && num_detached == 0 && num_rejected == 0 {
+        (num_attached, num_detached, num_rejected) = client
+            .wait_instance_change(Some(0), Some(0), Some(0))
+            .await?;
+    }
+
+    // We expect either the inferlet was launched successfully (num_attached == 1)
+    // or the inferlet was already terminated (num_attached == 0 && num_detached == 1).
+    if !((num_attached == 1 && num_detached == 0 && num_rejected == 0)
+        || (num_attached == 1 && num_detached == 1 && num_rejected == 0))
+    {
+        anyhow::bail!(
+            "Unexpected instance state: {} instance(s) attached, {} instance(s) detached, {} instance(s) rejected",
+            num_attached,
+            num_detached,
+            num_rejected
+        );
+    }
+
+    // If the inferlet was just started, wait for it to finish.
+    while num_attached == 1 && num_detached == 0 && num_rejected == 0 {
+        (num_attached, num_detached, num_rejected) = client
+            .wait_instance_change(Some(1), Some(0), Some(0))
+            .await?;
+    }
+
+    // Check that the inferlet was terminated.
+    if !(num_attached == 1 && num_detached == 1 && num_rejected == 0) {
+        anyhow::bail!(
+            "Unexpected instance state: {} instance(s) attached, {} instance(s) detached, {} instance(s) rejected",
+            num_attached,
+            num_detached,
             num_rejected
         );
     }
