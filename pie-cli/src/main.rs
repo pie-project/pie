@@ -374,6 +374,28 @@ async fn start_interactive_session(
         }
     }
 
+    let backend_query_client = connect_and_authenticate(&client_config).await?;
+    
+    // Query the number of attached and rejected backends.
+    let (mut num_attached, mut num_rejected) = backend_query_client.wait_backend_change(None, None).await?;
+    
+    // If no backends are attached or rejected, wait for a change.
+    while (num_attached as usize) < backend_processes.len() && num_rejected == 0 {
+        (num_attached, num_rejected) = backend_query_client.wait_backend_change(Some(num_attached), Some(num_rejected)).await?;
+    }
+    
+    // We expect no backends to be rejected and the number of attached backends
+    // to match the number of backend processes.
+    if (num_attached as usize) != backend_processes.len() || num_rejected != 0 {
+        anyhow::bail!(
+            "Unexpected backend state: {} backend(s) attached, {} backend(s) rejected",
+            num_attached,
+            num_rejected
+        );
+    }
+
+    std::mem::drop(backend_query_client);
+    
     // 5. Start the main interactive loop
     loop {
         match rl.readline("pie> ") {
@@ -501,25 +523,28 @@ async fn handle_interactive_command(
     Ok(false)
 }
 
+/// Connects to the engine and authenticates the client.
+async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
+    let url = format!("ws://{}:{}", client_config.host, client_config.port);
+    let client = match Client::connect(&url).await {
+        Ok(c) => c,
+        Err(_) => {
+            anyhow::bail!("Could not connect to engine at {}. Is it running?", url);
+        }
+    };
+
+    let token = create_jwt("default", pie::auth::Role::User)?;
+    client.authenticate(&token).await?;
+    Ok(client)
+}
+
 /// Connects to the engine and executes a Wasm inferlet.
 async fn handle_run(
     args: ShellRunArgs,
     client_config: &ClientConfig,
     printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
 ) -> Result<()> {
-    let url = format!("ws://{}:{}", client_config.host, client_config.port);
-    let client = match Client::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => {
-            return Err(anyhow!(
-                "Could not connect to engine at {}. Is it running?",
-                url
-            ));
-        }
-    };
-
-    let token = create_jwt("default", pie::auth::Role::User)?;
-    client.authenticate(&token).await?;
+    let client = connect_and_authenticate(client_config).await?;
 
     let wasm_blob = fs::read(&args.wasm_path)
         .with_context(|| format!("Failed to read Wasm file at {:?}", args.wasm_path))?;
