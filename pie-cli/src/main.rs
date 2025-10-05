@@ -677,14 +677,11 @@ async fn start_engine_and_backend(
                     .arg(value.to_string().trim_matches('"').to_string());
             }
 
-            // Make sure the backend process is a process group leader.
+            // On Linux, ask the kernel to send SIGKILL to this process when
+            // the parent (the Rust program) dies. This handles accidental termination.
+            #[cfg(target_os = "linux")]
             unsafe {
                 cmd.pre_exec(|| {
-                    nix::unistd::setsid()?;
-
-                    // On Linux, ask the kernel to send SIGKILL to this process when
-                    // the parent (the Rust program) dies. This handles accidental termination.
-                    #[cfg(target_os = "linux")]
                     {
                         // libc::PR_SET_PDEATHSIG is the raw constant for this operation.
                         // SIGKILL is a non-catchable, non-ignorable signal.
@@ -918,21 +915,27 @@ async fn terminate_engine_and_backend(
     shutdown_tx: oneshot::Sender<()>,
     server_handle: tokio::task::JoinHandle<()>,
 ) -> Result<()> {
+    println!();
+    println!("🔄 Terminating backend processes...");
+
     // Iterate through the child processes, signal them, and wait for them to exit.
     for mut child in backend_processes {
         if let Some(pid) = child.id() {
-            let pgid = nix::unistd::Pid::from_raw(pid as i32);
-            println!("- Terminating backend process group with PID: {}", pid);
+            let pid = nix::unistd::Pid::from_raw(pid as i32);
+            println!("🔄 Terminating backend uv process with PID: {}", pid);
 
-            // Send SIGTERM to the entire process group.
-            if let Err(e) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM) {
-                eprintln!("  Failed to send SIGTERM to process group {}: {}", pid, e);
+            // Send SIGTERM to the `uv` process. It will forward the signal to the backend process.
+            if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
+                eprintln!("  Failed to send SIGTERM to uv process {}: {}", pid, e);
             }
-        }
 
-        // This prevents the main program from exiting before cleanup is complete.
-        if let Err(e) = child.wait().await {
-            eprintln!("  Error while waiting for backend process to exit: {}", e);
+            // Wait for the `uv` process to exit. By the time it exits, the backend process will
+            // have been terminated.
+            let exit_status = child.wait().await;
+
+            if let Err(e) = exit_status {
+                eprintln!("  Error while waiting for uv process to exit: {}", e);
+            }
         }
     }
 
