@@ -18,7 +18,7 @@ use rustyline::hint::Hinter;
 use rustyline::history::FileHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Helper}; // The Helper trait is still needed
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use std::{
@@ -57,6 +57,9 @@ enum Commands {
     #[command(subcommand)]
     /// Manage local models.
     Model(ModelCommands),
+    #[command(subcommand)]
+    /// Manage configuration.
+    Config(ConfigCommands),
 }
 
 #[derive(Args, Debug)]
@@ -136,8 +139,22 @@ pub struct RemoveModelArgs {
     pub model_name: String,
 }
 
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommands {
+    /// Create a default config file.
+    Init(ConfigInitArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ConfigInitArgs {
+    /// Backend type (e.g., "python", "metal")
+    pub backend_type: String,
+    /// Path to the backend executable
+    pub exec_path: String,
+}
+
 // Helper struct for parsing the TOML config file
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 struct ConfigFile {
     host: Option<String>,
     port: Option<u16>,
@@ -204,6 +221,14 @@ async fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber)?;
             handle_model_command(cmd).await?;
+        }
+        Commands::Config(cmd) => {
+            // Config commands don't start the engine, so they can use a simple logger
+            let subscriber = FmtSubscriber::builder()
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)?;
+            handle_config_command(cmd).await?;
         }
     }
     Ok(())
@@ -450,6 +475,16 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
     Ok(())
 }
 
+/// Handles the `pie config` command.
+async fn handle_config_command(command: ConfigCommands) -> Result<()> {
+    match command {
+        ConfigCommands::Init(args) => {
+            init_default_config_file(&args.exec_path, &args.backend_type)?;
+        }
+    }
+    Ok(())
+}
+
 //================================================================================//
 // SECTION: Helpers
 //================================================================================//
@@ -525,6 +560,91 @@ fn get_default_config_path() -> Result<PathBuf> {
     let pie_home = get_pie_home()?;
     let config_path = pie_home.join("config.toml");
     Ok(config_path)
+}
+
+fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<String> {
+    // Create the backend configuration as a TOML table
+    let backend_table = [
+        (
+            "backend_type",
+            toml::Value::String(backend_type.to_string()),
+        ),
+        ("exec_path", toml::Value::String(exec_path.to_string())),
+        ("model", toml::Value::String("qwen-3-0.6b".into())),
+        ("device", toml::Value::String("cuda:0".into())),
+        ("dtype", toml::Value::String("bfloat16".into())),
+        ("kv_page_size", toml::Value::Integer(16)),
+        ("max_batch_tokens", toml::Value::Integer(10240)),
+        ("max_dist_size", toml::Value::Integer(32)),
+        ("max_num_kv_pages", toml::Value::Integer(10240)),
+        ("max_num_embeds", toml::Value::Integer(128)),
+        ("max_num_adapters", toml::Value::Integer(32)),
+        ("max_adapter_rank", toml::Value::Integer(8)),
+        ("gpu_mem_headroom", toml::Value::Float(10.0)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect::<toml::Table>();
+
+    // Create the ConfigFile object
+    let config_file = ConfigFile {
+        host: Some("127.0.0.1".to_string()),
+        port: Some(8080),
+        enable_auth: None,
+        auth_secret: None,
+        cache_dir: None,
+        verbose: None,
+        log: None,
+        backend: vec![toml::Value::Table(backend_table)],
+    };
+
+    // Serialize to TOML string
+    let config_content =
+        toml::to_string_pretty(&config_file).context("Failed to serialize config to TOML")?;
+
+    Ok(config_content)
+}
+
+fn init_default_config_file(exec_path: &str, backend_type: &str) -> Result<()> {
+    println!("⚙️ Initializing PIE configuration...");
+
+    let config_path = get_default_config_path()?;
+
+    // Check if config file already exists
+    if config_path.exists() {
+        print!(
+            "⚠️ Configuration file already exists at {:?}. Overwrite? [y/N] ",
+            config_path
+        );
+        io::stdout().flush().context("Failed to flush stdout")?;
+
+        let mut confirmation = String::new();
+        io::stdin()
+            .read_line(&mut confirmation)
+            .context("Failed to read user input")?;
+
+        if confirmation.trim().to_lowercase() != "y" {
+            println!("Aborted by user.");
+            return Ok(());
+        }
+    }
+
+    // Create the directory if it doesn't exist
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create config directory at {:?}", parent))?;
+    }
+
+    // Create the default config file
+    let config_content = create_default_config_content(&exec_path, &backend_type)?;
+    fs::write(&config_path, &config_content)
+        .with_context(|| format!("Failed to write config file at {:?}", config_path))?;
+
+    println!("✅ Configuration file created at {:?}", config_path);
+    println!("Config file content:");
+    println!("{}", config_content);
+
+    Ok(())
 }
 
 async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>> {
