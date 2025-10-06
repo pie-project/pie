@@ -145,6 +145,8 @@ pub enum ConfigCommands {
     Init(ConfigInitArgs),
     /// Update the entries of the default config file.
     Update(ConfigUpdateArgs),
+    /// Show the content of the default config file.
+    Show,
 }
 
 #[derive(Args, Debug)]
@@ -553,6 +555,9 @@ async fn handle_config_command(command: ConfigCommands) -> Result<()> {
         ConfigCommands::Update(args) => {
             update_default_config_file(args)?;
         }
+        ConfigCommands::Show => {
+            show_default_config_file()?;
+        }
     }
     Ok(())
 }
@@ -899,6 +904,28 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         .with_context(|| format!("Failed to write updated config file at {:?}", config_path))?;
 
     println!("✅ Configuration file updated at {:?}", config_path);
+    Ok(())
+}
+
+fn show_default_config_file() -> Result<()> {
+    let config_path = get_default_config_path()?;
+
+    // Check if config file exists
+    if !config_path.exists() {
+        anyhow::bail!(
+            "Configuration file not found at {:?}. Run `pie config init` first.",
+            config_path
+        );
+    }
+
+    // Read and display the config file content
+    let config_content = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+
+    println!("📄 Configuration file at {:?}:", config_path);
+    println!();
+    println!("{}", config_content);
+
     Ok(())
 }
 
