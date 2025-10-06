@@ -89,12 +89,11 @@ pub struct ServeArgs {
 /// Arguments to submit an inferlet (Wasm program) to the engine in the shell.
 pub struct RunArgs {
     /// Path to the .wasm inferlet file.
-    #[arg(long, short, value_parser = expand_tilde)]
+    #[arg(value_parser = expand_tilde)]
     pub inferlet: PathBuf,
     /// Path to a custom TOML configuration file.
     #[arg(long, short)]
     pub config: Option<PathBuf>,
-    /// Accept arguments after `--` and pass them to the Wasm program.
     /// A log file to write to.
     #[arg(long)]
     pub log: Option<PathBuf>,
