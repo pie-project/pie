@@ -19,6 +19,7 @@ use rustyline::history::FileHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Helper}; // The Helper trait is still needed
 use serde::Deserialize;
+use std::path::Path;
 use std::sync::Arc;
 use std::{
     env,
@@ -647,11 +648,15 @@ async fn start_engine_and_backend(
                 .get("exec_path")
                 .and_then(|v| v.as_str())
                 .context("`exec_path` is missing or not a string.")?;
+            let exec_parent_path = Path::new(exec_path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .context("`exec_path` has no parent directory.")?;
 
             let mut cmd = if backend_type == "python" {
                 let mut cmd = TokioCommand::new("uv");
                 cmd.arg("--project");
-                cmd.arg("../backend/backend-python");
+                cmd.arg(exec_parent_path);
                 cmd.arg("run");
                 cmd.arg("python");
                 cmd.arg("-u");
