@@ -349,10 +349,16 @@ async fn handle_serve_command(
         start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
 
     // Start the interactive session, passing both configs
-    run_shell(client_config, rl, printer).await?;
+    run_shell(&client_config, rl, printer).await?;
 
     // Terminate the engine and backend services
-    terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
+    terminate_engine_and_backend(
+        &client_config,
+        backend_processes,
+        shutdown_tx,
+        server_handle,
+    )
+    .await?;
 
     Ok(())
 }
@@ -375,7 +381,13 @@ async fn handle_run_command(
     wait_for_instance_finish(&client_config).await?;
 
     // Terminate the engine and backend services
-    terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
+    terminate_engine_and_backend(
+        &client_config,
+        backend_processes,
+        shutdown_tx,
+        server_handle,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1214,7 +1226,7 @@ async fn create_editor_and_printer() -> Result<(
 
 /// Runs the interactive shell.
 async fn run_shell(
-    client_config: ClientConfig,
+    client_config: &ClientConfig,
     mut rl: Editor<MyHelper, FileHistory>,
     printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
 ) -> Result<()> {
@@ -1239,7 +1251,7 @@ async fn run_shell(
                 match handle_shell_command(
                     &parts[0],
                     &parts[1..].iter().map(AsRef::as_ref).collect::<Vec<_>>(),
-                    &client_config,
+                    client_config,
                     &printer,
                 )
                 .await
@@ -1342,13 +1354,28 @@ async fn print_backend_stats(
     Ok(())
 }
 
+/// Stops the backend heartbeat.
+async fn stop_backend_heartbeat(client_config: &ClientConfig) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+    println!("🔄 Stopping backend heartbeat...");
+    client.stop_backend_heartbeat().await?;
+    println!("✅ Backend heartbeat stopped.");
+    Ok(())
+}
+
 /// Terminates the engine and backend processes.
 async fn terminate_engine_and_backend(
+    client_config: &ClientConfig,
     backend_processes: Vec<Child>,
     shutdown_tx: oneshot::Sender<()>,
     server_handle: tokio::task::JoinHandle<()>,
 ) -> Result<()> {
     println!();
+
+    // Stop the backend heartbeat before sending the signals to the backend processes.
+    // This is to avoid broken pipe errors due to sending signals to the backend processes
+    // after they have exited.
+    stop_backend_heartbeat(client_config).await?;
     println!("🔄 Terminating backend processes...");
 
     // Iterate through the child processes, signal them, and wait for them to exit.

@@ -154,6 +154,9 @@ pub enum ClientMessage {
 
     #[serde(rename = "query_backend_stats")]
     QueryBackendStats { corr_id: u32 },
+
+    #[serde(rename = "stop_backend_heartbeat")]
+    StopBackendHeartbeat { corr_id: u32 },
 }
 
 /// Messages from server -> client
@@ -551,6 +554,9 @@ impl Client {
                 }
                 ClientMessage::QueryBackendStats { corr_id } => {
                     self.handle_query_backend_stats(corr_id).await;
+                }
+                ClientMessage::StopBackendHeartbeat { corr_id } => {
+                    self.handle_stop_backend_heartbeat(corr_id).await;
                 }
             },
             ClientCommand::Internal(cmd) => match cmd {
@@ -1157,6 +1163,17 @@ impl Client {
             stats_str.push_str(&format!("{:<40} | {}\n", key, value));
         }
         self.send_response(corr_id, true, stats_str).await;
+    }
+
+    async fn handle_stop_backend_heartbeat(&mut self, corr_id: u32) {
+        if !self.authenticated {
+            self.send_response(corr_id, false, "Not authenticated".into())
+                .await;
+            return;
+        }
+        model::stop_heartbeat().await;
+        self.send_response(corr_id, true, "Backend heartbeat stopped".into())
+            .await;
     }
 
     /// Cleans up client resources upon disconnection.

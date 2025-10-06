@@ -208,6 +208,7 @@ impl Client {
             ClientMessage::Authenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::LaunchInstance { corr_id, .. }
+            | ClientMessage::StopBackendHeartbeat { corr_id }
             | ClientMessage::QueryBackendStats { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
@@ -258,6 +259,16 @@ impl Client {
             Ok(result)
         } else {
             anyhow::bail!("Query backend stats failed: {}", result)
+        }
+    }
+
+    pub async fn stop_backend_heartbeat(&self) -> Result<()> {
+        let msg = ClientMessage::StopBackendHeartbeat { corr_id: 0 };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        if successful {
+            Ok(())
+        } else {
+            anyhow::bail!("Stop backend heartbeat failed: {}", result)
         }
     }
 
