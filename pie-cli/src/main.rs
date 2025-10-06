@@ -137,7 +137,7 @@ pub struct RemoveModelArgs {
 }
 
 // Helper struct for parsing the TOML config file
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug)]
 struct ConfigFile {
     host: Option<String>,
     port: Option<u16>,
@@ -462,13 +462,12 @@ fn build_configs(
     verbose: bool,
     log: Option<PathBuf>,
 ) -> Result<(EngineConfig, Vec<toml::Value>)> {
-    let cfg_file: ConfigFile = if let Some(path) = &config_path {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file at {:?}", path))?;
-        toml::from_str(&content)?
-    } else {
-        ConfigFile::default()
-    };
+    let config_path = config_path
+        .map(Ok)
+        .unwrap_or_else(get_default_config_path)?;
+    let config_str = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+    let cfg_file: ConfigFile = toml::from_str(&config_str)?;
 
     let enable_auth = if no_auth {
         false
@@ -520,6 +519,12 @@ fn get_shell_history_path() -> Result<PathBuf> {
     let pie_home = get_pie_home()?;
     let history_path = pie_home.join(".pie_history");
     Ok(history_path)
+}
+
+fn get_default_config_path() -> Result<PathBuf> {
+    let pie_home = get_pie_home()?;
+    let config_path = pie_home.join("config.toml");
+    Ok(config_path)
 }
 
 async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>> {
