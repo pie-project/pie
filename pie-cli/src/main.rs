@@ -497,6 +497,10 @@ fn build_configs(
         log: log.clone().or(cfg_file.log),
     };
 
+    if cfg_file.backend.is_empty() {
+        anyhow::bail!("No backend configurations found in the configuration file.");
+    }
+
     // Return both the engine config and the backend configs
     Ok((engine_config, cfg_file.backend))
 }
