@@ -143,6 +143,8 @@ pub struct RemoveModelArgs {
 pub enum ConfigCommands {
     /// Create a default config file.
     Init(ConfigInitArgs),
+    /// Update the entries of the default config file.
+    Update(ConfigUpdateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -151,6 +153,73 @@ pub struct ConfigInitArgs {
     pub backend_type: String,
     /// Path to the backend executable
     pub exec_path: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ConfigUpdateArgs {
+    // Engine configuration options
+    /// The network host to bind to
+    #[arg(long)]
+    pub host: Option<String>,
+    /// The network port to use
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Enable or disable authentication
+    #[arg(long)]
+    pub enable_auth: Option<bool>,
+    /// Authentication secret
+    #[arg(long)]
+    pub auth_secret: Option<String>,
+    /// Cache directory path
+    #[arg(long)]
+    pub cache_dir: Option<String>,
+    /// Enable verbose logging
+    #[arg(long)]
+    pub verbose: Option<bool>,
+    /// Log file path
+    #[arg(long)]
+    pub log: Option<String>,
+
+    // Backend configuration options (prefixed with backend-)
+    /// Backend type
+    #[arg(long)]
+    pub backend_type: Option<String>,
+    /// Backend executable path
+    #[arg(long)]
+    pub backend_exec_path: Option<String>,
+    /// Model name
+    #[arg(long)]
+    pub backend_model: Option<String>,
+    /// Device (e.g., "cuda:0", "mps")
+    #[arg(long)]
+    pub backend_device: Option<String>,
+    /// Data type (e.g., "bfloat16", "float16")
+    #[arg(long)]
+    pub backend_dtype: Option<String>,
+    /// KV page size
+    #[arg(long)]
+    pub backend_kv_page_size: Option<i64>,
+    /// Maximum batch tokens
+    #[arg(long)]
+    pub backend_max_batch_tokens: Option<i64>,
+    /// Maximum distribution size
+    #[arg(long)]
+    pub backend_max_dist_size: Option<i64>,
+    /// Maximum number of KV pages
+    #[arg(long)]
+    pub backend_max_num_kv_pages: Option<i64>,
+    /// Maximum number of embeddings
+    #[arg(long)]
+    pub backend_max_num_embeds: Option<i64>,
+    /// Maximum number of adapters
+    #[arg(long)]
+    pub backend_max_num_adapters: Option<i64>,
+    /// Maximum adapter rank
+    #[arg(long)]
+    pub backend_max_adapter_rank: Option<i64>,
+    /// GPU memory headroom
+    #[arg(long)]
+    pub backend_gpu_mem_headroom: Option<f64>,
 }
 
 // Helper struct for parsing the TOML config file
@@ -481,6 +550,9 @@ async fn handle_config_command(command: ConfigCommands) -> Result<()> {
         ConfigCommands::Init(args) => {
             init_default_config_file(&args.exec_path, &args.backend_type)?;
         }
+        ConfigCommands::Update(args) => {
+            update_default_config_file(args)?;
+        }
     }
     Ok(())
 }
@@ -644,6 +716,189 @@ fn init_default_config_file(exec_path: &str, backend_type: &str) -> Result<()> {
     println!("Config file content:");
     println!("{}", config_content);
 
+    Ok(())
+}
+
+fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
+    // Check if any update options were provided
+    let has_engine_updates = args.host.is_some()
+        || args.port.is_some()
+        || args.enable_auth.is_some()
+        || args.auth_secret.is_some()
+        || args.cache_dir.is_some()
+        || args.verbose.is_some()
+        || args.log.is_some();
+
+    let has_backend_updates = args.backend_type.is_some()
+        || args.backend_exec_path.is_some()
+        || args.backend_model.is_some()
+        || args.backend_device.is_some()
+        || args.backend_dtype.is_some()
+        || args.backend_kv_page_size.is_some()
+        || args.backend_max_batch_tokens.is_some()
+        || args.backend_max_dist_size.is_some()
+        || args.backend_max_num_kv_pages.is_some()
+        || args.backend_max_num_embeds.is_some()
+        || args.backend_max_num_adapters.is_some()
+        || args.backend_max_adapter_rank.is_some()
+        || args.backend_gpu_mem_headroom.is_some();
+
+    if !has_engine_updates && !has_backend_updates {
+        println!("⚠️ No configuration options provided to update.");
+        println!("Use `pie config update --help` to see available options.");
+        return Ok(());
+    }
+
+    println!("⚙️ Updating PIE configuration...");
+
+    let config_path = get_default_config_path()?;
+
+    // Check if config file exists
+    if !config_path.exists() {
+        anyhow::bail!(
+            "Configuration file not found at {:?}. Run `pie config init` first.",
+            config_path
+        );
+    }
+
+    // Read and parse the existing config file
+    let config_str = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+    let mut config_file: ConfigFile = toml::from_str(&config_str)
+        .with_context(|| format!("Failed to parse config file at {:?}", config_path))?;
+
+    // Update engine configuration fields
+    if let Some(host) = args.host {
+        config_file.host = Some(host);
+        println!("✅ Updated host");
+    }
+    if let Some(port) = args.port {
+        config_file.port = Some(port);
+        println!("✅ Updated port");
+    }
+    if let Some(enable_auth) = args.enable_auth {
+        config_file.enable_auth = Some(enable_auth);
+        println!("✅ Updated enable_auth");
+    }
+    if let Some(auth_secret) = args.auth_secret {
+        config_file.auth_secret = Some(auth_secret);
+        println!("✅ Updated auth_secret");
+    }
+    if let Some(cache_dir) = args.cache_dir {
+        config_file.cache_dir = Some(PathBuf::from(cache_dir));
+        println!("✅ Updated cache_dir");
+    }
+    if let Some(verbose) = args.verbose {
+        config_file.verbose = Some(verbose);
+        println!("✅ Updated verbose");
+    }
+    if let Some(log) = args.log {
+        config_file.log = Some(PathBuf::from(log));
+        println!("✅ Updated log");
+    }
+
+    // Update backend configuration fields
+    if has_backend_updates {
+        if config_file.backend.is_empty() {
+            anyhow::bail!(
+                "No backend configuration found in config file. Cannot update backend settings."
+            );
+        }
+
+        // Update the first backend entry (assuming single backend for now)
+        if let Some(toml::Value::Table(backend_table)) = config_file.backend.get_mut(0) {
+            if let Some(backend_type) = args.backend_type {
+                backend_table.insert(
+                    "backend_type".to_string(),
+                    toml::Value::String(backend_type),
+                );
+                println!("✅ Updated backend_type");
+            }
+            if let Some(exec_path) = args.backend_exec_path {
+                backend_table.insert("exec_path".to_string(), toml::Value::String(exec_path));
+                println!("✅ Updated backend exec_path");
+            }
+            if let Some(model) = args.backend_model {
+                backend_table.insert("model".to_string(), toml::Value::String(model));
+                println!("✅ Updated backend model");
+            }
+            if let Some(device) = args.backend_device {
+                backend_table.insert("device".to_string(), toml::Value::String(device));
+                println!("✅ Updated backend device");
+            }
+            if let Some(dtype) = args.backend_dtype {
+                backend_table.insert("dtype".to_string(), toml::Value::String(dtype));
+                println!("✅ Updated backend dtype");
+            }
+            if let Some(kv_page_size) = args.backend_kv_page_size {
+                backend_table.insert(
+                    "kv_page_size".to_string(),
+                    toml::Value::Integer(kv_page_size),
+                );
+                println!("✅ Updated backend kv_page_size");
+            }
+            if let Some(max_batch_tokens) = args.backend_max_batch_tokens {
+                backend_table.insert(
+                    "max_batch_tokens".to_string(),
+                    toml::Value::Integer(max_batch_tokens),
+                );
+                println!("✅ Updated backend max_batch_tokens");
+            }
+            if let Some(max_dist_size) = args.backend_max_dist_size {
+                backend_table.insert(
+                    "max_dist_size".to_string(),
+                    toml::Value::Integer(max_dist_size),
+                );
+                println!("✅ Updated backend max_dist_size");
+            }
+            if let Some(max_num_kv_pages) = args.backend_max_num_kv_pages {
+                backend_table.insert(
+                    "max_num_kv_pages".to_string(),
+                    toml::Value::Integer(max_num_kv_pages),
+                );
+                println!("✅ Updated backend max_num_kv_pages");
+            }
+            if let Some(max_num_embeds) = args.backend_max_num_embeds {
+                backend_table.insert(
+                    "max_num_embeds".to_string(),
+                    toml::Value::Integer(max_num_embeds),
+                );
+                println!("✅ Updated backend max_num_embeds");
+            }
+            if let Some(max_num_adapters) = args.backend_max_num_adapters {
+                backend_table.insert(
+                    "max_num_adapters".to_string(),
+                    toml::Value::Integer(max_num_adapters),
+                );
+                println!("✅ Updated backend max_num_adapters");
+            }
+            if let Some(max_adapter_rank) = args.backend_max_adapter_rank {
+                backend_table.insert(
+                    "max_adapter_rank".to_string(),
+                    toml::Value::Integer(max_adapter_rank),
+                );
+                println!("✅ Updated backend max_adapter_rank");
+            }
+            if let Some(gpu_mem_headroom) = args.backend_gpu_mem_headroom {
+                backend_table.insert(
+                    "gpu_mem_headroom".to_string(),
+                    toml::Value::Float(gpu_mem_headroom),
+                );
+                println!("✅ Updated backend gpu_mem_headroom");
+            }
+        } else {
+            anyhow::bail!("Invalid backend configuration format in config file.");
+        }
+    }
+
+    // Serialize and write the updated config back to file
+    let updated_config_content = toml::to_string_pretty(&config_file)
+        .context("Failed to serialize updated config to TOML")?;
+
+    fs::write(&config_path, updated_config_content)
+        .with_context(|| format!("Failed to write updated config file at {:?}", config_path))?;
+
+    println!("✅ Configuration file updated at {:?}", config_path);
     Ok(())
 }
 
