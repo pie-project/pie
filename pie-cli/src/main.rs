@@ -574,11 +574,12 @@ fn build_configs(
     verbose: bool,
     log: Option<PathBuf>,
 ) -> Result<(EngineConfig, Vec<toml::Value>)> {
-    let config_path = config_path
-        .map(Ok)
-        .unwrap_or_else(get_default_config_path)?;
-    let config_str = fs::read_to_string(&config_path)
-        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+    let config_str = match config_path {
+        Some(path) => fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file at {:?}", path))?,
+        None => fs::read_to_string(&get_default_config_path()?)
+            .context("Failed to read default config file. Try running `pie config init` first.")?,
+    };
     let cfg_file: ConfigFile = toml::from_str(&config_str)?;
 
     let enable_auth = if no_auth {
