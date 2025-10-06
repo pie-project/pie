@@ -42,7 +42,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber, Layer};
 //================================================================================//
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "PIE Command Line Interface")]
+#[command(author, version, about = "Pie Command Line Interface")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -63,7 +63,7 @@ enum Commands {
 }
 
 #[derive(Args, Debug)]
-/// Arguments for starting the PIE engine.
+/// Arguments for starting the Pie engine.
 pub struct ServeArgs {
     /// Path to a custom TOML configuration file.
     #[arg(long)]
@@ -424,7 +424,7 @@ async fn handle_shell_command(
                 "  run [--detach] <path> [ARGS]... - Run a .wasm inferlet with optional arguments"
             );
             println!("  query                  - (Placeholder) Query the engine state");
-            println!("  exit                   - Exit the PIE session");
+            println!("  exit                   - Exit the Pie session");
             println!("  help                   - Show this help message");
         }
         "exit" => {
@@ -684,7 +684,7 @@ fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<
 }
 
 fn init_default_config_file(exec_path: &str, backend_type: &str) -> Result<()> {
-    println!("⚙️ Initializing PIE configuration...");
+    println!("⚙️ Initializing Pie configuration...");
 
     let config_path = get_default_config_path()?;
 
@@ -755,7 +755,7 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("⚙️ Updating PIE configuration...");
+    println!("⚙️ Updating Pie configuration...");
 
     let config_path = get_default_config_path()?;
 
@@ -1027,8 +1027,8 @@ async fn start_engine_and_backend(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = oneshot::channel();
 
-    // Start the main PIE engine server
-    println!("🚀 Starting PIE engine...");
+    // Start the main Pie engine server
+    println!("🚀 Starting Pie engine...");
     let server_handle = tokio::spawn(async move {
         if let Err(e) = pie::run_server(engine_config, ready_tx, shutdown_rx).await {
             eprintln!("\n[Engine Error] Engine failed: {}", e);
