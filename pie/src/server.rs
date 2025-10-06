@@ -151,6 +151,9 @@ pub enum ClientMessage {
         cur_num_detached_instances: Option<u32>,
         cur_num_rejected_instances: Option<u32>,
     },
+
+    #[serde(rename = "query_backend_stats")]
+    QueryBackendStats { corr_id: u32 },
 }
 
 /// Messages from server -> client
@@ -545,6 +548,9 @@ impl Client {
                         cur_num_rejected_instances,
                     )
                     .await;
+                }
+                ClientMessage::QueryBackendStats { corr_id } => {
+                    self.handle_query_backend_stats(corr_id).await;
                 }
             },
             ClientCommand::Internal(cmd) => match cmd {
@@ -1134,6 +1140,23 @@ impl Client {
             // Wait for notification of instance changes
             notified.await;
         }
+    }
+
+    async fn handle_query_backend_stats(&mut self, corr_id: u32) {
+        if !self.authenticated {
+            self.send_response(corr_id, false, "Not authenticated".into())
+                .await;
+            return;
+        }
+        let runtime_stats = model::runtime_stats().await;
+        let mut sorted_stats: Vec<_> = runtime_stats.iter().collect();
+        sorted_stats.sort_by_key(|(k, _)| *k);
+
+        let mut stats_str = String::new();
+        for (key, value) in sorted_stats {
+            stats_str.push_str(&format!("{:<40} | {}\n", key, value));
+        }
+        self.send_response(corr_id, true, stats_str).await;
     }
 
     /// Cleans up client resources upon disconnection.

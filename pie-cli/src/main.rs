@@ -417,6 +417,9 @@ async fn handle_shell_command(
         "query" => {
             println!("(Query functionality not yet implemented)");
         }
+        "stat" => {
+            print_backend_stats(client_config, printer).await?;
+        }
         "help" => {
             println!("Available commands:");
             println!(
@@ -1322,6 +1325,20 @@ async fn run_inferlet(
         });
     }
 
+    Ok(())
+}
+
+async fn print_backend_stats(
+    client_config: &ClientConfig,
+    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+    let stats = client.query_backend_stats().await?;
+    {
+        let mut p = printer.lock().await;
+        p.print("Backend runtime stats:\n".to_string()).unwrap();
+        p.print(format!("{}\n", stats)).unwrap();
+    }
     Ok(())
 }
 

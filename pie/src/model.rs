@@ -16,7 +16,6 @@ use anyhow::Result;
 use anyhow::bail;
 use bytes::Bytes;
 use futures::future;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -375,10 +374,6 @@ impl Model {
         // Use a special correlation ID to distinguish heartbeats from regular requests.
         let heartbeat_corr_id = u32::MAX;
 
-        // Define the stats printing interval.
-        const STATS_PRINT_INTERVAL: Duration = Duration::from_secs(30);
-        let mut stats_interval = tokio::time::interval(STATS_PRINT_INTERVAL);
-
         loop {
             let sleep_duration = event_table
                 .values()
@@ -392,19 +387,6 @@ impl Model {
                 _ = shutdown_rx.recv() => {
                     println!("[Info] Shutdown signal received, exiting backend worker.");
                     break;
-                },
-
-                // Add a new arm to the select macro to handle the stats interval tick.
-                _ = stats_interval.tick() => {
-                    let stats = runtime_stats().await;
-                    println!("\n----- Runtime Stats -----");
-                    // Pretty-print the stats for better readability.
-                    let mut sorted_stats: Vec<_> = stats.iter().collect();
-                    sorted_stats.sort_by_key(|(k, _)| *k);
-                    for (key, value) in sorted_stats {
-                        println!("{:<40} | {}", key, value);
-                    }
-                    println!("-------------------------\n");
                 },
 
                 _ = heartbeat_interval.tick() => {

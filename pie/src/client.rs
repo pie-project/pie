@@ -207,7 +207,8 @@ impl Client {
         let corr_id_ref = match &mut msg {
             ClientMessage::Authenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
-            | ClientMessage::LaunchInstance { corr_id, .. } => corr_id,
+            | ClientMessage::LaunchInstance { corr_id, .. }
+            | ClientMessage::QueryBackendStats { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
         *corr_id_ref = corr_id_new;
@@ -247,6 +248,16 @@ impl Client {
             Ok(result)
         } else {
             anyhow::bail!("Query failed: {}", result)
+        }
+    }
+
+    pub async fn query_backend_stats(&self) -> Result<String> {
+        let msg = ClientMessage::QueryBackendStats { corr_id: 0 };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        if successful {
+            Ok(result)
+        } else {
+            anyhow::bail!("Query backend stats failed: {}", result)
         }
     }
 
