@@ -136,6 +136,8 @@ pub enum ModelCommands {
     Remove(RemoveModelArgs),
     /// Search for models in the model registry.
     Search(SearchModelArgs),
+    /// Show information about a model from the model registry.
+    Info(InfoModelArgs),
 }
 #[derive(Args, Debug)]
 pub struct AddModelArgs {
@@ -149,6 +151,11 @@ pub struct RemoveModelArgs {
 pub struct SearchModelArgs {
     /// Optional regular expression to filter model names.
     pub pattern: Option<String>,
+}
+#[derive(Args, Debug)]
+pub struct InfoModelArgs {
+    /// Name of the model to get information about.
+    pub model_name: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -630,6 +637,61 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
                 .filter(|name| regex.as_ref().map_or(true, |r| r.is_match(name)))
             {
                 println!("{name}");
+            }
+        }
+        ModelCommands::Info(args) => {
+            println!("📋 Getting model information for '{}'...", args.model_name);
+
+            // Fetch the TOML file content
+            let url = format!(
+                "https://raw.githubusercontent.com/pie-project/model-index/main/{}.toml",
+                args.model_name
+            );
+            let client = reqwest::Client::new();
+            let response = client
+                .get(&url)
+                .header("User-Agent", "pie-index-info/1.0")
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                anyhow::bail!("Model '{}' not found in the registry", args.model_name);
+            }
+
+            let toml_content = response.text().await?;
+
+            // Parse the TOML content
+            let parsed_toml: toml::Value =
+                toml::from_str(&toml_content).context("Failed to parse TOML file")?;
+
+            // Extract and display the architecture section
+            if let Some(architecture) = parsed_toml.get("architecture") {
+                println!("\n🏗️  Architecture:");
+                match architecture {
+                    toml::Value::Table(table) => {
+                        print_toml_table(table, 1);
+                    }
+                    _ => {
+                        println!("  {}", format_toml_value(architecture));
+                    }
+                }
+            } else {
+                println!("❌ No architecture section found in the model configuration");
+            }
+
+            // Check if the model is downloaded locally
+            let models_root = get_pie_home()?.join("models");
+            let model_files_dir = models_root.join(&args.model_name);
+            let metadata_path = models_root.join(format!("{}.toml", args.model_name));
+
+            let is_downloaded = model_files_dir.exists() && metadata_path.exists();
+            println!("\n📦 Download Status:");
+            if is_downloaded {
+                println!("  ✅ Downloaded locally");
+                println!("  📁 Location: {}", model_files_dir.display());
+            } else {
+                println!("  ❌ Not downloaded");
+                println!("  💡 Use `pie model add {}` to download", args.model_name);
             }
         }
     }
@@ -1597,4 +1659,44 @@ async fn wait_for_instance_finish(client_config: &ClientConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Helper function to print TOML tables with proper indentation
+fn print_toml_table(table: &toml::value::Table, indent_level: usize) {
+    let indent = "  ".repeat(indent_level);
+
+    for (key, value) in table {
+        match value {
+            toml::Value::Table(nested_table) => {
+                println!("{}{}:", indent, key);
+                print_toml_table(nested_table, indent_level + 1);
+            }
+            _ => {
+                println!("{}{}: {}", indent, key, format_toml_value(value));
+            }
+        }
+    }
+}
+
+/// Helper function to format TOML values for display
+fn format_toml_value(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(format_toml_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+        toml::Value::Table(table) => {
+            // For inline tables, keep the compact format
+            let items: Vec<String> = table
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, format_toml_value(v)))
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        toml::Value::Datetime(dt) => dt.to_string(),
+    }
 }
