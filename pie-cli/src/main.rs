@@ -30,6 +30,7 @@ use std::{
 };
 use tokio::io::BufReader;
 use tokio::process::{Child, Command as TokioCommand};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot::{self, Sender};
 use tokio::task::JoinHandle;
@@ -1421,19 +1422,45 @@ async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client
     Ok(client)
 }
 
-/// Waits for all backend processes to be attached.
+/// Waits for all backend processes to be attached. If any backend process terminates prematurely
+/// (before registering), this function will fail immediately.
 async fn wait_for_backend_ready(client_config: &ClientConfig, num_backends: usize) -> Result<()> {
     let backend_query_client = connect_and_authenticate(&client_config).await?;
 
-    // Query the number of attached and rejected backends.
-    let (mut num_attached, mut num_rejected) =
-        backend_query_client.wait_backend_change(None, None).await?;
+    // Set up SIGCHLD signal handler to detect when child processes terminate prematurely
+    let mut sigchld =
+        signal(SignalKind::child()).context("Failed to set up SIGCHLD signal handler")?;
 
-    // If backends have not all been attached, wait for them to be attached.
+    // Get initial backend state
+    let (mut num_attached, mut num_rejected) = tokio::select! {
+        result = backend_query_client.wait_backend_change(None, None) => {
+            result?
+        }
+        _ = sigchld.recv() => {
+            anyhow::bail!(
+                "Backend process(es) terminated prematurely before registering. \
+                 Check backend logs for errors."
+            );
+        }
+    };
+
+    // Wait for all backends to be attached
     while (num_attached as usize) < num_backends && num_rejected == 0 {
-        (num_attached, num_rejected) = backend_query_client
-            .wait_backend_change(Some(num_attached), Some(num_rejected))
-            .await?;
+        (num_attached, num_rejected) = tokio::select! {
+            result = backend_query_client
+                .wait_backend_change(
+                    Some(num_attached),
+                    Some(num_rejected)
+                ) => {
+                result?
+            }
+            _ = sigchld.recv() => {
+                anyhow::bail!(
+                    "Backend process(es) terminated prematurely before registering. \
+                     Check backend logs for errors."
+                );
+            }
+        };
     }
 
     // We expect no backends to be rejected and the number of attached backends
