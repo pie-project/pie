@@ -10,6 +10,7 @@ use pie::{
     client::{self, Client},
 };
 use rand::{Rng, distr::Alphanumeric};
+use regex::Regex;
 use reqwest::Client as HttpClient;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
@@ -19,6 +20,7 @@ use rustyline::history::FileHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Helper}; // The Helper trait is still needed
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::path::Path;
 use std::sync::Arc;
 use std::{
@@ -126,9 +128,14 @@ pub struct ShellRunArgs {
 // Other command structs (ModelCommands, etc.) remain the same
 #[derive(Subcommand, Debug)]
 pub enum ModelCommands {
+    /// List downloaded models.
     List,
+    /// Download a model from the model registry.
     Add(AddModelArgs),
+    /// Delete a downloaded model.
     Remove(RemoveModelArgs),
+    /// Search for models in the model registry.
+    Search(SearchModelArgs),
 }
 #[derive(Args, Debug)]
 pub struct AddModelArgs {
@@ -137,6 +144,11 @@ pub struct AddModelArgs {
 #[derive(Args, Debug)]
 pub struct RemoveModelArgs {
     pub model_name: String,
+}
+#[derive(Args, Debug)]
+pub struct SearchModelArgs {
+    /// Optional regular expression to filter model names.
+    pub pattern: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -555,6 +567,69 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
                 println!("✅ Model '{}' removed.", args.model_name);
             } else {
                 anyhow::bail!("Model '{}' not found locally.", args.model_name);
+            }
+        }
+        ModelCommands::Search(args) => {
+            println!("🔍 Searching for models...");
+
+            #[derive(Deserialize)]
+            struct Item {
+                name: String,
+                #[serde(rename = "type")]
+                item_type: String,
+            }
+
+            // Check available files under pie-project/model-index repository
+            let url = "https://api.github.com/repos/pie-project/model-index/contents";
+            let client = reqwest::Client::new();
+            let response = client
+                .get(url)
+                .query(&[("ref", "main")])
+                .header("User-Agent", "pie-index-list/1.0")
+                .send()
+                .await?;
+
+            let status = response.status();
+            let response_text = response.text().await?;
+
+            // Try to parse as an array first, if that fails, check if it's an error response
+            let items: Vec<Item> = match serde_json::from_str(&response_text) {
+                Ok(items) => items,
+                // Try to instead parse as a GitHub API error response if the initial parsing fails
+                Err(_) => {
+                    #[derive(Deserialize)]
+                    struct GitHubError {
+                        message: String,
+                    }
+
+                    if let Ok(error) = serde_json::from_str::<GitHubError>(&response_text) {
+                        anyhow::bail!("{}", error.message);
+                    } else {
+                        anyhow::bail!("GitHub API request failed with status: {}", status);
+                    }
+                }
+            };
+
+            // Compile regex if pattern is provided
+            let regex = if let Some(pattern) = &args.pattern {
+                Some(Regex::new(pattern).context("Invalid regular expression")?)
+            } else {
+                None
+            };
+
+            // Print matching model names
+            for name in items
+                .into_iter()
+                // Keep only files that are .toml and not traits.toml
+                .filter(|i| {
+                    i.item_type == "file" && i.name.ends_with(".toml") && i.name != "traits.toml"
+                })
+                // Remove the .toml suffix from the model name
+                .map(|i| i.name.strip_suffix(".toml").unwrap_or(&i.name).to_string())
+                // Filter by regex if provided
+                .filter(|name| regex.as_ref().map_or(true, |r| r.is_match(name)))
+            {
+                println!("{name}");
             }
         }
     }
