@@ -17,6 +17,16 @@ from config.common import ModelInfo
 CreateModelFn = Callable[[ModelInfo], Tuple[torch.nn.Module, dict]]
 
 
+class MetadataNotFoundError(FileNotFoundError):
+    """Exception raised when a metadata file is not found."""
+
+    model_name: str
+
+    def __init__(self, model_name: str, error: str):
+        self.model_name = model_name
+        super().__init__(error)
+
+
 def load_model_info(config: dict) -> ModelInfo:
     """Load the model information from the metadata file."""
 
@@ -27,7 +37,9 @@ def load_model_info(config: dict) -> ModelInfo:
     metadata_path = model_path / f"{model_name}.toml"
 
     if not metadata_path.exists():
-        raise FileNotFoundError(f"Metadata file not found at: {metadata_path}")
+        raise MetadataNotFoundError(
+            model_name, f"Metadata file not found at: {metadata_path}"
+        )
 
     # Load the model information from the metadata file.
     model_device = config["device"]

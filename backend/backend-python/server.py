@@ -42,6 +42,8 @@ from message import (
     UploadAdapterRequest,
 )
 
+from model_loader import MetadataNotFoundError
+
 
 class HandlerId(enum.Enum):
     """Enumeration of handler message types."""
@@ -508,10 +510,15 @@ def main(
 
     print_config(config)
 
-    start_service(
-        config=config,
-        handler_cls=Handler,
-    )
+    try:
+        start_service(
+            config=config,
+            handler_cls=Handler,
+        )
+    except MetadataNotFoundError as e:
+        print(f"Error: {e}")
+        print(f"Try `pie model add {e.model_name}` to download the model.")
+        os._exit(1)
 
 
 if __name__ == "__main__":
