@@ -225,30 +225,101 @@ fn init_default_config_file(exec_path: &str, backend_type: &str) -> Result<()> {
     Ok(())
 }
 
-fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
-    // Check if any update options were provided
-    let has_engine_updates = args.host.is_some()
-        || args.port.is_some()
-        || args.enable_auth.is_some()
-        || args.auth_secret.is_some()
-        || args.cache_dir.is_some()
-        || args.verbose.is_some()
-        || args.log.is_some();
+// Macro to check if any of the provided Option fields are Some
+macro_rules! any_some {
+    ($($field:expr),+ $(,)?) => {
+        $($field.is_some())||+
+    };
+}
 
-    let has_backend_updates = args.backend_type.is_some()
-        || args.backend_exec_path.is_some()
-        || args.backend_model.is_some()
-        || args.backend_device.is_some()
-        || args.backend_dtype.is_some()
-        || args.backend_kv_page_size.is_some()
-        || args.backend_max_batch_tokens.is_some()
-        || args.backend_max_dist_size.is_some()
-        || args.backend_max_num_kv_pages.is_some()
-        || args.backend_max_num_embeds.is_some()
-        || args.backend_max_num_adapters.is_some()
-        || args.backend_max_adapter_rank.is_some()
-        || args.backend_gpu_mem_headroom.is_some()
-        || args.backend_enable_profiling.is_some();
+// Macro to update multiple config fields declaratively (handles mixed types)
+macro_rules! update_fields {
+    ($config:expr, { $( $item:tt ),* $(,)? }) => {
+        $(
+            update_fields!(@item $config, $item);
+        )*
+    };
+    (@item $config:expr, ($field_name:ident, $var:ident)) => {
+        if let Some(val) = $var {
+            $config.$field_name = Some(val);
+            println!("✅ Updated {}", stringify!($field_name));
+        }
+    };
+    (@item $config:expr, ($field_name:ident, $var:ident, PathBuf)) => {
+        if let Some(val) = $var {
+            $config.$field_name = Some(PathBuf::from(val));
+            println!("✅ Updated {}", stringify!($field_name));
+        }
+    };
+}
+
+// Macro to update multiple backend TOML table fields declaratively
+macro_rules! update_backend_fields {
+    ($table:expr, { $( ($key:literal, $var:ident) ),* $(,)? }) => {
+        $(
+            if let Some(val) = $var {
+                $table.insert($key.to_string(), toml::Value::from(val));
+                println!("✅ Updated backend {}", $key);
+            }
+        )*
+    };
+}
+
+fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
+    // Destructure the entire struct to ensure we handle all fields
+    let ConfigUpdateArgs {
+        // Engine fields
+        host,
+        port,
+        enable_auth,
+        auth_secret,
+        cache_dir,
+        verbose,
+        log,
+        // Backend fields
+        backend_type,
+        backend_exec_path,
+        backend_model,
+        backend_device,
+        backend_dtype,
+        backend_kv_page_size,
+        backend_max_batch_tokens,
+        backend_max_dist_size,
+        backend_max_num_kv_pages,
+        backend_max_num_embeds,
+        backend_max_num_adapters,
+        backend_max_adapter_rank,
+        backend_gpu_mem_headroom,
+        backend_enable_profiling,
+    } = args;
+
+    // Check if any update options were provided
+    let has_engine_updates = any_some![
+        host,
+        port,
+        enable_auth,
+        auth_secret,
+        cache_dir,
+        verbose,
+        log,
+    ];
+
+    let has_backend_updates = any_some![
+        backend_type,
+        backend_exec_path,
+        backend_model,
+        backend_device,
+        backend_dtype,
+        backend_kv_page_size,
+        backend_max_batch_tokens,
+        backend_max_dist_size,
+        backend_max_num_kv_pages,
+        backend_max_num_embeds,
+        backend_max_num_adapters,
+        backend_max_adapter_rank,
+        backend_gpu_mem_headroom,
+        backend_enable_profiling,
+    ];
 
     if !has_engine_updates && !has_backend_updates {
         println!("⚠️ No configuration options provided to update.");
@@ -275,34 +346,15 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         .with_context(|| format!("Failed to parse config file at {:?}", config_path))?;
 
     // Update engine configuration fields
-    if let Some(host) = args.host {
-        config_file.host = Some(host);
-        println!("✅ Updated host");
-    }
-    if let Some(port) = args.port {
-        config_file.port = Some(port);
-        println!("✅ Updated port");
-    }
-    if let Some(enable_auth) = args.enable_auth {
-        config_file.enable_auth = Some(enable_auth);
-        println!("✅ Updated enable_auth");
-    }
-    if let Some(auth_secret) = args.auth_secret {
-        config_file.auth_secret = Some(auth_secret);
-        println!("✅ Updated auth_secret");
-    }
-    if let Some(cache_dir) = args.cache_dir {
-        config_file.cache_dir = Some(PathBuf::from(cache_dir));
-        println!("✅ Updated cache_dir");
-    }
-    if let Some(verbose) = args.verbose {
-        config_file.verbose = Some(verbose);
-        println!("✅ Updated verbose");
-    }
-    if let Some(log) = args.log {
-        config_file.log = Some(PathBuf::from(log));
-        println!("✅ Updated log");
-    }
+    update_fields!(config_file, {
+        (host, host),
+        (port, port),
+        (enable_auth, enable_auth),
+        (auth_secret, auth_secret),
+        (verbose, verbose),
+        (cache_dir, cache_dir, PathBuf),
+        (log, log, PathBuf),
+    });
 
     // Update backend configuration fields
     if has_backend_updates {
@@ -314,92 +366,22 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
 
         // Update the first backend entry (assuming single backend for now)
         if let Some(toml::Value::Table(backend_table)) = config_file.backend.get_mut(0) {
-            if let Some(backend_type) = args.backend_type {
-                backend_table.insert(
-                    "backend_type".to_string(),
-                    toml::Value::String(backend_type),
-                );
-                println!("✅ Updated backend_type");
-            }
-            if let Some(exec_path) = args.backend_exec_path {
-                backend_table.insert("exec_path".to_string(), toml::Value::String(exec_path));
-                println!("✅ Updated backend exec_path");
-            }
-            if let Some(model) = args.backend_model {
-                backend_table.insert("model".to_string(), toml::Value::String(model));
-                println!("✅ Updated backend model");
-            }
-            if let Some(device) = args.backend_device {
-                backend_table.insert("device".to_string(), toml::Value::String(device));
-                println!("✅ Updated backend device");
-            }
-            if let Some(dtype) = args.backend_dtype {
-                backend_table.insert("dtype".to_string(), toml::Value::String(dtype));
-                println!("✅ Updated backend dtype");
-            }
-            if let Some(kv_page_size) = args.backend_kv_page_size {
-                backend_table.insert(
-                    "kv_page_size".to_string(),
-                    toml::Value::Integer(kv_page_size),
-                );
-                println!("✅ Updated backend kv_page_size");
-            }
-            if let Some(max_batch_tokens) = args.backend_max_batch_tokens {
-                backend_table.insert(
-                    "max_batch_tokens".to_string(),
-                    toml::Value::Integer(max_batch_tokens),
-                );
-                println!("✅ Updated backend max_batch_tokens");
-            }
-            if let Some(max_dist_size) = args.backend_max_dist_size {
-                backend_table.insert(
-                    "max_dist_size".to_string(),
-                    toml::Value::Integer(max_dist_size),
-                );
-                println!("✅ Updated backend max_dist_size");
-            }
-            if let Some(max_num_kv_pages) = args.backend_max_num_kv_pages {
-                backend_table.insert(
-                    "max_num_kv_pages".to_string(),
-                    toml::Value::Integer(max_num_kv_pages),
-                );
-                println!("✅ Updated backend max_num_kv_pages");
-            }
-            if let Some(max_num_embeds) = args.backend_max_num_embeds {
-                backend_table.insert(
-                    "max_num_embeds".to_string(),
-                    toml::Value::Integer(max_num_embeds),
-                );
-                println!("✅ Updated backend max_num_embeds");
-            }
-            if let Some(max_num_adapters) = args.backend_max_num_adapters {
-                backend_table.insert(
-                    "max_num_adapters".to_string(),
-                    toml::Value::Integer(max_num_adapters),
-                );
-                println!("✅ Updated backend max_num_adapters");
-            }
-            if let Some(max_adapter_rank) = args.backend_max_adapter_rank {
-                backend_table.insert(
-                    "max_adapter_rank".to_string(),
-                    toml::Value::Integer(max_adapter_rank),
-                );
-                println!("✅ Updated backend max_adapter_rank");
-            }
-            if let Some(gpu_mem_headroom) = args.backend_gpu_mem_headroom {
-                backend_table.insert(
-                    "gpu_mem_headroom".to_string(),
-                    toml::Value::Float(gpu_mem_headroom),
-                );
-                println!("✅ Updated backend gpu_mem_headroom");
-            }
-            if let Some(enable_profiling) = args.backend_enable_profiling {
-                backend_table.insert(
-                    "enable_profiling".to_string(),
-                    toml::Value::Boolean(enable_profiling),
-                );
-                println!("✅ Updated backend enable_profiling");
-            }
+            update_backend_fields!(backend_table, {
+                ("backend_type", backend_type),
+                ("exec_path", backend_exec_path),
+                ("model", backend_model),
+                ("device", backend_device),
+                ("dtype", backend_dtype),
+                ("kv_page_size", backend_kv_page_size),
+                ("max_batch_tokens", backend_max_batch_tokens),
+                ("max_dist_size", backend_max_dist_size),
+                ("max_num_kv_pages", backend_max_num_kv_pages),
+                ("max_num_embeds", backend_max_num_embeds),
+                ("max_num_adapters", backend_max_num_adapters),
+                ("max_adapter_rank", backend_max_adapter_rank),
+                ("gpu_mem_headroom", backend_gpu_mem_headroom),
+                ("enable_profiling", backend_enable_profiling),
+            });
         } else {
             anyhow::bail!("Invalid backend configuration format in config file.");
         }
