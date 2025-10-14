@@ -8,33 +8,26 @@ use pie::{
     client::{self, Client},
 };
 use rand::{Rng, distr::Alphanumeric};
-use rustyline::completion::Completer;
+use rustyline::Editor;
 use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
 use rustyline::history::FileHistory;
-use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Editor, Helper};
 use std::path::Path;
 use std::sync::Arc;
-use std::{fs, io, path::PathBuf, process::Stdio};
+use std::{fs, path::PathBuf, process::Stdio};
 use tokio::io::BufReader;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::Mutex;
 use tokio::sync::oneshot::{self, Sender};
 use tokio::task::JoinHandle;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, FmtSubscriber, Layer};
 
 mod config;
 mod model;
+mod output;
 mod path;
 
 use config::{ConfigCommands, ConfigFile};
 use model::ModelCommands;
+use output::{MyHelper, SharedPrinter};
 
 //================================================================================//
 // SECTION: CLI Command & Config Structs
@@ -148,7 +141,7 @@ async fn main() -> Result<()> {
             )?;
 
             // Initialize logging based on the config and get the file-writer guard
-            let _guard = init_logging(&engine_config)?;
+            let _guard = output::init_logging(&engine_config)?;
 
             handle_serve_command(engine_config, backend_configs).await?;
         }
@@ -158,7 +151,7 @@ async fn main() -> Result<()> {
                 build_configs(args.config, false, None, None, false, args.log)?;
 
             // Initialize logging based on the config and get the file-writer guard
-            let _guard = init_logging(&engine_config)?;
+            let _guard = output::init_logging(&engine_config)?;
 
             handle_run_command(
                 engine_config,
@@ -170,18 +163,12 @@ async fn main() -> Result<()> {
         }
         Commands::Model(cmd) => {
             // Model commands don't start the engine, so they can use a simple logger
-            let subscriber = FmtSubscriber::builder()
-                .with_max_level(tracing::Level::INFO)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber)?;
+            output::init_simple_logging()?;
             model::handle_model_command(cmd).await?;
         }
         Commands::Config(cmd) => {
             // Config commands don't start the engine, so they can use a simple logger
-            let subscriber = FmtSubscriber::builder()
-                .with_max_level(tracing::Level::INFO)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber)?;
+            output::init_simple_logging()?;
             config::handle_config_command(cmd).await?;
         }
     }
@@ -192,42 +179,12 @@ async fn main() -> Result<()> {
 // SECTION: Command Handlers
 //================================================================================//
 
-// The incorrect `#[derive]` attribute has been removed.
-struct MyHelper;
-
-// To satisfy the `Helper` trait bounds, we must implement all its component traits.
-// For now, we'll provide empty implementations for the ones we don't need.
-
-impl Completer for MyHelper {
-    type Candidate = String;
-}
-
-impl Hinter for MyHelper {
-    type Hint = String;
-
-    fn hint(&self, _line: &str, _pos: usize, _ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
-        None // No hints for now
-    }
-}
-
-// Your existing Highlighter implementation is correct.
-impl Highlighter for MyHelper {}
-
-impl Validator for MyHelper {
-    fn validate(&self, _ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
-        Ok(ValidationResult::Valid(None)) // No validation
-    }
-}
-
-// Finally, we implement the `Helper` marker trait itself.
-impl Helper for MyHelper {}
-
 /// Handles the `pie serve` command.
 async fn handle_serve_command(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
 ) -> Result<()> {
-    let (rl, printer) = create_editor_and_printer().await?;
+    let (rl, printer) = output::create_editor_and_printer_with_history().await?;
 
     // Start the engine and backend services
     let (shutdown_tx, server_handle, backend_processes, client_config) =
@@ -255,7 +212,7 @@ async fn handle_run_command(
     inferlet_path: PathBuf,
     arguments: Vec<String>,
 ) -> Result<()> {
-    let (_rl, printer) = create_editor_and_printer().await?;
+    let (_rl, printer) = output::create_editor_and_printer_with_history().await?;
 
     // Start the engine and backend services
     let (shutdown_tx, server_handle, backend_processes, client_config) =
@@ -281,7 +238,7 @@ async fn handle_shell_command(
     command: &str,
     args: &[&str],
     client_config: &ClientConfig,
-    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+    printer: &SharedPrinter,
 ) -> Result<bool> {
     match command {
         "run" => {
@@ -300,14 +257,16 @@ async fn handle_shell_command(
                     .await
                     {
                         // Use the printer to avoid corrupting the prompt.
-                        let mut p = printer.lock().await;
-                        p.print(format!("Error running inferlet: {e}")).unwrap();
+                        let _ = output::print_with_printer(
+                            printer,
+                            format!("Error: running inferlet: {e}"),
+                        )
+                        .await;
                     }
                 }
                 Err(e) => {
                     // Clap's error messages are user-friendly and include usage.
-                    let mut p = printer.lock().await;
-                    p.print(e.to_string()).unwrap();
+                    let _ = output::print_with_printer(printer, e.to_string()).await;
                 }
             }
         }
@@ -396,64 +355,10 @@ fn build_configs(
     Ok((engine_config, cfg_file.backend))
 }
 
-fn get_shell_history_path() -> Result<PathBuf> {
-    let pie_home = path::get_pie_home()?;
-    let history_path = pie_home.join(".pie_history");
-    Ok(history_path)
-}
-
-fn init_logging(config: &EngineConfig) -> Result<Option<WorkerGuard>> {
-    let mut guard = None;
-
-    // Console logger setup
-    let console_filter = if config.verbose {
-        // If -v is passed, show info for everything
-        EnvFilter::new("info")
-    } else {
-        // Otherwise, use RUST_LOG or default to "warn"
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
-    };
-    let console_layer = tracing_subscriber::fmt::layer()
-        .with_writer(io::stdout)
-        .with_filter(console_filter);
-
-    // File logger setup
-    let file_layer = if let Some(log_path) = &config.log {
-        let parent = log_path
-            .parent()
-            .context("Log path has no parent directory")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create log directory at {:?}", parent))?;
-
-        let file_appender = tracing_appender::rolling::never(parent, log_path.file_name().unwrap());
-        let (non_blocking_writer, worker_guard) = tracing_appender::non_blocking(file_appender);
-
-        // Save the guard to be returned
-        guard = Some(worker_guard);
-
-        let layer = tracing_subscriber::fmt::layer()
-            .with_writer(non_blocking_writer)
-            .with_ansi(false) // No colors in files
-            .with_filter(EnvFilter::new("info")); // Log `INFO` and above to the file
-
-        Some(layer)
-    } else {
-        None
-    };
-
-    // Register the layers
-    tracing_subscriber::registry()
-        .with(console_layer)
-        .with(file_layer)
-        .init();
-
-    Ok(guard)
-}
-
 async fn start_engine_and_backend(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
-    printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+    printer: SharedPrinter,
 ) -> Result<(Sender<()>, JoinHandle<()>, Vec<Child>, ClientConfig)> {
     // Initialize engine and client configurations
     let client_config = ClientConfig {
@@ -633,25 +538,11 @@ async fn start_engine_and_backend(
     Ok((shutdown_tx, server_handle, backend_processes, client_config))
 }
 
-async fn create_editor_and_printer() -> Result<(
-    Editor<MyHelper, FileHistory>,
-    Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
-)> {
-    let mut rl = Editor::new()?;
-    rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
-    let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
-        Arc::new(Mutex::new(rl.create_external_printer()?));
-    let history_path = get_shell_history_path()?;
-    let _ = rl.load_history(&history_path);
-
-    Ok((rl, printer))
-}
-
 /// Runs the interactive shell.
 async fn run_shell(
     client_config: &ClientConfig,
     mut rl: Editor<MyHelper, FileHistory>,
-    printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+    printer: SharedPrinter,
 ) -> Result<()> {
     println!("Entering interactive session. Type 'help' for commands or use ↑/↓ for history.");
 
@@ -697,7 +588,7 @@ async fn run_shell(
     }
 
     println!("Shutting down services...");
-    if let Err(err) = rl.save_history(&get_shell_history_path()?) {
+    if let Err(err) = rl.save_history(&path::get_shell_history_path()?) {
         eprintln!("Warning: Failed to save command history: {}", err);
     }
 
@@ -710,7 +601,7 @@ async fn run_inferlet(
     inferlet_path: PathBuf,
     arguments: Vec<String>,
     detach: bool,
-    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+    printer: &SharedPrinter,
 ) -> Result<()> {
     let client = connect_and_authenticate(client_config).await?;
 
@@ -763,17 +654,11 @@ async fn run_inferlet(
     Ok(())
 }
 
-async fn print_backend_stats(
-    client_config: &ClientConfig,
-    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
-) -> Result<()> {
+async fn print_backend_stats(client_config: &ClientConfig, printer: &SharedPrinter) -> Result<()> {
     let client = connect_and_authenticate(client_config).await?;
     let stats = client.query_backend_stats().await?;
-    {
-        let mut p = printer.lock().await;
-        p.print("Backend runtime stats:\n".to_string()).unwrap();
-        p.print(format!("{}\n", stats)).unwrap();
-    }
+    let _ =
+        output::print_with_printer(printer, format!("Backend runtime stats:\n{}\n", stats)).await;
     Ok(())
 }
 
