@@ -14,3 +14,9 @@ pub fn get_pie_home() -> Result<PathBuf> {
             .ok_or_else(|| anyhow!("Failed to find home dir"))
     }
 }
+
+pub fn get_default_config_path() -> Result<PathBuf> {
+    let pie_home = get_pie_home()?;
+    let config_path = pie_home.join("config.toml");
+    Ok(config_path)
+}
