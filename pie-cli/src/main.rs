@@ -11,11 +11,13 @@ mod engine;
 mod model;
 mod output;
 mod path;
+mod run;
 
 use config::ConfigCommands;
 use engine::ClientConfig;
 use model::ModelCommands;
 use output::{MyHelper, SharedPrinter};
+use run::RunArgs;
 
 //================================================================================//
 // SECTION: CLI Command & Config Structs
@@ -63,23 +65,6 @@ pub struct ServeArgs {
     /// Enable verbose console logging.
     #[arg(long, short)]
     pub verbose: bool,
-}
-
-#[derive(Args, Debug)]
-/// Arguments to submit an inferlet (Wasm program) to the engine in the shell.
-pub struct RunArgs {
-    /// Path to the .wasm inferlet file.
-    #[arg(value_parser = expand_tilde)]
-    pub inferlet: PathBuf,
-    /// Path to a custom TOML configuration file.
-    #[arg(long, short)]
-    pub config: Option<PathBuf>,
-    /// A log file to write to.
-    #[arg(long)]
-    pub log: Option<PathBuf>,
-    /// Arguments to pass to the inferlet after `--`.
-    #[arg(last = true)]
-    pub arguments: Vec<String>,
 }
 
 /// Helper for clap to expand `~` in path arguments.
@@ -140,7 +125,7 @@ async fn main() -> Result<()> {
             // Initialize logging based on the config and get the file-writer guard
             let _guard = output::init_logging(&engine_config)?;
 
-            handle_run_command(
+            run::handle_run_command(
                 engine_config,
                 backend_configs,
                 args.inferlet,
@@ -189,34 +174,6 @@ async fn handle_serve_command(
     )
     .await?;
 
-    Ok(())
-}
-
-/// Handles the `pie run` command.
-async fn handle_run_command(
-    engine_config: EngineConfig,
-    backend_configs: Vec<toml::Value>,
-    inferlet_path: PathBuf,
-    arguments: Vec<String>,
-) -> Result<()> {
-    let (_rl, printer) = output::create_editor_and_printer_with_history().await?;
-
-    // Start the engine and backend services
-    let (shutdown_tx, server_handle, backend_processes, client_config) =
-        engine::start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
-
-    // Run the inferlet
-    engine::run_inferlet(&client_config, inferlet_path, arguments, false, &printer).await?;
-    engine::wait_for_instance_finish(&client_config).await?;
-
-    // Terminate the engine and backend services
-    engine::terminate_engine_and_backend(
-        &client_config,
-        backend_processes,
-        shutdown_tx,
-        server_handle,
-    )
-    .await?;
     Ok(())
 }
 
