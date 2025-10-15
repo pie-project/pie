@@ -40,7 +40,7 @@ pub struct ServeArgs {
 #[derive(Parser, Debug)]
 pub struct ShellRunArgs {
     /// Path to the .wasm inferlet file.
-    #[arg(value_parser = expand_tilde)]
+    #[arg(value_parser = path::expand_tilde)]
     pub inferlet_path: PathBuf,
 
     /// Stream the inferlet output to the console.
@@ -49,11 +49,6 @@ pub struct ShellRunArgs {
 
     /// Arguments to pass to the Wasm program.
     pub arguments: Vec<String>,
-}
-
-/// Helper for clap to expand `~` in path arguments.
-fn expand_tilde(s: &str) -> Result<PathBuf, std::convert::Infallible> {
-    Ok(PathBuf::from(shellexpand::tilde(s).as_ref()))
 }
 
 /// Handles the `pie serve` command.

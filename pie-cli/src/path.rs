@@ -26,3 +26,8 @@ pub fn get_shell_history_path() -> Result<PathBuf> {
     let history_path = pie_home.join(".pie_history");
     Ok(history_path)
 }
+
+/// Helper for clap to expand `~` in path arguments.
+pub fn expand_tilde(s: &str) -> Result<PathBuf, std::convert::Infallible> {
+    Ok(PathBuf::from(shellexpand::tilde(s).as_ref()))
+}

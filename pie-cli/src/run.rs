@@ -3,7 +3,7 @@
 //! This module implements the `pie run` subcommand for running inferlets
 //! with a one-shot Pie engine instance.
 
-use crate::{engine, output};
+use crate::{engine, output, path};
 use anyhow::Result;
 use clap::Args;
 use pie::Config as EngineConfig;
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[derive(Args, Debug)]
 pub struct RunArgs {
     /// Path to the .wasm inferlet file.
-    #[arg(value_parser = expand_tilde)]
+    #[arg(value_parser = path::expand_tilde)]
     pub inferlet: PathBuf,
     /// Path to a custom TOML configuration file.
     #[arg(long, short)]
@@ -24,11 +24,6 @@ pub struct RunArgs {
     /// Arguments to pass to the inferlet after `--`.
     #[arg(last = true)]
     pub arguments: Vec<String>,
-}
-
-/// Helper for clap to expand `~` in path arguments.
-fn expand_tilde(s: &str) -> Result<PathBuf, std::convert::Infallible> {
-    Ok(PathBuf::from(shellexpand::tilde(s).as_ref()))
 }
 
 /// Handles the `pie run` command.

@@ -364,10 +364,7 @@ pub async fn submit_inferlet_and_wait(
     printer: SharedPrinter,
 ) -> Result<()> {
     let instance = submit_inferlet(client_config, inferlet_path, arguments).await?;
-
-    stream_inferlet_output(instance, printer).await;
-
-    Ok(())
+    stream_inferlet_output(instance, printer).await
 }
 
 /// Submits an inferlet to the engine and returns the instance.
