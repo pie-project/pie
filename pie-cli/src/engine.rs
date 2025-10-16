@@ -356,6 +356,20 @@ pub async fn submit_detached_inferlet(
     Ok(())
 }
 
+/// Submits an inferlet to the engine and waits for it to finish.
+pub async fn submit_inferlet_and_wait(
+    client_config: &ClientConfig,
+    inferlet_path: PathBuf,
+    arguments: Vec<String>,
+    printer: SharedPrinter,
+) -> Result<()> {
+    let instance = submit_inferlet(client_config, inferlet_path, arguments).await?;
+
+    stream_inferlet_output(instance, printer).await;
+
+    Ok(())
+}
+
 /// Submits an inferlet to the engine and returns the instance.
 async fn submit_inferlet(
     client_config: &ClientConfig,
@@ -420,54 +434,6 @@ async fn stream_inferlet_output(mut instance: Instance, printer: SharedPrinter) 
             InstanceEvent::Blob(_) => continue,
         }
     }
-}
-
-/// Waits for the instance to finish.
-pub async fn wait_for_instance_finish(client_config: &ClientConfig) -> Result<()> {
-    let client = connect_and_authenticate(client_config).await?;
-
-    // Query the number of attached, detached, and rejected instances.
-    let (mut num_attached, mut num_detached, mut num_rejected) =
-        client.wait_instance_change(None, None, None).await?;
-
-    // If no instances are attached, detached, or rejected, wait for a change.
-    while num_attached == 0 && num_detached == 0 && num_rejected == 0 {
-        (num_attached, num_detached, num_rejected) = client
-            .wait_instance_change(Some(0), Some(0), Some(0))
-            .await?;
-    }
-
-    // We expect either the inferlet was launched successfully (num_attached == 1)
-    // or the inferlet was already terminated (num_attached == 0 && num_detached == 1).
-    if !((num_attached == 1 && num_detached == 0 && num_rejected == 0)
-        || (num_attached == 1 && num_detached == 1 && num_rejected == 0))
-    {
-        anyhow::bail!(
-            "Unexpected instance state: {} instance(s) attached, {} instance(s) detached, {} instance(s) rejected",
-            num_attached,
-            num_detached,
-            num_rejected
-        );
-    }
-
-    // If the inferlet was just started, wait for it to finish.
-    while num_attached == 1 && num_detached == 0 && num_rejected == 0 {
-        (num_attached, num_detached, num_rejected) = client
-            .wait_instance_change(Some(1), Some(0), Some(0))
-            .await?;
-    }
-
-    // Check that the inferlet was terminated.
-    if !(num_attached == 1 && num_detached == 1 && num_rejected == 0) {
-        anyhow::bail!(
-            "Unexpected instance state: {} instance(s) attached, {} instance(s) detached, {} instance(s) rejected",
-            num_attached,
-            num_detached,
-            num_rejected
-        );
-    }
-
-    Ok(())
 }
 
 /// Connects to the engine and authenticates the client.

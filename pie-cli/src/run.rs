@@ -52,9 +52,8 @@ pub async fn handle_run_command(
         engine::start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
 
     // Run the inferlet
-    engine::submit_detached_inferlet(&client_config, inferlet_path, arguments, true, &printer)
+    engine::submit_inferlet_and_wait(&client_config, inferlet_path, arguments, printer.clone())
         .await?;
-    engine::wait_for_instance_finish(&client_config).await?;
 
     // Terminate the engine and backend services
     engine::terminate_engine_and_backend(
