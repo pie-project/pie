@@ -43,9 +43,9 @@ pub struct ShellRunArgs {
     #[arg(value_parser = expand_tilde)]
     pub inferlet_path: PathBuf,
 
-    /// Run the inferlet in the background and print its instance ID.
+    /// Stream the inferlet output to the console.
     #[arg(long, short)]
-    pub detach: bool,
+    pub stream_output: bool,
 
     /// Arguments to pass to the Wasm program.
     pub arguments: Vec<String>,
@@ -102,12 +102,12 @@ async fn handle_shell_command(
 
             match ShellRunArgs::try_parse_from(clap_args) {
                 Ok(run_args) => {
-                    if let Err(e) = engine::run_inferlet(
+                    if let Err(e) = engine::submit_detached_inferlet(
                         client_config,
                         run_args.inferlet_path,
                         run_args.arguments,
-                        run_args.detach,
-                        printer,
+                        run_args.stream_output,
+                        printer.clone(),
                     )
                     .await
                     {

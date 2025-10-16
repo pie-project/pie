@@ -1,7 +1,7 @@
 //! Engine and backend management for the Pie CLI.
 
 use anyhow::{Context, Result};
-use pie::client::InstanceEvent;
+use pie::client::{Instance, InstanceEvent};
 use pie::server::EventCode;
 use pie::{
     Config as EngineConfig,
@@ -339,14 +339,29 @@ pub async fn terminate_engine_and_backend(
     Ok(())
 }
 
-/// Runs an inferlet on the engine.
-pub async fn run_inferlet(
+/// Submits an inferlet to the engine but does not wait for it to finish.
+pub async fn submit_detached_inferlet(
     client_config: &ClientConfig,
     inferlet_path: PathBuf,
     arguments: Vec<String>,
-    detach: bool,
-    printer: &SharedPrinter,
+    stream_output: bool,
+    printer: SharedPrinter,
 ) -> Result<()> {
+    let instance = submit_inferlet(client_config, inferlet_path, arguments).await?;
+
+    if stream_output {
+        tokio::spawn(stream_inferlet_output(instance, printer));
+    }
+
+    Ok(())
+}
+
+/// Submits an inferlet to the engine and returns the instance.
+async fn submit_inferlet(
+    client_config: &ClientConfig,
+    inferlet_path: PathBuf,
+    arguments: Vec<String>,
+) -> Result<Instance> {
     let client = connect_and_authenticate(client_config).await?;
 
     let inferlet_blob = fs::read(&inferlet_path)
@@ -359,43 +374,52 @@ pub async fn run_inferlet(
         println!("✅ Inferlet upload successful.");
     }
 
-    let mut instance = client.launch_instance(&hash, arguments).await?;
+    let instance = client.launch_instance(&hash, arguments).await?;
     println!("✅ Inferlet launched with ID: {}", instance.id());
+    Ok(instance)
+}
 
-    if !detach {
-        let instance_id = instance.id().to_string();
+/// Streams the output of an inferlet to the printer.
+async fn stream_inferlet_output(mut instance: Instance, printer: SharedPrinter) -> Result<()> {
+    let instance_id = instance.id().to_string();
+    loop {
+        let event = match instance.recv().await {
+            Ok(ev) => ev,
+            Err(e) => {
+                // The print operation should not fail.
+                printer
+                    .lock()
+                    .await
+                    .print(format!("[Inferlet {}] ReceiveError: {}", instance_id, e))
+                    .unwrap();
+                return Err(e);
+            }
+        };
+        match event {
+            // Handle events that have a specific code and a text message.
+            InstanceEvent::Event { code, message } => {
+                // Format the output string.
+                // Using the Debug representation of `code` is a clean way to get its name (e.g., "Completed").
+                let output = format!("[Inferlet {}] {:?}: {}", instance_id, code, message);
 
-        let printer_clone = Arc::clone(printer);
-        tokio::spawn(async move {
-            while let Ok(event) = instance.recv().await {
-                match event {
-                    // Handle events that have a specific code and a text message.
-                    InstanceEvent::Event { code, message } => {
-                        // Determine if this event signals the end of the instance's execution.
-                        // Any event other than a simple 'Message' is considered a final state.
-                        let is_terminated = !matches!(code, EventCode::Message);
+                // The print operation should not fail.
+                printer.lock().await.print(output).unwrap();
 
-                        // Format the output string.
-                        // Using the Debug representation of `code` is a clean way to get its name (e.g., "Completed").
-                        let output = format!("[Inferlet {}] {:?}: {}", instance_id, code, message);
-
-                        // Lock the printer, print the message, and then immediately release the lock.
-                        printer_clone.lock().await.print(output).unwrap();
-
-                        // If the instance's execution is finished, break out of the loop.
-                        if is_terminated {
-                            break;
-                        }
+                match code {
+                    EventCode::Completed => return Ok(()),
+                    EventCode::Message => continue,
+                    EventCode::Aborted
+                    | EventCode::Exception
+                    | EventCode::ServerError
+                    | EventCode::OutOfResources => {
+                        anyhow::bail!("inferlet terminated with status {:?}", code)
                     }
-                    // If we receive a raw data blob, we'll ignore it and wait for the next event.
-                    InstanceEvent::Blob(_) => continue,
                 }
             }
-            // No more "Press Enter" message needed!
-        });
+            // If we receive a raw data blob, we'll ignore it and wait for the next event.
+            InstanceEvent::Blob(_) => continue,
+        }
     }
-
-    Ok(())
 }
 
 /// Waits for the instance to finish.
