@@ -73,13 +73,9 @@ pub fn parse_engine_and_backend_config(
     } else {
         cfg_file.enable_auth.unwrap_or(true)
     };
-    let auth_secret = cfg_file.auth_secret.unwrap_or_else(|| {
-        rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(32)
-            .map(char::from)
-            .collect()
-    });
+    let auth_secret = cfg_file
+        .auth_secret
+        .unwrap_or_else(generate_random_auth_secret);
 
     let engine_config = EngineConfig {
         host: host
@@ -516,4 +512,13 @@ pub async fn print_backend_stats(
         crate::output::print_with_printer(printer, format!("Backend runtime stats:\n{}\n", stats))
             .await;
     Ok(())
+}
+
+/// Generates a random authentication secret.
+pub fn generate_random_auth_secret() -> String {
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(64)
+        .map(char::from)
+        .collect()
 }

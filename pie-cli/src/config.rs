@@ -3,7 +3,7 @@
 //! This module implements the `pie config` subcommands for managing Pie configuration files,
 //! including initializing, updating, and displaying configuration settings.
 
-use crate::path;
+use crate::{engine, path};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -168,8 +168,8 @@ fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<
     let config_file = ConfigFile {
         host: Some("127.0.0.1".to_string()),
         port: Some(8080),
-        enable_auth: None,
-        auth_secret: None,
+        enable_auth: Some(true),
+        auth_secret: Some(engine::generate_random_auth_secret()),
         cache_dir: None,
         verbose: None,
         log: None,

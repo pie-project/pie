@@ -79,7 +79,7 @@ pub async fn handle_submit_command(
 
     let auth_secret = auth_secret
         .or_else(|| config_file.as_ref().and_then(|cfg| cfg.auth_secret.clone()))
-        .unwrap_or("default".to_string());
+        .unwrap_or_else(engine::generate_random_auth_secret);
 
     // Initialize the JWT secret for authentication
     auth::init_secret(&auth_secret);
