@@ -3,11 +3,12 @@
 //! This module implements the `pie submit` subcommand for submitting inferlets
 //! to an existing running Pie engine instance.
 
-use crate::{engine, output, path};
+use crate::{engine, path};
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use libpie::auth;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 /// Arguments for the `pie submit` command.
 #[derive(Args, Debug)]
@@ -48,12 +49,6 @@ pub async fn handle_submit_command(
     inferlet_path: PathBuf,
     arguments: Vec<String>,
 ) -> Result<()> {
-    use anyhow::Context;
-    use std::fs;
-
-    // Create a printer for output handling (without editor since this is non-interactive)
-    let (_rl, printer) = output::create_editor_and_printer_with_history().await?;
-
     // Read config file only if when any parameter is missing
     let config_file = if host.is_none() || port.is_none() || auth_secret.is_none() {
         let config_str = match config_path {
@@ -85,15 +80,10 @@ pub async fn handle_submit_command(
     auth::init_secret(&auth_secret);
 
     // Create client configuration
-    let client_config = engine::ClientConfig {
-        host,
-        port,
-        auth_secret,
-    };
+    let client_config = engine::ClientConfig { host, port };
 
     // Submit the inferlet to the existing server
-    engine::submit_inferlet_and_wait(&client_config, inferlet_path, arguments, printer.clone())
-        .await?;
+    engine::submit_inferlet_and_wait(&client_config, inferlet_path, arguments).await?;
 
     Ok(())
 }

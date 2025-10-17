@@ -8,13 +8,11 @@ mod output;
 mod path;
 mod run;
 mod serve;
-mod submit;
 
 use config::ConfigCommands;
 use model::ModelCommands;
 use run::RunArgs;
 use serve::ServeArgs;
-use submit::SubmitArgs;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Pie Command Line Interface")]
@@ -29,8 +27,6 @@ enum Commands {
     Serve(ServeArgs),
     /// Run an inferlet with a one-shot Pie engine.
     Run(RunArgs),
-    /// Submit an inferlet to an existing running Pie engine.
-    Submit(SubmitArgs),
     #[command(subcommand)]
     /// Manage local models.
     Model(ModelCommands),
@@ -76,20 +72,6 @@ async fn main() -> Result<()> {
             run::handle_run_command(
                 engine_config,
                 backend_configs,
-                args.inferlet,
-                args.arguments,
-            )
-            .await?;
-        }
-        Commands::Submit(args) => {
-            // Submit commands don't start the engine, so they can use a simple logger
-            output::init_simple_logging()?;
-
-            submit::handle_submit_command(
-                args.config,
-                args.host,
-                args.port,
-                args.auth_secret,
                 args.inferlet,
                 args.arguments,
             )
