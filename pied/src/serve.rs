@@ -7,7 +7,7 @@
 use crate::{engine, output, path};
 use anyhow::Result;
 use clap::{Args, Parser};
-use pie::Config as EngineConfig;
+use libpie::Config as EngineConfig;
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;

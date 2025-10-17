@@ -1,8 +1,8 @@
 [package]
-name = "pie"
+name = "libpie"
 version = "0.2.0"
 edition = "2024"
-authors = ["In Gim <in.gim@yale.edu>"]
+authors = ["Pie Team"]
 description = "Pie: A Programmable LLM Serving System"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"

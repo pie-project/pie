@@ -2,7 +2,7 @@
 
 use crate::path;
 use anyhow::{Context, Result};
-use pie::Config as EngineConfig;
+use libpie::Config as EngineConfig;
 use rustyline::completion::Completer;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;

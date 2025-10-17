@@ -6,7 +6,7 @@
 use crate::{engine, output, path};
 use anyhow::Result;
 use clap::Args;
-use pie::Config as EngineConfig;
+use libpie::Config as EngineConfig;
 use std::path::PathBuf;
 
 /// Arguments for the `pie run` command.

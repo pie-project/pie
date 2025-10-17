@@ -12,7 +12,7 @@ name = "pied"
 path = "src/main.rs"
 
 [dependencies]
-pie = { path = "../pie", version = "0.2.0"  }
+libpie = { path = "../libpie", version = "0.2.0"  }
 tokio = { version = "1.38", features = ["full"] }
 anyhow = "1.0"
 futures-util = { version = "0.3", features = ["sink"] }

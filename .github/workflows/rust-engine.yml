@@ -26,5 +26,5 @@ jobs:
           override: true
 
       - name: Build Engine
-        working-directory: ./pie
+        working-directory: ./libpie
         run: cargo build --release
