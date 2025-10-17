@@ -2,13 +2,13 @@
 name = "pie-cli"
 version = "0.2.0"
 edition = "2024"
-authors = ["In Gim <in.gim@yale.edu>"]
-description = "Programmable Inference Engine (PIE) Command-Line Interface"
+authors = ["Pie Team"]
+description = "Programmable Inference Engine (PIE) Daemon"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [[bin]]
-name = "pie"
+name = "pied"
 path = "src/main.rs"
 
 [dependencies]
