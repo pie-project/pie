@@ -14,7 +14,7 @@ use rustyline::history::FileHistory;
 use std::path::PathBuf;
 
 /// Arguments for the `pie serve` command.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 pub struct ServeArgs {
     /// Path to a custom TOML configuration file.
     #[arg(long)]

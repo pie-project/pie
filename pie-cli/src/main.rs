@@ -20,7 +20,7 @@ use submit::SubmitArgs;
 #[command(author, version, about = "Pie Command Line Interface")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -43,7 +43,7 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    match cli.command.unwrap_or(Commands::Serve(ServeArgs::default())) {
         Commands::Serve(args) => {
             let (engine_config, backend_configs) = engine::parse_engine_and_backend_config(
                 args.config,
