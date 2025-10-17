@@ -34,6 +34,9 @@ pub struct ServeArgs {
     /// Enable verbose console logging.
     #[arg(long, short)]
     pub verbose: bool,
+    /// Enable interactive shell mode.
+    #[arg(long, short)]
+    pub interactive: bool,
 }
 
 /// Arguments for running inferlets within the interactive shell.
@@ -56,11 +59,12 @@ pub struct ShellRunArgs {
 /// This function:
 /// 1. Creates an editor and printer for the interactive shell
 /// 2. Starts the Pie engine and backend services
-/// 3. Runs the interactive shell session
+/// 3. Runs the interactive shell session or waits for ctrl-c
 /// 4. Terminates the engine and backend services on exit
 pub async fn handle_serve_command(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
+    interactive: bool,
 ) -> Result<()> {
     let (rl, printer) = output::create_editor_and_printer_with_history().await?;
 
@@ -68,8 +72,12 @@ pub async fn handle_serve_command(
     let (shutdown_tx, server_handle, backend_processes, client_config) =
         engine::start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
 
-    // Start the interactive session, passing both configs
-    run_shell(&client_config, rl, printer).await?;
+    // Run interactive shell or wait for ctrl-c
+    if interactive {
+        run_shell(&client_config, rl, printer).await?;
+    } else {
+        tokio::signal::ctrl_c().await?;
+    }
 
     // Terminate the engine and backend services
     engine::terminate_engine_and_backend(
