@@ -432,12 +432,9 @@ async fn stream_inferlet_output(mut instance: Instance, printer: SharedPrinter) 
 /// Connects to the engine and authenticates the client.
 pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
-    let client = match Client::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => {
-            anyhow::bail!("Could not connect to engine at {}. Is it running?", url);
-        }
-    };
+    let client = Client::connect(&url)
+        .await
+        .with_context(|| format!("Could not connect to engine at {}. Is it running?", url))?;
 
     let token = create_jwt("default", pie::auth::Role::User)?;
     client.authenticate(&token).await?;
