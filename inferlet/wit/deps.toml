@@ -1,4 +1,4 @@
-core = "../../pie-api/core/wit"
-adapter = "../../pie-api/adapter/wit"
-image = "../../pie-api/image/wit"
-zo = "../../pie-api/zo/wit"
+core = "../../inferlet-api/core/wit"
+adapter = "../../inferlet-api/adapter/wit"
+image = "../../inferlet-api/image/wit"
+zo = "../../inferlet-api/zo/wit"
