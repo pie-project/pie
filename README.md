@@ -75,46 +75,50 @@ Note the the very first inferlet response may take a few minutes due to the JIT 
 
 #### Step 1: Build
 
-Build the **PIE CLI** and the example inferlets.
+Build the **CLIs** and the example inferlets.
 
-- **Build the PIE CLI:**
-  From the repository root, run:
-
-  ```bash
-  cd pie-cli && cargo install --path .
-  ```
-
-- **Build the Examples:**
-
-  ```bash
-  cd example-apps && cargo build --target wasm32-wasip2 --release
-  ```
-
-
-#### Step 2: Run an Inferlet
-
-Download a model, start the engine, and run an inferlet.
-
-1. **Download a Model:**
-   Use the PIE CLI to add a model from the [model index](https://github.com/pie-project/model-index):
+1. **Build the `pie` and `pied` CLI:**
+   From the repository root, run
 
    ```bash
-   pie model add "llama-3.2-1b-instruct"
+   cd pie && cargo install --path .
    ```
 
-2. **Start the Engine:**
-   Launch the PIE engine with an example configuration. This opens the interactive PIE shell:
+   Also, from the repository root, run
+   ```bash
+   cd pied && cargo install --path .
+   ```
+
+2. **Build the Examples:**
 
    ```bash
-   cd pie-cli
-   pie start --config ./example_config.toml
+   cd example-apps && cargo build --target wasm32-wasip2 --release
    ```
 
-3. **Run an Inferlet:**
-   From within the PIE shell, execute a compiled inferlet:
+#### Step 2: Configure engine and backend
+
+1. Create default configuration file (substitute `$REPO` to the actual cloned repository path)
+   ```bash
+   pied config init python $REPO/backend/backend-python/server.py
+   ```
+
+2. Download the model
+   ```bash
+   pied model add qwen-3-0.6b
+   ```
+
+#### Step 3: Run an Inferlet
+
+1. **Start the Engine:**
+   Launch the Pie engine with the default configuration
 
    ```bash
-   pie> run ../example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
+   pied
    ```
 
+2. **Run an Inferlet:**
+   From another terminal window, run
 
+   ```bash
+   pie submit $REPO/example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
+   ```
