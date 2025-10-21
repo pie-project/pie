@@ -1,18 +1,19 @@
 [package]
-name = "pie-cli"
+name = "pie"
 version = "0.2.0"
 edition = "2024"
 authors = ["Pie Team"]
-description = "Programmable Inference Engine (PIE) Daemon"
+description = "Programmable Inference Engine (Pie)"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [[bin]]
-name = "pied"
+name = "pie"
 path = "src/main.rs"
 
 [dependencies]
 pie-client = { path = "../client/rust" }
+
 tokio = { version = "1.38", features = ["full"] }
 anyhow = "1.0"
 futures-util = { version = "0.3", features = ["sink"] }
