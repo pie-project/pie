@@ -9,7 +9,7 @@ mod submit;
 use submit::SubmitArgs;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Pie Client Command Line Interface")]
+#[command(author, version, about = "Programmable Inference Command Line Interface")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
