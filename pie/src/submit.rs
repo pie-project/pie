@@ -7,7 +7,7 @@ use crate::{engine, path};
 use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
-use libpie::auth;
+use pie_client::auth;
 use std::{fs, path::PathBuf};
 
 /// Arguments for the `pie submit` command.

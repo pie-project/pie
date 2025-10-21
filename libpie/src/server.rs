@@ -1,19 +1,19 @@
 use crate::instance::InstanceId;
 use crate::messaging::dispatch_u2i;
 use crate::model::Model;
-use crate::runtime::RuntimeError;
 use crate::service::{Service, ServiceError, install_service};
 use crate::utils::IdPool;
-use crate::{auth, messaging, model, runtime, service};
+use crate::{messaging, model, runtime, service};
 use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use pie_client::auth;
+use pie_client::message::{CHUNK_SIZE_BYTES, QUERY_MODEL_STATUS, QUERY_PROGRAM_EXISTS};
+use pie_client::message::{ClientMessage, EventCode, ServerMessage};
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
-use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -24,212 +24,7 @@ use tungstenite::Message;
 use tungstenite::protocol::Message as WsMessage;
 use uuid::Uuid;
 
-pub const CHUNK_SIZE_BYTES: usize = 256 * 1024; // 256 KiB
 static SERVICE_ID_SERVER: OnceLock<usize> = OnceLock::new();
-
-/// Define the various errors that can happen while handling messages.
-#[derive(Debug, Error)]
-pub enum ServerError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("WebSocket accept error: {0}")]
-    WsAccept(#[from] tungstenite::Error),
-
-    #[error("MessagePack decode error: {0}")]
-    MsgPackDecode(#[from] rmp_serde::decode::Error),
-
-    #[error("Text frames not supported")]
-    TextFrameNotSupported,
-
-    #[error("Chunk size {actual} exceeds {limit} bytes limit")]
-    ChunkTooLarge { actual: usize, limit: usize },
-
-    #[error("Mismatch in total_chunks: was {was}, now {now}")]
-    ChunkCountMismatch { was: usize, now: usize },
-
-    #[error("Out-of-order chunk: expected {expected}, got {got}")]
-    OutOfOrderChunk { expected: usize, got: usize },
-
-    #[error("Hash mismatch: expected {expected}, got {found})")]
-    HashMismatch { expected: String, found: String },
-
-    #[error("Invalid instance_id: {0}")]
-    InvalidInstanceId(String),
-
-    #[error("Instance {instance} not owned by client")]
-    NotOwnedInstance { instance: String },
-
-    #[error("No such running instance: {0}")]
-    NoSuchRunningInstance(String),
-
-    #[error("Failed to write program: {0}")]
-    FileWriteError(#[source] std::io::Error),
-
-    #[error("Failed to start program: {0}")]
-    StartProgramFailed(#[from] RuntimeError),
-}
-
-/// Messages from client -> server
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ClientMessage {
-    #[serde(rename = "authenticate")]
-    Authenticate { corr_id: u32, token: String },
-
-    #[serde(rename = "query")]
-    Query {
-        corr_id: u32,
-        subject: String,
-        record: String,
-    },
-
-    #[serde(rename = "upload_program")]
-    UploadProgram {
-        corr_id: u32,
-        program_hash: String,
-        chunk_index: usize,
-        total_chunks: usize,
-        #[serde(with = "serde_bytes")]
-        chunk_data: Vec<u8>,
-    },
-
-    #[serde(rename = "launch_instance")]
-    LaunchInstance {
-        corr_id: u32,
-        program_hash: String,
-        arguments: Vec<String>,
-    },
-
-    #[serde(rename = "launch_server_instance")]
-    LaunchServerInstance {
-        corr_id: u32,
-        port: u32,
-        program_hash: String,
-        arguments: Vec<String>,
-    },
-
-    #[serde(rename = "signal_instance")]
-    SignalInstance {
-        instance_id: String,
-        message: String,
-    },
-
-    #[serde(rename = "upload_blob")]
-    UploadBlob {
-        corr_id: u32,
-        instance_id: String,
-        blob_hash: String,
-        chunk_index: usize,
-        total_chunks: usize,
-        #[serde(with = "serde_bytes")]
-        chunk_data: Vec<u8>,
-    },
-
-    #[serde(rename = "terminate_instance")]
-    TerminateInstance { instance_id: String },
-
-    #[serde(rename = "attach_remote_service")]
-    AttachRemoteService {
-        corr_id: u32,
-        endpoint: String,
-        service_type: String,
-        service_name: String,
-    },
-
-    #[serde(rename = "wait_backend_change")]
-    WaitBackendChange {
-        corr_id: u32,
-        cur_num_attached_backends: Option<u32>,
-        cur_num_detached_backends: Option<u32>,
-    },
-
-    #[serde(rename = "wait_instance_change")]
-    WaitInstanceChange {
-        corr_id: u32,
-        cur_num_attached_instances: Option<u32>,
-        cur_num_detached_instances: Option<u32>,
-        cur_num_rejected_instances: Option<u32>,
-    },
-
-    #[serde(rename = "query_backend_stats")]
-    QueryBackendStats { corr_id: u32 },
-
-    #[serde(rename = "stop_backend_heartbeat")]
-    StopBackendHeartbeat { corr_id: u32 },
-}
-
-/// Messages from server -> client
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ServerMessage {
-    #[serde(rename = "response")]
-    Response {
-        corr_id: u32,
-        successful: bool,
-        result: String,
-    },
-
-    #[serde(rename = "instance_event")]
-    InstanceEvent {
-        instance_id: String,
-        event: u32,
-        message: String,
-    },
-
-    #[serde(rename = "download_blob")]
-    DownloadBlob {
-        corr_id: u32,
-        instance_id: String,
-        blob_hash: String,
-        chunk_index: usize,
-        total_chunks: usize,
-        #[serde(with = "serde_bytes")]
-        chunk_data: Vec<u8>,
-    },
-
-    #[serde(rename = "server_event")]
-    ServerEvent { message: String },
-
-    #[serde(rename = "backend_change")]
-    BackendChange {
-        corr_id: u32,
-        num_attached: u32,
-        num_rejected: u32,
-    },
-
-    #[serde(rename = "instance_change")]
-    InstanceChange {
-        corr_id: u32,
-        num_attached: u32,
-        num_detached: u32,
-        num_rejected: u32,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum EventCode {
-    Message = 0,
-    Completed = 1,
-    Aborted = 2,
-    Exception = 3,
-    ServerError = 4,
-    OutOfResources = 5,
-}
-
-impl EventCode {
-    pub fn from_u32(code: u32) -> Option<EventCode> {
-        match code {
-            0 => Some(EventCode::Message),
-            1 => Some(EventCode::Completed),
-            2 => Some(EventCode::Aborted),
-            3 => Some(EventCode::Exception),
-            4 => Some(EventCode::ServerError),
-            5 => Some(EventCode::OutOfResources),
-            _ => None,
-        }
-    }
-}
 
 type ClientId = u32;
 
@@ -366,9 +161,6 @@ enum ClientCommand {
     FromClient(ClientMessage),
     Internal(Command),
 }
-
-pub const QUERY_PROGRAM_EXISTS: &str = "program_exists";
-pub const QUERY_MODEL_STATUS: &str = "model_status";
 
 impl Client {
     async fn new(id: ClientId, stream: TcpStream, state: Arc<ServerState>) -> Result<Self> {

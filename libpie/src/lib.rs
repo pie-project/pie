@@ -1,11 +1,10 @@
 use anyhow::{Context, Result};
+use pie_client::auth;
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
 mod api;
-pub mod auth;
-pub mod client;
 mod instance;
 mod kvs;
 mod messaging;
@@ -16,7 +15,6 @@ mod service;
 mod utils;
 
 // Re-export core components from internal modules
-use crate::auth::{create_jwt, init_secret};
 use crate::kvs::KeyValueStore;
 use crate::messaging::{PubSub, PushPull};
 use crate::runtime::Runtime;
@@ -56,8 +54,8 @@ pub async fn run_server(
 
     if config.enable_auth {
         tracing::info!("Authentication is enabled.");
-        init_secret(&config.auth_secret);
-        let token = create_jwt("default", auth::Role::User)?;
+        auth::init_secret(&config.auth_secret);
+        let token = auth::create_jwt("default", auth::Role::User)?;
         tracing::info!("Use this token to authenticate: {}", token);
     } else {
         tracing::info!("Authentication is disabled.");

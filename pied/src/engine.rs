@@ -1,13 +1,11 @@
 //! Engine and backend management for the Pie CLI.
 
 use anyhow::{Context, Result};
-use libpie::client::{Instance, InstanceEvent};
-use libpie::server::EventCode;
-use libpie::{
-    Config as EngineConfig,
-    auth::{create_jwt, init_secret},
-    client::{self, Client},
-};
+use libpie::Config as EngineConfig;
+use pie_client::auth;
+use pie_client::client::{self, Client};
+use pie_client::client::{Instance, InstanceEvent};
+use pie_client::message::EventCode;
 use rand::{Rng, distr::Alphanumeric};
 use std::path::Path;
 use std::sync::Arc;
@@ -129,8 +127,8 @@ pub async fn start_engine_and_backend(
     let mut backend_processes = Vec::new();
     if !backend_configs.is_empty() {
         println!("🚀 Launching backend services...");
-        init_secret(&client_config.auth_secret);
-        let auth_token = create_jwt("backend-service", libpie::auth::Role::User)?;
+        auth::init_secret(&client_config.auth_secret);
+        let auth_token = auth::create_jwt("backend-service", auth::Role::User)?;
 
         for backend_config in &backend_configs {
             let backend_table = backend_config
@@ -436,7 +434,7 @@ pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Cl
         .await
         .with_context(|| format!("Could not connect to engine at {}. Is it running?", url))?;
 
-    let token = create_jwt("default", libpie::auth::Role::User)?;
+    let token = auth::create_jwt("default", auth::Role::User)?;
     client.authenticate(&token).await?;
     Ok(client)
 }

@@ -1,12 +1,9 @@
 //! Engine client utilities for the Pie CLI.
 
 use anyhow::{Context, Result};
-use libpie::client::{Instance, InstanceEvent};
-use libpie::server::EventCode;
-use libpie::{
-    auth::create_jwt,
-    client::{self, Client},
-};
+use pie_client::auth;
+use pie_client::client::{self, Client, Instance, InstanceEvent};
+use pie_client::message::EventCode;
 use rand::{Rng, distr::Alphanumeric};
 use std::fs;
 use std::path::PathBuf;
@@ -96,7 +93,7 @@ async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client
         }
     };
 
-    let token = create_jwt("default", libpie::auth::Role::User)?;
+    let token = auth::create_jwt("default", auth::Role::User)?;
     client.authenticate(&token).await?;
     Ok(client)
 }

@@ -1,5 +1,4 @@
-use crate::instance::InstanceId;
-use crate::server::{
+use crate::message::{
     CHUNK_SIZE_BYTES, ClientMessage, EventCode, QUERY_PROGRAM_EXISTS, ServerMessage,
 };
 use crate::utils::IdPool;
@@ -15,6 +14,7 @@ use tokio::task;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use uuid::Uuid;
 
+type InstanceId = Uuid;
 type CorrId = u32;
 
 /// A binary blob or a text-based event from an instance.
@@ -30,7 +30,6 @@ pub enum InstanceEvent {
 #[derive(Debug)]
 struct DownloadState {
     instance_id: InstanceId,
-    total_chunks: usize,
     buffer: Vec<u8>,
 }
 
@@ -449,7 +448,6 @@ async fn handle_server_message(
                 if let Ok(id) = Uuid::parse_str(&instance_id) {
                     let state = DownloadState {
                         instance_id: id,
-                        total_chunks,
                         buffer: Vec::with_capacity(total_chunks * CHUNK_SIZE_BYTES),
                     };
                     inner
