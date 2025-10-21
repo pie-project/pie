@@ -4,10 +4,10 @@
 //! and provides an interactive shell session for running inferlets and managing
 //! the engine state.
 
-use crate::{engine, output, path};
+use crate::engine::Config as EngineConfig;
+use crate::{output, path, service};
 use anyhow::Result;
 use clap::{Args, Parser};
-use libpie::Config as EngineConfig;
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
@@ -70,7 +70,7 @@ pub async fn handle_serve_command(
 
     // Start the engine and backend services
     let (shutdown_tx, server_handle, backend_processes, client_config) =
-        engine::start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
+        service::start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
 
     // Run interactive shell or wait for ctrl-c
     if interactive {
@@ -80,7 +80,7 @@ pub async fn handle_serve_command(
     }
 
     // Terminate the engine and backend services
-    engine::terminate_engine_and_backend(
+    service::terminate_engine_and_backend(
         &client_config,
         backend_processes,
         shutdown_tx,
@@ -95,7 +95,7 @@ pub async fn handle_serve_command(
 async fn handle_shell_command(
     command: &str,
     args: &[&str],
-    client_config: &engine::ClientConfig,
+    client_config: &service::ClientConfig,
     printer: &output::SharedPrinter,
 ) -> Result<bool> {
     match command {
@@ -105,7 +105,7 @@ async fn handle_shell_command(
 
             match ShellRunArgs::try_parse_from(clap_args) {
                 Ok(run_args) => {
-                    if let Err(e) = engine::submit_detached_inferlet(
+                    if let Err(e) = service::submit_detached_inferlet(
                         client_config,
                         run_args.inferlet_path,
                         run_args.arguments,
@@ -132,7 +132,7 @@ async fn handle_shell_command(
             println!("(Query functionality not yet implemented)");
         }
         "stat" => {
-            engine::print_backend_stats(client_config, printer).await?;
+            service::print_backend_stats(client_config, printer).await?;
         }
         "help" => {
             println!("Available commands:");
@@ -162,7 +162,7 @@ async fn handle_shell_command(
 /// This function provides the main interactive loop for the `pie serve` command,
 /// allowing users to run inferlets, query engine state, and manage the session.
 async fn run_shell(
-    client_config: &engine::ClientConfig,
+    client_config: &service::ClientConfig,
     mut rl: Editor<output::MyHelper, FileHistory>,
     printer: output::SharedPrinter,
 ) -> Result<()> {

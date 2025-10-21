@@ -1,4 +1,4 @@
-use crate::model::request::Request;
+use super::request::Request;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::mem::{Discriminant, discriminant};

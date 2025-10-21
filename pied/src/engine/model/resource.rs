@@ -1,6 +1,6 @@
-use crate::instance::InstanceId;
-use crate::runtime::{TerminationCause, trap};
-use crate::utils::IdPool;
+use crate::engine::instance::InstanceId;
+use crate::engine::runtime::{TerminationCause, trap};
+use crate::engine::utils::IdPool;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::time::Instant;
 use thiserror::Error;

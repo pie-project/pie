@@ -1,14 +1,14 @@
-use crate::api::core::{Blob, BlobResult, Queue};
-use crate::api::inferlet;
-use crate::instance::InstanceState;
-use crate::model::request::{DownloadAdapterRequest, Request, UploadAdapterRequest};
-use crate::model::resource::{ADAPTER_TYPE_ID, ResourceId};
-use crate::model::submit_request;
+use crate::engine::api::core::forward::ForwardPass;
+use crate::engine::api::core::{Blob, BlobResult, Queue};
+use crate::engine::api::inferlet;
+use crate::engine::instance::InstanceState;
+use crate::engine::model::request::{DownloadAdapterRequest, Request, UploadAdapterRequest};
+use crate::engine::model::resource::{ADAPTER_TYPE_ID, ResourceId};
+use crate::engine::model::submit_request;
 use anyhow::Result;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
-use crate::api::core::forward::ForwardPass;
 
 impl inferlet::adapter::common::Host for InstanceState {
     async fn set_adapter(

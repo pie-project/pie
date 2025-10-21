@@ -3,15 +3,15 @@ pub mod request;
 pub mod resource;
 pub mod tokenizer;
 
-use crate::instance::InstanceId;
-use crate::model::batching::{BatchPolicySelector, BatchScheduler, ForwardPassPolicy};
-use crate::model::request::{
+use super::instance::InstanceId;
+use super::model::batching::{BatchPolicySelector, BatchScheduler, ForwardPassPolicy};
+use super::model::request::{
     FORWARD_PASS_ID, HANDSHAKE_ID, HandshakeRequest, HandshakeResponse, HeartbeatRequest, Request,
 };
-use crate::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
-use crate::model::tokenizer::BytePairEncoder;
-use crate::runtime::trap_exception;
-use crate::service::{self, Service, ServiceError};
+use super::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
+use super::model::tokenizer::BytePairEncoder;
+use super::runtime::trap_exception;
+use super::service::{self, Service, ServiceError};
 use anyhow::Result;
 use anyhow::bail;
 use bytes::Bytes;

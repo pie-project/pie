@@ -1,7 +1,12 @@
 //! Engine and backend management for the Pie CLI.
 
+use crate::config::ConfigFile;
+use crate::engine;
+use crate::output::SharedPrinter;
+use crate::path;
+
 use anyhow::{Context, Result};
-use libpie::Config as EngineConfig;
+use engine::Config as EngineConfig;
 use pie_client::auth;
 use pie_client::client::{self, Client};
 use pie_client::client::{Instance, InstanceEvent};
@@ -15,10 +20,6 @@ use tokio::process::{Child, Command as TokioCommand};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot::{self, Sender};
 use tokio::task::JoinHandle;
-
-use crate::config::ConfigFile;
-use crate::output::SharedPrinter;
-use crate::path;
 
 // Helper struct for what client commands need to know
 #[derive(Debug, Clone)]
@@ -116,7 +117,7 @@ pub async fn start_engine_and_backend(
     // Start the main Pie engine server
     println!("🚀 Starting Pie engine...");
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = libpie::run_server(engine_config, ready_tx, shutdown_rx).await {
+        if let Err(e) = engine::run_server(engine_config, ready_tx, shutdown_rx).await {
             eprintln!("\n[Engine Error] Engine failed: {}", e);
         }
     });

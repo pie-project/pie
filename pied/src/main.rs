@@ -1,18 +1,16 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-mod config;
+mod cli;
 mod engine;
-mod model;
-mod output;
-mod path;
-mod run;
-mod serve;
 
-use config::ConfigCommands;
-use model::ModelCommands;
-use run::RunArgs;
-use serve::ServeArgs;
+use cli::config::{self, ConfigCommands};
+use cli::model::{self, ModelCommands};
+use cli::output;
+use cli::path;
+use cli::run::{self, RunArgs};
+use cli::serve::{self, ServeArgs};
+use cli::service::{self};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Pie Command Line Interface")]
@@ -41,7 +39,7 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Commands::Serve(ServeArgs::default())) {
         Commands::Serve(args) => {
-            let (engine_config, backend_configs) = engine::parse_engine_and_backend_config(
+            let (engine_config, backend_configs) = service::parse_engine_and_backend_config(
                 args.config,
                 args.no_auth,
                 args.host,
@@ -57,7 +55,7 @@ async fn main() -> Result<()> {
         }
         Commands::Run(args) => {
             // Build both engine and backend configs.
-            let (engine_config, backend_configs) = engine::parse_engine_and_backend_config(
+            let (engine_config, backend_configs) = service::parse_engine_and_backend_config(
                 args.config,
                 false,
                 None,

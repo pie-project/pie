@@ -1,7 +1,7 @@
-use crate::api::core::{DebugQueryResult, Model};
-use crate::api::inferlet;
-use crate::instance::InstanceState;
-use crate::model;
+use crate::engine::api::core::{DebugQueryResult, Model};
+use crate::engine::api::inferlet;
+use crate::engine::instance::InstanceState;
+use crate::engine::model;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
@@ -10,7 +10,7 @@ use wasmtime_wasi::WasiView;
 impl inferlet::core::runtime::Host for InstanceState {
     async fn get_version(&mut self) -> anyhow::Result<String> {
         let (tx, rx) = oneshot::channel();
-        crate::runtime::Command::GetVersion { event: tx }.dispatch()?;
+        crate::engine::runtime::Command::GetVersion { event: tx }.dispatch()?;
         rx.await.map_err(Into::into)
     }
 
@@ -63,7 +63,7 @@ impl inferlet::core::runtime::Host for InstanceState {
             done: false,
         };
 
-        crate::runtime::Command::DebugQuery { query, event: tx }.dispatch()?;
+        crate::engine::runtime::Command::DebugQuery { query, event: tx }.dispatch()?;
         Ok(self.ctx().table.push(res)?)
     }
 }

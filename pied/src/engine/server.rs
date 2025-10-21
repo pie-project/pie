@@ -1,9 +1,9 @@
-use crate::instance::InstanceId;
-use crate::messaging::dispatch_u2i;
-use crate::model::Model;
-use crate::service::{Service, ServiceError, install_service};
-use crate::utils::IdPool;
-use crate::{messaging, model, runtime, service};
+use super::instance::InstanceId;
+use super::messaging::dispatch_u2i;
+use super::model::Model;
+use super::service::{Service, ServiceError, install_service};
+use super::utils::IdPool;
+use super::{messaging, model, runtime, service};
 use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;

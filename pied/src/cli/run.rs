@@ -3,10 +3,10 @@
 //! This module implements the `pie run` subcommand for running inferlets
 //! with a one-shot Pie engine instance.
 
-use crate::{engine, output, path};
+use crate::engine::Config as EngineConfig;
+use crate::{output, path, service};
 use anyhow::Result;
 use clap::Args;
-use libpie::Config as EngineConfig;
 use std::path::PathBuf;
 
 /// Arguments for the `pie run` command.
@@ -44,14 +44,14 @@ pub async fn handle_run_command(
 
     // Start the engine and backend services
     let (shutdown_tx, server_handle, backend_processes, client_config) =
-        engine::start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
+        service::start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
 
     // Run the inferlet
-    engine::submit_inferlet_and_wait(&client_config, inferlet_path, arguments, printer.clone())
+    service::submit_inferlet_and_wait(&client_config, inferlet_path, arguments, printer.clone())
         .await?;
 
     // Terminate the engine and backend services
-    engine::terminate_engine_and_backend(
+    service::terminate_engine_and_backend(
         &client_config,
         backend_processes,
         shutdown_tx,

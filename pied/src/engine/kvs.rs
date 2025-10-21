@@ -1,4 +1,4 @@
-use crate::service::{self, Service, ServiceError};
+use super::service::{self, Service, ServiceError};
 use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::oneshot;
