@@ -4,8 +4,8 @@
 //! and provides an interactive shell session for running inferlets and managing
 //! the engine state.
 
+use super::{output, path, service};
 use crate::engine::Config as EngineConfig;
-use crate::{output, path, service};
 use anyhow::Result;
 use clap::{Args, Parser};
 use rustyline::Editor;

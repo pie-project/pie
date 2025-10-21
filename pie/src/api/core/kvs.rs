@@ -1,6 +1,6 @@
-use crate::engine::api::inferlet;
-use crate::engine::instance::InstanceState;
-use crate::engine::kvs;
+use crate::api::inferlet;
+use crate::instance::InstanceState;
+use crate::kvs;
 use tokio::sync::oneshot;
 
 impl inferlet::core::kvs::Host for InstanceState {

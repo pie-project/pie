@@ -3,7 +3,7 @@
 //! This module implements the `pie config` subcommands for managing Pie configuration files,
 //! including initializing, updating, and displaying configuration settings.
 
-use crate::{path, service};
+use super::{path, service};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};

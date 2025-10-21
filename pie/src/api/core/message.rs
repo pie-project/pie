@@ -1,8 +1,8 @@
-use crate::engine::api::core::{Blob, BlobResult};
-use crate::engine::api::inferlet;
-use crate::engine::instance::InstanceState;
-use crate::engine::messaging::{PubSubCommand, PushPullCommand, dispatch_i2i, dispatch_u2i};
-use crate::engine::server;
+use crate::api::core::{Blob, BlobResult};
+use crate::api::inferlet;
+use crate::instance::InstanceState;
+use crate::messaging::{PubSubCommand, PushPullCommand, dispatch_i2i, dispatch_u2i};
+use crate::server;
 use async_trait::async_trait;
 use std::mem;
 use tokio::sync::{mpsc, oneshot};

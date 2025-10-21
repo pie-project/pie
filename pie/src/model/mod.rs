@@ -3,7 +3,6 @@ pub mod request;
 pub mod resource;
 pub mod tokenizer;
 
-use super::instance::InstanceId;
 use super::model::batching::{BatchPolicySelector, BatchScheduler, ForwardPassPolicy};
 use super::model::request::{
     FORWARD_PASS_ID, HANDSHAKE_ID, HandshakeRequest, HandshakeResponse, HeartbeatRequest, Request,
@@ -12,6 +11,7 @@ use super::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
 use super::model::tokenizer::BytePairEncoder;
 use super::runtime::trap_exception;
 use super::service::{self, Service, ServiceError};
+use crate::instance::InstanceId;
 use anyhow::Result;
 use anyhow::bail;
 use bytes::Bytes;

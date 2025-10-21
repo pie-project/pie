@@ -4,22 +4,12 @@ use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
-mod api;
-mod instance;
-mod kvs;
-mod messaging;
-mod model;
-mod runtime;
-pub mod server;
-mod service;
-mod utils;
-
 // Re-export core components from internal modules
-use kvs::KeyValueStore;
-use messaging::{PubSub, PushPull};
-use runtime::Runtime;
-use server::Server;
-use service::install_service;
+use crate::kvs::KeyValueStore;
+use crate::messaging::{PubSub, PushPull};
+use crate::runtime::Runtime;
+use crate::server::Server;
+use crate::service::install_service;
 
 /// Configuration for the PIE engine.
 #[derive(Debug)]

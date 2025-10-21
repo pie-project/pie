@@ -3,8 +3,8 @@
 //! This module implements the `pie run` subcommand for running inferlets
 //! with a one-shot Pie engine instance.
 
+use super::{output, path, service};
 use crate::engine::Config as EngineConfig;
-use crate::{output, path, service};
 use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;

@@ -1,9 +1,10 @@
 use super::instance::InstanceId;
 use super::messaging::dispatch_u2i;
-use super::model::Model;
 use super::service::{Service, ServiceError, install_service};
 use super::utils::IdPool;
-use super::{messaging, model, runtime, service};
+use super::{messaging, runtime, service};
+use crate::model;
+use crate::model::Model;
 use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;

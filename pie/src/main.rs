@@ -1,16 +1,24 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod api;
 mod cli;
 mod engine;
+mod instance;
+mod kvs;
+mod messaging;
+mod model;
+mod runtime;
+mod server;
+mod service;
+mod utils;
 
 use cli::config::{self, ConfigCommands};
-use cli::model::{self, ModelCommands};
+use cli::model::ModelCommands;
 use cli::output;
 use cli::path;
 use cli::run::{self, RunArgs};
 use cli::serve::{self, ServeArgs};
-use cli::service::{self};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Pie Command Line Interface")]
@@ -39,7 +47,7 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Commands::Serve(ServeArgs::default())) {
         Commands::Serve(args) => {
-            let (engine_config, backend_configs) = service::parse_engine_and_backend_config(
+            let (engine_config, backend_configs) = cli::service::parse_engine_and_backend_config(
                 args.config,
                 args.no_auth,
                 args.host,
@@ -55,7 +63,7 @@ async fn main() -> Result<()> {
         }
         Commands::Run(args) => {
             // Build both engine and backend configs.
-            let (engine_config, backend_configs) = service::parse_engine_and_backend_config(
+            let (engine_config, backend_configs) = cli::service::parse_engine_and_backend_config(
                 args.config,
                 false,
                 None,
@@ -78,7 +86,7 @@ async fn main() -> Result<()> {
         Commands::Model(cmd) => {
             // Model commands don't start the engine, so they can use a simple logger
             output::init_simple_logging()?;
-            model::handle_model_command(cmd).await?;
+            cli::model::handle_model_command(cmd).await?;
         }
         Commands::Config(cmd) => {
             // Config commands don't start the engine, so they can use a simple logger

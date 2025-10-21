@@ -1,10 +1,10 @@
-use crate::engine::api::core::Queue;
-use crate::engine::api::core::forward::ForwardPass;
-use crate::engine::api::inferlet;
-use crate::engine::instance::InstanceState;
-use crate::engine::model::request::{InitializeAdapterRequest, Request, UpdateAdapterRequest};
-use crate::engine::model::resource::{ADAPTER_TYPE_ID, ResourceId};
-use crate::engine::model::submit_request;
+use crate::api::core::Queue;
+use crate::api::core::forward::ForwardPass;
+use crate::api::inferlet;
+use crate::instance::InstanceState;
+use crate::model::request::{InitializeAdapterRequest, Request, UpdateAdapterRequest};
+use crate::model::resource::{ADAPTER_TYPE_ID, ResourceId};
+use crate::model::submit_request;
 use anyhow::{Result, bail};
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

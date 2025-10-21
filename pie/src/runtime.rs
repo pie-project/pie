@@ -1,7 +1,8 @@
 use super::instance::{InstanceId, InstanceState};
-use super::model::request::QueryResponse;
 use super::service::{Service, ServiceError};
-use super::{api, model, server, service};
+use super::{api, server, service};
+use crate::model;
+use crate::model::request::QueryResponse;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
 use std::net::SocketAddr;
