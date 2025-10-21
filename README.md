@@ -78,7 +78,7 @@ Note the the very first inferlet response may take a few minutes due to the JIT 
 
 Build the **CLIs** and the example inferlets.
 
-1. **Build the `pie` and `pied` CLI:**
+1. **Build the engine `pie` and the client CLI `picli`:**
    From the repository root, run
 
    ```bash
@@ -87,7 +87,7 @@ Build the **CLIs** and the example inferlets.
 
    Also, from the repository root, run
    ```bash
-   cd pied && cargo install --path .
+   cd client/cli && cargo install --path .
    ```
 
 2. **Build the Examples:**
@@ -100,12 +100,12 @@ Build the **CLIs** and the example inferlets.
 
 1. Create default configuration file (substitute `$REPO` to the actual cloned repository path)
    ```bash
-   pied config init python $REPO/backend/backend-python/server.py
+   pie config init python $REPO/backend/backend-python/server.py
    ```
 
 2. Download the model
    ```bash
-   pied model add qwen-3-0.6b
+   pie model add qwen-3-0.6b
    ```
 
 #### Step 3: Run an Inferlet
@@ -114,12 +114,12 @@ Build the **CLIs** and the example inferlets.
    Launch the Pie engine with the default configuration
 
    ```bash
-   pied
+   pie
    ```
 
 2. **Run an Inferlet:**
    From another terminal window, run
 
    ```bash
-   pie submit $REPO/example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
+   picli submit $REPO/example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
    ```
