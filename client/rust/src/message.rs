@@ -95,14 +95,6 @@ pub enum ClientMessage {
         service_name: String,
     },
 
-    #[serde(rename = "wait_instance_change")]
-    WaitInstanceChange {
-        corr_id: u32,
-        cur_num_attached_instances: Option<u32>,
-        cur_num_detached_instances: Option<u32>,
-        cur_num_rejected_instances: Option<u32>,
-    },
-
     #[serde(rename = "query_backend_stats")]
     QueryBackendStats { corr_id: u32 },
 
@@ -141,12 +133,4 @@ pub enum ServerMessage {
 
     #[serde(rename = "server_event")]
     ServerEvent { message: String },
-
-    #[serde(rename = "instance_change")]
-    InstanceChange {
-        corr_id: u32,
-        num_attached: u32,
-        num_detached: u32,
-        num_rejected: u32,
-    },
 }

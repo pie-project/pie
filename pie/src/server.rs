@@ -99,10 +99,6 @@ struct ServerState {
     backend_attached_count: AtomicU32,
     backend_rejected_count: AtomicU32,
     backend_notify: Notify,
-    instance_attached_count: AtomicU32,
-    instance_detached_count: AtomicU32,
-    instance_rejected_count: AtomicU32,
-    instance_notify: Notify,
 }
 
 pub struct Server {
@@ -120,10 +116,6 @@ impl Server {
             backend_attached_count: AtomicU32::new(0),
             backend_rejected_count: AtomicU32::new(0),
             backend_notify: Notify::new(),
-            instance_attached_count: AtomicU32::new(0),
-            instance_detached_count: AtomicU32::new(0),
-            instance_rejected_count: AtomicU32::new(0),
-            instance_notify: Notify::new(),
         });
 
         let listener_loop = task::spawn(Self::listener_loop(ip_port.to_string(), state.clone()));
@@ -379,20 +371,6 @@ impl Session {
                     )
                     .await;
                 }
-                ClientMessage::WaitInstanceChange {
-                    corr_id,
-                    cur_num_attached_instances,
-                    cur_num_detached_instances,
-                    cur_num_rejected_instances,
-                } => {
-                    self.handle_wait_instance_change(
-                        corr_id,
-                        cur_num_attached_instances,
-                        cur_num_detached_instances,
-                        cur_num_rejected_instances,
-                    )
-                    .await;
-                }
                 ClientMessage::QueryBackendStats { corr_id } => {
                     self.handle_query_backend_stats(corr_id).await;
                 }
@@ -470,10 +448,6 @@ impl Session {
                 _ => EventCode::ServerError,
             };
             self.send_inst_event(inst_id, event_code, message).await;
-            self.state
-                .instance_detached_count
-                .fetch_add(1, Ordering::SeqCst);
-            self.state.instance_notify.notify_waiters();
         }
     }
 
@@ -660,17 +634,9 @@ impl Session {
                 self.inst_owned.push(instance_id);
                 self.send_response(corr_id, true, instance_id.to_string())
                     .await;
-                self.state
-                    .instance_attached_count
-                    .fetch_add(1, Ordering::SeqCst);
-                self.state.instance_notify.notify_waiters();
             }
             Err(e) => {
                 self.send_response(corr_id, false, e.to_string()).await;
-                self.state
-                    .instance_rejected_count
-                    .fetch_add(1, Ordering::SeqCst);
-                self.state.instance_notify.notify_waiters();
             }
         }
     }
@@ -902,50 +868,6 @@ impl Session {
                 chunk_data: chunk.to_vec(),
             })
             .await;
-        }
-    }
-
-    async fn handle_wait_instance_change(
-        &mut self,
-        corr_id: u32,
-        cur_num_attached_instances: Option<u32>,
-        cur_num_detached_instances: Option<u32>,
-        cur_num_rejected_instances: Option<u32>,
-    ) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".into())
-                .await;
-            return;
-        }
-
-        loop {
-            // IMPORTANT: Create the notified future BEFORE checking the condition
-            // to avoid race condition where notification happens between check and wait
-            let notified = self.state.instance_notify.notified();
-
-            let num_attached = self.state.instance_attached_count.load(Ordering::SeqCst);
-            let num_detached = self.state.instance_detached_count.load(Ordering::SeqCst);
-            let num_rejected = self.state.instance_rejected_count.load(Ordering::SeqCst);
-
-            // Check if values have changed from what client knows
-            let attached_changed = cur_num_attached_instances.map_or(true, |v| v != num_attached);
-            let detached_changed = cur_num_detached_instances.map_or(true, |v| v != num_detached);
-            let rejected_changed = cur_num_rejected_instances.map_or(true, |v| v != num_rejected);
-
-            if attached_changed || detached_changed || rejected_changed {
-                // Return new values to client
-                self.send(ServerMessage::InstanceChange {
-                    corr_id,
-                    num_attached,
-                    num_detached,
-                    num_rejected,
-                })
-                .await;
-                return;
-            }
-
-            // Wait for notification of instance changes
-            notified.await;
         }
     }
 
