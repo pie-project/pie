@@ -44,7 +44,10 @@ def load_model_info(config: dict) -> ModelInfo:
     # Load the model information from the metadata file.
     model_device = config["device"]
     model_dtype = getattr(torch, config["dtype"])
-    model_info = ModelInfo.load_from_file(str(metadata_path), model_device, model_dtype)
+    max_batch_tokens = config["max_batch_tokens"]
+    model_info = ModelInfo.load_from_file(
+        str(metadata_path), model_device, model_dtype, max_batch_tokens
+    )
 
     return model_info
 

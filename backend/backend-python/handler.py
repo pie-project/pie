@@ -54,6 +54,56 @@ class Handler:
     max_num_adapters: int
     max_adapter_rank: int
 
+    def _calculate_activation_memory_bytes(self, model_info) -> int:
+        """Calculate memory needed for activation buffers based on model architecture.
+
+        This calculates the total memory required for pre-allocated activation buffers
+        that will be used during forward passes to prevent dynamic allocations.
+
+        Returns:
+            Total bytes needed for activation buffers
+        """
+        max_tokens = self.max_batch_tokens
+        hidden_size = model_info.architecture.hidden_size
+        intermediate_size = model_info.architecture.intermediate_size
+        num_q_heads = model_info.architecture.num_query_heads
+        num_kv_heads = model_info.architecture.num_key_value_heads
+        head_size = model_info.architecture.head_size
+        dtype_size = self.dtype.itemsize
+
+        # QKV projection buffer: [max_tokens, (num_q_heads + 2*num_kv_heads) * head_size]
+        qkv_size = max_tokens * (num_q_heads + 2 * num_kv_heads) * head_size * dtype_size
+
+        # Attention output buffer: [max_tokens, num_q_heads * head_size]
+        attn_out_size = max_tokens * num_q_heads * head_size * dtype_size
+
+        # O projection output buffer: [max_tokens, hidden_size]
+        o_proj_size = max_tokens * hidden_size * dtype_size
+
+        # MLP gate_up projection buffer: [max_tokens, 2 * intermediate_size]
+        gate_up_size = max_tokens * 2 * intermediate_size * dtype_size
+
+        # MLP activation buffer: [max_tokens, intermediate_size]
+        mlp_act_size = max_tokens * intermediate_size * dtype_size
+
+        # MLP down projection buffer: [max_tokens, hidden_size]
+        down_proj_size = max_tokens * hidden_size * dtype_size
+
+        # Layer output ping-pong buffers (2x): [max_tokens, hidden_size]
+        layer_out_size = 2 * max_tokens * hidden_size * dtype_size
+
+        total = (
+            qkv_size
+            + attn_out_size
+            + o_proj_size
+            + gate_up_size
+            + mlp_act_size
+            + down_proj_size
+            + layer_out_size
+        )
+
+        return total
+
     def __init__(
         self,
         config: dict,
@@ -165,9 +215,9 @@ class Handler:
 
         # If `gpu_mem_headroom` is set by the user, then we have to allocate the KV
         # cache at the end and dynamically calculate the number of KV pages based on
-        # the available GPU memory.
+        # the available GPU memory, accounting for both KV cache and activation buffers.
         if adaptive_kv_cache_size:
-            # Calculate the available GPU memory for the KV cache after accounting for
+            # Calculate the available GPU memory after accounting for
             # the reserved GPU memory specified through `gpu_mem_headroom`.
             free_gpu_mem_bytes, total_gpu_mem_bytes = torch.cuda.mem_get_info(
                 self.device
@@ -177,26 +227,59 @@ class Handler:
             useable_gpu_mem_bytes = total_gpu_mem_bytes * (
                 1 - (reserved_gpu_mem_percentage / 100)
             )
-            available_kv_cache_bytes = useable_gpu_mem_bytes - used_gpu_mem_bytes
+            available_memory_bytes = useable_gpu_mem_bytes - used_gpu_mem_bytes
 
-            if available_kv_cache_bytes <= 0:
+            if available_memory_bytes <= 0:
                 raise ValueError(
-                    "Not enough GPU memory available to allocate the KV cache. "
+                    "Not enough GPU memory available. "
                     "Please decrease 'gpu_mem_headroom'."
                 )
 
-            # Calculate the number of KV pages based on the available GPU memory.
-            self.max_num_kv_pages = int(
-                available_kv_cache_bytes
-                / (
-                    self.kv_page_size
-                    * 2
-                    * self.model_info.architecture.num_key_value_heads
-                    * self.model_info.architecture.head_size
-                    * self.model_info.architecture.num_layers
-                    * self.dtype.itemsize
-                )
+            # Calculate bytes needed for activation buffers
+            activation_bytes_needed = self._calculate_activation_memory_bytes(
+                self.model_info
             )
+
+            # Calculate bytes per KV page
+            kv_bytes_per_page = (
+                self.kv_page_size
+                * 2
+                * self.model_info.architecture.num_key_value_heads
+                * self.model_info.architecture.head_size
+                * self.model_info.architecture.num_layers
+                * self.dtype.itemsize
+            )
+
+            # Reserve memory for activation buffers first, then use remainder for KV cache
+            available_for_kv = available_memory_bytes - activation_bytes_needed
+
+            if available_for_kv <= 0:
+                # Not enough memory even for activation buffers alone
+                # Try to reduce max_batch_tokens proportionally
+                reduction_factor = available_memory_bytes / activation_bytes_needed
+                if reduction_factor < 0.1:  # Need at least 10% of requested size
+                    raise ValueError(
+                        f"Insufficient GPU memory. Available: {available_memory_bytes / 1e9:.2f}GB, "
+                        f"needed for activation buffers: {activation_bytes_needed / 1e9:.2f}GB. "
+                        "Please decrease 'gpu_mem_headroom' or 'max_batch_tokens'."
+                    )
+                # Reduce max_batch_tokens
+                original_max_batch_tokens = self.max_batch_tokens
+                self.max_batch_tokens = int(self.max_batch_tokens * reduction_factor)
+                # Update the architecture config with new max_batch_tokens
+                self.model_info.architecture.max_batch_tokens = self.max_batch_tokens
+                # Recalculate activation bytes with reduced batch size
+                activation_bytes_needed = self._calculate_activation_memory_bytes(
+                    self.model_info
+                )
+                available_for_kv = available_memory_bytes - activation_bytes_needed
+                print(
+                    f"Warning: Reduced max_batch_tokens from {original_max_batch_tokens} "
+                    f"to {self.max_batch_tokens} to respect 'gpu_mem_headroom'."
+                )
+
+            # Calculate the number of KV pages based on remaining available GPU memory
+            self.max_num_kv_pages = int(available_for_kv / kv_bytes_per_page)
 
             # If the user also specified "max_num_kv_pages", then we will use the
             # smaller of the two values.
@@ -208,6 +291,12 @@ class Handler:
                         f"'max_num_kv_pages' is reduced to {self.max_num_kv_pages} "
                         "to respect 'gpu_mem_headroom'."
                     )
+
+            print(
+                f"Memory allocation with gpu_mem_headroom={reserved_gpu_mem_percentage}%: "
+                f"activation_buffers={activation_bytes_needed / 1e9:.2f}GB, "
+                f"kv_cache={self.max_num_kv_pages * kv_bytes_per_page / 1e9:.2f}GB"
+            )
 
             self.kv_cache_at_layer = [
                 torch.zeros(
