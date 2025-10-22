@@ -221,7 +221,7 @@ impl Service for Runtime {
                 self.terminate_instance(inst_id, cause).await;
             }
 
-            Command::Warn { inst_id, message } => server::Command::Send {
+            Command::Warn { inst_id, message } => server::InstanceEvent::SendMsgToClient {
                 inst_id,
                 message: message.clone(),
             }
@@ -445,7 +445,7 @@ impl Runtime {
                 TerminationCause::OutOfResources(message) => (4, message),
             };
 
-            server::Command::DetachInstance {
+            server::InstanceEvent::DetachInstance {
                 inst_id: instance_id.clone(),
                 termination_code,
                 message,
@@ -617,7 +617,7 @@ impl Runtime {
 
         match result {
             Ok(return_value) => {
-                server::Command::DetachInstance {
+                server::InstanceEvent::DetachInstance {
                     inst_id: instance_id.clone(),
                     termination_code: 0,
                     message: return_value.unwrap_or("".to_string()),
@@ -627,7 +627,7 @@ impl Runtime {
             }
             Err(err) => {
                 println!("Instance {instance_id} failed: {err}");
-                server::Command::DetachInstance {
+                server::InstanceEvent::DetachInstance {
                     inst_id: instance_id.clone(),
                     termination_code: 2,
                     message: err.to_string(),

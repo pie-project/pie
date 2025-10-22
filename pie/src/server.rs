@@ -21,21 +21,18 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
-use tungstenite::Message;
-use tungstenite::protocol::Message as WsMessage;
+use tungstenite::Message as WsMessage;
 use uuid::Uuid;
-
-static SERVICE_ID_SERVER: OnceLock<usize> = OnceLock::new();
 
 type ClientId = u32;
 
 #[derive(Debug)]
-pub enum Command {
-    Send {
+pub enum InstanceEvent {
+    SendMsgToClient {
         inst_id: InstanceId,
         message: String,
     },
-    SendBlob {
+    SendBlobToClient {
         inst_id: InstanceId,
         data: Bytes,
     },
@@ -46,8 +43,9 @@ pub enum Command {
     },
 }
 
-impl Command {
+impl InstanceEvent {
     pub fn dispatch(self) -> Result<(), ServiceError> {
+        static SERVICE_ID_SERVER: OnceLock<usize> = OnceLock::new();
         let service_id =
             *SERVICE_ID_SERVER.get_or_init(move || service::get_service_id("server").unwrap());
         service::dispatch(service_id, self)
@@ -58,7 +56,7 @@ struct ServerState {
     enable_auth: bool,
     client_id_pool: Mutex<IdPool<ClientId>>,
     clients: DashMap<ClientId, JoinHandle<()>>,
-    instance_chans: DashMap<InstanceId, mpsc::Sender<ClientCommand>>,
+    client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
     backend_attached_count: AtomicU32,
     backend_rejected_count: AtomicU32,
     backend_notify: Notify,
@@ -74,12 +72,12 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(addr: &str, enable_auth: bool) -> Self {
+    pub fn new(ip_port: &str, enable_auth: bool) -> Self {
         let state = Arc::new(ServerState {
             enable_auth,
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
-            instance_chans: DashMap::new(),
+            client_cmd_txs: DashMap::new(),
             backend_attached_count: AtomicU32::new(0),
             backend_rejected_count: AtomicU32::new(0),
             backend_notify: Notify::new(),
@@ -89,21 +87,21 @@ impl Server {
             instance_notify: Notify::new(),
         });
 
-        let listener_loop = task::spawn(Self::listener_loop(addr.to_string(), state.clone()));
+        let listener_loop = task::spawn(Self::listener_loop(ip_port.to_string(), state.clone()));
         Server {
             state,
             listener_loop,
         }
     }
 
-    async fn listener_loop(addr: String, state: Arc<ServerState>) {
-        let listener = TcpListener::bind(addr).await.unwrap();
+    async fn listener_loop(ip_port: String, state: Arc<ServerState>) {
+        let listener = TcpListener::bind(ip_port).await.unwrap();
         while let Ok((stream, _addr)) = listener.accept().await {
             let id = {
                 let mut id_pool = state.client_id_pool.lock().await;
                 id_pool.acquire().unwrap()
             };
-            if let Ok(mut client) = Client::new(id, stream, state.clone()).await {
+            if let Ok(mut client) = Session::new(id, stream, state.clone()).await {
                 let client_handle = task::spawn(async move {
                     client.run().await;
                 });
@@ -115,19 +113,19 @@ impl Server {
 }
 
 impl Service for Server {
-    type Command = Command;
+    type Command = InstanceEvent;
 
     async fn handle(&mut self, cmd: Self::Command) {
         // Correctly extract instance_id from all relevant commands
         let inst_id = match &cmd {
-            Command::Send { inst_id, .. }
-            | Command::DetachInstance { inst_id, .. }
-            | Command::SendBlob { inst_id, .. } => *inst_id,
+            InstanceEvent::SendMsgToClient { inst_id, .. }
+            | InstanceEvent::DetachInstance { inst_id, .. }
+            | InstanceEvent::SendBlobToClient { inst_id, .. } => *inst_id,
         };
 
         // Send it to the client if it's connected
-        if let Some(chan) = self.state.instance_chans.get(&inst_id) {
-            chan.send(ClientCommand::Internal(cmd)).await.ok();
+        if let Some(chan) = self.state.client_cmd_txs.get(&inst_id) {
+            chan.send(SessionEvent::InstanceEvent(cmd)).await.ok();
         }
     }
 }
@@ -140,7 +138,7 @@ struct InFlightUpload {
     next_chunk_index: usize,
 }
 
-struct Client {
+struct Session {
     id: ClientId,
     authenticated: bool,
 
@@ -150,29 +148,29 @@ struct Client {
     inflight_blob_uploads: DashMap<String, InFlightUpload>,
     inst_owned: Vec<InstanceId>,
 
-    write_tx: mpsc::Sender<WsMessage>,
-    incoming_rx: mpsc::Receiver<ClientCommand>,
-    incoming_tx: mpsc::Sender<ClientCommand>,
+    ws_msg_tx: mpsc::Sender<WsMessage>,
+    client_cmd_rx: mpsc::Receiver<SessionEvent>,
+    client_cmd_tx: mpsc::Sender<SessionEvent>,
 
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
 }
 
-enum ClientCommand {
-    FromClient(ClientMessage),
-    Internal(Command),
+enum SessionEvent {
+    ClientRequest(ClientMessage),
+    InstanceEvent(InstanceEvent),
 }
 
-impl Client {
-    async fn new(id: ClientId, stream: TcpStream, state: Arc<ServerState>) -> Result<Self> {
-        let (write_tx, mut write_rx) = mpsc::channel(1000);
-        let (incoming_tx, incoming_rx) = mpsc::channel(1000);
+impl Session {
+    async fn new(id: ClientId, tcp_stream: TcpStream, state: Arc<ServerState>) -> Result<Self> {
+        let (ws_msg_tx, mut ws_msg_rx) = mpsc::channel(1000);
+        let (client_cmd_tx, client_cmd_rx) = mpsc::channel(1000);
 
-        let ws_stream = accept_async(stream).await?;
+        let ws_stream = accept_async(tcp_stream).await?;
         let (mut ws_writer, mut ws_reader) = ws_stream.split();
 
-        let writer_task = task::spawn(async move {
-            while let Some(message) = write_rx.recv().await {
+        let resp_pump = task::spawn(async move {
+            while let Some(message) = ws_msg_rx.recv().await {
                 if let Err(e) = ws_writer.send(message).await {
                     println!("Error writing to ws stream: {:?}", e);
                     break;
@@ -180,27 +178,32 @@ impl Client {
             }
         });
 
-        let incoming_tx_ = incoming_tx.clone();
-        let reader_task = task::spawn(async move {
-            let incoming_tx = incoming_tx_;
-            while let Some(Ok(msg)) = ws_reader.next().await {
-                match msg {
-                    Message::Binary(bin) => {
-                        match rmp_serde::decode::from_slice::<ClientMessage>(&bin) {
-                            Ok(client_message) => {
-                                incoming_tx
-                                    .send(ClientCommand::FromClient(client_message))
-                                    .await
-                                    .ok();
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to decode client msgpack: {:?}", e);
-                            }
-                        }
+        let cloned_client_cmd_tx = client_cmd_tx.clone();
+
+        let recv_pump = task::spawn(async move {
+            while let Some(Ok(ws_msg)) = ws_reader.next().await {
+                // Expect to receive only binary messages. Break the loop on close.
+                // Ignore all other messages.
+                let bytes = match ws_msg {
+                    WsMessage::Binary(bytes) => bytes,
+                    WsMessage::Close(_) => break,
+                    _ => continue,
+                };
+
+                // Deserialize the client message.
+                let client_msg = match rmp_serde::decode::from_slice::<ClientMessage>(&bytes) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        eprintln!("Failed to decode client msgpack: {:?}", e);
+                        continue;
                     }
-                    Message::Close(_) => break,
-                    _ => {}
-                }
+                };
+
+                // Forward the client message to the client command receiver.
+                cloned_client_cmd_tx
+                    .send(SessionEvent::ClientRequest(client_msg))
+                    .await
+                    .ok();
             }
         });
 
@@ -211,11 +214,11 @@ impl Client {
             inflight_program_upload: None,
             inflight_blob_uploads: DashMap::new(),
             inst_owned: Vec::new(),
-            write_tx,
-            incoming_rx,
-            incoming_tx,
-            writer_task,
-            reader_task,
+            ws_msg_tx,
+            client_cmd_rx,
+            client_cmd_tx,
+            writer_task: resp_pump,
+            reader_task: recv_pump,
         })
     }
 
@@ -224,7 +227,7 @@ impl Client {
         loop {
             tokio::select! {
                 biased;
-                Some(cmd) = self.incoming_rx.recv() => {
+                Some(cmd) = self.client_cmd_rx.recv() => {
                     self.handle_command(cmd).await;
                 },
                 _ = &mut self.reader_task => break,
@@ -236,9 +239,9 @@ impl Client {
     }
 
     /// Processes a single command.
-    async fn handle_command(&mut self, cmd: ClientCommand) {
+    async fn handle_command(&mut self, cmd: SessionEvent) {
         match cmd {
-            ClientCommand::FromClient(message) => match message {
+            SessionEvent::ClientRequest(message) => match message {
                 ClientMessage::Authenticate { corr_id, token } => {
                     self.handle_authenticate(corr_id, token).await
                 }
@@ -352,12 +355,12 @@ impl Client {
                     self.handle_stop_backend_heartbeat(corr_id).await;
                 }
             },
-            ClientCommand::Internal(cmd) => match cmd {
-                Command::Send { inst_id, message } => {
+            SessionEvent::InstanceEvent(cmd) => match cmd {
+                InstanceEvent::SendMsgToClient { inst_id, message } => {
                     self.send_inst_event(inst_id, EventCode::Message, message)
                         .await
                 }
-                Command::DetachInstance {
+                InstanceEvent::DetachInstance {
                     inst_id,
                     termination_code,
                     message,
@@ -365,7 +368,7 @@ impl Client {
                     self.handle_detach_instance(inst_id, termination_code, message)
                         .await;
                 }
-                Command::SendBlob { inst_id, data } => {
+                InstanceEvent::SendBlobToClient { inst_id, data } => {
                     self.handle_send_blob(inst_id, data).await;
                 }
             },
@@ -375,7 +378,7 @@ impl Client {
     async fn send(&self, msg: ServerMessage) {
         if let Ok(encoded) = rmp_serde::to_vec_named(&msg) {
             if self
-                .write_tx
+                .ws_msg_tx
                 .send(WsMessage::Binary(encoded.into()))
                 .await
                 .is_err()
@@ -414,7 +417,7 @@ impl Client {
         }
         self.inst_owned.retain(|&id| id != inst_id);
 
-        if self.state.instance_chans.remove(&inst_id).is_some() {
+        if self.state.client_cmd_txs.remove(&inst_id).is_some() {
             let event_code = match termination_code {
                 0 => EventCode::Completed,
                 1 => EventCode::Aborted,
@@ -607,8 +610,8 @@ impl Client {
         match evt_rx.await.unwrap() {
             Ok(instance_id) => {
                 self.state
-                    .instance_chans
-                    .insert(instance_id, self.incoming_tx.clone());
+                    .client_cmd_txs
+                    .insert(instance_id, self.client_cmd_tx.clone());
                 self.inst_owned.push(instance_id);
                 self.send_response(corr_id, true, instance_id.to_string())
                     .await;
@@ -972,7 +975,7 @@ impl Client {
     /// Cleans up client resources upon disconnection.
     async fn cleanup(&mut self) {
         for inst_id in self.inst_owned.drain(..) {
-            if self.state.instance_chans.remove(&inst_id).is_some() {
+            if self.state.client_cmd_txs.remove(&inst_id).is_some() {
                 runtime::trap_exception(inst_id, "socket terminated");
             }
         }

@@ -55,7 +55,7 @@ impl Pollable for Subscription {
 
 impl inferlet::core::message::Host for InstanceState {
     async fn send(&mut self, message: String) -> anyhow::Result<()> {
-        server::Command::Send {
+        server::InstanceEvent::SendMsgToClient {
             inst_id: self.id(),
             message,
         }
@@ -80,7 +80,7 @@ impl inferlet::core::message::Host for InstanceState {
     async fn send_blob(&mut self, blob: Resource<Blob>) -> anyhow::Result<()> {
         let data = mem::take(&mut self.ctx().table.get_mut(&blob)?.data);
 
-        server::Command::SendBlob {
+        server::InstanceEvent::SendBlobToClient {
             inst_id: self.id(),
             data,
         }
