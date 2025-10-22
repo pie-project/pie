@@ -80,13 +80,7 @@ pub async fn handle_serve_command(
     }
 
     // Terminate the engine and backend services
-    service::terminate_engine_and_backend(
-        &client_config,
-        backend_processes,
-        shutdown_tx,
-        server_handle,
-    )
-    .await?;
+    service::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
 
     Ok(())
 }

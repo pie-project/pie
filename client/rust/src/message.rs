@@ -97,9 +97,6 @@ pub enum ClientMessage {
 
     #[serde(rename = "query_backend_stats")]
     QueryBackendStats { corr_id: u32 },
-
-    #[serde(rename = "stop_backend_heartbeat")]
-    StopBackendHeartbeat { corr_id: u32 },
 }
 
 /// Messages from server -> client

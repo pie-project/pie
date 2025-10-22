@@ -68,6 +68,9 @@ pub enum InternalEvent {
         cur_num_rejected_backends: Option<u32>,
         tx: oneshot::Sender<(u32, u32)>,
     },
+    StopBackendHeartbeat {
+        tx: oneshot::Sender<()>,
+    },
 }
 
 impl ServerEvent {
@@ -173,6 +176,9 @@ impl Service for Server {
                         cur_num_rejected_backends,
                         tx,
                     );
+                }
+                InternalEvent::StopBackendHeartbeat { tx } => {
+                    stop_backend_heartbeat(tx);
                 }
             },
         }
@@ -373,9 +379,6 @@ impl Session {
                 }
                 ClientMessage::QueryBackendStats { corr_id } => {
                     self.handle_query_backend_stats(corr_id).await;
-                }
-                ClientMessage::StopBackendHeartbeat { corr_id } => {
-                    self.handle_stop_backend_heartbeat(corr_id).await;
                 }
             },
             SessionEvent::InstanceEvent(cmd) => match cmd {
@@ -888,17 +891,6 @@ impl Session {
         self.send_response(corr_id, true, stats_str).await;
     }
 
-    async fn handle_stop_backend_heartbeat(&mut self, corr_id: u32) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".into())
-                .await;
-            return;
-        }
-        model::stop_heartbeat().await;
-        self.send_response(corr_id, true, "Backend heartbeat stopped".into())
-            .await;
-    }
-
     /// Cleans up client resources upon disconnection.
     async fn cleanup(&mut self) {
         for inst_id in self.inst_owned.drain(..) {
@@ -913,35 +905,9 @@ impl Session {
     }
 }
 
-fn handle_wait_backend_change(
-    state: &Arc<ServerState>,
-    cur_num_attached_backends: Option<u32>,
-    cur_num_detached_backends: Option<u32>,
-    tx: oneshot::Sender<(u32, u32)>,
-) {
-    let state = Arc::clone(state);
-
+fn stop_backend_heartbeat(tx: oneshot::Sender<()>) {
     tokio::spawn(async move {
-        loop {
-            // IMPORTANT: Create the notified future BEFORE checking the condition
-            // to avoid race condition where notification happens between check and wait
-            let notified = state.backend_notify.notified();
-
-            let num_attached = state.backend_attached_count.load(Ordering::SeqCst);
-            let num_rejected = state.backend_rejected_count.load(Ordering::SeqCst);
-
-            // Check if values have changed from what client knows
-            let attached_changed = cur_num_attached_backends.map_or(true, |v| v != num_attached);
-            let rejected_changed = cur_num_detached_backends.map_or(true, |v| v != num_rejected);
-
-            // Send back the new values if they have changed
-            if attached_changed || rejected_changed {
-                tx.send((num_attached, num_rejected)).unwrap();
-                return;
-            }
-
-            // Wait for notification of backend changes
-            notified.await;
-        }
+        model::stop_heartbeat().await;
+        tx.send(()).unwrap();
     });
 }

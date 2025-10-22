@@ -284,17 +284,17 @@ pub async fn start_engine_and_backend(
 }
 
 /// Stops the backend heartbeat.
-pub async fn stop_backend_heartbeat(client_config: &ClientConfig) -> Result<()> {
-    let client = connect_and_authenticate(client_config).await?;
+pub async fn stop_backend_heartbeat() -> Result<()> {
     println!("🔄 Stopping backend heartbeat...");
-    client.stop_backend_heartbeat().await?;
+    let (tx, rx) = oneshot::channel();
+    InternalEvent::StopBackendHeartbeat { tx }.dispatch()?;
+    rx.await?;
     println!("✅ Backend heartbeat stopped.");
     Ok(())
 }
 
 /// Terminates the engine and backend processes.
 pub async fn terminate_engine_and_backend(
-    client_config: &ClientConfig,
     backend_processes: Vec<Child>,
     shutdown_tx: oneshot::Sender<()>,
     server_handle: tokio::task::JoinHandle<()>,
@@ -304,7 +304,7 @@ pub async fn terminate_engine_and_backend(
     // Stop the backend heartbeat before sending the signals to the backend processes.
     // This is to avoid broken pipe errors due to sending signals to the backend processes
     // after they have exited.
-    stop_backend_heartbeat(client_config).await?;
+    stop_backend_heartbeat().await?;
     println!("🔄 Terminating backend processes...");
 
     // Iterate through the child processes, signal them, and wait for them to exit.
