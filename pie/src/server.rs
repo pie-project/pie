@@ -27,6 +27,24 @@ use uuid::Uuid;
 type ClientId = u32;
 
 #[derive(Debug)]
+pub enum ServerEvent {
+    InstanceEvent(InstanceEvent),
+    InternalEvent(InternalEvent),
+}
+
+impl From<InstanceEvent> for ServerEvent {
+    fn from(event: InstanceEvent) -> Self {
+        ServerEvent::InstanceEvent(event)
+    }
+}
+
+impl From<InternalEvent> for ServerEvent {
+    fn from(event: InternalEvent) -> Self {
+        ServerEvent::InternalEvent(event)
+    }
+}
+
+#[derive(Debug)]
 pub enum InstanceEvent {
     SendMsgToClient {
         inst_id: InstanceId,
@@ -43,12 +61,33 @@ pub enum InstanceEvent {
     },
 }
 
-impl InstanceEvent {
+#[derive(Debug)]
+pub enum InternalEvent {
+    WaitBackendChange {
+        cur_num_attached_backends: Option<u32>,
+        cur_num_rejected_backends: Option<u32>,
+        tx: oneshot::Sender<(u32, u32)>,
+    },
+}
+
+impl ServerEvent {
     pub fn dispatch(self) -> Result<(), ServiceError> {
         static SERVICE_ID_SERVER: OnceLock<usize> = OnceLock::new();
         let service_id =
             *SERVICE_ID_SERVER.get_or_init(move || service::get_service_id("server").unwrap());
         service::dispatch(service_id, self)
+    }
+}
+
+impl InstanceEvent {
+    pub fn dispatch(self) -> Result<(), ServiceError> {
+        ServerEvent::from(self).dispatch()
+    }
+}
+
+impl InternalEvent {
+    pub fn dispatch(self) -> Result<(), ServiceError> {
+        ServerEvent::from(self).dispatch()
     }
 }
 
@@ -113,19 +152,37 @@ impl Server {
 }
 
 impl Service for Server {
-    type Command = InstanceEvent;
+    type Command = ServerEvent;
 
     async fn handle(&mut self, cmd: Self::Command) {
-        // Correctly extract instance_id from all relevant commands
-        let inst_id = match &cmd {
-            InstanceEvent::SendMsgToClient { inst_id, .. }
-            | InstanceEvent::DetachInstance { inst_id, .. }
-            | InstanceEvent::SendBlobToClient { inst_id, .. } => *inst_id,
-        };
+        match cmd {
+            ServerEvent::InstanceEvent(event) => {
+                // Correctly extract instance_id from all relevant commands
+                let inst_id = match &event {
+                    InstanceEvent::SendMsgToClient { inst_id, .. }
+                    | InstanceEvent::DetachInstance { inst_id, .. }
+                    | InstanceEvent::SendBlobToClient { inst_id, .. } => *inst_id,
+                };
 
-        // Send it to the client if it's connected
-        if let Some(chan) = self.state.client_cmd_txs.get(&inst_id) {
-            chan.send(SessionEvent::InstanceEvent(cmd)).await.ok();
+                // Send it to the client if it's connected
+                if let Some(chan) = self.state.client_cmd_txs.get(&inst_id) {
+                    chan.send(SessionEvent::InstanceEvent(event)).await.ok();
+                }
+            }
+            ServerEvent::InternalEvent(event) => match event {
+                InternalEvent::WaitBackendChange {
+                    cur_num_attached_backends,
+                    cur_num_rejected_backends,
+                    tx,
+                } => {
+                    handle_wait_backend_change(
+                        &self.state,
+                        cur_num_attached_backends,
+                        cur_num_rejected_backends,
+                        tx,
+                    );
+                }
+            },
         }
     }
 }
@@ -319,18 +376,6 @@ impl Session {
                         chunk_index,
                         total_chunks,
                         chunk_data,
-                    )
-                    .await;
-                }
-                ClientMessage::WaitBackendChange {
-                    corr_id,
-                    cur_num_attached_backends,
-                    cur_num_detached_backends,
-                } => {
-                    self.handle_wait_backend_change(
-                        corr_id,
-                        cur_num_attached_backends,
-                        cur_num_detached_backends,
                     )
                     .await;
                 }
@@ -860,46 +905,6 @@ impl Session {
         }
     }
 
-    async fn handle_wait_backend_change(
-        &mut self,
-        corr_id: u32,
-        cur_num_attached_backends: Option<u32>,
-        cur_num_detached_backends: Option<u32>,
-    ) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".into())
-                .await;
-            return;
-        }
-
-        loop {
-            // IMPORTANT: Create the notified future BEFORE checking the condition
-            // to avoid race condition where notification happens between check and wait
-            let notified = self.state.backend_notify.notified();
-
-            let num_attached = self.state.backend_attached_count.load(Ordering::SeqCst);
-            let num_rejected = self.state.backend_rejected_count.load(Ordering::SeqCst);
-
-            // Check if values have changed from what client knows
-            let attached_changed = cur_num_attached_backends.map_or(true, |v| v != num_attached);
-            let rejected_changed = cur_num_detached_backends.map_or(true, |v| v != num_rejected);
-
-            if attached_changed || rejected_changed {
-                // Return new values to client
-                self.send(ServerMessage::BackendChange {
-                    corr_id,
-                    num_attached,
-                    num_rejected,
-                })
-                .await;
-                return;
-            }
-
-            // Wait for notification of backend changes
-            notified.await;
-        }
-    }
-
     async fn handle_wait_instance_change(
         &mut self,
         corr_id: u32,
@@ -984,4 +989,37 @@ impl Session {
         self.state.clients.remove(&self.id);
         self.state.client_id_pool.lock().await.release(self.id).ok();
     }
+}
+
+fn handle_wait_backend_change(
+    state: &Arc<ServerState>,
+    cur_num_attached_backends: Option<u32>,
+    cur_num_detached_backends: Option<u32>,
+    tx: oneshot::Sender<(u32, u32)>,
+) {
+    let state = Arc::clone(state);
+
+    tokio::spawn(async move {
+        loop {
+            // IMPORTANT: Create the notified future BEFORE checking the condition
+            // to avoid race condition where notification happens between check and wait
+            let notified = state.backend_notify.notified();
+
+            let num_attached = state.backend_attached_count.load(Ordering::SeqCst);
+            let num_rejected = state.backend_rejected_count.load(Ordering::SeqCst);
+
+            // Check if values have changed from what client knows
+            let attached_changed = cur_num_attached_backends.map_or(true, |v| v != num_attached);
+            let rejected_changed = cur_num_detached_backends.map_or(true, |v| v != num_rejected);
+
+            // Send back the new values if they have changed
+            if attached_changed || rejected_changed {
+                tx.send((num_attached, num_rejected)).unwrap();
+                return;
+            }
+
+            // Wait for notification of backend changes
+            notified.await;
+        }
+    });
 }
