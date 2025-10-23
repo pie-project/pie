@@ -11,7 +11,7 @@ use engine::Config as EngineConfig;
 use pie_client::auth;
 use pie_client::client::{self, Client};
 use pie_client::client::{Instance, InstanceEvent};
-use pie_client::message::EventCode;
+use pie_client::message::{EventCode, QUERY_BACKEND_STATS};
 use rand::{Rng, distr::Alphanumeric};
 use std::path::Path;
 use std::sync::Arc;
@@ -510,7 +510,7 @@ pub async fn print_backend_stats(
     printer: &SharedPrinter,
 ) -> Result<()> {
     let client = connect_and_authenticate(client_config).await?;
-    let stats = client.query_backend_stats().await?;
+    let stats = client.query(QUERY_BACKEND_STATS, "".to_string()).await?;
     let _ =
         crate::output::print_with_printer(printer, format!("Backend runtime stats:\n{}\n", stats))
             .await;

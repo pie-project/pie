@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub const CHUNK_SIZE_BYTES: usize = 256 * 1024; // 256 KiB
 pub const QUERY_PROGRAM_EXISTS: &str = "program_exists";
 pub const QUERY_MODEL_STATUS: &str = "model_status";
+pub const QUERY_BACKEND_STATS: &str = "backend_stats";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum EventCode {
@@ -94,9 +95,6 @@ pub enum ClientMessage {
         service_type: String,
         service_name: String,
     },
-
-    #[serde(rename = "query_backend_stats")]
-    QueryBackendStats { corr_id: u32 },
 }
 
 /// Messages from server -> client

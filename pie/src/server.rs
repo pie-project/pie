@@ -10,7 +10,9 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use pie_client::auth;
-use pie_client::message::{CHUNK_SIZE_BYTES, QUERY_MODEL_STATUS, QUERY_PROGRAM_EXISTS};
+use pie_client::message::{
+    CHUNK_SIZE_BYTES, QUERY_BACKEND_STATS, QUERY_MODEL_STATUS, QUERY_PROGRAM_EXISTS,
+};
 use pie_client::message::{ClientMessage, EventCode, ServerMessage};
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -431,9 +433,6 @@ impl Session {
                     )
                     .await;
                 }
-                ClientMessage::QueryBackendStats { corr_id } => {
-                    self.handle_query_backend_stats(corr_id).await;
-                }
             },
             SessionEvent::InstanceEvent(cmd) => match cmd {
                 InstanceEvent::SendMsgToClient { inst_id, message } => {
@@ -550,6 +549,17 @@ impl Session {
                     serde_json::to_string(&runtime_stats).unwrap(),
                 )
                 .await;
+            }
+            QUERY_BACKEND_STATS => {
+                let runtime_stats = model::runtime_stats().await;
+                let mut sorted_stats: Vec<_> = runtime_stats.iter().collect();
+                sorted_stats.sort_by_key(|(k, _)| *k);
+
+                let mut stats_str = String::new();
+                for (key, value) in sorted_stats {
+                    stats_str.push_str(&format!("{:<40} | {}\n", key, value));
+                }
+                self.send_response(corr_id, true, stats_str).await;
             }
             _ => println!("Unknown query subject: {}", subject),
         }
@@ -914,23 +924,6 @@ impl Session {
             })
             .await;
         }
-    }
-
-    async fn handle_query_backend_stats(&mut self, corr_id: u32) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".into())
-                .await;
-            return;
-        }
-        let runtime_stats = model::runtime_stats().await;
-        let mut sorted_stats: Vec<_> = runtime_stats.iter().collect();
-        sorted_stats.sort_by_key(|(k, _)| *k);
-
-        let mut stats_str = String::new();
-        for (key, value) in sorted_stats {
-            stats_str.push_str(&format!("{:<40} | {}\n", key, value));
-        }
-        self.send_response(corr_id, true, stats_str).await;
     }
 
     /// Cleans up client resources upon disconnection.

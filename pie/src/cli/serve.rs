@@ -131,9 +131,9 @@ async fn handle_shell_command(
         "help" => {
             println!("Available commands:");
             println!(
-                "  run [--detach] <path> [ARGS]... - Run a .wasm inferlet with optional arguments"
+                "  run [--stream-output] <path> [ARGS]... - Run a .wasm inferlet with optional arguments"
             );
-            println!("  query                  - (Placeholder) Query the engine state");
+            println!("  stat                   - Query the backend statistics");
             println!("  exit                   - Exit the Pie session");
             println!("  help                   - Show this help message");
         }
