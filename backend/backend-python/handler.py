@@ -72,7 +72,9 @@ class Handler:
         dtype_size = self.dtype.itemsize
 
         # QKV projection buffer: [max_tokens, (num_q_heads + 2*num_kv_heads) * head_size]
-        qkv_size = max_tokens * (num_q_heads + 2 * num_kv_heads) * head_size * dtype_size
+        qkv_size = (
+            max_tokens * (num_q_heads + 2 * num_kv_heads) * head_size * dtype_size
+        )
 
         # Attention output buffer: [max_tokens, num_q_heads * head_size]
         attn_out_size = max_tokens * num_q_heads * head_size * dtype_size
@@ -259,9 +261,10 @@ class Handler:
                 reduction_factor = available_memory_bytes / activation_bytes_needed
                 if reduction_factor < 0.1:  # Need at least 10% of requested size
                     raise ValueError(
-                        f"Insufficient GPU memory. Available: {available_memory_bytes / 1e9:.2f}GB, "
-                        f"needed for activation buffers: {activation_bytes_needed / 1e9:.2f}GB. "
-                        "Please decrease 'gpu_mem_headroom' or 'max_batch_tokens'."
+                        f"Insufficient GPU memory. "
+                        f"Available: {available_memory_bytes / 1e9:.2f}GB, "
+                        f"needed: {activation_bytes_needed / 1e9:.2f}GB. "
+                        "Decrease 'gpu_mem_headroom' or 'max_batch_tokens'."
                     )
                 # Reduce max_batch_tokens
                 original_max_batch_tokens = self.max_batch_tokens

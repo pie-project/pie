@@ -170,11 +170,16 @@ class L4maMlp(nn.Module):
 
         gate_up_buffer = activation_buffers["gate_up_buffer"][:n]
         torch.addmm(
-            self.gate_up_proj.bias if self.gate_up_proj.bias is not None
-            else torch.zeros(self.gate_up_proj.out_features, device=x.device, dtype=x.dtype),
+            (
+                self.gate_up_proj.bias
+                if self.gate_up_proj.bias is not None
+                else torch.zeros(
+                    self.gate_up_proj.out_features, device=x.device, dtype=x.dtype
+                )
+            ),
             x,
             self.gate_up_proj.weight.t(),
-            out=gate_up_buffer
+            out=gate_up_buffer,
         )
         return gate_up_buffer
 
@@ -202,11 +207,18 @@ class L4maMlp(nn.Module):
 
         down_proj_buffer = activation_buffers["down_proj_buffer"][:n]
         torch.addmm(
-            self.down_proj.bias if self.down_proj.bias is not None
-            else torch.zeros(self.down_proj.out_features, device=interim.device, dtype=interim.dtype),
+            (
+                self.down_proj.bias
+                if self.down_proj.bias is not None
+                else torch.zeros(
+                    self.down_proj.out_features,
+                    device=interim.device,
+                    dtype=interim.dtype,
+                )
+            ),
             interim,
             self.down_proj.weight.t(),
-            out=down_proj_buffer
+            out=down_proj_buffer,
         )
         return down_proj_buffer
 
@@ -254,8 +266,7 @@ class L4maAttention(nn.Module):
         adapter_subpass: Optional[AdapterSubpass],
         activation_buffers: dict,
     ) -> torch.Tensor:
-        """Attention forward pass using FlashInfer ops directly.
-        """
+        """Attention forward pass using FlashInfer ops directly."""
 
         n, _ = hidden_states.size()
         qkv_states = self._qkv_projection(hidden_states, activation_buffers)
@@ -333,11 +344,18 @@ class L4maAttention(nn.Module):
 
         qkv_buffer = activation_buffers["qkv_buffer"][:n]
         torch.addmm(
-            self.qkv_proj.bias if self.qkv_proj.bias is not None
-            else torch.zeros(self.qkv_proj.out_features, device=hidden_states.device, dtype=hidden_states.dtype),
+            (
+                self.qkv_proj.bias
+                if self.qkv_proj.bias is not None
+                else torch.zeros(
+                    self.qkv_proj.out_features,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            ),
             hidden_states,
             self.qkv_proj.weight.t(),
-            out=qkv_buffer
+            out=qkv_buffer,
         )
         return qkv_buffer
 
@@ -352,11 +370,18 @@ class L4maAttention(nn.Module):
 
         o_proj_buffer = activation_buffers["o_proj_buffer"][:n]
         torch.addmm(
-            self.o_proj.bias if self.o_proj.bias is not None
-            else torch.zeros(self.o_proj.out_features, device=attn_output.device, dtype=attn_output.dtype),
+            (
+                self.o_proj.bias
+                if self.o_proj.bias is not None
+                else torch.zeros(
+                    self.o_proj.out_features,
+                    device=attn_output.device,
+                    dtype=attn_output.dtype,
+                )
+            ),
             attn_output,
             self.o_proj.weight.t(),
-            out=o_proj_buffer
+            out=o_proj_buffer,
         )
         return o_proj_buffer
 
@@ -426,7 +451,9 @@ class L4maDecoderLayer(nn.Module):
             hidden_states = self._post_attention_normalization(hidden_states)
 
         with start_profile("mlp"):
-            hidden_states = self.mlp(hidden_states, activation_buffers=activation_buffers)
+            hidden_states = self.mlp(
+                hidden_states, activation_buffers=activation_buffers
+            )
 
         with start_profile("mlp_residual"):
             hidden_states = residual + hidden_states
@@ -550,7 +577,8 @@ class L4maModel(nn.Module):
         # Calculate total memory allocated
         total_bytes = sum(buf.numel() * buf.element_size() for buf in buffers.values())
         print(
-            f"Allocated {total_bytes / 1e9:.2f}GB for activation buffers across {len(buffers)} tensors"
+            f"Allocated {total_bytes / 1e9:.2f}GB for activation buffers "
+            f"across {len(buffers)} tensors"
         )
 
         return buffers

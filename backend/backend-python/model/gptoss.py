@@ -474,11 +474,18 @@ class GptOssAttention(nn.Module):
 
         qkv_buffer = activation_buffers["qkv_buffer"][:n]
         torch.addmm(
-            self.qkv_proj.bias if self.qkv_proj.bias is not None
-            else torch.zeros(self.qkv_proj.out_features, device=hidden_states.device, dtype=hidden_states.dtype),
+            (
+                self.qkv_proj.bias
+                if self.qkv_proj.bias is not None
+                else torch.zeros(
+                    self.qkv_proj.out_features,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            ),
             hidden_states,
             self.qkv_proj.weight.t(),
-            out=qkv_buffer
+            out=qkv_buffer,
         )
         return qkv_buffer
 
@@ -772,7 +779,8 @@ class GptOssModel(nn.Module):
         # Calculate total memory allocated
         total_bytes = sum(buf.numel() * buf.element_size() for buf in buffers.values())
         print(
-            f"Allocated {total_bytes / 1e9:.2f}GB for activation buffers across {len(buffers)} tensors"
+            f"Allocated {total_bytes / 1e9:.2f}GB for activation buffers "
+            f"across {len(buffers)} tensors"
         )
 
         return buffers
