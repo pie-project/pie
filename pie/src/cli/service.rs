@@ -484,7 +484,7 @@ pub async fn wait_for_backend_ready(num_backends: usize) -> Result<()> {
             }
             _ = sigchld.recv() => {
                 anyhow::bail!(
-                    "Backend process(es) terminated prematurely before registering. \\
+                    "Backend process(es) terminated prematurely before registering. \
                      Check backend logs for errors."
                 );
             }
