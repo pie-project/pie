@@ -178,16 +178,24 @@ impl BatchPolicy for ForwardPassPolicy {
         if self.trigger.load(Ordering::SeqCst) {
             if self.trigger.swap(false, Ordering::SeqCst) {
                 let mut tokens_in_batch = 0;
-                let mut num_requests_to_drain = queue.len(); // Default to draining the entire queue.
+                let mut num_requests_to_drain = 0; // Will be updated as we add requests
 
                 for (i, request) in queue.iter().enumerate() {
                     if let Request::ForwardPass(req, _) = &request.req {
-                        tokens_in_batch += req.input_tokens.len() + req.input_embed_ptrs.len();
+                        let request_tokens = req.input_tokens.len() + req.input_embed_ptrs.len();
+                        let new_total = tokens_in_batch + request_tokens;
 
-                        if tokens_in_batch >= self.max_batch_tokens {
-                            num_requests_to_drain = i + 1;
+                        // Check if adding this request would exceed the limit
+                        if new_total > self.max_batch_tokens {
+                            // Don't include this request - it would exceed the limit
                             break;
                         }
+
+                        tokens_in_batch = new_total;
+                        num_requests_to_drain = i + 1;
+                    } else {
+                        // For non-ForwardPass requests, include them eagerly
+                        num_requests_to_drain = i + 1;
                     }
                 }
                 //
