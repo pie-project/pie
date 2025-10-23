@@ -111,15 +111,69 @@ class Qwen2Mlp(nn.Module):
         )
         self.act_fn = nn.SiLU()
 
-    def forward(self, x):
-        """Forward pass through the MLP layer."""
-        gate_up_proj_out = self.gate_up_proj(x)
+    def forward(self, x, activation_buffers: dict):
+        """Forward pass through the MLP layer.
+
+        Args:
+            x: Input tensor
+            activation_buffers: Pre-allocated buffers
+        """
+        gate_up_proj_out = self._gate_up_projection(x, activation_buffers)
         gate_proj, up_proj = gate_up_proj_out.chunk(2, dim=-1)
-
-        interim = self.act_fn(gate_proj) * up_proj
-
-        down_proj = self.down_proj(interim)
+        interim = self._silu_activation(gate_proj, up_proj, activation_buffers)
+        down_proj = self._down_projection(interim, activation_buffers)
         return down_proj
+
+    def _gate_up_projection(self, x, activation_buffers: dict):
+        """Gate/Up projection."""
+        n = x.shape[0]
+        if n > activation_buffers["gate_up_buffer"].shape[0]:
+            raise RuntimeError(
+                f"Batch size {n} exceeds max_batch_tokens "
+                f"{activation_buffers['gate_up_buffer'].shape[0]}"
+            )
+
+        gate_up_buffer = activation_buffers["gate_up_buffer"][:n]
+        torch.addmm(
+            self.gate_up_proj.bias if self.gate_up_proj.bias is not None
+            else torch.zeros(self.gate_up_proj.out_features, device=x.device, dtype=x.dtype),
+            x,
+            self.gate_up_proj.weight.t(),
+            out=gate_up_buffer
+        )
+        return gate_up_buffer
+
+    def _silu_activation(self, gate_proj, up_proj, activation_buffers: dict):
+        """SiLU activation."""
+        n = gate_proj.shape[0]
+        if n > activation_buffers["mlp_act_buffer"].shape[0]:
+            raise RuntimeError(
+                f"Batch size {n} exceeds max_batch_tokens "
+                f"{activation_buffers['mlp_act_buffer'].shape[0]}"
+            )
+
+        mlp_act_buffer = activation_buffers["mlp_act_buffer"][:n]
+        torch.mul(self.act_fn(gate_proj), up_proj, out=mlp_act_buffer)
+        return mlp_act_buffer
+
+    def _down_projection(self, interim, activation_buffers: dict):
+        """Down projection."""
+        n = interim.shape[0]
+        if n > activation_buffers["down_proj_buffer"].shape[0]:
+            raise RuntimeError(
+                f"Batch size {n} exceeds max_batch_tokens "
+                f"{activation_buffers['down_proj_buffer'].shape[0]}"
+            )
+
+        down_proj_buffer = activation_buffers["down_proj_buffer"][:n]
+        torch.addmm(
+            self.down_proj.bias if self.down_proj.bias is not None
+            else torch.zeros(self.down_proj.out_features, device=interim.device, dtype=interim.dtype),
+            interim,
+            self.down_proj.weight.t(),
+            out=down_proj_buffer
+        )
+        return down_proj_buffer
 
 
 class Qwen2Attention(nn.Module):
@@ -164,12 +218,13 @@ class Qwen2Attention(nn.Module):
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
         adapter_subpass: Optional[AdapterSubpass],
+        activation_buffers: dict,
     ) -> torch.Tensor:
         """Forward pass through the attention module."""
 
         n, _ = hidden_states.size()
 
-        qkv_states = self.qkv_proj(hidden_states)
+        qkv_states = self._qkv_projection(hidden_states, activation_buffers)
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
         )
@@ -216,9 +271,45 @@ class Qwen2Attention(nn.Module):
         attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
         attn_output = attn_output.reshape(n, -1)
 
-        attn_output = self.o_proj(attn_output)
+        return self._output_projection(attn_output, activation_buffers)
 
-        return attn_output
+    def _qkv_projection(self, hidden_states: torch.Tensor, activation_buffers: dict):
+        """QKV projection."""
+        n = hidden_states.shape[0]
+        if n > activation_buffers["qkv_buffer"].shape[0]:
+            raise RuntimeError(
+                f"Batch size {n} exceeds max_batch_tokens "
+                f"{activation_buffers['qkv_buffer'].shape[0]}"
+            )
+
+        qkv_buffer = activation_buffers["qkv_buffer"][:n]
+        torch.addmm(
+            self.qkv_proj.bias if self.qkv_proj.bias is not None
+            else torch.zeros(self.qkv_proj.out_features, device=hidden_states.device, dtype=hidden_states.dtype),
+            hidden_states,
+            self.qkv_proj.weight.t(),
+            out=qkv_buffer
+        )
+        return qkv_buffer
+
+    def _output_projection(self, attn_output: torch.Tensor, activation_buffers: dict):
+        """Output projection."""
+        n = attn_output.shape[0]
+        if n > activation_buffers["o_proj_buffer"].shape[0]:
+            raise RuntimeError(
+                f"Batch size {n} exceeds max_batch_tokens "
+                f"{activation_buffers['o_proj_buffer'].shape[0]}"
+            )
+
+        o_proj_buffer = activation_buffers["o_proj_buffer"][:n]
+        torch.addmm(
+            self.o_proj.bias if self.o_proj.bias is not None
+            else torch.zeros(self.o_proj.out_features, device=attn_output.device, dtype=attn_output.dtype),
+            attn_output,
+            self.o_proj.weight.t(),
+            out=o_proj_buffer
+        )
+        return o_proj_buffer
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -258,6 +349,7 @@ class Qwen2DecoderLayer(nn.Module):
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
         adapter_subpass: Optional[AdapterSubpass],
+        activation_buffers: dict,
     ) -> torch.Tensor:
         """Forward pass through the decoder layer."""
         residual = hidden_states
@@ -276,6 +368,7 @@ class Qwen2DecoderLayer(nn.Module):
             batch_indices=batch_indices,
             batch_positions=batch_positions,
             adapter_subpass=adapter_subpass,
+            activation_buffers=activation_buffers,
         )
 
         hidden_states = residual + hidden_states
@@ -284,7 +377,7 @@ class Qwen2DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, activation_buffers=activation_buffers)
 
         hidden_states = residual + hidden_states
 
@@ -328,6 +421,82 @@ class Qwen2Model(nn.Module):
         self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
         )
+
+        # Pre-allocate activation buffers to reserve memory and cap maximum usage.
+        # These buffers reserve GPU memory upfront, making the memory footprint predictable
+        # and preventing OOM errors that would otherwise occur mid-inference.
+        # Note: Currently used for memory reservation. Future enhancement could use these
+        # buffers directly with custom CUDA kernels or F.linear with output management.
+        self.activation_buffers = self._create_activation_buffers(config)
+
+    def _create_activation_buffers(self, config: Qwen2Arch) -> dict:
+        """Create pre-allocated activation buffers based on max_batch_tokens.
+
+        These buffers are sized for the maximum batch size and will be reused across
+        all forward passes to prevent dynamic memory allocation.
+
+        Returns:
+            Dictionary of pre-allocated tensor buffers
+        """
+        max_tokens = config.max_batch_tokens
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+        num_query_heads = config.num_query_heads
+        num_kv_heads = config.num_key_value_heads
+        head_size = config.head_size
+        device = config.device
+        dtype = config.dtype
+
+        print(
+            f"Pre-allocating activation buffers for max_batch_tokens={max_tokens}, "
+            f"hidden_size={hidden_size}, intermediate_size={intermediate_size}"
+        )
+
+        buffers = {
+            # QKV projection output: [max_tokens, (num_query_heads + 2*num_kv_heads) * head_size]
+            "qkv_buffer": torch.empty(
+                (max_tokens, (num_query_heads + 2 * num_kv_heads) * head_size),
+                device=device,
+                dtype=dtype,
+            ),
+            # Attention output buffer: [max_tokens, num_query_heads * head_size]
+            "attn_out_buffer": torch.empty(
+                (max_tokens, num_query_heads * head_size),
+                device=device,
+                dtype=dtype,
+            ),
+            # O projection output buffer: [max_tokens, hidden_size]
+            "o_proj_buffer": torch.empty(
+                (max_tokens, hidden_size), device=device, dtype=dtype
+            ),
+            # MLP gate_up projection output: [max_tokens, 2 * intermediate_size]
+            "gate_up_buffer": torch.empty(
+                (max_tokens, 2 * intermediate_size), device=device, dtype=dtype
+            ),
+            # MLP activation output: [max_tokens, intermediate_size]
+            "mlp_act_buffer": torch.empty(
+                (max_tokens, intermediate_size), device=device, dtype=dtype
+            ),
+            # MLP down projection output: [max_tokens, hidden_size]
+            "down_proj_buffer": torch.empty(
+                (max_tokens, hidden_size), device=device, dtype=dtype
+            ),
+            # Layer output buffers (ping-pong pattern between layers)
+            "layer_out_0": torch.empty(
+                (max_tokens, hidden_size), device=device, dtype=dtype
+            ),
+            "layer_out_1": torch.empty(
+                (max_tokens, hidden_size), device=device, dtype=dtype
+            ),
+        }
+
+        # Calculate total memory allocated
+        total_bytes = sum(buf.numel() * buf.element_size() for buf in buffers.values())
+        print(
+            f"Allocated {total_bytes / 1e9:.2f}GB for activation buffers across {len(buffers)} tensors"
+        )
+
+        return buffers
 
     def forward(
         self,
@@ -390,6 +559,7 @@ class Qwen2Model(nn.Module):
                 batch_indices=batch_indices,
                 batch_positions=batch_positions,
                 adapter_subpass=adapter_subpass,
+                activation_buffers=self.activation_buffers,
             )
 
             hidden_states = layer_outputs

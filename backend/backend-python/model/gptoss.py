@@ -409,11 +409,12 @@ class GptOssAttention(nn.Module):
         batch_positions: torch.IntTensor,
         attention_mask: torch.Tensor,
         adapter_subpass: AdapterSubpass | None,
+        activation_buffers: dict,
     ) -> torch.Tensor:
         """Forward pass through the attention module."""
         n, _ = hidden_states.size()
 
-        qkv_states = self.qkv_proj(hidden_states)
+        qkv_states = self._qkv_projection(hidden_states, activation_buffers)
 
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
@@ -461,6 +462,25 @@ class GptOssAttention(nn.Module):
         )
 
         return new_attn_output
+
+    def _qkv_projection(self, hidden_states: torch.Tensor, activation_buffers: dict):
+        """QKV projection."""
+        n = hidden_states.shape[0]
+        if n > activation_buffers["qkv_buffer"].shape[0]:
+            raise RuntimeError(
+                f"Batch size {n} exceeds max_batch_tokens "
+                f"{activation_buffers['qkv_buffer'].shape[0]}"
+            )
+
+        qkv_buffer = activation_buffers["qkv_buffer"][:n]
+        torch.addmm(
+            self.qkv_proj.bias if self.qkv_proj.bias is not None
+            else torch.zeros(self.qkv_proj.out_features, device=hidden_states.device, dtype=hidden_states.dtype),
+            hidden_states,
+            self.qkv_proj.weight.t(),
+            out=qkv_buffer
+        )
+        return qkv_buffer
 
 
 class GptOssRouter(nn.Module):
@@ -649,6 +669,7 @@ class GptOssDecoderLayer(nn.Module):
         full_mask: torch.Tensor,
         window_mask: torch.Tensor,
         adapter_subpass: AdapterSubpass | None,
+        activation_buffers: dict,
     ) -> torch.Tensor:
         """Forward pass through the decoder layer."""
         residual = hidden_states
@@ -668,6 +689,7 @@ class GptOssDecoderLayer(nn.Module):
             batch_positions=batch_positions,
             attention_mask=window_mask if self.layer_idx % 2 == 0 else full_mask,
             adapter_subpass=adapter_subpass,
+            activation_buffers=activation_buffers,
         )
 
         hidden_states = residual + hidden_states
@@ -708,6 +730,52 @@ class GptOssModel(nn.Module):
             device=config.device,
         )
         self.sliding_window = config.sliding_window
+
+        # Pre-allocate activation buffers to reserve memory and cap maximum usage.
+        # These buffers reserve GPU memory upfront, making the memory footprint predictable
+        # and preventing OOM errors that would otherwise occur mid-inference.
+        # Note: For GptOss, only attention buffers are pre-allocated due to the
+        # complex MoE architecture with custom einsum operations.
+        self.activation_buffers = self._create_activation_buffers(config)
+
+    def _create_activation_buffers(self, config: GptOssArch) -> dict:
+        """Create pre-allocated activation buffers based on max_batch_tokens.
+
+        These buffers are sized for the maximum batch size and will be reused across
+        all forward passes to prevent dynamic memory allocation.
+
+        Returns:
+            Dictionary of pre-allocated tensor buffers
+        """
+        max_tokens = config.max_batch_tokens
+        hidden_size = config.hidden_size
+        num_query_heads = config.num_query_heads
+        num_kv_heads = config.num_key_value_heads
+        head_size = config.head_size
+        device = config.device
+        dtype = config.dtype
+
+        print(
+            f"Pre-allocating activation buffers for max_batch_tokens={max_tokens}, "
+            f"hidden_size={hidden_size}"
+        )
+
+        buffers = {
+            # QKV projection output: [max_tokens, (num_query_heads + 2*num_kv_heads) * head_size]
+            "qkv_buffer": torch.empty(
+                (max_tokens, (num_query_heads + 2 * num_kv_heads) * head_size),
+                device=device,
+                dtype=dtype,
+            ),
+        }
+
+        # Calculate total memory allocated
+        total_bytes = sum(buf.numel() * buf.element_size() for buf in buffers.values())
+        print(
+            f"Allocated {total_bytes / 1e9:.2f}GB for activation buffers across {len(buffers)} tensors"
+        )
+
+        return buffers
 
     def forward(
         self,
@@ -802,6 +870,7 @@ class GptOssModel(nn.Module):
                 full_mask=full_mask,
                 window_mask=window_mask,
                 adapter_subpass=adapter_subpass,
+                activation_buffers=self.activation_buffers,
             )
 
             hidden_states = layer_outputs
