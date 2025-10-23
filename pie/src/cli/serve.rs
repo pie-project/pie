@@ -12,6 +12,7 @@ use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Arguments for the `pie serve` command.
 #[derive(Args, Debug, Default)]
@@ -70,7 +71,12 @@ pub async fn handle_serve_command(
 
     // Start the engine and backend services
     let (shutdown_tx, server_handle, backend_processes, client_config) =
-        service::start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
+        service::start_engine_and_backend(
+            engine_config,
+            backend_configs,
+            Some(Arc::clone(&printer)),
+        )
+        .await?;
 
     // Run interactive shell or wait for ctrl-c
     if interactive {

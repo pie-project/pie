@@ -14,7 +14,6 @@ use pie_client::client::{Instance, InstanceEvent};
 use pie_client::message::{EventCode, QUERY_BACKEND_STATS};
 use rand::{Rng, distr::Alphanumeric};
 use std::path::Path;
-use std::sync::Arc;
 use std::{fs, path::PathBuf, process::Stdio};
 use tokio::io::BufReader;
 use tokio::process::{Child, Command as TokioCommand};
@@ -104,7 +103,7 @@ pub fn parse_engine_and_backend_config(
 pub async fn start_engine_and_backend(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
-    printer: SharedPrinter,
+    printer: Option<SharedPrinter>,
 ) -> Result<(Sender<()>, JoinHandle<()>, Vec<Child>, ClientConfig)> {
     // Initialize engine and client configurations
     let client_config = ClientConfig {
@@ -215,7 +214,7 @@ pub async fn start_engine_and_backend(
                 .take()
                 .context("Could not capture stderr from backend process.")?;
 
-            let printer_clone = Arc::clone(&printer);
+            let printer_clone = printer.clone();
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut reader = BufReader::new(stdout);
@@ -227,26 +226,34 @@ pub async fn start_engine_and_backend(
                             // We've received `n` bytes. Convert to a string (lossily) and print.
                             let output = String::from_utf8_lossy(&buffer[..n]);
                             // Use `print!` to avoid adding an extra newline
-                            printer_clone
-                                .lock()
-                                .await
-                                .print(format!("[Backend] {}", output))
-                                .unwrap();
+                            if let Some(printer) = &printer_clone {
+                                printer
+                                    .lock()
+                                    .await
+                                    .print(format!("[Backend] {}", output))
+                                    .unwrap();
+                            } else {
+                                print!("[Backend] {}", output);
+                            }
                         }
                         Err(e) => {
                             // Handle read error, e.g., print it and break
-                            printer_clone
-                                .lock()
-                                .await
-                                .print(format!("[Backend Read Error] {}", e))
-                                .unwrap();
+                            if let Some(printer) = &printer_clone {
+                                printer
+                                    .lock()
+                                    .await
+                                    .print(format!("[Backend Read Error] {}", e))
+                                    .unwrap();
+                            } else {
+                                eprint!("[Backend Read Error] {}", e);
+                            }
                             break;
                         }
                     }
                 }
             });
 
-            let printer_clone = Arc::clone(&printer);
+            let printer_clone = printer.clone();
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut reader = BufReader::new(stderr);
@@ -256,18 +263,26 @@ pub async fn start_engine_and_backend(
                         Ok(0) => break,
                         Ok(n) => {
                             let output = String::from_utf8_lossy(&buffer[..n]);
-                            printer_clone
-                                .lock()
-                                .await
-                                .print(format!("[Backend] {}", output))
-                                .unwrap();
+                            if let Some(printer) = &printer_clone {
+                                printer
+                                    .lock()
+                                    .await
+                                    .print(format!("[Backend] {}", output))
+                                    .unwrap();
+                            } else {
+                                eprint!("[Backend] {}", output);
+                            }
                         }
                         Err(e) => {
-                            printer_clone
-                                .lock()
-                                .await
-                                .print(format!("[Backend Read Error] {}", e))
-                                .unwrap();
+                            if let Some(printer) = &printer_clone {
+                                printer
+                                    .lock()
+                                    .await
+                                    .print(format!("[Backend Read Error] {}", e))
+                                    .unwrap();
+                            } else {
+                                eprint!("[Backend Read Error] {}", e);
+                            }
                             break;
                         }
                     }
@@ -346,7 +361,7 @@ pub async fn submit_detached_inferlet(
     let instance = submit_inferlet(client_config, inferlet_path, arguments).await?;
 
     if stream_output {
-        tokio::spawn(stream_inferlet_output(instance, printer));
+        tokio::spawn(stream_inferlet_output(instance, Some(printer)));
     }
 
     Ok(())
@@ -357,7 +372,7 @@ pub async fn submit_inferlet_and_wait(
     client_config: &ClientConfig,
     inferlet_path: PathBuf,
     arguments: Vec<String>,
-    printer: SharedPrinter,
+    printer: Option<SharedPrinter>,
 ) -> Result<()> {
     let instance = submit_inferlet(client_config, inferlet_path, arguments).await?;
     stream_inferlet_output(instance, printer).await
@@ -387,18 +402,25 @@ async fn submit_inferlet(
 }
 
 /// Streams the output of an inferlet to the printer.
-async fn stream_inferlet_output(mut instance: Instance, printer: SharedPrinter) -> Result<()> {
+async fn stream_inferlet_output(
+    mut instance: Instance,
+    printer: Option<SharedPrinter>,
+) -> Result<()> {
     let instance_id = instance.id().to_string();
     loop {
         let event = match instance.recv().await {
             Ok(ev) => ev,
             Err(e) => {
                 // The print operation should not fail.
-                printer
-                    .lock()
-                    .await
-                    .print(format!("[Inferlet {}] ReceiveError: {}", instance_id, e))
-                    .unwrap();
+                if let Some(printer) = &printer {
+                    printer
+                        .lock()
+                        .await
+                        .print(format!("[Inferlet {}] ReceiveError: {}", instance_id, e))
+                        .unwrap();
+                } else {
+                    eprint!("[Inferlet {}] ReceiveError: {}", instance_id, e);
+                }
                 return Err(e);
             }
         };
@@ -410,7 +432,11 @@ async fn stream_inferlet_output(mut instance: Instance, printer: SharedPrinter) 
                 let output = format!("[Inferlet {}] {:?}: {}", instance_id, code, message);
 
                 // The print operation should not fail.
-                printer.lock().await.print(output).unwrap();
+                if let Some(printer) = &printer {
+                    printer.lock().await.print(output).unwrap();
+                } else {
+                    print!("{}", output);
+                }
 
                 match code {
                     EventCode::Completed => return Ok(()),

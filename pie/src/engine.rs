@@ -30,7 +30,7 @@ pub struct Config {
 pub async fn run_server(
     config: Config,
     ready_tx: oneshot::Sender<()>,
-    mut shutdown_rx: oneshot::Receiver<()>,
+    shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     // Ensure the cache directory exists
     fs::create_dir_all(&config.cache_dir).with_context(|| {
@@ -71,18 +71,8 @@ pub async fn run_server(
     tracing::info!("✅ PIE runtime started successfully on {}", server_url);
     ready_tx.send(()).unwrap();
 
-    // Wait for either a Ctrl+C signal or the shutdown signal from the parent task
-    tokio::select! {
-        res = tokio::signal::ctrl_c() => {
-            if let Err(e) = res {
-                tracing::error!("Failed to listen for Ctrl+C: {}", e);
-            }
-            tracing::info!("Ctrl+C received, shutting down.");
-        }
-        _ = &mut shutdown_rx => {
-            tracing::info!("Shutdown signal received, shutting down.");
-        }
-    }
+    shutdown_rx.await?;
+    tracing::info!("Shutdown signal received, shutting down.");
 
     Ok(())
 }
