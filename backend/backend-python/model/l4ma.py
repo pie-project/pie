@@ -33,6 +33,50 @@ else:
 VERSION = "0.1.0"
 
 
+def calculate_activation_memory_bytes(
+    max_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype_size: int,
+) -> int:
+    """Calculate total memory needed for activation buffers.
+
+    Args:
+        max_tokens: Maximum number of tokens in a batch
+        hidden_size: Hidden layer size
+        intermediate_size: MLP intermediate size
+        num_query_heads: Number of query attention heads
+        num_kv_heads: Number of key/value attention heads
+        head_size: Size of each attention head
+        dtype_size: Size of data type in bytes (e.g., 2 for float16)
+
+    Returns:
+        Total bytes needed for all activation buffers
+    """
+    qkv_size = (
+        max_tokens * (num_query_heads + 2 * num_kv_heads) * head_size * dtype_size
+    )
+    attn_out_size = max_tokens * num_query_heads * head_size * dtype_size
+    o_proj_size = max_tokens * hidden_size * dtype_size
+    gate_up_size = max_tokens * 2 * intermediate_size * dtype_size
+    mlp_act_size = max_tokens * intermediate_size * dtype_size
+    down_proj_size = max_tokens * hidden_size * dtype_size
+    layer_out_size = 2 * max_tokens * hidden_size * dtype_size
+
+    return (
+        qkv_size
+        + attn_out_size
+        + o_proj_size
+        + gate_up_size
+        + mlp_act_size
+        + down_proj_size
+        + layer_out_size
+    )
+
+
 @dataclass
 class L4maArch(CommonArch):
     """L4MA/Llama specific architecture configuration."""
@@ -509,8 +553,6 @@ class L4maModel(nn.Module):
         # Pre-allocate activation buffers to reserve memory and cap maximum usage.
         # These buffers reserve GPU memory upfront, making the memory footprint predictable
         # and preventing OOM errors that would otherwise occur mid-inference.
-        # Note: Currently used for memory reservation. Future enhancement could use these
-        # buffers directly with custom CUDA kernels or F.linear with output management.
         self.activation_buffers = self._create_activation_buffers(config)
 
     def _create_activation_buffers(self, config: L4maArch) -> dict:

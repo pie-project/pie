@@ -20,6 +20,12 @@ import message
 from adapter_utils import ensure_adapter_available
 from platform_detection import is_apple_silicon
 
+# Import model-specific activation memory calculators
+import model.l4ma as l4ma_module
+import model.qwen2 as qwen2_module
+import model.qwen3 as qwen3_module
+import model.gptoss_utils as gptoss_utils_module
+
 # Import profiler for performance analysis
 from profiler import start_profile
 
@@ -59,10 +65,12 @@ class Handler:
 
         This calculates the total memory required for pre-allocated activation buffers
         that will be used during forward passes to prevent dynamic allocations.
+        Each model defines its own memory calculation based on which buffers it allocates.
 
         Returns:
             Total bytes needed for activation buffers
         """
+        # Get model architecture parameters
         max_tokens = self.max_batch_tokens
         hidden_size = model_info.architecture.hidden_size
         intermediate_size = model_info.architecture.intermediate_size
@@ -70,41 +78,41 @@ class Handler:
         num_kv_heads = model_info.architecture.num_key_value_heads
         head_size = model_info.architecture.head_size
         dtype_size = self.dtype.itemsize
+        arch_type = model_info.architecture.type
 
-        # QKV projection buffer: [max_tokens, (num_q_heads + 2*num_kv_heads) * head_size]
-        qkv_size = (
-            max_tokens * (num_q_heads + 2 * num_kv_heads) * head_size * dtype_size
-        )
+        # Map architecture type to model-specific calculation function
+        model_calculators = {
+            "l4ma": l4ma_module.calculate_activation_memory_bytes,
+            "qwen2": qwen2_module.calculate_activation_memory_bytes,
+            "qwen3": qwen3_module.calculate_activation_memory_bytes,
+            "gptoss": gptoss_utils_module.calculate_activation_memory_bytes,
+        }
 
-        # Attention output buffer: [max_tokens, num_q_heads * head_size]
-        attn_out_size = max_tokens * num_q_heads * head_size * dtype_size
+        if arch_type not in model_calculators:
+            raise ValueError(
+                f"Unknown architecture type '{arch_type}'. "
+                f"Supported types: {list(model_calculators.keys())}"
+            )
 
-        # O projection output buffer: [max_tokens, hidden_size]
-        o_proj_size = max_tokens * hidden_size * dtype_size
+        # Use model-specific calculation function
+        calculator = model_calculators[arch_type]
 
-        # MLP gate_up projection buffer: [max_tokens, 2 * intermediate_size]
-        gate_up_size = max_tokens * 2 * intermediate_size * dtype_size
+        # Build kwargs for calculator
+        calc_kwargs = {
+            "max_tokens": max_tokens,
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "num_query_heads": num_q_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_size": head_size,
+            "dtype_size": dtype_size,
+        }
 
-        # MLP activation buffer: [max_tokens, intermediate_size]
-        mlp_act_size = max_tokens * intermediate_size * dtype_size
+        # Add num_experts for GptOss (if available)
+        if hasattr(model_info.architecture, "num_experts"):
+            calc_kwargs["num_experts"] = model_info.architecture.num_experts
 
-        # MLP down projection buffer: [max_tokens, hidden_size]
-        down_proj_size = max_tokens * hidden_size * dtype_size
-
-        # Layer output ping-pong buffers (2x): [max_tokens, hidden_size]
-        layer_out_size = 2 * max_tokens * hidden_size * dtype_size
-
-        total = (
-            qkv_size
-            + attn_out_size
-            + o_proj_size
-            + gate_up_size
-            + mlp_act_size
-            + down_proj_size
-            + layer_out_size
-        )
-
-        return total
+        return calculator(**calc_kwargs)
 
     def __init__(
         self,

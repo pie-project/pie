@@ -250,13 +250,16 @@ class GptOssAttention(nn.Module):
         kv_page_indices: torch.IntTensor,
         attention_mask: torch.Tensor,
         kv_cache_at_layer: torch.Tensor,
+        activation_buffers: dict,
     ):
-        output_embeds = torch.empty(
-            queries.shape[0],
-            self.config.hidden_size,
-            dtype=queries.dtype,
-            device=queries.device,
-        )
+        n = queries.shape[0]
+        if n > activation_buffers["attn_output_buffer"].shape[0]:
+            raise RuntimeError(
+                f"Batch size {n} exceeds max_batch_tokens "
+                f"{activation_buffers['attn_output_buffer'].shape[0]}"
+            )
+
+        output_embeds = activation_buffers["attn_output_buffer"][:n]
         kv_page_size = kv_cache_at_layer.shape[2]
         mask_offset = 0
         batch_num = len(qo_indptr) - 1
@@ -459,6 +462,7 @@ class GptOssAttention(nn.Module):
             kv_page_indices,
             attention_mask,
             kv_cache_at_layer[self.layer_idx],
+            activation_buffers,
         )
 
         return new_attn_output
@@ -516,12 +520,14 @@ class GptOssRouter(nn.Module):
             )
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, hidden_states: torch.Tensor, activation_buffers: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through the router."""
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        router_logits = torch.nn.functional.linear(  # pylint: disable=not-callable
-            hidden_states, self.weight, self.bias
-        )
+
+        # Use pre-allocated router logits buffer
+        router_logits = self._router_projection(hidden_states, activation_buffers)
 
         router_top_value, router_indices = torch.topk(
             router_logits, self.experts_per_token, dim=-1, sorted=True
@@ -532,6 +538,34 @@ class GptOssRouter(nn.Module):
             1, router_indices, router_top_value
         )
         return router_scores, router_indices
+
+    def _router_projection(
+        self, hidden_states: torch.Tensor, activation_buffers: dict
+    ) -> torch.Tensor:
+        """Router projection using pre-allocated buffer."""
+        n = hidden_states.shape[0]
+        if n > activation_buffers["router_logits_buffer"].shape[0]:
+            raise RuntimeError(
+                f"Batch size {n} exceeds max_batch_tokens "
+                f"{activation_buffers['router_logits_buffer'].shape[0]}"
+            )
+
+        router_logits_buffer = activation_buffers["router_logits_buffer"][:n]
+        torch.addmm(
+            (
+                self.bias
+                if self.bias is not None
+                else torch.zeros(
+                    self.num_experts,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            ),
+            hidden_states,
+            self.weight.t(),
+            out=router_logits_buffer,
+        )
+        return router_logits_buffer
 
 
 class GptOssExperts(nn.Module):
@@ -620,10 +654,10 @@ class GptOssMlp(nn.Module):
         self.router = GptOssRouter(config)
         self.experts = GptOssExperts(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, activation_buffers: dict) -> torch.Tensor:
         """Forward pass through the MLP layer."""
         # Router determines expert selection and weights
-        router_scores, router_indices = self.router(x)
+        router_scores, router_indices = self.router(x, activation_buffers)
 
         # Extract the weights for selected experts
         expert_weights = torch.gather(router_scores, 1, router_indices)
@@ -704,7 +738,7 @@ class GptOssDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, activation_buffers=activation_buffers)
 
         hidden_states = residual + hidden_states
 
@@ -759,6 +793,7 @@ class GptOssModel(nn.Module):
         num_query_heads = config.num_query_heads
         num_kv_heads = config.num_key_value_heads
         head_size = config.head_size
+        num_experts = config.num_experts
         device = config.device
         dtype = config.dtype
 
@@ -771,6 +806,18 @@ class GptOssModel(nn.Module):
             # QKV projection output: [max_tokens, (num_query_heads + 2*num_kv_heads) * head_size]
             "qkv_buffer": torch.empty(
                 (max_tokens, (num_query_heads + 2 * num_kv_heads) * head_size),
+                device=device,
+                dtype=dtype,
+            ),
+            # Attention output buffer: [max_tokens, hidden_size]
+            "attn_output_buffer": torch.empty(
+                (max_tokens, hidden_size),
+                device=device,
+                dtype=dtype,
+            ),
+            # Router logits buffer: [max_tokens, num_experts]
+            "router_logits_buffer": torch.empty(
+                (max_tokens, num_experts),
                 device=device,
                 dtype=dtype,
             ),
