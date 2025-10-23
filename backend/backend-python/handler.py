@@ -557,6 +557,18 @@ class ForwardPassBatch:
 
     def add_request(self, req: message.ForwardPassRequest):
         """Processes and adds a single request to the batch."""
+        # Validate that adding this request won't exceed max_batch_tokens
+        new_total = self.total_tokens_in_batch + len(req.input_tokens)
+        if new_total > self._handler.max_batch_tokens:
+            raise ValueError(
+                f"Batch size would exceed max_batch_tokens limit. "
+                f"Current batch: {self.total_tokens_in_batch} tokens, "
+                f"new request: {len(req.input_tokens)} tokens, "
+                f"would total: {new_total} tokens, "
+                f"limit: {self._handler.max_batch_tokens} tokens. "
+                "Engine/controller must split requests into smaller batches."
+            )
+
         self._original_reqs.append(req)
 
         # Handle adapter information
