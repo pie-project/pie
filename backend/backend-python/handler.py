@@ -245,11 +245,6 @@ class Handler:
                     "Please decrease 'gpu_mem_headroom'."
                 )
 
-            # Calculate bytes needed for activation buffers
-            activation_bytes_needed = self._calculate_activation_memory_bytes(
-                self.model_info
-            )
-
             # Calculate bytes per KV page
             kv_bytes_per_page = (
                 self.kv_page_size
@@ -260,37 +255,31 @@ class Handler:
                 * self.dtype.itemsize
             )
 
-            # Reserve memory for activation buffers first, then use remainder for KV cache
-            available_for_kv = available_memory_bytes - activation_bytes_needed
+            # Activation buffers are already allocated during model load above (line 208).
+            # Their memory usage is already reflected in used_gpu_mem_bytes, so we use
+            # available_memory_bytes directly for KV cache without subtracting again.
+            available_for_kv = available_memory_bytes
 
-            if available_for_kv <= 0:
-                # Not enough memory even for activation buffers alone
-                # Try to reduce max_batch_tokens proportionally
-                reduction_factor = available_memory_bytes / activation_bytes_needed
-                if reduction_factor < 0.1:  # Need at least 10% of requested size
-                    raise ValueError(
-                        f"Insufficient GPU memory. "
-                        f"Available: {available_memory_bytes / 1e9:.2f}GB, "
-                        f"needed: {activation_bytes_needed / 1e9:.2f}GB. "
-                        "Decrease 'gpu_mem_headroom' or 'max_batch_tokens'."
-                    )
-                # Reduce max_batch_tokens
-                original_max_batch_tokens = self.max_batch_tokens
-                self.max_batch_tokens = int(self.max_batch_tokens * reduction_factor)
-                # Update the architecture config with new max_batch_tokens
-                self.model_info.architecture.max_batch_tokens = self.max_batch_tokens
-                # Recalculate activation bytes with reduced batch size
-                activation_bytes_needed = self._calculate_activation_memory_bytes(
-                    self.model_info
-                )
-                available_for_kv = available_memory_bytes - activation_bytes_needed
-                print(
-                    f"Warning: Reduced max_batch_tokens from {original_max_batch_tokens} "
-                    f"to {self.max_batch_tokens} to respect 'gpu_mem_headroom'."
-                )
+            # NOTE: If you want to reduce activation buffer size, you must decrease
+            # max_batch_tokens BEFORE model load (in config) and re-instantiate the model,
+            # since activation buffers are pre-allocated during model initialization.
 
             # Calculate the number of KV pages based on remaining available GPU memory
             self.max_num_kv_pages = int(available_for_kv / kv_bytes_per_page)
+
+            # Calculate activation bytes for display purposes only (not used for allocation)
+            activation_bytes_needed = self._calculate_activation_memory_bytes(
+                self.model_info
+            )
+
+            # Ensure we have at least one KV page
+            if self.max_num_kv_pages == 0:
+                raise ValueError(
+                    f"Insufficient GPU memory for KV cache. "
+                    f"Available: {available_for_kv / 1e9:.2f}GB, "
+                    f"needed for 1 page: {kv_bytes_per_page / 1e9:.2f}GB. "
+                    "Decrease 'gpu_mem_headroom', 'max_batch_tokens', or 'kv_page_size'."
+                )
 
             # If the user also specified "max_num_kv_pages", then we will use the
             # smaller of the two values.
