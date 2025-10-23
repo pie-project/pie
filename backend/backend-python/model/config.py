@@ -42,6 +42,7 @@ class CommonArch:
     # Fields that will be set by the backend config file
     device: str
     dtype: torch.dtype
+    max_batch_tokens: int
 
 
 @dataclass
@@ -60,7 +61,7 @@ class ModelInfo:
 
     @staticmethod
     def load_from_file(
-        cfg_file_path: str, device: str, dtype: torch.dtype
+        cfg_file_path: str, device: str, dtype: torch.dtype, max_batch_tokens: int
     ) -> "ModelInfo":
         """
         Parses a dictionary (from loaded TOML data) into the ModelMetadata struct,
@@ -70,11 +71,12 @@ class ModelInfo:
         # Load and parse TOML file
         cfg = ModelConfig.load_from_file(cfg_file_path)
 
-        # Set the device and dtype fields we got from the backend config file
+        # Set the device, dtype, and max_batch_tokens fields we got from the backend config file
         # so that they will be populated in the architecture object
         arch_dict = cfg.get_required_key(cfg.root, "architecture")
         arch_dict["device"] = device
         arch_dict["dtype"] = dtype
+        arch_dict["max_batch_tokens"] = max_batch_tokens
 
         # Get the architecture object
         # Note: Import architecture classes from their respective model files
@@ -185,6 +187,7 @@ class ModelConfig:
             "rms_norm_eps": get_required_arch_key("rms_norm_eps"),
             "device": get_required_arch_key("device"),
             "dtype": get_required_arch_key("dtype"),
+            "max_batch_tokens": get_required_arch_key("max_batch_tokens"),
         }
 
     def get_chat_template_dict(self) -> dict:
