@@ -192,12 +192,11 @@ impl Server {
                 let mut id_pool = state.client_id_pool.lock().await;
                 id_pool.acquire().unwrap()
             };
-            if let Ok(mut client) = Session::new(id, stream, state.clone()).await {
-                let client_handle = task::spawn(async move {
-                    client.run().await;
-                });
 
-                state.clients.insert(id, client_handle);
+            if let Ok(session_handle) = Session::spawn(id, stream, state.clone()).await {
+                state.clients.insert(id, session_handle);
+            } else {
+                eprintln!("Error creating session for client {}", id);
             }
         }
     }
@@ -263,8 +262,8 @@ struct Session {
     client_cmd_rx: mpsc::Receiver<SessionEvent>,
     client_cmd_tx: mpsc::Sender<SessionEvent>,
 
-    writer_task: JoinHandle<()>,
-    reader_task: JoinHandle<()>,
+    resp_pump: JoinHandle<()>,
+    recv_pump: JoinHandle<()>,
 }
 
 enum SessionEvent {
@@ -273,7 +272,11 @@ enum SessionEvent {
 }
 
 impl Session {
-    async fn new(id: ClientId, tcp_stream: TcpStream, state: Arc<ServerState>) -> Result<Self> {
+    async fn spawn(
+        id: ClientId,
+        tcp_stream: TcpStream,
+        state: Arc<ServerState>,
+    ) -> Result<JoinHandle<()>> {
         let (ws_msg_tx, mut ws_msg_rx) = mpsc::channel(1000);
         let (client_cmd_tx, client_cmd_rx) = mpsc::channel(1000);
 
@@ -318,7 +321,7 @@ impl Session {
             }
         });
 
-        Ok(Self {
+        let mut session = Self {
             id,
             authenticated: !state.enable_auth,
             state,
@@ -328,25 +331,24 @@ impl Session {
             ws_msg_tx,
             client_cmd_rx,
             client_cmd_tx,
-            writer_task: resp_pump,
-            reader_task: recv_pump,
-        })
-    }
+            resp_pump,
+            recv_pump,
+        };
 
-    /// Manages the entire lifecycle of a client connection.
-    async fn run(&mut self) {
-        loop {
-            tokio::select! {
-                biased;
-                Some(cmd) = self.client_cmd_rx.recv() => {
-                    self.handle_command(cmd).await;
-                },
-                _ = &mut self.reader_task => break,
-                _ = &mut self.writer_task => break,
-                else => break,
+        Ok(task::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(cmd) = session.client_cmd_rx.recv() => {
+                        session.handle_command(cmd).await;
+                    },
+                    _ = &mut session.recv_pump => break,
+                    _ = &mut session.resp_pump => break,
+                    else => break,
+                }
             }
-        }
-        self.cleanup().await;
+            session.cleanup().await;
+        }))
     }
 
     /// Processes a single command.
@@ -933,8 +935,8 @@ impl Session {
                 runtime::trap_exception(inst_id, "socket terminated");
             }
         }
-        self.reader_task.abort();
-        self.writer_task.abort();
+        self.recv_pump.abort();
+        self.resp_pump.abort();
         self.state.clients.remove(&self.id);
         self.state.client_id_pool.lock().await.release(self.id).ok();
     }
