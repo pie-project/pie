@@ -5,7 +5,7 @@ use super::utils::IdPool;
 use super::{messaging, runtime, service};
 use crate::model;
 use crate::model::Model;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -193,10 +193,14 @@ impl Server {
                 id_pool.acquire().unwrap()
             };
 
-            if let Ok(session_handle) = Session::spawn(id, stream, state.clone()).await {
-                state.clients.insert(id, session_handle);
-            } else {
-                eprintln!("Error creating session for client {}", id);
+            match Session::spawn(id, stream, state.clone()).await {
+                Ok(session_handle) => {
+                    state.clients.insert(id, session_handle);
+                }
+                Err(e) => {
+                    eprintln!("Error creating session for client {}: {}", id, e);
+                    state.client_id_pool.lock().await.release(id).ok();
+                }
             }
         }
     }
@@ -250,7 +254,6 @@ struct InFlightUpload {
 
 struct Session {
     id: ClientId,
-    authenticated: bool,
 
     state: Arc<ServerState>,
 
@@ -323,7 +326,6 @@ impl Session {
 
         let mut session = Self {
             id,
-            authenticated: !state.enable_auth,
             state,
             inflight_program_upload: None,
             inflight_blob_uploads: DashMap::new(),
@@ -336,27 +338,60 @@ impl Session {
         };
 
         Ok(task::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    Some(cmd) = session.client_cmd_rx.recv() => {
-                        session.handle_command(cmd).await;
-                    },
-                    _ = &mut session.recv_pump => break,
-                    _ = &mut session.resp_pump => break,
-                    else => break,
+            if session.authenticate().await.is_ok() {
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some(cmd) = session.client_cmd_rx.recv() => {
+                            session.handle_command(cmd).await;
+                        },
+                        _ = &mut session.recv_pump => break,
+                        _ = &mut session.resp_pump => break,
+                        else => break,
+                    }
                 }
             }
             session.cleanup().await;
         }))
     }
 
+    async fn authenticate(&mut self) -> Result<()> {
+        if !self.state.enable_auth {
+            return Ok(());
+        }
+
+        let cmd = tokio::select! {
+            biased;
+            Some(cmd) = self.client_cmd_rx.recv() => {
+                cmd
+            },
+            _ = &mut self.recv_pump => { bail!("Socket terminated"); },
+            _ = &mut self.resp_pump => { bail!("Socket terminated"); },
+            else => { bail!("Socket terminated"); },
+        };
+
+        let SessionEvent::ClientRequest(ClientMessage::Authenticate { corr_id, token }) = cmd
+        else {
+            bail!("Expected Authenticate message");
+        };
+
+        let Ok(claims) = auth::validate_jwt(&token) else {
+            self.send_response(corr_id, false, "Invalid token".to_string())
+                .await;
+            bail!("Invalid token")
+        };
+
+        self.send_response(corr_id, true, claims.sub).await;
+        Ok(())
+    }
+
     /// Processes a single command.
     async fn handle_command(&mut self, cmd: SessionEvent) {
         match cmd {
             SessionEvent::ClientRequest(message) => match message {
-                ClientMessage::Authenticate { corr_id, token } => {
-                    self.handle_authenticate(corr_id, token).await
+                ClientMessage::Authenticate { corr_id, token: _ } => {
+                    self.send_response(corr_id, true, "Already authenticated".to_string())
+                        .await;
                 }
                 ClientMessage::Query {
                     corr_id,
@@ -493,9 +528,6 @@ impl Session {
         termination_code: u32,
         message: String,
     ) {
-        if !self.authenticated {
-            return;
-        }
         self.inst_owned.retain(|&id| id != inst_id);
 
         if self.state.client_cmd_txs.remove(&inst_id).is_some() {
@@ -509,28 +541,7 @@ impl Session {
         }
     }
 
-    async fn handle_authenticate(&mut self, corr_id: u32, token: String) {
-        if !self.authenticated {
-            if let Ok(claims) = auth::validate_jwt(&token) {
-                self.authenticated = true;
-                self.send_response(corr_id, true, claims.sub).await;
-            } else {
-                self.send_response(corr_id, false, "Invalid token".to_string())
-                    .await;
-            }
-        } else {
-            self.send_response(corr_id, true, "Already authenticated".to_string())
-                .await;
-        }
-    }
-
     async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".to_string())
-                .await;
-            return;
-        }
-
         match subject.as_str() {
             QUERY_PROGRAM_EXISTS => {
                 let (evt_tx, evt_rx) = oneshot::channel();
@@ -575,12 +586,6 @@ impl Session {
         total_chunks: usize,
         mut chunk_data: Vec<u8>,
     ) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".to_string())
-                .await;
-            return;
-        }
-
         if chunk_data.len() > CHUNK_SIZE_BYTES {
             self.send_response(
                 corr_id,
@@ -681,12 +686,6 @@ impl Session {
         program_hash: String,
         arguments: Vec<String>,
     ) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".to_string())
-                .await;
-            return;
-        }
-
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchInstance {
             program_hash,
@@ -717,12 +716,6 @@ impl Session {
         program_hash: String,
         arguments: Vec<String>,
     ) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".to_string())
-                .await;
-            return;
-        }
-
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchServerInstance {
             program_hash,
@@ -742,9 +735,6 @@ impl Session {
     }
 
     async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
-        if !self.authenticated {
-            return;
-        }
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.inst_owned.contains(&inst_id) {
                 dispatch_u2i(messaging::PushPullCommand::Push {
@@ -756,9 +746,6 @@ impl Session {
     }
 
     async fn handle_terminate_instance(&mut self, instance_id: String) {
-        if !self.authenticated {
-            return;
-        }
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.inst_owned.contains(&inst_id) {
                 runtime::trap(inst_id, runtime::TerminationCause::Signal);
@@ -773,11 +760,6 @@ impl Session {
         service_type: String,
         service_name: String,
     ) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".into())
-                .await;
-            return;
-        }
         match service_type.as_str() {
             "model" => match Model::new(&endpoint).await {
                 Ok(model_service) => {
@@ -816,12 +798,6 @@ impl Session {
         total_chunks: usize,
         mut chunk_data: Vec<u8>,
     ) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".to_string())
-                .await;
-            return;
-        }
-
         let inst_id = match Uuid::parse_str(&instance_id) {
             Ok(id) => id,
             Err(_) => {
@@ -908,10 +884,6 @@ impl Session {
 
     /// Handles an internal command to send a blob to the connected client.
     async fn handle_send_blob(&mut self, inst_id: InstanceId, data: Bytes) {
-        if !self.authenticated {
-            return;
-        }
-
         let blob_hash = blake3::hash(&data).to_hex().to_string();
         let total_chunks = (data.len() + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES;
 
