@@ -338,20 +338,22 @@ impl Session {
         };
 
         Ok(task::spawn(async move {
-            if session.authenticate().await.is_ok() {
-                loop {
-                    tokio::select! {
-                        biased;
-                        Some(cmd) = session.client_cmd_rx.recv() => {
-                            session.handle_command(cmd).await;
-                        },
-                        _ = &mut session.recv_pump => break,
-                        _ = &mut session.resp_pump => break,
-                        else => break,
-                    }
+            if let Err(e) = session.authenticate().await {
+                eprintln!("Error authenticating client {}: {}", id, e);
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(cmd) = session.client_cmd_rx.recv() => {
+                        session.handle_command(cmd).await;
+                    },
+                    _ = &mut session.recv_pump => break,
+                    _ = &mut session.resp_pump => break,
+                    else => break,
                 }
             }
-            session.cleanup().await;
         }))
     }
 
@@ -899,9 +901,10 @@ impl Session {
             .await;
         }
     }
+}
 
-    /// Cleans up client resources upon disconnection.
-    async fn cleanup(&mut self) {
+impl Drop for Session {
+    fn drop(&mut self) {
         for inst_id in self.inst_owned.drain(..) {
             if self.state.client_cmd_txs.remove(&inst_id).is_some() {
                 runtime::trap_exception(inst_id, "socket terminated");
@@ -910,7 +913,15 @@ impl Session {
         self.recv_pump.abort();
         self.resp_pump.abort();
         self.state.clients.remove(&self.id);
-        self.state.client_id_pool.lock().await.release(self.id).ok();
+
+        let id = self.id;
+        let state = Arc::clone(&self.state);
+
+        // We need to spawn a task to release the ID because the drop handler
+        // is not async. It's okay as long as the ID is eventually released.
+        task::spawn(async move {
+            state.client_id_pool.lock().await.release(id).ok();
+        });
     }
 }
 
