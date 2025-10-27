@@ -382,20 +382,27 @@ impl Runtime {
         let engine = self.engine.clone();
         let linker = self.linker.clone();
 
+        // Create a oneshot channel to signal when the task can start
+        let (start_tx, start_rx) = oneshot::channel();
+
         let join_handle = tokio::spawn(Self::launch(
             instance_id,
             component,
             arguments,
             engine,
             linker,
+            start_rx,
         ));
 
-        // Record in the “running_instances” so we can manage it later
+        // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             hash: hash.to_string(),
             join_handle,
         };
         self.running_instances.insert(instance_id, instance_handle);
+
+        // Signal the task to start now that the join_handle is in the map
+        let _ = start_tx.send(());
 
         Ok(instance_id)
     }
@@ -415,17 +422,23 @@ impl Runtime {
         let linker = self.linker.clone();
         let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
 
+        // Create a oneshot channel to signal when the task can start
+        let (start_tx, start_rx) = oneshot::channel();
+
         let join_handle = tokio::spawn(Self::launch_server(
-            addr, component, arguments, engine, linker,
+            addr, component, arguments, engine, linker, start_rx,
         ));
 
-        // Record in the “running_instances” so we can manage it later
+        // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             hash: hash.to_string(),
             join_handle,
         };
         self.running_server_instances
             .insert(instance_id, instance_handle);
+
+        // Signal the task to start now that the join_handle is in the map
+        let _ = start_tx.send(());
 
         Ok(instance_id)
     }
@@ -520,7 +533,11 @@ impl Runtime {
         arguments: Vec<String>,
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
+        start_rx: oneshot::Receiver<()>,
     ) {
+        // Wait for the signal to start
+        let _ = start_rx.await;
+
         let result = async {
             let socket = tokio::net::TcpSocket::new_v4()?;
             socket.set_reuseaddr(!cfg!(windows))?;
@@ -571,7 +588,11 @@ impl Runtime {
         arguments: Vec<String>,
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
+        start_rx: oneshot::Receiver<()>,
     ) {
+        // Wait for the signal to start
+        let _ = start_rx.await;
+
         let inst_state = InstanceState::new(instance_id, arguments).await;
 
         // Wrap everything in a closure returning a Result,
