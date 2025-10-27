@@ -153,7 +153,7 @@ pub struct Runtime {
 
 #[derive(Debug, Clone)]
 pub enum TerminationCause {
-    Normal,
+    Normal(String),
     Signal,
     Exception(String),
     SystemError(String),
@@ -451,7 +451,7 @@ impl Runtime {
             model::cleanup_instance(instance_id.clone());
 
             let (termination_code, message) = match cause {
-                TerminationCause::Normal => (0, "Normal termination".to_string()),
+                TerminationCause::Normal(message) => (0, message),
                 TerminationCause::Signal => (1, "Signal termination".to_string()),
                 TerminationCause::Exception(message) => (2, message),
                 TerminationCause::SystemError(message) => (3, message),
@@ -637,10 +637,10 @@ impl Runtime {
         .await;
 
         match result {
-            Ok(_return_value) => {
+            Ok(return_value) => {
                 Command::Trap {
                     inst_id: instance_id,
-                    cause: TerminationCause::Normal,
+                    cause: TerminationCause::Normal(return_value.unwrap_or_default()),
                 }
                 .dispatch()
                 .ok();
