@@ -443,8 +443,8 @@ impl Runtime {
         Ok(instance_id)
     }
 
-    /// Terminate (abort) a running instance
-    pub async fn terminate_instance(&self, instance_id: InstanceId, cause: TerminationCause) {
+    /// Terminate or abort a running instance
+    async fn terminate_instance(&self, instance_id: InstanceId, cause: TerminationCause) {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
 
@@ -637,28 +637,23 @@ impl Runtime {
         .await;
 
         match result {
-            Ok(return_value) => {
-                server::InstanceEvent::DetachInstance {
-                    inst_id: instance_id.clone(),
-                    termination_code: 0,
-                    message: return_value.unwrap_or("".to_string()),
+            Ok(_return_value) => {
+                Command::Trap {
+                    inst_id: instance_id,
+                    cause: TerminationCause::Normal,
                 }
                 .dispatch()
                 .ok();
             }
             Err(err) => {
                 println!("Instance {instance_id} failed: {err}");
-                server::InstanceEvent::DetachInstance {
-                    inst_id: instance_id.clone(),
-                    termination_code: 2,
-                    message: err.to_string(),
+                Command::Trap {
+                    inst_id: instance_id,
+                    cause: TerminationCause::Exception(err.to_string()),
                 }
                 .dispatch()
                 .ok();
             }
         }
-
-        // force cleanup of the remaining resources
-        model::cleanup_instance(instance_id);
     }
 }
