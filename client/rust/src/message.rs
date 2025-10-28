@@ -34,7 +34,11 @@ impl EventCode {
 #[serde(tag = "type")]
 pub enum ClientMessage {
     #[serde(rename = "authenticate")]
-    Authenticate { corr_id: u32, token: String },
+    Authenticate {
+        corr_id: u32,
+        username: String,
+        token: String,
+    },
 
     #[serde(rename = "query")]
     Query {

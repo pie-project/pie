@@ -375,7 +375,7 @@ impl Session {
         };
 
         match cmd {
-            SessionEvent::ClientRequest(ClientMessage::Authenticate { corr_id, token }) => {
+            SessionEvent::ClientRequest(ClientMessage::Authenticate { corr_id, token, .. }) => {
                 self.external_authenticate(corr_id, token).await
             }
             SessionEvent::ClientRequest(ClientMessage::InternalAuthenticate { corr_id, token }) => {
@@ -411,7 +411,7 @@ impl Session {
     async fn handle_command(&mut self, cmd: SessionEvent) {
         match cmd {
             SessionEvent::ClientRequest(message) => match message {
-                ClientMessage::Authenticate { corr_id, token: _ } => {
+                ClientMessage::Authenticate { corr_id, .. } => {
                     self.send_response(corr_id, true, "Already authenticated".to_string())
                         .await;
                 }

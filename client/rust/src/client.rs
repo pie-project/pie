@@ -219,9 +219,10 @@ impl Client {
         Ok((successful, result))
     }
 
-    pub async fn authenticate(&self, token: &str) -> Result<()> {
+    pub async fn authenticate(&self, username: &str, token: &str) -> Result<()> {
         let msg = ClientMessage::Authenticate {
             corr_id: 0,
+            username: username.to_string(),
             token: token.to_string(),
         };
         let (successful, result) = self.send_msg_and_wait(msg).await?;

@@ -94,7 +94,7 @@ async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client
     };
 
     let token = auth::create_jwt("default", auth::Role::User)?;
-    client.authenticate(&token).await?;
+    client.authenticate("default", &token).await?;
     Ok(client)
 }
 
