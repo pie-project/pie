@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod api;
+mod auth;
 mod cli;
 mod engine;
 mod instance;
@@ -13,6 +14,7 @@ mod server;
 mod service;
 mod utils;
 
+use cli::auth::AuthCommands;
 use cli::config::{self, ConfigCommands};
 use cli::model::ModelCommands;
 use cli::output;
@@ -39,6 +41,9 @@ enum Commands {
     #[command(subcommand)]
     /// Manage configuration.
     Config(ConfigCommands),
+    #[command(subcommand)]
+    /// Manage authorized clients.
+    Auth(AuthCommands),
 }
 
 #[tokio::main]
@@ -92,6 +97,11 @@ async fn main() -> Result<()> {
             // Config commands don't start the engine, so they can use a simple logger
             output::init_simple_logging()?;
             config::handle_config_command(cmd).await?;
+        }
+        Commands::Auth(cmd) => {
+            // Auth commands don't start the engine, so they can use a simple logger
+            output::init_simple_logging()?;
+            cli::auth::handle_auth_command(cmd).await?;
         }
     }
     Ok(())
