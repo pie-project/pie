@@ -1,3 +1,4 @@
+use super::auth::AuthorizedClients;
 use super::instance::InstanceId;
 use super::messaging::dispatch_u2i;
 use super::service::{Service, ServiceError, install_service};
@@ -98,6 +99,7 @@ impl InternalEvent {
 
 struct ServerState {
     enable_auth: bool,
+    authorized_clients: AuthorizedClients,
     internal_auth_token: String,
     client_id_pool: Mutex<IdPool<ClientId>>,
     clients: DashMap<ClientId, JoinHandle<()>>,
@@ -170,9 +172,15 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(ip_port: &str, enable_auth: bool, internal_auth_token: String) -> Self {
+    pub fn new(
+        ip_port: &str,
+        enable_auth: bool,
+        authorized_clients: AuthorizedClients,
+        internal_auth_token: String,
+    ) -> Self {
         let state = Arc::new(ServerState {
             enable_auth,
+            authorized_clients,
             internal_auth_token,
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
@@ -375,9 +383,11 @@ impl Session {
         };
 
         match cmd {
-            SessionEvent::ClientRequest(ClientMessage::Authenticate { corr_id, token, .. }) => {
-                self.external_authenticate(corr_id, token).await
-            }
+            SessionEvent::ClientRequest(ClientMessage::Authenticate {
+                corr_id,
+                token,
+                username,
+            }) => self.external_authenticate(corr_id, token, username).await,
             SessionEvent::ClientRequest(ClientMessage::InternalAuthenticate { corr_id, token }) => {
                 self.internal_authenticate(corr_id, token).await
             }
@@ -385,7 +395,23 @@ impl Session {
         }
     }
 
-    async fn external_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
+    async fn external_authenticate(
+        &self,
+        corr_id: u32,
+        token: String,
+        username: String,
+    ) -> Result<()> {
+        // Check if the username is in the authorized clients file
+        if self.state.authorized_clients.get(&username).is_none() {
+            self.send_response(
+                corr_id,
+                false,
+                format!("User '{}' is not authorized", username),
+            )
+            .await;
+            bail!("User '{}' is not authorized", username)
+        }
+
         let Ok(claims) = auth::validate_jwt(&token) else {
             self.send_response(corr_id, false, "Invalid token".to_string())
                 .await;

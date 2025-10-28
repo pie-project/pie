@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
-// Re-export core components from internal modules
+use crate::auth::AuthorizedClients;
 use crate::kvs::KeyValueStore;
 use crate::messaging::{PubSub, PushPull};
 use crate::runtime::Runtime;
@@ -31,6 +31,7 @@ pub struct Config {
 /// signal to terminate gracefully.
 pub async fn run_server(
     config: Config,
+    authorized_clients: AuthorizedClients,
     ready_tx: oneshot::Sender<String>,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -70,7 +71,12 @@ pub async fn run_server(
         })
         .collect::<Result<String, _>>()?;
 
-    let server = Server::new(&server_url, config.enable_auth, internal_auth_token.clone());
+    let server = Server::new(
+        &server_url,
+        config.enable_auth,
+        authorized_clients,
+        internal_auth_token.clone(),
+    );
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
     let kv_store = KeyValueStore::new();
