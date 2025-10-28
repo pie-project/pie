@@ -267,7 +267,7 @@ struct Session {
     client_cmd_rx: mpsc::Receiver<SessionEvent>,
     client_cmd_tx: mpsc::Sender<SessionEvent>,
 
-    resp_pump: JoinHandle<()>,
+    send_pump: JoinHandle<()>,
     recv_pump: JoinHandle<()>,
 }
 
@@ -288,7 +288,7 @@ impl Session {
         let ws_stream = accept_async(tcp_stream).await?;
         let (mut ws_writer, mut ws_reader) = ws_stream.split();
 
-        let resp_pump = task::spawn(async move {
+        let send_pump = task::spawn(async move {
             while let Some(message) = ws_msg_rx.recv().await {
                 if let Err(e) = ws_writer.send(message).await {
                     println!("Error writing to ws stream: {:?}", e);
@@ -335,7 +335,7 @@ impl Session {
             ws_msg_tx,
             client_cmd_rx,
             client_cmd_tx,
-            resp_pump,
+            send_pump,
             recv_pump,
         };
 
@@ -352,7 +352,7 @@ impl Session {
                         session.handle_command(cmd).await;
                     },
                     _ = &mut session.recv_pump => break,
-                    _ = &mut session.resp_pump => break,
+                    _ = &mut session.send_pump => break,
                     else => break,
                 }
             }
@@ -370,7 +370,7 @@ impl Session {
                 cmd
             },
             _ = &mut self.recv_pump => { bail!("Socket terminated"); },
-            _ = &mut self.resp_pump => { bail!("Socket terminated"); },
+            _ = &mut self.send_pump => { bail!("Socket terminated"); },
             else => { bail!("Socket terminated"); },
         };
 
@@ -934,8 +934,13 @@ impl Drop for Session {
                 runtime::trap_exception(inst_id, "socket terminated");
             }
         }
+
+        // Abort the receive pump so that it no longer receives messages from the client.
+        // Note that we DO NOT abort the send pump because there might be pending messages
+        // that need to be sent to the client. When this session is dropped, the `ws_msg_tx`
+        // object will also be dropped, which will cause the send pump to terminate.
         self.recv_pump.abort();
-        self.resp_pump.abort();
+
         self.state.clients.remove(&self.id);
 
         let id = self.id;
