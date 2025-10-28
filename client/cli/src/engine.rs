@@ -1,18 +1,21 @@
 //! Engine client utilities for the Pie CLI.
 
+use crate::path;
 use anyhow::{Context, Result};
 use pie_client::auth;
 use pie_client::client::{self, Client, Instance, InstanceEvent};
+use pie_client::crypto::ParsedPrivateKey;
 use pie_client::message::EventCode;
-use rand::{Rng, distr::Alphanumeric};
+use rand::{Rng, distributions::Alphanumeric};
 use std::fs;
 use std::path::PathBuf;
 
 // Helper struct for what client commands need to know
-#[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub host: String,
     pub port: u16,
+    pub username: String,
+    pub private_key: Option<ParsedPrivateKey>,
 }
 
 /// Submits an inferlet to the engine and waits for it to finish.
@@ -94,13 +97,13 @@ async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client
     };
 
     let token = auth::create_jwt("default", auth::Role::User)?;
-    client.authenticate("default", &token).await?;
+    client.authenticate(&client_config.username, &token).await?;
     Ok(client)
 }
 
 /// Generates a random authentication secret.
 pub fn generate_random_auth_secret() -> String {
-    rand::rng()
+    rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(64)
         .map(char::from)

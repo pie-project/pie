@@ -31,6 +31,8 @@ async fn main() -> Result<()> {
                 args.config,
                 args.host,
                 args.port,
+                args.username,
+                args.private_key_path,
                 args.auth_secret,
                 args.inferlet,
                 args.arguments,

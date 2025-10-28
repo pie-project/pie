@@ -3,7 +3,7 @@
 //! This module implements the `pie submit` subcommand for submitting inferlets
 //! to an existing running Pie engine instance.
 
-use crate::{engine, path};
+use crate::{crypto, engine, path};
 use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
@@ -25,6 +25,12 @@ pub struct SubmitArgs {
     /// The network port to connect to.
     #[arg(long)]
     pub port: Option<u16>,
+    /// The username to use for authentication.
+    #[arg(long)]
+    pub username: Option<String>,
+    /// Path to the private key file to use for authentication.
+    #[arg(long)]
+    pub private_key_path: Option<PathBuf>,
     /// Authentication secret for connecting to the server.
     #[arg(long)]
     pub auth_secret: Option<String>,
@@ -45,12 +51,14 @@ pub async fn handle_submit_command(
     config_path: Option<PathBuf>,
     host: Option<String>,
     port: Option<u16>,
+    username: Option<String>,
+    private_key_path: Option<PathBuf>,
     auth_secret: Option<String>,
     inferlet_path: PathBuf,
     arguments: Vec<String>,
 ) -> Result<()> {
     // Read config file only if when any parameter is missing
-    let config_file = if host.is_none() || port.is_none() || auth_secret.is_none() {
+    let config_file = if host.is_none() || port.is_none() || auth_secret.is_none() || username.is_none() || private_key_path.is_none() {
         let config_str = match config_path {
             Some(path) => fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read config file at {:?}", path))?,
@@ -76,11 +84,36 @@ pub async fn handle_submit_command(
         .or_else(|| config_file.as_ref().and_then(|cfg| cfg.auth_secret.clone()))
         .unwrap_or_else(engine::generate_random_auth_secret);
 
+    let username = username
+        .or_else(|| config_file.as_ref().and_then(|cfg| cfg.username.clone()))
+        .unwrap_or_else(|| "default".to_string());
+
+    // Get the private key path from either command-line or config file
+    let private_key_path = private_key_path
+        .or_else(|| config_file.as_ref().and_then(|cfg| cfg.private_key_path.clone()));
+    
+    // Read and parse the private key from the file if a path is provided
+    let private_key = match private_key_path {
+        Some(path) => {
+            let key_content = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read private key file at {:?}", path))?;
+            let parsed = crypto::ParsedPrivateKey::parse(&key_content)
+                .with_context(|| format!("Failed to parse private key from {:?}", path))?;
+            Some(parsed)
+        }
+        None => None,
+    };
+
     // Initialize the JWT secret for authentication
     auth::init_secret(&auth_secret);
 
     // Create client configuration
-    let client_config = engine::ClientConfig { host, port };
+    let client_config = engine::ClientConfig { 
+        host, 
+        port, 
+        username, 
+        private_key,
+    };
 
     // Submit the inferlet to the existing server
     engine::submit_inferlet_and_wait(&client_config, inferlet_path, arguments).await?;

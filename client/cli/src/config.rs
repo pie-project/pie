@@ -10,6 +10,8 @@ pub struct ConfigFile {
     pub port: Option<u16>,
     pub enable_auth: Option<bool>,
     pub auth_secret: Option<String>,
+    pub username: Option<String>,
+    pub private_key_path: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
     pub verbose: Option<bool>,
     pub log: Option<PathBuf>,
