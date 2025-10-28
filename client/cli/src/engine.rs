@@ -15,7 +15,94 @@ pub struct ClientConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
+    pub auth_secret: String,
     pub private_key: Option<ParsedPrivateKey>,
+}
+
+impl ClientConfig {
+    pub fn new(
+        config_path: Option<PathBuf>,
+        host: Option<String>,
+        port: Option<u16>,
+        auth_secret: Option<String>,
+        username: Option<String>,
+        private_key_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        // Read config file only if when any parameter is missing
+        let config_file = if host.is_none()
+            || port.is_none()
+            || auth_secret.is_none()
+            || username.is_none()
+            || private_key_path.is_none()
+        {
+            let config_str = match config_path {
+                Some(path) => fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read config file at {:?}", path))?,
+                None => fs::read_to_string(&crate::path::get_default_config_path()?).context(
+                    "Failed to read default config file. Try running `pie-cli config init` first.",
+                )?,
+            };
+            Some(toml::from_str::<crate::config::ConfigFile>(&config_str)?)
+        } else {
+            None
+        };
+
+        // Prefer command-line arguments and use config file values if not provided
+        let host = host
+            .or_else(|| config_file.as_ref().and_then(|cfg| cfg.host.clone()))
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+
+        let port = port
+            .or_else(|| config_file.as_ref().and_then(|cfg| cfg.port))
+            .unwrap_or(8080);
+
+        let auth_secret = auth_secret
+            .or_else(|| config_file.as_ref().and_then(|cfg| cfg.auth_secret.clone()))
+            .unwrap_or_else(generate_random_auth_secret);
+
+        let username = username
+            .or_else(|| config_file.as_ref().and_then(|cfg| cfg.username.clone()))
+            .unwrap_or_else(|| "default".to_string());
+
+        // Get the private key path from either command-line or config file
+        let private_key_path = private_key_path
+            .or_else(|| {
+                config_file
+                    .as_ref()
+                    .and_then(|cfg| cfg.private_key_path.clone())
+            })
+            .map(|p| {
+                p.to_str()
+                    .map(|s| s.to_owned())
+                    .context("Private key path is not a valid UTF-8 string")
+            })
+            .transpose()?
+            .map(|p| path::expand_tilde(&p))
+            .transpose()?;
+
+        // Read and parse the private key from the file if a path is provided
+        let private_key = match private_key_path {
+            Some(path) => {
+                let key_content = fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read private key file at {:?}", path))?;
+                let parsed = ParsedPrivateKey::parse(&key_content)
+                    .with_context(|| format!("Failed to parse private key from {:?}", path))?;
+                Some(parsed)
+            }
+            None => None,
+        };
+
+        // Initialize the JWT secret for authentication
+        auth::init_secret(&auth_secret);
+
+        Ok(Self {
+            host,
+            port,
+            auth_secret,
+            username,
+            private_key,
+        })
+    }
 }
 
 /// Submits an inferlet to the engine and waits for it to finish.
@@ -87,7 +174,7 @@ async fn stream_inferlet_output(mut instance: Instance) -> Result<()> {
 }
 
 /// Connects to the engine and authenticates the client.
-async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
+pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
     let client = match Client::connect(&url).await {
         Ok(c) => c,

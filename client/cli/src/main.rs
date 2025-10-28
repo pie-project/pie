@@ -4,9 +4,11 @@ use clap::{Parser, Subcommand};
 mod config;
 mod engine;
 mod path;
+mod ping;
 mod submit;
 
 use config::ConfigCommands;
+use ping::PingArgs;
 use submit::SubmitArgs;
 
 #[derive(Parser, Debug)]
@@ -24,6 +26,8 @@ struct Cli {
 enum Commands {
     /// Submit an inferlet to a running Pie engine.
     Submit(SubmitArgs),
+    /// Check if the Pie engine is alive and responsive.
+    Ping(PingArgs),
     #[command(subcommand)]
     /// Manage configuration.
     Config(ConfigCommands),
@@ -44,6 +48,17 @@ async fn main() -> Result<()> {
                 args.auth_secret,
                 args.inferlet,
                 args.arguments,
+            )
+            .await?;
+        }
+        Commands::Ping(args) => {
+            ping::handle_ping_command(
+                args.config,
+                args.host,
+                args.port,
+                args.username,
+                args.private_key_path,
+                args.auth_secret,
             )
             .await?;
         }
