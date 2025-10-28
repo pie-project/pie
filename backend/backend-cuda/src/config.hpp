@@ -52,7 +52,7 @@ struct AppConfig {
     int port = 10123;
     std::string controller_host = "localhost";
     int controller_port = 9123;
-    std::optional<std::string> auth_token;
+    std::optional<std::string> internal_auth_token;
 
     // Model & Cache
     std::string model_name;

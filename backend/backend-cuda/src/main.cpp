@@ -192,9 +192,9 @@ void register_with_controller(const AppConfig& config, const std::string& servic
                         msgpack::sbuffer sbuf;
                         msgpack::packer<msgpack::sbuffer> packer(sbuf);
                         packer.pack_map(3);
-                        packer.pack("type"); packer.pack("authenticate");
+                        packer.pack("type"); packer.pack("internal_authenticate");
                         packer.pack("corr_id"); packer.pack(0);
-                        packer.pack("token"); packer.pack(config.auth_token);
+                        packer.pack("token"); packer.pack(config.internal_auth_token);
                         webSocket.sendBinary(std::string(sbuf.data(), sbuf.size()));
                         state = RegistrationState::AwaitingAuthResponse;
                     }
@@ -562,7 +562,7 @@ int main(int argc, char* argv[]) {
     app.add_option("--port", cli_config.port, "The port number to listen on.");
     app.add_option("--controller_host", cli_config.controller_host, "The controller hostname.");
     app.add_option("--controller_port", cli_config.controller_port, "The controller port number.");
-    app.add_option("--auth_token", cli_config.auth_token, "The authentication token for the controller.");
+    app.add_option("--internal_auth_token", cli_config.internal_auth_token, "The authentication token for the controller.");
     app.add_option("--model", cli_config.model_name, "The model name (e.g., 'llama-3.2-1b-instruct').");
     app.add_option("--cache_dir", cache_dir_opt, "The directory for caching models.");
     app.add_option("--kv_page_size", cli_config.kv_page_size, "The KV page size.");
@@ -596,8 +596,8 @@ int main(int argc, char* argv[]) {
         if (app.count("--model") > 0) final_config.model_name = cli_config.model_name;
         else if (auto node = config_from_file["model"]; node.is_string()) final_config.model_name = node.as_string()->get();
 
-        if (app.count("--auth_token") > 0) final_config.auth_token = cli_config.auth_token;
-        else if (auto node = config_from_file["auth_token"]; node.is_string()) final_config.auth_token = node.as_string()->get();
+        if (app.count("--internal_auth_token") > 0) final_config.internal_auth_token = cli_config.internal_auth_token;
+        else if (auto node = config_from_file["internal_auth_token"]; node.is_string()) final_config.internal_auth_token = node.as_string()->get();
 
         final_config.cache_dir = get_cache_dir(cache_dir_opt, config_from_file);
         // (Other config assignments remain the same)
