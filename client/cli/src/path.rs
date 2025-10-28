@@ -6,12 +6,11 @@ use anyhow::{Result, anyhow};
 use std::{env, path::PathBuf};
 
 pub fn get_pie_home() -> Result<PathBuf> {
-    if let Ok(path) = env::var("PIE_HOME") {
+    if let Ok(path) = env::var("PIE_CLI_HOME") {
         Ok(PathBuf::from(path))
     } else {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow!("Failed to find home directory"))?;
-        Ok(home.join(".cache").join("pie"))
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("Failed to find home directory"))?;
+        Ok(home.join(".pie_cli"))
     }
 }
 

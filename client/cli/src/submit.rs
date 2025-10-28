@@ -58,7 +58,12 @@ pub async fn handle_submit_command(
     arguments: Vec<String>,
 ) -> Result<()> {
     // Read config file only if when any parameter is missing
-    let config_file = if host.is_none() || port.is_none() || auth_secret.is_none() || username.is_none() || private_key_path.is_none() {
+    let config_file = if host.is_none()
+        || port.is_none()
+        || auth_secret.is_none()
+        || username.is_none()
+        || private_key_path.is_none()
+    {
         let config_str = match config_path {
             Some(path) => fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read config file at {:?}", path))?,
@@ -90,8 +95,20 @@ pub async fn handle_submit_command(
 
     // Get the private key path from either command-line or config file
     let private_key_path = private_key_path
-        .or_else(|| config_file.as_ref().and_then(|cfg| cfg.private_key_path.clone()));
-    
+        .or_else(|| {
+            config_file
+                .as_ref()
+                .and_then(|cfg| cfg.private_key_path.clone())
+        })
+        .map(|p| {
+            p.to_str()
+                .map(|s| s.to_owned())
+                .context("Private key path is not a valid UTF-8 string")
+        })
+        .transpose()?
+        .map(|p| path::expand_tilde(&p))
+        .transpose()?;
+
     // Read and parse the private key from the file if a path is provided
     let private_key = match private_key_path {
         Some(path) => {
@@ -108,10 +125,10 @@ pub async fn handle_submit_command(
     auth::init_secret(&auth_secret);
 
     // Create client configuration
-    let client_config = engine::ClientConfig { 
-        host, 
-        port, 
-        username, 
+    let client_config = engine::ClientConfig {
+        host,
+        port,
+        username,
         private_key,
     };
 
