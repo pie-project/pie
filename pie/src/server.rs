@@ -98,6 +98,7 @@ impl InternalEvent {
 
 struct ServerState {
     enable_auth: bool,
+    internal_auth_token: String,
     client_id_pool: Mutex<IdPool<ClientId>>,
     clients: DashMap<ClientId, JoinHandle<()>>,
     client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
@@ -169,9 +170,10 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(ip_port: &str, enable_auth: bool) -> Self {
+    pub fn new(ip_port: &str, enable_auth: bool, internal_auth_token: String) -> Self {
         let state = Arc::new(ServerState {
             enable_auth,
+            internal_auth_token,
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
             client_cmd_txs: DashMap::new(),
@@ -372,11 +374,18 @@ impl Session {
             else => { bail!("Socket terminated"); },
         };
 
-        let SessionEvent::ClientRequest(ClientMessage::Authenticate { corr_id, token }) = cmd
-        else {
-            bail!("Expected Authenticate message");
-        };
+        match cmd {
+            SessionEvent::ClientRequest(ClientMessage::Authenticate { corr_id, token }) => {
+                self.external_authenticate(corr_id, token).await
+            }
+            SessionEvent::ClientRequest(ClientMessage::InternalAuthenticate { corr_id, token }) => {
+                self.internal_authenticate(corr_id, token).await
+            }
+            _ => bail!("Expected Authenticate message"),
+        }
+    }
 
+    async fn external_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
         let Ok(claims) = auth::validate_jwt(&token) else {
             self.send_response(corr_id, false, "Invalid token".to_string())
                 .await;
@@ -387,11 +396,26 @@ impl Session {
         Ok(())
     }
 
+    async fn internal_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
+        if token != self.state.internal_auth_token {
+            self.send_response(corr_id, false, "Invalid token".to_string())
+                .await;
+            bail!("Invalid token")
+        }
+        self.send_response(corr_id, true, "Authenticated".to_string())
+            .await;
+        Ok(())
+    }
+
     /// Processes a single command.
     async fn handle_command(&mut self, cmd: SessionEvent) {
         match cmd {
             SessionEvent::ClientRequest(message) => match message {
                 ClientMessage::Authenticate { corr_id, token: _ } => {
+                    self.send_response(corr_id, true, "Already authenticated".to_string())
+                        .await;
+                }
+                ClientMessage::InternalAuthenticate { corr_id, token: _ } => {
                     self.send_response(corr_id, true, "Already authenticated".to_string())
                         .await;
                 }

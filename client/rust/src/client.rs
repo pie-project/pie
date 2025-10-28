@@ -201,6 +201,7 @@ impl Client {
         let corr_id_new = self.inner.corr_id_pool.lock().await.acquire()?;
         let corr_id_ref = match &mut msg {
             ClientMessage::Authenticate { corr_id, .. }
+            | ClientMessage::InternalAuthenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::LaunchInstance { corr_id, .. } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
@@ -228,6 +229,19 @@ impl Client {
             Ok(())
         } else {
             anyhow::bail!("Authentication failed: {}", result)
+        }
+    }
+
+    pub async fn internal_authenticate(&self, token: &str) -> Result<()> {
+        let msg = ClientMessage::InternalAuthenticate {
+            corr_id: 0,
+            token: token.to_string(),
+        };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        if successful {
+            Ok(())
+        } else {
+            anyhow::bail!("Internal authentication failed: {}", result)
         }
     }
 

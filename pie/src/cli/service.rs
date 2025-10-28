@@ -8,7 +8,6 @@ use crate::server::InternalEvent;
 
 use anyhow::{Context, Result};
 use engine::Config as EngineConfig;
-use pie_client::auth;
 use pie_client::client::{self, Client};
 use pie_client::client::{Instance, InstanceEvent};
 use pie_client::message::{EventCode, QUERY_BACKEND_STATS};
@@ -27,6 +26,7 @@ pub struct ClientConfig {
     pub host: String,
     pub port: u16,
     pub auth_secret: String,
+    pub internal_auth_token: Option<String>,
 }
 
 /// Helper function to add a TOML value as a command-line argument.
@@ -106,10 +106,11 @@ pub async fn start_engine_and_backend(
     printer: Option<SharedPrinter>,
 ) -> Result<(Sender<()>, JoinHandle<()>, Vec<Child>, ClientConfig)> {
     // Initialize engine and client configurations
-    let client_config = ClientConfig {
+    let mut client_config = ClientConfig {
         host: engine_config.host.clone(),
         port: engine_config.port,
         auth_secret: engine_config.auth_secret.clone(),
+        internal_auth_token: None,
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -121,15 +122,14 @@ pub async fn start_engine_and_backend(
             eprintln!("\n[Engine Error] Engine failed: {}", e);
         }
     });
-    ready_rx.await.unwrap();
+    let internal_auth_token = ready_rx.await.unwrap();
+    client_config.internal_auth_token = Some(internal_auth_token);
     println!("✅ Engine started.");
 
     // Launch all configured backend services
     let mut backend_processes = Vec::new();
     if !backend_configs.is_empty() {
         println!("🚀 Launching backend services...");
-        auth::init_secret(&client_config.auth_secret);
-        let auth_token = auth::create_jwt("backend-service", auth::Role::User)?;
 
         for backend_config in &backend_configs {
             let backend_table = backend_config
@@ -170,8 +170,8 @@ pub async fn start_engine_and_backend(
                 .arg(&client_config.host)
                 .arg("--controller_port")
                 .arg(client_config.port.to_string())
-                .arg("--auth_token")
-                .arg(&auth_token);
+                .arg("--internal_auth_token")
+                .arg(&client_config.internal_auth_token.as_ref().unwrap());
 
             for (key, value) in backend_table {
                 if key == "backend_type" || key == "exec_path" {
@@ -462,8 +462,8 @@ pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Cl
         .await
         .with_context(|| format!("Could not connect to engine at {}. Is it running?", url))?;
 
-    let token = auth::create_jwt("default", auth::Role::User)?;
-    client.authenticate(&token).await?;
+    let token = client_config.internal_auth_token.as_ref().unwrap();
+    client.internal_authenticate(token).await?;
     Ok(client)
 }
 

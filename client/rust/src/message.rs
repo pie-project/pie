@@ -95,6 +95,9 @@ pub enum ClientMessage {
         service_type: String,
         service_name: String,
     },
+
+    #[serde(rename = "internal_authenticate")]
+    InternalAuthenticate { corr_id: u32, token: String },
 }
 
 /// Messages from server -> client

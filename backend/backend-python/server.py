@@ -253,9 +253,9 @@ def register_thread(config: Dict[str, Any], endpoint: str) -> None:
         with connect(controller_addr) as websocket:
             auth_msg = msgpack.packb(
                 {
-                    "type": "authenticate",
+                    "type": "internal_authenticate",
                     "corr_id": 0,
-                    "token": config["auth_token"],
+                    "token": config["internal_auth_token"],
                 },
                 use_bin_type=True,
             )
@@ -487,7 +487,7 @@ def main(
     port: int = 10123,
     controller_host: str = "localhost",
     controller_port: int = 9123,
-    auth_token: str | None = None,
+    internal_auth_token: str | None = None,
     cache_dir: str | None = None,
     kv_page_size: int = 16,
     max_dist_size: int = 64,
@@ -510,7 +510,7 @@ def main(
         port: Port for the ZMQ service to bind to.
         controller_host: Hostname of the controller to register with.
         controller_port: Port of the controller to register with.
-        auth_token: Authentication token for connecting to the controller.
+        internal_auth_token: Internal authentication token for connecting to the controller.
         cache_dir: Directory for model cache. Defaults to PIE_HOME env var,
                    then the platform-specific user cache dir.
         kv_page_size: The size of each page in the key-value cache.
@@ -545,7 +545,7 @@ def main(
         port=port,
         controller_host=controller_host,
         controller_port=controller_port,
-        auth_token=auth_token,
+        internal_auth_token=internal_auth_token,
         cache_dir=cache_dir,
         kv_page_size=kv_page_size,
         max_dist_size=max_dist_size,

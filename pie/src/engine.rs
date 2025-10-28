@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use pie_client::auth;
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
@@ -29,7 +31,7 @@ pub struct Config {
 /// signal to terminate gracefully.
 pub async fn run_server(
     config: Config,
-    ready_tx: oneshot::Sender<()>,
+    ready_tx: oneshot::Sender<String>,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     // Ensure the cache directory exists
@@ -57,7 +59,18 @@ pub async fn run_server(
 
     let server_url = format!("{}:{}", config.host, config.port);
 
-    let server = Server::new(&server_url, config.enable_auth);
+    // Generate a random 64-character string for internal client connection authentication.
+    // Use OsRng for cryptographic randomness.
+    const CHARSET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let internal_auth_token: String = (0..64)
+        .map(|_| {
+            OsRng
+                .try_next_u32()
+                .map(|n| CHARSET[n as usize % CHARSET.len()] as char)
+        })
+        .collect::<Result<String, _>>()?;
+
+    let server = Server::new(&server_url, config.enable_auth, internal_auth_token.clone());
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
     let kv_store = KeyValueStore::new();
@@ -69,7 +82,7 @@ pub async fn run_server(
     install_service("messaging-user2inst", messaging_user2inst);
 
     tracing::info!("✅ PIE runtime started successfully on {}", server_url);
-    ready_tx.send(()).unwrap();
+    ready_tx.send(internal_auth_token).unwrap();
 
     shutdown_rx.await?;
     tracing::info!("Shutdown signal received, shutting down.");
