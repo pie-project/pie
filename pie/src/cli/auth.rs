@@ -10,7 +10,7 @@ use clap::Subcommand;
 use rsa::RsaPublicKey;
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
 };
 
 #[derive(Subcommand, Debug)]
@@ -57,17 +57,17 @@ async fn handle_auth_add_subcommand() -> Result<()> {
 
     // Prompt for public key
     println!();
-    println!("Enter public key:");
+    println!("Enter public key (paste multi-line PEM, then press Ctrl-D on a new line):");
     println!("  Supported formats:");
-    println!("  - OpenSSH");
-    println!("  - PKCS#8 PEM");
-    println!("  - PKCS#1 PEM");
+    println!("  - OpenSSH (single line)");
+    println!("  - PKCS#8 PEM (multi-line)");
+    println!("  - PKCS#1 PEM (multi-line)");
     print!("> ");
     io::stdout().flush().context("Failed to flush stdout")?;
 
     let mut public_key = String::new();
     io::stdin()
-        .read_line(&mut public_key)
+        .read_to_string(&mut public_key)
         .context("Failed to read public key")?;
     let public_key = public_key.trim().to_string();
 

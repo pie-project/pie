@@ -31,9 +31,6 @@ pub struct ConfigUpdateArgs {
     /// Port to connect to
     #[arg(long)]
     pub port: Option<u16>,
-    /// Authentication secret
-    #[arg(long)]
-    pub auth_secret: Option<String>,
     /// Username for authentication
     #[arg(long)]
     pub username: Option<String>,
@@ -47,7 +44,6 @@ pub struct ConfigUpdateArgs {
 pub struct ConfigFile {
     pub host: Option<String>,
     pub port: Option<u16>,
-    pub auth_secret: Option<String>,
     pub username: Option<String>,
     pub private_key_path: Option<PathBuf>,
 }
@@ -130,10 +126,6 @@ async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
         updated.push(format!("port = {}", port));
         config.port = Some(port);
     }
-    if let Some(auth_secret) = args.auth_secret {
-        updated.push(format!("auth_secret = \"{}\"", auth_secret));
-        config.auth_secret = Some(auth_secret);
-    }
     if let Some(username) = args.username {
         updated.push(format!("username = \"{}\"", username));
         config.username = Some(username);
@@ -198,7 +190,6 @@ fn create_default_config_content() -> String {
     format!(
         r#"host = "127.0.0.1"
 port = 8080
-auth_secret = "your-secret-here"
 username = "{username}"
 private_key_path = "~/.ssh/id_rsa"
 "#,

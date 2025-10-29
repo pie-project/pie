@@ -29,6 +29,10 @@ impl AuthorizedClients {
 
     /// Saves the authorized clients to the given TOML file.
     pub fn save(&self, auth_path: &Path) -> Result<()> {
+        if let Some(parent) = auth_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create parent dir for {:?}", auth_path))?;
+        }
         let content = toml::to_string_pretty(self)
             .context(format!("Failed to serialize authorized clients to TOML"))?;
         fs::write(auth_path, content).context(format!(
@@ -71,9 +75,7 @@ impl AuthorizedClients {
             })
             .or_insert_with(|| {
                 println!("Created new user '{}'", username);
-                ClientKeys {
-                    keys: vec![public_key],
-                }
+                ClientKeys::new(public_key)
             });
     }
 
@@ -91,7 +93,7 @@ pub struct ClientKeys {
 }
 
 impl ClientKeys {
-    pub fn new(public_key: RsaPublicKey) -> Self {
+    fn new(public_key: RsaPublicKey) -> Self {
         Self {
             keys: vec![public_key],
         }
@@ -99,6 +101,10 @@ impl ClientKeys {
 
     pub fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    pub fn keys(&self) -> &[RsaPublicKey] {
+        &self.keys
     }
 }
 

@@ -1,8 +1,10 @@
+use crate::crypto::ParsedPrivateKey;
 use crate::message::{
     CHUNK_SIZE_BYTES, ClientMessage, EventCode, QUERY_PROGRAM_EXISTS, ServerMessage,
 };
 use crate::utils::IdPool;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -201,6 +203,7 @@ impl Client {
         let corr_id_new = self.inner.corr_id_pool.lock().await.acquire()?;
         let corr_id_ref = match &mut msg {
             ClientMessage::Authenticate { corr_id, .. }
+            | ClientMessage::Signature { corr_id, .. }
             | ClientMessage::InternalAuthenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::LaunchInstance { corr_id, .. } => corr_id,
@@ -219,20 +222,55 @@ impl Client {
         Ok((successful, result))
     }
 
-    pub async fn authenticate(&self, username: &str, token: &str) -> Result<()> {
+    /// Authenticates the client with the server using a username and private key.
+    pub async fn authenticate(&self, username: &str, private_key: &ParsedPrivateKey) -> Result<()> {
+        // Send the authentication request to the server to get a challenge
         let msg = ClientMessage::Authenticate {
             corr_id: 0,
             username: username.to_string(),
-            token: token.to_string(),
         };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+
+        if !successful {
+            anyhow::bail!(
+                "Authentication failed for username {}: {}",
+                username,
+                result
+            )
+        }
+
+        // Decode the base64-encoded challenge from the server
+        let challenge = base64::engine::general_purpose::STANDARD
+            .decode(result.as_bytes())
+            .context("Failed to decode challenge from base64")?;
+
+        // Sign the challenge with the private key
+        let signature_bytes = private_key.sign(&challenge)?;
+
+        // Encode the signature to base64
+        let signature = base64::engine::general_purpose::STANDARD.encode(&signature_bytes);
+
+        // Send the signature to the server to verify the authentication
+        let msg = ClientMessage::Signature {
+            corr_id: 0,
+            signature,
+        };
+
         let (successful, result) = self.send_msg_and_wait(msg).await?;
         if successful {
             Ok(())
         } else {
-            anyhow::bail!("Authentication failed: {}", result)
+            anyhow::bail!(
+                "Signature verification failed for username {}: {}",
+                username,
+                result
+            )
         }
     }
 
+    /// Authenticates the client with the server using an internal token.
+    /// This method is used for internal communication between the backend and the engine
+    /// as well as between the Pie shell and the engine. This is not used for user authentication.
     pub async fn internal_authenticate(&self, token: &str) -> Result<()> {
         let msg = ClientMessage::InternalAuthenticate {
             corr_id: 0,
@@ -403,6 +441,11 @@ async fn handle_server_message(
         }
         ServerMessage::ServerEvent { message } => {
             server_event_tx.send(message).await.ok();
+        }
+        ServerMessage::Challenge { corr_id, challenge } => {
+            if let Some((_, sender)) = inner.pending_requests.remove(&corr_id) {
+                sender.send((true, challenge)).ok();
+            }
         }
     }
 }

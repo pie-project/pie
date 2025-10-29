@@ -12,7 +12,7 @@ use engine::Config as EngineConfig;
 use pie_client::client::{self, Client};
 use pie_client::client::{Instance, InstanceEvent};
 use pie_client::message::{EventCode, QUERY_BACKEND_STATS};
-use rand::{Rng, distr::Alphanumeric};
+use rand::Rng;
 use std::path::Path;
 use std::{fs, path::PathBuf, process::Stdio};
 use tokio::io::BufReader;
@@ -26,7 +26,6 @@ use tokio::task::JoinHandle;
 pub struct ClientConfig {
     pub host: String,
     pub port: u16,
-    pub auth_secret: String,
     pub internal_auth_token: Option<String>,
 }
 
@@ -73,9 +72,6 @@ pub fn parse_engine_and_backend_config(
     } else {
         cfg_file.enable_auth.unwrap_or(true)
     };
-    let auth_secret = cfg_file
-        .auth_secret
-        .unwrap_or_else(generate_random_auth_secret);
 
     let engine_config = EngineConfig {
         host: host
@@ -84,7 +80,6 @@ pub fn parse_engine_and_backend_config(
             .unwrap_or_else(|| "127.0.0.1".to_string()),
         port: port.or(cfg_file.port).unwrap_or(8080),
         enable_auth,
-        auth_secret,
         cache_dir: cfg_file
             .cache_dir
             .unwrap_or_else(|| path::get_pie_home().unwrap().join("programs")),
@@ -110,11 +105,15 @@ pub async fn start_engine_and_backend(
     let mut client_config = ClientConfig {
         host: engine_config.host.clone(),
         port: engine_config.port,
-        auth_secret: engine_config.auth_secret.clone(),
         internal_auth_token: None,
     };
-    let authorized_clients =
-        AuthorizedClients::load(&path::get_authorized_clients_path()?).unwrap();
+
+    let authorized_clients_path = path::get_authorized_clients_path()?;
+    let authorized_clients = if authorized_clients_path.exists() {
+        AuthorizedClients::load(&authorized_clients_path)?
+    } else {
+        AuthorizedClients::default()
+    };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -547,13 +546,4 @@ pub async fn print_backend_stats(
         crate::output::print_with_printer(printer, format!("Backend runtime stats:\n{}\n", stats))
             .await;
     Ok(())
-}
-
-/// Generates a random authentication secret.
-pub fn generate_random_auth_secret() -> String {
-    rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(64)
-        .map(char::from)
-        .collect()
 }

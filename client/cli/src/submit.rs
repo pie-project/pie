@@ -30,9 +30,6 @@ pub struct SubmitArgs {
     /// Path to the private key file to use for authentication.
     #[arg(long)]
     pub private_key_path: Option<PathBuf>,
-    /// Authentication secret for connecting to the server.
-    #[arg(long)]
-    pub auth_secret: Option<String>,
     /// Arguments to pass to the inferlet after `--`.
     #[arg(last = true)]
     pub arguments: Vec<String>,
@@ -52,18 +49,11 @@ pub async fn handle_submit_command(
     port: Option<u16>,
     username: Option<String>,
     private_key_path: Option<PathBuf>,
-    auth_secret: Option<String>,
     inferlet_path: PathBuf,
     arguments: Vec<String>,
 ) -> Result<()> {
-    let client_config = engine::ClientConfig::new(
-        config_path,
-        host,
-        port,
-        auth_secret,
-        username,
-        private_key_path,
-    )?;
+    let client_config =
+        engine::ClientConfig::new(config_path, host, port, username, private_key_path)?;
 
     engine::submit_inferlet_and_wait(&client_config, inferlet_path, arguments).await
 }

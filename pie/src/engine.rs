@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use pie_client::auth;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 use std::fs;
@@ -19,7 +18,6 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub enable_auth: bool,
-    pub auth_secret: String,
     pub cache_dir: PathBuf,
     pub verbose: bool,
     pub log: Option<PathBuf>,
@@ -47,9 +45,6 @@ pub async fn run_server(
 
     if config.enable_auth {
         tracing::info!("Authentication is enabled.");
-        auth::init_secret(&config.auth_secret);
-        let token = auth::create_jwt("default", auth::Role::User)?;
-        tracing::info!("Use this token to authenticate: {}", token);
     } else {
         tracing::info!("Authentication is disabled.");
     }

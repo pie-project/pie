@@ -26,9 +26,6 @@ pub struct PingArgs {
     /// Path to the private key file to use for authentication.
     #[arg(long)]
     pub private_key_path: Option<PathBuf>,
-    /// Authentication secret for connecting to the server.
-    #[arg(long)]
-    pub auth_secret: Option<String>,
 }
 
 /// Handles the `pie-cli ping` command.
@@ -44,16 +41,9 @@ pub async fn handle_ping_command(
     port: Option<u16>,
     username: Option<String>,
     private_key_path: Option<PathBuf>,
-    auth_secret: Option<String>,
 ) -> Result<()> {
-    let client_config = engine::ClientConfig::new(
-        config_path,
-        host,
-        port,
-        auth_secret,
-        username,
-        private_key_path,
-    )?;
+    let client_config =
+        engine::ClientConfig::new(config_path, host, port, username, private_key_path)?;
 
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
     println!("🔍 Pinging Pie engine at {}", url);

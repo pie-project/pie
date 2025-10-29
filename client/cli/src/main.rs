@@ -45,7 +45,6 @@ async fn main() -> Result<()> {
                 args.port,
                 args.username,
                 args.private_key_path,
-                args.auth_secret,
                 args.inferlet,
                 args.arguments,
             )
@@ -58,7 +57,6 @@ async fn main() -> Result<()> {
                 args.port,
                 args.username,
                 args.private_key_path,
-                args.auth_secret,
             )
             .await?;
         }

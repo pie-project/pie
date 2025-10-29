@@ -3,7 +3,7 @@
 //! This module implements the `pie config` subcommands for managing Pie configuration files,
 //! including initializing, updating, and displaying configuration settings.
 
-use super::{path, service};
+use super::path;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -43,9 +43,6 @@ pub struct ConfigUpdateArgs {
     /// Enable or disable authentication
     #[arg(long)]
     pub enable_auth: Option<bool>,
-    /// Authentication secret
-    #[arg(long)]
-    pub auth_secret: Option<String>,
     /// Cache directory path
     #[arg(long)]
     pub cache_dir: Option<String>,
@@ -107,7 +104,6 @@ pub struct ConfigFile {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub enable_auth: Option<bool>,
-    pub auth_secret: Option<String>,
     pub cache_dir: Option<PathBuf>,
     pub verbose: Option<bool>,
     pub log: Option<PathBuf>,
@@ -169,7 +165,6 @@ fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<
         host: Some("127.0.0.1".to_string()),
         port: Some(8080),
         enable_auth: Some(true),
-        auth_secret: Some(service::generate_random_auth_secret()),
         cache_dir: None,
         verbose: None,
         log: None,
@@ -272,7 +267,6 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         host,
         port,
         enable_auth,
-        auth_secret,
         cache_dir,
         verbose,
         log,
@@ -294,15 +288,7 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
     } = args;
 
     // Check if any update options were provided
-    let has_engine_updates = any_some![
-        host,
-        port,
-        enable_auth,
-        auth_secret,
-        cache_dir,
-        verbose,
-        log,
-    ];
+    let has_engine_updates = any_some![host, port, enable_auth, cache_dir, verbose, log,];
 
     let has_backend_updates = any_some![
         backend_type,
@@ -350,7 +336,6 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         (host, host),
         (port, port),
         (enable_auth, enable_auth),
-        (auth_secret, auth_secret),
         (verbose, verbose),
         (cache_dir, cache_dir, PathBuf),
         (log, log, PathBuf),
