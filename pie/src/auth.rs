@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
+use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use rsa::RsaPublicKey;
-use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::pkcs1::{DecodeRsaPublicKey, EncodeRsaPublicKey};
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey, LineEnding};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use ssh_key::{Algorithm, PublicKey};
+use ssh_key::{Algorithm, PublicKey as SshPublicKey};
 use std::{collections::HashMap, fs, path::Path};
 
 /// Structure representing the authorized_clients.toml file format.
@@ -63,11 +64,23 @@ impl AuthorizedClients {
 
     /// Inserts a new authorized client and its public key into the authorized clients.
     pub fn insert(&mut self, username: &str, public_key: RsaPublicKey) {
+        // Convert to VerifiablePublicKey
+        let verifiable_key = match PublicKey::from_rsa_key(public_key) {
+            Ok(key) => key,
+            Err(e) => {
+                eprintln!("Failed to create verifiable key: {}", e);
+                return;
+            }
+        };
+
         self.clients
             .entry(username.to_owned())
             .and_modify(|client_keys| {
-                if !client_keys.keys.contains(&public_key) {
-                    client_keys.keys.push(public_key.clone());
+                // Check if key already exists by comparing PKCS#1 DER bytes
+                let already_exists = client_keys.keys.contains(&verifiable_key);
+
+                if !already_exists {
+                    client_keys.keys.push(verifiable_key.clone());
                     println!("Added new key to existing user '{}'", username);
                 } else {
                     println!("Key already exists for user '{}'", username);
@@ -75,7 +88,7 @@ impl AuthorizedClients {
             })
             .or_insert_with(|| {
                 println!("Created new user '{}'", username);
-                ClientKeys::new(public_key)
+                ClientKeys::new(verifiable_key)
             });
     }
 
@@ -85,15 +98,50 @@ impl AuthorizedClients {
     }
 }
 
+/// A public key that can be used for signature verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicKey {
+    /// Public key in PKCS#1 DER format
+    pkcs1_der: Vec<u8>,
+}
+
+impl PublicKey {
+    /// Create a new public key from an RSA public key.
+    fn from_rsa_key(rsa_key: RsaPublicKey) -> Result<Self> {
+        // Convert to PKCS#1 DER format for ring verification
+        let pkcs1_der = rsa_key
+            .to_pkcs1_der()
+            .context("Failed to encode public key as PKCS#1 DER")?
+            .as_bytes()
+            .to_vec();
+
+        Ok(Self { pkcs1_der })
+    }
+
+    /// Reconstruct the RSA public key from PKCS#1 DER
+    fn to_rsa_key(&self) -> Result<RsaPublicKey> {
+        RsaPublicKey::from_pkcs1_der(&self.pkcs1_der)
+            .context("Failed to parse PKCS#1 DER to RsaPublicKey")
+    }
+
+    /// Verify a signature using PKCS#1 v1.5 with SHA-256.
+    pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<()> {
+        let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &self.pkcs1_der);
+        public_key
+            .verify(message, signature)
+            .map_err(|_| anyhow::anyhow!("Signature verification failed"))
+    }
+}
+
 /// Structure representing keys for a single client/user.
 #[derive(Debug)]
 pub struct ClientKeys {
     /// List of authorized public keys for this user
-    keys: Vec<RsaPublicKey>,
+    keys: Vec<PublicKey>,
 }
 
 impl ClientKeys {
-    fn new(public_key: RsaPublicKey) -> Self {
+    fn new(public_key: PublicKey) -> Self {
         Self {
             keys: vec![public_key],
         }
@@ -103,7 +151,7 @@ impl ClientKeys {
         self.keys.len()
     }
 
-    pub fn keys(&self) -> &[RsaPublicKey] {
+    pub fn keys(&self) -> &[PublicKey] {
         &self.keys
     }
 }
@@ -120,7 +168,12 @@ impl Serialize for ClientKeys {
             .keys
             .iter()
             .map(|key| {
-                key.to_public_key_pem(LineEnding::LF)
+                key.to_rsa_key()
+                    .and_then(|rsa_key| {
+                        rsa_key
+                            .to_public_key_pem(LineEnding::LF)
+                            .map_err(|e| anyhow::anyhow!("Failed to encode PEM: {}", e))
+                    })
                     .map_err(serde::ser::Error::custom)
             })
             .collect();
@@ -143,13 +196,15 @@ impl<'de> Deserialize<'de> for ClientKeys {
         }
 
         let helper = ClientKeysHelper::deserialize(deserializer)?;
-        let keys: Result<Vec<RsaPublicKey>, _> = helper
+        let keys: Result<Vec<PublicKey>, _> = helper
             .keys
             .iter()
             .map(|key_str| {
-                parse_rsa_public_key(key_str).map_err(|e| {
-                    serde::de::Error::custom(format!("Failed to parse public key: {}", e))
-                })
+                parse_rsa_public_key(key_str)
+                    .and_then(|rsa_key| PublicKey::from_rsa_key(rsa_key))
+                    .map_err(|e| {
+                        serde::de::Error::custom(format!("Failed to parse public key: {}", e))
+                    })
             })
             .collect();
 
@@ -165,7 +220,7 @@ impl<'de> Deserialize<'de> for ClientKeys {
 /// - PKCS#1 PEM
 pub fn parse_rsa_public_key(key_content: &str) -> Result<RsaPublicKey> {
     // Try parsing as OpenSSH format first (most common for ~/.ssh/id_rsa.pub)
-    if let Ok(ssh_key) = PublicKey::from_openssh(key_content) {
+    if let Ok(ssh_key) = SshPublicKey::from_openssh(key_content) {
         return from_ssh_public_key(ssh_key);
     }
 
@@ -183,7 +238,7 @@ pub fn parse_rsa_public_key(key_content: &str) -> Result<RsaPublicKey> {
 }
 
 /// Converts an SSH public key to an RSA public key.
-fn from_ssh_public_key(ssh_key: PublicKey) -> Result<RsaPublicKey> {
+fn from_ssh_public_key(ssh_key: SshPublicKey) -> Result<RsaPublicKey> {
     // Ensure it's an RSA key
     if !matches!(ssh_key.algorithm(), Algorithm::Rsa { .. }) {
         bail!(

@@ -17,9 +17,6 @@ use pie_client::message::{
 use pie_client::message::{ClientMessage, EventCode, ServerMessage};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
-use rsa::pkcs1v15::VerifyingKey;
-use rsa::sha2::Sha256;
-use rsa::signature::Verifier;
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -455,20 +452,11 @@ impl Session {
                 bail!("Failed to decode signature for user '{}': {}", username, e)
             }
         };
-        let signature = match rsa::pkcs1v15::Signature::try_from(&signature_bytes[..]) {
-            Ok(signature) => signature,
-            Err(e) => {
-                self.send_response(corr_id, false, format!("Invalid signature: {}", e))
-                    .await;
-                bail!("Failed to decode signature for user '{}': {}", username, e)
-            }
-        };
 
         // Check if the signature is valid for any of the user's public keys
         let verified = public_keys
             .iter()
-            .map(|key| VerifyingKey::<Sha256>::new(key.clone()))
-            .any(|key| key.verify(&challenge, &signature).is_ok());
+            .any(|key| key.verify(&challenge, &signature_bytes).is_ok());
 
         if !verified {
             self.send_response(corr_id, false, "Signature verification failed".to_string())

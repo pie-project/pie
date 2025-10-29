@@ -23,6 +23,7 @@ tokio = { version = "1.45.1", features = ["full"] } # ["full", "tracing"]
 tokio-tungstenite = "0.28.0"
 futures = "0.3.31"
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
-rsa = { version = "0.9", features = ["sha2"] }
+ring = "0.17"
+rsa = { version = "0.9", default-features = false, features = ["pem", "sha2"] }
 ssh-key = { version = "0.6", features = ["rsa"] }
 base64 = "0.22"
