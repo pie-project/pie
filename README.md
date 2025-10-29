@@ -73,7 +73,8 @@ Note that the very first inferlet response may take a few minutes due to the JIT
 
 Build the **CLIs** and the example inferlets.
 
-1. **Build the engine `pie` and the client CLI `picli`:**
+1. **Build the engine `pie` and the client CLI `pie-cli`:**
+
    From the repository root, run
 
    ```bash
@@ -87,34 +88,73 @@ Build the **CLIs** and the example inferlets.
 
 2. **Build the Examples:**
 
+   From the repository root, run
    ```bash
    cd example-apps && cargo build --target wasm32-wasip2 --release
    ```
 
-#### Step 2: Configure engine and backend
+#### Step 2: Configure Engine and Backend
 
-1. Create default configuration file (substitute `$REPO` to the actual cloned repository path)
+1. **Create default configuration file:**
+
+   Substitute `$REPO` to the actual repository root and run
    ```bash
    pie config init python $REPO/backend/backend-python/server.py
    ```
 
-2. Download the model
+2. **Download the model:**
+
+   The default config file specifies the expected model. Run the following command to download it.
    ```bash
    pie model add qwen-3-0.6b
    ```
 
-#### Step 3: Run an Inferlet
+3. **Test the engine:**
 
-1. **Start the Engine:**
-   Launch the Pie engine with the default configuration
-
+   Run an inferlet directly with the engine. Due to JIT compilation of FlashInfer kernels, the first run will have **very long** latency.
    ```bash
-   pie
+   pie run \
+       $REPO/example-apps/target/wasm32-wasip2/release/text_completion.wasm \
+       -- \
+       --prompt "Where is the capital of France?"
    ```
 
-2. **Run an Inferlet:**
-   From another terminal window, run
+#### Step 3: Run an Inferlet from a User Client
 
+1. **Create User Public Key:**
+
+   If you don't already have an RSA key pair in `~/.ssh`, generate one with the following command
    ```bash
-   picli submit $REPO/example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
+   ssh-keygen -t rsa -b 4096
+   ```
+
+2. **Create default user client configuration file:**
+
+   The following command creates a default user client configuration file with the current Unix username and the private RSA key in `~/.ssh`.
+   ```bash
+   pie-cli config init
+   ```
+
+3. **Register the user on the engine:**
+
+   Run the following command and when prompted, paste in the Unix username and the public key from `~/.ssh/id_rsa.pub`.
+   ```bash
+   pie auth add
+   ```
+
+4. **Start the Engine:**
+
+   Launch the Pie engine with the default configuration.
+   ```bash
+   pie serve
+   ```
+
+5. **Run an Inferlet:**
+
+   From another terminal window, run
+   ```bash
+   pie-cli submit \
+       $REPO/example-apps/target/wasm32-wasip2/release/text_completion.wasm \
+       -- \
+       --prompt "Where is the capital of France?"
    ```
