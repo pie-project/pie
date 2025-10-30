@@ -25,5 +25,6 @@ futures = "0.3.31"
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
 ring = "0.17"
 rsa = { version = "0.9", default-features = false, features = ["pem", "sha2"] }
-ssh-key = { version = "0.6", features = ["rsa"] }
+ssh-key = { version = "0.6", features = ["rsa", "ed25519"] }
+pem = "3.0"
 base64 = "0.22"
