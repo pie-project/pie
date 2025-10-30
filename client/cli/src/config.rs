@@ -80,17 +80,40 @@ async fn handle_config_init_subcommand() -> Result<()> {
 
     // Create parent directories if they don't exist
     if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {:?}", parent))?;
+        fs::create_dir_all(parent).context(format!("Failed to create directory {:?}", parent))?;
     }
 
+    // Find the SSH key or use default
+    let ssh_key_path = find_ssh_key().context("Failed to find SSH key")?;
+    const DEFAULT_KEY_PATH: &str = "~/.ssh/id_ed25519";
+
     // Create the config file with default content
-    let default_content = create_default_config_content();
+    let default_content =
+        create_default_config_content(ssh_key_path.as_deref().unwrap_or(DEFAULT_KEY_PATH));
     fs::write(&config_path, &default_content)
-        .with_context(|| format!("Failed to write config file at {:?}", config_path))?;
+        .context(format!("Failed to write config file at {:?}", config_path))?;
 
     println!("✅ Created default configuration file at {:?}", config_path);
-    print_default_config_content(&config_path, &default_content);
+    print_default_config_content(&default_content);
+
+    // Warn if the key doesn't exist
+    if ssh_key_path.is_none() {
+        println!();
+        println!(
+            "⚠️ Warning: Private key not found in '~/.ssh', using default path: '{}'",
+            DEFAULT_KEY_PATH
+        );
+        println!("   Please take either of the following actions:");
+        println!("   1. Generate an SSH key pair by running `ssh-keygen`");
+        println!("   2. Update the key path in the config file:");
+        println!("      `pie-cli config update --private-key-path <path>`");
+    // Otherwise, print the key path
+    } else {
+        println!("✅ Using private key found at {:?}", ssh_key_path.unwrap());
+        println!("   You can update the key path in the config file:");
+        println!("      `pie-cli config update --private-key-path <path>`");
+    }
+
     Ok(())
 }
 
@@ -108,11 +131,11 @@ async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
 
     // Read the existing config file
     let config_str = fs::read_to_string(&config_path)
-        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+        .context(format!("Failed to read config file at {:?}", config_path))?;
 
     // Parse the existing config
     let mut config: ConfigFile = toml::from_str(&config_str)
-        .with_context(|| format!("Failed to parse config file at {:?}", config_path))?;
+        .context(format!("Failed to parse config file at {:?}", config_path))?;
 
     // Track which fields were updated
     let mut updated = Vec::new();
@@ -143,11 +166,13 @@ async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
 
     // Serialize the updated config
     let updated_config_str =
-        toml::to_string_pretty(&config).with_context(|| "Failed to serialize updated config")?;
+        toml::to_string_pretty(&config).context("Failed to serialize updated config")?;
 
     // Write the updated config back to the file
-    fs::write(&config_path, updated_config_str)
-        .with_context(|| format!("Failed to write updated config to {:?}", config_path))?;
+    fs::write(&config_path, updated_config_str).context(format!(
+        "Failed to write updated config to {:?}",
+        config_path
+    ))?;
 
     println!("✅ Updated configuration file at {:?}", config_path);
     println!("   Updated fields:");
@@ -172,27 +197,45 @@ async fn handle_config_show_subcommand() -> Result<()> {
 
     // Read and display the config file content
     let config_content = fs::read_to_string(&config_path)
-        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+        .context(format!("Failed to read config file at {:?}", config_path))?;
 
-    print_default_config_content(&config_path, &config_content);
+    println!("📄 Configuration file at {:?}:", config_path);
+    print_default_config_content(&config_content);
 
     Ok(())
 }
 
-fn print_default_config_content(config_path: &PathBuf, config_content: &str) {
-    println!("📄 Configuration file at {:?}:", config_path);
-    println!();
+fn print_default_config_content(config_content: &str) {
     println!("{}", config_content);
 }
 
+/// Find the SSH key in the user's `~/.ssh` directory.
+/// Searches for keys in order: `id_ed25519`, `id_rsa`, `id_ecdsa`.
+/// Returns `Some(path)` if a key is found, `None` otherwise.
+fn find_ssh_key() -> Result<Option<String>> {
+    let home = dirs::home_dir().context("Failed to find home directory")?;
+    let ssh_dir = home.join(".ssh");
+
+    // Search for keys in order of preference
+    for key_name in &["id_ed25519", "id_rsa", "id_ecdsa"] {
+        let key_path = ssh_dir.join(key_name);
+        if key_path.exists() {
+            return Ok(Some(format!("~/.ssh/{}", key_name)));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Create the default content of the config file.
-fn create_default_config_content() -> String {
+fn create_default_config_content(private_key_path: &str) -> String {
     format!(
         r#"host = "127.0.0.1"
 port = 8080
 username = "{username}"
-private_key_path = "~/.ssh/id_rsa"
+private_key_path = "{private_key_path}"
 "#,
-        username = whoami::username()
+        username = whoami::username(),
+        private_key_path = private_key_path
     )
 }
