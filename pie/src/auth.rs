@@ -21,6 +21,30 @@ pub struct AuthorizedClients {
     clients: HashMap<String, ClientKeys>,
 }
 
+/// Result of inserting a key
+#[derive(Debug, PartialEq)]
+pub enum InsertKeyResult {
+    /// A new user was created with this key
+    CreatedUser,
+    /// Key was added to an existing user
+    AddedKey,
+    /// A key with this name already exists for this user
+    KeyNameExists,
+}
+
+/// Result of removing a key
+#[derive(Debug, PartialEq)]
+pub enum RemoveKeyResult {
+    /// Key was removed and it was the last key for the user (user entry also removed)
+    RemovedLastKey,
+    /// Key was removed but user still has other keys
+    RemovedKey,
+    /// Key name not found for this user
+    KeyNotFound,
+    /// User not found
+    UserNotFound,
+}
+
 impl AuthorizedClients {
     /// Loads the authorized clients from the given TOML file.
     pub fn load(auth_path: &Path) -> Result<Self> {
@@ -69,22 +93,49 @@ impl AuthorizedClients {
     }
 
     /// Inserts a new authorized client and its public key into the authorized clients.
-    pub fn insert(&mut self, username: &str, public_key: PublicKey) {
+    /// Key names must be unique per user.
+    pub fn insert(
+        &mut self,
+        username: &str,
+        key_name: String,
+        public_key: PublicKey,
+    ) -> InsertKeyResult {
+        let mut result = InsertKeyResult::AddedKey;
         self.clients
             .entry(username.to_owned())
             .and_modify(|client_keys| {
-                // Check if key already exists
-                if !client_keys.keys.contains(&public_key) {
-                    client_keys.keys.push(public_key.clone());
-                    println!("Added new key to existing user '{}'", username);
+                if client_keys.has_key_name(&key_name) {
+                    result = InsertKeyResult::KeyNameExists;
                 } else {
-                    println!("Key already exists for user '{}'", username);
+                    client_keys.insert_key(key_name.clone(), public_key.clone());
+                    result = InsertKeyResult::AddedKey;
                 }
             })
             .or_insert_with(|| {
-                println!("Created new user '{}'", username);
-                ClientKeys::new(public_key)
+                result = InsertKeyResult::CreatedUser;
+                ClientKeys::new(key_name, public_key)
             });
+        result
+    }
+
+    /// Removes a specific key from a user by key name.
+    pub fn remove_key(&mut self, username: &str, key_name: &str) -> RemoveKeyResult {
+        if let Some(client_keys) = self.clients.get_mut(username) {
+            let removed = client_keys.remove_key(key_name);
+            if !removed {
+                return RemoveKeyResult::KeyNotFound;
+            }
+
+            // If the user has no keys left, remove the user entirely
+            if client_keys.len() == 0 {
+                self.clients.remove(username);
+                RemoveKeyResult::RemovedLastKey
+            } else {
+                RemoveKeyResult::RemovedKey
+            }
+        } else {
+            RemoveKeyResult::UserNotFound
+        }
     }
 
     /// Removes an authorized client and its public keys from the authorized clients.
@@ -374,23 +425,47 @@ impl PublicKey {
 /// Structure representing keys for a single client/user.
 #[derive(Debug)]
 pub struct ClientKeys {
-    /// List of authorized public keys for this user
-    keys: Vec<PublicKey>,
+    /// Map of key names to their public keys
+    /// Key names must be unique per user, but the same public key can have multiple names
+    keys: HashMap<String, PublicKey>,
 }
 
 impl ClientKeys {
-    fn new(public_key: PublicKey) -> Self {
-        Self {
-            keys: vec![public_key],
-        }
+    fn new(name: String, public_key: PublicKey) -> Self {
+        let mut keys = HashMap::new();
+        keys.insert(name, public_key);
+        Self { keys }
     }
 
+    /// Returns the number of keys in the client.
     pub fn len(&self) -> usize {
         self.keys.len()
     }
 
-    pub fn keys(&self) -> &[PublicKey] {
-        &self.keys
+    /// Returns an iterator over (name, key) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &PublicKey)> {
+        self.keys.iter()
+    }
+
+    /// Returns all public keys (values).
+    pub fn public_keys(&self) -> impl Iterator<Item = &PublicKey> {
+        self.keys.values()
+    }
+
+    /// Check if a key with the given name exists.
+    pub fn has_key_name(&self, name: &str) -> bool {
+        self.keys.contains_key(name)
+    }
+
+    /// Remove a key by name. Returns true if a key was removed.
+    pub fn remove_key(&mut self, name: &str) -> bool {
+        self.keys.remove(name).is_some()
+    }
+
+    /// Insert a new key with the given name. Returns true if this is a new name,
+    /// false if the name already existed (and was replaced).
+    pub fn insert_key(&mut self, name: String, public_key: PublicKey) -> bool {
+        self.keys.insert(name, public_key).is_none()
     }
 }
 
@@ -401,19 +476,20 @@ impl Serialize for ClientKeys {
     {
         use serde::ser::SerializeStruct;
 
-        // Serialize keys to SSH public key format (OpenSSH)
-        let keys_pem: Result<Vec<String>, _> = self
+        // Serialize as a map of name -> SSH public key string
+        let keys_map: Result<HashMap<&str, String>, _> = self
             .keys
             .iter()
-            .map(|key| {
+            .map(|(name, key)| {
                 key.to_ssh_public_key_string()
+                    .map(|key_str| (name.as_str(), key_str))
                     .map_err(serde::ser::Error::custom)
             })
             .collect();
 
-        let keys_pem = keys_pem?;
+        let keys_map = keys_map?;
         let mut state = serializer.serialize_struct("ClientKeys", 1)?;
-        state.serialize_field("keys", &keys_pem)?;
+        state.serialize_field("keys", &keys_map)?;
         state.end()
     }
 }
@@ -425,17 +501,22 @@ impl<'de> Deserialize<'de> for ClientKeys {
     {
         #[derive(Deserialize)]
         struct ClientKeysHelper {
-            keys: Vec<String>,
+            keys: HashMap<String, String>,
         }
 
         let helper = ClientKeysHelper::deserialize(deserializer)?;
-        let keys: Result<Vec<PublicKey>, _> = helper
+        let keys: Result<HashMap<String, PublicKey>, _> = helper
             .keys
-            .iter()
-            .map(|key_str| {
-                PublicKey::parse(key_str).map_err(|e| {
-                    serde::de::Error::custom(format!("Failed to parse public key: {}", e))
-                })
+            .into_iter()
+            .map(|(name, key_str)| {
+                PublicKey::parse(&key_str)
+                    .map(|public_key| (name.clone(), public_key))
+                    .map_err(|e| {
+                        serde::de::Error::custom(format!(
+                            "Failed to parse public key '{}': {}",
+                            name, e
+                        ))
+                    })
             })
             .collect();
 

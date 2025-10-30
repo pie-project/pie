@@ -3,7 +3,7 @@ use super::messaging::dispatch_u2i;
 use super::service::{Service, ServiceError, install_service};
 use super::utils::IdPool;
 use super::{messaging, runtime, service};
-use crate::auth::AuthorizedClients;
+use crate::auth::{AuthorizedClients, PublicKey};
 use crate::model;
 use crate::model::Model;
 use anyhow::{Result, bail};
@@ -398,8 +398,8 @@ impl Session {
     /// Authenticates a user client using public key.
     async fn external_authenticate(&mut self, corr_id: u32, username: String) -> Result<()> {
         // Check if the username is in the authorized clients file and get the user's public keys
-        let public_keys = match self.state.authorized_clients.get(&username) {
-            Some(keys) => keys.keys().to_owned(),
+        let public_keys: Vec<PublicKey> = match self.state.authorized_clients.get(&username) {
+            Some(keys) => keys.public_keys().cloned().collect(),
             None => {
                 self.send_response(
                     corr_id,
