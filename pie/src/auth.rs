@@ -1,12 +1,16 @@
 use anyhow::{Context, Result, bail};
 use pem;
-use ring::signature::{ED25519, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
+use ring::signature::{
+    ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, ED25519, RSA_PKCS1_2048_8192_SHA256,
+    UnparsedPublicKey,
+};
 use rsa::RsaPublicKey;
 use rsa::pkcs1::{DecodeRsaPublicKey, EncodeRsaPublicKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::traits::PublicKeyParts;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use ssh_key::{Algorithm, PublicKey as SshPublicKey};
+use ssh_key::public::EcdsaPublicKey;
+use ssh_key::{Algorithm, EcdsaCurve, PublicKey as SshPublicKey};
 use std::{collections::HashMap, fs, path::Path};
 
 /// Structure representing the authorized_clients.toml file format.
@@ -96,15 +100,24 @@ pub enum PublicKey {
     Rsa(Vec<u8>),
     /// ED25519 public key stored as raw 32-byte key
     Ed25519(Box<[u8; 32]>),
+    /// ECDSA P-256 public key stored as uncompressed point (65 bytes: 0x04 + 32-byte x + 32-byte y)
+    EcdsaP256(Box<[u8; 65]>),
+    /// ECDSA P-384 public key stored as uncompressed point (97 bytes: 0x04 + 48-byte x + 48-byte y)
+    EcdsaP384(Box<[u8; 97]>),
 }
 
 impl PublicKey {
     /// Attempts to parse a public key from a string in various formats.
     ///
     /// Supported formats:
-    /// - OpenSSH (RSA, ED25519)
-    /// - PKCS#8 PEM (RSA, ED25519)
+    /// - OpenSSH (RSA, ED25519, ECDSA)
+    /// - PKCS#8 PEM (RSA, ED25519, ECDSA)
     /// - PKCS#1 PEM (RSA)
+    ///
+    /// Supported key lengths:
+    /// - RSA (2048-8192 bits)
+    /// - ED25519 (256 bits)
+    /// - ECDSA (256, 384 bits)
     pub fn parse(key_content: &str) -> Result<Self> {
         // Try parsing as OpenSSH format first (most common)
         if let Ok(ssh_key) = SshPublicKey::from_openssh(key_content) {
@@ -121,13 +134,18 @@ impl PublicKey {
             return Self::from_rsa_key(rsa_key);
         }
 
-        // Try parsing as PKCS#8 PEM format (ED25519)
+        // Try parsing as PKCS#8 PEM format (ED25519 or ECDSA)
         if let Ok(pkcs8_der) = pem::parse(key_content) {
             // Try to parse as ED25519 public key from PKCS#8
             if let Ok(ed25519_key) =
                 ssh_key::public::Ed25519PublicKey::try_from(pkcs8_der.contents())
             {
                 return Self::from_ed25519_key(ed25519_key.as_ref());
+            }
+
+            // Try to parse as ECDSA public key from PKCS#8
+            if let Ok(ecdsa_key) = Self::try_parse_ecdsa_from_pkcs8(pkcs8_der.contents()) {
+                return Ok(ecdsa_key);
             }
         }
 
@@ -160,8 +178,17 @@ impl PublicKey {
 
                 Self::from_ed25519_key(ed25519_public.as_ref())
             }
+            Algorithm::Ecdsa { curve } => {
+                // Extract the ECDSA public key
+                let key_data = ssh_key.key_data();
+                let ecdsa_public = key_data
+                    .ecdsa()
+                    .context("Failed to extract ECDSA key data")?;
+
+                Self::from_ecdsa_key(ecdsa_public, &curve)
+            }
             algo => bail!(
-                "Unsupported key algorithm: {:?}. Supported: RSA, ED25519.",
+                "Unsupported key algorithm: {:?}. Supported: RSA, ED25519, ECDSA (P-256, P-384).",
                 algo
             ),
         }
@@ -184,6 +211,78 @@ impl PublicKey {
         Ok(Self::Ed25519(Box::new(*public_key_bytes)))
     }
 
+    /// Converts from an ECDSA public key from SSH format.
+    fn from_ecdsa_key(ecdsa_public: &EcdsaPublicKey, curve: &EcdsaCurve) -> Result<Self> {
+        match curve {
+            EcdsaCurve::NistP256 => {
+                let point_bytes = ecdsa_public.as_ref();
+                if point_bytes.len() != 65 {
+                    bail!(
+                        "Invalid P-256 public key point length: expected 65 bytes, got {}",
+                        point_bytes.len()
+                    );
+                }
+                let mut bytes = [0u8; 65];
+                bytes.copy_from_slice(point_bytes);
+                Ok(Self::EcdsaP256(Box::new(bytes)))
+            }
+            EcdsaCurve::NistP384 => {
+                let point_bytes = ecdsa_public.as_ref();
+                if point_bytes.len() != 97 {
+                    bail!(
+                        "Invalid P-384 public key point length: expected 97 bytes, got {}",
+                        point_bytes.len()
+                    );
+                }
+                let mut bytes = [0u8; 97];
+                bytes.copy_from_slice(point_bytes);
+                Ok(Self::EcdsaP384(Box::new(bytes)))
+            }
+            EcdsaCurve::NistP521 => {
+                bail!("ECDSA P-521 curve is not supported by the ring crate")
+            }
+        }
+    }
+
+    /// Try to parse ECDSA public key from PKCS#8 DER bytes.
+    fn try_parse_ecdsa_from_pkcs8(pkcs8_der: &[u8]) -> Result<Self> {
+        use p256::pkcs8::DecodePublicKey;
+
+        // Try P-256
+        if let Ok(p256_key) = p256::PublicKey::from_public_key_der(pkcs8_der) {
+            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            let encoded_point = p256_key.to_encoded_point(false);
+            let point_bytes = encoded_point.as_bytes();
+            if point_bytes.len() != 65 {
+                bail!(
+                    "Invalid P-256 public key point length: expected 65 bytes, got {}",
+                    point_bytes.len()
+                );
+            }
+            let mut bytes = [0u8; 65];
+            bytes.copy_from_slice(point_bytes);
+            return Ok(Self::EcdsaP256(Box::new(bytes)));
+        }
+
+        // Try P-384
+        if let Ok(p384_key) = p384::PublicKey::from_public_key_der(pkcs8_der) {
+            use p384::elliptic_curve::sec1::ToEncodedPoint;
+            let encoded_point = p384_key.to_encoded_point(false);
+            let point_bytes = encoded_point.as_bytes();
+            if point_bytes.len() != 97 {
+                bail!(
+                    "Invalid P-384 public key point length: expected 97 bytes, got {}",
+                    point_bytes.len()
+                );
+            }
+            let mut bytes = [0u8; 97];
+            bytes.copy_from_slice(point_bytes);
+            return Ok(Self::EcdsaP384(Box::new(bytes)));
+        }
+
+        bail!("Failed to parse ECDSA public key from PKCS#8")
+    }
+
     /// Converts to SSH public key format for serialization
     fn to_ssh_public_key_string(&self) -> Result<String> {
         match self {
@@ -198,9 +297,9 @@ impl PublicKey {
                 // Create SSH RSA public key from components
                 let ssh_rsa = ssh_key::public::RsaPublicKey {
                     e: ssh_key::Mpint::from_positive_bytes(&e_bytes)
-                        .map_err(|e| anyhow::anyhow!("Failed to create Mpint for e: {}", e))?,
+                        .context("Failed to create Mpint for e")?,
                     n: ssh_key::Mpint::from_positive_bytes(&n_bytes)
-                        .map_err(|e| anyhow::anyhow!("Failed to create Mpint for n: {}", e))?,
+                        .context("Failed to create Mpint for n")?,
                 };
                 let public_key = SshPublicKey::from(ssh_rsa);
                 Ok(public_key.to_openssh().map_err(|e| {
@@ -210,11 +309,31 @@ impl PublicKey {
             Self::Ed25519(bytes) => {
                 let ssh_ed25519 =
                     ssh_key::public::Ed25519PublicKey::try_from(bytes.as_ref().as_ref())
-                        .map_err(|e| anyhow::anyhow!("Failed to create ED25519 SSH key: {}", e))?;
+                        .context("Failed to create ED25519 SSH key")?;
                 let public_key = SshPublicKey::from(ssh_ed25519);
                 Ok(public_key.to_openssh().map_err(|e| {
                     anyhow::anyhow!("Failed to encode ED25519 key to OpenSSH format: {}", e)
                 })?)
+            }
+            Self::EcdsaP256(point_bytes) => {
+                use p256::EncodedPoint;
+                let encoded_point = EncodedPoint::from_bytes(point_bytes.as_ref())
+                    .context("Failed to create EncodedPoint from P-256 bytes")?;
+                let ssh_ecdsa = ssh_key::public::EcdsaPublicKey::NistP256(encoded_point);
+                let public_key = SshPublicKey::from(ssh_ecdsa);
+                Ok(public_key
+                    .to_openssh()
+                    .context("Failed to encode ECDSA P-256 key to OpenSSH format")?)
+            }
+            Self::EcdsaP384(point_bytes) => {
+                use p384::EncodedPoint;
+                let encoded_point = EncodedPoint::from_bytes(point_bytes.as_ref())
+                    .context("Failed to create EncodedPoint from P-384 bytes")?;
+                let ssh_ecdsa = ssh_key::public::EcdsaPublicKey::NistP384(encoded_point);
+                let public_key = SshPublicKey::from(ssh_ecdsa);
+                Ok(public_key
+                    .to_openssh()
+                    .context("Failed to encode ECDSA P-384 key to OpenSSH format")?)
             }
         }
     }
@@ -233,6 +352,20 @@ impl PublicKey {
                 public_key
                     .verify(message, signature)
                     .map_err(|_| anyhow::anyhow!("ED25519 signature verification failed"))
+            }
+            Self::EcdsaP256(point_bytes) => {
+                let public_key =
+                    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, point_bytes.as_ref());
+                public_key
+                    .verify(message, signature)
+                    .map_err(|_| anyhow::anyhow!("ECDSA P-256 signature verification failed"))
+            }
+            Self::EcdsaP384(point_bytes) => {
+                let public_key =
+                    UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, point_bytes.as_ref());
+                public_key
+                    .verify(message, signature)
+                    .map_err(|_| anyhow::anyhow!("ECDSA P-384 signature verification failed"))
             }
         }
     }
