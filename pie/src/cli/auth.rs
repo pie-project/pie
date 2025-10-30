@@ -4,10 +4,9 @@
 //! by adding or removing their public keys in the `authorized_clients.toml` file.
 
 use super::path;
-use crate::auth::{self, AuthorizedClients};
+use crate::auth::{AuthorizedClients, PublicKey};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use rsa::RsaPublicKey;
 use std::{
     fs,
     io::{self, Read, Write},
@@ -75,9 +74,8 @@ async fn handle_auth_add_subcommand() -> Result<()> {
         bail!("Public key cannot be empty");
     }
 
-    // Validates that the string is a valid RSA public key by parsing it.
-    let public_key =
-        auth::parse_rsa_public_key(&public_key).context("Failed to parse public key")?;
+    // Validates that the string is a valid public key by parsing it.
+    let public_key = PublicKey::parse(&public_key).context("Failed to parse public key")?;
 
     // Add the key to `authorized_clients.toml`
     add_authorized_client(&username, public_key)?;
@@ -160,7 +158,7 @@ async fn handle_auth_list_subcommand() -> Result<()> {
 }
 
 /// Adds an authorized client to the `authorized_clients.toml` file.
-fn add_authorized_client(username: &str, public_key: RsaPublicKey) -> Result<()> {
+fn add_authorized_client(username: &str, public_key: PublicKey) -> Result<()> {
     let auth_path = path::get_authorized_clients_path()?;
 
     // Create the directory if it doesn't exist
