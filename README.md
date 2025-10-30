@@ -123,23 +123,29 @@ Build the **CLIs** and the example inferlets.
 
 1. **Create User Public Key:**
 
-   If you don't already have an RSA key pair in `~/.ssh`, generate one with the following command
+   If you don't already have a key pair in `~/.ssh`, generate one with the following command.
+   By default, the private key will be generated in `~/.ssh/id_ed25519` and the public key in `~/.ssh/id_ed25519.pub`.
+   Please make sure the passphrase is *empty*.
    ```bash
-   ssh-keygen -t rsa -b 4096
+   ssh-keygen
    ```
+
+   In addition to ED25519, you can also use RSA or ECDSA keys.
 
 2. **Create default user client configuration file:**
 
-   The following command creates a default user client configuration file with the current Unix username and the private RSA key in `~/.ssh`.
+   The following command creates a default user client configuration file using the current Unix username and the private key in `~/.ssh`.
    ```bash
    pie-cli config init
    ```
 
 3. **Register the user on the engine:**
 
-   Run the following command and when prompted, paste in the Unix username and the public key from `~/.ssh/id_rsa.pub`.
+   Run the following command to register the current user on the engine.
+   `my-first-key` is the name of the key and can be any string.
+   `cat` reads the public key from `~/.ssh/id_ed25519.pub` and pipes it to `pie auth add`.
    ```bash
-   pie auth add
+   cat ~/.ssh/id_ed25519.pub | pie auth add $(whoami) my-first-key
    ```
 
 4. **Start the Engine:**
