@@ -6,80 +6,76 @@
 use super::path;
 use crate::auth::{AuthorizedClients, InsertKeyResult, PublicKey, RemoveKeyResult};
 use anyhow::{Context, Result, bail};
+use chrono::Local;
 use clap::Subcommand;
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
 };
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommands {
     /// Add an authorized client and its public key.
-    /// The public key can be in OpenSSH, PKCS#8 PEM, or PKCS#1 PEM format.
-    /// A user can have multiple public keys.
-    Add,
-    /// Remove an authorized client and all its public keys.
-    Remove,
-    /// Remove a specific key from an authorized client.
-    RemoveKey,
+    /// The public key is read from stdin and can be in OpenSSH, PKCS#8 PEM, or PKCS#1 PEM format.
+    /// If key_name is not provided, the current timestamp will be used.
+    Add {
+        /// Username of the client
+        username: String,
+        /// Optional name for this key (e.g., 'laptop', 'desktop'). Defaults to current timestamp.
+        key_name: Option<String>,
+    },
+    /// Remove an authorized client or a specific key.
+    /// If key_name is provided, only that key is removed.
+    /// If key_name is not provided, the entire user entry is removed.
+    Remove {
+        /// Username of the client
+        username: String,
+        /// Optional name of the specific key to remove. If omitted, removes the entire user.
+        key_name: Option<String>,
+    },
     /// List all authorized clients and their keys.
     List,
 }
 
 /// Handles the `pie auth` command.
-/// These commands take input from stdin to avoid exposing sensitive information
-/// to the shell history.
+/// Public keys are read from stdin to avoid exposing them in shell history.
 pub async fn handle_auth_command(command: AuthCommands) -> Result<()> {
     match command {
-        AuthCommands::Add => handle_auth_add_subcommand().await,
-        AuthCommands::Remove => handle_auth_remove_subcommand().await,
-        AuthCommands::RemoveKey => handle_auth_remove_key_subcommand().await,
+        AuthCommands::Add { username, key_name } => {
+            handle_auth_add_subcommand(username, key_name).await
+        }
+        AuthCommands::Remove { username, key_name } => {
+            handle_auth_remove_subcommand(username, key_name).await
+        }
         AuthCommands::List => handle_auth_list_subcommand().await,
     }
 }
 
 /// Handles the `pie auth add` subcommand.
-async fn handle_auth_add_subcommand() -> Result<()> {
-    println!("🔐 Adding authorized client...");
-    println!();
+async fn handle_auth_add_subcommand(username: String, key_name: Option<String>) -> Result<()> {
+    // Generate key name if not provided (using current timestamp)
+    let key_name = key_name.unwrap_or(Local::now().format("%Y-%m-%d-%H:%M:%S").to_string());
 
-    // Prompt for username
-    print!("Enter username: ");
-    io::stdout().flush().context("Failed to flush stdout")?;
+    // Only show prompts if stdin is a terminal (interactive mode)
+    if io::stdin().is_terminal() {
+        println!("🔐 Adding authorized client...");
+        println!("   Username: {}", username);
+        println!("   Key name: {}", key_name);
+        println!();
 
-    let mut username = String::new();
-    io::stdin()
-        .read_line(&mut username)
-        .context("Failed to read username")?;
-    let username = username.trim().to_string();
-
-    if username.is_empty() {
-        bail!("Username cannot be empty");
+        // Prompt for public key
+        println!("Enter public key (paste, then press Ctrl-D on a new line):");
+        println!("  Supported algorithms:");
+        println!("  - RSA (2048-8192 bits)");
+        println!("  - ED25519 (256 bits)");
+        println!("  - ECDSA (256, 384 bits)");
+        println!("  Supported formats:");
+        println!("  - OpenSSH (single line)");
+        println!("  - PKCS#8 PEM (multi-line)");
+        println!("  - PKCS#1 PEM (multi-line)");
+        print!("> ");
+        io::stdout().flush().context("Failed to flush stdout")?;
     }
-
-    // Prompt for key name
-    print!("Enter key name: ");
-    io::stdout().flush().context("Failed to flush stdout")?;
-
-    let mut key_name = String::new();
-    io::stdin()
-        .read_line(&mut key_name)
-        .context("Failed to read key name")?;
-    let key_name = key_name.trim().to_string();
-
-    if key_name.is_empty() {
-        bail!("Key name cannot be empty");
-    }
-
-    // Prompt for public key
-    println!();
-    println!("Enter public key (paste multi-line PEM, then press Ctrl-D on a new line):");
-    println!("  Supported formats:");
-    println!("  - OpenSSH (single line)");
-    println!("  - PKCS#8 PEM (multi-line)");
-    println!("  - PKCS#1 PEM (multi-line)");
-    print!("> ");
-    io::stdout().flush().context("Failed to flush stdout")?;
 
     let mut public_key = String::new();
     io::stdin()
@@ -107,71 +103,33 @@ async fn handle_auth_add_subcommand() -> Result<()> {
 }
 
 /// Handles the `pie auth remove` subcommand.
-async fn handle_auth_remove_subcommand() -> Result<()> {
-    println!("🔐 Removing authorized client...");
-    println!();
+async fn handle_auth_remove_subcommand(username: String, key_name: Option<String>) -> Result<()> {
+    match key_name {
+        Some(key_name) => {
+            // Remove a specific key
+            println!("🔐 Removing key from authorized client...");
+            println!("   Username: {}", username);
+            println!("   Key name: {}", key_name);
+            println!();
 
-    // Prompt for username
-    print!("Enter username to remove: ");
-    io::stdout().flush().context("Failed to flush stdout")?;
+            remove_authorized_client_key(&username, &key_name)?;
 
-    let mut username = String::new();
-    io::stdin()
-        .read_line(&mut username)
-        .context("Failed to read username")?;
-    let username = username.trim().to_string();
+            println!(
+                "✅ Successfully removed key '{}' from user '{}'",
+                key_name, username
+            );
+        }
+        None => {
+            // Remove entire user
+            println!("🔐 Removing authorized client...");
+            println!("   Username: {}", username);
+            println!();
 
-    if username.is_empty() {
-        bail!("Username cannot be empty");
+            remove_authorized_client(&username)?;
+
+            println!("✅ Successfully removed user '{}'", username);
+        }
     }
-
-    // Remove the client from authorized_clients.toml
-    remove_authorized_client(&username)?;
-
-    println!("✅ Successfully removed user '{}'", username);
-    Ok(())
-}
-
-/// Handles the `pie auth remove-key` subcommand.
-async fn handle_auth_remove_key_subcommand() -> Result<()> {
-    println!("🔐 Removing specific key from authorized client...");
-    println!();
-
-    // Prompt for username
-    print!("Enter username: ");
-    io::stdout().flush().context("Failed to flush stdout")?;
-
-    let mut username = String::new();
-    io::stdin()
-        .read_line(&mut username)
-        .context("Failed to read username")?;
-    let username = username.trim().to_string();
-
-    if username.is_empty() {
-        bail!("Username cannot be empty");
-    }
-
-    // Prompt for key name
-    print!("Enter key name to remove: ");
-    io::stdout().flush().context("Failed to flush stdout")?;
-
-    let mut key_name = String::new();
-    io::stdin()
-        .read_line(&mut key_name)
-        .context("Failed to read key name")?;
-    let key_name = key_name.trim().to_string();
-
-    if key_name.is_empty() {
-        bail!("Key name cannot be empty");
-    }
-
-    // Remove the specific key from authorized_clients.toml
-    remove_authorized_client_key(&username, &key_name)?;
-
-    println!(
-        "✅ Successfully removed key '{}' from user '{}'",
-        key_name, username
-    );
     Ok(())
 }
 
