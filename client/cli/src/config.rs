@@ -6,6 +6,7 @@
 use super::path;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
+use pie_client::crypto::ParsedPrivateKey;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -84,20 +85,32 @@ async fn handle_config_init_subcommand() -> Result<()> {
     }
 
     // Find the SSH key or use default
-    let ssh_key_path = find_ssh_key().context("Failed to find SSH key")?;
+    let found_key_path = find_ssh_key().context("Failed to find SSH key")?;
     const DEFAULT_KEY_PATH: &str = "~/.ssh/id_ed25519";
 
     // Create the config file with default content
     let default_content =
-        create_default_config_content(ssh_key_path.as_deref().unwrap_or(DEFAULT_KEY_PATH));
+        create_default_config_content(found_key_path.as_deref().unwrap_or(DEFAULT_KEY_PATH));
     fs::write(&config_path, &default_content)
         .context(format!("Failed to write config file at {:?}", config_path))?;
 
     println!("✅ Created default configuration file at {:?}", config_path);
     print_default_config_content(&default_content);
 
-    // Warn if the key doesn't exist
-    if ssh_key_path.is_none() {
+    // If the key exists, print it and validate it
+    if let Some(found_key_path) = found_key_path {
+        println!("✅ Using private key found at {:?}", found_key_path);
+        println!("   You can update the key path in the config file:");
+        println!("      `pie-cli config update --private-key-path <path>`");
+
+        if !validate_private_key(&found_key_path) {
+            println!(
+                "   The configuration has been saved, but you'll need to \
+                provide a valid key to connect."
+            );
+        }
+    // Otherwise, warn if the key doesn't exist
+    } else {
         println!();
         println!(
             "⚠️ Warning: Private key not found in '~/.ssh', using default path: '{}'",
@@ -106,11 +119,6 @@ async fn handle_config_init_subcommand() -> Result<()> {
         println!("   Please take either of the following actions:");
         println!("   1. Generate an SSH key pair by running `ssh-keygen`");
         println!("   2. Update the key path in the config file:");
-        println!("      `pie-cli config update --private-key-path <path>`");
-    // Otherwise, print the key path
-    } else {
-        println!("✅ Using private key found at {:?}", ssh_key_path.unwrap());
-        println!("   You can update the key path in the config file:");
         println!("      `pie-cli config update --private-key-path <path>`");
     }
 
@@ -139,6 +147,7 @@ async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
 
     // Track which fields were updated
     let mut updated = Vec::new();
+    let mut updated_key_path: Option<String> = None;
 
     // Update fields if provided
     if let Some(host) = args.host {
@@ -156,11 +165,12 @@ async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
     if let Some(private_key_path) = args.private_key_path {
         let path_str = private_key_path.to_string_lossy().to_string();
         updated.push(format!("private_key_path = \"{}\"", path_str));
+        updated_key_path = Some(path_str.clone());
         config.private_key_path = Some(private_key_path);
     }
 
     if updated.is_empty() {
-        println!("⚠️  No fields provided to update.");
+        println!("⚠️ No fields provided to update.");
         return Ok(());
     }
 
@@ -178,6 +188,16 @@ async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
     println!("   Updated fields:");
     for field in updated {
         println!("   - {}", field);
+    }
+
+    // If the private key path was updated, validate it
+    if let Some(key_path) = updated_key_path {
+        if !validate_private_key(&key_path) {
+            println!(
+                "   The configuration has been saved, but you'll need to \
+                provide a valid key to connect."
+            );
+        }
     }
 
     Ok(())
@@ -238,4 +258,35 @@ private_key_path = "{private_key_path}"
         username = whoami::username(),
         private_key_path = private_key_path
     )
+}
+
+/// Validate that a private key at the given path can be parsed.
+/// Prints a warning if the key cannot be parsed, but does not return an error.
+fn validate_private_key(key_path: &str) -> bool {
+    // Expand tilde in the path
+    let path = PathBuf::from(shellexpand::tilde(key_path).as_ref());
+
+    if !path.exists() {
+        println!();
+        println!("⚠️ Warning: Private key file not found at {:?}", path);
+        return false;
+    }
+
+    match fs::read_to_string(&path) {
+        Ok(key_content) => match ParsedPrivateKey::parse(&key_content) {
+            Ok(_) => return true,
+            Err(e) => {
+                println!();
+                println!("⚠️ Warning: Failed to parse private key at {:?}", path);
+                println!("   Error: {}", e);
+            }
+        },
+        Err(e) => {
+            println!();
+            println!("⚠️ Warning: Failed to read private key file at {:?}", path);
+            println!("   Error: {}", e);
+        }
+    }
+
+    false
 }
