@@ -19,6 +19,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -475,14 +476,25 @@ impl Session {
     /// This method is used for internal communication between the backend and the engine
     /// as well as between the Pie shell and the engine. This is not used for user authentication.
     async fn internal_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
-        if token != self.state.internal_auth_token {
-            self.send_response(corr_id, false, "Invalid token".to_string())
+        if token == self.state.internal_auth_token {
+            self.send_response(corr_id, true, "Authenticated".to_string())
                 .await;
-            bail!("Invalid token")
+            return Ok(());
         }
-        self.send_response(corr_id, true, "Authenticated".to_string())
+
+        // Add random delay to mitigate timing-based side-channel attacks
+        let rng = SystemRandom::new();
+        let mut random_bytes = [0u8; 2];
+        rng.fill(&mut random_bytes)
+            .map_err(|e| anyhow!("Failed to generate random delay: {:?}", e))?;
+
+        // Sleep for 1000-3000 milliseconds
+        let delay_ms = 1000 + (u16::from_le_bytes(random_bytes) % 2001) as u64;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+        self.send_response(corr_id, false, "Invalid token".to_string())
             .await;
-        Ok(())
+        bail!("Invalid token")
     }
 
     /// Processes a single command.
