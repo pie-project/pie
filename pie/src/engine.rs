@@ -1,6 +1,5 @@
-use anyhow::{Context, Result};
-use rand::TryRngCore;
-use rand::rngs::OsRng;
+use anyhow::{Context, Result, anyhow};
+use ring::rand::{SecureRandom, SystemRandom};
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
@@ -56,15 +55,37 @@ pub async fn run_server(
     let server_url = format!("{}:{}", config.host, config.port);
 
     // Generate a random 64-character string for internal client connection authentication.
-    // Use OsRng for cryptographic randomness.
+    // Use `ring::rand::SystemRandom` for cryptographic randomness with rejection sampling
+    // to avoid modulo bias.
     const CHARSET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    let internal_auth_token: String = (0..64)
-        .map(|_| {
-            OsRng
-                .try_next_u32()
-                .map(|n| CHARSET[n as usize % CHARSET.len()] as char)
-        })
-        .collect::<Result<String, _>>()?;
+    let rng = SystemRandom::new();
+    let mut internal_auth_token = String::with_capacity(64);
+
+    // Rejection sampling threshold: 256 - (256 % 62) = 248
+    // Accept only bytes < 248 to ensure uniform distribution
+    let threshold = 256 - (256 % CHARSET.len());
+
+    while internal_auth_token.len() < 64 {
+        let mut random_bytes = [0u8; 128];
+        rng.fill(&mut random_bytes).map_err(|e| {
+            anyhow!(
+                "Failed to generate random bytes for internal auth token: {}",
+                e
+            )
+        })?;
+
+        for &byte in &random_bytes {
+            if internal_auth_token.len() >= 64 {
+                break;
+            }
+
+            // Reject bytes >= threshold to avoid modulo bias
+            if (byte as usize) < threshold {
+                let idx = (byte as usize) % CHARSET.len();
+                internal_auth_token.push(CHARSET[idx] as char);
+            }
+        }
+    }
 
     let server = Server::new(
         &server_url,

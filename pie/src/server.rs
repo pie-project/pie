@@ -6,7 +6,7 @@ use super::{messaging, runtime, service};
 use crate::auth::{AuthorizedClients, PublicKey};
 use crate::model;
 use crate::model::Model;
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -15,8 +15,7 @@ use pie_client::message::{
     CHUNK_SIZE_BYTES, QUERY_BACKEND_STATS, QUERY_MODEL_STATUS, QUERY_PROGRAM_EXISTS,
 };
 use pie_client::message::{ClientMessage, EventCode, ServerMessage};
-use rand::TryRngCore;
-use rand::rngs::OsRng;
+use ring::rand::{SecureRandom, SystemRandom};
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -411,10 +410,13 @@ impl Session {
             }
         };
 
-        // Generate a cryptographically secure random challenge (32 bytes = 256 bits)
-        let challenge: Vec<u8> = (0..32)
-            .map(|_| OsRng.try_next_u32().map(|n| (n & 0xFF) as u8).unwrap())
-            .collect();
+        // Generate a cryptographically secure random challenge (48 bytes = 384 bits)
+        // Use `ring::rand::SystemRandom` for cryptographic randomness.
+        // Size chosen to match ECDSA P-384, the highest security level supported.
+        let rng = SystemRandom::new();
+        let mut challenge = [0u8; 48];
+        rng.fill(&mut challenge)
+            .map_err(|e| anyhow!("Failed to generate random challenge: {}", e))?;
 
         // Encode the challenge as base64 and send it to the client
         let challenge_b64 = base64::engine::general_purpose::STANDARD.encode(&challenge);
