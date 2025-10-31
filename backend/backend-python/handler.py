@@ -20,6 +20,12 @@ import message
 from adapter_utils import ensure_adapter_available
 from platform_detection import is_apple_silicon
 
+# Import model-specific activation memory calculators
+import model.l4ma as l4ma_module
+import model.qwen2 as qwen2_module
+import model.qwen3 as qwen3_module
+import model.gptoss_utils as gptoss_utils_module
+
 # Import profiler for performance analysis
 from profiler import start_profile
 
@@ -53,6 +59,60 @@ class Handler:
     max_num_embeds: int
     max_num_adapters: int
     max_adapter_rank: int
+
+    def _calculate_activation_memory_bytes(self, model_info) -> int:
+        """Calculate memory needed for activation buffers based on model architecture.
+
+        This calculates the total memory required for pre-allocated activation buffers
+        that will be used during forward passes to prevent dynamic allocations.
+        Each model defines its own memory calculation based on which buffers it allocates.
+
+        Returns:
+            Total bytes needed for activation buffers
+        """
+        # Get model architecture parameters
+        max_tokens = self.max_batch_tokens
+        hidden_size = model_info.architecture.hidden_size
+        intermediate_size = model_info.architecture.intermediate_size
+        num_q_heads = model_info.architecture.num_query_heads
+        num_kv_heads = model_info.architecture.num_key_value_heads
+        head_size = model_info.architecture.head_size
+        dtype_size = self.dtype.itemsize
+        arch_type = model_info.architecture.type
+
+        # Map architecture type to model-specific calculation function
+        model_calculators = {
+            "l4ma": l4ma_module.calculate_activation_memory_bytes,
+            "qwen2": qwen2_module.calculate_activation_memory_bytes,
+            "qwen3": qwen3_module.calculate_activation_memory_bytes,
+            "gptoss": gptoss_utils_module.calculate_activation_memory_bytes,
+        }
+
+        if arch_type not in model_calculators:
+            raise ValueError(
+                f"Unknown architecture type '{arch_type}'. "
+                f"Supported types: {list(model_calculators.keys())}"
+            )
+
+        # Use model-specific calculation function
+        calculator = model_calculators[arch_type]
+
+        # Build kwargs for calculator
+        calc_kwargs = {
+            "max_tokens": max_tokens,
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "num_query_heads": num_q_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_size": head_size,
+            "dtype_size": dtype_size,
+        }
+
+        # Add num_experts for GptOss (if available)
+        if hasattr(model_info.architecture, "num_experts"):
+            calc_kwargs["num_experts"] = model_info.architecture.num_experts
+
+        return calculator(**calc_kwargs)
 
     def __init__(
         self,
@@ -165,9 +225,9 @@ class Handler:
 
         # If `gpu_mem_headroom` is set by the user, then we have to allocate the KV
         # cache at the end and dynamically calculate the number of KV pages based on
-        # the available GPU memory.
+        # the available GPU memory, accounting for both KV cache and activation buffers.
         if adaptive_kv_cache_size:
-            # Calculate the available GPU memory for the KV cache after accounting for
+            # Calculate the available GPU memory after accounting for
             # the reserved GPU memory specified through `gpu_mem_headroom`.
             free_gpu_mem_bytes, total_gpu_mem_bytes = torch.cuda.mem_get_info(
                 self.device
@@ -177,26 +237,49 @@ class Handler:
             useable_gpu_mem_bytes = total_gpu_mem_bytes * (
                 1 - (reserved_gpu_mem_percentage / 100)
             )
-            available_kv_cache_bytes = useable_gpu_mem_bytes - used_gpu_mem_bytes
+            available_memory_bytes = useable_gpu_mem_bytes - used_gpu_mem_bytes
 
-            if available_kv_cache_bytes <= 0:
+            if available_memory_bytes <= 0:
                 raise ValueError(
-                    "Not enough GPU memory available to allocate the KV cache. "
+                    "Not enough GPU memory available. "
                     "Please decrease 'gpu_mem_headroom'."
                 )
 
-            # Calculate the number of KV pages based on the available GPU memory.
-            self.max_num_kv_pages = int(
-                available_kv_cache_bytes
-                / (
-                    self.kv_page_size
-                    * 2
-                    * self.model_info.architecture.num_key_value_heads
-                    * self.model_info.architecture.head_size
-                    * self.model_info.architecture.num_layers
-                    * self.dtype.itemsize
-                )
+            # Calculate bytes per KV page
+            kv_bytes_per_page = (
+                self.kv_page_size
+                * 2
+                * self.model_info.architecture.num_key_value_heads
+                * self.model_info.architecture.head_size
+                * self.model_info.architecture.num_layers
+                * self.dtype.itemsize
             )
+
+            # Activation buffers are already allocated during model load above (line 208).
+            # Their memory usage is already reflected in used_gpu_mem_bytes, so we use
+            # available_memory_bytes directly for KV cache without subtracting again.
+            available_for_kv = available_memory_bytes
+
+            # NOTE: If you want to reduce activation buffer size, you must decrease
+            # max_batch_tokens BEFORE model load (in config) and re-instantiate the model,
+            # since activation buffers are pre-allocated during model initialization.
+
+            # Calculate the number of KV pages based on remaining available GPU memory
+            self.max_num_kv_pages = int(available_for_kv / kv_bytes_per_page)
+
+            # Calculate activation bytes for display purposes only (not used for allocation)
+            activation_bytes_needed = self._calculate_activation_memory_bytes(
+                self.model_info
+            )
+
+            # Ensure we have at least one KV page
+            if self.max_num_kv_pages == 0:
+                raise ValueError(
+                    f"Insufficient GPU memory for KV cache. "
+                    f"Available: {available_for_kv / 1e9:.2f}GB, "
+                    f"needed for 1 page: {kv_bytes_per_page / 1e9:.2f}GB. "
+                    "Decrease 'gpu_mem_headroom', 'max_batch_tokens', or 'kv_page_size'."
+                )
 
             # If the user also specified "max_num_kv_pages", then we will use the
             # smaller of the two values.
@@ -208,6 +291,12 @@ class Handler:
                         f"'max_num_kv_pages' is reduced to {self.max_num_kv_pages} "
                         "to respect 'gpu_mem_headroom'."
                     )
+
+            print(
+                f"Memory allocation with gpu_mem_headroom={reserved_gpu_mem_percentage}%: "
+                f"activation_buffers={activation_bytes_needed / 1e9:.2f}GB, "
+                f"kv_cache={self.max_num_kv_pages * kv_bytes_per_page / 1e9:.2f}GB"
+            )
 
             self.kv_cache_at_layer = [
                 torch.zeros(
@@ -468,6 +557,18 @@ class ForwardPassBatch:
 
     def add_request(self, req: message.ForwardPassRequest):
         """Processes and adds a single request to the batch."""
+        # Validate that adding this request won't exceed max_batch_tokens
+        new_total = self.total_tokens_in_batch + len(req.input_tokens)
+        if new_total > self._handler.max_batch_tokens:
+            raise ValueError(
+                f"Batch size would exceed max_batch_tokens limit. "
+                f"Current batch: {self.total_tokens_in_batch} tokens, "
+                f"new request: {len(req.input_tokens)} tokens, "
+                f"would total: {new_total} tokens, "
+                f"limit: {self._handler.max_batch_tokens} tokens. "
+                "Engine/controller must split requests into smaller batches."
+            )
+
         self._original_reqs.append(req)
 
         # Handle adapter information

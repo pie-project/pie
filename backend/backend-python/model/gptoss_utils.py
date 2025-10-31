@@ -199,3 +199,46 @@ class GptOssRotaryEmbedding(nn.Module):
         )
 
         return query, key
+
+
+def calculate_activation_memory_bytes(
+    max_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,  # pylint: disable=unused-argument
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype_size: int,
+    num_experts: int = 8,  # Default for GptOss
+) -> int:
+    """Calculate total memory needed for activation buffers.
+
+    Note: GptOss preallocates QKV, attention output, and router logits buffers.
+    Expert intermediate buffers are not preallocated due to the MoE architecture
+    with custom einsum operations that don't support buffer reuse.
+
+    Args:
+        max_tokens: Maximum number of tokens in a batch
+        hidden_size: Hidden layer size
+        intermediate_size: MLP intermediate size (unused for GptOss)
+        num_query_heads: Number of query attention heads
+        num_kv_heads: Number of key/value attention heads
+        head_size: Size of each attention head
+        dtype_size: Size of data type in bytes (e.g., 2 for float16)
+        num_experts: Number of experts in MoE (default: 8)
+
+    Returns:
+        Total bytes needed for activation buffers
+    """
+    # QKV projection buffer: [max_tokens, (num_query_heads + 2*num_kv_heads) * head_size]
+    qkv_size = (
+        max_tokens * (num_query_heads + 2 * num_kv_heads) * head_size * dtype_size
+    )
+
+    # Attention output buffer: [max_tokens, hidden_size]
+    attn_output_size = max_tokens * hidden_size * dtype_size
+
+    # Router logits buffer: [max_tokens, num_experts]
+    router_logits_size = max_tokens * num_experts * dtype_size
+
+    return qkv_size + attn_output_size + router_logits_size
