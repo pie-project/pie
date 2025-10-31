@@ -1,17 +1,23 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use pem;
 use ring::signature::{
-    UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, ED25519,
-    RSA_PKCS1_2048_8192_SHA256,
+    ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, ED25519, RSA_PKCS1_2048_8192_SHA256,
+    UnparsedPublicKey,
 };
+use rsa::RsaPublicKey;
 use rsa::pkcs1::{DecodeRsaPublicKey, EncodeRsaPublicKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::traits::PublicKeyParts;
-use rsa::RsaPublicKey;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ssh_key::public::EcdsaPublicKey;
 use ssh_key::{Algorithm, EcdsaCurve, PublicKey as SshPublicKey};
 use std::{collections::HashMap, fs, path::Path};
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// Structure representing the authorized_clients.toml file format.
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -48,27 +54,53 @@ pub enum RemoveKeyResult {
 impl AuthorizedClients {
     /// Loads the authorized clients from the given TOML file.
     pub fn load(auth_path: &Path) -> Result<Self> {
+        // Check file permissions (Unix only)
+        #[cfg(unix)]
+        check_file_permissions(auth_path)?;
+
         let content = fs::read_to_string(auth_path).context(format!(
-            "Failed to read authorized clients file at {:?}",
-            auth_path
+            "Failed to read authorized clients file at '{}'",
+            auth_path.display()
         ))?;
         toml::from_str(&content).context(format!(
-            "Failed to parse authorized clients file at {:?}",
-            auth_path
+            "Failed to parse authorized clients file at '{}'",
+            auth_path.display()
         ))
     }
 
     /// Saves the authorized clients to the given TOML file.
     pub fn save(&self, auth_path: &Path) -> Result<()> {
         if let Some(parent) = auth_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create parent dir for {:?}", auth_path))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create parent dir for '{}'", auth_path.display())
+            })?;
         }
+
+        // Check if file exists and handle permissions (Unix only)
+        #[cfg(unix)]
+        {
+            // File exists, verify its permissions
+            if auth_path.exists() {
+                check_file_permissions(auth_path)?;
+            // File doesn't exist, create it with correct permissions
+            } else {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(auth_path)
+                    .context(format!(
+                        "Failed to create authorized clients file at '{}'",
+                        auth_path.display()
+                    ))?;
+            }
+        }
+
         let content = toml::to_string_pretty(self)
             .context(format!("Failed to serialize authorized clients to TOML"))?;
         fs::write(auth_path, content).context(format!(
-            "Failed to write authorized clients file at {:?}",
-            auth_path
+            "Failed to write authorized clients file at '{}'",
+            auth_path.display()
         ))
     }
 
@@ -531,4 +563,27 @@ impl<'de> Deserialize<'de> for ClientKeys {
 
         Ok(ClientKeys { keys: keys? })
     }
+}
+
+/// Check file permissions and bail if they're not 0o600 (Unix only).
+#[cfg(unix)]
+fn check_file_permissions(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path).context(format!(
+        "Failed to read metadata for file at '{}'",
+        path.display()
+    ))?;
+    let permissions = metadata.permissions();
+    let mode = permissions.mode() & 0o777;
+
+    // Check if permissions are too permissive (should be 0o600)
+    if mode != 0o600 {
+        bail!(
+            "File at '{}' has insecure permissions: {:o}. \
+            Run: `chmod 600 '{}'`",
+            path.display(),
+            mode,
+            path.display()
+        );
+    }
+    Ok(())
 }

@@ -272,6 +272,14 @@ fn validate_private_key(key_path: &str) -> bool {
         return false;
     }
 
+    // Check file permissions (Unix only)
+    #[cfg(unix)]
+    if let Err(e) = path::check_private_key_permissions(&path) {
+        println!();
+        println!("⚠️ Warning: {}", e);
+        return false;
+    }
+
     match fs::read_to_string(&path) {
         Ok(key_content) => match ParsedPrivateKey::parse(&key_content) {
             Ok(_) => return true,

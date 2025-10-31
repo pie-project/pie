@@ -25,22 +25,20 @@ impl ClientConfig {
         private_key_path: Option<PathBuf>,
     ) -> Result<Self> {
         // Read config file only if when any parameter is missing
-        let config_file = if host.is_none()
-            || port.is_none()
-            || username.is_none()
-            || private_key_path.is_none()
-        {
-            let config_str = match config_path {
+        let config_file =
+            if host.is_none() || port.is_none() || username.is_none() || private_key_path.is_none()
+            {
+                let config_str = match config_path {
                 Some(path) => fs::read_to_string(&path)
                     .context(format!("Failed to read config file at {:?}", path))?,
                 None => fs::read_to_string(&crate::path::get_default_config_path()?).context(
                     "Failed to read default config file. Try running `pie-cli config init` first.",
                 )?,
             };
-            Some(toml::from_str::<crate::config::ConfigFile>(&config_str)?)
-        } else {
-            None
-        };
+                Some(toml::from_str::<crate::config::ConfigFile>(&config_str)?)
+            } else {
+                None
+            };
 
         // Prefer command-line arguments and use config file values if not provided
         let host = host
@@ -69,6 +67,10 @@ impl ClientConfig {
             .map(|p| path::expand_tilde(&p))
             .transpose()?
             .context("Private key is required for authentication")?;
+
+        // Check private key file permissions (Unix only)
+        #[cfg(unix)]
+        path::check_private_key_permissions(&private_key_path)?;
 
         // Read and parse the private key from the file if a path is provided
         let key_content = fs::read_to_string(&private_key_path).context(format!(
