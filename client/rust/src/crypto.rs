@@ -8,6 +8,7 @@ use ring::signature::{
 };
 use rsa::RsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+use rsa::traits::PublicKeyParts;
 use ssh_key::{Algorithm, EcdsaCurve, PrivateKey as SshPrivateKey};
 
 /// Enum representing the supported key types
@@ -27,10 +28,11 @@ impl ParsedPrivateKey {
     /// Parse a private key from PEM or SSH format string.
     ///
     /// Supports:
-    /// - OpenSSH format for RSA, ED25519, and ECDSA keys (e.g., ~/.ssh/id_rsa, ~/.ssh/id_ed25519, ~/.ssh/id_ecdsa)
+    /// - OpenSSH format for RSA, ED25519, and ECDSA keys
     /// - PKCS#8 PEM format for RSA, ED25519, and ECDSA keys
     /// - PKCS#1 PEM format for RSA keys
     /// - ECDSA curves supported: P-256 (nistp256), P-384 (nistp384)
+    /// - RSA keys must be at least 2048 bits (minimum enforced for security)
     pub fn parse(key_content: &str) -> Result<Self> {
         // Try parsing as OpenSSH format first (most common)
         if let Ok(ssh_key) = SshPrivateKey::from_openssh(key_content) {
@@ -64,6 +66,9 @@ impl ParsedPrivateKey {
     fn from_pem(key_content: &str) -> Result<Self> {
         // Try parsing as RSA PKCS#8/PKCS#1 first
         if let Ok(rsa_key) = RsaPrivateKey::from_pkcs8_pem(key_content) {
+            // Check that the key is at least 2048 bits
+            Self::check_rsa_key_size(&rsa_key)?;
+
             // Convert to PKCS#8 DER format expected by the `ring` crate
             let pkcs8_der = rsa_key
                 .to_pkcs8_der()
@@ -131,6 +136,9 @@ impl ParsedPrivateKey {
         // Construct the key from the RSA components
         let rsa_key = RsaPrivateKey::from_components(n, e, d, vec![p, q])
             .context("Failed to construct RSA private key from SSH components")?;
+
+        // Check that the key is at least 2048 bits
+        Self::check_rsa_key_size(&rsa_key)?;
 
         // Convert to PKCS#8 DER format expected by the `ring` crate
         let pkcs8_der = rsa_key
@@ -240,6 +248,18 @@ impl ParsedPrivateKey {
                 bail!("P-521 curve is not supported")
             }
         }
+    }
+
+    /// Check that an RSA private key is at least 2048 bits.
+    fn check_rsa_key_size(rsa_key: &RsaPrivateKey) -> Result<()> {
+        let key_size_bits = rsa_key.size() * 8;
+        if key_size_bits < 2048 {
+            bail!(
+                "RSA key is too weak: {} bits (minimum required: 2048 bits)",
+                key_size_bits
+            );
+        }
+        Ok(())
     }
 
     /// Sign data with the private key.

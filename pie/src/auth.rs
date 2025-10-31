@@ -1,13 +1,13 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use pem;
 use ring::signature::{
-    ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, ED25519, RSA_PKCS1_2048_8192_SHA256,
-    UnparsedPublicKey,
+    UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, ED25519,
+    RSA_PKCS1_2048_8192_SHA256,
 };
-use rsa::RsaPublicKey;
 use rsa::pkcs1::{DecodeRsaPublicKey, EncodeRsaPublicKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::traits::PublicKeyParts;
+use rsa::RsaPublicKey;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ssh_key::public::EcdsaPublicKey;
 use ssh_key::{Algorithm, EcdsaCurve, PublicKey as SshPublicKey};
@@ -166,7 +166,7 @@ impl PublicKey {
     /// - PKCS#1 PEM (RSA)
     ///
     /// Supported key lengths:
-    /// - RSA (2048-8192 bits)
+    /// - RSA (2048-8192 bits, minimum 2048 bits enforced)
     /// - ED25519 (256 bits)
     /// - ECDSA (256, 384 bits)
     pub fn parse(key_content: &str) -> Result<Self> {
@@ -247,6 +247,15 @@ impl PublicKey {
 
     /// Converts from an RSA public key.
     fn from_rsa_key(rsa_key: RsaPublicKey) -> Result<Self> {
+        // Check that the key is at least 2048 bits
+        let key_size_bits = rsa_key.size() * 8;
+        if key_size_bits < 2048 {
+            bail!(
+                "RSA key is too weak: {} bits (minimum required: 2048 bits)",
+                key_size_bits
+            );
+        }
+
         // Convert to PKCS#1 DER format for ring verification
         let pkcs1_der = rsa_key
             .to_pkcs1_der()
