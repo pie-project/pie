@@ -181,21 +181,16 @@ pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Cl
         }
     };
 
-    // Use the private key to authenticate with the server if authentication is enabled.
+    let result = client
+        .authenticate(&client_config.username, &client_config.private_key)
+        .await;
+
     if client_config.enable_auth {
-        let private_key = client_config
-            .private_key
-            .as_ref()
-            .context("Private key is required when authentication is enabled")?;
-        client
-            .authenticate(&client_config.username, private_key)
-            .await?;
-    // Otherwise, ping the server to ensure it doesn't require client authentication.
+        result.context("Failed to authenticate with engine using the specified private key")?;
     } else {
-        client
-            .ping()
-            .await
-            .context("Server requires client authentication")?;
+        result.context(
+            "Failed to authenticate with engine (client public key authentication disabled)",
+        )?;
     }
 
     Ok(client)

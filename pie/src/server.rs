@@ -370,10 +370,6 @@ impl Session {
     }
 
     async fn authenticate(&mut self) -> Result<()> {
-        if !self.state.enable_auth {
-            return Ok(());
-        }
-
         let cmd = tokio::select! {
             biased;
             Some(cmd) = self.client_cmd_rx.recv() => {
@@ -385,13 +381,13 @@ impl Session {
         };
 
         match cmd {
-            SessionEvent::ClientRequest(ClientMessage::Authenticate { corr_id, username }) => {
+            SessionEvent::ClientRequest(ClientMessage::Identification { corr_id, username }) => {
                 self.external_authenticate(corr_id, username).await
             }
             SessionEvent::ClientRequest(ClientMessage::InternalAuthenticate { corr_id, token }) => {
                 self.internal_authenticate(corr_id, token).await
             }
-            _ => bail!("Expected Authenticate message"),
+            _ => bail!("Expected Identification or InternalAuthenticate message"),
         }
     }
 
@@ -410,6 +406,18 @@ impl Session {
                 bail!("User '{}' is not authorized", username)
             }
         };
+
+        // If authentication is disabled, we authorize the user as long as they are
+        // in the authorized users file and need not to challenge them.
+        if !self.state.enable_auth {
+            self.send_response(
+                corr_id,
+                true,
+                "Authenticated (Engine disabled authentication)".to_string(),
+            )
+            .await;
+            return Ok(());
+        }
 
         // Generate a cryptographically secure random challenge (48 bytes = 384 bits)
         // Use `ring::rand::SystemRandom` for cryptographic randomness.
@@ -501,7 +509,7 @@ impl Session {
     async fn handle_command(&mut self, cmd: SessionEvent) {
         match cmd {
             SessionEvent::ClientRequest(message) => match message {
-                ClientMessage::Authenticate { corr_id, .. } => {
+                ClientMessage::Identification { corr_id, .. } => {
                     self.send_response(corr_id, true, "Already authenticated".to_string())
                         .await;
                 }

@@ -33,8 +33,8 @@ impl EventCode {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    #[serde(rename = "authenticate")]
-    Authenticate { corr_id: u32, username: String },
+    #[serde(rename = "identification")]
+    Identification { corr_id: u32, username: String },
 
     #[serde(rename = "signature")]
     Signature { corr_id: u32, signature: String },

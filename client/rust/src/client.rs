@@ -203,7 +203,7 @@ impl Client {
     async fn send_msg_and_wait(&self, mut msg: ClientMessage) -> Result<(bool, String)> {
         let corr_id_new = self.inner.corr_id_pool.lock().await.acquire()?;
         let corr_id_ref = match &mut msg {
-            ClientMessage::Authenticate { corr_id, .. }
+            ClientMessage::Identification { corr_id, .. }
             | ClientMessage::Signature { corr_id, .. }
             | ClientMessage::InternalAuthenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
@@ -225,28 +225,35 @@ impl Client {
     }
 
     /// Authenticates the client with the server using a username and private key.
-    pub async fn authenticate(&self, username: &str, private_key: &ParsedPrivateKey) -> Result<()> {
-        // Send the authentication request to the server to get a challenge
-        let msg = ClientMessage::Authenticate {
+    pub async fn authenticate(
+        &self,
+        username: &str,
+        private_key: &Option<ParsedPrivateKey>,
+    ) -> Result<()> {
+        // Send the authentication request to the engine to get a challenge
+        let msg = ClientMessage::Identification {
             corr_id: 0,
             username: username.to_string(),
         };
-        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        let (successful, result) = self
+            .send_msg_and_wait(msg)
+            .await
+            .context("Failed to send identification message to engine")?;
 
         if !successful {
-            anyhow::bail!(
-                "Authentication failed for username {}: {}",
-                username,
-                result
-            )
+            anyhow::bail!("Username '{}' rejected by engine: {}", username, result)
         }
 
-        // If the server has disabled authentication, we can return early.
-        if result == "Already authenticated" {
+        // If the engine has disabled public key authentication, we can return early.
+        if result == "Authenticated (Engine disabled authentication)" {
             return Ok(());
         }
 
-        // Otherwise, the server has enabled authentication and we need to sign
+        let private_key = private_key
+            .as_ref()
+            .context("Client private key is required when engine uses public key authentication")?;
+
+        // Otherwise, the engine has enabled public key authentication and we need to sign
         // the challenge encoded in base64 with the private key.
         let challenge = base64::engine::general_purpose::STANDARD
             .decode(result.as_bytes())
@@ -264,12 +271,15 @@ impl Client {
             signature,
         };
 
-        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        let (successful, result) = self
+            .send_msg_and_wait(msg)
+            .await
+            .context("Failed to send signature message to engine")?;
         if successful {
             Ok(())
         } else {
             anyhow::bail!(
-                "Signature verification failed for username {}: {}",
+                "Signature verification failed for username '{}': {}",
                 username,
                 result
             )
