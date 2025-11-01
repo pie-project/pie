@@ -101,6 +101,9 @@ pub enum ClientMessage {
 
     #[serde(rename = "internal_authenticate")]
     InternalAuthenticate { corr_id: u32, token: String },
+
+    #[serde(rename = "ping")]
+    Ping { corr_id: u32 },
 }
 
 /// Messages from server -> client

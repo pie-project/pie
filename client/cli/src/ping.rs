@@ -4,9 +4,10 @@
 //! of a running Pie engine instance.
 
 use crate::engine;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 use std::path::PathBuf;
+use std::time::Instant;
 
 /// Arguments for the `pie-cli ping` command.
 #[derive(Args, Debug)]
@@ -48,14 +49,17 @@ pub async fn handle_ping_command(
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
     println!("🔍 Pinging Pie engine at {}", url);
 
-    match engine::connect_and_authenticate(&client_config).await {
-        Ok(_) => {
-            println!("✅ SUCCESS: Pie engine is alive and responsive!");
-            Ok(())
-        }
-        Err(e) => {
-            println!("❌ FAILURE: Could not reach Pie engine.");
-            Err(e)
-        }
-    }
+    let client = engine::connect_and_authenticate(&client_config)
+        .await
+        .context("Failed to connect to Pie engine")?;
+
+    let start_time = Instant::now();
+    client.ping().await.context("Failed to ping Pie engine")?;
+    let duration = start_time.elapsed();
+
+    println!(
+        "✅ Pie engine is alive and responsive! (latency: {:.3}ms)",
+        duration.as_secs_f64() * 1000.0
+    );
+    Ok(())
 }

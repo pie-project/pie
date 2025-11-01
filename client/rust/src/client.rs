@@ -206,7 +206,8 @@ impl Client {
             | ClientMessage::Signature { corr_id, .. }
             | ClientMessage::InternalAuthenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
-            | ClientMessage::LaunchInstance { corr_id, .. } => corr_id,
+            | ClientMessage::LaunchInstance { corr_id, .. }
+            | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
         *corr_id_ref = corr_id_new;
@@ -363,6 +364,16 @@ impl Client {
             })
         } else {
             anyhow::bail!("Launch instance failed: {}", result)
+        }
+    }
+
+    pub async fn ping(&self) -> Result<()> {
+        let msg = ClientMessage::Ping { corr_id: 0 };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        if successful {
+            Ok(())
+        } else {
+            anyhow::bail!("Ping failed: {}", result)
         }
     }
 }

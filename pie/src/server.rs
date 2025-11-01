@@ -590,6 +590,9 @@ impl Session {
                     )
                     .await;
                 }
+                ClientMessage::Ping { corr_id } => {
+                    self.send_response(corr_id, true, "Pong".to_string()).await;
+                }
             },
             SessionEvent::InstanceEvent(cmd) => match cmd {
                 InstanceEvent::SendMsgToClient { inst_id, message } => {
