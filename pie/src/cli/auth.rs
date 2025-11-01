@@ -1,11 +1,11 @@
 //! Authorization management commands for Pie.
 //!
-//! This module implements the `pie auth` commands for managing authorized clients
-//! by adding or removing their public keys in the `authorized_clients.toml` file.
+//! This module implements the `pie auth` commands for managing authorized users
+//! by adding or removing their public keys in the `authorized_users.toml` file.
 
 use super::path;
 use crate::auth::{
-    AuthorizedClients, InsertKeyResult, InsertUserResult, PublicKey, RemoveKeyResult,
+    AuthorizedUsers, InsertKeyResult, InsertUserResult, PublicKey, RemoveKeyResult,
     RemoveUserResult,
 };
 use anyhow::{Context, Result, bail};
@@ -18,25 +18,25 @@ use std::{
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommands {
-    /// Add an authorized client and its public key.
+    /// Add an authorized user and its public key.
     /// The public key is read from stdin and can be in OpenSSH, PKCS#8 PEM, or PKCS#1 PEM format.
     /// If key_name is not provided, the current timestamp will be used.
     Add {
-        /// Username of the client
+        /// Username of the user
         username: String,
         /// Optional name for this key (e.g., 'laptop', 'desktop'). Defaults to current timestamp.
         key_name: Option<String>,
     },
-    /// Remove an authorized client or a specific key.
+    /// Remove an authorized user or a specific key.
     /// If key_name is provided, only that key is removed.
     /// If key_name is not provided, the entire user entry is removed.
     Remove {
-        /// Username of the client
+        /// Username of the user
         username: String,
         /// Optional name of the specific key to remove. If omitted, removes the entire user.
         key_name: Option<String>,
     },
-    /// List all authorized clients and their keys.
+    /// List all authorized users and their keys.
     List,
 }
 
@@ -61,7 +61,7 @@ async fn handle_auth_add_subcommand(username: String, key_name: Option<String>) 
 
     // Only show prompts if stdin is a terminal (interactive mode)
     if io::stdin().is_terminal() {
-        println!("🔐 Adding authorized client...");
+        println!("🔐 Adding authorized user...");
         println!("   Username: {}", username);
         println!("   Key name: {}", key_name);
         println!();
@@ -91,7 +91,7 @@ async fn handle_auth_add_subcommand(username: String, key_name: Option<String>) 
         println!();
         println!("⚠️ Warning: No public key provided");
 
-        let result = add_authorized_client(&username)?;
+        let result = add_authorized_user(&username)?;
 
         match result {
             InsertUserResult::CreatedUser => {
@@ -108,9 +108,9 @@ async fn handle_auth_add_subcommand(username: String, key_name: Option<String>) 
     // Validates that the string is a valid public key by parsing it.
     let public_key = PublicKey::parse(&public_key).context("Failed to parse public key")?;
 
-    // Ensure the client exists first, then add the key
-    let user_result = add_authorized_client(&username)?;
-    let key_result = add_key_for_authorized_client(&username, key_name.clone(), public_key)?;
+    // Ensure the user exists first, then add the key
+    let user_result = add_authorized_user(&username)?;
+    let key_result = add_key_for_authorized_user(&username, key_name.clone(), public_key)?;
 
     println!();
     match key_result {
@@ -144,7 +144,7 @@ async fn handle_auth_remove_subcommand(username: String, key_name: Option<String
     match key_name {
         Some(key_name) => {
             // Remove a specific key
-            let result = remove_authorized_client_key(&username, &key_name)?;
+            let result = remove_authorized_user_key(&username, &key_name)?;
 
             match result {
                 RemoveKeyResult::RemovedKey => {
@@ -160,7 +160,7 @@ async fn handle_auth_remove_subcommand(username: String, key_name: Option<String
         }
         None => {
             // Remove entire user
-            let result = remove_authorized_client(&username)?;
+            let result = remove_authorized_user(&username)?;
 
             match result {
                 RemoveUserResult::RemovedUser => {
@@ -177,45 +177,45 @@ async fn handle_auth_remove_subcommand(username: String, key_name: Option<String
 
 /// Handles the `pie auth list` subcommand.
 async fn handle_auth_list_subcommand() -> Result<()> {
-    let auth_path = path::get_authorized_clients_path()?;
+    let auth_path = path::get_authorized_users_path()?;
 
     // Check if the file exists
     if !auth_path.exists() {
-        println!("📋 No authorized clients found.");
+        println!("📋 No authorized users found.");
         println!("    (File not found at {:?})", auth_path);
         return Ok(());
     }
 
-    // Read and parse the authorized clients file
-    let authorized_clients = AuthorizedClients::load(&auth_path)?;
+    // Read and parse the authorized users file
+    let authorized_users = AuthorizedUsers::load(&auth_path)?;
 
-    // Check if there are any clients
-    if authorized_clients.is_empty() {
-        println!("📋 No authorized clients found.");
+    // Check if there are any users
+    if authorized_users.is_empty() {
+        println!("📋 No authorized users found.");
         return Ok(());
     }
 
-    // Print the list of authorized clients
-    println!("📋 Authorized clients:");
+    // Print the list of authorized users
+    println!("📋 Authorized users:");
     println!("    File: {:?}", auth_path);
     println!();
 
     // Collect and sort usernames for consistent output
-    let mut usernames: Vec<&String> = authorized_clients
+    let mut usernames: Vec<&String> = authorized_users
         .iter()
         .map(|(username, _)| username)
         .collect();
     usernames.sort();
 
     for username in usernames {
-        if let Some(client_keys) = authorized_clients.get(username) {
-            let key_count = client_keys.len();
+        if let Some(user_keys) = authorized_users.get(username) {
+            let key_count = user_keys.len();
             let key_word = if key_count == 1 { "key" } else { "keys" };
             println!("  {} ({} {}):", username, key_count, key_word);
 
             // List individual keys with their names
             // Collect and sort key names for consistent output
-            let mut key_names: Vec<&String> = client_keys.iter().map(|(name, _)| name).collect();
+            let mut key_names: Vec<&String> = user_keys.iter().map(|(name, _)| name).collect();
             key_names.sort();
             for key_name in key_names {
                 println!("    - {}", key_name);
@@ -224,89 +224,89 @@ async fn handle_auth_list_subcommand() -> Result<()> {
     }
 
     println!();
-    println!("Total: {} authorized client(s)", authorized_clients.len());
+    println!("Total: {} authorized user(s)", authorized_users.len());
 
     Ok(())
 }
 
-/// Creates an authorized client entry in the `authorized_clients.toml` file.
-/// Does nothing if the client already exists.
-fn add_authorized_client(username: &str) -> Result<InsertUserResult> {
-    let auth_path = path::get_authorized_clients_path()?;
+/// Creates an authorized user entry in the `authorized_users.toml` file.
+/// Does nothing if the user already exists.
+fn add_authorized_user(username: &str) -> Result<InsertUserResult> {
+    let auth_path = path::get_authorized_users_path()?;
 
     // Create the directory if it doesn't exist
     if let Some(parent) = auth_path.parent() {
         fs::create_dir_all(parent).context(format!(
-            "Failed to create authorized clients directory at {:?}",
+            "Failed to create authorized users directory at {:?}",
             parent
         ))?;
     }
 
-    // Read existing authorized clients or create a new structure
-    let mut authorized_clients = if auth_path.exists() {
-        AuthorizedClients::load(&auth_path)?
+    // Read existing authorized users or create a new structure
+    let mut authorized_users = if auth_path.exists() {
+        AuthorizedUsers::load(&auth_path)?
     } else {
-        AuthorizedClients::default()
+        AuthorizedUsers::default()
     };
 
     // Add the user without keys
-    let result = authorized_clients.insert_user(username);
+    let result = authorized_users.insert_user(username);
 
     // Serialize and write back to file
-    authorized_clients.save(&auth_path)?;
+    authorized_users.save(&auth_path)?;
 
     Ok(result)
 }
 
-/// Adds a key to an authorized client in the `authorized_clients.toml` file.
-fn add_key_for_authorized_client(
+/// Adds a key to an authorized user in the `authorized_users.toml` file.
+fn add_key_for_authorized_user(
     username: &str,
     key_name: String,
     public_key: PublicKey,
 ) -> Result<InsertKeyResult> {
-    let auth_path = path::get_authorized_clients_path()?;
+    let auth_path = path::get_authorized_users_path()?;
 
-    // Read existing authorized clients
-    let mut authorized_clients =
-        AuthorizedClients::load(&auth_path).context("Failed to load authorized clients file")?;
+    // Read existing authorized users
+    let mut authorized_users =
+        AuthorizedUsers::load(&auth_path).context("Failed to load authorized users file")?;
 
     // Add the key to the user
-    let result = authorized_clients.insert_key_for_user(username, key_name, public_key);
+    let result = authorized_users.insert_key_for_user(username, key_name, public_key);
 
     // Serialize and write back to file
-    authorized_clients.save(&auth_path)?;
+    authorized_users.save(&auth_path)?;
 
     Ok(result)
 }
 
-/// Removes an authorized client from the `authorized_clients.toml` file.
-fn remove_authorized_client(username: &str) -> Result<RemoveUserResult> {
-    let auth_path = path::get_authorized_clients_path()?;
+/// Removes an authorized user from the `authorized_users.toml` file.
+fn remove_authorized_user(username: &str) -> Result<RemoveUserResult> {
+    let auth_path = path::get_authorized_users_path()?;
 
     // Check if the file exists
     if !auth_path.exists() {
         bail!(
-            "Authorized clients file not found at {:?}. No clients to remove.",
+            "Authorized users file not found at {:?}. No users to remove.",
             auth_path
         );
     }
 
-    // Read existing authorized clients
-    let mut authorized_clients = AuthorizedClients::load(&auth_path)?;
+    // Read existing authorized users
+    let mut authorized_users = AuthorizedUsers::load(&auth_path)?;
 
     // Check if user exists and get key count for confirmation prompt
-    let client_keys = authorized_clients.get(username);
-    if client_keys.is_none() {
+    let user_keys = authorized_users.get(username);
+    if user_keys.is_none() {
         return Ok(RemoveUserResult::UserNotFound);
     }
 
     // Get the number of keys for the user
-    let key_count = client_keys.unwrap().len();
+    let key_count = user_keys.unwrap().len();
 
     // Prompt for confirmation if stdin is a terminal
     if io::stdin().is_terminal() {
         print!(
-            "⚠️  This will remove user '{}' and all {} key(s). Continue? (y/N): ",
+            "⚠️ This will remove user '{}' and all {} key(s). Continue? (y/N): ",
             username, key_count
         );
         io::stdout().flush().context("Failed to flush stdout")?;
@@ -324,34 +324,34 @@ fn remove_authorized_client(username: &str) -> Result<RemoveUserResult> {
     }
 
     // Remove the user
-    let result = authorized_clients.remove_user(username);
+    let result = authorized_users.remove_user(username);
 
     // Serialize and write back to file
-    authorized_clients.save(&auth_path)?;
+    authorized_users.save(&auth_path)?;
 
     Ok(result)
 }
 
-/// Removes a specific key from an authorized client in the `authorized_clients.toml` file.
-fn remove_authorized_client_key(username: &str, key_name: &str) -> Result<RemoveKeyResult> {
-    let auth_path = path::get_authorized_clients_path()?;
+/// Removes a specific key from an authorized user in the `authorized_users.toml` file.
+fn remove_authorized_user_key(username: &str, key_name: &str) -> Result<RemoveKeyResult> {
+    let auth_path = path::get_authorized_users_path()?;
 
     // Check if the file exists
     if !auth_path.exists() {
         bail!(
-            "Authorized clients file not found at {:?}. No clients to remove.",
+            "Authorized users file not found at {:?}. No users to remove.",
             auth_path
         );
     }
 
-    // Read existing authorized clients
-    let mut authorized_clients = AuthorizedClients::load(&auth_path)?;
+    // Read existing authorized users
+    let mut authorized_users = AuthorizedUsers::load(&auth_path)?;
 
     // Remove the specific key
-    let result = authorized_clients.remove_key(username, key_name);
+    let result = authorized_users.remove_key(username, key_name);
 
     // Serialize and write back to file
-    authorized_clients.save(&auth_path)?;
+    authorized_users.save(&auth_path)?;
 
     Ok(result)
 }

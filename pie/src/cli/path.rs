@@ -35,10 +35,10 @@ pub fn get_shell_history_path() -> Result<PathBuf> {
     Ok(history_path)
 }
 
-pub fn get_authorized_clients_path() -> Result<PathBuf> {
+pub fn get_authorized_users_path() -> Result<PathBuf> {
     let pie_home = get_pie_home()?;
-    let authorized_clients_path = pie_home.join("authorized_clients.toml");
-    Ok(authorized_clients_path)
+    let authorized_users_path = pie_home.join("authorized_users.toml");
+    Ok(authorized_users_path)
 }
 
 /// Helper for clap to expand `~` in path arguments.

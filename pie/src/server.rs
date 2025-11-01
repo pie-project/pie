@@ -3,7 +3,7 @@ use super::messaging::dispatch_u2i;
 use super::service::{Service, ServiceError, install_service};
 use super::utils::IdPool;
 use super::{messaging, runtime, service};
-use crate::auth::{AuthorizedClients, PublicKey};
+use crate::auth::{AuthorizedUsers, PublicKey};
 use crate::model;
 use crate::model::Model;
 use anyhow::{Result, anyhow, bail};
@@ -101,7 +101,7 @@ impl InternalEvent {
 
 struct ServerState {
     enable_auth: bool,
-    authorized_clients: AuthorizedClients,
+    authorized_users: AuthorizedUsers,
     internal_auth_token: String,
     client_id_pool: Mutex<IdPool<ClientId>>,
     clients: DashMap<ClientId, JoinHandle<()>>,
@@ -177,12 +177,12 @@ impl Server {
     pub fn new(
         ip_port: &str,
         enable_auth: bool,
-        authorized_clients: AuthorizedClients,
+        authorized_users: AuthorizedUsers,
         internal_auth_token: String,
     ) -> Self {
         let state = Arc::new(ServerState {
             enable_auth,
-            authorized_clients,
+            authorized_users,
             internal_auth_token,
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
@@ -397,8 +397,8 @@ impl Session {
 
     /// Authenticates a user client using public key.
     async fn external_authenticate(&mut self, corr_id: u32, username: String) -> Result<()> {
-        // Check if the username is in the authorized clients file and get the user's public keys
-        let public_keys: Vec<PublicKey> = match self.state.authorized_clients.get(&username) {
+        // Check if the username is in the authorized users file and get the user's public keys
+        let public_keys: Vec<PublicKey> = match self.state.authorized_users.get(&username) {
             Some(keys) => keys.public_keys().cloned().collect(),
             None => {
                 self.send_response(

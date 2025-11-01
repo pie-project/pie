@@ -19,12 +19,12 @@ use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-/// Structure representing the authorized_clients.toml file format.
+/// Structure representing the authorized_users.toml file format.
 #[derive(Deserialize, Serialize, Debug, Default)]
-pub struct AuthorizedClients {
+pub struct AuthorizedUsers {
     /// Map of username to their list of authorized public keys
     #[serde(default)]
-    clients: HashMap<String, ClientKeys>,
+    users: HashMap<String, UserKeys>,
 }
 
 /// Result of inserting a user
@@ -67,24 +67,24 @@ pub enum RemoveUserResult {
     UserNotFound,
 }
 
-impl AuthorizedClients {
-    /// Loads the authorized clients from the given TOML file.
+impl AuthorizedUsers {
+    /// Loads the authorized users from the given TOML file.
     pub fn load(auth_path: &Path) -> Result<Self> {
         // Check file permissions (Unix only)
         #[cfg(unix)]
         check_file_permissions(auth_path)?;
 
         let content = fs::read_to_string(auth_path).context(format!(
-            "Failed to read authorized clients file at '{}'",
+            "Failed to read authorized users file at '{}'",
             auth_path.display()
         ))?;
         toml::from_str(&content).context(format!(
-            "Failed to parse authorized clients file at '{}'",
+            "Failed to parse authorized users file at '{}'",
             auth_path.display()
         ))
     }
 
-    /// Saves the authorized clients to the given TOML file.
+    /// Saves the authorized users to the given TOML file.
     pub fn save(&self, auth_path: &Path) -> Result<()> {
         if let Some(parent) = auth_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -113,39 +113,39 @@ impl AuthorizedClients {
         }
 
         let content = toml::to_string_pretty(self)
-            .context(format!("Failed to serialize authorized clients to TOML"))?;
+            .context(format!("Failed to serialize authorized users to TOML"))?;
         fs::write(auth_path, content).context(format!(
-            "Failed to write authorized clients file at '{}'",
+            "Failed to write authorized users file at {}",
             auth_path.display()
         ))
     }
 
-    /// Checks if the authorized clients are empty.
+    /// Checks if the authorized users are empty.
     pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
+        self.users.is_empty()
     }
 
-    /// Returns the number of authorized clients.
+    /// Returns the number of authorized users.
     pub fn len(&self) -> usize {
-        self.clients.len()
+        self.users.len()
     }
 
-    /// Returns an iterator over the authorized clients.
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &ClientKeys)> {
-        self.clients.iter()
+    /// Returns an iterator over the authorized users.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &UserKeys)> {
+        self.users.iter()
     }
 
-    /// Returns the client keys for the given username.
-    pub fn get(&self, username: &str) -> Option<&ClientKeys> {
-        self.clients.get(username)
+    /// Returns the user keys for the given username.
+    pub fn get(&self, username: &str) -> Option<&UserKeys> {
+        self.users.get(username)
     }
 
     /// Inserts a new authorized user without any keys.
     pub fn insert_user(&mut self, username: &str) -> InsertUserResult {
-        if self.clients.contains_key(username) {
+        if self.users.contains_key(username) {
             InsertUserResult::UserExists
         } else {
-            self.clients.insert(username.to_owned(), ClientKeys::new());
+            self.users.insert(username.to_owned(), UserKeys::new());
             InsertUserResult::CreatedUser
         }
     }
@@ -158,11 +158,11 @@ impl AuthorizedClients {
         key_name: String,
         public_key: PublicKey,
     ) -> InsertKeyResult {
-        if let Some(client_keys) = self.clients.get_mut(username) {
-            if client_keys.has_key_name(&key_name) {
+        if let Some(user_keys) = self.users.get_mut(username) {
+            if user_keys.has_key_name(&key_name) {
                 InsertKeyResult::KeyNameExists
             } else {
-                client_keys.insert_key(key_name, public_key);
+                user_keys.insert_key(key_name, public_key);
                 InsertKeyResult::AddedKey
             }
         } else {
@@ -172,8 +172,8 @@ impl AuthorizedClients {
 
     /// Removes a specific key from a user by key name.
     pub fn remove_key(&mut self, username: &str, key_name: &str) -> RemoveKeyResult {
-        if let Some(client_keys) = self.clients.get_mut(username) {
-            let removed = client_keys.remove_key(key_name);
+        if let Some(user_keys) = self.users.get_mut(username) {
+            let removed = user_keys.remove_key(key_name);
             if removed {
                 RemoveKeyResult::RemovedKey
             } else {
@@ -184,9 +184,9 @@ impl AuthorizedClients {
         }
     }
 
-    /// Removes an authorized user and all their public keys from the authorized clients.
+    /// Removes an authorized user and all their public keys from the authorized users.
     pub fn remove_user(&mut self, username: &str) -> RemoveUserResult {
-        if self.clients.remove(username).is_some() {
+        if self.users.remove(username).is_some() {
             RemoveUserResult::RemovedUser
         } else {
             RemoveUserResult::UserNotFound
@@ -481,15 +481,15 @@ impl PublicKey {
     }
 }
 
-/// Structure representing keys for a single client/user.
+/// Structure representing keys for a single user.
 #[derive(Debug)]
-pub struct ClientKeys {
+pub struct UserKeys {
     /// Map of key names to their public keys
     /// Key names must be unique per user, but the same public key can have multiple names
     keys: HashMap<String, PublicKey>,
 }
 
-impl ClientKeys {
+impl UserKeys {
     fn new() -> Self {
         Self {
             keys: HashMap::new(),
@@ -528,7 +528,7 @@ impl ClientKeys {
     }
 }
 
-impl Serialize for ClientKeys {
+impl Serialize for UserKeys {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -547,23 +547,23 @@ impl Serialize for ClientKeys {
             .collect();
 
         let keys_map = keys_map?;
-        let mut state = serializer.serialize_struct("ClientKeys", 1)?;
+        let mut state = serializer.serialize_struct("UserKeys", 1)?;
         state.serialize_field("keys", &keys_map)?;
         state.end()
     }
 }
 
-impl<'de> Deserialize<'de> for ClientKeys {
+impl<'de> Deserialize<'de> for UserKeys {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct ClientKeysHelper {
+        struct UserKeysHelper {
             keys: HashMap<String, String>,
         }
 
-        let helper = ClientKeysHelper::deserialize(deserializer)?;
+        let helper = UserKeysHelper::deserialize(deserializer)?;
         let keys: Result<HashMap<String, PublicKey>, _> = helper
             .keys
             .into_iter()
@@ -579,7 +579,7 @@ impl<'de> Deserialize<'de> for ClientKeys {
             })
             .collect();
 
-        Ok(ClientKeys { keys: keys? })
+        Ok(UserKeys { keys: keys? })
     }
 }
 

@@ -1,6 +1,6 @@
 //! Engine and backend management for the Pie CLI.
 
-use crate::auth::AuthorizedClients;
+use crate::auth::AuthorizedUsers;
 use crate::config::ConfigFile;
 use crate::engine;
 use crate::output::SharedPrinter;
@@ -108,11 +108,11 @@ pub async fn start_engine_and_backend(
         internal_auth_token: None,
     };
 
-    let authorized_clients_path = path::get_authorized_clients_path()?;
-    let authorized_clients = if authorized_clients_path.exists() {
-        AuthorizedClients::load(&authorized_clients_path)?
+    let authorized_users_path = path::get_authorized_users_path()?;
+    let authorized_users = if authorized_users_path.exists() {
+        AuthorizedUsers::load(&authorized_users_path)?
     } else {
-        AuthorizedClients::default()
+        AuthorizedUsers::default()
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -122,7 +122,7 @@ pub async fn start_engine_and_backend(
     println!("🚀 Starting Pie engine...");
     let server_handle = tokio::spawn(async move {
         if let Err(e) =
-            engine::run_server(engine_config, authorized_clients, ready_tx, shutdown_rx).await
+            engine::run_server(engine_config, authorized_users, ready_tx, shutdown_rx).await
         {
             eprintln!("\n[Engine Error] Engine failed: {}", e);
         }

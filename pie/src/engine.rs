@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
-use crate::auth::AuthorizedClients;
+use crate::auth::AuthorizedUsers;
 use crate::kvs::KeyValueStore;
 use crate::messaging::{PubSub, PushPull};
 use crate::runtime::Runtime;
@@ -28,7 +28,7 @@ pub struct Config {
 /// signal to terminate gracefully.
 pub async fn run_server(
     config: Config,
-    authorized_clients: AuthorizedClients,
+    authorized_users: AuthorizedUsers,
     ready_tx: oneshot::Sender<String>,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -90,7 +90,7 @@ pub async fn run_server(
     let server = Server::new(
         &server_url,
         config.enable_auth,
-        authorized_clients,
+        authorized_users,
         internal_auth_token.clone(),
     );
     let messaging_inst2inst = PubSub::new();
