@@ -27,26 +27,42 @@ pub struct AuthorizedClients {
     clients: HashMap<String, ClientKeys>,
 }
 
-/// Result of inserting a key
+/// Result of inserting a user
+#[derive(Debug, PartialEq)]
+pub enum InsertUserResult {
+    /// User was created
+    CreatedUser,
+    /// User already exists
+    UserExists,
+}
+
+/// Result of inserting a key for a user
 #[derive(Debug, PartialEq)]
 pub enum InsertKeyResult {
-    /// A new user was created with this key
-    CreatedUser,
-    /// Key was added to an existing user
+    /// Key was added successfully
     AddedKey,
     /// A key with this name already exists for this user
     KeyNameExists,
+    /// User not found
+    UserNotFound,
 }
 
 /// Result of removing a key
 #[derive(Debug, PartialEq)]
 pub enum RemoveKeyResult {
-    /// Key was removed and it was the last key for the user (user entry also removed)
-    RemovedLastKey,
-    /// Key was removed but user still has other keys
+    /// Key was removed successfully
     RemovedKey,
     /// Key name not found for this user
     KeyNotFound,
+    /// User not found
+    UserNotFound,
+}
+
+/// Result of removing a user
+#[derive(Debug, PartialEq)]
+pub enum RemoveUserResult {
+    /// User was removed
+    RemovedUser,
     /// User not found
     UserNotFound,
 }
@@ -124,55 +140,57 @@ impl AuthorizedClients {
         self.clients.get(username)
     }
 
-    /// Inserts a new authorized client and its public key into the authorized clients.
+    /// Inserts a new authorized user without any keys.
+    pub fn insert_user(&mut self, username: &str) -> InsertUserResult {
+        if self.clients.contains_key(username) {
+            InsertUserResult::UserExists
+        } else {
+            self.clients.insert(username.to_owned(), ClientKeys::new());
+            InsertUserResult::CreatedUser
+        }
+    }
+
+    /// Adds a key to an existing authorized user.
     /// Key names must be unique per user.
-    pub fn insert(
+    pub fn insert_key_for_user(
         &mut self,
         username: &str,
         key_name: String,
         public_key: PublicKey,
     ) -> InsertKeyResult {
-        let mut result = InsertKeyResult::AddedKey;
-        self.clients
-            .entry(username.to_owned())
-            .and_modify(|client_keys| {
-                if client_keys.has_key_name(&key_name) {
-                    result = InsertKeyResult::KeyNameExists;
-                } else {
-                    client_keys.insert_key(key_name.clone(), public_key.clone());
-                    result = InsertKeyResult::AddedKey;
-                }
-            })
-            .or_insert_with(|| {
-                result = InsertKeyResult::CreatedUser;
-                ClientKeys::new(key_name, public_key)
-            });
-        result
+        if let Some(client_keys) = self.clients.get_mut(username) {
+            if client_keys.has_key_name(&key_name) {
+                InsertKeyResult::KeyNameExists
+            } else {
+                client_keys.insert_key(key_name, public_key);
+                InsertKeyResult::AddedKey
+            }
+        } else {
+            InsertKeyResult::UserNotFound
+        }
     }
 
     /// Removes a specific key from a user by key name.
     pub fn remove_key(&mut self, username: &str, key_name: &str) -> RemoveKeyResult {
         if let Some(client_keys) = self.clients.get_mut(username) {
             let removed = client_keys.remove_key(key_name);
-            if !removed {
-                return RemoveKeyResult::KeyNotFound;
-            }
-
-            // If the user has no keys left, remove the user entirely
-            if client_keys.len() == 0 {
-                self.clients.remove(username);
-                RemoveKeyResult::RemovedLastKey
-            } else {
+            if removed {
                 RemoveKeyResult::RemovedKey
+            } else {
+                RemoveKeyResult::KeyNotFound
             }
         } else {
             RemoveKeyResult::UserNotFound
         }
     }
 
-    /// Removes an authorized client and its public keys from the authorized clients.
-    pub fn remove(&mut self, username: &str) -> Option<ClientKeys> {
-        self.clients.remove(username)
+    /// Removes an authorized user and all their public keys from the authorized clients.
+    pub fn remove_user(&mut self, username: &str) -> RemoveUserResult {
+        if self.clients.remove(username).is_some() {
+            RemoveUserResult::RemovedUser
+        } else {
+            RemoveUserResult::UserNotFound
+        }
     }
 }
 
@@ -472,10 +490,10 @@ pub struct ClientKeys {
 }
 
 impl ClientKeys {
-    fn new(name: String, public_key: PublicKey) -> Self {
-        let mut keys = HashMap::new();
-        keys.insert(name, public_key);
-        Self { keys }
+    fn new() -> Self {
+        Self {
+            keys: HashMap::new(),
+        }
     }
 
     /// Returns the number of keys in the client.
