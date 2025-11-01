@@ -181,6 +181,7 @@ pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Cl
         }
     };
 
+    // Use the private key to authenticate with the server if authentication is enabled.
     if client_config.enable_auth {
         let private_key = client_config
             .private_key
@@ -189,6 +190,12 @@ pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Cl
         client
             .authenticate(&client_config.username, private_key)
             .await?;
+    // Otherwise, ping the server to ensure it doesn't require client authentication.
+    } else {
+        client
+            .ping()
+            .await
+            .context("Server requires client authentication")?;
     }
 
     Ok(client)

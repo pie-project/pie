@@ -182,6 +182,7 @@ impl Client {
                     _ => {}
                 }
             }
+            handle_server_termination(&reader_inner).await;
         });
 
         Ok(Client {
@@ -465,4 +466,12 @@ async fn handle_server_message(
             }
         }
     }
+}
+
+/// When the server teminates, clear all pending requests, instance events, and downloads
+/// to avoid locking up the client indefinitely.
+async fn handle_server_termination(inner: &Arc<ClientInner>) {
+    inner.pending_requests.clear();
+    inner.inst_event_tx.clear();
+    inner.pending_downloads.clear();
 }
