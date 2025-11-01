@@ -13,7 +13,8 @@ pub struct ClientConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
-    pub private_key: ParsedPrivateKey,
+    pub private_key: Option<ParsedPrivateKey>,
+    pub enable_auth: bool,
 }
 
 impl ClientConfig {
@@ -53,40 +54,51 @@ impl ClientConfig {
             .or(config_file.as_ref().and_then(|cfg| cfg.username.clone()))
             .unwrap_or(whoami::username());
 
-        // Get the private key path from either command-line or config file
-        let private_key_path = private_key_path
-            .or(config_file
-                .as_ref()
-                .and_then(|cfg| cfg.private_key_path.clone()))
-            .map(|p| {
-                p.to_str()
-                    .map(|s| s.to_owned())
-                    .context("Private key path is not a valid UTF-8 string")
-            })
-            .transpose()?
-            .map(|p| path::expand_tilde(&p))
-            .transpose()?
-            .context("Private key is required for authentication")?;
+        // Get enable_auth setting (default to true if not specified)
+        let enable_auth = config_file
+            .as_ref()
+            .and_then(|cfg| cfg.enable_auth)
+            .unwrap_or(true);
 
-        // Check private key file permissions (Unix only)
-        #[cfg(unix)]
-        path::check_private_key_permissions(&private_key_path)?;
+        let mut private_key = None;
 
-        // Read and parse the private key from the file if a path is provided
-        let key_content = fs::read_to_string(&private_key_path).context(format!(
-            "Failed to read private key file at {:?}",
-            private_key_path
-        ))?;
-        let private_key = ParsedPrivateKey::parse(&key_content).context(format!(
-            "Failed to parse private key from {:?}",
-            private_key_path
-        ))?;
+        // Load the private key only if authentication is enabled
+        if enable_auth {
+            let private_key_path = private_key_path
+                .or(config_file
+                    .as_ref()
+                    .and_then(|cfg| cfg.private_key_path.clone()))
+                .map(|p| {
+                    p.to_str()
+                        .map(|s| s.to_owned())
+                        .context("Private key path is not a valid UTF-8 string")
+                })
+                .transpose()?
+                .map(|p| path::expand_tilde(&p))
+                .transpose()?
+                .context("Private key is required when authentication is enabled")?;
+
+            // Check private key file permissions (Unix only)
+            #[cfg(unix)]
+            path::check_private_key_permissions(&private_key_path)?;
+
+            // Read and parse the private key from the file if a path is provided
+            let key_content = fs::read_to_string(&private_key_path).context(format!(
+                "Failed to read private key file at {:?}",
+                private_key_path
+            ))?;
+            private_key = Some(ParsedPrivateKey::parse(&key_content).context(format!(
+                "Failed to parse private key from {:?}",
+                private_key_path
+            ))?);
+        }
 
         Ok(Self {
             host,
             port,
             username,
             private_key,
+            enable_auth,
         })
     }
 }
@@ -159,7 +171,7 @@ async fn stream_inferlet_output(mut instance: Instance) -> Result<()> {
     }
 }
 
-/// Connects to the engine and authenticates the client.
+/// Connects to the engine and authenticates the client if authentication is enabled.
 pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
     let client = match Client::connect(&url).await {
@@ -169,8 +181,15 @@ pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Cl
         }
     };
 
-    client
-        .authenticate(&client_config.username, &client_config.private_key)
-        .await?;
+    if client_config.enable_auth {
+        let private_key = client_config
+            .private_key
+            .as_ref()
+            .context("Private key is required when authentication is enabled")?;
+        client
+            .authenticate(&client_config.username, private_key)
+            .await?;
+    }
+
     Ok(client)
 }

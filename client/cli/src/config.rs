@@ -17,7 +17,11 @@ use std::{
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommands {
     /// Create a default config file.
-    Init,
+    Init {
+        /// Enable authentication
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        enable_auth: bool,
+    },
     /// Update the entries of the default config file.
     Update(ConfigUpdateArgs),
     /// Show the content of the default config file.
@@ -38,6 +42,9 @@ pub struct ConfigUpdateArgs {
     /// Path to private key file
     #[arg(long, value_parser = path::expand_tilde)]
     pub private_key_path: Option<PathBuf>,
+    /// Enable authentication
+    #[arg(long)]
+    pub enable_auth: Option<bool>,
 }
 
 // Helper struct for parsing the TOML config file
@@ -47,19 +54,20 @@ pub struct ConfigFile {
     pub port: Option<u16>,
     pub username: Option<String>,
     pub private_key_path: Option<PathBuf>,
+    pub enable_auth: Option<bool>,
 }
 
 /// Handles the `pie-cli config` command.
 pub async fn handle_config_command(command: ConfigCommands) -> Result<()> {
     match command {
-        ConfigCommands::Init => handle_config_init_subcommand().await,
+        ConfigCommands::Init { enable_auth } => handle_config_init_subcommand(enable_auth).await,
         ConfigCommands::Update(args) => handle_config_update_subcommand(args).await,
         ConfigCommands::Show => handle_config_show_subcommand().await,
     }
 }
 
 /// Create a default config file.
-async fn handle_config_init_subcommand() -> Result<()> {
+async fn handle_config_init_subcommand(enable_auth: bool) -> Result<()> {
     let config_path = path::get_default_config_path()?;
 
     // Check if config file already exists
@@ -85,41 +93,46 @@ async fn handle_config_init_subcommand() -> Result<()> {
     }
 
     // Find the SSH key or use default
-    let found_key_path = find_ssh_key().context("Failed to find SSH key")?;
+    let found_key_path = find_ssh_key().context("Failed when searching for SSH key")?;
     const DEFAULT_KEY_PATH: &str = "~/.ssh/id_ed25519";
 
     // Create the config file with default content
-    let default_content =
-        create_default_config_content(found_key_path.as_deref().unwrap_or(DEFAULT_KEY_PATH));
+    let default_content = create_default_config_content(
+        found_key_path.as_deref().unwrap_or(DEFAULT_KEY_PATH),
+        enable_auth,
+    );
     fs::write(&config_path, &default_content)
         .context(format!("Failed to write config file at {:?}", config_path))?;
 
     println!("✅ Created default configuration file at {:?}", config_path);
     print_default_config_content(&default_content);
 
-    // If the key exists, print it and validate it
-    if let Some(found_key_path) = found_key_path {
-        println!("✅ Using private key found at {:?}", found_key_path);
-        println!("   You can update the key path in the config file:");
-        println!("      `pie-cli config update --private-key-path <path>`");
+    // Print messages about the private key if authentication is enabled
+    if enable_auth {
+        // If the key exists, print it and validate it
+        if let Some(found_key_path) = found_key_path {
+            println!("✅ Using private key found at {:?}", found_key_path);
+            println!("   You can update the key path in the config file:");
+            println!("      `pie-cli config update --private-key-path <path>`");
 
-        if !validate_private_key(&found_key_path) {
+            if !validate_private_key(&found_key_path) {
+                println!(
+                    "   The configuration has been saved, but you'll need to \
+                    provide a valid key to connect."
+                );
+            }
+        // Otherwise, warn if the key doesn't exist
+        } else {
+            println!();
             println!(
-                "   The configuration has been saved, but you'll need to \
-                provide a valid key to connect."
+                "⚠️ Warning: Private key not found in '~/.ssh', using default path: '{}'",
+                DEFAULT_KEY_PATH
             );
+            println!("   Please take either of the following actions when using authentication:");
+            println!("   1. Generate an SSH key pair by running `ssh-keygen`");
+            println!("   2. Update the key path in the config file:");
+            println!("      `pie-cli config update --private-key-path <path>`");
         }
-    // Otherwise, warn if the key doesn't exist
-    } else {
-        println!();
-        println!(
-            "⚠️ Warning: Private key not found in '~/.ssh', using default path: '{}'",
-            DEFAULT_KEY_PATH
-        );
-        println!("   Please take either of the following actions:");
-        println!("   1. Generate an SSH key pair by running `ssh-keygen`");
-        println!("   2. Update the key path in the config file:");
-        println!("      `pie-cli config update --private-key-path <path>`");
     }
 
     Ok(())
@@ -167,6 +180,10 @@ async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
         updated.push(format!("private_key_path = \"{}\"", path_str));
         updated_key_path = Some(path_str.clone());
         config.private_key_path = Some(private_key_path);
+    }
+    if let Some(enable_auth) = args.enable_auth {
+        updated.push(format!("enable_auth = {}", enable_auth));
+        config.enable_auth = Some(enable_auth);
     }
 
     if updated.is_empty() {
@@ -248,15 +265,19 @@ fn find_ssh_key() -> Result<Option<String>> {
 }
 
 /// Create the default content of the config file.
-fn create_default_config_content(private_key_path: &str) -> String {
+fn create_default_config_content(private_key_path: &str, enable_auth: bool) -> String {
+    let private_key_path = if enable_auth { private_key_path } else { "" };
+
     format!(
         r#"host = "127.0.0.1"
 port = 8080
 username = "{username}"
 private_key_path = "{private_key_path}"
+enable_auth = {enable_auth}
 "#,
         username = whoami::username(),
-        private_key_path = private_key_path
+        private_key_path = private_key_path,
+        enable_auth = enable_auth
     )
 }
 
