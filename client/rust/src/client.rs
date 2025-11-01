@@ -47,7 +47,7 @@ pub struct Client {
 #[derive(Debug)]
 struct ClientInner {
     ws_writer_tx: UnboundedSender<Message>,
-    corr_id_pool: Mutex<IdPool<CorrId>>,
+    corr_id_pool: IdPool<CorrId>,
     pending_requests: DashMap<CorrId, oneshot::Sender<(bool, String)>>,
     inst_event_tx: DashMap<InstanceId, mpsc::Sender<InstanceEvent>>,
     // Use a Mutex per entry to avoid deadlocking the DashMap shard
@@ -87,9 +87,9 @@ impl Instance {
     /// Uploads a binary blob to the instance, handling chunking and awaiting confirmation.
     pub async fn upload_blob(&self, blob: &[u8]) -> Result<()> {
         let blob_hash = hash_blob(blob);
-        let corr_id = self.inner.corr_id_pool.lock().await.acquire()?;
+        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let (tx, rx) = oneshot::channel();
-        self.inner.pending_requests.insert(corr_id, tx);
+        self.inner.pending_requests.insert(*corr_id_guard, tx);
 
         let total_size = blob.len();
         // An empty blob is sent as one empty chunk.
@@ -103,7 +103,7 @@ impl Instance {
             let start = chunk_index * CHUNK_SIZE_BYTES;
             let end = (start + CHUNK_SIZE_BYTES).min(total_size);
             let msg = ClientMessage::UploadBlob {
-                corr_id,
+                corr_id: *corr_id_guard,
                 instance_id: self.id.to_string(),
                 blob_hash: blob_hash.clone(),
                 chunk_index,
@@ -116,7 +116,7 @@ impl Instance {
         }
 
         let (successful, result) = rx.await?;
-        self.inner.corr_id_pool.lock().await.release(corr_id)?;
+
         if successful {
             Ok(())
         } else {
@@ -153,7 +153,7 @@ impl Client {
 
         let inner = Arc::new(ClientInner {
             ws_writer_tx: ws_writer_tx.clone(),
-            corr_id_pool: Mutex::new(IdPool::new(CorrId::MAX)),
+            corr_id_pool: IdPool::new(CorrId::MAX),
             pending_requests: DashMap::new(),
             inst_event_tx: DashMap::new(),
             pending_downloads: DashMap::new(),
@@ -201,7 +201,7 @@ impl Client {
     }
 
     async fn send_msg_and_wait(&self, mut msg: ClientMessage) -> Result<(bool, String)> {
-        let corr_id_new = self.inner.corr_id_pool.lock().await.acquire()?;
+        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let corr_id_ref = match &mut msg {
             ClientMessage::Identification { corr_id, .. }
             | ClientMessage::Signature { corr_id, .. }
@@ -211,16 +211,15 @@ impl Client {
             | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
-        *corr_id_ref = corr_id_new;
+        *corr_id_ref = *corr_id_guard;
 
         let (tx, rx) = oneshot::channel();
-        self.inner.pending_requests.insert(corr_id_new, tx);
+        self.inner.pending_requests.insert(*corr_id_guard, tx);
         self.inner
             .ws_writer_tx
             .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
 
         let (successful, result) = rx.await?;
-        self.inner.corr_id_pool.lock().await.release(corr_id_new)?;
         Ok((successful, result))
     }
 
@@ -324,9 +323,9 @@ impl Client {
 
     pub async fn upload_program(&self, blob: &[u8]) -> Result<()> {
         let program_hash = hash_blob(blob);
-        let corr_id = self.inner.corr_id_pool.lock().await.acquire()?;
+        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let (tx, rx) = oneshot::channel();
-        self.inner.pending_requests.insert(corr_id, tx);
+        self.inner.pending_requests.insert(*corr_id_guard, tx);
 
         let total_size = blob.len();
         let total_chunks = if total_size == 0 {
@@ -339,7 +338,7 @@ impl Client {
             let start = chunk_index * CHUNK_SIZE_BYTES;
             let end = (start + CHUNK_SIZE_BYTES).min(total_size);
             let msg = ClientMessage::UploadProgram {
-                corr_id,
+                corr_id: *corr_id_guard,
                 program_hash: program_hash.clone(),
                 chunk_index,
                 total_chunks,
@@ -351,7 +350,7 @@ impl Client {
         }
 
         let (successful, result) = rx.await?;
-        self.inner.corr_id_pool.lock().await.release(corr_id)?;
+
         if successful {
             Ok(())
         } else {
