@@ -240,7 +240,13 @@ impl Client {
             )
         }
 
-        // Decode the base64-encoded challenge from the server
+        // If the server has disabled authentication, we can return early.
+        if result == "Already authenticated" {
+            return Ok(());
+        }
+
+        // Otherwise, the server has enabled authentication and we need to sign
+        // the challenge encoded in base64 with the private key.
         let challenge = base64::engine::general_purpose::STANDARD
             .decode(result.as_bytes())
             .context("Failed to decode challenge from base64")?;
