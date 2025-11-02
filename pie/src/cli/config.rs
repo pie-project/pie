@@ -25,10 +25,10 @@ pub enum ConfigCommands {
 
 #[derive(Args, Debug)]
 pub struct ConfigInitArgs {
-    /// Backend type (e.g., "python", "metal")
+    /// Backend type (e.g., "python", "metal", "dummy")
     pub backend_type: String,
-    /// Path to the backend executable
-    pub exec_path: String,
+    /// Path to the backend executable (not used for "dummy" backend)
+    pub exec_path: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -122,7 +122,7 @@ pub async fn handle_config_command(command: ConfigCommands) -> Result<()> {
 
 /// Handles the `pie config init` subcommand.
 async fn handle_config_init_subcommand(args: ConfigInitArgs) -> Result<()> {
-    init_default_config_file(&args.exec_path, &args.backend_type)
+    init_default_config_file(args.exec_path, &args.backend_type)
 }
 
 /// Handles the `pie config update` subcommand.
@@ -135,30 +135,51 @@ async fn handle_config_show_subcommand() -> Result<()> {
     show_default_config_file()
 }
 
-fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<String> {
+fn create_default_config_content(exec_path: Option<String>, backend_type: &str) -> Result<String> {
+    // Validate `exec_path` based on backend type
+    if backend_type == "dummy" {
+        if exec_path.is_some() {
+            println!("⚠️ Warning: exec_path is not used for dummy backend and will be ignored.");
+        }
+    } else if exec_path.is_none() {
+        anyhow::bail!(
+            "exec_path is required for backend type '{}'. \
+             Please provide the path to the backend executable.",
+            backend_type
+        );
+    }
+
+    let exec_path = exec_path.unwrap_or_default();
+
     // Create the backend configuration as a TOML table
-    let backend_table = [
-        (
-            "backend_type",
-            toml::Value::String(backend_type.to_string()),
-        ),
-        ("exec_path", toml::Value::String(exec_path.to_string())),
-        ("model", toml::Value::String("qwen-3-0.6b".into())),
-        ("device", toml::Value::String("cuda:0".into())),
-        ("dtype", toml::Value::String("bfloat16".into())),
-        ("kv_page_size", toml::Value::Integer(16)),
-        ("max_batch_tokens", toml::Value::Integer(10240)),
-        ("max_dist_size", toml::Value::Integer(32)),
-        ("max_num_kv_pages", toml::Value::Integer(10240)),
-        ("max_num_embeds", toml::Value::Integer(128)),
-        ("max_num_adapters", toml::Value::Integer(32)),
-        ("max_adapter_rank", toml::Value::Integer(8)),
-        ("gpu_mem_headroom", toml::Value::Float(10.0)),
-        ("enable_profiling", toml::Value::Boolean(false)),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
-    .collect::<toml::Table>();
+    let mut backend_fields: Vec<(&str, toml::Value)> = vec![(
+        "backend_type",
+        toml::Value::String(backend_type.to_string()),
+    )];
+
+    // Add remaining fields for non-dummy backends
+    if backend_type != "dummy" {
+        backend_fields.extend_from_slice(&[
+            ("exec_path", toml::Value::String(exec_path)),
+            ("model", toml::Value::String("qwen-3-0.6b".into())),
+            ("device", toml::Value::String("cuda:0".into())),
+            ("dtype", toml::Value::String("bfloat16".into())),
+            ("kv_page_size", toml::Value::Integer(16)),
+            ("max_batch_tokens", toml::Value::Integer(10240)),
+            ("max_dist_size", toml::Value::Integer(32)),
+            ("max_num_kv_pages", toml::Value::Integer(10240)),
+            ("max_num_embeds", toml::Value::Integer(128)),
+            ("max_num_adapters", toml::Value::Integer(32)),
+            ("max_adapter_rank", toml::Value::Integer(8)),
+            ("gpu_mem_headroom", toml::Value::Float(10.0)),
+            ("enable_profiling", toml::Value::Boolean(false)),
+        ]);
+    }
+
+    let backend_table = backend_fields
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect::<toml::Table>();
 
     // Create the ConfigFile object
     let config_file = ConfigFile {
@@ -178,7 +199,7 @@ fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<
     Ok(config_content)
 }
 
-fn init_default_config_file(exec_path: &str, backend_type: &str) -> Result<()> {
+fn init_default_config_file(exec_path: Option<String>, backend_type: &str) -> Result<()> {
     println!("⚙️ Initializing Pie configuration...");
 
     let config_path = path::get_default_config_path()?;
@@ -209,7 +230,7 @@ fn init_default_config_file(exec_path: &str, backend_type: &str) -> Result<()> {
     }
 
     // Create the default config file
-    let config_content = create_default_config_content(&exec_path, &backend_type)?;
+    let config_content = create_default_config_content(exec_path, backend_type)?;
     fs::write(&config_path, &config_content)
         .with_context(|| format!("Failed to write config file at {:?}", config_path))?;
 
