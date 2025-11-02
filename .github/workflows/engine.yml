@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -35,7 +35,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -59,7 +59,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Download pie binary
         uses: actions/download-artifact@v4
@@ -87,3 +87,6 @@ jobs:
 
       - name: Run disable authentication test
         run: ./tests/engine/auth/disable_auth.sh
+
+      - name: Run key strength test
+        run: ./tests/engine/auth/key_strength.sh

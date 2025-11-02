@@ -13,4 +13,8 @@ echo "Running key algorithm test..."
 echo "Running disable authentication test..."
 "${SCRIPT_DIR}/disable_auth.sh"
 
+# Run key strength test
+echo "Running key strength test..."
+"${SCRIPT_DIR}/key_strength.sh"
+
 echo "All authentication tests passed."
