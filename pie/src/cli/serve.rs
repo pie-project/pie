@@ -67,26 +67,32 @@ pub async fn handle_serve_command(
     backend_configs: Vec<toml::Value>,
     interactive: bool,
 ) -> Result<()> {
-    let (rl, printer) = output::create_editor_and_printer_with_history().await?;
-
-    // Start the engine and backend services
-    let (shutdown_tx, server_handle, backend_processes, client_config) =
-        manager::start_engine_and_backend(
-            engine_config,
-            backend_configs,
-            Some(Arc::clone(&printer)),
-        )
-        .await?;
-
-    // Run interactive shell or wait for ctrl-c
     if interactive {
-        run_shell(&client_config, rl, printer).await?;
-    } else {
-        tokio::signal::ctrl_c().await?;
-    }
+        // Interactive mode: create shell, start services, run shell, cleanup
+        let (rl, printer) = output::create_editor_and_printer_with_history().await?;
 
-    // Terminate the engine and backend services
-    manager::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
+        let (shutdown_tx, server_handle, backend_processes, client_config) =
+            manager::start_engine_and_backend(
+                engine_config,
+                backend_configs,
+                Some(Arc::clone(&printer)),
+            )
+            .await?;
+
+        run_shell(&client_config, rl, printer).await?;
+
+        manager::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle)
+            .await?;
+    } else {
+        // Non-interactive mode: start services, wait for signal, cleanup
+        let (shutdown_tx, server_handle, backend_processes, _client_config) =
+            manager::start_engine_and_backend(engine_config, backend_configs, None).await?;
+
+        tokio::signal::ctrl_c().await?;
+
+        manager::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle)
+            .await?;
+    }
 
     Ok(())
 }
