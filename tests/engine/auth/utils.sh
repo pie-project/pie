@@ -59,3 +59,61 @@ generate_unique_config_path() {
     return 1
 }
 
+# Start the Pie engine and wait for it to be ready
+# Usage: start_pie_engine <config_path> [pid_variable_name]
+# Example: start_pie_engine "$PIE_CONFIG" "PIE_SERVE_PID"
+# Sets the specified variable (default: PIE_SERVE_PID) to the process ID
+# The engine will start on port 8080
+# Returns 0 on success, non-zero on failure
+start_pie_engine() {
+    local config_path=$1
+    local pid_var=${2:-PIE_SERVE_PID}
+    local port=8080
+    
+    if [ -z "$config_path" ]; then
+        echo "Error: config_path is required" >&2
+        return 1
+    fi
+    
+    if [ ! -f "$config_path" ]; then
+        echo "Error: config file not found: $config_path" >&2
+        return 1
+    fi
+    
+    # Start pie serve in background
+    pie serve --config "$config_path" >/dev/null 2>&1 &
+    local pid=$!
+    
+    # Set the PID to the specified variable name
+    # Since this function is sourced, the variable will be in the caller's scope
+    eval "${pid_var}=${pid}"
+    
+    # Wait for the server to be ready
+    echo "Waiting for pie serve to start..."
+    sleep 3
+    
+    # Check if process is still running
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "Error: pie serve process died immediately" >&2
+        return 1
+    fi
+    
+    # Try to connect with a timeout, retry up to 15 times
+    local max_retries=15
+    local retry_count=0
+    while [ $retry_count -lt $max_retries ]; do
+        # Use bash built-in TCP check (more portable than nc)
+        if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+            echo "Server is ready"
+            return 0
+        fi
+        retry_count=$((retry_count + 1))
+        if [ $retry_count -ge $max_retries ]; then
+            echo "Error: Server failed to become ready after $max_retries attempts" >&2
+            return 1
+        fi
+        sleep 1
+    done
+    
+    return 1
+}

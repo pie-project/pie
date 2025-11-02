@@ -102,52 +102,34 @@ echo "All keys generated and added to authorized users list"
 pie config init dummy --path "$PIE_CONFIG"
 pie-cli config init --path "$PIE_CLI_CONFIG"
 
-pie serve --config "$PIE_CONFIG" &
-PIE_SERVE_PID=$!
-
-# Wait for the server to be ready
-echo "Waiting for pie serve to start..."
-sleep 3
-
-# Check if process is still running
-if ! kill -0 "$PIE_SERVE_PID" 2>/dev/null; then
-    echo "Error: pie serve process died immediately"
-    exit 1
-fi
-
-# Try to connect with a timeout, retry up to 15 times
-MAX_RETRIES=15
-RETRY_COUNT=0
-while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if nc -z 127.0.0.1 8080 2>/dev/null; then
-        echo "Server is ready"
-        break
-    fi
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
-        echo "Error: Server failed to become ready after $MAX_RETRIES attempts"
-        exit 1
-    fi
-    sleep 1
-done
+# Start the Pie engine and wait for it to be ready
+start_pie_engine "$PIE_CONFIG" "PIE_SERVE_PID" || exit 1
 
 pie-cli config update --path "$PIE_CLI_CONFIG" --username "pie-test"
 
 # Test Key 1: RSA 4096 bits
+echo "Testing RSA 4096 bits key..."
 pie-cli config update --path "$PIE_CLI_CONFIG" --private-key-path "$RSA_KEY"
 timeout 10 pie-cli ping --config "$PIE_CLI_CONFIG" || { echo "Error: ping with RSA key failed"; exit 1; }
+echo "RSA 4096 bits key test passed"
 
 # Test Key 2: ED25519
+echo "Testing ED25519 key..."
 pie-cli config update --path "$PIE_CLI_CONFIG" --private-key-path "$ED25519_KEY"
 timeout 10 pie-cli ping --config "$PIE_CLI_CONFIG" || { echo "Error: ping with ED25519 key failed"; exit 1; }
+echo "ED25519 key test passed"
 
 # Test Key 3: ECDSA P-256
+echo "Testing ECDSA P-256 key..."
 pie-cli config update --path "$PIE_CLI_CONFIG" --private-key-path "$ECDSA_256_KEY"
 timeout 10 pie-cli ping --config "$PIE_CLI_CONFIG" || { echo "Error: ping with ECDSA P-256 key failed"; exit 1; }
+echo "ECDSA P-256 key test passed"
 
 # Test Key 4: ECDSA P-384
+echo "Testing ECDSA P-384 key..."
 pie-cli config update --path "$PIE_CLI_CONFIG" --private-key-path "$ECDSA_384_KEY"
 timeout 10 pie-cli ping --config "$PIE_CLI_CONFIG" || { echo "Error: ping with ECDSA P-384 key failed"; exit 1; }
+echo "ECDSA P-384 key test passed"
 
 echo "All tests passed"
 

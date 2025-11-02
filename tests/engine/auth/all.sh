@@ -8,6 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Run key algorithm test
 echo "Running key algorithm test..."
 "${SCRIPT_DIR}/key_algorithm.sh"
-echo "Done."
+
+# Run disable authentication test
+echo "Running disable authentication test..."
+"${SCRIPT_DIR}/disable_auth.sh"
 
 echo "All authentication tests passed."

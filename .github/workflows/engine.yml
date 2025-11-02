@@ -84,3 +84,6 @@ jobs:
 
       - name: Run key algorithm test
         run: ./tests/engine/auth/key_algorithm.sh
+
+      - name: Run disable authentication test
+        run: ./tests/engine/auth/disable_auth.sh
