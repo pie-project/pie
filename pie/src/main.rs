@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 mod api;
 mod auth;
 mod cli;
+mod dummy;
 mod engine;
 mod instance;
 mod kvs;
@@ -52,7 +53,7 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Commands::Serve(ServeArgs::default())) {
         Commands::Serve(args) => {
-            let (engine_config, backend_configs) = cli::service::parse_engine_and_backend_config(
+            let (engine_config, backend_configs) = cli::manager::parse_engine_and_backend_config(
                 args.config,
                 args.no_auth,
                 args.host,
@@ -68,7 +69,7 @@ async fn main() -> Result<()> {
         }
         Commands::Run(args) => {
             // Build both engine and backend configs.
-            let (engine_config, backend_configs) = cli::service::parse_engine_and_backend_config(
+            let (engine_config, backend_configs) = cli::manager::parse_engine_and_backend_config(
                 args.config,
                 false,
                 None,

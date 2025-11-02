@@ -2,6 +2,7 @@
 
 use crate::auth::AuthorizedUsers;
 use crate::config::ConfigFile;
+use crate::dummy::{self, DummyBackendConfig};
 use crate::engine;
 use crate::output::SharedPrinter;
 use crate::path;
@@ -133,6 +134,8 @@ pub async fn start_engine_and_backend(
 
     // Launch all configured backend services
     let mut backend_processes = Vec::new();
+    let mut num_dummy_backends = 0;
+
     if !backend_configs.is_empty() {
         println!("🚀 Launching backend services...");
 
@@ -144,6 +147,29 @@ pub async fn start_engine_and_backend(
                 .get("backend_type")
                 .and_then(|v| v.as_str())
                 .context("`backend_type` is missing or not a string.")?;
+
+            // Handle dummy backend specially (no exec_path required)
+            if backend_type == "dummy" {
+                println!("- Starting dummy backend");
+
+                let dummy_config = DummyBackendConfig {
+                    controller_host: client_config.host.clone(),
+                    controller_port: client_config.port,
+                    internal_auth_token: client_config.internal_auth_token.clone().unwrap(),
+                };
+
+                // Spawn as detached task - no need to track the handle
+                tokio::spawn(async move {
+                    if let Err(e) = dummy::start_dummy_backend(dummy_config).await {
+                        eprintln!("[Dummy Backend] Error: {}", e);
+                    }
+                });
+
+                num_dummy_backends += 1;
+                continue;
+            }
+
+            // For non-dummy backends, exec_path is required
             let exec_path = backend_table
                 .get("exec_path")
                 .and_then(|v| v.as_str())
@@ -298,7 +324,7 @@ pub async fn start_engine_and_backend(
         }
     }
 
-    wait_for_backend_ready(backend_processes.len()).await?;
+    wait_for_backend_ready(backend_processes.len() + num_dummy_backends).await?;
 
     Ok((shutdown_tx, server_handle, backend_processes, client_config))
 }
@@ -325,6 +351,11 @@ pub async fn terminate_engine_and_backend(
     // This is to avoid broken pipe errors due to sending signals to the backend processes
     // after they have exited.
     stop_backend_heartbeat().await?;
+
+    // Note: Dummy backends are spawned as detached tokio tasks and will be automatically
+    // terminated when the engine shuts down, since they lose their connection.
+    // They are not included in the backend_processes vector.
+
     println!("🔄 Terminating backend processes...");
 
     // Iterate through the child processes, signal them, and wait for them to exit.
