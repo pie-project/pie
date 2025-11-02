@@ -1,0 +1,86 @@
+name: Test Engine and Client CLI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-engine:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Build Engine
+        working-directory: ./pie
+        run: cargo build --release
+
+      - name: Upload pie binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pie-binary
+          path: pie/target/release/pie
+          retention-days: 1
+
+  build-client-cli:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Build Client CLI
+        working-directory: ./client/cli
+        run: cargo build --release
+
+      - name: Upload pie-cli binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pie-cli-binary
+          path: client/cli/target/release/pie-cli
+          retention-days: 1
+
+  test-engine-authentication:
+    needs: [build-engine, build-client-cli]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Download pie binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pie-binary
+          path: ./bin
+
+      - name: Download pie-cli binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pie-cli-binary
+          path: ./bin
+
+      - name: Make binaries executable
+        run: |
+          chmod +x ./bin/pie
+          chmod +x ./bin/pie-cli
+
+      - name: Add binaries to PATH
+        run: |
+          echo "$(pwd)/bin" >> $GITHUB_PATH
+
+      - name: Run key algorithm test
+        run: ./tests/engine/auth/key_algorithm.sh
