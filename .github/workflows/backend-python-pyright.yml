@@ -34,4 +34,4 @@ jobs:
       # Run pyright check.
       # See `pyrightconfig.json` for the configuration of the check.
       - name: Run pyright check
-        run: ./tests/backend-python-pyright.sh
+        run: ./tests/format/backend-python-pyright.sh

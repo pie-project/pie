@@ -34,4 +34,4 @@ jobs:
       # Run pylint check.
       # See `.pylintrc` for the configuration of the check.
       - name: Run pylint check
-        run: ./tests/backend-python-pylint.sh
+        run: ./tests/format/backend-python-pylint.sh

@@ -24,4 +24,4 @@ jobs:
 
       # Run black format check
       - name: Run black format check
-        run: ./tests/backend-python-format.sh
+        run: ./tests/format/backend-python-format.sh
