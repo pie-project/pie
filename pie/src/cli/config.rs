@@ -20,7 +20,11 @@ pub enum ConfigCommands {
     /// Update the entries of the default config file.
     Update(ConfigUpdateArgs),
     /// Show the content of the default config file.
-    Show,
+    Show {
+        /// Path to the config file to show (uses default path if not specified)
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -29,6 +33,9 @@ pub struct ConfigInitArgs {
     pub backend_type: String,
     /// Path to the backend executable (not used for "dummy" backend)
     pub exec_path: Option<String>,
+    /// Path where the config file should be saved (uses default path if not specified)
+    #[arg(long)]
+    pub path: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -96,6 +103,9 @@ pub struct ConfigUpdateArgs {
     /// Enable profiling
     #[arg(long)]
     pub backend_enable_profiling: Option<bool>,
+    /// Path to the config file to update (uses default path if not specified)
+    #[arg(long)]
+    pub path: Option<String>,
 }
 
 // Helper struct for parsing the TOML config file
@@ -116,13 +126,13 @@ pub async fn handle_config_command(command: ConfigCommands) -> Result<()> {
     match command {
         ConfigCommands::Init(args) => handle_config_init_subcommand(args).await,
         ConfigCommands::Update(args) => handle_config_update_subcommand(args).await,
-        ConfigCommands::Show => handle_config_show_subcommand().await,
+        ConfigCommands::Show { path } => handle_config_show_subcommand(path).await,
     }
 }
 
 /// Handles the `pie config init` subcommand.
 async fn handle_config_init_subcommand(args: ConfigInitArgs) -> Result<()> {
-    init_default_config_file(args.exec_path, &args.backend_type)
+    init_default_config_file(args.exec_path, &args.backend_type, args.path)
 }
 
 /// Handles the `pie config update` subcommand.
@@ -131,8 +141,8 @@ async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
 }
 
 /// Handles the `pie config show` subcommand.
-async fn handle_config_show_subcommand() -> Result<()> {
-    show_default_config_file()
+async fn handle_config_show_subcommand(custom_path: Option<String>) -> Result<()> {
+    show_default_config_file(custom_path)
 }
 
 fn create_default_config_content(exec_path: Option<String>, backend_type: &str) -> Result<String> {
@@ -199,10 +209,18 @@ fn create_default_config_content(exec_path: Option<String>, backend_type: &str) 
     Ok(config_content)
 }
 
-fn init_default_config_file(exec_path: Option<String>, backend_type: &str) -> Result<()> {
+fn init_default_config_file(
+    exec_path: Option<String>,
+    backend_type: &str,
+    custom_path: Option<String>,
+) -> Result<()> {
     println!("⚙️ Initializing Pie configuration...");
 
-    let config_path = path::get_default_config_path()?;
+    let config_path = if let Some(path_str) = custom_path {
+        PathBuf::from(path_str)
+    } else {
+        path::get_default_config_path()?
+    };
 
     // Check if config file already exists
     if config_path.exists() {
@@ -306,6 +324,8 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         backend_max_adapter_rank,
         backend_gpu_mem_headroom,
         backend_enable_profiling,
+        // Path field
+        path,
     } = args;
 
     // Check if any update options were provided
@@ -336,7 +356,11 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
 
     println!("⚙️ Updating Pie configuration...");
 
-    let config_path = path::get_default_config_path()?;
+    let config_path = if let Some(path_str) = path {
+        PathBuf::from(path_str)
+    } else {
+        path::get_default_config_path()?
+    };
 
     // Check if config file exists
     if !config_path.exists() {
@@ -404,8 +428,12 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
     Ok(())
 }
 
-fn show_default_config_file() -> Result<()> {
-    let config_path = path::get_default_config_path()?;
+fn show_default_config_file(custom_path: Option<String>) -> Result<()> {
+    let config_path = if let Some(path_str) = custom_path {
+        PathBuf::from(path_str)
+    } else {
+        path::get_default_config_path()?
+    };
 
     // Check if config file exists
     if !config_path.exists() {

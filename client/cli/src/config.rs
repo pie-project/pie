@@ -21,11 +21,18 @@ pub enum ConfigCommands {
         /// Enable authentication
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         enable_auth: bool,
+        /// Path where the config file should be saved (uses default path if not specified)
+        #[arg(long)]
+        path: Option<String>,
     },
     /// Update the entries of the default config file.
     Update(ConfigUpdateArgs),
     /// Show the content of the default config file.
-    Show,
+    Show {
+        /// Path to the config file to show (uses default path if not specified)
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -45,6 +52,9 @@ pub struct ConfigUpdateArgs {
     /// Enable authentication
     #[arg(long)]
     pub enable_auth: Option<bool>,
+    /// Path to the config file to update (uses default path if not specified)
+    #[arg(long)]
+    pub path: Option<String>,
 }
 
 // Helper struct for parsing the TOML config file
@@ -60,15 +70,24 @@ pub struct ConfigFile {
 /// Handles the `pie-cli config` command.
 pub async fn handle_config_command(command: ConfigCommands) -> Result<()> {
     match command {
-        ConfigCommands::Init { enable_auth } => handle_config_init_subcommand(enable_auth).await,
+        ConfigCommands::Init { enable_auth, path } => {
+            handle_config_init_subcommand(enable_auth, path).await
+        }
         ConfigCommands::Update(args) => handle_config_update_subcommand(args).await,
-        ConfigCommands::Show => handle_config_show_subcommand().await,
+        ConfigCommands::Show { path } => handle_config_show_subcommand(path).await,
     }
 }
 
 /// Create a default config file.
-async fn handle_config_init_subcommand(enable_auth: bool) -> Result<()> {
-    let config_path = path::get_default_config_path()?;
+async fn handle_config_init_subcommand(
+    enable_auth: bool,
+    custom_path: Option<String>,
+) -> Result<()> {
+    let config_path = if let Some(path_str) = custom_path {
+        PathBuf::from(path_str)
+    } else {
+        path::get_default_config_path()?
+    };
 
     // Check if config file already exists
     if config_path.exists() {
@@ -140,7 +159,12 @@ async fn handle_config_init_subcommand(enable_auth: bool) -> Result<()> {
 
 /// Update the specified entries of the default config file.
 async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
-    let config_path = path::get_default_config_path()?;
+    let custom_path = args.path;
+    let config_path = if let Some(path_str) = custom_path {
+        PathBuf::from(path_str)
+    } else {
+        path::get_default_config_path()?
+    };
 
     // Check if config file exists
     if !config_path.exists() {
@@ -221,8 +245,12 @@ async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
 }
 
 /// Show the content of the default config file.
-async fn handle_config_show_subcommand() -> Result<()> {
-    let config_path = path::get_default_config_path()?;
+async fn handle_config_show_subcommand(custom_path: Option<String>) -> Result<()> {
+    let config_path = if let Some(path_str) = custom_path {
+        PathBuf::from(path_str)
+    } else {
+        path::get_default_config_path()?
+    };
 
     // Check if config file exists
     if !config_path.exists() {
