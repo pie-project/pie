@@ -67,7 +67,7 @@ pub async fn handle_model_command(command: ModelCommands) -> Result<()> {
 /// Handles the `pie model list` subcommand.
 async fn handle_model_list_subcommand() -> Result<()> {
     println!("📚 Available local models:");
-    let models_dir = path::get_pie_home()?.join("models");
+    let models_dir = path::get_pie_cache_home()?.join("models");
     if !models_dir.exists() {
         println!("  No models found.");
         return Ok(());
@@ -85,7 +85,7 @@ async fn handle_model_list_subcommand() -> Result<()> {
 async fn handle_model_add_subcommand(args: AddModelArgs) -> Result<()> {
     println!("➕ Adding model: {}", args.model_name);
 
-    let models_root = path::get_pie_home()?.join("models");
+    let models_root = path::get_pie_cache_home()?.join("models");
     let model_files_dir = models_root.join(&args.model_name);
     let metadata_path = models_root.join(format!("{}.toml", args.model_name));
 
@@ -150,7 +150,7 @@ async fn handle_model_add_subcommand(args: AddModelArgs) -> Result<()> {
 /// Handles the `pie model remove` subcommand.
 async fn handle_model_remove_subcommand(args: RemoveModelArgs) -> Result<()> {
     println!("🗑️ Removing model: {}", args.model_name);
-    let models_root = path::get_pie_home()?.join("models");
+    let models_root = path::get_pie_cache_home()?.join("models");
     let model_files_dir = models_root.join(&args.model_name);
     let metadata_path = models_root.join(format!("{}.toml", args.model_name));
     let mut was_removed = false;
@@ -276,7 +276,7 @@ async fn handle_model_info_subcommand(args: InfoModelArgs) -> Result<()> {
     }
 
     // Check if the model is downloaded locally
-    let models_root = path::get_pie_home()?.join("models");
+    let models_root = path::get_pie_cache_home()?.join("models");
     let model_files_dir = models_root.join(&args.model_name);
     let metadata_path = models_root.join(format!("{}.toml", args.model_name));
 

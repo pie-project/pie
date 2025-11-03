@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod api;
+mod auth;
 mod cli;
+mod dummy;
 mod engine;
 mod instance;
 mod kvs;
@@ -13,6 +15,7 @@ mod server;
 mod service;
 mod utils;
 
+use cli::auth::AuthCommands;
 use cli::config::{self, ConfigCommands};
 use cli::model::ModelCommands;
 use cli::output;
@@ -39,6 +42,9 @@ enum Commands {
     #[command(subcommand)]
     /// Manage configuration.
     Config(ConfigCommands),
+    #[command(subcommand)]
+    /// Manage authorized clients.
+    Auth(AuthCommands),
 }
 
 #[tokio::main]
@@ -47,7 +53,7 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Commands::Serve(ServeArgs::default())) {
         Commands::Serve(args) => {
-            let (engine_config, backend_configs) = cli::service::parse_engine_and_backend_config(
+            let (engine_config, backend_configs) = cli::manager::parse_engine_and_backend_config(
                 args.config,
                 args.no_auth,
                 args.host,
@@ -59,11 +65,11 @@ async fn main() -> Result<()> {
             // Initialize logging based on the config and get the file-writer guard
             let _guard = output::init_logging(&engine_config)?;
 
-            serve::handle_serve_command(engine_config, backend_configs, args.interactive, args.daemon).await?;
+            serve::handle_serve_command(engine_config, backend_configs, args.interactive).await?;
         }
         Commands::Run(args) => {
             // Build both engine and backend configs.
-            let (engine_config, backend_configs) = cli::service::parse_engine_and_backend_config(
+            let (engine_config, backend_configs) = cli::manager::parse_engine_and_backend_config(
                 args.config,
                 false,
                 None,
@@ -92,6 +98,11 @@ async fn main() -> Result<()> {
             // Config commands don't start the engine, so they can use a simple logger
             output::init_simple_logging()?;
             config::handle_config_command(cmd).await?;
+        }
+        Commands::Auth(cmd) => {
+            // Auth commands don't start the engine, so they can use a simple logger
+            output::init_simple_logging()?;
+            cli::auth::handle_auth_command(cmd).await?;
         }
     }
     Ok(())

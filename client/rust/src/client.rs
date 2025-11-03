@@ -1,8 +1,10 @@
+use crate::crypto::ParsedPrivateKey;
 use crate::message::{
     CHUNK_SIZE_BYTES, ClientMessage, EventCode, QUERY_PROGRAM_EXISTS, ServerMessage,
 };
 use crate::utils::IdPool;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -45,7 +47,7 @@ pub struct Client {
 #[derive(Debug)]
 struct ClientInner {
     ws_writer_tx: UnboundedSender<Message>,
-    corr_id_pool: Mutex<IdPool<CorrId>>,
+    corr_id_pool: IdPool<CorrId>,
     pending_requests: DashMap<CorrId, oneshot::Sender<(bool, String)>>,
     inst_event_tx: DashMap<InstanceId, mpsc::Sender<InstanceEvent>>,
     // Use a Mutex per entry to avoid deadlocking the DashMap shard
@@ -85,9 +87,9 @@ impl Instance {
     /// Uploads a binary blob to the instance, handling chunking and awaiting confirmation.
     pub async fn upload_blob(&self, blob: &[u8]) -> Result<()> {
         let blob_hash = hash_blob(blob);
-        let corr_id = self.inner.corr_id_pool.lock().await.acquire()?;
+        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let (tx, rx) = oneshot::channel();
-        self.inner.pending_requests.insert(corr_id, tx);
+        self.inner.pending_requests.insert(*corr_id_guard, tx);
 
         let total_size = blob.len();
         // An empty blob is sent as one empty chunk.
@@ -101,7 +103,7 @@ impl Instance {
             let start = chunk_index * CHUNK_SIZE_BYTES;
             let end = (start + CHUNK_SIZE_BYTES).min(total_size);
             let msg = ClientMessage::UploadBlob {
-                corr_id,
+                corr_id: *corr_id_guard,
                 instance_id: self.id.to_string(),
                 blob_hash: blob_hash.clone(),
                 chunk_index,
@@ -114,7 +116,7 @@ impl Instance {
         }
 
         let (successful, result) = rx.await?;
-        self.inner.corr_id_pool.lock().await.release(corr_id)?;
+
         if successful {
             Ok(())
         } else {
@@ -151,7 +153,7 @@ impl Client {
 
         let inner = Arc::new(ClientInner {
             ws_writer_tx: ws_writer_tx.clone(),
-            corr_id_pool: Mutex::new(IdPool::new(CorrId::MAX)),
+            corr_id_pool: IdPool::new(CorrId::MAX),
             pending_requests: DashMap::new(),
             inst_event_tx: DashMap::new(),
             pending_downloads: DashMap::new(),
@@ -180,6 +182,7 @@ impl Client {
                     _ => {}
                 }
             }
+            handle_server_termination(&reader_inner).await;
         });
 
         Ok(Client {
@@ -198,40 +201,93 @@ impl Client {
     }
 
     async fn send_msg_and_wait(&self, mut msg: ClientMessage) -> Result<(bool, String)> {
-        let corr_id_new = self.inner.corr_id_pool.lock().await.acquire()?;
+        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let corr_id_ref = match &mut msg {
-            ClientMessage::Authenticate { corr_id, .. }
+            ClientMessage::Identification { corr_id, .. }
+            | ClientMessage::Signature { corr_id, .. }
             | ClientMessage::InternalAuthenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
-            | ClientMessage::LaunchInstance { corr_id, .. } => corr_id,
+            | ClientMessage::LaunchInstance { corr_id, .. }
+            | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
-        *corr_id_ref = corr_id_new;
+        *corr_id_ref = *corr_id_guard;
 
         let (tx, rx) = oneshot::channel();
-        self.inner.pending_requests.insert(corr_id_new, tx);
+        self.inner.pending_requests.insert(*corr_id_guard, tx);
         self.inner
             .ws_writer_tx
             .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
 
         let (successful, result) = rx.await?;
-        self.inner.corr_id_pool.lock().await.release(corr_id_new)?;
         Ok((successful, result))
     }
 
-    pub async fn authenticate(&self, token: &str) -> Result<()> {
-        let msg = ClientMessage::Authenticate {
+    /// Authenticates the client with the server using a username and private key.
+    pub async fn authenticate(
+        &self,
+        username: &str,
+        private_key: &Option<ParsedPrivateKey>,
+    ) -> Result<()> {
+        // Send the authentication request to the engine to get a challenge
+        let msg = ClientMessage::Identification {
             corr_id: 0,
-            token: token.to_string(),
+            username: username.to_string(),
         };
-        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        let (successful, result) = self
+            .send_msg_and_wait(msg)
+            .await
+            .context("Failed to send identification message to engine")?;
+
+        if !successful {
+            anyhow::bail!("Username '{}' rejected by engine: {}", username, result)
+        }
+
+        // If the engine has disabled public key authentication, we can return early.
+        if result == "Authenticated (Engine disabled authentication)" {
+            return Ok(());
+        }
+
+        let private_key = private_key
+            .as_ref()
+            .context("Client private key is required when engine uses public key authentication")?;
+
+        // Otherwise, the engine has enabled public key authentication and we need to sign
+        // the challenge encoded in base64 with the private key.
+        let challenge = base64::engine::general_purpose::STANDARD
+            .decode(result.as_bytes())
+            .context("Failed to decode challenge from base64")?;
+
+        // Sign the challenge with the private key
+        let signature_bytes = private_key.sign(&challenge)?;
+
+        // Encode the signature to base64
+        let signature = base64::engine::general_purpose::STANDARD.encode(&signature_bytes);
+
+        // Send the signature to the server to verify the authentication
+        let msg = ClientMessage::Signature {
+            corr_id: 0,
+            signature,
+        };
+
+        let (successful, result) = self
+            .send_msg_and_wait(msg)
+            .await
+            .context("Failed to send signature message to engine")?;
         if successful {
             Ok(())
         } else {
-            anyhow::bail!("Authentication failed: {}", result)
+            anyhow::bail!(
+                "Signature verification failed for username '{}': {}",
+                username,
+                result
+            )
         }
     }
 
+    /// Authenticates the client with the server using an internal token.
+    /// This method is used for internal communication between the backend and the engine
+    /// as well as between the Pie shell and the engine. This is not used for user authentication.
     pub async fn internal_authenticate(&self, token: &str) -> Result<()> {
         let msg = ClientMessage::InternalAuthenticate {
             corr_id: 0,
@@ -267,9 +323,9 @@ impl Client {
 
     pub async fn upload_program(&self, blob: &[u8]) -> Result<()> {
         let program_hash = hash_blob(blob);
-        let corr_id = self.inner.corr_id_pool.lock().await.acquire()?;
+        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let (tx, rx) = oneshot::channel();
-        self.inner.pending_requests.insert(corr_id, tx);
+        self.inner.pending_requests.insert(*corr_id_guard, tx);
 
         let total_size = blob.len();
         let total_chunks = if total_size == 0 {
@@ -282,7 +338,7 @@ impl Client {
             let start = chunk_index * CHUNK_SIZE_BYTES;
             let end = (start + CHUNK_SIZE_BYTES).min(total_size);
             let msg = ClientMessage::UploadProgram {
-                corr_id,
+                corr_id: *corr_id_guard,
                 program_hash: program_hash.clone(),
                 chunk_index,
                 total_chunks,
@@ -294,7 +350,7 @@ impl Client {
         }
 
         let (successful, result) = rx.await?;
-        self.inner.corr_id_pool.lock().await.release(corr_id)?;
+
         if successful {
             Ok(())
         } else {
@@ -324,6 +380,16 @@ impl Client {
             })
         } else {
             anyhow::bail!("Launch instance failed: {}", result)
+        }
+    }
+
+    pub async fn ping(&self) -> Result<()> {
+        let msg = ClientMessage::Ping { corr_id: 0 };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        if successful {
+            Ok(())
+        } else {
+            anyhow::bail!("Ping failed: {}", result)
         }
     }
 }
@@ -403,5 +469,18 @@ async fn handle_server_message(
         ServerMessage::ServerEvent { message } => {
             server_event_tx.send(message).await.ok();
         }
+        ServerMessage::Challenge { corr_id, challenge } => {
+            if let Some((_, sender)) = inner.pending_requests.remove(&corr_id) {
+                sender.send((true, challenge)).ok();
+            }
+        }
     }
+}
+
+/// When the server teminates, clear all pending requests, instance events, and downloads
+/// to avoid locking up the client indefinitely.
+async fn handle_server_termination(inner: &Arc<ClientInner>) {
+    inner.pending_requests.clear();
+    inner.inst_event_tx.clear();
+    inner.pending_downloads.clear();
 }

@@ -1,17 +1,12 @@
-#! /bin/bash
-
+#!/bin/bash
 set -e
 
-ROOT="$(dirname "$(dirname "${BASH_SOURCE[0]}")")"
+ROOT="$(dirname "$(dirname "$(dirname "${BASH_SOURCE[0]}")")")"
 
-# Run pylint check.
-# See `.pylintrc` for the configuration of the check.
+# Set PYTHONPATH so imports work
+export PYTHONPATH="${ROOT}:${PYTHONPATH}"
 
-PYTHONPATH=${ROOT}:${ROOT}/backend/backend-python uv run \
-    --project ${ROOT}/backend/backend-python \
-    --with pylint \
-    --with torch \
-    pylint --disable=R \
+uvx black --check \
     ${ROOT}/backend/backend-python/__init__.py \
     ${ROOT}/backend/backend-python/adapter.py \
     ${ROOT}/backend/backend-python/adapter_utils.py \

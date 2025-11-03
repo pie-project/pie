@@ -3,20 +3,23 @@ use super::messaging::dispatch_u2i;
 use super::service::{Service, ServiceError, install_service};
 use super::utils::IdPool;
 use super::{messaging, runtime, service};
+use crate::auth::{AuthorizedUsers, PublicKey};
 use crate::model;
 use crate::model::Model;
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
+use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use pie_client::auth;
 use pie_client::message::{
     CHUNK_SIZE_BYTES, QUERY_BACKEND_STATS, QUERY_MODEL_STATUS, QUERY_PROGRAM_EXISTS,
 };
 use pie_client::message::{ClientMessage, EventCode, ServerMessage};
+use ring::rand::{SecureRandom, SystemRandom};
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -98,6 +101,7 @@ impl InternalEvent {
 
 struct ServerState {
     enable_auth: bool,
+    authorized_users: AuthorizedUsers,
     internal_auth_token: String,
     client_id_pool: Mutex<IdPool<ClientId>>,
     clients: DashMap<ClientId, JoinHandle<()>>,
@@ -170,9 +174,15 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(ip_port: &str, enable_auth: bool, internal_auth_token: String) -> Self {
+    pub fn new(
+        ip_port: &str,
+        enable_auth: bool,
+        authorized_users: AuthorizedUsers,
+        internal_auth_token: String,
+    ) -> Self {
         let state = Arc::new(ServerState {
             enable_auth,
+            authorized_users,
             internal_auth_token,
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
@@ -360,10 +370,6 @@ impl Session {
     }
 
     async fn authenticate(&mut self) -> Result<()> {
-        if !self.state.enable_auth {
-            return Ok(());
-        }
-
         let cmd = tokio::select! {
             biased;
             Some(cmd) = self.client_cmd_rx.recv() => {
@@ -375,43 +381,139 @@ impl Session {
         };
 
         match cmd {
-            SessionEvent::ClientRequest(ClientMessage::Authenticate { corr_id, token }) => {
-                self.external_authenticate(corr_id, token).await
+            SessionEvent::ClientRequest(ClientMessage::Identification { corr_id, username }) => {
+                self.external_authenticate(corr_id, username).await
             }
             SessionEvent::ClientRequest(ClientMessage::InternalAuthenticate { corr_id, token }) => {
                 self.internal_authenticate(corr_id, token).await
             }
-            _ => bail!("Expected Authenticate message"),
+            _ => bail!("Expected Identification or InternalAuthenticate message"),
         }
     }
 
-    async fn external_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
-        let Ok(claims) = auth::validate_jwt(&token) else {
-            self.send_response(corr_id, false, "Invalid token".to_string())
+    /// Authenticates a user client using public key.
+    async fn external_authenticate(&mut self, corr_id: u32, username: String) -> Result<()> {
+        // Check if the username is in the authorized users file and get the user's public keys
+        let public_keys: Vec<PublicKey> = match self.state.authorized_users.get(&username) {
+            Some(keys) => keys.public_keys().cloned().collect(),
+            None => {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!("User '{}' is not authorized", username),
+                )
                 .await;
-            bail!("Invalid token")
+                bail!("User '{}' is not authorized", username)
+            }
         };
 
-        self.send_response(corr_id, true, claims.sub).await;
-        Ok(())
-    }
-
-    async fn internal_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
-        if token != self.state.internal_auth_token {
-            self.send_response(corr_id, false, "Invalid token".to_string())
-                .await;
-            bail!("Invalid token")
+        // If authentication is disabled, we authorize the user as long as they are
+        // in the authorized users file and need not to challenge them.
+        if !self.state.enable_auth {
+            self.send_response(
+                corr_id,
+                true,
+                "Authenticated (Engine disabled authentication)".to_string(),
+            )
+            .await;
+            return Ok(());
         }
+
+        // Generate a cryptographically secure random challenge (48 bytes = 384 bits)
+        // Use `ring::rand::SystemRandom` for cryptographic randomness.
+        // Size chosen to match ECDSA P-384, the highest security level supported.
+        let rng = SystemRandom::new();
+        let mut challenge = [0u8; 48];
+        rng.fill(&mut challenge)
+            .map_err(|e| anyhow!("Failed to generate random challenge: {}", e))?;
+
+        // Encode the challenge as base64 and send it to the client
+        let challenge_b64 = base64::engine::general_purpose::STANDARD.encode(&challenge);
+        self.send_response(corr_id, true, challenge_b64).await;
+
+        // Wait for the signature response from the client
+        let cmd = tokio::select! {
+            biased;
+            Some(cmd) = self.client_cmd_rx.recv() => {
+                cmd
+            },
+            _ = &mut self.recv_pump => { bail!("Socket terminated"); },
+            _ = &mut self.send_pump => { bail!("Socket terminated"); },
+            else => { bail!("Socket terminated"); },
+        };
+
+        // Verify the signature
+        let (corr_id, signature_b64) = match cmd {
+            SessionEvent::ClientRequest(ClientMessage::Signature { corr_id, signature }) => {
+                (corr_id, signature)
+            }
+            _ => {
+                bail!("Expected Signature message for user '{}'", username)
+            }
+        };
+
+        // Decode the signature from base64
+        let signature_bytes = match base64::engine::general_purpose::STANDARD
+            .decode(signature_b64.as_bytes())
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.send_response(corr_id, false, format!("Invalid signature encoding: {}", e))
+                    .await;
+                bail!("Failed to decode signature for user '{}': {}", username, e)
+            }
+        };
+
+        // Check if the signature is valid for any of the user's public keys
+        let verified = public_keys
+            .iter()
+            .any(|key| key.verify(&challenge, &signature_bytes).is_ok());
+
+        if !verified {
+            self.send_response(corr_id, false, "Signature verification failed".to_string())
+                .await;
+            bail!("Signature verification failed for user '{}'", username)
+        }
+
         self.send_response(corr_id, true, "Authenticated".to_string())
             .await;
         Ok(())
+    }
+
+    /// Authenticates a client using an internal token.
+    /// This method is used for internal communication between the backend and the engine
+    /// as well as between the Pie shell and the engine. This is not used for user authentication.
+    async fn internal_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
+        if token == self.state.internal_auth_token {
+            self.send_response(corr_id, true, "Authenticated".to_string())
+                .await;
+            return Ok(());
+        }
+
+        // Add random delay to mitigate timing-based side-channel attacks
+        let rng = SystemRandom::new();
+        let mut random_bytes = [0u8; 2];
+        rng.fill(&mut random_bytes)
+            .map_err(|e| anyhow!("Failed to generate random delay: {:?}", e))?;
+
+        // Sleep for 1000-3000 milliseconds
+        let delay_ms = 1000 + (u16::from_le_bytes(random_bytes) % 2001) as u64;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+        self.send_response(corr_id, false, "Invalid token".to_string())
+            .await;
+        bail!("Invalid token")
     }
 
     /// Processes a single command.
     async fn handle_command(&mut self, cmd: SessionEvent) {
         match cmd {
             SessionEvent::ClientRequest(message) => match message {
-                ClientMessage::Authenticate { corr_id, token: _ } => {
+                ClientMessage::Identification { corr_id, .. } => {
+                    self.send_response(corr_id, true, "Already authenticated".to_string())
+                        .await;
+                }
+                ClientMessage::Signature { corr_id, .. } => {
                     self.send_response(corr_id, true, "Already authenticated".to_string())
                         .await;
                 }
@@ -495,6 +597,9 @@ impl Session {
                         chunk_data,
                     )
                     .await;
+                }
+                ClientMessage::Ping { corr_id } => {
+                    self.send_response(corr_id, true, "Pong".to_string()).await;
                 }
             },
             SessionEvent::InstanceEvent(cmd) => match cmd {

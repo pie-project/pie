@@ -4,7 +4,7 @@
 //! and provides an interactive shell session for running inferlets and managing
 //! the engine state.
 
-use super::{output, path, service};
+use super::{manager, output, path};
 use crate::engine::Config as EngineConfig;
 use anyhow::Result;
 use clap::{Args, Parser};
@@ -38,9 +38,6 @@ pub struct ServeArgs {
     /// Enable interactive shell mode.
     #[arg(long, short)]
     pub interactive: bool,
-    /// Run in daemon mode (non-interactive, no TTY required).
-    #[arg(long)]
-    pub daemon: bool,
 }
 
 /// Arguments for running inferlets within the interactive shell.
@@ -61,7 +58,7 @@ pub struct ShellRunArgs {
 /// Handles the `pie serve` command.
 ///
 /// This function:
-/// 1. Creates an editor and printer for the interactive shell (unless in daemon mode)
+/// 1. Creates an editor and printer for the interactive shell (if interactive mode)
 /// 2. Starts the Pie engine and backend services
 /// 3. Runs the interactive shell session or waits for ctrl-c
 /// 4. Terminates the engine and backend services on exit
@@ -69,45 +66,32 @@ pub async fn handle_serve_command(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
     interactive: bool,
-    daemon: bool,
 ) -> Result<()> {
-    // In daemon mode, don't create editor/printer (no TTY required)
-    if daemon {
-        // Start the engine and backend services without a printer
-        let (shutdown_tx, server_handle, backend_processes, _client_config) =
-            service::start_engine_and_backend(
-                engine_config,
-                backend_configs,
-                None,
-            )
-            .await?;
-
-        // Wait for ctrl-c
-        tokio::signal::ctrl_c().await?;
-
-        // Terminate the engine and backend services
-        service::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
-    } else {
+    if interactive {
+        // Interactive mode: create shell, start services, run shell, cleanup
         let (rl, printer) = output::create_editor_and_printer_with_history().await?;
 
-        // Start the engine and backend services
         let (shutdown_tx, server_handle, backend_processes, client_config) =
-            service::start_engine_and_backend(
+            manager::start_engine_and_backend(
                 engine_config,
                 backend_configs,
                 Some(Arc::clone(&printer)),
             )
             .await?;
 
-        // Run interactive shell or wait for ctrl-c
-        if interactive {
-            run_shell(&client_config, rl, printer).await?;
-        } else {
-            tokio::signal::ctrl_c().await?;
-        }
+        run_shell(&client_config, rl, printer).await?;
 
-        // Terminate the engine and backend services
-        service::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
+        manager::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle)
+            .await?;
+    } else {
+        // Non-interactive mode: start services, wait for signal, cleanup
+        let (shutdown_tx, server_handle, backend_processes, _client_config) =
+            manager::start_engine_and_backend(engine_config, backend_configs, None).await?;
+
+        tokio::signal::ctrl_c().await?;
+
+        manager::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle)
+            .await?;
     }
 
     Ok(())
@@ -117,7 +101,7 @@ pub async fn handle_serve_command(
 async fn handle_shell_command(
     command: &str,
     args: &[&str],
-    client_config: &service::ClientConfig,
+    client_config: &manager::ClientConfig,
     printer: &output::SharedPrinter,
 ) -> Result<bool> {
     match command {
@@ -127,7 +111,7 @@ async fn handle_shell_command(
 
             match ShellRunArgs::try_parse_from(clap_args) {
                 Ok(run_args) => {
-                    if let Err(e) = service::submit_detached_inferlet(
+                    if let Err(e) = manager::submit_detached_inferlet(
                         client_config,
                         run_args.inferlet_path,
                         run_args.arguments,
@@ -154,7 +138,7 @@ async fn handle_shell_command(
             println!("(Query functionality not yet implemented)");
         }
         "stat" => {
-            service::print_backend_stats(client_config, printer).await?;
+            manager::print_backend_stats(client_config, printer).await?;
         }
         "help" => {
             println!("Available commands:");
@@ -184,7 +168,7 @@ async fn handle_shell_command(
 /// This function provides the main interactive loop for the `pie serve` command,
 /// allowing users to run inferlets, query engine state, and manage the session.
 async fn run_shell(
-    client_config: &service::ClientConfig,
+    client_config: &manager::ClientConfig,
     mut rl: Editor<output::MyHelper, FileHistory>,
     printer: output::SharedPrinter,
 ) -> Result<()> {

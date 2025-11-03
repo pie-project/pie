@@ -2,7 +2,7 @@
 
 set -e
 
-ROOT="$(dirname "$(dirname "${BASH_SOURCE[0]}")")"
+ROOT="$(dirname "$(dirname "$(dirname "${BASH_SOURCE[0]}")")")"
 
 # Run pyright check.
 # See `pyrightconfig.json` for the configuration of the check.

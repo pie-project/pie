@@ -33,8 +33,11 @@ impl EventCode {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    #[serde(rename = "authenticate")]
-    Authenticate { corr_id: u32, token: String },
+    #[serde(rename = "identification")]
+    Identification { corr_id: u32, username: String },
+
+    #[serde(rename = "signature")]
+    Signature { corr_id: u32, signature: String },
 
     #[serde(rename = "query")]
     Query {
@@ -98,6 +101,9 @@ pub enum ClientMessage {
 
     #[serde(rename = "internal_authenticate")]
     InternalAuthenticate { corr_id: u32, token: String },
+
+    #[serde(rename = "ping")]
+    Ping { corr_id: u32 },
 }
 
 /// Messages from server -> client
@@ -131,4 +137,7 @@ pub enum ServerMessage {
 
     #[serde(rename = "server_event")]
     ServerEvent { message: String },
+
+    #[serde(rename = "challenge")]
+    Challenge { corr_id: u32, challenge: String },
 }

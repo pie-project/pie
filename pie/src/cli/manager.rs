@@ -1,6 +1,8 @@
 //! Engine and backend management for the Pie CLI.
 
+use crate::auth::AuthorizedUsers;
 use crate::config::ConfigFile;
+use crate::dummy::{self, DummyBackendConfig};
 use crate::engine;
 use crate::output::SharedPrinter;
 use crate::path;
@@ -11,7 +13,7 @@ use engine::Config as EngineConfig;
 use pie_client::client::{self, Client};
 use pie_client::client::{Instance, InstanceEvent};
 use pie_client::message::{EventCode, QUERY_BACKEND_STATS};
-use rand::{Rng, distr::Alphanumeric};
+use rand::Rng;
 use std::path::Path;
 use std::{fs, path::PathBuf, process::Stdio};
 use tokio::io::BufReader;
@@ -25,7 +27,6 @@ use tokio::task::JoinHandle;
 pub struct ClientConfig {
     pub host: String,
     pub port: u16,
-    pub auth_secret: String,
     pub internal_auth_token: Option<String>,
 }
 
@@ -72,9 +73,6 @@ pub fn parse_engine_and_backend_config(
     } else {
         cfg_file.enable_auth.unwrap_or(true)
     };
-    let auth_secret = cfg_file
-        .auth_secret
-        .unwrap_or_else(generate_random_auth_secret);
 
     let engine_config = EngineConfig {
         host: host
@@ -83,7 +81,6 @@ pub fn parse_engine_and_backend_config(
             .unwrap_or_else(|| "127.0.0.1".to_string()),
         port: port.or(cfg_file.port).unwrap_or(8080),
         enable_auth,
-        auth_secret,
         cache_dir: cfg_file
             .cache_dir
             .unwrap_or_else(|| path::get_pie_home().unwrap().join("programs")),
@@ -109,16 +106,25 @@ pub async fn start_engine_and_backend(
     let mut client_config = ClientConfig {
         host: engine_config.host.clone(),
         port: engine_config.port,
-        auth_secret: engine_config.auth_secret.clone(),
         internal_auth_token: None,
     };
+
+    let authorized_users_path = path::get_authorized_users_path()?;
+    let authorized_users = if authorized_users_path.exists() {
+        AuthorizedUsers::load(&authorized_users_path)?
+    } else {
+        AuthorizedUsers::default()
+    };
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = oneshot::channel();
 
     // Start the main Pie engine server
     println!("🚀 Starting Pie engine...");
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = engine::run_server(engine_config, ready_tx, shutdown_rx).await {
+        if let Err(e) =
+            engine::run_server(engine_config, authorized_users, ready_tx, shutdown_rx).await
+        {
             eprintln!("\n[Engine Error] Engine failed: {}", e);
         }
     });
@@ -128,6 +134,8 @@ pub async fn start_engine_and_backend(
 
     // Launch all configured backend services
     let mut backend_processes = Vec::new();
+    let mut num_dummy_backends = 0;
+
     if !backend_configs.is_empty() {
         println!("🚀 Launching backend services...");
 
@@ -139,6 +147,29 @@ pub async fn start_engine_and_backend(
                 .get("backend_type")
                 .and_then(|v| v.as_str())
                 .context("`backend_type` is missing or not a string.")?;
+
+            // Handle dummy backend specially (no exec_path required)
+            if backend_type == "dummy" {
+                println!("- Starting dummy backend");
+
+                let dummy_config = DummyBackendConfig {
+                    controller_host: client_config.host.clone(),
+                    controller_port: client_config.port,
+                    internal_auth_token: client_config.internal_auth_token.clone().unwrap(),
+                };
+
+                // Spawn as detached task - no need to track the handle
+                tokio::spawn(async move {
+                    if let Err(e) = dummy::start_dummy_backend(dummy_config).await {
+                        eprintln!("[Dummy Backend] Error: {}", e);
+                    }
+                });
+
+                num_dummy_backends += 1;
+                continue;
+            }
+
+            // For non-dummy backends, exec_path is required
             let exec_path = backend_table
                 .get("exec_path")
                 .and_then(|v| v.as_str())
@@ -293,7 +324,7 @@ pub async fn start_engine_and_backend(
         }
     }
 
-    wait_for_backend_ready(backend_processes.len()).await?;
+    wait_for_backend_ready(backend_processes.len() + num_dummy_backends).await?;
 
     Ok((shutdown_tx, server_handle, backend_processes, client_config))
 }
@@ -320,6 +351,11 @@ pub async fn terminate_engine_and_backend(
     // This is to avoid broken pipe errors due to sending signals to the backend processes
     // after they have exited.
     stop_backend_heartbeat().await?;
+
+    // Note: Dummy backends are spawned as detached tokio tasks and will be automatically
+    // terminated when the engine shuts down, since they lose their connection.
+    // They are not included in the backend_processes vector.
+
     println!("🔄 Terminating backend processes...");
 
     // Iterate through the child processes, signal them, and wait for them to exit.
@@ -541,13 +577,4 @@ pub async fn print_backend_stats(
         crate::output::print_with_printer(printer, format!("Backend runtime stats:\n{}\n", stats))
             .await;
     Ok(())
-}
-
-/// Generates a random authentication secret.
-pub fn generate_random_auth_secret() -> String {
-    rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(64)
-        .map(char::from)
-        .collect()
 }

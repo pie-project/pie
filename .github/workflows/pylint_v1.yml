@@ -41,4 +41,4 @@ jobs:
           HEAD_REF=$(git rev-parse --verify pr_head 2>/dev/null || echo "$HEAD_SHA")
 
           # Run the centralized linting script for pylint_v1 workflow
-          ./tests/run_pylint_v1.sh "$BASE_REF" "$HEAD_REF"
+          ./tests/format/run_pylint_v1.sh "$BASE_REF" "$HEAD_REF"

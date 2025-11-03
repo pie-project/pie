@@ -3,7 +3,7 @@
 //! This module implements the `pie config` subcommands for managing Pie configuration files,
 //! including initializing, updating, and displaying configuration settings.
 
-use super::{path, service};
+use super::path;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -20,15 +20,22 @@ pub enum ConfigCommands {
     /// Update the entries of the default config file.
     Update(ConfigUpdateArgs),
     /// Show the content of the default config file.
-    Show,
+    Show {
+        /// Path to the config file to show (uses default path if not specified)
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]
 pub struct ConfigInitArgs {
-    /// Backend type (e.g., "python", "metal")
+    /// Backend type (e.g., "python", "metal", "dummy")
     pub backend_type: String,
-    /// Path to the backend executable
-    pub exec_path: String,
+    /// Path to the backend executable (not used for "dummy" backend)
+    pub exec_path: Option<String>,
+    /// Path where the config file should be saved (uses default path if not specified)
+    #[arg(long)]
+    pub path: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -43,9 +50,6 @@ pub struct ConfigUpdateArgs {
     /// Enable or disable authentication
     #[arg(long)]
     pub enable_auth: Option<bool>,
-    /// Authentication secret
-    #[arg(long)]
-    pub auth_secret: Option<String>,
     /// Cache directory path
     #[arg(long)]
     pub cache_dir: Option<String>,
@@ -99,6 +103,9 @@ pub struct ConfigUpdateArgs {
     /// Enable profiling
     #[arg(long)]
     pub backend_enable_profiling: Option<bool>,
+    /// Path to the config file to update (uses default path if not specified)
+    #[arg(long)]
+    pub path: Option<String>,
 }
 
 // Helper struct for parsing the TOML config file
@@ -107,7 +114,6 @@ pub struct ConfigFile {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub enable_auth: Option<bool>,
-    pub auth_secret: Option<String>,
     pub cache_dir: Option<PathBuf>,
     pub verbose: Option<bool>,
     pub log: Option<PathBuf>,
@@ -120,13 +126,13 @@ pub async fn handle_config_command(command: ConfigCommands) -> Result<()> {
     match command {
         ConfigCommands::Init(args) => handle_config_init_subcommand(args).await,
         ConfigCommands::Update(args) => handle_config_update_subcommand(args).await,
-        ConfigCommands::Show => handle_config_show_subcommand().await,
+        ConfigCommands::Show { path } => handle_config_show_subcommand(path).await,
     }
 }
 
 /// Handles the `pie config init` subcommand.
 async fn handle_config_init_subcommand(args: ConfigInitArgs) -> Result<()> {
-    init_default_config_file(&args.exec_path, &args.backend_type)
+    init_default_config_file(args.exec_path, &args.backend_type, args.path)
 }
 
 /// Handles the `pie config update` subcommand.
@@ -135,41 +141,61 @@ async fn handle_config_update_subcommand(args: ConfigUpdateArgs) -> Result<()> {
 }
 
 /// Handles the `pie config show` subcommand.
-async fn handle_config_show_subcommand() -> Result<()> {
-    show_default_config_file()
+async fn handle_config_show_subcommand(custom_path: Option<String>) -> Result<()> {
+    show_default_config_file(custom_path)
 }
 
-fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<String> {
+fn create_default_config_content(exec_path: Option<String>, backend_type: &str) -> Result<String> {
+    // Validate `exec_path` based on backend type
+    if backend_type == "dummy" {
+        if exec_path.is_some() {
+            println!("⚠️ Warning: exec_path is not used for dummy backend and will be ignored.");
+        }
+    } else if exec_path.is_none() {
+        anyhow::bail!(
+            "exec_path is required for backend type '{}'. \
+             Please provide the path to the backend executable.",
+            backend_type
+        );
+    }
+
+    let exec_path = exec_path.unwrap_or_default();
+
     // Create the backend configuration as a TOML table
-    let backend_table = [
-        (
-            "backend_type",
-            toml::Value::String(backend_type.to_string()),
-        ),
-        ("exec_path", toml::Value::String(exec_path.to_string())),
-        ("model", toml::Value::String("qwen-3-0.6b".into())),
-        ("device", toml::Value::String("cuda:0".into())),
-        ("dtype", toml::Value::String("bfloat16".into())),
-        ("kv_page_size", toml::Value::Integer(16)),
-        ("max_batch_tokens", toml::Value::Integer(10240)),
-        ("max_dist_size", toml::Value::Integer(32)),
-        ("max_num_kv_pages", toml::Value::Integer(10240)),
-        ("max_num_embeds", toml::Value::Integer(128)),
-        ("max_num_adapters", toml::Value::Integer(32)),
-        ("max_adapter_rank", toml::Value::Integer(8)),
-        ("gpu_mem_headroom", toml::Value::Float(10.0)),
-        ("enable_profiling", toml::Value::Boolean(false)),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
-    .collect::<toml::Table>();
+    let mut backend_fields: Vec<(&str, toml::Value)> = vec![(
+        "backend_type",
+        toml::Value::String(backend_type.to_string()),
+    )];
+
+    // Add remaining fields for non-dummy backends
+    if backend_type != "dummy" {
+        backend_fields.extend_from_slice(&[
+            ("exec_path", toml::Value::String(exec_path)),
+            ("model", toml::Value::String("qwen-3-0.6b".into())),
+            ("device", toml::Value::String("cuda:0".into())),
+            ("dtype", toml::Value::String("bfloat16".into())),
+            ("kv_page_size", toml::Value::Integer(16)),
+            ("max_batch_tokens", toml::Value::Integer(10240)),
+            ("max_dist_size", toml::Value::Integer(32)),
+            ("max_num_kv_pages", toml::Value::Integer(10240)),
+            ("max_num_embeds", toml::Value::Integer(128)),
+            ("max_num_adapters", toml::Value::Integer(32)),
+            ("max_adapter_rank", toml::Value::Integer(8)),
+            ("gpu_mem_headroom", toml::Value::Float(10.0)),
+            ("enable_profiling", toml::Value::Boolean(false)),
+        ]);
+    }
+
+    let backend_table = backend_fields
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect::<toml::Table>();
 
     // Create the ConfigFile object
     let config_file = ConfigFile {
         host: Some("127.0.0.1".to_string()),
         port: Some(8080),
         enable_auth: Some(true),
-        auth_secret: Some(service::generate_random_auth_secret()),
         cache_dir: None,
         verbose: None,
         log: None,
@@ -183,10 +209,18 @@ fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<
     Ok(config_content)
 }
 
-fn init_default_config_file(exec_path: &str, backend_type: &str) -> Result<()> {
+fn init_default_config_file(
+    exec_path: Option<String>,
+    backend_type: &str,
+    custom_path: Option<String>,
+) -> Result<()> {
     println!("⚙️ Initializing Pie configuration...");
 
-    let config_path = path::get_default_config_path()?;
+    let config_path = if let Some(path_str) = custom_path {
+        PathBuf::from(path_str)
+    } else {
+        path::get_default_config_path()?
+    };
 
     // Check if config file already exists
     if config_path.exists() {
@@ -214,7 +248,7 @@ fn init_default_config_file(exec_path: &str, backend_type: &str) -> Result<()> {
     }
 
     // Create the default config file
-    let config_content = create_default_config_content(&exec_path, &backend_type)?;
+    let config_content = create_default_config_content(exec_path, backend_type)?;
     fs::write(&config_path, &config_content)
         .with_context(|| format!("Failed to write config file at {:?}", config_path))?;
 
@@ -272,7 +306,6 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         host,
         port,
         enable_auth,
-        auth_secret,
         cache_dir,
         verbose,
         log,
@@ -291,18 +324,12 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         backend_max_adapter_rank,
         backend_gpu_mem_headroom,
         backend_enable_profiling,
+        // Path field
+        path,
     } = args;
 
     // Check if any update options were provided
-    let has_engine_updates = any_some![
-        host,
-        port,
-        enable_auth,
-        auth_secret,
-        cache_dir,
-        verbose,
-        log,
-    ];
+    let has_engine_updates = any_some![host, port, enable_auth, cache_dir, verbose, log,];
 
     let has_backend_updates = any_some![
         backend_type,
@@ -329,7 +356,11 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
 
     println!("⚙️ Updating Pie configuration...");
 
-    let config_path = path::get_default_config_path()?;
+    let config_path = if let Some(path_str) = path {
+        PathBuf::from(path_str)
+    } else {
+        path::get_default_config_path()?
+    };
 
     // Check if config file exists
     if !config_path.exists() {
@@ -350,7 +381,6 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         (host, host),
         (port, port),
         (enable_auth, enable_auth),
-        (auth_secret, auth_secret),
         (verbose, verbose),
         (cache_dir, cache_dir, PathBuf),
         (log, log, PathBuf),
@@ -398,8 +428,12 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
     Ok(())
 }
 
-fn show_default_config_file() -> Result<()> {
-    let config_path = path::get_default_config_path()?;
+fn show_default_config_file(custom_path: Option<String>) -> Result<()> {
+    let config_path = if let Some(path_str) = custom_path {
+        PathBuf::from(path_str)
+    } else {
+        path::get_default_config_path()?
+    };
 
     // Check if config file exists
     if !config_path.exists() {
