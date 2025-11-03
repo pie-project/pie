@@ -38,6 +38,9 @@ pub struct ServeArgs {
     /// Enable interactive shell mode.
     #[arg(long, short)]
     pub interactive: bool,
+    /// Run in daemon mode (non-interactive, no TTY required).
+    #[arg(long)]
+    pub daemon: bool,
 }
 
 /// Arguments for running inferlets within the interactive shell.
@@ -58,7 +61,7 @@ pub struct ShellRunArgs {
 /// Handles the `pie serve` command.
 ///
 /// This function:
-/// 1. Creates an editor and printer for the interactive shell
+/// 1. Creates an editor and printer for the interactive shell (unless in daemon mode)
 /// 2. Starts the Pie engine and backend services
 /// 3. Runs the interactive shell session or waits for ctrl-c
 /// 4. Terminates the engine and backend services on exit
@@ -66,27 +69,46 @@ pub async fn handle_serve_command(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
     interactive: bool,
+    daemon: bool,
 ) -> Result<()> {
-    let (rl, printer) = output::create_editor_and_printer_with_history().await?;
+    // In daemon mode, don't create editor/printer (no TTY required)
+    if daemon {
+        // Start the engine and backend services without a printer
+        let (shutdown_tx, server_handle, backend_processes, _client_config) =
+            service::start_engine_and_backend(
+                engine_config,
+                backend_configs,
+                None,
+            )
+            .await?;
 
-    // Start the engine and backend services
-    let (shutdown_tx, server_handle, backend_processes, client_config) =
-        service::start_engine_and_backend(
-            engine_config,
-            backend_configs,
-            Some(Arc::clone(&printer)),
-        )
-        .await?;
-
-    // Run interactive shell or wait for ctrl-c
-    if interactive {
-        run_shell(&client_config, rl, printer).await?;
-    } else {
+        // Wait for ctrl-c
         tokio::signal::ctrl_c().await?;
-    }
 
-    // Terminate the engine and backend services
-    service::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
+        // Terminate the engine and backend services
+        service::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
+    } else {
+        let (rl, printer) = output::create_editor_and_printer_with_history().await?;
+
+        // Start the engine and backend services
+        let (shutdown_tx, server_handle, backend_processes, client_config) =
+            service::start_engine_and_backend(
+                engine_config,
+                backend_configs,
+                Some(Arc::clone(&printer)),
+            )
+            .await?;
+
+        // Run interactive shell or wait for ctrl-c
+        if interactive {
+            run_shell(&client_config, rl, printer).await?;
+        } else {
+            tokio::signal::ctrl_c().await?;
+        }
+
+        // Terminate the engine and backend services
+        service::terminate_engine_and_backend(backend_processes, shutdown_tx, server_handle).await?;
+    }
 
     Ok(())
 }

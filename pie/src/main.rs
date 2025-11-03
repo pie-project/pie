@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
             // Initialize logging based on the config and get the file-writer guard
             let _guard = output::init_logging(&engine_config)?;
 
-            serve::handle_serve_command(engine_config, backend_configs, args.interactive).await?;
+            serve::handle_serve_command(engine_config, backend_configs, args.interactive, args.daemon).await?;
         }
         Commands::Run(args) => {
             // Build both engine and backend configs.
