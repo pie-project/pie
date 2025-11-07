@@ -1,6 +1,6 @@
 use crate::crypto::ParsedPrivateKey;
 use crate::message::{
-    CHUNK_SIZE_BYTES, ClientMessage, EventCode, QUERY_PROGRAM_EXISTS, ServerMessage,
+    CHUNK_SIZE_BYTES, ClientMessage, EventCode, InstanceInfo, QUERY_PROGRAM_EXISTS, ServerMessage,
 };
 use crate::utils::IdPool;
 use anyhow::{Context, Result};
@@ -49,6 +49,7 @@ struct ClientInner {
     ws_writer_tx: UnboundedSender<Message>,
     corr_id_pool: IdPool<CorrId>,
     pending_requests: DashMap<CorrId, oneshot::Sender<(bool, String)>>,
+    pending_list_requests: DashMap<CorrId, oneshot::Sender<Vec<InstanceInfo>>>,
     inst_event_tx: DashMap<InstanceId, mpsc::Sender<InstanceEvent>>,
     // Use a Mutex per entry to avoid deadlocking the DashMap shard
     pending_downloads: DashMap<String, Mutex<DownloadState>>, // Key: blob_hash
@@ -155,6 +156,7 @@ impl Client {
             ws_writer_tx: ws_writer_tx.clone(),
             corr_id_pool: IdPool::new(CorrId::MAX),
             pending_requests: DashMap::new(),
+            pending_list_requests: DashMap::new(),
             inst_event_tx: DashMap::new(),
             pending_downloads: DashMap::new(),
         });
@@ -221,6 +223,24 @@ impl Client {
 
         let (successful, result) = rx.await?;
         Ok((successful, result))
+    }
+
+    async fn send_list_msg_and_wait(&self, mut msg: ClientMessage) -> Result<Vec<InstanceInfo>> {
+        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
+        let corr_id_ref = match &mut msg {
+            ClientMessage::ListInstances { corr_id } => corr_id,
+            _ => anyhow::bail!("Invalid message type for list helper"),
+        };
+        *corr_id_ref = *corr_id_guard;
+
+        let (tx, rx) = oneshot::channel();
+        self.inner.pending_list_requests.insert(*corr_id_guard, tx);
+        self.inner
+            .ws_writer_tx
+            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+
+        let instances = rx.await?;
+        Ok(instances)
     }
 
     /// Authenticates the client with the server using a username and private key.
@@ -392,6 +412,11 @@ impl Client {
             anyhow::bail!("Ping failed: {}", result)
         }
     }
+
+    pub async fn list_instances(&self) -> Result<Vec<InstanceInfo>> {
+        let msg = ClientMessage::ListInstances { corr_id: 0 };
+        self.send_list_msg_and_wait(msg).await
+    }
 }
 
 /// Main message handler function called by the reader task.
@@ -474,6 +499,11 @@ async fn handle_server_message(
                 sender.send((true, challenge)).ok();
             }
         }
+        ServerMessage::LiveInstances { corr_id, instances } => {
+            if let Some((_, sender)) = inner.pending_list_requests.remove(&corr_id) {
+                sender.send(instances).ok();
+            }
+        }
     }
 }
 
@@ -481,6 +511,7 @@ async fn handle_server_message(
 /// to avoid locking up the client indefinitely.
 async fn handle_server_termination(inner: &Arc<ClientInner>) {
     inner.pending_requests.clear();
+    inner.pending_list_requests.clear();
     inner.inst_event_tx.clear();
     inner.pending_downloads.clear();
 }

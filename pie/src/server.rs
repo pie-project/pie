@@ -11,9 +11,7 @@ use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use pie_client::message::{
-    CHUNK_SIZE_BYTES, QUERY_BACKEND_STATS, QUERY_MODEL_STATUS, QUERY_PROGRAM_EXISTS,
-};
+use pie_client::message;
 use pie_client::message::{ClientMessage, EventCode, ServerMessage};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::mem;
@@ -601,6 +599,9 @@ impl Session {
                 ClientMessage::Ping { corr_id } => {
                     self.send_response(corr_id, true, "Pong".to_string()).await;
                 }
+                ClientMessage::ListInstances { corr_id } => {
+                    self.handle_list_instances(corr_id).await;
+                }
             },
             SessionEvent::InstanceEvent(cmd) => match cmd {
                 InstanceEvent::SendMsgToClient { inst_id, message } => {
@@ -674,7 +675,7 @@ impl Session {
 
     async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
         match subject.as_str() {
-            QUERY_PROGRAM_EXISTS => {
+            message::QUERY_PROGRAM_EXISTS => {
                 let (evt_tx, evt_rx) = oneshot::channel();
                 runtime::Command::ProgramExists {
                     hash: record,
@@ -685,7 +686,7 @@ impl Session {
                 self.send_response(corr_id, true, evt_rx.await.unwrap().to_string())
                     .await;
             }
-            QUERY_MODEL_STATUS => {
+            message::QUERY_MODEL_STATUS => {
                 let runtime_stats = model::runtime_stats().await;
                 self.send_response(
                     corr_id,
@@ -694,7 +695,7 @@ impl Session {
                 )
                 .await;
             }
-            QUERY_BACKEND_STATS => {
+            message::QUERY_BACKEND_STATS => {
                 let runtime_stats = model::runtime_stats().await;
                 let mut sorted_stats: Vec<_> = runtime_stats.iter().collect();
                 sorted_stats.sort_by_key(|(k, _)| *k);
@@ -709,6 +710,22 @@ impl Session {
         }
     }
 
+    async fn handle_list_instances(&self, corr_id: u32) {
+        let (evt_tx, evt_rx) = oneshot::channel();
+        runtime::Command::ListInstances { event: evt_tx }
+            .dispatch()
+            .unwrap();
+
+        let instance_ids = evt_rx.await.unwrap();
+        let instances: Vec<message::InstanceInfo> = instance_ids
+            .into_iter()
+            .map(|id| message::InstanceInfo { id })
+            .collect();
+
+        self.send(ServerMessage::LiveInstances { corr_id, instances })
+            .await;
+    }
+
     async fn handle_upload_program(
         &mut self,
         corr_id: u32,
@@ -717,14 +734,14 @@ impl Session {
         total_chunks: usize,
         mut chunk_data: Vec<u8>,
     ) {
-        if chunk_data.len() > CHUNK_SIZE_BYTES {
+        if chunk_data.len() > message::CHUNK_SIZE_BYTES {
             self.send_response(
                 corr_id,
                 false,
                 format!(
                     "Chunk size {} exceeds limit {}",
                     chunk_data.len(),
-                    CHUNK_SIZE_BYTES
+                    message::CHUNK_SIZE_BYTES
                 ),
             )
             .await;
@@ -963,7 +980,7 @@ impl Session {
                 InFlightUpload {
                     hash: blob_hash.clone(),
                     total_chunks,
-                    buffer: Vec::with_capacity(total_chunks * CHUNK_SIZE_BYTES),
+                    buffer: Vec::with_capacity(total_chunks * message::CHUNK_SIZE_BYTES),
                     next_chunk_index: 0,
                 },
             );
@@ -1016,9 +1033,9 @@ impl Session {
     /// Handles an internal command to send a blob to the connected client.
     async fn handle_send_blob(&mut self, inst_id: InstanceId, data: Bytes) {
         let blob_hash = blake3::hash(&data).to_hex().to_string();
-        let total_chunks = (data.len() + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES;
+        let total_chunks = (data.len() + message::CHUNK_SIZE_BYTES - 1) / message::CHUNK_SIZE_BYTES;
 
-        for (i, chunk) in data.chunks(CHUNK_SIZE_BYTES).enumerate() {
+        for (i, chunk) in data.chunks(message::CHUNK_SIZE_BYTES).enumerate() {
             self.send(ServerMessage::DownloadBlob {
                 corr_id: 0,
                 instance_id: inst_id.to_string(),

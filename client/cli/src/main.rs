@@ -3,11 +3,13 @@ use clap::{Parser, Subcommand};
 
 mod config;
 mod engine;
+mod list;
 mod path;
 mod ping;
 mod submit;
 
 use config::ConfigCommands;
+use list::ListArgs;
 use ping::PingArgs;
 use submit::SubmitArgs;
 
@@ -28,6 +30,8 @@ enum Commands {
     Submit(SubmitArgs),
     /// Check if the Pie engine is alive and responsive.
     Ping(PingArgs),
+    /// List all running inferlet instances.
+    List(ListArgs),
     #[command(subcommand)]
     /// Manage configuration.
     Config(ConfigCommands),
@@ -52,6 +56,16 @@ async fn main() -> Result<()> {
         }
         Commands::Ping(args) => {
             ping::handle_ping_command(
+                args.config,
+                args.host,
+                args.port,
+                args.username,
+                args.private_key_path,
+            )
+            .await?;
+        }
+        Commands::List(args) => {
+            list::handle_list_command(
                 args.config,
                 args.host,
                 args.port,

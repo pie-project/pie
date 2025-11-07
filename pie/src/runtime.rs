@@ -118,6 +118,10 @@ pub enum Command {
         query: String,
         event: oneshot::Sender<QueryResponse>,
     },
+
+    ListInstances {
+        event: oneshot::Sender<Vec<String>>,
+    },
 }
 
 impl Command {
@@ -274,6 +278,14 @@ impl Service for Runtime {
                 };
 
                 event.send(QueryResponse { value: res }).unwrap();
+            }
+            Command::ListInstances { event } => {
+                let instances: Vec<String> = self
+                    .running_instances
+                    .iter()
+                    .map(|item| item.key().to_string())
+                    .collect();
+                event.send(instances).unwrap();
             }
         }
     }

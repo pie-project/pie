@@ -29,6 +29,11 @@ impl EventCode {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InstanceInfo {
+    pub id: String,
+}
+
 /// Messages from client -> server
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -104,6 +109,9 @@ pub enum ClientMessage {
 
     #[serde(rename = "ping")]
     Ping { corr_id: u32 },
+
+    #[serde(rename = "list_instances")]
+    ListInstances { corr_id: u32 },
 }
 
 /// Messages from server -> client
@@ -140,4 +148,10 @@ pub enum ServerMessage {
 
     #[serde(rename = "challenge")]
     Challenge { corr_id: u32, challenge: String },
+
+    #[serde(rename = "live_instances")]
+    LiveInstances {
+        corr_id: u32,
+        instances: Vec<InstanceInfo>,
+    },
 }
