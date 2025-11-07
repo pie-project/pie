@@ -43,36 +43,13 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Submit(args) => {
-            submit::handle_submit_command(
-                args.config,
-                args.host,
-                args.port,
-                args.username,
-                args.private_key_path,
-                args.inferlet,
-                args.arguments,
-            )
-            .await?;
+            submit::handle_submit_command(args).await?;
         }
         Commands::Ping(args) => {
-            ping::handle_ping_command(
-                args.config,
-                args.host,
-                args.port,
-                args.username,
-                args.private_key_path,
-            )
-            .await?;
+            ping::handle_ping_command(args).await?;
         }
         Commands::List(args) => {
-            list::handle_list_command(
-                args.config,
-                args.host,
-                args.port,
-                args.username,
-                args.private_key_path,
-            )
-            .await?;
+            list::handle_list_command(args).await?;
         }
         Commands::Config(cmd) => {
             config::handle_config_command(cmd).await?;

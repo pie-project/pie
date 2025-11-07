@@ -36,15 +36,14 @@ pub struct ListArgs {
 /// 3. Attempts to connect to the Pie engine server
 /// 4. Queries for all live instances
 /// 5. Displays the list of running inferlet instances
-pub async fn handle_list_command(
-    config_path: Option<PathBuf>,
-    host: Option<String>,
-    port: Option<u16>,
-    username: Option<String>,
-    private_key_path: Option<PathBuf>,
-) -> Result<()> {
-    let client_config =
-        engine::ClientConfig::new(config_path, host, port, username, private_key_path)?;
+pub async fn handle_list_command(args: ListArgs) -> Result<()> {
+    let client_config = engine::ClientConfig::new(
+        args.config,
+        args.host,
+        args.port,
+        args.username,
+        args.private_key_path,
+    )?;
 
     let client = engine::connect_and_authenticate(&client_config)
         .await

@@ -43,17 +43,14 @@ pub struct SubmitArgs {
 /// 3. Connects to the existing Pie engine server
 /// 4. Submits the specified inferlet with the provided arguments
 /// 5. Waits for the inferlet to finish execution and prints the result
-pub async fn handle_submit_command(
-    config_path: Option<PathBuf>,
-    host: Option<String>,
-    port: Option<u16>,
-    username: Option<String>,
-    private_key_path: Option<PathBuf>,
-    inferlet_path: PathBuf,
-    arguments: Vec<String>,
-) -> Result<()> {
-    let client_config =
-        engine::ClientConfig::new(config_path, host, port, username, private_key_path)?;
+pub async fn handle_submit_command(args: SubmitArgs) -> Result<()> {
+    let client_config = engine::ClientConfig::new(
+        args.config,
+        args.host,
+        args.port,
+        args.username,
+        args.private_key_path,
+    )?;
 
-    engine::submit_inferlet_and_wait(&client_config, inferlet_path, arguments).await
+    engine::submit_inferlet_and_wait(&client_config, args.inferlet, args.arguments).await
 }

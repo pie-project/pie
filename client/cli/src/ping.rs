@@ -36,15 +36,14 @@ pub struct PingArgs {
 /// 2. Creates a client configuration from config and command-line arguments
 /// 3. Attempts to connect to the Pie engine server
 /// 4. Reports success if the connection and authentication succeed, or failure otherwise
-pub async fn handle_ping_command(
-    config_path: Option<PathBuf>,
-    host: Option<String>,
-    port: Option<u16>,
-    username: Option<String>,
-    private_key_path: Option<PathBuf>,
-) -> Result<()> {
-    let client_config =
-        engine::ClientConfig::new(config_path, host, port, username, private_key_path)?;
+pub async fn handle_ping_command(args: PingArgs) -> Result<()> {
+    let client_config = engine::ClientConfig::new(
+        args.config,
+        args.host,
+        args.port,
+        args.username,
+        args.private_key_path,
+    )?;
 
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
     println!("🔍 Pinging Pie engine at {}", url);
