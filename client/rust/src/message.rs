@@ -32,6 +32,8 @@ impl EventCode {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InstanceInfo {
     pub id: String,
+    pub cmd_name: String,
+    pub arguments: Vec<String>,
 }
 
 /// Messages from client -> server
@@ -65,6 +67,7 @@ pub enum ClientMessage {
     LaunchInstance {
         corr_id: u32,
         program_hash: String,
+        cmd_name: String,
         arguments: Vec<String>,
     },
 
@@ -73,6 +76,7 @@ pub enum ClientMessage {
         corr_id: u32,
         port: u32,
         program_hash: String,
+        cmd_name: String,
         arguments: Vec<String>,
     },
 

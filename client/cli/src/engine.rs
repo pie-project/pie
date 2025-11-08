@@ -131,7 +131,12 @@ async fn submit_inferlet(
         println!("✅ Inferlet upload successful.");
     }
 
-    let instance = client.launch_instance(&hash, arguments).await?;
+    let cmd_name = inferlet_path
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let instance = client.launch_instance(hash, cmd_name, arguments).await?;
     println!("✅ Inferlet launched with ID: {}", instance.id());
     Ok(instance)
 }

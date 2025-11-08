@@ -62,10 +62,56 @@ pub async fn handle_list_command(args: ListArgs) -> Result<()> {
             instances.len(),
             if instances.len() == 1 { "" } else { "s" }
         );
-        for (idx, instance) in instances.iter().enumerate() {
-            println!("  {}. {}", idx + 1, instance.id);
+        for instance in instances.iter() {
+            // Extract first 4 characters of UUID
+            let uuid_prefix = instance.id.chars().take(4).collect::<String>();
+
+            // Format arguments as a space-separated string
+            let args_str = instance.arguments.join(" ");
+
+            // Truncate command and arguments if too long
+            const MAX_CMD_LEN: usize = 40;
+            const MAX_ARGS_LEN: usize = 60;
+            let cmd_display = truncate_with_ellipsis(instance.cmd_name.clone(), MAX_CMD_LEN);
+            let args_display = truncate_with_ellipsis(args_str, MAX_ARGS_LEN);
+
+            println!("  {} {} {}", uuid_prefix, cmd_display, args_display);
         }
     }
 
     Ok(())
+}
+
+/// Truncates a string to a maximum length, appending "..." if truncated.
+fn truncate_with_ellipsis(mut s: String, max_display_chars: usize) -> String {
+    let mut chars_scanned = 0;
+    let mut truncation_byte_pos = None;
+    let chars_before_ellipsis = max_display_chars.saturating_sub(3);
+    
+    for (byte_pos, _) in s.char_indices() {
+        if chars_scanned == chars_before_ellipsis {
+            truncation_byte_pos = Some(byte_pos);
+        }
+        chars_scanned += 1;
+        if chars_scanned > max_display_chars {
+            break;
+        }
+    }
+    
+    // If string fits within the limit, no truncation needed
+    if chars_scanned <= max_display_chars {
+        return s;
+    }
+    
+    // Edge case: ellipsis itself is too long to fit
+    if max_display_chars < 3 {
+        return s.chars().take(max_display_chars).collect();
+    }
+    
+    // Truncate and append ellipsis
+    if let Some(byte_pos) = truncation_byte_pos {
+        s.truncate(byte_pos);
+        s.push_str("...");
+    }
+    s
 }

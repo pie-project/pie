@@ -380,12 +380,14 @@ impl Client {
 
     pub async fn launch_instance(
         &self,
-        program_hash: &str,
+        program_hash: String,
+        cmd_name: String,
         arguments: Vec<String>,
     ) -> Result<Instance> {
         let msg = ClientMessage::LaunchInstance {
             corr_id: 0,
-            program_hash: program_hash.to_string(),
+            program_hash,
+            cmd_name,
             arguments,
         };
         let (successful, result) = self.send_msg_and_wait(msg).await?;

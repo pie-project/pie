@@ -543,19 +543,27 @@ impl Session {
                 ClientMessage::LaunchInstance {
                     corr_id,
                     program_hash,
+                    cmd_name,
                     arguments,
                 } => {
-                    self.handle_launch_instance(corr_id, program_hash, arguments)
+                    self.handle_launch_instance(corr_id, program_hash, cmd_name, arguments)
                         .await
                 }
                 ClientMessage::LaunchServerInstance {
                     corr_id,
                     port,
                     program_hash,
+                    cmd_name,
                     arguments,
                 } => {
-                    self.handle_launch_server_instance(corr_id, port, program_hash, arguments)
-                        .await
+                    self.handle_launch_server_instance(
+                        corr_id,
+                        port,
+                        program_hash,
+                        cmd_name,
+                        arguments,
+                    )
+                    .await
                 }
                 ClientMessage::SignalInstance {
                     instance_id,
@@ -716,11 +724,7 @@ impl Session {
             .dispatch()
             .unwrap();
 
-        let instance_ids = evt_rx.await.unwrap();
-        let instances: Vec<message::InstanceInfo> = instance_ids
-            .into_iter()
-            .map(|id| message::InstanceInfo { id })
-            .collect();
+        let instances = evt_rx.await.unwrap();
 
         self.send(ServerMessage::LiveInstances { corr_id, instances })
             .await;
@@ -832,11 +836,13 @@ impl Session {
         &mut self,
         corr_id: u32,
         program_hash: String,
+        cmd_name: String,
         arguments: Vec<String>,
     ) {
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchInstance {
             program_hash,
+            cmd_name,
             arguments,
             event: evt_tx,
         }
@@ -862,12 +868,14 @@ impl Session {
         corr_id: u32,
         port: u32,
         program_hash: String,
+        cmd_name: String,
         arguments: Vec<String>,
     ) {
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchServerInstance {
             program_hash,
             port,
+            cmd_name,
             arguments,
             event: evt_tx,
         }

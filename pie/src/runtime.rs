@@ -5,6 +5,7 @@ use crate::model;
 use crate::model::request::QueryResponse;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
+use pie_client::message;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
@@ -93,6 +94,7 @@ pub enum Command {
 
     LaunchInstance {
         program_hash: String,
+        cmd_name: String,
         arguments: Vec<String>,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
     },
@@ -100,6 +102,7 @@ pub enum Command {
     LaunchServerInstance {
         program_hash: String,
         port: u32,
+        cmd_name: String,
         arguments: Vec<String>,
         event: oneshot::Sender<Result<(), RuntimeError>>,
     },
@@ -120,7 +123,7 @@ pub enum Command {
     },
 
     ListInstances {
-        event: oneshot::Sender<Vec<String>>,
+        event: oneshot::Sender<Vec<message::InstanceInfo>>,
     },
 }
 
@@ -165,7 +168,9 @@ pub enum TerminationCause {
 }
 
 pub struct InstanceHandle {
-    pub hash: String,
+    pub program_hash: String,
+    pub cmd_name: String,
+    pub arguments: Vec<String>,
     //pub to_origin: Sender<ServerMessage>,
     // pub evt_from_system: Sender<String>,
     // pub evt_from_origin: Sender<String>,
@@ -203,21 +208,28 @@ impl Service for Runtime {
             }
 
             Command::LaunchInstance {
-                program_hash: hash,
+                program_hash,
+                cmd_name,
                 event,
                 arguments,
             } => {
-                let instance_id = self.launch_instance(&hash, arguments).await.unwrap();
+                let instance_id = self
+                    .launch_instance(program_hash, cmd_name, arguments)
+                    .await
+                    .unwrap();
                 event.send(Ok(instance_id)).unwrap();
             }
 
             Command::LaunchServerInstance {
-                program_hash: hash,
+                program_hash,
                 port,
+                cmd_name,
                 arguments,
                 event,
             } => {
-                let _ = self.launch_server_instance(&hash, port, arguments).await;
+                let _ = self
+                    .launch_server_instance(program_hash, cmd_name, port, arguments)
+                    .await;
                 event.send(Ok(())).unwrap();
             }
 
@@ -255,7 +267,7 @@ impl Service for Runtime {
                                 format!(
                                     "Instance ID: {}, Program Hash: {}",
                                     item.key(),
-                                    item.value().hash
+                                    item.value().program_hash
                                 )
                             })
                             .collect();
@@ -280,10 +292,14 @@ impl Service for Runtime {
                 event.send(QueryResponse { value: res }).unwrap();
             }
             Command::ListInstances { event } => {
-                let instances: Vec<String> = self
+                let instances: Vec<message::InstanceInfo> = self
                     .running_instances
                     .iter()
-                    .map(|item| item.key().to_string())
+                    .map(|item| message::InstanceInfo {
+                        id: item.key().to_string(),
+                        cmd_name: item.value().cmd_name.clone(),
+                        arguments: item.value().arguments.clone(),
+                    })
                     .collect();
                 event.send(instances).unwrap();
             }
@@ -383,10 +399,11 @@ impl Runtime {
     /// Actually start a program instance
     pub async fn launch_instance(
         &self,
-        hash: &str,
+        program_hash: String,
+        cmd_name: String,
         arguments: Vec<String>,
     ) -> Result<InstanceId, RuntimeError> {
-        let component = self.get_component(hash)?;
+        let component = self.get_component(&program_hash)?;
 
         let instance_id = Uuid::new_v4();
 
@@ -400,7 +417,7 @@ impl Runtime {
         let join_handle = tokio::spawn(Self::launch(
             instance_id,
             component,
-            arguments,
+            arguments.clone(),
             engine,
             linker,
             start_rx,
@@ -408,7 +425,9 @@ impl Runtime {
 
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
-            hash: hash.to_string(),
+            program_hash,
+            cmd_name,
+            arguments,
             join_handle,
         };
         self.running_instances.insert(instance_id, instance_handle);
@@ -422,12 +441,13 @@ impl Runtime {
     /// Actually start a program instance
     pub async fn launch_server_instance(
         &self,
-        hash: &str,
+        program_hash: String,
+        cmd_name: String,
         port: u32,
         arguments: Vec<String>,
     ) -> Result<InstanceId, RuntimeError> {
         let instance_id = Uuid::new_v4();
-        let component = self.get_component(hash)?;
+        let component = self.get_component(&program_hash)?;
 
         // Instantiate and run in a task
         let engine = self.engine.clone();
@@ -438,12 +458,19 @@ impl Runtime {
         let (start_tx, start_rx) = oneshot::channel();
 
         let join_handle = tokio::spawn(Self::launch_server(
-            addr, component, arguments, engine, linker, start_rx,
+            addr,
+            component,
+            arguments.clone(),
+            engine,
+            linker,
+            start_rx,
         ));
 
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
-            hash: hash.to_string(),
+            program_hash,
+            cmd_name,
+            arguments,
             join_handle,
         };
         self.running_server_instances
