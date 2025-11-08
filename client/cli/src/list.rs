@@ -26,6 +26,9 @@ pub struct ListArgs {
     /// Path to the private key file to use for authentication.
     #[arg(long)]
     pub private_key_path: Option<PathBuf>,
+    /// Display the full UUID instead of just the first 4 characters.
+    #[arg(long)]
+    pub full: bool,
 }
 
 /// Handles the `pie-cli list` command.
@@ -62,24 +65,82 @@ pub async fn handle_list_command(args: ListArgs) -> Result<()> {
             instances.len(),
             if instances.len() == 1 { "" } else { "s" }
         );
-        for instance in instances.iter() {
-            // Extract first 4 characters of UUID
-            let uuid_prefix = instance.id.chars().take(4).collect::<String>();
+        println!();
 
-            // Format arguments as a space-separated string
-            let args_str = instance.arguments.join(" ");
+        // Column widths for the table
+        // UUID is typically 36 characters (with hyphens)
+        let id_width = if args.full { 36 } else { 4 };
+        const CMD_WIDTH: usize = 24;
+        let args_width = if args.full { 32 } else { 64 };
+
+        // Print table header
+        println!(
+            "{:<id_width$}  {:<cmd_width$}  {:<args_width$}",
+            "ID",
+            "COMMAND",
+            "ARGUMENTS",
+            id_width = id_width,
+            cmd_width = CMD_WIDTH,
+            args_width = args_width
+        );
+
+        // Print separator line
+        println!(
+            "{}  {}  {}",
+            "-".repeat(id_width),
+            "-".repeat(CMD_WIDTH),
+            "-".repeat(args_width)
+        );
+
+        // Print each instance
+        for instance in instances.iter() {
+            // Use full UUID or just the first 4 characters based on the flag
+            let uuid_display = if args.full {
+                instance.id.clone()
+            } else {
+                instance.id.chars().take(4).collect::<String>()
+            };
+
+            // Format arguments with proper quoting to show grouping
+            let args_str = format_arguments(&instance.arguments);
 
             // Truncate command and arguments if too long
-            const MAX_CMD_LEN: usize = 40;
-            const MAX_ARGS_LEN: usize = 60;
-            let cmd_display = truncate_with_ellipsis(instance.cmd_name.clone(), MAX_CMD_LEN);
-            let args_display = truncate_with_ellipsis(args_str, MAX_ARGS_LEN);
+            let cmd_display = truncate_with_ellipsis(instance.cmd_name.clone(), CMD_WIDTH);
+            let args_display = truncate_with_ellipsis(args_str, args_width);
 
-            println!("  {} {} {}", uuid_prefix, cmd_display, args_display);
+            // Print row with proper padding
+            println!(
+                "{:<id_width$}  {:<cmd_width$}  {:<args_width$}",
+                uuid_display,
+                cmd_display,
+                args_display,
+                id_width = id_width,
+                cmd_width = CMD_WIDTH,
+                args_width = args_width
+            );
         }
     }
 
     Ok(())
+}
+
+/// Formats arguments with proper quoting to preserve grouping information.
+///
+/// Arguments containing spaces or special characters are quoted to show
+/// they are a single argument. For example: ["-p", "Hello World"] becomes
+/// `-p "Hello World"` instead of `-p Hello World`.
+fn format_arguments(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            // Quote if the argument contains spaces or is empty
+            if arg.is_empty() || arg.contains(char::is_whitespace) {
+                format!("\"{}\"", arg.replace('"', "\\\""))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Truncates a string to a maximum length, appending "..." if truncated.
