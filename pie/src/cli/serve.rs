@@ -47,10 +47,6 @@ pub struct ShellRunArgs {
     #[arg(value_parser = path::expand_tilde)]
     pub inferlet_path: PathBuf,
 
-    /// Stream the inferlet output to the console.
-    #[arg(long, short)]
-    pub stream_output: bool,
-
     /// Arguments to pass to the Wasm program.
     pub arguments: Vec<String>,
 }
@@ -115,7 +111,7 @@ async fn handle_shell_command(
                         client_config,
                         run_args.inferlet_path,
                         run_args.arguments,
-                        run_args.stream_output,
+                        true,
                         printer.clone(),
                     )
                     .await

@@ -1,13 +1,13 @@
 use super::api::core::Queue;
 use super::utils;
 use crate::model::resource::{ResourceId, ResourceTypeId};
+use crate::server::InstanceEvent;
 use anyhow::{Result, format_err};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 use uuid::Uuid;
@@ -15,7 +15,7 @@ use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::async_trait;
 use wasmtime_wasi::cli::IsTerminal;
 use wasmtime_wasi::cli::StdoutStream;
-use wasmtime_wasi::p2::{OutputStream, Pollable, StreamError, StreamResult};
+use wasmtime_wasi::p2::{OutputStream, Pollable, StreamResult};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
@@ -109,16 +109,12 @@ impl WasiHttpView for InstanceState {
 // Define your custom stdout type.
 
 impl InstanceState {
-    pub async fn new(id: Uuid, arguments: Vec<String>) -> Self {
+    pub async fn new(id: InstanceId, arguments: Vec<String>) -> Self {
         let mut builder = WasiCtx::builder();
         builder.inherit_network(); // TODO: Replace with socket_addr_check later.
 
-        let short_id = shorten_uuid(&id);
-        let stdout_prefix = format!("stdout [{short_id}] :: ");
-        let stderr_prefix = format!("stderr [{short_id}] :: ");
-
-        builder.stdout(LogStream::new(stdout_prefix, Output::Stdout));
-        builder.stderr(LogStream::new(stderr_prefix, Output::Stderr));
+        builder.stdout(LogStream::new(OutputType::Stdout, id));
+        builder.stderr(LogStream::new(OutputType::Stderr, id));
 
         InstanceState {
             id,
@@ -194,82 +190,57 @@ impl InstanceState {
     }
 }
 
-////////////////////////
-// Helper functions for making stdout and stderr more readable.
-
-fn shorten_uuid(uuid: &Uuid) -> String {
-    // Convert the UUID to a string and split it by '-' to take the first segment.
-    uuid.to_string().split('-').next().unwrap().to_string()
-}
-
-#[derive(Clone)]
-enum Output {
+#[derive(Clone, Debug)]
+pub enum OutputType {
     Stdout,
     Stderr,
 }
 
-impl Output {
-    fn write_all(&self, buf: &[u8]) -> io::Result<()> {
-        use io::Write;
-
+impl OutputType {
+    fn write_all(&self, buf: &[u8], instance_id: InstanceId) {
         match self {
-            Output::Stdout => io::stdout().write_all(buf),
-            Output::Stderr => io::stderr().write_all(buf),
+            OutputType::Stdout => {
+                InstanceEvent::StreamingOutput {
+                    inst_id: instance_id,
+                    output_type: OutputType::Stdout,
+                    content: String::from_utf8_lossy(buf).to_string(),
+                }
+                .dispatch()
+                .unwrap();
+            }
+            OutputType::Stderr => {
+                InstanceEvent::StreamingOutput {
+                    inst_id: instance_id,
+                    output_type: OutputType::Stderr,
+                    content: String::from_utf8_lossy(buf).to_string(),
+                }
+                .dispatch()
+                .unwrap();
+            }
         }
     }
 }
 
 #[derive(Clone)]
 struct LogStream {
-    output: Output,
+    output: OutputType,
     state: Arc<LogStreamState>,
 }
 
 struct LogStreamState {
-    prefix: String,
-    needs_prefix_on_next_write: AtomicBool,
+    instance_id: InstanceId,
 }
 
 impl LogStream {
-    fn new(prefix: String, output: Output) -> LogStream {
+    fn new(output: OutputType, instance_id: InstanceId) -> LogStream {
         LogStream {
             output,
-            state: Arc::new(LogStreamState {
-                prefix,
-                needs_prefix_on_next_write: AtomicBool::new(true),
-            }),
+            state: Arc::new(LogStreamState { instance_id }),
         }
     }
 
-    fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
-        while !bytes.is_empty() {
-            if self
-                .state
-                .needs_prefix_on_next_write
-                .load(Ordering::Relaxed)
-            {
-                self.output.write_all(self.state.prefix.as_bytes())?;
-                self.state
-                    .needs_prefix_on_next_write
-                    .store(false, Ordering::Relaxed);
-            }
-            match bytes.iter().position(|b| *b == b'\n') {
-                Some(i) => {
-                    let (a, b) = bytes.split_at(i + 1);
-                    bytes = b;
-                    self.output.write_all(a)?;
-                    self.state
-                        .needs_prefix_on_next_write
-                        .store(true, Ordering::Relaxed);
-                }
-                None => {
-                    self.output.write_all(bytes)?;
-                    break;
-                }
-            }
-        }
-
-        Ok(())
+    fn write_all(&mut self, bytes: &[u8]) {
+        self.output.write_all(bytes, self.state.instance_id);
     }
 }
 
@@ -285,16 +256,15 @@ impl StdoutStream for LogStream {
 impl IsTerminal for LogStream {
     fn is_terminal(&self) -> bool {
         match &self.output {
-            Output::Stdout => std::io::stdout().is_terminal(),
-            Output::Stderr => std::io::stderr().is_terminal(),
+            OutputType::Stdout => std::io::stdout().is_terminal(),
+            OutputType::Stderr => std::io::stderr().is_terminal(),
         }
     }
 }
 
 impl OutputStream for LogStream {
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
-        self.write_all(&bytes)
-            .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
+        self.write_all(&bytes);
         Ok(())
     }
 
@@ -318,7 +288,8 @@ impl AsyncWrite for LogStream {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Poll::Ready(self.write_all(buf).map(|_| buf.len()))
+        self.write_all(buf);
+        Poll::Ready(Ok(buf.len()))
     }
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))

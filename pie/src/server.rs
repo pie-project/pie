@@ -1,19 +1,17 @@
-use super::instance::InstanceId;
-use super::messaging::dispatch_u2i;
-use super::service::{Service, ServiceError, install_service};
-use super::utils::IdPool;
-use super::{messaging, runtime, service};
 use crate::auth::{AuthorizedUsers, PublicKey};
+use crate::instance::{InstanceId, OutputType};
+use crate::messaging::{self, dispatch_u2i};
 use crate::model;
 use crate::model::Model;
-use crate::runtime::TerminationCause;
+use crate::runtime::{self, TerminationCause};
+use crate::service::{self, Service, ServiceError, install_service};
+use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use pie_client::message;
-use pie_client::message::{ClientMessage, EventCode, ServerMessage};
+use pie_client::message::{self, ClientMessage, EventCode, ServerMessage, StreamingOutput};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -61,6 +59,11 @@ pub enum InstanceEvent {
     DetachInstance {
         inst_id: InstanceId,
         cause: TerminationCause,
+    },
+    StreamingOutput {
+        inst_id: InstanceId,
+        output_type: OutputType,
+        content: String,
     },
 }
 
@@ -226,7 +229,8 @@ impl Service for Server {
                 let inst_id = match &event {
                     InstanceEvent::SendMsgToClient { inst_id, .. }
                     | InstanceEvent::DetachInstance { inst_id, .. }
-                    | InstanceEvent::SendBlobToClient { inst_id, .. } => *inst_id,
+                    | InstanceEvent::SendBlobToClient { inst_id, .. }
+                    | InstanceEvent::StreamingOutput { inst_id, .. } => *inst_id,
                 };
 
                 // Send it to the client if it's connected
@@ -621,6 +625,14 @@ impl Session {
                 }
                 InstanceEvent::SendBlobToClient { inst_id, data } => {
                     self.handle_send_blob(inst_id, data).await;
+                }
+                InstanceEvent::StreamingOutput {
+                    inst_id,
+                    output_type,
+                    content,
+                } => {
+                    self.handle_streaming_output(inst_id, output_type, content)
+                        .await;
                 }
             },
         }
@@ -1044,6 +1056,23 @@ impl Session {
             })
             .await;
         }
+    }
+
+    async fn handle_streaming_output(
+        &mut self,
+        inst_id: InstanceId,
+        output_type: OutputType,
+        content: String,
+    ) {
+        let output = match output_type {
+            OutputType::Stdout => StreamingOutput::Stdout(content),
+            OutputType::Stderr => StreamingOutput::Stderr(content),
+        };
+        self.send(ServerMessage::StreamingOutput {
+            instance_id: inst_id.to_string(),
+            output,
+        })
+        .await;
     }
 }
 

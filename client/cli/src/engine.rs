@@ -144,11 +144,15 @@ async fn submit_inferlet(
 /// Streams the output of an inferlet.
 async fn stream_inferlet_output(mut instance: Instance) -> Result<()> {
     let instance_id = instance.id().to_string();
+    let short_id = instance_id[..instance_id.len().min(8)].to_string();
+    let mut at_line_start_stdout = true;
+    let mut at_line_start_stderr = true;
+
     loop {
         let event = match instance.recv().await {
             Ok(ev) => ev,
             Err(e) => {
-                println!("[Inferlet {}] ReceiveError: {}", instance_id, e);
+                println!("[Instance {}] ReceiveError: {}", short_id, e);
                 return Err(e);
             }
         };
@@ -157,7 +161,7 @@ async fn stream_inferlet_output(mut instance: Instance) -> Result<()> {
             InstanceEvent::Event { code, message } => {
                 // Format the output string.
                 // Using the Debug representation of `code` is a clean way to get its name (e.g., "Completed").
-                println!("[Inferlet {}] {:?}: {}", instance_id, code, message);
+                println!("[Instance {}] {:?}: {}", short_id, code, message);
 
                 match code {
                     EventCode::Completed => return Ok(()),
@@ -170,8 +174,81 @@ async fn stream_inferlet_output(mut instance: Instance) -> Result<()> {
                     }
                 }
             }
+            // Handle streaming stdout
+            InstanceEvent::Stdout(content) => {
+                handle_streaming_output(false, content, &short_id, &mut at_line_start_stdout).await;
+            }
+            // Handle streaming stderr
+            InstanceEvent::Stderr(content) => {
+                handle_streaming_output(true, content, &short_id, &mut at_line_start_stderr).await;
+            }
             // If we receive a raw data blob, we'll ignore it and wait for the next event.
             InstanceEvent::Blob(_) => continue,
+        }
+    }
+}
+
+/// Helper to handle streaming output (stdout or stderr).
+async fn handle_streaming_output(
+    is_stderr: bool,
+    content: String,
+    short_id: &str,
+    at_line_start: &mut bool,
+) {
+    let at_start = *at_line_start;
+    let short_id = short_id.to_string();
+    *at_line_start = tokio::task::spawn_blocking(move || {
+        let mut at_start_local = at_start;
+        if is_stderr {
+            write_with_prefix(
+                std::io::stderr().lock(),
+                &content,
+                &short_id,
+                &mut at_start_local,
+            );
+        } else {
+            write_with_prefix(
+                std::io::stdout().lock(),
+                &content,
+                &short_id,
+                &mut at_start_local,
+            );
+        }
+        at_start_local
+    })
+    .await
+    .unwrap_or(at_start);
+}
+
+/// Helper function to print output with instance ID prefix only at the start of new lines.
+fn write_with_prefix(
+    mut writer: impl std::io::Write,
+    content: &str,
+    short_id: &str,
+    at_line_start: &mut bool,
+) {
+    if content.is_empty() {
+        return;
+    }
+
+    let lines = content.split('\n');
+    let mut first = true;
+
+    for line in lines {
+        if !first {
+            // We encountered a '\n' separator, print it
+            let _ = writeln!(writer);
+            *at_line_start = true;
+        }
+        first = false;
+
+        // Add prefix only if we're at line start and the line is non-empty
+        if !line.is_empty() {
+            if *at_line_start {
+                let _ = write!(writer, "[Instance {}] ", short_id);
+                *at_line_start = false;
+            }
+            let _ = write!(writer, "{}", line);
         }
     }
 }

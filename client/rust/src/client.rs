@@ -1,6 +1,7 @@
 use crate::crypto::ParsedPrivateKey;
 use crate::message::{
     CHUNK_SIZE_BYTES, ClientMessage, EventCode, InstanceInfo, QUERY_PROGRAM_EXISTS, ServerMessage,
+    StreamingOutput,
 };
 use crate::utils::IdPool;
 use anyhow::{Context, Result};
@@ -26,6 +27,10 @@ pub enum InstanceEvent {
     Event { code: EventCode, message: String },
     /// A binary blob of data sent from the instance.
     Blob(Vec<u8>),
+    /// Streaming output to stdout from the instance.
+    Stdout(String),
+    /// Streaming output to stderr from the instance.
+    Stderr(String),
 }
 
 /// Holds the state for a blob being downloaded from the server.
@@ -515,6 +520,20 @@ async fn handle_server_message(
         ServerMessage::LiveInstances { corr_id, instances } => {
             if let Some((_, sender)) = inner.pending_list_requests.remove(&corr_id) {
                 sender.send(instances).ok();
+            }
+        }
+        ServerMessage::StreamingOutput {
+            instance_id,
+            output,
+        } => {
+            if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
+                if let Some(sender) = inner.inst_event_tx.get(&inst_id) {
+                    let event = match output {
+                        StreamingOutput::Stdout(output) => InstanceEvent::Stdout(output),
+                        StreamingOutput::Stderr(output) => InstanceEvent::Stderr(output),
+                    };
+                    sender.send(event).await.ok();
+                }
             }
         }
     }

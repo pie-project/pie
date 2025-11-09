@@ -36,6 +36,12 @@ pub struct InstanceInfo {
     pub arguments: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub enum StreamingOutput {
+    Stdout(String),
+    Stderr(String),
+}
+
 /// Messages from client -> server
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -157,5 +163,11 @@ pub enum ServerMessage {
     LiveInstances {
         corr_id: u32,
         instances: Vec<InstanceInfo>,
+    },
+
+    #[serde(rename = "streaming_output")]
+    StreamingOutput {
+        instance_id: String,
+        output: StreamingOutput,
     },
 }
