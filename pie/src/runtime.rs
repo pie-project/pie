@@ -28,7 +28,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 static SERVICE_ID_RUNTIME: OnceLock<usize> = OnceLock::new();
 
 pub fn trap(instance_id: InstanceId, cause: TerminationCause) {
-    Command::Trap {
+    Command::TerminateInstance {
         inst_id: instance_id,
         cause,
     }
@@ -40,7 +40,7 @@ pub fn trap_exception<T>(instance_id: InstanceId, exception: T)
 where
     T: ToString,
 {
-    Command::Trap {
+    Command::TerminateInstance {
         inst_id: instance_id,
         cause: TerminationCause::Exception(exception.to_string()),
     }
@@ -107,9 +107,13 @@ pub enum Command {
         event: oneshot::Sender<Result<(), RuntimeError>>,
     },
 
-    Trap {
+    TerminateInstance {
         inst_id: InstanceId,
         cause: TerminationCause,
+    },
+
+    DropInstance {
+        inst_id: InstanceId,
     },
 
     Warn {
@@ -233,8 +237,12 @@ impl Service for Runtime {
                 event.send(Ok(())).unwrap();
             }
 
-            Command::Trap { inst_id, cause } => {
+            Command::TerminateInstance { inst_id, cause } => {
                 self.terminate_instance(inst_id, cause).await;
+            }
+
+            Command::DropInstance { inst_id } => {
+                self.drop_instance(inst_id).await;
             }
 
             Command::Warn { inst_id, message } => server::InstanceEvent::SendMsgToClient {
@@ -482,28 +490,33 @@ impl Runtime {
         Ok(instance_id)
     }
 
-    /// Terminate or abort a running instance
+    /// Terminate or abort a running instance. It will also send a detach event to
+    /// the server so that the client can be notified. This function is used when the
+    /// client session is still active. Use [`drop_instance`] instead if you want to
+    /// drop the instance without notifying the client.
     async fn terminate_instance(&self, instance_id: InstanceId, cause: TerminationCause) {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
 
             model::cleanup_instance(instance_id.clone());
 
-            let (termination_code, message) = match cause {
-                TerminationCause::Normal(message) => (0, message),
-                TerminationCause::Signal => (1, "Signal termination".to_string()),
-                TerminationCause::Exception(message) => (2, message),
-                TerminationCause::SystemError(message) => (3, message),
-                TerminationCause::OutOfResources(message) => (4, message),
-            };
-
             server::InstanceEvent::DetachInstance {
-                inst_id: instance_id.clone(),
-                termination_code,
-                message,
+                inst_id: instance_id,
+                cause,
             }
             .dispatch()
             .ok();
+        }
+    }
+
+    /// Drop a running instance. This will not notify the server. This function is used
+    /// when the client session has been or is being closed. Use [`terminate_instance`]
+    /// instead if you want to notify the client.
+    async fn drop_instance(&mut self, instance_id: InstanceId) {
+        if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
+            handle.join_handle.abort();
+
+            model::cleanup_instance(instance_id);
         }
     }
 
@@ -677,7 +690,7 @@ impl Runtime {
 
         match result {
             Ok(return_value) => {
-                Command::Trap {
+                Command::TerminateInstance {
                     inst_id: instance_id,
                     cause: TerminationCause::Normal(return_value.unwrap_or_default()),
                 }
@@ -686,7 +699,7 @@ impl Runtime {
             }
             Err(err) => {
                 println!("Instance {instance_id} failed: {err}");
-                Command::Trap {
+                Command::TerminateInstance {
                     inst_id: instance_id,
                     cause: TerminationCause::Exception(err.to_string()),
                 }

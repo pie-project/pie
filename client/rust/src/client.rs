@@ -419,6 +419,17 @@ impl Client {
         let msg = ClientMessage::ListInstances { corr_id: 0 };
         self.send_list_msg_and_wait(msg).await
     }
+
+    /// Terminates an instance by its ID (fire-and-forget).
+    pub async fn terminate_instance(&self, instance_id: &str) -> Result<()> {
+        let msg = ClientMessage::TerminateInstance {
+            instance_id: instance_id.to_string(),
+        };
+        self.inner
+            .ws_writer_tx
+            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+        Ok(())
+    }
 }
 
 /// Main message handler function called by the reader task.

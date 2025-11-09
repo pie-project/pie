@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod abort;
 mod config;
 mod engine;
 mod list;
@@ -8,6 +9,7 @@ mod path;
 mod ping;
 mod submit;
 
+use abort::AbortArgs;
 use config::ConfigCommands;
 use list::ListArgs;
 use ping::PingArgs;
@@ -32,6 +34,8 @@ enum Commands {
     Ping(PingArgs),
     /// List all running inferlet instances.
     List(ListArgs),
+    /// Terminate a running inferlet instance.
+    Abort(AbortArgs),
     #[command(subcommand)]
     /// Manage configuration.
     Config(ConfigCommands),
@@ -50,6 +54,9 @@ async fn main() -> Result<()> {
         }
         Commands::List(args) => {
             list::handle_list_command(args).await?;
+        }
+        Commands::Abort(args) => {
+            abort::handle_abort_command(args).await?;
         }
         Commands::Config(cmd) => {
             config::handle_config_command(cmd).await?;

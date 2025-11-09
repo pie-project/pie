@@ -6,6 +6,7 @@ use super::{messaging, runtime, service};
 use crate::auth::{AuthorizedUsers, PublicKey};
 use crate::model;
 use crate::model::Model;
+use crate::runtime::TerminationCause;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use bytes::Bytes;
@@ -59,8 +60,7 @@ pub enum InstanceEvent {
     },
     DetachInstance {
         inst_id: InstanceId,
-        termination_code: u32,
-        message: String,
+        cause: TerminationCause,
     },
 }
 
@@ -269,7 +269,7 @@ struct Session {
 
     inflight_program_upload: Option<InFlightUpload>,
     inflight_blob_uploads: DashMap<String, InFlightUpload>,
-    inst_owned: Vec<InstanceId>,
+    attached_instances: Vec<InstanceId>,
 
     ws_msg_tx: mpsc::Sender<WsMessage>,
     client_cmd_rx: mpsc::Receiver<SessionEvent>,
@@ -339,7 +339,7 @@ impl Session {
             state,
             inflight_program_upload: None,
             inflight_blob_uploads: DashMap::new(),
-            inst_owned: Vec::new(),
+            attached_instances: Vec::new(),
             ws_msg_tx,
             client_cmd_rx,
             client_cmd_tx,
@@ -616,13 +616,8 @@ impl Session {
                     self.send_inst_event(inst_id, EventCode::Message, message)
                         .await
                 }
-                InstanceEvent::DetachInstance {
-                    inst_id,
-                    termination_code,
-                    message,
-                } => {
-                    self.handle_detach_instance(inst_id, termination_code, message)
-                        .await;
+                InstanceEvent::DetachInstance { inst_id, cause } => {
+                    self.handle_detach_instance(inst_id, cause).await;
                 }
                 InstanceEvent::SendBlobToClient { inst_id, data } => {
                     self.handle_send_blob(inst_id, data).await;
@@ -662,21 +657,18 @@ impl Session {
         .await;
     }
 
-    async fn handle_detach_instance(
-        &mut self,
-        inst_id: InstanceId,
-        termination_code: u32,
-        message: String,
-    ) {
-        self.inst_owned.retain(|&id| id != inst_id);
+    async fn handle_detach_instance(&mut self, inst_id: InstanceId, cause: TerminationCause) {
+        self.attached_instances.retain(|&id| id != inst_id);
 
         if self.state.client_cmd_txs.remove(&inst_id).is_some() {
-            let event_code = match termination_code {
-                0 => EventCode::Completed,
-                1 => EventCode::Aborted,
-                2 => EventCode::Exception,
-                _ => EventCode::ServerError,
+            let (event_code, message) = match cause {
+                TerminationCause::Normal(message) => (EventCode::Completed, message),
+                TerminationCause::Signal => (EventCode::Aborted, "Signal termination".to_string()),
+                TerminationCause::Exception(message) => (EventCode::Exception, message),
+                TerminationCause::SystemError(message) => (EventCode::ServerError, message),
+                TerminationCause::OutOfResources(message) => (EventCode::ServerError, message),
             };
+
             self.send_inst_event(inst_id, event_code, message).await;
         }
     }
@@ -853,7 +845,7 @@ impl Session {
                 self.state
                     .client_cmd_txs
                     .insert(instance_id, self.client_cmd_tx.clone());
-                self.inst_owned.push(instance_id);
+                self.attached_instances.push(instance_id);
                 self.send_response(corr_id, true, instance_id.to_string())
                     .await;
             }
@@ -892,7 +884,7 @@ impl Session {
 
     async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-            if self.inst_owned.contains(&inst_id) {
+            if self.attached_instances.contains(&inst_id) {
                 dispatch_u2i(messaging::PushPullCommand::Push {
                     topic: inst_id.to_string(),
                     message,
@@ -903,9 +895,7 @@ impl Session {
 
     async fn handle_terminate_instance(&mut self, instance_id: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-            if self.inst_owned.contains(&inst_id) {
-                runtime::trap(inst_id, runtime::TerminationCause::Signal);
-            }
+            runtime::trap(inst_id, runtime::TerminationCause::Signal);
         }
     }
 
@@ -966,7 +956,7 @@ impl Session {
                 return;
             }
         };
-        if !self.inst_owned.contains(&inst_id) {
+        if !self.attached_instances.contains(&inst_id) {
             self.send_response(
                 corr_id,
                 false,
@@ -1059,9 +1049,11 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        for inst_id in self.inst_owned.drain(..) {
+        for inst_id in self.attached_instances.drain(..) {
             if self.state.client_cmd_txs.remove(&inst_id).is_some() {
-                runtime::trap_exception(inst_id, "socket terminated");
+                runtime::Command::DropInstance { inst_id }
+                    .dispatch()
+                    .unwrap();
             }
         }
 

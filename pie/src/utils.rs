@@ -3,7 +3,6 @@
 use anyhow::{Error, Result};
 use num_traits::PrimInt;
 use std::collections::BTreeSet;
-use std::hash::Hash;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 /// A fast, thread-safe counter.
