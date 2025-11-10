@@ -30,10 +30,18 @@ impl EventCode {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub enum InstanceStatus {
+    Attached,
+    Detached,
+    Finished,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InstanceInfo {
     pub id: String,
     pub cmd_name: String,
     pub arguments: Vec<String>,
+    pub status: InstanceStatus,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

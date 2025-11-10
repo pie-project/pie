@@ -25,27 +25,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static SERVICE_ID_RUNTIME: OnceLock<usize> = OnceLock::new();
 
-pub fn trap(instance_id: InstanceId, cause: TerminationCause) {
-    Command::TerminateInstance {
-        inst_id: instance_id,
-        cause,
-    }
-    .dispatch()
-    .unwrap();
-}
-
-pub fn trap_exception<T>(instance_id: InstanceId, exception: T)
-where
-    T: ToString,
-{
-    Command::TerminateInstance {
-        inst_id: instance_id,
-        cause: TerminationCause::Exception(exception.to_string()),
-    }
-    .dispatch()
-    .unwrap();
-}
-
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     /// Wrap general I/O errors
@@ -106,13 +85,14 @@ pub enum Command {
         event: oneshot::Sender<Result<(), RuntimeError>>,
     },
 
-    TerminateInstance {
+    AbortInstance {
         inst_id: InstanceId,
-        cause: TerminationCause,
+        notification_to_client: Option<TerminationCause>,
     },
 
-    DropInstance {
+    FinishInstance {
         inst_id: InstanceId,
+        cause: TerminationCause,
     },
 
     #[allow(dead_code)]
@@ -158,6 +138,9 @@ pub struct Runtime {
     /// Running instances
     running_instances: DashMap<InstanceId, InstanceHandle>,
 
+    /// Finished instances
+    finished_instances: DashMap<InstanceId, InstanceHandle>,
+
     /// Running server instances
     running_server_instances: DashMap<InstanceId, InstanceHandle>,
 }
@@ -170,11 +153,35 @@ pub enum TerminationCause {
     OutOfResources(String),
 }
 
+#[derive(Debug, Clone)]
+pub enum InstanceRunningState {
+    /// The instance is running and a client is attached to it.
+    /// The output will be streamed to the client.
+    Attached,
+    /// The instance is running and not attached to a client.
+    /// The output will be buffered.
+    Detached,
+    /// The instance has finished execution.
+    /// The output is buffered and waiting to be streamed to the client.
+    Finished(TerminationCause),
+}
+
+impl From<InstanceRunningState> for message::InstanceStatus {
+    fn from(state: InstanceRunningState) -> Self {
+        match state {
+            InstanceRunningState::Attached => message::InstanceStatus::Attached,
+            InstanceRunningState::Detached => message::InstanceStatus::Detached,
+            InstanceRunningState::Finished(_) => message::InstanceStatus::Finished,
+        }
+    }
+}
+
 pub struct InstanceHandle {
     pub program_hash: String,
     pub cmd_name: String,
     pub arguments: Vec<String>,
     pub output_delivery_ctrl: OutputDeliveryCtrl,
+    pub running_state: InstanceRunningState,
     pub join_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -234,12 +241,15 @@ impl Service for Runtime {
                 event.send(Ok(())).unwrap();
             }
 
-            Command::TerminateInstance { inst_id, cause } => {
-                self.terminate_instance(inst_id, cause).await;
+            Command::AbortInstance {
+                inst_id,
+                notification_to_client,
+            } => {
+                self.abort_instance(inst_id, notification_to_client);
             }
 
-            Command::DropInstance { inst_id } => {
-                self.drop_instance(inst_id).await;
+            Command::FinishInstance { inst_id, cause } => {
+                self.finish_instance(inst_id, cause);
             }
 
             Command::SetOutputDelivery { inst_id, mode } => {
@@ -298,12 +308,15 @@ impl Service for Runtime {
                 let instances: Vec<message::InstanceInfo> = self
                     .running_instances
                     .iter()
+                    .chain(self.finished_instances.iter())
                     .map(|item| message::InstanceInfo {
                         id: item.key().to_string(),
                         cmd_name: item.value().cmd_name.clone(),
                         arguments: item.value().arguments.clone(),
+                        status: item.value().running_state.clone().into(),
                     })
                     .collect();
+
                 event.send(instances).unwrap();
             }
         }
@@ -345,6 +358,7 @@ impl Runtime {
             programs_in_memory: DashMap::new(),
             programs_in_disk: DashMap::new(),
             running_instances: DashMap::new(),
+            finished_instances: DashMap::new(),
             running_server_instances: DashMap::new(),
         }
     }
@@ -432,12 +446,19 @@ impl Runtime {
         // Wait for the output delivery controller to be sent back
         let output_delivery_ctrl = output_delivery_ctrl_rx.await.unwrap();
 
+        let running_state = if detached {
+            InstanceRunningState::Detached
+        } else {
+            InstanceRunningState::Attached
+        };
+
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             program_hash,
             cmd_name,
             arguments,
             output_delivery_ctrl,
+            running_state,
             join_handle,
         };
         self.running_instances.insert(instance_id, instance_handle);
@@ -486,6 +507,7 @@ impl Runtime {
             cmd_name,
             arguments,
             output_delivery_ctrl,
+            running_state: InstanceRunningState::Detached,
             join_handle,
         };
         self.running_server_instances
@@ -497,33 +519,66 @@ impl Runtime {
         Ok(instance_id)
     }
 
-    /// Terminate or abort a running instance. It will also send a detach event to
-    /// the server so that the client can be notified. This function is used when the
-    /// client session is still active. Use [`drop_instance`] instead if you want to
-    /// drop the instance without notifying the client.
-    async fn terminate_instance(&self, instance_id: InstanceId, cause: TerminationCause) {
-        if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
+    /// Abort a running instance, and optionally notify the client.
+    fn abort_instance(
+        &self,
+        instance_id: InstanceId,
+        notification_to_client: Option<TerminationCause>,
+    ) {
+        let instance = self
+            .running_instances
+            .remove(&instance_id)
+            .or(self.finished_instances.remove(&instance_id));
+
+        if let Some((_, handle)) = instance {
             handle.join_handle.abort();
 
             model::cleanup_instance(instance_id.clone());
 
-            server::InstanceEvent::Terminate {
-                inst_id: instance_id,
-                cause,
+            if let Some(cause) = notification_to_client {
+                server::InstanceEvent::Terminate {
+                    inst_id: instance_id,
+                    cause,
+                }
+                .dispatch()
+                .ok();
             }
-            .dispatch()
-            .ok();
         }
     }
 
-    /// Drop a running instance. This will not notify the server. This function is used
-    /// when the client session has been or is being closed. Use [`terminate_instance`]
-    /// instead if you want to notify the client.
-    async fn drop_instance(&mut self, instance_id: InstanceId) {
-        if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
-            handle.join_handle.abort();
+    /// Finish a running instance. If the instance is attached, it will notify the client and
+    /// clean up the instance. If the instance is detached, it will mark the instance as finished
+    /// and add it to the finished instances map. If the instance is already finished, it will
+    /// panic.
+    fn finish_instance(&self, instance_id: InstanceId, cause: TerminationCause) {
+        if let Some((_, mut handle)) = self.running_instances.remove(&instance_id) {
+            match handle.running_state {
+                // For an attached instance, its output must have been streamed to the client,
+                // so we can clean up the instance and notify the client about the termination.
+                InstanceRunningState::Attached => {
+                    handle.join_handle.abort();
+                    model::cleanup_instance(instance_id.clone());
 
-            model::cleanup_instance(instance_id);
+                    server::InstanceEvent::Terminate {
+                        inst_id: instance_id,
+                        cause,
+                    }
+                    .dispatch()
+                    .ok();
+                }
+                // For a detached instance, we can just mark it as finished and add it to the
+                // finished instances map. Its output is buffered and waiting to be streamed to
+                //the client.
+                InstanceRunningState::Detached => {
+                    handle.running_state = InstanceRunningState::Finished(cause);
+                    self.finished_instances.insert(instance_id, handle);
+                }
+                // If the instance is already finished, we can't finish it again.
+                // This should never happen.
+                InstanceRunningState::Finished(_) => {
+                    panic!("Instance {instance_id} is already finished and cannot be sealed again")
+                }
+            }
         }
     }
 
@@ -724,7 +779,7 @@ impl Runtime {
 
         match result {
             Ok(return_value) => {
-                Command::TerminateInstance {
+                Command::FinishInstance {
                     inst_id: instance_id,
                     cause: TerminationCause::Normal(return_value.unwrap_or_default()),
                 }
@@ -733,7 +788,7 @@ impl Runtime {
             }
             Err(err) => {
                 println!("Instance {instance_id} failed: {err}");
-                Command::TerminateInstance {
+                Command::FinishInstance {
                     inst_id: instance_id,
                     cause: TerminationCause::Exception(err.to_string()),
                 }

@@ -1,5 +1,5 @@
 use crate::instance::InstanceId;
-use crate::runtime::{TerminationCause, trap};
+use crate::runtime::{self, TerminationCause};
 use crate::utils::IdPool;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::time::Instant;
@@ -175,12 +175,14 @@ impl ResourceManager {
 
             if let Some(victim_id) = victim_id {
                 self.cleanup(victim_id)?;
-                trap(
-                    victim_id,
-                    TerminationCause::OutOfResources(
+                runtime::Command::AbortInstance {
+                    inst_id: victim_id,
+                    notification_to_client: Some(TerminationCause::OutOfResources(
                         "Terminated by OOM killer for an older instance".to_string(),
-                    ),
-                );
+                    )),
+                }
+                .dispatch()
+                .unwrap();
             } else {
                 return Err(ResourceError::OomUnrecoverable(
                     "Not enough memory after terminating all newer instances.".to_string(),

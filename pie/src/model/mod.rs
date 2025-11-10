@@ -9,7 +9,7 @@ use super::model::request::{
 };
 use super::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
 use super::model::tokenizer::BytePairEncoder;
-use super::runtime::trap_exception;
+use super::runtime::{self, TerminationCause};
 use super::service::{self, Service, ServiceError};
 use crate::instance::InstanceId;
 use anyhow::Result;
@@ -140,6 +140,18 @@ pub fn submit_request(
     }
     .dispatch(service_id)?;
     Ok(())
+}
+
+fn terminate_instance_with_exception<T>(inst_id: InstanceId, exception: T)
+where
+    T: ToString,
+{
+    runtime::Command::AbortInstance {
+        inst_id,
+        notification_to_client: Some(TerminationCause::Exception(exception.to_string())),
+    }
+    .dispatch()
+    .unwrap();
 }
 
 /// Defines the set of operations available for the key-value store.
@@ -659,7 +671,7 @@ impl Service for Model {
                         println!("[Warn] Allocate response channel closed before sending.");
                     }
                 }
-                Err(e) => trap_exception(inst_id, e),
+                Err(e) => terminate_instance_with_exception(inst_id, e),
             },
             Command::Deallocate {
                 inst_id,
@@ -667,12 +679,12 @@ impl Service for Model {
                 ptrs,
             } => {
                 if let Err(e) = self.resource_manager.deallocate(inst_id, type_id, ptrs) {
-                    trap_exception(inst_id, e);
+                    terminate_instance_with_exception(inst_id, e);
                 }
             }
             Command::Cleanup { inst_id } => {
                 if let Err(e) = self.resource_manager.cleanup(inst_id) {
-                    trap_exception(inst_id, e);
+                    terminate_instance_with_exception(inst_id, e);
                 }
             }
             Command::GetAllExported { type_id, response } => {
@@ -688,7 +700,7 @@ impl Service for Model {
                 name,
             } => {
                 if let Err(e) = self.resource_manager.export(inst_id, type_id, ptrs, name) {
-                    trap_exception(inst_id, e);
+                    terminate_instance_with_exception(inst_id, e);
                 }
             }
             Command::Import {
@@ -702,7 +714,7 @@ impl Service for Model {
                         println!("[Warn] Import response channel closed before sending.");
                     }
                 }
-                Err(e) => trap_exception(inst_id, e),
+                Err(e) => terminate_instance_with_exception(inst_id, e),
             },
             Command::ReleaseExported {
                 inst_id,
@@ -710,7 +722,7 @@ impl Service for Model {
                 name,
             } => {
                 if let Err(e) = self.resource_manager.release_exported(type_id, name) {
-                    trap_exception(inst_id, e);
+                    terminate_instance_with_exception(inst_id, e);
                 }
             }
             Command::StopHeartbeat {

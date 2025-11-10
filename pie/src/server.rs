@@ -912,7 +912,12 @@ impl Session {
 
     async fn handle_terminate_instance(&mut self, instance_id: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-            runtime::trap(inst_id, runtime::TerminationCause::Signal);
+            runtime::Command::AbortInstance {
+                inst_id,
+                notification_to_client: Some(runtime::TerminationCause::Signal),
+            }
+            .dispatch()
+            .unwrap();
         }
     }
 
@@ -1084,9 +1089,15 @@ impl Drop for Session {
     fn drop(&mut self) {
         for inst_id in self.attached_instances.drain(..) {
             if self.state.client_cmd_txs.remove(&inst_id).is_some() {
-                runtime::Command::DropInstance { inst_id }
-                    .dispatch()
-                    .unwrap();
+                // Request the runtime to terminate the instance.
+                // Need not to notify the client because the client has disconnected
+                // from this session.
+                runtime::Command::AbortInstance {
+                    inst_id,
+                    notification_to_client: None,
+                }
+                .dispatch()
+                .unwrap();
             }
         }
 
