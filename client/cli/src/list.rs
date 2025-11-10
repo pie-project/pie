@@ -26,9 +26,12 @@ pub struct ListArgs {
     /// Path to the private key file to use for authentication.
     #[arg(long)]
     pub private_key_path: Option<PathBuf>,
-    /// Display the full UUID instead of just the first 4 characters.
+    /// Display the full UUID.
     #[arg(long)]
     pub full: bool,
+    /// Display the first 8 characters of the UUID.
+    #[arg(long)]
+    pub long: bool,
 }
 
 /// Handles the `pie-cli list` command.
@@ -69,9 +72,21 @@ pub async fn handle_list_command(args: ListArgs) -> Result<()> {
 
         // Column widths for the table
         // UUID is typically 36 characters (with hyphens)
-        let id_width = if args.full { 36 } else { 4 };
+        let id_width = if args.full {
+            36
+        } else if args.long {
+            8
+        } else {
+            4
+        };
         const CMD_WIDTH: usize = 24;
-        let args_width = if args.full { 32 } else { 64 };
+        let args_width = if args.full {
+            32
+        } else if args.long {
+            60
+        } else {
+            64
+        };
 
         // Print table header
         println!(
@@ -94,9 +109,11 @@ pub async fn handle_list_command(args: ListArgs) -> Result<()> {
 
         // Print each instance
         for instance in instances.iter() {
-            // Use full UUID or just the first 4 characters based on the flag
+            // Use full UUID, first 8 characters, or first 4 characters based on the flag
             let uuid_display = if args.full {
                 instance.id.clone()
+            } else if args.long {
+                instance.id.chars().take(8).collect::<String>()
             } else {
                 instance.id.chars().take(4).collect::<String>()
             };
