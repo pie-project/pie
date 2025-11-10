@@ -86,6 +86,9 @@ pub enum ClientMessage {
         detached: bool,
     },
 
+    #[serde(rename = "attach_instance")]
+    AttachInstance { corr_id: u32, instance_id: String },
+
     #[serde(rename = "launch_server_instance")]
     LaunchServerInstance {
         corr_id: u32,

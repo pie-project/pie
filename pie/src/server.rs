@@ -3,7 +3,7 @@ use crate::instance::{InstanceId, OutputChannel};
 use crate::messaging::{self, dispatch_u2i};
 use crate::model;
 use crate::model::Model;
-use crate::runtime::{self, TerminationCause};
+use crate::runtime::{self, AttachInstanceResult, TerminationCause};
 use crate::service::{self, Service, ServiceError, install_service};
 use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
@@ -555,6 +555,12 @@ impl Session {
                     )
                     .await
                 }
+                ClientMessage::AttachInstance {
+                    corr_id,
+                    instance_id,
+                } => {
+                    self.handle_attach_instance(corr_id, instance_id).await;
+                }
                 ClientMessage::LaunchServerInstance {
                     corr_id,
                     port,
@@ -868,6 +874,50 @@ impl Session {
             }
             Err(e) => {
                 self.send_response(corr_id, false, e.to_string()).await;
+            }
+        }
+    }
+
+    async fn handle_attach_instance(&mut self, corr_id: u32, instance_id: String) {
+        let (evt_tx, evt_rx) = oneshot::channel();
+
+        let inst_id = match Uuid::parse_str(&instance_id) {
+            Ok(id) => id,
+            Err(_) => {
+                self.send_response(corr_id, false, "Invalid instance_id".to_string())
+                    .await;
+                return;
+            }
+        };
+
+        self.state
+            .client_cmd_txs
+            .insert(inst_id, self.client_cmd_tx.clone());
+        self.attached_instances.push(inst_id);
+
+        runtime::Command::AttachInstance {
+            inst_id,
+            event: evt_tx,
+        }
+        .dispatch()
+        .unwrap();
+
+        match evt_rx.await.unwrap() {
+            AttachInstanceResult::AttachedRunning | AttachInstanceResult::AttachedFinished => {
+                self.send_response(corr_id, true, "Instance attached".to_string())
+                    .await;
+            }
+            AttachInstanceResult::InstanceNotFound => {
+                self.state.client_cmd_txs.remove(&inst_id);
+                self.attached_instances.retain(|&id| id != inst_id);
+                self.send_response(corr_id, false, "Instance not found".to_string())
+                    .await;
+            }
+            AttachInstanceResult::AlreadyAttached => {
+                self.state.client_cmd_txs.remove(&inst_id);
+                self.attached_instances.retain(|&id| id != inst_id);
+                self.send_response(corr_id, false, "Instance already attached".to_string())
+                    .await;
             }
         }
     }

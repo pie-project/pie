@@ -215,6 +215,7 @@ impl Client {
             | ClientMessage::InternalAuthenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::LaunchInstance { corr_id, .. }
+            | ClientMessage::AttachInstance { corr_id, .. }
             | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
@@ -409,6 +410,26 @@ impl Client {
             })
         } else {
             anyhow::bail!("Launch instance failed: {}", result)
+        }
+    }
+
+    pub async fn attach_instance(&self, instance_id: &str) -> Result<Instance> {
+        let msg = ClientMessage::AttachInstance {
+            corr_id: 0,
+            instance_id: instance_id.to_string(),
+        };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        if successful {
+            let (tx, rx) = mpsc::channel(64);
+            let instance_id = Uuid::parse_str(instance_id)?;
+            self.inner.inst_event_tx.insert(instance_id, tx);
+            Ok(Instance {
+                id: instance_id,
+                inner: Arc::clone(&self.inner),
+                event_rx: rx,
+            })
+        } else {
+            anyhow::bail!("Attach instance failed: {}", result)
         }
     }
 

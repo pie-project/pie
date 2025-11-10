@@ -77,6 +77,11 @@ pub enum Command {
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
     },
 
+    AttachInstance {
+        inst_id: InstanceId,
+        event: oneshot::Sender<AttachInstanceResult>,
+    },
+
     LaunchServerInstance {
         program_hash: String,
         port: u32,
@@ -176,6 +181,18 @@ impl From<InstanceRunningState> for message::InstanceStatus {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum AttachInstanceResult {
+    /// The instance is running and the client has been attached to it successfully.
+    AttachedRunning,
+    /// The instance has finished execution and the client has been attached to it successfully.
+    AttachedFinished,
+    /// The instance is not found.
+    InstanceNotFound,
+    /// Another client has already been attached to this instance.
+    AlreadyAttached,
+}
+
 pub struct InstanceHandle {
     pub program_hash: String,
     pub cmd_name: String,
@@ -226,6 +243,11 @@ impl Service for Runtime {
                     .await
                     .unwrap();
                 event.send(Ok(instance_id)).unwrap();
+            }
+
+            Command::AttachInstance { inst_id, event } => {
+                let res = self.attach_instance(inst_id);
+                event.send(res).unwrap();
             }
 
             Command::LaunchServerInstance {
@@ -467,6 +489,49 @@ impl Runtime {
         let _ = start_tx.send(());
 
         Ok(instance_id)
+    }
+
+    /// Set the instance as attached. Its output will be streamed to the client.
+    fn attach_instance(&self, inst_id: InstanceId) -> AttachInstanceResult {
+        // Check if the instance is still running.
+        if let Some(mut handle) = self.running_instances.get_mut(&inst_id) {
+            // An instance cannot be attached if it is already attached.
+            if let InstanceRunningState::Attached = handle.running_state {
+                return AttachInstanceResult::AlreadyAttached;
+            }
+
+            // Set the instance as attached. Its output will be streamed to the client.
+            handle.running_state = InstanceRunningState::Attached;
+            handle
+                .output_delivery_ctrl
+                .set_output_delivery(OutputDelivery::Streamed);
+            return AttachInstanceResult::AttachedRunning;
+        }
+
+        // Check if the instance has finished execution.
+        if let Some((_, handle)) = self.finished_instances.remove(&inst_id) {
+            // Stream the buffered output to the client.
+            handle
+                .output_delivery_ctrl
+                .set_output_delivery(OutputDelivery::Streamed);
+
+            // Clean up the instance.
+            handle.join_handle.abort();
+            model::cleanup_instance(inst_id.clone());
+
+            // Notify the client about the instance's termination.
+            if let InstanceRunningState::Finished(cause) = handle.running_state {
+                server::InstanceEvent::Terminate { inst_id, cause }
+                    .dispatch()
+                    .ok();
+            } else {
+                panic!("Instance {inst_id} is not finished but is in the finished instances map")
+            }
+
+            return AttachInstanceResult::AttachedFinished;
+        }
+
+        return AttachInstanceResult::InstanceNotFound;
     }
 
     /// Actually start a program instance
