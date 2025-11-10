@@ -1,4 +1,4 @@
-use super::instance::{InstanceId, InstanceState};
+use super::instance::{InstanceId, InstanceState, OutputDelivery, OutputDeliveryCtrl};
 use super::service::{Service, ServiceError};
 use super::{api, server, service};
 use crate::model;
@@ -12,9 +12,7 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 use wasmtime::component::Resource;
-use wasmtime::{
-    Config, Engine, PoolingAllocationConfig, Store, component::Component, component::Linker,
-};
+use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
 use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::bindings::exports::wasi::http::incoming_handler::{
     IncomingRequest, ResponseOutparam,
@@ -96,6 +94,7 @@ pub enum Command {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
+        output_delivery: OutputDelivery,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
     },
 
@@ -116,9 +115,10 @@ pub enum Command {
         inst_id: InstanceId,
     },
 
-    Warn {
+    #[allow(dead_code)]
+    SetOutputDelivery {
         inst_id: InstanceId,
-        message: String,
+        mode: OutputDelivery,
     },
 
     DebugQuery {
@@ -167,7 +167,6 @@ pub enum TerminationCause {
     Normal(String),
     Signal,
     Exception(String),
-    SystemError(String),
     OutOfResources(String),
 }
 
@@ -175,6 +174,7 @@ pub struct InstanceHandle {
     pub program_hash: String,
     pub cmd_name: String,
     pub arguments: Vec<String>,
+    pub output_delivery_ctrl: OutputDeliveryCtrl,
     //pub to_origin: Sender<ServerMessage>,
     // pub evt_from_system: Sender<String>,
     // pub evt_from_origin: Sender<String>,
@@ -216,9 +216,10 @@ impl Service for Runtime {
                 cmd_name,
                 event,
                 arguments,
+                output_delivery,
             } => {
                 let instance_id = self
-                    .launch_instance(program_hash, cmd_name, arguments)
+                    .launch_instance(program_hash, cmd_name, arguments, output_delivery)
                     .await
                     .unwrap();
                 event.send(Ok(instance_id)).unwrap();
@@ -245,12 +246,10 @@ impl Service for Runtime {
                 self.drop_instance(inst_id).await;
             }
 
-            Command::Warn { inst_id, message } => server::InstanceEvent::SendMsgToClient {
-                inst_id,
-                message: message.clone(),
+            Command::SetOutputDelivery { inst_id, mode } => {
+                self.set_output_delivery(inst_id, mode);
             }
-            .dispatch()
-            .unwrap(),
+
             Command::GetVersion { event } => {
                 event.send(VERSION.to_string()).unwrap();
             }
@@ -321,10 +320,8 @@ impl Runtime {
         let mut config = Config::default();
         config.async_support(true);
 
-        let mut pooling_config = PoolingAllocationConfig::default();
-
         // TODO: Adjust settings later: https://docs.wasmtime.dev/api/wasmtime/struct.PoolingAllocationConfig.html
-
+        // let mut pooling_config = PoolingAllocationConfig::default();
         //config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
 
         let engine = Engine::new(&config).unwrap();
@@ -410,6 +407,7 @@ impl Runtime {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
+        output_delivery: OutputDelivery,
     ) -> Result<InstanceId, RuntimeError> {
         let component = self.get_component(&program_hash)?;
 
@@ -421,21 +419,29 @@ impl Runtime {
 
         // Create a oneshot channel to signal when the task can start
         let (start_tx, start_rx) = oneshot::channel();
+        // Create a oneshot channel to receive the output delivery controller
+        let (output_delivery_ctrl_tx, output_delivery_ctrl_rx) = oneshot::channel();
 
         let join_handle = tokio::spawn(Self::launch(
             instance_id,
             component,
             arguments.clone(),
+            output_delivery,
             engine,
             linker,
             start_rx,
+            output_delivery_ctrl_tx,
         ));
+
+        // Wait for the output delivery controller to be sent back
+        let output_delivery_ctrl = output_delivery_ctrl_rx.await.unwrap();
 
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             program_hash,
             cmd_name,
             arguments,
+            output_delivery_ctrl,
             join_handle,
         };
         self.running_instances.insert(instance_id, instance_handle);
@@ -474,11 +480,16 @@ impl Runtime {
             start_rx,
         ));
 
+        // Create a dummy output delivery controller for server instances (not used since each request gets its own instance)
+        let (dummy_state, output_delivery_ctrl) = InstanceState::new(Uuid::new_v4(), vec![]).await;
+        drop(dummy_state); // We don't actually use this
+
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             program_hash,
             cmd_name,
             arguments,
+            output_delivery_ctrl,
             join_handle,
         };
         self.running_server_instances
@@ -520,6 +531,15 @@ impl Runtime {
         }
     }
 
+    /// Set the output delivery for a running instance
+    fn set_output_delivery(&self, instance_id: InstanceId, output_delivery: OutputDelivery) {
+        if let Some(handle) = self.running_instances.get(&instance_id) {
+            handle
+                .output_delivery_ctrl
+                .set_output_delivery(output_delivery);
+        }
+    }
+
     async fn handle_server_request(
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
@@ -528,7 +548,7 @@ impl Runtime {
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
         let inst_id = Uuid::new_v4();
-        let inst_state = InstanceState::new(inst_id, arguments).await;
+        let (inst_state, _output_delivery_ctrl) = InstanceState::new(inst_id, arguments).await;
 
         let mut store = Store::new(&engine, inst_state);
         let (sender, receiver) = oneshot::channel();
@@ -638,14 +658,26 @@ impl Runtime {
         instance_id: InstanceId,
         component: Component,
         arguments: Vec<String>,
+        output_delivery: OutputDelivery,
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
         start_rx: oneshot::Receiver<()>,
+        output_delivery_ctrl_tx: oneshot::Sender<OutputDeliveryCtrl>,
     ) {
-        // Wait for the signal to start
-        let _ = start_rx.await;
+        // Create the instance state and output delivery controller
+        let (inst_state, output_delivery_ctrl) = InstanceState::new(instance_id, arguments).await;
 
-        let inst_state = InstanceState::new(instance_id, arguments).await;
+        // Set the initial output delivery mode
+        output_delivery_ctrl.set_output_delivery(output_delivery);
+
+        // Send the output delivery controller back before starting
+        output_delivery_ctrl_tx
+            .send(output_delivery_ctrl)
+            .map_err(|_| "Failed to send output delivery controller")
+            .unwrap();
+
+        // Wait for the signal to start
+        start_rx.await.unwrap();
 
         // Wrap everything in a closure returning a Result,
         // so we can capture errors more systematically if desired:

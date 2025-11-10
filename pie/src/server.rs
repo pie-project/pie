@@ -1,5 +1,5 @@
 use crate::auth::{AuthorizedUsers, PublicKey};
-use crate::instance::{InstanceId, OutputType};
+use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
 use crate::messaging::{self, dispatch_u2i};
 use crate::model;
 use crate::model::Model;
@@ -62,7 +62,7 @@ pub enum InstanceEvent {
     },
     StreamingOutput {
         inst_id: InstanceId,
-        output_type: OutputType,
+        output_type: OutputChannel,
         content: String,
     },
 }
@@ -677,7 +677,6 @@ impl Session {
                 TerminationCause::Normal(message) => (EventCode::Completed, message),
                 TerminationCause::Signal => (EventCode::Aborted, "Signal termination".to_string()),
                 TerminationCause::Exception(message) => (EventCode::Exception, message),
-                TerminationCause::SystemError(message) => (EventCode::ServerError, message),
                 TerminationCause::OutOfResources(message) => (EventCode::ServerError, message),
             };
 
@@ -848,6 +847,7 @@ impl Session {
             program_hash,
             cmd_name,
             arguments,
+            output_delivery: OutputDelivery::Streamed,
             event: evt_tx,
         }
         .dispatch()
@@ -1061,12 +1061,12 @@ impl Session {
     async fn handle_streaming_output(
         &mut self,
         inst_id: InstanceId,
-        output_type: OutputType,
+        output_type: OutputChannel,
         content: String,
     ) {
         let output = match output_type {
-            OutputType::Stdout => StreamingOutput::Stdout(content),
-            OutputType::Stderr => StreamingOutput::Stderr(content),
+            OutputChannel::Stdout => StreamingOutput::Stdout(content),
+            OutputChannel::Stderr => StreamingOutput::Stderr(content),
         };
         self.send(ServerMessage::StreamingOutput {
             instance_id: inst_id.to_string(),
