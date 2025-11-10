@@ -388,12 +388,14 @@ impl Client {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
+        detached: bool,
     ) -> Result<Instance> {
         let msg = ClientMessage::LaunchInstance {
             corr_id: 0,
             program_hash,
             cmd_name,
             arguments,
+            detached,
         };
         let (successful, result) = self.send_msg_and_wait(msg).await?;
         if successful {

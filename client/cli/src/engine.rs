@@ -103,21 +103,12 @@ impl ClientConfig {
     }
 }
 
-/// Submits an inferlet to the engine and waits for it to finish.
-pub async fn submit_inferlet_and_wait(
-    client_config: &ClientConfig,
-    inferlet_path: PathBuf,
-    arguments: Vec<String>,
-) -> Result<()> {
-    let instance = submit_inferlet(client_config, inferlet_path, arguments).await?;
-    stream_inferlet_output(instance).await
-}
-
 /// Submits an inferlet to the engine and returns the instance.
-async fn submit_inferlet(
+pub async fn submit_inferlet(
     client_config: &ClientConfig,
     inferlet_path: PathBuf,
     arguments: Vec<String>,
+    detached: bool,
 ) -> Result<Instance> {
     let client = connect_and_authenticate(client_config).await?;
 
@@ -136,13 +127,15 @@ async fn submit_inferlet(
         .unwrap()
         .to_string_lossy()
         .to_string();
-    let instance = client.launch_instance(hash, cmd_name, arguments).await?;
+    let instance = client
+        .launch_instance(hash, cmd_name, arguments, detached)
+        .await?;
     println!("✅ Inferlet launched with ID: {}", instance.id());
     Ok(instance)
 }
 
 /// Streams the output of an inferlet.
-async fn stream_inferlet_output(mut instance: Instance) -> Result<()> {
+pub async fn stream_inferlet_output(mut instance: Instance) -> Result<()> {
     let instance_id = instance.id().to_string();
     let short_id = instance_id[..instance_id.len().min(8)].to_string();
     let mut at_line_start_stdout = true;

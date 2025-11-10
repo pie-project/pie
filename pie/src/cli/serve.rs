@@ -107,7 +107,7 @@ async fn handle_shell_command(
 
             match ShellRunArgs::try_parse_from(clap_args) {
                 Ok(run_args) => {
-                    if let Err(e) = manager::submit_detached_inferlet(
+                    if let Err(e) = manager::submit_concurrent_inferlet(
                         client_config,
                         run_args.inferlet_path,
                         run_args.arguments,

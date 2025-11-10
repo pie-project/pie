@@ -1,5 +1,5 @@
 use crate::auth::{AuthorizedUsers, PublicKey};
-use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
+use crate::instance::{InstanceId, OutputChannel};
 use crate::messaging::{self, dispatch_u2i};
 use crate::model;
 use crate::model::Model;
@@ -56,7 +56,7 @@ pub enum InstanceEvent {
         inst_id: InstanceId,
         data: Bytes,
     },
-    DetachInstance {
+    Terminate {
         inst_id: InstanceId,
         cause: TerminationCause,
     },
@@ -171,7 +171,6 @@ impl BackendStatus {
 
 pub struct Server {
     state: Arc<ServerState>,
-    listener_loop: task::JoinHandle<()>,
 }
 
 impl Server {
@@ -191,11 +190,8 @@ impl Server {
             backend_status: Arc::new(BackendStatus::new()),
         });
 
-        let listener_loop = task::spawn(Self::listener_loop(ip_port.to_string(), state.clone()));
-        Server {
-            state,
-            listener_loop,
-        }
+        let _listener = task::spawn(Self::listener_loop(ip_port.to_string(), state.clone()));
+        Server { state }
     }
 
     async fn listener_loop(ip_port: String, state: Arc<ServerState>) {
@@ -228,7 +224,7 @@ impl Service for Server {
                 // Correctly extract instance_id from all relevant commands
                 let inst_id = match &event {
                     InstanceEvent::SendMsgToClient { inst_id, .. }
-                    | InstanceEvent::DetachInstance { inst_id, .. }
+                    | InstanceEvent::Terminate { inst_id, .. }
                     | InstanceEvent::SendBlobToClient { inst_id, .. }
                     | InstanceEvent::StreamingOutput { inst_id, .. } => *inst_id,
                 };
@@ -260,7 +256,6 @@ impl Service for Server {
 
 /// A generic struct to manage chunked, in-flight uploads for both programs and blobs.
 struct InFlightUpload {
-    hash: String,
     total_chunks: usize,
     buffer: Vec<u8>,
     next_chunk_index: usize,
@@ -549,9 +544,16 @@ impl Session {
                     program_hash,
                     cmd_name,
                     arguments,
+                    detached,
                 } => {
-                    self.handle_launch_instance(corr_id, program_hash, cmd_name, arguments)
-                        .await
+                    self.handle_launch_instance(
+                        corr_id,
+                        program_hash,
+                        cmd_name,
+                        arguments,
+                        detached,
+                    )
+                    .await
                 }
                 ClientMessage::LaunchServerInstance {
                     corr_id,
@@ -620,8 +622,8 @@ impl Session {
                     self.send_inst_event(inst_id, EventCode::Message, message)
                         .await
                 }
-                InstanceEvent::DetachInstance { inst_id, cause } => {
-                    self.handle_detach_instance(inst_id, cause).await;
+                InstanceEvent::Terminate { inst_id, cause } => {
+                    self.handle_instance_termination(inst_id, cause).await;
                 }
                 InstanceEvent::SendBlobToClient { inst_id, data } => {
                     self.handle_send_blob(inst_id, data).await;
@@ -669,7 +671,7 @@ impl Session {
         .await;
     }
 
-    async fn handle_detach_instance(&mut self, inst_id: InstanceId, cause: TerminationCause) {
+    async fn handle_instance_termination(&mut self, inst_id: InstanceId, cause: TerminationCause) {
         self.attached_instances.retain(|&id| id != inst_id);
 
         if self.state.client_cmd_txs.remove(&inst_id).is_some() {
@@ -764,7 +766,6 @@ impl Session {
                 return;
             }
             self.inflight_program_upload = Some(InFlightUpload {
-                hash: program_hash.clone(),
                 total_chunks,
                 buffer: Vec::new(),
                 next_chunk_index: 0,
@@ -841,23 +842,27 @@ impl Session {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
+        detached: bool,
     ) {
         let (evt_tx, evt_rx) = oneshot::channel();
+
         runtime::Command::LaunchInstance {
             program_hash,
             cmd_name,
             arguments,
-            output_delivery: OutputDelivery::Streamed,
+            detached,
             event: evt_tx,
         }
         .dispatch()
         .unwrap();
         match evt_rx.await.unwrap() {
             Ok(instance_id) => {
-                self.state
-                    .client_cmd_txs
-                    .insert(instance_id, self.client_cmd_tx.clone());
-                self.attached_instances.push(instance_id);
+                if !detached {
+                    self.state
+                        .client_cmd_txs
+                        .insert(instance_id, self.client_cmd_tx.clone());
+                    self.attached_instances.push(instance_id);
+                }
                 self.send_response(corr_id, true, instance_id.to_string())
                     .await;
             }
@@ -988,7 +993,6 @@ impl Session {
             self.inflight_blob_uploads.insert(
                 blob_hash.clone(),
                 InFlightUpload {
-                    hash: blob_hash.clone(),
                     total_chunks,
                     buffer: Vec::with_capacity(total_chunks * message::CHUNK_SIZE_BYTES),
                     next_chunk_index: 0,

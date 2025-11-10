@@ -75,6 +75,7 @@ pub enum ClientMessage {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
+        detached: bool,
     },
 
     #[serde(rename = "launch_server_instance")]

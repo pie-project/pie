@@ -94,7 +94,7 @@ pub enum Command {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
-        output_delivery: OutputDelivery,
+        detached: bool,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
     },
 
@@ -175,13 +175,9 @@ pub struct InstanceHandle {
     pub cmd_name: String,
     pub arguments: Vec<String>,
     pub output_delivery_ctrl: OutputDeliveryCtrl,
-    //pub to_origin: Sender<ServerMessage>,
-    // pub evt_from_system: Sender<String>,
-    // pub evt_from_origin: Sender<String>,
-    // pub evt_from_peers: Sender<(String, String)>,
     pub join_handle: tokio::task::JoinHandle<()>,
 }
-//#[async_trait]
+
 impl Service for Runtime {
     type Command = Command;
 
@@ -216,10 +212,10 @@ impl Service for Runtime {
                 cmd_name,
                 event,
                 arguments,
-                output_delivery,
+                detached,
             } => {
                 let instance_id = self
-                    .launch_instance(program_hash, cmd_name, arguments, output_delivery)
+                    .launch_instance(program_hash, cmd_name, arguments, detached)
                     .await
                     .unwrap();
                 event.send(Ok(instance_id)).unwrap();
@@ -407,7 +403,7 @@ impl Runtime {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
-        output_delivery: OutputDelivery,
+        detached: bool,
     ) -> Result<InstanceId, RuntimeError> {
         let component = self.get_component(&program_hash)?;
 
@@ -426,7 +422,7 @@ impl Runtime {
             instance_id,
             component,
             arguments.clone(),
-            output_delivery,
+            detached,
             engine,
             linker,
             start_rx,
@@ -511,7 +507,7 @@ impl Runtime {
 
             model::cleanup_instance(instance_id.clone());
 
-            server::InstanceEvent::DetachInstance {
+            server::InstanceEvent::Terminate {
                 inst_id: instance_id,
                 cause,
             }
@@ -658,7 +654,7 @@ impl Runtime {
         instance_id: InstanceId,
         component: Component,
         arguments: Vec<String>,
-        output_delivery: OutputDelivery,
+        detached: bool,
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
         start_rx: oneshot::Receiver<()>,
@@ -666,6 +662,12 @@ impl Runtime {
     ) {
         // Create the instance state and output delivery controller
         let (inst_state, output_delivery_ctrl) = InstanceState::new(instance_id, arguments).await;
+
+        let output_delivery = if detached {
+            OutputDelivery::Buffered
+        } else {
+            OutputDelivery::Streamed
+        };
 
         // Set the initial output delivery mode
         output_delivery_ctrl.set_output_delivery(output_delivery);

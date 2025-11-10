@@ -30,6 +30,9 @@ pub struct SubmitArgs {
     /// Path to the private key file to use for authentication.
     #[arg(long)]
     pub private_key_path: Option<PathBuf>,
+    /// Run the inferlet in detached mode.
+    #[arg(short, long, default_value = "false")]
+    pub detached: bool,
     /// Arguments to pass to the inferlet after `--`.
     #[arg(last = true)]
     pub arguments: Vec<String>,
@@ -52,5 +55,13 @@ pub async fn handle_submit_command(args: SubmitArgs) -> Result<()> {
         args.private_key_path,
     )?;
 
-    engine::submit_inferlet_and_wait(&client_config, args.inferlet, args.arguments).await
+    let instance =
+        engine::submit_inferlet(&client_config, args.inferlet, args.arguments, args.detached)
+            .await?;
+
+    if !args.detached {
+        engine::stream_inferlet_output(instance).await?;
+    }
+
+    Ok(())
 }

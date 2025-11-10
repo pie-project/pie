@@ -387,14 +387,14 @@ pub async fn terminate_engine_and_backend(
 }
 
 /// Submits an inferlet to the engine but does not wait for it to finish.
-pub async fn submit_detached_inferlet(
+pub async fn submit_concurrent_inferlet(
     client_config: &ClientConfig,
     inferlet_path: PathBuf,
     arguments: Vec<String>,
     stream_output: bool,
     printer: SharedPrinter,
 ) -> Result<()> {
-    let instance = submit_inferlet(client_config, inferlet_path, arguments).await?;
+    let instance = submit_inferlet(client_config, inferlet_path, arguments, false).await?;
 
     if stream_output {
         tokio::spawn(stream_inferlet_output(instance, Some(printer)));
@@ -410,7 +410,7 @@ pub async fn submit_inferlet_and_wait(
     arguments: Vec<String>,
     printer: Option<SharedPrinter>,
 ) -> Result<()> {
-    let instance = submit_inferlet(client_config, inferlet_path, arguments).await?;
+    let instance = submit_inferlet(client_config, inferlet_path, arguments, false).await?;
     stream_inferlet_output(instance, printer).await
 }
 
@@ -419,6 +419,7 @@ async fn submit_inferlet(
     client_config: &ClientConfig,
     inferlet_path: PathBuf,
     arguments: Vec<String>,
+    detached: bool,
 ) -> Result<Instance> {
     let client = connect_and_authenticate(client_config).await?;
 
@@ -437,7 +438,9 @@ async fn submit_inferlet(
         .unwrap()
         .to_string_lossy()
         .to_string();
-    let instance = client.launch_instance(hash, cmd_name, arguments).await?;
+    let instance = client
+        .launch_instance(hash, cmd_name, arguments, detached)
+        .await?;
     println!("✅ Inferlet launched with ID: {}", instance.id());
     Ok(instance)
 }
