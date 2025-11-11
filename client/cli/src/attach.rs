@@ -39,7 +39,9 @@ pub struct AttachArgs {
 /// 4. Queries for all live instances
 /// 5. Matches the UUID prefix to find the target instance
 /// 6. Attaches to the instance if a unique match is found
-/// 7. Streams the inferlet output
+/// 7. Streams the inferlet output with signal handling:
+///    - Ctrl-C (SIGINT): Terminates the inferlet on the server
+///    - Ctrl-D (EOF): Detaches from the inferlet (continues running on server)
 /// 8. Reports errors if no match or multiple matches are found
 pub async fn handle_attach_command(args: AttachArgs) -> Result<()> {
     let client_config = ClientConfig::new(
@@ -89,7 +91,7 @@ pub async fn handle_attach_command(args: AttachArgs) -> Result<()> {
                 instance_id, instance_info.cmd_name
             );
 
-            engine::stream_inferlet_output(instance).await?;
+            engine::stream_inferlet_output(instance, client).await?;
             Ok(())
         }
         _ => {

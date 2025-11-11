@@ -2,11 +2,12 @@
 
 use crate::path;
 use anyhow::{Context, Result};
-use pie_client::client::{self, Client, Instance, InstanceEvent};
+use pie_client::client::{Client, Instance, InstanceEvent};
 use pie_client::crypto::ParsedPrivateKey;
 use pie_client::message::EventCode;
 use std::fs;
 use std::path::PathBuf;
+use tokio::signal;
 
 // Helper struct for what client commands need to know
 pub struct ClientConfig {
@@ -103,80 +104,105 @@ impl ClientConfig {
     }
 }
 
-/// Submits an inferlet to the engine and returns the instance.
-pub async fn submit_inferlet(
-    client_config: &ClientConfig,
-    inferlet_path: PathBuf,
-    arguments: Vec<String>,
-    detached: bool,
-) -> Result<Instance> {
-    let client = connect_and_authenticate(client_config).await?;
-
-    let inferlet_blob = fs::read(&inferlet_path)
-        .with_context(|| format!("Failed to read Wasm file at {:?}", inferlet_path))?;
-    let hash = client::hash_blob(&inferlet_blob);
-    println!("Inferlet hash: {}", hash);
-
-    if !client.program_exists(&hash).await? {
-        client.upload_program(&inferlet_blob).await?;
-        println!("✅ Inferlet upload successful.");
-    }
-
-    let cmd_name = inferlet_path
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-    let instance = client
-        .launch_instance(hash, cmd_name, arguments, detached)
-        .await?;
-    println!("✅ Inferlet launched with ID: {}", instance.id());
-    Ok(instance)
-}
-
 /// Streams the output of an inferlet.
-pub async fn stream_inferlet_output(mut instance: Instance) -> Result<()> {
+///
+/// Behavior:
+/// - Ctrl-C (SIGINT): Sends a terminate request to the server to kill the inferlet
+/// - Ctrl-D (EOF): Detaches from the inferlet (continues running on server)
+pub async fn stream_inferlet_output(mut instance: Instance, client: Client) -> Result<()> {
     let instance_id = instance.id().to_string();
     let short_id = instance_id[..instance_id.len().min(8)].to_string();
     let mut at_line_start_stdout = true;
     let mut at_line_start_stderr = true;
 
-    loop {
-        let event = match instance.recv().await {
-            Ok(ev) => ev,
-            Err(e) => {
-                println!("[Instance {}] ReceiveError: {}", short_id, e);
-                return Err(e);
-            }
-        };
-        match event {
-            // Handle events that have a specific code and a text message.
-            InstanceEvent::Event { code, message } => {
-                // Format the output string.
-                // Using the Debug representation of `code` is a clean way to get its name (e.g., "Completed").
-                println!("[Instance {}] {:?}: {}", short_id, code, message);
+    // Set up Ctrl-C signal handler
+    let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+        .context("Failed to set up SIGINT handler")?;
 
-                match code {
-                    EventCode::Completed => return Ok(()),
-                    EventCode::Message => continue,
-                    EventCode::Aborted
-                    | EventCode::Exception
-                    | EventCode::ServerError
-                    | EventCode::OutOfResources => {
-                        anyhow::bail!("inferlet terminated with status {:?}", code)
+    // We use a separate OS thread with blocking I/O to monitor stdin for EOF, rather than
+    // using `tokio::io::stdin()`. This is because async stdin puts the terminal in non-blocking
+    // mode, which can leave the terminal in an inconsistent state if we exit through other
+    // paths (e.g., when the inferlet completes naturally). The blocking thread approach keeps
+    // the terminal in normal mode and ensures clean process termination.
+    let (eof_tx, mut eof_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let _stdin_monitor = std::thread::spawn(move || {
+        use std::io::{self, Read};
+        let mut stdin = io::stdin();
+        let mut buf = [0u8; 1];
+
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    // EOF detected (Ctrl-D pressed) or stdin closed
+                    let _ = eof_tx.blocking_send(());
+                    break;
+                }
+                Ok(_) => {
+                    // Ignore any input data and continue monitoring
+                    continue;
+                }
+            }
+        }
+    });
+
+    // Main event loop: stream output and handle signals
+    loop {
+        tokio::select! {
+            // Ctrl-C: Send termination request to server
+            _ = sigint.recv() => {
+                println!("\n[Instance {}] Received Ctrl-C, terminating instance ...", short_id);
+                if let Err(e) = client.terminate_instance(&instance_id).await {
+                    eprintln!("[Instance {}] Failed to send terminate request: {}", short_id, e);
+                }
+                return Ok(());
+            }
+
+            // Ctrl-D: Detach without terminating
+            _ = eof_rx.recv() => {
+                println!("\n[Instance {}] Detached from instance ...", short_id);
+                return Ok(());
+            }
+
+            // Process instance events (output, completion, errors)
+            event_result = instance.recv() => {
+                let event = match event_result {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        println!("[Instance {}] ReceiveError: {}", short_id, e);
+                        return Err(e);
+                    }
+                };
+
+                match event {
+                    InstanceEvent::Event { code, message } => {
+                        println!("[Instance {}] {:?}: {}", short_id, code, message);
+
+                        match code {
+                            EventCode::Completed => return Ok(()),
+                            EventCode::Message => continue,
+                            EventCode::Aborted
+                            | EventCode::Exception
+                            | EventCode::ServerError
+                            | EventCode::OutOfResources => {
+                                anyhow::bail!("inferlet terminated with status {:?}", code)
+                            }
+                        }
+                    }
+
+                    InstanceEvent::Stdout(content) => {
+                        handle_streaming_output(false, content, &short_id, &mut at_line_start_stdout).await;
+                    }
+
+                    InstanceEvent::Stderr(content) => {
+                        handle_streaming_output(true, content, &short_id, &mut at_line_start_stderr).await;
+                    }
+
+                    InstanceEvent::Blob(_) => {
+                        // Ignore binary blobs
+                        continue;
                     }
                 }
             }
-            // Handle streaming stdout
-            InstanceEvent::Stdout(content) => {
-                handle_streaming_output(false, content, &short_id, &mut at_line_start_stdout).await;
-            }
-            // Handle streaming stderr
-            InstanceEvent::Stderr(content) => {
-                handle_streaming_output(true, content, &short_id, &mut at_line_start_stderr).await;
-            }
-            // If we receive a raw data blob, we'll ignore it and wait for the next event.
-            InstanceEvent::Blob(_) => continue,
         }
     }
 }

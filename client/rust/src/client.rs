@@ -146,17 +146,6 @@ impl Instance {
             .await
             .ok_or(anyhow!("Event channel closed"))
     }
-
-    /// Requests the server to terminate the instance (fire-and-forget).
-    pub async fn terminate(&self) -> Result<()> {
-        let msg = ClientMessage::TerminateInstance {
-            instance_id: self.id.to_string(),
-        };
-        self.inner
-            .ws_writer_tx
-            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
-        Ok(())
-    }
 }
 
 impl Client {
@@ -224,6 +213,7 @@ impl Client {
             ClientMessage::Identification { corr_id, .. }
             | ClientMessage::Signature { corr_id, .. }
             | ClientMessage::InternalAuthenticate { corr_id, .. }
+            | ClientMessage::TerminateInstance { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
@@ -469,12 +459,15 @@ impl Client {
     /// Terminates an instance by its ID (fire-and-forget).
     pub async fn terminate_instance(&self, instance_id: &str) -> Result<()> {
         let msg = ClientMessage::TerminateInstance {
+            corr_id: 0,
             instance_id: instance_id.to_string(),
         };
-        self.inner
-            .ws_writer_tx
-            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
-        Ok(())
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        if successful {
+            Ok(())
+        } else {
+            anyhow::bail!("Terminate instance failed: {}", result)
+        }
     }
 }
 

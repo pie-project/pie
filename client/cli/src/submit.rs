@@ -5,8 +5,11 @@
 
 use crate::engine;
 use crate::path;
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
+use pie_client::client;
+use std::fs;
 use std::path::PathBuf;
 
 /// Arguments for the `pie submit` command.
@@ -45,7 +48,9 @@ pub struct SubmitArgs {
 /// 2. Creates a client configuration from config and command-line arguments
 /// 3. Connects to the existing Pie engine server
 /// 4. Submits the specified inferlet with the provided arguments
-/// 5. Waits for the inferlet to finish execution and prints the result
+/// 5. In non-detached mode, streams the inferlet output with signal handling:
+///    - Ctrl-C (SIGINT): Terminates the inferlet on the server
+///    - Ctrl-D (EOF): Detaches from the inferlet (continues running on server)
 pub async fn handle_submit_command(args: SubmitArgs) -> Result<()> {
     let client_config = engine::ClientConfig::new(
         args.config,
@@ -55,12 +60,32 @@ pub async fn handle_submit_command(args: SubmitArgs) -> Result<()> {
         args.private_key_path,
     )?;
 
-    let instance =
-        engine::submit_inferlet(&client_config, args.inferlet, args.arguments, args.detached)
-            .await?;
+    let client = engine::connect_and_authenticate(&client_config).await?;
+
+    let inferlet_blob = fs::read(&args.inferlet)
+        .context(format!("Failed to read Wasm file at {:?}", args.inferlet))?;
+    let hash = client::hash_blob(&inferlet_blob);
+    println!("Inferlet hash: {}", hash);
+
+    if !client.program_exists(&hash).await? {
+        client.upload_program(&inferlet_blob).await?;
+        println!("✅ Inferlet upload successful.");
+    }
+
+    let cmd_name = args
+        .inferlet
+        .file_stem()
+        .context("Inferlet path must have a valid file name")?
+        .to_string_lossy()
+        .to_string();
+    let instance = client
+        .launch_instance(hash, cmd_name, args.arguments, args.detached)
+        .await?;
+
+    println!("✅ Inferlet launched with ID: {}", instance.id());
 
     if !args.detached {
-        engine::stream_inferlet_output(instance).await?;
+        engine::stream_inferlet_output(instance, client).await?;
     }
 
     Ok(())

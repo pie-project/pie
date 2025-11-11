@@ -581,9 +581,10 @@ impl Session {
                     instance_id,
                     message,
                 } => self.handle_signal_instance(instance_id, message).await,
-                ClientMessage::TerminateInstance { instance_id } => {
-                    self.handle_terminate_instance(instance_id).await
-                }
+                ClientMessage::TerminateInstance {
+                    corr_id,
+                    instance_id,
+                } => self.handle_terminate_instance(corr_id, instance_id).await,
                 ClientMessage::AttachRemoteService {
                     corr_id,
                     endpoint,
@@ -1014,7 +1015,7 @@ impl Session {
         }
     }
 
-    async fn handle_terminate_instance(&mut self, instance_id: String) {
+    async fn handle_terminate_instance(&mut self, corr_id: u32, instance_id: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             runtime::Command::TerminateInstance {
                 inst_id,
@@ -1022,6 +1023,12 @@ impl Session {
             }
             .dispatch()
             .unwrap();
+
+            self.send_response(corr_id, true, "Instance terminated".to_string())
+                .await;
+        } else {
+            self.send_response(corr_id, false, "Malformed instance ID".to_string())
+                .await;
         }
     }
 

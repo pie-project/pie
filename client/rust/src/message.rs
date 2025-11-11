@@ -116,7 +116,7 @@ pub enum ClientMessage {
     },
 
     #[serde(rename = "terminate_instance")]
-    TerminateInstance { instance_id: String },
+    TerminateInstance { corr_id: u32, instance_id: String },
 
     #[serde(rename = "attach_remote_service")]
     AttachRemoteService {
