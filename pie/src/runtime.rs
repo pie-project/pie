@@ -81,6 +81,15 @@ pub enum Command {
         event: oneshot::Sender<AttachInstanceResult>,
     },
 
+    GetOutputDeliveryCtrl {
+        inst_id: InstanceId,
+        event: oneshot::Sender<GetOutputDeliveryCtrlResult>,
+    },
+
+    DetachInstance {
+        inst_id: InstanceId,
+    },
+
     LaunchServerInstance {
         program_hash: String,
         port: u32,
@@ -192,6 +201,14 @@ pub enum AttachInstanceResult {
     AlreadyAttached,
 }
 
+#[derive(Clone)]
+pub enum GetOutputDeliveryCtrlResult {
+    /// The output delivery controller was successfully retrieved.
+    Success(OutputDeliveryCtrl),
+    /// The instance was not found.
+    InstanceNotFound,
+}
+
 pub struct InstanceHandle {
     pub program_hash: String,
     pub cmd_name: String,
@@ -254,6 +271,23 @@ impl Service for Runtime {
                     .send(res)
                     .map_err(|_| "Failed to send attach instance result")
                     .unwrap();
+            }
+
+            Command::GetOutputDeliveryCtrl { inst_id, event } => {
+                let res = match self.running_instances.get(&inst_id) {
+                    Some(handle) => {
+                        GetOutputDeliveryCtrlResult::Success(handle.output_delivery_ctrl.clone())
+                    }
+                    None => GetOutputDeliveryCtrlResult::InstanceNotFound,
+                };
+                event
+                    .send(res)
+                    .map_err(|_| "Failed to send output delivery controller")
+                    .unwrap();
+            }
+
+            Command::DetachInstance { inst_id } => {
+                self.detach_instance(inst_id);
             }
 
             Command::LaunchServerInstance {
@@ -523,6 +557,14 @@ impl Runtime {
         }
 
         return AttachInstanceResult::InstanceNotFound;
+    }
+
+    /// Set the instance as detached. Prior to calling this method, the instance output delivery
+    /// mode must be set to buffered.
+    fn detach_instance(&self, inst_id: InstanceId) {
+        if let Some(mut handle) = self.running_instances.get_mut(&inst_id) {
+            handle.running_state = InstanceRunningState::Detached;
+        }
     }
 
     /// Actually start a program instance

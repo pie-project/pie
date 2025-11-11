@@ -1191,18 +1191,38 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Detach all attached instances.
         for inst_id in self.attached_instances.drain(..) {
-            if self.state.client_cmd_txs.remove(&inst_id).is_some() {
-                // Request the runtime to terminate the instance.
-                // Need not to notify the client because the client has disconnected
-                // from this session.
-                runtime::Command::TerminateInstance {
+            let server_state = Arc::clone(&self.state);
+
+            // We need to spawn a task to detach the instance because the drop handler
+            // is not async. It's okay as long as the instance is detached eventually.
+            task::spawn(async move {
+                // Get the output delivery controller of the instance.
+                let (evt_tx, evt_rx) = oneshot::channel();
+                runtime::Command::GetOutputDeliveryCtrl {
                     inst_id,
-                    notification_to_client: None,
+                    event: evt_tx,
                 }
                 .dispatch()
                 .unwrap();
-            }
+
+                // Set the output delivery mode to buffered.
+                match evt_rx.await.unwrap() {
+                    runtime::GetOutputDeliveryCtrlResult::Success(output_delivery_ctrl) => {
+                        output_delivery_ctrl.set_output_delivery(OutputDelivery::Buffered);
+                    }
+                    runtime::GetOutputDeliveryCtrlResult::InstanceNotFound => return,
+                }
+
+                // Remove the forwarding channel to the instance from the server state.
+                server_state.client_cmd_txs.remove(&inst_id);
+
+                // Set the instance as detached so that it can be attached to another client.
+                runtime::Command::DetachInstance { inst_id }
+                    .dispatch()
+                    .unwrap();
+            });
         }
 
         // Abort the receive pump so that it no longer receives messages from the client.
