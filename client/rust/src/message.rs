@@ -147,6 +147,20 @@ pub enum ServerMessage {
         result: String,
     },
 
+    #[serde(rename = "instance_launch_result")]
+    InstanceLaunchResult {
+        corr_id: u32,
+        successful: bool,
+        message: String,
+    },
+
+    #[serde(rename = "instance_attach_result")]
+    InstanceAttachResult {
+        corr_id: u32,
+        successful: bool,
+        message: String,
+    },
+
     #[serde(rename = "instance_event")]
     InstanceEvent {
         instance_id: String,

@@ -668,6 +668,24 @@ impl Session {
         .await;
     }
 
+    async fn send_launch_result(&self, corr_id: u32, successful: bool, message: String) {
+        self.send(ServerMessage::InstanceLaunchResult {
+            corr_id,
+            successful,
+            message,
+        })
+        .await;
+    }
+
+    async fn send_attach_result(&self, corr_id: u32, successful: bool, message: String) {
+        self.send(ServerMessage::InstanceAttachResult {
+            corr_id,
+            successful,
+            message,
+        })
+        .await;
+    }
+
     async fn send_inst_event(&self, inst_id: InstanceId, event: EventCode, message: String) {
         self.send(ServerMessage::InstanceEvent {
             instance_id: inst_id.to_string(),
@@ -877,13 +895,13 @@ impl Session {
                 // Send the instance ID to the client before allowing output. This is especially
                 // important for attached instances to prevent a race condition where output
                 // arrives at the client side before the client receives the instance ID.
-                self.send_response(corr_id, true, instance_id.to_string())
+                self.send_launch_result(corr_id, true, instance_id.to_string())
                     .await;
                 output_delivery_ctrl.allow_output();
             }
             // The instance failed to launch. Notify the client about the error.
             Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
+                self.send_launch_result(corr_id, false, e.to_string()).await;
             }
         }
     }
@@ -893,7 +911,7 @@ impl Session {
         let inst_id = match Uuid::parse_str(&instance_id) {
             Ok(id) => id,
             Err(_) => {
-                self.send_response(corr_id, false, "Invalid instance_id".to_string())
+                self.send_attach_result(corr_id, false, "Invalid instance_id".to_string())
                     .await;
                 return;
             }
@@ -920,7 +938,7 @@ impl Session {
             // The instance was attached successfully. Notify the client first and then change
             // the output delivery mode to streamed so that the client can start receiving output.
             AttachInstanceResult::AttachedRunning(output_delivery_ctrl) => {
-                self.send_response(corr_id, true, "Instance attached".to_string())
+                self.send_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
                 output_delivery_ctrl.set_output_delivery(OutputDelivery::Streamed);
             }
@@ -928,7 +946,7 @@ impl Session {
             // output delivery mode to streamed so that the client can receive the final output.
             // Then, terminate the instance and notify the client about the termination.
             AttachInstanceResult::AttachedFinished(output_delivery_ctrl, cause) => {
-                self.send_response(corr_id, true, "Instance attached".to_string())
+                self.send_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
                 output_delivery_ctrl.set_output_delivery(OutputDelivery::Streamed);
 
@@ -944,7 +962,7 @@ impl Session {
             AttachInstanceResult::InstanceNotFound => {
                 self.state.client_cmd_txs.remove(&inst_id);
                 self.attached_instances.retain(|&id| id != inst_id);
-                self.send_response(corr_id, false, "Instance not found".to_string())
+                self.send_attach_result(corr_id, false, "Instance not found".to_string())
                     .await;
             }
             // The instance is already attached to another client.
@@ -952,7 +970,7 @@ impl Session {
             AttachInstanceResult::AlreadyAttached => {
                 self.state.client_cmd_txs.remove(&inst_id);
                 self.attached_instances.retain(|&id| id != inst_id);
-                self.send_response(corr_id, false, "Instance already attached".to_string())
+                self.send_attach_result(corr_id, false, "Instance already attached".to_string())
                     .await;
             }
         }

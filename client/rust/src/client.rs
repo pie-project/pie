@@ -4,7 +4,7 @@ use crate::message::{
     StreamingOutput,
 };
 use crate::utils::IdPool;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -55,6 +55,15 @@ struct ClientInner {
     corr_id_pool: IdPool<CorrId>,
     pending_requests: DashMap<CorrId, oneshot::Sender<(bool, String)>>,
     pending_list_requests: DashMap<CorrId, oneshot::Sender<Vec<InstanceInfo>>>,
+    pending_launch_requests:
+        DashMap<CorrId, oneshot::Sender<Result<(InstanceId, mpsc::Receiver<InstanceEvent>)>>>,
+    pending_attach_requests: DashMap<
+        CorrId,
+        (
+            InstanceId,
+            oneshot::Sender<Result<mpsc::Receiver<InstanceEvent>>>,
+        ),
+    >,
     inst_event_tx: DashMap<InstanceId, mpsc::Sender<InstanceEvent>>,
     // Use a Mutex per entry to avoid deadlocking the DashMap shard
     pending_downloads: DashMap<String, Mutex<DownloadState>>, // Key: blob_hash
@@ -135,7 +144,7 @@ impl Instance {
         self.event_rx
             .recv()
             .await
-            .ok_or_else(|| anyhow::anyhow!("Event channel closed"))
+            .ok_or(anyhow!("Event channel closed"))
     }
 
     /// Requests the server to terminate the instance (fire-and-forget).
@@ -162,6 +171,8 @@ impl Client {
             corr_id_pool: IdPool::new(CorrId::MAX),
             pending_requests: DashMap::new(),
             pending_list_requests: DashMap::new(),
+            pending_launch_requests: DashMap::new(),
+            pending_attach_requests: DashMap::new(),
             inst_event_tx: DashMap::new(),
             pending_downloads: DashMap::new(),
         });
@@ -214,8 +225,6 @@ impl Client {
             | ClientMessage::Signature { corr_id, .. }
             | ClientMessage::InternalAuthenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
-            | ClientMessage::LaunchInstance { corr_id, .. }
-            | ClientMessage::AttachInstance { corr_id, .. }
             | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
@@ -391,46 +400,55 @@ impl Client {
         arguments: Vec<String>,
         detached: bool,
     ) -> Result<Instance> {
+        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let msg = ClientMessage::LaunchInstance {
-            corr_id: 0,
+            corr_id: *corr_id_guard,
             program_hash,
             cmd_name,
             arguments,
             detached,
         };
-        let (successful, result) = self.send_msg_and_wait(msg).await?;
-        if successful {
-            let inst_id = Uuid::parse_str(&result)?;
-            let (tx, rx) = mpsc::channel(64);
-            self.inner.inst_event_tx.insert(inst_id, tx);
-            Ok(Instance {
-                id: inst_id,
-                inner: Arc::clone(&self.inner),
-                event_rx: rx,
-            })
-        } else {
-            anyhow::bail!("Launch instance failed: {}", result)
-        }
+
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .pending_launch_requests
+            .insert(*corr_id_guard, tx);
+        self.inner
+            .ws_writer_tx
+            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+
+        let (inst_id, event_rx) = rx.await??;
+
+        Ok(Instance {
+            id: inst_id,
+            inner: Arc::clone(&self.inner),
+            event_rx,
+        })
     }
 
     pub async fn attach_instance(&self, instance_id: &str) -> Result<Instance> {
+        let instance_id = Uuid::parse_str(instance_id)?;
+        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let msg = ClientMessage::AttachInstance {
-            corr_id: 0,
+            corr_id: *corr_id_guard,
             instance_id: instance_id.to_string(),
         };
-        let (successful, result) = self.send_msg_and_wait(msg).await?;
-        if successful {
-            let (tx, rx) = mpsc::channel(64);
-            let instance_id = Uuid::parse_str(instance_id)?;
-            self.inner.inst_event_tx.insert(instance_id, tx);
-            Ok(Instance {
-                id: instance_id,
-                inner: Arc::clone(&self.inner),
-                event_rx: rx,
-            })
-        } else {
-            anyhow::bail!("Attach instance failed: {}", result)
-        }
+
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .pending_attach_requests
+            .insert(*corr_id_guard, (instance_id, tx));
+        self.inner
+            .ws_writer_tx
+            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+
+        let event_rx = rx.await??;
+
+        Ok(Instance {
+            id: instance_id,
+            inner: Arc::clone(&self.inner),
+            event_rx,
+        })
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -474,6 +492,62 @@ async fn handle_server_message(
         } => {
             if let Some((_, sender)) = inner.pending_requests.remove(&corr_id) {
                 sender.send((successful, result)).ok();
+            }
+        }
+        ServerMessage::InstanceLaunchResult {
+            corr_id,
+            successful,
+            message: instance_id,
+        } => {
+            if let Some((_, sender)) = inner.pending_launch_requests.remove(&corr_id) {
+                if successful {
+                    // Insert the channel here in the message handler rather than in
+                    // `launch_instance` to avoid a race condition. Instance events may arrive
+                    // immediately after the launch result, so the channel must exist before we
+                    // process any events. If `launch_instance` (running in a different task) were
+                    // to insert the channel, it might not be ready in time, causing events to be
+                    // dropped.
+                    if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
+                        let (tx, rx) = mpsc::channel(64);
+                        inner.inst_event_tx.insert(inst_id, tx);
+                        sender.send(Ok((inst_id, rx))).ok();
+                    } else {
+                        sender
+                            .send(Err(anyhow!(
+                                "Received invalid instance ID: {}",
+                                instance_id
+                            )))
+                            .ok();
+                    }
+                } else {
+                    sender
+                        .send(Err(anyhow!("Launch instance failed: {}", instance_id)))
+                        .ok();
+                }
+            }
+        }
+        ServerMessage::InstanceAttachResult {
+            corr_id,
+            successful,
+            message,
+        } => {
+            if let Some((_, (instance_id, sender))) = inner.pending_attach_requests.remove(&corr_id)
+            {
+                if successful {
+                    // Insert the channel here in the message handler rather than in
+                    // `attach_instance` to avoid a race condition. Instance events may arrive
+                    // immediately after the attach result, so the channel must exist before we
+                    // process any events. If `attach_instance` (running in a different task) were
+                    // to insert the channel, it might not be ready in time, causing events to be
+                    //dropped.
+                    let (tx, rx) = mpsc::channel(64);
+                    inner.inst_event_tx.insert(instance_id, tx);
+                    sender.send(Ok(rx)).ok();
+                } else {
+                    sender
+                        .send(Err(anyhow!("Attach instance failed: {}", message)))
+                        .ok();
+                }
             }
         }
         ServerMessage::InstanceEvent {
@@ -567,6 +641,8 @@ async fn handle_server_message(
 async fn handle_server_termination(inner: &Arc<ClientInner>) {
     inner.pending_requests.clear();
     inner.pending_list_requests.clear();
+    inner.pending_launch_requests.clear();
+    inner.pending_attach_requests.clear();
     inner.inst_event_tx.clear();
     inner.pending_downloads.clear();
 }
