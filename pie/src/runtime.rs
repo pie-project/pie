@@ -73,7 +73,7 @@ pub enum Command {
         cmd_name: String,
         arguments: Vec<String>,
         detached: bool,
-        event: oneshot::Sender<Result<(OutputDeliveryCtrl, InstanceId), RuntimeError>>,
+        event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
     },
 
     AttachInstance {
@@ -81,12 +81,11 @@ pub enum Command {
         event: oneshot::Sender<AttachInstanceResult>,
     },
 
-    GetOutputDeliveryCtrl {
+    DetachInstance {
         inst_id: InstanceId,
-        event: oneshot::Sender<GetOutputDeliveryCtrlResult>,
     },
 
-    DetachInstance {
+    AllowOutput {
         inst_id: InstanceId,
     },
 
@@ -108,7 +107,6 @@ pub enum Command {
         cause: TerminationCause,
     },
 
-    #[allow(dead_code)]
     SetOutputDelivery {
         inst_id: InstanceId,
         mode: OutputDelivery,
@@ -170,9 +168,22 @@ pub enum TerminationCause {
 pub enum InstanceRunningState {
     /// The instance is running and a client is attached to it.
     /// The output will be streamed to the client.
+    ///
+    /// Note that this enum does not directly affect the output streaming behavior.
+    /// The output streaming behavior is determined by the output delivery mode.
+    /// The `Attached` state merely prevents other clients from attaching to the same
+    /// instance. Once an instance is set to `Attached`, the output delivery mode must
+    /// be set to `Streamed` via the `SetOutputDelivery` command.
     Attached,
     /// The instance is running and not attached to a client.
     /// The output will be buffered.
+    ///
+    /// Note that this enum does not directly affect the output streaming behavior.
+    /// The output streaming behavior is determined by the output delivery mode.
+    /// The `Detached` state merely indicates that the instance is not attached to a
+    /// client and other clients can attach to it. Before setting the instance to
+    /// `Detached`, the output delivery mode must be set to `Buffered` via the
+    /// `SetOutputDelivery` command, so to prevent the output from being lost.
     Detached,
     /// The instance has finished execution.
     /// The output is buffered and waiting to be streamed to the client.
@@ -192,21 +203,13 @@ impl From<InstanceRunningState> for message::InstanceStatus {
 #[derive(Clone)]
 pub enum AttachInstanceResult {
     /// The instance is running and the client has been attached to it successfully.
-    AttachedRunning(OutputDeliveryCtrl),
+    AttachedRunning,
     /// The instance has finished execution and the client has been attached to it successfully.
-    AttachedFinished(OutputDeliveryCtrl, TerminationCause),
+    AttachedFinished(TerminationCause),
     /// The instance is not found.
     InstanceNotFound,
     /// Another client has already been attached to this instance.
     AlreadyAttached,
-}
-
-#[derive(Clone)]
-pub enum GetOutputDeliveryCtrlResult {
-    /// The output delivery controller was successfully retrieved.
-    Success(OutputDeliveryCtrl),
-    /// The instance was not found.
-    InstanceNotFound,
 }
 
 pub struct InstanceHandle {
@@ -259,9 +262,7 @@ impl Service for Runtime {
                     .await;
                 event
                     .send(res)
-                    .map_err(
-                        |_| "Failed to send output delivery controller after launching instance",
-                    )
+                    .map_err(|_| "Failed to send instance ID after launching instance")
                     .unwrap();
             }
 
@@ -273,21 +274,12 @@ impl Service for Runtime {
                     .unwrap();
             }
 
-            Command::GetOutputDeliveryCtrl { inst_id, event } => {
-                let res = match self.running_instances.get(&inst_id) {
-                    Some(handle) => {
-                        GetOutputDeliveryCtrlResult::Success(handle.output_delivery_ctrl.clone())
-                    }
-                    None => GetOutputDeliveryCtrlResult::InstanceNotFound,
-                };
-                event
-                    .send(res)
-                    .map_err(|_| "Failed to send output delivery controller")
-                    .unwrap();
-            }
-
             Command::DetachInstance { inst_id } => {
                 self.detach_instance(inst_id);
+            }
+
+            Command::AllowOutput { inst_id } => {
+                self.allow_output(inst_id);
             }
 
             Command::LaunchServerInstance {
@@ -480,7 +472,7 @@ impl Runtime {
         cmd_name: String,
         arguments: Vec<String>,
         detached: bool,
-    ) -> Result<(OutputDeliveryCtrl, InstanceId), RuntimeError> {
+    ) -> Result<InstanceId, RuntimeError> {
         let component = self.get_component(&program_hash)?;
         let instance_id = Uuid::new_v4();
 
@@ -518,7 +510,7 @@ impl Runtime {
             program_hash,
             cmd_name,
             arguments,
-            output_delivery_ctrl: output_delivery_ctrl.clone(),
+            output_delivery_ctrl,
             running_state,
             join_handle,
         };
@@ -527,7 +519,7 @@ impl Runtime {
         // Signal the task to start now that the join_handle is in the map
         let _ = start_tx.send(());
 
-        Ok((output_delivery_ctrl, instance_id))
+        Ok(instance_id)
     }
 
     /// Set the instance as attached. Its output will be streamed to the client.
@@ -540,19 +532,20 @@ impl Runtime {
             }
 
             handle.running_state = InstanceRunningState::Attached;
-
-            return AttachInstanceResult::AttachedRunning(handle.output_delivery_ctrl.clone());
+            return AttachInstanceResult::AttachedRunning;
         }
 
         // Check if the instance has finished execution.
-        if let Some(handle) = self.finished_instances.get(&inst_id) {
-            if let InstanceRunningState::Finished(ref cause) = handle.running_state {
-                return AttachInstanceResult::AttachedFinished(
-                    handle.output_delivery_ctrl.clone(),
-                    cause.clone(),
-                );
-            } else {
-                panic!("Instance {inst_id} is not finished but is in the finished instances map")
+        if let Some(mut handle) = self.finished_instances.get_mut(&inst_id) {
+            // Set the instance to attached to prevent other clients from attaching to it.
+            // Take the termination cause from the finished state and return it. The code that
+            // takes the termination cause should be responsible for later cleaning up the instance.
+            if matches!(&handle.running_state, InstanceRunningState::Finished(_)) {
+                if let InstanceRunningState::Finished(cause) =
+                    std::mem::replace(&mut handle.running_state, InstanceRunningState::Attached)
+                {
+                    return AttachInstanceResult::AttachedFinished(cause);
+                }
             }
         }
 
@@ -564,6 +557,13 @@ impl Runtime {
     fn detach_instance(&self, inst_id: InstanceId) {
         if let Some(mut handle) = self.running_instances.get_mut(&inst_id) {
             handle.running_state = InstanceRunningState::Detached;
+        }
+    }
+
+    /// Allow output for a running instance
+    fn allow_output(&self, inst_id: InstanceId) {
+        if let Some(handle) = self.running_instances.get(&inst_id) {
+            handle.output_delivery_ctrl.allow_output();
         }
     }
 
@@ -683,6 +683,12 @@ impl Runtime {
     /// Set the output delivery for a running instance
     fn set_output_delivery(&self, instance_id: InstanceId, output_delivery: OutputDelivery) {
         if let Some(handle) = self.running_instances.get(&instance_id) {
+            handle
+                .output_delivery_ctrl
+                .set_output_delivery(output_delivery);
+        }
+
+        if let Some(handle) = self.finished_instances.get(&instance_id) {
             handle
                 .output_delivery_ctrl
                 .set_output_delivery(output_delivery);

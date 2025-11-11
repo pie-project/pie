@@ -883,7 +883,7 @@ impl Session {
 
         match evt_rx.await.unwrap() {
             // The instance was launched successfully. Notify the client about the instance ID.
-            Ok((output_delivery_ctrl, instance_id)) => {
+            Ok(instance_id) => {
                 // If the instance is not detached, add it to the attached instances so that its
                 // output can be streamed to the client after it is launched.
                 if !detached {
@@ -898,7 +898,15 @@ impl Session {
                 // arrives at the client side before the client receives the instance ID.
                 self.send_launch_result(corr_id, true, instance_id.to_string())
                     .await;
-                output_delivery_ctrl.allow_output();
+
+                // Allow the instance to start producing output. We must do this after sending the
+                // instance ID to the client to prevent a race condition where output arrives at
+                // the client side before the client receives the instance ID.
+                runtime::Command::AllowOutput {
+                    inst_id: instance_id,
+                }
+                .dispatch()
+                .unwrap();
             }
             // The instance failed to launch. Notify the client about the error.
             Err(e) => {
@@ -918,13 +926,6 @@ impl Session {
             }
         };
 
-        // Add the instance to the attached instances so that its output can be streamed
-        // to the client after it is attached.
-        self.state
-            .client_cmd_txs
-            .insert(inst_id, self.client_cmd_tx.clone());
-        self.attached_instances.push(inst_id);
-
         let (evt_tx, evt_rx) = oneshot::channel();
 
         // Change instance state to attached.
@@ -938,19 +939,50 @@ impl Session {
         match evt_rx.await.unwrap() {
             // The instance was attached successfully. Notify the client first and then change
             // the output delivery mode to streamed so that the client can start receiving output.
-            AttachInstanceResult::AttachedRunning(output_delivery_ctrl) => {
+            AttachInstanceResult::AttachedRunning => {
                 self.send_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
-                output_delivery_ctrl.set_output_delivery(OutputDelivery::Streamed);
+
+                // Update the map so that instance events will be forwarded to this session.
+                self.state
+                    .client_cmd_txs
+                    .insert(inst_id, self.client_cmd_tx.clone());
+                self.attached_instances.push(inst_id);
+
+                // Set the output delivery mode to streamed so that new and any buffered output
+                // will be sent to the server as instance events, which will be forwarded to this
+                // session.
+                runtime::Command::SetOutputDelivery {
+                    inst_id,
+                    mode: OutputDelivery::Streamed,
+                }
+                .dispatch()
+                .unwrap();
             }
             // The instance has finished execution. Notify the client first and then change the
             // output delivery mode to streamed so that the client can receive the final output.
             // Then, terminate the instance and notify the client about the termination.
-            AttachInstanceResult::AttachedFinished(output_delivery_ctrl, cause) => {
+            AttachInstanceResult::AttachedFinished(cause) => {
                 self.send_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
-                output_delivery_ctrl.set_output_delivery(OutputDelivery::Streamed);
 
+                // Update the map so that instance events will be forwarded to this session.
+                self.state
+                    .client_cmd_txs
+                    .insert(inst_id, self.client_cmd_tx.clone());
+                self.attached_instances.push(inst_id);
+
+                // Set the output delivery mode to streamed so that new and any buffered output
+                // will be sent to the server as instance events, which will be forwarded to this
+                // session.
+                runtime::Command::SetOutputDelivery {
+                    inst_id,
+                    mode: OutputDelivery::Streamed,
+                }
+                .dispatch()
+                .unwrap();
+
+                // Terminate the instance and notify the client about the termination.
                 runtime::Command::TerminateInstance {
                     inst_id,
                     notification_to_client: Some(cause),
@@ -961,16 +993,12 @@ impl Session {
             // The instance was not found.
             // Remove it from the attached instances and notify the client about the error.
             AttachInstanceResult::InstanceNotFound => {
-                self.state.client_cmd_txs.remove(&inst_id);
-                self.attached_instances.retain(|&id| id != inst_id);
                 self.send_attach_result(corr_id, false, "Instance not found".to_string())
                     .await;
             }
             // The instance is already attached to another client.
             // Remove it from the attached instances and notify the client about the error.
             AttachInstanceResult::AlreadyAttached => {
-                self.state.client_cmd_txs.remove(&inst_id);
-                self.attached_instances.retain(|&id| id != inst_id);
                 self.send_attach_result(corr_id, false, "Instance already attached".to_string())
                     .await;
             }
@@ -1205,22 +1233,13 @@ impl Drop for Session {
             // We need to spawn a task to detach the instance because the drop handler
             // is not async. It's okay as long as the instance is detached eventually.
             task::spawn(async move {
-                // Get the output delivery controller of the instance.
-                let (evt_tx, evt_rx) = oneshot::channel();
-                runtime::Command::GetOutputDeliveryCtrl {
+                // Set the output delivery mode to buffered.
+                runtime::Command::SetOutputDelivery {
                     inst_id,
-                    event: evt_tx,
+                    mode: OutputDelivery::Buffered,
                 }
                 .dispatch()
                 .unwrap();
-
-                // Set the output delivery mode to buffered.
-                match evt_rx.await.unwrap() {
-                    runtime::GetOutputDeliveryCtrlResult::Success(output_delivery_ctrl) => {
-                        output_delivery_ctrl.set_output_delivery(OutputDelivery::Buffered);
-                    }
-                    runtime::GetOutputDeliveryCtrlResult::InstanceNotFound => return,
-                }
 
                 // Remove the forwarding channel to the instance from the server state.
                 server_state.client_cmd_txs.remove(&inst_id);
