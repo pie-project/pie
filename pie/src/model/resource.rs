@@ -175,7 +175,7 @@ impl ResourceManager {
 
             if let Some(victim_id) = victim_id {
                 self.cleanup(victim_id)?;
-                runtime::Command::AbortInstance {
+                runtime::Command::TerminateInstance {
                     inst_id: victim_id,
                     notification_to_client: Some(TerminationCause::OutOfResources(
                         "Terminated by OOM killer for an older instance".to_string(),

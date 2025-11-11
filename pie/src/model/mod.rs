@@ -146,7 +146,7 @@ fn terminate_instance_with_exception<T>(inst_id: InstanceId, exception: T)
 where
     T: ToString,
 {
-    runtime::Command::AbortInstance {
+    runtime::Command::TerminateInstance {
         inst_id,
         notification_to_client: Some(TerminationCause::Exception(exception.to_string())),
     }

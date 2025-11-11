@@ -8,10 +8,11 @@ use ringbuffer::{AllocRingBuffer, RingBuffer};
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
+use tokio::sync::Notify;
 use uuid::Uuid;
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::async_trait;
@@ -43,6 +44,14 @@ impl OutputDeliveryCtrl {
                 self.stderr_stream.set_deliver_to_stream();
             }
         }
+    }
+
+    /// Allow output to be written to the streams.
+    /// This should be called after the instance ID has been communicated to the client
+    /// to prevent a race condition where output arrives before the instance ID.
+    pub fn allow_output(&self) {
+        self.stdout_stream.allow_output();
+        self.stderr_stream.allow_output();
     }
 }
 
@@ -291,6 +300,11 @@ struct LogStreamState {
     instance_id: InstanceId,
     mode: AtomicU8,
     buffer: Mutex<AllocRingBuffer<u8>>,
+    /// Tracks whether output is allowed to be written.
+    /// Starts as false to prevent output before the instance ID is sent to the client.
+    output_allowed: AtomicBool,
+    /// Notifies async waiters when output becomes allowed.
+    output_allowed_notify: Notify,
 }
 
 impl LogStream {
@@ -304,8 +318,17 @@ impl LogStream {
                 instance_id,
                 mode: AtomicU8::new(OutputDelivery::Buffered.to_u8()),
                 buffer: Mutex::new(AllocRingBuffer::new(Self::DEFAULT_BUFFER_CAPACITY)),
+                output_allowed: AtomicBool::new(false),
+                output_allowed_notify: Notify::new(),
             }),
         }
+    }
+
+    /// Allow output to be written to this stream.
+    /// This should be called after the instance ID has been communicated to the client.
+    fn allow_output(&self) {
+        self.state.output_allowed.store(true, Ordering::Release);
+        self.state.output_allowed_notify.notify_waiters();
     }
 
     /// Set the delivery mode to buffering
@@ -386,13 +409,30 @@ impl OutputStream for LogStream {
     }
 
     fn check_write(&mut self) -> StreamResult<usize> {
-        Ok(1024 * 1024)
+        // If output is not allowed yet, return 0 to signal backpressure.
+        // This prevents writes until the instance ID has been sent to the client.
+        if !self.state.output_allowed.load(Ordering::Acquire) {
+            Ok(0)
+        } else {
+            Ok(1024 * 1024)
+        }
     }
 }
 
 #[async_trait]
 impl Pollable for LogStream {
-    async fn ready(&mut self) {}
+    async fn ready(&mut self) {
+        // IMPORTANT: Call notified() BEFORE checking the condition to avoid
+        // missing the notification (lost wakeup problem).
+        let notified = self.state.output_allowed_notify.notified();
+
+        // Wait until output is allowed before becoming ready.
+        // This prevents a race condition where output is sent before
+        // the client receives the instance ID.
+        if !self.state.output_allowed.load(Ordering::Acquire) {
+            notified.await;
+        }
+    }
 }
 
 impl AsyncWrite for LogStream {
@@ -409,7 +449,7 @@ impl AsyncWrite for LogStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }

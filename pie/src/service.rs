@@ -25,7 +25,7 @@ where
 
 pub fn dispatch<C>(service_id: usize, cmd: C) -> Result<(), ServiceError>
 where
-    C: Any + Send + Sync + Debug + 'static,
+    C: Any + Send + Sync + 'static,
 {
     SERVICE_DISPATCHER
         .get()
@@ -102,7 +102,7 @@ impl ServiceDispatcher {
 
     pub fn dispatch<C>(&self, service_id: usize, cmd: C) -> Result<(), ServiceError>
     where
-        C: Any + Send + Sync + Debug + 'static,
+        C: Any + Send + Sync + 'static,
     {
         let cmd = Box::new(cmd);
 
@@ -117,7 +117,7 @@ impl ServiceDispatcher {
 
     pub fn dispatch_with<C>(&self, name: &str, cmd: C) -> Result<(), ServiceError>
     where
-        C: Any + Send + Sync + Debug + 'static,
+        C: Any + Send + Sync + 'static,
     {
         let service_id = self
             .get_service_id(name)

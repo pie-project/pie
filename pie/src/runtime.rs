@@ -52,7 +52,6 @@ pub enum RuntimeError {
     Other(String),
 }
 
-#[derive(Debug)]
 pub enum Command {
     GetVersion {
         event: oneshot::Sender<String>,
@@ -74,7 +73,7 @@ pub enum Command {
         cmd_name: String,
         arguments: Vec<String>,
         detached: bool,
-        event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
+        event: oneshot::Sender<Result<(OutputDeliveryCtrl, InstanceId), RuntimeError>>,
     },
 
     AttachInstance {
@@ -90,7 +89,7 @@ pub enum Command {
         event: oneshot::Sender<Result<(), RuntimeError>>,
     },
 
-    AbortInstance {
+    TerminateInstance {
         inst_id: InstanceId,
         notification_to_client: Option<TerminationCause>,
     },
@@ -181,12 +180,12 @@ impl From<InstanceRunningState> for message::InstanceStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AttachInstanceResult {
     /// The instance is running and the client has been attached to it successfully.
-    AttachedRunning,
+    AttachedRunning(OutputDeliveryCtrl),
     /// The instance has finished execution and the client has been attached to it successfully.
-    AttachedFinished,
+    AttachedFinished(OutputDeliveryCtrl, TerminationCause),
     /// The instance is not found.
     InstanceNotFound,
     /// Another client has already been attached to this instance.
@@ -238,16 +237,23 @@ impl Service for Runtime {
                 arguments,
                 detached,
             } => {
-                let instance_id = self
+                let res = self
                     .launch_instance(program_hash, cmd_name, arguments, detached)
-                    .await
+                    .await;
+                event
+                    .send(res)
+                    .map_err(
+                        |_| "Failed to send output delivery controller after launching instance",
+                    )
                     .unwrap();
-                event.send(Ok(instance_id)).unwrap();
             }
 
             Command::AttachInstance { inst_id, event } => {
                 let res = self.attach_instance(inst_id);
-                event.send(res).unwrap();
+                event
+                    .send(res)
+                    .map_err(|_| "Failed to send attach instance result")
+                    .unwrap();
             }
 
             Command::LaunchServerInstance {
@@ -263,11 +269,11 @@ impl Service for Runtime {
                 event.send(Ok(())).unwrap();
             }
 
-            Command::AbortInstance {
+            Command::TerminateInstance {
                 inst_id,
                 notification_to_client,
             } => {
-                self.abort_instance(inst_id, notification_to_client);
+                self.terminate_instance(inst_id, notification_to_client);
             }
 
             Command::FinishInstance { inst_id, cause } => {
@@ -440,9 +446,8 @@ impl Runtime {
         cmd_name: String,
         arguments: Vec<String>,
         detached: bool,
-    ) -> Result<InstanceId, RuntimeError> {
+    ) -> Result<(OutputDeliveryCtrl, InstanceId), RuntimeError> {
         let component = self.get_component(&program_hash)?;
-
         let instance_id = Uuid::new_v4();
 
         // Instantiate and run in a task
@@ -479,7 +484,7 @@ impl Runtime {
             program_hash,
             cmd_name,
             arguments,
-            output_delivery_ctrl,
+            output_delivery_ctrl: output_delivery_ctrl.clone(),
             running_state,
             join_handle,
         };
@@ -488,7 +493,7 @@ impl Runtime {
         // Signal the task to start now that the join_handle is in the map
         let _ = start_tx.send(());
 
-        Ok(instance_id)
+        Ok((output_delivery_ctrl, instance_id))
     }
 
     /// Set the instance as attached. Its output will be streamed to the client.
@@ -500,35 +505,21 @@ impl Runtime {
                 return AttachInstanceResult::AlreadyAttached;
             }
 
-            // Set the instance as attached. Its output will be streamed to the client.
             handle.running_state = InstanceRunningState::Attached;
-            handle
-                .output_delivery_ctrl
-                .set_output_delivery(OutputDelivery::Streamed);
-            return AttachInstanceResult::AttachedRunning;
+
+            return AttachInstanceResult::AttachedRunning(handle.output_delivery_ctrl.clone());
         }
 
         // Check if the instance has finished execution.
-        if let Some((_, handle)) = self.finished_instances.remove(&inst_id) {
-            // Stream the buffered output to the client.
-            handle
-                .output_delivery_ctrl
-                .set_output_delivery(OutputDelivery::Streamed);
-
-            // Clean up the instance.
-            handle.join_handle.abort();
-            model::cleanup_instance(inst_id.clone());
-
-            // Notify the client about the instance's termination.
-            if let InstanceRunningState::Finished(cause) = handle.running_state {
-                server::InstanceEvent::Terminate { inst_id, cause }
-                    .dispatch()
-                    .ok();
+        if let Some(handle) = self.finished_instances.get(&inst_id) {
+            if let InstanceRunningState::Finished(ref cause) = handle.running_state {
+                return AttachInstanceResult::AttachedFinished(
+                    handle.output_delivery_ctrl.clone(),
+                    cause.clone(),
+                );
             } else {
                 panic!("Instance {inst_id} is not finished but is in the finished instances map")
             }
-
-            return AttachInstanceResult::AttachedFinished;
         }
 
         return AttachInstanceResult::InstanceNotFound;
@@ -584,8 +575,8 @@ impl Runtime {
         Ok(instance_id)
     }
 
-    /// Abort a running instance, and optionally notify the client.
-    fn abort_instance(
+    /// Terminate a running instance, and optionally notify the client.
+    fn terminate_instance(
         &self,
         instance_id: InstanceId,
         notification_to_client: Option<TerminationCause>,
