@@ -53,6 +53,30 @@ jobs:
           path: client/cli/target/release/pie-cli
           retention-days: 1
 
+  build-example-apps:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-wasip2
+
+      - name: Build Example Apps
+        working-directory: ./example-apps
+        run: cargo build --target wasm32-wasip2 --release
+
+      - name: Upload example apps
+        uses: actions/upload-artifact@v4
+        with:
+          name: echo-inferlet
+          path: example-apps/target/wasm32-wasip2/release/echo.wasm
+          retention-days: 1
+
   test-engine-authentication:
     needs: [build-engine, build-client-cli]
     runs-on: ubuntu-latest
@@ -90,3 +114,50 @@ jobs:
 
       - name: Run key strength test
         run: ./tests/engine/auth/key_strength.sh
+
+  test-engine-execute:
+    needs: [build-engine, build-client-cli, build-example-apps]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download pie binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pie-binary
+          path: ./bin
+
+      - name: Download pie-cli binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pie-cli-binary
+          path: ./bin
+
+      - name: Download echo inferlet
+        uses: actions/download-artifact@v4
+        with:
+          name: echo-inferlet
+          path: ./bin
+      
+      - name: Make binaries executable
+        run: |
+          chmod +x ./bin/pie
+          chmod +x ./bin/pie-cli
+
+      - name: Add binaries to PATH
+        run: |
+          echo "$(pwd)/bin" >> $GITHUB_PATH
+
+      - name: Run submit attached test
+        run: ./tests/engine/execute/submit_attached.sh ./bin
+
+      - name: Run submit detached test
+        run: ./tests/engine/execute/submit_detached.sh ./bin
+
+      - name: Run abort test
+        run: ./tests/engine/execute/abort.sh ./bin
+
+      - name: Run attach test
+        run: ./tests/engine/execute/attach.sh ./bin
