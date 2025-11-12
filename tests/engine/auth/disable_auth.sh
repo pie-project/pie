@@ -8,7 +8,7 @@
 #
 # Test Procedure:
 #   1. Generates an ED25519 SSH key pair
-#   2. Adds the public key to the pie authorized users list for user "pie-test"
+#   2. Adds the public key to the pie authorized users list with a randomized username
 #   3. Initializes pie engine and pie-cli configurations with unique random names
 #   4. Test when both ends enable authentication; ping should succeed
 #   5. Test when both ends disable authentication; ping should succeed
@@ -29,7 +29,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source utility functions
-source "${SCRIPT_DIR}/utils.sh"
+source "${SCRIPT_DIR}/../utils.sh"
+
+# Generate randomized username
+TEST_USERNAME="pie-test-$(generate_random_string)"
 
 PIE_SERVE_PID=""
 
@@ -46,7 +49,7 @@ cleanup() {
     fi
     
     # Remove authorized keys from the engine
-    yes | pie auth remove "pie-test" || true
+    yes | pie auth remove "$TEST_USERNAME" || true
     
     # Clean up generated key
     if [ -n "$ED25519_KEY" ]; then
@@ -69,7 +72,7 @@ echo "Generating key and adding to authorized users list..."
 # Generate ED25519 key and add to authorized users list
 ED25519_KEY=$(generate_unique_key_path "ed25519")
 ssh-keygen -t ed25519 -f "$ED25519_KEY" -N "" -C "test-ed25519" -q
-cat "${ED25519_KEY}.pub" | pie auth add "pie-test" "test-ed25519"
+cat "${ED25519_KEY}.pub" | pie auth add "$TEST_USERNAME" "test-ed25519"
 
 echo "Key generated and added to authorized users list"
 
@@ -78,7 +81,7 @@ pie config init dummy --path "$PIE_CONFIG"
 pie-cli config init --path "$PIE_CLI_CONFIG"
 
 # Configure client username
-pie-cli config update --path "$PIE_CLI_CONFIG" --username "pie-test"
+pie-cli config update --path "$PIE_CLI_CONFIG" --username "$TEST_USERNAME"
 
 # Configure client private key
 pie-cli config update --path "$PIE_CLI_CONFIG" --private-key-path "$ED25519_KEY"

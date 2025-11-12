@@ -12,7 +12,7 @@
 #
 # Test Procedure:
 #   1. Generates SSH key pairs for each algorithm type
-#   2. Adds each public key to the pie authorized users list for user "pie-test"
+#   2. Adds each public key to the pie authorized users list with a randomized username
 #   3. Initializes pie engine and pie-cli configurations with unique random names
 #   4. Starts the pie engine in the background
 #   5. Tests each key by configuring pie-cli to use it and executing a ping command
@@ -31,7 +31,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source utility functions
-source "${SCRIPT_DIR}/utils.sh"
+source "${SCRIPT_DIR}/../utils.sh"
+
+# Generate randomized username
+TEST_USERNAME="pie-test-$(generate_random_string)"
 
 # Array to track generated key files for cleanup
 GENERATED_KEYS=()
@@ -50,7 +53,7 @@ cleanup() {
     fi
     
     # Remove authorized keys from the engine
-    yes | pie auth remove "pie-test" || true
+    yes | pie auth remove "$TEST_USERNAME" || true
     
     # Clean up generated keys
     for key in "${GENERATED_KEYS[@]}"; do
@@ -76,25 +79,25 @@ echo "Generating keys and adding to authorized users list..."
 RSA_KEY=$(generate_unique_key_path "rsa")
 ssh-keygen -t rsa -b 4096 -f "$RSA_KEY" -N "" -C "test-rsa-4096" -q
 GENERATED_KEYS+=("$RSA_KEY")
-cat "${RSA_KEY}.pub" | pie auth add "pie-test" "test-rsa-4096"
+cat "${RSA_KEY}.pub" | pie auth add "$TEST_USERNAME" "test-rsa-4096"
 
 # Key 2: ED25519
 ED25519_KEY=$(generate_unique_key_path "ed25519")
 ssh-keygen -t ed25519 -f "$ED25519_KEY" -N "" -C "test-ed25519" -q
 GENERATED_KEYS+=("$ED25519_KEY")
-cat "${ED25519_KEY}.pub" | pie auth add "pie-test" "test-ed25519"
+cat "${ED25519_KEY}.pub" | pie auth add "$TEST_USERNAME" "test-ed25519"
 
 # Key 3: ECDSA P-256
 ECDSA_256_KEY=$(generate_unique_key_path "ecdsa-p256")
 ssh-keygen -t ecdsa -b 256 -f "$ECDSA_256_KEY" -N "" -C "test-ecdsa-p256" -q
 GENERATED_KEYS+=("$ECDSA_256_KEY")
-cat "${ECDSA_256_KEY}.pub" | pie auth add "pie-test" "test-ecdsa-p256"
+cat "${ECDSA_256_KEY}.pub" | pie auth add "$TEST_USERNAME" "test-ecdsa-p256"
 
 # Key 4: ECDSA P-384
 ECDSA_384_KEY=$(generate_unique_key_path "ecdsa-p384")
 ssh-keygen -t ecdsa -b 384 -f "$ECDSA_384_KEY" -N "" -C "test-ecdsa-p384" -q
 GENERATED_KEYS+=("$ECDSA_384_KEY")
-cat "${ECDSA_384_KEY}.pub" | pie auth add "pie-test" "test-ecdsa-p384"
+cat "${ECDSA_384_KEY}.pub" | pie auth add "$TEST_USERNAME" "test-ecdsa-p384"
 
 echo "All keys generated and added to authorized users list"
 
@@ -105,7 +108,7 @@ pie-cli config init --path "$PIE_CLI_CONFIG"
 # Start the Pie engine and wait for it to be ready
 start_pie_engine "$PIE_CONFIG" "PIE_SERVE_PID" || exit 1
 
-pie-cli config update --path "$PIE_CLI_CONFIG" --username "pie-test"
+pie-cli config update --path "$PIE_CLI_CONFIG" --username "$TEST_USERNAME"
 
 # Test Key 1: RSA 4096 bits
 echo "Testing RSA 4096 bits key..."

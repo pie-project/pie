@@ -8,7 +8,7 @@
 #
 # Test Procedure:
 #   1. Generates an insecure RSA 1536 bit key pair
-#   2. Attempts to add the public key to the pie authorized users list for user "pie-test"
+#   2. Attempts to add the public key to the pie authorized users list with a randomized username
 #   3. Verifies that the add operation fails (key should be rejected)
 #   4. Cleans up all generated files and auth keys
 #
@@ -24,12 +24,15 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source utility functions
-source "${SCRIPT_DIR}/utils.sh"
+source "${SCRIPT_DIR}/../utils.sh"
+
+# Generate randomized username
+TEST_USERNAME="pie-test-$(generate_random_string)"
 
 # Cleanup function
 cleanup() {
     # Remove authorized keys from the engine
-    yes 2>/dev/null | pie auth remove "pie-test" >/dev/null 2>&1 || true
+    yes 2>/dev/null | pie auth remove "$TEST_USERNAME" >/dev/null 2>&1 || true
     
     # Clean up generated key
     if [ -n "$RSA_WEAK_KEY" ]; then
@@ -50,7 +53,7 @@ ssh-keygen -t rsa -b 1536 -f "$RSA_WEAK_KEY" -N "" -C "test-rsa-1536" -q
 echo "Attempting to add insecure key to authorized users list..."
 
 # Try to add the key - this should fail
-if pie auth add "pie-test" "test-rsa-1536" < "${RSA_WEAK_KEY}.pub" >/dev/null 2>&1; then
+if pie auth add "$TEST_USERNAME" "test-rsa-1536" < "${RSA_WEAK_KEY}.pub" >/dev/null 2>&1; then
     echo "Error: Insecure RSA 1536 bit key was unexpectedly accepted"
     exit 1
 fi
