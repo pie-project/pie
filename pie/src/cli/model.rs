@@ -326,7 +326,10 @@ async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>
             if last_update.elapsed().as_millis() > 250 {
                 let downloaded_mb = downloaded as f64 / (1024.0 * 1024.0);
                 let total_mb = total_size as f64 / (1024.0 * 1024.0);
-                eprintln!("Downloading {}... {:.2} MiB/{:.2} MiB", file_name, downloaded_mb, total_mb);
+                eprintln!(
+                    "Downloading {}... {:.2} MiB/{:.2} MiB",
+                    file_name, downloaded_mb, total_mb
+                );
                 last_update = std::time::Instant::now();
             }
         }

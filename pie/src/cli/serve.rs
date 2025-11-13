@@ -172,7 +172,24 @@ async fn run_shell(
 
     // The main interactive loop
     loop {
-        match rl.readline("pie> ") {
+        // Use spawn_blocking to avoid blocking the async runtime
+        let readline_result = tokio::task::spawn_blocking(move || {
+            let result = rl.readline("pie> ");
+            (rl, result)
+        })
+        .await;
+
+        let (rl_from_task, result) = match readline_result {
+            Ok((rl, result)) => (rl, result),
+            Err(e) => {
+                eprintln!("Error in readline task: {}", e);
+                println!("Shutting down services...");
+                return Ok(());
+            }
+        };
+        rl = rl_from_task;
+
+        match result {
             Ok(line) => {
                 let _ = rl.add_history_entry(line.as_str());
                 let parts: Vec<String> = match shlex::split(&line) {
@@ -195,11 +212,13 @@ async fn run_shell(
                 .await
                 {
                     Ok(should_exit) if should_exit => break,
-                    Ok(_) => (),
+                    Ok(_) => {}
                     Err(e) => eprintln!("Error: {}", e),
                 }
             }
-            Err(ReadlineError::Interrupted) => println!("(To exit, type 'exit' or press Ctrl-D)"),
+            Err(ReadlineError::Interrupted) => {
+                println!("(To exit, type 'exit' or press Ctrl-D)");
+            }
             Err(ReadlineError::Eof) => {
                 println!("Exiting...");
                 break;
