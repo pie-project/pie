@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use tokio::sync::oneshot;
 
 use crate::auth::AuthorizedUsers;
-use crate::kvs::KeyValueStore;
+use crate::kvs;
 use crate::messaging::{PubSub, PushPull};
 use crate::runtime;
 use crate::server::Server;
@@ -91,11 +91,10 @@ pub async fn run_server(
     );
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
-    let kv_store = KeyValueStore::new();
 
     runtime::start_service(&config.cache_dir);
     install_legacy_service("server", server);
-    install_legacy_service("kvs", kv_store);
+    kvs::start_service();
     install_legacy_service("messaging-inst2inst", messaging_inst2inst);
     install_legacy_service("messaging-user2inst", messaging_user2inst);
 

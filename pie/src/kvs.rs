@@ -1,14 +1,17 @@
-use super::service::{self, LegacyService, LegacyServiceError};
+use super::service::{CommandDispatcher, Service, ServiceCommand};
 use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::oneshot;
 
-static SERVICE_ID_KVS: OnceLock<usize> = OnceLock::new();
+/// The sender of the command channel, which is used to send commands to the
+/// handler task.
+static COMMAND_DISPATCHER: OnceLock<CommandDispatcher<Command>> = OnceLock::new();
 
-/// Dispatches a command to the key-value store service.
-pub fn dispatch(command: Command) -> Result<(), LegacyServiceError> {
-    let service_id = *SERVICE_ID_KVS.get_or_init(|| service::get_legacy_service_id("kvs").unwrap());
-    service::dispatch_legacy(service_id, command)
+/// Starts the key-value store service. A daemon task will be spawned to handle the
+/// commands dispatched from other services.
+pub fn start_service() {
+    let kvs = KeyValueStore::new();
+    kvs.start(&COMMAND_DISPATCHER);
 }
 
 /// Defines the set of operations available for the key-value store.
@@ -39,31 +42,29 @@ pub enum Command {
     },
 }
 
+impl ServiceCommand for Command {
+    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &COMMAND_DISPATCHER;
+}
+
 /// An in-memory key-value store service.
 ///
 /// It uses a `DashMap` for concurrent, lock-free reads and writes,
 /// making it suitable for a multi-threaded, asynchronous environment.
 #[derive(Debug, Clone)]
-pub struct KeyValueStore {
+struct KeyValueStore {
     store: Arc<DashMap<String, String>>,
 }
 
 impl KeyValueStore {
     /// Creates a new, empty `KeyValueStore`.
-    pub fn new() -> Self {
+    fn new() -> Self {
         KeyValueStore {
             store: Arc::new(DashMap::new()),
         }
     }
 }
 
-impl Default for KeyValueStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl LegacyService for KeyValueStore {
+impl Service for KeyValueStore {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
