@@ -1,6 +1,6 @@
 use crate::auth::{AuthorizedUsers, PublicKey};
 use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
-use crate::messaging::{self, dispatch_u2i};
+use crate::messaging::PushPullCommand;
 use crate::model;
 use crate::model::Model;
 use crate::runtime::{self, AttachInstanceResult, TerminationCause};
@@ -1035,10 +1035,11 @@ impl Session {
     async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.attached_instances.contains(&inst_id) {
-                dispatch_u2i(messaging::PushPullCommand::Push {
+                PushPullCommand::Push {
                     topic: inst_id.to_string(),
                     message,
-                });
+                }
+                .dispatch();
             }
         }
     }
@@ -1168,10 +1169,11 @@ impl Session {
                 let final_hash = blake3::hash(&inflight.buffer).to_hex().to_string();
 
                 if final_hash == blob_hash {
-                    dispatch_u2i(messaging::PushPullCommand::PushBlob {
+                    PushPullCommand::PushBlob {
                         topic: inst_id.to_string(),
                         message: Bytes::from(mem::take(&mut inflight.buffer)),
-                    });
+                    }
+                    .dispatch();
                     self.send_response(corr_id, true, "Blob sent to instance".to_string())
                         .await;
                 } else {

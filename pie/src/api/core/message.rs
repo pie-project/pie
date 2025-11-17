@@ -1,8 +1,9 @@
 use crate::api::core::{Blob, BlobResult};
 use crate::api::inferlet;
 use crate::instance::InstanceState;
-use crate::messaging::{PubSubCommand, PushPullCommand, dispatch_i2i, dispatch_u2i};
+use crate::messaging::{PubSubCommand, PushPullCommand};
 use crate::server;
+use crate::service::ServiceCommand;
 use async_trait::async_trait;
 use std::mem;
 use tokio::sync::{mpsc, oneshot};
@@ -65,10 +66,11 @@ impl inferlet::core::message::Host for InstanceState {
 
     async fn receive(&mut self) -> anyhow::Result<Resource<ReceiveResult>> {
         let (tx, rx) = oneshot::channel();
-        dispatch_u2i(PushPullCommand::Pull {
+        PushPullCommand::Pull {
             topic: self.id().to_string(),
             message: tx,
-        });
+        }
+        .dispatch();
         let res = ReceiveResult {
             receiver: rx,
             result: None,
@@ -90,10 +92,11 @@ impl inferlet::core::message::Host for InstanceState {
 
     async fn receive_blob(&mut self) -> anyhow::Result<Resource<BlobResult>> {
         let (tx, rx) = oneshot::channel();
-        dispatch_u2i(PushPullCommand::PullBlob {
+        PushPullCommand::PullBlob {
             topic: self.id().to_string(),
             message: tx,
-        });
+        }
+        .dispatch();
         let res = BlobResult {
             receiver: rx,
             result: None,
@@ -103,18 +106,19 @@ impl inferlet::core::message::Host for InstanceState {
     }
 
     async fn broadcast(&mut self, topic: String, message: String) -> anyhow::Result<()> {
-        dispatch_i2i(PubSubCommand::Publish { topic, message });
+        PubSubCommand::Publish { topic, message }.dispatch();
         Ok(())
     }
 
     async fn subscribe(&mut self, topic: String) -> anyhow::Result<Resource<Subscription>> {
         let (tx, rx) = mpsc::channel(64);
         let (sub_tx, sub_rx) = oneshot::channel();
-        dispatch_i2i(PubSubCommand::Subscribe {
+        PubSubCommand::Subscribe {
             topic: topic.clone(),
             sender: tx,
             sub_id: sub_tx,
-        });
+        }
+        .dispatch();
         let sub_id = sub_rx.await?;
         let sub = Subscription {
             id: sub_id,
@@ -162,7 +166,7 @@ impl inferlet::core::message::HostSubscription for InstanceState {
         sub.done = true;
         let topic = sub.topic.clone();
         let sub_id = sub.id;
-        dispatch_i2i(PubSubCommand::Unsubscribe { topic, sub_id });
+        PubSubCommand::Unsubscribe { topic, sub_id }.dispatch();
         Ok(())
     }
 

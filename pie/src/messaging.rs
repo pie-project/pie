@@ -1,5 +1,4 @@
-use super::service;
-use super::service::LegacyService;
+use super::service::{CommandDispatcher, Service, ServiceCommand};
 use super::utils::IdPool;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -8,21 +7,19 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-static SERVICE_ID_MESSAGING_INST2INST: OnceLock<usize> = OnceLock::new();
-static SERVICE_ID_MESSAGING_USER2INST: OnceLock<usize> = OnceLock::new();
+/// The senders of the command channels, which are used to send commands to the
+/// handler tasks.
+static PUBSUB_COMMAND_DISPATCHER: OnceLock<CommandDispatcher<PubSubCommand>> = OnceLock::new();
+static PUSHPULL_COMMAND_DISPATCHER: OnceLock<CommandDispatcher<PushPullCommand>> = OnceLock::new();
 
-pub fn dispatch_i2i(command: PubSubCommand) {
-    let service_id = *SERVICE_ID_MESSAGING_INST2INST
-        .get_or_init(|| service::get_legacy_service_id("messaging-inst2inst").unwrap());
+/// Starts the messaging service. Two daemon tasks will be spawned to handle the
+/// commands dispatched from other services.
+pub fn start_service() {
+    let pubsub = PubSub::new();
+    let pushpull = PushPull::new();
 
-    service::dispatch_legacy(service_id, command).unwrap();
-}
-
-pub fn dispatch_u2i(command: PushPullCommand) {
-    let service_id = *SERVICE_ID_MESSAGING_USER2INST
-        .get_or_init(|| service::get_legacy_service_id("messaging-user2inst").unwrap());
-
-    service::dispatch_legacy(service_id, command).unwrap();
+    pubsub.start(&PUBSUB_COMMAND_DISPATCHER);
+    pushpull.start(&PUSHPULL_COMMAND_DISPATCHER);
 }
 
 type ListenerId = usize;
@@ -49,6 +46,10 @@ pub enum PubSubCommand {
     Unsubscribe { topic: String, sub_id: ListenerId },
 }
 
+impl ServiceCommand for PubSubCommand {
+    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &PUBSUB_COMMAND_DISPATCHER;
+}
+
 #[derive(Debug)]
 pub enum PushPullCommand {
     Push {
@@ -72,14 +73,9 @@ pub enum PushPullCommand {
     },
 }
 
-// impl PubSubCommand {
-//     pub fn dispatch(self) -> Result<(), ServiceError> {
-//         let service_id = *SERVICE_ID_MESSAGING
-//             .get_or_init(move || service::get_service_id("messaging").unwrap());
-//
-//         service::dispatch(service_id, self)
-//     }
-// }
+impl ServiceCommand for PushPullCommand {
+    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &PUSHPULL_COMMAND_DISPATCHER;
+}
 
 #[derive(Debug)]
 pub struct PubSub {
@@ -143,7 +139,7 @@ impl PubSub {
     }
 }
 //#[async_trait]
-impl LegacyService for PubSub {
+impl Service for PubSub {
     type Command = PubSubCommand;
 
     async fn handle(&mut self, cmd: Self::Command) {
@@ -305,7 +301,7 @@ impl PushPull {
     }
 }
 
-impl LegacyService for PushPull {
+impl Service for PushPull {
     type Command = PushPullCommand;
 
     async fn handle(&mut self, cmd: Self::Command) {
