@@ -4,7 +4,7 @@ use crate::messaging::PushPullCommand;
 use crate::model;
 use crate::model::Model;
 use crate::runtime::{self, AttachInstanceResult, TerminationCause};
-use crate::service::{CommandDispatcher, Service, ServiceCommand, install_legacy_service};
+use crate::service::{CommandDispatcher, Service, ServiceCommand};
 use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -1070,8 +1070,7 @@ impl Session {
         match service_type.as_str() {
             "model" => match Model::new(&endpoint).await {
                 Ok(model_service) => {
-                    if let Some(service_id) = install_legacy_service(&service_name, model_service) {
-                        model::register_model(service_name, service_id);
+                    if model::install_model(service_name, model_service).is_some() {
                         self.send_response(corr_id, true, "Model service registered".into())
                             .await;
                         self.state.backend_status.increment_attached_count();

@@ -10,49 +10,84 @@ use super::model::request::{
 use super::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
 use super::model::tokenizer::BytePairEncoder;
 use super::runtime::{self, TerminationCause};
-use super::service::{self, LegacyService, LegacyServiceError, ServiceCommand};
+use super::service::ServiceCommand;
 use crate::instance::InstanceId;
 use anyhow::Result;
 use anyhow::bail;
 use bytes::Bytes;
 use futures::future;
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{self, JoinHandle};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 pub type HandlerId = u32;
 
 pub type CmdQueueId = u32;
 
-static REGISTERED_MODELS: std::sync::LazyLock<boxcar::Vec<(String, usize)>> =
-    std::sync::LazyLock::new(boxcar::Vec::new);
+static MODEL_DISPATCHER: LazyLock<ModelDispatcher> = LazyLock::new(|| ModelDispatcher {
+    models: boxcar::Vec::new(),
+});
+
+#[derive(Debug, Error)]
+pub enum ModelDispatchError {
+    #[error("Invalid model index: {0}")]
+    InvalidModelIndex(usize),
+}
+
+#[derive(Debug)]
+struct ModelDispatcher {
+    models: boxcar::Vec<(String, mpsc::UnboundedSender<Command>)>,
+}
+
+pub fn install_model(model_name: String, mut model: Model) -> Option<usize> {
+    // Make sure the name is not already registered
+    for (_, (existing_name, _)) in MODEL_DISPATCHER.models.iter() {
+        if existing_name == &model_name {
+            return None;
+        }
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    MODEL_DISPATCHER.models.push((model_name, tx));
+    let model_id = MODEL_DISPATCHER.models.count() - 1;
+
+    // Start the handler task for the model.
+    task::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            model.handle(cmd).await;
+        }
+    });
+
+    Some(model_id)
+}
 
 pub fn registered_models() -> Vec<String> {
-    REGISTERED_MODELS
+    MODEL_DISPATCHER
+        .models
         .iter()
-        .map(|(_, (model_name, _))| model_name.clone())
+        .map(|(_, (name, _))| name.clone())
         .collect()
 }
 
-pub fn register_model(model_name: String, service_id: usize) {
-    REGISTERED_MODELS.push((model_name, service_id));
-}
-
 pub fn model_service_id(model_name: &str) -> Option<usize> {
-    REGISTERED_MODELS
+    MODEL_DISPATCHER
+        .models
         .iter()
         .find(|(_, (name, _))| name == model_name)
-        .map(|(_, (_, service_id))| *service_id)
+        .map(|(idx, _)| idx)
 }
 
 pub fn cleanup_instance(inst_id: InstanceId) {
-    REGISTERED_MODELS.iter().for_each(|(_, (_, service_id))| {
-        Command::Cleanup { inst_id }.dispatch(*service_id).ok();
-    })
+    for (model_id, _) in MODEL_DISPATCHER.models.iter() {
+        Command::Cleanup { inst_id }.dispatch(model_id).ok();
+    }
 }
 
 /// Asynchronously collects runtime statistics from all registered models.
@@ -61,11 +96,11 @@ pub async fn runtime_stats() -> HashMap<String, String> {
     let mut futures = Vec::new();
 
     // Dispatch requests to all models concurrently.
-    for (_, (model_name, service_id)) in REGISTERED_MODELS.iter() {
+    for (model_id, (model_name, _)) in MODEL_DISPATCHER.models.iter() {
         let (tx, rx) = oneshot::channel();
         let cmd = Command::GetRuntimeStats { response: tx };
 
-        if cmd.dispatch(*service_id).is_ok() {
+        if cmd.dispatch(model_id).is_ok() {
             // Store the model name and the future for its response.
             futures.push((model_name.clone(), rx));
         } else {
@@ -112,10 +147,10 @@ pub async fn runtime_stats() -> HashMap<String, String> {
 /// the backend after it has exited.
 pub async fn stop_heartbeat() {
     let mut ack_receivers = Vec::new();
-    for (_, (_, service_id)) in REGISTERED_MODELS.iter() {
+    for (model_id, _) in MODEL_DISPATCHER.models.iter() {
         let (tx, rx) = oneshot::channel();
         Command::StopHeartbeat { acknowledge: tx }
-            .dispatch(*service_id)
+            .dispatch(model_id)
             .unwrap();
         ack_receivers.push(rx);
     }
@@ -208,8 +243,15 @@ pub enum Command {
 }
 
 impl Command {
-    pub fn dispatch(self, service_id: usize) -> Result<(), LegacyServiceError> {
-        service::dispatch_legacy(service_id, self)
+    pub fn dispatch(self, model_id: usize) -> Result<(), ModelDispatchError> {
+        let (_, tx) = MODEL_DISPATCHER
+            .models
+            .get(model_id)
+            .ok_or(ModelDispatchError::InvalidModelIndex(model_id))?;
+
+        tx.send(self).unwrap();
+
+        Ok(())
     }
 }
 
@@ -629,12 +671,8 @@ impl Model {
 
         Ok((received_corr_id, received_handler_id, frames))
     }
-}
 
-impl LegacyService for Model {
-    type Command = Command;
-
-    async fn handle(&mut self, cmd: Self::Command) {
+    async fn handle(&mut self, cmd: Command) {
         match cmd {
             Command::Submit {
                 cmd_queue_id,
