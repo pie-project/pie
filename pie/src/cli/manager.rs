@@ -333,7 +333,7 @@ pub async fn start_engine_and_backend(
 pub async fn stop_backend_heartbeat() -> Result<()> {
     println!("🔄 Stopping backend heartbeat...");
     let (tx, rx) = oneshot::channel();
-    InternalEvent::StopBackendHeartbeat { tx }.dispatch()?;
+    InternalEvent::StopBackendHeartbeat { tx }.dispatch();
     rx.await?;
     println!("✅ Backend heartbeat stopped.");
     Ok(())
@@ -657,7 +657,7 @@ pub async fn wait_for_backend_ready(num_backends: usize) -> Result<()> {
         cur_num_rejected_backends: None,
         tx,
     }
-    .dispatch()?;
+    .dispatch();
 
     // Get initial backend state
     let (mut num_attached, mut num_rejected) = tokio::select! {
@@ -680,7 +680,7 @@ pub async fn wait_for_backend_ready(num_backends: usize) -> Result<()> {
             cur_num_rejected_backends: Some(num_rejected),
             tx,
         }
-        .dispatch()?;
+        .dispatch();
         (num_attached, num_rejected) = tokio::select! {
             result = rx => {
                 result?

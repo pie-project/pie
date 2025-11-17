@@ -59,7 +59,7 @@ impl inferlet::core::message::Host for InstanceState {
             inst_id: self.id(),
             message,
         }
-        .dispatch()?;
+        .dispatch();
         Ok(())
     }
 
@@ -84,7 +84,7 @@ impl inferlet::core::message::Host for InstanceState {
             inst_id: self.id(),
             data,
         }
-        .dispatch()?;
+        .dispatch();
         Ok(())
     }
 

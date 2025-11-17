@@ -4,9 +4,7 @@ use crate::messaging::{self, dispatch_u2i};
 use crate::model;
 use crate::model::Model;
 use crate::runtime::{self, AttachInstanceResult, TerminationCause};
-use crate::service::{
-    self, LegacyService, LegacyServiceError, ServiceCommand, install_legacy_service,
-};
+use crate::service::{CommandDispatcher, Service, ServiceCommand, install_legacy_service};
 use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -29,6 +27,22 @@ use tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
 type ClientId = u32;
+
+/// The sender of the command channel, which is used to send commands to the
+/// handler task.
+static COMMAND_DISPATCHER: OnceLock<CommandDispatcher<ServerEvent>> = OnceLock::new();
+
+/// Starts the server service. A daemon task will be spawned to handle the
+/// commands dispatched from other services.
+pub fn start_service(
+    ip_port: &str,
+    enable_auth: bool,
+    authorized_users: AuthorizedUsers,
+    internal_auth_token: String,
+) {
+    let server = Server::new(ip_port, enable_auth, authorized_users, internal_auth_token);
+    server.start(&COMMAND_DISPATCHER);
+}
 
 #[derive(Debug)]
 pub enum ServerEvent {
@@ -81,23 +95,18 @@ pub enum InternalEvent {
     },
 }
 
-impl ServerEvent {
-    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
-        static SERVICE_ID_SERVER: OnceLock<usize> = OnceLock::new();
-        let service_id = *SERVICE_ID_SERVER
-            .get_or_init(move || service::get_legacy_service_id("server").unwrap());
-        service::dispatch_legacy(service_id, self)
-    }
+impl ServiceCommand for ServerEvent {
+    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &COMMAND_DISPATCHER;
 }
 
 impl InstanceEvent {
-    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
+    pub fn dispatch(self) {
         ServerEvent::from(self).dispatch()
     }
 }
 
 impl InternalEvent {
-    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
+    pub fn dispatch(self) {
         ServerEvent::from(self).dispatch()
     }
 }
@@ -171,12 +180,12 @@ impl BackendStatus {
     }
 }
 
-pub struct Server {
+struct Server {
     state: Arc<ServerState>,
 }
 
 impl Server {
-    pub fn new(
+    fn new(
         ip_port: &str,
         enable_auth: bool,
         authorized_users: AuthorizedUsers,
@@ -217,7 +226,7 @@ impl Server {
     }
 }
 
-impl LegacyService for Server {
+impl Service for Server {
     type Command = ServerEvent;
 
     async fn handle(&mut self, cmd: Self::Command) {

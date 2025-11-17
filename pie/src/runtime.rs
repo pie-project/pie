@@ -646,8 +646,7 @@ impl Runtime {
                     inst_id: instance_id,
                     cause,
                 }
-                .dispatch()
-                .ok();
+                .dispatch();
             }
         }
     }
@@ -669,8 +668,7 @@ impl Runtime {
                         inst_id: instance_id,
                         cause,
                     }
-                    .dispatch()
-                    .ok();
+                    .dispatch();
                 }
                 // For a detached instance, we can just mark it as finished and add it to the
                 // finished instances map. Its output is buffered and waiting to be streamed to

@@ -244,24 +244,18 @@ impl OutputChannel {
     /// Send the output to the server so that it can be delivered to the client
     fn dispatch_output(&self, content: String, instance_id: InstanceId) {
         match self {
-            OutputChannel::Stdout => {
-                InstanceEvent::StreamingOutput {
-                    inst_id: instance_id,
-                    output_type: OutputChannel::Stdout,
-                    content,
-                }
-                .dispatch()
-                .unwrap();
+            OutputChannel::Stdout => InstanceEvent::StreamingOutput {
+                inst_id: instance_id,
+                output_type: OutputChannel::Stdout,
+                content,
             }
-            OutputChannel::Stderr => {
-                InstanceEvent::StreamingOutput {
-                    inst_id: instance_id,
-                    output_type: OutputChannel::Stderr,
-                    content,
-                }
-                .dispatch()
-                .unwrap();
+            .dispatch(),
+            OutputChannel::Stderr => InstanceEvent::StreamingOutput {
+                inst_id: instance_id,
+                output_type: OutputChannel::Stderr,
+                content,
             }
+            .dispatch(),
         }
     }
 }
