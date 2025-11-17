@@ -1,8 +1,9 @@
 use super::instance::{InstanceId, InstanceState, OutputDelivery, OutputDeliveryCtrl};
-use super::service::{LegacyService, LegacyServiceError};
-use super::{api, server, service};
+use super::service::{CommandDispatcher, Service};
+use super::{api, server};
 use crate::model;
 use crate::model::request::QueryResponse;
+use crate::service::ServiceCommand;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
 use pie_client::message;
@@ -23,7 +24,19 @@ use wasmtime_wasi_http::io::TokioIo;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-static SERVICE_ID_RUNTIME: OnceLock<usize> = OnceLock::new();
+/// The sender of the command channel, which is used to send commands to the
+/// handler task.
+static COMMAND_DISPATCHER: OnceLock<CommandDispatcher<Command>> = OnceLock::new();
+
+/// Starts the runtime service. A daemon task will be spawned to handle the
+/// commands dispatched from other services.
+pub fn start_service<P: AsRef<std::path::Path>>(cache_dir: P) {
+    let runtime = Runtime::new(cache_dir);
+
+    // Loading existing programs should not fail.
+    runtime.load_existing_programs().unwrap();
+    runtime.start(&COMMAND_DISPATCHER);
+}
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -122,18 +135,13 @@ pub enum Command {
     },
 }
 
-impl Command {
-    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
-        let service_id = *SERVICE_ID_RUNTIME
-            .get_or_init(move || service::get_legacy_service_id("runtime").unwrap());
-
-        service::dispatch_legacy(service_id, self)
-    }
+impl ServiceCommand for Command {
+    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &COMMAND_DISPATCHER;
 }
 
 /// Holds the “global” or “runtime” data that the controller needs to manage
 /// instances, compiled programs, etc.
-pub struct Runtime {
+struct Runtime {
     /// The Wasmtime engine (global)
     engine: Engine,
     linker: Arc<Linker<InstanceState>>,
@@ -212,16 +220,16 @@ pub enum AttachInstanceResult {
     AlreadyAttached,
 }
 
-pub struct InstanceHandle {
-    pub program_hash: String,
-    pub cmd_name: String,
-    pub arguments: Vec<String>,
-    pub output_delivery_ctrl: OutputDeliveryCtrl,
-    pub running_state: InstanceRunningState,
-    pub join_handle: tokio::task::JoinHandle<()>,
+struct InstanceHandle {
+    program_hash: String,
+    cmd_name: String,
+    arguments: Vec<String>,
+    output_delivery_ctrl: OutputDeliveryCtrl,
+    running_state: InstanceRunningState,
+    join_handle: tokio::task::JoinHandle<()>,
 }
 
-impl LegacyService for Runtime {
+impl Service for Runtime {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
@@ -378,7 +386,7 @@ impl LegacyService for Runtime {
 }
 
 impl Runtime {
-    pub fn new<P: AsRef<std::path::Path>>(cache_dir: P) -> Self {
+    fn new<P: AsRef<std::path::Path>>(cache_dir: P) -> Self {
         // Configure Wasmtime engine
         let mut config = Config::default();
         config.async_support(true);
@@ -417,7 +425,7 @@ impl Runtime {
         }
     }
 
-    pub fn load_existing_programs(&self) -> Result<(), RuntimeError> {
+    fn load_existing_programs(&self) -> Result<(), RuntimeError> {
         let entries = std::fs::read_dir(&self.cache_dir)?; // Will map to RuntimeError::Io automatically
         for entry in entries {
             let entry = entry?; // same here, auto-converted to RuntimeError::Io
@@ -466,7 +474,7 @@ impl Runtime {
     }
 
     /// Actually start a program instance
-    pub async fn launch_instance(
+    async fn launch_instance(
         &self,
         program_hash: String,
         cmd_name: String,
@@ -568,7 +576,7 @@ impl Runtime {
     }
 
     /// Actually start a program instance
-    pub async fn launch_server_instance(
+    async fn launch_server_instance(
         &self,
         program_hash: String,
         cmd_name: String,
@@ -887,8 +895,7 @@ impl Runtime {
                     inst_id: instance_id,
                     cause: TerminationCause::Normal(return_value.unwrap_or_default()),
                 }
-                .dispatch()
-                .ok();
+                .dispatch();
             }
             Err(err) => {
                 println!("Instance {instance_id} failed: {err}");
@@ -896,8 +903,7 @@ impl Runtime {
                     inst_id: instance_id,
                     cause: TerminationCause::Exception(err.to_string()),
                 }
-                .dispatch()
-                .ok();
+                .dispatch();
             }
         }
     }

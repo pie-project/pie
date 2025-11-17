@@ -10,7 +10,7 @@ use super::model::request::{
 use super::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
 use super::model::tokenizer::BytePairEncoder;
 use super::runtime::{self, TerminationCause};
-use super::service::{self, LegacyService, LegacyServiceError};
+use super::service::{self, LegacyService, LegacyServiceError, ServiceCommand};
 use crate::instance::InstanceId;
 use anyhow::Result;
 use anyhow::bail;
@@ -150,8 +150,7 @@ where
         inst_id,
         notification_to_client: Some(TerminationCause::Exception(exception.to_string())),
     }
-    .dispatch()
-    .unwrap();
+    .dispatch();
 }
 
 /// Defines the set of operations available for the key-value store.

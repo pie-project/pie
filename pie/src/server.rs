@@ -4,7 +4,9 @@ use crate::messaging::{self, dispatch_u2i};
 use crate::model;
 use crate::model::Model;
 use crate::runtime::{self, AttachInstanceResult, TerminationCause};
-use crate::service::{self, LegacyService, LegacyServiceError, install_legacy_service};
+use crate::service::{
+    self, LegacyService, LegacyServiceError, ServiceCommand, install_legacy_service,
+};
 use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -719,8 +721,7 @@ impl Session {
                     hash: record,
                     event: evt_tx,
                 }
-                .dispatch()
-                .unwrap();
+                .dispatch();
                 self.send_response(corr_id, true, evt_rx.await.unwrap().to_string())
                     .await;
             }
@@ -750,9 +751,7 @@ impl Session {
 
     async fn handle_list_instances(&self, corr_id: u32) {
         let (evt_tx, evt_rx) = oneshot::channel();
-        runtime::Command::ListInstances { event: evt_tx }
-            .dispatch()
-            .unwrap();
+        runtime::Command::ListInstances { event: evt_tx }.dispatch();
 
         let instances = evt_rx.await.unwrap();
 
@@ -852,8 +851,7 @@ impl Session {
                     raw: mem::take(&mut inflight.buffer),
                     event: evt_tx,
                 }
-                .dispatch()
-                .unwrap();
+                .dispatch();
                 evt_rx.await.unwrap().unwrap();
                 self.send_response(corr_id, true, final_hash).await;
             }
@@ -878,8 +876,7 @@ impl Session {
             detached,
             event: evt_tx,
         }
-        .dispatch()
-        .unwrap();
+        .dispatch();
 
         match evt_rx.await.unwrap() {
             // The instance was launched successfully. Notify the client about the instance ID.
@@ -905,8 +902,7 @@ impl Session {
                 runtime::Command::AllowOutput {
                     inst_id: instance_id,
                 }
-                .dispatch()
-                .unwrap();
+                .dispatch();
             }
             // The instance failed to launch. Notify the client about the error.
             Err(e) => {
@@ -933,8 +929,7 @@ impl Session {
             inst_id,
             event: evt_tx,
         }
-        .dispatch()
-        .unwrap();
+        .dispatch();
 
         match evt_rx.await.unwrap() {
             // The instance was attached successfully. Notify the client first and then change
@@ -956,8 +951,7 @@ impl Session {
                     inst_id,
                     mode: OutputDelivery::Streamed,
                 }
-                .dispatch()
-                .unwrap();
+                .dispatch();
             }
             // The instance has finished execution. Notify the client first and then change the
             // output delivery mode to streamed so that the client can receive the final output.
@@ -979,16 +973,14 @@ impl Session {
                     inst_id,
                     mode: OutputDelivery::Streamed,
                 }
-                .dispatch()
-                .unwrap();
+                .dispatch();
 
                 // Terminate the instance and notify the client about the termination.
                 runtime::Command::TerminateInstance {
                     inst_id,
                     notification_to_client: Some(cause),
                 }
-                .dispatch()
-                .unwrap();
+                .dispatch();
             }
             // The instance was not found.
             // Remove it from the attached instances and notify the client about the error.
@@ -1021,8 +1013,7 @@ impl Session {
             arguments,
             event: evt_tx,
         }
-        .dispatch()
-        .unwrap();
+        .dispatch();
         match evt_rx.await.unwrap() {
             Ok(_) => {
                 self.send_response(corr_id, true, "server launched".to_string())
@@ -1049,8 +1040,7 @@ impl Session {
                 inst_id,
                 notification_to_client: Some(runtime::TerminationCause::Signal),
             }
-            .dispatch()
-            .unwrap();
+            .dispatch();
 
             self.send_response(corr_id, true, "Instance terminated".to_string())
                 .await;
@@ -1238,16 +1228,13 @@ impl Drop for Session {
                     inst_id,
                     mode: OutputDelivery::Buffered,
                 }
-                .dispatch()
-                .unwrap();
+                .dispatch();
 
                 // Remove the forwarding channel to the instance from the server state.
                 server_state.client_cmd_txs.remove(&inst_id);
 
                 // Set the instance as detached so that it can be attached to another client.
-                runtime::Command::DetachInstance { inst_id }
-                    .dispatch()
-                    .unwrap();
+                runtime::Command::DetachInstance { inst_id }.dispatch();
             });
         }
 

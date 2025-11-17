@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 use crate::auth::AuthorizedUsers;
 use crate::kvs::KeyValueStore;
 use crate::messaging::{PubSub, PushPull};
-use crate::runtime::Runtime;
+use crate::runtime;
 use crate::server::Server;
 use crate::service::install_legacy_service;
 
@@ -47,10 +47,6 @@ pub async fn run_server(
     } else {
         tracing::info!("Authentication is disabled.");
     }
-
-    // Set up core services
-    let runtime = Runtime::new(&config.cache_dir);
-    runtime.load_existing_programs()?;
 
     let server_url = format!("{}:{}", config.host, config.port);
 
@@ -97,7 +93,7 @@ pub async fn run_server(
     let messaging_user2inst = PushPull::new();
     let kv_store = KeyValueStore::new();
 
-    install_legacy_service("runtime", runtime);
+    runtime::start_service(&config.cache_dir);
     install_legacy_service("server", server);
     install_legacy_service("kvs", kv_store);
     install_legacy_service("messaging-inst2inst", messaging_inst2inst);
