@@ -9,7 +9,7 @@ use crate::kvs::KeyValueStore;
 use crate::messaging::{PubSub, PushPull};
 use crate::runtime::Runtime;
 use crate::server::Server;
-use crate::service::install_service;
+use crate::service::install_legacy_service;
 
 /// Configuration for the PIE engine.
 #[derive(Debug)]
@@ -97,11 +97,11 @@ pub async fn run_server(
     let messaging_user2inst = PushPull::new();
     let kv_store = KeyValueStore::new();
 
-    install_service("runtime", runtime);
-    install_service("server", server);
-    install_service("kvs", kv_store);
-    install_service("messaging-inst2inst", messaging_inst2inst);
-    install_service("messaging-user2inst", messaging_user2inst);
+    install_legacy_service("runtime", runtime);
+    install_legacy_service("server", server);
+    install_legacy_service("kvs", kv_store);
+    install_legacy_service("messaging-inst2inst", messaging_inst2inst);
+    install_legacy_service("messaging-user2inst", messaging_user2inst);
 
     tracing::info!("✅ PIE runtime started successfully on {}", server_url);
     ready_tx.send(internal_auth_token).unwrap();

@@ -1,5 +1,5 @@
 use super::service;
-use super::service::Service;
+use super::service::LegacyService;
 use super::utils::IdPool;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -13,16 +13,16 @@ static SERVICE_ID_MESSAGING_USER2INST: OnceLock<usize> = OnceLock::new();
 
 pub fn dispatch_i2i(command: PubSubCommand) {
     let service_id = *SERVICE_ID_MESSAGING_INST2INST
-        .get_or_init(|| service::get_service_id("messaging-inst2inst").unwrap());
+        .get_or_init(|| service::get_legacy_service_id("messaging-inst2inst").unwrap());
 
-    service::dispatch(service_id, command).unwrap();
+    service::dispatch_legacy(service_id, command).unwrap();
 }
 
 pub fn dispatch_u2i(command: PushPullCommand) {
     let service_id = *SERVICE_ID_MESSAGING_USER2INST
-        .get_or_init(|| service::get_service_id("messaging-user2inst").unwrap());
+        .get_or_init(|| service::get_legacy_service_id("messaging-user2inst").unwrap());
 
-    service::dispatch(service_id, command).unwrap();
+    service::dispatch_legacy(service_id, command).unwrap();
 }
 
 type ListenerId = usize;
@@ -143,7 +143,7 @@ impl PubSub {
     }
 }
 //#[async_trait]
-impl Service for PubSub {
+impl LegacyService for PubSub {
     type Command = PubSubCommand;
 
     async fn handle(&mut self, cmd: Self::Command) {
@@ -305,7 +305,7 @@ impl PushPull {
     }
 }
 
-impl Service for PushPull {
+impl LegacyService for PushPull {
     type Command = PushPullCommand;
 
     async fn handle(&mut self, cmd: Self::Command) {

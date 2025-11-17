@@ -4,7 +4,7 @@ use crate::messaging::{self, dispatch_u2i};
 use crate::model;
 use crate::model::Model;
 use crate::runtime::{self, AttachInstanceResult, TerminationCause};
-use crate::service::{self, Service, ServiceError, install_service};
+use crate::service::{self, LegacyService, LegacyServiceError, install_legacy_service};
 use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -80,22 +80,22 @@ pub enum InternalEvent {
 }
 
 impl ServerEvent {
-    pub fn dispatch(self) -> Result<(), ServiceError> {
+    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
         static SERVICE_ID_SERVER: OnceLock<usize> = OnceLock::new();
-        let service_id =
-            *SERVICE_ID_SERVER.get_or_init(move || service::get_service_id("server").unwrap());
-        service::dispatch(service_id, self)
+        let service_id = *SERVICE_ID_SERVER
+            .get_or_init(move || service::get_legacy_service_id("server").unwrap());
+        service::dispatch_legacy(service_id, self)
     }
 }
 
 impl InstanceEvent {
-    pub fn dispatch(self) -> Result<(), ServiceError> {
+    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
         ServerEvent::from(self).dispatch()
     }
 }
 
 impl InternalEvent {
-    pub fn dispatch(self) -> Result<(), ServiceError> {
+    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
         ServerEvent::from(self).dispatch()
     }
 }
@@ -215,7 +215,7 @@ impl Server {
     }
 }
 
-impl Service for Server {
+impl LegacyService for Server {
     type Command = ServerEvent;
 
     async fn handle(&mut self, cmd: Self::Command) {
@@ -1070,7 +1070,7 @@ impl Session {
         match service_type.as_str() {
             "model" => match Model::new(&endpoint).await {
                 Ok(model_service) => {
-                    if let Some(service_id) = install_service(&service_name, model_service) {
+                    if let Some(service_id) = install_legacy_service(&service_name, model_service) {
                         model::register_model(service_name, service_id);
                         self.send_response(corr_id, true, "Model service registered".into())
                             .await;

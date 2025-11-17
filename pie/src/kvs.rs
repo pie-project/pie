@@ -1,4 +1,4 @@
-use super::service::{self, Service, ServiceError};
+use super::service::{self, LegacyService, LegacyServiceError};
 use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::oneshot;
@@ -6,9 +6,9 @@ use tokio::sync::oneshot;
 static SERVICE_ID_KVS: OnceLock<usize> = OnceLock::new();
 
 /// Dispatches a command to the key-value store service.
-pub fn dispatch(command: Command) -> Result<(), ServiceError> {
-    let service_id = *SERVICE_ID_KVS.get_or_init(|| service::get_service_id("kvs").unwrap());
-    service::dispatch(service_id, command)
+pub fn dispatch(command: Command) -> Result<(), LegacyServiceError> {
+    let service_id = *SERVICE_ID_KVS.get_or_init(|| service::get_legacy_service_id("kvs").unwrap());
+    service::dispatch_legacy(service_id, command)
 }
 
 /// Defines the set of operations available for the key-value store.
@@ -63,7 +63,7 @@ impl Default for KeyValueStore {
     }
 }
 
-impl Service for KeyValueStore {
+impl LegacyService for KeyValueStore {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {

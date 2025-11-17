@@ -1,5 +1,5 @@
 use super::instance::{InstanceId, InstanceState, OutputDelivery, OutputDeliveryCtrl};
-use super::service::{Service, ServiceError};
+use super::service::{LegacyService, LegacyServiceError};
 use super::{api, server, service};
 use crate::model;
 use crate::model::request::QueryResponse;
@@ -123,11 +123,11 @@ pub enum Command {
 }
 
 impl Command {
-    pub fn dispatch(self) -> Result<(), ServiceError> {
-        let service_id =
-            *SERVICE_ID_RUNTIME.get_or_init(move || service::get_service_id("runtime").unwrap());
+    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
+        let service_id = *SERVICE_ID_RUNTIME
+            .get_or_init(move || service::get_legacy_service_id("runtime").unwrap());
 
-        service::dispatch(service_id, self)
+        service::dispatch_legacy(service_id, self)
     }
 }
 
@@ -221,7 +221,7 @@ pub struct InstanceHandle {
     pub join_handle: tokio::task::JoinHandle<()>,
 }
 
-impl Service for Runtime {
+impl LegacyService for Runtime {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
