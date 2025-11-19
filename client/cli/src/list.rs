@@ -174,7 +174,7 @@ fn truncate_with_ellipsis(mut s: String, max_display_chars: usize) -> String {
     let mut chars_scanned = 0;
     let mut truncation_byte_pos = None;
     let chars_before_ellipsis = max_display_chars.saturating_sub(3);
-    
+
     for (byte_pos, _) in s.char_indices() {
         if chars_scanned == chars_before_ellipsis {
             truncation_byte_pos = Some(byte_pos);
@@ -184,17 +184,17 @@ fn truncate_with_ellipsis(mut s: String, max_display_chars: usize) -> String {
             break;
         }
     }
-    
+
     // If string fits within the limit, no truncation needed
     if chars_scanned <= max_display_chars {
         return s;
     }
-    
+
     // Edge case: ellipsis itself is too long to fit
     if max_display_chars < 3 {
         return s.chars().take(max_display_chars).collect();
     }
-    
+
     // Truncate and append ellipsis
     if let Some(byte_pos) = truncation_byte_pos {
         s.truncate(byte_pos);

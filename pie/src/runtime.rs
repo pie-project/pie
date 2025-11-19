@@ -85,6 +85,7 @@ pub enum Command {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
+        library_hashes: Vec<String>,
         detached: bool,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
     },
@@ -263,10 +264,11 @@ impl Service for Runtime {
                 cmd_name,
                 event,
                 arguments,
+                library_hashes,
                 detached,
             } => {
                 let res = self
-                    .launch_instance(program_hash, cmd_name, arguments, detached)
+                    .launch_instance(program_hash, cmd_name, arguments, library_hashes, detached)
                     .await;
                 event
                     .send(res)
@@ -479,6 +481,7 @@ impl Runtime {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
+        _library_hashes: Vec<String>,
         detached: bool,
     ) -> Result<InstanceId, RuntimeError> {
         let component = self.get_component(&program_hash)?;

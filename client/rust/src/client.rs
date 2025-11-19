@@ -388,6 +388,7 @@ impl Client {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
+        library_hashes: Vec<String>,
         detached: bool,
     ) -> Result<Instance> {
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
@@ -396,6 +397,7 @@ impl Client {
             program_hash,
             cmd_name,
             arguments,
+            library_hashes,
             detached,
         };
 

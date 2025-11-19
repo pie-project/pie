@@ -439,7 +439,7 @@ async fn submit_inferlet(
         .to_string_lossy()
         .to_string();
     let instance = client
-        .launch_instance(hash, cmd_name, arguments, detached)
+        .launch_instance(hash, cmd_name, arguments, vec![], detached)
         .await?;
     println!("✅ Inferlet launched with ID: {}", instance.id());
     Ok(instance)

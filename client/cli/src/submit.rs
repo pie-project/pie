@@ -36,6 +36,9 @@ pub struct SubmitArgs {
     /// Run the inferlet in detached mode.
     #[arg(short, long, default_value = "false")]
     pub detached: bool,
+    /// Paths to .wasm library files to link with the inferlet.
+    #[arg(short, long, value_parser = path::expand_tilde)]
+    pub link: Vec<PathBuf>,
     /// Arguments to pass to the inferlet after `--`.
     #[arg(last = true)]
     pub arguments: Vec<String>,
@@ -72,6 +75,21 @@ pub async fn handle_submit_command(args: SubmitArgs) -> Result<()> {
         println!("✅ Inferlet upload successful.");
     }
 
+    let mut library_hashes = Vec::new();
+    for library_path in &args.link {
+        let library_blob = fs::read(library_path)
+            .context(format!("Failed to read library file at {:?}", library_path))?;
+        let library_hash = client::hash_blob(&library_blob);
+        println!("Library hash: {}", library_hash);
+
+        if !client.program_exists(&library_hash).await? {
+            client.upload_program(&library_blob).await?;
+            println!("✅ Library upload successful.");
+        }
+
+        library_hashes.push(library_hash);
+    }
+
     let cmd_name = args
         .inferlet
         .file_stem()
@@ -79,7 +97,13 @@ pub async fn handle_submit_command(args: SubmitArgs) -> Result<()> {
         .to_string_lossy()
         .to_string();
     let instance = client
-        .launch_instance(hash, cmd_name, args.arguments, args.detached)
+        .launch_instance(
+            hash,
+            cmd_name,
+            args.arguments,
+            library_hashes,
+            args.detached,
+        )
         .await?;
 
     println!("✅ Inferlet launched with ID: {}", instance.id());
