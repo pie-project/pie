@@ -12,6 +12,8 @@ use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
+use wac_graph::{CompositionGraph, EncodeOptions};
+use wac_types::Package;
 use wasmtime::component::Resource;
 use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
 use wasmtime_wasi_http::WasiHttpView;
@@ -34,7 +36,7 @@ pub fn start_service<P: AsRef<std::path::Path>>(cache_dir: P) {
     let runtime = Runtime::new(cache_dir);
 
     // Loading existing programs should not fail.
-    runtime.load_existing_programs().unwrap();
+    runtime.discover_existing_programs().unwrap();
     runtime.start(&COMMAND_DISPATCHER);
 }
 
@@ -140,7 +142,15 @@ impl ServiceCommand for Command {
     const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &COMMAND_DISPATCHER;
 }
 
-/// Holds the “global” or “runtime” data that the controller needs to manage
+/// Stores both the compiled Component and raw bytes for a WASM program
+/// Currently, we cannot get the raw bytes from the parsed `Component`, but we
+/// need the raw bytes to compose components, therefore we store both.
+struct Program {
+    component: Component,
+    bytes: Vec<u8>,
+}
+
+/// Holds the "global" or "runtime" data that the controller needs to manage
 /// instances, compiled programs, etc.
 struct Runtime {
     /// The Wasmtime engine (global)
@@ -149,8 +159,8 @@ struct Runtime {
 
     cache_dir: std::path::PathBuf,
 
-    /// Pre-compiled WASM components, keyed by BLAKE3 hex string
-    programs_in_memory: DashMap<String, Component>,
+    /// WASM components and their bytes in memory, keyed by hash of the component.
+    programs_in_memory: DashMap<String, Program>,
 
     /// Paths to compiled modules on disk
     programs_in_disk: DashMap<String, std::path::PathBuf>,
@@ -245,7 +255,12 @@ impl Service for Runtime {
                 if self.programs_in_memory.contains_key(&hash) {
                     event.send(Ok(hash)).unwrap();
                 } else if let Ok(component) = Component::from_binary(&self.engine, raw.as_slice()) {
-                    self.programs_in_memory.insert(hash.to_string(), component);
+                    // Store both component and bytes in memory
+                    let program = Program {
+                        component,
+                        bytes: raw.clone(),
+                    };
+                    self.programs_in_memory.insert(hash.to_string(), program);
 
                     // Write to disk
                     let file_path = std::path::Path::new(&self.cache_dir).join(&hash);
@@ -427,7 +442,7 @@ impl Runtime {
         }
     }
 
-    fn load_existing_programs(&self) -> Result<(), RuntimeError> {
+    fn discover_existing_programs(&self) -> Result<(), RuntimeError> {
         let entries = std::fs::read_dir(&self.cache_dir)?; // Will map to RuntimeError::Io automatically
         for entry in entries {
             let entry = entry?; // same here, auto-converted to RuntimeError::Io
@@ -441,36 +456,113 @@ impl Runtime {
         Ok(())
     }
 
-    fn get_component(&self, hash: &str) -> Result<Component, RuntimeError> {
-        // 1) Make sure the `Component` is loaded in memory
-        if self.programs_in_memory.get(hash).is_none() {
-            // load from disk if possible
-            if let Some(path_entry) = self.programs_in_disk.get(hash) {
-                // Use a custom error variant for compile errors
-
-                let component =
-                    Component::from_file(&self.engine, path_entry.value()).map_err(|err| {
-                        RuntimeError::CompileWasm {
-                            path: path_entry.value().to_path_buf(),
-                            source: err,
-                        }
-                    })?;
-                self.programs_in_memory.insert(hash.to_string(), component);
-            } else {
-                // If not on disk either, return a custom error
-                return Err(RuntimeError::MissingProgram(hash.to_string()));
-            }
+    /// Ensures the program data is loaded in memory (either already cached or loaded from disk)
+    fn ensure_program_loaded(&self, hash: &str) -> Result<(), RuntimeError> {
+        // 1) Check if already in memory
+        if self.programs_in_memory.contains_key(hash) {
+            return Ok(());
         }
 
-        // 2) Now we have a compiled component
-        let component = match self.programs_in_memory.get(hash) {
-            Some(c) => c.clone(),
+        // 2) Load from disk if possible
+        if let Some(path_entry) = self.programs_in_disk.get(hash) {
+            let path = path_entry.value();
+            let bytes = std::fs::read(path)?;
+
+            // Compile the component
+            let component = Component::from_binary(&self.engine, &bytes).map_err(|err| {
+                RuntimeError::CompileWasm {
+                    path: path.to_path_buf(),
+                    source: err,
+                }
+            })?;
+
+            // Store both component and bytes in memory for future use
+            let program_data = Program { component, bytes };
+            self.programs_in_memory
+                .insert(hash.to_string(), program_data);
+            Ok(())
+        } else {
+            // If not on disk either, return a custom error
+            Err(RuntimeError::MissingProgram(hash.to_string()))
+        }
+    }
+
+    fn get_component_bytes(&self, hash: &str) -> Result<Vec<u8>, RuntimeError> {
+        // Ensure the program data is loaded
+        self.ensure_program_loaded(hash)?;
+
+        // Get the bytes from memory
+        match self.programs_in_memory.get(hash) {
+            Some(program) => Ok(program.bytes.clone()),
             None => {
-                return Err(RuntimeError::Other(
-                    "Failed to get component from memory".into(),
-                ));
+                // This should never happen since ensure_program_loaded succeeded
+                Err(RuntimeError::Other(
+                    "Failed to get component bytes from memory".into(),
+                ))
             }
-        };
+        }
+    }
+
+    fn get_component(&self, hash: &str) -> Result<Component, RuntimeError> {
+        // Ensure the program data is loaded
+        self.ensure_program_loaded(hash)?;
+
+        // Get the component from memory
+        match self.programs_in_memory.get(hash) {
+            Some(program) => Ok(program.component.clone()),
+            None => {
+                // This should never happen since ensure_program_loaded succeeded
+                Err(RuntimeError::Other(
+                    "Failed to get component from memory".into(),
+                ))
+            }
+        }
+    }
+
+    fn compose_components(
+        &self,
+        program_hash: &str,
+        library_hashes: &[String],
+    ) -> Result<Component, RuntimeError> {
+        // Create a new composition graph
+        let mut graph = CompositionGraph::new();
+
+        // Load the main program component (socket)
+        let socket_bytes = self.get_component_bytes(program_hash)?;
+        let socket_package = Package::from_bytes("socket", None, socket_bytes, graph.types_mut())
+            .map_err(|e| {
+            RuntimeError::Other(format!("Failed to load socket component: {}", e))
+        })?;
+        let socket_id = graph.register_package(socket_package).map_err(|e| {
+            RuntimeError::Other(format!("Failed to register socket package: {}", e))
+        })?;
+
+        // Load each library component (plugs)
+        let mut plug_ids = Vec::new();
+        for (idx, library_hash) in library_hashes.iter().enumerate() {
+            let plug_bytes = self.get_component_bytes(library_hash)?;
+            let plug_name = format!("plug_{}", idx);
+            let plug_package = Package::from_bytes(&plug_name, None, plug_bytes, graph.types_mut())
+                .map_err(|e| {
+                    RuntimeError::Other(format!("Failed to load plug component {}: {}", idx, e))
+                })?;
+            let plug_id = graph.register_package(plug_package).map_err(|e| {
+                RuntimeError::Other(format!("Failed to register plug package {}: {}", idx, e))
+            })?;
+            plug_ids.push(plug_id);
+        }
+
+        // Perform the composition: plug the libraries' exports into the socket's imports
+        wac_graph::plug(&mut graph, plug_ids, socket_id)
+            .map_err(|e| RuntimeError::Other(format!("Failed to compose components: {}", e)))?;
+
+        // Encode the composed component to bytes
+        let composed_bytes = graph.encode(EncodeOptions::default()).map_err(|e| {
+            RuntimeError::Other(format!("Failed to encode composed component: {}", e))
+        })?;
+
+        // Create a Component from the composed bytes
+        let component = Component::from_binary(&self.engine, &composed_bytes)?;
 
         Ok(component)
     }
@@ -481,10 +573,16 @@ impl Runtime {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
-        _library_hashes: Vec<String>,
+        library_hashes: Vec<String>,
         detached: bool,
     ) -> Result<InstanceId, RuntimeError> {
-        let component = self.get_component(&program_hash)?;
+        // If libraries are provided, compose the components
+        let component = if library_hashes.is_empty() {
+            self.get_component(&program_hash)?
+        } else {
+            self.compose_components(&program_hash, &library_hashes)?
+        };
+
         let instance_id = Uuid::new_v4();
 
         // Instantiate and run in a task
