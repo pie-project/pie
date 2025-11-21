@@ -77,6 +77,37 @@ jobs:
           path: example-apps/target/wasm32-wasip2/release/echo.wasm
           retention-days: 1
 
+  build-test-apps:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-wasip2
+
+      - name: Build Test Apps
+        working-directory: ./test-apps
+        run: cargo build --target wasm32-wasip2 --release
+
+      - name: Upload `greet.wasm`
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-inferlet-greet
+          path: test-apps/target/wasm32-wasip2/release/greet.wasm
+          retention-days: 1
+
+      - name: Upload `greet_lib.wasm`
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-inferlet-greet-lib
+          path: test-apps/target/wasm32-wasip2/release/greet_lib.wasm
+          retention-days: 1
+
   test-engine-authentication:
     needs: [build-engine, build-client-cli]
     runs-on: ubuntu-latest
@@ -140,7 +171,7 @@ jobs:
         with:
           name: echo-inferlet
           path: ./bin
-      
+
       - name: Make binaries executable
         run: |
           chmod +x ./bin/pie
@@ -161,3 +192,47 @@ jobs:
 
       - name: Run attach test
         run: ./tests/engine/execute/attach.sh ./bin
+
+  test-engine-link:
+    needs: [build-engine, build-client-cli, build-test-apps]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download pie binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pie-binary
+          path: ./bin
+
+      - name: Download pie-cli binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pie-cli-binary
+          path: ./bin
+
+      - name: Download `greet.wasm`
+        uses: actions/download-artifact@v4
+        with:
+          name: test-inferlet-greet
+          path: ./bin
+
+      - name: Download `greet_lib.wasm`
+        uses: actions/download-artifact@v4
+        with:
+          name: test-inferlet-greet-lib
+          path: ./bin
+
+      - name: Make binaries executable
+        run: |
+          chmod +x ./bin/pie
+          chmod +x ./bin/pie-cli
+
+      - name: Add binaries to PATH
+        run: |
+          echo "$(pwd)/bin" >> $GITHUB_PATH
+
+      - name: Run link standalone library test
+        run: ./tests/engine/link/standalone.sh ./bin
