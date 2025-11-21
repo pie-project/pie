@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["version", "greet", "greet-lib"]
+
+[workspace.dependencies]
+wit-bindgen = "0.48.0"
+inferlet = { path = "../inferlet" }
+inferlet-macros = { path = "../inferlet-macros" }
+[profile.release]
+lto = true

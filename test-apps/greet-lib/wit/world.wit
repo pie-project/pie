@@ -1,0 +1,10 @@
+package greet:lib;
+
+world greet-lib {
+    export greet;
+}
+
+interface greet {
+    greet: func(name: string) -> string;
+}
+
