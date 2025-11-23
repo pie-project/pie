@@ -519,16 +519,17 @@ impl Runtime {
         }
     }
 
-    fn compose_components(
+    /// Compose a component with a library. The library (plug) is linked into the
+    /// main program (socket).
+    fn compose_one_component(
         &self,
-        program_hash: &str,
-        library_hashes: &[String],
-    ) -> Result<Component, RuntimeError> {
+        socket_bytes: Vec<u8>,
+        plug_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, RuntimeError> {
         // Create a new composition graph
         let mut graph = CompositionGraph::new();
 
-        // Load the main program component (socket)
-        let socket_bytes = self.get_component_bytes(program_hash)?;
+        // Prepare the socket package
         let socket_package = Package::from_bytes("socket", None, socket_bytes, graph.types_mut())
             .map_err(|e| {
             RuntimeError::Other(format!("Failed to load socket component: {}", e))
@@ -537,23 +538,15 @@ impl Runtime {
             RuntimeError::Other(format!("Failed to register socket package: {}", e))
         })?;
 
-        // Load each library component (plugs)
-        let mut plug_ids = Vec::new();
-        for (idx, library_hash) in library_hashes.iter().enumerate() {
-            let plug_bytes = self.get_component_bytes(library_hash)?;
-            let plug_name = format!("plug_{}", idx);
-            let plug_package = Package::from_bytes(&plug_name, None, plug_bytes, graph.types_mut())
-                .map_err(|e| {
-                    RuntimeError::Other(format!("Failed to load plug component {}: {}", idx, e))
-                })?;
-            let plug_id = graph.register_package(plug_package).map_err(|e| {
-                RuntimeError::Other(format!("Failed to register plug package {}: {}", idx, e))
-            })?;
-            plug_ids.push(plug_id);
-        }
+        // Prepare the plug package
+        let plug_package = Package::from_bytes("plug", None, plug_bytes, graph.types_mut())
+            .map_err(|e| RuntimeError::Other(format!("Failed to load plug component: {}", e)))?;
+        let plug_id = graph
+            .register_package(plug_package)
+            .map_err(|e| RuntimeError::Other(format!("Failed to register plug package: {}", e)))?;
 
-        // Perform the composition: plug the libraries' exports into the socket's imports
-        wac_graph::plug(&mut graph, plug_ids, socket_id)
+        // Perform the composition: connect the plug's exports to the socket's imports
+        wac_graph::plug(&mut graph, vec![plug_id], socket_id)
             .map_err(|e| RuntimeError::Other(format!("Failed to compose components: {}", e)))?;
 
         // Encode the composed component to bytes
@@ -561,9 +554,33 @@ impl Runtime {
             RuntimeError::Other(format!("Failed to encode composed component: {}", e))
         })?;
 
-        // Create a Component from the composed bytes
-        let component = Component::from_binary(&self.engine, &composed_bytes)?;
+        Ok(composed_bytes)
+    }
 
+    /// Compose a component with multiple libraries. The libraries are linked into the main program
+    /// sequentially in the order of the library hashes.
+    ///
+    /// Notably, the composition is done iteratively. At each iteration, a library is linked into
+    /// the main program. This allows an interface instrumented by a library to be instrumented
+    /// again by another following library.
+    fn compose_components<T>(
+        &self,
+        program_hash: &str,
+        library_hashes: &[T],
+    ) -> Result<Component, RuntimeError>
+    where
+        T: AsRef<str>,
+    {
+        let mut socket_bytes = self.get_component_bytes(program_hash)?;
+
+        for library_hash in library_hashes {
+            let plug_bytes = self.get_component_bytes(library_hash.as_ref())?;
+            let composed_bytes = self.compose_one_component(socket_bytes, plug_bytes)?;
+            socket_bytes = composed_bytes;
+        }
+
+        // Create a Component from the composed bytes
+        let component = Component::from_binary(&self.engine, &socket_bytes)?;
         Ok(component)
     }
 
