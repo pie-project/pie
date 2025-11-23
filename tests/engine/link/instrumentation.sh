@@ -21,10 +21,20 @@
 #      names
 #   4. Configures the engine to use the dummy backend
 #   5. Starts the pie engine in the background
-#   6. Submits version.wasm with runtime-instrumentation-lib.wasm linked via
-#      the --link flag
-#      Verifies that the submit command completes successfully and produces
-#      output containing "Instrumented"
+#   6. Runs three test cases to verify runtime instrumentation linking:
+#      - Case 1: Submit inferlet without linked runtime instrumentation library
+#        Submits version.wasm without the --link flag and verifies that the
+#        output does NOT contain "Instrumented", confirming baseline behavior
+#      - Case 2: Submit inferlet with linked runtime instrumentation library
+#        Submits version.wasm with runtime_instrument_lib.wasm linked via the
+#        --link flag, verifies that the submit command completes successfully
+#        and the output contains "Instrumented", demonstrating that the runtime
+#        instrumentation API is working correctly
+#      - Case 3: Submit inferlet with nested instrumentation
+#        Submits version.wasm with runtime_instrument_lib.wasm linked twice via
+#        two --link flags, verifies that the output contains "Instrumented:
+#        Instrumented:", confirming that nested/multiple instrumentation layers
+#        work correctly
 #   7. Cleans up all generated files, auth keys, and background processes
 #
 # The script uses randomized file names for both SSH keys and configuration
@@ -105,37 +115,56 @@ echo "Using inferlet directory: $INFERLET_DIR"
 VERSION_INFERLET="$INFERLET_DIR/version.wasm"
 RUNTIME_INSTRUMENT_LIB_INFERLET="$INFERLET_DIR/runtime_instrument_lib.wasm"
 
-# Case 1: Submit inferlet with linked runtime instrumentation library
-echo "Test submitting inferlet with linked runtime instrumentation library"
-OUTPUT=$(timeout 10 pie-cli submit "$VERSION_INFERLET" --link "$RUNTIME_INSTRUMENT_LIB_INFERLET" \
+### Case 1: Submit inferlet without linked runtime instrumentation library
+echo "Test submitting inferlet without linked library"
+OUTPUT=$(timeout 10 pie-cli submit "$VERSION_INFERLET" \
     --config "$PIE_CLI_CONFIG" < <(sleep infinity) || \
     { echo "Error: submit command failed (Case 1)"; exit 1; })
 
+# Verify the output does NOT contain "Instrumented"
+if echo "$OUTPUT" | grep -q "Instrumented"; then
+    echo "Error: Output contains 'Instrumented' when it should not (Case 1)"
+    echo "Output was:"
+    echo "$OUTPUT"
+    exit 1
+else
+    echo "Case 1 passed: output does not contain 'Instrumented' when not linked"
+fi
+
+
+### Case 2: Submit inferlet with linked runtime instrumentation library
+echo "Test submitting inferlet with linked runtime instrumentation library"
+OUTPUT=$(timeout 10 pie-cli submit "$VERSION_INFERLET" --link "$RUNTIME_INSTRUMENT_LIB_INFERLET" \
+    --config "$PIE_CLI_CONFIG" < <(sleep infinity) || \
+    { echo "Error: submit command failed (Case 2)"; exit 1; })
+
 # Verify the output contains "Instrumented"
 if echo "$OUTPUT" | grep -q "Instrumented"; then
-    echo "Case 1 passed: output contains 'Instrumented' when linked"
+    echo "Case 2 passed: output contains 'Instrumented' when linked"
 else
-    echo "Error: Output does not contain 'Instrumented' (Case 1)"
+    echo "Error: Output does not contain 'Instrumented' (Case 2)"
     echo "Output was:"
     echo "$OUTPUT"
     exit 1
 fi
 
 
-# Case 2: Submit inferlet without linked runtime instrumentation library
-echo "Test submitting inferlet without linked library"
+### Case 3: Submit inferlet with nested instrumentation
+echo "Test submitting inferlet with nested instrumentation"
 OUTPUT=$(timeout 10 pie-cli submit "$VERSION_INFERLET" \
+    --link "$RUNTIME_INSTRUMENT_LIB_INFERLET" \
+    --link "$RUNTIME_INSTRUMENT_LIB_INFERLET" \
     --config "$PIE_CLI_CONFIG" < <(sleep infinity) || \
-    { echo "Error: submit command failed (Case 2)"; exit 1; })
+    { echo "Error: submit command failed (Case 3)"; exit 1; })
 
-# Verify the output does NOT contain "Instrumented"
-if echo "$OUTPUT" | grep -q "Instrumented"; then
-    echo "Error: Output contains 'Instrumented' when it should not (Case 2)"
+# Verify the output contains "Instrumented: Instrumented:"
+if echo "$OUTPUT" | grep -q "Instrumented: Instrumented:"; then
+    echo "Case 3 passed: output contains 'Instrumented: Instrumented:' with nested instrumentation"
+else
+    echo "Error: Output does not contain 'Instrumented: Instrumented:' (Case 3)"
     echo "Output was:"
     echo "$OUTPUT"
     exit 1
-else
-    echo "Case 2 passed: output does not contain 'Instrumented' when not linked"
 fi
 
 # Cleanup will be called automatically by the trap
