@@ -1,0 +1,31 @@
+interface runtime {
+
+    use wasi:io/poll@0.2.4.{pollable};
+    use common.{model, debug-query-result};
+
+    // Returns the runtime version string
+    get-version: func() -> string;
+
+    // Returns a unique identifier for the running instance
+    get-instance-id: func() -> string;
+
+    // Retrieves POSIX-style CLI arguments passed to the inferlet from the remote user client
+    get-arguments: func() -> list<string>;
+
+    // Sets the return value for the inferlet
+    set-return: func(value: string);
+
+    // Retrieve a model by name; returns None if not found
+    get-model: func(name: string) -> option<model>;
+
+    // Get a list of all available model names
+    get-all-models: func() -> list<string>;
+
+    // Get names of models that have all specified traits (e.g. "input_text", "tokenize")
+    get-all-models-with-traits: func(traits: list<string>) -> list<string>;
+
+    // Executes a debug command and returns the result as a string
+    debug-query: func(query: string) -> debug-query-result;
+
+
+}

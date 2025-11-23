@@ -1,0 +1,10 @@
+package runtime-instrument:lib;
+
+world runtime-instrument {
+    // Import the actual runtime implementation
+    import inferlet:core/runtime;
+    
+    // Export the instrumented runtime interface
+    export inferlet:core/runtime;
+}
+

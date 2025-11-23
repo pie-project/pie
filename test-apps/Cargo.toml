@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["version", "greet", "greet-lib"]
+members = ["version", "greet", "greet-lib", "runtime-instrument-lib"]
 
 [workspace.dependencies]
 wit-bindgen = "0.48.0"
