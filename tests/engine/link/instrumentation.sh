@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# Standalone Link Test
+# Instrumentation Link Test
 #
 # This test script verifies that the Pie engine correctly handles linking
 # a component inferlet via the pie-cli submit command with the --link flag
-# when the library does not import any API from the Pie engine.
+# when the library instruments the Pie engine's runtime API.
 #
 # Usage:
-#   ./standalone.sh [INFERLET_DIR]
+#   ./instrumentation.sh [INFERLET_DIR]
 #
 # Arguments:
 #   INFERLET_DIR - Optional. Path to the directory containing the inferlets.
@@ -21,9 +21,10 @@
 #      names
 #   4. Configures the engine to use the dummy backend
 #   5. Starts the pie engine in the background
-#   6. Submits greet.wasm with greet_lib.wasm linked via the --link flag
+#   6. Submits version.wasm with runtime-instrumentation-lib.wasm linked via
+#      the --link flag
 #      Verifies that the submit command completes successfully and produces
-#      the expected output "Hello, Tom!"
+#      output containing "Instrumented"
 #   7. Cleans up all generated files, auth keys, and background processes
 #
 # The script uses randomized file names for both SSH keys and configuration
@@ -101,23 +102,40 @@ pie-cli config update --path "$PIE_CLI_CONFIG" --private-key-path "$ED25519_KEY"
 
 # Configure the inferlets to use
 echo "Using inferlet directory: $INFERLET_DIR"
-GREET_INFERLET="$INFERLET_DIR/greet.wasm"
-GREET_LIB_INFERLET="$INFERLET_DIR/greet_lib.wasm"
+VERSION_INFERLET="$INFERLET_DIR/version.wasm"
+RUNTIME_INSTRUMENT_LIB_INFERLET="$INFERLET_DIR/runtime_instrument_lib.wasm"
 
-# Test: Submit inferlet with linked component
-echo "Test submitting inferlet with linked component"
-OUTPUT=$(timeout 10 pie-cli submit "$GREET_INFERLET" --link "$GREET_LIB_INFERLET" \
-    --config "$PIE_CLI_CONFIG" -- --name "Tom" < <(sleep infinity) || \
-    { echo "Error: submit command failed"; exit 1; })
+# Case 1: Submit inferlet with linked runtime instrumentation library
+echo "Test submitting inferlet with linked runtime instrumentation library"
+OUTPUT=$(timeout 10 pie-cli submit "$VERSION_INFERLET" --link "$RUNTIME_INSTRUMENT_LIB_INFERLET" \
+    --config "$PIE_CLI_CONFIG" < <(sleep infinity) || \
+    { echo "Error: submit command failed (Case 1)"; exit 1; })
 
-# Verify the output contains the expected greeting
-if echo "$OUTPUT" | grep -q "Hello, Tom!"; then
-    echo "Link test passed: output contains expected greeting"
+# Verify the output contains "Instrumented"
+if echo "$OUTPUT" | grep -q "Instrumented"; then
+    echo "Case 1 passed: output contains 'Instrumented' when linked"
 else
-    echo "Error: Output does not contain expected greeting 'Hello, Tom!'"
+    echo "Error: Output does not contain 'Instrumented' (Case 1)"
     echo "Output was:"
     echo "$OUTPUT"
     exit 1
+fi
+
+
+# Case 2: Submit inferlet without linked runtime instrumentation library
+echo "Test submitting inferlet without linked library"
+OUTPUT=$(timeout 10 pie-cli submit "$VERSION_INFERLET" \
+    --config "$PIE_CLI_CONFIG" < <(sleep infinity) || \
+    { echo "Error: submit command failed (Case 2)"; exit 1; })
+
+# Verify the output does NOT contain "Instrumented"
+if echo "$OUTPUT" | grep -q "Instrumented"; then
+    echo "Error: Output contains 'Instrumented' when it should not (Case 2)"
+    echo "Output was:"
+    echo "$OUTPUT"
+    exit 1
+else
+    echo "Case 2 passed: output does not contain 'Instrumented' when not linked"
 fi
 
 # Cleanup will be called automatically by the trap

@@ -108,6 +108,20 @@ jobs:
           path: test-apps/target/wasm32-wasip2/release/greet_lib.wasm
           retention-days: 1
 
+      - name: Upload `version.wasm`
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-inferlet-version
+          path: test-apps/target/wasm32-wasip2/release/version.wasm
+          retention-days: 1
+
+      - name: Upload `runtime_instrument_lib.wasm`
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-inferlet-runtime-instrument-lib
+          path: test-apps/target/wasm32-wasip2/release/runtime_instrument_lib.wasm
+          retention-days: 1
+
   test-engine-authentication:
     needs: [build-engine, build-client-cli]
     runs-on: ubuntu-latest
@@ -225,6 +239,18 @@ jobs:
           name: test-inferlet-greet-lib
           path: ./bin
 
+      - name: Download `version.wasm`
+        uses: actions/download-artifact@v4
+        with:
+          name: test-inferlet-version
+          path: ./bin
+
+      - name: Download `runtime_instrument_lib.wasm`
+        uses: actions/download-artifact@v4
+        with:
+          name: test-inferlet-runtime-instrument-lib
+          path: ./bin
+
       - name: Make binaries executable
         run: |
           chmod +x ./bin/pie
@@ -236,3 +262,6 @@ jobs:
 
       - name: Run link standalone library test
         run: ./tests/engine/link/standalone.sh ./bin
+
+      - name: Run link instrumentation library test
+        run: ./tests/engine/link/instrumentation.sh ./bin
