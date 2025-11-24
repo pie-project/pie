@@ -11,7 +11,7 @@
 #
 # Arguments:
 #   INFERLET_DIR - Optional. Path to the directory containing the inferlet.
-#                  Defaults to: ../../../example-apps/target/wasm32-wasip2/release
+#                  Defaults to: ../../../test-apps/target/wasm32-wasip2/release
 #
 # Test Procedure:
 #   1. Generates an ED25519 SSH key pair for authentication
@@ -52,7 +52,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Parse command-line arguments
-INFERLET_DIR="${1:-${SCRIPT_DIR}/../../../example-apps/target/wasm32-wasip2/release}"
+INFERLET_DIR="${1:-${SCRIPT_DIR}/../../../test-apps/target/wasm32-wasip2/release}"
 
 # Source utility functions
 source "${SCRIPT_DIR}/../utils.sh"

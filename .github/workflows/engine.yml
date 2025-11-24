@@ -70,13 +70,6 @@ jobs:
         working-directory: ./example-apps
         run: cargo build --target wasm32-wasip2 --release
 
-      - name: Upload example apps
-        uses: actions/upload-artifact@v4
-        with:
-          name: echo-inferlet
-          path: example-apps/target/wasm32-wasip2/release/echo.wasm
-          retention-days: 1
-
   build-test-apps:
     runs-on: ubuntu-latest
 
@@ -122,6 +115,13 @@ jobs:
           path: test-apps/target/wasm32-wasip2/release/runtime_instrument_lib.wasm
           retention-days: 1
 
+      - name: Upload echo inferlet
+        uses: actions/upload-artifact@v4
+        with:
+          name: echo-inferlet
+          path: test-apps/target/wasm32-wasip2/release/echo.wasm
+          retention-days: 1
+
   test-engine-authentication:
     needs: [build-engine, build-client-cli]
     runs-on: ubuntu-latest
@@ -161,7 +161,7 @@ jobs:
         run: ./tests/engine/auth/key_strength.sh
 
   test-engine-execute:
-    needs: [build-engine, build-client-cli, build-example-apps]
+    needs: [build-engine, build-client-cli, build-test-apps]
     runs-on: ubuntu-latest
 
     steps:
