@@ -8,6 +8,7 @@
 use inferlet::{Args, Result};
 
 #[inferlet::main]
-async fn main(_: Args) -> Result<String> {
-    Ok(inferlet::get_version())
+async fn main(_: Args) -> Result<()> {
+    println!("{}", inferlet::get_version());
+    Ok(())
 }

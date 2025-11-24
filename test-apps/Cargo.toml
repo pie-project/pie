@@ -5,6 +5,7 @@ members = [
     "greet",
     "greet-lib",
     "runtime-instrument-lib",
+    "runtime-shadow-lib",
     "echo",
 ]
 

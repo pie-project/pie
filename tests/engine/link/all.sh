@@ -13,5 +13,9 @@ echo "Running standalone link test..."
 echo "Running instrumentation link test..."
 "${SCRIPT_DIR}/instrumentation.sh"
 
+# Run shadow link test
+echo "Running shadow link test..."
+"${SCRIPT_DIR}/shadow.sh"
+
 echo "All link tests passed."
 

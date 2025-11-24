@@ -1,0 +1,7 @@
+package runtime-shadow:lib;
+
+world runtime-shadow {
+    // Export both interfaces (no imports needed)
+    export inferlet:core/common;
+    export inferlet:core/runtime;
+}
