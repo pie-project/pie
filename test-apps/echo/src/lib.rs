@@ -1,3 +1,12 @@
+//! Test application that prints text and optionally delays execution.
+//!
+//! This program accepts command-line arguments to control output and timing:
+//! - `--text` or `-t`: Text to print to stdout
+//! - `--delay` or `-d`: Delay in milliseconds before printing text
+//! - `--text-before-delay` or `-b`: Text to print before the delay
+//!
+//! Used for testing basic inferlet execution, argument passing, and timing behavior.
+
 use inferlet::{Args, Result, wasi, wstd};
 
 #[inferlet::main]
