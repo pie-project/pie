@@ -83,7 +83,6 @@ pub enum ClientMessage {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
-        library_hashes: Vec<String>,
         detached: bool,
     },
 
@@ -95,7 +94,6 @@ pub enum ClientMessage {
         corr_id: u32,
         port: u32,
         program_hash: String,
-        library_hashes: Vec<String>,
         cmd_name: String,
         arguments: Vec<String>,
     },

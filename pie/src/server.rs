@@ -555,7 +555,6 @@ impl Session {
                     program_hash,
                     cmd_name,
                     arguments,
-                    library_hashes,
                     detached,
                 } => {
                     self.handle_launch_instance(
@@ -563,7 +562,6 @@ impl Session {
                         program_hash,
                         cmd_name,
                         arguments,
-                        library_hashes,
                         detached,
                     )
                     .await
@@ -578,7 +576,6 @@ impl Session {
                     corr_id,
                     port,
                     program_hash,
-                    library_hashes: _,
                     cmd_name,
                     arguments,
                 } => {
@@ -877,7 +874,6 @@ impl Session {
         program_hash: String,
         cmd_name: String,
         arguments: Vec<String>,
-        library_hashes: Vec<String>,
         detached: bool,
     ) {
         let (evt_tx, evt_rx) = oneshot::channel();
@@ -886,7 +882,6 @@ impl Session {
             program_hash,
             cmd_name,
             arguments,
-            library_hashes,
             detached,
             event: evt_tx,
         }
