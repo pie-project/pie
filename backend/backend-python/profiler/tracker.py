@@ -417,7 +417,7 @@ class MemoryTracker:
 
 
 # Global singleton instance
-_global_tracker: MemoryTracker | None = None
+_GLOBAL_TRACKER: MemoryTracker | None = None
 
 
 def initialize_memory_tracker(
@@ -431,19 +431,19 @@ def initialize_memory_tracker(
         enabled: Whether memory tracking is enabled
         enable_timing: Whether timing profiling is enabled (unified profiler mode)
     """
-    global _global_tracker  # pylint: disable=global-statement
-    _global_tracker = MemoryTracker(
+    global _GLOBAL_TRACKER  # pylint: disable=global-statement
+    _GLOBAL_TRACKER = MemoryTracker(
         output_dir=output_dir, enabled=enabled, enable_timing=enable_timing
     )
 
 
 def get_memory_tracker() -> MemoryTracker:
     """Get the global memory tracker instance."""
-    global _global_tracker  # pylint: disable=global-statement
-    if _global_tracker is None:
+    global _GLOBAL_TRACKER  # pylint: disable=global-statement
+    if _GLOBAL_TRACKER is None:
         # Initialize with disabled tracker if not initialized
-        _global_tracker = MemoryTracker(enabled=False)
-    return _global_tracker
+        _GLOBAL_TRACKER = MemoryTracker(enabled=False)
+    return _GLOBAL_TRACKER
 
 
 def memory_checkpoint(name: str) -> nullcontext[None]:
