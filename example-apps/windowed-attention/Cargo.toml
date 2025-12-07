@@ -1,0 +1,11 @@
+[package]
+name = "windowed-attention"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet.workspace = true
+inferlet-macros.workspace = true
