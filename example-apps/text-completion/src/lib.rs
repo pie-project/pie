@@ -1,3 +1,7 @@
+//! Simple text completion example using chat-style prompting.
+//! This example demonstrates basic text generation with a system prompt and
+//! user message.
+
 use inferlet::stop_condition::{StopCondition, ends_with_any, max_len};
 use inferlet::{Args, Result, Sampler};
 use std::time::Instant;
