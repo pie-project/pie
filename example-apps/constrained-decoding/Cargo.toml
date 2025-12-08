@@ -1,0 +1,14 @@
+[package]
+name = "constrained-decoding"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet.workspace = true
+inferlet-macros.workspace = true
+llguidance = { version = "1.1.1", default-features = false, features = ["lark"] }
+fancy-regex = "0.15.0"
+once_cell = "1.21"
