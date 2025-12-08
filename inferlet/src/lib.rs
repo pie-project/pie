@@ -17,7 +17,7 @@ pub mod brle;
 pub mod chat;
 pub mod context;
 pub mod drafter;
-mod forward;
+pub mod forward;
 mod image;
 mod pool;
 pub mod sampler;
