@@ -16,6 +16,12 @@ interface tokenize {
 
         // Returns the tokenizer's vocabulary as a list of byte sequences (tokens)
         get-vocabs: func() -> tuple<list<u32>, list<list<u8>>>;
+
+        // Returns the split regular expression used by the tokenizer
+        get-split-regex: func() -> string;
+
+        // Returns the special tokens recognized by the tokenizer
+        get-special-tokens: func() -> tuple<list<u32>, list<list<u8>>>;
     }
 
 }

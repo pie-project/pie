@@ -246,20 +246,27 @@ impl BytePairEncoder {
         }
     }
 
-    pub fn special_tokens(&self) -> HashSet<&str> {
-        self.special_tokens_encoder
+    pub fn encode_with_special_tokens(&self, text: &str) -> Vec<Rank> {
+        let allowed_special = self
+            .special_tokens_encoder
             .keys()
             .map(|s| s.as_str())
-            .collect()
-    }
-
-    pub fn encode_with_special_tokens(&self, text: &str) -> Vec<Rank> {
-        let allowed_special = self.special_tokens();
+            .collect();
         self.encode(text, &allowed_special)
     }
 
+    pub fn get_special_tokens(&self) -> (Vec<Rank>, Vec<Vec<u8>>) {
+        (
+            self.special_tokens_decoder.keys().cloned().collect(),
+            self.special_tokens_decoder.values().cloned().collect(),
+        )
+    }
+
+    pub fn get_split_regex(&self) -> String {
+        self.regex.to_string()
+    }
+
     pub fn get_vocabs(&self) -> (Vec<Rank>, Vec<Vec<u8>>) {
-        // return decoder ranks and bytes
         (
             self.decoder.keys().cloned().collect(),
             self.decoder.values().cloned().collect(),

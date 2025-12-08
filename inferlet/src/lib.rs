@@ -350,10 +350,29 @@ impl Tokenizer {
     /// Retrieves the entire vocabulary of the tokenizer.
     ///
     /// # Returns
-    /// A `Vec<Vec<u8>>`, where each inner vector represents a single token in the
-    /// vocabulary as a sequence of bytes.
+    /// A tuple containing two vectors:
+    /// - The first vector contains the token IDs.
+    /// - The second vector contains the token byte sequences.
     pub fn get_vocabs(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
         self.inner.get_vocabs()
+    }
+
+    /// Retrieves the special tokens of the tokenizer.
+    ///
+    /// # Returns
+    /// A tuple containing two vectors:
+    /// - The first vector contains the special token IDs.
+    /// - The second vector contains the special token byte sequences.
+    pub fn get_special_tokens(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
+        self.inner.get_special_tokens()
+    }
+
+    /// Retrieves the split regular expression of the tokenizer.
+    ///
+    /// # Returns
+    /// A `String` representing the split regular expression.
+    pub fn get_split_regex(&self) -> String {
+        self.inner.get_split_regex()
     }
 }
 

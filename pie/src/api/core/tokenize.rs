@@ -49,6 +49,19 @@ impl inferlet::core::tokenize::HostTokenizer for InstanceState {
         }
     }
 
+    async fn get_split_regex(&mut self, this: Resource<Tokenizer>) -> anyhow::Result<String> {
+        let tokenizer = self.ctx().table.get(&this)?;
+        Ok(tokenizer.inner.get_split_regex())
+    }
+
+    async fn get_special_tokens(
+        &mut self,
+        this: Resource<Tokenizer>,
+    ) -> anyhow::Result<(Vec<u32>, Vec<Vec<u8>>)> {
+        let tokenizer = self.ctx().table.get(&this)?;
+        Ok(tokenizer.inner.get_special_tokens())
+    }
+
     async fn get_vocabs(
         &mut self,
         this: Resource<Tokenizer>,
