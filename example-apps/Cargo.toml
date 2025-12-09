@@ -6,6 +6,7 @@ members = [
     "prefix-tree",
     "recursion-of-thought",
     "text-completion",
+    "tree-of-thought",
     "watermarking",
     "windowed-attention",
 ]
