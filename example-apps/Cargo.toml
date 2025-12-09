@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "constrained-decoding",
     "prefix-caching",
+    "prefix-tree",
     "text-completion",
     "windowed-attention",
 ]
@@ -12,6 +13,7 @@ inferlet = { path = "../inferlet" }
 inferlet-macros = { path = "../inferlet-macros" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+futures = "0.3.31"
 
 [profile.release]
 lto = true
