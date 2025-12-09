@@ -4,6 +4,7 @@ members = [
     "constrained-decoding",
     "prefix-caching",
     "prefix-tree",
+    "recursion-of-thought",
     "text-completion",
     "windowed-attention",
 ]
