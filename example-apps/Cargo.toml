@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "constrained-decoding",
     "graph-of-thought",
+    "parallel-generation",
     "prefix-caching",
     "prefix-tree",
     "recursion-of-thought",
