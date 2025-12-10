@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "beam-search",
     "constrained-decoding",
     "graph-of-thought",
     "helloworld",
