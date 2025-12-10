@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "constrained-decoding",
     "graph-of-thought",
+    "image-fetch",
     "kvs",
     "output-validation",
     "parallel-generation",
