@@ -8,6 +8,7 @@ members = [
     "prefix-caching",
     "prefix-tree",
     "recursion-of-thought",
+    "skeleton-of-thought",
     "text-completion",
     "tree-of-thought",
     "watermarking",
