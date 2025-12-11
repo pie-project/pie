@@ -1,0 +1,12 @@
+[package]
+name = "agent-codeact"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet.workspace = true
+inferlet-macros.workspace = true
+boa_engine = "0.20.0"
