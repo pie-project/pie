@@ -10,6 +10,7 @@ members = [
     "graph-of-thought",
     "helloworld",
     "image-fetch",
+    "jacobi-decoding",
     "kvs",
     "output-validation",
     "parallel-generation",
