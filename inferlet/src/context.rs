@@ -799,6 +799,8 @@ impl Context {
     ///   used to sample from the main model's distributions during verification.
     /// * `stop_condition`: A mutable reference to an object implementing the `StopCondition`
     ///   trait, which determines when to halt generation.
+    /// * `num_token_generated_per_step`: An optional mutable reference to a vector of usize,
+    ///   used to track the number of tokens generated per step.
     ///
     /// # Returns
     ///
@@ -807,43 +809,62 @@ impl Context {
     /// # Panics
     ///
     /// This function will panic if the context's pending token buffer does not contain
-    /// exactly one token before the call, as this token is required to seed the
+    /// any tokens before the call, as these tokens are required to seed the
     /// speculative decoding process.
     pub async fn generate_with_drafter<D: Drafter, S: Sample, C: StopCondition>(
         &mut self,
         drafter: &mut D,
         sampler: &mut S,
         stop_condition: &mut C,
+        mut num_token_generated_per_step: Option<&mut Vec<usize>>,
     ) -> String {
+        assert!(
+            !self.token_ids_pending.is_empty(),
+            "Must have at least one seed token"
+        );
+
         // Synchronize the drafter with the main model's history before starting.
         drafter.update(&self.token_ids);
 
         let mut all_generated_tokens = Vec::new();
 
-        // --- Generation Loop ---
         // Each iteration performs one step of speculative decoding, which may accept
         // multiple tokens at once.
         loop {
+            // Pending tokens are the tokens that wait to be filled into the KV cache.
+            // They are either input by the user or accepted from the previous iteration.
             let token_ids_pending = mem::take(&mut self.token_ids_pending);
 
-            // Update the drafter with the seed and generate a sequence of draft tokens.
-            drafter.update(&all_generated_tokens);
+            // Clear the pending masks. The masks will be created in the following to
+            // accommodate the draft tokens.
+            self.token_mask_pending.clear();
+
+            // Update the drafter with the pending tokens.
+            drafter.update(&token_ids_pending);
+
+            // The drafter returns a forest of Tries. The vectors represent the Trie forest
+            // in DFS order. The draft position IDs are the depth of the nodes in the Trie.
+            // Draft root nodes are at depth 1. Draft position IDs are relative to the last
+            // pending token's position ID.
             let (draft_tokens, draft_pos_ids) = drafter.draft();
 
-            // Combine the seed and draft tokens into a single batch for the main model.
+            // Combine the pending and draft tokens into a single batch for the main model.
             let batch_tokens = [token_ids_pending.as_slice(), draft_tokens.as_slice()].concat();
-            //println!("pending len: {:?}", &token_ids_pending);
 
+            // This is the absolute position ID of the token after the last token in the KV cache.
+            let pos_offset = self.position_ids.last().map(|&p| p + 1).unwrap_or(0);
+
+            // The number of pending tokens.
+            let pending_len = token_ids_pending.len() as u32;
+
+            // The absolute position IDs of the tokens in the batch.
             let batch_positions = {
-                let pos_offset = self.position_ids.last().map(|&p| p + 1).unwrap_or(0);
-                let pending_len = token_ids_pending.len() as u32;
                 let mut positions = Vec::with_capacity(batch_tokens.len());
 
-                // Extend with base position to base + pending_len
+                // Calculate the absolute position IDs of the pending tokens.
                 positions.extend(pos_offset..pos_offset + pending_len);
-                //println!("pending positions: {:?}", &positions);
 
-                // Extend with adjusted draft positions
+                // Calculate the absolute position IDs of the draft tokens.
                 positions.extend(
                     draft_pos_ids
                         .iter()
@@ -853,93 +874,203 @@ impl Context {
                 positions
             };
 
-            //println!("verification batch tokens: {:?}", &batch_tokens);
-            //println!("verification batch positions: {:?}", &batch_positions);
+            // The attention masks for the batch.
+            let batch_masks = {
+                let mut masks = Vec::with_capacity(batch_tokens.len());
+
+                // The attention mask for a pending token in Brle format, which attends to
+                // all tokens before it.
+                let mut pending_token_brle = Brle::new(pos_offset as usize);
+
+                // For each pending token, increase the mask length by 1. `false` means
+                // not masked out, i.e., attend.
+                for _ in 0..pending_len as usize {
+                    pending_token_brle.append(false);
+                    masks.push(pending_token_brle.buffer.clone());
+                }
+
+                // Auxiliary data structure to track the immediate predecessor of a draft
+                // token in the Trie forest.
+                struct PredecessorInto {
+                    draft_mask_idx: usize,
+                    pos: u32,
+                }
+
+                // The attention mask for a draft token in binary format that attends to
+                // its predecessor tokens in the Trie forest. This mask will be updated
+                // for each draft token as we traverse the Trie forest. We start with
+                // everything masked out. `true` means masked out, i.e., not attend.
+                let mut draft_mask = vec![true; draft_tokens.len()];
+
+                // A data structure to track the predecessors of a draft token in the Trie
+                // forest. This vector will be updated for each draft token as we traverse
+                // the Trie forest.
+                let mut predecessors: Vec<PredecessorInto> = Vec::new();
+
+                // Iterate over the draft tokens. Use their absolute position IDs we
+                // calculated above.
+                for (batch_idx, &pos) in batch_positions
+                    .iter()
+                    .enumerate()
+                    .skip(pending_len as usize)
+                {
+                    let draft_mask_idx = batch_idx - pending_len as usize;
+
+                    // Update the pedecessors vector for the current draft token. Leveraging
+                    // the fact that the order of the draft tokens is a DFS visit of the Trie
+                    // forest, each next draft token shares common predecessors with the
+                    // previous token. We just need to discard the nodes that are not this
+                    // draft token's predecessors.
+                    //
+                    // At the same time, we update the draft mask so that discarded nodes are
+                    // masked out again.
+                    while let Some(predecessor) = predecessors.last() {
+                        if predecessor.pos != pos - 1 {
+                            draft_mask[predecessor.draft_mask_idx] = true;
+                            predecessors.pop();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // A token should attend to itself.
+                    draft_mask[draft_mask_idx] = false;
+
+                    // Add the current token to the predecessors vector, so that the next token
+                    // can use it to update the draft mask.
+                    predecessors.push(PredecessorInto {
+                        draft_mask_idx,
+                        pos,
+                    });
+
+                    // Get the attention mask for up until the last pending token, then extend it
+                    // with the attention mask for the draft tokens part.
+                    let mut brle = pending_token_brle.clone();
+                    brle.extend(&Brle::from_slice(&draft_mask[..=draft_mask_idx]));
+
+                    masks.push(brle.buffer);
+                }
+
+                masks
+            };
 
             // Allocate resources and expand the KV cache to accommodate the entire batch.
             self.grow_kv_pages(batch_tokens.len());
 
+            // Get distribution output for the last pending token and the draft tokens.
             let out_range = token_ids_pending.len() - 1..batch_tokens.len();
 
+            // Create a forward pass configuration and set the adapter if it is configured.
             let p = self.queue.create_forward_pass();
-            p.input_tokens(&batch_tokens, &batch_positions);
-            p.kv_cache(&self.kv_pages, self.kv_page_last_len);
-            p.output_distributions(&out_range.map(|x| x as u32).collect::<Vec<_>>(), 1.0, None);
-
-            let res = p.execute().await;
-            let output_distributions = res.distributions.unwrap();
-            // The speculation "Trie" is a tree of possibilities. The first token is always correct.
-            // R[n] (P[n+1] P[n+2] P[n+3] P[n+2] P[n+3]) (P[n+1] P[n+2]) (P[n+1] P[n+2]) ...
-
-            let mut accepted_tokens: Vec<u32> = Vec::new();
-            let mut draft_token_idx = 0; // Current index in the verification batch.
-
-            let mut num_retained_draft_tokens = 0;
-            let mut contiguous_flag = true;
-
-            // accept the first token
-            let first_accepted_token =
-                sampler.sample(&output_distributions[0].ids, &output_distributions[0].probs);
-
-            accepted_tokens.push(first_accepted_token);
-
-            while draft_token_idx < draft_tokens.len() {
-                //let next_token = *accepted_draft_tokens.last().unwrap();
-                let last_accepted_token = *accepted_tokens.last().unwrap();
-
-                let draft_token = draft_tokens[draft_token_idx];
-                let draft_next_dist = &output_distributions[draft_token_idx + 1];
-                let draft_next_token = sampler.sample(&draft_next_dist.ids, &draft_next_dist.probs);
-
-                if last_accepted_token == draft_token {
-                    // MATCH: Accept token and continue down the current path.
-                    accepted_tokens.push(draft_next_token);
-
-                    if contiguous_flag {
-                        num_retained_draft_tokens += 1;
-                    }
-
-                    // Check if this path has a child in the drafted Trie.
-                    let has_child = draft_token_idx + 1 < draft_tokens.len()
-                        && draft_pos_ids[draft_token_idx] + 1 == draft_pos_ids[draft_token_idx + 1];
-                    if has_child {
-                        draft_token_idx += 1; // Move to verify the child.
-                    } else {
-                        // Nothing left to verify, so we're done.
-                        break;
-                    }
-                } else {
-                    contiguous_flag = false;
-
-                    // Attempt to find a sibling branch in the draft to jump to.
-                    let current_level = draft_pos_ids[draft_token_idx];
-                    let next_sibling_draft_idx = (draft_token_idx + 1..draft_tokens.len())
-                        .find(|&idx| draft_pos_ids[idx] == current_level);
-
-                    if let Some(sibling_idx) = next_sibling_draft_idx {
-                        // Jump the batch index to the sibling's position.
-                        draft_token_idx = sibling_idx;
-                    } else {
-                        // No more valid paths to check.
-                        break;
-                    }
+            if let Some(adapter_ptr) = self.adapter_ptr {
+                p.set_adapter(adapter_ptr);
+                if let Some(adapter_random_seed) = self.adapter_random_seed {
+                    p.set_adapter_seed(adapter_random_seed);
                 }
             }
 
-            // Rewind the KV cache to discard the states of any rejected draft tokens.
-            let redundant_count =
-                batch_tokens.len() - token_ids_pending.len() - num_retained_draft_tokens;
+            // Run the forward pass.
+            p.input_tokens(&batch_tokens, &batch_positions);
+            p.kv_cache(&self.kv_pages, self.kv_page_last_len);
+            p.attention_mask(&batch_masks);
+            p.output_distributions(&out_range.map(|x| x as u32).collect::<Vec<_>>(), 0.0, None);
+            let pass_result = p.execute().await;
+            let output_distributions = pass_result.distributions.unwrap();
 
-            let num_tokens_to_keep = token_ids_pending.len() + num_retained_draft_tokens;
-            self.shrink_kv_pages(redundant_count);
+            // The longest path in the draft Trie forest the passed the verification.
+            let accepted_tokens = {
+                let mut tokens = Vec::new();
 
-            self.token_ids.extend(&batch_tokens[..num_tokens_to_keep]);
+                // The first accepted token is generated by the last pending token, which is
+                // always correct.
+                let first_accepted_token =
+                    sampler.sample(&output_distributions[0].ids, &output_distributions[0].probs);
+                tokens.push(first_accepted_token);
+
+                // Traverse through the draft Trie forest. During the loop iteration, we either
+                // move down the tree or jump to a sibling node, but we never move up.
+                let mut draft_token_idx = 0;
+                while draft_token_idx < draft_tokens.len() {
+                    let last_accepted_token = *tokens.last().unwrap();
+                    let draft_token = draft_tokens[draft_token_idx];
+
+                    // If a draft token is correct, we will move down the tree.
+                    if last_accepted_token == draft_token {
+                        // Accept the token generated by this correct draft token.
+                        let draft_next_dist = &output_distributions[draft_token_idx + 1];
+                        let draft_next_token =
+                            sampler.sample(&draft_next_dist.ids, &draft_next_dist.probs);
+                        tokens.push(draft_next_token);
+
+                        // Check if this draft node has a child node.
+                        let has_child = draft_token_idx + 1 < draft_tokens.len()
+                            && draft_pos_ids[draft_token_idx] + 1
+                                == draft_pos_ids[draft_token_idx + 1];
+
+                        // Move down if a child node exists.
+                        if has_child {
+                            draft_token_idx += 1;
+                        // Otherwise, we have reached the leaf node. Terminate the loop.
+                        } else {
+                            break;
+                        }
+
+                    // If a draft token is incorrect, we will jump to a sibling node.
+                    } else {
+                        // Attempt to find a sibling branch in the draft to jump to.
+                        let mut next_sibling_draft_idx = None;
+                        let cur_depth = draft_pos_ids[draft_token_idx];
+
+                        for idx in draft_token_idx + 1..draft_tokens.len() {
+                            // If we see a draft token at a shallower depth, we will be visiting
+                            // a different subtree, therefore, there is no more sibling node.
+                            if draft_pos_ids[idx] < cur_depth {
+                                break;
+                            }
+
+                            // Otherwise, if we see a draft token at the same depth, it is
+                            // the next sibling node.
+                            if draft_pos_ids[idx] == cur_depth {
+                                next_sibling_draft_idx = Some(idx);
+                                break;
+                            }
+
+                            // For nodes at a deeper depth, they are the descendants of
+                            // the current node, so we continue to search for the next sibling
+                            // node.
+                        }
+
+                        // Jump the sibling node if it exists, otherwise, terminate the loop.
+                        if let Some(sibling_idx) = next_sibling_draft_idx {
+                            draft_token_idx = sibling_idx;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                tokens
+            };
+
+            // Discard the KV cache entries for the draft tokens.
+            self.shrink_kv_pages(draft_tokens.len());
+
+            // Update the context's internal state to reflect that the previous pending tokens are
+            // now in the KV cache.
             self.position_ids
-                .extend(&batch_positions[..num_tokens_to_keep]);
-            //drafter.update(&batch_tokens[..num_tokens_to_keep]);
+                .extend(&batch_positions[..token_ids_pending.len()]);
+            self.token_ids.extend(token_ids_pending.into_iter());
 
+            // If the caller wants to track the number of tokens generated per step, record it.
+            if let Some(ref mut num_token_generated_per_step) = num_token_generated_per_step {
+                num_token_generated_per_step.push(accepted_tokens.len());
+            }
+
+            // Record the new generated tokens.
             all_generated_tokens.extend_from_slice(&accepted_tokens);
-            self.fill_tokens(accepted_tokens[num_retained_draft_tokens..].to_owned());
+
+            // Put the accepted tokens into the pending tokens buffer.
+            self.fill_tokens(accepted_tokens);
 
             // Check if the stop condition has been met after the step is complete.
             if stop_condition.check(&all_generated_tokens) {
