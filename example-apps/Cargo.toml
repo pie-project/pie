@@ -6,6 +6,7 @@ members = [
     "agent-swarm",
     "attention-sink",
     "beam-search",
+    "cacheback-decoding",
     "constrained-decoding",
     "graph-of-thought",
     "helloworld",
