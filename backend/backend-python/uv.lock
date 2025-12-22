@@ -826,7 +826,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67" },
     { name = "typing-extensions", marker = "extra == 'debug'", specifier = "~=4.15.0" },
     { name = "websockets", specifier = ">=15.0" },
-    { name = "ztensor", specifier = ">=0.1.4" },
+    { name = "ztensor", specifier = ">=1.1.1" },
 ]
 provides-extras = ["cuda", "macos", "debug"]
 
@@ -1303,7 +1303,7 @@ wheels = [
 
 [[package]]
 name = "ztensor"
-version = "0.1.4"
+version = "1.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cffi", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1311,18 +1311,17 @@ dependencies = [
     { name = "ml-dtypes", version = "0.5.1", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux')" },
     { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e1/51/7f514b1efb1de47f8aa7fca9f77fd5bcd2c8c49d9342215dc773725263eb/ztensor-0.1.4.tar.gz", hash = "sha256:2c53d86b04baa0bbf29c98a2054e656f379414419b83607c9f97a4c87892f200", size = 30205, upload-time = "2025-07-20T04:01:54.188Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b8/42/f67443050e3b74cc32ad1574d506bae97f165ddbf3553525642dd25de76d/ztensor-1.1.1.tar.gz", hash = "sha256:58f9c8876d9a2330e7b5847f23a41443e46e001b55ca2e33bc1572b809a99327", size = 209474, upload-time = "2025-12-22T03:34:02.609Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/bb/4a8f730596785a43af98453b29f2dea93ba8b7b719af8f74ad783e5c1c59/ztensor-0.1.4-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:9100cac51a2463690c9215b85558534d19d69e5fd2b0ce51772a9fa2acd8f6f0", size = 654368, upload-time = "2025-07-20T04:01:48.114Z" },
-    { url = "https://files.pythonhosted.org/packages/44/fc/9638dbd419cf16e2938c6ce7da6072b9f51d0a47e66477581ab3ca2bc7e2/ztensor-0.1.4-py3-none-macosx_11_0_arm64.whl", hash = "sha256:1c9a288a909e728843d62645fef10c2cca186ce04c026f2c732a7f9a78939a70", size = 546336, upload-time = "2025-07-20T04:01:46.737Z" },
-    { url = "https://files.pythonhosted.org/packages/fc/99/6a1b12dee788a644b33472f63de625a9a18084c99b9693c0196b13e8117c/ztensor-0.1.4-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:d41ea42ef67a310cba44ec6943c17172765b4114471cc2d06e7d9c772865b476", size = 669724, upload-time = "2025-07-20T04:01:39.105Z" },
-    { url = "https://files.pythonhosted.org/packages/28/70/ca2523449459afd9701e633cd00fb9797205c60c55aecceeb3f76f88f29a/ztensor-0.1.4-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:73879ced98fbc2c58259d9b01c30f6c1ee6be916aada3e76cd9a6c49a5fd7314", size = 671373, upload-time = "2025-07-20T04:01:40.694Z" },
-    { url = "https://files.pythonhosted.org/packages/21/46/660586d8cd0ad0f4e2651589e1b497bdc3fb8a0029964b83acc7ffcf892f/ztensor-0.1.4-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:49053817979ba74529bda8efe67487149f5ac09d6a05c07e3fecba043e085bf7", size = 812258, upload-time = "2025-07-20T04:01:42.123Z" },
-    { url = "https://files.pythonhosted.org/packages/57/3d/c1988f0961a9253d5bf9d1cb49c3fe15bd483b7df64f12fe498bdc2fbce8/ztensor-0.1.4-py3-none-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:371492a9f0158b8deb2b5d27736a311c72fb0272785307cef4bfad47771034df", size = 737532, upload-time = "2025-07-20T04:01:43.526Z" },
-    { url = "https://files.pythonhosted.org/packages/f0/6d/22c4b04cfef7f00628e8568433bcba1263941a236ae319a8f93d5cb3673d/ztensor-0.1.4-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c49c7229bf643b0533dc8967be5ad7b018fe4f310f8c2a41b109268ec7f76e7a", size = 733389, upload-time = "2025-07-20T04:01:45.754Z" },
-    { url = "https://files.pythonhosted.org/packages/c8/0b/fb15e1196f3110276d95798c2693f691a233ed69c21cb3a817066b558f33/ztensor-0.1.4-py3-none-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:0140d85e09634a676e707fadd501e7eca2bdd700c09d799f871cfa4556f73885", size = 755527, upload-time = "2025-07-20T04:01:44.697Z" },
-    { url = "https://files.pythonhosted.org/packages/4f/df/ae708ef2db5d665708b92f1a50a49ec3b71f7f5ab7a899204d8a68b34d07/ztensor-0.1.4-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:5dec0207985f8f800efaa0591bfc8de56e486f825c9939e56cfe1dcf79326cbe", size = 886234, upload-time = "2025-07-20T04:01:49.478Z" },
-    { url = "https://files.pythonhosted.org/packages/85/c7/b688423acf1c6f61bc7cd578eed8703ea2bda5d8d87eacae1e29ec3f3e52/ztensor-0.1.4-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:9d27969a92e252325b065a98b2b85421a47b608c431277088939a6d08f3e6e37", size = 939626, upload-time = "2025-07-20T04:01:50.518Z" },
-    { url = "https://files.pythonhosted.org/packages/35/c1/6090886214c138ac1584cac2280866512a48cb0306418b25316a5b608b89/ztensor-0.1.4-py3-none-musllinux_1_2_i686.whl", hash = "sha256:a7a580c7407c71440d4cd2688cf586e988892e06de1099bb5e6318b3d45c3f15", size = 937749, upload-time = "2025-07-20T04:01:52.025Z" },
-    { url = "https://files.pythonhosted.org/packages/f5/df/48dd4cf8b36df76333f20024f1994546a7e734c087d34c89a7e19e32c4a8/ztensor-0.1.4-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:e83db8f63d60a3c9496de501d1fd9d4754a51415abc1154a5c2c455dff76e6fa", size = 907453, upload-time = "2025-07-20T04:01:53.112Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/87/c59adb731e6cfa72b092615793ec2fb9161f155850a2eedde0abe8b092ff/ztensor-1.1.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:d1e62bdc5b46d7bae31e5245d9f1600807fe5ec7947240bbaedcdb1bdb279e58", size = 619650, upload-time = "2025-12-22T03:33:55.697Z" },
+    { url = "https://files.pythonhosted.org/packages/39/f4/7227c23135aaf139c088d3659610d4249d69c3e158c1735d7b36e20433c9/ztensor-1.1.1-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:43bc97492e6227b59a03368853336a9d24c86ff5d1a0c08a754cdbc924a5aa0d", size = 753547, upload-time = "2025-12-22T03:33:45.79Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/05/6b983bd7e59da1e746bd3347e8ee7647d297f881595ea64fdac29e388f43/ztensor-1.1.1-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:90e758d03ee6fc16241a0947ca4584843356be02e92b668040b27a1f39381f4c", size = 747240, upload-time = "2025-12-22T03:33:47.592Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/e3/c3e94065c1b98feeeafe39871bb09a3d414c1ff5f7f761ccfa01640e122a/ztensor-1.1.1-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:58d2987b2c74ed64feb2376976643a63a07bd233221f6051a7ccb2d46dcbf0fe", size = 890140, upload-time = "2025-12-22T03:33:48.902Z" },
+    { url = "https://files.pythonhosted.org/packages/91/5a/94ac54ef11ad0e229f8a24929d0f7174e055af1ded3c52c1fb38f2cbf15e/ztensor-1.1.1-py3-none-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:9243490c11226b06afe3eea5e6079af634a301cb6d964c72b35da3b59bd5abf3", size = 804843, upload-time = "2025-12-22T03:33:50.761Z" },
+    { url = "https://files.pythonhosted.org/packages/75/8d/3f966343d0df231ae37aa952e819d66a5e5918e87b9294fb6434ff2dbec1/ztensor-1.1.1-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c886132a2476245dd4d4eeae5353c16e535f7597aafa8463a275e8bc8d79b3d3", size = 819216, upload-time = "2025-12-22T03:33:54.22Z" },
+    { url = "https://files.pythonhosted.org/packages/59/ec/72915bc64a42f39a01366dc6527bc625a9921fe1c3228bdbd75f3145bf94/ztensor-1.1.1-py3-none-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:fc8b403a5b80e70c4ad1e201cb2100c3bda180d92cd68149bc93979e15fd54c1", size = 841278, upload-time = "2025-12-22T03:33:52.575Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/ef/a9d458ca3c11db74203e5409bba7edcbed2cda0863960a53d4d99b3985ae/ztensor-1.1.1-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:ca64eb08eecaaa63122be170083c4b0bed8784f63b6ab9f088596fc49918d803", size = 975464, upload-time = "2025-12-22T03:33:56.977Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/79/0fb8ba3e3e4544f9090068bee71074ccb877b78281dcd26db7710d3add4c/ztensor-1.1.1-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:6ed3cb966650002ab4ff684823b07b9c2e1df950a134e9258a667afc177eb91e", size = 1013067, upload-time = "2025-12-22T03:33:58.24Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/73/dae892f293f81afa99775ce081622ae0e00639bcacf542ee1feee87b5a90/ztensor-1.1.1-py3-none-musllinux_1_2_i686.whl", hash = "sha256:9d02c2d70b101f1624f8e00a5242a83b9d57d8f0b42a1de0390abe580219e10e", size = 1051900, upload-time = "2025-12-22T03:33:59.645Z" },
+    { url = "https://files.pythonhosted.org/packages/00/03/17443c714fb66022e9306f34937349a89ab245c363af2e7a5f37b95557ec/ztensor-1.1.1-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:85b07d9bc0279b905e0a93030b9e88409adedf0a2a25b459557ccdc25f2e5237", size = 1029414, upload-time = "2025-12-22T03:34:01.237Z" },
 ]
