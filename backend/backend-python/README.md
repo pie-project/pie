@@ -31,7 +31,7 @@ uv venv
 Next, install the `flashinfer` library.
 
 ```sh
-uv pip install flashinfer-python==0.3.1
+uv pip install flashinfer-python==0.5.3
 ```
 
 > **Note:** Depending on your system configuration, you might need to build `flashinfer` from the source. Please refer to the official [FlashInfer repository](https://github.com/flashinfer-ai/flashinfer) for detailed instructions.

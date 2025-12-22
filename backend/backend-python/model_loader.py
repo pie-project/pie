@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import sys
-import math
 from pathlib import Path
-from typing import Callable, Iterable, Tuple
+from typing import Callable, Tuple
 
 import torch
 import ztensor
 from tqdm import tqdm
 
 from model.config import ModelInfo
+from model.gptoss_utils import (
+    prepare_gptoss_moe_gate_up,
+    prepare_gptoss_moe_down,
+)
 
 
 CreateModelFn = Callable[[ModelInfo], Tuple[torch.nn.Module, dict]]
@@ -165,6 +168,7 @@ def _load_fused_parameter(
     Returns True if successful, False if the parameter loading is skipped due to errors.
     """
     source_names = fusion_details["sources"]
+    op = fusion_details["op"]
 
     source_tensors = []
     for source_name in source_names:
@@ -181,7 +185,7 @@ def _load_fused_parameter(
         source_tensors.append(tensor_data)
 
     with torch.no_grad():
-        if fusion_details["op"] == "fusion":
+        if op == "fusion":
             dim = fusion_details["dim"]
 
             if param.shape[dim] != sum(
@@ -205,25 +209,34 @@ def _load_fused_parameter(
                 )
                 current_offset += slice_size
 
-        elif fusion_details["op"] == "dequantize_mxfp4":
-            blocks, scales = source_tensors[0], source_tensors[1]
-            fused_tensor = _dequantize_from_mxfp4(
-                blocks,
-                scales,
-                fp4_values=fusion_details["fp4_values"],
-                dtype=param.dtype,
-                device=str(param.device),
+        elif op == "prepare_gptoss_moe_gate_up":
+            result = prepare_gptoss_moe_gate_up(
+                source_tensors[0],  # blocks
+                source_tensors[1],  # scales
+                source_tensors[2],  # bias
+                fusion_details,
+                str(param.device),
             )
-            if fused_tensor.shape != param.shape:
-                print(
-                    f"    Warning: Shape mismatch for fused tensor '{param_name}'. "
-                    "Skipping."
-                )
-                return False
+            output_type = fusion_details["output_type"]
+            param.copy_(result[output_type], non_blocking=non_blocking)
 
-            param.copy_(fused_tensor, non_blocking=non_blocking)
+        elif op == "prepare_gptoss_moe_down":
+            result = prepare_gptoss_moe_down(
+                source_tensors[0],  # blocks
+                source_tensors[1],  # scales
+                source_tensors[2],  # bias
+                fusion_details,
+                str(param.device),
+            )
+            output_type = fusion_details["output_type"]
+            param.copy_(result[output_type], non_blocking=non_blocking)
+
+        elif op == "to_float32":
+            converted = source_tensors[0].to(torch.float32)
+            param.copy_(converted, non_blocking=non_blocking)
+
         else:
-            raise ValueError(f"Unknown fusion operation: {fusion_details['op']}")
+            raise ValueError(f"Unknown fusion operation: {op}")
 
     return True
 
@@ -255,52 +268,6 @@ def _load_regular_parameter(
         param.copy_(tensor_data, non_blocking=non_blocking)
 
     return True
-
-
-def _dequantize_from_mxfp4(
-    blocks: torch.Tensor,
-    scales: torch.Tensor,
-    fp4_values: Iterable[float],
-    device: str,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """
-    Convert MXFP4 format tensors (blocks and scales) to bfloat16 format.
-
-    Args:
-        blocks: The packed FP4 values tensor (uint8)
-        scales: The block scales tensor
-        dtype: Target dtype for conversion (default: torch.bfloat16)
-
-    Returns:
-        Converted tensor in the target dtype
-    """
-    scales = scales.to(torch.int32) - 127
-
-    assert (
-        blocks.shape[:-1] == scales.shape
-    ), f"{blocks.shape=} does not match {scales.shape=}"
-
-    lut = torch.tensor(fp4_values, dtype=dtype, device=device)
-
-    *prefix_shape, g, b = blocks.shape
-    rows_total = math.prod(prefix_shape) * g
-
-    blocks = blocks.reshape(rows_total, b).to(device)
-    scales = scales.reshape(rows_total, 1).to(device)
-
-    # Extract low and high 4-bit indices
-    idx_lo = (blocks & 0x0F).to(torch.long)
-    idx_hi = (blocks >> 4).to(torch.long)
-
-    # Create output tensor and populate
-    out = torch.empty(rows_total, b * 2, dtype=dtype, device=device)
-    out[:, 0::2] = lut[idx_lo]  # Low 4-bit values at even indices
-    out[:, 1::2] = lut[idx_hi]  # High 4-bit values at odd indices
-
-    torch.ldexp(out, scales, out=out)
-
-    return out.reshape(*prefix_shape, g, b * 2).view(*prefix_shape, g * b * 2)
 
 
 __all__ = ["load_model", "load_model_info"]

@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+
 
 import torch
 from torch import nn
 import flashinfer as ops
+from flashinfer.attention import BatchAttentionWithAttentionSinkWrapper
 from adapter_utils import AdapterSubpass
 from model.config import CommonArch, ModelConfig
 from model.gptoss_utils import (
-    FP4_VALUES,
-    chunked_enumerate,
-    GptOssRMSNorm,
-    GptOssRotaryEmbedding,
+    pad_to_multiple,
+    ALIGNMENT,
+    TUNE_MAX_NUM_TOKENS,
 )
-from einops import einsum, rearrange
 
 
 VERSION = "0.1.0"
@@ -38,6 +39,8 @@ class GptOssArch(CommonArch):
     # Model specific parameters
     initial_context_length: int
     sliding_window: int
+    swiglu_alpha: float
+    swiglu_beta: float
     swiglu_limit: float
 
     @staticmethod
@@ -67,6 +70,8 @@ class GptOssArch(CommonArch):
             arch_dict, "initial_context_length"
         )
         sliding_window = cfg.get_required_key(arch_dict, "sliding_window")
+        swiglu_alpha = cfg.get_required_key(arch_dict, "swiglu_alpha")
+        swiglu_beta = cfg.get_required_key(arch_dict, "swiglu_beta")
         swiglu_limit = cfg.get_required_key(arch_dict, "swiglu_limit")
 
         return GptOssArch(
@@ -81,6 +86,8 @@ class GptOssArch(CommonArch):
             rope_ntk_beta=rope_ntk_beta,
             initial_context_length=initial_context_length,
             sliding_window=sliding_window,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
         )
 
@@ -91,11 +98,11 @@ def create_fusion_map(model: nn.Module):
 
     Returns:
         A dictionary mapping {
-            fused_tensor_name: {"sources": [source_names], "dim": cat_dim, "type": type}
+            fused_tensor_name: {"sources": [source_names], "dim": cat_dim, "op": op_type, ...}
         }.
-        For MXFP4 tensors, type is "mxfp4" and sources contains [blocks_name, scales_name].
-        For fusion tensors, type is "fusion" and sources contains the tensors to concatenate.
-        For regular tensors, type is "regular" and sources contains the single tensor name.
+        For fusion tensors, op is "fusion" and sources contains the tensors to concatenate.
+        For MoE tensors, op is "prepare_moe_gate_up" or "prepare_moe_down" which dequantizes,
+        preprocesses, and re-quantizes the weights for the FlashInfer kernel.
     """
     fusion_map = {}
     for name, module in model.named_modules():
@@ -124,33 +131,212 @@ def create_fusion_map(model: nn.Module):
                     "op": "fusion",
                 }
 
-        # --- Rule for GptOssExperts MXFP4 Weights ---
-        elif isinstance(module, GptOssExperts):
-            # Handle gate_up_proj weights (MXFP4 format)
-            target_gate_up = f"{name}.gate_up_proj"
-            blocks_gate_up = f"{name}.gate_up_proj_blocks"
-            scales_gate_up = f"{name}.gate_up_proj_scales"
-            fusion_map[target_gate_up] = {
-                "sources": [blocks_gate_up, scales_gate_up],
-                "op": "dequantize_mxfp4",
-                "fp4_values": FP4_VALUES,
+            # Convert sinks from bfloat16 to float32 at load time
+            target_sinks = f"{name}.sinks"
+            fusion_map[target_sinks] = {
+                "sources": [target_sinks],
+                "op": "to_float32",
             }
 
-            # Handle down_proj weights (MXFP4 format)
-            target_down = f"{name}.down_proj"
+        # --- Rule for GptOssExperts MoE Weight Preparation ---
+        elif isinstance(module, GptOssExperts):
+            # Common config for MoE preparation
+            moe_config = {
+                "hidden_size": module.hidden_size,
+                "intermediate_size": module.intermediate_size,
+                "padded_hidden_size": module.padded_hidden_size,
+                "padded_intermediate_size": module.padded_intermediate_size,
+                "num_experts": module.num_experts,
+            }
+
+            # gate_up: MXFP4 weights + bias -> prepared gemm1 weights, scales, bias
+            blocks_gate_up = f"{name}.gate_up_proj_blocks"
+            scales_gate_up = f"{name}.gate_up_proj_scales"
+            bias_gate_up = f"{name}.gate_up_proj_bias"
+
+            fusion_map[f"{name}.gemm1_weights"] = {
+                "sources": [blocks_gate_up, scales_gate_up, bias_gate_up],
+                "op": "prepare_gptoss_moe_gate_up",
+                "output_type": "weights",
+                **moe_config,
+            }
+            fusion_map[f"{name}.gemm1_scales"] = {
+                "sources": [blocks_gate_up, scales_gate_up, bias_gate_up],
+                "op": "prepare_gptoss_moe_gate_up",
+                "output_type": "scales",
+                **moe_config,
+            }
+            fusion_map[f"{name}.gemm1_bias"] = {
+                "sources": [blocks_gate_up, scales_gate_up, bias_gate_up],
+                "op": "prepare_gptoss_moe_gate_up",
+                "output_type": "bias",
+                **moe_config,
+            }
+
+            # down: MXFP4 weights + bias -> prepared gemm2 weights, scales, bias
             blocks_down = f"{name}.down_proj_blocks"
             scales_down = f"{name}.down_proj_scales"
-            fusion_map[target_down] = {
-                "sources": [blocks_down, scales_down],
-                "op": "dequantize_mxfp4",
-                "fp4_values": FP4_VALUES,
+            bias_down = f"{name}.down_proj_bias"
+
+            fusion_map[f"{name}.gemm2_weights"] = {
+                "sources": [blocks_down, scales_down, bias_down],
+                "op": "prepare_gptoss_moe_down",
+                "output_type": "weights",
+                **moe_config,
+            }
+            fusion_map[f"{name}.gemm2_scales"] = {
+                "sources": [blocks_down, scales_down, bias_down],
+                "op": "prepare_gptoss_moe_down",
+                "output_type": "scales",
+                **moe_config,
+            }
+            fusion_map[f"{name}.gemm2_bias"] = {
+                "sources": [blocks_down, scales_down, bias_down],
+                "op": "prepare_gptoss_moe_down",
+                "output_type": "bias",
+                **moe_config,
             }
 
     return fusion_map
 
 
+class GptOssRMSNorm(nn.Module):
+    """GPT OSS RMS Normalization layer, which has a scaling parameter."""
+
+    def __init__(self, hidden_size: int, device: str, eps: float = 1e-6):
+        """RMS Normalization layer."""
+
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.ones(hidden_size, device=device, dtype=torch.float32)
+        )
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        """Forward pass through the RMS Normalization layer with scaling parameter."""
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * hidden_states).to(input_dtype)
+
+
+class GptOssRotaryEmbedding(nn.Module):
+    """Rotary Position Embedding with YaRN scaling support."""
+
+    def __init__(
+        self,
+        head_dim: int,
+        base: int,
+        dtype: torch.dtype,
+        initial_context_length: int = 4096,
+        scaling_factor: float = 1.0,
+        ntk_alpha: float = 1.0,
+        ntk_beta: float = 32.0,
+        device: torch.device | None = None,
+        max_position_id: int = 131072,
+    ) -> None:
+        super().__init__()
+        self.head_dim = head_dim
+        self.base = base
+        self.dtype = dtype
+        self.initial_context_length = initial_context_length
+        self.scaling_factor = scaling_factor
+        self.ntk_alpha = ntk_alpha
+        self.ntk_beta = ntk_beta
+        self.device = device
+        self.max_position_id = max_position_id
+
+        # Pre-compute concentration and inv_freq since they're constant
+        self._concentration, self._inv_freq = self._compute_concentration_and_inv_freq()
+
+        # Pre-compute the full cos/sin cache for all positions up to max_position_id
+        self._cos_sin_cache = self._precompute_cos_sin_cache()
+
+    def _compute_concentration_and_inv_freq(self) -> tuple[float, torch.Tensor]:
+        """See YaRN paper: https://arxiv.org/abs/2309.00071"""
+        freq = self.base ** (
+            torch.arange(0, self.head_dim, 2, dtype=torch.float, device=self.device)
+            / self.head_dim
+        )
+        if self.scaling_factor > 1.0:
+            concentration = (
+                0.1 * math.log(self.scaling_factor) + 1.0
+            )  # YaRN concentration
+
+            d_half = self.head_dim / 2
+            # NTK by parts
+            low = (
+                d_half
+                * math.log(self.initial_context_length / (self.ntk_beta * 2 * math.pi))
+                / math.log(self.base)
+            )
+            high = (
+                d_half
+                * math.log(self.initial_context_length / (self.ntk_alpha * 2 * math.pi))
+                / math.log(self.base)
+            )
+            assert 0 < low < high < d_half - 1
+
+            interpolation = 1.0 / (self.scaling_factor * freq)
+            extrapolation = 1.0 / freq
+
+            ramp = (
+                torch.arange(d_half, dtype=torch.float32, device=freq.device) - low
+            ) / (high - low)
+            mask = 1 - ramp.clamp(0, 1)
+
+            inv_freq = interpolation * (1 - mask) + extrapolation * mask
+        else:
+            concentration = 1.0
+            inv_freq = 1.0 / freq
+
+        return concentration, inv_freq
+
+    def _precompute_cos_sin_cache(self) -> torch.Tensor:
+        """Pre-compute cos/sin cache for all positions up to max_position_id."""
+        # Create position indices
+        position_ids = torch.arange(
+            self.max_position_id, dtype=torch.float32, device=self.device
+        )
+
+        # Compute frequencies for all positions
+        freqs = torch.einsum("i,j->ij", position_ids, self._inv_freq)
+
+        # Compute cos and sin values with concentration
+        cos_cache = freqs.cos() * self._concentration
+        sin_cache = freqs.sin() * self._concentration
+
+        # Concatenate cos and sin for FlashInfer format
+        # Shape: [max_position_id, head_dim] where head_dim contains
+        # [cos_0, cos_1, ..., sin_0, sin_1, ...]
+        cos_sin_cache = torch.cat([cos_cache, sin_cache], dim=-1)
+
+        # Ensure float32 precision for numerical accuracy
+        return cos_sin_cache.to(torch.float32)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary embedding to query and key tensors using position IDs."""
+        # Use FlashInfer's optimized RoPE function with pre-computed cache
+        ops.apply_rope_with_cos_sin_cache_inplace(
+            positions=position_ids.to(torch.int32),
+            query=query,
+            key=key,
+            head_size=self.head_dim,
+            cos_sin_cache=self._cos_sin_cache,
+            is_neox=True,  # GPT-OSS uses Neox-style RoPE
+        )
+
+        return query, key
+
+
 class GptOssAttention(nn.Module):
-    """GPT OSS attention module with attention sink."""
+    """GPT OSS attention module with attention sink using FlashInfer."""
 
     def __init__(self, config: GptOssArch, layer_idx: int, rope: GptOssRotaryEmbedding):
         """Initialize the GPT OSS attention module."""
@@ -160,22 +346,20 @@ class GptOssAttention(nn.Module):
         self.head_dim = config.head_size
         self.num_attention_heads = config.num_query_heads
         self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
-        # Apply sliding window to even layers and full attention to odd layers
-        # This follows the GPT-OSS alternating attention pattern
-        self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
 
         # Define the output sizes for Q, K, and V for clarity
         self.q_size = config.num_query_heads * config.head_size
         self.k_size = config.num_key_value_heads * config.head_size
         self.v_size = config.num_key_value_heads * config.head_size
 
-        # Sink tokens parameter
+        # Sink tokens parameter for attention sink
+        # Declared as float32 (converted from bfloat16 at load time via fusion_map)
+        # FlashInfer fused MoE kernel expects float32 sinks
         self.sinks = nn.Parameter(
             torch.empty(
                 config.num_query_heads,
                 device=torch.device(config.device),
-                dtype=config.dtype,
+                dtype=torch.float32,
             )
         )
 
@@ -200,214 +384,17 @@ class GptOssAttention(nn.Module):
 
         self.rope = rope
 
-    def _ceil_div(self, a: int, b: int) -> int:
-        return -(-a // b)
-
-    def _attend_one_page(
-        self,
-        query: torch.Tensor,
-        paged_keys: torch.Tensor,
-        paged_mask: torch.Tensor,
-        paged_values: torch.Tensor,
-        sum_exp: torch.Tensor,
-        sum_val: torch.Tensor,
-        max_score: torch.Tensor,
-    ):
-        page_attn_scores = einsum(query, paged_keys, "q h d, s h d -> h q s")
-        page_attn_scores = (page_attn_scores + paged_mask).to(torch.float32)
-        page_max_score = torch.max(page_attn_scores, dim=-1, keepdim=False).values
-
-        # Convert -inf elements to 0.0 in page_max_score
-        page_max_score = torch.where(
-            torch.isinf(page_max_score) & (page_max_score < 0),
-            torch.tensor(0.0, dtype=page_max_score.dtype, device=page_max_score.device),
-            page_max_score,
-        )
-
-        page_attn_scores = torch.exp(page_attn_scores - page_max_score.unsqueeze(-1))
-
-        page_sum_exp = torch.sum(page_attn_scores, dim=-1, keepdim=False)
-        page_sum_val = einsum(
-            page_attn_scores, paged_values.to(torch.float32), "h q s, s h d -> h q d"
-        )
-
-        new_max_score = torch.max(max_score, page_max_score)
-        alpha = torch.exp(max_score - new_max_score)
-        beta = torch.exp(page_max_score - new_max_score)
-
-        sum_exp = sum_exp * alpha + page_sum_exp * beta
-        sum_val = sum_val * alpha.unsqueeze(-1) + page_sum_val * beta.unsqueeze(-1)
-        max_score = new_max_score
-
-        return sum_val, sum_exp, max_score
-
-    def _paged_attention(
-        self,
-        queries: torch.Tensor,
-        qo_indptr: torch.IntTensor,
-        kv_page_indptr: torch.IntTensor,
-        kv_last_page_lens: torch.IntTensor,
-        kv_page_indices: torch.IntTensor,
-        attention_mask: torch.Tensor,
-        kv_cache_at_layer: torch.Tensor,
-    ):
-        output_embeds = torch.empty(
-            queries.shape[0],
-            self.config.hidden_size,
-            dtype=queries.dtype,
-            device=queries.device,
-        )
-        kv_page_size = kv_cache_at_layer.shape[2]
-        mask_offset = 0
-        batch_num = len(qo_indptr) - 1
-
-        for batch_idx in range(batch_num):
-            q_start = qo_indptr[batch_idx]
-            q_end = qo_indptr[batch_idx + 1]
-            query_len = int(q_end - q_start)
-
-            kv_page_start = int(kv_page_indptr[batch_idx])
-            kv_page_end = int(kv_page_indptr[batch_idx + 1])
-            kv_last_page_len = int(kv_last_page_lens[batch_idx])
-
-            seq_len = int(
-                (kv_page_end - kv_page_start - 1) * kv_page_size + kv_last_page_len
-            )
-
-            mask_len = seq_len * query_len
-            mask = attention_mask[mask_offset : mask_offset + mask_len].view(
-                query_len, seq_len
-            )
-            mask_offset += mask_len
-
-            # If this attention layer uses a sliding window, we keep only the last
-            # few pages of the KV cache and the corresponding mask.
-            if self.sliding_window != 0:
-                attn_page_cnt = 1 + self._ceil_div(
-                    self.sliding_window - kv_last_page_len, kv_page_size
-                )
-                kv_page_start = max(kv_page_start, kv_page_end - attn_page_cnt)
-
-                seq_len = int(
-                    (kv_page_end - kv_page_start - 1) * kv_page_size + kv_last_page_len
-                )
-
-                mask = mask[:, -seq_len:]
-
-            query = queries[q_start:q_end, :] * self.scaling
-
-            sum_exp = torch.zeros(
-                self.num_attention_heads,
-                query_len,
-                device=query.device,
-                dtype=torch.float32,
-            )
-            sum_val = torch.zeros(
-                self.num_attention_heads,
-                query_len,
-                self.head_dim,
-                device=query.device,
-                dtype=torch.float32,
-            )
-            max_score = torch.zeros(
-                self.num_attention_heads,
-                query_len,
-                device=query.device,
-                dtype=torch.float32,
-            )
-
-            # Attend to all but the last page, processing 32 pages at a time
-            for page_cnts, kv_page_idx_idxs in chunked_enumerate(
-                range(kv_page_start, kv_page_end - 1), 32
-            ):
-                chunk_kv_page_indices = kv_page_indices[kv_page_idx_idxs]
-
-                # Gather keys and values for all pages in the chunk at once
-                # Shape: [chunk_size, page_size, num_kv_heads, head_dim]
-                chunk_keys = kv_cache_at_layer[chunk_kv_page_indices, 0]
-                chunk_values = kv_cache_at_layer[chunk_kv_page_indices, 1]
-
-                # Reshape to concatenate pages as one page:
-                # [chunk_size * page_size, num_kv_heads, head_dim]
-                paged_keys = chunk_keys.view(
-                    -1, chunk_keys.shape[-2], chunk_keys.shape[-1]
-                )
-                paged_values = chunk_values.view(
-                    -1, chunk_values.shape[-2], chunk_values.shape[-1]
-                )
-
-                paged_keys = torch.repeat_interleave(
-                    paged_keys, self.num_key_value_groups, dim=1
-                )
-                paged_values = torch.repeat_interleave(
-                    paged_values, self.num_key_value_groups, dim=1
-                )
-
-                chunk_size = len(page_cnts)
-                mask_start = page_cnts[0] * kv_page_size
-                mask_end = mask_start + chunk_size * kv_page_size
-                paged_mask = mask[:, mask_start:mask_end].unsqueeze(0)
-
-                sum_val, sum_exp, max_score = self._attend_one_page(
-                    query,
-                    paged_keys,
-                    paged_mask,
-                    paged_values,
-                    sum_exp,
-                    sum_val,
-                    max_score,
-                )
-
-            # Attend to the last page
-            page_cnt = kv_page_end - kv_page_start - 1
-            kv_page_idx_idx = kv_page_end - 1
-
-            kv_page_idx = kv_page_indices[kv_page_idx_idx]
-            paged_keys = kv_cache_at_layer[kv_page_idx, 0][:kv_last_page_len]
-            paged_values = kv_cache_at_layer[kv_page_idx, 1][:kv_last_page_len]
-
-            paged_keys = torch.repeat_interleave(
-                paged_keys, self.num_key_value_groups, dim=1
-            )
-            paged_values = torch.repeat_interleave(
-                paged_values, self.num_key_value_groups, dim=1
-            )
-
-            paged_mask_offset = page_cnt * kv_page_size
-            paged_mask = mask[:, paged_mask_offset : paged_mask_offset + kv_page_size][
-                ..., :kv_last_page_len
-            ]
-            paged_mask = paged_mask.unsqueeze(0)
-
-            sum_val, sum_exp, max_score = self._attend_one_page(
-                query, paged_keys, paged_mask, paged_values, sum_exp, sum_val, max_score
-            )
-
-            adjusted_sinks = self.sinks.unsqueeze(-1) - max_score
-            adjusted_sinks = torch.exp(adjusted_sinks)
-            sum_exp += adjusted_sinks
-
-            attn_output = sum_val / sum_exp.unsqueeze(-1)
-            attn_output = rearrange(attn_output, "h q d -> q (h d)")
-
-            attn_output = self.o_proj(attn_output.to(queries.dtype))
-
-            output_embeds[q_start:q_end, :] = attn_output
-
-        return output_embeds
-
     def forward(
         self,
+        wrapper: BatchAttentionWithAttentionSinkWrapper,
         hidden_states: torch.Tensor,
         position_ids: torch.IntTensor,
-        qo_indptr: torch.IntTensor,
         kv_cache_at_layer: torch.Tensor,
         kv_page_indices: torch.IntTensor,
         kv_page_indptr: torch.IntTensor,
         kv_last_page_lens: torch.IntTensor,
         batch_indices: torch.IntTensor,
         batch_positions: torch.IntTensor,
-        attention_mask: torch.Tensor,
         adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the attention module."""
@@ -450,17 +437,18 @@ class GptOssAttention(nn.Module):
             kv_layout="NHD",
         )
 
-        new_attn_output = self._paged_attention(
+        # Run attention using FlashInfer with attention sink support
+        attn_output = wrapper.run(
             query_states,
-            qo_indptr,
-            kv_page_indptr,
-            kv_last_page_lens,
-            kv_page_indices,
-            attention_mask,
             kv_cache_at_layer[self.layer_idx],
+            self.sinks,
+            self.scaling,
         )
+        attn_output = attn_output.reshape(n, -1)
 
-        return new_attn_output
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
 
 
 class GptOssRouter(nn.Module):
@@ -489,102 +477,207 @@ class GptOssRouter(nn.Module):
             )
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the router."""
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Get raw router logits without top-k selection."""
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         router_logits = torch.nn.functional.linear(  # pylint: disable=not-callable
             hidden_states, self.weight, self.bias
         )
-
-        router_top_value, router_indices = torch.topk(
-            router_logits, self.experts_per_token, dim=-1, sorted=True
-        )
-
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1)
-        router_scores = torch.zeros_like(router_logits).scatter_(
-            1, router_indices, router_top_value
-        )
-        return router_scores, router_indices
+        return router_logits
 
 
 class GptOssExperts(nn.Module):
-    """GPT OSS Experts layer containing the actual expert parameters."""
+    """GPT OSS Experts layer using FlashInfer fused MoE with MXFP4 weights."""
 
     def __init__(self, config: GptOssArch):
         """Initialize the GPT OSS Experts layer."""
         super().__init__()
         self.config = config
         self.num_experts = config.num_experts
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.swiglu_alpha = config.swiglu_alpha
+        self.swiglu_beta = config.swiglu_beta
         self.swiglu_limit = config.swiglu_limit
+        self.experts_per_token = config.experts_per_token
 
-        self.gate_up_proj = nn.Parameter(
+        # Compute padded dimensions for FlashInfer alignment requirements
+        self.padded_hidden_size = pad_to_multiple(config.hidden_size, ALIGNMENT)
+        self.padded_intermediate_size = pad_to_multiple(
+            config.intermediate_size, ALIGNMENT
+        )
+
+        device = torch.device(config.device)
+
+        # Pre-processed MXFP4 weights for FlashInfer kernel
+        # These are loaded already prepared (quantized, shuffled) by model_loader
+        # Using register_buffer since these are inference-only weights
+        # (uint8/float8 can't have gradients)
+        self.register_buffer(
+            "gemm1_weights",
             torch.empty(
                 (
                     config.num_experts,
-                    config.intermediate_size * 2,
-                    config.hidden_size,
+                    self.padded_intermediate_size * 2,
+                    self.padded_hidden_size // 2,
                 ),
-                device=torch.device(config.device),
-                dtype=config.dtype,
-            )
+                device=device,
+                dtype=torch.uint8,
+            ),
         )
-        self.gate_up_proj_bias = nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.intermediate_size * 2),
-                device=torch.device(config.device),
-                dtype=config.dtype,
-            )
-        )
-        self.down_proj = nn.Parameter(
+        self.register_buffer(
+            "gemm1_scales",
             torch.empty(
                 (
                     config.num_experts,
-                    config.hidden_size,
-                    config.intermediate_size,
+                    self.padded_intermediate_size * 2,
+                    self.padded_hidden_size // 32,
                 ),
-                device=torch.device(config.device),
-                dtype=config.dtype,
-            )
+                device=device,
+                dtype=torch.float8_e4m3fn,
+            ),
         )
-        self.down_proj_bias = nn.Parameter(
+        self.register_buffer(
+            "gemm1_bias",
             torch.empty(
-                (config.num_experts, config.hidden_size),
-                device=torch.device(config.device),
-                dtype=config.dtype,
-            )
+                (config.num_experts, self.padded_intermediate_size * 2),
+                device=device,
+                dtype=torch.float32,
+            ),
         )
 
-    def forward(self, t: torch.Tensor, expert_indices: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the experts."""
+        self.register_buffer(
+            "gemm2_weights",
+            torch.empty(
+                (
+                    config.num_experts,
+                    self.padded_hidden_size,
+                    self.padded_intermediate_size // 2,
+                ),
+                device=device,
+                dtype=torch.uint8,
+            ),
+        )
+        self.register_buffer(
+            "gemm2_scales",
+            torch.empty(
+                (
+                    config.num_experts,
+                    self.padded_hidden_size,
+                    self.padded_intermediate_size // 32,
+                ),
+                device=device,
+                dtype=torch.float8_e4m3fn,
+            ),
+        )
+        self.register_buffer(
+            "gemm2_bias",
+            torch.empty(
+                (config.num_experts, self.padded_hidden_size),
+                device=device,
+                dtype=torch.float32,
+            ),
+        )
 
-        # Gate and Up projection
-        gate_up_proj = self.gate_up_proj[expert_indices, ...]
-        gate_up_proj_bias = self.gate_up_proj_bias[expert_indices, ...]
+        # Scale scalars for the kernel
+        self._output1_scale_scalar = torch.full((self.num_experts,), 1.0, device=device)
+        self._output1_scale_gate_scalar = torch.full(
+            (self.num_experts,), 1.0, device=device
+        )
+        self._output2_scale_scalar = torch.full((self.num_experts,), 1.0, device=device)
 
-        t = torch.einsum("beck,bk->bec", gate_up_proj, t) + gate_up_proj_bias
+        # Activation parameters for GPT OSS style SwiGLU
+        self._gemm1_alpha = torch.full(
+            (self.num_experts,),
+            self.swiglu_alpha,
+            device=device,
+            dtype=torch.float32,
+        )
+        self._gemm1_beta = torch.full(
+            (self.num_experts,),
+            self.swiglu_beta,
+            device=device,
+            dtype=torch.float32,
+        )
+        # Clamp limit for activation inputs
+        self._gemm1_clamp_limit = torch.full(
+            (self.num_experts,),
+            self.swiglu_limit,
+            device=device,
+            dtype=torch.float32,
+        )
 
-        # Inline swiglu function
-        x_glu, x_linear = t[..., ::2], t[..., 1::2]
+    def forward(
+        self, hidden_states: torch.Tensor, expert_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Forward pass through the experts using FlashInfer fused MoE.
 
-        # Clamp the input values
-        x_glu = x_glu.clamp(min=None, max=self.swiglu_limit)
-        x_linear = x_linear.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        out_glu = x_glu * torch.sigmoid(1.702 * x_glu)
+        Args:
+            hidden_states: Input tensor of shape [num_tokens, hidden_size]
+            expert_logits: Router logits of shape [num_tokens, num_experts]
 
-        # Add an extra bias of 1 to the linear layer
-        t = out_glu * (x_linear + 1)
+        Returns:
+            Output tensor of shape [num_tokens, hidden_size]
+        """
+        # Ensure hidden states are bfloat16
+        hidden_states_bf16 = hidden_states.to(torch.bfloat16)
 
-        # Down projection
-        down_proj = self.down_proj[expert_indices, ...]
-        down_proj_bias = self.down_proj_bias[expert_indices, ...]
+        # Pad hidden states if necessary
+        if self.hidden_size != self.padded_hidden_size:
+            num_tokens = hidden_states_bf16.shape[0]
+            padded_hidden = torch.zeros(
+                (num_tokens, self.padded_hidden_size),
+                dtype=hidden_states_bf16.dtype,
+                device=hidden_states_bf16.device,
+            )
+            padded_hidden[:, : self.hidden_size] = hidden_states_bf16
+            hidden_states_bf16 = padded_hidden
 
-        t = torch.einsum("beck,bek->bec", down_proj, t) + down_proj_bias
+        # Call FlashInfer fused MoE kernel with pre-loaded weights
+        output = ops.trtllm_fp4_block_scale_moe(
+            routing_logits=expert_logits.to(torch.bfloat16),
+            routing_bias=None,
+            hidden_states=hidden_states_bf16,
+            hidden_states_scale=None,
+            gemm1_weights=self.gemm1_weights,
+            gemm1_weights_scale=self.gemm1_scales,
+            gemm1_bias=self.gemm1_bias,
+            gemm1_alpha=self._gemm1_alpha,
+            gemm1_beta=self._gemm1_beta,
+            gemm1_clamp_limit=self._gemm1_clamp_limit,
+            gemm2_weights=self.gemm2_weights,
+            gemm2_weights_scale=self.gemm2_scales,
+            gemm2_bias=self.gemm2_bias,
+            output1_scale_scalar=self._output1_scale_scalar,
+            output1_scale_gate_scalar=self._output1_scale_gate_scalar,
+            output2_scale_scalar=self._output2_scale_scalar,
+            num_experts=self.num_experts,
+            top_k=self.experts_per_token,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=self.padded_intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=self.num_experts,
+            routed_scaling_factor=None,
+            tile_tokens_dim=None,
+            routing_method_type=1,  # 1: Renormalize (TopK -> Softmax)
+            gated_act_type=0,  # 0: SwiGlu
+            do_finalize=True,
+            tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+        )
 
-        return t
+        output = output[0]
+
+        # Strip padding from output
+        if self.hidden_size != self.padded_hidden_size:
+            output = output[:, : self.hidden_size]
+
+        return output.to(hidden_states.dtype)
 
 
 class GptOssMlp(nn.Module):
-    """GPT OSS MLP layer with Mixture of Experts."""
+    """GPT OSS MLP layer with Mixture of Experts using FlashInfer fused MoE."""
 
     def __init__(self, config: GptOssArch):
         """Initialize the GPT OSS MLP layer."""
@@ -595,19 +688,14 @@ class GptOssMlp(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the MLP layer."""
-        # Router determines expert selection and weights
-        router_scores, router_indices = self.router(x)
+        # Get router logits (the fused MoE kernel handles routing internally)
+        router_logits = self.router(x)
 
-        # Extract the weights for selected experts
-        expert_weights = torch.gather(router_scores, 1, router_indices)
+        # Forward through experts with fused MoE
+        # The FlashInfer kernel handles top-k selection, softmax, and weighted sum
+        output = self.experts(x, router_logits)
 
-        # Forward through experts
-        t = self.experts(x, router_indices)
-
-        # Weighted sum of experts
-        t = torch.einsum("bec,be->bc", t, expert_weights)
-
-        return t
+        return output
 
 
 class GptOssDecoderLayer(nn.Module):
@@ -637,17 +725,16 @@ class GptOssDecoderLayer(nn.Module):
 
     def forward(
         self,
+        wrapper_window: BatchAttentionWithAttentionSinkWrapper,
+        wrapper_full: BatchAttentionWithAttentionSinkWrapper,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        qo_indptr: torch.Tensor,
         kv_cache_at_layer: torch.Tensor,
         kv_page_indices: torch.Tensor,
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
-        full_mask: torch.Tensor,
-        window_mask: torch.Tensor,
         adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the decoder layer."""
@@ -655,18 +742,21 @@ class GptOssDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
+        # Select wrapper based on layer index:
+        # Even layers use sliding window attention, odd layers use full attention
+        wrapper = wrapper_window if self.layer_idx % 2 == 0 else wrapper_full
+
         # Self Attention
         hidden_states = self.self_attn(
+            wrapper=wrapper,
             hidden_states=hidden_states,
             position_ids=position_ids,
-            qo_indptr=qo_indptr,
             kv_cache_at_layer=kv_cache_at_layer,
             kv_page_indices=kv_page_indices,
             kv_page_indptr=kv_page_indptr,
             kv_last_page_lens=kv_last_page_lens,
             batch_indices=batch_indices,
             batch_positions=batch_positions,
-            attention_mask=window_mask if self.layer_idx % 2 == 0 else full_mask,
             adapter_subpass=adapter_subpass,
         )
 
@@ -709,6 +799,36 @@ class GptOssModel(nn.Module):
         )
         self.sliding_window = config.sliding_window
 
+        # Create separate workspace buffers for each FlashInfer wrapper
+        self.workspace_buffer_window = torch.empty(
+            128 * 1024 * 1024, dtype=torch.uint8, device=config.device
+        )
+        self.workspace_buffer_full = torch.empty(
+            128 * 1024 * 1024, dtype=torch.uint8, device=config.device
+        )
+
+        # Create wrapper for even layers (with sliding window attention)
+        self.wrapper_window = BatchAttentionWithAttentionSinkWrapper(
+            float_workspace_buffer=self.workspace_buffer_window,
+            kv_layout="NHD",
+            window_left=config.sliding_window - 1,
+            q_data_type=config.dtype,
+            kv_data_type=config.dtype,
+            head_dim_qk=config.head_size,
+            head_dim_vo=config.head_size,
+        )
+
+        # Create wrapper for odd layers (full attention, no sliding window)
+        self.wrapper_full = BatchAttentionWithAttentionSinkWrapper(
+            float_workspace_buffer=self.workspace_buffer_full,
+            kv_layout="NHD",
+            window_left=-1,
+            q_data_type=config.dtype,
+            kv_data_type=config.dtype,
+            head_dim_qk=config.head_size,
+            head_dim_vo=config.head_size,
+        )
+
     def forward(
         self,
         input_embeds: torch.Tensor,
@@ -724,83 +844,72 @@ class GptOssModel(nn.Module):
     ) -> torch.Tensor:
         """Forward pass through the GPT OSS model."""
 
-        # The current naive implementation does not distinguish between
+        # The current implementation does not distinguish between
         # single-token inference mode and batch inference mode
         _ = single_token_inference_mode
+        # custom_mask is not used with attention sink wrapper
+        _ = custom_mask
 
         hidden_states = input_embeds
         n, _ = hidden_states.size()
 
         page_size = kv_cache_at_layer[0].shape[2]
 
+        seq_lens = ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size)
+
         batch_indices, batch_positions = ops.get_batch_indices_positions(
             append_indptr=qo_indptr,
-            seq_lens=ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size),
+            seq_lens=seq_lens,
             nnz=n,
         )
 
-        batch_num = len(qo_indptr) - 1
-
-        full_mask = custom_mask
-        window_mask = custom_mask.clone()
-
-        # For window attention layers, set the mask to 0 for positions that are
-        # outside the sliding window.
-        mask_offset = 0
-        for batch_idx in range(batch_num):
-            q_start = qo_indptr[batch_idx]
-            q_end = qo_indptr[batch_idx + 1]
-
-            kv_page_start = kv_page_indptr[batch_idx]
-            kv_page_end = kv_page_indptr[batch_idx + 1]
-
-            query_len = int(q_end - q_start)
-            seq_len = int(
-                (kv_page_end - kv_page_start - 1) * page_size
-                + kv_last_page_lens[batch_idx]
-            )
-            mask_len = seq_len * query_len
-
-            mask = window_mask[mask_offset : mask_offset + mask_len]
-            mask_offset += mask_len
-
-            mask = mask.view(query_len, seq_len)
-
-            pos_id = position_ids[q_start:q_end]
-            for q_idx in range(query_len):
-                mask[
-                    q_idx, : max(0, int(pos_id[q_idx]) - (self.sliding_window - 1))
-                ] = 0
-
-        full_mask = torch.where(
-            full_mask,
-            torch.tensor(0.0, dtype=input_embeds.dtype, device=input_embeds.device),
-            torch.tensor(
-                float("-inf"), dtype=input_embeds.dtype, device=input_embeds.device
-            ),
+        # Wrapper for windowed attention (even layers)
+        self.wrapper_window.plan(
+            qo_indptr,
+            kv_page_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            self.config.num_query_heads,
+            self.config.num_key_value_heads,
+            self.config.head_size,
+            page_size,
+            causal=True,
+            window_left=self.sliding_window - 1,
+            q_data_type=self.config.dtype,
+            kv_data_type=self.config.dtype,
+            non_blocking=True,
         )
-        window_mask = torch.where(
-            window_mask,
-            torch.tensor(0.0, dtype=input_embeds.dtype, device=input_embeds.device),
-            torch.tensor(
-                float("-inf"), dtype=input_embeds.dtype, device=input_embeds.device
-            ),
+
+        # Wrapper for full attention (odd layers)
+        self.wrapper_full.plan(
+            qo_indptr,
+            kv_page_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            self.config.num_query_heads,
+            self.config.num_key_value_heads,
+            self.config.head_size,
+            page_size,
+            causal=True,
+            window_left=-1,
+            q_data_type=self.config.dtype,
+            kv_data_type=self.config.dtype,
+            non_blocking=True,
         )
 
         for decoder_layer in self.layers:
 
             layer_outputs = decoder_layer(
+                wrapper_window=self.wrapper_window,
+                wrapper_full=self.wrapper_full,
                 hidden_states=hidden_states,
                 position_ids=position_ids,
-                qo_indptr=qo_indptr,
                 kv_cache_at_layer=kv_cache_at_layer,
                 kv_page_indices=kv_page_indices,
                 kv_page_indptr=kv_page_indptr,
                 kv_last_page_lens=kv_last_page_lens,
                 batch_indices=batch_indices,
                 batch_positions=batch_positions,
-                full_mask=full_mask,
-                window_mask=window_mask,
                 adapter_subpass=adapter_subpass,
             )
 
