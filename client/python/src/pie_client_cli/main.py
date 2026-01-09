@@ -78,7 +78,14 @@ PrivateKeyPathOption = Annotated[
 
 @app.command()
 def submit(
-    inferlet: Annotated[Path, typer.Argument(help="Path to the .wasm inferlet file.")],
+    inferlet: Annotated[
+        Optional[str],
+        typer.Argument(help="Inferlet name from registry (e.g., 'std/text-completion@0.1.0')"),
+    ] = None,
+    path: Annotated[
+        Optional[Path],
+        typer.Option("--path", "-p", help="Path to a local .wasm inferlet file"),
+    ] = None,
     config: ConfigOption = None,
     host: HostOption = None,
     port: PortOption = None,
@@ -96,10 +103,17 @@ def submit(
         Optional[list[str]], typer.Argument(help="Arguments to pass to the inferlet.")
     ] = None,
 ) -> None:
-    """Submit an inferlet to a running Pie engine."""
+    """Submit an inferlet to a running Pie engine.
+
+    You can specify an inferlet either by registry name or by path (mutually exclusive):
+
+    - By registry: pie-client submit std/text-completion@0.1.0
+    - By path: pie-client submit --path ./my_inferlet.wasm
+    """
     try:
         submit_cmd.handle_submit_command(
-            inferlet=expand_path(inferlet),
+            inferlet=inferlet,
+            path=expand_path(path),
             config=expand_path(config),
             host=host,
             port=port,

@@ -90,7 +90,8 @@ def compose_components(program_bytes: bytes, library_paths: list[Path]) -> bytes
 
 
 def handle_submit_command(
-    inferlet: Path,
+    inferlet: Optional[str] = None,
+    path: Optional[Path] = None,
     config: Optional[Path] = None,
     host: Optional[str] = None,
     port: Optional[int] = None,
@@ -102,13 +103,31 @@ def handle_submit_command(
 ) -> None:
     """Handle the `pie-cli submit` command.
 
+    You can specify an inferlet either by registry name or by path (mutually exclusive):
+
+    - By registry: pie-client submit std/text-completion@0.1.0
+    - By path: pie-client submit --path ./my_inferlet.wasm
+
+    Steps:
     1. Creates a client configuration from config file and command-line arguments
     2. Connects to the Pie engine server
-    3. If libraries are specified, composes them with the inferlet using wac
-    4. Uploads the composed inferlet if not already on server
+    3. If using path and libraries are specified, composes them with the inferlet using wac
+    4. Uploads the composed inferlet if not already on server (path mode only)
     5. Launches the inferlet with the provided arguments
     6. In non-detached mode, streams the inferlet output with signal handling
     """
+    # Validate at least one of inferlet or path is provided
+    if inferlet is None and path is None:
+        typer.echo("Error: Specify an inferlet name or --path", err=True)
+        raise typer.Exit(1)
+
+    # Handle the case where --path is used with -- separator
+    # Positional args after -- get captured as `inferlet` first, so
+    # prepend it to `arguments` instead
+    if inferlet is not None and path is not None:
+        arguments = [inferlet] + (arguments or [])
+        inferlet = None
+
     link = link or []
     arguments = arguments or []
 
@@ -123,36 +142,53 @@ def handle_submit_command(
     client = engine.connect_and_authenticate(client_config)
 
     try:
-        # Read the main inferlet
-        if not inferlet.exists():
-            raise FileNotFoundError(f"Inferlet file not found: {inferlet}")
+        if path is not None:
+            # Launch from local file path
+            if not path.exists():
+                raise FileNotFoundError(f"Inferlet file not found: {path}")
 
-        inferlet_blob = inferlet.read_bytes()
+            inferlet_blob = path.read_bytes()
 
-        # If libraries are specified, compose them with the main inferlet
-        if link:
-            final_blob = compose_components(inferlet_blob, link)
+            # If libraries are specified, compose them with the main inferlet
+            if link:
+                final_blob = compose_components(inferlet_blob, link)
+            else:
+                final_blob = inferlet_blob
+
+            # Calculate the hash of the final composed blob
+            program_hash = blake3.blake3(final_blob).hexdigest()
+            typer.echo(f"Final inferlet hash: {program_hash}")
+
+            # Upload the composed inferlet to the server
+            if not engine.program_exists(client, program_hash):
+                engine.upload_program(client, final_blob)
+                typer.echo("✅ Inferlet upload successful.")
+            else:
+                typer.echo("Inferlet already exists on server.")
+
+            # Launch the instance
+            instance = engine.launch_instance(
+                client,
+                program_hash,
+                arguments,
+                detached,
+            )
         else:
-            final_blob = inferlet_blob
+            # Launch from registry
+            if link:
+                typer.echo(
+                    "Warning: --link option is ignored when launching from registry",
+                    err=True,
+                )
 
-        # Calculate the hash of the final composed blob
-        program_hash = blake3.blake3(final_blob).hexdigest()
-        typer.echo(f"Final inferlet hash: {program_hash}")
+            typer.echo(f"Launching from registry: {inferlet}")
 
-        # Upload the composed inferlet to the server
-        if not engine.program_exists(client, program_hash):
-            engine.upload_program(client, final_blob)
-            typer.echo("✅ Inferlet upload successful.")
-        else:
-            typer.echo("Inferlet already exists on server.")
-
-        # Launch the instance
-        instance = engine.launch_instance(
-            client,
-            program_hash,
-            arguments,
-            detached,
-        )
+            instance = engine.launch_instance_from_registry(
+                client,
+                inferlet,
+                arguments,
+                detached,
+            )
 
         typer.echo(f"✅ Inferlet launched with ID: {instance.instance_id}")
 
