@@ -41,10 +41,7 @@ pie config init
 # 2. Download a model
 pie model download Qwen/Qwen3-0.6B
 
-# 3. Start the engine
-pie serve
-
-# 4. (In another terminal) Run an inferlet
+# 3. Run an inferlet
 pie run ./my_inferlet.wasm -- --prompt "Hello, world!"
 ```
 

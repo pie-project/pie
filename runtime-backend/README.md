@@ -19,24 +19,3 @@ For Metal (macOS) support:
 ```bash
 pip install -e ".[metal]"
 ```
-
-### Verification
-
-To verify the installation and environment compatibility, run:
-
-```bash
-pie-backend --doctor
-```
-
-
-
-## Project Structure
-
-```
-backend-python/
-├── pyproject.toml       # Project configuration
-├── src/
-│   └── pie_backend/
-│       ├── runtime.py   # Runtime module
-│       └── server.py    # Server module
-```
