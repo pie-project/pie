@@ -82,12 +82,18 @@ def start_server(
         test_t.start()
 
     # Setup shutdown signal handlers
+    # IMPORTANT: We raise KeyboardInterrupt instead of just setting an event,
+    # because the pycrust worker loop (in Rust) only exits on KeyboardInterrupt.
+    # This ensures iceoryx2 resources are properly cleaned up on SIGTERM.
     def shutdown_handler(signum, _frame):
         if not shutdown_event.is_set():
             msg = f"\nReceived signal {signum}, shutting down server..."
             if log_queue:
                 log_queue.put({"level": "DEBUG", "message": msg})
             shutdown_event.set()
+            # Raise KeyboardInterrupt to make pycrust worker exit cleanly
+            # This allows iceoryx2 to cleanup its semaphores properly
+            raise KeyboardInterrupt()
 
     signal.signal(signal.SIGTERM, shutdown_handler)
     signal.signal(signal.SIGINT, shutdown_handler)
@@ -125,7 +131,7 @@ def start_server(
                 )
 
         # Stop remaining threads
-        if reg_t.is_alive():
+        if reg_t and reg_t.is_alive():
             reg_t.join(timeout=2.0)
         if test_t and test_t.is_alive():
             test_t.join(timeout=2.0)
