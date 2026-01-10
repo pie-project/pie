@@ -148,7 +148,7 @@ fn start_server(
         let rt = Arc::new(tokio::runtime::Runtime::new()
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?);
 
-        let internal_token = rt.block_on(async {
+        let (internal_token, shutdown_tx) = rt.block_on(async {
             let authorized_users = match authorized_users_path {
                 Some(path) => AuthorizedUsers::load(&PathBuf::from(path)).map_err(|e| {
                     PyRuntimeError::new_err(format!("Failed to load authorized users: {}", e))
@@ -176,17 +176,10 @@ fn start_server(
             Ok::<(String, oneshot::Sender<()>), PyErr>((internal_token, shutdown_tx))
         })?;
 
-        let (token, shutdown_tx) = internal_token;
-
-        // Keep the runtime alive by leaking it (it will be cleaned up when the handle is dropped)
-        // We use Arc to share the runtime
-        let runtime_clone = Arc::clone(&rt);
-        std::mem::forget(rt);
-
         Ok(ServerHandle {
-            internal_token: token,
+            internal_token,
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
-            runtime: runtime_clone,
+            runtime: rt,
         })
     })
 }
