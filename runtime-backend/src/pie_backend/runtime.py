@@ -59,15 +59,15 @@ class Runtime:
     adapters: dict
 
     # Logging
-    log_queue: object | None
+    log_queue: object
 
-    def __init__(self, config: RuntimeConfig, log_queue: object | None = None):
+    def __init__(self, config: RuntimeConfig, log_queue: object):
         """
         Initialize the runtime.
 
         Args:
             config: Runtime configuration
-            log_queue: Optional queue for sending logs back to controller
+            log_queue: Queue for sending logs back to controller
         """
         self.config = config
         self.log_queue = log_queue
