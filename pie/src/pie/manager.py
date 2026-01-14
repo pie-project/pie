@@ -487,7 +487,7 @@ def _start_multi_gpu_ffi_backend(
     # Wait for ALL workers to signal they've connected to IPC
     # Each worker sends its rank when ready
     for _ in range(world_size):
-        rank = ready_queue.get(timeout=120)  # 2 minute timeout for model loading
+        rank = ready_queue.get(timeout=240)  # 2 minute timeout for model loading
 
     # Clean up the ready_queue to prevent semaphore leak
     ready_queue.close()
