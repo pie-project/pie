@@ -774,7 +774,6 @@ class ForwardPass:
             local_expert_offset=0,
             local_num_experts=cfg.num_experts,
             routed_scaling_factor=None,
-            tile_tokens_dim=None,
             routing_method_type=1,  # Renormalize (TopK -> Softmax)
             gated_act_type=0,  # SwiGlu
             do_finalize=True,
