@@ -9,6 +9,7 @@ members = [
     "constrained-decoding",
     "graph-of-thought",
     "helloworld",
+    "http-server",
     "image-fetch",
     "jacobi-decoding",
     "kvs",

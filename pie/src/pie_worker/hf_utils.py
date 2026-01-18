@@ -20,6 +20,8 @@ HF_TO_PIE_ARCH = {
     "qwen3": "qwen3",
     "gptoss": "gptoss",
     "gpt_oss": "gptoss",  # HuggingFace config may use underscore variant
+    "gemma2": "gemma2",
+    "gemma3_text": "gemma3",
 }
 
 
@@ -112,7 +114,7 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
         "special_tokens": {},
         "split_regex": "",
         "escape_non_printable": False,
-        "escape_non_printable": False,
+        "sentencepiece_space": False,
     }
 
     # Load tokenizer.json for vocabulary
@@ -138,11 +140,21 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
                 continue
 
         # Auto-detect escape_non_printable
-        # If the vocabulary contains U+0100 (Ā), it likely uses the byte-level mapping
-        # where non-printable bytes are mapped to unicode characters starting at U+0100.
-        # This is common in GPT-2, RoBERTa, and Qwen tokenizers.
-        if "Ā" in vocab or "\u0100" in vocab:
+        # GPT-2, RoBERTa, and Qwen tokenizers use a byte-level mapping where
+        # non-printable bytes are mapped to unicode characters starting at U+0100.
+        # The key indicator is a standalone single-character token "Ā" (U+0100)
+        # at a LOW token ID (< 256), which represents byte 0x00 in these tokenizers.
+        # If "Ā" exists but has a HIGH token ID (like 239503 in Gemma 2), it's just
+        # a linguistic character, not a byte-level mapping token.
+        A_macron_id = vocab.get("\u0100")  # U+0100 = Ā
+        if A_macron_id is not None and A_macron_id < 256:
             result["escape_non_printable"] = True
+
+        # Auto-detect SentencePiece tokenizers
+        # SentencePiece uses ▁ (U+2581) to encode spaces at word boundaries.
+        # Check if any of the first 1000 tokens contain this character.
+        sentencepiece_detected = any("▁" in tok for tok in list(vocab.keys())[:1000])
+        result["sentencepiece_space"] = sentencepiece_detected
 
         result["merge_table"] = merge_table
 
@@ -170,7 +182,10 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
 
         # Extract pre_tokenizer pattern (split_regex)
         pre_tokenizer = tokenizer_data.get("pre_tokenizer", {})
-        if pre_tokenizer.get("type") == "Sequence":
+        pt_type = pre_tokenizer.get("type", "")
+        
+        if pt_type == "Sequence":
+            # Common case: Sequence of pretokenizers (GPT-style, Qwen)
             pretokenizers = pre_tokenizer.get("pretokenizers", [])
             for pt in pretokenizers:
                 if pt.get("type") == "Split" and "pattern" in pt:
@@ -178,6 +193,27 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
                     if isinstance(pattern, dict) and "Regex" in pattern:
                         result["split_regex"] = pattern["Regex"]
                         break
+        elif pt_type == "Split":
+            # Direct Split pretokenizer (Gemma 2)
+            pattern = pre_tokenizer.get("pattern", {})
+            if isinstance(pattern, dict):
+                if "Regex" in pattern:
+                    result["split_regex"] = pattern["Regex"]
+                elif "String" in pattern:
+                    # Simple string split (e.g., " ") - escape for regex
+                    import re
+                    escaped = re.escape(pattern["String"])
+                    # Create a regex that splits on the pattern but keeps content
+                    # For space-based splitting, match non-space runs
+                    if pattern["String"] == " ":
+                        result["split_regex"] = r"[^ ]+"
+                    else:
+                        result["split_regex"] = f"[^{escaped}]+"
+        
+        # Fallback: if no split_regex found, use a sensible default
+        # This matches Unicode word characters and non-space sequences
+        if not result.get("split_regex"):
+            result["split_regex"] = r"[^\s]+"
 
     return result
 

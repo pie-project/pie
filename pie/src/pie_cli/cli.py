@@ -8,6 +8,7 @@ import typer
 from . import config, model, auth
 from .serve import serve
 from .run import run
+from .http import http
 from .doctor import doctor
 
 app = typer.Typer(
@@ -19,6 +20,7 @@ app = typer.Typer(
 # Register top-level commands
 app.command()(serve)
 app.command()(run)
+app.command()(http)
 app.command()(doctor)
 
 # Register subcommand groups

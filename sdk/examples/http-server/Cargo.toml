@@ -1,0 +1,11 @@
+[package]
+name = "http-server"
+version = "0.1.0"
+edition = "2024"
+description = "A simple HTTP server inferlet demonstrating the wasi:http/incoming-handler interface"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wstd = "0.5.6"

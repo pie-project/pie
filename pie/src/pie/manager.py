@@ -249,6 +249,7 @@ def _build_backend_config(
         ),
         "random_seed": model_config.get("random_seed", 42),
         "use_cuda_graphs": model_config.get("use_cuda_graphs", False),
+        "dummy_mode": model_config.get("dummy_mode", False),
     }
 
     # Add device with correct key

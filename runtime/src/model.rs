@@ -362,6 +362,7 @@ impl Model {
             handshake_info.tokenizer_special_tokens,
             &handshake_info.tokenizer_split_regex,
             handshake_info.tokenizer_escape_non_printable,
+            handshake_info.tokenizer_sentencepiece_space,
         ));
 
         let info = ModelInfo {

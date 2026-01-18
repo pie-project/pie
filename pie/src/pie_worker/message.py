@@ -40,6 +40,7 @@ class HandshakeResponse(msgspec.Struct, gc=False):
     tokenizer_special_tokens: dict[str, int]
     tokenizer_split_regex: str
     tokenizer_escape_non_printable: bool
+    tokenizer_sentencepiece_space: bool
 
 
 class QueryRequest(msgspec.Struct, gc=False):

@@ -297,3 +297,48 @@ Qwen3Template = ChatTemplate(
     template=_QWEN_3_TEMPLATE_CONTENT,
     stop_tokens=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
 )
+
+# Gemma 2 chat template
+# Note: Gemma 2 doesn't support system messages natively.
+# This template prepends system content to the first user message.
+_GEMMA_2_TEMPLATE_CONTENT = """
+{%- set system_message = "" -%}
+{%- for m in messages -%}
+{%- if m.role == "system" -%}
+{%- set system_message = m.content -%}
+{%- endif -%}
+{%- endfor -%}
+<bos>
+{%- for m in messages -%}
+{%- if m.role == "user" -%}
+<start_of_turn>user
+{%- if loop.first and system_message -%}
+{{ system_message }}
+
+{{ m.content }}<end_of_turn>
+{%- else -%}
+{{ m.content }}<end_of_turn>
+{%- endif -%}
+{%- elif m.role == "assistant" -%}
+<start_of_turn>model
+{{ m.content }}<end_of_turn>
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+<start_of_turn>model
+{%- endif -%}
+"""
+
+Gemma2Template = ChatTemplate(
+    template_type="minijinja",
+    template=_GEMMA_2_TEMPLATE_CONTENT,
+    stop_tokens=["<end_of_turn>", "<eos>"],
+)
+
+# Gemma 3 chat template
+# Same format as Gemma 2 - uses the same template structure
+Gemma3Template = ChatTemplate(
+    template_type="minijinja",
+    template=_GEMMA_2_TEMPLATE_CONTENT,  # Same template as Gemma 2
+    stop_tokens=["<end_of_turn>", "<eos>"],
+)

@@ -27,6 +27,7 @@ def load_config(
     cache_dir: str | None = None,
     log_dir: str | None = None,
     registry: str | None = None,
+    dummy_mode: bool = False,
 ) -> tuple[dict, list[dict]]:
     """Load and merge configuration from file and CLI arguments.
 
@@ -84,6 +85,11 @@ def load_config(
         console.print("[red]✗[/red] No model configuration found")
         raise typer.Exit(1)
 
+    # Apply dummy_mode override from CLI
+    if dummy_mode:
+        for model_config in model_configs:
+            model_config["dummy_mode"] = True
+
     return engine_config, model_configs
 
 
@@ -107,6 +113,9 @@ def serve(
     monitor: bool = typer.Option(
         False, "--monitor", "-m", help="Launch real-time TUI monitor"
     ),
+    dummy: bool = typer.Option(
+        False, "--dummy", help="Enable dummy mode (skip GPU weight loading, return random tokens)"
+    ),
 ) -> None:
     """Start the Pie engine and enter an interactive session.
 
@@ -122,6 +131,7 @@ def serve(
             verbose=verbose,
             cache_dir=cache_dir,
             log_dir=log_dir,
+            dummy_mode=dummy,
         )
     except typer.Exit:
         raise

@@ -65,6 +65,9 @@ class RuntimeConfig:
         str  # "auto", "float32", "float16", "bfloat16", "int4", "int8", "float8"
     )
 
+    # Dummy mode - skip GPU weight loading, return random tokens
+    dummy_mode: bool = False
+
     # =========================================================================
     # Convenience Properties (formerly in model.Config)
     # =========================================================================
@@ -151,6 +154,7 @@ class RuntimeConfig:
         use_cuda_graphs: bool = True,
         tensor_parallel_size: int = 1,
         adapter_path: str | None = None,
+        dummy_mode: bool = False,
     ) -> "RuntimeConfig":
         """
         Factory method to build a validated and resolved RuntimeConfig.
@@ -174,6 +178,7 @@ class RuntimeConfig:
             telemetry_enabled: Enable telemetry/tracing
             telemetry_endpoint: OTLP endpoint for traces
             telemetry_service_name: Service name in traces
+            dummy_mode: Skip GPU weight loading and return random tokens
 
         Returns:
             Configured RuntimeConfig instance
@@ -243,6 +248,7 @@ class RuntimeConfig:
             weight_dtype=weight_dtype,
             tensor_parallel_size=tensor_parallel_size,
             adapter_path=resolved_adapter_path,
+            dummy_mode=dummy_mode,
         )
 
     def print(self) -> None:

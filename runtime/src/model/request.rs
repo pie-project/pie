@@ -134,6 +134,7 @@ pub struct HandshakeResponse {
     pub tokenizer_special_tokens: HashMap<String, u32>,
     pub tokenizer_split_regex: String,
     pub tokenizer_escape_non_printable: bool,
+    pub tokenizer_sentencepiece_space: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
