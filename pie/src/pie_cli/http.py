@@ -34,6 +34,9 @@ def http(
     dummy: bool = typer.Option(
         False, "--dummy", help="Enable dummy mode (skip GPU weight loading, return random tokens)"
     ),
+    pie_port: Optional[int] = typer.Option(
+        None, "--pie-port", help="Port for the internal Pie engine to listen on"
+    ),
     arguments: Optional[list[str]] = typer.Argument(
         None, help="Arguments to pass to the inferlet"
     ),
@@ -72,6 +75,7 @@ def http(
             config,
             log_dir=str(log.parent) if log else None,
             dummy_mode=dummy,
+            port=pie_port,
         )
     except typer.Exit:
         raise

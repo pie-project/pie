@@ -116,6 +116,38 @@ impl StreamEmitter {
         })
     }
 
+    /// Emit response.function_call_arguments.delta
+    pub fn function_call_arguments_delta(
+        &mut self,
+        item_id: &str,
+        call_id: &str,
+        output_index: u32,
+        delta: &str,
+    ) -> String {
+        self.format_event("response.function_call_arguments.delta", FunctionCallArgumentsDeltaData {
+            item_id: item_id.to_string(),
+            call_id: call_id.to_string(),
+            output_index,
+            delta: delta.to_string(),
+        })
+    }
+
+    /// Emit response.function_call_arguments.done
+    pub fn function_call_arguments_done(
+        &mut self,
+        item_id: &str,
+        call_id: &str,
+        output_index: u32,
+        arguments: &str,
+    ) -> String {
+        self.format_event("response.function_call_arguments.done", FunctionCallArgumentsDoneData {
+            item_id: item_id.to_string(),
+            call_id: call_id.to_string(),
+            output_index,
+            arguments: arguments.to_string(),
+        })
+    }
+
     /// Emit response.output_item.done
     pub fn output_item_done(&mut self, output_index: u32, item: &OutputItem) -> String {
         self.format_event("response.output_item.done", OutputItemDoneData {

@@ -270,6 +270,20 @@ impl Context {
         self.flush_chat_messages2(false);
     }
 
+    pub fn fill_tool(&mut self, text: &str) {
+        self.formatter.tool(text);
+        self.flush_chat_messages2(false);
+    }
+
+    pub fn fill_assistant_tool_call(&mut self, name: &str, arguments: serde_json::Value) {
+        let tool_call = crate::chat::ToolCall {
+            name: name.to_string(),
+            arguments,
+        };
+        self.formatter.assistant_response("", None::<&str>, Some(vec![tool_call]));
+        self.flush_chat_messages2(false);
+    }
+
     pub fn mask_tokens(&mut self, indices: &[usize], mask: bool) {
         self.token_mask_current.mask(indices, mask)
     }

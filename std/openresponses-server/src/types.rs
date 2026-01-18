@@ -364,3 +364,21 @@ pub struct OutputTextDoneData {
     pub content_index: u32,
     pub text: String,
 }
+
+/// response.function_call_arguments.delta event data
+#[derive(Debug, Serialize)]
+pub struct FunctionCallArgumentsDeltaData {
+    pub item_id: String,
+    pub call_id: String,
+    pub output_index: u32,
+    pub delta: String,
+}
+
+/// response.function_call_arguments.done event data
+#[derive(Debug, Serialize)]
+pub struct FunctionCallArgumentsDoneData {
+    pub item_id: String,
+    pub call_id: String,
+    pub output_index: u32,
+    pub arguments: String,
+}
