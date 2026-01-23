@@ -265,6 +265,10 @@ impl ForwardPass {
         api::forward::attention_mask(&self.inner, mask);
     }
 
+    pub fn sampling_mask(&self, mask: &[u32]) {
+        api::forward::sampling_mask(&self.inner, mask);
+    }
+
     pub fn kv_cache(&self, kv_pages: &[KvPage], last_kv_page_len: usize) {
         let ptrs = kv_pages.iter().map(|kv| kv.ptr()).collect::<Vec<_>>();
         api::forward::kv_cache(&self.inner, &ptrs, last_kv_page_len as u32);

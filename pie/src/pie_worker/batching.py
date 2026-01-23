@@ -31,6 +31,7 @@ class Batch:
         kv_page_size: int,
         max_dist_size: int,
         adapters: dict[int, Any],
+        vocab_size: int | None = None,
     ) -> None:
         """
         Initialize a Batch from BatchedForwardPassRequest dict.
@@ -40,6 +41,7 @@ class Batch:
             kv_page_size: KV cache page size from model config
             max_dist_size: Max distribution size from model config
             adapters: Dictionary of active adapters
+            vocab_size: Model vocabulary size (optional, needed for sampling masks)
         """
         # Initialize timing dict as instance attribute
         self.timing: dict[str, float] = {
@@ -178,6 +180,32 @@ class Batch:
         else:
             self.indices_for_logits = []
 
+        # ===== SAMPLING MASK HANDLING =====
+        self.sampling_masks = None
+        if vocab_size is not None and "sampling_masks" in args:
+            sampling_masks_u32 = _decode_u32(args["sampling_masks"]).astype(np.int32)
+            sampling_mask_indptr = _decode_u32(args["sampling_mask_indptr"]).astype(
+                np.int32
+            )
+
+            # Check if we have any sampling masks at all
+            if len(sampling_masks_u32) > 0:
+                # 1. Decode per-request masks (num_requests, vocab_size)
+                # Initialize to True (allow all) so empty masks work as expected
+                per_request_masks = decode_sampling_masks(
+                    sampling_masks_u32, sampling_mask_indptr, num_requests, vocab_size
+                )
+
+                # 2. Expand to match logits (tokens per request)
+                # If doing single-token decoding, indices_per_request is all 1s
+                # Logic matches indices_for_logits expansion
+                if len(self.indices_for_logits) > 0:
+                    # Use indices_per_request from earlier (diff of output_token_indptr)
+                    # We repeat the per-request mask rows
+                    self.sampling_masks = np.repeat(
+                        per_request_masks, indices_per_request, axis=0
+                    )
+
         # ===== ADAPTER HANDLING (still needs per-request loop for now) =====
         adapter_indices = args["adapter_indices"]
         adapter_seeds = args["adapter_seeds"]
@@ -283,6 +311,11 @@ class Batch:
             "top_k": top_k_tensor,
             "top_p": top_p_tensor,
             "min_p": min_p_tensor,
+            "sampling_masks": (
+                torch.as_tensor(self.sampling_masks, device=device, dtype=torch.bool)
+                if self.sampling_masks is not None
+                else None
+            ),
         }
 
     def create_responses(
@@ -385,5 +418,64 @@ def decode_brle_batch(
             bits_consumed += eff_len
             curr_bit_pos += eff_len
             is_true_run = not is_true_run
+
+    return result
+
+
+@njit(cache=True)
+def decode_sampling_masks(
+    flattened_masks: np.ndarray,
+    mask_indptr: np.ndarray,
+    num_requests: int,
+    vocab_size: int,
+) -> np.ndarray:
+    """
+    Decode BRLE sampling masks.
+
+    Args:
+        flattened_masks: Concatenated BRLE run lengths (int32)
+        mask_indptr: Pointers to BRLE ranges per request (int32)
+        num_requests: Number of requests
+        vocab_size: Size of vocabulary (dim 1 of output)
+
+    Returns:
+        Boolean array of shape (num_requests, vocab_size).
+        Initialized to True (allow all). BRLE runs are applied on top.
+    """
+    result = np.ones((num_requests, vocab_size), dtype=np.bool_)
+
+    for i in range(num_requests):
+        rle_start = mask_indptr[i]
+        rle_end = mask_indptr[i + 1]
+
+        # If empty RLE, we leave as True (allow all)
+        if rle_end == rle_start:
+            continue
+
+        # Standard BRLE decoding
+        curr_pos = 0
+        is_true_run = True  # Starts with True runs
+
+        for run_idx in range(rle_start, rle_end):
+            if curr_pos >= vocab_size:
+                break
+
+            run_len = flattened_masks[run_idx]
+            remaining = vocab_size - curr_pos
+            eff_len = min(run_len, remaining)
+
+            if eff_len > 0:
+                if not is_true_run:
+                    # Set to False
+                    result[i, curr_pos : curr_pos + eff_len] = False
+                # Else leave as True
+
+            curr_pos += eff_len
+            is_true_run = not is_true_run
+
+        # If RLE ended before vocab_size, remaining are left as True (since we init to True)
+        # This is safe? Usually mask covers full range.
+        # If mask is short, we assume trailing are allowed? Or blocked?
+        # Protocol should assert full coverage, but 'allow' is safer default.
 
     return result

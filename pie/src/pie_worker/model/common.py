@@ -231,6 +231,10 @@ def sample_common(
     # Apply lm_head_fn
     logits = lm_head_fn(logits_input)
 
+    # Apply sampling mask
+    if (sampling_masks := sampling_metadata.get("sampling_masks")) is not None:
+        logits.masked_fill_(~sampling_masks, -float("inf"))
+
     # Apply safe_scaled_softmax
     temperatures = sampling_metadata["temperatures"]
     probs = safe_scaled_softmax(logits, temperatures)
