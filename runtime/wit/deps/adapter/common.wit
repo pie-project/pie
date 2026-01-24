@@ -13,7 +13,7 @@ interface common {
         queue: borrow<queue>,
         adapter-ptr: pointer,
         name: string
-    );
+    ) -> blob-result;
 
     upload-adapter: func(
         queue: borrow<queue>,
