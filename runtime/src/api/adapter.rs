@@ -29,16 +29,24 @@ impl inferlet::adapter::common::Host for InstanceState {
         queue: Resource<Queue>,
         mut adapter_ptr: ResourceId,
         name: String,
-    ) -> Result<()> {
+    ) -> Result<Resource<crate::api::core::BlobResult>> {
         let (svc_id, queue_id, priority) = self.read_queue(&queue)?;
 
         adapter_ptr = self.translate_resource_ptr(svc_id, ADAPTER_TYPE_ID, adapter_ptr)?;
 
+        let (tx, rx) = tokio::sync::oneshot::channel();
         let req = Request::DownloadAdapter(DownloadAdapterRequest { adapter_ptr, name });
 
         submit_request(svc_id, queue_id, priority, req)?;
 
-        Ok(())
+        // TODO: The actual download should send the blob data through tx
+        // For now, create a BlobResult that will receive the data
+        let blob_result = crate::api::core::BlobResult {
+            receiver: rx,
+            result: None,
+            done: false,
+        };
+        Ok(self.ctx().table.push(blob_result)?)
     }
 
     async fn upload_adapter(

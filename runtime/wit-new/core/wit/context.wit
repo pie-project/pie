@@ -16,9 +16,6 @@ interface context {
         // Merges another context into this one
         join: func(other: borrow<context>);
 
-        // Dropping is implicit in WIT resources, but explicit method requested
-        drop: func();
-
         // Acquires a lock on the context, returning a lock result
         lock: func() -> future-bool;
 

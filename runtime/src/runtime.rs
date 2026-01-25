@@ -134,6 +134,12 @@ pub enum Command {
         username: String,
         event: oneshot::Sender<Vec<message::InstanceInfo>>,
     },
+
+    Spawn {
+        package_name: String,
+        args: Vec<String>,
+        result: oneshot::Sender<String>,
+    },
 }
 
 impl ServiceCommand for Command {
@@ -392,6 +398,21 @@ impl Service for Runtime {
                 instances.truncate(50);
 
                 event.send(instances).unwrap();
+            }
+
+            Command::Spawn {
+                package_name,
+                args,
+                result,
+            } => {
+                // TODO: Implement spawning child inferlet
+                // For now, return a placeholder error message
+                // In a full implementation, this would:
+                // 1. Look up the package by name
+                // 2. Launch a new instance 
+                // 3. Wait for it to complete
+                // 4. Send the return value through the result channel
+                let _ = result.send(format!("spawn not yet implemented: {} {:?}", package_name, args));
             }
 
         }

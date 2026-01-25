@@ -1,5 +1,7 @@
 interface runtime {
 
+    use types.{future-string};
+
     // Returns the runtime version string
     version: func() -> string;
 
@@ -17,5 +19,9 @@ interface runtime {
 
     // Sets the return value for the inferlet
     set-return: func(value: string);
+
+    // Spawns a new inferlet with the given package name and arguments
+    // Returns the result of the spawned inferlet
+    spawn: func(package-name: string, args: list<string>) -> future-string;
 
 }

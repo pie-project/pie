@@ -1,0 +1,76 @@
+//! pie:zo/zo - Zero-Order Optimization functions
+
+use crate::api_new::pie;
+use crate::api_new::types::Queue;
+use crate::api_new::inference::ForwardPass;
+use crate::api_new::adapter::Adapter;
+use crate::instance::InstanceState;
+use crate::model::request::{InitializeAdapterRequest, Request, UpdateAdapterRequest};
+use crate::model::submit_request;
+use anyhow::Result;
+use wasmtime::component::Resource;
+use wasmtime_wasi::WasiView;
+
+impl pie::zo::zo::Host for InstanceState {
+    async fn adapter_seed(&mut self, pass: Resource<ForwardPass>, seed: i64) -> Result<()> {
+        let pass = self.ctx().table.get_mut(&pass)?;
+        // Store seed for adapter perturbation
+        // In the new API, we'll need to extend ForwardPass to store this
+        let _ = (pass, seed);
+        Ok(())
+    }
+
+    async fn initialize(
+        &mut self,
+        adapter: Resource<Adapter>,
+        queue: Resource<Queue>,
+        rank: u32,
+        alpha: f32,
+        population_size: u32,
+        mu_fraction: f32,
+        initial_sigma: f32,
+    ) -> Result<()> {
+        let queue_data = self.ctx().table.get(&queue)?;
+        let svc_id = queue_data.service_id;
+        let queue_id = queue_data.uid;
+        
+        let adapter = self.ctx().table.get(&adapter)?;
+
+        let req = Request::InitializeAdapter(InitializeAdapterRequest {
+            adapter_ptr: adapter.ptr,
+            rank,
+            alpha,
+            population_size,
+            mu_fraction,
+            initial_sigma,
+        });
+
+        submit_request(svc_id, queue_id, 0, req)?;
+        Ok(())
+    }
+
+    async fn update(
+        &mut self,
+        adapter: Resource<Adapter>,
+        queue: Resource<Queue>,
+        scores: Vec<f32>,
+        seeds: Vec<i64>,
+        max_sigma: f32,
+    ) -> Result<()> {
+        let queue_data = self.ctx().table.get(&queue)?;
+        let svc_id = queue_data.service_id;
+        let queue_id = queue_data.uid;
+        
+        let adapter = self.ctx().table.get(&adapter)?;
+
+        let req = Request::UpdateAdapter(UpdateAdapterRequest {
+            adapter_ptr: adapter.ptr,
+            scores,
+            seeds,
+            max_sigma,
+        });
+
+        submit_request(svc_id, queue_id, 0, req)?;
+        Ok(())
+    }
+}

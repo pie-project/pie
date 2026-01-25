@@ -5,6 +5,7 @@
 
 // Public modules (core engine logic)
 pub mod api;
+pub mod api_new;
 pub mod auth;
 pub mod dummy;
 pub mod engine;
