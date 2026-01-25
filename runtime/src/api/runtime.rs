@@ -30,21 +30,11 @@ impl pie::core::runtime::Host for InstanceState {
         Ok(model::registered_models())
     }
 
-    async fn arguments(&mut self) -> Result<Vec<String>> {
-        let args = InstanceState::arguments(self);
-        Ok(args.to_vec())
-    }
-
-    async fn set_return(&mut self, value: String) -> Result<()> {
-        self.return_value = Some(value);
-        Ok(())
-    }
-
     async fn spawn(
         &mut self,
         package_name: String,
         args: Vec<String>,
-    ) -> Result<Resource<FutureString>> {
+    ) -> Result<Result<Resource<FutureString>, String>> {
         let (tx, rx) = oneshot::channel();
         
         // Dispatch spawn command to runtime
@@ -56,6 +46,6 @@ impl pie::core::runtime::Host for InstanceState {
         .dispatch();
 
         let future_string = FutureString::new(rx);
-        Ok(self.ctx().table.push(future_string)?)
+        Ok(Ok(self.ctx().table.push(future_string)?))
     }
 }

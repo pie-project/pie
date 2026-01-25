@@ -194,7 +194,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         &mut self,
         this: Resource<ForwardPass>,
         queue: Resource<Queue>,
-    ) -> Result<Resource<FutureOutput>> {
+    ) -> Result<Result<Resource<FutureOutput>, String>> {
         let queue_data = self.ctx().table.get(&queue)?;
         let svc_id = queue_data.service_id;
         let queue_id = queue_data.uid;
@@ -229,7 +229,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             result: None,
             done: false,
         };
-        Ok(self.ctx().table.push(future_output)?)
+        Ok(Ok(self.ctx().table.push(future_output)?))
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {

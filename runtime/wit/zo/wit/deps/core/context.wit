@@ -1,7 +1,7 @@
 interface context {
 
     use wasi:io/poll@0.2.4.{pollable};
-    use types.{future-bool};
+    use types.{error, future-bool};
 
     resource context {
         // Creates a new context, optionally with a name
@@ -11,13 +11,10 @@ interface context {
         get: static func(name: string) -> option<context>;
 
         // Forks this context into a new one with the given name
-        fork: func(new-name: string) -> context;
+        fork: func(new-name: string) -> result<context, error>;
 
         // Merges another context into this one
-        join: func(other: borrow<context>);
-
-        // Dropping is implicit in WIT resources, but explicit method requested
-        drop: func();
+        join: func(other: borrow<context>) -> result<_, error>;
 
         // Acquires a lock on the context, returning a lock result
         lock: func() -> future-bool;
@@ -26,10 +23,10 @@ interface context {
         unlock: func();
 
         // Grows the context capacity
-        grow: func(size: u32);
+        grow: func(size: u32) -> result<_, error>;
 
         // Shrinks the context capacity
-        shrink: func(size: u32);
+        shrink: func(size: u32) -> result<_, error>;
     }
 
 }

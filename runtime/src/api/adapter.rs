@@ -49,13 +49,13 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         Ok(())
     }
 
-    async fn load(&mut self, _this: Resource<Adapter>, _queue: Resource<Queue>, _path: String) -> Result<()> {
+    async fn load(&mut self, _this: Resource<Adapter>, _queue: Resource<Queue>, _path: String) -> Result<Result<(), String>> {
         // TODO: Load adapter weights from path
-        Ok(())
+        Ok(Ok(()))
     }
 
-    async fn save(&mut self, _this: Resource<Adapter>, _queue: Resource<Queue>, _path: String) -> Result<()> {
+    async fn save(&mut self, _this: Resource<Adapter>, _queue: Resource<Queue>, _path: String) -> Result<Result<(), String>> {
         // TODO: Save adapter weights to path
-        Ok(())
+        Ok(Ok(()))
     }
 }

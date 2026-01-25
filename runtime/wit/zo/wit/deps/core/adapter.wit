@@ -1,13 +1,7 @@
 interface adapter {
     use wasi:io/poll@0.2.4.{pollable};
 
-    use types.{queue, future-bool};
-    use inference.{forward-pass};
-
-    use-adapter: func(
-        pass: borrow<forward-pass>,
-        adapter: borrow<adapter>
-    );
+    use types.{queue, error, future-bool};
     
     resource adapter {
 
@@ -17,15 +11,13 @@ interface adapter {
 
         clone: func(name:string) -> adapter;
 
-        drop: func();
-
         lock: func() -> future-bool;
 
         unlock: func();
 
-        load: func(queue: borrow<queue>, path:string);
+        load: func(queue: borrow<queue>, path:string) -> result<_, error>;
 
-        save: func(queue: borrow<queue>, path:string);
+        save: func(queue: borrow<queue>, path:string) -> result<_, error>;
 
     }
 

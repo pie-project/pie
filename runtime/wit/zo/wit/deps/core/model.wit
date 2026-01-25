@@ -1,5 +1,7 @@
 interface model {
 
+    use types.{error};
+
     // Resource representing a specific model instance
     resource model {
         constructor(name: string);
@@ -15,7 +17,7 @@ interface model {
         tokenize: func(text: string) -> list<u32>;
 
         // Converts token IDs back into a decoded string
-        detokenize: func(tokens: list<u32>) -> string;
+        detokenize: func(tokens: list<u32>) -> result<string, error>;
 
         // Returns the tokenizer's vocabulary as a list of byte sequences (tokens)
         vocabs: func() -> tuple<list<u32>, list<list<u8>>>;

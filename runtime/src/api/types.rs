@@ -89,10 +89,6 @@ impl pie::core::types::HostQueue for InstanceState {
         anyhow::bail!("Queue::new not yet implemented")
     }
 
-    async fn get_service_id(&mut self, this: Resource<Queue>) -> Result<u32> {
-        Ok(self.ctx().table.get(&this)?.service_id as u32)
-    }
-
     async fn synchronize(&mut self, _this: Resource<Queue>) -> Result<Resource<FutureBool>> {
         // TODO: Implement synchronization
         anyhow::bail!("Queue::synchronize not yet implemented")

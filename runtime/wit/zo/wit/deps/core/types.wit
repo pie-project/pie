@@ -2,10 +2,11 @@ interface types {
 
     use wasi:io/poll@0.2.4.{pollable};
 
+    type error = string;
+
     // Queue resource with methods for synchronization and priority control
     resource queue {
         constructor();
-        get-service-id: func() -> u32;
         synchronize: func() -> future-bool; // Begin synchronization process
     }
 

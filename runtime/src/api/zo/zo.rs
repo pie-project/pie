@@ -29,7 +29,7 @@ impl pie::zo::zo::Host for InstanceState {
         population_size: u32,
         mu_fraction: f32,
         initial_sigma: f32,
-    ) -> Result<()> {
+    ) -> Result<Result<(), String>> {
         let queue_data = self.ctx().table.get(&queue)?;
         let svc_id = queue_data.service_id;
         let queue_id = queue_data.uid;
@@ -46,7 +46,7 @@ impl pie::zo::zo::Host for InstanceState {
         });
 
         submit_request(svc_id, queue_id, 0, req)?;
-        Ok(())
+        Ok(Ok(()))
     }
 
     async fn update(
@@ -56,7 +56,7 @@ impl pie::zo::zo::Host for InstanceState {
         scores: Vec<f32>,
         seeds: Vec<i64>,
         max_sigma: f32,
-    ) -> Result<()> {
+    ) -> Result<Result<(), String>> {
         let queue_data = self.ctx().table.get(&queue)?;
         let svc_id = queue_data.service_id;
         let queue_id = queue_data.uid;
@@ -71,6 +71,6 @@ impl pie::zo::zo::Host for InstanceState {
         });
 
         submit_request(svc_id, queue_id, 0, req)?;
-        Ok(())
+        Ok(Ok(()))
     }
 }

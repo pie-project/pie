@@ -26,16 +26,16 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(None)
     }
 
-    async fn fork(&mut self, this: Resource<Context>, new_name: String) -> Result<Resource<Context>> {
+    async fn fork(&mut self, this: Resource<Context>, new_name: String) -> Result<Result<Resource<Context>, String>> {
         let _parent = self.ctx().table.get(&this)?;
         // TODO: Fork KV cache pages
         let forked = Context { name: new_name };
-        Ok(self.ctx().table.push(forked)?)
+        Ok(Ok(self.ctx().table.push(forked)?))
     }
 
-    async fn join(&mut self, _this: Resource<Context>, _other: Resource<Context>) -> Result<()> {
+    async fn join(&mut self, _this: Resource<Context>, _other: Resource<Context>) -> Result<Result<(), String>> {
         // TODO: Merge contexts
-        Ok(())
+        Ok(Ok(()))
     }
 
     async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
@@ -53,13 +53,13 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(())
     }
 
-    async fn grow(&mut self, _this: Resource<Context>, _size: u32) -> Result<()> {
+    async fn grow(&mut self, _this: Resource<Context>, _size: u32) -> Result<Result<(), String>> {
         // TODO: Grow context capacity
-        Ok(())
+        Ok(Ok(()))
     }
 
-    async fn shrink(&mut self, _this: Resource<Context>, _size: u32) -> Result<()> {
+    async fn shrink(&mut self, _this: Resource<Context>, _size: u32) -> Result<Result<(), String>> {
         // TODO: Shrink context capacity
-        Ok(())
+        Ok(Ok(()))
     }
 }

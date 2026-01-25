@@ -67,12 +67,12 @@ impl pie::core::model::HostTokenizer for InstanceState {
         Ok(tokenizer.inner.encode_with_special_tokens(&text))
     }
 
-    async fn detokenize(&mut self, this: Resource<Tokenizer>, tokens: Vec<u32>) -> Result<String> {
+    async fn detokenize(&mut self, this: Resource<Tokenizer>, tokens: Vec<u32>) -> Result<Result<String, String>> {
         let tokenizer = self.ctx().table.get(&this)?;
-        tokenizer
-            .inner
-            .decode(&tokens)
-            .map_err(|e| anyhow::anyhow!("Failed to decode tokens: {:?}", e))
+        match tokenizer.inner.decode(&tokens) {
+            Ok(s) => Ok(Ok(s)),
+            Err(e) => Ok(Err(format!("Failed to decode tokens: {:?}", e))),
+        }
     }
 
     async fn vocabs(&mut self, this: Resource<Tokenizer>) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
