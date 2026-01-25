@@ -1,0 +1,29 @@
+interface model {
+
+    // Resource representing a specific model instance
+    resource model {
+        constructor(name: string);
+        prompt-template: func() -> string;       // Returns the prompt formatting template in Tera
+        stop-tokens: func() -> list<string>;
+        tokenizer: func() -> tokenizer;
+    }
+
+    // Tokenizer resource for encoding and decoding text
+    resource tokenizer {
+
+        // Converts input text into a list of token IDs
+        tokenize: func(text: string) -> list<u32>;
+
+        // Converts token IDs back into a decoded string
+        detokenize: func(tokens: list<u32>) -> string;
+
+        // Returns the tokenizer's vocabulary as a list of byte sequences (tokens)
+        vocabs: func() -> tuple<list<u32>, list<list<u8>>>;
+
+        // Returns the split regular expression used by the tokenizer
+        split-regex: func() -> string;
+
+        // Returns the special tokens recognized by the tokenizer
+        special-tokens: func() -> tuple<list<u32>, list<list<u8>>>;
+    }
+}

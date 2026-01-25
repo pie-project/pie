@@ -1,0 +1,28 @@
+interface types {
+
+    use wasi:io/poll@0.2.4.{pollable};
+
+    // Queue resource with methods for synchronization and priority control
+    resource queue {
+        constructor();
+        get-service-id: func() -> u32;
+        synchronize: func() -> future-bool; // Begin synchronization process
+    }
+
+    // Result of a synchronization attempt
+    resource future-bool {
+        pollable: func() -> pollable;               // Returns a pollable for async readiness checks
+        get: func() -> option<bool>;                // Returns true if sync succeeded, false if failed, none if not ready
+    }
+
+
+    // Result of an async receive operation
+    resource future-string {
+        // Pollable to check readiness
+        pollable: func() -> pollable;
+
+        // Retrieves the message if available; None if not ready
+        get: func() -> option<string>;
+    }
+
+}

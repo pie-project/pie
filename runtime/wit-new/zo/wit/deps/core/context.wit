@@ -1,0 +1,35 @@
+interface context {
+
+    use wasi:io/poll@0.2.4.{pollable};
+    use types.{future-bool};
+
+    resource context {
+        // Creates a new context, optionally with a name
+        constructor(name: string);
+
+        // Retrieves an existing context by name
+        get: static func(name: string) -> option<context>;
+
+        // Forks this context into a new one with the given name
+        fork: func(new-name: string) -> context;
+
+        // Merges another context into this one
+        join: func(other: borrow<context>);
+
+        // Dropping is implicit in WIT resources, but explicit method requested
+        drop: func();
+
+        // Acquires a lock on the context, returning a lock result
+        lock: func() -> future-bool;
+
+        // Releases the lock
+        unlock: func();
+
+        // Grows the context capacity
+        grow: func(size: u32);
+
+        // Shrinks the context capacity
+        shrink: func(size: u32);
+    }
+
+}

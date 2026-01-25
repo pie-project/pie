@@ -1,0 +1,70 @@
+interface inference {
+
+    use wasi:io/poll@0.2.4.{pollable};
+    use types.{queue};
+    use context.{context};
+    use model.{model};
+    use adapter.{adapter};
+
+    resource forward-pass {
+        constructor(model: borrow<model>);
+
+        kv-page-size: func() -> u32; // Get the size of a KV page
+
+        context: func(
+            context: borrow<context>,
+        );
+
+        input-tokens: func(
+            tokens: list<u32>,
+            positions: list<u32>,
+        );
+
+        input-speculative-tokens: func(
+            tokens: list<u32>,
+            positions: list<u32>,
+        );
+
+        attention-mask: func(
+            mask: list<list<u32>>,
+        );
+
+        sampling-mask: func(
+            mask: list<u32>,
+        );
+
+        sampler: func(
+            indices: list<u32>,
+            sampler: sampler,
+        );
+
+        adapter: func(
+            adapter: borrow<adapter>,
+        );
+
+        execute: func(queue: borrow<queue>) -> future-output;
+    }
+
+    variant sampler {
+        multinomial(tuple<f32, u32>),
+        top-k(tuple<f32, u32>),
+        top-p(tuple<f32, f32>),
+        min-p(tuple<f32, f32>),
+        top-k-top-p(tuple<f32, u32, f32>),
+        dist(tuple<f32, u32>),
+    }
+
+    resource future-output {
+        // Returns a pollable object to check when the result is ready
+        pollable: func() -> pollable;
+
+        get: func() -> option<output>;
+    }
+
+    variant output {
+        none,
+        tokens(list<u32>),
+        distributions(list<tuple<list<u32>, list<f32>>>) // Each tuple: (token IDs, associated probabilities)
+    }
+
+}
