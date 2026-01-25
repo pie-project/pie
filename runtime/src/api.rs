@@ -1,31 +1,43 @@
-pub mod core;
-pub mod image;
-
+pub mod types;
+pub mod context;
+pub mod model;
+pub mod inference;
+pub mod messaging;
 pub mod adapter;
-pub mod zo;
-pub mod actor;
+pub mod runtime;
 
+pub mod mcp;
+pub mod zo;
+
+use crate::instance::InstanceState;
 use wasmtime::component::HasSelf;
 
 wasmtime::component::bindgen!({
     path: "wit",
-    world: "exec",
+    world: "inferlet",
     with: {
         "wasi:io/poll": wasmtime_wasi::p2::bindings::io::poll,
-        "inferlet:core/common.blob-result": core::BlobResult,
-        "inferlet:core/common.model": core::Model,
-        "inferlet:core/common.queue": core::Queue,
-        "inferlet:core/common.blob": core::Blob,
-        "inferlet:core/common.debug-query-result": core::DebugQueryResult,
-        "inferlet:core/common.synchronization-result": core::SynchronizationResult,
-        "inferlet:core/message.subscription": core::message::Subscription,
-        "inferlet:core/message.receive-result": core::message::ReceiveResult,
-        "inferlet:core/forward.forward-pass": core::forward::ForwardPass,
-        "inferlet:core/forward.forward-pass-result": core::forward::ForwardPassResult,
-        "inferlet:core/tokenize.tokenizer": core::tokenize::Tokenizer,
-        "inferlet:actor/common.global-context": actor::GlobalContext,
-        "inferlet:actor/common.adapter": actor::Adapter,
-        "inferlet:actor/common.optimizer": actor::Optimizer,
+        // pie:core/types
+        "pie:core/types.queue": types::Queue,
+        "pie:core/types.future-bool": types::FutureBool,
+        "pie:core/types.future-string": types::FutureString,
+        // pie:core/context
+        "pie:core/context.context": context::Context,
+        // pie:core/model
+        "pie:core/model.model": model::Model,
+        "pie:core/model.tokenizer": model::Tokenizer,
+        // pie:core/inference
+        "pie:core/inference.forward-pass": inference::ForwardPass,
+        "pie:core/inference.future-output": inference::FutureOutput,
+        // pie:core/messaging
+        "pie:core/messaging.subscription": messaging::Subscription,
+        // pie:core/adapter
+        "pie:core/adapter.adapter": adapter::Adapter,
+        // pie:mcp/types
+        "pie:mcp/types.future-content": mcp::FutureContent,
+        "pie:mcp/types.future-json-string": mcp::FutureJsonString,
+        // pie:mcp/client
+        "pie:mcp/client.session": mcp::Session,
     },
     imports: { default: async | trappable },
     exports: { default: async },
@@ -33,27 +45,27 @@ wasmtime::component::bindgen!({
 
 pub fn add_to_linker<T>(linker: &mut wasmtime::component::Linker<T>) -> Result<(), wasmtime::Error>
 where
-    T: inferlet::core::common::Host
-        + inferlet::core::forward::Host
-        + inferlet::core::tokenize::Host
-        + inferlet::core::runtime::Host
-        + inferlet::core::kvs::Host
-        + inferlet::core::message::Host
-        + inferlet::adapter::common::Host
-        + inferlet::zo::evolve::Host
-        + inferlet::image::image::Host
-        + inferlet::actor::common::Host,
+    T: pie::core::types::Host
+        + pie::core::context::Host
+        + pie::core::model::Host
+        + pie::core::inference::Host
+        + pie::core::messaging::Host
+        + pie::core::adapter::Host
+        + pie::core::runtime::Host
+        + pie::mcp::types::Host
+        + pie::mcp::client::Host
+        + pie::zo::zo::Host,
 {
-    inferlet::core::common::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    inferlet::core::forward::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    inferlet::core::tokenize::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    inferlet::core::runtime::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    inferlet::core::kvs::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    inferlet::core::message::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    inferlet::adapter::common::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    inferlet::zo::evolve::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    inferlet::image::image::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    inferlet::actor::common::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::context::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::model::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::inference::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::messaging::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::adapter::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::runtime::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::mcp::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::mcp::client::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::zo::zo::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
 
     Ok(())
 }

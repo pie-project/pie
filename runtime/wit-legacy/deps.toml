@@ -1,0 +1,5 @@
+core = "./core/wit"
+adapter = "./adapter/wit"
+image = "./image/wit"
+zo = "./zo/wit"
+actor = "./actor/wit"

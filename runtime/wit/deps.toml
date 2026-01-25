@@ -1,5 +1,3 @@
 core = "./core/wit"
-adapter = "./adapter/wit"
-image = "./image/wit"
+mcp = "./mcp/wit"
 zo = "./zo/wit"
-actor = "./actor/wit"

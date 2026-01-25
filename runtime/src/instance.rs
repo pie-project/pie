@@ -1,4 +1,4 @@
-use super::api::core::Queue;
+use super::api_legacy::core::Queue;
 use super::utils;
 use crate::model::resource::{ResourceId, ResourceTypeId};
 use crate::server::InstanceEvent;
