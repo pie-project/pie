@@ -5,7 +5,9 @@ interface adapter {
     
     resource adapter {
 
-        constructor(name:string);
+        create: static func(name:string) -> result<adapter, error>;
+
+        destroy: func() -> result<_, error>;
 
         get: static func(name:string) -> option<adapter>;
 

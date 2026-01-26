@@ -3,9 +3,11 @@ use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
+use anyhow::Result;
 
 /// Unique identifier for a context.
 pub type ContextId = u64;
+pub type LockId = u64;
 
 /// Model-indexed dispatcher for context services.
 static CONTEXT_DISPATCHER: LazyLock<ContextDispatcher> = LazyLock::new(|| ContextDispatcher {
@@ -46,12 +48,21 @@ pub enum Command {
     /// Creates a new context with the given name.
     /// Returns the ID of the newly created context.
     Create {
+        user_id: u32,
         name: String,
-        response: oneshot::Sender<ContextId>,
+        response: oneshot::Sender<Result<ContextId>>,
     },
+
+    Destroy {
+        id: ContextId,
+        lock_id: LockId,
+        response: oneshot::Sender<Result<()>>,
+    },
+
     /// Retrieves an existing context by name.
     /// Returns the context ID if found.
     Get {
+        user_id: u32,
         name: String,
         response: oneshot::Sender<Option<ContextId>>,
     },
@@ -66,29 +77,32 @@ pub enum Command {
     Join {
         target_id: ContextId,
         other_id: ContextId,
-        response: oneshot::Sender<bool>,
+        lock_id: LockId,
+        response: oneshot::Sender<Result<()>>,
     },
     /// Acquires a lock on the context.
     Lock {
         id: ContextId,
-        response: oneshot::Sender<bool>,
+        response: oneshot::Sender<LockId>,
     },
     /// Releases the lock on the context.
     Unlock {
         id: ContextId,
-        response: oneshot::Sender<bool>,
+        lock_id: LockId,
     },
     /// Grows the context capacity.
     Grow {
         id: ContextId,
+        lock_id: LockId,
         size: u32,
-        response: oneshot::Sender<bool>,
+        response: oneshot::Sender<Result<()>>,
     },
     /// Shrinks the context capacity.
     Shrink {
         id: ContextId,
+        lock_id: LockId,
         size: u32,
-        response: oneshot::Sender<bool>,
+        response: oneshot::Sender<Result<()>>,
     },
 }
 
@@ -104,20 +118,28 @@ impl Command {
     }
 }
 
+
+#[derive(Debug, Clone)]
+enum Record {
+    Fill(Vec<u32>)
+}
+
 /// Internal representation of a context.
 #[derive(Debug, Clone)]
 struct Context {
-    name: String,
-    capacity: u32,
-    locked: bool,
+    lineage: Vec<Record>,
+    pages: Vec<usize>, // hash keys
+    last_page_len: usize,
+    mutex: Option<LockId>
 }
 
 impl Context {
-    fn new(name: String) -> Self {
+    fn new() -> Self {
         Context {
-            name,
-            capacity: 0,
-            locked: false,
+            lineage: Vec::new(),
+            pages: Vec::new(),
+            last_page_len: 0,
+            mutex: None,
         }
     }
 }
@@ -149,14 +171,27 @@ impl ContextService {
 
     async fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::Create { name, response } => {
+            Command::Create { user_id: _, name, response } => {
                 let id = self.next_id();
-                let ctx = Context::new(name.clone());
+                let ctx = Context::new();
                 self.contexts.insert(id, ctx);
                 self.name_to_id.insert(name, id);
-                let _ = response.send(id);
+                let _ = response.send(Ok(id));
             }
-            Command::Get { name, response } => {
+            Command::Destroy { id, lock_id, response } => {
+                let result = if let Some(ctx) = self.contexts.get(&id) {
+                    if ctx.mutex == Some(lock_id) {
+                        self.contexts.remove(&id);
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("Context not locked by this lock_id"))
+                    }
+                } else {
+                    Err(anyhow::anyhow!("Context not found"))
+                };
+                let _ = response.send(result);
+            }
+            Command::Get { user_id: _, name, response } => {
                 let id = self.name_to_id.get(&name).map(|v| *v.value());
                 let _ = response.send(id);
             }
@@ -168,8 +203,7 @@ impl ContextService {
                 let result = if let Some(ctx) = self.contexts.get(&id) {
                     let new_id = self.next_id();
                     let mut new_ctx = ctx.value().clone();
-                    new_ctx.name = new_name.clone();
-                    new_ctx.locked = false;
+                    new_ctx.mutex = None; // New fork is unlocked
                     self.contexts.insert(new_id, new_ctx);
                     self.name_to_id.insert(new_name, new_id);
                     Some(new_id)
@@ -181,62 +215,81 @@ impl ContextService {
             Command::Join {
                 target_id,
                 other_id,
+                lock_id,
                 response,
             } => {
-                let success = if self.contexts.contains_key(&target_id)
-                    && self.contexts.contains_key(&other_id)
-                {
-                    // Merge capacity from other into target
-                    if let Some(other) = self.contexts.get(&other_id) {
+                let result = if let Some(target) = self.contexts.get(&target_id) {
+                    if target.mutex != Some(lock_id) {
+                        Err(anyhow::anyhow!("Target context not locked by this lock_id"))
+                    } else if let Some(other) = self.contexts.get(&other_id) {
+                        // Merge pages from other into target
+                        drop(other);
+                        drop(target);
                         if let Some(mut target) = self.contexts.get_mut(&target_id) {
-                            target.capacity += other.capacity;
+                            if let Some(other) = self.contexts.get(&other_id) {
+                                target.pages.extend(other.pages.iter().cloned());
+                            }
                         }
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("Other context not found"))
                     }
-                    true
                 } else {
-                    false
+                    Err(anyhow::anyhow!("Target context not found"))
                 };
-                let _ = response.send(success);
+                let _ = response.send(result);
             }
             Command::Lock { id, response } => {
-                let success = if let Some(mut ctx) = self.contexts.get_mut(&id) {
-                    if !ctx.locked {
-                        ctx.locked = true;
-                        true
+                let lock_id = self.next_id(); // Use next_id as lock_id generator
+                if let Some(mut ctx) = self.contexts.get_mut(&id) {
+                    if ctx.mutex.is_none() {
+                        ctx.mutex = Some(lock_id);
+                        let _ = response.send(lock_id);
                     } else {
-                        false
+                        // Already locked, send 0 to indicate failure
+                        let _ = response.send(0);
                     }
                 } else {
-                    false
-                };
-                let _ = response.send(success);
+                    let _ = response.send(0);
+                }
             }
-            Command::Unlock { id, response } => {
-                let success = if let Some(mut ctx) = self.contexts.get_mut(&id) {
-                    ctx.locked = false;
-                    true
-                } else {
-                    false
-                };
-                let _ = response.send(success);
+            Command::Unlock { id, lock_id } => {
+                if let Some(mut ctx) = self.contexts.get_mut(&id) {
+                    if ctx.mutex == Some(lock_id) {
+                        ctx.mutex = None;
+                    }
+                }
             }
-            Command::Grow { id, size, response } => {
-                let success = if let Some(mut ctx) = self.contexts.get_mut(&id) {
-                    ctx.capacity = ctx.capacity.saturating_add(size);
-                    true
+            Command::Grow { id, lock_id, size, response } => {
+                let result = if let Some(mut ctx) = self.contexts.get_mut(&id) {
+                    if ctx.mutex == Some(lock_id) {
+                        // Add new pages as needed
+                        let pages_needed = size as usize;
+                        for _ in 0..pages_needed {
+                            ctx.pages.push(0); // Placeholder page
+                        }
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("Context not locked by this lock_id"))
+                    }
                 } else {
-                    false
+                    Err(anyhow::anyhow!("Context not found"))
                 };
-                let _ = response.send(success);
+                let _ = response.send(result);
             }
-            Command::Shrink { id, size, response } => {
-                let success = if let Some(mut ctx) = self.contexts.get_mut(&id) {
-                    ctx.capacity = ctx.capacity.saturating_sub(size);
-                    true
+            Command::Shrink { id, lock_id, size, response } => {
+                let result = if let Some(mut ctx) = self.contexts.get_mut(&id) {
+                    if ctx.mutex == Some(lock_id) {
+                        let pages_to_remove = (size as usize).min(ctx.pages.len());
+                        ctx.pages.truncate(ctx.pages.len().saturating_sub(pages_to_remove));
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("Context not locked by this lock_id"))
+                    }
                 } else {
-                    false
+                    Err(anyhow::anyhow!("Context not found"))
                 };
-                let _ = response.send(success);
+                let _ = response.send(result);
             }
         }
     }

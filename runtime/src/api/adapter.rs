@@ -16,10 +16,15 @@ pub struct Adapter {
 impl pie::core::adapter::Host for InstanceState {}
 
 impl pie::core::adapter::HostAdapter for InstanceState {
-    async fn new(&mut self, name: String) -> Result<Resource<Adapter>> {
+    async fn create(&mut self, name: String) -> Result<Result<Resource<Adapter>, String>> {
         // TODO: Allocate adapter resource
         let adapter = Adapter { name, ptr: 0 };
-        Ok(self.ctx().table.push(adapter)?)
+        Ok(Ok(self.ctx().table.push(adapter)?))
+    }
+
+    async fn destroy(&mut self, this: Resource<Adapter>) -> Result<Result<(), String>> {
+        self.ctx().table.delete(this)?;
+        Ok(Ok(()))
     }
 
     async fn get(&mut self, _name: String) -> Result<Option<Resource<Adapter>>> {

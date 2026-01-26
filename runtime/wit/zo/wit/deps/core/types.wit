@@ -16,7 +16,6 @@ interface types {
         get: func() -> option<bool>;                // Returns true if sync succeeded, false if failed, none if not ready
     }
 
-
     // Result of an async receive operation
     resource future-string {
         // Pollable to check readiness

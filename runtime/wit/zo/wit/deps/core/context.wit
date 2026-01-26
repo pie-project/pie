@@ -5,7 +5,9 @@ interface context {
 
     resource context {
         // Creates a new context, optionally with a name
-        constructor(name: string);
+        create: static func(name: string) -> result<context, error>;
+
+        destroy: func() -> result<_, error>;
 
         // Retrieves an existing context by name
         get: static func(name: string) -> option<context>;
@@ -20,7 +22,7 @@ interface context {
         lock: func() -> future-bool;
 
         // Releases the lock
-        unlock: func();
+        unlock: func() -> result<_, error>;
 
         // Grows the context capacity
         grow: func(size: u32) -> result<_, error>;
