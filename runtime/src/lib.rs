@@ -4,6 +4,7 @@
 //! It exposes functionality via PyO3 bindings for integration with Python.
 // Public modules (core engine logic)
 pub mod actor;
+pub mod adapter;
 pub mod api;
 pub mod api_legacy;
 pub mod auth;

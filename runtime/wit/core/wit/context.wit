@@ -24,9 +24,6 @@ interface context {
         // Releases the lock
         unlock: func() -> result<_, error>;
 
-        // Grows the context capacity
-        grow: func(size: u32) -> result<_, error>;
-
         // Shrinks the context capacity
         shrink: func(size: u32) -> result<_, error>;
     }

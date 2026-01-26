@@ -74,20 +74,19 @@ pub enum Message {
         lock_id: LockId,
     },
 
-    /// Grows the context capacity.
-    Grow {
-        id: ContextId,
-        lock_id: LockId,
-        size: u32,
-        response: oneshot::Sender<Result<()>>,
-    },
-
     /// Shrinks the context capacity.
     Shrink {
         id: ContextId,
         lock_id: LockId,
         size: u32,
         response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Get Page hash
+    GetPageHash {
+        ids: Vec<ContextId>,
+        
+        response: oneshot::Sender<Result<u64>>,
     },
 }
 
@@ -108,16 +107,17 @@ enum Record {
 #[derive(Debug, Clone)]
 struct Context {
     lineage: Vec<Record>,
-    pages: Vec<usize>,
+    page_hashes: Vec<usize>,
     last_page_len: usize,
     mutex: Option<LockId>,
 }
+
 
 impl Context {
     fn new() -> Self {
         Context {
             lineage: Vec::new(),
-            pages: Vec::new(),
+            page_hashes: Vec::new(),
             last_page_len: 0,
             mutex: None,
         }
@@ -192,7 +192,7 @@ impl Handle for ContextActor {
                         drop(target);
                         if let Some(mut target) = self.contexts.get_mut(&target_id) {
                             if let Some(other) = self.contexts.get(&other_id) {
-                                target.pages.extend(other.pages.iter().cloned());
+                                target.page_hashes.extend(other.page_hashes.iter().cloned());
                             }
                         }
                         Ok(())
@@ -224,28 +224,12 @@ impl Handle for ContextActor {
                     }
                 }
             }
-            Message::Grow { id, lock_id, size, response } => {
-                let result = if let Some(mut ctx) = self.contexts.get_mut(&id) {
-                    if ctx.mutex == Some(lock_id) {
-                        let pages_needed = size as usize;
-                        for _ in 0..pages_needed {
-                            ctx.pages.push(0);
-                        }
-                        Ok(())
-                    } else {
-                        Err(anyhow::anyhow!("Context not locked by this lock_id"))
-                    }
-                } else {
-                    Err(anyhow::anyhow!("Context not found"))
-                };
-                let _ = response.send(result);
-            }
             Message::Shrink { id, lock_id, size, response } => {
                 let result = if let Some(mut ctx) = self.contexts.get_mut(&id) {
                     if ctx.mutex == Some(lock_id) {
-                        let pages_to_remove = (size as usize).min(ctx.pages.len());
-                        let new_len = ctx.pages.len().saturating_sub(pages_to_remove);
-                        ctx.pages.truncate(new_len);
+                        let pages_to_remove = (size as usize).min(ctx.page_hashes.len());
+                        let new_len = ctx.page_hashes.len().saturating_sub(pages_to_remove);
+                        ctx.page_hashes.truncate(new_len);
                         Ok(())
                     } else {
                         Err(anyhow::anyhow!("Context not locked by this lock_id"))
