@@ -1,6 +1,7 @@
 //! pie:core/context - Context resource for KV cache management
 
 use crate::api::pie;
+use crate::api::model::Model;
 use crate::api::types::FutureBool;
 use crate::instance::InstanceState;
 use anyhow::Result;
@@ -13,10 +14,26 @@ pub struct Context {
     // TODO: Add KV cache page pointers and state
 }
 
-impl pie::core::context::Host for InstanceState {}
+impl pie::core::context::Host for InstanceState {
+    async fn kv_page_size(&mut self, _model: Resource<Model>) -> Result<u32> {
+        // TODO: Get actual page size from model
+        Ok(256)
+    }
+
+    async fn allocate_pages(&mut self, _model: Resource<Model>, num_pages: u32) -> Result<Result<Vec<u32>, String>> {
+        // TODO: Allocate KV pages from model's page pool
+        let page_ids: Vec<u32> = (0..num_pages).collect();
+        Ok(Ok(page_ids))
+    }
+
+    async fn free_pages(&mut self, _model: Resource<Model>, _page_ids: Vec<u32>) -> Result<Result<(), String>> {
+        // TODO: Free KV pages back to model's page pool
+        Ok(Ok(()))
+    }
+}
 
 impl pie::core::context::HostContext for InstanceState {
-    async fn create(&mut self, name: String) -> Result<Result<Resource<Context>, String>> {
+    async fn create(&mut self, _model: Resource<Model>, name: String) -> Result<Result<Resource<Context>, String>> {
         let ctx = Context { name };
         Ok(Ok(self.ctx().table.push(ctx)?))
     }
@@ -26,7 +43,7 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(Ok(()))
     }
 
-    async fn get(&mut self, _name: String) -> Result<Option<Resource<Context>>> {
+    async fn get(&mut self, _model: Resource<Model>, _name: String) -> Result<Option<Resource<Context>>> {
         // TODO: Look up existing context by name
         Ok(None)
     }
@@ -58,13 +75,13 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(Ok(()))
     }
 
-    async fn grow(&mut self, _this: Resource<Context>, _size: u32) -> Result<Result<(), String>> {
-        // TODO: Grow context capacity
+    async fn commit_pages(&mut self, _this: Resource<Context>, _page_ids: Vec<u32>) -> Result<Result<(), String>> {
+        // TODO: Commit KV pages to context
         Ok(Ok(()))
     }
 
-    async fn shrink(&mut self, _this: Resource<Context>, _size: u32) -> Result<Result<(), String>> {
-        // TODO: Shrink context capacity
+    async fn trim_pages(&mut self, _this: Resource<Context>, _num_pages: u32) -> Result<Result<(), String>> {
+        // TODO: Trim KV pages from context
         Ok(Ok(()))
     }
 }

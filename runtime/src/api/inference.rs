@@ -89,10 +89,12 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(self.ctx().table.push(pass)?)
     }
 
-    async fn kv_page_size(&mut self, this: Resource<ForwardPass>) -> Result<u32> {
-        // TODO: Get from model info
-        let _ = self.ctx().table.get(&this)?;
-        Ok(256) // Default page size
+    async fn kv_pages(&mut self, this: Resource<ForwardPass>, page_ids: Vec<u32>) -> Result<()> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        // TODO: Store page IDs for KV cache lookup during forward pass
+        let _ = page_ids; // Store in pass when implementing
+        let _ = pass;
+        Ok(())
     }
 
     async fn context(&mut self, _this: Resource<ForwardPass>, _context: Resource<Context>) -> Result<()> {

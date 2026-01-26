@@ -2,15 +2,18 @@ interface context {
 
     use wasi:io/poll@0.2.4.{pollable};
     use types.{error, future-bool};
+    use model.{model};
+
+    type page-id = u32;
 
     resource context {
         // Creates a new context, optionally with a name
-        create: static func(name: string) -> result<context, error>;
+        create: static func(model:borrow<model>, name: string) -> result<context, error>;
 
         destroy: func() -> result<_, error>;
 
         // Retrieves an existing context by name
-        get: static func(name: string) -> option<context>;
+        get: static func(model:borrow<model>, name: string) -> option<context>;
 
         // Forks this context into a new one with the given name
         fork: func(new-name: string) -> result<context, error>;
@@ -24,8 +27,18 @@ interface context {
         // Releases the lock
         unlock: func() -> result<_, error>;
 
-        // Shrinks the context capacity
-        shrink: func(size: u32) -> result<_, error>;
+        // Commit the KV pages to the context
+        commit-pages: func(page-ids: list<page-id>) -> result<_, error>;
+
+        // Trim the KV pages (shrink)
+        trim-pages: func(num-pages: u32) -> result<_, error>;
     }
+
+    // Get the size of a KV page
+    kv-page-size: func(model:borrow<model>) -> u32;
+
+    allocate-pages: func(model:borrow<model>, num-pages: u32) -> result<list<page-id>, error>;
+
+    free-pages: func(model:borrow<model>, page-ids: list<page-id>) -> result<_, error>;
 
 }

@@ -239,6 +239,11 @@ impl Handle for ContextActor {
                 };
                 let _ = response.send(result);
             }
+            Message::GetPageHash { ids, response } => {
+                // TODO: Compute page hash from context IDs
+                let _ = ids;
+                let _ = response.send(Ok(0));
+            }
         }
     }
 }

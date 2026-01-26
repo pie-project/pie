@@ -8,11 +8,11 @@
 //!
 //! Uses fixed power-of-2 prefix boundaries for O(log N) cache lookups:
 //! - Prefix hashes at boundaries: 16, 64, 256, 1024, 4096 pages
-//! - Tail hashes for pages beyond the largest matched boundary
-//!
-//! This enables fast "short-circuit" lookups for shared prefixes like system prompts.
+//! - Use `GetCachedPrefix` with `HashTree` for fast routing discovery
+//! - Use `Put` with flat `Vec<PageHash>` for robust allocation
+//! - Use `Unref` with `HashTree` to clean up both pages and prefix markers
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
@@ -49,57 +49,32 @@ pub(crate) fn spawn() -> usize {
 // ============================================================================
 
 /// Hierarchical hash structure for efficient prefix matching.
-///
-/// Combines coarse prefix hashes (at fixed boundaries) with fine-grained
-/// tail hashes for pages beyond the largest boundary.
 #[derive(Debug, Clone)]
 pub struct HashTree {
     /// Prefix hashes at power-of-2 boundaries: (boundary, hash)
-    /// e.g., [(16, H(0..16)), (64, H(0..64)), ...]
     prefix_hashes: Vec<(usize, PageHash)>,
     
-    /// Individual page hashes for the tail (beyond largest prefix boundary)
-    tail_hashes: Vec<PageHash>,
-    
-    /// Starting page index for tail_hashes
-    tail_start: usize,
-    
-    /// Total number of pages
-    total_pages: usize,
+    /// Full list of page hashes (needed for Unref correct counting)
+    all_hashes: Vec<PageHash>,
 }
 
 impl HashTree {
     /// Build a HashTree from individual page hashes.
-    ///
-    /// Each page hash is H(tokens[0..page_end]) for that page.
     pub fn from_page_hashes(page_hashes: &[PageHash]) -> Self {
         let total_pages = page_hashes.len();
         let mut prefix_hashes = Vec::new();
-        let mut largest_boundary = 0;
         
         // Build prefix hashes at each boundary
         for &boundary in PREFIX_BOUNDARIES {
             if total_pages >= boundary {
-                // Merkle-style: hash the prefix hashes together
                 let prefix_hash = Self::merkle_hash(&page_hashes[..boundary]);
                 prefix_hashes.push((boundary, prefix_hash));
-                largest_boundary = boundary;
             }
         }
         
-        // Tail = individual hashes beyond the largest boundary
-        let tail_start = largest_boundary;
-        let tail_hashes = if tail_start < total_pages {
-            page_hashes[tail_start..].to_vec()
-        } else {
-            Vec::new()
-        };
-        
         HashTree {
             prefix_hashes,
-            tail_hashes,
-            tail_start,
-            total_pages,
+            all_hashes: page_hashes.to_vec(),
         }
     }
     
@@ -112,32 +87,28 @@ impl HashTree {
         hasher.finish()
     }
     
-    /// Get the largest prefix hash (most coarse).
+    /// Get the largest prefix hash for routing.
     pub fn largest_prefix(&self) -> Option<(usize, PageHash)> {
         self.prefix_hashes.last().copied()
     }
     
     /// Find the longest cached prefix in a store.
-    ///
-    /// Returns the number of pages that are cached (as a contiguous prefix).
     pub fn find_cached_prefix(&self, store: &PageStore) -> usize {
         let mut cached_pages = 0;
         
-        // 1. Check prefix hashes (coarse, fast) - from smallest to largest
+        // 1. Check prefix hashes (coarse, fast)
         for &(boundary, hash) in &self.prefix_hashes {
             if store.has_prefix_hash(hash) {
                 cached_pages = boundary;
             } else {
-                // Prefix not found, no point checking larger ones
                 break;
             }
         }
         
-        // 2. Check tail hashes individually (fine, but small)
-        for (i, &hash) in self.tail_hashes.iter().enumerate() {
-            let page_idx = self.tail_start + i;
+        // 2. Check remaining individual pages
+        for (i, &hash) in self.all_hashes.iter().enumerate().skip(cached_pages) {
             if store.has_page_hash(hash) {
-                cached_pages = page_idx + 1;
+                cached_pages = i + 1;
             } else {
                 break;
             }
@@ -145,17 +116,12 @@ impl HashTree {
         
         cached_pages
     }
-    
-    /// Get all hashes that need to be stored (prefix + tail).
-    pub fn all_hashes(&self) -> impl Iterator<Item = PageHash> + '_ {
-        self.prefix_hashes.iter().map(|(_, h)| *h)
-            .chain(self.tail_hashes.iter().copied())
-    }
-    
-    pub fn total_pages(&self) -> usize {
-        self.total_pages
-    }
 }
+
+
+// how about "hot pages" as in beam search or spec dec?
+// maybe commit the cold ones, and let inferlets control the workspace kvcache?
+
 
 // ============================================================================
 // Messages
@@ -171,21 +137,31 @@ pub enum Message {
     },
 
     /// Lookup cached prefix using HashTree, returns (node_id, cached_pages)
-    GetCachedPrefix {
+    Get {
         tree: HashTree,
         response: oneshot::Sender<Option<(NodeId, usize)>>,
     },
 
-    /// Store pages using HashTree for routing
+    /// Store pages using flat hashes (safe, constructs prefixes internally)
     Put {
-        tree: HashTree,
+        hashes: Vec<PageHash>,
         response: oneshot::Sender<Vec<(NodeId, PhysicalPageId)>>,
     },
 
-    /// Decrement reference count for pages by hash
+    /// Decrement ref counts using Tree (cleans up prefixes and pages)
     Unref {
-        hashes: Vec<PageHash>,
+        tree: HashTree,
         node_hint: Option<NodeId>,
+    },
+
+    Allocate {
+        num_pages: usize,
+        node: NodeId,
+        response: oneshot::Sender<Vec<(NodeId, PhysicalPageId)>>,
+    },
+
+    Free {
+        page_ids: Vec<(NodeId, PhysicalPageId)>,
     },
 }
 
@@ -208,11 +184,13 @@ struct PageStore {
     /// Individual page hashes -> physical page ID
     page_hash_to_id: HashMap<PageHash, PhysicalPageId>,
     page_id_to_hash: HashMap<PhysicalPageId, PageHash>,
+    
+    /// Reference counts for pages
     ref_counts: HashMap<PhysicalPageId, usize>,
     free_pages: Vec<PhysicalPageId>,
     
-    /// Prefix hashes (Merkle interior nodes) - just need existence check
-    prefix_hashes: HashSet<PageHash>,
+    /// Reference counts for prefix hashes (Merkle nodes)
+    prefix_ref_counts: HashMap<PageHash, usize>,
 }
 
 impl PageStore {
@@ -224,7 +202,7 @@ impl PageStore {
             page_id_to_hash: HashMap::new(),
             ref_counts: HashMap::new(),
             free_pages: (0..total_pages).collect(),
-            prefix_hashes: HashSet::new(),
+            prefix_ref_counts: HashMap::new(),
         }
     }
 
@@ -240,9 +218,9 @@ impl PageStore {
         self.load_factor() >= LOAD_THRESHOLD
     }
 
-    /// Check if a prefix hash exists (Merkle interior node)
+    /// Check if a prefix hash exists and has refs
     fn has_prefix_hash(&self, hash: PageHash) -> bool {
-        self.prefix_hashes.contains(&hash)
+        self.prefix_ref_counts.contains_key(&hash)
     }
     
     /// Check if an individual page hash exists
@@ -250,19 +228,27 @@ impl PageStore {
         self.page_hash_to_id.contains_key(&hash)
     }
 
-    /// Store a prefix hash (Merkle interior node)
-    fn put_prefix_hash(&mut self, hash: PageHash) {
-        self.prefix_hashes.insert(hash);
+    /// Register a prefix hash (increment ref count)
+    fn ref_prefix(&mut self, hash: PageHash) {
+        *self.prefix_ref_counts.entry(hash).or_insert(0) += 1;
     }
 
-    /// Store an individual page hash, returns physical page ID
+    /// Deregister a prefix hash (decrement ref count)
+    fn unref_prefix(&mut self, hash: PageHash) {
+        if let Some(count) = self.prefix_ref_counts.get_mut(&hash) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.prefix_ref_counts.remove(&hash);
+            }
+        }
+    }
+
+    /// Store individual page, returns physical page ID
     fn put_page(&mut self, hash: PageHash) -> Option<PhysicalPageId> {
-        // Dedup: if already exists, bump ref count
         if let Some(&page_id) = self.page_hash_to_id.get(&hash) {
             *self.ref_counts.entry(page_id).or_insert(1) += 1;
             return Some(page_id);
         }
-        // Allocate new page
         if let Some(page_id) = self.free_pages.pop() {
             self.page_hash_to_id.insert(hash, page_id);
             self.page_id_to_hash.insert(page_id, hash);
@@ -273,7 +259,8 @@ impl PageStore {
         }
     }
 
-    fn unref(&mut self, hash: &PageHash) -> bool {
+    /// Unref individual page
+    fn unref_page(&mut self, hash: &PageHash) -> bool {
         if let Some(&page_id) = self.page_hash_to_id.get(hash) {
             if let Some(count) = self.ref_counts.get_mut(&page_id) {
                 *count = count.saturating_sub(1);
@@ -294,32 +281,24 @@ impl PageStore {
 // KvCacheActor
 // ============================================================================
 
-/// The KV cache actor manages multiple page stores with routing.
 #[derive(Debug)]
 struct KvCacheActor {
     stores: Vec<PageStore>,
 }
 
 impl KvCacheActor {
-    /// Hash-Affinity + Spillover routing using the tree's largest prefix
+    /// Use HashTree (built locally) to route `Put` requests
     fn route(&self, tree: &HashTree) -> Option<NodeId> {
-        if self.stores.is_empty() {
-            return None;
-        }
+        if self.stores.is_empty() { return None; }
 
-        // Use largest prefix hash for affinity
-        let affinity_hash = tree.largest_prefix()
-            .map(|(_, h)| h)
-            .unwrap_or(0);
-        
+        let affinity_hash = tree.largest_prefix().map(|(_, h)| h).unwrap_or(0);
         let primary = (affinity_hash as usize) % self.stores.len();
 
-        // 1. Primary not overloaded → use it
         if !self.stores[primary].is_overloaded() {
             return Some(primary);
         }
 
-        // 2. Find node that has the largest prefix cached
+        // Search for cache hits using prefixes
         for &(boundary, hash) in tree.prefix_hashes.iter().rev() {
             let cached = self.stores.iter()
                 .filter(|s| !s.is_overloaded() && s.has_prefix_hash(hash))
@@ -329,7 +308,7 @@ impl KvCacheActor {
             }
         }
 
-        // 3. Spillover to least-loaded
+        // Spillover
         self.stores.iter()
             .min_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap())
             .map(|s| s.node_id)
@@ -351,57 +330,62 @@ impl Handle for KvCacheActor {
                 let _ = response.send(node_id);
             }
 
-            Message::GetCachedPrefix { tree, response } => {
-                // Find the best node with cached prefix
+            Message::Get { tree, response } => {
                 let mut best: Option<(NodeId, usize)> = None;
-                
                 for store in &self.stores {
                     let cached = tree.find_cached_prefix(store);
                     if cached > best.map(|(_, c)| c).unwrap_or(0) {
                         best = Some((store.node_id, cached));
                     }
                 }
-                
                 let _ = response.send(best);
             }
 
-            Message::Put { tree, response } => {
+            Message::Put { hashes, response } => {
+                // Build tree locally to determine routing and update prefixes
+                let tree = HashTree::from_page_hashes(&hashes);
                 let mut results = Vec::new();
-                
-                // Route to best node
+
                 if let Some(node_id) = self.route(&tree) {
                     let store = &mut self.stores[node_id];
                     
-                    // Store prefix hashes (Merkle interior nodes)
+                    // 1. Ref count the prefixes (Merkle nodes)
                     for &(_, hash) in &tree.prefix_hashes {
-                        store.put_prefix_hash(hash);
+                        store.ref_prefix(hash);
                     }
-                    
-                    // Store tail page hashes
-                    for &hash in &tree.tail_hashes {
+
+                    // 2. Alloc/Ref the actual pages
+                    for &hash in &hashes {
                         if let Some(page_id) = store.put_page(hash) {
                             results.push((node_id, page_id));
                         }
                     }
                 }
-                
                 let _ = response.send(results);
             }
 
-            Message::Unref { hashes, node_hint } => {
-                for hash in hashes {
+            Message::Unref { tree, node_hint } => {
+                // Remove prefixes if hinted
+                if let Some(node_id) = node_hint {
+                     if let Some(store) = self.stores.get_mut(node_id) {
+                         for &(_, hash) in &tree.prefix_hashes {
+                             store.unref_prefix(hash);
+                         }
+                     }
+                }
+
+                // Remove pages (search everywhere)
+                for hash in tree.all_hashes {
                     let found = if let Some(node_id) = node_hint {
-                        self.stores.get_mut(node_id)
-                            .map(|s| s.unref(&hash))
-                            .unwrap_or(false)
+                        self.stores.get_mut(node_id).map(|s| s.unref_page(&hash)).unwrap_or(false)
                     } else {
                         false
                     };
-                    
+
                     if !found {
                         for store in &mut self.stores {
-                            if store.unref(&hash) {
-                                break;
+                            if store.unref_page(&hash) {
+                                break; 
                             }
                         }
                     }

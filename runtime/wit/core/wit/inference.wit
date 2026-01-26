@@ -5,14 +5,17 @@ interface inference {
     use context.{context};
     use model.{model};
     use adapter.{adapter};
+    use context.{page-id};
 
     resource forward-pass {
         constructor(model: borrow<model>);
 
-        kv-page-size: func() -> u32; // Get the size of a KV page
-
         context: func(
             context: borrow<context>,
+        );
+
+        kv-pages: func(
+            page-ids: list<page-id>,
         );
 
         input-tokens: func(
