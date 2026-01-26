@@ -1,47 +1,29 @@
+//! Model Service - Model registration and tokenizer management
+//!
+//! This module provides a model-specific actor for managing model metadata,
+//! tokenization, and coordinating associated actors (context, inference, kvcache).
+
 use std::sync::LazyLock;
-use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task;
+use tokio::sync::oneshot;
 
-use super::context;
-use super::inference;
+use crate::actor::{Handle, Actors, SendError};
+use crate::context;
+use crate::inference;
+use crate::kvcache;
 
-/// Model-indexed dispatcher for model services.
-static MODEL_NEW_DISPATCHER: LazyLock<ModelDispatcher> = LazyLock::new(|| ModelDispatcher {
-    services: boxcar::Vec::new(),
-});
+/// Global address table for model actors.
+static ACTOR: LazyLock<Actors<Message>> = LazyLock::new(Actors::new);
 
-#[derive(Debug, Error)]
-pub enum ModelDispatchError {
-    #[error("Invalid model index: {0}")]
-    InvalidModelIndex(usize),
-}
-
-#[derive(Debug)]
-struct ModelDispatcher {
-    services: boxcar::Vec<mpsc::UnboundedSender<Command>>,
-}
-
-/// Installs a new model and its associated context and inference services.
-/// Returns the global model ID that can be used with all three services.
+/// Installs a new model and spawns its associated actors.
+/// Returns the global model ID that can be used with all actors.
 pub fn install_model(info: ModelInfo) -> usize {
-    // Install the model service and get the ID from boxcar
-    let svc = ModelService::new(info);
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let model_id = MODEL_NEW_DISPATCHER.services.push(tx);
+    // Spawn the model actor and get its ID
+    let model_id = ACTOR.spawn_with::<ModelActor, _>(|| ModelActor::with_info(info));
 
-    task::spawn(async move {
-        let mut svc = svc;
-        while let Some(cmd) = rx.recv().await {
-            svc.handle(cmd).await;
-        }
-    });
-
-    // Install the associated context service with the same ID
-    context::install_service(model_id);
-
-    // Install the associated inference service with the same ID
-    inference::install_service(model_id);
+    // Spawn the associated actors with the same model ID
+    let _ = context::spawn();
+    let _ = inference::spawn();
+    let _ = kvcache::spawn();
 
     model_id
 }
@@ -62,9 +44,9 @@ pub struct TokenizerInfo {
     pub special_tokens: (Vec<u32>, Vec<Vec<u8>>),
 }
 
-/// Defines the set of operations available for the model service.
+/// Messages for the model actor.
 #[derive(Debug)]
-pub enum Command {
+pub enum Message {
     /// Gets the prompt template for this model.
     GetPromptTemplate {
         response: oneshot::Sender<String>,
@@ -97,51 +79,60 @@ pub enum Command {
     },
 }
 
-impl Command {
-    /// Dispatches this command to the model service for the given model.
-    pub fn dispatch(self, model_id: usize) -> Result<(), ModelDispatchError> {
-        let tx = MODEL_NEW_DISPATCHER
-            .services
-            .get(model_id)
-            .ok_or(ModelDispatchError::InvalidModelIndex(model_id))?;
-        tx.send(self).unwrap();
-        Ok(())
+impl Message {
+    /// Sends this message to the model actor for the given model.
+    pub fn send(self, model_idx: usize) -> Result<(), SendError> {
+        ACTOR.send(model_idx, self)
     }
 }
 
-/// The model service provides model and tokenizer functionality.
+/// The model actor provides model and tokenizer functionality.
 #[derive(Debug)]
-struct ModelService {
+struct ModelActor {
     info: ModelInfo,
     tokenizer: Option<TokenizerInfo>,
 }
 
-impl ModelService {
-    /// Creates a new `ModelService`.
-    fn new(info: ModelInfo) -> Self {
-        ModelService {
+impl ModelActor {
+    fn with_info(info: ModelInfo) -> Self {
+        ModelActor {
             info,
             tokenizer: None,
         }
     }
+}
 
-    async fn handle(&mut self, cmd: Command) {
-        match cmd {
-            Command::GetPromptTemplate { response } => {
+impl Handle for ModelActor {
+    type Message = Message;
+
+    fn new() -> Self {
+        ModelActor {
+            info: ModelInfo {
+                name: String::new(),
+                prompt_template: String::new(),
+                stop_tokens: Vec::new(),
+            },
+            tokenizer: None,
+        }
+    }
+
+    async fn handle(&mut self, msg: Message) {
+        match msg {
+            Message::GetPromptTemplate { response } => {
                 let _ = response.send(self.info.prompt_template.clone());
             }
-            Command::GetStopTokens { response } => {
+            Message::GetStopTokens { response } => {
                 let _ = response.send(self.info.stop_tokens.clone());
             }
-            Command::Tokenize { text: _, response } => {
+            Message::Tokenize { text: _, response } => {
                 // TODO: Implement actual tokenization via backend
                 let _ = response.send(vec![]);
             }
-            Command::Detokenize { tokens: _, response } => {
+            Message::Detokenize { tokens: _, response } => {
                 // TODO: Implement actual detokenization via backend
                 let _ = response.send(String::new());
             }
-            Command::GetVocabs { response } => {
+            Message::GetVocabs { response } => {
                 let vocabs = self
                     .tokenizer
                     .as_ref()
@@ -149,7 +140,7 @@ impl ModelService {
                     .unwrap_or_default();
                 let _ = response.send(vocabs);
             }
-            Command::GetSplitRegex { response } => {
+            Message::GetSplitRegex { response } => {
                 let regex = self
                     .tokenizer
                     .as_ref()
@@ -157,7 +148,7 @@ impl ModelService {
                     .unwrap_or_default();
                 let _ = response.send(regex);
             }
-            Command::GetSpecialTokens { response } => {
+            Message::GetSpecialTokens { response } => {
                 let tokens = self
                     .tokenizer
                     .as_ref()

@@ -1,4 +1,4 @@
-use super::service::{CommandDispatcher, Service, ServiceCommand};
+use super::actor::{CommandDispatcher, Service, ServiceCommand};
 use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::oneshot;

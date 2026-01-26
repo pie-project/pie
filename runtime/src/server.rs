@@ -3,7 +3,7 @@ use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
 use crate::messaging::PushPullCommand;
 use crate::model;
 use crate::runtime::{self, AttachInstanceResult, TerminationCause};
-use crate::service::{CommandDispatcher, Service, ServiceCommand};
+use crate::actor::{CommandDispatcher, Service, ServiceCommand};
 use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;

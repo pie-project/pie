@@ -1,9 +1,9 @@
 use super::instance::{InstanceId, InstanceState, OutputDelivery, OutputDeliveryCtrl};
-use super::service::{CommandDispatcher, Service};
+use super::actor::{CommandDispatcher, Service};
 use super::{api, server};
 use crate::model;
 use crate::model::request::QueryResponse;
-use crate::service::ServiceCommand;
+use crate::actor::ServiceCommand;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
 use pie_client::message;

@@ -1,6 +1,6 @@
 use crate::instance::InstanceId;
 use crate::runtime::{self, TerminationCause};
-use crate::service::ServiceCommand;
+use crate::actor::ServiceCommand;
 use crate::telemetry;
 use crate::utils::IdPool;
 use std::collections::{HashMap, HashSet, hash_map::Entry};

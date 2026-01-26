@@ -1,4 +1,4 @@
-use super::service::{CommandDispatcher, Service, ServiceCommand};
+use super::actor::{CommandDispatcher, Service, ServiceCommand};
 use super::utils::IdPool;
 use bytes::Bytes;
 use dashmap::DashMap;

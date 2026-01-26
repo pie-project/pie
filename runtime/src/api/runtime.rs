@@ -4,7 +4,7 @@ use crate::api::pie;
 use crate::api::types::FutureString;
 use crate::instance::InstanceState;
 use crate::model;
-use crate::service::ServiceCommand;
+use crate::actor::ServiceCommand;
 use anyhow::Result;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;

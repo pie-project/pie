@@ -1,42 +1,23 @@
+//! Inference Service - Forward pass management for model execution
+//!
+//! This module provides a model-specific actor for managing forward passes
+//! with configurable samplers, input tokens, and attention masks.
+
 use std::sync::LazyLock;
-use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::oneshot;
+
+use crate::actor::{Handle, Actors, SendError};
 
 /// Unique identifier for a forward pass.
 pub type ForwardPassId = u64;
 
-/// Model-indexed dispatcher for inference services.
-static INFERENCE_DISPATCHER: LazyLock<InferenceDispatcher> = LazyLock::new(|| InferenceDispatcher {
-    services: boxcar::Vec::new(),
-});
+/// Global registry for inference actors.
+static ACTOR: LazyLock<Actors<Message>> = LazyLock::new(Actors::new);
 
-#[derive(Debug, Error)]
-pub enum InferenceDispatchError {
-    #[error("Invalid model index: {0}")]
-    InvalidModelIndex(usize),
-}
-
-#[derive(Debug)]
-struct InferenceDispatcher {
-    services: boxcar::Vec<mpsc::UnboundedSender<Command>>,
-}
-
-/// Installs a new inference service for the given model ID.
-/// This is only called internally by model_new::install_model.
-pub(super) fn install_service(model_id: usize) {
-    let svc = InferenceService::new();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    
-    let idx = INFERENCE_DISPATCHER.services.push(tx);
-    debug_assert_eq!(idx, model_id, "Inference service ID mismatch");
-
-    task::spawn(async move {
-        let mut svc = svc;
-        while let Some(cmd) = rx.recv().await {
-            svc.handle(cmd).await;
-        }
-    });
+/// Spawns a new inference actor.
+pub(crate) fn spawn() -> usize {
+    ACTOR.spawn::<InferenceActor>()
 }
 
 /// Sampler configuration for token generation.
@@ -58,10 +39,10 @@ pub enum Output {
     Distributions(Vec<(Vec<u32>, Vec<f32>)>),
 }
 
-/// Defines the set of operations available for the inference service.
+/// Messages for the inference actor.
 #[derive(Debug)]
-pub enum Command {
-    /// Creates a new forward pass for the given model.
+pub enum Message {
+    /// Creates a new forward pass.
     CreateForwardPass {
         response: oneshot::Sender<ForwardPassId>,
     },
@@ -120,15 +101,10 @@ pub enum Command {
     },
 }
 
-impl Command {
-    /// Dispatches this command to the inference service for the given model.
-    pub fn dispatch(self, model_id: usize) -> Result<(), InferenceDispatchError> {
-        let tx = INFERENCE_DISPATCHER
-            .services
-            .get(model_id)
-            .ok_or(InferenceDispatchError::InvalidModelIndex(model_id))?;
-        tx.send(self).unwrap();
-        Ok(())
+impl Message {
+    /// Sends this message to the inference actor for the given model.
+    pub fn send(self, model_idx: usize) -> Result<(), SendError> {
+        ACTOR.send(model_idx, self)
     }
 }
 
@@ -146,38 +122,33 @@ struct ForwardPass {
     adapter_id: Option<u64>,
 }
 
-/// The inference service manages forward passes for a model.
+/// The inference actor manages forward passes for a model.
 #[derive(Debug)]
-struct InferenceService {
+struct InferenceActor {
     forward_passes: dashmap::DashMap<ForwardPassId, ForwardPass>,
-    next_id: std::sync::atomic::AtomicU64,
+    next_id: AtomicU64,
     kv_page_size: u32,
 }
 
-impl InferenceService {
-    /// Creates a new `InferenceService`.
+impl Handle for InferenceActor {
+    type Message = Message;
+
     fn new() -> Self {
-        InferenceService {
+        InferenceActor {
             forward_passes: dashmap::DashMap::new(),
-            next_id: std::sync::atomic::AtomicU64::new(1),
-            kv_page_size: 16, // Default page size
+            next_id: AtomicU64::new(1),
+            kv_page_size: 16,
         }
     }
 
-    /// Generates a new unique forward pass ID.
-    fn next_id(&self) -> ForwardPassId {
-        self.next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    async fn handle(&mut self, cmd: Command) {
-        match cmd {
-            Command::CreateForwardPass { response } => {
+    async fn handle(&mut self, msg: Message) {
+        match msg {
+            Message::CreateForwardPass { response } => {
                 let id = self.next_id();
                 self.forward_passes.insert(id, ForwardPass::default());
                 let _ = response.send(id);
             }
-            Command::GetKvPageSize { fp_id, response } => {
+            Message::GetKvPageSize { fp_id, response } => {
                 let result = if self.forward_passes.contains_key(&fp_id) {
                     Some(self.kv_page_size)
                 } else {
@@ -185,62 +156,45 @@ impl InferenceService {
                 };
                 let _ = response.send(result);
             }
-            Command::SetContext { fp_id, context_id } => {
+            Message::SetContext { fp_id, context_id } => {
                 if let Some(mut fp) = self.forward_passes.get_mut(&fp_id) {
                     fp.context_id = Some(context_id);
                 }
             }
-            Command::SetInputTokens {
-                fp_id,
-                tokens,
-                positions,
-            } => {
+            Message::SetInputTokens { fp_id, tokens, positions } => {
                 if let Some(mut fp) = self.forward_passes.get_mut(&fp_id) {
                     fp.tokens = tokens;
                     fp.positions = positions;
                 }
             }
-            Command::SetSpeculativeTokens {
-                fp_id,
-                tokens,
-                positions,
-            } => {
+            Message::SetSpeculativeTokens { fp_id, tokens, positions } => {
                 if let Some(mut fp) = self.forward_passes.get_mut(&fp_id) {
                     fp.speculative_tokens = tokens;
                     fp.speculative_positions = positions;
                 }
             }
-            Command::SetAttentionMask { fp_id, mask } => {
+            Message::SetAttentionMask { fp_id, mask } => {
                 if let Some(mut fp) = self.forward_passes.get_mut(&fp_id) {
                     fp.attention_mask = mask;
                 }
             }
-            Command::SetSamplingMask { fp_id, mask } => {
+            Message::SetSamplingMask { fp_id, mask } => {
                 if let Some(mut fp) = self.forward_passes.get_mut(&fp_id) {
                     fp.sampling_mask = mask;
                 }
             }
-            Command::SetSampler {
-                fp_id,
-                indices,
-                sampler,
-            } => {
+            Message::SetSampler { fp_id, indices, sampler } => {
                 if let Some(mut fp) = self.forward_passes.get_mut(&fp_id) {
                     fp.samplers.push((indices, sampler));
                 }
             }
-            Command::SetAdapter { fp_id, adapter_id } => {
+            Message::SetAdapter { fp_id, adapter_id } => {
                 if let Some(mut fp) = self.forward_passes.get_mut(&fp_id) {
                     fp.adapter_id = Some(adapter_id);
                 }
             }
-            Command::Execute {
-                fp_id,
-                queue_id: _,
-                response,
-            } => {
+            Message::Execute { fp_id, queue_id: _, response } => {
                 // TODO: Actually execute the forward pass via the model backend
-                // For now, just return empty output
                 let output = if self.forward_passes.contains_key(&fp_id) {
                     Output::None
                 } else {
@@ -248,9 +202,15 @@ impl InferenceService {
                 };
                 let _ = response.send(output);
             }
-            Command::Destroy { fp_id } => {
+            Message::Destroy { fp_id } => {
                 self.forward_passes.remove(&fp_id);
             }
         }
+    }
+}
+
+impl InferenceActor {
+    fn next_id(&self) -> ForwardPassId {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 }

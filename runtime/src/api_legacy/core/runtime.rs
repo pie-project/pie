@@ -2,7 +2,7 @@ use crate::api_legacy::core::{DebugQueryResult, Model};
 use crate::api_legacy::inferlet;
 use crate::instance::InstanceState;
 use crate::model;
-use crate::service::ServiceCommand;
+use crate::actor::ServiceCommand;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;

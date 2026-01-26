@@ -14,7 +14,7 @@ use super::model::request::{
 use super::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
 use super::model::tokenizer::BytePairEncoder;
 use super::runtime::{self, TerminationCause};
-use super::service::ServiceCommand;
+use super::actor::ServiceCommand;
 use crate::instance::InstanceId;
 use anyhow::Result;
 

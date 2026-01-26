@@ -3,7 +3,7 @@ use crate::api_legacy::inferlet;
 use crate::instance::InstanceState;
 use crate::messaging::{PubSubCommand, PushPullCommand};
 use crate::server;
-use crate::service::ServiceCommand;
+use crate::actor::ServiceCommand;
 use async_trait::async_trait;
 use std::mem;
 use tokio::sync::{mpsc, oneshot};
