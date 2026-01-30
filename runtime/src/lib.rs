@@ -4,9 +4,10 @@
 //! It exposes functionality via PyO3 bindings for integration with Python.
 // Public modules (core engine logic)
 pub mod actor;
+pub mod legacy_service;
 pub mod adapter;
 pub mod api;
-pub mod api_legacy;
+pub mod legacy_api;
 pub mod auth;
 pub mod brle;
 pub mod context;
@@ -15,12 +16,15 @@ pub mod engine;
 pub mod inference;
 pub mod instance;
 pub mod kvcache;
-pub mod kvs;
+pub mod legacy_kvs;
 pub mod messaging;
+pub mod legacy_messaging;
+pub mod legacy_model;
 pub mod model;
-pub mod model_new;
 pub mod runtime;
+pub mod legacy_runtime;
 pub mod server;
+pub mod legacy_server;
 pub mod telemetry;
 pub mod utils;
 

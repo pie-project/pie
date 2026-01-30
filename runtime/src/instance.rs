@@ -1,6 +1,6 @@
-use super::api_legacy::core::Queue;
+use super::legacy_api::core::Queue;
 use super::utils;
-use crate::model::resource::{ResourceId, ResourceTypeId};
+use crate::legacy_model::resource::{ResourceId, ResourceTypeId};
 use crate::server::InstanceEvent;
 use anyhow::{Result, format_err};
 use bytes::Bytes;

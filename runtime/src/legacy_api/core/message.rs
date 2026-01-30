@@ -1,9 +1,9 @@
-use crate::api_legacy::core::{Blob, BlobResult};
-use crate::api_legacy::inferlet;
+use crate::legacy_api::core::{Blob, BlobResult};
+use crate::legacy_api::inferlet;
 use crate::instance::InstanceState;
-use crate::messaging::{PubSubCommand, PushPullCommand};
+use crate::legacy_messaging::{PubSubCommand, PushPullCommand};
 use crate::server;
-use crate::actor::ServiceCommand;
+use crate::legacy_service::ServiceCommand;
 use async_trait::async_trait;
 use std::mem;
 use tokio::sync::{mpsc, oneshot};

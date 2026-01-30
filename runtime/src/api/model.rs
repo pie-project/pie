@@ -2,8 +2,8 @@
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use crate::model::tokenizer::BytePairEncoder;
-use crate::model::ModelInfo;
+use crate::legacy_model::tokenizer::BytePairEncoder;
+use crate::legacy_model::ModelInfo;
 use anyhow::Result;
 use std::sync::Arc;
 use wasmtime::component::Resource;
@@ -24,9 +24,9 @@ impl pie::core::model::Host for InstanceState {}
 
 impl pie::core::model::HostModel for InstanceState {
     async fn new(&mut self, name: String) -> Result<Resource<Model>> {
-        if let Some(service_id) = crate::model::model_service_id(&name) {
+        if let Some(service_id) = crate::legacy_model::model_service_id(&name) {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            crate::model::Command::GetInfo { response: tx }.dispatch(service_id)?;
+            crate::legacy_model::Command::GetInfo { response: tx }.dispatch(service_id)?;
             let info = rx.await?;
             let model = Model {
                 service_id,

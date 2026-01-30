@@ -11,12 +11,12 @@ use serde::{de::DeserializeOwned, Serialize};
 /// Uses ipc-channel to communicate with Python processes in other PIDs.
 #[derive(Clone)]
 pub struct AsyncIpcClient {
-    backend: std::sync::Arc<crate::model::ffi_ipc::FfiIpcBackend>,
+    backend: std::sync::Arc<crate::legacy_model::ffi_ipc::FfiIpcBackend>,
 }
 
 impl AsyncIpcClient {
     /// Create a new IPC client from an FfiIpcBackend.
-    pub fn new(backend: std::sync::Arc<crate::model::ffi_ipc::FfiIpcBackend>) -> Self {
+    pub fn new(backend: std::sync::Arc<crate::legacy_model::ffi_ipc::FfiIpcBackend>) -> Self {
         Self { backend }
     }
     

@@ -136,7 +136,7 @@ impl ServerHandle {
 
     /// Get list of registered model names (backends that have connected).
     fn registered_models(&self) -> Vec<String> {
-        crate::model::registered_models()
+        crate::legacy_model::registered_models()
     }
 
     fn __repr__(&self) -> String {
@@ -245,9 +245,9 @@ pub struct PartialServerHandle {
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     runtime: Arc<tokio::runtime::Runtime>,
     /// IPC backends (not yet handshaked)
-    backends: Arc<Mutex<Option<Vec<crate::model::RpcBackend>>>>,
+    backends: Arc<Mutex<Option<Vec<crate::legacy_model::RpcBackend>>>>,
     /// Scheduler config for model creation
-    scheduler_config: crate::model::SchedulerConfig,
+    scheduler_config: crate::legacy_model::SchedulerConfig,
 }
 
 #[pymethods]
@@ -257,7 +257,7 @@ impl PartialServerHandle {
     /// This should be called after Python IPC workers have connected.
     /// Blocks until handshake completes successfully.
     fn complete(&self, py: Python<'_>) -> PyResult<ServerHandle> {
-        use crate::model::{self, Model};
+        use crate::legacy_model::{self, Model};
         
         py.allow_threads(|| {
             let backends = {
@@ -279,7 +279,7 @@ impl PartialServerHandle {
                 let model_name = model.name().to_string();
                 
                 // Register the model with the engine
-                let model_id = model::install_model(model_name.clone(), model);
+                let model_id = legacy_model::install_model(model_name.clone(), model);
                 if model_id.is_none() {
                     return Err(PyRuntimeError::new_err(format!(
                         "Failed to register model '{}': already exists", model_name
@@ -328,9 +328,9 @@ fn start_server_phase1(
     authorized_users_path: Option<String>,
     num_groups: usize,
 ) -> PyResult<(PartialServerHandle, Vec<String>)> {
-    use crate::model::{SchedulerConfig, RpcBackend};
-    use crate::model::ffi_bridge::AsyncIpcClient;
-    use crate::model::ffi_ipc::FfiIpcBackend;
+    use crate::legacy_model::{SchedulerConfig, RpcBackend};
+    use crate::legacy_model::ffi_bridge::AsyncIpcClient;
+    use crate::legacy_model::ffi_ipc::FfiIpcBackend;
     
     // Allow other Python threads to run while we block
     py.allow_threads(|| {
@@ -401,7 +401,7 @@ pub fn _pie(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ServerConfig>()?;
     m.add_class::<ServerHandle>()?;
     m.add_class::<PartialServerHandle>()?;
-    m.add_class::<crate::model::ffi_ipc::FfiIpcQueue>()?;
+    m.add_class::<crate::legacy_model::ffi_ipc::FfiIpcQueue>()?;
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     m.add_function(wrap_pyfunction!(start_server_phase1, m)?)?;
     m.add_function(wrap_pyfunction!(initialize_backend, m)?)?;

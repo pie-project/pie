@@ -1,9 +1,9 @@
-use crate::api_legacy::core::Queue;
-use crate::api_legacy::inferlet;
+use crate::legacy_api::core::Queue;
+use crate::legacy_api::inferlet;
 use crate::instance::InstanceState;
-use crate::model::request::{ForwardPassRequest, ForwardPassResponse, Request};
-use crate::model::resource::{EMBED_TYPE_ID, KV_PAGE_TYPE_ID, ResourceId};
-use crate::model::submit_request;
+use crate::legacy_model::request::{ForwardPassRequest, ForwardPassResponse, Request};
+use crate::legacy_model::resource::{EMBED_TYPE_ID, KV_PAGE_TYPE_ID, ResourceId};
+use crate::legacy_model::submit_request;
 use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::iter;

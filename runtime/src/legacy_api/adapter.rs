@@ -1,10 +1,10 @@
-use crate::api_legacy::core::forward::ForwardPass;
-use crate::api_legacy::core::{Blob, Queue};
-use crate::api_legacy::inferlet;
+use crate::legacy_api::core::forward::ForwardPass;
+use crate::legacy_api::core::{Blob, Queue};
+use crate::legacy_api::inferlet;
 use crate::instance::InstanceState;
-use crate::model::request::{DownloadAdapterRequest, Request, UploadAdapterRequest};
-use crate::model::resource::{ADAPTER_TYPE_ID, ResourceId};
-use crate::model::submit_request;
+use crate::legacy_model::request::{DownloadAdapterRequest, Request, UploadAdapterRequest};
+use crate::legacy_model::resource::{ADAPTER_TYPE_ID, ResourceId};
+use crate::legacy_model::submit_request;
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -29,7 +29,7 @@ impl inferlet::adapter::common::Host for InstanceState {
         queue: Resource<Queue>,
         mut adapter_ptr: ResourceId,
         name: String,
-    ) -> Result<Resource<crate::api_legacy::core::BlobResult>> {
+    ) -> Result<Resource<crate::legacy_api::core::BlobResult>> {
         let (svc_id, queue_id, priority) = self.read_queue(&queue)?;
 
         adapter_ptr = self.translate_resource_ptr(svc_id, ADAPTER_TYPE_ID, adapter_ptr)?;
@@ -41,7 +41,7 @@ impl inferlet::adapter::common::Host for InstanceState {
 
         // TODO: The actual download should send the blob data through tx
         // For now, create a BlobResult that will receive the data
-        let blob_result = crate::api_legacy::core::BlobResult {
+        let blob_result = crate::legacy_api::core::BlobResult {
             receiver: rx,
             result: None,
             done: false,

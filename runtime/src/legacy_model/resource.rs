@@ -1,6 +1,6 @@
 use crate::instance::InstanceId;
 use crate::runtime::{self, TerminationCause};
-use crate::actor::ServiceCommand;
+use crate::legacy_service::ServiceCommand;
 use crate::telemetry;
 use crate::utils::IdPool;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
@@ -302,7 +302,7 @@ impl ResourceManager {
                 }
 
                 self.cleanup(victim_id)?;
-                runtime::Command::TerminateInstance {
+                crate::legacy_runtime::Command::TerminateInstance {
                     inst_id: victim_id,
                     notification_to_client: Some(TerminationCause::OutOfResources(
                         "Terminated by OOM killer for an older instance".to_string(),

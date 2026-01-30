@@ -1,9 +1,9 @@
-use crate::api_legacy::core::Queue;
-use crate::api_legacy::inferlet;
+use crate::legacy_api::core::Queue;
+use crate::legacy_api::inferlet;
 use crate::instance::InstanceState;
-use crate::model::request::{EmbedImageRequest, Request};
-use crate::model::resource::{EMBED_TYPE_ID, ResourceId};
-use crate::model::submit_request;
+use crate::legacy_model::request::{EmbedImageRequest, Request};
+use crate::legacy_model::resource::{EMBED_TYPE_ID, ResourceId};
+use crate::legacy_model::submit_request;
 use anyhow::Result;
 use wasmtime::component::Resource;
 

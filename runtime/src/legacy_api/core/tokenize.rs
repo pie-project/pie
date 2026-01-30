@@ -1,7 +1,7 @@
-use crate::api_legacy::core::Model;
-use crate::api_legacy::inferlet;
+use crate::legacy_api::core::Model;
+use crate::legacy_api::inferlet;
 use crate::instance::InstanceState;
-use crate::model::tokenizer::BytePairEncoder;
+use crate::legacy_model::tokenizer::BytePairEncoder;
 use anyhow::bail;
 use std::sync::Arc;
 use wasmtime::component::Resource;

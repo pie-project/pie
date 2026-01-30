@@ -97,6 +97,30 @@ impl<Msg: Send + 'static> Actor<Msg> {
         });
     }
     
+    /// Spawns the actor using a factory function for custom initialization.
+    ///
+    /// # Panics
+    /// Panics if the actor has already been spawned.
+    pub fn spawn_with<H, F>(&self, factory: F)
+    where
+        H: Handle<Message = Msg>,
+        F: FnOnce() -> H,
+    {
+        let mut handler = factory();
+        let (tx, mut rx) = unbounded_channel();
+
+        self.tx
+            .set(tx)
+            .map_err(|_| "Actor already spawned")
+            .unwrap();
+
+        task::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                handler.handle(msg).await;
+            }
+        });
+    }
+    
     /// Sends a message to the actor.
     pub fn send(&self, msg: Msg) -> Result<(), SendError> {
         self.tx
@@ -188,46 +212,4 @@ impl<Msg: Send + 'static> Actors<Msg> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-}
-
-// =============================================================================
-// Legacy Compatibility (Service/ServiceCommand/CommandDispatcher)
-// =============================================================================
-
-/// Legacy: A singleton service that handles commands.
-pub trait Service
-where
-    Self: Sized + Send + 'static,
-{
-    type Command: ServiceCommand;
-    fn handle(&mut self, cmd: Self::Command) -> impl Future<Output = ()> + Send;
-
-    fn start(mut self, dispatcher: &OnceLock<CommandDispatcher<Self::Command>>) {
-        let (tx, mut rx) = unbounded_channel();
-
-        task::spawn(async move {
-            while let Some(cmd) = rx.recv().await {
-                self.handle(cmd).await;
-            }
-        });
-
-        dispatcher
-            .set(CommandDispatcher { tx })
-            .map_err(|_| format!("Service {} already started", std::any::type_name::<Self>()))
-            .unwrap();
-    }
-}
-
-/// Legacy: A command that can be dispatched to a singleton service.
-pub trait ServiceCommand: Send + 'static + Sized {
-    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>>;
-
-    fn dispatch(self) {
-        Self::DISPATCHER.get().unwrap().tx.send(self).unwrap();
-    }
-}
-
-/// Legacy: Dispatcher for singleton services.
-pub struct CommandDispatcher<T> {
-    tx: UnboundedSender<T>,
 }

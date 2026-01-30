@@ -4,13 +4,13 @@ pub mod message;
 pub mod runtime;
 pub mod tokenize;
 
-use crate::api_legacy::inferlet;
-use crate::api_legacy::inferlet::core::common::Priority;
+use crate::legacy_api::inferlet;
+use crate::legacy_api::inferlet::core::common::Priority;
 use crate::instance::InstanceState;
-use crate::model;
-use crate::model::request::{QueryRequest, QueryResponse, Request};
-use crate::model::resource::{ResourceId, ResourceTypeId};
-use crate::model::{ModelInfo, submit_request};
+use crate::legacy_model;
+use crate::legacy_model::request::{QueryRequest, QueryResponse, Request};
+use crate::legacy_model::resource::{ResourceId, ResourceTypeId};
+use crate::legacy_model::{ModelInfo, submit_request};
 use anyhow::Result;
 use bytes::Bytes;
 use std::mem;
@@ -111,7 +111,7 @@ impl inferlet::core::common::Host for InstanceState {
         let svc_id = self.ctx().table.get(&queue)?.service_id;
         let (tx, rx) = oneshot::channel();
 
-        model::Command::Allocate {
+        legacy_model::Command::Allocate {
             inst_id,
             type_id: resource_type,
             count: count as usize,
@@ -135,7 +135,7 @@ impl inferlet::core::common::Host for InstanceState {
         let svc_id = self.ctx().table.get(&queue)?.service_id;
         self.unmap_resources(svc_id, resource_type, &ptrs);
 
-        model::Command::Deallocate {
+        legacy_model::Command::Deallocate {
             inst_id,
             type_id: resource_type,
             ptrs,
@@ -152,7 +152,7 @@ impl inferlet::core::common::Host for InstanceState {
     ) -> Result<Vec<(String, u32)>> {
         let q = self.ctx().table.get(&queue)?;
         let (tx, rx) = oneshot::channel();
-        model::Command::GetAllExported {
+        legacy_model::Command::GetAllExported {
             type_id: resource_type,
             response: tx,
         }
@@ -176,7 +176,7 @@ impl inferlet::core::common::Host for InstanceState {
     ) -> Result<()> {
         let inst_id = self.id();
         let svc_id = self.ctx().table.get(&queue)?.service_id;
-        model::Command::ReleaseExported {
+        legacy_model::Command::ReleaseExported {
             inst_id,
             type_id: resource_type,
             name,
@@ -201,7 +201,7 @@ impl inferlet::core::common::Host for InstanceState {
             Ok::<_, anyhow::Error>(())
         })?;
 
-        model::Command::Export {
+        legacy_model::Command::Export {
             inst_id,
             type_id: resource_type,
             ptrs,
@@ -223,7 +223,7 @@ impl inferlet::core::common::Host for InstanceState {
 
         let (tx, rx) = oneshot::channel();
 
-        model::Command::Import {
+        legacy_model::Command::Import {
             inst_id,
             type_id: resource_type,
             name,

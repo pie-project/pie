@@ -3,9 +3,9 @@
 use crate::api::pie;
 use crate::api::types::FutureString;
 use crate::instance::InstanceState;
-use crate::messaging::{PubSubCommand, PushPullCommand};
+use crate::legacy_messaging::{PubSubCommand, PushPullCommand};
 use crate::server;
-use crate::actor::ServiceCommand;
+use crate::legacy_service::ServiceCommand;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::mem;

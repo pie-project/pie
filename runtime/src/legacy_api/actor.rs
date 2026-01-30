@@ -1,4 +1,4 @@
-use crate::api_legacy::inferlet;
+use crate::legacy_api::inferlet;
 use crate::instance::InstanceState;
 use anyhow::Result;
 use wasmtime::component::Resource;

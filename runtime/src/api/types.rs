@@ -2,7 +2,7 @@
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use crate::model::ModelInfo;
+use crate::legacy_model::ModelInfo;
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

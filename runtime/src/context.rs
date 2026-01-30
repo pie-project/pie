@@ -710,7 +710,7 @@ impl ContextService {
 /// The context actor wraps ContextService for async message handling.
 #[derive(Debug)]
 struct ContextActor {
-    manager: ContextService,
+    service: ContextService,
 }
 
 impl Handle for ContextActor {
@@ -720,77 +720,77 @@ impl Handle for ContextActor {
         let page_size = 64; // Default page size
         let page_store = Arc::new(RwLock::new(PageStore::new(page_size)));
         ContextActor {
-            manager: ContextService::new(page_store, page_size),
+            service: ContextService::new(page_store, page_size),
         }
     }
 
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::Create { user_id, name, fill, response } => {
-                let result = self.manager.create(user_id, name, fill);
+                let result = self.service.create(user_id, name, fill);
                 let _ = response.send(result);
             }
             Message::Destroy { id, lock_id, response } => {
-                let result = self.manager.destroy(id, lock_id);
+                let result = self.service.destroy(id, lock_id);
                 let _ = response.send(result);
             }
             Message::Get { user_id, name, response } => {
-                let id = self.manager.get(user_id, name);
+                let id = self.service.get(user_id, name);
                 let _ = response.send(id);
             }
             Message::Fork { id, user_id, new_name, response } => {
-                let result = self.manager.fork(id, user_id, new_name);
+                let result = self.service.fork(id, user_id, new_name);
                 let _ = response.send(result);
             }
             Message::Lock { id, response } => {
-                let lock_id = self.manager.lock(id);
+                let lock_id = self.service.lock(id);
                 let _ = response.send(lock_id);
             }
             Message::Unlock { id, lock_id } => {
-                self.manager.unlock(id, lock_id);
+                self.service.unlock(id, lock_id);
             }
             Message::PageSize { id: _, response } => {
-                let size = self.manager.page_size();
+                let size = self.service.page_size();
                 let _ = response.send(size);
             }
             Message::NumTotalPages { id, response } => {
-                let count = self.manager.num_total_pages(id);
+                let count = self.service.num_total_pages(id);
                 let _ = response.send(count);
             }
             Message::NumTotalTokens { id, lock_id: _, response } => {
-                let count = self.manager.num_total_tokens(id);
+                let count = self.service.num_total_tokens(id);
                 let _ = response.send(count);
             }
             Message::CommitPages { id, lock_id, indices, response } => {
-                let result = self.manager.commit_pages(id, lock_id, indices);
+                let result = self.service.commit_pages(id, lock_id, indices);
                 let _ = response.send(result);
             }
             Message::AllocatePages { id, lock_id, num_pages, response } => {
-                let result = self.manager.allocate_pages(id, lock_id, num_pages);
+                let result = self.service.allocate_pages(id, lock_id, num_pages);
                 let _ = response.send(result);
             }
             Message::FreePages { id, lock_id, num_pages, response } => {
-                let result = self.manager.free_pages(id, lock_id, num_pages);
+                let result = self.service.free_pages(id, lock_id, num_pages);
                 let _ = response.send(result);
             }
             Message::GetPointer { id, lock_id: _, response } => {
-                let pointer = self.manager.get_pointer(id);
+                let pointer = self.service.get_pointer(id);
                 let _ = response.send(pointer);
             }
             Message::SetPointer { id, lock_id: _, pointer, response } => {
-                let result = self.manager.set_pointer(id, pointer);
+                let result = self.service.set_pointer(id, pointer);
                 let _ = response.send(result);
             }
             Message::GetUncommittedTokens { id, lock_id: _, response } => {
-                let tokens = self.manager.get_uncommitted_tokens(id);
+                let tokens = self.service.get_uncommitted_tokens(id);
                 let _ = response.send(tokens);
             }
             Message::SetUncommittedTokens { id, lock_id: _, tokens, response } => {
-                let result = self.manager.set_uncommitted_tokens(id, tokens);
+                let result = self.service.set_uncommitted_tokens(id, tokens);
                 let _ = response.send(result);
             }
             Message::GetPhysicalPageIds { id, lock_id: _, response } => {
-                let page_ids = self.manager.get_physical_page_ids(id);
+                let page_ids = self.service.get_physical_page_ids(id);
                 let _ = response.send(page_ids);
             }
         }

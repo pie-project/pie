@@ -1,8 +1,8 @@
-use crate::api_legacy::core::{DebugQueryResult, Model};
-use crate::api_legacy::inferlet;
+use crate::legacy_api::core::{DebugQueryResult, Model};
+use crate::legacy_api::inferlet;
 use crate::instance::InstanceState;
-use crate::model;
-use crate::actor::ServiceCommand;
+use crate::legacy_model;
+use crate::legacy_service::ServiceCommand;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
@@ -11,7 +11,7 @@ use wasmtime_wasi::WasiView;
 impl inferlet::core::runtime::Host for InstanceState {
     async fn get_version(&mut self) -> anyhow::Result<String> {
         let (tx, rx) = oneshot::channel();
-        crate::runtime::Command::GetVersion { event: tx }.dispatch();
+        crate::legacy_runtime::Command::GetVersion { event: tx }.dispatch();
         rx.await.map_err(Into::into)
     }
 
@@ -29,9 +29,9 @@ impl inferlet::core::runtime::Host for InstanceState {
     }
 
     async fn get_model(&mut self, name: String) -> anyhow::Result<Option<Resource<Model>>> {
-        if let Some(service_id) = model::model_service_id(&name) {
+        if let Some(service_id) = legacy_model::model_service_id(&name) {
             let (tx, rx) = oneshot::channel();
-            model::Command::GetInfo { response: tx }.dispatch(service_id)?;
+            legacy_model::Command::GetInfo { response: tx }.dispatch(service_id)?;
             let info = rx.await?;
             let model = Model {
                 service_id,
@@ -44,7 +44,7 @@ impl inferlet::core::runtime::Host for InstanceState {
     }
 
     async fn get_all_models(&mut self) -> anyhow::Result<Vec<String>> {
-        Ok(model::registered_models())
+        Ok(legacy_model::registered_models())
     }
 
     async fn get_all_models_with_traits(
@@ -52,7 +52,7 @@ impl inferlet::core::runtime::Host for InstanceState {
         _traits: Vec<String>,
     ) -> anyhow::Result<Vec<String>> {
         // Placeholder: Implement trait filtering logic
-        Ok(model::registered_models())
+        Ok(legacy_model::registered_models())
     }
 
     async fn debug_query(&mut self, query: String) -> anyhow::Result<Resource<DebugQueryResult>> {
@@ -64,7 +64,7 @@ impl inferlet::core::runtime::Host for InstanceState {
             done: false,
         };
 
-        crate::runtime::Command::DebugQuery { query, event: tx }.dispatch();
+        crate::legacy_runtime::Command::DebugQuery { query, event: tx }.dispatch();
         Ok(self.ctx().table.push(res)?)
     }
 }
