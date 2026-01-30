@@ -9,7 +9,6 @@ use tokio::sync::oneshot;
 use crate::actor::{Handle, Actors, SendError};
 use crate::context;
 use crate::inference;
-use crate::kvcache;
 
 /// Global address table for model actors.
 static ACTOR: LazyLock<Actors<Message>> = LazyLock::new(Actors::new);
@@ -21,9 +20,9 @@ pub fn install_model(info: ModelInfo) -> usize {
     let model_id = ACTOR.spawn_with::<ModelActor, _>(|| ModelActor::with_info(info));
 
     // Spawn the associated actors with the same model ID
+    // Note: PageStore is now owned by ContextActor, so no separate kvcache actor
     let _ = context::spawn();
     let _ = inference::spawn();
-    let _ = kvcache::spawn();
 
     model_id
 }

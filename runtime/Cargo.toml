@@ -68,3 +68,4 @@ reqwest = { version = "0.12", features = ["rustls-tls"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 bytemuck = { version = "1.21", features = ["derive"] }
 ipc-channel = "0.19"
+rustc-hash = "2.1"

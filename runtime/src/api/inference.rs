@@ -66,6 +66,7 @@ enum SamplerType {
     TopK = 3,
     MinP = 4,
     TopKTopP = 5,
+    Embedding = 6,
 }
 
 impl pie::core::inference::Host for InstanceState {}
@@ -87,14 +88,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             adapter: None,
         };
         Ok(self.ctx().table.push(pass)?)
-    }
-
-    async fn kv_pages(&mut self, this: Resource<ForwardPass>, page_ids: Vec<u32>) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        // TODO: Store page IDs for KV cache lookup during forward pass
-        let _ = page_ids; // Store in pass when implementing
-        let _ = pass;
-        Ok(())
     }
 
     async fn context(&mut self, _this: Resource<ForwardPass>, _context: Resource<Context>) -> Result<()> {
@@ -176,6 +169,9 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Distribution as u32));
                 sampler_map.insert("temperature".to_string(), rmpv::Value::from(temp));
                 sampler_map.insert("top_k".to_string(), rmpv::Value::from(k));
+            }
+            pie::core::inference::Sampler::Embedding => {
+                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Embedding as u32));
             }
         }
 

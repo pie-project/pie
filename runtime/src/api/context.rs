@@ -11,30 +11,21 @@ use wasmtime_wasi::WasiView;
 #[derive(Debug)]
 pub struct Context {
     pub name: String,
+    pub pointer: u32,
+    pub staged_tokens: Vec<u32>,
     // TODO: Add KV cache page pointers and state
 }
 
-impl pie::core::context::Host for InstanceState {
-    async fn kv_page_size(&mut self, _model: Resource<Model>) -> Result<u32> {
-        // TODO: Get actual page size from model
-        Ok(256)
-    }
-
-    async fn allocate_pages(&mut self, _model: Resource<Model>, num_pages: u32) -> Result<Result<Vec<u32>, String>> {
-        // TODO: Allocate KV pages from model's page pool
-        let page_ids: Vec<u32> = (0..num_pages).collect();
-        Ok(Ok(page_ids))
-    }
-
-    async fn free_pages(&mut self, _model: Resource<Model>, _page_ids: Vec<u32>) -> Result<Result<(), String>> {
-        // TODO: Free KV pages back to model's page pool
-        Ok(Ok(()))
-    }
-}
+impl pie::core::context::Host for InstanceState {}
 
 impl pie::core::context::HostContext for InstanceState {
-    async fn create(&mut self, _model: Resource<Model>, name: String) -> Result<Result<Resource<Context>, String>> {
-        let ctx = Context { name };
+    async fn create(&mut self, _model: Resource<Model>, name: String, fill: Option<Vec<u32>>) -> Result<Result<Resource<Context>, String>> {
+        let _ = fill;
+        let ctx = Context { 
+            name,
+            pointer: 0,
+            staged_tokens: vec![],
+        };
         Ok(Ok(self.ctx().table.push(ctx)?))
     }
 
@@ -49,9 +40,12 @@ impl pie::core::context::HostContext for InstanceState {
     }
 
     async fn fork(&mut self, this: Resource<Context>, new_name: String) -> Result<Result<Resource<Context>, String>> {
-        let _parent = self.ctx().table.get(&this)?;
-        // TODO: Fork KV cache pages
-        let forked = Context { name: new_name };
+        let parent = self.ctx().table.get(&this)?;
+        let forked = Context { 
+            name: new_name,
+            pointer: parent.pointer,
+            staged_tokens: parent.staged_tokens.clone(),
+        };
         Ok(Ok(self.ctx().table.push(forked)?))
     }
 
@@ -75,13 +69,56 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(Ok(()))
     }
 
-    async fn commit_pages(&mut self, _this: Resource<Context>, _page_ids: Vec<u32>) -> Result<Result<(), String>> {
+    async fn page_size(&mut self, _this: Resource<Context>) -> Result<u32> {
+        Ok(256) // TODO: Get from model
+    }
+
+    async fn num_total_pages(&mut self, _this: Resource<Context>) -> Result<u32> {
+        // TODO: Get number of committed pages
+        Ok(0)
+    }
+
+    async fn num_total_tokens(&mut self, _this: Resource<Context>) -> Result<u32> {
+        // TODO: Get total tokens
+        Ok(0)
+    }
+
+    async fn commit_pages(&mut self, _this: Resource<Context>, _indices: Vec<u32>) -> Result<Result<(), String>> {
         // TODO: Commit KV pages to context
         Ok(Ok(()))
     }
 
-    async fn trim_pages(&mut self, _this: Resource<Context>, _num_pages: u32) -> Result<Result<(), String>> {
-        // TODO: Trim KV pages from context
+    async fn allocate_pages(&mut self, _this: Resource<Context>, _num_pages: u32) -> Result<Result<(), String>> {
+        // TODO: Allocate pages
         Ok(Ok(()))
     }
+
+    async fn free_pages(&mut self, _this: Resource<Context>, _num_pages: u32) -> Result<Result<(), String>> {
+        // TODO: Free pages
+        Ok(Ok(()))
+    }
+
+    async fn pointer(&mut self, this: Resource<Context>) -> Result<u32> {
+        let ctx = self.ctx().table.get(&this)?;
+        Ok(ctx.pointer)
+    }
+
+    async fn set_pointer(&mut self, this: Resource<Context>, pointer: u32) -> Result<Result<(), String>> {
+        let ctx = self.ctx().table.get_mut(&this)?;
+        ctx.pointer = pointer;
+        Ok(Ok(()))
+    }
+
+    async fn staged_tokens(&mut self, this: Resource<Context>) -> Result<Vec<u32>> {
+        let ctx = self.ctx().table.get(&this)?;
+        Ok(ctx.staged_tokens.clone())
+    }
+
+    async fn set_staged_tokens(&mut self, this: Resource<Context>, tokens: Vec<u32>) -> Result<Result<(), String>> {
+        let ctx = self.ctx().table.get_mut(&this)?;
+        ctx.staged_tokens = tokens;
+        Ok(Ok(()))
+    }
+
+
 }

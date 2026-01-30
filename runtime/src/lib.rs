@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod api;
 pub mod api_legacy;
 pub mod auth;
+pub mod brle;
 pub mod context;
 pub mod dummy;
 pub mod engine;

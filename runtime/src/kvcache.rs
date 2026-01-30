@@ -1,208 +1,471 @@
 //! KV Cache - Content-Addressable Storage (CAS) for KV cache pages
 //!
-//! This module provides a model-specific actor for managing KV cache pages
+//! This module provides the PageStore for managing KV cache pages
 //! using content-addressable storage. Pages are identified by their content hash,
 //! enabling efficient deduplication and sharing across contexts.
-//!
-//! ## Hierarchical Hashing (Merkle-style)
-//!
-//! Uses fixed power-of-2 prefix boundaries for O(log N) cache lookups:
-//! - Prefix hashes at boundaries: 16, 64, 256, 1024, 4096 pages
-//! - Use `GetCachedPrefix` with `HashTree` for fast routing discovery
-//! - Use `Put` with flat `Vec<PageHash>` for robust allocation
-//! - Use `Unref` with `HashTree` to clean up both pages and prefix markers
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
-use tokio::sync::oneshot;
+use rustc_hash::{FxHashMap, FxHasher};
 use anyhow::Result;
 
-use crate::actor::{Handle, Actors, SendError};
+use crate::brle::Brle;
 
 /// Hash key for content-addressable pages
 pub type PageHash = u64;
 
+pub type PageId = usize;
+
 /// Physical page index in GPU memory
-pub type PhysicalPageId = usize;
+pub type PhysicalPageId = u32;
 
 /// Node identifier
-pub type NodeId = usize;
+pub type NodeId = u8;
 
 /// Load threshold for spillover (fraction of capacity)
 const LOAD_THRESHOLD: f64 = 0.8;
 
-/// Fixed prefix boundaries (power-of-2 aligned)
-const PREFIX_BOUNDARIES: &[usize] = &[16, 64, 256, 1024, 4096];
 
-/// Global registry for KV cache actors.
-static ACTOR: LazyLock<Actors<Message>> = LazyLock::new(Actors::new);
-
-/// Spawns a new KV cache actor.
-pub(crate) fn spawn() -> usize {
-    ACTOR.spawn::<KvCacheActor>()
-}
-
-// ============================================================================
-// HashTree: Merkle-style hierarchical hashing
-// ============================================================================
-
-/// Hierarchical hash structure for efficient prefix matching.
-#[derive(Debug, Clone)]
-pub struct HashTree {
-    /// Prefix hashes at power-of-2 boundaries: (boundary, hash)
-    prefix_hashes: Vec<(usize, PageHash)>,
-    
-    /// Full list of page hashes (needed for Unref correct counting)
-    all_hashes: Vec<PageHash>,
-}
-
-impl HashTree {
-    /// Build a HashTree from individual page hashes.
-    pub fn from_page_hashes(page_hashes: &[PageHash]) -> Self {
-        let total_pages = page_hashes.len();
-        let mut prefix_hashes = Vec::new();
-        
-        // Build prefix hashes at each boundary
-        for &boundary in PREFIX_BOUNDARIES {
-            if total_pages >= boundary {
-                let prefix_hash = Self::merkle_hash(&page_hashes[..boundary]);
-                prefix_hashes.push((boundary, prefix_hash));
-            }
-        }
-        
-        HashTree {
-            prefix_hashes,
-            all_hashes: page_hashes.to_vec(),
-        }
-    }
-    
-    /// Compute Merkle hash of a slice of page hashes.
-    fn merkle_hash(hashes: &[PageHash]) -> PageHash {
-        let mut hasher = DefaultHasher::new();
-        for h in hashes {
-            h.hash(&mut hasher);
-        }
-        hasher.finish()
-    }
-    
-    /// Get the largest prefix hash for routing.
-    pub fn largest_prefix(&self) -> Option<(usize, PageHash)> {
-        self.prefix_hashes.last().copied()
-    }
-    
-    /// Find the longest cached prefix in a store.
-    pub fn find_cached_prefix(&self, store: &PageStore) -> usize {
-        let mut cached_pages = 0;
-        
-        // 1. Check prefix hashes (coarse, fast)
-        for &(boundary, hash) in &self.prefix_hashes {
-            if store.has_prefix_hash(hash) {
-                cached_pages = boundary;
-            } else {
-                break;
-            }
-        }
-        
-        // 2. Check remaining individual pages
-        for (i, &hash) in self.all_hashes.iter().enumerate().skip(cached_pages) {
-            if store.has_page_hash(hash) {
-                cached_pages = i + 1;
-            } else {
-                break;
-            }
-        }
-        
-        cached_pages
-    }
-}
-
-
-// how about "hot pages" as in beam search or spec dec?
-// maybe commit the cold ones, and let inferlets control the workspace kvcache?
-
-
-// ============================================================================
-// Messages
-// ============================================================================
-
-/// Messages for the KV cache actor.
 #[derive(Debug)]
-pub enum Message {
-    /// Adds a new node/GPU to the cache pool
-    AddNode {
-        total_pages: usize,
-        response: oneshot::Sender<NodeId>,
-    },
-
-    /// Lookup cached prefix using HashTree, returns (node_id, cached_pages)
-    Get {
-        tree: HashTree,
-        response: oneshot::Sender<Option<(NodeId, usize)>>,
-    },
-
-    /// Store pages using flat hashes (safe, constructs prefixes internally)
-    Put {
-        hashes: Vec<PageHash>,
-        response: oneshot::Sender<Vec<(NodeId, PhysicalPageId)>>,
-    },
-
-    /// Decrement ref counts using Tree (cleans up prefixes and pages)
-    Unref {
-        tree: HashTree,
-        node_hint: Option<NodeId>,
-    },
-
-    Allocate {
-        num_pages: usize,
-        node: NodeId,
-        response: oneshot::Sender<Vec<(NodeId, PhysicalPageId)>>,
-    },
-
-    Free {
-        page_ids: Vec<(NodeId, PhysicalPageId)>,
-    },
+pub enum Mapping {
+    Single(NodeId, PhysicalPageId),
+    Replicated(Vec<(NodeId, PhysicalPageId)>),
 }
 
-impl Message {
-    pub fn send(self, model_idx: usize) -> Result<(), SendError> {
-        ACTOR.send(model_idx, self)
+#[derive(Debug)]
+pub struct Page {
+    pub mapping: Mapping,
+    pub hash: Option<PageHash>,  // None if mutable (not yet committed)
+    pub refcount: u16,
+    pub max_position: Option<u32>,  // Highest position ID in this page (None if uncommitted)
+}
+
+impl Page {
+    fn is_mutable(&self) -> bool {
+        self.hash.is_none()
+    }
+
+    fn node_id(&self) -> NodeId {
+        match &self.mapping {
+            Mapping::Single(node_id, _) => *node_id,
+            Mapping::Replicated(mappings) => mappings[0].0,
+        }
+    }
+
+    /// Add mapping from another page, deduplicating by node.
+    /// Returns redundant physical pages that should be freed.
+    fn add_mapping(&mut self, other: Mapping) -> Vec<(NodeId, PhysicalPageId)> {
+        let mut new_entries = match other {
+            Mapping::Single(n, p) => vec![(n, p)],
+            Mapping::Replicated(v) => v,
+        };
+        
+        let mut all_entries = match &self.mapping {
+            Mapping::Single(n, p) => vec![(*n, *p)],
+            Mapping::Replicated(v) => v.clone(),
+        };
+        
+        let mut redundant = Vec::new();
+        
+        // Deduplicate by node: keep first occurrence, mark rest as redundant
+        for (new_node, new_phys) in new_entries {
+            if let Some(_) = all_entries.iter().find(|(n, _)| *n == new_node) {
+                // Already have a page on this node, mark new one as redundant
+                redundant.push((new_node, new_phys));
+            } else {
+                // New node, add it
+                all_entries.push((new_node, new_phys));
+            }
+        }
+        
+        // Update mapping
+        self.mapping = if all_entries.len() == 1 {
+            Mapping::Single(all_entries[0].0, all_entries[0].1)
+        } else {
+            Mapping::Replicated(all_entries)
+        };
+        
+        redundant
     }
 }
 
 // ============================================================================
-// PageStore: Per-node storage
+// PageStore: Centralized logical page storage
 // ============================================================================
 
-/// Per-node page storage
 #[derive(Debug)]
-struct PageStore {
-    node_id: NodeId,
-    total_pages: usize,
-    
-    /// Individual page hashes -> physical page ID
-    page_hash_to_id: HashMap<PageHash, PhysicalPageId>,
-    page_id_to_hash: HashMap<PhysicalPageId, PageHash>,
-    
-    /// Reference counts for pages
-    ref_counts: HashMap<PhysicalPageId, usize>,
-    free_pages: Vec<PhysicalPageId>,
-    
-    /// Reference counts for prefix hashes (Merkle nodes)
-    prefix_ref_counts: HashMap<PageHash, usize>,
+pub struct PageStore {
+    page_size: usize,
+    pages: Vec<Option<Page>>, // the index of page is the page id
+    index: FxHashMap<PageHash, PageId>,
+    free_page_ids: Vec<PageId>, // recycled page IDs
+    lru: VecDeque<PageId>, // pages with refcount=0, front=oldest
+
+    /// Per-gpu storage
+    nodes: Vec<PhysicalPageStore>, // the index of node is the node id
 }
 
 impl PageStore {
-    fn new(node_id: NodeId, total_pages: usize) -> Self {
+    pub fn new(page_size: usize) -> Self {
         PageStore {
-            node_id,
+            page_size,
+            pages: Vec::new(),
+            index: FxHashMap::default(),
+            free_page_ids: Vec::new(),
+            lru: VecDeque::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    /// Get the page size (number of tokens per page)
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// Register a new node/GPU and return its ID
+    pub fn register_node(&mut self, total_pages: usize) -> NodeId {
+        let node_id = self.nodes.len() as NodeId;
+        self.nodes.push(PhysicalPageStore::new(total_pages));
+        node_id
+    }
+
+    /// Compute hash chain from tokens.
+    /// Returns a list of (page_index, page_hash) pairs.
+    fn compute_hashes(&self, tokens: &[u32]) -> Vec<PageHash> {
+        let mut hashes = Vec::new();
+        let mut prev_hash: PageHash = 0;
+
+        for chunk in tokens.chunks(self.page_size) {
+            // Hash the token content
+            let mut hasher = FxHasher::default();
+            chunk.hash(&mut hasher);
+            let content_hash = hasher.finish();
+
+            // Chain with previous hash
+            let mut chain_hasher = FxHasher::default();
+            content_hash.hash(&mut chain_hasher);
+            prev_hash.hash(&mut chain_hasher);
+            let page_hash = chain_hasher.finish();
+
+            hashes.push(page_hash);
+            prev_hash = page_hash;
+        }
+
+        hashes
+    }
+
+    /// Lookup cached pages by token prefix (longest prefix match).
+    /// Automatically increments refcount for matched pages.
+    pub fn lookup(&mut self, tokens: &[u32]) -> Option<Vec<PageId>> {
+        if tokens.is_empty() {
+            return None;
+        }
+
+        let hashes = self.compute_hashes(tokens);
+        let mut matched_pages = Vec::new();
+
+        for hash in &hashes {
+            if let Some(&page_id) = self.index.get(hash) {
+                // Increment refcount
+                if let Some(page) = self.pages[page_id].as_mut() {
+                    if page.refcount == 0 {
+                        // Remove from LRU since it's now in use
+                        self.lru.retain(|&id| id != page_id);
+                    }
+                    page.refcount += 1;
+                    matched_pages.push(page_id);
+                }
+            } else {
+                // No match, stop here (prefix matching)
+                break;
+            }
+        }
+
+        if matched_pages.is_empty() {
+            None
+        } else {
+            Some(matched_pages)
+        }
+    }
+
+    /// Commit pages to the cache, making them immutable and shareable.
+    /// Hash chain includes tokens, positions, and masks.
+    /// Returns (final_page_ids, final_hash) for continued chaining.
+    pub fn commit(
+        &mut self,
+        page_ids: &[PageId],
+        tokens: &[u32],
+        positions: &[u32],
+        masks: &[Brle],
+        prev_hash: PageHash,
+    ) -> Result<(Vec<PageId>, PageHash)> {
+        if tokens.len() != positions.len() || tokens.len() != masks.len() {
+            anyhow::bail!(
+                "Length mismatch: {} tokens, {} positions, {} masks",
+                tokens.len(),
+                positions.len(),
+                masks.len()
+            );
+        }
+
+        // Compute hashes with position and mask info
+        let mut hashes = Vec::new();
+        let mut max_positions = Vec::new();
+        let mut running_hash = prev_hash;
+
+        for (chunk_idx, chunk) in tokens.chunks(self.page_size).enumerate() {
+            let start = chunk_idx * self.page_size;
+            let end = start + chunk.len();
+            let chunk_positions = &positions[start..end];
+            let chunk_masks = &masks[start..end];
+
+            // Hash tokens
+            let mut hasher = FxHasher::default();
+            chunk.hash(&mut hasher);
+            
+            // Hash positions
+            for pos in chunk_positions {
+                pos.hash(&mut hasher);
+            }
+            
+            // Hash masks
+            for mask in chunk_masks {
+                mask.hash(&mut hasher);
+            }
+            
+            let content_hash = hasher.finish();
+
+            // Chain with previous hash
+            let mut chain_hasher = FxHasher::default();
+            content_hash.hash(&mut chain_hasher);
+            running_hash.hash(&mut chain_hasher);
+            let page_hash = chain_hasher.finish();
+
+            hashes.push(page_hash);
+            running_hash = page_hash;
+
+            // Find max position for this page
+            let max_pos = chunk_positions.iter().copied().max();
+            max_positions.push(max_pos);
+        }
+
+        if page_ids.len() != hashes.len() {
+            anyhow::bail!(
+                "Page count mismatch: {} pages but {} hashes",
+                page_ids.len(),
+                hashes.len()
+            );
+        }
+
+        let mut final_page_ids = Vec::with_capacity(page_ids.len());
+
+        for (i, (&page_id, &hash)) in page_ids.iter().zip(hashes.iter()).enumerate() {
+            let max_pos = max_positions[i];
+
+            // Check for existing canonical page
+            if let Some(&canonical_id) = self.index.get(&hash) {
+                if canonical_id != page_id {
+                    // Deduplicate: merge current page into canonical
+                    if let Some(page) = self.pages[page_id].take() {
+                        if let Some(canonical_page) = self.pages[canonical_id].as_mut() {
+                            if canonical_page.refcount == 0 {
+                                self.lru.retain(|&id| id != canonical_id);
+                            }
+                            let redundant = canonical_page.add_mapping(page.mapping);
+                            for (node_id, phys_id) in redundant {
+                                self.nodes[node_id as usize].free_pages.push(phys_id);
+                            }
+                            canonical_page.refcount += 1;
+                        }
+                    }
+                    self.free_page_ids.push(page_id);
+                    final_page_ids.push(canonical_id);
+                    continue;
+                }
+            }
+
+            // Normal commit
+            let page = self.pages[page_id].as_mut().unwrap();
+            debug_assert!(page.is_mutable(), "Page {} is already committed", page_id);
+            page.hash = Some(hash);
+            page.max_position = max_pos;
+            self.index.insert(hash, page_id);
+            final_page_ids.push(page_id);
+        }
+
+        Ok((final_page_ids, running_hash))
+    }
+
+    /// Select the best node for allocation.
+    /// If affinity is specified, use that node. Otherwise, use the node with lowest load.
+    fn select_node(&self, affinity: Option<PageId>) -> Option<NodeId> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+
+        if let Some(affinity_page_id) = affinity {
+            if let Some(page) = self.pages.get(affinity_page_id).and_then(|p| p.as_ref()) {
+                return Some(page.node_id());
+            }
+        }
+
+        // Select node with lowest load
+        self.nodes
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.load_factor()
+                    .partial_cmp(&b.load_factor())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx as NodeId)
+    }
+
+    /// Try to evict one page from the LRU (must have refcount=0).
+    /// Returns true if a page was evicted.
+    fn evict_one(&mut self, target_node: NodeId) -> bool {
+        // Find a page in LRU that belongs to the target node
+        let mut evict_idx = None;
+        for (i, &page_id) in self.lru.iter().enumerate() {
+            if let Some(page) = self.pages[page_id].as_ref() {
+                if page.node_id() == target_node && page.refcount == 0 {
+                    evict_idx = Some(i);
+                    break;
+                }
+            }
+        }
+
+        if let Some(idx) = evict_idx {
+            let page_id = self.lru.remove(idx).unwrap();
+            self.free_page(page_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Free a page, returning its physical page to the node.
+    fn free_page(&mut self, page_id: PageId) {
+        if let Some(page) = self.pages[page_id].take() {
+            // Remove from index if committed
+            if let Some(hash) = page.hash {
+                // Only remove from index if it points to this specific page
+                if let Some(&id) = self.index.get(&hash) {
+                    if id == page_id {
+                        self.index.remove(&hash);
+                    }
+                }
+            }
+
+            // Return physical page to node
+            match page.mapping {
+                Mapping::Single(node_id, phys_id) => {
+                    self.nodes[node_id as usize].free_pages.push(phys_id);
+                }
+                Mapping::Replicated(mappings) => {
+                    for (node_id, phys_id) in mappings {
+                        self.nodes[node_id as usize].free_pages.push(phys_id);
+                    }
+                }
+            }
+
+            // Recycle the page ID
+            self.free_page_ids.push(page_id);
+        }
+    }
+
+    /// Allocate pages on a specific node.
+    pub fn allocate(&mut self, num_pages: usize, affinity: Option<PageId>) -> Result<Vec<PageId>> {
+        let node_id = self.select_node(affinity)
+            .ok_or_else(|| anyhow::anyhow!("No nodes registered"))?;
+
+        // Try to allocate, evicting if necessary
+        let mut allocated = Vec::with_capacity(num_pages);
+        
+        for _ in 0..num_pages {
+            // Try to get a free physical page, evicting if necessary
+            let phys_id = loop {
+                if let Some(phys_id) = self.nodes[node_id as usize].free_pages.pop() {
+                    break phys_id;
+                }
+                // Try to evict a page from this node
+                if !self.evict_one(node_id) {
+                    // Failed to evict, rollback allocations
+                    for page_id in allocated {
+                        self.free_page(page_id);
+                    }
+                    anyhow::bail!("Out of memory on node {}", node_id);
+                }
+            };
+
+            // Get or create a page ID
+            let page_id = if let Some(id) = self.free_page_ids.pop() {
+                id
+            } else {
+                let id = self.pages.len();
+                self.pages.push(None);
+                id
+            };
+
+            // Create the page
+            self.pages[page_id] = Some(Page {
+                mapping: Mapping::Single(node_id, phys_id),
+                hash: None, // mutable
+                refcount: 1,
+                max_position: None,
+            });
+
+            allocated.push(page_id);
+        }
+
+        Ok(allocated)
+    }
+
+    /// Release pages (decrease refcount).
+    pub fn release(&mut self, page_ids: &[PageId]) {
+        for &page_id in page_ids {
+            if let Some(page) = self.pages[page_id].as_mut() {
+                page.refcount = page.refcount.saturating_sub(1);
+                if page.refcount == 0 {
+                    if page.is_mutable() {
+                        // Mutable pages with refcount=0 are immediately freed
+                        self.free_page(page_id);
+                    } else {
+                        // Committed pages go to LRU for potential reuse
+                        self.lru.push_back(page_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Acquire pages (increase refcount).
+    /// Used when forking contexts to share committed pages.
+    pub fn acquire(&mut self, page_ids: &[PageId]) {
+        for &page_id in page_ids {
+            if let Some(page) = self.pages[page_id].as_mut() {
+                if page.refcount == 0 {
+                    // Remove from LRU since it's now in use
+                    self.lru.retain(|&id| id != page_id);
+                }
+                page.refcount += 1;
+            }
+        }
+    }
+}
+
+// Per-gpu storage
+#[derive(Debug)]
+struct PhysicalPageStore {
+    total_pages: usize,
+    free_pages: Vec<PhysicalPageId>,
+}
+
+impl PhysicalPageStore {
+    fn new(total_pages: usize) -> Self {
+        PhysicalPageStore {
             total_pages,
-            page_hash_to_id: HashMap::new(),
-            page_id_to_hash: HashMap::new(),
-            ref_counts: HashMap::new(),
-            free_pages: (0..total_pages).collect(),
-            prefix_ref_counts: HashMap::new(),
+            free_pages: (0..total_pages as PhysicalPageId).collect(),
         }
     }
 
@@ -214,183 +477,8 @@ impl PageStore {
         }
     }
 
+    #[allow(dead_code)]
     fn is_overloaded(&self) -> bool {
         self.load_factor() >= LOAD_THRESHOLD
-    }
-
-    /// Check if a prefix hash exists and has refs
-    fn has_prefix_hash(&self, hash: PageHash) -> bool {
-        self.prefix_ref_counts.contains_key(&hash)
-    }
-    
-    /// Check if an individual page hash exists
-    fn has_page_hash(&self, hash: PageHash) -> bool {
-        self.page_hash_to_id.contains_key(&hash)
-    }
-
-    /// Register a prefix hash (increment ref count)
-    fn ref_prefix(&mut self, hash: PageHash) {
-        *self.prefix_ref_counts.entry(hash).or_insert(0) += 1;
-    }
-
-    /// Deregister a prefix hash (decrement ref count)
-    fn unref_prefix(&mut self, hash: PageHash) {
-        if let Some(count) = self.prefix_ref_counts.get_mut(&hash) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.prefix_ref_counts.remove(&hash);
-            }
-        }
-    }
-
-    /// Store individual page, returns physical page ID
-    fn put_page(&mut self, hash: PageHash) -> Option<PhysicalPageId> {
-        if let Some(&page_id) = self.page_hash_to_id.get(&hash) {
-            *self.ref_counts.entry(page_id).or_insert(1) += 1;
-            return Some(page_id);
-        }
-        if let Some(page_id) = self.free_pages.pop() {
-            self.page_hash_to_id.insert(hash, page_id);
-            self.page_id_to_hash.insert(page_id, hash);
-            self.ref_counts.insert(page_id, 1);
-            Some(page_id)
-        } else {
-            None
-        }
-    }
-
-    /// Unref individual page
-    fn unref_page(&mut self, hash: &PageHash) -> bool {
-        if let Some(&page_id) = self.page_hash_to_id.get(hash) {
-            if let Some(count) = self.ref_counts.get_mut(&page_id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.ref_counts.remove(&page_id);
-                    self.page_id_to_hash.remove(&page_id);
-                    self.page_hash_to_id.remove(hash);
-                    self.free_pages.push(page_id);
-                }
-                return true;
-            }
-        }
-        false
-    }
-}
-
-// ============================================================================
-// KvCacheActor
-// ============================================================================
-
-#[derive(Debug)]
-struct KvCacheActor {
-    stores: Vec<PageStore>,
-}
-
-impl KvCacheActor {
-    /// Use HashTree (built locally) to route `Put` requests
-    fn route(&self, tree: &HashTree) -> Option<NodeId> {
-        if self.stores.is_empty() { return None; }
-
-        let affinity_hash = tree.largest_prefix().map(|(_, h)| h).unwrap_or(0);
-        let primary = (affinity_hash as usize) % self.stores.len();
-
-        if !self.stores[primary].is_overloaded() {
-            return Some(primary);
-        }
-
-        // Search for cache hits using prefixes
-        for &(boundary, hash) in tree.prefix_hashes.iter().rev() {
-            let cached = self.stores.iter()
-                .filter(|s| !s.is_overloaded() && s.has_prefix_hash(hash))
-                .min_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap());
-            if let Some(store) = cached {
-                return Some(store.node_id);
-            }
-        }
-
-        // Spillover
-        self.stores.iter()
-            .min_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap())
-            .map(|s| s.node_id)
-    }
-}
-
-impl Handle for KvCacheActor {
-    type Message = Message;
-
-    fn new() -> Self {
-        KvCacheActor { stores: Vec::new() }
-    }
-
-    async fn handle(&mut self, msg: Message) {
-        match msg {
-            Message::AddNode { total_pages, response } => {
-                let node_id = self.stores.len();
-                self.stores.push(PageStore::new(node_id, total_pages));
-                let _ = response.send(node_id);
-            }
-
-            Message::Get { tree, response } => {
-                let mut best: Option<(NodeId, usize)> = None;
-                for store in &self.stores {
-                    let cached = tree.find_cached_prefix(store);
-                    if cached > best.map(|(_, c)| c).unwrap_or(0) {
-                        best = Some((store.node_id, cached));
-                    }
-                }
-                let _ = response.send(best);
-            }
-
-            Message::Put { hashes, response } => {
-                // Build tree locally to determine routing and update prefixes
-                let tree = HashTree::from_page_hashes(&hashes);
-                let mut results = Vec::new();
-
-                if let Some(node_id) = self.route(&tree) {
-                    let store = &mut self.stores[node_id];
-                    
-                    // 1. Ref count the prefixes (Merkle nodes)
-                    for &(_, hash) in &tree.prefix_hashes {
-                        store.ref_prefix(hash);
-                    }
-
-                    // 2. Alloc/Ref the actual pages
-                    for &hash in &hashes {
-                        if let Some(page_id) = store.put_page(hash) {
-                            results.push((node_id, page_id));
-                        }
-                    }
-                }
-                let _ = response.send(results);
-            }
-
-            Message::Unref { tree, node_hint } => {
-                // Remove prefixes if hinted
-                if let Some(node_id) = node_hint {
-                     if let Some(store) = self.stores.get_mut(node_id) {
-                         for &(_, hash) in &tree.prefix_hashes {
-                             store.unref_prefix(hash);
-                         }
-                     }
-                }
-
-                // Remove pages (search everywhere)
-                for hash in tree.all_hashes {
-                    let found = if let Some(node_id) = node_hint {
-                        self.stores.get_mut(node_id).map(|s| s.unref_page(&hash)).unwrap_or(false)
-                    } else {
-                        false
-                    };
-
-                    if !found {
-                        for store in &mut self.stores {
-                            if store.unref_page(&hash) {
-                                break; 
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 }

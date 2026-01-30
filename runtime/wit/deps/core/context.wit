@@ -7,8 +7,9 @@ interface context {
     type page-id = u32;
 
     resource context {
+
         // Creates a new context, optionally with a name
-        create: static func(model:borrow<model>, name: string) -> result<context, error>;
+        create: static func(model:borrow<model>, name: string, fill: option<list<u32>>) -> result<context, error>;
 
         destroy: func() -> result<_, error>;
 
@@ -27,18 +28,28 @@ interface context {
         // Releases the lock
         unlock: func() -> result<_, error>;
 
+        page-size: func() -> u32;
+
+        // Number of committed KV pages in the context
+        num-total-pages: func() -> u32;
+
+        num-total-tokens: func() -> u32;
+
         // Commit the KV pages to the context
-        commit-pages: func(page-ids: list<page-id>) -> result<_, error>;
+        commit-pages: func(indices: list<u32>) -> result<_, error>;
 
-        // Trim the KV pages (shrink)
-        trim-pages: func(num-pages: u32) -> result<_, error>;
+        allocate-pages: func(num-pages: u32) -> result<_, error>;
+
+        free-pages: func(num-pages: u32) -> result<_, error>;
+
+        pointer: func() -> u32;
+
+        set-pointer: func(pointer: u32) -> result<_, error>;
+
+        staged-tokens: func() -> list<u32>;
+
+        set-staged-tokens: func(tokens: list<u32>) -> result<_, error>;
+
     }
-
-    // Get the size of a KV page
-    kv-page-size: func(model:borrow<model>) -> u32;
-
-    allocate-pages: func(model:borrow<model>, num-pages: u32) -> result<list<page-id>, error>;
-
-    free-pages: func(model:borrow<model>, page-ids: list<page-id>) -> result<_, error>;
 
 }
