@@ -105,6 +105,37 @@ pub struct PageStore {
     nodes: Vec<PhysicalPageStore>, // the index of node is the node id
 }
 
+
+// Per-gpu storage
+#[derive(Debug)]
+struct PhysicalPageStore {
+    total_pages: usize,
+    free_pages: Vec<PhysicalPageId>,
+}
+
+impl PhysicalPageStore {
+    fn new(total_pages: usize) -> Self {
+        PhysicalPageStore {
+            total_pages,
+            free_pages: (0..total_pages as PhysicalPageId).collect(),
+        }
+    }
+
+    fn load_factor(&self) -> f64 {
+        if self.total_pages == 0 {
+            1.0
+        } else {
+            (self.total_pages - self.free_pages.len()) as f64 / self.total_pages as f64
+        }
+    }
+
+    #[allow(dead_code)]
+    fn is_overloaded(&self) -> bool {
+        self.load_factor() >= LOAD_THRESHOLD
+    }
+}
+
+
 impl PageStore {
     pub fn new(page_size: usize) -> Self {
         PageStore {
@@ -452,33 +483,17 @@ impl PageStore {
             }
         }
     }
-}
 
-// Per-gpu storage
-#[derive(Debug)]
-struct PhysicalPageStore {
-    total_pages: usize,
-    free_pages: Vec<PhysicalPageId>,
-}
-
-impl PhysicalPageStore {
-    fn new(total_pages: usize) -> Self {
-        PhysicalPageStore {
-            total_pages,
-            free_pages: (0..total_pages as PhysicalPageId).collect(),
-        }
-    }
-
-    fn load_factor(&self) -> f64 {
-        if self.total_pages == 0 {
-            1.0
+    /// Get physical page mappings for a logical page.
+    /// Returns the (NodeId, PhysicalPageId) pairs for a page.
+    pub fn get_physical_mappings(&self, page_id: PageId) -> Vec<(NodeId, PhysicalPageId)> {
+        if let Some(Some(page)) = self.pages.get(page_id) {
+            match &page.mapping {
+                Mapping::Single(node_id, phys_id) => vec![(*node_id, *phys_id)],
+                Mapping::Replicated(mappings) => mappings.clone(),
+            }
         } else {
-            (self.total_pages - self.free_pages.len()) as f64 / self.total_pages as f64
+            Vec::new()
         }
-    }
-
-    #[allow(dead_code)]
-    fn is_overloaded(&self) -> bool {
-        self.load_factor() >= LOAD_THRESHOLD
     }
 }
