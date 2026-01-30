@@ -88,6 +88,14 @@ def submit(
         Optional[Path],
         typer.Option("--path", "-p", help="Path to a local .wasm inferlet file"),
     ] = None,
+    manifest: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--manifest",
+            "-m",
+            help="Path to the manifest TOML file (required when using --path)",
+        ),
+    ] = None,
     config: ConfigOption = None,
     host: HostOption = None,
     port: PortOption = None,
@@ -110,12 +118,13 @@ def submit(
     You can specify an inferlet either by registry name or by path (mutually exclusive):
 
     - By registry: pie-client submit std/text-completion@0.1.0
-    - By path: pie-client submit --path ./my_inferlet.wasm
+    - By path: pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml
     """
     try:
         submit_cmd.handle_submit_command(
             inferlet=inferlet,
             path=expand_path(path),
+            manifest=expand_path(manifest),
             config=expand_path(config),
             host=host,
             port=port,

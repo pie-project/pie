@@ -76,6 +76,7 @@ pub enum ClientMessage {
     UploadProgram {
         corr_id: u32,
         program_hash: String,
+        manifest: String,
         chunk_index: usize,
         total_chunks: usize,
         #[serde(with = "serde_bytes")]
@@ -85,7 +86,7 @@ pub enum ClientMessage {
     #[serde(rename = "launch_instance")]
     LaunchInstance {
         corr_id: u32,
-        program_hash: String,
+        inferlet: String,
         arguments: Vec<String>,
         detached: bool,
     },
@@ -105,7 +106,7 @@ pub enum ClientMessage {
     LaunchServerInstance {
         corr_id: u32,
         port: u32,
-        program_hash: String,
+        inferlet: String,
         arguments: Vec<String>,
     },
 

@@ -6,7 +6,7 @@ use crate::runtime::{self, AttachInstanceResult, TerminationCause};
 use crate::actor::{CommandDispatcher, Service, ServiceCommand};
 use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
-use base64::Engine;
+use base64::Engine as Base64Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -25,6 +25,8 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
 use tungstenite::Message as WsMessage;
 use uuid::Uuid;
+use wasmtime::Engine as WasmEngine;
+use wasmtime::component::Component;
 
 type ClientId = u32;
 
@@ -41,6 +43,7 @@ pub fn start_service(
     internal_auth_token: String,
     registry_url: String,
     cache_dir: PathBuf,
+    wasm_engine: WasmEngine,
 ) {
     let server = Server::new(
         ip_port,
@@ -49,6 +52,7 @@ pub fn start_service(
         internal_auth_token,
         registry_url,
         cache_dir,
+        wasm_engine,
     );
     server.start(&COMMAND_DISPATCHER);
 }
@@ -99,7 +103,6 @@ pub enum InternalEvent {
         cur_num_rejected_backends: Option<u32>,
         tx: oneshot::Sender<(u32, u32)>,
     },
-
 }
 
 impl ServiceCommand for ServerEvent {
@@ -119,6 +122,8 @@ impl InternalEvent {
 }
 
 struct ServerState {
+    /// Wasmtime engine for compiling WASM to native code (shared with runtime)
+    wasm_engine: WasmEngine,
     enable_auth: bool,
     authorized_users: AuthorizedUsers,
     internal_auth_token: String,
@@ -128,6 +133,10 @@ struct ServerState {
     clients: DashMap<ClientId, JoinHandle<()>>,
     client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
     backend_status: Arc<BackendStatus>,
+    /// Uploaded programs on disk, keyed by (namespace, name, version), value is (path, hash)
+    uploaded_programs_in_disk: DashMap<(String, String, String), (PathBuf, String)>,
+    /// Registry-downloaded programs on disk, keyed by (namespace, name, version), value is (path, hash)
+    registry_programs_in_disk: DashMap<(String, String, String), (PathBuf, String)>,
 }
 
 struct BackendStatus {
@@ -201,8 +210,26 @@ impl Server {
         internal_auth_token: String,
         registry_url: String,
         cache_dir: PathBuf,
+        wasm_engine: WasmEngine,
     ) -> Self {
+        let uploaded_programs_in_disk = DashMap::new();
+        let registry_programs_in_disk = DashMap::new();
+
+        // Load existing programs from disk
+        // - Uploads: {cache_dir}/programs/{namespace}/{name}/{version}.wasm
+        // - Registry: {cache_dir}/registry/{namespace}/{name}/{version}.wasm
+        let programs_dir = cache_dir.join("programs");
+        if programs_dir.exists() {
+            load_programs_from_dir(&programs_dir, &uploaded_programs_in_disk);
+        }
+
+        let registry_dir = cache_dir.join("registry");
+        if registry_dir.exists() {
+            load_programs_from_dir(&registry_dir, &registry_programs_in_disk);
+        }
+
         let state = Arc::new(ServerState {
+            wasm_engine,
             enable_auth,
             authorized_users,
             internal_auth_token,
@@ -212,6 +239,8 @@ impl Server {
             clients: DashMap::new(),
             client_cmd_txs: DashMap::new(),
             backend_status: Arc::new(BackendStatus::new()),
+            uploaded_programs_in_disk,
+            registry_programs_in_disk,
         });
 
         let _listener = task::spawn(Self::listener_loop(ip_port.to_string(), state.clone()));
@@ -270,7 +299,6 @@ impl Service for Server {
                         tx,
                     );
                 }
-
             },
         }
     }
@@ -281,6 +309,7 @@ struct InFlightUpload {
     total_chunks: usize,
     buffer: Vec<u8>,
     next_chunk_index: usize,
+    manifest: String,
 }
 
 struct Session {
@@ -555,6 +584,7 @@ impl Session {
                 ClientMessage::UploadProgram {
                     corr_id,
                     program_hash,
+                    manifest,
                     chunk_index,
                     total_chunks,
                     chunk_data,
@@ -562,6 +592,7 @@ impl Session {
                     self.handle_upload_program(
                         corr_id,
                         program_hash,
+                        manifest,
                         chunk_index,
                         total_chunks,
                         chunk_data,
@@ -570,17 +601,12 @@ impl Session {
                 }
                 ClientMessage::LaunchInstance {
                     corr_id,
-                    program_hash,
+                    inferlet,
                     arguments,
                     detached,
                 } => {
-                    self.handle_launch_instance(
-                        corr_id,
-                        program_hash,
-                        arguments,
-                        detached,
-                    )
-                    .await
+                    self.handle_launch_instance(corr_id, inferlet, arguments, detached)
+                        .await
                 }
                 ClientMessage::LaunchInstanceFromRegistry {
                     corr_id,
@@ -589,10 +615,7 @@ impl Session {
                     detached,
                 } => {
                     self.handle_launch_instance_from_registry(
-                        corr_id,
-                        inferlet,
-                        arguments,
-                        detached,
+                        corr_id, inferlet, arguments, detached,
                     )
                     .await
                 }
@@ -605,16 +628,11 @@ impl Session {
                 ClientMessage::LaunchServerInstance {
                     corr_id,
                     port,
-                    program_hash,
+                    inferlet,
                     arguments,
                 } => {
-                    self.handle_launch_server_instance(
-                        corr_id,
-                        port,
-                        program_hash,
-                        arguments,
-                    )
-                    .await
+                    self.handle_launch_server_instance(corr_id, port, inferlet, arguments)
+                        .await
                 }
                 ClientMessage::SignalInstance {
                     instance_id,
@@ -753,14 +771,48 @@ impl Session {
     async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
         match subject.as_str() {
             message::QUERY_PROGRAM_EXISTS => {
-                let (evt_tx, evt_rx) = oneshot::channel();
-                runtime::Command::ProgramExists {
-                    hash: record,
-                    event: evt_tx,
-                }
-                .dispatch();
-                self.send_response(corr_id, true, evt_rx.await.unwrap().to_string())
-                    .await;
+                // Parse the record as "namespace/name@version" or "namespace/name@version#hash"
+                let (inferlet_part, hash) = if let Some(idx) = record.find('#') {
+                    let (inferlet, hash_part) = record.split_at(idx);
+                    (inferlet.to_string(), Some(hash_part[1..].to_string()))
+                } else {
+                    (record.clone(), None)
+                };
+                let program_key = parse_inferlet_name(&inferlet_part);
+
+                // Check only uploaded programs (not registry programs)
+                let program_exists = self
+                    .state
+                    .uploaded_programs_in_disk
+                    .contains_key(&program_key);
+
+                let (namespace, name, version) = program_key;
+
+                // If hash is provided, verify it matches
+                let result = if program_exists && hash.is_some() {
+                    let expected_hash = hash.unwrap();
+                    // Read the stored hash from the .hash file (uploads location only)
+                    let hash_file_path = self
+                        .state
+                        .cache_dir
+                        .join("programs")
+                        .join(&namespace)
+                        .join(&name)
+                        .join(format!("{}.hash", version));
+
+                    let stored_hash = tokio::fs::read_to_string(&hash_file_path).await;
+
+                    if let Ok(hash_content) = stored_hash {
+                        hash_content.trim() == expected_hash
+                    } else {
+                        // If we can't read the hash file, consider it a mismatch
+                        false
+                    }
+                } else {
+                    program_exists
+                };
+
+                self.send_response(corr_id, true, result.to_string()).await;
             }
             message::QUERY_MODEL_STATUS => {
                 let runtime_stats = model::runtime_stats().await;
@@ -804,6 +856,7 @@ impl Session {
         &mut self,
         corr_id: u32,
         program_hash: String,
+        manifest: String,
         chunk_index: usize,
         total_chunks: usize,
         mut chunk_data: Vec<u8>,
@@ -834,6 +887,7 @@ impl Session {
                 total_chunks,
                 buffer: Vec::new(),
                 next_chunk_index: 0,
+                manifest: manifest.clone(),
             });
         }
 
@@ -885,17 +939,96 @@ impl Session {
                     ),
                 )
                 .await;
-            } else {
-                let (evt_tx, evt_rx) = oneshot::channel();
-                runtime::Command::UploadProgram {
-                    hash: final_hash.clone(),
-                    raw: mem::take(&mut inflight.buffer),
-                    event: evt_tx,
-                }
-                .dispatch();
-                evt_rx.await.unwrap().unwrap();
-                self.send_response(corr_id, true, final_hash).await;
+                self.inflight_program_upload = None;
+                return;
             }
+
+            // Parse the manifest to extract namespace, name, and version
+            let manifest_content = mem::take(&mut inflight.manifest);
+            let (namespace, name, version) = match parse_manifest(&manifest_content) {
+                Ok(result) => result,
+                Err(e) => {
+                    self.send_response(corr_id, false, format!("Failed to parse manifest: {}", e))
+                        .await;
+                    self.inflight_program_upload = None;
+                    return;
+                }
+            };
+
+            // Write to disk: {cache_dir}/programs/{namespace}/{name}/{version}.{wasm,toml,hash}
+            let dir_path = self
+                .state
+                .cache_dir
+                .join("programs")
+                .join(&namespace)
+                .join(&name);
+            if let Err(e) = tokio::fs::create_dir_all(&dir_path).await {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!("Failed to create directory {:?}: {}", dir_path, e),
+                )
+                .await;
+                self.inflight_program_upload = None;
+                return;
+            }
+
+            let wasm_file_path = dir_path.join(format!("{}.wasm", version));
+            let manifest_file_path = dir_path.join(format!("{}.toml", version));
+            let hash_file_path = dir_path.join(format!("{}.hash", version));
+
+            let raw_bytes = mem::take(&mut inflight.buffer);
+
+            if let Err(e) = tokio::fs::write(&wasm_file_path, &raw_bytes).await {
+                self.send_response(corr_id, false, format!("Failed to write WASM file: {}", e))
+                    .await;
+                self.inflight_program_upload = None;
+                return;
+            }
+            if let Err(e) = tokio::fs::write(&manifest_file_path, &manifest_content).await {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!("Failed to write manifest file: {}", e),
+                )
+                .await;
+                self.inflight_program_upload = None;
+                return;
+            }
+            if let Err(e) = tokio::fs::write(&hash_file_path, &final_hash).await {
+                self.send_response(corr_id, false, format!("Failed to write hash file: {}", e))
+                    .await;
+                self.inflight_program_upload = None;
+                return;
+            }
+
+            // Update the server's uploaded_programs_in_disk map
+            let program_key = (namespace.clone(), name.clone(), version.clone());
+            self.state
+                .uploaded_programs_in_disk
+                .insert(program_key, (wasm_file_path.clone(), final_hash.clone()));
+
+            // Compile WASM to Component in a blocking thread to avoid starving async runtime
+            let component = match compile_wasm_component(&self.state.wasm_engine, raw_bytes).await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.send_response(corr_id, false, e.to_string()).await;
+                    self.inflight_program_upload = None;
+                    return;
+                }
+            };
+
+            // Inform the runtime to load the pre-compiled component
+            let (evt_tx, evt_rx) = oneshot::channel();
+            runtime::Command::LoadProgram {
+                hash: final_hash.clone(),
+                component,
+                event: evt_tx,
+            }
+            .dispatch();
+
+            evt_rx.await.unwrap();
+            self.send_response(corr_id, true, final_hash).await;
             self.inflight_program_upload = None;
         }
     }
@@ -903,15 +1036,146 @@ impl Session {
     async fn handle_launch_instance(
         &mut self,
         corr_id: u32,
-        program_hash: String,
+        inferlet: String,
+        arguments: Vec<String>,
+        detached: bool,
+    ) {
+        let program_key = parse_inferlet_name(&inferlet);
+
+        // First, check if the program exists in uploaded programs
+        if let Some((wasm_path, hash)) = self
+            .state
+            .uploaded_programs_in_disk
+            .get(&program_key)
+            .map(|e| e.value().clone())
+        {
+            // Program found in uploaded programs - ensure it's loaded and launch it
+            if let Err(e) =
+                ensure_program_loaded_from_path(&self.state.wasm_engine, &wasm_path, &hash).await
+            {
+                self.send_launch_result(corr_id, false, e).await;
+                return;
+            }
+
+            // Launch the instance
+            self.launch_instance_from_loaded_program(corr_id, hash, arguments, detached)
+                .await;
+        // Program not found in uploaded programs - fall back to registry
+        } else {
+            self.handle_launch_instance_from_registry(corr_id, inferlet, arguments, detached)
+                .await;
+        }
+    }
+
+    /// Handles the LaunchInstanceFromRegistry command.
+    ///
+    /// This downloads an inferlet from the registry (with local caching) and launches it.
+    async fn handle_launch_instance_from_registry(
+        &mut self,
+        corr_id: u32,
+        inferlet: String,
+        arguments: Vec<String>,
+        detached: bool,
+    ) {
+        // Parse the inferlet name into namespace, name, and version
+        let (namespace, name, version) = parse_inferlet_name(&inferlet);
+        let program_key = (namespace.clone(), name.clone(), version.clone());
+
+        // Check if the program is already cached on disk
+        if let Some((wasm_path, hash)) = self
+            .state
+            .registry_programs_in_disk
+            .get(&program_key)
+            .map(|e| e.value().clone())
+        {
+            // Program is cached on disk - ensure it's loaded
+            if let Err(e) =
+                ensure_program_loaded_from_path(&self.state.wasm_engine, &wasm_path, &hash).await
+            {
+                self.send_launch_result(corr_id, false, e).await;
+                return;
+            }
+
+            // Launch the instance
+            self.launch_instance_from_loaded_program(corr_id, hash, arguments, detached)
+                .await;
+        } else {
+            // Program not cached - download from registry
+            match download_inferlet_from_registry(
+                &self.state.registry_url,
+                &self.state.cache_dir,
+                &namespace,
+                &name,
+                &version,
+            )
+            .await
+            {
+                Ok((program_hash, program_data, _manifest)) => {
+                    // The wasm file is saved by `download_inferlet_from_registry` at:
+                    // {cache_dir}/registry/{namespace}/{name}/{version}.wasm
+                    let wasm_path = self
+                        .state
+                        .cache_dir
+                        .join("registry")
+                        .join(&namespace)
+                        .join(&name)
+                        .join(format!("{}.wasm", version));
+
+                    // Update the server's registry_programs_in_disk map
+                    self.state
+                        .registry_programs_in_disk
+                        .insert(program_key, (wasm_path, program_hash.clone()));
+
+                    // Compile WASM to Component in a blocking thread
+                    let component =
+                        match compile_wasm_component(&self.state.wasm_engine, program_data).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                self.send_launch_result(corr_id, false, e.to_string()).await;
+                                return;
+                            }
+                        };
+
+                    // Register the pre-compiled component with the runtime
+                    let (evt_tx, evt_rx) = oneshot::channel();
+                    runtime::Command::LoadProgram {
+                        hash: program_hash.clone(),
+                        component,
+                        event: evt_tx,
+                    }
+                    .dispatch();
+
+                    evt_rx.await.unwrap();
+
+                    // Launch the instance
+                    self.launch_instance_from_loaded_program(
+                        corr_id,
+                        program_hash,
+                        arguments,
+                        detached,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    self.send_launch_result(corr_id, false, e.to_string()).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Internal helper to launch an instance after the program is already loaded.
+    async fn launch_instance_from_loaded_program(
+        &mut self,
+        corr_id: u32,
+        hash: String,
         arguments: Vec<String>,
         detached: bool,
     ) {
         let (evt_tx, evt_rx) = oneshot::channel();
-
         runtime::Command::LaunchInstance {
             username: self.username.clone(),
-            program_hash,
+            hash,
             arguments,
             detached,
             event: evt_tx,
@@ -919,7 +1183,6 @@ impl Session {
         .dispatch();
 
         match evt_rx.await.unwrap() {
-            // The instance was launched successfully. Notify the client about the instance ID.
             Ok(instance_id) => {
                 // If the instance is not detached, add it to the attached instances so that its
                 // output can be streamed to the client after it is launched.
@@ -944,59 +1207,8 @@ impl Session {
                 }
                 .dispatch();
             }
-            // The instance failed to launch. Notify the client about the error.
             Err(e) => {
                 self.send_launch_result(corr_id, false, e.to_string()).await;
-            }
-        }
-    }
-
-    /// Handles the LaunchInstanceFromRegistry command.
-    ///
-    /// This downloads an inferlet from the registry (with local caching) and launches it.
-    async fn handle_launch_instance_from_registry(
-        &mut self,
-        corr_id: u32,
-        inferlet: String,
-        arguments: Vec<String>,
-        detached: bool,
-    ) {
-        // Parse the inferlet name into namespace, name, and version
-        let (namespace, name, version) = parse_inferlet_name(&inferlet);
-
-        // Attempt to download/cache the inferlet
-        match download_inferlet_from_registry(
-            &self.state.registry_url,
-            &self.state.cache_dir,
-            &namespace,
-            &name,
-            &version,
-        )
-        .await
-        {
-            Ok((program_hash, program_data)) => {
-                // Upload the program to the runtime (registers it for execution)
-                let (evt_tx, evt_rx) = oneshot::channel();
-                runtime::Command::UploadProgram {
-                    hash: program_hash.clone(),
-                    raw: program_data,
-                    event: evt_tx,
-                }
-                .dispatch();
-
-                if let Err(e) = evt_rx.await.unwrap() {
-                    self.send_launch_result(corr_id, false, format!("Failed to register program: {}", e))
-                        .await;
-                    return;
-                }
-
-                // Now launch the instance using the same flow as handle_launch_instance
-                self.handle_launch_instance(corr_id, program_hash, arguments, detached)
-                    .await;
-            }
-            Err(e) => {
-                self.send_launch_result(corr_id, false, e.to_string())
-                    .await;
             }
         }
     }
@@ -1091,24 +1303,54 @@ impl Session {
         &mut self,
         corr_id: u32,
         port: u32,
-        program_hash: String,
+        inferlet: String,
         arguments: Vec<String>,
     ) {
-        let (evt_tx, evt_rx) = oneshot::channel();
-        runtime::Command::LaunchServerInstance {
-            username: self.username.clone(),
-            program_hash,
-            port,
-            arguments,
-            event: evt_tx,
-        }
-        .dispatch();
-        match evt_rx.await.unwrap() {
-            Ok(_) => {
-                self.send_response(corr_id, true, "server launched".to_string())
-                    .await
+        let program_key = parse_inferlet_name(&inferlet);
+
+        // Look up the wasm path and hash from disk maps
+        let program_info = self
+            .state
+            .uploaded_programs_in_disk
+            .get(&program_key)
+            .map(|e| e.value().clone())
+            .or_else(|| {
+                self.state
+                    .registry_programs_in_disk
+                    .get(&program_key)
+                    .map(|e| e.value().clone())
+            });
+
+        // Ensure the program is loaded
+        if let Some((wasm_path, hash)) = program_info {
+            if let Err(e) =
+                ensure_program_loaded_from_path(&self.state.wasm_engine, &wasm_path, &hash).await
+            {
+                self.send_response(corr_id, false, e).await;
+                return;
             }
-            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
+
+            let (evt_tx, evt_rx) = oneshot::channel();
+            runtime::Command::LaunchServerInstance {
+                username: self.username.clone(),
+                hash,
+                port,
+                arguments,
+                event: evt_tx,
+            }
+            .dispatch();
+
+            match evt_rx.await.unwrap() {
+                Ok(_) => {
+                    self.send_response(corr_id, true, "server launched".to_string())
+                        .await
+                }
+                Err(e) => self.send_response(corr_id, false, e.to_string()).await,
+            }
+        } else {
+            self.send_response(corr_id, false, "Program not found".to_string())
+                .await;
+            return;
         }
     }
 
@@ -1203,6 +1445,7 @@ impl Session {
                     total_chunks,
                     buffer: Vec::with_capacity(total_chunks * message::CHUNK_SIZE_BYTES),
                     next_chunk_index: 0,
+                    manifest: String::new(), // Not used for blob uploads
                 },
             );
         }
@@ -1331,7 +1574,169 @@ impl Drop for Session {
     }
 }
 
+/// Helper to load programs from a directory with structure {dir}/{namespace}/{name}/{version}.wasm
+fn load_programs_from_dir(
+    dir: &std::path::Path,
+    programs_in_disk: &DashMap<(String, String, String), (PathBuf, String)>,
+) {
+    // Iterate through namespace directories
+    let ns_entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
 
+    for ns_entry in ns_entries.flatten() {
+        let ns_path = ns_entry.path();
+        if !ns_path.is_dir() {
+            continue;
+        }
+        let namespace = match ns_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Iterate through name directories
+        let name_entries = match std::fs::read_dir(&ns_path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for name_entry in name_entries.flatten() {
+            let name_path = name_entry.path();
+            if !name_path.is_dir() {
+                continue;
+            }
+            let name = match name_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // Iterate through version files
+            let file_entries = match std::fs::read_dir(&name_path) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            for file_entry in file_entries.flatten() {
+                let file_path = file_entry.path();
+                if file_path.extension().is_some_and(|ext| ext == "wasm") {
+                    // Extract version from filename (e.g., "0.1.0.wasm" -> "0.1.0")
+                    let version = match file_path.file_stem().and_then(|s| s.to_str()) {
+                        Some(v) => v.to_string(),
+                        None => continue,
+                    };
+
+                    // Read the hash from the corresponding .hash file
+                    let hash_path = file_path.with_extension("hash");
+                    let hash = match std::fs::read_to_string(&hash_path) {
+                        Ok(h) => h.trim().to_string(),
+                        Err(_) => continue, // Skip programs without a hash file
+                    };
+
+                    let key = (namespace.clone(), name.clone(), version);
+                    programs_in_disk.insert(key, (file_path, hash));
+                }
+            }
+        }
+    }
+}
+
+/// Parses a manifest TOML string to extract namespace, name, and version.
+///
+/// The manifest must have a [package] section with "name" (in "namespace/name" format)
+/// and "version" fields.
+fn parse_manifest(manifest: &str) -> Result<(String, String, String)> {
+    let table: toml::Table =
+        toml::from_str(manifest).map_err(|e| anyhow!("Failed to parse manifest TOML: {}", e))?;
+
+    let package = table
+        .get("package")
+        .and_then(|p| p.as_table())
+        .ok_or_else(|| anyhow!("Manifest missing [package] section"))?;
+
+    let full_name = package
+        .get("name")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| anyhow!("Manifest missing package.name field"))?;
+
+    let version = package
+        .get("version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Manifest missing package.version field"))?;
+
+    // Parse "namespace/name" format
+    let parts: Vec<&str> = full_name.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        bail!(
+            "Invalid package.name format '{}': expected 'namespace/name'",
+            full_name
+        );
+    }
+
+    Ok((
+        parts[0].to_string(),
+        parts[1].to_string(),
+        version.to_string(),
+    ))
+}
+
+/// Compiles WASM bytes to a Component in a blocking thread.
+///
+/// This runs the compilation on a dedicated thread pool to avoid blocking the async runtime,
+/// since WASM compilation can be CPU-intensive.
+async fn compile_wasm_component(engine: &WasmEngine, wasm_bytes: Vec<u8>) -> Result<Component> {
+    let engine = engine.clone();
+    match tokio::task::spawn_blocking(move || Component::from_binary(&engine, &wasm_bytes)).await {
+        Ok(Ok(component)) => Ok(component),
+        Ok(Err(e)) => Err(anyhow!("Failed to compile WASM: {}", e)),
+        Err(e) => Err(anyhow!("Compilation task failed: {}", e)),
+    }
+}
+
+/// Ensures a program is loaded in the runtime from a given wasm file path with a known hash.
+///
+/// This checks if the program is already loaded in memory (with hash verification).
+/// If not, it reads the wasm from disk, compiles it, and loads it into the runtime.
+///
+/// Returns Ok(()) on success, or Err(error_message) on failure.
+async fn ensure_program_loaded_from_path(
+    wasm_engine: &WasmEngine,
+    wasm_path: &PathBuf,
+    hash: &str,
+) -> Result<(), String> {
+    // Check if the program is already loaded in memory
+    let (loaded_tx, loaded_rx) = oneshot::channel();
+    runtime::Command::ProgramLoaded {
+        hash: hash.to_string(),
+        event: loaded_tx,
+    }
+    .dispatch();
+
+    let is_loaded = loaded_rx.await.unwrap();
+
+    if !is_loaded {
+        // Read from disk, compile, and load
+        let raw_bytes = tokio::fs::read(wasm_path)
+            .await
+            .map_err(|e| format!("Failed to read program from disk at {:?}: {}", wasm_path, e))?;
+
+        let component = compile_wasm_component(wasm_engine, raw_bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let (load_tx, load_rx) = oneshot::channel();
+        runtime::Command::LoadProgram {
+            hash: hash.to_string(),
+            component,
+            event: load_tx,
+        }
+        .dispatch();
+
+        load_rx.await.unwrap();
+    }
+
+    Ok(())
+}
 
 /// Parses an inferlet name into (namespace, name, version).
 ///
@@ -1360,44 +1765,63 @@ fn parse_inferlet_name(inferlet: &str) -> (String, String, String) {
 
 /// Downloads an inferlet from the registry, with local caching.
 ///
-/// Returns (program_hash, program_data) on success.
+/// Returns (program_hash, program_data, manifest) on success.
 async fn download_inferlet_from_registry(
     registry_url: &str,
     cache_dir: &std::path::Path,
     namespace: &str,
     name: &str,
     version: &str,
-) -> Result<(String, Vec<u8>)> {
-    // Build the cache path: {cache_dir}/registry/{namespace}/{name}/{version}.wasm
-    let cache_path = cache_dir
-        .join("registry")
-        .join(namespace)
-        .join(name)
-        .join(format!("{}.wasm", version));
+) -> Result<(String, Vec<u8>, String)> {
+    // Build the cache paths:
+    // - Wasm binary: {cache_dir}/registry/{namespace}/{name}/{version}.wasm
+    // - Manifest: {cache_dir}/registry/{namespace}/{name}/{version}.toml
+    // - Hash: {cache_dir}/registry/{namespace}/{name}/{version}.hash
+    let cache_base = cache_dir.join("registry").join(namespace).join(name);
+    let wasm_cache_path = cache_base.join(format!("{}.wasm", version));
+    let manifest_cache_path = cache_base.join(format!("{}.toml", version));
+    let hash_cache_path = cache_base.join(format!("{}.hash", version));
 
-    // Check if we have a cached copy
-    if cache_path.exists() {
+    // Check if we have all cached files
+    if wasm_cache_path.exists() && manifest_cache_path.exists() && hash_cache_path.exists() {
         tracing::info!(
             "Using cached inferlet: {}/{} @ {} from {:?}",
             namespace,
             name,
             version,
-            cache_path
+            wasm_cache_path
         );
-        let data = tokio::fs::read(&cache_path).await.map_err(|e| {
-            anyhow!("Failed to read cached inferlet at {:?}: {}", cache_path, e)
+        let wasm_data = tokio::fs::read(&wasm_cache_path).await.map_err(|e| {
+            anyhow!(
+                "Failed to read cached inferlet at {:?}: {}",
+                wasm_cache_path,
+                e
+            )
         })?;
-        let hash = blake3::hash(&data).to_hex().to_string();
-        return Ok((hash, data));
+        let manifest_data = tokio::fs::read_to_string(&manifest_cache_path)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to read cached manifest at {:?}: {}",
+                    manifest_cache_path,
+                    e
+                )
+            })?;
+        let hash = tokio::fs::read_to_string(&hash_cache_path)
+            .await
+            .map_err(|e| anyhow!("Failed to read cached hash at {:?}: {}", hash_cache_path, e))?;
+        return Ok((hash, wasm_data, manifest_data));
     }
 
-    // Build the download URL
-    let download_url = format!(
+    // Build the download URLs
+    let base_url = registry_url.trim_end_matches('/');
+    let wasm_download_url = format!(
         "{}/api/v1/inferlets/{}/{}/{}/download",
-        registry_url.trim_end_matches('/'),
-        namespace,
-        name,
-        version
+        base_url, namespace, name, version
+    );
+    let manifest_download_url = format!(
+        "{}/api/v1/inferlets/{}/{}/{}/manifest",
+        base_url, namespace, name, version
     );
 
     tracing::info!(
@@ -1405,7 +1829,7 @@ async fn download_inferlet_from_registry(
         namespace,
         name,
         version,
-        download_url
+        wasm_download_url
     );
 
     // Create an HTTP client that follows redirects
@@ -1414,16 +1838,16 @@ async fn download_inferlet_from_registry(
         .build()
         .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
 
-    // Perform the download
-    let response = client
-        .get(&download_url)
+    // Download the wasm binary
+    let wasm_response = client
+        .get(&wasm_download_url)
         .send()
         .await
         .map_err(|e| anyhow!("Failed to download inferlet from registry: {}", e))?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+    if !wasm_response.status().is_success() {
+        let status = wasm_response.status();
+        let body = wasm_response.text().await.unwrap_or_default();
         bail!(
             "Registry returned error {} for {}/{} @ {}: {}",
             status,
@@ -1434,13 +1858,13 @@ async fn download_inferlet_from_registry(
         );
     }
 
-    let data = response
+    let wasm_data = wasm_response
         .bytes()
         .await
         .map_err(|e| anyhow!("Failed to read inferlet data: {}", e))?
         .to_vec();
 
-    if data.is_empty() {
+    if wasm_data.is_empty() {
         bail!(
             "Registry returned empty data for {}/{} @ {}",
             namespace,
@@ -1449,26 +1873,72 @@ async fn download_inferlet_from_registry(
         );
     }
 
-    let hash = blake3::hash(&data).to_hex().to_string();
+    // Download the manifest
+    tracing::info!(
+        "Downloading manifest for {}/{} @ {} from {}",
+        namespace,
+        name,
+        version,
+        manifest_download_url
+    );
 
-    // Cache the downloaded inferlet
-    if let Some(parent) = cache_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            anyhow!("Failed to create cache directory {:?}: {}", parent, e)
-        })?;
+    let manifest_response = client
+        .get(&manifest_download_url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to download manifest from registry: {}", e))?;
+
+    if !manifest_response.status().is_success() {
+        let status = manifest_response.status();
+        let body = manifest_response.text().await.unwrap_or_default();
+        bail!(
+            "Registry returned error {} for manifest {}/{} @ {}: {}",
+            status,
+            namespace,
+            name,
+            version,
+            body
+        );
     }
-    tokio::fs::write(&cache_path, &data).await.map_err(|e| {
-        anyhow!("Failed to cache inferlet at {:?}: {}", cache_path, e)
-    })?;
+
+    let manifest_data = manifest_response
+        .text()
+        .await
+        .map_err(|e| anyhow!("Failed to read manifest data: {}", e))?;
+
+    let hash = blake3::hash(&wasm_data).to_hex().to_string();
+
+    // Cache the downloaded files
+    tokio::fs::create_dir_all(&cache_base)
+        .await
+        .map_err(|e| anyhow!("Failed to create cache directory {:?}: {}", cache_base, e))?;
+
+    tokio::fs::write(&wasm_cache_path, &wasm_data)
+        .await
+        .map_err(|e| anyhow!("Failed to cache inferlet at {:?}: {}", wasm_cache_path, e))?;
+
+    tokio::fs::write(&manifest_cache_path, &manifest_data)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to cache manifest at {:?}: {}",
+                manifest_cache_path,
+                e
+            )
+        })?;
+
+    tokio::fs::write(&hash_cache_path, &hash)
+        .await
+        .map_err(|e| anyhow!("Failed to cache hash at {:?}: {}", hash_cache_path, e))?;
 
     tracing::info!(
         "Cached inferlet {}/{} @ {} to {:?} (hash: {})",
         namespace,
         name,
         version,
-        cache_path,
+        wasm_cache_path,
         hash
     );
 
-    Ok((hash, data))
+    Ok((hash, wasm_data, manifest_data))
 }

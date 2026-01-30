@@ -14,10 +14,10 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-] 
+]
 
 # Base dependencies (CPU compatible / PyPI available)
-dependencies = [ 
+dependencies = [
     "einops>=0.8.1",
     "fire>=0.6",
     "httpx>=0.27",
@@ -28,7 +28,7 @@ dependencies = [
     "opentelemetry-api>=1.20.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
-    "pie-client", 
+    "pie-client",
     "platformdirs>=4.3",
     "psutil>=7.1.3",
     "pyzmq>=27.0.0",
@@ -47,7 +47,7 @@ dependencies = [
 
 cuda = [
     "torch>=2.7.1",
-    "torchao>=0.14.1",  
+    "torchao>=0.14.1",
     "flashinfer-python>=0.6.1",
     "flashinfer-cubin>=0.6.1",
 ]
@@ -55,7 +55,7 @@ cuda = [
 # for uv only
 cu126 = [
     "torch>=2.7.1",
-    "torchao>=0.14.1",  
+    "torchao>=0.14.1",
     "flashinfer-python>=0.6.1",
     "flashinfer-cubin>=0.6.1",
 ]
@@ -63,7 +63,7 @@ cu126 = [
 # for uv only
 cu128 = [
     "torch>=2.7.1",
-    "torchao>=0.14.1",  
+    "torchao>=0.14.1",
     "flashinfer-python>=0.6.1",
     "flashinfer-cubin>=0.6.1",
     "flashinfer-jit-cache>=0.6.1",
@@ -72,7 +72,7 @@ cu128 = [
 # for uv only
 cu130 = [
     "torch>=2.7.1",
-    "torchao>=0.14.1",  
+    "torchao>=0.14.1",
     "flashinfer-python>=0.6.1",
     "flashinfer-cubin>=0.6.1",
     "flashinfer-jit-cache>=0.6.1",
@@ -82,6 +82,7 @@ cu130 = [
 # --- Metal (macOS) ---
 metal = [
     "torch>=2.7.1",
+    "torchao>=0.14.1",
     "pyobjc-core>=10.0,<11.0",
     "pyobjc-framework-Metal>=10.0,<11.0",
     "pyobjc-framework-MetalKit>=10.0,<11.0",
@@ -133,7 +134,7 @@ flashinfer-jit-cache = [
     { index = "flashinfer-cu130", extra = "cu130" },
 ]
 
-[tool.maturin] 
+[tool.maturin]
 python-source = "src"
 python-packages = ["pie", "pie_cli", "pie_worker", "flashinfer_metal"]
 module-name = "pie._pie"
@@ -145,7 +146,7 @@ cache-keys = [{file = "pyproject.toml"}, {file = "../runtime/Cargo.toml"}, {file
 
 # Declare CUDA/Metal extras as mutually exclusive
 conflicts = [
-    [ 
+    [
         { extra = "cu126" },
         { extra = "cu128" },
         { extra = "cu130" },

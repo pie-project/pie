@@ -6,6 +6,7 @@ to an existing running Pie engine instance.
 
 import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,42 @@ import blake3
 import typer
 
 from . import engine
+
+
+def parse_manifest(manifest_content: str) -> tuple[str, str, str]:
+    """Parse the manifest to extract namespace, name, and version.
+
+    Args:
+        manifest_content: The TOML manifest content as a string.
+
+    Returns:
+        A tuple of (namespace, name, version).
+
+    Raises:
+        ValueError: If the manifest is missing required fields or has invalid format.
+    """
+    manifest = tomllib.loads(manifest_content)
+
+    package = manifest.get("package")
+    if package is None:
+        raise ValueError("Manifest missing [package] section")
+
+    full_name = package.get("name")
+    if full_name is None:
+        raise ValueError("Manifest missing package.name field")
+
+    version = package.get("version")
+    if version is None:
+        raise ValueError("Manifest missing package.version field")
+
+    # Parse "namespace/name" format
+    parts = full_name.split("/", 1)
+    if len(parts) != 2:
+        raise ValueError(
+            f"Invalid package.name format '{full_name}': expected 'namespace/name'"
+        )
+
+    return parts[0], parts[1], version
 
 
 def compose_components(program_bytes: bytes, library_paths: list[Path]) -> bytes:
@@ -92,6 +129,7 @@ def compose_components(program_bytes: bytes, library_paths: list[Path]) -> bytes
 def handle_submit_command(
     inferlet: Optional[str] = None,
     path: Optional[Path] = None,
+    manifest: Optional[Path] = None,
     config: Optional[Path] = None,
     host: Optional[str] = None,
     port: Optional[int] = None,
@@ -106,7 +144,7 @@ def handle_submit_command(
     You can specify an inferlet either by registry name or by path (mutually exclusive):
 
     - By registry: pie-client submit std/text-completion@0.1.0
-    - By path: pie-client submit --path ./my_inferlet.wasm
+    - By path: pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml
 
     Steps:
     1. Creates a client configuration from config file and command-line arguments
@@ -128,6 +166,11 @@ def handle_submit_command(
         arguments = [inferlet] + (arguments or [])
         inferlet = None
 
+    # Validate manifest is provided when using --path
+    if path is not None and manifest is None:
+        typer.echo("Error: --manifest is required when using --path", err=True)
+        raise typer.Exit(1)
+
     link = link or []
     arguments = arguments or []
 
@@ -147,7 +190,15 @@ def handle_submit_command(
             if not path.exists():
                 raise FileNotFoundError(f"Inferlet file not found: {path}")
 
+            if not manifest.exists():
+                raise FileNotFoundError(f"Manifest file not found: {manifest}")
+
             inferlet_blob = path.read_bytes()
+            manifest_content = manifest.read_text()
+
+            # Parse the manifest to extract namespace, name, and version
+            namespace, name, version = parse_manifest(manifest_content)
+            typer.echo(f"Inferlet: {namespace}/{name}@{version}")
 
             # If libraries are specified, compose them with the main inferlet
             if link:
@@ -155,21 +206,22 @@ def handle_submit_command(
             else:
                 final_blob = inferlet_blob
 
-            # Calculate the hash of the final composed blob
+            # Calculate the hash of the final blob
             program_hash = blake3.blake3(final_blob).hexdigest()
-            typer.echo(f"Final inferlet hash: {program_hash}")
+            inferlet_name = f"{namespace}/{name}@{version}"
 
-            # Upload the composed inferlet to the server
-            if not engine.program_exists(client, program_hash):
-                engine.upload_program(client, final_blob)
+            # Upload the composed inferlet to the server (check both name and hash match)
+            if not engine.program_exists(client, inferlet_name, program_hash):
+                engine.upload_program(client, final_blob, manifest_content)
                 typer.echo("✅ Inferlet upload successful.")
             else:
                 typer.echo("Inferlet already exists on server.")
 
             # Launch the instance
+            inferlet_name = f"{namespace}/{name}@{version}"
             instance = engine.launch_instance(
                 client,
-                program_hash,
+                inferlet_name,
                 arguments,
                 detached,
             )

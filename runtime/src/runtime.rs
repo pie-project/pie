@@ -13,7 +13,7 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 use wasmtime::component::Resource;
-use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
+use wasmtime::{Engine, Store, component::Component, component::Linker};
 use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::bindings::exports::wasi::http::incoming_handler::{
     IncomingRequest, ResponseOutparam,
@@ -30,11 +30,8 @@ static COMMAND_DISPATCHER: OnceLock<CommandDispatcher<Command>> = OnceLock::new(
 
 /// Starts the runtime service. A daemon task will be spawned to handle the
 /// commands dispatched from other services.
-pub fn start_service<P: AsRef<std::path::Path>>(cache_dir: P) {
-    let runtime = Runtime::new(cache_dir);
-
-    // Loading existing programs should not fail.
-    runtime.load_existing_programs().unwrap();
+pub fn start_service(engine: Engine) {
+    let runtime = Runtime::new(engine);
     runtime.start(&COMMAND_DISPATCHER);
 }
 
@@ -70,20 +67,20 @@ pub enum Command {
         event: oneshot::Sender<String>,
     },
 
-    ProgramExists {
+    LoadProgram {
+        hash: String,
+        component: Component,
+        event: oneshot::Sender<()>,
+    },
+
+    ProgramLoaded {
         hash: String,
         event: oneshot::Sender<bool>,
     },
 
-    UploadProgram {
-        hash: String,
-        raw: Vec<u8>,
-        event: oneshot::Sender<Result<String, RuntimeError>>,
-    },
-
     LaunchInstance {
         username: String,
-        program_hash: String,
+        hash: String,
         arguments: Vec<String>,
         detached: bool,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
@@ -104,7 +101,7 @@ pub enum Command {
 
     LaunchServerInstance {
         username: String,
-        program_hash: String,
+        hash: String,
         port: u32,
         arguments: Vec<String>,
         event: oneshot::Sender<Result<(), RuntimeError>>,
@@ -153,13 +150,8 @@ struct Runtime {
     engine: Engine,
     linker: Arc<Linker<InstanceState>>,
 
-    cache_dir: std::path::PathBuf,
-
-    /// Pre-compiled WASM components, keyed by BLAKE3 hex string
-    programs_in_memory: DashMap<String, Component>,
-
-    /// Paths to compiled modules on disk
-    programs_in_disk: DashMap<String, std::path::PathBuf>,
+    /// Pre-compiled WASM components, keyed by hash
+    compiled_programs: DashMap<String, Component>,
 
     /// Running instances
     running_instances: DashMap<InstanceId, InstanceHandle>,
@@ -237,45 +229,35 @@ struct InstanceHandle {
     join_handle: tokio::task::JoinHandle<()>,
 }
 
-
 impl Service for Runtime {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
         match cmd {
-            Command::ProgramExists { hash, event } => {
-                let exists = self.programs_in_memory.contains_key(&hash)
-                    || self.programs_in_disk.contains_key(&hash);
-                event.send(exists).unwrap();
+            Command::LoadProgram {
+                hash,
+                component,
+                event,
+            } => {
+                // Store the pre-compiled component keyed by hash
+                self.compiled_programs.insert(hash, component);
+                event.send(()).unwrap();
             }
 
-            Command::UploadProgram { hash, raw, event } => {
-                if self.programs_in_memory.contains_key(&hash) {
-                    event.send(Ok(hash)).unwrap();
-                } else if let Ok(component) = Component::from_binary(&self.engine, raw.as_slice()) {
-                    self.programs_in_memory.insert(hash.to_string(), component);
-
-                    // Write to disk
-                    let file_path = std::path::Path::new(&self.cache_dir).join(&hash);
-                    std::fs::write(&file_path, &raw).unwrap();
-                    self.programs_in_disk.insert(hash.clone(), file_path);
-                    event.send(Ok(hash)).unwrap();
-                } else {
-                    event
-                        .send(Err(RuntimeError::Other("Failed to compile".into())))
-                        .unwrap();
-                }
+            Command::ProgramLoaded { hash, event } => {
+                let is_loaded = self.compiled_programs.contains_key(&hash);
+                event.send(is_loaded).unwrap();
             }
 
             Command::LaunchInstance {
                 username,
-                program_hash,
+                hash,
                 event,
                 arguments,
                 detached,
             } => {
                 let res = self
-                    .launch_instance(username, program_hash, arguments, detached)
+                    .launch_instance(username, hash, arguments, detached)
                     .await;
                 event
                     .send(res)
@@ -301,13 +283,13 @@ impl Service for Runtime {
 
             Command::LaunchServerInstance {
                 username,
-                program_hash,
+                hash,
                 port,
                 arguments,
                 event,
             } => {
                 let _ = self
-                    .launch_server_instance(username, program_hash, port, arguments)
+                    .launch_server_instance(username, hash, port, arguments)
                     .await;
                 event.send(Ok(())).unwrap();
             }
@@ -348,10 +330,11 @@ impl Service for Runtime {
                             .running_instances
                             .iter()
                             .map(|item| {
+                                let handle = item.value();
                                 format!(
-                                    "Instance ID: {}, Program Hash: {}",
+                                    "Instance ID: {}, Program hash: {}",
                                     item.key(),
-                                    item.value().program_hash
+                                    handle.program_hash
                                 )
                             })
                             .collect();
@@ -359,13 +342,13 @@ impl Service for Runtime {
                         format!("{}", instances.join("\n"))
                     }
                     "list_in_memory_programs" => {
-                        let keys: Vec<String> = self
-                            .programs_in_memory
+                        let hashes: Vec<String> = self
+                            .compiled_programs
                             .iter()
                             .map(|item| item.key().clone())
                             .collect();
 
-                        format!("{}", keys.join("\n"))
+                        format!("{}", hashes.join("\n"))
                     }
 
                     _ => {
@@ -392,7 +375,7 @@ impl Service for Runtime {
                         kv_pages_used: 0, // TODO: query from resource_manager
                     })
                     .collect();
-                
+
                 // Sort by elapsed time (most recent first) and limit to 50 for performance
                 instances.sort_by(|a, b| a.elapsed_secs.cmp(&b.elapsed_secs));
                 instances.truncate(50);
@@ -420,17 +403,7 @@ impl Service for Runtime {
 }
 
 impl Runtime {
-    fn new<P: AsRef<std::path::Path>>(cache_dir: P) -> Self {
-        // Configure Wasmtime engine
-        let mut config = Config::default();
-        config.async_support(true);
-
-        // TODO: Adjust settings later: https://docs.wasmtime.dev/api/wasmtime/struct.PoolingAllocationConfig.html
-        // let mut pooling_config = PoolingAllocationConfig::default();
-        //config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
-
-        let engine = Engine::new(&config).unwrap();
-
+    fn new(engine: Engine) -> Self {
         let mut linker = Linker::<InstanceState>::new(&engine);
 
         // Add to linker
@@ -443,79 +416,33 @@ impl Runtime {
 
         api::add_to_linker(&mut linker).unwrap();
 
-        let cache_dir = cache_dir.as_ref().join("programs");
-        // Ensure the cache directory exists
-        std::fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
-
         Self {
             engine,
             linker: Arc::new(linker),
-            cache_dir,
-            programs_in_memory: DashMap::new(),
-            programs_in_disk: DashMap::new(),
+            compiled_programs: DashMap::new(),
             running_instances: DashMap::new(),
             finished_instances: DashMap::new(),
             running_server_instances: DashMap::new(),
         }
     }
 
-    fn load_existing_programs(&self) -> Result<(), RuntimeError> {
-        let entries = std::fs::read_dir(&self.cache_dir)?; // Will map to RuntimeError::Io automatically
-        for entry in entries {
-            let entry = entry?; // same here, auto-converted to RuntimeError::Io
-            if entry.file_type()?.is_file() {
-                let path = entry.path();
-                let data = std::fs::read(&path)?; // also auto Io
-                let hash = blake3::hash(&data).to_hex().to_string();
-                self.programs_in_disk.insert(hash, path);
-            }
-        }
-        Ok(())
-    }
-
     fn get_component(&self, hash: &str) -> Result<Component, RuntimeError> {
-        // 1) Make sure the `Component` is loaded in memory
-        if self.programs_in_memory.get(hash).is_none() {
-            // load from disk if possible
-            if let Some(path_entry) = self.programs_in_disk.get(hash) {
-                // Use a custom error variant for compile errors
-
-                let component =
-                    Component::from_file(&self.engine, path_entry.value()).map_err(|err| {
-                        RuntimeError::CompileWasm {
-                            path: path_entry.value().to_path_buf(),
-                            source: err,
-                        }
-                    })?;
-                self.programs_in_memory.insert(hash.to_string(), component);
-            } else {
-                // If not on disk either, return a custom error
-                return Err(RuntimeError::MissingProgram(hash.to_string()));
-            }
+        // Get the component from memory by hash
+        match self.compiled_programs.get(hash) {
+            Some(entry) => Ok(entry.value().clone()),
+            None => Err(RuntimeError::MissingProgram(hash.to_string())),
         }
-
-        // 2) Now we have a compiled component
-        let component = match self.programs_in_memory.get(hash) {
-            Some(c) => c.clone(),
-            None => {
-                return Err(RuntimeError::Other(
-                    "Failed to get component from memory".into(),
-                ));
-            }
-        };
-
-        Ok(component)
     }
 
     /// Actually start a program instance
     async fn launch_instance(
         &self,
         username: String,
-        program_hash: String,
+        hash: String,
         arguments: Vec<String>,
         detached: bool,
     ) -> Result<InstanceId, RuntimeError> {
-        let component = self.get_component(&program_hash)?;
+        let component = self.get_component(&hash)?;
         let instance_id = Uuid::new_v4();
 
         // Instantiate and run in a task
@@ -551,7 +478,7 @@ impl Runtime {
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             username,
-            program_hash,
+            program_hash: hash,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -615,12 +542,12 @@ impl Runtime {
     async fn launch_server_instance(
         &self,
         username: String,
-        program_hash: String,
+        hash: String,
         port: u32,
         arguments: Vec<String>,
     ) -> Result<InstanceId, RuntimeError> {
         let instance_id = Uuid::new_v4();
-        let component = self.get_component(&program_hash)?;
+        let component = self.get_component(&hash)?;
 
         // Instantiate and run in a task
         let engine = self.engine.clone();
@@ -641,13 +568,14 @@ impl Runtime {
         ));
 
         // Create a dummy output delivery controller for server instances (not used since each request gets its own instance)
-        let (dummy_state, output_delivery_ctrl) = InstanceState::new(Uuid::new_v4(), username.clone(), vec![]).await;
+        let (dummy_state, output_delivery_ctrl) =
+            InstanceState::new(Uuid::new_v4(), username.clone(), vec![]).await;
         drop(dummy_state); // We don't actually use this
 
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             username,
-            program_hash,
+            program_hash: hash,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -748,7 +676,8 @@ impl Runtime {
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
         let inst_id = Uuid::new_v4();
-        let (inst_state, _output_delivery_ctrl) = InstanceState::new(inst_id, username, arguments).await;
+        let (inst_state, _output_delivery_ctrl) =
+            InstanceState::new(inst_id, username, arguments).await;
 
         let mut store = Store::new(&engine, inst_state);
         let (sender, receiver) = oneshot::channel();
@@ -869,7 +798,8 @@ impl Runtime {
         output_delivery_ctrl_tx: oneshot::Sender<OutputDeliveryCtrl>,
     ) {
         // Create the instance state and output delivery controller
-        let (inst_state, output_delivery_ctrl) = InstanceState::new(instance_id, username, arguments).await;
+        let (inst_state, output_delivery_ctrl) =
+            InstanceState::new(instance_id, username, arguments).await;
 
         let output_delivery = if detached {
             OutputDelivery::Buffered

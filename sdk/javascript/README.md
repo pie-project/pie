@@ -4,27 +4,33 @@ JavaScript/TypeScript library for writing Pie inferlets.
 
 ## Quick Start with Examples
 
-See `../inferlet-examples/` for complete examples:
+Examples live under `sdk/examples/javascript`:
 
-- **text-completion-js** - Basic text generation with sampling
-- **beam-search-js** - Beam search decoding
+- **text-completion** - Basic text generation with sampling
+- **beam-search** - Beam search decoding
 
-Build and run an example:
+Install dependencies and build an example:
 
 ```bash
-cd ../inferlet-examples/text-completion-js
-pie-cli build . -o text-completion.wasm
-pie-cli submit text-completion.wasm -- --prompt "Hello"
+cd sdk/javascript
+npm install
+
+# If needed, activate Python venv (e.g., sdk/python/.venv)
+# cd ../python && source .venv/bin/activate && cd ../javascript
+
+# Build example
+bakery build "$PWD/../examples/javascript/text-completion" \
+  -o "$PWD/../text-completion.wasm"
 ```
 
 ## How to Create My Own Inferlet
 
 ```bash
-# Create a new inferlet with TypeScript (recommended)
-pie-cli create my-inferlet
+# Create a new inferlet with TypeScript
+bakery create my-inferlet --ts
 ```
 
-For JavaScript, use `pie-cli create my-inferlet --js`.
+Note: The default is Rust. Use `--ts` for TypeScript/JavaScript projects.
 
 This generates:
 - `index.ts` - Your inferlet code (or `index.js` for JavaScript)
@@ -35,18 +41,13 @@ This generates:
 
 ```bash
 cd my-inferlet
-pie-cli build . -o my-inferlet.wasm
+# With venv activated
+bakery build "$PWD" -o "$PWD/my-inferlet.wasm"
 ```
 
 ### Run
 
-Make sure the Pie server is running:
-
-```bash
-pie-cli ping
-```
-
-Then submit the compiled inferlet:
+Make sure the Pie engine is running, then submit the compiled inferlet:
 
 ```bash
 pie-cli submit my-inferlet.wasm
@@ -54,36 +55,52 @@ pie-cli submit my-inferlet.wasm
 
 ## Writing Inferlets
 
-Inferlets use **top-level await**. Write your logic directly without boilerplate:
+Inferlets use **top-level await**. Import the APIs you need from `'inferlet'`:
 
 ```typescript
 // my-inferlet/index.ts
+
+import { Context, getAutoModel, getArguments, send } from 'inferlet';
+
+const args = getArguments();
+const prompt = (args.prompt as string) ?? 'Hello, world!';
 
 const model = getAutoModel();
 const ctx = new Context(model);
 
 ctx.fillSystem('You are a helpful assistant.');
-ctx.fillUser('Hello!');
+ctx.fillUser(prompt);
 
-const sampler = Sampler.topP(0.6, 0.95);
-const eosTokens = model.eosTokens().map((arr) => [...arr]);
-const stopCond = maxLen(256).or(endsWithAny(eosTokens));
+const result = await ctx.generate({
+  sampling: { topP: 0.95, temperature: 0.6 },
+  stop: { maxTokens: 256, sequences: model.eosTokens }
+});
 
-const result = await ctx.generate(sampler, stopCond);
 send(result);
-send('\n');
 ```
 
 The build system automatically:
-- Injects all inferlet globals (`getAutoModel`, `Context`, `Sampler`, etc.)
+- Resolves imports from the `inferlet` package
 - Wraps your code in the WIT interface
 - Handles error reporting
 
-## Available Globals
+## Available APIs
 
-### Core
+Import the APIs you need from the `'inferlet'` package:
+
+```typescript
+import {
+  Context,
+  getAutoModel,
+  getArguments,
+  send,
+  // ... other APIs as needed
+} from 'inferlet';
+```
+
+### Core Functions
 - `getAutoModel()` - Returns the model instance
-- `getArguments()` - Returns command-line arguments as an array
+- `getArguments()` - Returns command-line arguments as an object
 - `send(text)` - Sends output to the client
 
 ### Classes
@@ -93,28 +110,36 @@ The build system automatically:
 - `Tokenizer` - Text tokenization
 
 ### Stop Conditions
-- `maxLen(n)` - Stops after `n` tokens
-- `endsWith(tokens)` - Stops when output ends with the specified tokens
-- `endsWithAny(tokenArrays)` - Stops when output ends with any of the token sequences
+Stop conditions are configured in the `generate()` options object:
 
-Stop conditions can be combined: `maxLen(256).or(endsWithAny(eosTokens))`
+```typescript
+const result = await ctx.generate({
+  sampling: { topP: 0.95, temperature: 0.6 },
+  stop: {
+    maxTokens: 256,
+    sequences: model.eosTokens  // Array of token sequences
+  }
+});
+```
 
 ## CLI Reference
 
 ### Create
 
 ```bash
-pie-cli create <name> [OPTIONS]
+bakery create <name> [OPTIONS]
 
 Options:
-  --js               Use JavaScript instead of TypeScript
+  --ts, -t           Create a TypeScript project instead of Rust
   -o, --output <dir> Output directory (default: current directory)
 ```
+
+Note: TypeScript projects support both `.ts` and `.js` files. The default (without `--ts`) creates a Rust project.
 
 ### Build
 
 ```bash
-pie-cli build <input> -o <output.wasm> [OPTIONS]
+bakery build <input> -o <output.wasm> [OPTIONS]
 
 Options:
   --debug    Use debug build of StarlingMonkey runtime
@@ -125,7 +150,7 @@ Options:
 The generated `tsconfig.json` provides full IDE support:
 - Auto-completion for all inferlet APIs
 - Type checking for your code
-- No explicit imports needed
+- Import resolution via path mappings
 
 Path mappings point to `inferlet-js/src/` for type definitions.
 
@@ -151,11 +176,11 @@ npm run test:watch    # Watch mode
 Integration tests verify the full pipeline: TypeScript → WASM → JS execution.
 
 ```
-TypeScript source → pie-cli build → .wasm → jco transpile → Node.js execution
+TypeScript source → bakery build → .wasm → jco transpile → Node.js execution
 ```
 
 These tests require `pie-cli` in PATH. They:
-1. Build test fixtures to WASM using `pie-cli build`
+1. Build test fixtures to WASM using `bakery build`
 2. Transpile WASM to JS using `jco transpile`
 3. Execute the transpiled component with mock host functions
 4. Verify outputs are captured correctly

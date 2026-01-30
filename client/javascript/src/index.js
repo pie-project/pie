@@ -298,9 +298,10 @@ export class PieClient {
     /**
      * Uploads a program to the server in chunks.
      * @param {Uint8Array} programBytes The program content as a byte array.
+     * @param {string} manifest The manifest TOML content as a string.
      * @returns {Promise<void>}
      */
-    async uploadProgram(programBytes) {
+    async uploadProgram(programBytes, manifest) {
         const programHash = blake3(programBytes).toString('hex');
         const chunkSize = 256 * 1024; // 256 KiB, must match server
         const totalChunks = Math.ceil(programBytes.length / chunkSize);
@@ -318,6 +319,7 @@ export class PieClient {
                 type: "upload_program",
                 corr_id: corr_id,
                 program_hash: programHash,
+                manifest: manifest,
                 chunk_index: i,
                 total_chunks: totalChunks,
                 chunk_data: chunkData,
@@ -339,11 +341,29 @@ export class PieClient {
      * @param {string[]} [args=[]] Optional command-line arguments.
      * @returns {Promise<Instance>}
      */
-    async launchInstance(programHash, args = []) {
+    /**
+     * Launches an instance of a program.
+     *
+     * This method performs a two-level search for the inferlet:
+     * 1. First, it searches for the program among client-uploaded programs.
+     * 2. If not found, it falls back to searching the registry.
+     *
+     * The inferlet parameter can be:
+     * - Full name with version: "std/text-completion@0.1.0"
+     * - Without namespace (defaults to "std"): "text-completion@0.1.0"
+     * - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
+     *
+     * @param {string} inferlet The inferlet name (e.g., "std/text-completion@0.1.0").
+     * @param {string[]} [args=[]] Optional command-line arguments.
+     * @param {boolean} [detached=false] If true, the instance runs in detached mode.
+     * @returns {Promise<Instance>}
+     */
+    async launchInstance(inferlet, args = [], detached = false) {
         const msg = {
             type: "launch_instance",
-            program_hash: programHash,
+            inferlet: inferlet,
             arguments: args,
+            detached: detached,
         };
         const { successful, result } = await this._sendMsgAndWait(msg);
         if (successful) {
@@ -356,7 +376,11 @@ export class PieClient {
     }
 
     /**
-     * Launches an instance from an inferlet in the registry.
+     * Launches an instance from an inferlet in the registry only.
+     *
+     * Unlike `launchInstance`, this method searches only the registry and does not
+     * check client-uploaded programs. Use this when you explicitly want to launch
+     * an inferlet from the registry.
      * 
      * The inferlet parameter can be:
      * - Full name with version: "std/text-completion@0.1.0"
@@ -422,15 +446,18 @@ async function main() {
         // 1. Authenticate (if needed)
         // await client.authenticate("your-super-secret-jwt-token");
 
-        // 2. Upload a simple program
+        // 2. Upload a simple program with manifest
         const programCode = new TextEncoder().encode('print("Hello from JavaScript instance!")');
-        await client.uploadProgram(programCode);
-        const programHash = blake3(programCode).toString('hex');
-        console.log(`[Example] Program hash: ${programHash}`);
+        const manifest = `[package]
+name = "example/hello-world"
+version = "0.1.0"
+`;
+        await client.uploadProgram(programCode, manifest);
+        console.log(`[Example] Uploaded program: example/hello-world@0.1.0`);
 
-        // 3. Launch the instance
+        // 3. Launch the instance using inferlet name
         console.log("[Example] Launching instance...");
-        const instance = await client.launchInstance(programHash);
+        const instance = await client.launchInstance("example/hello-world@0.1.0");
         console.log(`[Example] Launched instance with ID: ${instance.instanceId}`);
 
         // 4. Wait for the instance to finish

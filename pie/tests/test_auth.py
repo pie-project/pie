@@ -8,9 +8,52 @@ import pytest
 import toml
 from typer.testing import CliRunner
 
+from pie.auth import load_authorized_users, save_authorized_users
 from pie_cli.cli import app
 
 runner = CliRunner()
+
+
+class TestAuthFormat:
+    """Tests for auth file format compatibility with Rust runtime."""
+
+    def test_save_produces_rust_compatible_format(self, tmp_path):
+        """Verifies saved format matches Rust AuthorizedUsers struct expectations."""
+        auth_path = tmp_path / "authorized_users.toml"
+        users = {"testuser": {"mykey": "ssh-ed25519 AAAAC3..."}}
+
+        save_authorized_users(auth_path, users)
+
+        # Check raw TOML structure matches Rust expectations
+        raw = toml.loads(auth_path.read_text())
+        assert "users" in raw
+        assert "testuser" in raw["users"]
+        assert "keys" in raw["users"]["testuser"]
+        assert raw["users"]["testuser"]["keys"]["mykey"] == "ssh-ed25519 AAAAC3..."
+
+    def test_load_handles_nested_format(self, tmp_path):
+        """Loads files in the nested format expected by Rust."""
+        auth_path = tmp_path / "authorized_users.toml"
+        auth_path.write_text('[users.testuser.keys]\nmykey = "ssh-ed25519 AAAAC3..."')
+
+        users = load_authorized_users(auth_path)
+
+        assert "testuser" in users
+        assert "mykey" in users["testuser"]
+        assert users["testuser"]["mykey"] == "ssh-ed25519 AAAAC3..."
+
+    def test_roundtrip_preserves_data(self, tmp_path):
+        """Save then load preserves all user data."""
+        auth_path = tmp_path / "authorized_users.toml"
+        original = {
+            "alice": {"laptop": "key1", "desktop": "key2"},
+            "bob": {"server": "key3"},
+        }
+
+        save_authorized_users(auth_path, original)
+        loaded = load_authorized_users(auth_path)
+
+        assert loaded == original
 
 
 class TestAuthAdd:
@@ -30,7 +73,7 @@ class TestAuthAdd:
 
         assert result.exit_code == 0
         assert auth_path.exists()
-        users = toml.loads(auth_path.read_text())
+        users = load_authorized_users(auth_path)
         assert "testuser" in users
         assert "mykey" in users["testuser"]
 
@@ -48,7 +91,7 @@ class TestAuthAdd:
 
         assert result.exit_code == 0
         assert auth_path.exists()
-        users = toml.loads(auth_path.read_text())
+        users = load_authorized_users(auth_path)
         assert "testuser" in users
         assert len(users["testuser"]) == 0  # No keys
 
@@ -56,7 +99,8 @@ class TestAuthAdd:
         """Adds key to existing user."""
         auth_path = tmp_path / ".pie" / "authorized_users.toml"
         auth_path.parent.mkdir(parents=True, exist_ok=True)
-        auth_path.write_text('[testuser]\nkey1 = "existing-key"\n')
+        # Use nested format
+        save_authorized_users(auth_path, {"testuser": {"key1": "existing-key"}})
 
         with patch.dict(os.environ, {"PIE_HOME": str(tmp_path / ".pie")}):
             result = runner.invoke(
@@ -66,7 +110,7 @@ class TestAuthAdd:
             )
 
         assert result.exit_code == 0
-        users = toml.loads(auth_path.read_text())
+        users = load_authorized_users(auth_path)
         assert "key1" in users["testuser"]
         assert "key2" in users["testuser"]
 
@@ -78,7 +122,7 @@ class TestAuthRemove:
         """Removes entire user."""
         auth_path = tmp_path / ".pie" / "authorized_users.toml"
         auth_path.parent.mkdir(parents=True, exist_ok=True)
-        auth_path.write_text('[testuser]\nkey1 = "key-content"\n')
+        save_authorized_users(auth_path, {"testuser": {"key1": "key-content"}})
 
         with patch.dict(os.environ, {"PIE_HOME": str(tmp_path / ".pie")}):
             result = runner.invoke(
@@ -88,20 +132,20 @@ class TestAuthRemove:
             )
 
         assert result.exit_code == 0
-        users = toml.loads(auth_path.read_text())
+        users = load_authorized_users(auth_path)
         assert "testuser" not in users
 
     def test_remove_specific_key(self, tmp_path):
         """Removes specific key from user."""
         auth_path = tmp_path / ".pie" / "authorized_users.toml"
         auth_path.parent.mkdir(parents=True, exist_ok=True)
-        auth_path.write_text('[testuser]\nkey1 = "content1"\nkey2 = "content2"\n')
+        save_authorized_users(auth_path, {"testuser": {"key1": "content1", "key2": "content2"}})
 
         with patch.dict(os.environ, {"PIE_HOME": str(tmp_path / ".pie")}):
             result = runner.invoke(app, ["auth", "remove", "testuser", "key1"])
 
         assert result.exit_code == 0
-        users = toml.loads(auth_path.read_text())
+        users = load_authorized_users(auth_path)
         assert "testuser" in users
         assert "key1" not in users["testuser"]
         assert "key2" in users["testuser"]
@@ -125,8 +169,9 @@ class TestAuthList:
         """Lists all users and their keys."""
         auth_path = tmp_path / ".pie" / "authorized_users.toml"
         auth_path.parent.mkdir(parents=True, exist_ok=True)
-        auth_path.write_text(
-            '[alice]\nlaptop = "key1"\ndesktop = "key2"\n\n[bob]\nserver = "key3"\n'
+        save_authorized_users(
+            auth_path,
+            {"alice": {"laptop": "key1", "desktop": "key2"}, "bob": {"server": "key3"}},
         )
 
         with patch.dict(os.environ, {"PIE_HOME": str(tmp_path / ".pie")}):

@@ -11,10 +11,11 @@ Beam search is a decoding strategy that maintains multiple candidate sequences (
 From the pie repository root:
 
 ```bash
-cd inferlet-py
+cd sdk/python
 uv venv
 source .venv/bin/activate
 uv pip install -e ".[dev]"
+uv pip install -e ../tools/bakery
 ```
 
 ## Build
@@ -22,8 +23,9 @@ uv pip install -e ".[dev]"
 From the pie repository root (with venv activated):
 
 ```bash
-source inferlet-py/.venv/bin/activate
-pie-cli build --python example-apps-py/beam-search -o beam-search.wasm
+# Build
+bakery build "$PWD/sdk/examples/python/beam-search" \
+    -o "$PWD/beam-search.wasm"
 ```
 
 ## Run
@@ -31,9 +33,6 @@ pie-cli build --python example-apps-py/beam-search -o beam-search.wasm
 Requires a running Pie engine:
 
 ```bash
-# Check engine is running
-pie-cli ping
-
 # Submit with default settings (beam_size=4)
 pie-cli submit beam-search.wasm -- --prompt "What is 2 + 2?"
 
