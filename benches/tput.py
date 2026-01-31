@@ -42,17 +42,18 @@ async def run_benchmark(args):
     manifest = tomllib.loads(manifest_content)
     namespace, name = manifest["package"]["name"].split("/", 1)
     version = manifest["package"]["version"]
-    program_hash = blake3(program_bytes).hexdigest()
+    wasm_hash = blake3(program_bytes).hexdigest()
+    toml_hash = blake3(manifest_content.encode()).hexdigest()
     inferlet_name = f"{namespace}/{name}@{version}"
-    print(f"Inferlet: {inferlet_name} ({program_hash})")
+    print(f"Inferlet: {inferlet_name} (wasm: {wasm_hash}, toml: {toml_hash})")
 
     # 2. Connect to server
     print(f"Connecting to {args.server}...")
     async with PieClient(args.server) as client:
         await client.authenticate("benchmark-user")
 
-        # 3. Upload program (check both name and hash match)
-        if not await client.program_exists(inferlet_name, program_hash):
+        # 3. Upload program (check both name and hashes match)
+        if not await client.program_exists(inferlet_name, wasm_hash, toml_hash):
             print("Uploading program...")
             await client.upload_program(program_bytes, manifest_content)
         else:

@@ -385,7 +385,12 @@ class PieClient:
         msg = {"type": "query", "subject": subject, "record": record}
         return await self._send_msg_and_wait(msg)
 
-    async def program_exists(self, inferlet: str, hash: str | None = None) -> bool:
+    async def program_exists(
+        self,
+        inferlet: str,
+        wasm_hash: str | None = None,
+        toml_hash: str | None = None,
+    ) -> bool:
         """Check if a program exists on the server.
 
         The inferlet parameter can be:
@@ -395,10 +400,16 @@ class PieClient:
 
         Args:
             inferlet: The inferlet name (e.g., "std/text-completion@0.1.0").
-            hash: Optional hash to verify. If provided, also checks that the stored hash matches.
+            wasm_hash: Optional WASM binary hash to verify.
+            toml_hash: Optional TOML manifest hash to verify.
+                If hashes are provided, both must be specified together.
         """
-        if hash:
-            query = f"{inferlet}#{hash}"
+        if (wasm_hash is None) != (toml_hash is None):
+            raise ValueError(
+                "wasm_hash and toml_hash must both be provided or both be None"
+            )
+        if wasm_hash and toml_hash:
+            query = f"{inferlet}#{wasm_hash}+{toml_hash}"
         else:
             query = inferlet
         successful, result = await self.query("program_exists", query)

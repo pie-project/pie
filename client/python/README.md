@@ -48,7 +48,7 @@ asyncio.run(main())
 | `authenticate(username, private_key)` | Public key authentication (challenge-response) |
 | `internal_authenticate(token)` | Token-based internal authentication |
 | `upload_program(bytes)` | Upload a WASM program |
-| `program_exists(hash)` | Check if program is uploaded |
+| `program_exists(inferlet, wasm_hash, toml_hash)` | Check if program is uploaded with optional hash verification |
 | `launch_instance(hash, args, detached)` | Launch a program instance |
 | `attach_instance(instance_id)` | Attach to a detached instance |
 | `list_instances()` | List running instances |

@@ -341,18 +341,24 @@ impl Client {
     }
 
     /// Check if a program exists by its inferlet name.
-    /// Optionally verifies that the stored hash matches the provided hash.
+    /// Optionally verifies that the stored hashes match the provided hashes.
     ///
     /// The `inferlet` parameter can be:
     /// - Full name with version: `std/text-completion@0.1.0`
     /// - Without namespace (defaults to `std`): `text-completion@0.1.0`
     /// - Without version (defaults to `latest`): `std/text-completion` or `text-completion`
     ///
-    /// If `hash` is provided, also checks that the stored hash matches.
-    pub async fn program_exists(&self, inferlet: &str, hash: Option<&str>) -> Result<bool> {
-        let query = match hash {
-            Some(h) => format!("{}#{}", inferlet, h),
-            None => inferlet.to_string(),
+    /// If hashes are provided, both `wasm_hash` and `toml_hash` must be specified together.
+    pub async fn program_exists(
+        &self,
+        inferlet: &str,
+        wasm_hash: Option<&str>,
+        toml_hash: Option<&str>,
+    ) -> Result<bool> {
+        let query = match (wasm_hash, toml_hash) {
+            (Some(wasm), Some(toml)) => format!("{}#{}+{}", inferlet, wasm, toml),
+            (None, None) => inferlet.to_string(),
+            _ => anyhow::bail!("wasm_hash and toml_hash must both be provided or both be None"),
         };
         self.query(QUERY_PROGRAM_EXISTS, query)
             .await
