@@ -7,7 +7,7 @@ pub mod resource;
 pub mod tokenizer;
 
 use batching::SharedScheduler;
-use request::{
+use crate::ffi::format::{
     BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassRequest, ForwardPassResponse,
     HandshakeRequest, HandshakeResponse, QueryRequest, QueryResponse, Request,
 };

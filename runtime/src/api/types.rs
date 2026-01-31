@@ -1,26 +1,15 @@
-//! pie:core/types - Queue, FutureBool, FutureString resources
+//! pie:core/types - FutureBool, FutureString resources
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use crate::legacy_model::ModelInfo;
 use anyhow::Result;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 use wasmtime_wasi::async_trait;
 use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 
-static NEXT_QUEUE_ID: AtomicU32 = AtomicU32::new(0);
-
-#[derive(Debug, Clone)]
-pub struct Queue {
-    pub service_id: usize,
-    pub info: Arc<ModelInfo>,
-    pub uid: u32,
-}
-
+/// Future for boolean results (e.g., synchronization, lock acquisition)
 #[derive(Debug)]
 pub struct FutureBool {
     receiver: oneshot::Receiver<bool>,
@@ -51,6 +40,7 @@ impl Pollable for FutureBool {
     }
 }
 
+/// Future for string results (e.g., spawn results, async messages)
 #[derive(Debug)]
 pub struct FutureString {
     receiver: oneshot::Receiver<String>,
@@ -82,23 +72,6 @@ impl Pollable for FutureString {
 }
 
 impl pie::core::types::Host for InstanceState {}
-
-impl pie::core::types::HostQueue for InstanceState {
-    async fn new(&mut self) -> Result<Resource<Queue>> {
-        // TODO: Create queue - requires model context
-        anyhow::bail!("Queue::new not yet implemented")
-    }
-
-    async fn synchronize(&mut self, _this: Resource<Queue>) -> Result<Resource<FutureBool>> {
-        // TODO: Implement synchronization
-        anyhow::bail!("Queue::synchronize not yet implemented")
-    }
-
-    async fn drop(&mut self, this: Resource<Queue>) -> Result<()> {
-        self.ctx().table.delete(this)?;
-        Ok(())
-    }
-}
 
 impl pie::core::types::HostFutureBool for InstanceState {
     async fn pollable(&mut self, this: Resource<FutureBool>) -> Result<Resource<DynPollable>> {

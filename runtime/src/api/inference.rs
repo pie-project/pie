@@ -1,7 +1,6 @@
 //! pie:core/inference - ForwardPass, FutureOutput, Sampler, Output
 
 use crate::api::pie;
-use crate::api::types::Queue;
 use crate::api::context::Context;
 use crate::api::model::Model;
 use crate::api::adapter::Adapter;
@@ -182,22 +181,18 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     }
 
     async fn adapter(&mut self, this: Resource<ForwardPass>, adapter: Resource<Adapter>) -> Result<()> {
-        let adapter_ptr = self.ctx().table.get(&adapter)?.ptr;
+        let adapter_id = self.ctx().table.get(&adapter)?.adapter_id;
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.adapter = Some(adapter_ptr);
+        pass.adapter = Some(adapter_id as u32);
         Ok(())
     }
 
     async fn execute(
         &mut self,
         this: Resource<ForwardPass>,
-        queue: Resource<Queue>,
     ) -> Result<Result<Resource<FutureOutput>, String>> {
-        let queue_data = self.ctx().table.get(&queue)?;
-        let svc_id = queue_data.service_id;
-        let queue_id = queue_data.uid;
-
         let pass = self.ctx().table.get_mut(&this)?;
+        let svc_id = pass.model_service_id;
 
         let request = ForwardPassRequest {
             input_tokens: take(&mut pass.input_tokens),
@@ -220,7 +215,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
         let (tx, rx) = oneshot::channel();
         let req = Request::ForwardPass(request, Some(tx));
-        submit_request(svc_id, queue_id, 0, req)?;
+        submit_request(svc_id, 0, 0, req)?;
 
         let future_output = FutureOutput {
             receiver: rx,

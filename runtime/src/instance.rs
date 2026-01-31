@@ -181,6 +181,10 @@ impl InstanceState {
         self.id
     }
 
+    pub fn get_username(&self) -> String {
+        self.username.clone()
+    }
+
     pub fn arguments(&self) -> &[String] {
         &self.arguments
     }

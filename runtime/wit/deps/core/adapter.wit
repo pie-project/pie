@@ -1,7 +1,7 @@
 interface adapter {
     use wasi:io/poll@0.2.4.{pollable};
 
-    use types.{queue, error, future-bool};
+    use types.{error, future-bool};
     
     resource adapter {
 
@@ -17,9 +17,9 @@ interface adapter {
 
         unlock: func();
 
-        load: func(queue: borrow<queue>, path:string) -> result<_, error>;
+        load: func(path:string) -> result<_, error>;
 
-        save: func(queue: borrow<queue>, path:string) -> result<_, error>;
+        save: func(path:string) -> result<_, error>;
 
     }
 

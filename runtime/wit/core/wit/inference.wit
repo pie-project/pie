@@ -1,7 +1,7 @@
 interface inference {
 
     use wasi:io/poll@0.2.4.{pollable};
-    use types.{error, queue};
+    use types.{error};
     use context.{context};
     use model.{model};
     use adapter.{adapter};
@@ -41,7 +41,7 @@ interface inference {
             adapter: borrow<adapter>,
         );
 
-        execute: func(queue: borrow<queue>) -> result<future-output, error>;
+        execute: func() -> result<future-output, error>;
     }
 
     variant sampler {

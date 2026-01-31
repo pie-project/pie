@@ -3,7 +3,7 @@
 use crate::api::pie;
 use crate::api::types::FutureString;
 use crate::instance::InstanceState;
-use crate::legacy_model;
+use crate::model;
 
 use anyhow::Result;
 use tokio::sync::oneshot;
@@ -13,7 +13,7 @@ use wasmtime_wasi::WasiView;
 impl pie::core::runtime::Host for InstanceState {
     async fn version(&mut self) -> Result<String> {
         let (tx, rx) = oneshot::channel();
-        crate::runtime::send(crate::runtime::Message::GetVersion { response: tx }).unwrap();
+        crate::runtime::send(crate::runtime::Message::GetVersion { response: tx })?;
         rx.await.map_err(Into::into)
     }
 
@@ -22,12 +22,11 @@ impl pie::core::runtime::Host for InstanceState {
     }
 
     async fn username(&mut self) -> Result<String> {
-        // TODO: Implement username access from InstanceState
-        Ok("unknown".to_string())
+        Ok(self.get_username())
     }
 
     async fn models(&mut self) -> Result<Vec<String>> {
-        Ok(legacy_model::registered_models())
+        Ok(model::registered_models())
     }
 
     async fn spawn(
@@ -36,14 +35,13 @@ impl pie::core::runtime::Host for InstanceState {
         args: Vec<String>,
     ) -> Result<Result<Resource<FutureString>, String>> {
         let (tx, rx) = oneshot::channel();
-        
+
         // Dispatch spawn command to runtime
         crate::runtime::send(crate::runtime::Message::Spawn {
             package_name,
             args,
             result: tx,
-        })
-        .unwrap();
+        })?;
 
         let future_string = FutureString::new(rx);
         Ok(Ok(self.ctx().table.push(future_string)?))

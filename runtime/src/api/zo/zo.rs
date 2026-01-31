@@ -1,7 +1,6 @@
 //! pie:zo/zo - Zero-Order Optimization functions
 
 use crate::api::pie;
-use crate::api::types::Queue;
 use crate::api::inference::ForwardPass;
 use crate::api::adapter::Adapter;
 use crate::instance::InstanceState;
@@ -23,21 +22,17 @@ impl pie::zo::zo::Host for InstanceState {
     async fn initialize(
         &mut self,
         adapter: Resource<Adapter>,
-        queue: Resource<Queue>,
         rank: u32,
         alpha: f32,
         population_size: u32,
         mu_fraction: f32,
         initial_sigma: f32,
     ) -> Result<Result<(), String>> {
-        let queue_data = self.ctx().table.get(&queue)?;
-        let svc_id = queue_data.service_id;
-        let queue_id = queue_data.uid;
-        
         let adapter = self.ctx().table.get(&adapter)?;
+        let model_idx = adapter.model_idx;
 
         let req = Request::InitializeAdapter(InitializeAdapterRequest {
-            adapter_ptr: adapter.ptr,
+            adapter_ptr: adapter.adapter_id as u32,
             rank,
             alpha,
             population_size,
@@ -45,32 +40,28 @@ impl pie::zo::zo::Host for InstanceState {
             initial_sigma,
         });
 
-        submit_request(svc_id, queue_id, 0, req)?;
+        submit_request(model_idx, 0, 0, req)?;
         Ok(Ok(()))
     }
 
     async fn update(
         &mut self,
         adapter: Resource<Adapter>,
-        queue: Resource<Queue>,
         scores: Vec<f32>,
         seeds: Vec<i64>,
         max_sigma: f32,
     ) -> Result<Result<(), String>> {
-        let queue_data = self.ctx().table.get(&queue)?;
-        let svc_id = queue_data.service_id;
-        let queue_id = queue_data.uid;
-        
         let adapter = self.ctx().table.get(&adapter)?;
+        let model_idx = adapter.model_idx;
 
         let req = Request::UpdateAdapter(UpdateAdapterRequest {
-            adapter_ptr: adapter.ptr,
+            adapter_ptr: adapter.adapter_id as u32,
             scores,
             seeds,
             max_sigma,
         });
 
-        submit_request(svc_id, queue_id, 0, req)?;
+        submit_request(model_idx, 0, 0, req)?;
         Ok(Ok(()))
     }
 }

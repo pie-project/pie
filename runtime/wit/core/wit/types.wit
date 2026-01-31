@@ -4,12 +4,6 @@ interface types {
 
     type error = string;
 
-    // Queue resource with methods for synchronization and priority control
-    resource queue {
-        constructor();
-        synchronize: func() -> future-bool; // Begin synchronization process
-    }
-
     // Result of a synchronization attempt
     resource future-bool {
         pollable: func() -> pollable;               // Returns a pollable for async readiness checks

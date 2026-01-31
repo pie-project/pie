@@ -18,7 +18,6 @@ wasmtime::component::bindgen!({
     with: {
         "wasi:io/poll": wasmtime_wasi::p2::bindings::io::poll,
         // pie:core/types
-        "pie:core/types.queue": types::Queue,
         "pie:core/types.future-bool": types::FutureBool,
         "pie:core/types.future-string": types::FutureString,
         // pie:core/context
