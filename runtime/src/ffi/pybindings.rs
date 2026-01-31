@@ -274,7 +274,7 @@ impl ServerHandle {
 
     /// Get list of registered model names (backends that have connected).
     fn registered_models(&self) -> Vec<String> {
-        crate::legacy_model::registered_models()
+        crate::model::registered_models()
     }
 
     fn __repr__(&self) -> String {
@@ -294,9 +294,7 @@ pub struct PartialServerHandle {
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     runtime: Arc<tokio::runtime::Runtime>,
     /// IPC backends (not yet handshaked)
-    backends: Arc<Mutex<Option<Vec<crate::legacy_model::RpcBackend>>>>,
-    /// Scheduler config for model creation
-    scheduler_config: crate::legacy_model::SchedulerConfig,
+    backends: Arc<Mutex<Option<Vec<crate::model::RpcBackend>>>>,
 }
 
 #[pymethods]
@@ -306,7 +304,7 @@ impl PartialServerHandle {
     /// This should be called after Python IPC workers have connected.
     /// Blocks until handshake completes successfully.
     fn complete(&self, py: Python<'_>) -> PyResult<ServerHandle> {
-        use crate::legacy_model::{self, Model};
+        use crate::model;
         
         py.allow_threads(|| {
             let backends = {
@@ -318,21 +316,12 @@ impl PartialServerHandle {
                 })?
             };
             
-            let scheduler_config = self.scheduler_config.clone();
-            
             self.runtime.block_on(async {
-                // Now Python workers are connected, handshake will succeed
-                let model = Model::new_with_backends(backends, scheduler_config).await
-                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create model: {}", e)))?;
-                
-                let model_name = model.name().to_string();
-                
-                // Register the model with the engine
-                let model_id = legacy_model::install_model(model_name.clone(), model);
-                if model_id.is_none() {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "Failed to register model '{}': already exists", model_name
-                    )));
+                // Install each backend as a model
+                for backend in backends {
+                    let model_id = model::install_model_with_backend(backend).await
+                        .map_err(|e| PyRuntimeError::new_err(format!("Failed to install model: {}", e)))?;
+                    tracing::info!("Installed model with ID: {}", model_id);
                 }
                 
                 Ok::<(), PyErr>(())
@@ -381,7 +370,7 @@ fn start_server_phase1(
     authorized_users_path: Option<String>,
     num_groups: usize,
 ) -> PyResult<(PartialServerHandle, Vec<String>)> {
-    use crate::legacy_model::{SchedulerConfig, RpcBackend};
+    use crate::model::RpcBackend;
     
     // Allow other Python threads to run while we block
     py.allow_threads(|| {
@@ -422,7 +411,7 @@ fn start_server_phase1(
                     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create IPC backend for group {}: {}", group_id, e)))?;
                 
                 let ipc_client = AsyncIpcClient::new(Arc::new(ipc_backend));
-                backends.push(RpcBackend::new_ipc(ipc_client));
+                backends.push(RpcBackend::new(ipc_client));
                 ipc_server_names.push(server_name);
             }
 
@@ -438,7 +427,6 @@ fn start_server_phase1(
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             runtime: rt,
             backends: Arc::new(Mutex::new(Some(backends))),
-            scheduler_config: SchedulerConfig::default(),
         };
         
         Ok((handle, server_names))

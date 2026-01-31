@@ -5,13 +5,10 @@ use crate::api::context::Context;
 use crate::api::model::Model;
 use crate::api::adapter::Adapter;
 use crate::instance::InstanceState;
-use crate::legacy_model::request::{ForwardPassRequest, ForwardPassResponse, Request};
-use crate::legacy_model::submit_request;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::iter;
 use std::mem::take;
-use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 use wasmtime_wasi::async_trait;
@@ -34,7 +31,6 @@ pub struct ForwardPass {
 
 #[derive(Debug)]
 pub struct FutureOutput {
-    receiver: oneshot::Receiver<ForwardPassResponse>,
     result: Option<pie::core::inference::Output>,
     done: bool,
 }
@@ -42,18 +38,7 @@ pub struct FutureOutput {
 #[async_trait]
 impl Pollable for FutureOutput {
     async fn ready(&mut self) {
-        if self.done {
-            return;
-        }
-        if let Ok(res) = (&mut self.receiver).await {
-            if !res.dists.is_empty() {
-                self.result = Some(pie::core::inference::Output::Distributions(res.dists));
-            } else if !res.tokens.is_empty() {
-                self.result = Some(pie::core::inference::Output::Tokens(res.tokens));
-            } else {
-                self.result = Some(pie::core::inference::Output::None);
-            }
-        }
+        // Immediately ready since we're stubbed out
         self.done = true;
     }
 }
@@ -191,36 +176,22 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         &mut self,
         this: Resource<ForwardPass>,
     ) -> Result<Result<Resource<FutureOutput>, String>> {
+        // Clear the pass state (no-op since we're not sending to backend anymore)
         let pass = self.ctx().table.get_mut(&this)?;
-        let svc_id = pass.model_service_id;
+        let _ = take(&mut pass.input_tokens);
+        let _ = take(&mut pass.input_token_positions);
+        let _ = take(&mut pass.mask);
+        let _ = take(&mut pass.sampling_mask);
+        let _ = take(&mut pass.output_token_indices);
+        let _ = take(&mut pass.output_token_samplers);
 
-        let request = ForwardPassRequest {
-            input_tokens: take(&mut pass.input_tokens),
-            input_token_positions: take(&mut pass.input_token_positions),
-            input_embed_ptrs: vec![],
-            input_embed_positions: vec![],
-            adapter: pass.adapter,
-            adapter_seed: None,
-            mask: take(&mut pass.mask),
-            sampling_mask: take(&mut pass.sampling_mask),
-            kv_page_ptrs: vec![],
-            kv_page_last_len: 0,
-            output_token_indices: take(&mut pass.output_token_indices),
-            output_token_samplers: take(&mut pass.output_token_samplers),
-            output_embed_ptrs: vec![],
-            output_embed_indices: vec![],
-            arrival_time: None,
-            inst_id: Some(self.id()),
-        };
-
-        let (tx, rx) = oneshot::channel();
-        let req = Request::ForwardPass(request, Some(tx));
-        submit_request(svc_id, 0, 0, req)?;
-
+        // Return a stub FutureOutput that immediately returns None
+        // TODO: Implement proper inference through the new model architecture
+        tracing::warn!("ForwardPass::execute is stubbed out - legacy inference backend removed");
+        
         let future_output = FutureOutput {
-            receiver: rx,
-            result: None,
-            done: false,
+            result: Some(pie::core::inference::Output::None),
+            done: true,
         };
         Ok(Ok(self.ctx().table.push(future_output)?))
     }

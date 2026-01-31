@@ -4,8 +4,6 @@ use crate::api::pie;
 use crate::api::inference::ForwardPass;
 use crate::api::adapter::Adapter;
 use crate::instance::InstanceState;
-use crate::legacy_model::request::{InitializeAdapterRequest, Request, UpdateAdapterRequest};
-use crate::legacy_model::submit_request;
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -28,19 +26,13 @@ impl pie::zo::zo::Host for InstanceState {
         mu_fraction: f32,
         initial_sigma: f32,
     ) -> Result<Result<(), String>> {
+        // Stubbed out - legacy model backend removed
+        // TODO: Implement through new model architecture
         let adapter = self.ctx().table.get(&adapter)?;
-        let model_idx = adapter.model_idx;
-
-        let req = Request::InitializeAdapter(InitializeAdapterRequest {
-            adapter_ptr: adapter.adapter_id as u32,
-            rank,
-            alpha,
-            population_size,
-            mu_fraction,
-            initial_sigma,
-        });
-
-        submit_request(model_idx, 0, 0, req)?;
+        tracing::warn!(
+            "zo::initialize is stubbed out - adapter_id={}, rank={}, alpha={}, pop_size={}, mu_frac={}, sigma={}",
+            adapter.adapter_id, rank, alpha, population_size, mu_fraction, initial_sigma
+        );
         Ok(Ok(()))
     }
 
@@ -51,17 +43,13 @@ impl pie::zo::zo::Host for InstanceState {
         seeds: Vec<i64>,
         max_sigma: f32,
     ) -> Result<Result<(), String>> {
+        // Stubbed out - legacy model backend removed
+        // TODO: Implement through new model architecture
         let adapter = self.ctx().table.get(&adapter)?;
-        let model_idx = adapter.model_idx;
-
-        let req = Request::UpdateAdapter(UpdateAdapterRequest {
-            adapter_ptr: adapter.adapter_id as u32,
-            scores,
-            seeds,
-            max_sigma,
-        });
-
-        submit_request(model_idx, 0, 0, req)?;
+        tracing::warn!(
+            "zo::update is stubbed out - adapter_id={}, scores_len={}, seeds_len={}, max_sigma={}",
+            adapter.adapter_id, scores.len(), seeds.len(), max_sigma
+        );
         Ok(Ok(()))
     }
 }

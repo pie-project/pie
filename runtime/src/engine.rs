@@ -8,9 +8,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 use wasmtime::{Config as WasmConfig, Engine as WasmEngine};
 
 use crate::auth::AuthorizedUsers;
-use crate::legacy_kvs;
-use crate::messaging;
-use crate::legacy_messaging;
 use crate::runtime;
 use crate::server;
 use crate::telemetry::{self, TelemetryConfig};
@@ -100,8 +97,6 @@ pub async fn run_server(
         cache_dir: config.cache_dir.clone(),
         wasm_engine,
     });
-    legacy_kvs::start_service();
-    legacy_messaging::start_service();
 
     ready_tx.send(internal_auth_token).unwrap();
 

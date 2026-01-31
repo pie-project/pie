@@ -1,3 +1,0 @@
-io = "https://github.com/WebAssembly/wasi-io/archive/v0.2.4.tar.gz"
-http = "https://github.com/WebAssembly/wasi-http/archive/v0.2.4.tar.gz"
-core = "../../core/wit"

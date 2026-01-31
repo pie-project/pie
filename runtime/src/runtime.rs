@@ -24,18 +24,87 @@ use wasmtime_wasi_http::io::TokioIo;
 
 use super::instance::{InstanceId, InstanceState, OutputDelivery, OutputDeliveryCtrl};
 use crate::actor::{Actor, Handle, SendError};
-use crate::legacy_model;
-use crate::legacy_model::request::QueryResponse;
+use crate::ffi::format::QueryResponse;
 use crate::{api, server};
+use thiserror::Error;
 
 // =============================================================================
-// Re-exports from legacy module for compatibility
+// Shared Type Definitions
 // =============================================================================
 
-// Re-export shared types that other modules depend on
-pub use crate::legacy_runtime::{
-    AttachInstanceResult, InstanceRunningState, RuntimeError, TerminationCause,
-};
+#[derive(Debug, Error)]
+pub enum RuntimeError {
+    /// Wrap general I/O errors
+    #[error("I/O error occurred: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Wrap Wasmtime errors
+    #[error("Wasmtime error occurred: {0}")]
+    Wasmtime(#[from] wasmtime::Error),
+
+    /// No program found for a given hash
+    #[error("No such program with hash={0}")]
+    MissingProgram(String),
+
+    /// Failed to compile a WASM component from disk
+    #[error("Failed to compile program at path {path:?}: {source}")]
+    CompileWasm {
+        path: std::path::PathBuf,
+        #[source]
+        source: wasmtime::Error,
+    },
+
+    /// Fallback for unexpected cases
+    #[error("Runtime error: {0}")]
+    Other(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum TerminationCause {
+    Normal(String),
+    Signal,
+    Exception(String),
+    OutOfResources(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum InstanceRunningState {
+    /// The instance is running and a client is attached to it.
+    Attached,
+    /// The instance is running and not attached to a client.
+    Detached,
+    /// The instance has finished execution.
+    Finished(TerminationCause),
+}
+
+impl From<InstanceRunningState> for pie_client::message::InstanceStatus {
+    fn from(state: InstanceRunningState) -> Self {
+        match state {
+            InstanceRunningState::Attached => pie_client::message::InstanceStatus::Attached,
+            InstanceRunningState::Detached => pie_client::message::InstanceStatus::Detached,
+            InstanceRunningState::Finished(_) => pie_client::message::InstanceStatus::Finished,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum AttachInstanceResult {
+    /// The instance is running and the client has been attached to it successfully.
+    AttachedRunning,
+    /// The instance has finished execution and the client has been attached to it successfully.
+    AttachedFinished(TerminationCause),
+    /// The instance is not found.
+    InstanceNotFound,
+    /// Another client has already been attached to this instance.
+    AlreadyAttached,
+}
+
+/// Cleanup resources for a finished instance.
+/// This is a stub for now since the new model architecture doesn't require per-instance cleanup.
+fn cleanup_instance(_inst_id: InstanceId) {
+    // No-op: The new model/context/inference actors manage their own resources.
+    // Instance-specific resources are cleaned up when the instance task terminates.
+}
 
 // =============================================================================
 // Instance State Types (local to new Runtime)
@@ -548,7 +617,7 @@ impl Runtime {
 
         if let Some((_, handle)) = instance {
             handle.join_handle.abort();
-            legacy_model::cleanup_instance(instance_id);
+            cleanup_instance(instance_id);
 
             if let Some(cause) = notification_to_client {
                 server::Message::InstanceEvent(server::InstanceEvent::Terminate {
@@ -567,7 +636,7 @@ impl Runtime {
             match handle.running_state {
                 InstanceRunningState::Attached => {
                     handle.join_handle.abort();
-                    legacy_model::cleanup_instance(instance_id);
+                    cleanup_instance(instance_id);
 
                     server::Message::InstanceEvent(server::InstanceEvent::Terminate {
                         inst_id: instance_id,

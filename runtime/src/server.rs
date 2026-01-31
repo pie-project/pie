@@ -31,9 +31,9 @@ use crate::actor::{Actor, Handle, SendError};
 use crate::auth::{AuthorizedUsers, PublicKey};
 use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
 use crate::messaging::{self, PushPullMessage};
-use crate::legacy_model;
 use crate::runtime::{self, AttachInstanceResult, TerminationCause};
 use crate::utils::IdPool;
+use std::collections::HashMap;
 
 type ClientId = u32;
 
@@ -855,7 +855,8 @@ impl Session {
                 self.send_response(corr_id, true, result.to_string()).await;
             }
             message::QUERY_MODEL_STATUS => {
-                let runtime_stats = legacy_model::runtime_stats().await;
+                // Runtime stats now stubbed - the new model architecture uses per-actor stats
+                let runtime_stats: HashMap<String, String> = HashMap::new();
                 self.send_response(
                     corr_id,
                     true,
@@ -864,7 +865,8 @@ impl Session {
                 .await;
             }
             message::QUERY_BACKEND_STATS => {
-                let runtime_stats = legacy_model::runtime_stats().await;
+                // Runtime stats now stubbed - the new model architecture uses per-actor stats
+                let runtime_stats: HashMap<String, String> = HashMap::new();
                 let mut sorted_stats: Vec<_> = runtime_stats.iter().collect();
                 sorted_stats.sort_by_key(|(k, _)| *k);
 
