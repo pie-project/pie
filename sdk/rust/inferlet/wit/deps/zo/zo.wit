@@ -1,0 +1,28 @@
+interface zo {
+
+    use pie:core/types.{error};
+    use pie:core/inference.{forward-pass};
+    use pie:core/adapter.{adapter};
+
+    adapter-seed: func(
+        self: borrow<forward-pass>,
+        seed: s64
+    );
+
+    initialize: func(
+        self: borrow<adapter>,
+        rank: u32,
+        alpha: f32,
+        population-size: u32,
+        mu-fraction: f32,
+        initial-sigma: f32
+    ) -> result<_, error>;
+
+    update: func(
+        self: borrow<adapter>,
+        scores: list<f32>,
+        seeds: list<s64>,
+        max-sigma: f32
+    ) -> result<_, error>;
+
+}

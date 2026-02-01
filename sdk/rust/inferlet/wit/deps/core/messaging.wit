@@ -1,0 +1,30 @@
+interface messaging {
+
+    use wasi:io/poll@0.2.4.{pollable};
+    use types.{future-string};
+
+    // Represents a subscription to a broadcast topic
+    resource subscription {
+        // Pollable to check for new messages on the topic
+        pollable: func() -> pollable;
+
+        // Retrieves a new message from the topic, if available
+        get: func() -> option<string>;
+
+        // Cancels the subscription
+        unsubscribe: func();
+    }
+
+    // Sends a message to the remote user client
+    send: func(message: string);
+
+    // Receives an incoming message from the remote user client
+    receive: func() -> future-string;
+
+    // Publishes a message to a topic (broadcast to all subscribers)
+    broadcast: func(topic: string, message: string);
+
+    // Subscribes to a topic and returns a subscription handle
+    subscribe: func(topic: string) -> subscription;
+
+}

@@ -1,0 +1,21 @@
+interface runtime {
+
+    use types.{error, future-string};
+
+    // Returns the runtime version string
+    version: func() -> string;
+
+    // Returns a unique identifier for the running instance
+    instance-id: func() -> string;
+
+    // Returns the username of the user who invoked the inferlet
+    username: func() -> string;
+
+    // Get a list of all available model names
+    models: func() -> list<string>;
+
+    // Spawns a new inferlet with the given package name and arguments
+    // Returns the result of the spawned inferlet
+    spawn: func(package-name: string, args: list<string>) -> result<future-string, error>;
+
+}
