@@ -14,10 +14,10 @@ interface model {
     resource tokenizer {
 
         // Converts input text into a list of token IDs
-        tokenize: func(text: string) -> list<u32>;
+        encode: func(text: string) -> list<u32>;
 
         // Converts token IDs back into a decoded string
-        detokenize: func(tokens: list<u32>) -> result<string, error>;
+        decode: func(tokens: list<u32>) -> result<string, error>;
 
         // Returns the tokenizer's vocabulary as a list of byte sequences (tokens)
         vocabs: func() -> tuple<list<u32>, list<list<u8>>>;

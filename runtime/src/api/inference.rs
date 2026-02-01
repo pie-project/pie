@@ -232,16 +232,6 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
         }
     }
 
-    async fn get_speculative_tokens(&mut self, this: Resource<FutureOutput>) -> Result<Option<Vec<(u32, u32)>>> {
-        let result = self.ctx().table.get(&this)?;
-        if result.done {
-            // Stubbed - returns None (no speculative tokens)
-            Ok(None)
-        } else {
-            Ok(None)
-        }
-    }
-
     async fn drop(&mut self, this: Resource<FutureOutput>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())

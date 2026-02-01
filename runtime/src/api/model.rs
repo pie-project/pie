@@ -73,7 +73,7 @@ impl pie::core::model::HostModel for InstanceState {
 }
 
 impl pie::core::model::HostTokenizer for InstanceState {
-    async fn tokenize(&mut self, this: Resource<Tokenizer>, text: String) -> Result<Vec<u32>> {
+    async fn encode(&mut self, this: Resource<Tokenizer>, text: String) -> Result<Vec<u32>> {
         let tokenizer = self.ctx().table.get(&this)?;
         let service_id = tokenizer.service_id;
 
@@ -82,7 +82,7 @@ impl pie::core::model::HostTokenizer for InstanceState {
         Ok(rx.await?)
     }
 
-    async fn detokenize(
+    async fn decode(
         &mut self,
         this: Resource<Tokenizer>,
         tokens: Vec<u32>,
