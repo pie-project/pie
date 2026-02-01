@@ -406,6 +406,7 @@ impl pie::core::context::HostContext for InstanceState {
                 token,
                 position: i as u32,
                 mask: crate::brle::Brle::new(0),
+                adapter: None,
             })
             .collect();
 

@@ -107,9 +107,6 @@ def serve(
         None, "--cache-dir", help="Cache directory path"
     ),
     log_dir: str | None = typer.Option(None, "--log-dir", help="Log directory path"),
-    interactive: bool = typer.Option(
-        False, "--interactive", "-i", help="Enable interactive shell mode"
-    ),
     monitor: bool = typer.Option(
         False, "--monitor", "-m", help="Launch real-time TUI monitor"
     ),
@@ -168,11 +165,7 @@ def serve(
             engine_config, model_configs, console=console
         )
 
-        if interactive:
-            console.print("[dim]Type 'help' for commands, ↑/↓ for history[/dim]")
-            console.print()
-            manager.run_interactive_shell(engine_config, server_handle.internal_token)
-        elif monitor:
+        if monitor:
             # Launch real-time TUI monitor
             from pie_cli.monitor.app import LLMMonitorApp
             from pie_cli.monitor.provider import PieMetricsProvider

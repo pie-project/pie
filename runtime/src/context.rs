@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use anyhow::Result;
 
 use crate::actor::{Handle, Actors, SendError};
+use crate::adapter::AdapterId;
 use crate::brle::Brle;
 use crate::kvcache::{PageId, PageStore, NodeId, PhysicalPageId, PageHash};
 
@@ -166,6 +167,7 @@ enum Record {
         tokens: Vec<u32>,
         positions: Vec<u32>,
         mask: Vec<Brle>,
+        adapter: Option<AdapterId>,
     },
 }
 
@@ -174,6 +176,7 @@ pub struct TokenInfo {
     pub token: u32,
     pub position: u32,
     pub mask: Brle,
+    pub adapter: Option<AdapterId>,
 }
 
 // Lineage created during commit_pages()
@@ -250,6 +253,7 @@ impl ContextService {
                 tokens: tokens.clone(),
                 positions: Vec::new(),
                 mask: Vec::new(),
+                adapter: None,
             });
 
             let mut page_store = self.page_store.write().unwrap();
@@ -286,7 +290,8 @@ impl ContextService {
                         .map(|(i, &token)| TokenInfo { 
                             token, 
                             position: (tokens_matched + i) as u32, 
-                            mask: Brle::new(0) 
+                            mask: Brle::new(0),
+                            adapter: None,
                         })
                         .collect();
                 }
@@ -306,7 +311,8 @@ impl ContextService {
                     .map(|(i, token)| TokenInfo { 
                         token, 
                         position: i as u32, 
-                        mask: Brle::new(0) 
+                        mask: Brle::new(0),
+                        adapter: None,
                     })
                     .collect();
             }
@@ -701,6 +707,7 @@ impl ContextService {
             tokens: lineage_tokens,
             positions: lineage_positions,
             mask: lineage_masks,
+            adapter: None,
         });
 
         Ok(())

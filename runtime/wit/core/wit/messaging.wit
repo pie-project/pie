@@ -15,8 +15,6 @@ interface messaging {
         unsubscribe: func();
     }
 
-
-
     // Sends a message to the remote user client
     send: func(message: string);
 

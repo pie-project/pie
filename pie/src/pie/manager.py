@@ -24,35 +24,12 @@ class EngineError(Exception):
     pass
 
 
-class FfiWorkerHandle:
-    """Wrapper for FFI worker thread to look like a process for cleanup."""
-
-    def __init__(self, thread, stop_event):
-        self.thread = thread
-        self.stop_event = stop_event
-        self.pid = -1  # Pseudo-PID
-
-    def terminate(self):
-        self.stop_event.set()
-
-    def kill(self):
-        """Simulate kill by ensuring stop event is set (threads cannot be SIGKILLed)."""
-        self.stop_event.set()
-
-    def join(self, timeout=None):
-        self.thread.join(timeout=timeout)
-
-    def is_alive(self):
-        return self.thread.is_alive()
-
-
 def start_engine_and_backend(
     engine_config: dict,
     model_configs: list[dict],
     timeout: float = 300.0,
     console: Optional[Any] = None,
     on_status: Optional[callable] = None,
-    on_message: Optional[callable] = None,
 ) -> tuple["_pie.ServerHandle", list]:
     """Start the Pie engine and all configured backend services.
 
@@ -62,7 +39,6 @@ def start_engine_and_backend(
         timeout: Maximum time to wait for backends to connect (seconds)
         console: Optional rich.console.Console for output
         on_status: Optional callback for status updates: (status_message: str) -> None
-        on_message: Optional callback for log messages: (level: str, message: str) -> None
 
     Returns:
         Tuple of (ServerHandle, list of backend processes - empty for FFI mode)
@@ -78,7 +54,6 @@ def start_engine_and_backend(
         timeout: Maximum time to wait for backends to connect (seconds)
         console: Optional rich.console.Console for output
         on_status: Optional callback for status updates: (status_message: str) -> None
-        on_message: Optional callback for log messages: (level: str, message: str) -> None
 
     Returns:
         Tuple of (ServerHandle, list of backend processes - empty for FFI mode)
@@ -90,10 +65,6 @@ def start_engine_and_backend(
     def status_update(msg: str):
         if on_status:
             on_status(msg)
-
-    def log_message(level: str, msg: str):
-        if on_message:
-            on_message(level, msg)
 
     from . import path as pie_path
     from . import _pie
@@ -138,14 +109,13 @@ def start_engine_and_backend(
         # Detect multi-GPU configuration
         device_value = model_config.get("device")
         world_size = len(device_value) if isinstance(device_value, list) else 1
-
         # Validate that all configured devices are accessible
-        devices_to_validate = (
+        device_value = (
             device_value if isinstance(device_value, list) else [device_value]
         )
         available_gpus = torch.cuda.device_count()
 
-        for device in devices_to_validate:
+        for device in device_value:
             if device and device.startswith("cuda:"):
                 device_idx = int(device.split(":")[1])
                 if device_idx >= available_gpus:
@@ -155,37 +125,19 @@ def start_engine_and_backend(
                         f"Check CUDA_VISIBLE_DEVICES environment variable."
                     )
 
-        if world_size > 1:
-            # Multi-GPU FFI mode: spawn worker processes
-            backend_processes = _start_multi_gpu_ffi_backend(
-                engine_config,
-                model_config,
-                server_config,
-                authorized_users_path,
-                device_value,
-                world_size,
-                console,
-                status_update,
-                timeout,
-            )
-            server_handle = backend_processes.pop(0)  # First element is server_handle
-        else:
-            # Single-GPU mode: use same IPC architecture as multi-GPU with world_size=1
-            status_update("Initializing single-GPU backend...")
-
-            # Treat as multi-GPU with 1 device for unified code path
-            backend_processes = _start_multi_gpu_ffi_backend(
-                engine_config,
-                model_config,
-                server_config,
-                authorized_users_path,
-                [device_value] if isinstance(device_value, str) else device_value,
-                1,  # world_size = 1
-                console,
-                status_update,
-                timeout,
-            )
-            server_handle = backend_processes.pop(0)  # First element is server_handle
+        # Multi-GPU FFI mode: spawn worker processes
+        backend_processes = _start_multi_gpu_ffi_backend(
+            engine_config,
+            model_config,
+            server_config,
+            authorized_users_path,
+            device_value,
+            world_size,
+            console,
+            status_update,
+            timeout,
+        )
+        server_handle = backend_processes.pop(0)  # First element is server_handle
 
     except Exception as e:
         raise EngineError(f"Failed to initialize backend: {e}") from e
@@ -341,53 +293,6 @@ def _setup_compute_process_groups(rank: int, group_topology: list[list[int]]) ->
 
     return pg_map
 
-
-def _create_runtime(
-    config_dict: dict,
-    devices: list[str],
-    rank: int,
-    world_size: int,
-    group_topology: list[list[int]],
-    result_queue: Any | None = None,
-    result_queues: list | None = None,  # All queues (for Rank 0)
-    pg_map: dict | None = None,
-    compute_pg_map: dict | None = None,
-):
-    """Create a Runtime instance for the given rank."""
-
-    from pie_worker.config import RuntimeConfig
-    from pie_worker.runtime import Runtime
-
-    # Remove device/devices from config to avoid duplicate argument
-    filtered_config = {
-        k: v for k, v in config_dict.items() if k not in ("device", "devices")
-    }
-
-    config = RuntimeConfig.from_args(
-        **filtered_config,
-        devices=devices,
-        rank=rank,
-        world_size=world_size,
-    )
-
-    # Determine my group ID
-    my_group_id = 0
-    for i, group in enumerate(group_topology):
-        if rank in group:
-            my_group_id = i
-            break
-
-    rt = Runtime(
-        config,
-        log_queue=None,
-        group_id=my_group_id,
-        result_queue=result_queue,
-        result_queues=result_queues,
-        process_groups=pg_map,
-        compute_process_groups=compute_pg_map,
-        group_topology=group_topology,
-    )
-    return rt
 
 
 # =============================================================================
@@ -1036,89 +941,6 @@ def terminate_engine_and_backend(
         log(f"Error cleaning up control channel: {e}")
 
 
-def run_interactive_shell(engine_config: dict, internal_token: str) -> None:
-    """Run the interactive shell session.
-
-    Args:
-        engine_config: Engine configuration dict
-        internal_token: Internal authentication token
-    """
-    # Simple readline-based shell
-    try:
-        import readline
-    except ImportError:
-        pass  # readline not available on all platforms
-
-    from . import path as pie_path
-
-    # Load history
-    history_path = pie_path.get_shell_history_path()
-    try:
-        if history_path.exists():
-            readline.read_history_file(str(history_path))
-    except (OSError, NameError):
-        pass
-
-    client_config = {
-        "host": engine_config.get("host", "127.0.0.1"),
-        "port": engine_config.get("port", 8080),
-        "internal_auth_token": internal_token,
-    }
-
-    print("Available commands:")
-    print("  run <path> [ARGS]... - Run a .wasm inferlet with optional arguments")
-    print("  stat                 - Query the backend statistics")
-    print("  exit                 - Exit the Pie session")
-    print("  help                 - Show this help message")
-
-    while True:
-        try:
-            line = input("pie> ")
-        except EOFError:
-            print("Exiting...")
-            break
-        except KeyboardInterrupt:
-            print("\n(To exit, type 'exit' or press Ctrl-D)")
-            continue
-
-        line = line.strip()
-        if not line:
-            continue
-
-        parts = line.split()
-        command = parts[0]
-        args = parts[1:]
-
-        if command == "exit":
-            print("Exiting...")
-            break
-        elif command == "help":
-            print("Available commands:")
-            print("  run <path> [ARGS]... - Run a .wasm inferlet")
-            print("  stat                 - Query backend statistics")
-            print("  exit                 - Exit the session")
-            print("  help                 - Show this help message")
-        elif command == "run":
-            if not args:
-                print("Usage: run <inferlet_path> [ARGS]...")
-                continue
-            inferlet_path = Path(args[0]).expanduser()
-            inferlet_args = args[1:]
-            try:
-                submit_inferlet_and_wait(client_config, inferlet_path, inferlet_args)
-            except Exception as e:
-                print(f"Error running inferlet: {e}")
-        elif command == "stat":
-            print("(stat command not yet implemented)")
-        else:
-            print(f"Unknown command: '{command}'. Type 'help' for a list of commands.")
-
-    # Save history
-    try:
-        history_path.parent.mkdir(parents=True, exist_ok=True)
-        readline.write_history_file(str(history_path))
-    except (OSError, NameError):
-        pass
 
 
 def submit_inferlet_and_wait(

@@ -7,6 +7,9 @@ interface inference {
     use adapter.{adapter};
     use context.{page-id};
 
+    // binary run-length encoding
+    type brle = list<u32>;
+
     resource forward-pass {
         constructor(model: borrow<model>);
 
@@ -24,12 +27,14 @@ interface inference {
             positions: list<u32>,
         );
 
+        // if not provided, fallback to causal mask
         attention-mask: func(
-            mask: list<list<u32>>,
+            mask: list<brle>,
         );
 
+        // if not provided, fallback to all ones (no masking)
         sampling-mask: func(
-            mask: list<u32>,
+            mask: brle,
         );
 
         sampler: func(
@@ -59,6 +64,8 @@ interface inference {
         pollable: func() -> pollable;
 
         get: func() -> option<output>;
+
+        get-speculative-tokens: func() -> option<list<tuple<u32, u32>>>;
     }
 
     variant output {

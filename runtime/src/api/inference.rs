@@ -5,6 +5,7 @@ use crate::api::context::Context;
 use crate::api::model::Model;
 use crate::api::adapter::Adapter;
 use crate::instance::InstanceState;
+use crate::brle::Brle;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::iter;
@@ -22,8 +23,8 @@ pub struct ForwardPass {
     input_token_positions: Vec<u32>,
     speculative_tokens: Vec<u32>,
     speculative_positions: Vec<u32>,
-    mask: Vec<Vec<u32>>,
-    sampling_mask: Option<Vec<u32>>,
+    mask: Vec<Brle>,
+    sampling_mask: Option<Brle>,
     output_token_indices: Vec<u32>,
     output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     adapter: Option<u32>,
@@ -104,14 +105,29 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     }
 
     async fn attention_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<Vec<u32>>) -> Result<()> {
+        let mut brle_masks = Vec::with_capacity(mask.len());
+        for buffer in mask {
+            let total_size = buffer.iter().map(|&x| x as usize).sum();
+            brle_masks.push(Brle {
+                buffer,
+                total_size,
+            });
+        }
+        
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.mask = mask;
+        pass.mask = brle_masks;
         Ok(())
     }
 
     async fn sampling_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<u32>) -> Result<()> {
+        let total_size = mask.iter().map(|&x| x as usize).sum();
+        let brle = Brle {
+            buffer: mask,
+            total_size,
+        };
+
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.sampling_mask = Some(mask);
+        pass.sampling_mask = Some(brle);
         Ok(())
     }
 
@@ -211,6 +227,16 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
         let result = self.ctx().table.get_mut(&this)?;
         if result.done {
             Ok(take(&mut result.result))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_speculative_tokens(&mut self, this: Resource<FutureOutput>) -> Result<Option<Vec<(u32, u32)>>> {
+        let result = self.ctx().table.get(&this)?;
+        if result.done {
+            // Stubbed - returns None (no speculative tokens)
+            Ok(None)
         } else {
             Ok(None)
         }
