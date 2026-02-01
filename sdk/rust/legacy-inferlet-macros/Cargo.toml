@@ -1,11 +1,11 @@
 [package]
-name = "inferlet-macros"
+name = "legacy-inferlet-macros"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Procedural macros for the inferlet library"
 license = "Apache-2.0"
-repository = "https://github.com/pie-project/pie"
+repository = "https://github.com/pie-project/pie" # Or the specific sub-path
 keywords = ["wasi", "wasm", "pie", "inferlet"]
 
 [lib]
