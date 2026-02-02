@@ -43,7 +43,7 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         }
     }
 
-    async fn destroy(&mut self, this: Resource<Adapter>) -> Result<Result<(), String>> {
+    async fn destroy(&mut self, this: Resource<Adapter>) -> Result<()> {
         let adapter = self.ctx().table.get(&this)?;
         let adapter_id = adapter.adapter_id;
         let model_idx = adapter.model_idx;
@@ -55,16 +55,13 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         }
         .send(model_idx)?;
 
-        match rx.await? {
-            Ok(()) => {
-                self.ctx().table.delete(this)?;
-                Ok(Ok(()))
-            }
-            Err(e) => Ok(Err(e.to_string())),
-        }
+        // Wait for response but ignore errors - destroy is void in WIT
+        let _ = rx.await;
+        self.ctx().table.delete(this)?;
+        Ok(())
     }
 
-    async fn get(&mut self, name: String) -> Result<Option<Resource<Adapter>>> {
+    async fn lookup(&mut self, name: String) -> Result<Option<Resource<Adapter>>> {
         // TODO: Get model_idx from instance context or infer from current model
         let model_idx = 0usize; // Placeholder - should be obtained from instance state
 
@@ -116,7 +113,7 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         Ok(())
     }
 
-    async fn lock(&mut self, this: Resource<Adapter>) -> Result<Resource<FutureBool>> {
+    async fn acquire_lock(&mut self, this: Resource<Adapter>) -> Result<Resource<FutureBool>> {
         let adapter = self.ctx().table.get(&this)?;
         let adapter_id = adapter.adapter_id;
         let model_idx = adapter.model_idx;
@@ -142,7 +139,7 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         Ok(self.ctx().table.push(future_bool)?)
     }
 
-    async fn unlock(&mut self, this: Resource<Adapter>) -> Result<()> {
+    async fn release_lock(&mut self, this: Resource<Adapter>) -> Result<Result<(), String>> {
         let adapter = self.ctx().table.get_mut(&this)?;
         let adapter_id = adapter.adapter_id;
         let model_idx = adapter.model_idx;
@@ -154,7 +151,7 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         }
         .send(model_idx)?;
 
-        Ok(())
+        Ok(Ok(()))
     }
 
     async fn load(

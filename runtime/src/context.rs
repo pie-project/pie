@@ -46,7 +46,7 @@ pub enum Message {
     },
 
     /// Retrieves an existing context by name.
-    Get {
+    Lookup {
         user_id: u32,
         name: String,
         response: oneshot::Sender<Option<ContextId>>,
@@ -61,33 +61,26 @@ pub enum Message {
     },
 
     /// Acquires a lock on the context.
-    Lock {
+    AcquireLock {
         id: ContextId,
         response: oneshot::Sender<LockId>,
     },
 
     /// Releases the lock on the context.
-    Unlock {
+    ReleaseLock {
         id: ContextId,
         lock_id: LockId,
     },
 
-    /// Get page size
-    PageSize {
+    /// Get tokens per page
+    TokensPerPage {
         id: ContextId,
         response: oneshot::Sender<u32>,
     },
 
-    /// Get total number of committed pages
-    NumTotalPages {
+    /// Get number of committed pages
+    CommittedPageCount {
         id: ContextId,
-        response: oneshot::Sender<u32>,
-    },
-
-    /// Get total number of tokens
-    NumTotalTokens {
-        id: ContextId,
-        lock_id: LockId,
         response: oneshot::Sender<u32>,
     },
 
@@ -95,61 +88,58 @@ pub enum Message {
     CommitPages {
         id: ContextId,
         lock_id: LockId,
-        indices: Vec<u32>,
+        page_indices: Vec<u32>,
         response: oneshot::Sender<Result<()>>,
     },
 
-    /// Allocate pages for the context
-    AllocatePages {
+    /// Reserve pages for the context
+    ReservePages {
         id: ContextId,
         lock_id: LockId,
         num_pages: u32,
         response: oneshot::Sender<Result<()>>,
     },
 
-    /// Free pages from the context
-    FreePages {
+    /// Release pages from the context
+    ReleasePages {
         id: ContextId,
         lock_id: LockId,
         num_pages: u32,
-        response: oneshot::Sender<Result<()>>,
     },
 
-
-    GetPhysicalPageIds {
-        id: ContextId,
-        lock_id: LockId,
-        response: oneshot::Sender<HashMap<NodeId, Vec<PhysicalPageId>>>,
-    },
-
-    /// Get the pointer position
-    GetPointer {
+    /// Get the cursor position
+    GetCursor {
         id: ContextId,
         lock_id: LockId,
         response: oneshot::Sender<u32>,
     },
 
-    /// Set the pointer position
-    SetPointer {
+    /// Set the cursor position
+    SetCursor {
         id: ContextId,
         lock_id: LockId,
-        pointer: u32,
-        response: oneshot::Sender<Result<()>>,
+        cursor: u32,
     },
 
-    /// Get uncommitted tokens
-    GetUncommittedTokens {
+    /// Get buffered tokens
+    GetBufferedTokens {
         id: ContextId,
         lock_id: LockId,
-        response: oneshot::Sender<Vec<TokenInfo>>,
+        response: oneshot::Sender<Vec<u32>>,
     },
 
-    /// Set uncommitted tokens
-    SetUncommittedTokens {
+    /// Set buffered tokens
+    SetBufferedTokens {
         id: ContextId,
         lock_id: LockId,
-        tokens: Vec<TokenInfo>,
-        response: oneshot::Sender<Result<()>>,
+        tokens: Vec<u32>,
+    },
+
+    /// Append buffered tokens (avoids get+set roundtrip)
+    AppendBufferedTokens {
+        id: ContextId,
+        lock_id: LockId,
+        tokens: Vec<u32>,
     },
 }
 
@@ -450,15 +440,39 @@ impl ContextService {
         }
     }
 
-    pub fn get_uncommitted_tokens(&self, id: ContextId) -> Vec<TokenInfo> {
+    pub fn get_buffered_tokens(&self, id: ContextId) -> Vec<u32> {
         self.contexts.get(&id)
-            .map(|ctx| ctx.tokens_uncommitted.clone())
+            .map(|ctx| ctx.tokens_uncommitted.iter().map(|t| t.token).collect())
             .unwrap_or_default()
     }
 
-    pub fn set_uncommitted_tokens(&self, id: ContextId, tokens: Vec<TokenInfo>) -> Result<()> {
+    pub fn set_buffered_tokens(&self, id: ContextId, tokens: Vec<u32>) -> Result<()> {
         if let Some(mut ctx) = self.contexts.get_mut(&id) {
-            ctx.tokens_uncommitted = tokens;
+            ctx.tokens_uncommitted = tokens.into_iter().enumerate().map(|(i, token)| {
+                TokenInfo {
+                    token,
+                    position: i as u32,
+                    mask: Brle::new(0),
+                    adapter: None,
+                }
+            }).collect();
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Context not found"))
+        }
+    }
+
+    pub fn append_buffered_tokens(&self, id: ContextId, tokens: Vec<u32>) -> Result<()> {
+        if let Some(mut ctx) = self.contexts.get_mut(&id) {
+            let start_pos = ctx.tokens_uncommitted.len();
+            ctx.tokens_uncommitted.extend(tokens.into_iter().enumerate().map(|(i, token)| {
+                TokenInfo {
+                    token,
+                    position: (start_pos + i) as u32,
+                    mask: Brle::new(0),
+                    adapter: None,
+                }
+            }));
             Ok(())
         } else {
             Err(anyhow::anyhow!("Context not found"))
@@ -741,7 +755,7 @@ impl Handle for ContextActor {
                 let result = self.service.destroy(id, lock_id);
                 let _ = response.send(result);
             }
-            Message::Get { user_id, name, response } => {
+            Message::Lookup { user_id, name, response } => {
                 let id = self.service.get(user_id, name);
                 let _ = response.send(id);
             }
@@ -749,56 +763,48 @@ impl Handle for ContextActor {
                 let result = self.service.fork(id, user_id, new_name);
                 let _ = response.send(result);
             }
-            Message::Lock { id, response } => {
+            Message::AcquireLock { id, response } => {
                 let lock_id = self.service.lock(id);
                 let _ = response.send(lock_id);
             }
-            Message::Unlock { id, lock_id } => {
+            Message::ReleaseLock { id, lock_id } => {
                 self.service.unlock(id, lock_id);
             }
-            Message::PageSize { id: _, response } => {
+            Message::TokensPerPage { id: _, response } => {
                 let size = self.service.page_size();
                 let _ = response.send(size);
             }
-            Message::NumTotalPages { id, response } => {
+            Message::CommittedPageCount { id, response } => {
                 let count = self.service.num_total_pages(id);
                 let _ = response.send(count);
             }
-            Message::NumTotalTokens { id, lock_id: _, response } => {
-                let count = self.service.num_total_tokens(id);
-                let _ = response.send(count);
-            }
-            Message::CommitPages { id, lock_id, indices, response } => {
-                let result = self.service.commit_pages(id, lock_id, indices);
+            Message::CommitPages { id, lock_id, page_indices, response } => {
+                let result = self.service.commit_pages(id, lock_id, page_indices);
                 let _ = response.send(result);
             }
-            Message::AllocatePages { id, lock_id, num_pages, response } => {
+            Message::ReservePages { id, lock_id, num_pages, response } => {
                 let result = self.service.allocate_pages(id, lock_id, num_pages);
                 let _ = response.send(result);
             }
-            Message::FreePages { id, lock_id, num_pages, response } => {
-                let result = self.service.free_pages(id, lock_id, num_pages);
-                let _ = response.send(result);
+            Message::ReleasePages { id, lock_id, num_pages } => {
+                let _ = self.service.free_pages(id, lock_id, num_pages);
             }
-            Message::GetPointer { id, lock_id: _, response } => {
-                let pointer = self.service.get_pointer(id);
-                let _ = response.send(pointer);
+            Message::GetCursor { id, lock_id: _, response } => {
+                let cursor = self.service.get_pointer(id);
+                let _ = response.send(cursor);
             }
-            Message::SetPointer { id, lock_id: _, pointer, response } => {
-                let result = self.service.set_pointer(id, pointer);
-                let _ = response.send(result);
+            Message::SetCursor { id, lock_id: _, cursor } => {
+                let _ = self.service.set_pointer(id, cursor);
             }
-            Message::GetUncommittedTokens { id, lock_id: _, response } => {
-                let tokens = self.service.get_uncommitted_tokens(id);
+            Message::GetBufferedTokens { id, lock_id: _, response } => {
+                let tokens = self.service.get_buffered_tokens(id);
                 let _ = response.send(tokens);
             }
-            Message::SetUncommittedTokens { id, lock_id: _, tokens, response } => {
-                let result = self.service.set_uncommitted_tokens(id, tokens);
-                let _ = response.send(result);
+            Message::SetBufferedTokens { id, lock_id: _, tokens } => {
+                let _ = self.service.set_buffered_tokens(id, tokens);
             }
-            Message::GetPhysicalPageIds { id, lock_id: _, response } => {
-                let page_ids = self.service.get_physical_page_ids(id);
-                let _ = response.send(page_ids);
+            Message::AppendBufferedTokens { id, lock_id: _, tokens } => {
+                let _ = self.service.append_buffered_tokens(id, tokens);
             }
         }
     }

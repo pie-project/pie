@@ -59,7 +59,7 @@ impl pie::core::context::HostContext for InstanceState {
         }
     }
 
-    async fn destroy(&mut self, this: Resource<Context>) -> Result<Result<(), String>> {
+    async fn destroy(&mut self, this: Resource<Context>) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_idx = ctx.model_idx;
@@ -73,16 +73,13 @@ impl pie::core::context::HostContext for InstanceState {
         }
         .send(model_idx)?;
 
-        match rx.await? {
-            Ok(()) => {
-                self.ctx().table.delete(this)?;
-                Ok(Ok(()))
-            }
-            Err(e) => Ok(Err(e.to_string())),
-        }
+        // Wait for response but ignore errors - destroy is void in WIT
+        let _ = rx.await;
+        self.ctx().table.delete(this)?;
+        Ok(())
     }
 
-    async fn get(
+    async fn lookup(
         &mut self,
         model: Resource<Model>,
         name: String,
@@ -92,7 +89,7 @@ impl pie::core::context::HostContext for InstanceState {
         let user_id = 0u32; // TODO: Get from InstanceState
 
         let (tx, rx) = oneshot::channel();
-        Message::Get {
+        Message::Lookup {
             user_id,
             name,
             response: tx,
@@ -146,28 +143,19 @@ impl pie::core::context::HostContext for InstanceState {
         }
     }
 
-    async fn join(
-        &mut self,
-        _this: Resource<Context>,
-        _other: Resource<Context>,
-    ) -> Result<Result<(), String>> {
-        // TODO: Implement join - merge contexts
-        Ok(Ok(()))
-    }
-
     async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
         // Note: This doesn't destroy the context in the actor, just the local resource
         self.ctx().table.delete(this)?;
         Ok(())
     }
 
-    async fn lock(&mut self, this: Resource<Context>) -> Result<Resource<FutureBool>> {
+    async fn acquire_lock(&mut self, this: Resource<Context>) -> Result<Resource<FutureBool>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_idx = ctx.model_idx;
 
         let (tx, rx) = oneshot::channel();
-        Message::Lock {
+        Message::AcquireLock {
             id: context_id,
             response: tx,
         }
@@ -190,13 +178,13 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(self.ctx().table.push(future_bool)?)
     }
 
-    async fn unlock(&mut self, this: Resource<Context>) -> Result<Result<(), String>> {
+    async fn release_lock(&mut self, this: Resource<Context>) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get_mut(&this)?;
         let context_id = ctx.context_id;
         let model_idx = ctx.model_idx;
         let lock_id = ctx.lock_id.take().unwrap_or(0);
 
-        Message::Unlock {
+        Message::ReleaseLock {
             id: context_id,
             lock_id,
         }
@@ -205,13 +193,13 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(Ok(()))
     }
 
-    async fn page_size(&mut self, this: Resource<Context>) -> Result<u32> {
+    async fn tokens_per_page(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_idx = ctx.model_idx;
 
         let (tx, rx) = oneshot::channel();
-        Message::PageSize {
+        Message::TokensPerPage {
             id: context_id,
             response: tx,
         }
@@ -220,13 +208,34 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(rx.await?)
     }
 
-    async fn num_total_pages(&mut self, this: Resource<Context>) -> Result<u32> {
+    async fn model(&mut self, this: Resource<Context>) -> Result<Resource<Model>> {
+        let ctx = self.ctx().table.get(&this)?;
+        let model_idx = ctx.model_idx;
+
+        // Create a Model resource for this context's model
+        // We need to get the model info from the ModelActor
+        use crate::model::{self, Message as ModelMessage, ModelInfo};
+        use std::sync::Arc;
+
+        let (tx, rx) = oneshot::channel();
+        ModelMessage::GetInfo { response: tx }.send(model_idx)?;
+        let info = rx.await?;
+
+        let model = Model {
+            service_id: model_idx,
+            info: Arc::new(info),
+            tokenizer: None,
+        };
+        Ok(self.ctx().table.push(model)?)
+    }
+
+    async fn committed_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_idx = ctx.model_idx;
 
         let (tx, rx) = oneshot::channel();
-        Message::NumTotalPages {
+        Message::CommittedPageCount {
             id: context_id,
             response: tx,
         }
@@ -235,27 +244,30 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(rx.await?)
     }
 
-    async fn num_total_tokens(&mut self, this: Resource<Context>) -> Result<u32> {
+    async fn uncommitted_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_idx = ctx.model_idx;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         let (tx, rx) = oneshot::channel();
-        Message::NumTotalTokens {
+        Message::GetBufferedTokens {
             id: context_id,
             lock_id,
             response: tx,
         }
         .send(model_idx)?;
 
-        Ok(rx.await?)
+        let tokens = rx.await?;
+        // Calculate page count from tokens
+        // TODO: Get actual page size for proper calculation
+        Ok((tokens.len() as u32 + 255) / 256) // Approximate page count
     }
 
     async fn commit_pages(
         &mut self,
         this: Resource<Context>,
-        indices: Vec<u32>,
+        page_indices: Vec<u32>,
     ) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
@@ -266,7 +278,7 @@ impl pie::core::context::HostContext for InstanceState {
         Message::CommitPages {
             id: context_id,
             lock_id,
-            indices,
+            page_indices,
             response: tx,
         }
         .send(model_idx)?;
@@ -277,7 +289,7 @@ impl pie::core::context::HostContext for InstanceState {
         }
     }
 
-    async fn allocate_pages(
+    async fn reserve_pages(
         &mut self,
         this: Resource<Context>,
         num_pages: u32,
@@ -288,7 +300,7 @@ impl pie::core::context::HostContext for InstanceState {
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         let (tx, rx) = oneshot::channel();
-        Message::AllocatePages {
+        Message::ReservePages {
             id: context_id,
             lock_id,
             num_pages,
@@ -302,39 +314,34 @@ impl pie::core::context::HostContext for InstanceState {
         }
     }
 
-    async fn free_pages(
+    async fn release_pages(
         &mut self,
         this: Resource<Context>,
         num_pages: u32,
-    ) -> Result<Result<(), String>> {
+    ) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_idx = ctx.model_idx;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
-        let (tx, rx) = oneshot::channel();
-        Message::FreePages {
+        Message::ReleasePages {
             id: context_id,
             lock_id,
             num_pages,
-            response: tx,
         }
         .send(model_idx)?;
 
-        match rx.await? {
-            Ok(()) => Ok(Ok(())),
-            Err(e) => Ok(Err(e.to_string())),
-        }
+        Ok(())
     }
 
-    async fn pointer(&mut self, this: Resource<Context>) -> Result<u32> {
+    async fn cursor(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_idx = ctx.model_idx;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         let (tx, rx) = oneshot::channel();
-        Message::GetPointer {
+        Message::GetCursor {
             id: context_id,
             lock_id,
             response: tx,
@@ -344,84 +351,80 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(rx.await?)
     }
 
-    async fn set_pointer(
+    async fn set_cursor(
         &mut self,
         this: Resource<Context>,
-        pointer: u32,
-    ) -> Result<Result<(), String>> {
+        cursor: u32,
+    ) -> Result<()> {
+        let ctx = self.ctx().table.get(&this)?;
+        let context_id = ctx.context_id;
+        let model_idx = ctx.model_idx;
+        let lock_id = ctx.lock_id.unwrap_or(0);
+
+        Message::SetCursor {
+            id: context_id,
+            lock_id,
+            cursor,
+        }
+        .send(model_idx)?;
+
+        Ok(())
+    }
+
+    async fn buffered_tokens(&mut self, this: Resource<Context>) -> Result<Vec<u32>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_idx = ctx.model_idx;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         let (tx, rx) = oneshot::channel();
-        Message::SetPointer {
-            id: context_id,
-            lock_id,
-            pointer,
-            response: tx,
-        }
-        .send(model_idx)?;
-
-        match rx.await? {
-            Ok(()) => Ok(Ok(())),
-            Err(e) => Ok(Err(e.to_string())),
-        }
-    }
-
-    async fn staged_tokens(&mut self, this: Resource<Context>) -> Result<Vec<u32>> {
-        let ctx = self.ctx().table.get(&this)?;
-        let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
-        let lock_id = ctx.lock_id.unwrap_or(0);
-
-        let (tx, rx) = oneshot::channel();
-        Message::GetUncommittedTokens {
+        Message::GetBufferedTokens {
             id: context_id,
             lock_id,
             response: tx,
         }
         .send(model_idx)?;
 
-        let token_infos = rx.await?;
-        // Extract just the token IDs from TokenInfo
-        Ok(token_infos.into_iter().map(|t| t.token).collect())
+        Ok(rx.await?)
     }
 
-    async fn set_staged_tokens(
+    async fn set_buffered_tokens(
         &mut self,
         this: Resource<Context>,
         tokens: Vec<u32>,
-    ) -> Result<Result<(), String>> {
+    ) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_idx = ctx.model_idx;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
-        // Convert tokens to TokenInfo (with default position/mask)
-        let token_infos: Vec<context::TokenInfo> = tokens
-            .into_iter()
-            .enumerate()
-            .map(|(i, token)| context::TokenInfo {
-                token,
-                position: i as u32,
-                mask: crate::brle::Brle::new(0),
-                adapter: None,
-            })
-            .collect();
-
-        let (tx, rx) = oneshot::channel();
-        Message::SetUncommittedTokens {
+        Message::SetBufferedTokens {
             id: context_id,
             lock_id,
-            tokens: token_infos,
-            response: tx,
+            tokens,
         }
         .send(model_idx)?;
 
-        match rx.await? {
-            Ok(()) => Ok(Ok(())),
-            Err(e) => Ok(Err(e.to_string())),
+        Ok(())
+    }
+
+    async fn append_buffered_tokens(
+        &mut self,
+        this: Resource<Context>,
+        tokens: Vec<u32>,
+    ) -> Result<()> {
+        let ctx = self.ctx().table.get(&this)?;
+        let context_id = ctx.context_id;
+        let model_idx = ctx.model_idx;
+        let lock_id = ctx.lock_id.unwrap_or(0);
+
+        Message::AppendBufferedTokens {
+            id: context_id,
+            lock_id,
+            tokens,
         }
+        .send(model_idx)?;
+
+        Ok(())
     }
 }

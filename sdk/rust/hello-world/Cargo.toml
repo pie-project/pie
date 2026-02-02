@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 inferlet = { path = "../inferlet" }
 anyhow = "1.0"
+wit-component = "0.244.0"
 
 [lib]
 crate-type = ["cdylib"]

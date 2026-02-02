@@ -7,15 +7,15 @@ interface adapter {
 
         create: static func(name:string) -> result<adapter, error>;
 
-        destroy: func() -> result<_, error>;
+        destroy: func();
 
-        get: static func(name:string) -> option<adapter>;
+        lookup: static func(name:string) -> option<adapter>;
 
         clone: func(name:string) -> adapter;
 
-        lock: func() -> future-bool;
+        acquire-lock: func() -> future-bool;
 
-        unlock: func();
+        release-lock: func() -> result<_, error>;
 
         load: func(path:string) -> result<_, error>;
 

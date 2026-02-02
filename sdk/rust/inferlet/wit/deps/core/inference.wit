@@ -64,8 +64,6 @@ interface inference {
         pollable: func() -> pollable;
 
         get: func() -> option<output>;
-
-        get-speculative-tokens: func() -> option<list<tuple<u32, u32>>>;
     }
 
     variant output {
