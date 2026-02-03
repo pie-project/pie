@@ -59,21 +59,6 @@ pub mod inference {
 
 use wstd::io::AsyncPollable;
 
-/// Extension trait for async context operations.
-pub trait ContextExt {
-    /// Acquires a lock on the context asynchronously.
-    fn acquire_lock_async(&self) -> impl std::future::Future<Output = bool>;
-}
-
-impl ContextExt for context::Context {
-    async fn acquire_lock_async(&self) -> bool {
-        let future = self.acquire_lock();
-        let pollable = future.pollable();
-        AsyncPollable::new(pollable).wait_for().await;
-        future.get().unwrap_or(false)
-    }
-}
-
 /// Extension trait for async adapter operations.
 pub trait AdapterExt {
     /// Acquires a lock on the adapter asynchronously.
@@ -133,14 +118,18 @@ impl FutureStringExt for types::FutureString {
 }
 
 // =============================================================================
-// High-Level Extension Traits
+// Context Extension Trait (Consolidated)
 // =============================================================================
 
-mod fill;
-mod generate;
+mod context_ext;
 
-pub use fill::{Fill, Message, ToolCall, render_template};
-pub use generate::Generate;
+pub use context_ext::{
+    // ContextExt trait (has Fill + Generate + async operations)
+    ContextExt,
+    // Supporting types
+    Message, ToolCall, render_template,
+    TokenStream, Speculate, Speculation, Constrain,
+};
 
 /// Prelude module for convenient imports.
 pub mod prelude {
@@ -158,8 +147,4 @@ pub mod prelude {
     pub use crate::ForwardPassExt;
     pub use crate::SubscriptionExt;
     pub use crate::FutureStringExt;
-    
-    // High-level traits
-    pub use crate::Fill;
-    pub use crate::Generate;
 }

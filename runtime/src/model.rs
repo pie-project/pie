@@ -182,6 +182,7 @@ pub struct ModelInfo {
     pub prompt_template: String,
     pub prompt_template_type: String,
     pub stop_tokens: Vec<String>,
+    pub stop_token_ids: Vec<u32>,
     pub kv_page_size: u32,
     pub max_batch_tokens: usize,
 }
@@ -195,6 +196,7 @@ impl Default for ModelInfo {
             prompt_template: String::new(),
             prompt_template_type: String::new(),
             stop_tokens: Vec::new(),
+            stop_token_ids: Vec::new(),
             kv_page_size: 0,
             max_batch_tokens: 0,
         }
@@ -220,10 +222,6 @@ pub enum Message {
     GetPromptTemplate {
         response: oneshot::Sender<String>,
     },
-    /// Gets the stop tokens for this model.
-    GetStopTokens {
-        response: oneshot::Sender<Vec<String>>,
-    },
     /// Tokenizes text.
     Tokenize {
         text: String,
@@ -245,6 +243,10 @@ pub enum Message {
     /// Gets the special tokens.
     GetSpecialTokens {
         response: oneshot::Sender<(Vec<u32>, Vec<Vec<u8>>)>,
+    },
+    /// Gets the stop tokens (as token IDs).
+    GetStopTokens {
+        response: oneshot::Sender<Vec<u32>>,
     },
     /// Gets the model info.
     GetInfo {
@@ -302,9 +304,6 @@ impl Handle for ModelActor {
             Message::GetPromptTemplate { response } => {
                 let _ = response.send(self.service.get_prompt_template());
             }
-            Message::GetStopTokens { response } => {
-                let _ = response.send(self.service.get_stop_tokens());
-            }
             Message::Tokenize { text, response } => {
                 let _ = response.send(self.service.tokenize(&text));
             }
@@ -319,6 +318,9 @@ impl Handle for ModelActor {
             }
             Message::GetSpecialTokens { response } => {
                 let _ = response.send(self.service.get_special_tokens());
+            }
+            Message::GetStopTokens { response } => {
+                let _ = response.send(self.service.get_stop_tokens());
             }
             Message::GetInfo { response } => {
                 let _ = response.send(self.service.info.clone());
@@ -365,6 +367,12 @@ impl Model {
             resp.tokenizer_sentencepiece_space,
         ));
 
+        // Compute stop_token_ids by tokenizing the stop_tokens
+        let stop_token_ids: Vec<u32> = resp.prompt_stop_tokens
+            .iter()
+            .flat_map(|s| tokenizer.encode_with_special_tokens(s))
+            .collect();
+
         let info = ModelInfo {
             name: resp.model_name,
             traits: resp.model_traits,
@@ -372,6 +380,7 @@ impl Model {
             prompt_template: resp.prompt_template,
             prompt_template_type: resp.prompt_template_type,
             stop_tokens: resp.prompt_stop_tokens,
+            stop_token_ids,
             kv_page_size: resp.kv_page_size,
             max_batch_tokens: resp.max_batch_tokens,
         };
@@ -420,11 +429,6 @@ impl Model {
         self.info.prompt_template.clone()
     }
 
-    /// Gets the stop tokens.
-    pub fn get_stop_tokens(&self) -> Vec<String> {
-        self.info.stop_tokens.clone()
-    }
-
     /// Tokenizes text into token IDs.
     pub fn tokenize(&self, text: &str) -> Vec<u32> {
         self.tokenizer
@@ -463,6 +467,11 @@ impl Model {
             .as_ref()
             .map(|t| t.get_special_tokens())
             .unwrap_or_default()
+    }
+
+    /// Gets the stop tokens.
+    pub fn get_stop_tokens(&self) -> Vec<u32> {
+        self.info.stop_token_ids.clone()
     }
 
     /// Gets the KV page size.

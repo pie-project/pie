@@ -24,9 +24,10 @@ pub struct ForwardPass {
     speculative_tokens: Vec<u32>,
     speculative_positions: Vec<u32>,
     mask: Vec<Brle>,
-    sampling_mask: Option<Brle>,
+    logit_mask: Option<Brle>,
     output_token_indices: Vec<u32>,
     output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
+    output_speculative_tokens: bool,
     adapter: Option<u32>,
 }
 
@@ -67,9 +68,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             speculative_tokens: vec![],
             speculative_positions: vec![],
             mask: vec![],
-            sampling_mask: None,
+            logit_mask: None,
             output_token_indices: vec![],
             output_token_samplers: vec![],
+            output_speculative_tokens: true, // enabled by default
             adapter: None,
         };
         Ok(self.ctx().table.push(pass)?)
@@ -104,6 +106,16 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
+    async fn output_speculative_tokens(
+        &mut self,
+        this: Resource<ForwardPass>,
+        flag: bool,
+    ) -> Result<()> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        pass.output_speculative_tokens = flag;
+        Ok(())
+    }
+
     async fn attention_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<Vec<u32>>) -> Result<()> {
         let mut brle_masks = Vec::with_capacity(mask.len());
         for buffer in mask {
@@ -119,7 +131,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
-    async fn sampling_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<u32>) -> Result<()> {
+    async fn logit_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<u32>) -> Result<()> {
         let total_size = mask.iter().map(|&x| x as usize).sum();
         let brle = Brle {
             buffer: mask,
@@ -127,7 +139,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         };
 
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.sampling_mask = Some(brle);
+        pass.logit_mask = Some(brle);
         Ok(())
     }
 
@@ -197,7 +209,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let _ = take(&mut pass.input_tokens);
         let _ = take(&mut pass.input_token_positions);
         let _ = take(&mut pass.mask);
-        let _ = take(&mut pass.sampling_mask);
+        let _ = take(&mut pass.logit_mask);
         let _ = take(&mut pass.output_token_indices);
         let _ = take(&mut pass.output_token_samplers);
 

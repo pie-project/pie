@@ -163,7 +163,7 @@ pub struct ForwardPassRequest {
     pub adapter: Option<u32>,
     pub adapter_seed: Option<i64>,
     pub mask: Vec<Vec<u32>>,
-    pub sampling_mask: Option<Vec<u32>>,
+    pub logit_mask: Option<Vec<u32>>,
     pub kv_page_ptrs: Vec<u32>,
     pub kv_page_last_len: u32,
     pub output_token_indices: Vec<u32>,
@@ -270,8 +270,8 @@ pub struct BatchedForwardPassRequest {
     // Attention masks (BRLE encoded, flattened, as raw bytes)
     pub flattened_masks: ByteVec, // Concatenation of all BRLE buffers
     pub mask_indptr: ByteVec,     // Pointers into flattened_masks for each token
-    pub sampling_masks: ByteVec,
-    pub sampling_mask_indptr: ByteVec,
+    pub logit_masks: ByteVec,
+    pub logit_mask_indptr: ByteVec,
 
     // Adapter info (one per request) - keep as Vec since these are small
     pub adapter_indices: Vec<Option<u32>>,
@@ -317,8 +317,8 @@ impl BatchedForwardPassRequest {
             qo_indptr: ByteVec(vec![0]),
             flattened_masks: ByteVec(Vec::new()),
             mask_indptr: ByteVec(vec![0]),
-            sampling_masks: ByteVec(Vec::new()),
-            sampling_mask_indptr: ByteVec(vec![0]),
+            logit_masks: ByteVec(Vec::new()),
+            logit_mask_indptr: ByteVec(vec![0]),
             adapter_indices: Vec::new(),
             adapter_seeds: Vec::new(),
             // SoA sampler fields
@@ -359,10 +359,10 @@ impl BatchedForwardPassRequest {
             self.mask_indptr.0.push(self.flattened_masks.0.len() as u32);
         }
 
-        if let Some(mask) = &req.sampling_mask {
-            self.sampling_masks.0.extend(mask);
+        if let Some(mask) = &req.logit_mask {
+            self.logit_masks.0.extend(mask);
         }
-        self.sampling_mask_indptr.0.push(self.sampling_masks.0.len() as u32);
+        self.logit_mask_indptr.0.push(self.logit_masks.0.len() as u32);
 
         // Adapter info
         self.adapter_indices.push(req.adapter);

@@ -27,13 +27,16 @@ interface inference {
             positions: list<u32>,
         );
 
+        // enabled by default
+        output-speculative-tokens: func(flag: bool);
+
         // if not provided, fallback to causal mask
         attention-mask: func(
             mask: list<brle>,
         );
 
         // if not provided, fallback to all ones (no masking)
-        sampling-mask: func(
+        logit-mask: func(
             mask: brle,
         );
 
@@ -69,6 +72,7 @@ interface inference {
     variant output {
         none,
         tokens(list<u32>),
+        tokens-with-speculation(tuple<list<u32>, list<u32>, list<u32>>), // accepted tokens, next spec tokens, next spec positions
         embeddings(list<list<u8>>),
         distributions(list<tuple<list<u32>, list<f32>>>) // Each tuple: (token IDs, associated probabilities)
     }

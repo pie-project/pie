@@ -5,8 +5,7 @@ interface model {
     // Resource representing a specific model instance
     resource model {
         constructor(name: string);
-        prompt-template: func() -> string;       // Returns the prompt formatting template in Tera
-        stop-tokens: func() -> list<string>;
+        chat-template: func() -> string;       // Returns the prompt formatting template in Tera
         tokenizer: func() -> tokenizer;
     }
 
@@ -27,5 +26,8 @@ interface model {
 
         // Returns the special tokens recognized by the tokenizer
         special-tokens: func() -> tuple<list<u32>, list<list<u8>>>;
+
+        // Returns the stop tokens recognized by the tokenizer
+        stop-tokens: func() -> list<u32>;
     }
 }

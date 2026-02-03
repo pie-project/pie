@@ -48,14 +48,9 @@ impl pie::core::model::HostModel for InstanceState {
         anyhow::bail!("Model '{}' not found", name)
     }
 
-    async fn prompt_template(&mut self, this: Resource<Model>) -> Result<String> {
+    async fn chat_template(&mut self, this: Resource<Model>) -> Result<String> {
         let model = self.ctx().table.get(&this)?;
         Ok(model.info.prompt_template.clone())
-    }
-
-    async fn stop_tokens(&mut self, this: Resource<Model>) -> Result<Vec<String>> {
-        let model = self.ctx().table.get(&this)?;
-        Ok(model.info.stop_tokens.clone())
     }
 
     async fn tokenizer(&mut self, this: Resource<Model>) -> Result<Resource<Tokenizer>> {
@@ -120,6 +115,15 @@ impl pie::core::model::HostTokenizer for InstanceState {
 
         let (tx, rx) = oneshot::channel();
         Message::GetSpecialTokens { response: tx }.send(service_id)?;
+        Ok(rx.await?)
+    }
+
+    async fn stop_tokens(&mut self, this: Resource<Tokenizer>) -> Result<Vec<u32>> {
+        let tokenizer = self.ctx().table.get(&this)?;
+        let service_id = tokenizer.service_id;
+
+        let (tx, rx) = oneshot::channel();
+        Message::GetStopTokens { response: tx }.send(service_id)?;
         Ok(rx.await?)
     }
 
