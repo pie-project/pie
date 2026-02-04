@@ -3,6 +3,9 @@
 //! This crate provides the core types and traits for building inferlets
 //! that run on the Pie inference engine.
 
+/// Result type for inferlet operations (compatible with WIT bindings).
+pub type Result<T> = std::result::Result<T, String>;
+
 // Re-export wstd for the macro to use
 pub use wstd;
 
@@ -77,11 +80,11 @@ impl AdapterExt for adapter::Adapter {
 /// Extension trait for async forward pass operations.
 pub trait ForwardPassExt {
     /// Executes the forward pass and waits for the result asynchronously.
-    fn execute_async(&self) -> impl std::future::Future<Output = Result<inference::Output, String>>;
+    fn execute_async(&self) -> impl std::future::Future<Output = Result<inference::Output>>;
 }
 
 impl ForwardPassExt for inference::ForwardPass {
-    async fn execute_async(&self) -> Result<inference::Output, String> {
+    async fn execute_async(&self) -> Result<inference::Output> {
         let future_output = self.execute()?;
         let pollable = future_output.pollable();
         AsyncPollable::new(pollable).wait_for().await;

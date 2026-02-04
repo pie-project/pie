@@ -31,7 +31,7 @@ pub struct Tokenizer {
 impl pie::core::model::Host for InstanceState {}
 
 impl pie::core::model::HostModel for InstanceState {
-    async fn new(&mut self, name: String) -> Result<Resource<Model>> {
+    async fn load(&mut self, name: String) -> Result<Result<Resource<Model>, String>> {
         if let Some(service_id) = model::model_service_id(&name) {
             // Get model info from the actor
             let (tx, rx) = oneshot::channel();
@@ -43,9 +43,9 @@ impl pie::core::model::HostModel for InstanceState {
                 info: Arc::new(info),
                 tokenizer: None,
             };
-            return Ok(self.ctx().table.push(model)?);
+            return Ok(Ok(self.ctx().table.push(model)?));
         }
-        anyhow::bail!("Model '{}' not found", name)
+        Ok(Err(format!("Model '{}' not found", name)))
     }
 
     async fn chat_template(&mut self, this: Resource<Model>) -> Result<String> {

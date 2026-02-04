@@ -10,13 +10,15 @@ use syn::{ItemFn, parse_macro_input};
 ///
 /// The function should have the signature:
 /// ```ignore
-/// async fn main(args: Vec<String>) -> Result<String, anyhow::Error>
+/// async fn main(args: Vec<String>) -> inferlet::Result<String>
 /// ```
 ///
 /// # Example
 /// ```ignore
+/// use inferlet::Result;
+///
 /// #[inferlet::main]
-/// async fn main(args: Vec<String>) -> anyhow::Result<String> {
+/// async fn main(args: Vec<String>) -> Result<String> {
 ///     Ok("Hello, world!".to_string())
 /// }
 /// ```
@@ -48,13 +50,8 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         struct __PieMain;
 
         impl inferlet::exports::pie::core::run::Guest for __PieMain {
-            fn run(args: Vec<String>) -> Result<String, String> {
-                let result = inferlet::wstd::runtime::block_on(async { #inner_fn_name(args).await });
-
-                match result {
-                    Ok(output) => Ok(output),
-                    Err(e) => Err(format!("{:?}", e)),
-                }
+            fn run(args: Vec<String>) -> std::result::Result<String, String> {
+                inferlet::wstd::runtime::block_on(async { #inner_fn_name(args).await })
             }
         }
 

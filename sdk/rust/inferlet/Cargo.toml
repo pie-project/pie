@@ -15,7 +15,6 @@ wstd = "0.5.6"
 trait-variant = "0.1.2"
 wasi = "0.14.7"
 inferlet-macros = { version = "0.1.0", path = "../inferlet-macros" }
-anyhow = "1.0.95"
 futures = "0.3.31"
 minijinja = { version = "2.7.1", default-features = false }
 serde = { version = "1.0", features = ["derive"] }

@@ -6,12 +6,16 @@
 //! - Generating tokens with speculative decoding
 
 use crate::context::Context;
+use crate::model::Model;
 use crate::inference::{ForwardPass, Output, Sampler};
 use crate::ForwardPassExt;
-use anyhow::{anyhow, Result};
+use crate::Result;
 use serde::Serialize;
 use serde_json::Value;
 use wstd::io::AsyncPollable;
+
+/// Simple counter for generating unique context names.
+static CONTEXT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // =============================================================================
 // Supporting Types
@@ -172,9 +176,12 @@ pub struct TokenStream<'a> {
     constraint: Option<Box<dyn Constrain>>,
     pending_tokens: Vec<u32>,
     done: bool,
+    max_tokens: Option<usize>,
+    tokens_generated: usize,
 }
 
 impl<'a> TokenStream<'a> {
+    
     /// Creates a new token stream with default (system) speculation.
     pub fn new(ctx: &'a Context, sampler: Sampler) -> Self {
         let model = ctx.model();
@@ -190,6 +197,8 @@ impl<'a> TokenStream<'a> {
             constraint: None,
             pending_tokens: Vec::new(),
             done: false,
+            max_tokens: None,
+            tokens_generated: 0,
         }
     }
 
@@ -205,9 +214,22 @@ impl<'a> TokenStream<'a> {
         self
     }
 
+    /// Sets the maximum number of tokens to generate.
+    pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
     /// Gets the next token from the stream.
-    pub async fn next(&mut self) -> Result<Option<u32>, String> {
+    pub async fn next(&mut self) -> Result<Option<u32>> {
+        // Check max tokens limit
+        if let Some(max) = self.max_tokens {
+            if self.tokens_generated >= max {
+                return Ok(None);
+            }
+        }
+
         if let Some(token) = self.pending_tokens.pop() {
+            self.tokens_generated += 1;
             return Ok(Some(token));
         }
 
@@ -231,7 +253,26 @@ impl<'a> TokenStream<'a> {
         Ok(Some(tokens[0]))
     }
 
-    async fn step(&mut self) -> Result<Vec<u32>, String> {
+    /// Collects all tokens from the stream (until stop token or max_tokens limit).
+    pub async fn collect_tokens(mut self) -> Result<Vec<u32>> {
+        let mut tokens = Vec::new();
+        while let Some(token) = self.next().await? {
+            tokens.push(token);
+        }
+        Ok(tokens)
+    }
+
+    /// Collects all tokens and decodes them to text.
+    pub async fn collect_text(mut self) -> Result<String> {
+        let mut tokens = Vec::new();
+        while let Some(token) = self.next().await? {
+            tokens.push(token);
+        }
+        let tokenizer = self.model.tokenizer();
+        tokenizer.decode(&tokens)
+    }
+
+    async fn step(&mut self) -> Result<Vec<u32>> {
         let buffered = self.ctx.buffered_tokens();
         if buffered.is_empty() {
             return Err("generate requires at least one buffered token".to_string());
@@ -299,6 +340,20 @@ impl<'a> TokenStream<'a> {
 
 /// Extension trait for Context - provides async operations, filling, and generation.
 pub trait ContextExt {
+    // --- Creation ---
+    
+    /// Creates a new context with an auto-generated globally unique name.
+    fn new(model: &Model) -> Result<Context> {
+        // Combine counter with address-based entropy for global uniqueness
+        let counter = CONTEXT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Use stack address as additional entropy source
+        let stack_addr = &counter as *const _ as u64;
+        // Simple mixing function
+        let mixed = counter.wrapping_mul(0x517cc1b727220a95) ^ stack_addr;
+        let name = format!("ctx-{:016x}", mixed);
+        Context::create(model, &name, None)
+    }
+    
     // --- Async Operations ---
     
     /// Acquires a lock on the context asynchronously.
@@ -401,7 +456,7 @@ impl ContextExt for Context {
             let tokens_needed = num_tokens - available_capacity;
             let pages_needed = (tokens_needed + page_size - 1) / page_size;
             self.reserve_pages(pages_needed)
-                .map_err(|e| anyhow!("Failed to reserve pages: {}", e))?;
+                .map_err(|e| format!("Failed to reserve pages: {}", e))?;
         }
         
         let pass = ForwardPass::new(&model);
@@ -411,14 +466,14 @@ impl ContextExt for Context {
         pass.input_tokens(tokens_to_flush, &positions);
         
         pass.execute_async().await
-            .map_err(|e| anyhow!("Forward pass failed: {}", e))?;
+            .map_err(|e| format!("Forward pass failed: {}", e))?;
         
         let new_cursor_abs = cursor + num_tokens;
         let pages_to_commit = new_cursor_abs / page_size;
         if pages_to_commit > 0 {
             let page_indices: Vec<u32> = (0..pages_to_commit).collect();
             self.commit_pages(&page_indices)
-                .map_err(|e| anyhow!("Failed to commit pages: {}", e))?;
+                .map_err(|e| format!("Failed to commit pages: {}", e))?;
         }
         
         let new_cursor = new_cursor_abs % page_size;

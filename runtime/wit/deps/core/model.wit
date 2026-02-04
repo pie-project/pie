@@ -4,7 +4,7 @@ interface model {
 
     // Resource representing a specific model instance
     resource model {
-        constructor(name: string);
+        load: static func(name: string) -> result<model, error>;
         chat-template: func() -> string;       // Returns the prompt formatting template in Tera
         tokenizer: func() -> tokenizer;
     }
