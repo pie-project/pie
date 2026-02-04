@@ -2,48 +2,47 @@
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use crate::model::{self, Message, ModelInfo};
+use crate::model::{self, ModelInfo};
 use crate::model::tokenizer::BytePairEncoder;
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
 /// Model resource - represents a reference to a registered model.
 #[derive(Debug, Clone)]
 pub struct Model {
-    /// The model service index (for routing to the correct ModelActor)
-    pub service_id: usize,
+    /// The model ID (for routing to the correct backend)
+    pub model_id: usize,
     /// Cached model info
     pub info: Arc<ModelInfo>,
-    /// Cached tokenizer (if available)
-    pub tokenizer: Option<Arc<BytePairEncoder>>,
+    /// Cached tokenizer
+    pub tokenizer: Arc<BytePairEncoder>,
 }
 
 /// Tokenizer resource - for tokenization operations.
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
-    /// The model service index 
-    pub service_id: usize,
+    /// Model info (for stop tokens)
+    pub info: Arc<ModelInfo>,
+    /// The tokenizer
+    pub tokenizer: Arc<BytePairEncoder>,
 }
 
 impl pie::core::model::Host for InstanceState {}
 
 impl pie::core::model::HostModel for InstanceState {
     async fn load(&mut self, name: String) -> Result<Result<Resource<Model>, String>> {
-        if let Some(service_id) = model::model_service_id(&name) {
-            // Get model info from the actor
-            let (tx, rx) = oneshot::channel();
-            Message::GetInfo { response: tx }.send(service_id)?;
-            let info = rx.await?;
-
-            let model = Model {
-                service_id,
-                info: Arc::new(info),
-                tokenizer: None,
-            };
-            return Ok(Ok(self.ctx().table.push(model)?));
+        if let Some(model_id) = model::model_id(&name) {
+            // Get cached model directly - no message passing needed
+            if let Some(m) = model::get_model(model_id) {
+                let model = Model {
+                    model_id,
+                    info: m.info,
+                    tokenizer: m.tokenizer,
+                };
+                return Ok(Ok(self.ctx().table.push(model)?));
+            }
         }
         Ok(Err(format!("Model '{}' not found", name)))
     }
@@ -56,7 +55,8 @@ impl pie::core::model::HostModel for InstanceState {
     async fn tokenizer(&mut self, this: Resource<Model>) -> Result<Resource<Tokenizer>> {
         let model = self.ctx().table.get(&this)?;
         let tokenizer = Tokenizer {
-            service_id: model.service_id,
+            info: Arc::clone(&model.info),
+            tokenizer: Arc::clone(&model.tokenizer),
         };
         Ok(self.ctx().table.push(tokenizer)?)
     }
@@ -70,11 +70,7 @@ impl pie::core::model::HostModel for InstanceState {
 impl pie::core::model::HostTokenizer for InstanceState {
     async fn encode(&mut self, this: Resource<Tokenizer>, text: String) -> Result<Vec<u32>> {
         let tokenizer = self.ctx().table.get(&this)?;
-        let service_id = tokenizer.service_id;
-
-        let (tx, rx) = oneshot::channel();
-        Message::Tokenize { text, response: tx }.send(service_id)?;
-        Ok(rx.await?)
+        Ok(tokenizer.tokenizer.encode_with_special_tokens(&text))
     }
 
     async fn decode(
@@ -83,48 +79,30 @@ impl pie::core::model::HostTokenizer for InstanceState {
         tokens: Vec<u32>,
     ) -> Result<Result<String, String>> {
         let tokenizer = self.ctx().table.get(&this)?;
-        let service_id = tokenizer.service_id;
-
-        let (tx, rx) = oneshot::channel();
-        Message::Detokenize { tokens, response: tx }.send(service_id)?;
-        let text = rx.await?;
-        Ok(Ok(text))
+        match tokenizer.tokenizer.decode(&tokens) {
+            Ok(text) => Ok(Ok(text)),
+            Err(e) => Ok(Err(e.to_string())),
+        }
     }
 
     async fn vocabs(&mut self, this: Resource<Tokenizer>) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
         let tokenizer = self.ctx().table.get(&this)?;
-        let service_id = tokenizer.service_id;
-
-        let (tx, rx) = oneshot::channel();
-        Message::GetVocabs { response: tx }.send(service_id)?;
-        Ok(rx.await?)
+        Ok(tokenizer.tokenizer.get_vocabs())
     }
 
     async fn split_regex(&mut self, this: Resource<Tokenizer>) -> Result<String> {
         let tokenizer = self.ctx().table.get(&this)?;
-        let service_id = tokenizer.service_id;
-
-        let (tx, rx) = oneshot::channel();
-        Message::GetSplitRegex { response: tx }.send(service_id)?;
-        Ok(rx.await?)
+        Ok(tokenizer.tokenizer.get_split_regex())
     }
 
     async fn special_tokens(&mut self, this: Resource<Tokenizer>) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
         let tokenizer = self.ctx().table.get(&this)?;
-        let service_id = tokenizer.service_id;
-
-        let (tx, rx) = oneshot::channel();
-        Message::GetSpecialTokens { response: tx }.send(service_id)?;
-        Ok(rx.await?)
+        Ok(tokenizer.tokenizer.get_special_tokens())
     }
 
     async fn stop_tokens(&mut self, this: Resource<Tokenizer>) -> Result<Vec<u32>> {
         let tokenizer = self.ctx().table.get(&this)?;
-        let service_id = tokenizer.service_id;
-
-        let (tx, rx) = oneshot::channel();
-        Message::GetStopTokens { response: tx }.send(service_id)?;
-        Ok(rx.await?)
+        Ok(tokenizer.info.stop_token_ids.clone())
     }
 
     async fn drop(&mut self, this: Resource<Tokenizer>) -> Result<()> {
@@ -132,3 +110,4 @@ impl pie::core::model::HostTokenizer for InstanceState {
         Ok(())
     }
 }
+

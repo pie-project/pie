@@ -133,11 +133,6 @@ pub fn spawn(engine: Engine) {
     ACTOR.spawn_with::<RuntimeActor, _>(|| RuntimeActor::with_engine(engine));
 }
 
-/// Sends a message to the Runtime actor.
-pub fn send(msg: Message) -> Result<(), SendError> {
-    ACTOR.send(msg)
-}
-
 /// Check if the runtime actor is spawned.
 pub fn is_spawned() -> bool {
     ACTOR.is_spawned()

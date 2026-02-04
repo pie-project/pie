@@ -33,7 +33,7 @@ impl pie::core::context::HostContext for InstanceState {
         fill: Option<Vec<u32>>,
     ) -> Result<Result<Resource<Context>, String>> {
         let model = self.ctx().table.get(&model)?;
-        let model_idx = model.service_id;
+        let model_idx = model.model_id;
         let user_id = 0u32; // TODO: Get from InstanceState
 
         let (tx, rx) = oneshot::channel();
@@ -85,7 +85,7 @@ impl pie::core::context::HostContext for InstanceState {
         name: String,
     ) -> Result<Option<Resource<Context>>> {
         let model = self.ctx().table.get(&model)?;
-        let model_idx = model.service_id;
+        let model_idx = model.model_id;
         let user_id = 0u32; // TODO: Get from InstanceState
 
         let (tx, rx) = oneshot::channel();
@@ -212,21 +212,17 @@ impl pie::core::context::HostContext for InstanceState {
         let ctx = self.ctx().table.get(&this)?;
         let model_idx = ctx.model_idx;
 
-        // Create a Model resource for this context's model
-        // We need to get the model info from the ModelActor
-        use crate::model::{self, Message as ModelMessage, ModelInfo};
-        use std::sync::Arc;
+        // Get cached model directly - no message passing needed
+        if let Some(m) = crate::model::get_model(model_idx) {
+            let model = Model {
+                model_id: model_idx,
+                info: m.info,
+                tokenizer: m.tokenizer,
+            };
+            return Ok(self.ctx().table.push(model)?);
+        }
 
-        let (tx, rx) = oneshot::channel();
-        ModelMessage::GetInfo { response: tx }.send(model_idx)?;
-        let info = rx.await?;
-
-        let model = Model {
-            service_id: model_idx,
-            info: Arc::new(info),
-            tokenizer: None,
-        };
-        Ok(self.ctx().table.push(model)?)
+        anyhow::bail!("Model not found in cache")
     }
 
     async fn committed_page_count(&mut self, this: Resource<Context>) -> Result<u32> {

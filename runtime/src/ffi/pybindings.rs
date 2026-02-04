@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use crate::auth::AuthorizedUsers;
 use crate::engine::{self, Config as EngineConfig};
 use crate::telemetry::TelemetryConfig;
-use super::rpc::{FfiIpcBackend, IpcChannels, IpcRequest, IpcResponse, AsyncIpcClient};
+use super::rpc::{FfiIpcBackend, IpcChannels, IpcRequest, IpcResponse, AsyncIpcClient, RpcBackend};
 
 // =============================================================================
 // FfiIpcQueue - Python side IPC client (PyO3)
@@ -294,7 +294,7 @@ pub struct PartialServerHandle {
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     runtime: Arc<tokio::runtime::Runtime>,
     /// IPC backends (not yet handshaked)
-    backends: Arc<Mutex<Option<Vec<crate::model::RpcBackend>>>>,
+    backends: Arc<Mutex<Option<Vec<RpcBackend>>>>,
 }
 
 #[pymethods]
@@ -370,7 +370,6 @@ fn start_server_phase1(
     authorized_users_path: Option<String>,
     num_groups: usize,
 ) -> PyResult<(PartialServerHandle, Vec<String>)> {
-    use crate::model::RpcBackend;
     
     // Allow other Python threads to run while we block
     py.allow_threads(|| {

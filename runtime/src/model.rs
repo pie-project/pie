@@ -1,34 +1,39 @@
 //! Model Service - Model registration and tokenizer management
 //!
-//! This module provides a model-specific actor for managing model metadata,
-//! tokenization, and coordinating associated actors (context, inference, kvcache).
+//! This module provides model metadata and tokenizer management via a global cache.
+//! All model and tokenizer operations access the cache directly without message passing.
 
 pub mod tokenizer;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 
-use crate::actor::{Actors, Handle, SendError};
 use crate::context;
+use crate::ffi::RpcBackend;
 use crate::inference;
-
-use crate::ffi::AsyncIpcClient;
 use tokenizer::BytePairEncoder;
 
-/// Global address table for model actors.
-static ACTOR: LazyLock<Actors<Message>> = LazyLock::new(Actors::new);
+/// Counter for generating unique model IDs.
+static MODEL_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Global registry mapping model names to service IDs.
-static NAME_REGISTRY: LazyLock<RwLock<HashMap<String, usize>>> =
+/// Global registry mapping model names to model IDs.
+static NAME_REGISTRY: LazyLock<RwLock<HashMap<String, ModelId>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Looks up a model by name and returns its service ID.
-pub fn model_service_id(model_name: &str) -> Option<usize> {
+/// Global cache for models (keyed by ModelId).
+static MODELS: LazyLock<RwLock<HashMap<ModelId, Model>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Type alias for model identifiers.
+pub type ModelId = usize;
+
+/// Looks up a model by name and returns its model ID.
+pub fn model_id(model_name: &str) -> Option<ModelId> {
     NAME_REGISTRY.read().ok()?.get(model_name).copied()
 }
 
@@ -38,6 +43,11 @@ pub fn registered_models() -> Vec<String> {
         .read()
         .map(|r| r.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// Gets cached model by model ID.
+pub fn get_model(model_id: ModelId) -> Option<Model> {
+    MODELS.read().ok()?.get(&model_id).cloned()
 }
 
 // =============================================================================
@@ -73,71 +83,32 @@ pub struct HandshakeResponse {
 }
 
 // =============================================================================
-// RPC Backend
-// =============================================================================
-
-/// RPC backend for Python IPC communication.
-#[derive(Clone)]
-pub struct RpcBackend {
-    client: AsyncIpcClient,
-}
-
-impl RpcBackend {
-    /// Create a new RPC backend from an IPC client.
-    pub fn new(client: AsyncIpcClient) -> Self {
-        Self { client }
-    }
-
-    /// Call a Python method asynchronously via IPC.
-    pub async fn call<T, R>(&self, method: &str, args: &T) -> Result<R>
-    where
-        T: Serialize + Send + Sync + Clone + 'static,
-        R: serde::de::DeserializeOwned + Send + 'static,
-    {
-        self.client.call(method, args).await
-    }
-
-    /// Call with timeout.
-    pub async fn call_with_timeout<T, R>(
-        &self,
-        method: &str,
-        args: &T,
-        timeout: Duration,
-    ) -> Result<R>
-    where
-        T: Serialize + Send + Sync + Clone + 'static,
-        R: serde::de::DeserializeOwned + Send + 'static,
-    {
-        self.client.call_with_timeout(method, args, timeout).await
-    }
-}
-
-impl std::fmt::Debug for RpcBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RpcBackend").finish()
-    }
-}
-
-// =============================================================================
 // Public API
 // =============================================================================
 
 /// Installs a new model by performing handshake with the backend.
-/// Returns the global model ID that can be used with all actors.
-pub async fn install_model_with_backend(backend: RpcBackend) -> Result<usize> {
+/// Returns the global model ID that can be used to access the model.
+pub async fn install_model_with_backend(backend: RpcBackend) -> Result<ModelId> {
     let resp = Model::handshake(&backend).await?;
     let model_name = resp.model_name.clone();
-    let service = Model::from_handshake(resp);
+    let model = Model::from_handshake(resp);
 
-    let model_id = ACTOR.spawn_with::<ModelActor, _>(|| ModelActor {
-        service,
-        #[allow(dead_code)]
-        backend: Some(backend),
-    });
+    // Generate a unique model ID
+    let model_id = MODEL_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
     // Register the model name
     if let Ok(mut registry) = NAME_REGISTRY.write() {
         registry.insert(model_name, model_id);
+    }
+
+    // Store in the global cache
+    if let Ok(mut cache) = MODELS.write() {
+        cache.insert(model_id, model);
+    }
+
+    // Store the backend for RPC calls
+    if let Ok(mut backends) = BACKENDS.write() {
+        backends.insert(model_id, backend);
     }
 
     // Spawn the associated actors with the same model ID
@@ -148,26 +119,10 @@ pub async fn install_model_with_backend(backend: RpcBackend) -> Result<usize> {
     Ok(model_id)
 }
 
-/// Installs a new model from pre-existing info (for testing or manual setup).
-/// Returns the global model ID that can be used with all actors.
-pub fn install_model(info: ModelInfo) -> usize {
-    let model_name = info.name.clone();
-    
-    // Spawn the model actor and get its ID
-    let model_id = ACTOR.spawn_with::<ModelActor, _>(|| ModelActor::with_info(info));
+/// Global storage for RPC backends (keyed by ModelId).
+static BACKENDS: LazyLock<RwLock<HashMap<ModelId, RpcBackend>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
-    // Register the model name
-    if let Ok(mut registry) = NAME_REGISTRY.write() {
-        registry.insert(model_name, model_id);
-    }
-
-    // Spawn the associated actors with the same model ID
-    // Note: PageStore is now owned by ContextActor, so no separate kvcache actor
-    let _ = context::spawn();
-    let _ = inference::spawn();
-
-    model_id
-}
 
 // =============================================================================
 // Model Info
@@ -212,134 +167,16 @@ pub struct TokenizerInfo {
 }
 
 // =============================================================================
-// Messages
-// =============================================================================
-
-/// Messages for the model actor.
-#[derive(Debug)]
-pub enum Message {
-    /// Gets the prompt template for this model.
-    GetPromptTemplate {
-        response: oneshot::Sender<String>,
-    },
-    /// Tokenizes text.
-    Tokenize {
-        text: String,
-        response: oneshot::Sender<Vec<u32>>,
-    },
-    /// Detokenizes token IDs.
-    Detokenize {
-        tokens: Vec<u32>,
-        response: oneshot::Sender<String>,
-    },
-    /// Gets the vocabulary.
-    GetVocabs {
-        response: oneshot::Sender<(Vec<u32>, Vec<Vec<u8>>)>,
-    },
-    /// Gets the split regex.
-    GetSplitRegex {
-        response: oneshot::Sender<String>,
-    },
-    /// Gets the special tokens.
-    GetSpecialTokens {
-        response: oneshot::Sender<(Vec<u32>, Vec<Vec<u8>>)>,
-    },
-    /// Gets the stop tokens (as token IDs).
-    GetStopTokens {
-        response: oneshot::Sender<Vec<u32>>,
-    },
-    /// Gets the model info.
-    GetInfo {
-        response: oneshot::Sender<ModelInfo>,
-    },
-}
-
-impl Message {
-    /// Sends this message to the model actor for the given model.
-    pub fn send(self, model_idx: usize) -> Result<(), SendError> {
-        ACTOR.send(model_idx, self)
-    }
-}
-
-// =============================================================================
-// Model Actor
-// =============================================================================
-
-/// The model actor provides model and tokenizer functionality.
-struct ModelActor {
-    service: Model,
-    #[allow(dead_code)]
-    backend: Option<RpcBackend>,
-}
-
-impl ModelActor {
-    fn with_info(info: ModelInfo) -> Self {
-        ModelActor {
-            service: Model::new(info),
-            backend: None,
-        }
-    }
-}
-
-impl std::fmt::Debug for ModelActor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ModelActor")
-            .field("service", &self.service)
-            .finish()
-    }
-}
-
-impl Handle for ModelActor {
-    type Message = Message;
-
-    fn new() -> Self {
-        ModelActor {
-            service: Model::new(ModelInfo::default()),
-            backend: None,
-        }
-    }
-
-    async fn handle(&mut self, msg: Message) {
-        match msg {
-            Message::GetPromptTemplate { response } => {
-                let _ = response.send(self.service.get_prompt_template());
-            }
-            Message::Tokenize { text, response } => {
-                let _ = response.send(self.service.tokenize(&text));
-            }
-            Message::Detokenize { tokens, response } => {
-                let _ = response.send(self.service.detokenize(&tokens));
-            }
-            Message::GetVocabs { response } => {
-                let _ = response.send(self.service.get_vocabs());
-            }
-            Message::GetSplitRegex { response } => {
-                let _ = response.send(self.service.get_split_regex());
-            }
-            Message::GetSpecialTokens { response } => {
-                let _ = response.send(self.service.get_special_tokens());
-            }
-            Message::GetStopTokens { response } => {
-                let _ = response.send(self.service.get_stop_tokens());
-            }
-            Message::GetInfo { response } => {
-                let _ = response.send(self.service.info.clone());
-            }
-        }
-    }
-}
-
-// =============================================================================
 // Model - Business Logic
 // =============================================================================
 
 /// The model service handles model metadata and tokenization.
 ///
 /// This is the core business logic, separate from the actor message handling.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Model {
-    info: ModelInfo,
-    tokenizer: Option<Arc<BytePairEncoder>>,
+    pub info: Arc<ModelInfo>,
+    pub tokenizer: Arc<BytePairEncoder>,
 }
 
 impl Model {
@@ -373,7 +210,7 @@ impl Model {
             .flat_map(|s| tokenizer.encode_with_special_tokens(s))
             .collect();
 
-        let info = ModelInfo {
+        let info = Arc::new(ModelInfo {
             name: resp.model_name,
             traits: resp.model_traits,
             description: resp.model_description,
@@ -383,40 +220,9 @@ impl Model {
             stop_token_ids,
             kv_page_size: resp.kv_page_size,
             max_batch_tokens: resp.max_batch_tokens,
-        };
+        });
 
-        Model {
-            info,
-            tokenizer: Some(tokenizer),
-        }
-    }
-
-    /// Creates a new model service with the given info.
-    pub fn new(info: ModelInfo) -> Self {
-        Model {
-            info,
-            tokenizer: None,
-        }
-    }
-
-    /// Sets the tokenizer from raw components.
-    pub fn set_tokenizer(
-        &mut self,
-        num_vocab: usize,
-        merge_table: HashMap<u32, Vec<u8>>,
-        special_tokens: HashMap<String, u32>,
-        split_regex: &str,
-        escape_non_printable: bool,
-        sentencepiece_space: bool,
-    ) {
-        self.tokenizer = Some(Arc::new(BytePairEncoder::new(
-            num_vocab,
-            merge_table,
-            special_tokens,
-            split_regex,
-            escape_non_printable,
-            sentencepiece_space,
-        )));
+        Model { info, tokenizer }
     }
 
     /// Gets the model name.
@@ -431,42 +237,32 @@ impl Model {
 
     /// Tokenizes text into token IDs.
     pub fn tokenize(&self, text: &str) -> Vec<u32> {
-        self.tokenizer
-            .as_ref()
-            .map(|t| t.encode_with_special_tokens(text))
-            .unwrap_or_default()
+        self.tokenizer.encode_with_special_tokens(text)
     }
 
     /// Detokenizes token IDs into text.
     pub fn detokenize(&self, tokens: &[u32]) -> String {
-        self.tokenizer
-            .as_ref()
-            .and_then(|t| t.decode(tokens).ok())
-            .unwrap_or_default()
+        self.tokenizer.decode(tokens).unwrap_or_default()
     }
 
     /// Gets the vocabulary.
     pub fn get_vocabs(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        self.tokenizer
-            .as_ref()
-            .map(|t| t.get_vocabs())
-            .unwrap_or_default()
+        self.tokenizer.get_vocabs()
     }
 
     /// Gets the split regex.
     pub fn get_split_regex(&self) -> String {
-        self.tokenizer
-            .as_ref()
-            .map(|t| t.get_split_regex())
-            .unwrap_or_default()
+        self.tokenizer.get_split_regex()
     }
 
     /// Gets the special tokens.
     pub fn get_special_tokens(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        self.tokenizer
-            .as_ref()
-            .map(|t| t.get_special_tokens())
-            .unwrap_or_default()
+        self.tokenizer.get_special_tokens()
+    }
+
+    /// Gets a clone of the tokenizer Arc.
+    pub fn tokenizer(&self) -> Arc<BytePairEncoder> {
+        Arc::clone(&self.tokenizer)
     }
 
     /// Gets the stop tokens.

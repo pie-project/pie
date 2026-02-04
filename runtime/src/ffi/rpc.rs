@@ -257,3 +257,52 @@ impl AsyncIpcClient {
             .map_err(|_| anyhow::anyhow!("IPC call timed out"))?
     }
 }
+
+// =============================================================================
+// RPC Backend
+// =============================================================================
+
+/// RPC backend for Python IPC communication.
+///
+/// Thin wrapper around AsyncIpcClient with stricter type bounds for use
+/// in model handshake and backend communication.
+#[derive(Clone)]
+pub struct RpcBackend {
+    client: AsyncIpcClient,
+}
+
+impl RpcBackend {
+    /// Create a new RPC backend from an IPC client.
+    pub fn new(client: AsyncIpcClient) -> Self {
+        Self { client }
+    }
+
+    /// Call a Python method asynchronously via IPC.
+    pub async fn call<T, R>(&self, method: &str, args: &T) -> Result<R>
+    where
+        T: Serialize + Send + Sync + Clone + 'static,
+        R: DeserializeOwned + Send + 'static,
+    {
+        self.client.call(method, args).await
+    }
+
+    /// Call with timeout.
+    pub async fn call_with_timeout<T, R>(
+        &self,
+        method: &str,
+        args: &T,
+        timeout: Duration,
+    ) -> Result<R>
+    where
+        T: Serialize + Send + Sync + Clone + 'static,
+        R: DeserializeOwned + Send + 'static,
+    {
+        self.client.call_with_timeout(method, args, timeout).await
+    }
+}
+
+impl std::fmt::Debug for RpcBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcBackend").finish()
+    }
+}

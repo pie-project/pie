@@ -25,7 +25,7 @@ pub use format::{
     QUERY_ID, UPDATE_ADAPTER_ID, UPLOAD_ADAPTER_ID,
 };
 
-pub use rpc::{AsyncIpcClient, FfiIpcBackend, IpcChannels, IpcRequest, IpcResponse};
+pub use rpc::{AsyncIpcClient, FfiIpcBackend, IpcChannels, IpcRequest, IpcResponse, RpcBackend};
 
 pub use pybindings::{
     _pie, FfiIpcQueue, PartialServerHandle, ServerConfig, ServerHandle,

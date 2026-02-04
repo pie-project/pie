@@ -17,7 +17,7 @@ use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 
 #[derive(Debug)]
 pub struct ForwardPass {
-    pub model_service_id: usize,
+    pub model_id: usize,
     pub queue_uid: u32,
     input_tokens: Vec<u32>,
     input_token_positions: Vec<u32>,
@@ -61,7 +61,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     async fn new(&mut self, model: Resource<Model>) -> Result<Resource<ForwardPass>> {
         let model = self.ctx().table.get(&model)?;
         let pass = ForwardPass {
-            model_service_id: model.service_id,
+            model_id: model.model_id,
             queue_uid: 0, // Will be set when execute is called
             input_tokens: vec![],
             input_token_positions: vec![],

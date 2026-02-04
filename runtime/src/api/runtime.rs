@@ -13,7 +13,7 @@ use wasmtime_wasi::WasiView;
 impl pie::core::runtime::Host for InstanceState {
     async fn version(&mut self) -> Result<String> {
         let (tx, rx) = oneshot::channel();
-        crate::runtime::send(crate::runtime::Message::GetVersion { response: tx })?;
+        crate::runtime::Message::GetVersion { response: tx }.send()?;
         rx.await.map_err(Into::into)
     }
 
@@ -37,11 +37,12 @@ impl pie::core::runtime::Host for InstanceState {
         let (tx, rx) = oneshot::channel();
 
         // Dispatch spawn command to runtime
-        crate::runtime::send(crate::runtime::Message::Spawn {
+        crate::runtime::Message::Spawn {
             package_name,
             args,
             result: tx,
-        })?;
+        }
+        .send()?;
 
         let future_string = FutureString::new(rx);
         Ok(Ok(self.ctx().table.push(future_string)?))

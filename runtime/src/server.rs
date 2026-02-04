@@ -465,13 +465,14 @@ impl Drop for Session {
         for inst_id in self.attached_instances.drain(..) {
             let server_state = Arc::clone(&self.state);
             task::spawn(async move {
-                runtime::send(runtime::Message::SetOutputDelivery {
+                runtime::Message::SetOutputDelivery {
                     inst_id,
                     mode: OutputDelivery::Buffered,
-                })
+                }
+                .send()
                 .unwrap();
                 server_state.client_cmd_txs.remove(&inst_id);
-                runtime::send(runtime::Message::DetachInstance { inst_id }).unwrap();
+                runtime::Message::DetachInstance { inst_id }.send().unwrap();
             });
         }
 
@@ -882,10 +883,11 @@ impl Session {
 
     async fn handle_list_instances(&self, corr_id: u32) {
         let (evt_tx, evt_rx) = oneshot::channel();
-        runtime::send(runtime::Message::ListInstances {
+        runtime::Message::ListInstances {
             username: self.username.clone(),
             response: evt_tx,
-        })
+        }
+        .send()
         .unwrap();
 
         let instances = evt_rx.await.unwrap();
@@ -1054,11 +1056,12 @@ impl Session {
             };
 
             let (evt_tx, evt_rx) = oneshot::channel();
-            runtime::send(runtime::Message::LoadProgram {
+            runtime::Message::LoadProgram {
                 hash: final_hash.clone(),
                 component,
                 response: evt_tx,
-            })
+            }
+            .send()
             .unwrap();
 
             evt_rx.await.unwrap();
@@ -1155,11 +1158,12 @@ impl Session {
                         };
 
                     let (evt_tx, evt_rx) = oneshot::channel();
-                    runtime::send(runtime::Message::LoadProgram {
+                    runtime::Message::LoadProgram {
                         hash: program_hash.clone(),
                         component,
                         response: evt_tx,
-                    })
+                    }
+                    .send()
                     .unwrap();
 
                     evt_rx.await.unwrap();
@@ -1187,13 +1191,14 @@ impl Session {
         detached: bool,
     ) {
         let (evt_tx, evt_rx) = oneshot::channel();
-        runtime::send(runtime::Message::LaunchInstance {
+        runtime::Message::LaunchInstance {
             username: self.username.clone(),
             hash,
             arguments,
             detached,
             response: evt_tx,
-        })
+        }
+        .send()
         .unwrap();
 
         match evt_rx.await.unwrap() {
@@ -1208,9 +1213,10 @@ impl Session {
                 self.send_launch_result(corr_id, true, instance_id.to_string())
                     .await;
 
-                runtime::send(runtime::Message::AllowOutput {
+                runtime::Message::AllowOutput {
                     inst_id: instance_id,
-                })
+                }
+                .send()
                 .unwrap();
             }
             Err(e) => {
@@ -1231,10 +1237,11 @@ impl Session {
 
         let (evt_tx, evt_rx) = oneshot::channel();
 
-        runtime::send(runtime::Message::AttachInstance {
+        runtime::Message::AttachInstance {
             inst_id,
             response: evt_tx,
-        })
+        }
+        .send()
         .unwrap();
 
         match evt_rx.await.unwrap() {
@@ -1247,10 +1254,11 @@ impl Session {
                     .insert(inst_id, self.client_cmd_tx.clone());
                 self.attached_instances.push(inst_id);
 
-                runtime::send(runtime::Message::SetOutputDelivery {
+                runtime::Message::SetOutputDelivery {
                     inst_id,
                     mode: OutputDelivery::Streamed,
-                })
+                }
+                .send()
                 .unwrap();
             }
             AttachInstanceResult::AttachedFinished(cause) => {
@@ -1262,16 +1270,18 @@ impl Session {
                     .insert(inst_id, self.client_cmd_tx.clone());
                 self.attached_instances.push(inst_id);
 
-                runtime::send(runtime::Message::SetOutputDelivery {
+                runtime::Message::SetOutputDelivery {
                     inst_id,
                     mode: OutputDelivery::Streamed,
-                })
+                }
+                .send()
                 .unwrap();
 
-                runtime::send(runtime::Message::TerminateInstance {
+                runtime::Message::TerminateInstance {
                     inst_id,
                     notification_to_client: Some(cause),
-                })
+                }
+                .send()
                 .unwrap();
             }
             AttachInstanceResult::InstanceNotFound => {
@@ -1315,13 +1325,14 @@ impl Session {
             }
 
             let (evt_tx, evt_rx) = oneshot::channel();
-            runtime::send(runtime::Message::LaunchServerInstance {
+            runtime::Message::LaunchServerInstance {
                 username: self.username.clone(),
                 hash,
                 port,
                 arguments,
                 response: evt_tx,
-            })
+            }
+            .send()
             .unwrap();
 
             match evt_rx.await.unwrap() {
@@ -1351,10 +1362,11 @@ impl Session {
 
     async fn handle_terminate_instance(&mut self, corr_id: u32, instance_id: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-            runtime::send(runtime::Message::TerminateInstance {
+            runtime::Message::TerminateInstance {
                 inst_id,
                 notification_to_client: Some(runtime::TerminationCause::Signal),
-            })
+            }
+            .send()
             .unwrap();
 
             self.send_response(corr_id, true, "Instance terminated".to_string())
@@ -1565,10 +1577,11 @@ async fn ensure_program_loaded_from_path(
     hash: &str,
 ) -> Result<(), String> {
     let (loaded_tx, loaded_rx) = oneshot::channel();
-    runtime::send(runtime::Message::ProgramLoaded {
+    runtime::Message::ProgramLoaded {
         hash: hash.to_string(),
         response: loaded_tx,
-    })
+    }
+    .send()
     .unwrap();
 
     let is_loaded = loaded_rx.await.unwrap();
@@ -1583,11 +1596,12 @@ async fn ensure_program_loaded_from_path(
             .map_err(|e| e.to_string())?;
 
         let (load_tx, load_rx) = oneshot::channel();
-        runtime::send(runtime::Message::LoadProgram {
+        runtime::Message::LoadProgram {
             hash: hash.to_string(),
             component,
             response: load_tx,
-        })
+        }
+        .send()
         .unwrap();
 
         load_rx.await.unwrap();
