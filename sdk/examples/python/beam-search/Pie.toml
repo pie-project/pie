@@ -1,0 +1,15 @@
+[package]
+name = "beam-search"
+version = "0.1.0"
+description = "Beam search decoding example using inferlet"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "The prompt to send to the model (default: 'Explain the LLM decoding process ELI5.')"}
+max_tokens = {type = "int", optional = true, description = "Maximum number of new tokens to generate (default: 128)"}
+beam_size = {type = "int", optional = true, description = "Number of beams for beam search decoding (default: 4)"}
+system = {type = "string", optional = true, description = "System prompt to set assistant behavior (default: 'You are a helpful, respectful and honest assistant.')"}

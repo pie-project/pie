@@ -1,0 +1,13 @@
+[package]
+name = "watermarking"
+version = "0.1.0"
+description = "Text watermarking using green/red list token partitioning"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "The prompt to send to the model (default: 'Explain the LLM decoding process ELI5.')"}
+max_tokens = {type = "int", optional = true, description = "Maximum number of new tokens to generate (default: 256)"}

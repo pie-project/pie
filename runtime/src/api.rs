@@ -9,7 +9,7 @@ use wasmtime::component::HasSelf;
 
 wasmtime::component::bindgen!({
     path: "wit",
-    world: "exec",
+    world: "imports",
     with: {
         "wasi:io/poll": wasmtime_wasi::p2::bindings::io::poll,
         "inferlet:core/common/blob-result": core::BlobResult,

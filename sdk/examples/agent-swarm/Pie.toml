@@ -1,0 +1,15 @@
+[package]
+name = "agent-swarm"
+version = "0.1.0"
+description = "Collaborative agent swarm for story writing pipeline"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+role = {type = "string", description = "Agent role: idea_generator, plot_developer, character_creator, or dialogue_writer"}
+group_id = {type = "int", optional = true, description = "Pipeline/group ID for this agent instance (default: 0)"}
+tokens_per_step = {type = "int", optional = true, description = "Max new tokens this agent should generate (default: 512)"}
+prompt = {type = "string", optional = true, description = "The prompt to send to the agent (default: 'A story about day dreaming in a park')"}

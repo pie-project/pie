@@ -1,0 +1,14 @@
+[package]
+name = "jacobi-decoding"
+version = "0.1.0"
+description = "Parallel Jacobi Decoding for speculative generation"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+max_tokens = {type = "int", optional = true, description = "Maximum number of tokens to generate (default: 512)"}
+speculation_length = {type = "int", optional = true, description = "Number of tokens to speculate in parallel (default: 5)"}
+prompt = {type = "string", optional = true, description = "Prompt to generate (default: 'Explain the LLM decoding process ELI5.')"}

@@ -1,0 +1,13 @@
+[package]
+name = "agent-codeact"
+version = "0.1.0"
+description = "CodeACT-style agentic workflow with JavaScript code execution"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+num_function_calls = {type = "int", optional = true, description = "Number of sequential code execution cycles (default: 5)"}
+tokens_between_calls = {type = "int", optional = true, description = "Max tokens for each generation step (default: 512)"}

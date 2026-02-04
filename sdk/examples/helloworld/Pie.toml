@@ -1,0 +1,11 @@
+[package]
+name = "helloworld"
+version = "0.1.0"
+description = "Simple hello world example demonstrating the inferlet runtime"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]

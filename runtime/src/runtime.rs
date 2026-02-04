@@ -84,6 +84,7 @@ pub enum Command {
 
     LaunchInstance {
         username: String,
+        program_name: String,
         program_hash: ProgramHash,
         arguments: Vec<String>,
         detached: bool,
@@ -282,13 +283,14 @@ impl Service for Runtime {
 
             Command::LaunchInstance {
                 username,
+                program_name,
                 program_hash,
                 event,
                 arguments,
                 detached,
             } => {
                 let res = self
-                    .launch_instance(username, program_hash, arguments, detached)
+                    .launch_instance(username, program_name, program_hash, arguments, detached)
                     .await;
                 event
                     .send(res)
@@ -511,6 +513,7 @@ impl Runtime {
     async fn launch_instance(
         &self,
         username: String,
+        program_name: String,
         program_hash: ProgramHash,
         arguments: Vec<String>,
         detached: bool,
@@ -532,6 +535,7 @@ impl Runtime {
         let join_handle = tokio::spawn(Self::launch(
             instance_id,
             username.clone(),
+            program_name,
             component,
             dependency_components,
             arguments.clone(),
@@ -877,6 +881,7 @@ impl Runtime {
     async fn launch(
         instance_id: InstanceId,
         username: String,
+        program_name: String,
         component: Component,
         dependency_components: Vec<Component>,
         arguments: Vec<String>,
@@ -929,9 +934,12 @@ impl Runtime {
                 .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
 
             // Attempt to call "run"
+            let run_interface = format!("pie:{}/run", program_name);
             let (_, run_export) = instance
-                .get_export(&mut store, None, "inferlet:core/run")
-                .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
+                .get_export(&mut store, None, &run_interface)
+                .ok_or_else(|| {
+                    RuntimeError::Other(format!("No '{}' export found", run_interface))
+                })?;
 
             let (_, run_func_export) = instance
                 .get_export(&mut store, Some(&run_export), "run")

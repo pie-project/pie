@@ -1,0 +1,12 @@
+[package]
+name = "parallel-generation"
+version = "0.1.0"
+description = "Parallel text generation from forked contexts with shared KV cache"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+max_tokens = {type = "int", optional = true, description = "Max tokens to generate for each prompt (default: 128)"}

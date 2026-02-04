@@ -1,0 +1,14 @@
+[package]
+name = "text-completion"
+version = "0.1.0"
+description = "Text completion example using inferlet"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "The user message to complete (default: 'Hello, world!')"}
+max_tokens = {type = "int", optional = true, description = "Maximum number of tokens to generate (default: 256)"}
+system = {type = "string", optional = true, description = "System prompt to set assistant behavior (default: 'You are a helpful assistant.')"}

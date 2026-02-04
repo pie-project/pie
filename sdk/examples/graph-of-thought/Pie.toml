@@ -1,0 +1,14 @@
+[package]
+name = "graph-of-thought"
+version = "0.1.0"
+description = "Graph-of-Thought for hierarchical aggregation of multiple proposals"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+question = {type = "string", optional = true, description = "The question to process (default: 'Calculate (42 + 3) * 5 / 15.')"}
+proposal_tokens = {type = "string", optional = true, description = "Comma-separated list of max tokens for initial proposals (default: '256,256,256,256,256,256,256,256')"}
+aggregation_tokens = {type = "int", optional = true, description = "Max tokens for each aggregation step (default: 256)"}

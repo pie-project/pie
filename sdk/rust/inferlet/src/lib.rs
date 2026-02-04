@@ -9,6 +9,7 @@ pub use pico_args::Arguments as Args;
 use std::collections::HashSet;
 use std::rc::Rc;
 pub use wasi;
+pub use wit_bindgen;
 pub use wstd;
 
 mod zo;
@@ -387,23 +388,26 @@ pub trait Run {
     async fn run() -> Result<(), String>;
 }
 
-pub struct App<T> {
-    _phantom: std::marker::PhantomData<T>,
-}
-
-impl<T> api::Guest for App<T>
-where
-    T: Run,
-{
-    fn run() -> Result<(), String> {
-        let result = wstd::runtime::block_on(async { T::run().await });
-        if let Err(e) = result {
-            return Err(format!("{:?}", e));
-        }
-
-        Ok(())
-    }
-}
+// NOTE: App<T> is no longer used because each package now has its own dynamically
+// generated Guest trait via the #[inferlet::main] macro. Use that macro instead.
+//
+// pub struct App<T> {
+//     _phantom: std::marker::PhantomData<T>,
+// }
+//
+// impl<T> api::Guest for App<T>
+// where
+//     T: Run,
+// {
+//     fn run() -> Result<(), String> {
+//         let result = wstd::runtime::block_on(async { T::run().await });
+//         if let Err(e) = result {
+//             return Err(format!("{:?}", e));
+//         }
+//
+//         Ok(())
+//     }
+// }
 // #[trait_variant::make(LocalServe: Send)]
 // pub trait Serve {
 //     async fn serve(

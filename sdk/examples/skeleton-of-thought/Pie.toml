@@ -1,0 +1,15 @@
+[package]
+name = "skeleton-of-thought"
+version = "0.1.0"
+description = "Skeleton-of-Thought for parallel elaboration of key points"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+question = {type = "string", optional = true, description = "The question to answer (default: 'What are the defining characteristics of Rome?')"}
+num_points = {type = "int", optional = true, description = "Maximum number of key points to generate in the plan (default: 3)"}
+plan_tokens = {type = "int", optional = true, description = "Max tokens for the planning generation (default: 256)"}
+elab_tokens = {type = "int", optional = true, description = "Max tokens for each elaboration generation (default: 256)"}

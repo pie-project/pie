@@ -1107,6 +1107,7 @@ impl Session {
             // Launch the instance
             self.launch_instance_from_loaded_program(
                 corr_id,
+                program_name.name.clone(),
                 program_metadata.wasm_hash,
                 program_metadata.manifest_hash,
                 arguments,
@@ -1175,6 +1176,7 @@ impl Session {
         // Launch the instance
         self.launch_instance_from_loaded_program(
             corr_id,
+            program_name.name.clone(),
             program_metadata.wasm_hash,
             program_metadata.manifest_hash,
             arguments,
@@ -1187,6 +1189,7 @@ impl Session {
     async fn launch_instance_from_loaded_program(
         &mut self,
         corr_id: u32,
+        program_name: String,
         wasm_hash: String,
         manifest_hash: String,
         arguments: Vec<String>,
@@ -1197,6 +1200,7 @@ impl Session {
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchInstance {
             username: self.username.clone(),
+            program_name,
             program_hash,
             arguments,
             detached,
