@@ -5,6 +5,7 @@ use crate::api::pie;
 use crate::api::types::FutureBool;
 use crate::context::{self, ContextId, LockId, Message};
 use crate::instance::InstanceState;
+use crate::model::ModelId;
 use anyhow::Result;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
@@ -15,8 +16,8 @@ use wasmtime_wasi::WasiView;
 pub struct Context {
     /// The context ID assigned by the ContextActor
     pub context_id: ContextId,
-    /// The model service index (for routing to the correct ContextActor)
-    pub model_idx: usize,
+    /// The model ID (for routing to the correct ContextActor)
+    pub model_id: ModelId,
     /// The user ID associated with this context
     pub user_id: u32,
     /// Currently held lock ID (if any)
@@ -33,7 +34,7 @@ impl pie::core::context::HostContext for InstanceState {
         fill: Option<Vec<u32>>,
     ) -> Result<Result<Resource<Context>, String>> {
         let model = self.ctx().table.get(&model)?;
-        let model_idx = model.model_id;
+        let model_id = model.model_id;
         let user_id = 0u32; // TODO: Get from InstanceState
 
         let (tx, rx) = oneshot::channel();
@@ -43,13 +44,13 @@ impl pie::core::context::HostContext for InstanceState {
             fill,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         match rx.await? {
             Ok(context_id) => {
                 let ctx = Context {
                     context_id,
-                    model_idx,
+                    model_id,
                     user_id,
                     lock_id: None,
                 };
@@ -62,7 +63,7 @@ impl pie::core::context::HostContext for InstanceState {
     async fn destroy(&mut self, this: Resource<Context>) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         let (tx, rx) = oneshot::channel();
@@ -71,7 +72,7 @@ impl pie::core::context::HostContext for InstanceState {
             lock_id,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         // Wait for response but ignore errors - destroy is void in WIT
         let _ = rx.await;
@@ -85,7 +86,7 @@ impl pie::core::context::HostContext for InstanceState {
         name: String,
     ) -> Result<Option<Resource<Context>>> {
         let model = self.ctx().table.get(&model)?;
-        let model_idx = model.model_id;
+        let model_id = model.model_id;
         let user_id = 0u32; // TODO: Get from InstanceState
 
         let (tx, rx) = oneshot::channel();
@@ -94,13 +95,13 @@ impl pie::core::context::HostContext for InstanceState {
             name,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         match rx.await? {
             Some(context_id) => {
                 let ctx = Context {
                     context_id,
-                    model_idx,
+                    model_id,
                     user_id,
                     lock_id: None,
                 };
@@ -117,7 +118,7 @@ impl pie::core::context::HostContext for InstanceState {
     ) -> Result<Result<Resource<Context>, String>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let user_id = ctx.user_id;
 
         let (tx, rx) = oneshot::channel();
@@ -127,13 +128,13 @@ impl pie::core::context::HostContext for InstanceState {
             new_name,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         match rx.await? {
             Ok(new_context_id) => {
                 let new_ctx = Context {
                     context_id: new_context_id,
-                    model_idx,
+                    model_id,
                     user_id,
                     lock_id: None,
                 };
@@ -152,14 +153,14 @@ impl pie::core::context::HostContext for InstanceState {
     async fn acquire_lock(&mut self, this: Resource<Context>) -> Result<Resource<FutureBool>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
 
         let (tx, rx) = oneshot::channel();
         Message::AcquireLock {
             id: context_id,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         // Create a channel to transform the LockId response into a bool
         let (bool_tx, bool_rx) = oneshot::channel();
@@ -181,14 +182,14 @@ impl pie::core::context::HostContext for InstanceState {
     async fn release_lock(&mut self, this: Resource<Context>) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get_mut(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.take().unwrap_or(0);
 
         Message::ReleaseLock {
             id: context_id,
             lock_id,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         Ok(Ok(()))
     }
@@ -196,26 +197,26 @@ impl pie::core::context::HostContext for InstanceState {
     async fn tokens_per_page(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
 
         let (tx, rx) = oneshot::channel();
         Message::TokensPerPage {
             id: context_id,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         Ok(rx.await?)
     }
 
     async fn model(&mut self, this: Resource<Context>) -> Result<Resource<Model>> {
         let ctx = self.ctx().table.get(&this)?;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
 
         // Get cached model directly - no message passing needed
-        if let Some(m) = crate::model::get_model(model_idx) {
+        if let Some(m) = crate::model::get_model(model_id) {
             let model = Model {
-                model_id: model_idx,
+                model_id: model_id,
                 info: m.info,
                 tokenizer: m.tokenizer,
             };
@@ -228,14 +229,14 @@ impl pie::core::context::HostContext for InstanceState {
     async fn committed_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
 
         let (tx, rx) = oneshot::channel();
         Message::CommittedPageCount {
             id: context_id,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         Ok(rx.await?)
     }
@@ -243,7 +244,7 @@ impl pie::core::context::HostContext for InstanceState {
     async fn uncommitted_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         let (tx, rx) = oneshot::channel();
@@ -252,7 +253,7 @@ impl pie::core::context::HostContext for InstanceState {
             lock_id,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         let tokens = rx.await?;
         // Calculate page count from tokens
@@ -267,7 +268,7 @@ impl pie::core::context::HostContext for InstanceState {
     ) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         let (tx, rx) = oneshot::channel();
@@ -277,7 +278,7 @@ impl pie::core::context::HostContext for InstanceState {
             page_indices,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         match rx.await? {
             Ok(()) => Ok(Ok(())),
@@ -292,7 +293,7 @@ impl pie::core::context::HostContext for InstanceState {
     ) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         let (tx, rx) = oneshot::channel();
@@ -302,7 +303,7 @@ impl pie::core::context::HostContext for InstanceState {
             num_pages,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         match rx.await? {
             Ok(()) => Ok(Ok(())),
@@ -317,7 +318,7 @@ impl pie::core::context::HostContext for InstanceState {
     ) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         Message::ReleasePages {
@@ -325,7 +326,7 @@ impl pie::core::context::HostContext for InstanceState {
             lock_id,
             num_pages,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         Ok(())
     }
@@ -333,7 +334,7 @@ impl pie::core::context::HostContext for InstanceState {
     async fn cursor(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         let (tx, rx) = oneshot::channel();
@@ -342,7 +343,7 @@ impl pie::core::context::HostContext for InstanceState {
             lock_id,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         Ok(rx.await?)
     }
@@ -354,7 +355,7 @@ impl pie::core::context::HostContext for InstanceState {
     ) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         Message::SetCursor {
@@ -362,7 +363,7 @@ impl pie::core::context::HostContext for InstanceState {
             lock_id,
             cursor,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         Ok(())
     }
@@ -370,7 +371,7 @@ impl pie::core::context::HostContext for InstanceState {
     async fn buffered_tokens(&mut self, this: Resource<Context>) -> Result<Vec<u32>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         let (tx, rx) = oneshot::channel();
@@ -379,7 +380,7 @@ impl pie::core::context::HostContext for InstanceState {
             lock_id,
             response: tx,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         Ok(rx.await?)
     }
@@ -391,7 +392,7 @@ impl pie::core::context::HostContext for InstanceState {
     ) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         Message::SetBufferedTokens {
@@ -399,7 +400,7 @@ impl pie::core::context::HostContext for InstanceState {
             lock_id,
             tokens,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         Ok(())
     }
@@ -411,7 +412,7 @@ impl pie::core::context::HostContext for InstanceState {
     ) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
-        let model_idx = ctx.model_idx;
+        let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
         Message::AppendBufferedTokens {
@@ -419,7 +420,7 @@ impl pie::core::context::HostContext for InstanceState {
             lock_id,
             tokens,
         }
-        .send(model_idx)?;
+        .send(model_id)?;
 
         Ok(())
     }

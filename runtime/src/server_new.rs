@@ -1,15 +1,10 @@
-//! Server Service - Client connection and request handling
-//!
-//! This module provides actors for server management using the
-//! modern actor model (Handle trait). It handles WebSocket connections,
-//! authentication, program management, and instance lifecycle.
-
-use std::mem;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
-
+use crate::auth::{AuthorizedUsers, PublicKey};
+use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
+use crate::messaging::PushPullCommand;
+use crate::model;
+use crate::runtime::{self, AttachInstanceResult, ProgramHash, TerminationCause};
+use crate::service::{CommandDispatcher, Service, ServiceCommand};
+use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine as Base64Engine;
 use bytes::Bytes;
@@ -17,79 +12,70 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use pie_client::message::{self, ClientMessage, EventCode, ServerMessage, StreamingOutput};
 use ring::rand::{SecureRandom, SystemRandom};
+use std::collections::HashSet;
+use std::mem;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::task::{self, JoinHandle};
+use tokio::task;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
 use tungstenite::Message as WsMessage;
 use uuid::Uuid;
 use wasmtime::Engine as WasmEngine;
 use wasmtime::component::Component;
 
-use crate::actor::{Actor, Handle, SendError};
-use crate::auth::{AuthorizedUsers, PublicKey};
-use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
-use crate::messaging::{self, PushPullMessage};
-use crate::runtime::{self, AttachInstanceResult, TerminationCause};
-use crate::utils::IdPool;
-use std::collections::HashSet;
-use std::path::Path;
-
 type ClientId = u32;
 
-// =============================================================================
-// Server Actor
-// =============================================================================
+/// The sender of the command channel, which is used to send commands to the
+/// handler task.
+static COMMAND_DISPATCHER: OnceLock<CommandDispatcher<ServerEvent>> = OnceLock::new();
 
-/// Global singleton Server actor.
-static ACTOR: LazyLock<Actor<Message>> = LazyLock::new(Actor::new);
-
-/// Spawns the Server actor with configuration.
-pub fn spawn(config: ServerConfig) {
-    ACTOR.spawn_with::<ServerActor, _>(|| ServerActor::with_config(config));
+/// Starts the server service. A daemon task will be spawned to handle the
+/// commands dispatched from other services.
+pub fn start_service(
+    ip_port: &str,
+    enable_auth: bool,
+    authorized_users: AuthorizedUsers,
+    internal_auth_token: String,
+    registry_url: String,
+    cache_dir: PathBuf,
+    wasm_engine: WasmEngine,
+) {
+    let server = Server::new(
+        ip_port,
+        enable_auth,
+        authorized_users,
+        internal_auth_token,
+        registry_url,
+        cache_dir,
+        wasm_engine,
+    );
+    server.start(&COMMAND_DISPATCHER);
 }
 
-/// Sends a message to the Server actor.
-pub fn send(msg: Message) -> Result<(), SendError> {
-    ACTOR.send(msg)
-}
-
-/// Check if the server actor is spawned.
-pub fn is_spawned() -> bool {
-    ACTOR.is_spawned()
-}
-
-// =============================================================================
-// Configuration
-// =============================================================================
-
-/// Server configuration.
 #[derive(Debug)]
-pub struct ServerConfig {
-    pub ip_port: String,
-    pub enable_auth: bool,
-    pub authorized_users: AuthorizedUsers,
-    pub internal_auth_token: String,
-    pub registry_url: String,
-    pub cache_dir: PathBuf,
-    pub wasm_engine: WasmEngine,
-}
-
-// =============================================================================
-// Messages
-// =============================================================================
-
-/// Messages for the Server actor.
-#[derive(Debug)]
-pub enum Message {
-    /// Instance event from runtime
+pub enum ServerEvent {
     InstanceEvent(InstanceEvent),
-    /// Internal event
     InternalEvent(InternalEvent),
 }
 
-/// Events from instances to be forwarded to clients.
+impl From<InstanceEvent> for ServerEvent {
+    fn from(event: InstanceEvent) -> Self {
+        ServerEvent::InstanceEvent(event)
+    }
+}
+
+impl From<InternalEvent> for ServerEvent {
+    fn from(event: InternalEvent) -> Self {
+        ServerEvent::InternalEvent(event)
+    }
+}
+
 #[derive(Debug)]
 pub enum InstanceEvent {
     SendMsgToClient {
@@ -111,7 +97,6 @@ pub enum InstanceEvent {
     },
 }
 
-/// Internal server events.
 #[derive(Debug)]
 pub enum InternalEvent {
     WaitBackendChange {
@@ -121,46 +106,21 @@ pub enum InternalEvent {
     },
 }
 
-impl From<InstanceEvent> for Message {
-    fn from(event: InstanceEvent) -> Self {
-        Message::InstanceEvent(event)
-    }
-}
-
-impl From<InternalEvent> for Message {
-    fn from(event: InternalEvent) -> Self {
-        Message::InternalEvent(event)
-    }
-}
-
-impl Message {
-    pub fn send(self) -> Result<(), SendError> {
-        ACTOR.send(self)
-    }
+impl ServiceCommand for ServerEvent {
+    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &COMMAND_DISPATCHER;
 }
 
 impl InstanceEvent {
     pub fn dispatch(self) {
-        let _ = Message::from(self).send();
+        ServerEvent::from(self).dispatch()
     }
 }
 
 impl InternalEvent {
     pub fn dispatch(self) {
-        let _ = Message::from(self).send();
+        ServerEvent::from(self).dispatch()
     }
 }
-
-/// Server status information.
-#[derive(Debug, Clone)]
-pub struct ServerStatus {
-    pub active_connections: usize,
-    pub total_requests: u64,
-}
-
-// =============================================================================
-// Program Metadata
-// =============================================================================
 
 /// Identifier for an inferlet (name, version).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -200,9 +160,23 @@ struct ProgramMetadata {
     dependencies: Vec<ProgramName>,
 }
 
-// =============================================================================
-// Backend Status
-// =============================================================================
+struct ServerState {
+    /// Wasmtime engine for compiling WASM to native code (shared with runtime)
+    wasm_engine: WasmEngine,
+    enable_auth: bool,
+    authorized_users: AuthorizedUsers,
+    internal_auth_token: String,
+    registry_url: String,
+    cache_dir: PathBuf,
+    client_id_pool: Mutex<IdPool<ClientId>>,
+    clients: DashMap<ClientId, JoinHandle<()>>,
+    client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
+    backend_status: Arc<BackendStatus>,
+    /// Uploaded programs on disk, keyed by program name (name, version)
+    uploaded_programs_in_disk: DashMap<ProgramName, ProgramMetadata>,
+    /// Registry-downloaded programs on disk, keyed by program name (name, version)
+    registry_programs_in_disk: DashMap<ProgramName, ProgramMetadata>,
+}
 
 struct BackendStatus {
     attached_count: AtomicU32,
@@ -219,13 +193,13 @@ impl BackendStatus {
         }
     }
 
-    fn increment_rejected_count(&self) {
-        self.rejected_count.fetch_add(1, Ordering::SeqCst);
+    fn increment_attached_count(&self) {
+        self.attached_count.fetch_add(1, Ordering::SeqCst);
         self.count_change_notify.notify_waiters();
     }
 
-    fn increment_attached_count(&self) {
-        self.attached_count.fetch_add(1, Ordering::SeqCst);
+    fn increment_rejected_count(&self) {
+        self.rejected_count.fetch_add(1, Ordering::SeqCst);
         self.count_change_notify.notify_waiters();
     }
 
@@ -237,77 +211,69 @@ impl BackendStatus {
     ) {
         tokio::spawn(async move {
             loop {
+                // IMPORTANT: Create the notified future BEFORE checking the condition
+                // to avoid race condition where notification happens between check and wait
                 let notified = self.count_change_notify.notified();
+
                 let num_attached = self.attached_count.load(Ordering::SeqCst);
                 let num_rejected = self.rejected_count.load(Ordering::SeqCst);
 
+                // Check if values have changed from what client knows
                 let attached_changed =
                     cur_num_attached_backends.map_or(true, |v| v != num_attached);
                 let rejected_changed =
                     cur_num_detached_backends.map_or(true, |v| v != num_rejected);
 
+                // Send back the new values if they have changed
                 if attached_changed || rejected_changed {
-                    let _ = tx.send((num_attached, num_rejected));
+                    tx.send((num_attached, num_rejected)).unwrap();
                     return;
                 }
+
+                // Wait for notification of backend changes
                 notified.await;
             }
         });
     }
 }
 
-// =============================================================================
-// Server State
-// =============================================================================
-
-struct ServerState {
-    wasm_engine: WasmEngine,
-    enable_auth: bool,
-    authorized_users: AuthorizedUsers,
-    internal_auth_token: String,
-    registry_url: String,
-    cache_dir: PathBuf,
-    client_id_pool: Mutex<IdPool<ClientId>>,
-    clients: DashMap<ClientId, JoinHandle<()>>,
-    client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
-    backend_status: Arc<BackendStatus>,
-    /// Uploaded programs on disk, keyed by program name
-    uploaded_programs_in_disk: DashMap<ProgramName, ProgramMetadata>,
-    /// Registry-downloaded programs on disk, keyed by program name
-    registry_programs_in_disk: DashMap<ProgramName, ProgramMetadata>,
-}
-
-// =============================================================================
-// Server
-// =============================================================================
-
 struct Server {
     state: Arc<ServerState>,
 }
 
 impl Server {
-    fn new(config: ServerConfig) -> Self {
+    fn new(
+        ip_port: &str,
+        enable_auth: bool,
+        authorized_users: AuthorizedUsers,
+        internal_auth_token: String,
+        registry_url: String,
+        cache_dir: PathBuf,
+        wasm_engine: WasmEngine,
+    ) -> Self {
         let uploaded_programs_in_disk = DashMap::new();
         let registry_programs_in_disk = DashMap::new();
 
-        let programs_dir = config.cache_dir.join("programs");
+        // Load existing programs from disk
+        // - Uploads: {cache_dir}/programs/{name}/{version}.wasm
+        // - Registry: {cache_dir}/registry/{name}/{version}.wasm
+        let programs_dir = cache_dir.join("programs");
         if programs_dir.exists() {
             load_programs_from_dir(&programs_dir, &uploaded_programs_in_disk);
         }
 
-        let registry_dir = config.cache_dir.join("registry");
+        let registry_dir = cache_dir.join("registry");
         if registry_dir.exists() {
             load_programs_from_dir(&registry_dir, &registry_programs_in_disk);
         }
 
-        let ip_port = config.ip_port.clone();
         let state = Arc::new(ServerState {
-            wasm_engine: config.wasm_engine,
-            enable_auth: config.enable_auth,
-            authorized_users: config.authorized_users,
-            internal_auth_token: config.internal_auth_token,
-            registry_url: config.registry_url,
-            cache_dir: config.cache_dir,
+            wasm_engine,
+            enable_auth,
+            authorized_users,
+            internal_auth_token,
+            registry_url,
+            cache_dir,
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
             client_cmd_txs: DashMap::new(),
@@ -316,7 +282,7 @@ impl Server {
             registry_programs_in_disk,
         });
 
-        let _listener = task::spawn(Self::listener_loop(ip_port, state.clone()));
+        let _listener = task::spawn(Self::listener_loop(ip_port.to_string(), state.clone()));
         Server { state }
     }
 
@@ -339,10 +305,15 @@ impl Server {
             }
         }
     }
+}
 
-    async fn handle(&mut self, msg: Message) {
-        match msg {
-            Message::InstanceEvent(event) => {
+impl Service for Server {
+    type Command = ServerEvent;
+
+    async fn handle(&mut self, cmd: Self::Command) {
+        match cmd {
+            ServerEvent::InstanceEvent(event) => {
+                // Correctly extract instance_id from all relevant commands
                 let inst_id = match &event {
                     InstanceEvent::SendMsgToClient { inst_id, .. }
                     | InstanceEvent::Terminate { inst_id, .. }
@@ -350,11 +321,12 @@ impl Server {
                     | InstanceEvent::StreamingOutput { inst_id, .. } => *inst_id,
                 };
 
+                // Send it to the client if it's connected
                 if let Some(chan) = self.state.client_cmd_txs.get(&inst_id) {
                     chan.send(SessionEvent::InstanceEvent(event)).await.ok();
                 }
             }
-            Message::InternalEvent(event) => match event {
+            ServerEvent::InternalEvent(event) => match event {
                 InternalEvent::WaitBackendChange {
                     cur_num_attached_backends,
                     cur_num_rejected_backends,
@@ -371,38 +343,7 @@ impl Server {
     }
 }
 
-// =============================================================================
-// ServerActor
-// =============================================================================
-
-struct ServerActor {
-    server: Server,
-}
-
-impl ServerActor {
-    fn with_config(config: ServerConfig) -> Self {
-        ServerActor {
-            server: Server::new(config),
-        }
-    }
-}
-
-impl Handle for ServerActor {
-    type Message = Message;
-
-    fn new() -> Self {
-        panic!("ServerActor requires config; use spawn() instead")
-    }
-
-    async fn handle(&mut self, msg: Message) {
-        self.server.handle(msg).await;
-    }
-}
-
-// =============================================================================
-// Session
-// =============================================================================
-
+/// A generic struct to manage chunked, in-flight uploads for both programs and blobs.
 struct InFlightUpload {
     total_chunks: usize,
     buffer: Vec<u8>,
@@ -410,23 +351,27 @@ struct InFlightUpload {
     manifest: String,
 }
 
-enum SessionEvent {
-    ClientRequest(ClientMessage),
-    InstanceEvent(InstanceEvent),
-}
-
 struct Session {
     id: ClientId,
     username: String,
+
     state: Arc<ServerState>,
+
     inflight_program_upload: Option<InFlightUpload>,
     inflight_blob_uploads: DashMap<String, InFlightUpload>,
     attached_instances: Vec<InstanceId>,
+
     ws_msg_tx: mpsc::Sender<WsMessage>,
     client_cmd_rx: mpsc::Receiver<SessionEvent>,
     client_cmd_tx: mpsc::Sender<SessionEvent>,
+
     send_pump: JoinHandle<()>,
     recv_pump: JoinHandle<()>,
+}
+
+enum SessionEvent {
+    ClientRequest(ClientMessage),
+    InstanceEvent(InstanceEvent),
 }
 
 impl Session {
@@ -452,14 +397,18 @@ impl Session {
         });
 
         let cloned_client_cmd_tx = client_cmd_tx.clone();
+
         let recv_pump = task::spawn(async move {
             while let Some(Ok(ws_msg)) = ws_reader.next().await {
+                // Expect to receive only binary messages. Break the loop on close.
+                // Ignore all other messages.
                 let bytes = match ws_msg {
                     WsMessage::Binary(bytes) => bytes,
                     WsMessage::Close(_) => break,
                     _ => continue,
                 };
 
+                // Deserialize the client message.
                 let client_msg = match rmp_serde::decode::from_slice::<ClientMessage>(&bytes) {
                     Ok(msg) => msg,
                     Err(e) => {
@@ -468,6 +417,7 @@ impl Session {
                     }
                 };
 
+                // Forward the client message to the client command receiver.
                 cloned_client_cmd_tx
                     .send(SessionEvent::ClientRequest(client_msg))
                     .await
@@ -508,44 +458,13 @@ impl Session {
             }
         }))
     }
-}
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        for inst_id in self.attached_instances.drain(..) {
-            let server_state = Arc::clone(&self.state);
-            task::spawn(async move {
-                runtime::Message::SetOutputDelivery {
-                    inst_id,
-                    mode: OutputDelivery::Buffered,
-                }
-                .send()
-                .unwrap();
-                server_state.client_cmd_txs.remove(&inst_id);
-                runtime::Message::DetachInstance { inst_id }.send().unwrap();
-            });
-        }
-
-        self.recv_pump.abort();
-        self.state.clients.remove(&self.id);
-
-        let id = self.id;
-        let state = Arc::clone(&self.state);
-        task::spawn(async move {
-            state.client_id_pool.lock().await.release(id).ok();
-        });
-    }
-}
-
-// =============================================================================
-// Session - Authentication
-// =============================================================================
-
-impl Session {
     async fn authenticate(&mut self) -> Result<()> {
         let cmd = tokio::select! {
             biased;
-            Some(cmd) = self.client_cmd_rx.recv() => cmd,
+            Some(cmd) = self.client_cmd_rx.recv() => {
+                cmd
+            },
             _ = &mut self.recv_pump => { bail!("Socket terminated"); },
             _ = &mut self.send_pump => { bail!("Socket terminated"); },
             else => { bail!("Socket terminated"); },
@@ -562,7 +481,11 @@ impl Session {
         }
     }
 
+    /// Authenticates a user client using public key.
     async fn external_authenticate(&mut self, corr_id: u32, username: String) -> Result<()> {
+        // If authentication is disabled, we authorize the user immediately without
+        // checking if they are in the authorized users file or challenging them.
+
         if !self.state.enable_auth {
             self.username = username;
             self.send_response(
@@ -574,6 +497,7 @@ impl Session {
             return Ok(());
         }
 
+        // Check if the username is in the authorized users file and get the user's public keys
         let public_keys: Vec<PublicKey> = match self.state.authorized_users.get(&username) {
             Some(keys) => keys.public_keys().cloned().collect(),
             None => {
@@ -587,29 +511,40 @@ impl Session {
             }
         };
 
+        // Generate a cryptographically secure random challenge (48 bytes = 384 bits)
+        // Use `ring::rand::SystemRandom` for cryptographic randomness.
+        // Size chosen to match ECDSA P-384, the highest security level supported.
         let rng = SystemRandom::new();
         let mut challenge = [0u8; 48];
         rng.fill(&mut challenge)
             .map_err(|e| anyhow!("Failed to generate random challenge: {}", e))?;
 
+        // Encode the challenge as base64 and send it to the client
         let challenge_b64 = base64::engine::general_purpose::STANDARD.encode(&challenge);
         self.send_response(corr_id, true, challenge_b64).await;
 
+        // Wait for the signature response from the client
         let cmd = tokio::select! {
             biased;
-            Some(cmd) = self.client_cmd_rx.recv() => cmd,
+            Some(cmd) = self.client_cmd_rx.recv() => {
+                cmd
+            },
             _ = &mut self.recv_pump => { bail!("Socket terminated"); },
             _ = &mut self.send_pump => { bail!("Socket terminated"); },
             else => { bail!("Socket terminated"); },
         };
 
+        // Verify the signature
         let (corr_id, signature_b64) = match cmd {
             SessionEvent::ClientRequest(ClientMessage::Signature { corr_id, signature }) => {
                 (corr_id, signature)
             }
-            _ => bail!("Expected Signature message for user '{}'", username),
+            _ => {
+                bail!("Expected Signature message for user '{}'", username)
+            }
         };
 
+        // Decode the signature from base64
         let signature_bytes = match base64::engine::general_purpose::STANDARD
             .decode(signature_b64.as_bytes())
         {
@@ -621,6 +556,7 @@ impl Session {
             }
         };
 
+        // Check if the signature is valid for any of the user's public keys
         let verified = public_keys
             .iter()
             .any(|key| key.verify(&challenge, &signature_bytes).is_ok());
@@ -637,6 +573,9 @@ impl Session {
         Ok(())
     }
 
+    /// Authenticates a client using an internal token.
+    /// This method is used for internal communication between the backend and the engine
+    /// as well as between the Pie shell and the engine. This is not used for user authentication.
     async fn internal_authenticate(&mut self, corr_id: u32, token: String) -> Result<()> {
         if token == self.state.internal_auth_token {
             self.username = "internal".to_string();
@@ -645,17 +584,168 @@ impl Session {
             return Ok(());
         }
 
+        // Add random delay to mitigate timing-based side-channel attacks
         let rng = SystemRandom::new();
         let mut random_bytes = [0u8; 2];
         rng.fill(&mut random_bytes)
             .map_err(|e| anyhow!("Failed to generate random delay: {:?}", e))?;
 
+        // Sleep for 1000-3000 milliseconds
         let delay_ms = 1000 + (u16::from_le_bytes(random_bytes) % 2001) as u64;
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
         self.send_response(corr_id, false, "Invalid token".to_string())
             .await;
         bail!("Invalid token")
+    }
+
+    /// Processes a single command.
+    async fn handle_command(&mut self, cmd: SessionEvent) {
+        match cmd {
+            SessionEvent::ClientRequest(message) => match message {
+                ClientMessage::Identification { corr_id, .. } => {
+                    self.send_response(corr_id, true, "Already authenticated".to_string())
+                        .await;
+                }
+                ClientMessage::Signature { corr_id, .. } => {
+                    self.send_response(corr_id, true, "Already authenticated".to_string())
+                        .await;
+                }
+                ClientMessage::InternalAuthenticate { corr_id, token: _ } => {
+                    self.send_response(corr_id, true, "Already authenticated".to_string())
+                        .await;
+                }
+                ClientMessage::Query {
+                    corr_id,
+                    subject,
+                    record,
+                } => self.handle_query(corr_id, subject, record).await,
+                ClientMessage::InstallProgram {
+                    corr_id,
+                    program_hash,
+                    manifest,
+                    chunk_index,
+                    total_chunks,
+                    chunk_data,
+                } => {
+                    self.handle_install_program(
+                        corr_id,
+                        program_hash,
+                        manifest,
+                        chunk_index,
+                        total_chunks,
+                        chunk_data,
+                    )
+                    .await
+                }
+                ClientMessage::LaunchInstance {
+                    corr_id,
+                    inferlet,
+                    arguments,
+                    detached,
+                } => {
+                    let program_name = ProgramName::parse(&inferlet);
+                    self.handle_launch_instance(corr_id, program_name, arguments, detached)
+                        .await
+                }
+                ClientMessage::LaunchInstanceFromRegistry {
+                    corr_id,
+                    inferlet,
+                    arguments,
+                    detached,
+                } => {
+                    let program_name = ProgramName::parse(&inferlet);
+                    self.handle_launch_instance_from_registry(
+                        corr_id,
+                        program_name,
+                        arguments,
+                        detached,
+                    )
+                    .await
+                }
+                ClientMessage::AttachInstance {
+                    corr_id,
+                    instance_id,
+                } => {
+                    self.handle_attach_instance(corr_id, instance_id).await;
+                }
+                ClientMessage::LaunchServerInstance {
+                    corr_id,
+                    port,
+                    inferlet,
+                    arguments,
+                } => {
+                    self.handle_launch_server_instance(corr_id, port, inferlet, arguments)
+                        .await
+                }
+                ClientMessage::SignalInstance {
+                    instance_id,
+                    message,
+                } => self.handle_signal_instance(instance_id, message).await,
+                ClientMessage::TerminateInstance {
+                    corr_id,
+                    instance_id,
+                } => self.handle_terminate_instance(corr_id, instance_id).await,
+                ClientMessage::AttachRemoteService {
+                    corr_id,
+                    endpoint,
+                    service_type,
+                    service_name,
+                } => {
+                    self.handle_attach_remote_service(
+                        corr_id,
+                        endpoint,
+                        service_type,
+                        service_name,
+                    )
+                    .await;
+                }
+                ClientMessage::UploadBlob {
+                    corr_id,
+                    instance_id,
+                    blob_hash,
+                    chunk_index,
+                    total_chunks,
+                    chunk_data,
+                } => {
+                    self.handle_upload_blob(
+                        corr_id,
+                        instance_id,
+                        blob_hash,
+                        chunk_index,
+                        total_chunks,
+                        chunk_data,
+                    )
+                    .await;
+                }
+                ClientMessage::Ping { corr_id } => {
+                    self.send_response(corr_id, true, "Pong".to_string()).await;
+                }
+                ClientMessage::ListInstances { corr_id } => {
+                    self.handle_list_instances(corr_id).await;
+                }
+            },
+            SessionEvent::InstanceEvent(cmd) => match cmd {
+                InstanceEvent::SendMsgToClient { inst_id, message } => {
+                    self.send_inst_event(inst_id, EventCode::Message, message)
+                        .await
+                }
+                InstanceEvent::Terminate { inst_id, cause } => {
+                    self.handle_instance_termination(inst_id, cause).await;
+                }
+                InstanceEvent::SendBlobToClient { inst_id, data } => {
+                    self.handle_send_blob(inst_id, data).await;
+                }
+                InstanceEvent::StreamingOutput {
+                    inst_id,
+                    output_type,
+                    content,
+                } => {
+                    self.handle_streaming_output(inst_id, output_type, content)
+                        .await;
+                }
+            },
+        }
     }
 
     async fn send(&self, msg: ServerMessage) {
@@ -705,148 +795,6 @@ impl Session {
             message,
         })
         .await;
-    }
-}
-
-// =============================================================================
-// Session - Command Handlers
-// =============================================================================
-
-impl Session {
-    async fn handle_command(&mut self, cmd: SessionEvent) {
-        match cmd {
-            SessionEvent::ClientRequest(message) => match message {
-                ClientMessage::Identification { corr_id, .. } => {
-                    self.send_response(corr_id, true, "Already authenticated".to_string())
-                        .await;
-                }
-                ClientMessage::Signature { corr_id, .. } => {
-                    self.send_response(corr_id, true, "Already authenticated".to_string())
-                        .await;
-                }
-                ClientMessage::InternalAuthenticate { corr_id, token: _ } => {
-                    self.send_response(corr_id, true, "Already authenticated".to_string())
-                        .await;
-                }
-                ClientMessage::Query {
-                    corr_id,
-                    subject,
-                    record,
-                } => self.handle_query(corr_id, subject, record).await,
-                ClientMessage::UploadProgram {
-                    corr_id,
-                    program_hash,
-                    manifest,
-                    chunk_index,
-                    total_chunks,
-                    chunk_data,
-                } => {
-                    self.handle_upload_program(
-                        corr_id,
-                        program_hash,
-                        manifest,
-                        chunk_index,
-                        total_chunks,
-                        chunk_data,
-                    )
-                    .await
-                }
-                ClientMessage::LaunchInstance {
-                    corr_id,
-                    inferlet,
-                    arguments,
-                    detached,
-                } => {
-                    self.handle_launch_instance(corr_id, inferlet, arguments, detached)
-                        .await
-                }
-                ClientMessage::LaunchInstanceFromRegistry {
-                    corr_id,
-                    inferlet,
-                    arguments,
-                    detached,
-                } => {
-                    self.handle_launch_instance_from_registry(corr_id, inferlet, arguments, detached)
-                        .await
-                }
-                ClientMessage::AttachInstance {
-                    corr_id,
-                    instance_id,
-                } => {
-                    self.handle_attach_instance(corr_id, instance_id).await;
-                }
-                ClientMessage::LaunchServerInstance {
-                    corr_id,
-                    port,
-                    inferlet,
-                    arguments,
-                } => {
-                    self.handle_launch_server_instance(corr_id, port, inferlet, arguments)
-                        .await
-                }
-                ClientMessage::SignalInstance {
-                    instance_id,
-                    message,
-                } => self.handle_signal_instance(instance_id, message).await,
-                ClientMessage::TerminateInstance {
-                    corr_id,
-                    instance_id,
-                } => self.handle_terminate_instance(corr_id, instance_id).await,
-                ClientMessage::AttachRemoteService {
-                    corr_id,
-                    endpoint,
-                    service_type,
-                    service_name,
-                } => {
-                    self.handle_attach_remote_service(corr_id, endpoint, service_type, service_name)
-                        .await;
-                }
-                ClientMessage::UploadBlob {
-                    corr_id,
-                    instance_id,
-                    blob_hash,
-                    chunk_index,
-                    total_chunks,
-                    chunk_data,
-                } => {
-                    self.handle_upload_blob(
-                        corr_id,
-                        instance_id,
-                        blob_hash,
-                        chunk_index,
-                        total_chunks,
-                        chunk_data,
-                    )
-                    .await;
-                }
-                ClientMessage::Ping { corr_id } => {
-                    self.send_response(corr_id, true, "Pong".to_string()).await;
-                }
-                ClientMessage::ListInstances { corr_id } => {
-                    self.handle_list_instances(corr_id).await;
-                }
-            },
-            SessionEvent::InstanceEvent(cmd) => match cmd {
-                InstanceEvent::SendMsgToClient { inst_id, message } => {
-                    self.send_inst_event(inst_id, EventCode::Message, message)
-                        .await
-                }
-                InstanceEvent::Terminate { inst_id, cause } => {
-                    self.handle_instance_termination(inst_id, cause).await;
-                }
-                InstanceEvent::SendBlobToClient { inst_id, data } => {
-                    self.handle_send_blob(inst_id, data).await;
-                }
-                InstanceEvent::StreamingOutput {
-                    inst_id,
-                    output_type,
-                    content,
-                } => {
-                    self.handle_streaming_output(inst_id, output_type, content)
-                        .await;
-                }
-            },
-        }
     }
 
     async fn handle_instance_termination(&mut self, inst_id: InstanceId, cause: TerminationCause) {
@@ -904,9 +852,7 @@ impl Session {
                 self.send_response(corr_id, true, result.to_string()).await;
             }
             message::QUERY_MODEL_STATUS => {
-                // Model stats stubbed - the new model architecture uses per-actor stats
-                let runtime_stats: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
+                let runtime_stats = model::runtime_stats().await;
                 self.send_response(
                     corr_id,
                     true,
@@ -915,9 +861,7 @@ impl Session {
                 .await;
             }
             message::QUERY_BACKEND_STATS => {
-                // Backend stats stubbed - the new model architecture uses per-actor stats
-                let runtime_stats: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
+                let runtime_stats = model::runtime_stats().await;
                 let mut sorted_stats: Vec<_> = runtime_stats.iter().collect();
                 sorted_stats.sort_by_key(|(k, _)| *k);
 
@@ -933,12 +877,11 @@ impl Session {
 
     async fn handle_list_instances(&self, corr_id: u32) {
         let (evt_tx, evt_rx) = oneshot::channel();
-        runtime::Message::ListInstances {
+        runtime::Command::ListInstances {
             username: self.username.clone(),
-            response: evt_tx,
+            event: evt_tx,
         }
-        .send()
-        .unwrap();
+        .dispatch();
 
         let instances = evt_rx.await.unwrap();
 
@@ -946,7 +889,7 @@ impl Session {
             .await;
     }
 
-    async fn handle_upload_program(
+    async fn handle_install_program(
         &mut self,
         corr_id: u32,
         program_hash: String,
@@ -1050,7 +993,7 @@ impl Session {
             };
             let dependencies = parse_program_dependencies_from_manifest(&manifest_content);
 
-            // Write to disk: {cache_dir}/programs/{name}/{version}.{wasm,toml,wasm_hash,toml_hash}
+            // Write to disk: {cache_dir}/programs/{name}/{version}.{wasm,toml,hash}
             let dir_path = self
                 .state
                 .cache_dir
@@ -1126,25 +1069,6 @@ impl Session {
                 },
             );
 
-            let component = match compile_wasm_component(&self.state.wasm_engine, raw_bytes).await {
-                Ok(c) => c,
-                Err(e) => {
-                    self.send_response(corr_id, false, e.to_string()).await;
-                    self.inflight_program_upload = None;
-                    return;
-                }
-            };
-
-            let (evt_tx, evt_rx) = oneshot::channel();
-            runtime::Message::LoadProgram {
-                hash: final_hash.clone(),
-                component,
-                response: evt_tx,
-            }
-            .send()
-            .unwrap();
-
-            evt_rx.await.unwrap();
             self.send_response(corr_id, true, final_hash).await;
             self.inflight_program_upload = None;
         }
@@ -1153,23 +1077,21 @@ impl Session {
     async fn handle_launch_instance(
         &mut self,
         corr_id: u32,
-        inferlet: String,
+        program_name: ProgramName,
         arguments: Vec<String>,
         detached: bool,
     ) {
-        let program_name = ProgramName::parse(&inferlet);
-
-        // Check if program is in uploaded programs
-        if let Some(metadata) = self
+        // First, check if the program exists in uploaded programs
+        if let Some(program_metadata) = self
             .state
             .uploaded_programs_in_disk
             .get(&program_name)
             .map(|e| e.value().clone())
         {
-            // Ensure program and all its dependencies are loaded
+            // Program found in uploaded programs - ensure it's loaded (with dependencies) and launch it
             if let Err(e) = ensure_program_loaded_with_dependencies(
                 &self.state.wasm_engine,
-                &metadata,
+                &program_metadata,
                 &program_name,
                 &self.state.uploaded_programs_in_disk,
                 &self.state.registry_programs_in_disk,
@@ -1182,61 +1104,43 @@ impl Session {
                 return;
             }
 
+            // Launch the instance
             self.launch_instance_from_loaded_program(
                 corr_id,
-                metadata.wasm_hash,
+                program_name.name.clone(),
+                program_metadata.wasm_hash,
+                program_metadata.manifest_hash,
                 arguments,
                 detached,
             )
             .await;
+        // Program not found in uploaded programs - fall back to registry
         } else {
-            // Not in uploaded programs, try registry
-            self.handle_launch_instance_from_registry(corr_id, inferlet, arguments, detached)
+            self.handle_launch_instance_from_registry(corr_id, program_name, arguments, detached)
                 .await;
         }
     }
 
+    /// Handles the LaunchInstanceFromRegistry command.
+    ///
+    /// This downloads an inferlet from the registry (with local caching) and launches it.
     async fn handle_launch_instance_from_registry(
         &mut self,
         corr_id: u32,
-        inferlet: String,
+        program_name: ProgramName,
         arguments: Vec<String>,
         detached: bool,
     ) {
-        let program_name = ProgramName::parse(&inferlet);
-
-        // Check if program is already cached from registry
-        if let Some(metadata) = self
+        // Get the program metadata from cache or download from registry
+        let program_metadata = if let Some(metadata) = self
             .state
             .registry_programs_in_disk
             .get(&program_name)
             .map(|e| e.value().clone())
         {
-            // Ensure program and all its dependencies are loaded
-            if let Err(e) = ensure_program_loaded_with_dependencies(
-                &self.state.wasm_engine,
-                &metadata,
-                &program_name,
-                &self.state.uploaded_programs_in_disk,
-                &self.state.registry_programs_in_disk,
-                &self.state.registry_url,
-                &self.state.cache_dir,
-            )
-            .await
-            {
-                self.send_launch_result(corr_id, false, e).await;
-                return;
-            }
-
-            self.launch_instance_from_loaded_program(
-                corr_id,
-                metadata.wasm_hash,
-                arguments,
-                detached,
-            )
-            .await;
+            metadata
         } else {
-            // Download from registry
+            // Program not cached - download from registry
             match try_download_inferlet_from_registry(
                 &self.state.registry_url,
                 &self.state.cache_dir,
@@ -1245,58 +1149,69 @@ impl Session {
             )
             .await
             {
-                Ok(metadata) => {
-                    // Ensure program and all its dependencies are loaded
-                    if let Err(e) = ensure_program_loaded_with_dependencies(
-                        &self.state.wasm_engine,
-                        &metadata,
-                        &program_name,
-                        &self.state.uploaded_programs_in_disk,
-                        &self.state.registry_programs_in_disk,
-                        &self.state.registry_url,
-                        &self.state.cache_dir,
-                    )
-                    .await
-                    {
-                        self.send_launch_result(corr_id, false, e).await;
-                        return;
-                    }
-
-                    self.launch_instance_from_loaded_program(
-                        corr_id,
-                        metadata.wasm_hash,
-                        arguments,
-                        detached,
-                    )
-                    .await;
-                }
+                Ok(metadata) => metadata,
                 Err(e) => {
                     self.send_launch_result(corr_id, false, e.to_string()).await;
+                    return;
                 }
             }
+        };
+
+        // Load the program and its dependencies
+        if let Err(e) = ensure_program_loaded_with_dependencies(
+            &self.state.wasm_engine,
+            &program_metadata,
+            &program_name,
+            &self.state.uploaded_programs_in_disk,
+            &self.state.registry_programs_in_disk,
+            &self.state.registry_url,
+            &self.state.cache_dir,
+        )
+        .await
+        {
+            self.send_launch_result(corr_id, false, e).await;
+            return;
         }
+
+        // Launch the instance
+        self.launch_instance_from_loaded_program(
+            corr_id,
+            program_name.name.clone(),
+            program_metadata.wasm_hash,
+            program_metadata.manifest_hash,
+            arguments,
+            detached,
+        )
+        .await;
     }
 
+    /// Internal helper to launch an instance after the program is already loaded.
     async fn launch_instance_from_loaded_program(
         &mut self,
         corr_id: u32,
-        hash: String,
+        program_name: String,
+        wasm_hash: String,
+        manifest_hash: String,
         arguments: Vec<String>,
         detached: bool,
     ) {
+        let program_hash = ProgramHash::new(wasm_hash, manifest_hash);
+
         let (evt_tx, evt_rx) = oneshot::channel();
-        runtime::Message::LaunchInstance {
+        runtime::Command::LaunchInstance {
             username: self.username.clone(),
-            hash,
+            program_name,
+            program_hash,
             arguments,
             detached,
-            response: evt_tx,
+            event: evt_tx,
         }
-        .send()
-        .unwrap();
+        .dispatch();
 
         match evt_rx.await.unwrap() {
             Ok(instance_id) => {
+                // If the instance is not detached, add it to the attached instances so that its
+                // output can be streamed to the client after it is launched.
                 if !detached {
                     self.state
                         .client_cmd_txs
@@ -1304,14 +1219,19 @@ impl Session {
                     self.attached_instances.push(instance_id);
                 }
 
+                // Send the instance ID to the client before allowing output. This is especially
+                // important for attached instances to prevent a race condition where output
+                // arrives at the client side before the client receives the instance ID.
                 self.send_launch_result(corr_id, true, instance_id.to_string())
                     .await;
 
-                runtime::Message::AllowOutput {
+                // Allow the instance to start producing output. We must do this after sending the
+                // instance ID to the client to prevent a race condition where output arrives at
+                // the client side before the client receives the instance ID.
+                runtime::Command::AllowOutput {
                     inst_id: instance_id,
                 }
-                .send()
-                .unwrap();
+                .dispatch();
             }
             Err(e) => {
                 self.send_launch_result(corr_id, false, e.to_string()).await;
@@ -1320,6 +1240,7 @@ impl Session {
     }
 
     async fn handle_attach_instance(&mut self, corr_id: u32, instance_id: String) {
+        // Parse the instance ID from the string.
         let inst_id = match Uuid::parse_str(&instance_id) {
             Ok(id) => id,
             Err(_) => {
@@ -1331,57 +1252,72 @@ impl Session {
 
         let (evt_tx, evt_rx) = oneshot::channel();
 
-        runtime::Message::AttachInstance {
+        // Change instance state to attached.
+        runtime::Command::AttachInstance {
             inst_id,
-            response: evt_tx,
+            event: evt_tx,
         }
-        .send()
-        .unwrap();
+        .dispatch();
 
         match evt_rx.await.unwrap() {
+            // The instance was attached successfully. Notify the client first and then change
+            // the output delivery mode to streamed so that the client can start receiving output.
             AttachInstanceResult::AttachedRunning => {
                 self.send_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
 
+                // Update the map so that instance events will be forwarded to this session.
                 self.state
                     .client_cmd_txs
                     .insert(inst_id, self.client_cmd_tx.clone());
                 self.attached_instances.push(inst_id);
 
-                runtime::Message::SetOutputDelivery {
+                // Set the output delivery mode to streamed so that new and any buffered output
+                // will be sent to the server as instance events, which will be forwarded to this
+                // session.
+                runtime::Command::SetOutputDelivery {
                     inst_id,
                     mode: OutputDelivery::Streamed,
                 }
-                .send()
-                .unwrap();
+                .dispatch();
             }
+            // The instance has finished execution. Notify the client first and then change the
+            // output delivery mode to streamed so that the client can receive the final output.
+            // Then, terminate the instance and notify the client about the termination.
             AttachInstanceResult::AttachedFinished(cause) => {
                 self.send_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
 
+                // Update the map so that instance events will be forwarded to this session.
                 self.state
                     .client_cmd_txs
                     .insert(inst_id, self.client_cmd_tx.clone());
                 self.attached_instances.push(inst_id);
 
-                runtime::Message::SetOutputDelivery {
+                // Set the output delivery mode to streamed so that new and any buffered output
+                // will be sent to the server as instance events, which will be forwarded to this
+                // session.
+                runtime::Command::SetOutputDelivery {
                     inst_id,
                     mode: OutputDelivery::Streamed,
                 }
-                .send()
-                .unwrap();
+                .dispatch();
 
-                runtime::Message::TerminateInstance {
+                // Terminate the instance and notify the client about the termination.
+                runtime::Command::TerminateInstance {
                     inst_id,
                     notification_to_client: Some(cause),
                 }
-                .send()
-                .unwrap();
+                .dispatch();
             }
+            // The instance was not found.
+            // Remove it from the attached instances and notify the client about the error.
             AttachInstanceResult::InstanceNotFound => {
                 self.send_attach_result(corr_id, false, "Instance not found".to_string())
                     .await;
             }
+            // The instance is already attached to another client.
+            // Remove it from the attached instances and notify the client about the error.
             AttachInstanceResult::AlreadyAttached => {
                 self.send_attach_result(corr_id, false, "Instance already attached".to_string())
                     .await;
@@ -1398,7 +1334,7 @@ impl Session {
     ) {
         let program_name = ProgramName::parse(&inferlet);
 
-        // Check uploaded or registry programs for metadata
+        // Look up the program metadata from disk maps
         let program_metadata = self
             .state
             .uploaded_programs_in_disk
@@ -1411,11 +1347,11 @@ impl Session {
                     .map(|e| e.value().clone())
             });
 
-        if let Some(metadata) = program_metadata {
-            // Ensure program and dependencies are loaded
+        // Ensure the program is loaded (with dependencies)
+        if let Some(program_metadata) = program_metadata {
             if let Err(e) = ensure_program_loaded_with_dependencies(
                 &self.state.wasm_engine,
-                &metadata,
+                &program_metadata,
                 &program_name,
                 &self.state.uploaded_programs_in_disk,
                 &self.state.registry_programs_in_disk,
@@ -1429,15 +1365,17 @@ impl Session {
             }
 
             let (evt_tx, evt_rx) = oneshot::channel();
-            runtime::Message::LaunchServerInstance {
+            runtime::Command::LaunchServerInstance {
                 username: self.username.clone(),
-                hash: metadata.wasm_hash,
+                program_hash: ProgramHash::new(
+                    program_metadata.wasm_hash,
+                    program_metadata.manifest_hash,
+                ),
                 port,
                 arguments,
-                response: evt_tx,
+                event: evt_tx,
             }
-            .send()
-            .unwrap();
+            .dispatch();
 
             match evt_rx.await.unwrap() {
                 Ok(_) => {
@@ -1449,29 +1387,29 @@ impl Session {
         } else {
             self.send_response(corr_id, false, "Program not found".to_string())
                 .await;
+            return;
         }
     }
 
     async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.attached_instances.contains(&inst_id) {
-                messaging::pushpull_send(PushPullMessage::Push {
+                PushPullCommand::Push {
                     topic: inst_id.to_string(),
                     message,
-                })
-                .unwrap();
+                }
+                .dispatch();
             }
         }
     }
 
     async fn handle_terminate_instance(&mut self, corr_id: u32, instance_id: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-            runtime::Message::TerminateInstance {
+            runtime::Command::TerminateInstance {
                 inst_id,
                 notification_to_client: Some(runtime::TerminationCause::Signal),
             }
-            .send()
-            .unwrap();
+            .dispatch();
 
             self.send_response(corr_id, true, "Instance terminated".to_string())
                 .await;
@@ -1488,6 +1426,8 @@ impl Session {
         _service_type: String,
         _service_name: String,
     ) {
+        // IPC-based remote service attachment is no longer supported.
+        // In FFI mode, models are registered directly during server startup.
         self.send_response(
             corr_id,
             false,
@@ -1497,6 +1437,7 @@ impl Session {
         self.state.backend_status.increment_rejected_count();
     }
 
+    /// Handles a blob chunk uploaded by the client for a specific instance.
     async fn handle_upload_blob(
         &mut self,
         corr_id: u32,
@@ -1528,6 +1469,7 @@ impl Session {
             return;
         }
 
+        // Initialize or retrieve the in-flight upload
         if !self.inflight_blob_uploads.contains_key(&blob_hash) {
             if chunk_index != 0 {
                 self.send_response(corr_id, false, "First chunk index must be 0".to_string())
@@ -1540,7 +1482,7 @@ impl Session {
                     total_chunks,
                     buffer: Vec::with_capacity(total_chunks * message::CHUNK_SIZE_BYTES),
                     next_chunk_index: 0,
-                    manifest: String::new(),
+                    manifest: String::new(), // Not used for blob uploads
                 },
             );
         }
@@ -1559,7 +1501,7 @@ impl Session {
                     )
                 };
                 self.send_response(corr_id, false, error_msg).await;
-                self.inflight_blob_uploads.remove(&blob_hash);
+                self.inflight_blob_uploads.remove(&blob_hash); // Abort upload
                 return;
             }
 
@@ -1570,11 +1512,11 @@ impl Session {
                 let final_hash = blake3::hash(&inflight.buffer).to_hex().to_string();
 
                 if final_hash == blob_hash {
-                    messaging::pushpull_send(PushPullMessage::PushBlob {
+                    PushPullCommand::PushBlob {
                         topic: inst_id.to_string(),
                         message: Bytes::from(mem::take(&mut inflight.buffer)),
-                    })
-                    .unwrap();
+                    }
+                    .dispatch();
                     self.send_response(corr_id, true, "Blob sent to instance".to_string())
                         .await;
                 } else {
@@ -1590,6 +1532,7 @@ impl Session {
         }
     }
 
+    /// Handles an internal command to send a blob to the connected client.
     async fn handle_send_blob(&mut self, inst_id: InstanceId, data: Bytes) {
         let blob_hash = blake3::hash(&data).to_hex().to_string();
         let total_chunks = (data.len() + message::CHUNK_SIZE_BYTES - 1) / message::CHUNK_SIZE_BYTES;
@@ -1625,11 +1568,126 @@ impl Session {
     }
 }
 
-// =============================================================================
-// Helper Functions
-// =============================================================================
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Detach all attached instances.
+        for inst_id in self.attached_instances.drain(..) {
+            let server_state = Arc::clone(&self.state);
 
-/// Parses a manifest TOML string to extract the program name and version.
+            // We need to spawn a task to detach the instance because the drop handler
+            // is not async. It's okay as long as the instance is detached eventually.
+            task::spawn(async move {
+                // Set the output delivery mode to buffered.
+                runtime::Command::SetOutputDelivery {
+                    inst_id,
+                    mode: OutputDelivery::Buffered,
+                }
+                .dispatch();
+
+                // Remove the forwarding channel to the instance from the server state.
+                server_state.client_cmd_txs.remove(&inst_id);
+
+                // Set the instance as detached so that it can be attached to another client.
+                runtime::Command::DetachInstance { inst_id }.dispatch();
+            });
+        }
+
+        // Abort the receive pump so that it no longer receives messages from the client.
+        // Note that we DO NOT abort the send pump because there might be pending messages
+        // that need to be sent to the client. When this session is dropped, the `ws_msg_tx`
+        // object will also be dropped, which will cause the send pump to terminate.
+        self.recv_pump.abort();
+
+        self.state.clients.remove(&self.id);
+
+        let id = self.id;
+        let state = Arc::clone(&self.state);
+
+        // We need to spawn a task to release the ID because the drop handler
+        // is not async. It's okay as long as the ID is eventually released.
+        task::spawn(async move {
+            state.client_id_pool.lock().await.release(id).ok();
+        });
+    }
+}
+
+/// Helper to load programs from a directory with structure {dir}/{name}/{version}.wasm
+fn load_programs_from_dir(dir: &Path, programs_in_disk: &DashMap<ProgramName, ProgramMetadata>) {
+    // Iterate through name directories
+    let name_entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for name_entry in name_entries.flatten() {
+        let name_path = name_entry.path();
+        if !name_path.is_dir() {
+            continue;
+        }
+        let name = match name_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Iterate through version files
+        let file_entries = match std::fs::read_dir(&name_path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for file_entry in file_entries.flatten() {
+            let file_path = file_entry.path();
+            if file_path.extension().is_some_and(|ext| ext == "wasm") {
+                // Extract version from filename (e.g., "0.1.0.wasm" -> "0.1.0")
+                let version = match file_path.file_stem().and_then(|s| s.to_str()) {
+                    Some(v) => v.to_string(),
+                    None => continue,
+                };
+
+                // Read the hash from the corresponding .wasm_hash file
+                let wasm_hash_path = file_path.with_extension("wasm_hash");
+                let wasm_hash = match std::fs::read_to_string(&wasm_hash_path) {
+                    Ok(h) => h.trim().to_string(),
+                    Err(_) => continue, // Skip programs without a WASM hash file
+                };
+
+                // Read the hash from the corresponding .toml_hash file
+                let manifest_hash_path = file_path.with_extension("toml_hash");
+                let manifest_hash = match std::fs::read_to_string(&manifest_hash_path) {
+                    Ok(h) => h.trim().to_string(),
+                    Err(_) => continue, // Skip programs without a manifest hash file
+                };
+
+                // Read and parse the manifest to extract dependencies
+                let manifest_path = file_path.with_extension("toml");
+                let dependencies = match std::fs::read_to_string(&manifest_path) {
+                    Ok(manifest_content) => {
+                        parse_program_dependencies_from_manifest(&manifest_content)
+                    }
+                    Err(_) => continue, // Skip programs without a manifest file
+                };
+
+                let program_name = ProgramName {
+                    name: name.clone(),
+                    version,
+                };
+                programs_in_disk.insert(
+                    program_name,
+                    ProgramMetadata {
+                        wasm_path: file_path,
+                        wasm_hash,
+                        manifest_hash,
+                        dependencies,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Parses a manifest TOML string to extract the program name (name, version).
+///
+/// The manifest must have a [package] section with "name" and "version" fields.
 fn parse_program_name_from_manifest(manifest: &str) -> Result<ProgramName> {
     let table: toml::Table =
         toml::from_str(manifest).map_err(|e| anyhow!("Failed to parse manifest TOML: {}", e))?;
@@ -1655,35 +1713,37 @@ fn parse_program_name_from_manifest(manifest: &str) -> Result<ProgramName> {
     })
 }
 
-/// Parses a manifest TOML string to extract dependencies as ProgramName entries.
+/// Parses a manifest TOML string to extract the dependencies.
+///
+/// The optional "dependencies" field in the [package] section is an array of strings
+/// in the format "name@version". Returns an empty vector if parsing fails
+/// or no dependencies are specified.
 fn parse_program_dependencies_from_manifest(manifest: &str) -> Vec<ProgramName> {
     let table: toml::Table = match toml::from_str(manifest) {
         Ok(t) => t,
         Err(_) => return Vec::new(),
     };
 
-    let Some(dependencies) = table.get("dependencies").and_then(|d| d.as_table()) else {
-        return Vec::new();
+    let package = match table.get("package").and_then(|p| p.as_table()) {
+        Some(p) => p,
+        None => return Vec::new(),
     };
 
-    dependencies
-        .iter()
-        .filter_map(|(name, value)| {
-            let version = value
-                .as_table()
-                .and_then(|t| t.get("version"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("latest");
-
-            Some(ProgramName {
-                name: name.clone(),
-                version: version.to_string(),
-            })
+    package
+        .get("dependencies")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ProgramName::parse))
+                .collect()
         })
-        .collect()
+        .unwrap_or_default()
 }
 
 /// Compiles WASM bytes to a Component in a blocking thread.
+///
+/// This runs the compilation on a dedicated thread pool to avoid blocking the async runtime,
+/// since WASM compilation can be CPU-intensive.
 async fn compile_wasm_component(engine: &WasmEngine, wasm_bytes: Vec<u8>) -> Result<Component> {
     let engine = engine.clone();
     match tokio::task::spawn_blocking(move || Component::from_binary(&engine, &wasm_bytes)).await {
@@ -1695,8 +1755,17 @@ async fn compile_wasm_component(engine: &WasmEngine, wasm_bytes: Vec<u8>) -> Res
 
 /// Ensures a program and all its dependencies are loaded in the runtime.
 ///
-/// This function recursively loads all dependencies first, then loads the program itself.
-/// It includes cycle detection to prevent infinite loops.
+/// This checks if the program is already loaded in memory (with hash verification).
+/// If not, it reads the wasm from disk, compiles it, and loads it into the runtime,
+/// then recursively loads all dependencies.
+///
+/// If a dependency is not found in the uploaded or registry programs, it will be
+/// downloaded from the registry.
+///
+/// Invariant: if a program is loaded, all its dependencies are also loaded.
+/// This allows us to skip recursive checks when a program is already loaded.
+///
+/// Returns Ok(()) on success, or Err(error_message) if the program or any dependency fails to load.
 async fn ensure_program_loaded_with_dependencies(
     wasm_engine: &WasmEngine,
     program_metadata: &ProgramMetadata,
@@ -1706,196 +1775,204 @@ async fn ensure_program_loaded_with_dependencies(
     registry_url: &str,
     cache_dir: &Path,
 ) -> Result<(), String> {
-    // Use a work queue to avoid async recursion
-    // Each entry is (program_name, program_metadata, already_processed_deps)
-    let mut work_stack: Vec<(ProgramName, ProgramMetadata, bool)> = Vec::new();
-    let mut visited: HashSet<ProgramName> = HashSet::new();
-    let mut loaded: HashSet<String> = HashSet::new();
+    let mut visited = HashSet::new();
+    return recur_ensure_program_loaded_with_dependencies(
+        wasm_engine,
+        program_metadata,
+        program_name,
+        uploaded_programs,
+        registry_programs,
+        registry_url,
+        cache_dir,
+        &mut visited,
+    )
+    .await;
 
-    // Start with the main program
-    work_stack.push((program_name.clone(), program_metadata.clone(), false));
-
-    while let Some((current_name, current_metadata, deps_processed)) = work_stack.pop() {
-        if deps_processed {
-            // All dependencies are loaded, now load this program
-            if loaded.contains(&current_metadata.wasm_hash) {
-                continue;
-            }
-
-            let (loaded_tx, loaded_rx) = oneshot::channel();
-            runtime::Message::ProgramLoaded {
-                hash: current_metadata.wasm_hash.clone(),
-                response: loaded_tx,
-            }
-            .send()
-            .unwrap();
-
-            let is_loaded = loaded_rx.await.unwrap();
-
-            if !is_loaded {
-                let raw_bytes = tokio::fs::read(&current_metadata.wasm_path)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "Failed to read program from disk at {:?}: {}",
-                            current_metadata.wasm_path, e
-                        )
-                    })?;
-
-                let component = compile_wasm_component(wasm_engine, raw_bytes)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                let (load_tx, load_rx) = oneshot::channel();
-                runtime::Message::LoadProgram {
-                    hash: current_metadata.wasm_hash.clone(),
-                    component,
-                    response: load_tx,
-                }
-                .send()
-                .unwrap();
-
-                load_rx.await.unwrap();
-            }
-
-            loaded.insert(current_metadata.wasm_hash.clone());
-        } else {
-            // First visit: check for cycles and queue dependencies
-            if visited.contains(&current_name) {
-                return Err(format!(
-                    "Dependency cycle detected for {}@{}",
-                    current_name.name, current_name.version
-                ));
-            }
-            visited.insert(current_name.clone());
-
-            // Re-add this program with deps_processed = true (to load after deps)
-            work_stack.push((current_name, current_metadata.clone(), true));
-
-            // Add all dependencies to process (in reverse order so they're processed first)
-            for dep in current_metadata.dependencies.iter().rev() {
-                // Skip if already visited
-                if visited.contains(dep) {
-                    continue;
-                }
-
-                // Get dependency metadata
-                let dep_metadata = if let Some(meta) = uploaded_programs
-                    .get(dep)
-                    .or_else(|| registry_programs.get(dep))
-                    .map(|e| e.value().clone())
-                {
-                    meta
-                } else {
-                    // Download dependency from registry
-                    try_download_inferlet_from_registry(registry_url, cache_dir, dep, registry_programs)
-                        .await
-                        .map_err(|e| {
-                            format!("Failed to download dependency {}@{}: {}", dep.name, dep.version, e)
-                        })?
-                };
-
-                work_stack.push((dep.clone(), dep_metadata, false));
-            }
+    // Inner recursive helper function.
+    // The `visited` set is used to detect dependency cycles. It tracks which programs are currently
+    // being processed in the call stack. If a program is encountered that's already in the visited set,
+    // a cycle has been detected.
+    async fn recur_ensure_program_loaded_with_dependencies(
+        wasm_engine: &WasmEngine,
+        program_metadata: &ProgramMetadata,
+        program_name: &ProgramName,
+        uploaded_programs: &DashMap<ProgramName, ProgramMetadata>,
+        registry_programs: &DashMap<ProgramName, ProgramMetadata>,
+        registry_url: &str,
+        cache_dir: &Path,
+        visited: &mut HashSet<ProgramName>,
+    ) -> Result<(), String> {
+        // Check for dependency cycle
+        if visited.contains(program_name) {
+            return Err(format!(
+                "Dependency cycle detected: {}@{}",
+                program_name.name, program_name.version
+            ));
         }
-    }
 
-    Ok(())
+        // Check if the program is already loaded in memory
+        let (loaded_tx, loaded_rx) = oneshot::channel();
+        runtime::Command::ProgramLoaded {
+            program_hash: ProgramHash::new(
+                program_metadata.wasm_hash.clone(),
+                program_metadata.manifest_hash.clone(),
+            ),
+            event: loaded_tx,
+        }
+        .dispatch();
+
+        let is_loaded = loaded_rx.await.unwrap();
+
+        // If already loaded, dependencies are guaranteed to be loaded (invariant)
+        if is_loaded {
+            return Ok(());
+        }
+
+        // Mark this program as being visited (in the current recursion stack)
+        visited.insert(program_name.clone());
+
+        // First, recursively ensure all dependencies are loaded
+        for dep_name in &program_metadata.dependencies {
+            // Look up the dependency in uploaded programs first, then registry programs,
+            // and download from registry if not found
+            let dep_metadata = if let Some(entry) = uploaded_programs.get(dep_name) {
+                entry.value().clone()
+            } else if let Some(entry) = registry_programs.get(dep_name) {
+                entry.value().clone()
+            } else {
+                // Download from registry
+                try_download_inferlet_from_registry(
+                    registry_url,
+                    cache_dir,
+                    dep_name,
+                    registry_programs,
+                )
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to resolve dependency {}@{}. It was not uploaded nor found in the registry ({})",
+                        dep_name.name, dep_name.version, e
+                    )
+                })?
+            };
+
+            // Recursively ensure the dependency and its dependencies are loaded
+            Box::pin(recur_ensure_program_loaded_with_dependencies(
+                wasm_engine,
+                &dep_metadata,
+                dep_name,
+                uploaded_programs,
+                registry_programs,
+                registry_url,
+                cache_dir,
+                visited,
+            ))
+            .await?;
+        }
+
+        // Remove from visited set after processing dependencies (no longer in current recursion path)
+        visited.remove(program_name);
+
+        // Now load the current program (dependencies are already loaded)
+        let raw_bytes = tokio::fs::read(&program_metadata.wasm_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to read program from disk at {:?}: {}",
+                    program_metadata.wasm_path, e
+                )
+            })?;
+
+        let component = compile_wasm_component(wasm_engine, raw_bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Build the dependencies list as ProgramHash instances
+        // All dependencies are guaranteed to be in one of the maps at this point
+        let dependencies: Vec<ProgramHash> = program_metadata
+            .dependencies
+            .iter()
+            .filter_map(|dep_name| {
+                uploaded_programs
+                    .get(dep_name)
+                    .or_else(|| registry_programs.get(dep_name))
+                    .map(|entry| {
+                        let meta = entry.value();
+                        ProgramHash::new(meta.wasm_hash.clone(), meta.manifest_hash.clone())
+                    })
+            })
+            .collect();
+
+        let (load_tx, load_rx) = oneshot::channel();
+        runtime::Command::LoadProgram {
+            program_hash: ProgramHash::new(
+                program_metadata.wasm_hash.clone(),
+                program_metadata.manifest_hash.clone(),
+            ),
+            component,
+            dependencies,
+            event: load_tx,
+        }
+        .dispatch();
+
+        load_rx.await.unwrap();
+
+        Ok(())
+    }
 }
 
 /// Downloads an inferlet from the registry, with local caching.
-/// Uses flat namespace structure: {cache_dir}/registry/{name}/{version}.{wasm,toml,wasm_hash,toml_hash}
+///
+/// This function downloads the inferlet from the registry,
+/// parses the manifest for dependencies, creates the ProgramMetadata,
+/// and inserts it into the registry_programs_in_disk map.
+///
+/// Returns ProgramMetadata on success.
 async fn try_download_inferlet_from_registry(
     registry_url: &str,
     cache_dir: &Path,
     program_name: &ProgramName,
     registry_programs_in_disk: &DashMap<ProgramName, ProgramMetadata>,
 ) -> Result<ProgramMetadata> {
-    let cache_base = cache_dir.join("registry").join(&program_name.name);
-    let wasm_cache_path = cache_base.join(format!("{}.wasm", program_name.version));
-    let manifest_cache_path = cache_base.join(format!("{}.toml", program_name.version));
-    let wasm_hash_cache_path = cache_base.join(format!("{}.wasm_hash", program_name.version));
-    let manifest_hash_cache_path = cache_base.join(format!("{}.toml_hash", program_name.version));
+    let name = &program_name.name;
+    let version = &program_name.version;
 
-    // Check if already cached
-    if wasm_cache_path.exists()
-        && manifest_cache_path.exists()
-        && wasm_hash_cache_path.exists()
-        && manifest_hash_cache_path.exists()
-    {
-        tracing::info!(
-            "Using cached inferlet: {} @ {} from {:?}",
-            program_name.name,
-            program_name.version,
-            wasm_cache_path
-        );
-        let wasm_hash = tokio::fs::read_to_string(&wasm_hash_cache_path)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to read cached WASM hash at {:?}: {}",
-                    wasm_hash_cache_path,
-                    e
-                )
-            })?
-            .trim()
-            .to_string();
-        let manifest_hash = tokio::fs::read_to_string(&manifest_hash_cache_path)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to read cached manifest hash at {:?}: {}",
-                    manifest_hash_cache_path,
-                    e
-                )
-            })?
-            .trim()
-            .to_string();
-        let manifest_data = tokio::fs::read_to_string(&manifest_cache_path)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to read cached manifest at {:?}: {}",
-                    manifest_cache_path,
-                    e
-                )
-            })?;
+    // Build the cache paths:
+    // - Wasm binary: {cache_dir}/registry/{name}/{version}.wasm
+    // - Manifest: {cache_dir}/registry/{name}/{version}.toml
+    // - Wasm hash: {cache_dir}/registry/{name}/{version}.wasm_hash
+    // - Manifest hash: {cache_dir}/registry/{name}/{version}.toml_hash
+    let cache_base = cache_dir.join("registry").join(name);
+    let wasm_path = cache_base.join(format!("{}.wasm", version));
+    let manifest_path = cache_base.join(format!("{}.toml", version));
+    let wasm_hash_path = cache_base.join(format!("{}.wasm_hash", version));
+    let manifest_hash_path = cache_base.join(format!("{}.toml_hash", version));
 
-        let dependencies = parse_program_dependencies_from_manifest(&manifest_data);
-
-        let metadata = ProgramMetadata {
-            wasm_path: wasm_cache_path,
-            wasm_hash,
-            manifest_hash,
-            dependencies,
-        };
-        return Ok(metadata);
-    }
-
-    // Download from registry (using flat namespace)
+    // Build the download URLs
     let base_url = registry_url.trim_end_matches('/');
     let wasm_download_url = format!(
         "{}/api/v1/inferlets/{}/{}/download",
-        base_url, program_name.name, program_name.version
+        base_url, name, version
     );
     let manifest_download_url = format!(
         "{}/api/v1/inferlets/{}/{}/manifest",
-        base_url, program_name.name, program_name.version
+        base_url, name, version
     );
 
     tracing::info!(
         "Downloading inferlet: {} @ {} from {}",
-        program_name.name,
-        program_name.version,
+        name,
+        version,
         wasm_download_url
     );
 
+    // Create an HTTP client that follows redirects
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
 
-    // Download WASM
+    // Download the wasm binary
     let wasm_response = client
         .get(&wasm_download_url)
         .send()
@@ -1908,8 +1985,8 @@ async fn try_download_inferlet_from_registry(
         bail!(
             "Registry returned error {} for {} @ {}: {}",
             status,
-            program_name.name,
-            program_name.version,
+            name,
+            version,
             body
         );
     }
@@ -1921,18 +1998,14 @@ async fn try_download_inferlet_from_registry(
         .to_vec();
 
     if wasm_data.is_empty() {
-        bail!(
-            "Registry returned empty data for {} @ {}",
-            program_name.name,
-            program_name.version
-        );
+        bail!("Registry returned empty data for {} @ {}", name, version);
     }
 
-    // Download manifest
+    // Download the manifest
     tracing::info!(
         "Downloading manifest for {} @ {} from {}",
-        program_name.name,
-        program_name.version,
+        name,
+        version,
         manifest_download_url
     );
 
@@ -1948,8 +2021,8 @@ async fn try_download_inferlet_from_registry(
         bail!(
             "Registry returned error {} for manifest {} @ {}: {}",
             status,
-            program_name.name,
-            program_name.version,
+            name,
+            version,
             body
         );
     }
@@ -1959,138 +2032,52 @@ async fn try_download_inferlet_from_registry(
         .await
         .map_err(|e| anyhow!("Failed to read manifest data: {}", e))?;
 
-    // Compute hashes
     let wasm_hash = blake3::hash(&wasm_data).to_hex().to_string();
     let manifest_hash = blake3::hash(manifest_data.as_bytes()).to_hex().to_string();
 
-    // Parse dependencies from manifest
-    let dependencies = parse_program_dependencies_from_manifest(&manifest_data);
-
-    // Cache to disk
+    // Cache the downloaded files
     tokio::fs::create_dir_all(&cache_base)
         .await
         .map_err(|e| anyhow!("Failed to create cache directory {:?}: {}", cache_base, e))?;
 
-    tokio::fs::write(&wasm_cache_path, &wasm_data)
+    tokio::fs::write(&wasm_path, &wasm_data)
         .await
-        .map_err(|e| anyhow!("Failed to cache inferlet at {:?}: {}", wasm_cache_path, e))?;
+        .map_err(|e| anyhow!("Failed to cache inferlet at {:?}: {}", wasm_path, e))?;
 
-    tokio::fs::write(&manifest_cache_path, &manifest_data)
+    tokio::fs::write(&manifest_path, &manifest_data)
         .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to cache manifest at {:?}: {}",
-                manifest_cache_path,
-                e
-            )
-        })?;
+        .map_err(|e| anyhow!("Failed to cache manifest at {:?}: {}", manifest_path, e))?;
 
-    tokio::fs::write(&wasm_hash_cache_path, &wasm_hash)
+    tokio::fs::write(&wasm_hash_path, &wasm_hash)
         .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to cache WASM hash at {:?}: {}",
-                wasm_hash_cache_path,
-                e
-            )
-        })?;
+        .map_err(|e| anyhow!("Failed to cache WASM hash at {:?}: {}", wasm_hash_path, e))?;
 
-    tokio::fs::write(&manifest_hash_cache_path, &manifest_hash)
+    tokio::fs::write(&manifest_hash_path, &manifest_hash)
         .await
         .map_err(|e| {
             anyhow!(
                 "Failed to cache manifest hash at {:?}: {}",
-                manifest_hash_cache_path,
+                manifest_hash_path,
                 e
             )
         })?;
 
     tracing::info!(
-        "Cached inferlet {} @ {} to {:?} (wasm_hash: {}, manifest_hash: {})",
-        program_name.name,
-        program_name.version,
-        wasm_cache_path,
-        wasm_hash,
-        manifest_hash
+        "Cached inferlet {} @ {} to {:?} (hash: {})",
+        name,
+        version,
+        wasm_path,
+        wasm_hash
     );
 
+    // Parse dependencies and create metadata
+    let dependencies = parse_program_dependencies_from_manifest(&manifest_data);
     let metadata = ProgramMetadata {
-        wasm_path: wasm_cache_path,
+        wasm_path,
         wasm_hash,
         manifest_hash,
         dependencies,
     };
-
-    // Add to in-memory map
     registry_programs_in_disk.insert(program_name.clone(), metadata.clone());
-
     Ok(metadata)
-}
-
-/// Helper to load programs from a directory with structure {dir}/{name}/{version}.wasm
-/// Uses flat namespace structure (no namespace subdirectory).
-fn load_programs_from_dir(dir: &Path, programs_in_disk: &DashMap<ProgramName, ProgramMetadata>) {
-    let name_entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-
-    for name_entry in name_entries.flatten() {
-        let name_path = name_entry.path();
-        if !name_path.is_dir() {
-            continue;
-        }
-        let name = match name_path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-
-        let file_entries = match std::fs::read_dir(&name_path) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-
-        for file_entry in file_entries.flatten() {
-            let file_path = file_entry.path();
-            if file_path.extension().is_some_and(|ext| ext == "wasm") {
-                let version = match file_path.file_stem().and_then(|s| s.to_str()) {
-                    Some(v) => v.to_string(),
-                    None => continue,
-                };
-
-                // Read WASM hash
-                let wasm_hash_path = name_path.join(format!("{}.wasm_hash", version));
-                let wasm_hash = match std::fs::read_to_string(&wasm_hash_path) {
-                    Ok(h) => h.trim().to_string(),
-                    Err(_) => continue,
-                };
-
-                // Read manifest hash
-                let manifest_hash_path = name_path.join(format!("{}.toml_hash", version));
-                let manifest_hash = match std::fs::read_to_string(&manifest_hash_path) {
-                    Ok(h) => h.trim().to_string(),
-                    Err(_) => continue,
-                };
-
-                // Read manifest for dependencies
-                let manifest_path = name_path.join(format!("{}.toml", version));
-                let dependencies = match std::fs::read_to_string(&manifest_path) {
-                    Ok(manifest) => parse_program_dependencies_from_manifest(&manifest),
-                    Err(_) => Vec::new(),
-                };
-
-                let key = ProgramName {
-                    name: name.clone(),
-                    version,
-                };
-                let metadata = ProgramMetadata {
-                    wasm_path: file_path,
-                    wasm_hash,
-                    manifest_hash,
-                    dependencies,
-                };
-                programs_in_disk.insert(key, metadata);
-            }
-        }
-    }
 }
