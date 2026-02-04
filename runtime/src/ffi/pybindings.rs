@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 use crate::auth::AuthorizedUsers;
-use crate::engine::{self, Config as EngineConfig};
+use crate::bootstrap::{self, Config as BootstrapConfig};
 use crate::telemetry::TelemetryConfig;
 use super::rpc::{FfiIpcBackend, IpcChannels, IpcRequest, IpcResponse, AsyncIpcClient, RpcBackend};
 
@@ -212,9 +212,9 @@ impl ServerConfig {
     }
 }
 
-impl From<ServerConfig> for EngineConfig {
+impl From<ServerConfig> for BootstrapConfig {
     fn from(cfg: ServerConfig) -> Self {
-        EngineConfig {
+        BootstrapConfig {
             host: cfg.host,
             port: cfg.port,
             enable_auth: cfg.enable_auth,
@@ -387,11 +387,11 @@ fn start_server_phase1(
             let (ready_tx, ready_rx) = oneshot::channel();
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-            let engine_config: EngineConfig = config.into();
+            let bootstrap_config: BootstrapConfig = config.into();
 
             // Spawn the server in a background task
             tokio::spawn(async move {
-                if let Err(e) = engine::run_server(engine_config, authorized_users, ready_tx, shutdown_rx).await {
+                if let Err(e) = bootstrap::run_server(bootstrap_config, authorized_users, ready_tx, shutdown_rx).await {
                     eprintln!("[PIE] Server error: {}", e);
                 }
             });

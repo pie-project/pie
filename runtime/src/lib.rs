@@ -10,7 +10,7 @@ pub mod api;
 pub mod auth;
 pub mod context;
 pub mod dummy;
-pub mod engine;
+pub mod bootstrap;
 pub mod inference;
 pub mod instance;
 pub mod kvcache;
