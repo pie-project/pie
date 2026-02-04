@@ -28,6 +28,8 @@ use crate::ffi::format::QueryResponse;
 use crate::{api, server};
 use thiserror::Error;
 
+mod dynamic_linking;
+
 // =============================================================================
 // Shared Type Definitions
 // =============================================================================
@@ -42,9 +44,9 @@ pub enum RuntimeError {
     #[error("Wasmtime error occurred: {0}")]
     Wasmtime(#[from] wasmtime::Error),
 
-    /// No program found for a given hash
-    #[error("No such program with hash={0}")]
-    MissingProgram(String),
+    /// No program found for the given hashes
+    #[error("No such program with wasm_hash={0}, manifest_hash={1}")]
+    MissingProgram(String, String),
 
     /// Failed to compile a WASM component from disk
     #[error("Failed to compile program at path {path:?}: {source}")]
@@ -57,6 +59,37 @@ pub enum RuntimeError {
     /// Fallback for unexpected cases
     #[error("Runtime error: {0}")]
     Other(String),
+}
+
+/// A key identifying a compiled program by its WASM and manifest hashes.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct ProgramHash {
+    pub wasm_hash: String,
+    pub manifest_hash: String,
+}
+
+impl ProgramHash {
+    pub fn new(wasm_hash: String, manifest_hash: String) -> Self {
+        Self {
+            wasm_hash,
+            manifest_hash,
+        }
+    }
+}
+
+impl std::fmt::Display for ProgramHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.wasm_hash, self.manifest_hash)
+    }
+}
+
+/// A compiled program with its component and dependency information.
+#[derive(Clone)]
+struct CompiledProgram {
+    /// The compiled WASM component
+    component: Component,
+    /// Dependencies of this program, each specified by their hashes
+    dependencies: Vec<ProgramHash>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +146,8 @@ fn cleanup_instance(_inst_id: InstanceId) {
 /// Handle to a running instance, tracking its state and resources.
 struct InstanceHandle {
     username: String,
-    program_hash: String,
+    program_name: String,
+    program_hash: ProgramHash,
     arguments: Vec<String>,
     start_time: std::time::Instant,
     output_delivery_ctrl: OutputDeliveryCtrl,
@@ -153,21 +187,23 @@ pub enum Message {
 
     /// Load a pre-compiled program component
     LoadProgram {
-        hash: String,
+        program_hash: ProgramHash,
         component: Component,
+        dependencies: Vec<ProgramHash>,
         response: oneshot::Sender<()>,
     },
 
     /// Check if a program is loaded
     ProgramLoaded {
-        hash: String,
+        program_hash: ProgramHash,
         response: oneshot::Sender<bool>,
     },
 
     /// Launch a program instance
     LaunchInstance {
         username: String,
-        hash: String,
+        program_name: String,
+        program_hash: ProgramHash,
         arguments: Vec<String>,
         detached: bool,
         response: oneshot::Sender<Result<InstanceId, RuntimeError>>,
@@ -192,7 +228,8 @@ pub enum Message {
     /// Launch a server instance (HTTP handler)
     LaunchServerInstance {
         username: String,
-        hash: String,
+        program_name: String,
+        program_hash: ProgramHash,
         port: u32,
         arguments: Vec<String>,
         response: oneshot::Sender<Result<(), RuntimeError>>,
@@ -240,16 +277,16 @@ impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Message::GetVersion { .. } => write!(f, "GetVersion"),
-            Message::LoadProgram { hash, .. } => write!(f, "LoadProgram {{ hash: {} }}", hash),
-            Message::ProgramLoaded { hash, .. } => write!(f, "ProgramLoaded {{ hash: {} }}", hash),
-            Message::LaunchInstance { username, hash, detached, .. } => {
-                write!(f, "LaunchInstance {{ username: {}, hash: {}, detached: {} }}", username, hash, detached)
+            Message::LoadProgram { program_hash, .. } => write!(f, "LoadProgram {{ program_hash: {:?} }}", program_hash),
+            Message::ProgramLoaded { program_hash, .. } => write!(f, "ProgramLoaded {{ program_hash: {:?} }}", program_hash),
+            Message::LaunchInstance { username, program_hash, detached, .. } => {
+                write!(f, "LaunchInstance {{ username: {}, program_hash: {:?}, detached: {} }}", username, program_hash, detached)
             }
             Message::AttachInstance { inst_id, .. } => write!(f, "AttachInstance {{ inst_id: {} }}", inst_id),
             Message::DetachInstance { inst_id } => write!(f, "DetachInstance {{ inst_id: {} }}", inst_id),
             Message::AllowOutput { inst_id } => write!(f, "AllowOutput {{ inst_id: {} }}", inst_id),
-            Message::LaunchServerInstance { username, hash, port, .. } => {
-                write!(f, "LaunchServerInstance {{ username: {}, hash: {}, port: {} }}", username, hash, port)
+            Message::LaunchServerInstance { username, program_hash, port, .. } => {
+                write!(f, "LaunchServerInstance {{ username: {}, program_hash: {:?}, port: {} }}", username, program_hash, port)
             }
             Message::TerminateInstance { inst_id, .. } => write!(f, "TerminateInstance {{ inst_id: {} }}", inst_id),
             Message::FinishInstance { inst_id, .. } => write!(f, "FinishInstance {{ inst_id: {} }}", inst_id),
@@ -298,26 +335,28 @@ impl Handle for RuntimeActor {
                 let _ = response.send(self.service.get_version());
             }
             Message::LoadProgram {
-                hash,
+                program_hash,
                 component,
+                dependencies,
                 response,
             } => {
-                self.service.load_program(hash, component);
+                self.service.load_program(program_hash, component, dependencies);
                 let _ = response.send(());
             }
-            Message::ProgramLoaded { hash, response } => {
-                let _ = response.send(self.service.program_loaded(&hash));
+            Message::ProgramLoaded { program_hash, response } => {
+                let _ = response.send(self.service.program_loaded(&program_hash));
             }
             Message::LaunchInstance {
                 username,
-                hash,
+                program_name,
+                program_hash,
                 arguments,
                 detached,
                 response,
             } => {
                 let result = self
                     .service
-                    .launch_instance(username, hash, arguments, detached)
+                    .launch_instance(username, program_name, program_hash, arguments, detached)
                     .await;
                 let _ = response.send(result);
             }
@@ -332,14 +371,15 @@ impl Handle for RuntimeActor {
             }
             Message::LaunchServerInstance {
                 username,
-                hash,
+                program_name,
+                program_hash,
                 port,
                 arguments,
                 response,
             } => {
                 let result = self
                     .service
-                    .launch_server_instance(username, hash, port, arguments)
+                    .launch_server_instance(username, program_name, program_hash, port, arguments)
                     .await;
                 let _ = response.send(result);
             }
@@ -386,8 +426,8 @@ pub struct Runtime {
     engine: Engine,
     /// Pre-configured linker with WASI and API bindings
     linker: Arc<Linker<InstanceState>>,
-    /// Pre-compiled WASM components, keyed by hash
-    compiled_programs: DashMap<String, Component>,
+    /// Pre-compiled WASM components, keyed by ProgramHash
+    compiled_programs: DashMap<ProgramHash, CompiledProgram>,
     /// Running instances
     running_instances: DashMap<InstanceId, InstanceHandle>,
     /// Finished instances (awaiting attachment)
@@ -427,21 +467,28 @@ impl Runtime {
         VERSION.to_string()
     }
 
-    /// Loads a pre-compiled program component.
-    pub fn load_program(&self, hash: String, component: Component) {
-        self.compiled_programs.insert(hash, component);
+    /// Loads a pre-compiled program component with its dependencies.
+    pub fn load_program(&self, program_hash: ProgramHash, component: Component, dependencies: Vec<ProgramHash>) {
+        let compiled_program = CompiledProgram {
+            component,
+            dependencies,
+        };
+        self.compiled_programs.insert(program_hash, compiled_program);
     }
 
     /// Checks if a program is loaded.
-    pub fn program_loaded(&self, hash: &str) -> bool {
-        self.compiled_programs.contains_key(hash)
+    pub fn program_loaded(&self, program_hash: &ProgramHash) -> bool {
+        self.compiled_programs.contains_key(program_hash)
     }
 
     /// Retrieves a compiled component by hash.
-    fn get_component(&self, hash: &str) -> Result<Component, RuntimeError> {
-        match self.compiled_programs.get(hash) {
-            Some(entry) => Ok(entry.value().clone()),
-            None => Err(RuntimeError::MissingProgram(hash.to_string())),
+    fn get_component(&self, program_hash: &ProgramHash) -> Result<Component, RuntimeError> {
+        match self.compiled_programs.get(program_hash) {
+            Some(entry) => Ok(entry.value().component.clone()),
+            None => Err(RuntimeError::MissingProgram(
+                program_hash.wasm_hash.clone(),
+                program_hash.manifest_hash.clone(),
+            )),
         }
     }
 
@@ -449,11 +496,12 @@ impl Runtime {
     pub async fn launch_instance(
         &self,
         username: String,
-        hash: String,
+        program_name: String,
+        program_hash: ProgramHash,
         arguments: Vec<String>,
         detached: bool,
     ) -> Result<InstanceId, RuntimeError> {
-        let component = self.get_component(&hash)?;
+        let component = self.get_component(&program_hash)?;
         let instance_id = Uuid::new_v4();
 
         let engine = self.engine.clone();
@@ -487,7 +535,8 @@ impl Runtime {
         // Record in running instances
         let instance_handle = InstanceHandle {
             username,
-            program_hash: hash,
+            program_name,
+            program_hash,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -555,12 +604,13 @@ impl Runtime {
     pub async fn launch_server_instance(
         &self,
         username: String,
-        hash: String,
+        program_name: String,
+        program_hash: ProgramHash,
         port: u32,
         arguments: Vec<String>,
     ) -> Result<(), RuntimeError> {
         let instance_id = Uuid::new_v4();
-        let component = self.get_component(&hash)?;
+        let component = self.get_component(&program_hash)?;
 
         let engine = self.engine.clone();
         let linker = self.linker.clone();
@@ -585,7 +635,8 @@ impl Runtime {
 
         let instance_handle = InstanceHandle {
             username,
-            program_hash: hash,
+            program_name,
+            program_hash,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -675,7 +726,7 @@ impl Runtime {
                 let hashes: Vec<String> = self
                     .compiled_programs
                     .iter()
-                    .map(|item| item.key().clone())
+                    .map(|item| item.key().to_string())
                     .collect();
                 hashes.join("\n")
             }

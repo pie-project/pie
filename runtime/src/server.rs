@@ -187,6 +187,12 @@ impl ProgramName {
     }
 }
 
+impl std::fmt::Display for ProgramName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.name, self.version)
+    }
+}
+
 /// Metadata for a cached inferlet program on disk.
 #[derive(Clone, Debug)]
 struct ProgramMetadata {
@@ -1121,8 +1127,8 @@ impl Session {
                 ProgramMetadata {
                     wasm_path: wasm_file_path.clone(),
                     wasm_hash: final_hash.clone(),
-                    manifest_hash,
-                    dependencies,
+                    manifest_hash: manifest_hash.clone(),
+                    dependencies: dependencies.clone(),
                 },
             );
 
@@ -1137,8 +1143,14 @@ impl Session {
 
             let (evt_tx, evt_rx) = oneshot::channel();
             runtime::Message::LoadProgram {
-                hash: final_hash.clone(),
+                program_hash: runtime::ProgramHash::new(final_hash.clone(), manifest_hash.clone()),
                 component,
+                dependencies: dependencies.iter().map(|dep_name| {
+                    // Convert dependency names to ProgramHash - lookup from metadata
+                    let dep_meta = self.state.uploaded_programs_in_disk.get(dep_name)
+                        .expect("dependency should be loaded");
+                    runtime::ProgramHash::new(dep_meta.wasm_hash.clone(), dep_meta.manifest_hash.clone())
+                }).collect(),
                 response: evt_tx,
             }
             .send()
@@ -1184,7 +1196,8 @@ impl Session {
 
             self.launch_instance_from_loaded_program(
                 corr_id,
-                metadata.wasm_hash,
+                program_name.to_string(),
+                &metadata,
                 arguments,
                 detached,
             )
@@ -1230,7 +1243,8 @@ impl Session {
 
             self.launch_instance_from_loaded_program(
                 corr_id,
-                metadata.wasm_hash,
+                program_name.to_string(),
+                &metadata,
                 arguments,
                 detached,
             )
@@ -1264,7 +1278,8 @@ impl Session {
 
                     self.launch_instance_from_loaded_program(
                         corr_id,
-                        metadata.wasm_hash,
+                        program_name.to_string(),
+                        &metadata,
                         arguments,
                         detached,
                     )
@@ -1280,14 +1295,19 @@ impl Session {
     async fn launch_instance_from_loaded_program(
         &mut self,
         corr_id: u32,
-        hash: String,
+        program_name: String,
+        metadata: &ProgramMetadata,
         arguments: Vec<String>,
         detached: bool,
     ) {
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Message::LaunchInstance {
             username: self.username.clone(),
-            hash,
+            program_name,
+            program_hash: runtime::ProgramHash::new(
+                metadata.wasm_hash.clone(),
+                metadata.manifest_hash.clone(),
+            ),
             arguments,
             detached,
             response: evt_tx,
@@ -1431,7 +1451,11 @@ impl Session {
             let (evt_tx, evt_rx) = oneshot::channel();
             runtime::Message::LaunchServerInstance {
                 username: self.username.clone(),
-                hash: metadata.wasm_hash,
+                program_name: program_name.to_string(),
+                program_hash: runtime::ProgramHash::new(
+                    metadata.wasm_hash.clone(),
+                    metadata.manifest_hash.clone(),
+                ),
                 port,
                 arguments,
                 response: evt_tx,
@@ -1724,7 +1748,10 @@ async fn ensure_program_loaded_with_dependencies(
 
             let (loaded_tx, loaded_rx) = oneshot::channel();
             runtime::Message::ProgramLoaded {
-                hash: current_metadata.wasm_hash.clone(),
+                program_hash: runtime::ProgramHash::new(
+                    current_metadata.wasm_hash.clone(),
+                    current_metadata.manifest_hash.clone(),
+                ),
                 response: loaded_tx,
             }
             .send()
@@ -1748,8 +1775,18 @@ async fn ensure_program_loaded_with_dependencies(
 
                 let (load_tx, load_rx) = oneshot::channel();
                 runtime::Message::LoadProgram {
-                    hash: current_metadata.wasm_hash.clone(),
+                    program_hash: runtime::ProgramHash::new(
+                        current_metadata.wasm_hash.clone(),
+                        current_metadata.manifest_hash.clone(),
+                    ),
                     component,
+                    dependencies: current_metadata.dependencies.iter().map(|dep_name| {
+                        // Look up each dependency's metadata to get its hashes
+                        uploaded_programs.get(dep_name)
+                            .or_else(|| registry_programs.get(dep_name))
+                            .map(|m| runtime::ProgramHash::new(m.wasm_hash.clone(), m.manifest_hash.clone()))
+                            .expect("dependency should be loaded by this point")
+                    }).collect(),
                     response: load_tx,
                 }
                 .send()
