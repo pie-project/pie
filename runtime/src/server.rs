@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::{self, JoinHandle};
 
 use crate::actor::{Actor, Handle, SendError};
-use crate::auth::AuthorizedUsers;
+
 use crate::instance::{InstanceId, OutputChannel};
 use crate::runtime::TerminationCause;
 use crate::utils::IdPool;
@@ -57,9 +57,6 @@ pub fn is_spawned() -> bool {
 #[derive(Debug)]
 pub struct ServerConfig {
     pub ip_port: String,
-    pub enable_auth: bool,
-    pub authorized_users: AuthorizedUsers,
-    pub internal_auth_token: String,
 }
 
 // =============================================================================
@@ -125,9 +122,6 @@ pub struct ServerStatus {
 // =============================================================================
 
 pub struct ServerState {
-    pub enable_auth: bool,
-    pub authorized_users: AuthorizedUsers,
-    pub internal_auth_token: String,
     pub client_id_pool: Mutex<IdPool<ClientId>>,
     pub clients: DashMap<ClientId, JoinHandle<()>>,
     pub client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
@@ -145,9 +139,6 @@ impl Server {
     fn new(config: ServerConfig) -> Self {
         let ip_port = config.ip_port.clone();
         let state = Arc::new(ServerState {
-            enable_auth: config.enable_auth,
-            authorized_users: config.authorized_users,
-            internal_auth_token: config.internal_auth_token,
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
             client_cmd_txs: DashMap::new(),

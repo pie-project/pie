@@ -10,7 +10,7 @@ use base64::Engine as Base64Engine;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use pie_client::message::{ClientMessage, EventCode, ServerMessage};
-use ring::rand::{SecureRandom, SystemRandom};
+
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
@@ -19,6 +19,7 @@ use tungstenite::Message as WsMessage;
 
 use crate::instance::{InstanceId, OutputDelivery};
 use crate::runtime::{self, TerminationCause};
+use crate::auth;
 
 use super::blob::InFlightUpload;
 use super::{InstanceEvent, ServerState};
@@ -179,7 +180,12 @@ impl Session {
     }
 
     async fn external_authenticate(&mut self, corr_id: u32, username: String) -> Result<()> {
-        if !self.state.enable_auth {
+        // Check if auth is enabled
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        auth::Message::IsAuthEnabled { response: tx }.send()?;
+        let auth_enabled = rx.await?;
+
+        if !auth_enabled {
             self.username = username;
             self.send_response(
                 corr_id,
@@ -190,8 +196,15 @@ impl Session {
             return Ok(());
         }
 
-        let public_keys: Vec<_> = match self.state.authorized_users.get(&username) {
-            Some(keys) => keys.public_keys().cloned().collect(),
+        // Get user's public keys from auth actor
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        auth::Message::GetUserKeys {
+            username: username.clone(),
+            response: tx,
+        }.send()?;
+        
+        let _public_keys = match rx.await? {
+            Some(keys) => keys,
             None => {
                 self.send_response(
                     corr_id,
@@ -203,10 +216,10 @@ impl Session {
             }
         };
 
-        let rng = SystemRandom::new();
-        let mut challenge = [0u8; 48];
-        rng.fill(&mut challenge)
-            .map_err(|e| anyhow::anyhow!("Failed to generate random challenge: {}", e))?;
+        // Generate challenge using auth actor
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        auth::Message::GenerateChallenge { response: tx }.send()?;
+        let challenge = rx.await??;
 
         let challenge_b64 = base64::engine::general_purpose::STANDARD.encode(&challenge);
         self.send_response(corr_id, true, challenge_b64).await;
@@ -237,9 +250,15 @@ impl Session {
             }
         };
 
-        let verified = public_keys
-            .iter()
-            .any(|key| key.verify(&challenge, &signature_bytes).is_ok());
+        // Verify signature using auth actor
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        auth::Message::VerifySignature {
+            username: username.clone(),
+            challenge: challenge.clone(),
+            signature: signature_bytes,
+            response: tx,
+        }.send()?;
+        let verified = rx.await?;
 
         if !verified {
             self.send_response(corr_id, false, "Signature verification failed".to_string())
@@ -254,19 +273,22 @@ impl Session {
     }
 
     async fn internal_authenticate(&mut self, corr_id: u32, token: String) -> Result<()> {
-        if token == self.state.internal_auth_token {
+        // Verify token using auth actor
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        auth::Message::VerifyInternalToken {
+            token: token.clone(),
+            response: tx,
+        }.send()?;
+        
+        if rx.await? {
             self.username = "internal".to_string();
             self.send_response(corr_id, true, "Authenticated".to_string())
                 .await;
             return Ok(());
         }
-
-        let rng = SystemRandom::new();
-        let mut random_bytes = [0u8; 2];
-        rng.fill(&mut random_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to generate random delay: {:?}", e))?;
-
-        let delay_ms = 1000 + (u16::from_le_bytes(random_bytes) % 2001) as u64;
+        // Add a random delay to prevent timing attacks
+        use rand::Rng;
+        let delay_ms = rand::rng().random_range(1000..=3000);
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
         self.send_response(corr_id, false, "Invalid token".to_string())

@@ -7,7 +7,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use wasmtime::{Config as WasmConfig, Engine as WasmEngine};
 
-use crate::auth::AuthorizedUsers;
+use crate::auth;
 use crate::program;
 use crate::runtime;
 use crate::server;
@@ -32,7 +32,7 @@ pub struct Config {
 /// signal to terminate gracefully.
 pub async fn run_server(
     config: Config,
-    authorized_users: AuthorizedUsers,
+    authorized_users: auth::AuthorizedUsers,
     ready_tx: oneshot::Sender<String>,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -95,12 +95,16 @@ pub async fn run_server(
         cache_dir: config.cache_dir.clone(),
     });
 
-    runtime::spawn(wasm_engine);
-    server::spawn(server::ServerConfig {
-        ip_port: server_url,
+    // Spawn the auth actor (Actor-based auth)
+    auth::spawn(auth::AuthConfig {
         enable_auth: config.enable_auth,
         authorized_users,
         internal_auth_token: internal_auth_token.clone(),
+    });
+
+    runtime::spawn(wasm_engine);
+    server::spawn(server::ServerConfig {
+        ip_port: server_url,
     });
 
     ready_tx.send(internal_auth_token).unwrap();

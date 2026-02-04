@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-use crate::auth::AuthorizedUsers;
+use crate::auth;
 use crate::bootstrap::{self, Config as BootstrapConfig};
 use crate::telemetry::TelemetryConfig;
 use super::rpc::{FfiIpcBackend, IpcChannels, IpcRequest, IpcResponse, AsyncIpcClient, RpcBackend};
@@ -378,10 +378,10 @@ fn start_server_phase1(
 
         let result = rt.block_on(async {
             let authorized_users = match authorized_users_path {
-                Some(path) => AuthorizedUsers::load(&PathBuf::from(path)).map_err(|e| {
+                Some(path) => auth::AuthorizedUsers::load(&PathBuf::from(path)).map_err(|e| {
                     PyRuntimeError::new_err(format!("Failed to load authorized users: {}", e))
                 })?,
-                None => AuthorizedUsers::default(),
+                None => auth::AuthorizedUsers::default(),
             };
 
             let (ready_tx, ready_rx) = oneshot::channel();
