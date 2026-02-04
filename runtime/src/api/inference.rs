@@ -5,7 +5,7 @@ use crate::api::context::Context;
 use crate::api::model::Model;
 use crate::api::adapter::Adapter;
 use crate::instance::InstanceState;
-use crate::brle::Brle;
+use crate::inference::brle::Brle;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::iter;

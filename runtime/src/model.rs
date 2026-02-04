@@ -112,7 +112,7 @@ pub async fn install_model_with_backend(backend: RpcBackend) -> Result<ModelId> 
     }
 
     // Spawn the associated actors with the same model ID
-    // Note: PageStore is now owned by ContextActor, so no separate kvcache actor
+    // Note: PageStore is now owned by ContextManagerActor, so no separate kvcache actor
     let _ = context::spawn();
     let _ = inference::spawn();
 

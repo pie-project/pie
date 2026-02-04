@@ -10,6 +10,7 @@
 //! - Batches are sent to Python via RPC
 
 pub mod batching;
+pub mod brle;
 pub mod request;
 pub mod rpc;
 

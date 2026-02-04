@@ -12,7 +12,7 @@ use anyhow::Result;
 
 use crate::actor::{Handle, Actors, SendError};
 use crate::adapter::AdapterId;
-use crate::brle::Brle;
+use crate::inference::brle::Brle;
 use crate::kvcache::{PageId, PageStore, NodeId, PhysicalPageId, PageHash};
 
 /// Unique identifier for a context.
@@ -24,7 +24,7 @@ static ACTOR: LazyLock<Actors<Message>> = LazyLock::new(Actors::new);
 
 /// Spawns a new context actor.
 pub(crate) fn spawn() -> usize {
-    ACTOR.spawn::<ContextActor>()
+    ACTOR.spawn::<ContextManagerActor>()
 }
 
 /// Messages for the context actor.
@@ -207,7 +207,7 @@ impl Context {
 /// The context manager handles all context operations.
 /// This is the core business logic, separate from the actor message handling.
 #[derive(Debug)]
-pub struct ContextService {
+pub struct ContextManager {
     pub page_store: Arc<RwLock<PageStore>>,
     contexts: DashMap<ContextId, Context>,
     name_to_id: DashMap<(u32, String), ContextId>,
@@ -215,9 +215,9 @@ pub struct ContextService {
     pub page_size: usize,
 }
 
-impl ContextService {
+impl ContextManager {
     pub fn new(page_store: Arc<RwLock<PageStore>>, page_size: usize) -> Self {
-        ContextService {
+        ContextManager {
             page_store,
             contexts: DashMap::new(),
             name_to_id: DashMap::new(),
@@ -728,20 +728,20 @@ impl ContextService {
     }
 }
 
-/// The context actor wraps ContextService for async message handling.
+/// The context actor wraps ContextManager for async message handling.
 #[derive(Debug)]
-struct ContextActor {
-    service: ContextService,
+struct ContextManagerActor {
+    service: ContextManager,
 }
 
-impl Handle for ContextActor {
+impl Handle for ContextManagerActor {
     type Message = Message;
 
     fn new() -> Self {
         let page_size = 64; // Default page size
         let page_store = Arc::new(RwLock::new(PageStore::new(page_size)));
-        ContextActor {
-            service: ContextService::new(page_store, page_size),
+        ContextManagerActor {
+            service: ContextManager::new(page_store, page_size),
         }
     }
 

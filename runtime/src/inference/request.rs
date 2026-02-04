@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use crate::adapter::AdapterId;
-use crate::brle::Brle;
+use super::brle::Brle;
 use crate::kvcache::{NodeId, PageId};
 
 /// Sampler configuration for token generation.

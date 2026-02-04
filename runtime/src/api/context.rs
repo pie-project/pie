@@ -11,12 +11,12 @@ use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-/// Context resource - represents a KV cache context managed by the ContextActor.
+/// Context resource - represents a KV cache context managed by the ContextManagerActor.
 #[derive(Debug)]
 pub struct Context {
-    /// The context ID assigned by the ContextActor
+    /// The context ID assigned by the ContextManagerActor
     pub context_id: ContextId,
-    /// The model ID (for routing to the correct ContextActor)
+    /// The model ID (for routing to the correct ContextManagerActor)
     pub model_id: ModelId,
     /// The user ID associated with this context
     pub user_id: u32,
