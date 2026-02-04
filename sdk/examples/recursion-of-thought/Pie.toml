@@ -1,0 +1,15 @@
+[package]
+name = "recursion-of-thought"
+version = "0.1.0"
+description = "Recursion-of-Thought for divide-and-conquer problem solving"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+question = {type = "string", optional = true, description = "The initial question to solve (default: 'Please calculate the expression (42 + 3) * 5 / 15.')"}
+max_depth = {type = "int", optional = true, description = "Maximum recursion depth (default: 5)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens to generate at each step (default: 128)"}
+verbose = {type = "bool", optional = true, description = "Print intermediate messages during recursion"}

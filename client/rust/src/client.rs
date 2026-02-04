@@ -10,6 +10,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use rmp_serde::{decode, encode};
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -341,26 +343,50 @@ impl Client {
     }
 
     /// Check if a program exists by its inferlet name.
-    /// Optionally verifies that the stored hash matches the provided hash.
+    /// Optionally verifies that the stored hashes match the provided file contents.
     ///
     /// The `inferlet` parameter can be:
-    /// - Full name with version: `std/text-completion@0.1.0`
-    /// - Without namespace (defaults to `std`): `text-completion@0.1.0`
-    /// - Without version (defaults to `latest`): `std/text-completion` or `text-completion`
+    /// - Full name with version: `text-completion@0.1.0`
+    /// - Without version (defaults to `latest`): `text-completion`
     ///
-    /// If `hash` is provided, also checks that the stored hash matches.
-    pub async fn program_exists(&self, inferlet: &str, hash: Option<&str>) -> Result<bool> {
-        let query = match hash {
-            Some(h) => format!("{}#{}", inferlet, h),
-            None => inferlet.to_string(),
+    /// If paths are provided, both `wasm_path` and `manifest_path` must be specified together.
+    /// The function will read the files and compute blake3 hashes for verification.
+    pub async fn program_exists(
+        &self,
+        inferlet: &str,
+        wasm_path: Option<&Path>,
+        manifest_path: Option<&Path>,
+    ) -> Result<bool> {
+        let query = match (wasm_path, manifest_path) {
+            (Some(wasm_p), Some(manifest_p)) => {
+                let wasm_bytes = fs::read(wasm_p)
+                    .with_context(|| format!("Failed to read WASM file: {:?}", wasm_p))?;
+                let manifest_content = fs::read_to_string(manifest_p)
+                    .with_context(|| format!("Failed to read manifest file: {:?}", manifest_p))?;
+                let wasm_hash = hash_blob(&wasm_bytes);
+                let manifest_hash = hash_blob(manifest_content.as_bytes());
+                format!("{}#{}+{}", inferlet, wasm_hash, manifest_hash)
+            }
+            (None, None) => inferlet.to_string(),
+            _ => anyhow::bail!("wasm_path and manifest_path must both be provided or both be None"),
         };
         self.query(QUERY_PROGRAM_EXISTS, query)
             .await
             .map(|r| r == "true")
     }
 
-    pub async fn upload_program(&self, blob: &[u8], manifest: &str) -> Result<()> {
-        let program_hash = hash_blob(blob);
+    /// Upload a program to the server.
+    ///
+    /// Args:
+    ///     wasm_path: Path to the WASM binary file.
+    ///     manifest_path: Path to the manifest TOML file.
+    pub async fn install_program(&self, wasm_path: &Path, manifest_path: &Path) -> Result<()> {
+        let blob = fs::read(wasm_path)
+            .with_context(|| format!("Failed to read WASM file: {:?}", wasm_path))?;
+        let manifest = fs::read_to_string(manifest_path)
+            .with_context(|| format!("Failed to read manifest file: {:?}", manifest_path))?;
+
+        let program_hash = hash_blob(&blob);
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let (tx, rx) = oneshot::channel();
         self.inner.pending_requests.insert(*corr_id_guard, tx);
@@ -375,7 +401,7 @@ impl Client {
         for chunk_index in 0..total_chunks {
             let start = chunk_index * CHUNK_SIZE_BYTES;
             let end = (start + CHUNK_SIZE_BYTES).min(total_size);
-            let msg = ClientMessage::UploadProgram {
+            let msg = ClientMessage::InstallProgram {
                 corr_id: *corr_id_guard,
                 program_hash: program_hash.clone(),
                 manifest: manifest.to_string(),
@@ -393,7 +419,7 @@ impl Client {
         if successful {
             Ok(())
         } else {
-            anyhow::bail!("Program upload failed: {}", result)
+            anyhow::bail!("Program install failed: {}", result)
         }
     }
 
@@ -404,9 +430,8 @@ impl Client {
     /// 2. If not found, it falls back to searching the registry.
     ///
     /// The `inferlet` parameter can be:
-    /// - Full name with version: `std/text-completion@0.1.0`
-    /// - Without namespace (defaults to `std`): `text-completion@0.1.0`
-    /// - Without version (defaults to `latest`): `std/text-completion` or `text-completion`
+    /// - Full name with version: `text-completion@0.1.0`
+    /// - Without version (defaults to `latest`): `text-completion`
     pub async fn launch_instance(
         &self,
         inferlet: String,
@@ -445,9 +470,8 @@ impl Client {
     /// explicitly want to launch an inferlet from the registry.
     ///
     /// The `inferlet` parameter can be:
-    /// - Full name with version: `std/text-completion@0.1.0`
-    /// - Without namespace (defaults to `std`): `text-completion@0.1.0`
-    /// - Without version (defaults to `latest`): `std/text-completion` or `text-completion`
+    /// - Full name with version: `text-completion@0.1.0`
+    /// - Without version (defaults to `latest`): `text-completion`
     pub async fn launch_instance_from_registry(
         &self,
         inferlet: String,

@@ -35,9 +35,9 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 opentelemetry-semantic-conventions = "0.27"
 serde_json = "1.0"
-wasmtime = { version = "40.0.0", features = ["pooling-allocator"] }
-wasmtime-wasi = "40.0.0"
-wasmtime-wasi-http = "40.0.0"
+wasmtime = { version = "38.0.0", features = ["pooling-allocator", "component-model-async"] }
+wasmtime-wasi = "38.0.0"
+wasmtime-wasi-http = "38.0.0"
 bytes = "1.10.1"
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
 dashmap = "6.1.0"

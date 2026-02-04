@@ -733,7 +733,7 @@ impl Session {
                     subject,
                     record,
                 } => self.handle_query(corr_id, subject, record).await,
-                ClientMessage::UploadProgram {
+                ClientMessage::InstallProgram {
                     corr_id,
                     program_hash,
                     manifest,

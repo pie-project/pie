@@ -1,0 +1,12 @@
+[package]
+name = "prefix-tree"
+version = "0.1.0"
+description = "Prefix tree caching with concurrent generation from shared context"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+num_tokens = {type = "int", optional = true, description = "Number of tokens to generate for each prompt (default: 128)"}

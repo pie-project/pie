@@ -7,5 +7,5 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-inferlet.workspace = true
-inferlet-macros.workspace = true
+inferlet = { path = "../../sdk/rust/inferlet" }
+inferlet-macros = { path = "../../sdk/rust/inferlet-macros" }

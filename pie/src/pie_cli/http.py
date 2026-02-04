@@ -19,7 +19,7 @@ console = Console()
 
 def http(
     inferlet: Optional[str] = typer.Argument(
-        None, help="Inferlet name from registry (e.g., 'std/http-server@0.1.0')"
+        None, help="Inferlet name from registry (e.g., 'http-server@0.1.0')"
     ),
     path: Optional[Path] = typer.Option(
         None, "--path", "-p", help="Path to a local .wasm server inferlet file"
@@ -48,7 +48,7 @@ def http(
 
     \b
     - By path: pie http --path ./server.wasm --port 8080
-    - By registry: pie http std/http-server@0.1.0 --port 8080
+    - By registry: pie http http-server@0.1.0 --port 8080
 
     The server will run until interrupted with Ctrl+C.
     """
@@ -177,10 +177,10 @@ def _launch_server_inferlet(
             program_bytes = path.read_bytes()
             program_hash = blake3.blake3(program_bytes).hexdigest()
 
-            # Upload if needed
+            # Install if needed
             if not await client.program_exists(program_hash):
-                console.print(f"[dim]Uploading {path.name}...[/dim]")
-                await client.upload_program(program_bytes)
+                console.print(f"[dim]Installing {path.name}...[/dim]")
+                await client.install_program(program_bytes)
 
             # Launch as server instance
             console.print(f"[dim]Starting server on port {port}...[/dim]")

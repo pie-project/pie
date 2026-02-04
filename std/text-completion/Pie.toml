@@ -1,22 +1,18 @@
 [package]
-name = "std/text-completion"
+name = "text-completion"
 version = "0.1.0"
 description = "Simple text completion inferlet"
 authors = ["In Gim <in.gim@yale.edu>"]
 repository = "https://github.com/pie-project/pie"
 readme = "README.md"
-keywords = ["text-generation", "llm", "completion"]
 
-[engine]
-min_version = "^1.0.0"
-[interface]
-inputs = [
-    { name = "prompt", type = "string", description = "The user message to complete" },
-    { name = "system", type = "string", optional = true, description = "System prompt to set assistant behavior" },
-    { name = "max_tokens", type = "int", optional = true, description = "Maximum number of tokens to generate (default: 256)" },
-    { name = "temperature", type = "float", optional = true, description = "Sampling temperature (default: 0.6)" },
-    { name = "top_p", type = "float", optional = true, description = "Top-p nucleus sampling threshold (default: 0.95)" },
-]
-outputs = [
-    { name = "completion", type = "string", description = "The generated text completion" }
-]
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", description = "The user message to complete"}
+system = {type = "string", optional = true, description = "System prompt to set assistant behavior"}
+max_tokens = {type = "int", optional = true, description = "Maximum number of tokens to generate (default: 256)"}
+temperature = {type = "float", optional = true, description = "Sampling temperature (default: 0.6)"}
+top_p = {type = "float", optional = true, description = "Top-p nucleus sampling threshold (default: 0.95)"}

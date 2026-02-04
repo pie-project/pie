@@ -1,0 +1,14 @@
+[package]
+name = "tree-of-thought"
+version = "0.1.0"
+description = "Tree-of-Thought for multi-branch reasoning (Propose, Execute, Reflect)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+question = {type = "string", optional = true, description = "The question to solve (default: 'Calculate (42 + 3) * 5 / 15.')"}
+num_branches = {type = "int", optional = true, description = "Number of branches at each level of the tree (default: 2)"}
+max_tokens = {type = "int", optional = true, description = "Max new tokens to generate at each step (default: 512)"}

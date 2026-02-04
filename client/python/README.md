@@ -24,9 +24,9 @@ async def main():
         # If server auth is disabled, any username works without a key:
         # await client.authenticate("any_username")
         
-        # Upload and launch a program
+        # Install and launch a program
         with open("my_program.wasm", "rb") as f:
-            await client.upload_program(f.read())
+            await client.install_program(f.read())
         
         program_hash = "..."  # blake3 hash of the wasm binary
         instance = await client.launch_instance(program_hash)
@@ -47,8 +47,8 @@ asyncio.run(main())
 |--------|-------------|
 | `authenticate(username, private_key)` | Public key authentication (challenge-response) |
 | `internal_authenticate(token)` | Token-based internal authentication |
-| `upload_program(bytes)` | Upload a WASM program |
-| `program_exists(hash)` | Check if program is uploaded |
+| `install_program(wasm_path, manifest_path)` | Install a WASM program from file paths |
+| `program_exists(inferlet, wasm_path, manifest_path)` | Check if program is uploaded with optional file-based hash verification |
 | `launch_instance(hash, args, detached)` | Launch a program instance |
 | `attach_instance(instance_id)` | Attach to a detached instance |
 | `list_instances()` | List running instances |

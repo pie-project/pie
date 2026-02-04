@@ -10,10 +10,6 @@ from typing import Annotated, Optional
 
 from rich.table import Table
 from rich.panel import Panel
-from rich.text import Text
-from rich.console import Group
-from rich.padding import Padding
-from rich.columns import Columns
 from rich import box
 from .console import console
 
@@ -27,7 +23,6 @@ from .registry import (
     RegistryError,
     PublishStartRequest,
     PublishCommitRequest,
-    resolve_name,
 )
 
 
@@ -64,16 +59,13 @@ def search(
     query: Annotated[str, typer.Argument(help="Search query.")] = "",
     page: Annotated[int, typer.Option("--page", "-p", help="Page number.")] = 1,
     per_page: Annotated[int, typer.Option("--per-page", help="Results per page.")] = 20,
-    namespace: Annotated[
-        Optional[str], typer.Option("--namespace", "-n", help="Filter by namespace.")
-    ] = None,
 ) -> None:
     """Search for inferlets in the registry."""
     try:
         with RegistryClient(base_url=REGISTRY_URL) as client:
             with console.status("Searching..."):
                 result = client.search(
-                    query=query, page=page, per_page=per_page, namespace=namespace
+                    query=query, page=page, per_page=per_page
                 )
 
             if result.total == 0:
@@ -97,7 +89,7 @@ def search(
             table.add_column("DESCRIPTION", style="dim")
 
             for item in result.items:
-                name = item.full_name
+                name = item.name
                 version = item.latest_version or "-"
                 downloads = _format_downloads(item.downloads)
                 description = (item.description or "").split("\n")[0][:60]
@@ -124,7 +116,7 @@ def info(
     name: Annotated[
         str,
         typer.Argument(
-            help="Inferlet name (e.g., 'react' or 'ingim/tree-of-thought')."
+            help="Inferlet name (e.g., 'text-completion')."
         ),
     ],
 ) -> None:
@@ -137,7 +129,7 @@ def info(
             latest = detail.versions[0] if detail.versions else None
 
             # --- Header ---
-            title_str = f"{detail.full_name}"
+            title_str = f"{detail.name}"
             if latest:
                 title_str += f"@{latest.num}"
 
@@ -154,72 +146,73 @@ def info(
                     console.print(
                         f"[dim]url:[/dim] [blue link={latest.repository}]{latest.repository}[/blue link]"
                     )
-                if latest.requires_engine:
-                    console.print(f"[dim]engine: {latest.requires_engine}[/dim]")
+                if latest.runtime:
+                    runtime_str = ", ".join(f"{k}={v}" for k, v in latest.runtime.items())
+                    console.print(f"[dim]runtime: {runtime_str}[/dim]")
 
             console.print()
 
-            # --- Interface Panels ---
-            if latest and latest.interface_spec:
-                # Helper to create a table style
-                def create_interface_table():
-                    t = Table(
-                        show_header=False,
-                        box=None,
-                        padding=(0, 2),
+            # --- Parameters Panel ---
+            if latest and latest.parameters:
+                param_table = Table(
+                    show_header=False,
+                    box=None,
+                    padding=(0, 2),
+                    expand=True,
+                    pad_edge=False,
+                )
+                param_table.add_column("Name", style="white", no_wrap=True)
+                param_table.add_column("Type", style="green", no_wrap=True)
+                param_table.add_column("Description", style="dim", ratio=1)
+
+                for param_name, param_info in latest.parameters.items():
+                    param_type = param_info.get("type", "?")
+                    optional = " (opt)" if param_info.get("optional") else ""
+                    desc = param_info.get("description", "")
+                    param_table.add_row(param_name, f"{param_type}{optional}", desc)
+
+                console.print(
+                    Panel(
+                        param_table,
+                        title="Parameters",
+                        title_align="left",
+                        box=box.ROUNDED,
+                        border_style="dim",
                         expand=True,
-                        pad_edge=False,
+                        padding=(0, 1),
                     )
-                    t.add_column("Name", style="white", no_wrap=True)
-                    t.add_column("Type", style="green", no_wrap=True)
-                    t.add_column("Description", style="dim", ratio=1)
-                    return t
+                )
 
-                if "inputs" in latest.interface_spec:
-                    inp_table = create_interface_table()
-                    for inp in latest.interface_spec["inputs"]:
-                        inp_name = inp.get("name", "?")
-                        inp_type = inp.get("type", "?")
-                        optional = " (opt)" if inp.get("optional") else ""
-                        desc = inp.get("description", "")
-                        inp_table.add_row(inp_name, f"{inp_type}{optional}", desc)
+            # --- Dependencies Panel ---
+            if latest and latest.dependencies:
+                dep_table = Table(
+                    show_header=False,
+                    box=None,
+                    padding=(0, 2),
+                    expand=True,
+                    pad_edge=False,
+                )
+                dep_table.add_column("Name", style="cyan", no_wrap=True)
+                dep_table.add_column("Version", style="green", no_wrap=True)
 
-                    console.print(
-                        Panel(
-                            inp_table,
-                            title="Inputs",
-                            title_align="left",
-                            box=box.ROUNDED,
-                            border_style="dim",
-                            expand=True,
-                            padding=(0, 1),
-                        )
+                for dep_name, dep_version in latest.dependencies.items():
+                    dep_table.add_row(dep_name, dep_version)
+
+                console.print(
+                    Panel(
+                        dep_table,
+                        title="Dependencies",
+                        title_align="left",
+                        box=box.ROUNDED,
+                        border_style="dim",
+                        expand=True,
+                        padding=(0, 1),
                     )
-
-                if "outputs" in latest.interface_spec:
-                    out_table = create_interface_table()
-                    for out in latest.interface_spec["outputs"]:
-                        out_name = out.get("name", "?")
-                        out_type = out.get("type", "?")
-                        desc = out.get("description", "")
-                        out_table.add_row(out_name, out_type, desc)
-
-                    console.print(
-                        Panel(
-                            out_table,
-                            title="Outputs",
-                            title_align="left",
-                            box=box.ROUNDED,
-                            border_style="dim",
-                            expand=True,
-                            padding=(0, 1),
-                        )
-                    )
+                )
 
     except RegistryError as e:
         if e.status_code == 404:
-            namespace, pkg_name = resolve_name(name)
-            console.print(f"[red]❌ Inferlet '{namespace}/{pkg_name}' not found[/red]")
+            console.print(f"[red]❌ Inferlet '{name}' not found[/red]")
         else:
             console.print(f"[red]❌ Error: {e.detail}[/red]")
         raise typer.Exit(1)
@@ -249,11 +242,11 @@ def publish(
 
     # Extract package info
     package = manifest.get("package", {})
-    full_name = package.get("name")
+    name = package.get("name")
     version = package.get("version")
     description = package.get("description")
 
-    if not full_name:
+    if not name:
         console.print("[red]❌ Missing 'package.name' in Pie.toml[/red]")
         raise typer.Exit(1)
 
@@ -282,16 +275,14 @@ def publish(
                 f"[yellow]⚠️ README file '{readme_filename}' specified in Pie.toml but not found[/yellow]"
             )
 
-    # Parse namespace/name
-    namespace, name = resolve_name(full_name)
+    # Get runtime requirements
+    runtime = manifest.get("runtime")
 
-    # Get engine requirements
-    engine = manifest.get("engine", {})
-    requires_engine = engine.get("min_version")
+    # Get parameters
+    parameters = manifest.get("parameters")
 
-    # Get interface spec
-    interface = manifest.get("interface", {})
-    interface_spec = interface if interface else None
+    # Get dependencies
+    dependencies = manifest.get("dependencies")
 
     # Find the .wasm artifact
     wasm_path = directory / f"{name}.wasm"
@@ -311,7 +302,7 @@ def publish(
         console.print(f"[red]❌ No .wasm artifact found. Expected: {name}.wasm[/red]")
         raise typer.Exit(1)
 
-    console.print(f"📦 Publishing [bold cyan]{namespace}/{name}@{version}[/bold cyan]")
+    console.print(f"📦 Publishing [bold cyan]{name}@{version}[/bold cyan]")
     console.print(f"   Artifact: [blue]{wasm_path.name}[/blue]")
 
     # Load the token
@@ -332,20 +323,8 @@ def publish(
 
     try:
         with RegistryClient(token=token, base_url=REGISTRY_URL) as client:
-            # Verify we're authenticated as the right user
+            # Verify we're authenticated
             user = client.get_me()
-
-            if namespace != "std" and namespace != user.login:
-                console.print(
-                    f"[red]❌ Cannot publish to namespace '{namespace}' as user '{user.login}'[/red]"
-                )
-                raise typer.Exit(1)
-
-            if namespace == "std" and not user.is_superuser:
-                console.print(
-                    "[red]❌ Only superusers can publish to the 'std' namespace[/red]"
-                )
-                raise typer.Exit(1)
 
             console.print(f"🔐 Publishing as: [bold]{user.login}[/bold]")
             console.print()
@@ -354,18 +333,11 @@ def publish(
             with console.status("[bold green]Publishing...[/bold green]") as status:
                 status.update("[bold green]📤 Starting publish...[/bold green]")
                 start_req = PublishStartRequest(
-                    namespace=namespace,
                     name=name,
                     version=version,
                     checksum=checksum,
                     size_bytes=size_bytes,
                     description=description,
-                    requires_engine=requires_engine,
-                    interface_spec=interface_spec,
-                    authors=authors,
-                    keywords=keywords,
-                    repository=repository,
-                    readme=readme_content,
                 )
                 start_resp = client.start_publish(start_req)
 
@@ -374,15 +346,15 @@ def publish(
 
                 status.update("[bold green]📤 Finalizing publish...[/bold green]")
                 commit_req = PublishCommitRequest(
-                    namespace=namespace,
                     name=name,
                     version=version,
                     storage_path=start_resp.storage_path,
                     checksum=checksum,
                     size_bytes=size_bytes,
                     description=description,
-                    requires_engine=requires_engine,
-                    interface_spec=interface_spec,
+                    runtime=runtime,
+                    parameters=parameters,
+                    dependencies=dependencies,
                     authors=authors,
                     keywords=keywords,
                     repository=repository,
@@ -392,9 +364,9 @@ def publish(
 
             console.print(
                 Panel(
-                    f"Published: [bold]{commit_resp.full_name}@{commit_resp.version}[/bold]\n\n"
+                    f"Published: [bold]{commit_resp.name}@{commit_resp.version}[/bold]\n\n"
                     f"Install with:\n"
-                    f"   pie run {commit_resp.full_name}",
+                    f"   pie run {commit_resp.name}",
                     title="[green]✅ Published[/green]",
                     border_style="green",
                 )
@@ -403,3 +375,4 @@ def publish(
     except RegistryError as e:
         console.print(f"[red]❌ Publish failed: {e.detail}[/red]")
         raise typer.Exit(1)
+

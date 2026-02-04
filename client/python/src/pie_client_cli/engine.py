@@ -322,34 +322,40 @@ def attach_instance(client: PieClient, instance_id: str) -> Instance:
     )
 
 
-def upload_program(client: PieClient, program_bytes: bytes, manifest: str) -> None:
-    """Upload a program (sync wrapper).
+def install_program(client: PieClient, wasm_path: str, manifest_path: str) -> None:
+    """Install a program (sync wrapper).
 
     Args:
         client: The PieClient instance.
-        program_bytes: The WASM binary data.
-        manifest: The manifest TOML content as a string.
+        wasm_path: Path to the WASM binary file.
+        manifest_path: Path to the manifest TOML file.
     """
     asyncio.get_event_loop().run_until_complete(
-        client.upload_program(program_bytes, manifest)
+        client.install_program(wasm_path, manifest_path)
     )
 
 
-def program_exists(client: PieClient, inferlet: str, hash: str | None = None) -> bool:
+def program_exists(
+    client: PieClient,
+    inferlet: str,
+    wasm_path: str | None = None,
+    manifest_path: str | None = None,
+) -> bool:
     """Check if a program exists (sync wrapper).
 
     The inferlet parameter can be:
-    - Full name with version: "std/text-completion@0.1.0"
-    - Without namespace (defaults to "std"): "text-completion@0.1.0"
-    - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
+    - Full name with version: "text-completion@0.1.0"
+    - Without version (defaults to "latest"): "text-completion"
 
     Args:
         client: The Pie client.
-        inferlet: The inferlet name (e.g., "std/text-completion@0.1.0").
-        hash: Optional hash to verify. If provided, also checks that the stored hash matches.
+        inferlet: The inferlet name (e.g., "text-completion@0.1.0").
+        wasm_path: Optional path to the WASM binary file for hash verification.
+        manifest_path: Optional path to the manifest TOML file for hash verification.
+            If paths are provided, both must be specified together.
     """
     return asyncio.get_event_loop().run_until_complete(
-        client.program_exists(inferlet, hash)
+        client.program_exists(inferlet, wasm_path, manifest_path)
     )
 
 
@@ -366,9 +372,8 @@ def launch_instance(
     2. If not found, it falls back to searching the registry.
 
     The inferlet parameter can be:
-    - Full name with version: "std/text-completion@0.1.0"
-    - Without namespace (defaults to "std"): "text-completion@0.1.0"
-    - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
+    - Full name with version: "text-completion@0.1.0"
+    - Without version (defaults to "latest"): "text-completion"
     """
     return asyncio.get_event_loop().run_until_complete(
         client.launch_instance(inferlet, arguments, detached)
@@ -388,9 +393,8 @@ def launch_instance_from_registry(
     an inferlet from the registry.
 
     The inferlet parameter can be:
-    - Full name with version: "std/text-completion@0.1.0"
-    - Without namespace (defaults to "std"): "text-completion@0.1.0"
-    - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
+    - Full name with version: "text-completion@0.1.0"
+    - Without version (defaults to "latest"): "text-completion"
     """
     return asyncio.get_event_loop().run_until_complete(
         client.launch_instance_from_registry(inferlet, arguments, detached)

@@ -18,25 +18,25 @@ wasmtime::component::bindgen!({
     with: {
         "wasi:io/poll": wasmtime_wasi::p2::bindings::io::poll,
         // pie:core/types
-        "pie:core/types.future-bool": types::FutureBool,
-        "pie:core/types.future-string": types::FutureString,
+        "pie:core/types/future-bool": types::FutureBool,
+        "pie:core/types/future-string": types::FutureString,
         // pie:core/context
-        "pie:core/context.context": context::Context,
+        "pie:core/context/context": context::Context,
         // pie:core/model
-        "pie:core/model.model": model::Model,
-        "pie:core/model.tokenizer": model::Tokenizer,
+        "pie:core/model/model": model::Model,
+        "pie:core/model/tokenizer": model::Tokenizer,
         // pie:core/inference
-        "pie:core/inference.forward-pass": inference::ForwardPass,
-        "pie:core/inference.future-output": inference::FutureOutput,
+        "pie:core/inference/forward-pass": inference::ForwardPass,
+        "pie:core/inference/future-output": inference::FutureOutput,
         // pie:core/messaging
-        "pie:core/messaging.subscription": messaging::Subscription,
+        "pie:core/messaging/subscription": messaging::Subscription,
         // pie:core/adapter
-        "pie:core/adapter.adapter": adapter::Adapter,
+        "pie:core/adapter/adapter": adapter::Adapter,
         // pie:mcp/types
-        "pie:mcp/types.future-content": mcp::FutureContent,
-        "pie:mcp/types.future-json-string": mcp::FutureJsonString,
+        "pie:mcp/types/future-content": mcp::FutureContent,
+        "pie:mcp/types/future-json-string": mcp::FutureJsonString,
         // pie:mcp/client
-        "pie:mcp/client.session": mcp::Session,
+        "pie:mcp/client/session": mcp::Session,
     },
     imports: { default: async | trappable },
     exports: { default: async },

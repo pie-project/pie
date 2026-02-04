@@ -19,10 +19,13 @@ console = Console()
 
 def run(
     inferlet: Optional[str] = typer.Argument(
-        None, help="Inferlet name from registry (e.g., 'std/text-completion@0.1.0')"
+        None, help="Inferlet name from registry (e.g., 'text-completion@0.1.0')"
     ),
     path: Optional[Path] = typer.Option(
         None, "--path", "-p", help="Path to a local .wasm inferlet file"
+    ),
+    manifest: Optional[Path] = typer.Option(
+        None, "--manifest", "-m", help="Path to the manifest TOML file (required with --path)"
     ),
     config: Optional[Path] = typer.Option(
         None, "--config", "-c", help="Path to TOML configuration file"
@@ -43,7 +46,7 @@ def run(
 
     You can specify an inferlet either by registry name or by path (mutually exclusive):
 
-    - By registry: pie run std/text-completion@0.1.0
+    - By registry: pie run text-completion@0.1.0
     - By path: pie run --path ./my_inferlet.wasm
     """
     # Validate at least one of inferlet or path is provided
@@ -61,6 +64,16 @@ def run(
     # Verify inferlet exists if using path
     if path is not None and not path.exists():
         console.print(f"[red]✗[/red] File not found: {path}")
+        raise typer.Exit(1)
+
+    # Manifest is required when using --path
+    if path is not None and manifest is None:
+        console.print("[red]✗[/red] --manifest is required when using --path")
+        raise typer.Exit(1)
+
+    # Verify manifest exists if provided
+    if manifest is not None and not manifest.exists():
+        console.print(f"[red]✗[/red] Manifest not found: {manifest}")
         raise typer.Exit(1)
 
     try:
@@ -112,7 +125,7 @@ def run(
 
         if path is not None:
             manager.submit_inferlet_and_wait(
-                client_config, path, arguments or [], server_handle, backend_processes
+                client_config, path, manifest, arguments or [], server_handle, backend_processes
             )
         else:
             # Launch from registry

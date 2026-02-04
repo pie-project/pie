@@ -522,8 +522,9 @@ def _ipc_worker_process(
              _init_distributed(rank, world_size, master_port, devices[rank])
         else:
              # Skip distributed for single device to avoid NCCL/socket issues
-             torch.cuda.set_device(devices[rank])
-             pass
+            device_str = devices[rank]
+            if device_str.startswith("cuda"):
+                torch.cuda.set_device(device_str)
 
         # Setup process groups (collective ops - all ranks must participate)
         # Capture the mappings to pass to Runtime
@@ -946,6 +947,7 @@ def terminate_engine_and_backend(
 def submit_inferlet_and_wait(
     client_config: dict,
     inferlet_path: Path,
+    manifest_path: Path,
     arguments: list[str],
     server_handle: "_pie.ServerHandle | None" = None,
     backend_processes: list | None = None,
@@ -956,6 +958,7 @@ def submit_inferlet_and_wait(
     Args:
         client_config: Client configuration with host, port, internal_auth_token
         inferlet_path: Path to the .wasm inferlet file
+        manifest_path: Path to the manifest TOML file
         arguments: Arguments to pass to the inferlet
         server_handle: Optional server handle for process monitoring
         backend_processes: Optional list of backend processes to monitor
@@ -964,6 +967,7 @@ def submit_inferlet_and_wait(
         _submit_inferlet_async(
             client_config,
             inferlet_path,
+            manifest_path,
             arguments,
             server_handle,
             backend_processes,
@@ -975,6 +979,7 @@ def submit_inferlet_and_wait(
 async def _submit_inferlet_async(
     client_config: dict,
     inferlet_path: Path,
+    manifest_path: Path,
     arguments: list[str],
     server_handle: "_pie.ServerHandle | None" = None,
     backend_processes: list | None = None,
@@ -982,7 +987,7 @@ async def _submit_inferlet_async(
 ) -> None:
     """Async implementation of submit_inferlet_and_wait."""
 
-    import blake3
+    import tomllib
     from pie_client import PieClient, Event
 
     def emit(event_type: str, msg: str):
@@ -995,10 +1000,9 @@ async def _submit_inferlet_async(
     if not inferlet_path.exists():
         raise FileNotFoundError(f"Inferlet not found: {inferlet_path}")
 
-    # Read and hash the inferlet
-    inferlet_blob = inferlet_path.read_bytes()
-    program_hash = blake3.blake3(inferlet_blob).hexdigest()
-    emit("info", f"Inferlet hash: {program_hash}")
+    # Check manifest exists
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
     # Build the WebSocket URI
     host = client_config.get("host", "127.0.0.1")
@@ -1014,21 +1018,29 @@ async def _submit_inferlet_async(
         )
 
     try:
+        # Parse manifest to get inferlet name
+        manifest_content = manifest_path.read_text()
+        manifest = tomllib.loads(manifest_content)
+        package_name = manifest["package"]["name"]
+        version = manifest["package"]["version"]
+        inferlet_name = f"{package_name}@{version}"
+        emit("info", f"Inferlet: {inferlet_name}")
+
         async with PieClient(server_uri) as client:
             # Authenticate with internal token
             await client.internal_authenticate(internal_token)
 
-            # Check if program already exists, upload if not
-            if not await client.program_exists(program_hash):
-                emit("info", "Uploading inferlet...")
-                await client.upload_program(inferlet_blob)
+            # Check if program already exists, install if not
+            if not await client.program_exists(inferlet_name, inferlet_path, manifest_path):
+                emit("info", "Installing inferlet...")
+                await client.install_program(inferlet_path, manifest_path)
             else:
                 emit("info", "Inferlet already cached on server.")
 
             # Launch the instance
             emit("info", f"Launching {inferlet_path.name}...")
             instance = await client.launch_instance(
-                program_hash=program_hash,
+                inferlet_name,
                 arguments=arguments,
                 detached=False,
             )
@@ -1118,7 +1130,7 @@ def submit_inferlet_from_registry_and_wait(
 
     Args:
         client_config: Client configuration with host, port, internal_auth_token
-        inferlet_name: Inferlet name (e.g., "std/text-completion@0.1.0")
+        inferlet_name: Inferlet name (e.g., "text-completion@0.1.0")
         arguments: Arguments to pass to the inferlet
         server_handle: Optional server handle for process monitoring
         backend_processes: Optional list of backend processes to monitor

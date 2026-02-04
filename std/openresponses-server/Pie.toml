@@ -1,0 +1,12 @@
+[package]
+name = "openresponses-server"
+version = "0.1.0"
+description = "OpenResponses-compliant HTTP server for LLM inference"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+# No CLI parameters - this is an HTTP server that receives input via HTTP requests
+[parameters]

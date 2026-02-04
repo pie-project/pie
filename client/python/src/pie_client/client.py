@@ -6,6 +6,7 @@ import blake3
 
 from enum import Enum
 from dataclasses import dataclass
+from pathlib import Path
 
 from .crypto import ParsedPrivateKey
 
@@ -385,20 +386,34 @@ class PieClient:
         msg = {"type": "query", "subject": subject, "record": record}
         return await self._send_msg_and_wait(msg)
 
-    async def program_exists(self, inferlet: str, hash: str | None = None) -> bool:
+    async def program_exists(
+        self,
+        inferlet: str,
+        wasm_path: str | Path | None = None,
+        manifest_path: str | Path | None = None,
+    ) -> bool:
         """Check if a program exists on the server.
 
         The inferlet parameter can be:
-        - Full name with version: "std/text-completion@0.1.0"
-        - Without namespace (defaults to "std"): "text-completion@0.1.0"
-        - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
+        - Full name with version: "text-completion@0.1.0"
+        - Without version (defaults to "latest"): "text-completion"
 
         Args:
-            inferlet: The inferlet name (e.g., "std/text-completion@0.1.0").
-            hash: Optional hash to verify. If provided, also checks that the stored hash matches.
+            inferlet: The inferlet name (e.g., "text-completion@0.1.0").
+            wasm_path: Optional path to the WASM binary file for hash verification.
+            manifest_path: Optional path to the manifest TOML file for hash verification.
+                If paths are provided, both must be specified together.
         """
-        if hash:
-            query = f"{inferlet}#{hash}"
+        if (wasm_path is None) != (manifest_path is None):
+            raise ValueError(
+                "wasm_path and manifest_path must both be provided or both be None"
+            )
+        if wasm_path and manifest_path:
+            wasm_bytes = Path(wasm_path).read_bytes()
+            manifest_content = Path(manifest_path).read_text()
+            wasm_hash = blake3.blake3(wasm_bytes).hexdigest()
+            manifest_hash = blake3.blake3(manifest_content.encode()).hexdigest()
+            query = f"{inferlet}#{wasm_hash}+{manifest_hash}"
         else:
             query = inferlet
         successful, result = await self.query("program_exists", query)
@@ -445,16 +460,18 @@ class PieClient:
 
         return result
 
-    async def upload_program(self, program_bytes: bytes, manifest: str):
-        """Upload a program to the server in chunks.
+    async def install_program(self, wasm_path: str | Path, manifest_path: str | Path):
+        """Install a program to the server in chunks.
 
         Args:
-            program_bytes: The WASM binary data.
-            manifest: The manifest TOML content as a string.
+            wasm_path: Path to the WASM binary file.
+            manifest_path: Path to the manifest TOML file.
         """
+        program_bytes = Path(wasm_path).read_bytes()
+        manifest = Path(manifest_path).read_text()
         program_hash = blake3.blake3(program_bytes).hexdigest()
         template = {
-            "type": "upload_program",
+            "type": "install_program",
             "program_hash": program_hash,
             "manifest": manifest,
         }
@@ -483,11 +500,10 @@ class PieClient:
         2. If not found, it falls back to searching the registry.
 
         The inferlet parameter can be:
-        - Full name with version: "std/text-completion@0.1.0"
-        - Without namespace (defaults to "std"): "text-completion@0.1.0"
-        - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
+        - Full name with version: "text-completion@0.1.0"
+        - Without version (defaults to "latest"): "text-completion"
 
-        :param inferlet: The inferlet name (e.g., "std/text-completion@0.1.0").
+        :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
         :param arguments: Command-line arguments to pass to the inferlet.
         :param detached: If True, the instance runs in detached mode.
         :return: An Instance object for the launched inferlet.
@@ -523,11 +539,10 @@ class PieClient:
         an inferlet from the registry.
 
         The inferlet parameter can be:
-        - Full name with version: "std/text-completion@0.1.0"
-        - Without namespace (defaults to "std"): "text-completion@0.1.0"
-        - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
+        - Full name with version: "text-completion@0.1.0"
+        - Without version (defaults to "latest"): "text-completion"
 
-        :param inferlet: The inferlet name (e.g., "std/text-completion@0.1.0").
+        :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
         :param arguments: Command-line arguments to pass to the inferlet.
         :param detached: If True, the instance runs in detached mode.
         :return: An Instance object for the launched inferlet.

@@ -81,7 +81,7 @@ def submit(
     inferlet: Annotated[
         Optional[str],
         typer.Argument(
-            help="Inferlet name from registry (e.g., 'std/text-completion@0.1.0')"
+            help="Inferlet name from registry (e.g., 'text-completion@0.1.0')"
         ),
     ] = None,
     path: Annotated[
@@ -117,7 +117,7 @@ def submit(
 
     You can specify an inferlet either by registry name or by path (mutually exclusive):
 
-    - By registry: pie-client submit std/text-completion@0.1.0
+    - By registry: pie-client submit text-completion@0.1.0
     - By path: pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml
     """
     try:

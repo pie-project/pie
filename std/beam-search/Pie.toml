@@ -1,0 +1,14 @@
+[package]
+name = "beam-search"
+version = "0.1.0"
+description = "Text generation inferlet with beam search decoding"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "The prompt to send to the model (default: 'Explain the LLM decoding process ELI5.')"}
+max_tokens = {type = "int", optional = true, description = "Maximum number of new tokens to generate (default: 128)"}
+beam_size = {type = "int", optional = true, description = "The beam size for decoding (default: 1)"}

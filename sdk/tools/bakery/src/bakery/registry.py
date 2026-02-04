@@ -21,8 +21,10 @@ class VersionInfo:
     checksum: str
     size_bytes: int
     description: Optional[str]
-    requires_engine: Optional[str]
-    interface_spec: Optional[dict[str, Any]]
+    runtime: Optional[dict[str, str]]
+    parameters: Optional[dict[str, Any]]
+    dependencies: Optional[dict[str, str]]
+    wit: Optional[str]
     yanked: bool
     created_at: datetime
     authors: Optional[list[str]] = None
@@ -38,8 +40,10 @@ class VersionInfo:
             checksum=data["checksum"],
             size_bytes=data["size_bytes"],
             description=data.get("description"),
-            requires_engine=data.get("requires_engine"),
-            interface_spec=data.get("interface_spec"),
+            runtime=data.get("runtime"),
+            parameters=data.get("parameters"),
+            dependencies=data.get("dependencies"),
+            wit=data.get("wit"),
             yanked=data.get("yanked", False),
             created_at=datetime.fromisoformat(
                 data["created_at"].replace("Z", "+00:00")
@@ -56,9 +60,7 @@ class InferletListItem:
     """Summary info for an inferlet in search results."""
 
     id: str
-    namespace: str
     name: str
-    full_name: str
     description: Optional[str]
     downloads: int
     latest_version: Optional[str]
@@ -69,9 +71,7 @@ class InferletListItem:
         """Create an InferletListItem from API response dict."""
         return cls(
             id=data["id"],
-            namespace=data["namespace"],
             name=data["name"],
-            full_name=data["full_name"],
             description=data.get("description"),
             downloads=data.get("downloads", 0),
             latest_version=data.get("latest_version"),
@@ -86,9 +86,7 @@ class InferletDetail:
     """Detailed information about an inferlet including all versions."""
 
     id: str
-    namespace: str
     name: str
-    full_name: str
     downloads: int
     created_at: datetime
     versions: list[VersionInfo]
@@ -98,9 +96,7 @@ class InferletDetail:
         """Create an InferletDetail from API response dict."""
         return cls(
             id=data["id"],
-            namespace=data["namespace"],
             name=data["name"],
-            full_name=data["full_name"],
             downloads=data.get("downloads", 0),
             created_at=datetime.fromisoformat(
                 data["created_at"].replace("Z", "+00:00")
@@ -135,23 +131,15 @@ class SearchResponse:
 class PublishStartRequest:
     """Request to start publishing an inferlet."""
 
-    namespace: str
     name: str
     version: str
     checksum: str
     size_bytes: int
     description: Optional[str] = None
-    requires_engine: Optional[str] = None
-    interface_spec: Optional[dict[str, Any]] = None
-    authors: Optional[list[str]] = None
-    keywords: Optional[list[str]] = None
-    repository: Optional[str] = None
-    readme: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert to API request dict."""
         result = {
-            "namespace": self.namespace,
             "name": self.name,
             "version": self.version,
             "checksum": self.checksum,
@@ -159,18 +147,6 @@ class PublishStartRequest:
         }
         if self.description:
             result["description"] = self.description
-        if self.requires_engine:
-            result["requires_engine"] = self.requires_engine
-        if self.interface_spec:
-            result["interface_spec"] = self.interface_spec
-        if self.authors:
-            result["authors"] = self.authors
-        if self.keywords:
-            result["keywords"] = self.keywords
-        if self.repository:
-            result["repository"] = self.repository
-        if self.readme:
-            result["readme"] = self.readme
         return result
 
 
@@ -196,15 +172,15 @@ class PublishStartResponse:
 class PublishCommitRequest:
     """Request to finalize a publish operation."""
 
-    namespace: str
     name: str
     version: str
     storage_path: str
     checksum: str
     size_bytes: int
     description: Optional[str] = None
-    requires_engine: Optional[str] = None
-    interface_spec: Optional[dict[str, Any]] = None
+    runtime: Optional[dict[str, str]] = None
+    parameters: Optional[dict[str, Any]] = None
+    dependencies: Optional[dict[str, str]] = None
     authors: Optional[list[str]] = None
     keywords: Optional[list[str]] = None
     repository: Optional[str] = None
@@ -213,7 +189,6 @@ class PublishCommitRequest:
     def to_dict(self) -> dict:
         """Convert to API request dict."""
         result = {
-            "namespace": self.namespace,
             "name": self.name,
             "version": self.version,
             "storage_path": self.storage_path,
@@ -222,10 +197,12 @@ class PublishCommitRequest:
         }
         if self.description:
             result["description"] = self.description
-        if self.requires_engine:
-            result["requires_engine"] = self.requires_engine
-        if self.interface_spec:
-            result["interface_spec"] = self.interface_spec
+        if self.runtime:
+            result["runtime"] = self.runtime
+        if self.parameters:
+            result["parameters"] = self.parameters
+        if self.dependencies:
+            result["dependencies"] = self.dependencies
         if self.authors:
             result["authors"] = self.authors
         if self.keywords:
@@ -242,7 +219,7 @@ class PublishCommitResponse:
     """Response from finalizing a publish operation."""
 
     id: str
-    full_name: str
+    name: str
     version: str
     storage_path: str
 
@@ -251,7 +228,7 @@ class PublishCommitResponse:
         """Create a PublishCommitResponse from API response dict."""
         return cls(
             id=data["id"],
-            full_name=data["full_name"],
+            name=data["name"],
             version=data["version"],
             storage_path=data["storage_path"],
         )
@@ -278,21 +255,6 @@ class UserInfo:
             is_superuser=data.get("is_superuser", False),
         )
 
-
-def resolve_name(name: str) -> tuple[str, str]:
-    """Parse an inferlet name into (namespace, name).
-
-    If name contains '/', splits on first '/'.
-    If name is bare (no '/'), assumes 'std' namespace.
-
-    Examples:
-        "react" -> ("std", "react")
-        "ingim/tree-of-thought" -> ("ingim", "tree-of-thought")
-    """
-    if "/" in name:
-        parts = name.split("/", 1)
-        return parts[0], parts[1]
-    return "std", name
 
 
 class RegistryError(Exception):
@@ -370,7 +332,6 @@ class RegistryClient:
         query: str = "",
         page: int = 1,
         per_page: int = 20,
-        namespace: Optional[str] = None,
     ) -> SearchResponse:
         """Search for inferlets.
 
@@ -378,14 +339,11 @@ class RegistryClient:
             query: Search query string.
             page: Page number (1-indexed).
             per_page: Items per page (max 100).
-            namespace: Optional namespace filter.
 
         Returns:
             SearchResponse with matching inferlets.
         """
         params = {"q": query, "page": page, "per_page": per_page}
-        if namespace:
-            params["namespace"] = namespace
 
         response = self._get_client().get("/inferlets", params=params)
         return SearchResponse.from_dict(self._handle_response(response))
@@ -394,13 +352,12 @@ class RegistryClient:
         """Get detailed information about an inferlet.
 
         Args:
-            name: Inferlet name (e.g., "react" or "ingim/tree-of-thought").
+            name: Inferlet name (e.g., "text-completion").
 
         Returns:
             InferletDetail with full metadata and versions.
         """
-        namespace, pkg_name = resolve_name(name)
-        response = self._get_client().get(f"/inferlets/{namespace}/{pkg_name}")
+        response = self._get_client().get(f"/inferlets/{name}")
         return InferletDetail.from_dict(self._handle_response(response))
 
     def get_me(self) -> UserInfo:
@@ -428,7 +385,7 @@ class RegistryClient:
             PublishStartResponse with upload URL.
 
         Raises:
-            RegistryError: If authentication fails or namespace not allowed.
+            RegistryError: If authentication fails or request is invalid.
         """
         response = self._get_client().post("/inferlets/new", json=request.to_dict())
         return PublishStartResponse.from_dict(self._handle_response(response))

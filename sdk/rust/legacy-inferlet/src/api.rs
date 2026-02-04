@@ -1,4 +1,3 @@
-pub use crate::api::exports::inferlet::core::run::Guest;
 pub use crate::api::inferlet::adapter;
 pub use crate::api::inferlet::core::common::{
     Blob, BlobResult, DebugQueryResult, Model, Queue, SynchronizationResult, Priority,
@@ -20,8 +19,7 @@ pub use crate::api::inferlet::actor;
 
 wit_bindgen::generate!({
     path: "wit",
-    world: "exec",
-    pub_export_macro: true,
+    world: "imports",
     with: {
          "wasi:io/poll@0.2.4": wasi::io::poll,
     },

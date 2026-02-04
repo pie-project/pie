@@ -72,8 +72,8 @@ pub enum ClientMessage {
         record: String,
     },
 
-    #[serde(rename = "upload_program")]
-    UploadProgram {
+    #[serde(rename = "install_program")]
+    InstallProgram {
         corr_id: u32,
         program_hash: String,
         manifest: String,

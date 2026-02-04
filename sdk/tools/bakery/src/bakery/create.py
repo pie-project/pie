@@ -12,6 +12,7 @@ from typing import Optional
 
 from rich.panel import Panel
 from .console import console
+from . import path as path_utils
 import typer
 
 
@@ -28,34 +29,6 @@ def get_template(name: str) -> Template:
     return Template(template_content)
 
 
-def get_inferlet_js_path() -> Path:
-    """Get the path to the inferlet-js library.
-
-    Searches in order:
-    1. PIE_SDK environment variable
-    2. Walk up from current directory (for development)
-
-    Raises:
-        FileNotFoundError: If inferlet-js cannot be found.
-    """
-    # Try PIE_SDK environment variable
-    if pie_sdk := os.environ.get("PIE_SDK"):
-        path = Path(pie_sdk) / "javascript"
-        if path.exists():
-            return path
-
-    # Walk up from current directory (development mode)
-    current_dir = Path.cwd()
-    for parent in [current_dir] + list(current_dir.parents):
-        inferlet_js_path = parent / "sdk" / "javascript"
-        if inferlet_js_path.exists() and (inferlet_js_path / "package.json").exists():
-            return inferlet_js_path
-
-    raise FileNotFoundError(
-        f"Could not find inferlet-js directory.\n"
-        f"Searched from: {current_dir}\n"
-        f"Make sure you're running from within the pie repository or that PIE_SDK is set."
-    )
 
 
 def validate_project_name(name: str) -> None:
@@ -228,7 +201,7 @@ def handle_create_command(
     else:
         # Generate TypeScript project
         try:
-            inferlet_js_path = get_inferlet_js_path()
+            inferlet_js_path = path_utils.get_inferlet_js_path()
             project_dir_abs = project_dir.resolve()
             try:
                 relative_path = inferlet_js_path.resolve().relative_to(

@@ -1,0 +1,11 @@
+[package]
+name = "kvs"
+version = "0.1.0"
+description = "Key-value store API demonstration for persistent storage"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]

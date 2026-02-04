@@ -1,0 +1,13 @@
+[package]
+name = "agent-react"
+version = "0.1.0"
+description = "ReAct-style (Reasoning + Acting) agent workflow with tool execution"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+num_function_calls = {type = "int", optional = true, description = "Number of sequential Thought/Action/Observation cycles (default: 5)"}
+tokens_between_calls = {type = "int", optional = true, description = "Max tokens for each Thought/Action step (default: 512)"}

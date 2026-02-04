@@ -1,0 +1,13 @@
+[package]
+name = "cacheback-decoding"
+version = "0.1.0"
+description = "Speculative decoding with cache-based drafter using n-gram matching"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "The prompt to send to the model (default: 'Keep printing hello, world! 100 times.')"}
+max_tokens = {type = "int", optional = true, description = "Maximum number of new tokens to generate (default: 256)"}
