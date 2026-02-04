@@ -11,11 +11,7 @@ use uuid::Uuid;
 
 use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
 use crate::messaging::{self, PushPullMessage};
-use crate::program::{
-    ProgramMetadata, ProgramName, compile_wasm_component,
-    ensure_program_loaded_with_dependencies, parse_program_dependencies_from_manifest,
-    parse_program_name_from_manifest, try_download_inferlet_from_registry,
-};
+use crate::program::{self, ProgramMetadata, ProgramName};
 use crate::runtime::{self, AttachInstanceResult};
 
 use super::blob::InFlightUpload;
@@ -38,31 +34,15 @@ impl Session {
                 };
                 let program_name = ProgramName::parse(&inferlet_part);
 
-                // Check only uploaded programs (not registry programs) and get metadata
-                let program_metadata = self
-                    .state
-                    .uploaded_programs_in_disk
-                    .get(&program_name)
-                    .map(|entry| entry.value().clone());
+                // Parse expected hashes if provided (format: "wasm_hash+manifest_hash")
+                let expected_hashes = hashes.and_then(|hash_str| {
+                    hash_str.find('+').map(|plus_idx| {
+                        let (wasm, manifest_part) = hash_str.split_at(plus_idx);
+                        (wasm.to_string(), manifest_part[1..].to_string())
+                    })
+                });
 
-                // If hashes are provided, verify they match (format: "wasm_hash+manifest_hash")
-                let result = match (&program_metadata, hashes) {
-                    (Some(metadata), Some(hash_str)) => {
-                        // Parse the hash string as "wasm_hash+manifest_hash"
-                        if let Some(plus_idx) = hash_str.find('+') {
-                            let (expected_wasm_hash, manifest_part) = hash_str.split_at(plus_idx);
-                            let expected_manifest_hash = &manifest_part[1..];
-                            metadata.wasm_hash == expected_wasm_hash
-                                && metadata.manifest_hash == expected_manifest_hash
-                        } else {
-                            // Invalid format: '+' separator required
-                            false
-                        }
-                    }
-                    (Some(_), None) => true, // Program exists, no hash verification needed
-                    (None, _) => false,      // Program doesn't exist
-                };
-
+                let result = program::program_exists(&program_name, expected_hashes).await;
                 self.send_response(corr_id, true, result.to_string()).await;
             }
             message::QUERY_MODEL_STATUS => {
@@ -188,138 +168,20 @@ impl Session {
         inflight.buffer.append(&mut chunk_data);
         inflight.next_chunk_index += 1;
 
-        // On final chunk, verify and save
+        // On final chunk, delegate to program actor for verification, storage, and compilation
         if inflight.next_chunk_index == total_chunks {
-            let final_hash = blake3::hash(&inflight.buffer).to_hex().to_string();
-            if final_hash != program_hash {
-                self.send_response(
-                    corr_id,
-                    false,
-                    format!(
-                        "Hash mismatch: expected {}, got {}",
-                        program_hash, final_hash
-                    ),
-                )
-                .await;
-                self.inflight_program_upload = None;
-                return;
-            }
+            let wasm_bytes = mem::take(&mut inflight.buffer);
+            let manifest = mem::take(&mut inflight.manifest);
+            let expected_hash = program_hash;
 
-            // Parse the manifest to extract name, version, and dependencies
-            let manifest_content = mem::take(&mut inflight.manifest);
-            let program_name = match parse_program_name_from_manifest(&manifest_content) {
-                Ok(result) => result,
-                Err(e) => {
-                    self.send_response(corr_id, false, format!("Failed to parse manifest: {}", e))
-                        .await;
-                    self.inflight_program_upload = None;
-                    return;
+            match program::upload(wasm_bytes, manifest, expected_hash).await {
+                Ok(result) => {
+                    self.send_response(corr_id, true, result.wasm_hash).await;
                 }
-            };
-            let dependencies = parse_program_dependencies_from_manifest(&manifest_content);
-
-            // Write to disk: {cache_dir}/programs/{name}/{version}.{wasm,toml,wasm_hash,toml_hash}
-            let dir_path = self
-                .state
-                .cache_dir
-                .join("programs")
-                .join(&program_name.name);
-            if let Err(e) = tokio::fs::create_dir_all(&dir_path).await {
-                self.send_response(
-                    corr_id,
-                    false,
-                    format!("Failed to create directory {:?}: {}", dir_path, e),
-                )
-                .await;
-                self.inflight_program_upload = None;
-                return;
-            }
-
-            let wasm_file_path = dir_path.join(format!("{}.wasm", program_name.version));
-            let manifest_file_path = dir_path.join(format!("{}.toml", program_name.version));
-            let wasm_hash_file_path = dir_path.join(format!("{}.wasm_hash", program_name.version));
-            let manifest_hash_file_path =
-                dir_path.join(format!("{}.toml_hash", program_name.version));
-
-            let raw_bytes = mem::take(&mut inflight.buffer);
-            let manifest_hash = blake3::hash(manifest_content.as_bytes())
-                .to_hex()
-                .to_string();
-
-            if let Err(e) = tokio::fs::write(&wasm_file_path, &raw_bytes).await {
-                self.send_response(corr_id, false, format!("Failed to write WASM file: {}", e))
-                    .await;
-                self.inflight_program_upload = None;
-                return;
-            }
-            if let Err(e) = tokio::fs::write(&manifest_file_path, &manifest_content).await {
-                self.send_response(
-                    corr_id,
-                    false,
-                    format!("Failed to write manifest file: {}", e),
-                )
-                .await;
-                self.inflight_program_upload = None;
-                return;
-            }
-            if let Err(e) = tokio::fs::write(&wasm_hash_file_path, &final_hash).await {
-                self.send_response(
-                    corr_id,
-                    false,
-                    format!("Failed to write WASM hash file: {}", e),
-                )
-                .await;
-                self.inflight_program_upload = None;
-                return;
-            }
-            if let Err(e) = tokio::fs::write(&manifest_hash_file_path, &manifest_hash).await {
-                self.send_response(
-                    corr_id,
-                    false,
-                    format!("Failed to write manifest hash file: {}", e),
-                )
-                .await;
-                self.inflight_program_upload = None;
-                return;
-            }
-
-            // Update the server's uploaded_programs_in_disk map
-            self.state.uploaded_programs_in_disk.insert(
-                program_name,
-                ProgramMetadata {
-                    wasm_path: wasm_file_path.clone(),
-                    wasm_hash: final_hash.clone(),
-                    manifest_hash: manifest_hash.clone(),
-                    dependencies: dependencies.clone(),
-                },
-            );
-
-            let component = match compile_wasm_component(&self.state.wasm_engine, raw_bytes).await {
-                Ok(c) => c,
                 Err(e) => {
-                    self.send_response(corr_id, false, e.to_string()).await;
-                    self.inflight_program_upload = None;
-                    return;
+                    self.send_response(corr_id, false, e).await;
                 }
-            };
-
-            let (evt_tx, evt_rx) = oneshot::channel();
-            runtime::Message::LoadProgram {
-                program_hash: runtime::ProgramHash::new(final_hash.clone(), manifest_hash.clone()),
-                component,
-                dependencies: dependencies.iter().map(|dep_name| {
-                    // Convert dependency names to ProgramHash - lookup from metadata
-                    let dep_meta = self.state.uploaded_programs_in_disk.get(dep_name)
-                        .expect("dependency should be loaded");
-                    runtime::ProgramHash::new(dep_meta.wasm_hash.clone(), dep_meta.manifest_hash.clone())
-                }).collect(),
-                response: evt_tx,
             }
-            .send()
-            .unwrap();
-
-            evt_rx.await.unwrap();
-            self.send_response(corr_id, true, final_hash).await;
             self.inflight_program_upload = None;
         }
     }
@@ -339,123 +201,20 @@ impl Session {
     ) {
         let program_name = ProgramName::parse(&inferlet);
 
-        // Check if program is in uploaded programs
-        if let Some(metadata) = self
-            .state
-            .uploaded_programs_in_disk
-            .get(&program_name)
-            .map(|e| e.value().clone())
-        {
-            // Ensure program and all its dependencies are loaded
-            if let Err(e) = ensure_program_loaded_with_dependencies(
-                &self.state.wasm_engine,
-                &metadata,
-                &program_name,
-                &self.state.uploaded_programs_in_disk,
-                &self.state.registry_programs_in_disk,
-                &self.state.registry_url,
-                &self.state.cache_dir,
-            )
-            .await
-            {
-                self.send_launch_result(corr_id, false, e).await;
-                return;
-            }
-
-            self.launch_instance_from_loaded_program(
-                corr_id,
-                program_name.to_string(),
-                &metadata,
-                arguments,
-                detached,
-            )
-            .await;
-        } else {
-            // Not in uploaded programs, try registry
-            self.handle_launch_instance_from_registry(corr_id, inferlet, arguments, detached)
+        // Install program and dependencies (handles both uploaded and registry)
+        match program::install(&program_name).await {
+            Ok(metadata) => {
+                self.launch_instance_from_loaded_program(
+                    corr_id,
+                    program_name.to_string(),
+                    &metadata,
+                    arguments,
+                    detached,
+                )
                 .await;
-        }
-    }
-
-    pub async fn handle_launch_instance_from_registry(
-        &mut self,
-        corr_id: u32,
-        inferlet: String,
-        arguments: Vec<String>,
-        detached: bool,
-    ) {
-        let program_name = ProgramName::parse(&inferlet);
-
-        // Check if program is already cached from registry
-        if let Some(metadata) = self
-            .state
-            .registry_programs_in_disk
-            .get(&program_name)
-            .map(|e| e.value().clone())
-        {
-            // Ensure program and all its dependencies are loaded
-            if let Err(e) = ensure_program_loaded_with_dependencies(
-                &self.state.wasm_engine,
-                &metadata,
-                &program_name,
-                &self.state.uploaded_programs_in_disk,
-                &self.state.registry_programs_in_disk,
-                &self.state.registry_url,
-                &self.state.cache_dir,
-            )
-            .await
-            {
-                self.send_launch_result(corr_id, false, e).await;
-                return;
             }
-
-            self.launch_instance_from_loaded_program(
-                corr_id,
-                program_name.to_string(),
-                &metadata,
-                arguments,
-                detached,
-            )
-            .await;
-        } else {
-            // Download from registry
-            match try_download_inferlet_from_registry(
-                &self.state.registry_url,
-                &self.state.cache_dir,
-                &program_name,
-                &self.state.registry_programs_in_disk,
-            )
-            .await
-            {
-                Ok(metadata) => {
-                    // Ensure program and all its dependencies are loaded
-                    if let Err(e) = ensure_program_loaded_with_dependencies(
-                        &self.state.wasm_engine,
-                        &metadata,
-                        &program_name,
-                        &self.state.uploaded_programs_in_disk,
-                        &self.state.registry_programs_in_disk,
-                        &self.state.registry_url,
-                        &self.state.cache_dir,
-                    )
-                    .await
-                    {
-                        self.send_launch_result(corr_id, false, e).await;
-                        return;
-                    }
-
-                    self.launch_instance_from_loaded_program(
-                        corr_id,
-                        program_name.to_string(),
-                        &metadata,
-                        arguments,
-                        detached,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    self.send_launch_result(corr_id, false, e.to_string()).await;
-                }
+            Err(e) => {
+                self.send_launch_result(corr_id, false, e).await;
             }
         }
     }
@@ -516,61 +275,35 @@ impl Session {
     ) {
         let program_name = ProgramName::parse(&inferlet);
 
-        // Check uploaded or registry programs for metadata
-        let program_metadata = self
-            .state
-            .uploaded_programs_in_disk
-            .get(&program_name)
-            .map(|e| e.value().clone())
-            .or_else(|| {
-                self.state
-                    .registry_programs_in_disk
-                    .get(&program_name)
-                    .map(|e| e.value().clone())
-            });
-
-        if let Some(metadata) = program_metadata {
-            // Ensure program and dependencies are loaded
-            if let Err(e) = ensure_program_loaded_with_dependencies(
-                &self.state.wasm_engine,
-                &metadata,
-                &program_name,
-                &self.state.uploaded_programs_in_disk,
-                &self.state.registry_programs_in_disk,
-                &self.state.registry_url,
-                &self.state.cache_dir,
-            )
-            .await
-            {
-                self.send_response(corr_id, false, e).await;
-                return;
-            }
-
-            let (evt_tx, evt_rx) = oneshot::channel();
-            runtime::Message::LaunchServerInstance {
-                username: self.username.clone(),
-                program_name: program_name.to_string(),
-                program_hash: runtime::ProgramHash::new(
-                    metadata.wasm_hash.clone(),
-                    metadata.manifest_hash.clone(),
-                ),
-                port,
-                arguments,
-                response: evt_tx,
-            }
-            .send()
-            .unwrap();
-
-            match evt_rx.await.unwrap() {
-                Ok(_) => {
-                    self.send_response(corr_id, true, "server launched".to_string())
-                        .await
+        // Install program and dependencies (handles both uploaded and registry)
+        match program::install(&program_name).await {
+            Ok(metadata) => {
+                let (evt_tx, evt_rx) = oneshot::channel();
+                runtime::Message::LaunchServerInstance {
+                    username: self.username.clone(),
+                    program_name: program_name.to_string(),
+                    program_hash: runtime::ProgramHash::new(
+                        metadata.wasm_hash.clone(),
+                        metadata.manifest_hash.clone(),
+                    ),
+                    port,
+                    arguments,
+                    response: evt_tx,
                 }
-                Err(e) => self.send_response(corr_id, false, e.to_string()).await,
+                .send()
+                .unwrap();
+
+                match evt_rx.await.unwrap() {
+                    Ok(_) => {
+                        self.send_response(corr_id, true, "server launched".to_string())
+                            .await
+                    }
+                    Err(e) => self.send_response(corr_id, false, e.to_string()).await,
+                }
             }
-        } else {
-            self.send_response(corr_id, false, "Program not found".to_string())
-                .await;
+            Err(e) => {
+                self.send_response(corr_id, false, e).await;
+            }
         }
     }
 }
@@ -692,7 +425,6 @@ impl Session {
             "Remote service attachment is not supported in FFI mode".into(),
         )
         .await;
-        self.state.backend_status.increment_rejected_count();
     }
 
     pub async fn handle_streaming_output(

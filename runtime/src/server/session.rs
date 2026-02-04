@@ -382,7 +382,8 @@ impl Session {
                     arguments,
                     detached,
                 } => {
-                    self.handle_launch_instance_from_registry(corr_id, inferlet, arguments, detached)
+                    // handle_launch_instance now handles both uploaded and registry programs
+                    self.handle_launch_instance(corr_id, inferlet, arguments, detached)
                         .await
                 }
                 ClientMessage::AttachInstance {

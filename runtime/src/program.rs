@@ -16,6 +16,10 @@ use wasmtime::component::Component;
 use crate::actor::{Actor, Handle, SendError};
 use crate::runtime;
 
+mod repository;
+pub use repository::{InMemoryEntry, ProgramRepository};
+use repository::{load_programs_from_dir, try_download_inferlet_from_registry};
+
 // =============================================================================
 // Program Actor
 // =============================================================================
@@ -25,7 +29,24 @@ static ACTOR: LazyLock<Actor<Message>> = LazyLock::new(Actor::new);
 
 /// Spawns the Program Manager actor with configuration.
 pub fn spawn(config: ProgramManagerConfig) {
-    ACTOR.spawn_with::<ProgramManagerActor, _>(|| ProgramManagerActor::with_config(config));
+    let repository = std::sync::Arc::new(ProgramRepository::new(
+        config.registry_url.clone(),
+        config.cache_dir.clone(),
+    ));
+
+    // Scan disk on startup: load existing programs into on_disk tier
+    let programs_dir = config.cache_dir.join("programs");
+    if programs_dir.exists() {
+        load_programs_from_dir(&programs_dir, repository.on_disk_mut());
+    }
+    let registry_dir = config.cache_dir.join("registry");
+    if registry_dir.exists() {
+        load_programs_from_dir(&registry_dir, repository.on_disk_mut());
+    }
+
+    ACTOR.spawn_with::<ProgramManagerActor, _>(|| {
+        ProgramManagerActor::new(config.wasm_engine, repository)
+    });
 }
 
 /// Sends a message to the Program Manager actor.
@@ -36,6 +57,70 @@ pub fn send(msg: Message) -> Result<(), SendError> {
 /// Check if the program manager actor is spawned.
 pub fn is_spawned() -> bool {
     ACTOR.is_spawned()
+}
+
+/// Upload a new program. Stores in memory + disk (does NOT install).
+pub async fn upload(
+    wasm_bytes: Vec<u8>,
+    manifest: String,
+    expected_hash: String,
+) -> Result<UploadResult, String> {
+    let (tx, rx) = oneshot::channel();
+    Message::UploadProgram {
+        wasm_bytes,
+        manifest,
+        expected_hash,
+        response: tx,
+    }
+    .send()
+    .map_err(|_| "Program manager not running".to_string())?;
+    rx.await.map_err(|_| "Program manager did not respond".to_string())?
+}
+
+/// Check if a program exists in repository (any tier) with optional hash verification.
+pub async fn program_exists(name: &ProgramName, expected_hashes: Option<(String, String)>) -> bool {
+    let (tx, rx) = oneshot::channel();
+    let _ = Message::ProgramExists {
+        name: name.clone(),
+        expected_hashes,
+        response: tx,
+    }
+    .send();
+    rx.await.unwrap_or(false)
+}
+
+/// Check if a program is installed (JIT compiled and ready to run).
+pub async fn is_program_installed(name: &ProgramName) -> bool {
+    let (tx, rx) = oneshot::channel();
+    let _ = Message::IsProgramInstalled {
+        name: name.clone(),
+        response: tx,
+    }
+    .send();
+    rx.await.unwrap_or(false)
+}
+
+/// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies.
+pub async fn install(name: &ProgramName) -> Result<ProgramMetadata, String> {
+    let (tx, rx) = oneshot::channel();
+    Message::InstallProgram {
+        name: name.clone(),
+        response: tx,
+    }
+    .send()
+    .map_err(|_| "Program manager not running".to_string())?;
+    rx.await.map_err(|_| "Program manager did not respond".to_string())?
+}
+
+/// Get program metadata by name.
+pub async fn get_metadata(name: &ProgramName) -> Option<ProgramMetadata> {
+    let (tx, rx) = oneshot::channel();
+    let _ = Message::GetMetadata {
+        name: name.clone(),
+        response: tx,
+    }
+    .send();
+    rx.await.ok().flatten()
 }
 
 // =============================================================================
@@ -63,22 +148,31 @@ pub enum Message {
         response: oneshot::Sender<Option<ProgramMetadata>>,
     },
 
-    /// Register a newly uploaded program
-    RegisterUpload {
-        name: ProgramName,
-        metadata: ProgramMetadata,
+    /// Upload a new program: store in memory + disk (does NOT install)
+    UploadProgram {
+        wasm_bytes: Vec<u8>,
+        manifest: String,
+        expected_hash: String,
+        response: oneshot::Sender<Result<UploadResult, String>>,
     },
 
-    /// Ensure a program and its dependencies are loaded in runtime
-    EnsureLoaded {
+    /// Check if a program exists in repository (any tier) with optional hash verification
+    ProgramExists {
+        name: ProgramName,
+        expected_hashes: Option<(String, String)>,
+        response: oneshot::Sender<bool>,
+    },
+
+    /// Check if a program is installed (JIT compiled and ready to run)
+    IsProgramInstalled {
+        name: ProgramName,
+        response: oneshot::Sender<bool>,
+    },
+
+    /// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies
+    InstallProgram {
         name: ProgramName,
         response: oneshot::Sender<Result<ProgramMetadata, String>>,
-    },
-
-    /// Download a program from registry
-    DownloadFromRegistry {
-        name: ProgramName,
-        response: oneshot::Sender<Result<ProgramMetadata>>,
     },
 }
 
@@ -136,106 +230,184 @@ pub struct ProgramMetadata {
     pub dependencies: Vec<ProgramName>,
 }
 
+/// Result of a successful program upload.
+#[derive(Clone, Debug)]
+pub struct UploadResult {
+    pub wasm_hash: String,
+    pub manifest_hash: String,
+}
+
 // =============================================================================
-// Program Service
+// Program Manager (Service)
 // =============================================================================
 
-/// The program service handles program caching and loading.
+/// The program service handles program caching, installation, and loading.
 /// This is the core business logic, separate from the actor message handling.
-#[derive(Debug)]
 struct ProgramManager {
     wasm_engine: WasmEngine,
-    registry_url: String,
-    cache_dir: PathBuf,
-    /// Uploaded programs on disk, keyed by program name
-    uploaded_programs: DashMap<ProgramName, ProgramMetadata>,
-    /// Registry-downloaded programs on disk, keyed by program name
-    registry_programs: DashMap<ProgramName, ProgramMetadata>,
+    repository: std::sync::Arc<ProgramRepository>,
+    /// Installed (JIT compiled) programs, keyed by program hash
+    installed_programs: std::collections::HashMap<runtime::ProgramHash, Component>,
 }
 
 impl ProgramManager {
-    fn new(config: ProgramManagerConfig) -> Self {
-        let uploaded_programs = DashMap::new();
-        let registry_programs = DashMap::new();
-
-        let programs_dir = config.cache_dir.join("programs");
-        if programs_dir.exists() {
-            load_programs_from_dir(&programs_dir, &uploaded_programs);
-        }
-
-        let registry_dir = config.cache_dir.join("registry");
-        if registry_dir.exists() {
-            load_programs_from_dir(&registry_dir, &registry_programs);
-        }
-
+    fn new(wasm_engine: WasmEngine, repository: std::sync::Arc<ProgramRepository>) -> Self {
         ProgramManager {
-            wasm_engine: config.wasm_engine,
-            registry_url: config.registry_url,
-            cache_dir: config.cache_dir,
-            uploaded_programs,
-            registry_programs,
+            wasm_engine,
+            repository,
+            installed_programs: std::collections::HashMap::new(),
         }
     }
 
     fn get_metadata(&self, name: &ProgramName) -> Option<ProgramMetadata> {
-        self.uploaded_programs
-            .get(name)
-            .or_else(|| self.registry_programs.get(name))
-            .map(|e| e.value().clone())
+        self.repository.get_metadata(name)
     }
 
-    fn register_upload(&self, name: ProgramName, metadata: ProgramMetadata) {
-        self.uploaded_programs.insert(name, metadata);
+    fn program_exists(&self, name: &ProgramName, expected_hashes: Option<(String, String)>) -> bool {
+        self.repository.exists_with_hash(name, expected_hashes)
     }
 
-    /// Access uploaded programs for external use
-    pub fn uploaded_programs(&self) -> &DashMap<ProgramName, ProgramMetadata> {
-        &self.uploaded_programs
+    fn is_program_installed(&self, name: &ProgramName) -> bool {
+        if let Some(metadata) = self.repository.get_metadata(name) {
+            let hash = runtime::ProgramHash::new(metadata.wasm_hash, metadata.manifest_hash);
+            self.installed_programs.contains_key(&hash)
+        } else {
+            false
+        }
     }
 
-    /// Access registry programs for external use
-    pub fn registry_programs(&self) -> &DashMap<ProgramName, ProgramMetadata> {
-        &self.registry_programs
+    /// Upload a new program: verify hash, store in memory + disk (does NOT install).
+    async fn upload_program(
+        &mut self,
+        wasm_bytes: Vec<u8>,
+        manifest: String,
+        expected_hash: String,
+    ) -> Result<UploadResult, String> {
+        // Verify the hash
+        let wasm_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
+        if wasm_hash != expected_hash {
+            return Err(format!(
+                "Hash mismatch: expected {}, got {}",
+                expected_hash, wasm_hash
+            ));
+        }
+
+        // Parse manifest for name and dependencies
+        let program_name = parse_program_name_from_manifest(&manifest)
+            .map_err(|e| format!("Failed to parse manifest: {}", e))?;
+        let dependencies = parse_program_dependencies_from_manifest(&manifest);
+
+        // Compute manifest hash
+        let manifest_hash = blake3::hash(manifest.as_bytes()).to_hex().to_string();
+
+        // Write to disk: {cache_dir}/programs/{name}/{version}.{wasm,toml,wasm_hash,toml_hash}
+        let dir_path = self.repository.cache_dir.join("programs").join(&program_name.name);
+        tokio::fs::create_dir_all(&dir_path)
+            .await
+            .map_err(|e| format!("Failed to create directory {:?}: {}", dir_path, e))?;
+
+        let wasm_file_path = dir_path.join(format!("{}.wasm", program_name.version));
+        let manifest_file_path = dir_path.join(format!("{}.toml", program_name.version));
+        let wasm_hash_file_path = dir_path.join(format!("{}.wasm_hash", program_name.version));
+        let manifest_hash_file_path = dir_path.join(format!("{}.toml_hash", program_name.version));
+
+        tokio::fs::write(&wasm_file_path, &wasm_bytes)
+            .await
+            .map_err(|e| format!("Failed to write WASM file: {}", e))?;
+        tokio::fs::write(&manifest_file_path, &manifest)
+            .await
+            .map_err(|e| format!("Failed to write manifest file: {}", e))?;
+        tokio::fs::write(&wasm_hash_file_path, &wasm_hash)
+            .await
+            .map_err(|e| format!("Failed to write WASM hash file: {}", e))?;
+        tokio::fs::write(&manifest_hash_file_path, &manifest_hash)
+            .await
+            .map_err(|e| format!("Failed to write manifest hash file: {}", e))?;
+
+        // Create metadata
+        let metadata = ProgramMetadata {
+            wasm_path: wasm_file_path.clone(),
+            wasm_hash: wasm_hash.clone(),
+            manifest_hash: manifest_hash.clone(),
+            dependencies: dependencies.clone(),
+        };
+
+        // Register in repository (memory + disk tiers)
+        self.repository.register(program_name, wasm_bytes, metadata);
+
+        Ok(UploadResult {
+            wasm_hash,
+            manifest_hash,
+        })
     }
 
-    async fn ensure_loaded(&self, name: &ProgramName) -> Result<ProgramMetadata, String> {
-        let metadata = match self.get_metadata(name) {
+    /// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies.
+    async fn install_program(&mut self, name: &ProgramName) -> Result<ProgramMetadata, String> {
+        // Step 1: Find program in repository, or download from registry
+        let metadata = match self.repository.get_metadata(name) {
             Some(m) => m,
             None => {
-                // Try to download from registry
+                // Download from registry (this will also get dependencies)
                 try_download_inferlet_from_registry(
-                    &self.registry_url,
-                    &self.cache_dir,
+                    &self.repository.registry_url,
+                    &self.repository.cache_dir,
                     name,
-                    &self.registry_programs,
+                    self.repository.on_disk_mut(),
                 )
                 .await
                 .map_err(|e| e.to_string())?
             }
         };
 
-        ensure_program_loaded_with_dependencies(
-            &self.wasm_engine,
-            &metadata,
-            name,
-            &self.uploaded_programs,
-            &self.registry_programs,
-            &self.registry_url,
-            &self.cache_dir,
-        )
-        .await?;
+        // Step 2: Install dependencies first (recursive)
+        for dep_name in &metadata.dependencies {
+            if !self.is_program_installed(dep_name) {
+                Box::pin(self.install_program(dep_name)).await?;
+            }
+        }
+
+        // Step 3: Check if already installed
+        let program_hash = runtime::ProgramHash::new(metadata.wasm_hash.clone(), metadata.manifest_hash.clone());
+        if self.installed_programs.contains_key(&program_hash) {
+            return Ok(metadata);
+        }
+
+        // Step 4: Fetch WASM bytes (uses repository.fetch() internally)
+        let entry = self.repository.fetch(name).await?;
+        let wasm_bytes = entry.wasm_bytes;
+
+        // Step 5: JIT compile
+        let component = compile_wasm_component(&self.wasm_engine, wasm_bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Step 6: Register with runtime
+        let dep_hashes: Vec<runtime::ProgramHash> = metadata
+            .dependencies
+            .iter()
+            .map(|dep_name| {
+                let dep_meta = self.repository.get_metadata(dep_name)
+                    .expect("dependency should exist after installation");
+                runtime::ProgramHash::new(dep_meta.wasm_hash, dep_meta.manifest_hash)
+            })
+            .collect();
+
+        let (evt_tx, evt_rx) = oneshot::channel();
+        runtime::Message::LoadProgram {
+            program_hash: program_hash.clone(),
+            component: component.clone(),
+            dependencies: dep_hashes,
+            response: evt_tx,
+        }
+        .send()
+        .map_err(|_| "Failed to send LoadProgram message")?;
+
+        evt_rx.await.map_err(|_| "Failed to receive LoadProgram response")?;
+
+        // Step 7: Track as installed
+        self.installed_programs.insert(program_hash, component);
 
         Ok(metadata)
-    }
-
-    async fn download_from_registry(&self, name: &ProgramName) -> Result<ProgramMetadata> {
-        try_download_inferlet_from_registry(
-            &self.registry_url,
-            &self.cache_dir,
-            name,
-            &self.registry_programs,
-        )
-        .await
     }
 }
 
@@ -248,9 +420,9 @@ struct ProgramManagerActor {
 }
 
 impl ProgramManagerActor {
-    fn with_config(config: ProgramManagerConfig) -> Self {
+    fn new(wasm_engine: WasmEngine, repository: std::sync::Arc<ProgramRepository>) -> Self {
         ProgramManagerActor {
-            service: ProgramManager::new(config),
+            service: ProgramManager::new(wasm_engine, repository),
         }
     }
 }
@@ -268,15 +440,20 @@ impl Handle for ProgramManagerActor {
                 let result = self.service.get_metadata(&name);
                 let _ = response.send(result);
             }
-            Message::RegisterUpload { name, metadata } => {
-                self.service.register_upload(name, metadata);
-            }
-            Message::EnsureLoaded { name, response } => {
-                let result = self.service.ensure_loaded(&name).await;
+            Message::UploadProgram { wasm_bytes, manifest, expected_hash, response } => {
+                let result = self.service.upload_program(wasm_bytes, manifest, expected_hash).await;
                 let _ = response.send(result);
             }
-            Message::DownloadFromRegistry { name, response } => {
-                let result = self.service.download_from_registry(&name).await;
+            Message::ProgramExists { name, expected_hashes, response } => {
+                let result = self.service.program_exists(&name, expected_hashes);
+                let _ = response.send(result);
+            }
+            Message::IsProgramInstalled { name, response } => {
+                let result = self.service.is_program_installed(&name);
+                let _ = response.send(result);
+            }
+            Message::InstallProgram { name, response } => {
+                let result = self.service.install_program(&name).await;
                 let _ = response.send(result);
             }
         }
@@ -472,296 +649,4 @@ pub async fn ensure_program_loaded_with_dependencies(
     }
 
     Ok(())
-}
-
-/// Downloads an inferlet from the registry, with local caching.
-/// Uses flat namespace structure: {cache_dir}/registry/{name}/{version}.{wasm,toml,wasm_hash,toml_hash}
-pub async fn try_download_inferlet_from_registry(
-    registry_url: &str,
-    cache_dir: &Path,
-    program_name: &ProgramName,
-    registry_programs_in_disk: &DashMap<ProgramName, ProgramMetadata>,
-) -> Result<ProgramMetadata> {
-    let cache_base = cache_dir.join("registry").join(&program_name.name);
-    let wasm_cache_path = cache_base.join(format!("{}.wasm", program_name.version));
-    let manifest_cache_path = cache_base.join(format!("{}.toml", program_name.version));
-    let wasm_hash_cache_path = cache_base.join(format!("{}.wasm_hash", program_name.version));
-    let manifest_hash_cache_path = cache_base.join(format!("{}.toml_hash", program_name.version));
-
-    // Check if already cached
-    if wasm_cache_path.exists()
-        && manifest_cache_path.exists()
-        && wasm_hash_cache_path.exists()
-        && manifest_hash_cache_path.exists()
-    {
-        tracing::info!(
-            "Using cached inferlet: {} @ {} from {:?}",
-            program_name.name,
-            program_name.version,
-            wasm_cache_path
-        );
-        let wasm_hash = tokio::fs::read_to_string(&wasm_hash_cache_path)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to read cached WASM hash at {:?}: {}",
-                    wasm_hash_cache_path,
-                    e
-                )
-            })?
-            .trim()
-            .to_string();
-        let manifest_hash = tokio::fs::read_to_string(&manifest_hash_cache_path)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to read cached manifest hash at {:?}: {}",
-                    manifest_hash_cache_path,
-                    e
-                )
-            })?
-            .trim()
-            .to_string();
-        let manifest_data = tokio::fs::read_to_string(&manifest_cache_path)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to read cached manifest at {:?}: {}",
-                    manifest_cache_path,
-                    e
-                )
-            })?;
-
-        let dependencies = parse_program_dependencies_from_manifest(&manifest_data);
-
-        let metadata = ProgramMetadata {
-            wasm_path: wasm_cache_path,
-            wasm_hash,
-            manifest_hash,
-            dependencies,
-        };
-        return Ok(metadata);
-    }
-
-    // Download from registry (using flat namespace)
-    let base_url = registry_url.trim_end_matches('/');
-    let wasm_download_url = format!(
-        "{}/api/v1/inferlets/{}/{}/download",
-        base_url, program_name.name, program_name.version
-    );
-    let manifest_download_url = format!(
-        "{}/api/v1/inferlets/{}/{}/manifest",
-        base_url, program_name.name, program_name.version
-    );
-
-    tracing::info!(
-        "Downloading inferlet: {} @ {} from {}",
-        program_name.name,
-        program_name.version,
-        wasm_download_url
-    );
-
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
-
-    // Download WASM
-    let wasm_response = client
-        .get(&wasm_download_url)
-        .send()
-        .await
-        .map_err(|e| anyhow!("Failed to download inferlet from registry: {}", e))?;
-
-    if !wasm_response.status().is_success() {
-        let status = wasm_response.status();
-        let body = wasm_response.text().await.unwrap_or_default();
-        bail!(
-            "Registry returned error {} for {} @ {}: {}",
-            status,
-            program_name.name,
-            program_name.version,
-            body
-        );
-    }
-
-    let wasm_data = wasm_response
-        .bytes()
-        .await
-        .map_err(|e| anyhow!("Failed to read inferlet data: {}", e))?
-        .to_vec();
-
-    if wasm_data.is_empty() {
-        bail!(
-            "Registry returned empty data for {} @ {}",
-            program_name.name,
-            program_name.version
-        );
-    }
-
-    // Download manifest
-    tracing::info!(
-        "Downloading manifest for {} @ {} from {}",
-        program_name.name,
-        program_name.version,
-        manifest_download_url
-    );
-
-    let manifest_response = client
-        .get(&manifest_download_url)
-        .send()
-        .await
-        .map_err(|e| anyhow!("Failed to download manifest from registry: {}", e))?;
-
-    if !manifest_response.status().is_success() {
-        let status = manifest_response.status();
-        let body = manifest_response.text().await.unwrap_or_default();
-        bail!(
-            "Registry returned error {} for manifest {} @ {}: {}",
-            status,
-            program_name.name,
-            program_name.version,
-            body
-        );
-    }
-
-    let manifest_data = manifest_response
-        .text()
-        .await
-        .map_err(|e| anyhow!("Failed to read manifest data: {}", e))?;
-
-    // Compute hashes
-    let wasm_hash = blake3::hash(&wasm_data).to_hex().to_string();
-    let manifest_hash = blake3::hash(manifest_data.as_bytes()).to_hex().to_string();
-
-    // Parse dependencies from manifest
-    let dependencies = parse_program_dependencies_from_manifest(&manifest_data);
-
-    // Cache to disk
-    tokio::fs::create_dir_all(&cache_base)
-        .await
-        .map_err(|e| anyhow!("Failed to create cache directory {:?}: {}", cache_base, e))?;
-
-    tokio::fs::write(&wasm_cache_path, &wasm_data)
-        .await
-        .map_err(|e| anyhow!("Failed to cache inferlet at {:?}: {}", wasm_cache_path, e))?;
-
-    tokio::fs::write(&manifest_cache_path, &manifest_data)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to cache manifest at {:?}: {}",
-                manifest_cache_path,
-                e
-            )
-        })?;
-
-    tokio::fs::write(&wasm_hash_cache_path, &wasm_hash)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to cache WASM hash at {:?}: {}",
-                wasm_hash_cache_path,
-                e
-            )
-        })?;
-
-    tokio::fs::write(&manifest_hash_cache_path, &manifest_hash)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to cache manifest hash at {:?}: {}",
-                manifest_hash_cache_path,
-                e
-            )
-        })?;
-
-    tracing::info!(
-        "Cached inferlet {} @ {} to {:?} (wasm_hash: {}, manifest_hash: {})",
-        program_name.name,
-        program_name.version,
-        wasm_cache_path,
-        wasm_hash,
-        manifest_hash
-    );
-
-    let metadata = ProgramMetadata {
-        wasm_path: wasm_cache_path,
-        wasm_hash,
-        manifest_hash,
-        dependencies,
-    };
-
-    // Add to in-memory map
-    registry_programs_in_disk.insert(program_name.clone(), metadata.clone());
-
-    Ok(metadata)
-}
-
-/// Helper to load programs from a directory with structure {dir}/{name}/{version}.wasm
-/// Uses flat namespace structure (no namespace subdirectory).
-pub fn load_programs_from_dir(dir: &Path, programs_in_disk: &DashMap<ProgramName, ProgramMetadata>) {
-    let name_entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-
-    for name_entry in name_entries.flatten() {
-        let name_path = name_entry.path();
-        if !name_path.is_dir() {
-            continue;
-        }
-        let name = match name_path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-
-        let file_entries = match std::fs::read_dir(&name_path) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-
-        for file_entry in file_entries.flatten() {
-            let file_path = file_entry.path();
-            if file_path.extension().is_some_and(|ext| ext == "wasm") {
-                let version = match file_path.file_stem().and_then(|s| s.to_str()) {
-                    Some(v) => v.to_string(),
-                    None => continue,
-                };
-
-                // Read WASM hash
-                let wasm_hash_path = name_path.join(format!("{}.wasm_hash", version));
-                let wasm_hash = match std::fs::read_to_string(&wasm_hash_path) {
-                    Ok(h) => h.trim().to_string(),
-                    Err(_) => continue,
-                };
-
-                // Read manifest hash
-                let manifest_hash_path = name_path.join(format!("{}.toml_hash", version));
-                let manifest_hash = match std::fs::read_to_string(&manifest_hash_path) {
-                    Ok(h) => h.trim().to_string(),
-                    Err(_) => continue,
-                };
-
-                // Read manifest for dependencies
-                let manifest_path = name_path.join(format!("{}.toml", version));
-                let dependencies = match std::fs::read_to_string(&manifest_path) {
-                    Ok(manifest) => parse_program_dependencies_from_manifest(&manifest),
-                    Err(_) => Vec::new(),
-                };
-
-                let key = ProgramName {
-                    name: name.clone(),
-                    version,
-                };
-                let metadata = ProgramMetadata {
-                    wasm_path: file_path,
-                    wasm_hash,
-                    manifest_hash,
-                    dependencies,
-                };
-                programs_in_disk.insert(key, metadata);
-            }
-        }
-    }
 }
