@@ -967,15 +967,17 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
 
     Build process:
     1. Check prerequisites (Node.js, npx)
-    2. Find inferlet-js and WIT paths
-    3. Ensure npm dependencies installed
-    4. Detect input type (file or package)
-    5. Bundle user code with esbuild
-    6. Check for Node.js imports (warnings)
-    7. Validate user code (no export run/main)
-    8. Generate WIT wrapper
-    9. Bundle wrapper with esbuild
-    10. Compile to WASM with componentize-js
+    2. Read package name from Pie.toml
+    3. Find inferlet-js and WIT paths
+    4. Ensure npm dependencies installed
+    5. Detect input type (file or package)
+    6. Bundle user code with esbuild
+    7. Check for Node.js imports (warnings)
+    8. Validate user code (no export run/main)
+    9. Generate WIT wrapper
+    10. Generate dynamic WIT with package-specific export
+    11. Bundle wrapper with esbuild
+    12. Compile to WASM with componentize-js
     """
     # Check prerequisites
     if not command_exists("node"):
@@ -988,10 +990,14 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
             "npx is required but not found. Please install Node.js (v18+)."
         )
 
+    # Read package name from Pie.toml
+    project_dir = input_path if input_path.is_dir() else input_path.parent
+    package_name = read_package_name(project_dir)
+
     # Resolve paths
     with console.status("[bold green]Resolving paths...[/bold green]"):
         inferlet_js_path = path_utils.get_inferlet_js_path()
-        wit_path = path_utils.get_wit_path()
+        wit_path = get_inferlet_wit_path()
 
     # Ensure npm dependencies
     ensure_npm_dependencies(inferlet_js_path)
@@ -999,6 +1005,7 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
     console.print("[bold]🏗️  Building JS inferlet...[/bold]")
     console.print(f"   Input: [blue]{input_path}[/blue]")
     console.print(f"   Output: [blue]{output}[/blue]")
+    console.print(f"   Package: [dim]{package_name}[/dim]")
 
     # Detect input type
     input_type, entry_point = detect_js_input_type(input_path)
@@ -1035,11 +1042,16 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
             status.update("[bold green]📦 Bundling final output...[/bold green]")
             run_esbuild(wrapper_js, final_bundle, inferlet_js_path, debug)
 
-            # Step 6: Compile to WASM
+            # Step 6: Generate dynamic WIT with package-specific export
+            status.update("[bold green]🔧 Generating dynamic WIT...[/bold green]")
+            temp_wit_dir = temp_path / "wit"
+            generate_dynamic_wit(wit_path, temp_wit_dir, package_name)
+
+            # Step 7: Compile to WASM
             status.update(
                 "[bold green]🔧 Compiling to WebAssembly component...[/bold green]"
             )
-            run_componentize_js(final_bundle, output, wit_path, debug)
+            run_componentize_js(final_bundle, output, temp_wit_dir, debug)
 
     # Success
     wasm_size = output.stat().st_size if output.exists() else 0
