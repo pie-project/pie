@@ -380,7 +380,8 @@ impl Client {
     /// Args:
     ///     wasm_path: Path to the WASM binary file.
     ///     manifest_path: Path to the manifest TOML file.
-    pub async fn install_program(&self, wasm_path: &Path, manifest_path: &Path) -> Result<()> {
+    ///     force_overwrite: If true, overwrite existing program with same name/version.
+    pub async fn add_program(&self, wasm_path: &Path, manifest_path: &Path, force_overwrite: bool) -> Result<()> {
         let blob = fs::read(wasm_path)
             .with_context(|| format!("Failed to read WASM file: {:?}", wasm_path))?;
         let manifest = fs::read_to_string(manifest_path)
@@ -401,10 +402,11 @@ impl Client {
         for chunk_index in 0..total_chunks {
             let start = chunk_index * CHUNK_SIZE_BYTES;
             let end = (start + CHUNK_SIZE_BYTES).min(total_size);
-            let msg = ClientMessage::InstallProgram {
+            let msg = ClientMessage::AddProgram {
                 corr_id: *corr_id_guard,
                 program_hash: program_hash.clone(),
                 manifest: manifest.to_string(),
+                force_overwrite,
                 chunk_index,
                 total_chunks,
                 chunk_data: blob[start..end].to_vec(),
@@ -463,45 +465,6 @@ impl Client {
         })
     }
 
-    /// Launches an instance from an inferlet in the registry only.
-    ///
-    /// Unlike [`launch_instance`](Self::launch_instance), this method searches only
-    /// the registry and does not check client-uploaded programs. Use this when you
-    /// explicitly want to launch an inferlet from the registry.
-    ///
-    /// The `inferlet` parameter can be:
-    /// - Full name with version: `text-completion@0.1.0`
-    /// - Without version (defaults to `latest`): `text-completion`
-    pub async fn launch_instance_from_registry(
-        &self,
-        inferlet: String,
-        arguments: Vec<String>,
-        detached: bool,
-    ) -> Result<Instance> {
-        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
-        let msg = ClientMessage::LaunchInstanceFromRegistry {
-            corr_id: *corr_id_guard,
-            inferlet,
-            arguments,
-            detached,
-        };
-
-        let (tx, rx) = oneshot::channel();
-        self.inner
-            .pending_launch_requests
-            .insert(*corr_id_guard, tx);
-        self.inner
-            .ws_writer_tx
-            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
-
-        let (inst_id, event_rx) = rx.await??;
-
-        Ok(Instance {
-            id: inst_id,
-            inner: Arc::clone(&self.inner),
-            event_rx,
-        })
-    }
 
     pub async fn attach_instance(&self, instance_id: &str) -> Result<Instance> {
         let instance_id = Uuid::parse_str(instance_id)?;

@@ -171,6 +171,87 @@ pub fn is_spawned() -> bool {
     ACTOR.is_spawned()
 }
 
+/// Launch an instance of a program.
+pub async fn launch_instance(
+    username: String,
+    program_name: String,
+    arguments: Vec<String>,
+    detached: bool,
+) -> Result<InstanceId, RuntimeError> {
+    let (tx, rx) = oneshot::channel();
+    Message::LaunchInstance {
+        username,
+        program_name,
+        arguments,
+        detached,
+        response: tx,
+    }
+    .send()
+    .map_err(|_| RuntimeError::Other("Runtime actor not running".to_string()))?;
+    rx.await.map_err(|_| RuntimeError::Other("Runtime actor did not respond".to_string()))?
+}
+
+/// Launch a server instance (HTTP handler).
+pub async fn launch_server_instance(
+    username: String,
+    program_name: String,
+    port: u32,
+    arguments: Vec<String>,
+) -> Result<(), RuntimeError> {
+    let (tx, rx) = oneshot::channel();
+    Message::LaunchServerInstance {
+        username,
+        program_name,
+        port,
+        arguments,
+        response: tx,
+    }
+    .send()
+    .map_err(|_| RuntimeError::Other("Runtime actor not running".to_string()))?;
+    rx.await.map_err(|_| RuntimeError::Other("Runtime actor did not respond".to_string()))?
+}
+
+/// List running instances for a user.
+pub async fn list_instances(username: String) -> Vec<message::InstanceInfo> {
+    let (tx, rx) = oneshot::channel();
+    let _ = Message::ListInstances {
+        username,
+        response: tx,
+    }
+    .send();
+    rx.await.unwrap_or_default()
+}
+
+/// Attach to an instance.
+pub async fn attach_instance(inst_id: InstanceId) -> AttachInstanceResult {
+    let (tx, rx) = oneshot::channel();
+    let _ = Message::AttachInstance {
+        inst_id,
+        response: tx,
+    }
+    .send();
+    rx.await.unwrap_or(AttachInstanceResult::InstanceNotFound)
+}
+
+/// Allow output for an instance (fire-and-forget).
+pub fn allow_output(inst_id: InstanceId) {
+    let _ = Message::AllowOutput { inst_id }.send();
+}
+
+/// Set output delivery mode for an instance (fire-and-forget).
+pub fn set_output_delivery(inst_id: InstanceId, mode: OutputDelivery) {
+    let _ = Message::SetOutputDelivery { inst_id, mode }.send();
+}
+
+/// Terminate an instance (fire-and-forget).
+pub fn terminate_instance(inst_id: InstanceId, notification_to_client: Option<TerminationCause>) {
+    let _ = Message::TerminateInstance {
+        inst_id,
+        notification_to_client,
+    }
+    .send();
+}
+
 // =============================================================================
 // Messages
 // =============================================================================
@@ -583,12 +664,20 @@ impl Runtime {
             cleanup_instance(instance_id);
 
             if let Some(cause) = notification_to_client {
-                server::Message::Terminate {
-                    inst_id: instance_id,
-                    cause,
-                }
-                .send()
-                .unwrap();
+                // Send termination notification directly to session
+                tokio::spawn(async move {
+                    if let Some(client_id) = server::get_client_id(instance_id).await {
+                        server::session_send(
+                            client_id,
+                            server::SessionMessage::Terminate {
+                                inst_id: instance_id,
+                                cause,
+                            },
+                        )
+                        .ok();
+                    }
+                    server::Message::UnregisterInstance { inst_id: instance_id }.send().ok();
+                });
             }
         }
     }
@@ -601,12 +690,20 @@ impl Runtime {
                     handle.join_handle.abort();
                     cleanup_instance(instance_id);
 
-                    server::Message::Terminate {
-                        inst_id: instance_id,
-                        cause,
-                    }
-                    .send()
-                    .unwrap();
+                    // Send termination notification directly to session
+                    tokio::spawn(async move {
+                        if let Some(client_id) = server::get_client_id(instance_id).await {
+                            server::session_send(
+                                client_id,
+                                server::SessionMessage::Terminate {
+                                    inst_id: instance_id,
+                                    cause,
+                                },
+                            )
+                            .ok();
+                        }
+                        server::Message::UnregisterInstance { inst_id: instance_id }.send().ok();
+                    });
                 }
                 InstanceRunningState::Detached => {
                     handle.running_state = InstanceRunningState::Finished(cause);

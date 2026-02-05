@@ -1,7 +1,7 @@
 interface messaging {
 
     use wasi:io/poll@0.2.4.{pollable};
-    use types.{future-string};
+    use types.{future-string, future-blob, blob};
 
     // Represents a subscription to a broadcast topic
     resource subscription {
@@ -20,6 +20,12 @@ interface messaging {
 
     // Receives an incoming message from the remote user client
     receive: func() -> future-string;
+
+    // Sends a blob to the remote user client
+    send-blob: func(blob: blob);
+
+    // Receives an incoming blob from the remote user client
+    receive-blob: func() -> future-blob;
 
     // Publishes a message to a topic (broadcast to all subscribers)
     broadcast: func(topic: string, message: string);

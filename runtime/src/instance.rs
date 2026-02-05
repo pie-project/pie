@@ -1,5 +1,4 @@
 use super::utils;
-use crate::server::Message as ServerMessage;
 use anyhow::{Result, format_err};
 use bytes::Bytes;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
@@ -305,22 +304,20 @@ pub enum OutputChannel {
 }
 
 impl OutputChannel {
-    /// Send the output to the server so that it can be delivered to the client
+    /// Send the output to the session actor for the client attached to this instance
     fn dispatch_output(&self, content: String, instance_id: InstanceId) {
-        match self {
-            OutputChannel::Stdout => ServerMessage::StreamingOutput {
-                inst_id: instance_id,
-                output_type: OutputChannel::Stdout,
-                content,
+        let output_type = self.clone();
+        // Spawn async task since this is called from sync context
+        tokio::spawn(async move {
+            if let Some(client_id) = crate::server::get_client_id(instance_id).await {
+                let msg = crate::server::SessionMessage::StreamingOutput {
+                    inst_id: instance_id,
+                    output_type,
+                    content,
+                };
+                crate::server::session_send(client_id, msg).ok();
             }
-            .dispatch(),
-            OutputChannel::Stderr => ServerMessage::StreamingOutput {
-                inst_id: instance_id,
-                output_type: OutputChannel::Stderr,
-                content,
-            }
-            .dispatch(),
-        }
+        });
     }
 }
 

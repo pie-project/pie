@@ -1,31 +1,32 @@
-//! Server Service - Client connection and request handling
+//! Server Service - Connection lifecycle and instance mapping
 //!
-//! This module provides actors for server management using the
-//! modern actor model (Handle trait). It handles WebSocket connections,
-//! authentication, program management, and instance lifecycle.
+//! This module provides the Server "superactor" that:
+//! - Manages the TCP listener and spawns session actors
+//! - Maintains the InstanceId → ClientId mapping for message routing
+//!
+//! Session actors register themselves in a global registry (see session.rs)
+//! and receive messages directly without routing through this actor.
 
 mod session;
-mod blob;
 mod handler;
+mod upload;
 
-pub use session::{Session, SessionEvent};
-pub use blob::InFlightUpload;
+pub use session::{Session, SessionMessage, send as session_send};
+pub use upload::InFlightUpload;
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::oneshot;
 use tokio::task::{self, JoinHandle};
 
 use crate::actor::{Actor, Handle, SendError};
+use crate::instance::InstanceId;
 
-use crate::instance::{InstanceId, OutputChannel};
-use crate::runtime::TerminationCause;
-use crate::utils::IdPool;
-
-type ClientId = u32;
+pub type ClientId = u32;
 
 // =============================================================================
 // Server Actor
@@ -54,24 +55,28 @@ pub fn is_spawned() -> bool {
 // =============================================================================
 
 /// Messages for the Server actor.
+/// 
+/// The server actor now handles only lifecycle and mapping operations.
+/// Session-specific messages go directly to session actors via session::send().
 #[derive(Debug)]
 pub enum Message {
-    SendMsgToClient {
+    /// Register an instance → client mapping (called when instance is launched)
+    RegisterInstance {
         inst_id: InstanceId,
-        message: String,
+        client_id: ClientId,
     },
-    SendBlobToClient {
+    /// Unregister an instance mapping (called when instance terminates or detaches)
+    UnregisterInstance {
         inst_id: InstanceId,
-        data: Bytes,
     },
-    Terminate {
+    /// Look up the client ID for an instance
+    GetClientId {
         inst_id: InstanceId,
-        cause: TerminationCause,
+        response: oneshot::Sender<Option<ClientId>>,
     },
-    StreamingOutput {
-        inst_id: InstanceId,
-        output_type: OutputChannel,
-        content: String,
+    /// Session has terminated, cleanup
+    SessionTerminated {
+        client_id: ClientId,
     },
 }
 
@@ -84,68 +89,14 @@ impl Message {
         let _ = self.send();
     }
 }
+
 // =============================================================================
-// Server State
+// Server State (shared with sessions)
 // =============================================================================
 
 pub struct ServerState {
-    pub client_id_pool: Mutex<IdPool<ClientId>>,
+    next_client_id: AtomicU32,
     pub clients: DashMap<ClientId, JoinHandle<()>>,
-    pub client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
-}
-
-// =============================================================================
-// Server
-// =============================================================================
-
-struct Server {
-    state: Arc<ServerState>,
-}
-
-impl Server {
-    fn new(addr: String) -> Self {
-        let state = Arc::new(ServerState {
-            client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
-            clients: DashMap::new(),
-            client_cmd_txs: DashMap::new(),
-        });
-
-        let _listener = task::spawn(Self::listener_loop(addr, state.clone()));
-        Server { state }
-    }
-
-    async fn listener_loop(addr: String, state: Arc<ServerState>) {
-        let listener = TcpListener::bind(addr).await.unwrap();
-        while let Ok((stream, _addr)) = listener.accept().await {
-            let id = {
-                let mut id_pool = state.client_id_pool.lock().await;
-                id_pool.acquire().unwrap()
-            };
-
-            match Session::spawn(id, stream, state.clone()).await {
-                Ok(session_handle) => {
-                    state.clients.insert(id, session_handle);
-                }
-                Err(e) => {
-                    tracing::error!("Error creating session for client {}: {}", id, e);
-                    state.client_id_pool.lock().await.release(id).ok();
-                }
-            }
-        }
-    }
-
-    async fn handle_message(&mut self, msg: Message) {
-        let inst_id = match &msg {
-            Message::SendMsgToClient { inst_id, .. }
-            | Message::Terminate { inst_id, .. }
-            | Message::SendBlobToClient { inst_id, .. }
-            | Message::StreamingOutput { inst_id, .. } => *inst_id,
-        };
-
-        if let Some(chan) = self.state.client_cmd_txs.get(&inst_id) {
-            chan.send(SessionEvent::InternalMessage(msg)).await.ok();
-        }
-    }
 }
 
 // =============================================================================
@@ -153,13 +104,40 @@ impl Server {
 // =============================================================================
 
 struct ServerActor {
-    server: Server,
+    state: Arc<ServerState>,
+    /// Maps InstanceId → ClientId for message routing
+    inst_to_client: HashMap<InstanceId, ClientId>,
 }
 
 impl ServerActor {
     fn new(addr: String) -> Self {
+        let state = Arc::new(ServerState {
+            next_client_id: AtomicU32::new(1),
+            clients: DashMap::new(),
+        });
+
+        let _listener = task::spawn(Self::listener_loop(addr, state.clone()));
+        
         ServerActor {
-            server: Server::new(addr),
+            state,
+            inst_to_client: HashMap::new(),
+        }
+    }
+
+    async fn listener_loop(addr: String, state: Arc<ServerState>) {
+        let listener = TcpListener::bind(addr).await.unwrap();
+        while let Ok((stream, _addr)) = listener.accept().await {
+            let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
+
+            match Session::spawn(id, stream, state.clone()).await {
+                Ok(()) => {
+                    // Session is now registered in SESSION_REGISTRY
+                    tracing::info!("Client {} connected", id);
+                }
+                Err(e) => {
+                    tracing::error!("Error creating session for client {}: {}", id, e);
+                }
+            }
         }
     }
 }
@@ -168,6 +146,38 @@ impl Handle for ServerActor {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
-        self.server.handle_message(msg).await;
+        match msg {
+            Message::RegisterInstance { inst_id, client_id } => {
+                self.inst_to_client.insert(inst_id, client_id);
+            }
+            Message::UnregisterInstance { inst_id } => {
+                self.inst_to_client.remove(&inst_id);
+            }
+            Message::GetClientId { inst_id, response } => {
+                let client_id = self.inst_to_client.get(&inst_id).copied();
+                response.send(client_id).ok();
+            }
+            Message::SessionTerminated { client_id } => {
+                // Remove all instances associated with this client
+                self.inst_to_client.retain(|_, &mut cid| cid != client_id);
+                tracing::info!("Client {} disconnected", client_id);
+            }
+        }
     }
+}
+
+// =============================================================================
+// Helper functions for external use
+// =============================================================================
+
+/// Gets the ClientId for an instance, sending the message via Server actor.
+pub async fn get_client_id(inst_id: InstanceId) -> Option<ClientId> {
+    let (tx, rx) = oneshot::channel();
+    Message::GetClientId {
+        inst_id,
+        response: tx,
+    }
+    .send()
+    .ok()?;
+    rx.await.ok().flatten()
 }

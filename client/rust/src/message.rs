@@ -72,11 +72,12 @@ pub enum ClientMessage {
         record: String,
     },
 
-    #[serde(rename = "install_program")]
-    InstallProgram {
+    #[serde(rename = "add_program")]
+    AddProgram {
         corr_id: u32,
         program_hash: String,
         manifest: String,
+        force_overwrite: bool,
         chunk_index: usize,
         total_chunks: usize,
         #[serde(with = "serde_bytes")]
@@ -85,14 +86,6 @@ pub enum ClientMessage {
 
     #[serde(rename = "launch_instance")]
     LaunchInstance {
-        corr_id: u32,
-        inferlet: String,
-        arguments: Vec<String>,
-        detached: bool,
-    },
-
-    #[serde(rename = "launch_instance_from_registry")]
-    LaunchInstanceFromRegistry {
         corr_id: u32,
         inferlet: String,
         arguments: Vec<String>,
@@ -129,14 +122,6 @@ pub enum ClientMessage {
 
     #[serde(rename = "terminate_instance")]
     TerminateInstance { corr_id: u32, instance_id: String },
-
-    #[serde(rename = "attach_remote_service")]
-    AttachRemoteService {
-        corr_id: u32,
-        endpoint: String,
-        service_type: String,
-        service_name: String,
-    },
 
     #[serde(rename = "internal_authenticate")]
     InternalAuthenticate { corr_id: u32, token: String },

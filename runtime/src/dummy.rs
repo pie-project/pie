@@ -74,58 +74,8 @@ pub async fn start_dummy_backend(config: DummyBackendConfig) -> Result<()> {
     }
     println!("[Dummy Backend] Connected to engine at {}", controller_url);
 
-    // Generate unique service name
-    let unique_id: u32 = rand::rng().random_range(100000..=999999);
-    let service_name = format!("pie-dummy-backend-{}", unique_id);
-
-    // Note: In FFI mode (the only mode now), remote service attachment is not supported.
-    // This registration will be rejected by the server, but is useful for testing the
-    // registration flow and error handling.
-
-    // Register with the engine
-    let register_msg = ClientMessage::AttachRemoteService {
-        corr_id: 0,
-        endpoint: service_name.clone(),
-        service_type: "model".to_string(),
-        service_name: "dummy-model".to_string(),
-    };
-    let register_bytes = Bytes::from(
-        encode::to_vec_named(&register_msg).context("Failed to encode registration message")?,
-    );
-    ws_write
-        .send(WsMessage::Binary(register_bytes))
-        .await
-        .context("Failed to send registration message")?;
-
-    // Wait for registration response
-    let response = ws_read
-        .next()
-        .await
-        .context("Connection closed before registration response")??;
-    let response_data = response.into_data();
-    let server_msg: ServerMessage =
-        rmp_serde::from_slice(&response_data).context("Failed to decode registration response")?;
-
-    match server_msg {
-        ServerMessage::Response {
-            successful, result, ..
-        } => {
-            if !successful {
-                anyhow::bail!("Registration failed: {}", result);
-            }
-        }
-        _ => anyhow::bail!("Unexpected response type for registration"),
-    }
-    println!(
-        "[Dummy Backend] Registered with engine (service: {})",
-        service_name
-    );
-
     // Keep the WebSocket connection alive
-    // Note: Remote service registration is no longer supported in FFI mode.
-    // The server will reject the registration, but this is useful for testing error handling.
-    println!("[Dummy Backend] Note: Remote service attachment is not supported in FFI mode.");
-    println!("[Dummy Backend] This is only useful for registration testing.");
+    println!("[Dummy Backend] Staying connected for testing purposes...");
 
     while let Some(result) = ws_read.next().await {
         match result {

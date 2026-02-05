@@ -155,6 +155,45 @@ impl Message {
 }
 
 // =============================================================================
+// Convenience Wrappers
+// =============================================================================
+
+/// Check if authentication is enabled.
+pub async fn is_auth_enabled() -> Result<bool> {
+    let (tx, rx) = oneshot::channel();
+    Message::IsAuthEnabled { response: tx }.send()?;
+    Ok(rx.await?)
+}
+
+/// Get public keys for a user (for challenge-response auth).
+pub async fn get_user_keys(username: String) -> Result<Option<Vec<PublicKey>>> {
+    let (tx, rx) = oneshot::channel();
+    Message::GetUserKeys { username, response: tx }.send()?;
+    Ok(rx.await?)
+}
+
+/// Generate a new challenge for authentication.
+pub async fn generate_challenge() -> Result<Vec<u8>> {
+    let (tx, rx) = oneshot::channel();
+    Message::GenerateChallenge { response: tx }.send()?;
+    rx.await?
+}
+
+/// Verify a signature against all user keys.
+pub async fn verify_signature(username: String, challenge: Vec<u8>, signature: Vec<u8>) -> Result<bool> {
+    let (tx, rx) = oneshot::channel();
+    Message::VerifySignature { username, challenge, signature, response: tx }.send()?;
+    Ok(rx.await?)
+}
+
+/// Verify internal auth token.
+pub async fn verify_internal_token(token: String) -> Result<bool> {
+    let (tx, rx) = oneshot::channel();
+    Message::VerifyInternalToken { token, response: tx }.send()?;
+    Ok(rx.await?)
+}
+
+// =============================================================================
 // Result Types
 // =============================================================================
 
