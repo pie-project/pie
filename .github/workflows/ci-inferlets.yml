@@ -1,0 +1,91 @@
+name: Inferlet Compilation CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'sdk/rust/inferlet/**'
+      - 'sdk/rust/inferlet-macros/**'
+      - 'sdk/python/**'
+      - 'sdk/javascript/**'
+      - 'sdk/interfaces/**'
+      - 'sdk/examples/**'
+      - 'sdk/tools/bakery/**'
+      - 'std/**'
+      - 'tests/ci-inferlets.sh'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'sdk/rust/inferlet/**'
+      - 'sdk/rust/inferlet-macros/**'
+      - 'sdk/python/**'
+      - 'sdk/javascript/**'
+      - 'sdk/interfaces/**'
+      - 'sdk/examples/**'
+      - 'sdk/tools/bakery/**'
+      - 'std/**'
+      - 'tests/ci-inferlets.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  rust-inferlets:
+    name: Rust Inferlets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            sdk/examples/target
+            std/*/target
+          key: ${{ runner.os }}-inferlets-rust-${{ hashFiles('sdk/examples/Cargo.lock', 'sdk/rust/inferlet/Cargo.toml') }}
+
+      - name: Build and validate Rust inferlets
+        run: ./tests/ci-inferlets.sh --rust
+
+  python-inferlets:
+    name: Python Inferlets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Build and validate Python inferlets
+        run: ./tests/ci-inferlets.sh --python
+
+  javascript-inferlets:
+    name: JavaScript/TypeScript Inferlets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Build and validate JS/TS inferlets
+        run: ./tests/ci-inferlets.sh --javascript
