@@ -25,7 +25,7 @@ use wasmtime_wasi_http::io::TokioIo;
 use super::instance::{InstanceId, InstanceState, OutputDelivery, OutputDeliveryCtrl};
 use crate::actor::{Actor, Handle, SendError};
 use crate::ffi::format::QueryResponse;
-use crate::{api, server};
+use crate::{api, program, server};
 use thiserror::Error;
 
 mod dynamic_linking;
@@ -120,7 +120,7 @@ impl From<InstanceRunningState> for pie_client::message::InstanceStatus {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum AttachInstanceResult {
     /// The instance is running and the client has been attached to it successfully.
     AttachedRunning,
@@ -147,7 +147,6 @@ fn cleanup_instance(_inst_id: InstanceId) {
 struct InstanceHandle {
     username: String,
     program_name: String,
-    program_hash: ProgramHash,
     arguments: Vec<String>,
     start_time: std::time::Instant,
     output_delivery_ctrl: OutputDeliveryCtrl,
@@ -178,32 +177,18 @@ pub fn is_spawned() -> bool {
 
 /// Messages for the Runtime actor.
 ///
-/// Note: Component doesn't implement Debug, so we manually implement it.
+/// Note: No longer needs manual Debug impl since Component is not passed in messages.
+#[derive(Debug)]
 pub enum Message {
     /// Get the runtime version
     GetVersion {
         response: oneshot::Sender<String>,
     },
 
-    /// Load a pre-compiled program component
-    LoadProgram {
-        program_hash: ProgramHash,
-        component: Component,
-        dependencies: Vec<ProgramHash>,
-        response: oneshot::Sender<()>,
-    },
-
-    /// Check if a program is loaded
-    ProgramLoaded {
-        program_hash: ProgramHash,
-        response: oneshot::Sender<bool>,
-    },
-
     /// Launch a program instance
     LaunchInstance {
         username: String,
         program_name: String,
-        program_hash: ProgramHash,
         arguments: Vec<String>,
         detached: bool,
         response: oneshot::Sender<Result<InstanceId, RuntimeError>>,
@@ -229,7 +214,6 @@ pub enum Message {
     LaunchServerInstance {
         username: String,
         program_name: String,
-        program_hash: ProgramHash,
         port: u32,
         arguments: Vec<String>,
         response: oneshot::Sender<Result<(), RuntimeError>>,
@@ -273,31 +257,6 @@ pub enum Message {
     },
 }
 
-impl std::fmt::Debug for Message {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Message::GetVersion { .. } => write!(f, "GetVersion"),
-            Message::LoadProgram { program_hash, .. } => write!(f, "LoadProgram {{ program_hash: {:?} }}", program_hash),
-            Message::ProgramLoaded { program_hash, .. } => write!(f, "ProgramLoaded {{ program_hash: {:?} }}", program_hash),
-            Message::LaunchInstance { username, program_hash, detached, .. } => {
-                write!(f, "LaunchInstance {{ username: {}, program_hash: {:?}, detached: {} }}", username, program_hash, detached)
-            }
-            Message::AttachInstance { inst_id, .. } => write!(f, "AttachInstance {{ inst_id: {} }}", inst_id),
-            Message::DetachInstance { inst_id } => write!(f, "DetachInstance {{ inst_id: {} }}", inst_id),
-            Message::AllowOutput { inst_id } => write!(f, "AllowOutput {{ inst_id: {} }}", inst_id),
-            Message::LaunchServerInstance { username, program_hash, port, .. } => {
-                write!(f, "LaunchServerInstance {{ username: {}, program_hash: {:?}, port: {} }}", username, program_hash, port)
-            }
-            Message::TerminateInstance { inst_id, .. } => write!(f, "TerminateInstance {{ inst_id: {} }}", inst_id),
-            Message::FinishInstance { inst_id, .. } => write!(f, "FinishInstance {{ inst_id: {} }}", inst_id),
-            Message::SetOutputDelivery { inst_id, .. } => write!(f, "SetOutputDelivery {{ inst_id: {} }}", inst_id),
-            Message::DebugQuery { query, .. } => write!(f, "DebugQuery {{ query: {} }}", query),
-            Message::ListInstances { username, .. } => write!(f, "ListInstances {{ username: {} }}", username),
-            Message::Spawn { package_name, .. } => write!(f, "Spawn {{ package_name: {} }}", package_name),
-        }
-    }
-}
-
 impl Message {
     /// Sends this message to the runtime actor.
     pub fn send(self) -> Result<(), SendError> {
@@ -334,29 +293,16 @@ impl Handle for RuntimeActor {
             Message::GetVersion { response } => {
                 let _ = response.send(self.service.get_version());
             }
-            Message::LoadProgram {
-                program_hash,
-                component,
-                dependencies,
-                response,
-            } => {
-                self.service.load_program(program_hash, component, dependencies);
-                let _ = response.send(());
-            }
-            Message::ProgramLoaded { program_hash, response } => {
-                let _ = response.send(self.service.program_loaded(&program_hash));
-            }
             Message::LaunchInstance {
                 username,
                 program_name,
-                program_hash,
                 arguments,
                 detached,
                 response,
             } => {
                 let result = self
                     .service
-                    .launch_instance(username, program_name, program_hash, arguments, detached)
+                    .launch_instance(username, program_name, arguments, detached)
                     .await;
                 let _ = response.send(result);
             }
@@ -372,14 +318,13 @@ impl Handle for RuntimeActor {
             Message::LaunchServerInstance {
                 username,
                 program_name,
-                program_hash,
                 port,
                 arguments,
                 response,
             } => {
                 let result = self
                     .service
-                    .launch_server_instance(username, program_name, program_hash, port, arguments)
+                    .launch_server_instance(username, program_name, port, arguments)
                     .await;
                 let _ = response.send(result);
             }
@@ -426,8 +371,6 @@ pub struct Runtime {
     engine: Engine,
     /// Pre-configured linker with WASI and API bindings
     linker: Arc<Linker<InstanceState>>,
-    /// Pre-compiled WASM components, keyed by ProgramHash
-    compiled_programs: DashMap<ProgramHash, CompiledProgram>,
     /// Running instances
     running_instances: DashMap<InstanceId, InstanceHandle>,
     /// Finished instances (awaiting attachment)
@@ -455,7 +398,6 @@ impl Runtime {
         Runtime {
             engine,
             linker: Arc::new(linker),
-            compiled_programs: DashMap::new(),
             running_instances: DashMap::new(),
             finished_instances: DashMap::new(),
             running_server_instances: DashMap::new(),
@@ -467,41 +409,19 @@ impl Runtime {
         VERSION.to_string()
     }
 
-    /// Loads a pre-compiled program component with its dependencies.
-    pub fn load_program(&self, program_hash: ProgramHash, component: Component, dependencies: Vec<ProgramHash>) {
-        let compiled_program = CompiledProgram {
-            component,
-            dependencies,
-        };
-        self.compiled_programs.insert(program_hash, compiled_program);
-    }
-
-    /// Checks if a program is loaded.
-    pub fn program_loaded(&self, program_hash: &ProgramHash) -> bool {
-        self.compiled_programs.contains_key(program_hash)
-    }
-
-    /// Retrieves a compiled component by hash.
-    fn get_component(&self, program_hash: &ProgramHash) -> Result<Component, RuntimeError> {
-        match self.compiled_programs.get(program_hash) {
-            Some(entry) => Ok(entry.value().component.clone()),
-            None => Err(RuntimeError::MissingProgram(
-                program_hash.wasm_hash.clone(),
-                program_hash.manifest_hash.clone(),
-            )),
-        }
-    }
-
     /// Launches a program instance.
     pub async fn launch_instance(
         &self,
         username: String,
         program_name: String,
-        program_hash: ProgramHash,
         arguments: Vec<String>,
         detached: bool,
     ) -> Result<InstanceId, RuntimeError> {
-        let component = self.get_component(&program_hash)?;
+        // Get the component from program manager
+        let component = program::get_component(&program::ProgramName::parse(&program_name))
+            .await
+            .ok_or_else(|| RuntimeError::Other(format!("Component not found for program: {}", program_name)))?;
+
         let instance_id = Uuid::new_v4();
 
         let engine = self.engine.clone();
@@ -536,7 +456,6 @@ impl Runtime {
         let instance_handle = InstanceHandle {
             username,
             program_name,
-            program_hash,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -605,12 +524,15 @@ impl Runtime {
         &self,
         username: String,
         program_name: String,
-        program_hash: ProgramHash,
         port: u32,
         arguments: Vec<String>,
     ) -> Result<(), RuntimeError> {
+        // Get the component from program manager
+        let component = program::get_component(&program::ProgramName::parse(&program_name))
+            .await
+            .ok_or_else(|| RuntimeError::Other(format!("Component not found for program: {}", program_name)))?;
+
         let instance_id = Uuid::new_v4();
-        let component = self.get_component(&program_hash)?;
 
         let engine = self.engine.clone();
         let linker = self.linker.clone();
@@ -636,7 +558,6 @@ impl Runtime {
         let instance_handle = InstanceHandle {
             username,
             program_name,
-            program_hash,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -714,21 +635,13 @@ impl Runtime {
                     .iter()
                     .map(|item| {
                         format!(
-                            "Instance ID: {}, Program hash: {}",
+                            "Instance ID: {}, Program: {}",
                             item.key(),
-                            item.value().program_hash
+                            item.value().program_name
                         )
                     })
                     .collect();
                 instances.join("\n")
-            }
-            "list_in_memory_programs" => {
-                let hashes: Vec<String> = self
-                    .compiled_programs
-                    .iter()
-                    .map(|item| item.key().to_string())
-                    .collect();
-                hashes.join("\n")
             }
             _ => format!("Unknown query: {}", query),
         };

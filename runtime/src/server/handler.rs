@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
 use crate::messaging::{self, PushPullMessage};
-use crate::program::{self, ProgramMetadata, ProgramName};
+use crate::program::{self, Manifest, ProgramName};
 use crate::runtime::{self, AttachInstanceResult};
 
 use super::blob::InFlightUpload;
@@ -25,24 +25,9 @@ impl Session {
     pub async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
         match subject.as_str() {
             message::QUERY_PROGRAM_EXISTS => {
-                // Parse the record as "name@version" or "name@version#wasm_hash+manifest_hash"
-                let (inferlet_part, hashes) = if let Some(idx) = record.find('#') {
-                    let (inferlet, hash_part) = record.split_at(idx);
-                    (inferlet.to_string(), Some(hash_part[1..].to_string()))
-                } else {
-                    (record.clone(), None)
-                };
-                let program_name = ProgramName::parse(&inferlet_part);
-
-                // Parse expected hashes if provided (format: "wasm_hash+manifest_hash")
-                let expected_hashes = hashes.and_then(|hash_str| {
-                    hash_str.find('+').map(|plus_idx| {
-                        let (wasm, manifest_part) = hash_str.split_at(plus_idx);
-                        (wasm.to_string(), manifest_part[1..].to_string())
-                    })
-                });
-
-                let result = program::program_exists(&program_name, expected_hashes).await;
+                // Parse the record as "name@version"
+                let program_name = ProgramName::parse(&record);
+                let result = program::is_registered(&program_name).await;
                 self.send_response(corr_id, true, result.to_string()).await;
             }
             message::QUERY_MODEL_STATUS => {
@@ -172,14 +157,16 @@ impl Session {
         if inflight.next_chunk_index == total_chunks {
             let wasm_bytes = mem::take(&mut inflight.buffer);
             let manifest = mem::take(&mut inflight.manifest);
-            let expected_hash = program_hash;
 
-            match program::upload(wasm_bytes, manifest, expected_hash).await {
-                Ok(result) => {
-                    self.send_response(corr_id, true, result.wasm_hash).await;
+            // TODO: force_overwrite should come from the upload request
+            let force_overwrite = false;
+
+            match program::register(wasm_bytes, manifest, force_overwrite).await {
+                Ok(()) => {
+                    self.send_response(corr_id, true, "Program registered successfully".to_string()).await;
                 }
                 Err(e) => {
-                    self.send_response(corr_id, false, e).await;
+                    self.send_response(corr_id, false, e.to_string()).await;
                 }
             }
             self.inflight_program_upload = None;
@@ -214,7 +201,7 @@ impl Session {
                 .await;
             }
             Err(e) => {
-                self.send_launch_result(corr_id, false, e).await;
+                self.send_launch_result(corr_id, false, e.to_string()).await;
             }
         }
     }
@@ -223,7 +210,7 @@ impl Session {
         &mut self,
         corr_id: u32,
         program_name: String,
-        metadata: &ProgramMetadata,
+        _metadata: &Manifest,
         arguments: Vec<String>,
         detached: bool,
     ) {
@@ -231,10 +218,6 @@ impl Session {
         runtime::Message::LaunchInstance {
             username: self.username.clone(),
             program_name,
-            program_hash: runtime::ProgramHash::new(
-                metadata.wasm_hash.clone(),
-                metadata.manifest_hash.clone(),
-            ),
             arguments,
             detached,
             response: evt_tx,
@@ -277,15 +260,11 @@ impl Session {
 
         // Install program and dependencies (handles both uploaded and registry)
         match program::install(&program_name).await {
-            Ok(metadata) => {
+            Ok(_metadata) => {
                 let (evt_tx, evt_rx) = oneshot::channel();
                 runtime::Message::LaunchServerInstance {
                     username: self.username.clone(),
                     program_name: program_name.to_string(),
-                    program_hash: runtime::ProgramHash::new(
-                        metadata.wasm_hash.clone(),
-                        metadata.manifest_hash.clone(),
-                    ),
                     port,
                     arguments,
                     response: evt_tx,
@@ -302,7 +281,7 @@ impl Session {
                 }
             }
             Err(e) => {
-                self.send_response(corr_id, false, e).await;
+                self.send_response(corr_id, false, e.to_string()).await;
             }
         }
     }
