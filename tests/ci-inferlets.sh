@@ -41,54 +41,64 @@ section() { echo -e "\n${BOLD}═══ $* ═══${NC}"; }
 # ---------------------------------------------------------------------------
 
 check_prerequisites() {
+    local need_rust=$1
+    local need_python=$2
+    local need_javascript=$3
+
     section "Checking prerequisites"
 
     local missing=()
 
-    # Rust
+    # Rust toolchain (needed by Rust builds and for installing wasm-tools)
     if command -v cargo &>/dev/null; then
         log "cargo: $(cargo --version)"
     else
         missing+=("cargo (install via rustup)")
     fi
 
-    if rustup target list --installed 2>/dev/null | grep -q wasm32-wasip2; then
-        log "wasm32-wasip2 target: installed"
-    else
-        missing+=("wasm32-wasip2 target (rustup target add wasm32-wasip2)")
+    if [[ "$need_rust" == true ]]; then
+        if rustup target list --installed 2>/dev/null | grep -q wasm32-wasip2; then
+            log "wasm32-wasip2 target: installed"
+        else
+            missing+=("wasm32-wasip2 target (rustup target add wasm32-wasip2)")
+        fi
     fi
 
-    # Node
-    if command -v node &>/dev/null; then
-        log "node: $(node --version)"
-    else
-        missing+=("node (v18+ required)")
+    # Node (JavaScript/TypeScript only)
+    if [[ "$need_javascript" == true ]]; then
+        if command -v node &>/dev/null; then
+            log "node: $(node --version)"
+        else
+            missing+=("node (v18+ required)")
+        fi
     fi
 
-    # uv
-    if command -v uv &>/dev/null; then
-        log "uv: $(uv --version)"
-    else
-        missing+=("uv (https://docs.astral.sh/uv/)")
+    # uv, bakery, componentize-py (Python and JavaScript only)
+    if [[ "$need_python" == true ]] || [[ "$need_javascript" == true ]]; then
+        if command -v uv &>/dev/null; then
+            log "uv: $(uv --version)"
+        else
+            missing+=("uv (https://docs.astral.sh/uv/)")
+        fi
+
+        if command -v bakery &>/dev/null; then
+            log "bakery: available"
+        else
+            log "bakery: not found — will install from source"
+            install_bakery
+        fi
     fi
 
-    # bakery
-    if command -v bakery &>/dev/null; then
-        log "bakery: available"
-    else
-        log "bakery: not found — will install from source"
-        install_bakery
+    if [[ "$need_python" == true ]]; then
+        if command -v componentize-py &>/dev/null; then
+            log "componentize-py: available"
+        else
+            log "componentize-py: not found — will install"
+            install_componentize_py
+        fi
     fi
 
-    # componentize-py
-    if command -v componentize-py &>/dev/null; then
-        log "componentize-py: available"
-    else
-        log "componentize-py: not found — will install"
-        install_componentize_py
-    fi
-
-    # wasm-tools
+    # wasm-tools (needed by all for validation)
     if command -v wasm-tools &>/dev/null; then
         log "wasm-tools: $(wasm-tools --version)"
     else
@@ -356,7 +366,7 @@ main() {
     echo "Repo: $REPO_ROOT"
     echo ""
 
-    check_prerequisites
+    check_prerequisites "$run_rust" "$run_python" "$run_javascript"
 
     if [[ "$run_setup" == true ]]; then
         log "Setup complete."
