@@ -103,9 +103,7 @@ pub async fn run_server(
     });
 
     runtime::spawn(wasm_engine);
-    server::spawn(server::ServerConfig {
-        ip_port: server_url,
-    });
+    server::spawn(server_url);
 
     ready_tx.send(internal_auth_token).unwrap();
 

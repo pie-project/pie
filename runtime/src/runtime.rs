@@ -284,10 +284,6 @@ impl RuntimeActor {
 impl Handle for RuntimeActor {
     type Message = Message;
 
-    fn new() -> Self {
-        panic!("RuntimeActor requires an engine; use spawn() instead")
-    }
-
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::GetVersion { response } => {
@@ -587,10 +583,10 @@ impl Runtime {
             cleanup_instance(instance_id);
 
             if let Some(cause) = notification_to_client {
-                server::Message::InstanceEvent(server::InstanceEvent::Terminate {
+                server::Message::Terminate {
                     inst_id: instance_id,
                     cause,
-                })
+                }
                 .send()
                 .unwrap();
             }
@@ -605,10 +601,10 @@ impl Runtime {
                     handle.join_handle.abort();
                     cleanup_instance(instance_id);
 
-                    server::Message::InstanceEvent(server::InstanceEvent::Terminate {
+                    server::Message::Terminate {
                         inst_id: instance_id,
                         cause,
-                    })
+                    }
                     .send()
                     .unwrap();
                 }

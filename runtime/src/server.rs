@@ -34,9 +34,9 @@ type ClientId = u32;
 /// Global singleton Server actor.
 static ACTOR: LazyLock<Actor<Message>> = LazyLock::new(Actor::new);
 
-/// Spawns the Server actor with configuration.
-pub fn spawn(config: ServerConfig) {
-    ACTOR.spawn_with::<ServerActor, _>(|| ServerActor::with_config(config));
+/// Spawns the Server actor with the given address.
+pub fn spawn(addr: String) {
+    ACTOR.spawn_with::<ServerActor, _>(|| ServerActor::new(addr));
 }
 
 /// Sends a message to the Server actor.
@@ -50,29 +50,12 @@ pub fn is_spawned() -> bool {
 }
 
 // =============================================================================
-// Configuration
-// =============================================================================
-
-/// Server configuration.
-#[derive(Debug)]
-pub struct ServerConfig {
-    pub ip_port: String,
-}
-
-// =============================================================================
 // Messages
 // =============================================================================
 
 /// Messages for the Server actor.
 #[derive(Debug)]
 pub enum Message {
-    /// Instance event from runtime
-    InstanceEvent(InstanceEvent),
-}
-
-/// Events from instances to be forwarded to clients.
-#[derive(Debug)]
-pub enum InstanceEvent {
     SendMsgToClient {
         inst_id: InstanceId,
         message: String,
@@ -92,31 +75,15 @@ pub enum InstanceEvent {
     },
 }
 
-impl From<InstanceEvent> for Message {
-    fn from(event: InstanceEvent) -> Self {
-        Message::InstanceEvent(event)
-    }
-}
-
 impl Message {
     pub fn send(self) -> Result<(), SendError> {
         ACTOR.send(self)
     }
-}
 
-impl InstanceEvent {
     pub fn dispatch(self) {
-        let _ = Message::from(self).send();
+        let _ = self.send();
     }
 }
-
-/// Server status information.
-#[derive(Debug, Clone)]
-pub struct ServerStatus {
-    pub active_connections: usize,
-    pub total_requests: u64,
-}
-
 // =============================================================================
 // Server State
 // =============================================================================
@@ -136,20 +103,19 @@ struct Server {
 }
 
 impl Server {
-    fn new(config: ServerConfig) -> Self {
-        let ip_port = config.ip_port.clone();
+    fn new(addr: String) -> Self {
         let state = Arc::new(ServerState {
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
             client_cmd_txs: DashMap::new(),
         });
 
-        let _listener = task::spawn(Self::listener_loop(ip_port, state.clone()));
+        let _listener = task::spawn(Self::listener_loop(addr, state.clone()));
         Server { state }
     }
 
-    async fn listener_loop(ip_port: String, state: Arc<ServerState>) {
-        let listener = TcpListener::bind(ip_port).await.unwrap();
+    async fn listener_loop(addr: String, state: Arc<ServerState>) {
+        let listener = TcpListener::bind(addr).await.unwrap();
         while let Ok((stream, _addr)) = listener.accept().await {
             let id = {
                 let mut id_pool = state.client_id_pool.lock().await;
@@ -161,27 +127,25 @@ impl Server {
                     state.clients.insert(id, session_handle);
                 }
                 Err(e) => {
-                    eprintln!("Error creating session for client {}: {}", id, e);
+                    tracing::error!("Error creating session for client {}: {}", id, e);
                     state.client_id_pool.lock().await.release(id).ok();
                 }
             }
         }
     }
 
-    async fn handle_instance_event(&mut self, event: InstanceEvent) {
-        let inst_id = match &event {
-            InstanceEvent::SendMsgToClient { inst_id, .. }
-            | InstanceEvent::Terminate { inst_id, .. }
-            | InstanceEvent::SendBlobToClient { inst_id, .. }
-            | InstanceEvent::StreamingOutput { inst_id, .. } => *inst_id,
+    async fn handle_message(&mut self, msg: Message) {
+        let inst_id = match &msg {
+            Message::SendMsgToClient { inst_id, .. }
+            | Message::Terminate { inst_id, .. }
+            | Message::SendBlobToClient { inst_id, .. }
+            | Message::StreamingOutput { inst_id, .. } => *inst_id,
         };
 
         if let Some(chan) = self.state.client_cmd_txs.get(&inst_id) {
-            chan.send(SessionEvent::InstanceEvent(event)).await.ok();
+            chan.send(SessionEvent::InternalMessage(msg)).await.ok();
         }
     }
-
-
 }
 
 // =============================================================================
@@ -193,9 +157,9 @@ struct ServerActor {
 }
 
 impl ServerActor {
-    fn with_config(config: ServerConfig) -> Self {
+    fn new(addr: String) -> Self {
         ServerActor {
-            server: Server::new(config),
+            server: Server::new(addr),
         }
     }
 }
@@ -203,13 +167,7 @@ impl ServerActor {
 impl Handle for ServerActor {
     type Message = Message;
 
-    fn new() -> Self {
-        panic!("ServerActor requires config; use spawn() instead")
-    }
-
     async fn handle(&mut self, msg: Message) {
-        match msg {
-            Message::InstanceEvent(event) => self.server.handle_instance_event(event).await,
-        }
+        self.server.handle_message(msg).await;
     }
 }

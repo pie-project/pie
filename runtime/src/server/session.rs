@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use base64::Engine as Base64Engine;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use pie_client::message::{ClientMessage, EventCode, ServerMessage};
+use pie_client::message::{ClientMessage, EventCode, ServerMessage as WireServerMessage};
 
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -22,13 +22,13 @@ use crate::runtime::{self, TerminationCause};
 use crate::auth;
 
 use super::blob::InFlightUpload;
-use super::{InstanceEvent, ServerState};
+use super::{Message as InternalMessage, ServerState};
 
 /// Events that can be sent to a session.
 #[derive(Debug)]
 pub enum SessionEvent {
     ClientRequest(ClientMessage),
-    InstanceEvent(InstanceEvent),
+    InternalMessage(InternalMessage),
 }
 
 /// A client session managing a WebSocket connection.
@@ -296,7 +296,7 @@ impl Session {
         bail!("Invalid token")
     }
 
-    pub async fn send(&self, msg: ServerMessage) {
+    pub async fn send(&self, msg: WireServerMessage) {
         if let Ok(encoded) = rmp_serde::to_vec_named(&msg) {
             if self
                 .ws_msg_tx
@@ -310,7 +310,7 @@ impl Session {
     }
 
     pub async fn send_response(&self, corr_id: u32, successful: bool, result: String) {
-        self.send(ServerMessage::Response {
+        self.send(WireServerMessage::Response {
             corr_id,
             successful,
             result,
@@ -319,7 +319,7 @@ impl Session {
     }
 
     pub async fn send_launch_result(&self, corr_id: u32, successful: bool, message: String) {
-        self.send(ServerMessage::InstanceLaunchResult {
+        self.send(WireServerMessage::InstanceLaunchResult {
             corr_id,
             successful,
             message,
@@ -328,7 +328,7 @@ impl Session {
     }
 
     pub async fn send_attach_result(&self, corr_id: u32, successful: bool, message: String) {
-        self.send(ServerMessage::InstanceAttachResult {
+        self.send(WireServerMessage::InstanceAttachResult {
             corr_id,
             successful,
             message,
@@ -337,7 +337,7 @@ impl Session {
     }
 
     pub async fn send_inst_event(&self, inst_id: InstanceId, event: EventCode, message: String) {
-        self.send(ServerMessage::InstanceEvent {
+        self.send(WireServerMessage::InstanceEvent {
             instance_id: inst_id.to_string(),
             event: event as u32,
             message,
@@ -465,18 +465,18 @@ impl Session {
                     self.handle_list_instances(corr_id).await;
                 }
             },
-            SessionEvent::InstanceEvent(cmd) => match cmd {
-                InstanceEvent::SendMsgToClient { inst_id, message } => {
+            SessionEvent::InternalMessage(msg) => match msg {
+                InternalMessage::SendMsgToClient { inst_id, message } => {
                     self.send_inst_event(inst_id, EventCode::Message, message)
                         .await
                 }
-                InstanceEvent::Terminate { inst_id, cause } => {
+                InternalMessage::Terminate { inst_id, cause } => {
                     self.handle_instance_termination(inst_id, cause).await;
                 }
-                InstanceEvent::SendBlobToClient { inst_id, data } => {
+                InternalMessage::SendBlobToClient { inst_id, data } => {
                     self.handle_send_blob(inst_id, data).await;
                 }
-                InstanceEvent::StreamingOutput {
+                InternalMessage::StreamingOutput {
                     inst_id,
                     output_type,
                     content,

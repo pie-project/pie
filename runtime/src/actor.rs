@@ -49,9 +49,6 @@ pub trait Handle: Send + 'static {
     /// The message type this handler processes.
     type Message: Send + 'static;
     
-    /// Creates a new instance of the handler.
-    fn new() -> Self;
-    
     /// Handles a message. Called sequentially for each message.
     fn handle(&mut self, msg: Self::Message) -> impl Future<Output = ()> + Send;
 }
@@ -80,9 +77,9 @@ impl<Msg: Send + 'static> Actor<Msg> {
     /// Panics if the actor has already been spawned.
     pub fn spawn<H>(&self)
     where
-        H: Handle<Message = Msg>,
+        H: Handle<Message = Msg> + Default,
     {
-        let mut handler = H::new();
+        let mut handler = H::default();
         let (tx, mut rx) = unbounded_channel();
 
         self.tx
@@ -159,9 +156,9 @@ impl<Msg: Send + 'static> Actors<Msg> {
     /// Spawns a new actor and returns its index.
     pub fn spawn<H>(&self) -> usize
     where
-        H: Handle<Message = Msg>,
+        H: Handle<Message = Msg> + Default,
     {
-        let mut handler = H::new();
+        let mut handler = H::default();
         let (tx, mut rx) = unbounded_channel();
         let idx = self.table.push(tx);
 

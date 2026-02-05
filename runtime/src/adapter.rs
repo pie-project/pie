@@ -111,16 +111,18 @@ struct AdapterActor {
     next_id: Arc<AtomicU64>,
 }
 
-impl Handle for AdapterActor {
-    type Message = Message;
-
-    fn new() -> Self {
+impl Default for AdapterActor {
+    fn default() -> Self {
         AdapterActor {
             adapters: HashMap::new(),
             name_to_id: HashMap::new(),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
+}
+
+impl Handle for AdapterActor {
+    type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
         match msg {

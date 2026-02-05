@@ -1,5 +1,5 @@
 use super::utils;
-use crate::server::InstanceEvent;
+use crate::server::Message as ServerMessage;
 use anyhow::{Result, format_err};
 use bytes::Bytes;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
@@ -308,13 +308,13 @@ impl OutputChannel {
     /// Send the output to the server so that it can be delivered to the client
     fn dispatch_output(&self, content: String, instance_id: InstanceId) {
         match self {
-            OutputChannel::Stdout => InstanceEvent::StreamingOutput {
+            OutputChannel::Stdout => ServerMessage::StreamingOutput {
                 inst_id: instance_id,
                 output_type: OutputChannel::Stdout,
                 content,
             }
             .dispatch(),
-            OutputChannel::Stderr => InstanceEvent::StreamingOutput {
+            OutputChannel::Stderr => ServerMessage::StreamingOutput {
                 inst_id: instance_id,
                 output_type: OutputChannel::Stderr,
                 content,

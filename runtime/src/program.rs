@@ -485,10 +485,6 @@ impl ProgramManagerActor {
 impl Handle for ProgramManagerActor {
     type Message = Message;
 
-    fn new() -> Self {
-        panic!("ProgramManagerActor requires config; use spawn() instead")
-    }
-
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::GetMetadata { name, response } => {

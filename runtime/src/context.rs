@@ -734,16 +734,18 @@ struct ContextManagerActor {
     service: ContextManager,
 }
 
-impl Handle for ContextManagerActor {
-    type Message = Message;
-
-    fn new() -> Self {
+impl Default for ContextManagerActor {
+    fn default() -> Self {
         let page_size = 64; // Default page size
         let page_store = Arc::new(RwLock::new(PageStore::new(page_size)));
         ContextManagerActor {
             service: ContextManager::new(page_store, page_size),
         }
     }
+}
+
+impl Handle for ContextManagerActor {
+    type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
         match msg {

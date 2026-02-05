@@ -318,10 +318,6 @@ impl AuthActor {
 impl Handle for AuthActor {
     type Message = Message;
 
-    fn new() -> Self {
-        panic!("AuthActor requires config; use spawn() instead")
-    }
-
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::LoadUsers { path, response } => {

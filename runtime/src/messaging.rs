@@ -56,10 +56,8 @@ struct PubSubActor {
     sub_id_pool: IdPool<ListenerId>,
 }
 
-impl Handle for PubSubActor {
-    type Message = PubSubMessage;
-
-    fn new() -> Self {
+impl Default for PubSubActor {
+    fn default() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let subscribers_by_topic = Arc::new(DashMap::new());
         let _event_loop_handle =
@@ -72,6 +70,10 @@ impl Handle for PubSubActor {
             sub_id_pool: IdPool::new(ListenerId::MAX),
         }
     }
+}
+
+impl Handle for PubSubActor {
+    type Message = PubSubMessage;
 
     async fn handle(&mut self, msg: PubSubMessage) {
         match msg {
@@ -175,10 +177,8 @@ struct PushPullActor {
     blob_queue_by_topic: Arc<DashMap<String, PushPullBlobQueue>>,
 }
 
-impl Handle for PushPullActor {
-    type Message = PushPullMessage;
-
-    fn new() -> Self {
+impl Default for PushPullActor {
+    fn default() -> Self {
         let (tx_string, rx_string) = mpsc::unbounded_channel();
         let string_queue_by_topic = Arc::new(DashMap::new());
         let _event_loop_handle_string = tokio::spawn(Self::event_loop_string(
@@ -202,6 +202,10 @@ impl Handle for PushPullActor {
             blob_queue_by_topic,
         }
     }
+}
+
+impl Handle for PushPullActor {
+    type Message = PushPullMessage;
 
     async fn handle(&mut self, msg: PushPullMessage) {
         match msg {

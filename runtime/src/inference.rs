@@ -443,10 +443,8 @@ impl std::fmt::Debug for InferenceActor {
     }
 }
 
-impl Handle for InferenceActor {
-    type Message = Message;
-
-    fn new() -> Self {
+impl Default for InferenceActor {
+    fn default() -> Self {
         // Create shared page store
         let page_store = Arc::new(RwLock::new(PageStore::new(64)));
         let service = Arc::new(InferenceService::new(page_store));
@@ -483,6 +481,10 @@ impl Handle for InferenceActor {
             shutdown_tx,
         }
     }
+}
+
+impl Handle for InferenceActor {
+    type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
         match msg {

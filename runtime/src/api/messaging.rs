@@ -39,7 +39,7 @@ impl Pollable for Subscription {
 
 impl pie::core::messaging::Host for InstanceState {
     async fn send(&mut self, message: String) -> Result<()> {
-        server::InstanceEvent::SendMsgToClient {
+        server::Message::SendMsgToClient {
             inst_id: self.id(),
             message,
         }
