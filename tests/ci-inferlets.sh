@@ -107,7 +107,7 @@ check_prerequisites() {
 
 install_bakery() {
     log "Installing bakery from $REPO_ROOT/sdk/tools/bakery ..."
-    uv pip install --system -e "$REPO_ROOT/sdk/tools/bakery" --quiet
+    uv tool install "$REPO_ROOT/sdk/tools/bakery" --quiet
     if command -v bakery &>/dev/null; then
         log "bakery: installed"
     else
@@ -118,8 +118,7 @@ install_bakery() {
 
 install_componentize_py() {
     log "Installing componentize-py ..."
-    uv tool install "componentize-py>=0.19" --quiet 2>/dev/null || \
-        uv pip install --system "componentize-py>=0.19" --quiet
+    uv tool install "componentize-py>=0.19" --quiet
     if command -v componentize-py &>/dev/null; then
         log "componentize-py: installed"
     else
