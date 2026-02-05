@@ -3,6 +3,7 @@
 //! This module provides a singleton actor for managing program (inferlet) metadata,
 //! caching, downloading from registry, and compilation.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -50,16 +51,29 @@ pub fn is_spawned() -> bool {
     ACTOR.is_spawned()
 }
 
-/// Register a new program. Stores in memory + disk (does NOT install).
-pub async fn register(
+/// Add a program with WASM binary and manifest. Stores in repository + disk (does NOT install).
+pub async fn add(
     wasm_binary: Vec<u8>,
-    manifest: String,
+    manifest: Manifest,
     force_overwrite: bool,
 ) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    Message::Register {
+    Message::Add {
         wasm_binary,
         manifest,
+        force_overwrite,
+        response: tx,
+    }
+    .send()
+    .map_err(|_| anyhow!("Program manager not running"))?;
+    rx.await.map_err(|_| anyhow!("Program manager did not respond"))?
+}
+
+/// Add a program from registry by name. Downloads and stores in repository + disk (does NOT install).
+pub async fn add_from_registry(name: &ProgramName, force_overwrite: bool) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    Message::AddFromRegistry {
+        name: name.clone(),
         force_overwrite,
         response: tx,
     }
@@ -71,7 +85,7 @@ pub async fn register(
 /// Check if a program is registered in repository.
 pub async fn is_registered(name: &ProgramName) -> bool {
     let (tx, rx) = oneshot::channel();
-    let _ = Message::IsRegistered {
+    let _ = Message::Exists {
         name: name.clone(),
         response: tx,
     }
@@ -91,7 +105,7 @@ pub async fn is_installed(name: &ProgramName) -> bool {
 }
 
 /// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies.
-pub async fn install(name: &ProgramName) -> Result<Manifest> {
+pub async fn install(name: &ProgramName) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     Message::Install {
         name: name.clone(),
@@ -161,16 +175,23 @@ pub enum Message {
         response: oneshot::Sender<Option<Manifest>>,
     },
 
-    /// Register a new program: store in memory + disk (does NOT install)
-    Register {
+    /// Add a program with WASM binary and manifest: store in repository + disk (does NOT install)
+    Add {
         wasm_binary: Vec<u8>,
-        manifest: String,
+        manifest: Manifest,
         force_overwrite: bool,
         response: oneshot::Sender<Result<()>>,
     },
 
-    /// Check if a program is registered in repository
-    IsRegistered {
+    /// Add a program from registry by name: download and store in repository + disk (does NOT install)
+    AddFromRegistry {
+        name: ProgramName,
+        force_overwrite: bool,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Check if a program exists in repository
+    Exists {
         name: ProgramName,
         response: oneshot::Sender<bool>,
     },
@@ -184,7 +205,7 @@ pub enum Message {
     /// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies
     Install {
         name: ProgramName,
-        response: oneshot::Sender<Result<Manifest>>,
+        response: oneshot::Sender<Result<()>>,
     },
 
     /// Uninstall a program: remove from installed programs (does NOT remove from cache)
@@ -204,8 +225,9 @@ impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Message::GetMetadata { name, .. } => write!(f, "GetMetadata {{ name: {:?} }}", name),
-            Message::Register { force_overwrite, .. } => write!(f, "Register {{ force_overwrite: {} }}", force_overwrite),
-            Message::IsRegistered { name, .. } => write!(f, "IsRegistered {{ name: {:?} }}", name),
+            Message::Add { force_overwrite, .. } => write!(f, "Add {{ force_overwrite: {} }}", force_overwrite),
+            Message::AddFromRegistry { name, force_overwrite, .. } => write!(f, "AddFromRegistry {{ name: {:?}, force_overwrite: {} }}", name, force_overwrite),
+            Message::Exists { name, .. } => write!(f, "Exists {{ name: {:?} }}", name),
             Message::IsInstalled { name, .. } => write!(f, "IsInstalled {{ name: {:?} }}", name),
             Message::Install { name, .. } => write!(f, "Install {{ name: {:?} }}", name),
             Message::Uninstall { name, .. } => write!(f, "Uninstall {{ name: {:?} }}", name),
@@ -264,7 +286,9 @@ struct ProgramManager {
     wasm_engine: WasmEngine,
     repository: Repository,
     /// Installed (JIT compiled) programs, keyed by program name
-    installed: std::collections::HashMap<ProgramName, (Component, Manifest)>,
+    installed: HashMap<ProgramName, Component>,
+    /// Programs that were explicitly installed (not pulled as dependencies)
+    explicit_installs: std::collections::HashSet<ProgramName>,
 }
 
 impl ProgramManager {
@@ -272,7 +296,8 @@ impl ProgramManager {
         ProgramManager {
             wasm_engine,
             repository,
-            installed: std::collections::HashMap::new(),
+            installed: HashMap::new(),
+            explicit_installs: std::collections::HashSet::new(),
         }
     }
 
@@ -280,69 +305,164 @@ impl ProgramManager {
         self.installed.contains_key(name)
     }
 
-    fn get_installed_metadata(&self, name: &ProgramName) -> Option<&Manifest> {
-        self.installed.get(name).map(|(_, m)| m)
+    fn get_manifest(&self, name: &ProgramName) -> Option<Manifest> {
+        self.repository.fetch_manifest(name)
     }
 
     fn get_component(&self, name: &ProgramName) -> Option<Component> {
-        self.installed.get(name).map(|(c, _)| c.clone())
+        self.installed.get(name).cloned()
     }
 
     fn is_registered(&self, name: &ProgramName) -> bool {
         self.repository.exists(name)
     }
 
-    /// Uninstall a program: remove from installed programs (does NOT remove from cache).
+    /// Uninstall a program and cascade remove orphaned dependencies.
     fn uninstall(&mut self, name: &ProgramName) -> bool {
-        self.installed.remove(name).is_some()
-    }
-
-    /// Register a new program: store in memory + disk (does NOT install).
-    async fn register(
-        &mut self,
-        wasm_binary: Vec<u8>,
-        manifest_content: String,
-        force_overwrite: bool,
-    ) -> Result<()> {
-        let manifest = Manifest::parse(&manifest_content)?;
-        self.repository.add(wasm_binary, manifest, force_overwrite).await
-    }
-
-    /// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies.
-    async fn install(&mut self, name: &ProgramName) -> Result<Manifest> {
-        // Step 0: Check if already installed (early exit)
-        if let Some((_, metadata)) = self.installed.get(name) {
-            return Ok(metadata.clone());
+        if self.installed.remove(name).is_none() {
+            return false;
         }
+        self.explicit_installs.remove(name);
 
-        // Step 1: Fetch WASM bytes (handles binary_cache -> disk -> registry fallback)
-        let wasm_binary = self.repository.fetch_wasm_binary(name).await?;
-
-        // Step 2: Get metadata from index
-        let metadata = self.repository.fetch_manifest(name)
-            .ok_or_else(|| anyhow!("Metadata not found for program: {}", name))?;
-
-        // Step 3: Install dependencies
-        for dep_name in metadata.dependency_names() {
-            if !self.is_installed(&dep_name) {
-                // Fetch and compile each dependency
-                let dep_wasm = self.repository.fetch_wasm_binary(&dep_name).await?;
-                let dep_metadata = self.repository.fetch_manifest(&dep_name)
-                    .ok_or_else(|| anyhow!("Metadata not found for dependency: {}", dep_name))?;
-                let dep_component = compile_wasm_component(&self.wasm_engine, dep_wasm)
-                    .await?;
-                self.installed.insert(dep_name, (dep_component, dep_metadata));
+        // Cascade: find and remove orphaned dependencies
+        loop {
+            let orphans = self.find_orphaned_dependencies();
+            if orphans.is_empty() {
+                break;
+            }
+            for orphan in orphans {
+                self.installed.remove(&orphan);
             }
         }
 
-        // Step 4: JIT compile
-        let component = compile_wasm_component(&self.wasm_engine, wasm_binary)
-            .await?;
+        true
+    }
 
-        // Step 5: Track as installed (program.rs now owns compiled programs)
-        self.installed.insert(name.clone(), (component, metadata.clone()));
 
-        Ok(metadata)
+    /// Add a program with WASM binary and manifest: store in repository + disk (does NOT install).
+    async fn add(
+        &mut self,
+        wasm_binary: Vec<u8>,
+        manifest: Manifest,
+        force_overwrite: bool,
+    ) -> Result<()> {
+        self.repository.add(wasm_binary, manifest, force_overwrite).await
+    }
+
+    /// Add a program from registry by name: download and store in repository + disk (does NOT install).
+    async fn add_from_registry(&mut self, name: &ProgramName, force_overwrite: bool) -> Result<()> {
+        self.repository.add_from_registry(name, force_overwrite).await
+    }
+
+    /// Install a program: JIT compile + link, resolves transitive dependencies.
+    async fn install(&mut self, name: &ProgramName) -> Result<()> {
+        // Step 0: Check if already installed (mark as explicit and exit)
+        if self.installed.contains_key(name) {
+            self.explicit_installs.insert(name.clone());
+            return Ok(());
+        }
+
+        // Step 1: Ensure program is in repository (downloads from registry if needed)
+        if !self.repository.exists(name) {
+            self.repository.add_from_registry(name, false).await?;
+        }
+
+        // Step 2: Resolve all transitive dependencies (flattened, deduplicated, topological order)
+        let dependencies = self.resolve_dependencies(name).await?;
+
+        // Step 3: Install each dependency in order
+        for dep_name in dependencies {
+            if !self.installed.contains_key(&dep_name) {
+                let dep_wasm = self.repository.fetch_wasm_binary(&dep_name).await?;
+                let dep_component = compile_wasm_component(&self.wasm_engine, dep_wasm).await?;
+                self.installed.insert(dep_name, dep_component);
+            }
+        }
+
+        // Step 4: JIT compile the main program
+        let wasm_binary = self.repository.fetch_wasm_binary(name).await?;
+        let component = compile_wasm_component(&self.wasm_engine, wasm_binary).await?;
+
+        // Step 5: Track as installed and mark as explicitly installed
+        self.installed.insert(name.clone(), component);
+        self.explicit_installs.insert(name.clone());
+
+        Ok(())
+    }
+
+    /// Resolve transitive dependencies iteratively and return flattened, deduplicated list.
+    /// Dependencies are returned in topological order (dependencies before dependents).
+    async fn resolve_dependencies(&mut self, name: &ProgramName) -> Result<Vec<ProgramName>> {
+        use std::collections::HashSet;
+
+        let mut resolved: Vec<ProgramName> = Vec::new();
+        let mut visited: HashSet<ProgramName> = HashSet::new();
+        // Stack entries: (program_name, children_processed)
+        let mut stack: Vec<(ProgramName, bool)> = vec![(name.clone(), false)];
+
+        while let Some((current, children_processed)) = stack.pop() {
+            if children_processed {
+                // Second visit: all children processed, add to resolved
+                resolved.push(current);
+                continue;
+            }
+
+            // Skip if already visited (handles cycles and duplicates)
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.insert(current.clone());
+
+            // Ensure program is in repository (downloads from registry if needed)
+            if !self.repository.exists(&current) {
+                self.repository.add_from_registry(&current, false).await?;
+            }
+
+            // Get manifest to find direct dependencies
+            let manifest = self.repository.fetch_manifest(&current)
+                .ok_or_else(|| anyhow!("Manifest not found for program: {}", current))?;
+
+            // Push current back with children_processed=true (for post-order)
+            stack.push((current, true));
+
+            // Push children (dependencies) to process first
+            for dep_name in manifest.dependency_names() {
+                if !visited.contains(&dep_name) {
+                    stack.push((dep_name, false));
+                }
+            }
+        }
+
+        // Remove the root program itself from the dependency list
+        resolved.retain(|dep| dep != name);
+
+        Ok(resolved)
+    }
+
+    /// Find dependencies that are no longer needed:
+    /// - Not explicitly installed
+    /// - No other installed program depends on them
+    fn find_orphaned_dependencies(&self) -> Vec<ProgramName> {
+        // Build reverse dependency map: program -> installed programs that depend on it
+        let mut reverse_deps: HashMap<ProgramName, Vec<ProgramName>> = HashMap::new();
+        for name in self.installed.keys() {
+            if let Some(manifest) = self.repository.fetch_manifest(name) {
+                for dep in manifest.dependency_names() {
+                    reverse_deps.entry(dep).or_default().push(name.clone());
+                }
+            }
+        }
+
+        self.installed
+            .keys()
+            .filter(|name| {
+                // Not explicitly installed
+                !self.explicit_installs.contains(*name) &&
+                // No other installed program depends on it
+                reverse_deps.get(*name).map_or(true, |dependents| dependents.is_empty())
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -372,14 +492,18 @@ impl Handle for ProgramManagerActor {
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::GetMetadata { name, response } => {
-                let result = self.service.get_installed_metadata(&name).cloned();
+                let result = self.service.get_manifest(&name);
                 let _ = response.send(result);
             }
-            Message::Register { wasm_binary, manifest, force_overwrite, response } => {
-                let result = self.service.register(wasm_binary, manifest, force_overwrite).await;
+            Message::Add { wasm_binary, manifest, force_overwrite, response } => {
+                let result = self.service.add(wasm_binary, manifest, force_overwrite).await;
                 let _ = response.send(result);
             }
-            Message::IsRegistered { name, response } => {
+            Message::AddFromRegistry { name, force_overwrite, response } => {
+                let result = self.service.add_from_registry(&name, force_overwrite).await;
+                let _ = response.send(result);
+            }
+            Message::Exists { name, response } => {
                 let result = self.service.is_registered(&name);
                 let _ = response.send(result);
             }

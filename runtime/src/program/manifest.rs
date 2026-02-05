@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::ProgramName;
 
 /// Parameter type definition.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParameterType {
     String,
@@ -20,7 +20,7 @@ pub enum ParameterType {
 }
 
 /// Parameter definition in the manifest.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parameter {
     #[serde(rename = "type")]
     pub param_type: ParameterType,
@@ -30,7 +30,7 @@ pub struct Parameter {
 }
 
 /// Package metadata section.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Package {
     pub name: String,
     pub version: String,
@@ -44,17 +44,14 @@ pub struct Package {
     pub readme: Option<String>,
 }
 
-/// Runtime requirements section (name -> version).
-pub type Runtime = BTreeMap<String, String>;
-
 /// Program manifest.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     /// Package metadata
     pub package: Package,
-    /// Runtime requirements
-    #[serde(default, skip_serializing_if = "is_runtime_empty")]
-    pub runtime: Runtime,
+    /// Runtime requirements (name -> version)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runtime: BTreeMap<String, String>,
     /// Parameter definitions
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parameters: BTreeMap<String, Parameter>,
@@ -63,8 +60,14 @@ pub struct Manifest {
     pub dependencies: BTreeMap<String, String>,
 }
 
-fn is_runtime_empty(runtime: &Runtime) -> bool {
-    runtime.is_empty()
+/// Build manifest URL for a program from registry.
+pub fn manifest_url(registry_url: &str, name: &ProgramName) -> String {
+    format!(
+        "{}/api/v1/inferlets/{}/{}/manifest",
+        registry_url.trim_end_matches('/'),
+        name.name,
+        name.version
+    )
 }
 
 impl Manifest {
@@ -75,8 +78,9 @@ impl Manifest {
     }
 
     /// Serialize manifest to TOML string.
-    pub fn to_string(&self) -> String {
-        toml::to_string_pretty(self).unwrap_or_default()
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string_pretty(self)
+            .map_err(|e| anyhow!("Failed to serialize manifest: {}", e))
     }
 
     /// Get program name (name + version).
@@ -100,21 +104,16 @@ impl Manifest {
 
     /// Fetch and parse manifest from a registry URL.
     pub async fn from_url(registry_url: &str, name: &ProgramName) -> Result<Self> {
-        let manifest_url = format!(
-            "{}/api/v1/inferlets/{}/{}/manifest",
-            registry_url.trim_end_matches('/'),
-            name.name,
-            name.version
-        );
+        let url = manifest_url(registry_url, name);
 
-        let response = reqwest::get(&manifest_url).await.map_err(|e| {
-            anyhow!("Failed to fetch manifest from {}: {}", manifest_url, e)
+        let response = reqwest::get(&url).await.map_err(|e| {
+            anyhow!("Failed to fetch manifest from {}: {}", url, e)
         })?;
 
         if !response.status().is_success() {
             bail!(
                 "Failed to fetch manifest: {} returned {}",
-                manifest_url,
+                url,
                 response.status()
             );
         }
@@ -174,11 +173,11 @@ bar = "0.2.0"
         assert!(manifest.parameters.contains_key("temperature"));
         
         let prompt = &manifest.parameters["prompt"];
-        assert!(matches!(prompt.param_type, ParameterType::String));
+        assert_eq!(prompt.param_type, ParameterType::String);
         assert!(!prompt.optional);
         
         let max_tokens = &manifest.parameters["max_tokens"];
-        assert!(matches!(max_tokens.param_type, ParameterType::Int));
+        assert_eq!(max_tokens.param_type, ParameterType::Int);
         assert!(max_tokens.optional);
         
         assert_eq!(manifest.dependencies.len(), 2);
@@ -207,13 +206,11 @@ version = "1.0.0"
     #[test]
     fn test_roundtrip_serialization() {
         let manifest = Manifest::parse(CANONICAL_MANIFEST).unwrap();
-        let serialized = manifest.to_string();
+        let serialized = manifest.to_toml().unwrap();
         let reparsed = Manifest::parse(&serialized).unwrap();
         
-        assert_eq!(manifest.package.name, reparsed.package.name);
-        assert_eq!(manifest.package.version, reparsed.package.version);
-        assert_eq!(manifest.dependencies.len(), reparsed.dependencies.len());
-        assert_eq!(manifest.parameters.len(), reparsed.parameters.len());
+        // With PartialEq, we can assert full equality
+        assert_eq!(manifest, reparsed);
     }
 
     #[test]

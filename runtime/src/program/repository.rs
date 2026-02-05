@@ -10,33 +10,39 @@ use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 
 use super::ProgramName;
-use super::manifest::Manifest;
+use super::manifest::{Manifest, manifest_url};
 
 // =============================================================================
 // Repository Types
 // =============================================================================
 
-/// Get the directory path for a program in the cache.
-fn program_dir(cache_dir: &Path, name: &ProgramName) -> PathBuf {
-    cache_dir.join("programs").join(&name.name)
-}
 
 /// Get the WASM file path for a program.
 fn wasm_path(cache_dir: &Path, name: &ProgramName) -> PathBuf {
-    program_dir(cache_dir, name).join(format!("{}.wasm", name.version))
+    cache_dir.join("programs").join(&name.name).join(format!("{}.wasm", name.version))
 }
 
 /// Get the manifest file path for a program.
 fn manifest_path(cache_dir: &Path, name: &ProgramName) -> PathBuf {
-    program_dir(cache_dir, name).join(format!("{}.toml", name.version))
+    cache_dir.join("programs").join(&name.name).join(format!("{}.toml", name.version))
+}
+
+/// Build WASM download URL for a program from registry.
+fn wasm_url(registry_url: &str, name: &ProgramName) -> String {
+    format!(
+        "{}/api/v1/inferlets/{}/{}/download",
+        registry_url.trim_end_matches('/'),
+        name.name,
+        name.version
+    )
 }
 
 /// Two-tier program repository: disk index + binary cache.
 pub struct Repository {
     /// Index: manifests for programs on disk
     index: HashMap<ProgramName, Manifest>,
-    /// Binary cache: WASM bytes for registered programs (consumed on fetch)
-    wasm_binary_cache: HashMap<ProgramName, Vec<u8>>,
+    /// Preloaded binaries: WASM bytes staged for immediate first-use (consumed on fetch)
+    preloaded_binaries: HashMap<ProgramName, Vec<u8>>,
     /// Registry URL for fallback downloads
     registry_url: String,
     /// Cache directory for disk storage
@@ -47,7 +53,7 @@ impl Repository {
     /// Create a new empty repository.
     pub fn new(registry_url: String, cache_dir: PathBuf) -> Self {
         Self {
-            wasm_binary_cache: HashMap::new(),
+            preloaded_binaries: HashMap::new(),
             index: HashMap::new(),
             registry_url,
             cache_dir,
@@ -60,10 +66,10 @@ impl Repository {
     }
 
 
-    /// Fetch WASM bytes for a program (consuming from wasm_binary_cache or loading from disk).
+    /// Fetch WASM bytes for a program (consuming from preloaded_binaries or loading from disk).
     pub async fn fetch_wasm_binary(&mut self, name: &ProgramName) -> Result<Vec<u8>> {
-        // Consume from wasm_binary_cache if present (e.g., user-registered program)
-        if let Some(wasm_binary) = self.wasm_binary_cache.remove(name) {
+        // Consume from preloaded_binaries if present (e.g., user-registered program)
+        if let Some(wasm_binary) = self.preloaded_binaries.remove(name) {
             return Ok(wasm_binary);
         }
 
@@ -82,7 +88,7 @@ impl Repository {
 
     /// Check if program is cached in repository.
     pub fn exists(&self, name: &ProgramName) -> bool {
-        self.index.contains_key(name) || self.wasm_binary_cache.contains_key(name)
+        self.index.contains_key(name)
     }
 
     /// Add a program by name (downloads from registry).
@@ -93,17 +99,12 @@ impl Repository {
         }
 
         // Download manifest
-        let manifest_url = format!(
-            "{}/api/v1/inferlets/{}/{}/manifest",
-            self.registry_url.trim_end_matches('/'),
-            name.name,
-            name.version
-        );
-        let manifest_response = reqwest::get(&manifest_url).await
-            .map_err(|e| anyhow!("Failed to download manifest from {}: {}", manifest_url, e))?;
+        let url = manifest_url(&self.registry_url, name);
+        let manifest_response = reqwest::get(&url).await
+            .map_err(|e| anyhow!("Failed to download manifest from {}: {}", url, e))?;
 
         if !manifest_response.status().is_success() {
-            bail!("Failed to download manifest: {} returned {}", manifest_url, manifest_response.status());
+            bail!("Failed to download manifest: {} returned {}", url, manifest_response.status());
         }
 
         let manifest_content = manifest_response.text().await
@@ -111,17 +112,12 @@ impl Repository {
         let manifest = Manifest::parse(&manifest_content)?;
 
         // Download WASM
-        let wasm_url = format!(
-            "{}/api/v1/inferlets/{}/{}/download",
-            self.registry_url.trim_end_matches('/'),
-            name.name,
-            name.version
-        );
-        let wasm_response = reqwest::get(&wasm_url).await
-            .map_err(|e| anyhow!("Failed to download WASM from {}: {}", wasm_url, e))?;
+        let url = wasm_url(&self.registry_url, name);
+        let wasm_response = reqwest::get(&url).await
+            .map_err(|e| anyhow!("Failed to download WASM from {}: {}", url, e))?;
 
         if !wasm_response.status().is_success() {
-            bail!("Failed to download WASM: {} returned {}", wasm_url, wasm_response.status());
+            bail!("Failed to download WASM: {} returned {}", url, wasm_response.status());
         }
 
         let wasm_binary = wasm_response.bytes().await
@@ -131,8 +127,8 @@ impl Repository {
         // Save to disk (updates index)
         self.store_program_cache(&wasm_binary, manifest).await?;
 
-        // Store in binary cache
-        self.wasm_binary_cache.insert(name.clone(), wasm_binary);
+        // Store in preloaded binaries for first-use optimization
+        self.preloaded_binaries.insert(name.clone(), wasm_binary);
 
         Ok(())
     }
@@ -154,8 +150,8 @@ impl Repository {
         // Save to disk (updates index)
         self.store_program_cache(&wasm_binary, manifest).await?;
 
-        // Store in binary cache
-        self.wasm_binary_cache.insert(name, wasm_binary);
+        // Store in preloaded binaries for first-use optimization
+        self.preloaded_binaries.insert(name, wasm_binary);
 
         Ok(())
     }
@@ -232,7 +228,7 @@ impl Repository {
         manifest: Manifest,
     ) -> Result<()> {
         let name = manifest.program_name();
-        let dir = program_dir(&self.cache_dir, &name);
+        let dir = self.cache_dir.join("programs").join(&name.name);
         let wasm = wasm_path(&self.cache_dir, &name);
         let manifest_file = manifest_path(&self.cache_dir, &name);
 
@@ -243,7 +239,7 @@ impl Repository {
         tokio::fs::write(&wasm, wasm_binary)
             .await
             .map_err(|e| anyhow!("Failed to write WASM file: {}", e))?;
-        tokio::fs::write(&manifest_file, manifest.to_string())
+        tokio::fs::write(&manifest_file, manifest.to_toml()?)
             .await
             .map_err(|e| anyhow!("Failed to write manifest file: {}", e))?;
 
@@ -257,7 +253,7 @@ impl Repository {
 impl std::fmt::Debug for Repository {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Repository")
-            .field("wasm_binary_cache_count", &self.wasm_binary_cache.len())
+            .field("preloaded_binaries_count", &self.preloaded_binaries.len())
             .field("index_count", &self.index.len())
             .field("registry_url", &self.registry_url)
             .finish()

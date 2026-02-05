@@ -156,12 +156,22 @@ impl Session {
         // On final chunk, delegate to program actor for verification, storage, and compilation
         if inflight.next_chunk_index == total_chunks {
             let wasm_bytes = mem::take(&mut inflight.buffer);
-            let manifest = mem::take(&mut inflight.manifest);
+            let manifest_str = mem::take(&mut inflight.manifest);
 
             // TODO: force_overwrite should come from the upload request
             let force_overwrite = false;
 
-            match program::register(wasm_bytes, manifest, force_overwrite).await {
+            // Parse manifest string before adding
+            let manifest = match Manifest::parse(&manifest_str) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.send_response(corr_id, false, format!("Invalid manifest: {}", e)).await;
+                    self.inflight_program_upload = None;
+                    return;
+                }
+            };
+
+            match program::add(wasm_bytes, manifest, force_overwrite).await {
                 Ok(()) => {
                     self.send_response(corr_id, true, "Program registered successfully".to_string()).await;
                 }
@@ -190,11 +200,10 @@ impl Session {
 
         // Install program and dependencies (handles both uploaded and registry)
         match program::install(&program_name).await {
-            Ok(metadata) => {
+            Ok(()) => {
                 self.launch_instance_from_loaded_program(
                     corr_id,
                     program_name.to_string(),
-                    &metadata,
                     arguments,
                     detached,
                 )
@@ -210,7 +219,6 @@ impl Session {
         &mut self,
         corr_id: u32,
         program_name: String,
-        _metadata: &Manifest,
         arguments: Vec<String>,
         detached: bool,
     ) {
@@ -260,7 +268,7 @@ impl Session {
 
         // Install program and dependencies (handles both uploaded and registry)
         match program::install(&program_name).await {
-            Ok(_metadata) => {
+            Ok(()) => {
                 let (evt_tx, evt_rx) = oneshot::channel();
                 runtime::Message::LaunchServerInstance {
                     username: self.username.clone(),
