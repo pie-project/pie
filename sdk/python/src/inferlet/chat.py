@@ -215,9 +215,14 @@ class ChatFormatter:
         Fallback formatting without Jinja2.
 
         Detects template style and formats accordingly:
+        - ChatML style: Uses <|im_start|>, <|im_end|> (Qwen, Yi, etc.)
         - Llama 3 style: Uses <|start_header_id|>, <|end_header_id|>, <|eot_id|>
         - Generic style: Uses [Role]: format
         """
+        # Detect ChatML style template (Qwen, Yi, etc.)
+        if self._template_str and "<|im_start|>" in self._template_str:
+            return self._format_chatml(messages, add_generation_prompt)
+
         # Detect Llama 3 style template
         if self._template_str and "<|start_header_id|>" in self._template_str:
             return self._format_llama3(messages, add_generation_prompt)
@@ -232,6 +237,42 @@ class ChatFormatter:
         result = "\n".join(parts)
         if add_generation_prompt:
             result += "\n[Assistant]:"
+        return result
+
+    def _format_chatml(
+        self,
+        messages: list[dict[str, Any]],
+        add_generation_prompt: bool,
+    ) -> str:
+        """
+        Format messages in ChatML style (Qwen, Yi, etc.).
+
+        Format:
+        <|im_start|>system
+        {content}<|im_end|>
+        <|im_start|>user
+        {content}<|im_end|>
+        <|im_start|>assistant
+        """
+        parts = []
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            # Map tool role to user with wrapper (ChatML convention)
+            if role == "tool":
+                parts.append(
+                    f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
+                )
+            else:
+                parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+
+        result = "".join(parts)
+
+        if add_generation_prompt:
+            result += "<|im_start|>assistant\n"
+
         return result
 
     def _format_llama3(
