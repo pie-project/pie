@@ -1,7 +1,14 @@
-//! Context Service - Execution context management with KV cache state
+//! # Context Module
 //!
-//! This module provides a model-specific actor for managing named execution
-//! contexts with support for forking, joining, locking, and capacity management.
+//! Manages named execution contexts with KV cache state for model inference.
+//!
+//! Each model gets a dedicated ContextManager actor that handles:
+//! - Context creation, destruction, and forking
+//! - Lock acquisition for exclusive access
+//! - Page management (commit, reserve, release)
+//! - Token buffering and cursor tracking
+//!
+//! Contexts are stored per-model via a ServiceArray, accessed by model index.
 
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -15,140 +22,142 @@ use crate::adapter::AdapterId;
 use crate::inference::brle::Brle;
 use crate::kvcache::{PageId, PageStore, NodeId, PhysicalPageId, PageHash};
 
+// =============================================================================
+// Public Types
+// =============================================================================
+
 /// Unique identifier for a context.
 pub type ContextId = u64;
 pub type LockId = u64;
 
-/// Global table of context actors.
-static ACTOR: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
+// =============================================================================
+// Public API
+// =============================================================================
 
-/// Spawns a new context actor.
-pub(crate) fn spawn() -> usize {
-    ACTOR.spawn::<ContextManagerActor>()
+static SERVICE_ARRAY: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
+
+/// Spawns a new context manager for a model.
+pub fn spawn() -> usize {
+    SERVICE_ARRAY.spawn::<ContextManager>()
 }
 
-/// Messages for the context actor.
-#[derive(Debug)]
-pub enum Message {
-    /// Creates a new context with the given name.
-    Create {
-        user_id: u32,
-        name: String,
-        fill: Option<Vec<u32>>,
-        response: oneshot::Sender<Result<ContextId>>,
-    },
-
-    /// Destroys a context.
-    Destroy {
-        id: ContextId,
-        lock_id: LockId,
-        response: oneshot::Sender<Result<()>>,
-    },
-
-    /// Retrieves an existing context by name.
-    Lookup {
-        user_id: u32,
-        name: String,
-        response: oneshot::Sender<Option<ContextId>>,
-    },
-
-    /// Forks a context into a new one with the given name.
-    Fork {
-        id: ContextId,
-        user_id: u32,
-        new_name: String,
-        response: oneshot::Sender<Result<ContextId>>,
-    },
-
-    /// Acquires a lock on the context.
-    AcquireLock {
-        id: ContextId,
-        response: oneshot::Sender<LockId>,
-    },
-
-    /// Releases the lock on the context.
-    ReleaseLock {
-        id: ContextId,
-        lock_id: LockId,
-    },
-
-    /// Get tokens per page
-    TokensPerPage {
-        id: ContextId,
-        response: oneshot::Sender<u32>,
-    },
-
-    /// Get number of committed pages
-    CommittedPageCount {
-        id: ContextId,
-        response: oneshot::Sender<u32>,
-    },
-
-    /// Commit pages to the context
-    CommitPages {
-        id: ContextId,
-        lock_id: LockId,
-        page_indices: Vec<u32>,
-        response: oneshot::Sender<Result<()>>,
-    },
-
-    /// Reserve pages for the context
-    ReservePages {
-        id: ContextId,
-        lock_id: LockId,
-        num_pages: u32,
-        response: oneshot::Sender<Result<()>>,
-    },
-
-    /// Release pages from the context
-    ReleasePages {
-        id: ContextId,
-        lock_id: LockId,
-        num_pages: u32,
-    },
-
-    /// Get the cursor position
-    GetCursor {
-        id: ContextId,
-        lock_id: LockId,
-        response: oneshot::Sender<u32>,
-    },
-
-    /// Set the cursor position
-    SetCursor {
-        id: ContextId,
-        lock_id: LockId,
-        cursor: u32,
-    },
-
-    /// Get buffered tokens
-    GetBufferedTokens {
-        id: ContextId,
-        lock_id: LockId,
-        response: oneshot::Sender<Vec<u32>>,
-    },
-
-    /// Set buffered tokens
-    SetBufferedTokens {
-        id: ContextId,
-        lock_id: LockId,
-        tokens: Vec<u32>,
-    },
-
-    /// Append buffered tokens (avoids get+set roundtrip)
-    AppendBufferedTokens {
-        id: ContextId,
-        lock_id: LockId,
-        tokens: Vec<u32>,
-    },
+/// Creates a new context with the given name.
+pub async fn create(model_idx: usize, user_id: u32, name: String, fill: Option<Vec<u32>>) -> Result<ContextId> {
+    let (tx, rx) = oneshot::channel();
+    send(model_idx, Message::Create { user_id, name, fill, response: tx })?;
+    rx.await?
 }
 
-impl Message {
-    /// Sends this message to the context actor for the given model.
-    pub fn send(self, model_idx: usize) -> anyhow::Result<()> {
-        ACTOR.send(model_idx, self)
+/// Destroys a context.
+pub async fn destroy(model_idx: usize, id: ContextId, lock_id: LockId) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    send(model_idx, Message::Destroy { id, lock_id, response: tx })?;
+    rx.await?
+}
+
+/// Looks up a context by name.
+pub async fn lookup(model_idx: usize, user_id: u32, name: String) -> Option<ContextId> {
+    let (tx, rx) = oneshot::channel();
+    send(model_idx, Message::Lookup { user_id, name, response: tx }).ok()?;
+    rx.await.ok()?
+}
+
+/// Forks a context into a new one.
+pub async fn fork(model_idx: usize, id: ContextId, user_id: u32, new_name: String) -> Result<ContextId> {
+    let (tx, rx) = oneshot::channel();
+    send(model_idx, Message::Fork { id, user_id, new_name, response: tx })?;
+    rx.await?
+}
+
+/// Acquires a lock on the context.
+pub async fn acquire_lock(model_idx: usize, id: ContextId) -> LockId {
+    let (tx, rx) = oneshot::channel();
+    if send(model_idx, Message::AcquireLock { id, response: tx }).is_err() {
+        return 0;
     }
+    rx.await.unwrap_or(0)
 }
+
+/// Releases the lock on the context.
+pub fn release_lock(model_idx: usize, id: ContextId, lock_id: LockId) -> Result<()> {
+    send(model_idx, Message::ReleaseLock { id, lock_id })
+}
+
+/// Gets the number of tokens per page.
+pub async fn tokens_per_page(model_idx: usize, id: ContextId) -> u32 {
+    let (tx, rx) = oneshot::channel();
+    if send(model_idx, Message::TokensPerPage { id, response: tx }).is_err() {
+        return 0;
+    }
+    rx.await.unwrap_or(0)
+}
+
+/// Gets the number of committed pages.
+pub async fn committed_page_count(model_idx: usize, id: ContextId) -> u32 {
+    let (tx, rx) = oneshot::channel();
+    if send(model_idx, Message::CommittedPageCount { id, response: tx }).is_err() {
+        return 0;
+    }
+    rx.await.unwrap_or(0)
+}
+
+/// Commits pages to the context.
+pub async fn commit_pages(model_idx: usize, id: ContextId, lock_id: LockId, page_indices: Vec<u32>) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    send(model_idx, Message::CommitPages { id, lock_id, page_indices, response: tx })?;
+    rx.await?
+}
+
+/// Reserves pages for the context.
+pub async fn reserve_pages(model_idx: usize, id: ContextId, lock_id: LockId, num_pages: u32) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    send(model_idx, Message::ReservePages { id, lock_id, num_pages, response: tx })?;
+    rx.await?
+}
+
+/// Releases pages from the context.
+pub fn release_pages(model_idx: usize, id: ContextId, lock_id: LockId, num_pages: u32) -> Result<()> {
+    send(model_idx, Message::ReleasePages { id, lock_id, num_pages })
+}
+
+/// Gets the cursor position.
+pub async fn get_cursor(model_idx: usize, id: ContextId, lock_id: LockId) -> u32 {
+    let (tx, rx) = oneshot::channel();
+    if send(model_idx, Message::GetCursor { id, lock_id, response: tx }).is_err() {
+        return 0;
+    }
+    rx.await.unwrap_or(0)
+}
+
+/// Sets the cursor position.
+pub fn set_cursor(model_idx: usize, id: ContextId, lock_id: LockId, cursor: u32) -> Result<()> {
+    send(model_idx, Message::SetCursor { id, lock_id, cursor })
+}
+
+/// Gets buffered tokens.
+pub async fn get_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId) -> Vec<u32> {
+    let (tx, rx) = oneshot::channel();
+    if send(model_idx, Message::GetBufferedTokens { id, lock_id, response: tx }).is_err() {
+        return Vec::new();
+    }
+    rx.await.unwrap_or_default()
+}
+
+/// Sets buffered tokens.
+pub fn set_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId, tokens: Vec<u32>) -> Result<()> {
+    send(model_idx, Message::SetBufferedTokens { id, lock_id, tokens })
+}
+
+/// Appends buffered tokens.
+pub fn append_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId, tokens: Vec<u32>) -> Result<()> {
+    send(model_idx, Message::AppendBufferedTokens { id, lock_id, tokens })
+}
+
+fn send(model_idx: usize, msg: Message) -> Result<()> {
+    SERVICE_ARRAY.send(model_idx, msg)
+}
+
+
 
 /// Record of operations on a context (for lineage tracking).
 #[derive(Debug, Clone)]
@@ -728,85 +737,92 @@ impl ContextManager {
     }
 }
 
-/// The context actor wraps ContextManager for async message handling.
+// =============================================================================
+// ServiceHandler Implementation
+// =============================================================================
+
+/// Messages handled by ContextManager.
 #[derive(Debug)]
-struct ContextManagerActor {
-    service: ContextManager,
+enum Message {
+    Create { user_id: u32, name: String, fill: Option<Vec<u32>>, response: oneshot::Sender<Result<ContextId>> },
+    Destroy { id: ContextId, lock_id: LockId, response: oneshot::Sender<Result<()>> },
+    Lookup { user_id: u32, name: String, response: oneshot::Sender<Option<ContextId>> },
+    Fork { id: ContextId, user_id: u32, new_name: String, response: oneshot::Sender<Result<ContextId>> },
+    AcquireLock { id: ContextId, response: oneshot::Sender<LockId> },
+    ReleaseLock { id: ContextId, lock_id: LockId },
+    TokensPerPage { id: ContextId, response: oneshot::Sender<u32> },
+    CommittedPageCount { id: ContextId, response: oneshot::Sender<u32> },
+    CommitPages { id: ContextId, lock_id: LockId, page_indices: Vec<u32>, response: oneshot::Sender<Result<()>> },
+    ReservePages { id: ContextId, lock_id: LockId, num_pages: u32, response: oneshot::Sender<Result<()>> },
+    ReleasePages { id: ContextId, lock_id: LockId, num_pages: u32 },
+    GetCursor { id: ContextId, lock_id: LockId, response: oneshot::Sender<u32> },
+    SetCursor { id: ContextId, lock_id: LockId, cursor: u32 },
+    GetBufferedTokens { id: ContextId, lock_id: LockId, response: oneshot::Sender<Vec<u32>> },
+    SetBufferedTokens { id: ContextId, lock_id: LockId, tokens: Vec<u32> },
+    AppendBufferedTokens { id: ContextId, lock_id: LockId, tokens: Vec<u32> },
 }
 
-impl Default for ContextManagerActor {
+
+impl Default for ContextManager {
     fn default() -> Self {
-        let page_size = 64; // Default page size
+        let page_size = 64;
         let page_store = Arc::new(RwLock::new(PageStore::new(page_size)));
-        ContextManagerActor {
-            service: ContextManager::new(page_store, page_size),
-        }
+        ContextManager::new(page_store, page_size)
     }
 }
 
-impl ServiceHandler for ContextManagerActor {
+impl ServiceHandler for ContextManager {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::Create { user_id, name, fill, response } => {
-                let result = self.service.create(user_id, name, fill);
-                let _ = response.send(result);
+                let _ = response.send(self.create(user_id, name, fill));
             }
             Message::Destroy { id, lock_id, response } => {
-                let result = self.service.destroy(id, lock_id);
-                let _ = response.send(result);
+                let _ = response.send(self.destroy(id, lock_id));
             }
             Message::Lookup { user_id, name, response } => {
-                let id = self.service.get(user_id, name);
-                let _ = response.send(id);
+                let _ = response.send(self.get(user_id, name));
             }
             Message::Fork { id, user_id, new_name, response } => {
-                let result = self.service.fork(id, user_id, new_name);
-                let _ = response.send(result);
+                let _ = response.send(self.fork(id, user_id, new_name));
             }
             Message::AcquireLock { id, response } => {
-                let lock_id = self.service.lock(id);
-                let _ = response.send(lock_id);
+                let _ = response.send(self.lock(id));
             }
             Message::ReleaseLock { id, lock_id } => {
-                self.service.unlock(id, lock_id);
+                self.unlock(id, lock_id);
             }
             Message::TokensPerPage { id: _, response } => {
-                let size = self.service.page_size();
-                let _ = response.send(size);
+                let _ = response.send(self.page_size());
             }
             Message::CommittedPageCount { id, response } => {
-                let count = self.service.num_total_pages(id);
-                let _ = response.send(count);
+                let _ = response.send(self.num_total_pages(id));
             }
             Message::CommitPages { id, lock_id, page_indices, response } => {
-                let result = self.service.commit_pages(id, lock_id, page_indices);
-                let _ = response.send(result);
+                let _ = response.send(self.commit_pages(id, lock_id, page_indices));
             }
             Message::ReservePages { id, lock_id, num_pages, response } => {
-                let result = self.service.allocate_pages(id, lock_id, num_pages);
-                let _ = response.send(result);
+                let _ = response.send(self.allocate_pages(id, lock_id, num_pages));
             }
             Message::ReleasePages { id, lock_id, num_pages } => {
-                let _ = self.service.free_pages(id, lock_id, num_pages);
+                let _ = self.free_pages(id, lock_id, num_pages);
             }
             Message::GetCursor { id, lock_id: _, response } => {
-                let cursor = self.service.get_pointer(id);
-                let _ = response.send(cursor);
+                let _ = response.send(self.get_pointer(id));
             }
             Message::SetCursor { id, lock_id: _, cursor } => {
-                let _ = self.service.set_pointer(id, cursor);
+                let _ = self.set_pointer(id, cursor);
             }
             Message::GetBufferedTokens { id, lock_id: _, response } => {
-                let tokens = self.service.get_buffered_tokens(id);
-                let _ = response.send(tokens);
+                let _ = response.send(self.get_buffered_tokens(id));
             }
             Message::SetBufferedTokens { id, lock_id: _, tokens } => {
-                let _ = self.service.set_buffered_tokens(id, tokens);
+                let _ = self.set_buffered_tokens(id, tokens);
             }
             Message::AppendBufferedTokens { id, lock_id: _, tokens } => {
-                let _ = self.service.append_buffered_tokens(id, tokens);
+                let _ = self.append_buffered_tokens(id, tokens);
             }
         }
     }
