@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use wasmtime::Engine as WasmEngine;
 use wasmtime::component::Component;
 
-use crate::actor::{Actor, Handle, SendError};
+use crate::service::{Service, ServiceHandler};
 
 mod manifest;
 mod repository;
@@ -24,7 +24,7 @@ pub use repository::Repository;
 // =============================================================================
 
 /// Global singleton Program Manager actor.
-static ACTOR: LazyLock<Actor<Message>> = LazyLock::new(Actor::new);
+static ACTOR: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Spawns the Program Manager actor with configuration.
 pub fn spawn(config: ProgramManagerConfig) {
@@ -42,7 +42,7 @@ pub fn spawn(config: ProgramManagerConfig) {
 }
 
 /// Sends a message to the Program Manager actor.
-pub fn send(msg: Message) -> Result<(), SendError> {
+pub fn send(msg: Message) -> anyhow::Result<()> {
     ACTOR.send(msg)
 }
 
@@ -237,7 +237,7 @@ impl std::fmt::Debug for Message {
 }
 
 impl Message {
-    pub fn send(self) -> Result<(), SendError> {
+    pub fn send(self) -> anyhow::Result<()> {
         ACTOR.send(self)
     }
 }
@@ -482,7 +482,7 @@ impl ProgramManagerActor {
     }
 }
 
-impl Handle for ProgramManagerActor {
+impl ServiceHandler for ProgramManagerActor {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {

@@ -40,12 +40,8 @@ impl Pollable for Subscription {
 impl pie::core::messaging::Host for InstanceState {
     async fn send(&mut self, message: String) -> Result<()> {
         let inst_id = self.id();
-        if let Some(client_id) = server::get_client_id(inst_id).await {
-            server::session_send(
-                client_id,
-                server::SessionMessage::SendMsg { inst_id, message },
-            )
-            .ok();
+        if let Ok(Some(client_id)) = server::get_client_id(inst_id).await {
+            server::sessions::send_msg(client_id, inst_id, message).ok();
         }
         Ok(())
     }

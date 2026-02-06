@@ -1,8 +1,14 @@
-//! Client Session management for WebSocket connections.
+//! # Session Module
 //!
-//! This module provides SessionActor - a full Actor implementation for handling
-//! individual client sessions. Sessions are registered in a global registry
-//! allowing direct message delivery without routing through the Server actor.
+//! Manages individual client sessions over WebSocket connections.
+//!
+//! Each client gets a dedicated Session actor that:
+//! - Handles WebSocket framing (send/receive pumps)
+//! - Processes client requests after authentication
+//! - Delivers instance output (messages, blobs, streaming)
+//!
+//! Sessions register in a global ServiceMap for Direct Addressing,
+//! bypassing the Server actor for high-throughput message delivery.
 
 use std::sync::{Arc, LazyLock};
 
@@ -18,8 +24,9 @@ use tokio::task::{self, JoinHandle};
 use tokio_tungstenite::accept_async;
 use tungstenite::Message as WsMessage;
 
-use crate::actor::{Actor, Handle, SendError};
-use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
+use crate::service::ServiceMap;
+use crate::instance::InstanceId;
+use crate::output::{OutputChannel, OutputDelivery};
 use crate::runtime::{self, TerminationCause};
 use crate::auth;
 
@@ -27,56 +34,73 @@ use super::upload::InFlightUpload;
 use super::{ClientId, ServerState};
 
 // =============================================================================
-// Session Registry
+// Public API
 // =============================================================================
 
-/// Global registry mapping ClientId to session actors.
-/// Allows direct message delivery to sessions without routing through Server.
-static SESSION_REGISTRY: LazyLock<DashMap<ClientId, Actor<SessionMessage>>> =
-    LazyLock::new(DashMap::new);
+static SERVICE_MAP: LazyLock<ServiceMap<ClientId, Message>> = LazyLock::new(ServiceMap::new);
 
-/// Sends a message directly to a session by ClientId.
-pub fn send(client_id: ClientId, msg: SessionMessage) -> Result<(), SendError> {
-    SESSION_REGISTRY
-        .get(&client_id)
-        .ok_or(SendError::NotSpawned)?
-        .send(msg)
+/// Sends a text message to a client's instance.
+pub fn send_msg(client_id: ClientId, inst_id: InstanceId, message: String) -> Result<()> {
+    SERVICE_MAP.send(&client_id, Message::SendMsg { inst_id, message })
 }
 
-/// Check if a session exists for the given ClientId.
+/// Sends binary data to a client's instance.
+pub fn send_blob(client_id: ClientId, inst_id: InstanceId, data: Bytes) -> Result<()> {
+    SERVICE_MAP.send(&client_id, Message::SendBlob { inst_id, data })
+}
+
+/// Notifies a client that an instance has terminated.
+pub fn terminate(client_id: ClientId, inst_id: InstanceId, cause: TerminationCause) -> Result<()> {
+    SERVICE_MAP.send(&client_id, Message::Terminate { inst_id, cause })
+}
+
+/// Streams output to a client's instance.
+pub fn streaming_output(
+    client_id: ClientId,
+    inst_id: InstanceId,
+    output_type: OutputChannel,
+    content: String,
+) -> Result<()> {
+    SERVICE_MAP.send(&client_id, Message::StreamingOutput { inst_id, output_type, content })
+}
+
+/// Checks if a session exists for the given client.
 pub fn exists(client_id: ClientId) -> bool {
-    SESSION_REGISTRY.contains_key(&client_id)
+    SERVICE_MAP.contains(&client_id)
 }
 
 // =============================================================================
-// Session Messages
+// Messages
 // =============================================================================
 
-/// Messages that can be sent directly to a SessionActor.
+/// Messages handled by Session actors.
 #[derive(Debug)]
-pub enum SessionMessage {
-    /// Send a text message to the client for a specific instance
+enum Message {
+    /// Send a text message to the client for a specific instance.
     SendMsg { inst_id: InstanceId, message: String },
-    /// Send binary data to the client for a specific instance
+    /// Send binary data to the client for a specific instance.
     SendBlob { inst_id: InstanceId, data: Bytes },
-    /// Notify client of instance termination
+    /// Notify client of instance termination.
     Terminate { inst_id: InstanceId, cause: TerminationCause },
-    /// Stream stdout/stderr output to the client
-    StreamingOutput {
-        inst_id: InstanceId,
-        output_type: OutputChannel,
-        content: String,
-    },
-    /// Internal: WebSocket message received from client
+    /// Stream stdout/stderr output to the client.
+    StreamingOutput { inst_id: InstanceId, output_type: OutputChannel, content: String },
+    /// WebSocket message received from client.
     ClientRequest(ClientMessage),
 }
 
 // =============================================================================
-// Session Actor (legacy name kept for handler.rs compatibility)
+// Session State
 // =============================================================================
 
+use crate::service::ServiceHandler;
+
+/// State for pending external authentication (challenge-response flow).
+struct PendingAuth {
+    username: String,
+    challenge: Vec<u8>,
+}
+
 /// A client session managing a WebSocket connection.
-/// Now implemented as a full Actor with Handle trait.
 pub struct Session {
     pub id: ClientId,
     pub username: String,
@@ -86,11 +110,12 @@ pub struct Session {
     pub ws_msg_tx: mpsc::Sender<WsMessage>,
     send_pump: JoinHandle<()>,
     recv_pump: JoinHandle<()>,
+    authenticated: bool,
+    pending_auth: Option<PendingAuth>,
 }
 
 impl Session {
     /// Spawns a new session actor for the given TCP connection.
-    /// Registers the session in the global SESSION_REGISTRY.
     pub async fn spawn(
         id: ClientId,
         tcp_stream: TcpStream,
@@ -132,16 +157,17 @@ impl Session {
                     };
 
                     // Send directly to session actor
-                    if send(client_id, SessionMessage::ClientRequest(client_msg)).is_err() {
+                    if SERVICE_MAP.send(&client_id, Message::ClientRequest(client_msg)).is_err() {
                         break;
                     }
                 }
                 // Session disconnected - trigger cleanup
-                super::send(super::Message::SessionTerminated { client_id }).ok();
+                super::session_terminated(client_id).ok();
             })
         };
 
-        let session = Session {
+        // Spawn into the global ServiceMap
+        SERVICE_MAP.spawn(id, || Session {
             id,
             username: String::new(),
             state,
@@ -150,35 +176,24 @@ impl Session {
             ws_msg_tx,
             send_pump,
             recv_pump,
-        };
-
-        // Create and register the actor
-        let actor = Actor::new();
-        actor.spawn_with::<SessionActor, _>(|| SessionActor::new(session));
-        SESSION_REGISTRY.insert(id, actor);
+            authenticated: false,
+            pending_auth: None,
+        })?;
 
         Ok(())
     }
 
-    /// Cleanup when session is terminated
+    /// Cleanup when session is terminated.
     fn cleanup(&mut self) {
         for inst_id in self.attached_instances.drain(..) {
-            runtime::Message::SetOutputDelivery {
-                inst_id,
-                mode: OutputDelivery::Buffered,
-            }
-            .send()
-            .ok();
-            
-            super::send(super::Message::UnregisterInstance { inst_id }).ok();
-            runtime::Message::DetachInstance { inst_id }.send().ok();
+            runtime::instance_actor::set_output_delivery(inst_id, OutputDelivery::Buffered);
+            runtime::instance_actor::detach(inst_id);
+            super::unregister_instance(inst_id).ok();
         }
 
         self.recv_pump.abort();
         self.state.clients.remove(&self.id);
-
-        // Remove from registry
-        SESSION_REGISTRY.remove(&self.id);
+        SERVICE_MAP.remove(&self.id);
     }
 }
 
@@ -189,81 +204,48 @@ impl Drop for Session {
 }
 
 // =============================================================================
-// SessionActor - Handle implementation
+// ServiceHandler Implementation
 // =============================================================================
 
-/// State for pending external authentication (challenge-response flow)
-struct PendingAuth {
-    username: String,
-    challenge: Vec<u8>,
-}
+impl ServiceHandler for Session {
+    type Message = Message;
 
-struct SessionActor {
-    session: Session,
-    authenticated: bool,
-    /// Stores challenge during external auth flow
-    pending_auth: Option<PendingAuth>,
-}
-
-impl SessionActor {
-    fn new(session: Session) -> Self {
-        SessionActor {
-            session,
-            authenticated: false,
-            pending_auth: None,
-        }
-    }
-}
-
-impl Handle for SessionActor {
-    type Message = SessionMessage;
-
-    async fn handle(&mut self, msg: SessionMessage) {
+    async fn handle(&mut self, msg: Message) {
         match msg {
-            SessionMessage::ClientRequest(client_msg) => {
+            Message::ClientRequest(client_msg) => {
                 if !self.authenticated {
-                    // Handle authentication
                     match self.handle_auth_message(client_msg).await {
                         Ok(true) => self.authenticated = true,
-                        Ok(false) => {} // Auth in progress (waiting for signature)
+                        Ok(false) => {} // Auth in progress
                         Err(e) => {
-                            tracing::error!("Auth error for client {}: {}", self.session.id, e);
-                            // Session will be cleaned up on drop
+                            tracing::error!("Auth error for client {}: {}", self.id, e);
                         }
                     }
                 } else {
-                    self.session.handle_client_message(client_msg).await;
+                    self.handle_client_message(client_msg).await;
                 }
             }
-            SessionMessage::SendMsg { inst_id, message } => {
-                self.session
-                    .send_inst_event(inst_id, EventCode::Message, message)
-                    .await;
+            Message::SendMsg { inst_id, message } => {
+                self.send_inst_event(inst_id, EventCode::Message, message).await;
             }
-            SessionMessage::SendBlob { inst_id, data } => {
-                self.session.handle_send_blob(inst_id, data).await;
+            Message::SendBlob { inst_id, data } => {
+                self.handle_send_blob(inst_id, data).await;
             }
-            SessionMessage::Terminate { inst_id, cause } => {
-                self.session.handle_instance_termination(inst_id, cause).await;
+            Message::Terminate { inst_id, cause } => {
+                self.handle_instance_termination(inst_id, cause).await;
             }
-            SessionMessage::StreamingOutput {
-                inst_id,
-                output_type,
-                content,
-            } => {
-                self.session
-                    .handle_streaming_output(inst_id, output_type, content)
-                    .await;
+            Message::StreamingOutput { inst_id, output_type, content } => {
+                self.handle_streaming_output(inst_id, output_type, content).await;
             }
         }
     }
 }
 
 // =============================================================================
-// SessionActor - Authentication
+// Session - Authentication
 // =============================================================================
 
-impl SessionActor {
+impl Session {
     /// Handle authentication message. Returns Ok(true) when fully authenticated.
     async fn handle_auth_message(&mut self, msg: ClientMessage) -> Result<bool> {
         match msg {
@@ -271,7 +253,7 @@ impl SessionActor {
                 self.handle_identification(corr_id, username).await
             }
             ClientMessage::InternalAuthenticate { corr_id, token } => {
-                self.session.internal_authenticate(corr_id, token).await?;
+                self.internal_authenticate(corr_id, token).await?;
                 Ok(true)
             }
             ClientMessage::Signature { corr_id, signature } => {
@@ -283,78 +265,54 @@ impl SessionActor {
         }
     }
 
-    /// Handle identification message - starts external auth flow
+    /// Handle identification message - starts external auth flow.
     async fn handle_identification(&mut self, corr_id: u32, username: String) -> Result<bool> {
-        // Check if auth is enabled
         if !auth::is_auth_enabled().await? {
-            self.session.username = username;
-            self.session.send_response(
-                corr_id,
-                true,
-                "Authenticated (Engine disabled authentication)".to_string(),
-            ).await;
+            self.username = username;
+            self.send_response(corr_id, true, "Authenticated (Engine disabled authentication)".to_string()).await;
             return Ok(true);
         }
 
-        // Get user's public keys from auth actor
         if auth::get_user_keys(username.clone()).await?.is_none() {
-            self.session.send_response(
-                corr_id,
-                false,
-                format!("User '{}' is not authorized", username),
-            ).await;
+            self.send_response(corr_id, false, format!("User '{}' is not authorized", username)).await;
             bail!("User '{}' is not authorized", username)
         }
 
-        // Generate challenge using auth actor
         let challenge = auth::generate_challenge().await?;
-
         let challenge_b64 = base64::engine::general_purpose::STANDARD.encode(&challenge);
-        self.session.send_response(corr_id, true, challenge_b64).await;
+        self.send_response(corr_id, true, challenge_b64).await;
 
-        // Store pending auth state - waiting for signature
-        self.pending_auth = Some(PendingAuth {
-            username,
-            challenge,
-        });
-
-        Ok(false) // Not yet authenticated, waiting for signature
+        self.pending_auth = Some(PendingAuth { username, challenge });
+        Ok(false)
     }
 
-    /// Handle signature message - completes external auth flow
+    /// Handle signature message - completes external auth flow.
     async fn handle_signature(&mut self, corr_id: u32, signature_b64: String) -> Result<bool> {
         let pending = match self.pending_auth.take() {
             Some(p) => p,
             None => {
-                self.session.send_response(corr_id, false, "No pending authentication".to_string()).await;
+                self.send_response(corr_id, false, "No pending authentication".to_string()).await;
                 bail!("Signature received without pending authentication")
             }
         };
 
-        let signature_bytes = match base64::engine::general_purpose::STANDARD
-            .decode(signature_b64.as_bytes())
-        {
+        let signature_bytes = match base64::engine::general_purpose::STANDARD.decode(signature_b64.as_bytes()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                self.session.send_response(corr_id, false, format!("Invalid signature encoding: {}", e)).await;
+                self.send_response(corr_id, false, format!("Invalid signature encoding: {}", e)).await;
                 bail!("Failed to decode signature: {}", e)
             }
         };
 
-        // Verify signature using auth actor
-        let verified = auth::verify_signature(
-            pending.username.clone(),
-            pending.challenge,
-            signature_bytes,
-        ).await?;
+        let verified = auth::verify_signature(pending.username.clone(), pending.challenge, signature_bytes).await?;
 
         if !verified {
-            self.session.send_response(corr_id, false, "Signature verification failed".to_string()).await;
+            self.send_response(corr_id, false, "Signature verification failed".to_string()).await;
             bail!("Signature verification failed for user '{}'", pending.username)
         }
 
-        self.session.send_response(corr_id, true, "Authenticated".to_string()).await;
-        self.session.username = pending.username;
+        self.send_response(corr_id, true, "Authenticated".to_string()).await;
+        self.username = pending.username;
         Ok(true)
     }
 }

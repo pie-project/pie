@@ -7,7 +7,8 @@ use bytes::Bytes;
 use pie_client::message::{self, ServerMessage, StreamingOutput};
 use uuid::Uuid;
 
-use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
+use crate::instance::InstanceId;
+use crate::output::{OutputChannel, OutputDelivery};
 use crate::messaging::{self, PushPullMessage};
 use crate::program::{self, Manifest, ProgramName};
 use crate::runtime::{self, AttachInstanceResult};

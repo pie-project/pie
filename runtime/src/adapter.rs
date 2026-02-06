@@ -9,14 +9,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use anyhow::Result;
 
-use crate::actor::{Handle, Actors, SendError};
+use crate::service::{ServiceHandler, ServiceArray};
 
 /// Unique identifier for an adapter.
 pub type AdapterId = u64;
 pub type LockId = u64;
 
 /// Global table of adapter actors.
-static ACTOR: LazyLock<Actors<Message>> = LazyLock::new(Actors::new);
+static ACTOR: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 
 /// Spawns a new adapter actor.
 pub(crate) fn spawn() -> usize {
@@ -80,7 +80,7 @@ pub enum Message {
 
 impl Message {
     /// Sends this message to the adapter actor for the given model.
-    pub fn send(self, model_idx: usize) -> Result<(), SendError> {
+    pub fn send(self, model_idx: usize) -> anyhow::Result<()> {
         ACTOR.send(model_idx, self)
     }
 }
@@ -121,7 +121,7 @@ impl Default for AdapterActor {
     }
 }
 
-impl Handle for AdapterActor {
+impl ServiceHandler for AdapterActor {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {

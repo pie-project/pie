@@ -28,14 +28,14 @@ use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use crate::actor::{Actor, Handle, SendError};
+use crate::service::{Service, ServiceHandler};
 
 // =============================================================================
 // Actor Setup (Singleton)
 // =============================================================================
 
 /// Global singleton Auth actor.
-static ACTOR: LazyLock<Actor<Message>> = LazyLock::new(Actor::new);
+static ACTOR: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Spawns the Auth actor with configuration.
 pub fn spawn(config: AuthConfig) {
@@ -149,7 +149,7 @@ pub enum Message {
 
 impl Message {
     /// Sends this message to the Auth actor.
-    pub fn send(self) -> Result<(), SendError> {
+    pub fn send(self) -> anyhow::Result<()> {
         ACTOR.send(self)
     }
 }
@@ -354,7 +354,7 @@ impl AuthActor {
     }
 }
 
-impl Handle for AuthActor {
+impl ServiceHandler for AuthActor {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {

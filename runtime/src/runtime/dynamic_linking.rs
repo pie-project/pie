@@ -222,11 +222,17 @@ use wasmtime::component::{
 };
 use wasmtime::{Engine, Store, StoreContextMut};
 
-use super::{InstanceState, RuntimeError};
+use super::InstanceState;
 
 /// Proxy marker type for host-defined resources used in dynamic linking.
 /// This is a phantom type used to create host resource handles.
 struct ProxyResource;
+
+/// Wrapper resource for component-defined resources.
+///
+/// This is used by the host to track resource handles that are defined in guest components.
+/// When a component exports a resource type, we create `ProxyResource` instances to
+/// manage those resources from the host side, enabling cross-component resource passing.
 
 /// Categories of functions in the component model
 enum FuncCategory {
@@ -1166,17 +1172,14 @@ pub(super) async fn instantiate_libraries(
     linker: &mut Linker<InstanceState>,
     store: &mut Store<InstanceState>,
     library_components: Vec<Component>,
-) -> Result<(), RuntimeError> {
+) -> anyhow::Result<()> {
     for lib_component in library_components {
         let lib_instance = linker
             .instantiate_async(&mut *store, &lib_component)
-            .await
-            .map_err(|e| RuntimeError::Other(format!("Failed to instantiate library: {e}")))?;
+            .await?;
 
         // Register forwarding implementations for this library's exports
-        register_component_exports(engine, linker, store, &lib_component, lib_instance).map_err(
-            |e| RuntimeError::Other(format!("Failed to register exports for library: {e}")),
-        )?;
+        register_component_exports(engine, linker, store, &lib_component, lib_instance)?;
     }
 
     Ok(())

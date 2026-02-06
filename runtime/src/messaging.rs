@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use crate::actor::{Actor, Actors, Handle, SendError};
+use crate::service::{Service, ServiceArray, ServiceHandler};
 use crate::utils::IdPool;
 
 type ListenerId = usize;
@@ -21,7 +21,7 @@ type ListenerId = usize;
 // =============================================================================
 
 /// Global singleton PubSub actor.
-static PUBSUB_ACTOR: LazyLock<Actor<PubSubMessage>> = LazyLock::new(Actor::new);
+static PUBSUB_ACTOR: LazyLock<Service<PubSubMessage>> = LazyLock::new(Service::new);
 
 /// Spawns the PubSub actor.
 pub fn spawn_pubsub() {
@@ -29,7 +29,7 @@ pub fn spawn_pubsub() {
 }
 
 /// Sends a message to the PubSub actor.
-pub fn pubsub_send(msg: PubSubMessage) -> Result<(), SendError> {
+pub fn pubsub_send(msg: PubSubMessage) -> anyhow::Result<()> {
     PUBSUB_ACTOR.send(msg)
 }
 
@@ -72,7 +72,7 @@ impl Default for PubSubActor {
     }
 }
 
-impl Handle for PubSubActor {
+impl ServiceHandler for PubSubActor {
     type Message = PubSubMessage;
 
     async fn handle(&mut self, msg: PubSubMessage) {
@@ -133,7 +133,7 @@ impl PubSubActor {
 // =============================================================================
 
 /// Global singleton PushPull actor.
-static PUSHPULL_ACTOR: LazyLock<Actor<PushPullMessage>> = LazyLock::new(Actor::new);
+static PUSHPULL_ACTOR: LazyLock<Service<PushPullMessage>> = LazyLock::new(Service::new);
 
 /// Spawns the PushPull actor.
 pub fn spawn_pushpull() {
@@ -141,7 +141,7 @@ pub fn spawn_pushpull() {
 }
 
 /// Sends a message to the PushPull actor.
-pub fn pushpull_send(msg: PushPullMessage) -> Result<(), SendError> {
+pub fn pushpull_send(msg: PushPullMessage) -> anyhow::Result<()> {
     PUSHPULL_ACTOR.send(msg)
 }
 
@@ -204,7 +204,7 @@ impl Default for PushPullActor {
     }
 }
 
-impl Handle for PushPullActor {
+impl ServiceHandler for PushPullActor {
     type Message = PushPullMessage;
 
     async fn handle(&mut self, msg: PushPullMessage) {
