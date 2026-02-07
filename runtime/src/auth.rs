@@ -39,7 +39,7 @@ static ACTOR: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Spawns the Auth actor with configuration.
 pub fn spawn(config: AuthConfig) {
-    ACTOR.spawn_with::<AuthActor, _>(|| AuthActor::with_config(config));
+    ACTOR.spawn(|| AuthActor::with_config(config)).expect("Auth already spawned");
 }
 
 /// Check if the auth actor is spawned.

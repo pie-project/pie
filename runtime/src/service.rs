@@ -42,7 +42,7 @@ use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel};
 use tokio::task;
 
 /// Trait for message handlers that process messages asynchronously.
-pub trait ServiceHandler: Send + 'static {
+pub(crate) trait ServiceHandler: Send + 'static {
     /// The message type this handler processes.
     type Message: Send + 'static;
     

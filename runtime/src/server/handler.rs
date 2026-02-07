@@ -165,11 +165,7 @@ impl Session {
             Ok(instance_id) => {
                 if !detached {
                     // Register instance -> client mapping with Server
-                    super::Message::RegisterInstance {
-                        inst_id: instance_id,
-                        client_id: self.id,
-                    }
-                    .send()
+                    super::register_instance(instance_id, self.id)
                     .ok();
                     self.attached_instances.push(instance_id);
                 }
@@ -240,11 +236,7 @@ impl Session {
                     .await;
 
                 // Register instance -> client mapping with Server
-                super::Message::RegisterInstance {
-                    inst_id,
-                    client_id: self.id,
-                }
-                .send()
+                super::register_instance(inst_id, self.id)
                 .ok();
                 self.attached_instances.push(inst_id);
 
@@ -255,11 +247,7 @@ impl Session {
                     .await;
 
                 // Register instance -> client mapping with Server
-                super::Message::RegisterInstance {
-                    inst_id,
-                    client_id: self.id,
-                }
-                .send()
+                super::register_instance(inst_id, self.id)
                 .ok();
                 self.attached_instances.push(inst_id);
 

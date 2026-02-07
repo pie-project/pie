@@ -75,7 +75,7 @@ pub fn exists(client_id: ClientId) -> bool {
 
 /// Messages handled by Session actors.
 #[derive(Debug)]
-enum Message {
+pub(crate) enum Message {
     /// Send a text message to the client for a specific instance.
     SendMsg { inst_id: InstanceId, message: String },
     /// Send binary data to the client for a specific instance.

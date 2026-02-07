@@ -126,8 +126,8 @@ impl InstanceActor {
         let detached = config.detached;
 
         // Create the actor entry in the registry first
-        let actor = Actor::new();
-        INSTANCE_REGISTRY.insert(inst_id, actor);
+        let service = Service::new();
+        INSTANCE_REGISTRY.insert(inst_id, service);
 
         // Get a reference to spawn with
         let actor_ref = INSTANCE_REGISTRY.get(&inst_id).unwrap();
@@ -159,7 +159,7 @@ impl InstanceActor {
         };
 
         // Spawn the actor with the initialized state
-        actor_ref.spawn_with::<InstanceActor, _>(|| InstanceActor {
+        actor_ref.spawn(|| InstanceActor {
             inst_id,
             username,
             program_name,
@@ -168,7 +168,7 @@ impl InstanceActor {
             output_delivery_ctrl,
             running_state,
             execution_handle: Some(execution_handle),
-        });
+        })?;
 
         Ok(inst_id)
     }

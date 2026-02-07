@@ -25,7 +25,7 @@ static PUBSUB_ACTOR: LazyLock<Service<PubSubMessage>> = LazyLock::new(Service::n
 
 /// Spawns the PubSub actor.
 pub fn spawn_pubsub() {
-    PUBSUB_ACTOR.spawn::<PubSubActor>();
+    PUBSUB_ACTOR.spawn(|| PubSubActor::default()).expect("PubSub already spawned");
 }
 
 /// Sends a message to the PubSub actor.
@@ -137,7 +137,7 @@ static PUSHPULL_ACTOR: LazyLock<Service<PushPullMessage>> = LazyLock::new(Servic
 
 /// Spawns the PushPull actor.
 pub fn spawn_pushpull() {
-    PUSHPULL_ACTOR.spawn::<PushPullActor>();
+    PUSHPULL_ACTOR.spawn(|| PushPullActor::default()).expect("PushPull already spawned");
 }
 
 /// Sends a message to the PushPull actor.

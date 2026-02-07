@@ -390,7 +390,7 @@ impl InferenceService {
     }
 
     /// Queues a forward pass request for execution.
-    fn forward_pass(&self, request: ForwardPassRequest) -> Result<ForwardPassOutput> {
+    fn forward_pass(&self, request: ForwardPassRequest, response_tx: oneshot::Sender<ForwardPassOutput>) -> Result<()> {
         // Determine target node based on page affinity
         let node_id = self.get_primary_node(&request.page_ids).unwrap_or(0);
 
@@ -402,13 +402,13 @@ impl InferenceService {
         // Queue the request
         let pending = PendingRequest {
             request,
-            response_tx: response,
+            response_tx,
             node_id,
             physical_page_ids,
         };
 
         self.request_tx.send(pending)?;
-        Ok(response.await?)
+        Ok(())
     }
 }
 
@@ -453,7 +453,6 @@ impl NodeBatch {
         self.total_tokens = 0;
         std::mem::take(&mut self.requests)
     }
-    }
 }
 
 // =============================================================================
@@ -462,7 +461,7 @@ impl NodeBatch {
 
 /// Messages handled by InferenceService.
 #[derive(Debug)]
-enum Message {
+pub(crate) enum Message {
     ForwardPass { request: ForwardPassRequest, response: oneshot::Sender<ForwardPassOutput> },
 }
 
@@ -473,8 +472,9 @@ impl ServiceHandler for InferenceService {
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::ForwardPass { request, response } => {
-                let res = self.forward_pass(request);
-                response.send(res).ok();
+                if let Err(e) = self.forward_pass(request, response) {
+                    tracing::error!("Failed to queue forward pass: {}", e);
+                }
             }
         }
     }

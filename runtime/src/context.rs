@@ -38,7 +38,7 @@ static SERVICE_ARRAY: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArr
 
 /// Spawns a new context manager for a model.
 pub fn spawn() -> usize {
-    SERVICE_ARRAY.spawn::<ContextManager>()
+    SERVICE_ARRAY.spawn(|| ContextManager::default()).expect("Failed to spawn context manager")
 }
 
 /// Creates a new context with the given name.
@@ -743,7 +743,7 @@ impl ContextManager {
 
 /// Messages handled by ContextManager.
 #[derive(Debug)]
-enum Message {
+pub(crate) enum Message {
     Create { user_id: u32, name: String, fill: Option<Vec<u32>>, response: oneshot::Sender<Result<ContextId>> },
     Destroy { id: ContextId, lock_id: LockId, response: oneshot::Sender<Result<()>> },
     Lookup { user_id: u32, name: String, response: oneshot::Sender<Option<ContextId>> },

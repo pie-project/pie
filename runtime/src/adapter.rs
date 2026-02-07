@@ -20,7 +20,7 @@ static ACTOR: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new)
 
 /// Spawns a new adapter actor.
 pub(crate) fn spawn() -> usize {
-    ACTOR.spawn::<AdapterActor>()
+    ACTOR.spawn(|| AdapterActor::default()).expect("Failed to spawn adapter actor")
 }
 
 /// Messages for the adapter actor.

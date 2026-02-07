@@ -2,7 +2,6 @@
 //!
 //! This module serves as the boundary between Rust and Python, providing:
 //! - `format`: Request/response types for IPC serialization
-//! - `rpc`: IPC backend and client for cross-process communication
 //! - `pybindings`: PyO3 bindings exposed to Python
 //!
 //! # Architecture
@@ -13,7 +12,6 @@
 
 pub mod format;
 pub mod pybindings;
-pub mod rpc;
 
 // Re-export commonly used types at the module level
 pub use format::{
@@ -25,8 +23,9 @@ pub use format::{
     QUERY_ID, UPDATE_ADAPTER_ID, UPLOAD_ADAPTER_ID,
 };
 
-pub use rpc::{AsyncIpcClient, FfiIpcBackend, IpcChannels, IpcRequest, IpcResponse, RpcBackend};
+// RPC types re-exported for convenience
+pub use crate::inference::rpc::{IpcRequest, IpcResponse};
 
 pub use pybindings::{
-    _pie, FfiIpcQueue, PartialServerHandle, ServerConfig, ServerHandle,
+    _pie, PartialServerHandle, ServerConfig, ServerHandle,
 };

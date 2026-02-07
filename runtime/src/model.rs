@@ -14,7 +14,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::context;
-use crate::ffi::RpcBackend;
+use crate::inference::rpc::RpcClient;
 use crate::inference;
 use tokenizer::BytePairEncoder;
 
@@ -88,7 +88,7 @@ pub struct HandshakeResponse {
 
 /// Installs a new model by performing handshake with the backend.
 /// Returns the global model ID that can be used to access the model.
-pub async fn install_model_with_backend(backend: RpcBackend) -> Result<ModelId> {
+pub async fn install_model_with_backend(backend: RpcClient) -> Result<ModelId> {
     let resp = Model::handshake(&backend).await?;
     let model_name = resp.model_name.clone();
     let model = Model::from_handshake(resp);
@@ -120,7 +120,7 @@ pub async fn install_model_with_backend(backend: RpcBackend) -> Result<ModelId> 
 }
 
 /// Global storage for RPC backends (keyed by ModelId).
-static BACKENDS: LazyLock<RwLock<HashMap<ModelId, RpcBackend>>> =
+static BACKENDS: LazyLock<RwLock<HashMap<ModelId, RpcClient>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 
@@ -184,7 +184,7 @@ impl Model {
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Perform handshake with Python backend.
-    pub async fn handshake(backend: &RpcBackend) -> Result<HandshakeResponse> {
+    pub async fn handshake(backend: &RpcClient) -> Result<HandshakeResponse> {
         let req = HandshakeRequest {
             version: "0.1.0".to_string(),
         };

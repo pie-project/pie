@@ -36,9 +36,9 @@ pub fn spawn(config: ProgramManagerConfig) {
     // Scan disk on startup: load existing programs into index
     repository.load_program_cache();
 
-    ACTOR.spawn_with::<ProgramManagerActor, _>(|| {
+    ACTOR.spawn(|| {
         ProgramManagerActor::new(config.wasm_engine, repository)
-    });
+    }).expect("Program manager already spawned");
 }
 
 /// Sends a message to the Program Manager actor.

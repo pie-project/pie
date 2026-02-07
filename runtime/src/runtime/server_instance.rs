@@ -107,8 +107,8 @@ impl ServerInstanceActor {
         let port = config.port;
 
         // Create the actor entry in the registry first
-        let actor = Actor::new();
-        SERVER_INSTANCE_REGISTRY.insert(inst_id, actor);
+        let service = Service::new();
+        SERVER_INSTANCE_REGISTRY.insert(inst_id, service);
 
         let actor_ref = SERVER_INSTANCE_REGISTRY.get(&inst_id).unwrap();
 
@@ -125,14 +125,14 @@ impl ServerInstanceActor {
         ));
 
         // Spawn the actor with initialized state
-        actor_ref.spawn_with::<ServerInstanceActor, _>(|| ServerInstanceActor {
+        actor_ref.spawn(|| ServerInstanceActor {
             inst_id,
             username,
             program_name,
             port,
             start_time: Instant::now(),
             listener_handle: Some(listener_handle),
-        });
+        })?;
 
         Ok(inst_id)
     }

@@ -86,7 +86,7 @@ static ACTOR: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Spawns the Runtime actor with the given engine.
 pub fn spawn(engine: Engine) {
-    ACTOR.spawn_with::<RuntimeActor, _>(|| RuntimeActor::with_engine(engine));
+    ACTOR.spawn(|| RuntimeActor::with_engine(engine)).expect("Runtime already spawned");
 }
 
 /// Check if the runtime actor is spawned.
