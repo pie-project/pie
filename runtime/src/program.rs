@@ -27,17 +27,17 @@ pub use repository::Repository;
 static ACTOR: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Spawns the Program Manager actor with configuration.
-pub fn spawn(config: ProgramManagerConfig) {
+pub fn spawn(wasm_engine: WasmEngine, registry_url: String, cache_dir: PathBuf) {
     let mut repository = Repository::new(
-        config.registry_url.clone(),
-        config.cache_dir.clone(),
+        registry_url,
+        cache_dir,
     );
 
     // Scan disk on startup: load existing programs into index
     repository.load_program_cache();
 
     ACTOR.spawn(|| {
-        ProgramManagerActor::new(config.wasm_engine, repository)
+        ProgramManagerActor::new(wasm_engine, repository)
     }).expect("Program manager already spawned");
 }
 
@@ -149,17 +149,7 @@ pub async fn get_component(name: &ProgramName) -> Option<Component> {
     rx.await.ok().flatten()
 }
 
-// =============================================================================
-// Configuration
-// =============================================================================
 
-/// Configuration for the Program Manager.
-#[derive(Debug)]
-pub struct ProgramManagerConfig {
-    pub wasm_engine: WasmEngine,
-    pub registry_url: String,
-    pub cache_dir: PathBuf,
-}
 
 // =============================================================================
 // Messages

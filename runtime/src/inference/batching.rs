@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::kvcache::NodeId;
+use crate::kvcache::DeviceId;
 
 // =============================================================================
 // Configuration
@@ -284,21 +284,21 @@ impl AdaptiveScheduler {
 }
 
 // =============================================================================
-// Multi-Node Scheduler
+// Multi-Device Scheduler
 // =============================================================================
 
-/// Multi-node scheduler managing independent schedulers for each compute node.
-pub struct MultiNodeScheduler {
-    schedulers: HashMap<NodeId, AdaptiveScheduler>,
+/// Multi-device scheduler managing independent schedulers for each device.
+pub struct MultiDeviceScheduler {
+    schedulers: HashMap<DeviceId, AdaptiveScheduler>,
     config: SchedulerConfig,
     max_batch_size: usize,
 }
 
-impl MultiNodeScheduler {
-    pub fn new(config: SchedulerConfig, max_batch_size: usize, num_nodes: usize) -> Self {
+impl MultiDeviceScheduler {
+    pub fn new(config: SchedulerConfig, max_batch_size: usize, num_devices: usize) -> Self {
         let mut schedulers = HashMap::new();
-        for i in 0..num_nodes {
-            schedulers.insert(i as NodeId, AdaptiveScheduler::new(config.clone(), max_batch_size));
+        for i in 0..num_devices {
+            schedulers.insert(i as DeviceId, AdaptiveScheduler::new(config.clone(), max_batch_size));
         }
         
         Self {
@@ -308,34 +308,34 @@ impl MultiNodeScheduler {
         }
     }
 
-    pub fn on_request_arrival(&mut self, node_id: NodeId, arrival_time: Instant) {
-        if let Some(sched) = self.schedulers.get_mut(&node_id) {
+    pub fn on_request_arrival(&mut self, device_id: DeviceId, arrival_time: Instant) {
+        if let Some(sched) = self.schedulers.get_mut(&device_id) {
             sched.on_request_arrival(arrival_time);
         }
     }
 
-    pub fn on_batch_complete(&mut self, node_id: NodeId, batch_size: usize, total_tokens: usize, latency: Duration) {
-        if let Some(sched) = self.schedulers.get_mut(&node_id) {
+    pub fn on_batch_complete(&mut self, device_id: DeviceId, batch_size: usize, total_tokens: usize, latency: Duration) {
+        if let Some(sched) = self.schedulers.get_mut(&device_id) {
             sched.on_batch_complete(batch_size, total_tokens, latency);
         }
     }
 
-    pub fn on_batch_fired(&mut self, node_id: NodeId) {
-        if let Some(sched) = self.schedulers.get_mut(&node_id) {
+    pub fn on_batch_fired(&mut self, device_id: DeviceId) {
+        if let Some(sched) = self.schedulers.get_mut(&device_id) {
             sched.on_batch_fired();
         }
     }
 
     pub fn should_fire(
         &mut self,
-        node_id: NodeId,
+        device_id: DeviceId,
         current_batch_size: usize,
         current_total_tokens: usize,
         max_batch_size: usize,
         max_batch_tokens: usize,
         in_flight_batches: usize,
     ) -> bool {
-        if let Some(sched) = self.schedulers.get_mut(&node_id) {
+        if let Some(sched) = self.schedulers.get_mut(&device_id) {
             sched.should_fire(
                 current_batch_size,
                 current_total_tokens,
@@ -348,7 +348,7 @@ impl MultiNodeScheduler {
         }
     }
     
-    /// Get aggregate metrics across all nodes.
+    /// Get aggregate metrics across all devices.
     pub fn get_aggregate_metrics(&self) -> (f64, f64) {
         let mut total_tps = 0.0;
         let mut total_lat = 0.0;
@@ -367,4 +367,4 @@ impl MultiNodeScheduler {
 }
 
 /// Shared scheduler state wrapped in Arc<Mutex> for thread-safe access.
-pub type SharedScheduler = Arc<Mutex<MultiNodeScheduler>>;
+pub type SharedScheduler = Arc<Mutex<MultiDeviceScheduler>>;

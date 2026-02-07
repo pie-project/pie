@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use crate::auth;
 use crate::bootstrap::{self, Config as BootstrapConfig};
 use crate::inference::rpc::{RpcClient, RpcServer};
-use crate::telemetry::TelemetryConfig;
+use crate::bootstrap::{TelemetryConfig, AuthConfig as BootstrapAuthConfig};
 
 // =============================================================================
 // PyRpcServer - Thin PyO3 wrapper around RpcServer
@@ -171,16 +171,20 @@ impl From<ServerConfig> for BootstrapConfig {
         BootstrapConfig {
             host: cfg.host,
             port: cfg.port,
-            enable_auth: cfg.enable_auth,
+            auth: BootstrapAuthConfig {
+                enabled: cfg.enable_auth,
+                authorized_users_dir: PathBuf::new(),
+            },
             cache_dir: PathBuf::from(cfg.cache_dir),
             verbose: cfg.verbose,
             log_dir: cfg.log_dir.map(PathBuf::from),
-            registry: cfg.registry,
+            registry_url: cfg.registry,
             telemetry: TelemetryConfig {
                 enabled: cfg.telemetry_enabled,
                 endpoint: cfg.telemetry_endpoint,
                 service_name: cfg.telemetry_service_name,
             },
+            models: vec![],
         }
     }
 }
@@ -337,30 +341,18 @@ fn start_server_phase1(
         );
 
         let result = rt.block_on(async {
-            let authorized_users = match authorized_users_path {
-                Some(path) => auth::AuthorizedUsers::load(&PathBuf::from(path)).map_err(|e| {
-                    PyRuntimeError::new_err(format!("Failed to load authorized users: {}", e))
-                })?,
-                None => auth::AuthorizedUsers::default(),
-            };
-
-            let (ready_tx, ready_rx) = oneshot::channel();
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-            let bootstrap_config: BootstrapConfig = config.into();
+            let mut bootstrap_config: BootstrapConfig = config.into();
 
-            tokio::spawn(async move {
-                if let Err(e) =
-                    bootstrap::run_server(bootstrap_config, authorized_users, ready_tx, shutdown_rx)
-                        .await
-                {
-                    eprintln!("[PIE] Server error: {}", e);
-                }
-            });
+            // Set the authorized users path if provided
+            if let Some(path) = authorized_users_path {
+                bootstrap_config.auth.authorized_users_dir = PathBuf::from(path);
+            }
 
-            let internal_token = ready_rx.await.map_err(|e| {
-                PyRuntimeError::new_err(format!("Server failed to start: {}", e))
-            })?;
+            let internal_token = bootstrap::bootstrap(bootstrap_config)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Server failed to start: {}", e)))?;
 
             Ok::<(String, oneshot::Sender<()>), PyErr>((internal_token, shutdown_tx))
         })?;

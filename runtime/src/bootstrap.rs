@@ -1,64 +1,71 @@
 use anyhow::{Context, Result};
 // use ring::rand::{SecureRandom, SystemRandom};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use tokio::sync::oneshot;
+use std::sync::{Arc, RwLock};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use wasmtime::{Config as WasmConfig, Engine as WasmEngine};
 
+use crate::adapter;
 use crate::auth;
+use crate::context;
+use crate::inference;
+use crate::inference::rpc::RpcClient;
+use crate::kvcache::{DeviceId, PageStore};
 use crate::program;
 use crate::runtime;
 use crate::server;
-use crate::telemetry::{self, TelemetryConfig};
+use crate::telemetry;
 
-/// Configuration for the PIE engine.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub host: String,
     pub port: u16,
-    pub enable_auth: bool,
+    pub auth: AuthConfig,
     pub cache_dir: PathBuf,
     pub verbose: bool,
     pub log_dir: Option<PathBuf>,
-    pub registry: String,
+    pub registry_url: String,
     pub telemetry: TelemetryConfig,
+    pub models: Vec<ModelConfig>,
 }
 
-/// Runs the PIE server logic within an existing Tokio runtime.
-///
-/// This async function sets up all the engine's services and listens for a shutdown
-/// signal to terminate gracefully.
-pub async fn run_server(
-    config: Config,
-    authorized_users: auth::AuthorizedUsers,
-    ready_tx: oneshot::Sender<String>,
-    shutdown_rx: oneshot::Receiver<()>,
-) -> Result<()> {
-    // Install panic hook to exit process on any Rust panic.
-    // This ensures Python parent process is notified when Rust crashes.
-    std::panic::set_hook(Box::new(|panic_info| {
-        // Log the panic with location if available
-        let location = panic_info.location().map(|loc| {
-            format!("{}:{}:{}", loc.file(), loc.line(), loc.column())
-        }).unwrap_or_else(|| "unknown location".to_string());
-        
-        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "Unknown panic".to_string()
-        };
-        
-        eprintln!("\n[FATAL] Rust runtime panic at {}: {}", location, message);
-        eprintln!("[FATAL] Terminating process to signal Python shutdown.");
-        
-        // Exit with non-zero code to signal failure to Python
-        //std::process::exit(1);
-    }));
 
+#[derive(Debug, Clone)]
+pub struct ModelConfig {
+    pub name: String,
+    pub chat_template: String,
+    pub stop_tokens: Vec<String>,
+    pub kv_page_size: u32,
+    pub tokenizer_path: PathBuf,
+    pub devices: Vec<DeviceConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceConfig {
+    pub hostname: String,
+    pub total_pages: usize,
+    pub max_batch_tokens: usize,
+    pub max_batch_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub service_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthConfig {
+    pub enabled: bool,
+    pub authorized_users_dir: PathBuf,
+}
+
+pub async fn bootstrap(
+    config: Config,
+) -> Result<String> {
     // Initialize tracing with file logging if log_dir is specified
     init_tracing(&config.log_dir, config.verbose, &config.telemetry)?;
 
@@ -72,44 +79,60 @@ pub async fn run_server(
         err_msg
     })?;
 
-
-    let server_url = format!("{}:{}", config.host, config.port);
-
-    // Generate a random 64-character string for internal client connection authentication.
-    let internal_auth_token = crate::auth::generate_internal_auth_token()?;
-
     // Create the Wasmtime engine (shared between runtime and server)
-    let mut wasm_config = WasmConfig::default();
+    let mut wasm_config = wasmtime::Config::default();
     wasm_config.async_support(true);
 
     // TODO: Adjust settings later: https://docs.wasmtime.dev/api/wasmtime/struct.PoolingAllocationConfig.html
     // let mut pooling_config = PoolingAllocationConfig::default();
     // wasm_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
     
-    let wasm_engine = WasmEngine::new(&wasm_config).unwrap();
+    let wasm_engine = wasmtime::Engine::new(&wasm_config).unwrap();
 
-    // Spawn the program manager (owns program state: cache, registry downloads)
-    program::spawn(program::ProgramManagerConfig {
-        wasm_engine: wasm_engine.clone(),
-        registry_url: config.registry.clone(),
-        cache_dir: config.cache_dir.clone(),
-    });
 
-    // Spawn the auth actor (Actor-based auth)
-    auth::spawn(auth::AuthConfig {
-        enable_auth: config.enable_auth,
-        authorized_users,
-        internal_auth_token: internal_auth_token.clone(),
-    });
+    // Spawn the auth actor
+    auth::spawn(
+        config.auth.enabled,
+        &config.auth.authorized_users_dir,
+    );
+
+    program::spawn(
+        wasm_engine.clone(),
+        config.registry_url.clone(),
+        config.cache_dir.clone(),
+    );
 
     runtime::spawn(wasm_engine);
-    server::spawn(server_url);
+    server::spawn(&config.host, config.port);
 
-    ready_tx.send(internal_auth_token).unwrap();
+    // Spawn per-model services: context, adapter, inference
+    for model_config in &config.models {
+        let page_size = model_config.kv_page_size as usize;
+        let page_store = Arc::new(RwLock::new(PageStore::new(page_size)));
 
-    shutdown_rx.await?;
+        // Register devices in the page store
+        // Aggregate max_batch_size and max_batch_tokens across devices
+        let rpc_clients: HashMap<DeviceId, RpcClient> = HashMap::new();
+        let mut max_batch_size = 0;
+        let mut max_batch_tokens = 0;
 
-    Ok(())
+        for device in &model_config.devices {
+            let device_id = page_store.write().unwrap().register_device(device.total_pages);
+            max_batch_size = max_batch_size.max(device.max_batch_size);
+            max_batch_tokens = max_batch_tokens.max(device.max_batch_tokens);
+
+            // RPC clients are connected later during phase 2 (pybindings)
+            // via PartialServerHandle.complete()
+            let _ = (device_id, &device.hostname);
+        }
+
+        // Spawn services with shared page store
+        context::spawn(Arc::clone(&page_store), page_size);
+        adapter::spawn();
+        inference::spawn(page_store, max_batch_size, max_batch_tokens, rpc_clients);
+    }
+
+    Ok(auth::get_internal_auth_token().await?)
 }
 
 /// Initialize the tracing subscriber with optional file logging and OTLP export.
@@ -144,7 +167,10 @@ fn init_tracing(
             let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
             std::mem::forget(_guard);
 
-            if let Some(otel_layer) = telemetry::init_otel_layer(telemetry_config) {
+            if let Some(otel_layer) = telemetry::init_otel_layer(
+                &telemetry_config.endpoint,
+                &telemetry_config.service_name,
+            ) {
                 registry
                     .with(otel_layer)
                     .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
@@ -172,7 +198,10 @@ fn init_tracing(
         }
         // Stdout + OTLP
         (None, true) => {
-            if let Some(otel_layer) = telemetry::init_otel_layer(telemetry_config) {
+            if let Some(otel_layer) = telemetry::init_otel_layer(
+                &telemetry_config.endpoint,
+                &telemetry_config.service_name,
+            ) {
                 registry
                     .with(otel_layer)
                     .with(fmt::layer())

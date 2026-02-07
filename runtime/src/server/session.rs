@@ -273,7 +273,7 @@ impl Session {
             return Ok(true);
         }
 
-        if auth::get_user_keys(username.clone()).await?.is_none() {
+        if !auth::user_exists(username.clone()).await? {
             self.send_response(corr_id, false, format!("User '{}' is not authorized", username)).await;
             bail!("User '{}' is not authorized", username)
         }

@@ -46,7 +46,8 @@ pub type ClientId = u32;
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Starts the server on the given address.
-pub fn spawn(addr: String) {
+pub fn spawn(host: &str, port: u16) {
+    let addr = format!("{}:{}", host, port);
     SERVICE.spawn::<Server, _>(|| Server::new(addr)).expect("Server already spawned");
 }
 

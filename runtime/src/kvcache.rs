@@ -19,8 +19,8 @@ pub type PageId = usize;
 /// Physical page index in GPU memory
 pub type PhysicalPageId = u32;
 
-/// Node identifier
-pub type NodeId = u8;
+/// Device identifier
+pub type DeviceId = u8;
 
 /// Load threshold for spillover (fraction of capacity)
 const LOAD_THRESHOLD: f64 = 0.8;
@@ -28,8 +28,8 @@ const LOAD_THRESHOLD: f64 = 0.8;
 
 #[derive(Debug)]
 pub enum Mapping {
-    Single(NodeId, PhysicalPageId),
-    Replicated(Vec<(NodeId, PhysicalPageId)>),
+    Single(DeviceId, PhysicalPageId),
+    Replicated(Vec<(DeviceId, PhysicalPageId)>),
 }
 
 #[derive(Debug)]
@@ -45,16 +45,16 @@ impl Page {
         self.hash.is_none()
     }
 
-    fn node_id(&self) -> NodeId {
+    fn device_id(&self) -> DeviceId {
         match &self.mapping {
-            Mapping::Single(node_id, _) => *node_id,
+            Mapping::Single(device_id, _) => *device_id,
             Mapping::Replicated(mappings) => mappings[0].0,
         }
     }
 
-    /// Add mapping from another page, deduplicating by node.
+    /// Add mapping from another page, deduplicating by device.
     /// Returns redundant physical pages that should be freed.
-    fn add_mapping(&mut self, other: Mapping) -> Vec<(NodeId, PhysicalPageId)> {
+    fn add_mapping(&mut self, other: Mapping) -> Vec<(DeviceId, PhysicalPageId)> {
         let mut new_entries = match other {
             Mapping::Single(n, p) => vec![(n, p)],
             Mapping::Replicated(v) => v,
@@ -67,14 +67,14 @@ impl Page {
         
         let mut redundant = Vec::new();
         
-        // Deduplicate by node: keep first occurrence, mark rest as redundant
-        for (new_node, new_phys) in new_entries {
-            if let Some(_) = all_entries.iter().find(|(n, _)| *n == new_node) {
-                // Already have a page on this node, mark new one as redundant
-                redundant.push((new_node, new_phys));
+        // Deduplicate by device: keep first occurrence, mark rest as redundant
+        for (new_device, new_phys) in new_entries {
+            if let Some(_) = all_entries.iter().find(|(n, _)| *n == new_device) {
+                // Already have a page on this device, mark new one as redundant
+                redundant.push((new_device, new_phys));
             } else {
-                // New node, add it
-                all_entries.push((new_node, new_phys));
+                // New device, add it
+                all_entries.push((new_device, new_phys));
             }
         }
         
@@ -101,12 +101,12 @@ pub struct PageStore {
     free_page_ids: Vec<PageId>, // recycled page IDs
     lru: VecDeque<PageId>, // pages with refcount=0, front=oldest
 
-    /// Per-gpu storage
-    nodes: Vec<PhysicalPageStore>, // the index of node is the node id
+    /// Per-device storage
+    devices: Vec<PhysicalPageStore>,
 }
 
 
-// Per-gpu storage
+// Per-device physical page storage
 #[derive(Debug)]
 struct PhysicalPageStore {
     total_pages: usize,
@@ -144,7 +144,7 @@ impl PageStore {
             index: FxHashMap::default(),
             free_page_ids: Vec::new(),
             lru: VecDeque::new(),
-            nodes: Vec::new(),
+            devices: Vec::new(),
         }
     }
 
@@ -153,11 +153,11 @@ impl PageStore {
         self.page_size
     }
 
-    /// Register a new node/GPU and return its ID
-    pub fn register_node(&mut self, total_pages: usize) -> NodeId {
-        let node_id = self.nodes.len() as NodeId;
-        self.nodes.push(PhysicalPageStore::new(total_pages));
-        node_id
+    /// Register a new device and return its ID
+    pub fn register_device(&mut self, total_pages: usize) -> DeviceId {
+        let device_id = self.devices.len() as DeviceId;
+        self.devices.push(PhysicalPageStore::new(total_pages));
+        device_id
     }
 
     /// Compute hash chain from tokens.
@@ -303,8 +303,8 @@ impl PageStore {
                                 self.lru.retain(|&id| id != canonical_id);
                             }
                             let redundant = canonical_page.add_mapping(page.mapping);
-                            for (node_id, phys_id) in redundant {
-                                self.nodes[node_id as usize].free_pages.push(phys_id);
+                            for (device_id, phys_id) in redundant {
+                                self.devices[device_id as usize].free_pages.push(phys_id);
                             }
                             canonical_page.refcount += 1;
                         }
@@ -327,21 +327,21 @@ impl PageStore {
         Ok((final_page_ids, running_hash))
     }
 
-    /// Select the best node for allocation.
-    /// If affinity is specified, use that node. Otherwise, use the node with lowest load.
-    fn select_node(&self, affinity: Option<PageId>) -> Option<NodeId> {
-        if self.nodes.is_empty() {
+    /// Select the best device for allocation.
+    /// If affinity is specified, use that device. Otherwise, use the device with lowest load.
+    fn select_device(&self, affinity: Option<PageId>) -> Option<DeviceId> {
+        if self.devices.is_empty() {
             return None;
         }
 
         if let Some(affinity_page_id) = affinity {
             if let Some(page) = self.pages.get(affinity_page_id).and_then(|p| p.as_ref()) {
-                return Some(page.node_id());
+                return Some(page.device_id());
             }
         }
 
-        // Select node with lowest load
-        self.nodes
+        // Select device with lowest load
+        self.devices
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
@@ -349,17 +349,17 @@ impl PageStore {
                     .partial_cmp(&b.load_factor())
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(idx, _)| idx as NodeId)
+            .map(|(idx, _)| idx as DeviceId)
     }
 
     /// Try to evict one page from the LRU (must have refcount=0).
     /// Returns true if a page was evicted.
-    fn evict_one(&mut self, target_node: NodeId) -> bool {
-        // Find a page in LRU that belongs to the target node
+    fn evict_one(&mut self, target_device: DeviceId) -> bool {
+        // Find a page in LRU that belongs to the target device
         let mut evict_idx = None;
         for (i, &page_id) in self.lru.iter().enumerate() {
             if let Some(page) = self.pages[page_id].as_ref() {
-                if page.node_id() == target_node && page.refcount == 0 {
+                if page.device_id() == target_device && page.refcount == 0 {
                     evict_idx = Some(i);
                     break;
                 }
@@ -388,14 +388,14 @@ impl PageStore {
                 }
             }
 
-            // Return physical page to node
+            // Return physical page to device
             match page.mapping {
-                Mapping::Single(node_id, phys_id) => {
-                    self.nodes[node_id as usize].free_pages.push(phys_id);
+                Mapping::Single(device_id, phys_id) => {
+                    self.devices[device_id as usize].free_pages.push(phys_id);
                 }
                 Mapping::Replicated(mappings) => {
-                    for (node_id, phys_id) in mappings {
-                        self.nodes[node_id as usize].free_pages.push(phys_id);
+                    for (device_id, phys_id) in mappings {
+                        self.devices[device_id as usize].free_pages.push(phys_id);
                     }
                 }
             }
@@ -405,10 +405,10 @@ impl PageStore {
         }
     }
 
-    /// Allocate pages on a specific node.
+    /// Allocate pages on a specific device.
     pub fn allocate(&mut self, num_pages: usize, affinity: Option<PageId>) -> Result<Vec<PageId>> {
-        let node_id = self.select_node(affinity)
-            .ok_or_else(|| anyhow::anyhow!("No nodes registered"))?;
+        let device_id = self.select_device(affinity)
+            .ok_or_else(|| anyhow::anyhow!("No devices registered"))?;
 
         // Try to allocate, evicting if necessary
         let mut allocated = Vec::with_capacity(num_pages);
@@ -416,16 +416,16 @@ impl PageStore {
         for _ in 0..num_pages {
             // Try to get a free physical page, evicting if necessary
             let phys_id = loop {
-                if let Some(phys_id) = self.nodes[node_id as usize].free_pages.pop() {
+                if let Some(phys_id) = self.devices[device_id as usize].free_pages.pop() {
                     break phys_id;
                 }
-                // Try to evict a page from this node
-                if !self.evict_one(node_id) {
+                // Try to evict a page from this device
+                if !self.evict_one(device_id) {
                     // Failed to evict, rollback allocations
                     for page_id in allocated {
                         self.free_page(page_id);
                     }
-                    anyhow::bail!("Out of memory on node {}", node_id);
+                    anyhow::bail!("Out of memory on device {}", device_id);
                 }
             };
 
@@ -440,7 +440,7 @@ impl PageStore {
 
             // Create the page
             self.pages[page_id] = Some(Page {
-                mapping: Mapping::Single(node_id, phys_id),
+                mapping: Mapping::Single(device_id, phys_id),
                 hash: None, // mutable
                 refcount: 1,
                 max_position: None,
@@ -485,11 +485,11 @@ impl PageStore {
     }
 
     /// Get physical page mappings for a logical page.
-    /// Returns the (NodeId, PhysicalPageId) pairs for a page.
-    pub fn get_physical_mappings(&self, page_id: PageId) -> Vec<(NodeId, PhysicalPageId)> {
+    /// Returns the (DeviceId, PhysicalPageId) pairs for a page.
+    pub fn get_physical_mappings(&self, page_id: PageId) -> Vec<(DeviceId, PhysicalPageId)> {
         if let Some(Some(page)) = self.pages.get(page_id) {
             match &page.mapping {
-                Mapping::Single(node_id, phys_id) => vec![(*node_id, *phys_id)],
+                Mapping::Single(device_id, phys_id) => vec![(*device_id, *phys_id)],
                 Mapping::Replicated(mappings) => mappings.clone(),
             }
         } else {

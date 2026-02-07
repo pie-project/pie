@@ -35,207 +35,65 @@ use crate::service::{Service, ServiceHandler};
 // =============================================================================
 
 /// Global singleton Auth actor.
-static ACTOR: LazyLock<Service<Message>> = LazyLock::new(Service::new);
+static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
-/// Spawns the Auth actor with configuration.
-pub fn spawn(config: AuthConfig) {
-    ACTOR.spawn(|| AuthActor::with_config(config)).expect("Auth already spawned");
+/// Spawns the Auth actor.
+pub fn spawn(enable_auth: bool, authorized_users_path: &Path) {
+    SERVICE.spawn(|| AuthService::new(enable_auth, authorized_users_path)).expect("Auth already spawned");
 }
 
-/// Check if the auth actor is spawned.
-pub fn is_spawned() -> bool {
-    ACTOR.is_spawned()
-}
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
-/// Auth configuration.
-#[derive(Debug)]
-pub struct AuthConfig {
-    pub enable_auth: bool,
-    pub authorized_users: AuthorizedUsers,
-    pub internal_auth_token: String,
-}
-
-// =============================================================================
-// Messages
-// =============================================================================
-
-/// Messages for the Auth actor.
-#[derive(Debug)]
-pub enum Message {
-    /// Load authorized users from path
-    LoadUsers {
-        path: PathBuf,
-        response: oneshot::Sender<Result<()>>,
-    },
-
-    /// Save authorized users to path
-    SaveUsers {
-        path: PathBuf,
-        response: oneshot::Sender<Result<()>>,
-    },
-
-    /// Check if a username is authorized
-    IsUserAuthorized {
-        username: String,
-        response: oneshot::Sender<bool>,
-    },
-
-    /// Get public keys for a user (for challenge-response auth)
-    GetUserKeys {
-        username: String,
-        response: oneshot::Sender<Option<Vec<PublicKey>>>,
-    },
-
-    /// Verify a signature against all user keys
-    VerifySignature {
-        username: String,
-        challenge: Vec<u8>,
-        signature: Vec<u8>,
-        response: oneshot::Sender<bool>,
-    },
-
-    /// Verify internal auth token
-    VerifyInternalToken {
-        token: String,
-        response: oneshot::Sender<bool>,
-    },
-
-    /// Insert a new user
-    InsertUser {
-        username: String,
-        response: oneshot::Sender<InsertUserResult>,
-    },
-
-    /// Remove a user
-    RemoveUser {
-        username: String,
-        response: oneshot::Sender<RemoveUserResult>,
-    },
-
-    /// Insert a key for a user
-    InsertKey {
-        username: String,
-        key_name: String,
-        public_key: PublicKey,
-        response: oneshot::Sender<InsertKeyResult>,
-    },
-
-    /// Remove a key from a user
-    RemoveKey {
-        username: String,
-        key_name: String,
-        response: oneshot::Sender<RemoveKeyResult>,
-    },
-
-    /// Generate a new challenge for authentication
-    GenerateChallenge {
-        response: oneshot::Sender<Result<Vec<u8>>>,
-    },
-
-    /// List all users
-    ListUsers {
-        response: oneshot::Sender<Vec<String>>,
-    },
-
-    /// Check if auth is enabled
-    IsAuthEnabled {
-        response: oneshot::Sender<bool>,
-    },
-}
-
-impl Message {
-    /// Sends this message to the Auth actor.
-    pub fn send(self) -> anyhow::Result<()> {
-        ACTOR.send(self)
-    }
+pub fn send(msg: Message) -> anyhow::Result<()> {
+    SERVICE.send(msg)
 }
 
 // =============================================================================
 // Convenience Wrappers
 // =============================================================================
 
-/// Check if authentication is enabled.
-pub async fn is_auth_enabled() -> Result<bool> {
+/// Check if a user exists in the authorized users list.
+pub async fn user_exists(username: String) -> Result<bool> {
     let (tx, rx) = oneshot::channel();
-    Message::IsAuthEnabled { response: tx }.send()?;
+    send(Message::UserExists { username, response: tx })?;
     Ok(rx.await?)
 }
 
-/// Get public keys for a user (for challenge-response auth).
-pub async fn get_user_keys(username: String) -> Result<Option<Vec<PublicKey>>> {
+/// Check if authentication is enabled.
+pub async fn is_auth_enabled() -> Result<bool> {
     let (tx, rx) = oneshot::channel();
-    Message::GetUserKeys { username, response: tx }.send()?;
+    send(Message::IsAuthEnabled { response: tx })?;
     Ok(rx.await?)
 }
 
 /// Generate a new challenge for authentication.
 pub async fn generate_challenge() -> Result<Vec<u8>> {
     let (tx, rx) = oneshot::channel();
-    Message::GenerateChallenge { response: tx }.send()?;
+    send(Message::GenerateChallenge { response: tx })?;
     rx.await?
 }
 
 /// Verify a signature against all user keys.
 pub async fn verify_signature(username: String, challenge: Vec<u8>, signature: Vec<u8>) -> Result<bool> {
     let (tx, rx) = oneshot::channel();
-    Message::VerifySignature { username, challenge, signature, response: tx }.send()?;
+    send(Message::VerifySignature { username, challenge, signature, response: tx })?;
     Ok(rx.await?)
 }
 
 /// Verify internal auth token.
 pub async fn verify_internal_token(token: String) -> Result<bool> {
     let (tx, rx) = oneshot::channel();
-    Message::VerifyInternalToken { token, response: tx }.send()?;
+    send(Message::VerifyInternalToken { token, response: tx })?;
     Ok(rx.await?)
 }
 
-// =============================================================================
-// Result Types
-// =============================================================================
-
-/// Result of inserting a user
-#[derive(Debug, PartialEq)]
-pub enum InsertUserResult {
-    /// User was created
-    CreatedUser,
-    /// User already exists
-    UserExists,
+/// Get the internal auth token.
+pub async fn get_internal_auth_token() -> Result<String> {
+    let (tx, rx) = oneshot::channel();
+    send(Message::GetInternalAuthToken { response: tx })?;
+    Ok(rx.await?)
 }
 
-/// Result of inserting a key for a user
-#[derive(Debug, PartialEq)]
-pub enum InsertKeyResult {
-    /// Key was added successfully
-    AddedKey,
-    /// A key with this name already exists for this user
-    KeyNameExists,
-    /// User not found
-    UserNotFound,
-}
 
-/// Result of removing a key
-#[derive(Debug, PartialEq)]
-pub enum RemoveKeyResult {
-    /// Key was removed successfully
-    RemovedKey,
-    /// Key name not found for this user
-    KeyNotFound,
-    /// User not found
-    UserNotFound,
-}
-
-/// Result of removing a user
-#[derive(Debug, PartialEq)]
-pub enum RemoveUserResult {
-    /// User was removed
-    RemovedUser,
-    /// User not found
-    UserNotFound,
-}
 
 // =============================================================================
 // AuthService (Business Logic)
@@ -247,16 +105,28 @@ pub enum RemoveUserResult {
 pub struct AuthService {
     enable_auth: bool,
     authorized_users: AuthorizedUsers,
+    authorized_users_path: PathBuf,
     internal_auth_token: String,
     rng: SystemRandom,
 }
 
 impl AuthService {
-    pub fn new(config: AuthConfig) -> Self {
+    pub fn new(enable_auth: bool, authorized_users_path: &Path) -> Self {
+        let authorized_users = if enable_auth {
+            AuthorizedUsers::load(authorized_users_path)
+                .expect("Failed to load authorized users")
+        } else {
+            AuthorizedUsers::default()
+        };
+
+        let internal_auth_token = generate_internal_auth_token()
+            .expect("Failed to generate internal auth token");
+
         AuthService {
-            enable_auth: config.enable_auth,
-            authorized_users: config.authorized_users,
-            internal_auth_token: config.internal_auth_token,
+            enable_auth,
+            authorized_users,
+            authorized_users_path: authorized_users_path.to_path_buf(),
+            internal_auth_token,
             rng: SystemRandom::new(),
         }
     }
@@ -269,35 +139,31 @@ impl AuthService {
 
     // ==================== User Operations ====================
 
-    pub fn load_users(&mut self, path: &Path) -> Result<()> {
-        self.authorized_users = AuthorizedUsers::load(path)?;
-        Ok(())
+    fn save(&self) {
+        if let Err(e) = self.authorized_users.save(&self.authorized_users_path) {
+            tracing::error!("Failed to save authorized users: {e}");
+        }
     }
 
-    pub fn save_users(&self, path: &Path) -> Result<()> {
-        self.authorized_users.save(path)
-    }
-
-    pub fn is_user_authorized(&self, username: &str) -> bool {
+    pub fn user_exists(&self, username: &str) -> bool {
         self.authorized_users.get(username).is_some()
     }
 
-    pub fn get_user_keys(&self, username: &str) -> Option<Vec<PublicKey>> {
-        self.authorized_users
-            .get(username)
-            .map(|keys| keys.public_keys().cloned().collect())
-    }
 
     pub fn list_users(&self) -> Vec<String> {
         self.authorized_users.iter().map(|(k, _)| k.clone()).collect()
     }
 
-    pub fn insert_user(&mut self, username: &str) -> InsertUserResult {
-        self.authorized_users.insert_user(username)
+    pub fn insert_user(&mut self, username: &str) -> Result<()> {
+        self.authorized_users.insert_user(username)?;
+        self.save();
+        Ok(())
     }
 
-    pub fn remove_user(&mut self, username: &str) -> RemoveUserResult {
-        self.authorized_users.remove_user(username)
+    pub fn remove_user(&mut self, username: &str) -> Result<()> {
+        self.authorized_users.remove_user(username)?;
+        self.save();
+        Ok(())
     }
 
     pub fn insert_key(
@@ -305,12 +171,16 @@ impl AuthService {
         username: &str,
         key_name: String,
         public_key: PublicKey,
-    ) -> InsertKeyResult {
-        self.authorized_users.insert_key_for_user(username, key_name, public_key)
+    ) -> Result<()> {
+        self.authorized_users.insert_key_for_user(username, key_name, public_key)?;
+        self.save();
+        Ok(())
     }
 
-    pub fn remove_key(&mut self, username: &str, key_name: &str) -> RemoveKeyResult {
-        self.authorized_users.remove_key(username, key_name)
+    pub fn remove_key(&mut self, username: &str, key_name: &str) -> Result<()> {
+        self.authorized_users.remove_key(username, key_name)?;
+        self.save();
+        Ok(())
     }
 
     // ==================== Authentication ====================
@@ -342,58 +212,115 @@ impl AuthService {
 // AuthActor
 // =============================================================================
 
-struct AuthActor {
-    service: AuthService,
+
+
+// =============================================================================
+// Messages
+// =============================================================================
+
+/// Messages for the Auth actor.
+#[derive(Debug)]
+pub enum Message {
+
+    /// Check if a username is authorized
+    UserExists {
+        username: String,
+        response: oneshot::Sender<bool>,
+    },
+
+    /// Verify a signature against all user keys
+    VerifySignature {
+        username: String,
+        challenge: Vec<u8>,
+        signature: Vec<u8>,
+        response: oneshot::Sender<bool>,
+    },
+
+    /// Verify internal auth token
+    VerifyInternalToken {
+        token: String,
+        response: oneshot::Sender<bool>,
+    },
+
+    /// Insert a new user
+    InsertUser {
+        username: String,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Remove a user
+    RemoveUser {
+        username: String,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Insert a key for a user
+    InsertKey {
+        username: String,
+        key_name: String,
+        public_key: PublicKey,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Remove a key from a user
+    RemoveKey {
+        username: String,
+        key_name: String,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Generate a new challenge for authentication
+    GenerateChallenge {
+        response: oneshot::Sender<Result<Vec<u8>>>,
+    },
+
+    /// List all users
+    ListUsers {
+        response: oneshot::Sender<Vec<String>>,
+    },
+
+    /// Check if auth is enabled
+    IsAuthEnabled {
+        response: oneshot::Sender<bool>,
+    },
+
+    /// Get the internal auth token
+    GetInternalAuthToken {
+        response: oneshot::Sender<String>,
+    },
 }
 
-impl AuthActor {
-    fn with_config(config: AuthConfig) -> Self {
-        AuthActor {
-            service: AuthService::new(config),
-        }
-    }
-}
 
-impl ServiceHandler for AuthActor {
+impl ServiceHandler for AuthService {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::LoadUsers { path, response } => {
-                let result = self.service.load_users(&path);
+
+            Message::UserExists { username, response } => {
+                let result = self.user_exists(&username);
                 let _ = response.send(result);
             }
-            Message::SaveUsers { path, response } => {
-                let result = self.service.save_users(&path);
-                let _ = response.send(result);
-            }
-            Message::IsUserAuthorized { username, response } => {
-                let result = self.service.is_user_authorized(&username);
-                let _ = response.send(result);
-            }
-            Message::GetUserKeys { username, response } => {
-                let result = self.service.get_user_keys(&username);
-                let _ = response.send(result);
-            }
+
             Message::VerifySignature {
                 username,
                 challenge,
                 signature,
                 response,
             } => {
-                let result = self.service.verify_signature(&username, &challenge, &signature);
+                let result = self.verify_signature(&username, &challenge, &signature);
                 let _ = response.send(result);
             }
             Message::VerifyInternalToken { token, response } => {
-                let result = self.service.verify_internal_token(&token);
+                let result = self.verify_internal_token(&token);
                 let _ = response.send(result);
             }
             Message::InsertUser { username, response } => {
-                let result = self.service.insert_user(&username);
+                let result = self.insert_user(&username);
                 let _ = response.send(result);
             }
             Message::RemoveUser { username, response } => {
-                let result = self.service.remove_user(&username);
+                let result = self.remove_user(&username);
                 let _ = response.send(result);
             }
             Message::InsertKey {
@@ -402,7 +329,7 @@ impl ServiceHandler for AuthActor {
                 public_key,
                 response,
             } => {
-                let result = self.service.insert_key(&username, key_name, public_key);
+                let result = self.insert_key(&username, key_name, public_key);
                 let _ = response.send(result);
             }
             Message::RemoveKey {
@@ -410,20 +337,23 @@ impl ServiceHandler for AuthActor {
                 key_name,
                 response,
             } => {
-                let result = self.service.remove_key(&username, &key_name);
+                let result = self.remove_key(&username, &key_name);
                 let _ = response.send(result);
             }
             Message::GenerateChallenge { response } => {
-                let result = self.service.generate_challenge();
+                let result = self.generate_challenge();
                 let _ = response.send(result);
             }
             Message::ListUsers { response } => {
-                let result = self.service.list_users();
+                let result = self.list_users();
                 let _ = response.send(result);
             }
             Message::IsAuthEnabled { response } => {
-                let result = self.service.is_auth_enabled();
+                let result = self.is_auth_enabled();
                 let _ = response.send(result);
+            }
+            Message::GetInternalAuthToken { response } => {
+                let _ = response.send(self.internal_auth_token.clone());
             }
         }
     }
@@ -458,7 +388,7 @@ impl AuthorizedUsers {
         ))
     }
 
-    /// Saves the authorized users to the given TOML file.
+    /// Saves the authorized users to the given TOML file atomically.
     pub fn save(&self, auth_path: &Path) -> Result<()> {
         if let Some(parent) = auth_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -466,32 +396,38 @@ impl AuthorizedUsers {
             })?;
         }
 
-        // Check if file exists and handle permissions (Unix only)
+        // Check permissions if file already exists (Unix only)
         #[cfg(unix)]
-        {
-            // File exists, verify its permissions
-            if auth_path.exists() {
-                check_file_permissions(auth_path)?;
-            // File doesn't exist, create it with correct permissions
-            } else {
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(auth_path)
-                    .context(format!(
-                        "Failed to create authorized clients file at '{}'",
-                        auth_path.display()
-                    ))?;
-            }
+        if auth_path.exists() {
+            check_file_permissions(auth_path)?;
         }
 
         let content = toml::to_string_pretty(self)
-            .context(format!("Failed to serialize authorized users to TOML"))?;
-        fs::write(auth_path, content).context(format!(
-            "Failed to write authorized users file at {}",
-            auth_path.display()
-        ))
+            .context("Failed to serialize authorized users to TOML")?;
+
+        // Atomic save: write to temp file, then rename
+        let tmp_path = auth_path.with_extension("tmp");
+        fs::write(&tmp_path, &content).with_context(|| {
+            format!("Failed to write temp file at '{}'", tmp_path.display())
+        })?;
+
+        // Set restrictive permissions on the temp file before rename (Unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!("Failed to set permissions on '{}'", tmp_path.display())
+                })?;
+        }
+
+        fs::rename(&tmp_path, auth_path).with_context(|| {
+            format!(
+                "Failed to rename '{}' to '{}'",
+                tmp_path.display(),
+                auth_path.display()
+            )
+        })
     }
 
     /// Checks if the authorized users are empty.
@@ -515,12 +451,12 @@ impl AuthorizedUsers {
     }
 
     /// Inserts a new authorized user without any keys.
-    pub fn insert_user(&mut self, username: &str) -> InsertUserResult {
+    pub fn insert_user(&mut self, username: &str) -> Result<()> {
         if self.users.contains_key(username) {
-            InsertUserResult::UserExists
+            bail!("User '{}' already exists", username)
         } else {
             self.users.insert(username.to_owned(), UserKeys::new());
-            InsertUserResult::CreatedUser
+            Ok(())
         }
     }
 
@@ -531,39 +467,38 @@ impl AuthorizedUsers {
         username: &str,
         key_name: String,
         public_key: PublicKey,
-    ) -> InsertKeyResult {
+    ) -> Result<()> {
         if let Some(user_keys) = self.users.get_mut(username) {
             if user_keys.has_key_name(&key_name) {
-                InsertKeyResult::KeyNameExists
+                bail!("Key '{}' already exists for user '{}'", key_name, username)
             } else {
                 user_keys.insert_key(key_name, public_key);
-                InsertKeyResult::AddedKey
+                Ok(())
             }
         } else {
-            InsertKeyResult::UserNotFound
+            bail!("User '{}' not found", username)
         }
     }
 
     /// Removes a specific key from a user by key name.
-    pub fn remove_key(&mut self, username: &str, key_name: &str) -> RemoveKeyResult {
+    pub fn remove_key(&mut self, username: &str, key_name: &str) -> Result<()> {
         if let Some(user_keys) = self.users.get_mut(username) {
-            let removed = user_keys.remove_key(key_name);
-            if removed {
-                RemoveKeyResult::RemovedKey
+            if user_keys.remove_key(key_name) {
+                Ok(())
             } else {
-                RemoveKeyResult::KeyNotFound
+                bail!("Key '{}' not found for user '{}'", key_name, username)
             }
         } else {
-            RemoveKeyResult::UserNotFound
+            bail!("User '{}' not found", username)
         }
     }
 
     /// Removes an authorized user and all their public keys from the authorized users.
-    pub fn remove_user(&mut self, username: &str) -> RemoveUserResult {
+    pub fn remove_user(&mut self, username: &str) -> Result<()> {
         if self.users.remove(username).is_some() {
-            RemoveUserResult::RemovedUser
+            Ok(())
         } else {
-            RemoveUserResult::UserNotFound
+            bail!("User '{}' not found", username)
         }
     }
 }

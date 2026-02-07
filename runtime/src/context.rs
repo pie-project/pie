@@ -20,7 +20,7 @@ use anyhow::Result;
 use crate::service::{ServiceHandler, ServiceArray};
 use crate::adapter::AdapterId;
 use crate::inference::brle::Brle;
-use crate::kvcache::{PageId, PageStore, NodeId, PhysicalPageId, PageHash};
+use crate::kvcache::{PageId, PageStore, DeviceId, PhysicalPageId, PageHash};
 
 // =============================================================================
 // Public Types
@@ -37,8 +37,8 @@ pub type LockId = u64;
 static SERVICE_ARRAY: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 
 /// Spawns a new context manager for a model.
-pub fn spawn() -> usize {
-    SERVICE_ARRAY.spawn(|| ContextManager::default()).expect("Failed to spawn context manager")
+pub fn spawn(page_store: Arc<RwLock<PageStore>>, page_size: usize) -> usize {
+    SERVICE_ARRAY.spawn(move || ContextManager::new(page_store, page_size)).expect("Failed to spawn context manager")
 }
 
 /// Creates a new context with the given name.
@@ -488,22 +488,22 @@ impl ContextManager {
         }
     }
 
-    pub fn get_physical_page_ids(&self, id: ContextId) -> HashMap<NodeId, Vec<PhysicalPageId>> {
-        let mut result: HashMap<NodeId, Vec<PhysicalPageId>> = HashMap::new();
+    pub fn get_physical_page_ids(&self, id: ContextId) -> HashMap<DeviceId, Vec<PhysicalPageId>> {
+        let mut result: HashMap<DeviceId, Vec<PhysicalPageId>> = HashMap::new();
         
         if let Some(ctx) = self.contexts.get(&id) {
             let page_store = self.page_store.read().unwrap();
             
             // Get all committed pages and collect their physical mappings
             for &page_id in &ctx.pages_committed {
-                for (node_id, phys_id) in page_store.get_physical_mappings(page_id) {
-                    result.entry(node_id).or_default().push(phys_id);
+                for (device_id, phys_id) in page_store.get_physical_mappings(page_id) {
+                    result.entry(device_id).or_default().push(phys_id);
                 }
             }
             // Also include uncommitted pages
             for &page_id in &ctx.pages_uncommitted {
-                for (node_id, phys_id) in page_store.get_physical_mappings(page_id) {
-                    result.entry(node_id).or_default().push(phys_id);
+                for (device_id, phys_id) in page_store.get_physical_mappings(page_id) {
+                    result.entry(device_id).or_default().push(phys_id);
                 }
             }
         }
@@ -763,13 +763,7 @@ pub(crate) enum Message {
 }
 
 
-impl Default for ContextManager {
-    fn default() -> Self {
-        let page_size = 64;
-        let page_store = Arc::new(RwLock::new(PageStore::new(page_size)));
-        ContextManager::new(page_store, page_size)
-    }
-}
+
 
 impl ServiceHandler for ContextManager {
     type Message = Message;

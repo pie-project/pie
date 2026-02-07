@@ -13,9 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::context;
 use crate::inference::rpc::RpcClient;
-use crate::inference;
 use tokenizer::BytePairEncoder;
 
 /// Counter for generating unique model IDs.
@@ -110,11 +108,6 @@ pub async fn install_model_with_backend(backend: RpcClient) -> Result<ModelId> {
     if let Ok(mut backends) = BACKENDS.write() {
         backends.insert(model_id, backend);
     }
-
-    // Spawn the associated actors with the same model ID
-    // Note: PageStore is now owned by ContextManagerActor, so no separate kvcache actor
-    let _ = context::spawn();
-    let _ = inference::spawn();
 
     Ok(model_id)
 }

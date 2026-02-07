@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use crate::adapter::AdapterId;
 use super::brle::Brle;
-use crate::kvcache::{NodeId, PageId};
+use crate::kvcache::{DeviceId, PageId};
 
 /// Sampler configuration for token generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,12 +183,12 @@ pub struct BatchedForwardPassRequest {
     pub request_num_samplers: ByteVec,
     /// Adapter indices (optional per request).
     pub adapter_indices: Vec<Option<AdapterId>>,
-    /// Node ID for routing.
-    pub node_id: NodeId,
+    /// Device ID for routing.
+    pub device_id: DeviceId,
 }
 
 impl BatchedForwardPassRequest {
-    pub fn new(node_id: NodeId) -> Self {
+    pub fn new(device_id: DeviceId) -> Self {
         Self {
             token_ids: ByteVec(Vec::new()),
             position_ids: ByteVec(Vec::new()),
@@ -207,7 +207,7 @@ impl BatchedForwardPassRequest {
             sampler_types: ByteVec(Vec::new()),
             request_num_samplers: ByteVec(Vec::new()),
             adapter_indices: Vec::new(),
-            node_id,
+            device_id,
         }
     }
 
