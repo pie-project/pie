@@ -37,8 +37,8 @@ pub type LockId = u64;
 static SERVICE_ARRAY: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 
 /// Spawns a new context manager for a model.
-pub fn spawn(page_store: Arc<RwLock<PageStore>>, page_size: usize) -> usize {
-    SERVICE_ARRAY.spawn(move || ContextManager::new(page_store, page_size)).expect("Failed to spawn context manager")
+pub fn spawn(page_store: Arc<RwLock<PageStore>>) -> usize {
+    SERVICE_ARRAY.spawn(move || ContextManager::new(page_store)).expect("Failed to spawn context manager")
 }
 
 /// Creates a new context with the given name.
@@ -225,7 +225,8 @@ pub struct ContextManager {
 }
 
 impl ContextManager {
-    pub fn new(page_store: Arc<RwLock<PageStore>>, page_size: usize) -> Self {
+    pub fn new(page_store: Arc<RwLock<PageStore>>) -> Self {
+        let page_size = page_store.read().unwrap().page_size();
         ContextManager {
             page_store,
             contexts: DashMap::new(),

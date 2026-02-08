@@ -19,7 +19,7 @@ pub type LockId = u64;
 static ACTOR: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 
 /// Spawns a new adapter actor.
-pub(crate) fn spawn() -> usize {
+pub(crate) fn spawn(_device_configs: &[crate::bootstrap::DeviceConfig]) -> usize {
     ACTOR.spawn(|| AdapterActor::default()).expect("Failed to spawn adapter actor")
 }
 

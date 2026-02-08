@@ -496,20 +496,22 @@ impl<'a> Iterator for RunIterator<'a> {
     type Item = (bool, usize, usize); // (value, start_index, end_index)
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.buffer.len() {
-            return None;
+        // Skip zero-length runs so consumers never see (value, N, N)
+        while self.index < self.buffer.len() {
+            let run_len = self.buffer[self.index] as usize;
+            let value = self.index % 2 != 0;
+
+            let start = self.current_pos;
+            let end = self.current_pos + run_len;
+
+            self.current_pos = end;
+            self.index += 1;
+
+            if run_len > 0 {
+                return Some((value, start, end));
+            }
         }
-
-        let run_len = self.buffer[self.index] as usize;
-        let value = self.index % 2 != 0;
-
-        let start = self.current_pos;
-        let end = self.current_pos + run_len;
-
-        self.current_pos = end;
-        self.index += 1;
-
-        Some((value, start, end))
+        None
     }
 }
 

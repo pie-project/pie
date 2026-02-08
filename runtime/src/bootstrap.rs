@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 // use ring::rand::{SecureRandom, SystemRandom};
-use std::collections::HashMap;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -11,8 +11,8 @@ use crate::adapter;
 use crate::auth;
 use crate::context;
 use crate::inference;
-use crate::inference::rpc::RpcClient;
-use crate::kvcache::{DeviceId, PageStore};
+
+use crate::kvcache::PageStore;
 use crate::program;
 use crate::runtime;
 use crate::server;
@@ -37,7 +37,7 @@ pub struct ModelConfig {
     pub name: String,
     pub chat_template: String,
     pub stop_tokens: Vec<String>,
-    pub kv_page_size: u32,
+    pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
     pub devices: Vec<DeviceConfig>,
 }
@@ -48,6 +48,14 @@ pub struct DeviceConfig {
     pub total_pages: usize,
     pub max_batch_tokens: usize,
     pub max_batch_size: usize,
+    /// Maximum number of batches in flight per device (default: 3).
+    pub max_in_flight_batches: usize,
+    /// RPC request timeout in seconds (default: 30).
+    pub request_timeout_secs: u64,
+    /// Maximum wait time before forcing a batch fire, in ms (default: 50).
+    pub max_wait_ms: u64,
+    /// Minimum batch size before considering throughput optimization (default: 8).
+    pub min_batch_for_optimization: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -107,29 +115,12 @@ pub async fn bootstrap(
 
     // Spawn per-model services: context, adapter, inference
     for model_config in &config.models {
-        let page_size = model_config.kv_page_size as usize;
-        let page_store = Arc::new(RwLock::new(PageStore::new(page_size)));
-
-        // Register devices in the page store
-        // Aggregate max_batch_size and max_batch_tokens across devices
-        let rpc_clients: HashMap<DeviceId, RpcClient> = HashMap::new();
-        let mut max_batch_size = 0;
-        let mut max_batch_tokens = 0;
-
-        for device in &model_config.devices {
-            let device_id = page_store.write().unwrap().register_device(device.total_pages);
-            max_batch_size = max_batch_size.max(device.max_batch_size);
-            max_batch_tokens = max_batch_tokens.max(device.max_batch_tokens);
-
-            // RPC clients are connected later during phase 2 (pybindings)
-            // via PartialServerHandle.complete()
-            let _ = (device_id, &device.hostname);
-        }
+        let page_store = Arc::new(RwLock::new(PageStore::new(model_config.kv_page_size, &model_config.devices)));
 
         // Spawn services with shared page store
-        context::spawn(Arc::clone(&page_store), page_size);
-        adapter::spawn();
-        inference::spawn(page_store, max_batch_size, max_batch_tokens, rpc_clients);
+        context::spawn(page_store.clone());
+        inference::spawn(page_store, &model_config.devices);
+        adapter::spawn(&model_config.devices);
     }
 
     Ok(auth::get_internal_auth_token().await?)

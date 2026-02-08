@@ -137,27 +137,24 @@ impl PhysicalPageStore {
 
 
 impl PageStore {
-    pub fn new(page_size: usize) -> Self {
+    pub fn new(page_size: usize, device_configs: &[crate::bootstrap::DeviceConfig]) -> Self {
+        let devices = device_configs
+            .iter()
+            .map(|d| PhysicalPageStore::new(d.total_pages))
+            .collect();
         PageStore {
             page_size,
             pages: Vec::new(),
             index: FxHashMap::default(),
             free_page_ids: Vec::new(),
             lru: VecDeque::new(),
-            devices: Vec::new(),
+            devices,
         }
     }
 
     /// Get the page size (number of tokens per page)
     pub fn page_size(&self) -> usize {
         self.page_size
-    }
-
-    /// Register a new device and return its ID
-    pub fn register_device(&mut self, total_pages: usize) -> DeviceId {
-        let device_id = self.devices.len() as DeviceId;
-        self.devices.push(PhysicalPageStore::new(total_pages));
-        device_id
     }
 
     /// Compute hash chain from tokens.
