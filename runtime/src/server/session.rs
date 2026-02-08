@@ -438,9 +438,9 @@ impl Session {
                 corr_id,
                 inferlet,
                 arguments,
-                detached,
+                capture_outputs,
             } => {
-                self.handle_launch_instance(corr_id, inferlet, arguments, detached)
+                self.handle_launch_instance(corr_id, inferlet, arguments, capture_outputs)
                     .await
             }
 

@@ -491,7 +491,7 @@ class PieClient:
         self,
         inferlet: str,
         arguments: list[str] | None = None,
-        detached: bool = False,
+        capture_outputs: bool = True,
     ) -> Instance:
         """Launch an instance of a program.
 
@@ -505,7 +505,7 @@ class PieClient:
 
         :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
         :param arguments: Command-line arguments to pass to the inferlet.
-        :param detached: If True, the instance runs in detached mode.
+        :param capture_outputs: If True, the instance outputs are streamed to the client.
         :return: An Instance object for the launched inferlet.
         """
         corr_id = self._get_next_corr_id()
@@ -514,7 +514,7 @@ class PieClient:
             "corr_id": corr_id,
             "inferlet": inferlet,
             "arguments": arguments or [],
-            "detached": detached,
+            "capture_outputs": capture_outputs,
         }
 
         future = asyncio.get_event_loop().create_future()
@@ -529,7 +529,7 @@ class PieClient:
         raise Exception(f"Failed to launch instance: {instance_id}")
 
     async def launch_instance_from_registry(
-        self, inferlet: str, arguments: list[str] | None = None, detached: bool = False
+        self, inferlet: str, arguments: list[str] | None = None, capture_outputs: bool = True
     ) -> Instance:
         """
         Launch an instance of an inferlet from the registry only.
@@ -544,7 +544,7 @@ class PieClient:
 
         :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
         :param arguments: Command-line arguments to pass to the inferlet.
-        :param detached: If True, the instance runs in detached mode.
+        :param capture_outputs: If True, the instance outputs are streamed to the client.
         :return: An Instance object for the launched inferlet.
         """
         corr_id = self._get_next_corr_id()
@@ -553,7 +553,7 @@ class PieClient:
             "corr_id": corr_id,
             "inferlet": inferlet,
             "arguments": arguments or [],
-            "detached": detached,
+            "capture_outputs": capture_outputs,
         }
 
         future = asyncio.get_event_loop().create_future()

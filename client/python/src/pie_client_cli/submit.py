@@ -137,7 +137,7 @@ def handle_submit_command(
     port: Optional[int] = None,
     username: Optional[str] = None,
     private_key_path: Optional[Path] = None,
-    detached: bool = False,
+    capture_outputs: bool = True,
     link: Optional[list[Path]] = None,
     arguments: Optional[list[str]] = None,
 ) -> None:
@@ -154,7 +154,7 @@ def handle_submit_command(
     3. If using path and libraries are specified, composes them with the inferlet using wac
     4. Uploads the composed inferlet if not already on server (path mode only)
     5. Launches the inferlet with the provided arguments
-    6. In non-detached mode, streams the inferlet output with signal handling
+    6. When capturing outputs, streams the inferlet output with signal handling
     """
     # Validate at least one of inferlet or path is provided
     if inferlet is None and path is None:
@@ -226,7 +226,7 @@ def handle_submit_command(
                 client,
                 inferlet_name,
                 arguments,
-                detached,
+                capture_outputs,
             )
         else:
             # Launch from registry
@@ -242,12 +242,12 @@ def handle_submit_command(
                 client,
                 inferlet,
                 arguments,
-                detached,
+                capture_outputs,
             )
 
         typer.echo(f"✅ Inferlet launched with ID: {instance.instance_id}")
 
-        if not detached:
+        if capture_outputs:
             engine.stream_inferlet_output(instance, client)
 
     finally:

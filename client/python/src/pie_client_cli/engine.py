@@ -363,7 +363,7 @@ def launch_instance(
     client: PieClient,
     inferlet: str,
     arguments: list[str],
-    detached: bool = False,
+    capture_outputs: bool = True,
 ) -> Instance:
     """Launch an instance (sync wrapper).
 
@@ -376,7 +376,7 @@ def launch_instance(
     - Without version (defaults to "latest"): "text-completion"
     """
     return asyncio.get_event_loop().run_until_complete(
-        client.launch_instance(inferlet, arguments, detached)
+        client.launch_instance(inferlet, arguments, capture_outputs)
     )
 
 
@@ -384,7 +384,7 @@ def launch_instance_from_registry(
     client: PieClient,
     inferlet: str,
     arguments: list[str],
-    detached: bool = False,
+    capture_outputs: bool = True,
 ) -> Instance:
     """Launch an instance from the registry only (sync wrapper).
 
@@ -397,7 +397,7 @@ def launch_instance_from_registry(
     - Without version (defaults to "latest"): "text-completion"
     """
     return asyncio.get_event_loop().run_until_complete(
-        client.launch_instance_from_registry(inferlet, arguments, detached)
+        client.launch_instance_from_registry(inferlet, arguments, capture_outputs)
     )
 
 

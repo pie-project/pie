@@ -438,14 +438,14 @@ impl Client {
         &self,
         inferlet: String,
         arguments: Vec<String>,
-        detached: bool,
+        capture_outputs: bool,
     ) -> Result<Instance> {
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let msg = ClientMessage::LaunchInstance {
             corr_id: *corr_id_guard,
             inferlet,
             arguments,
-            detached,
+            capture_outputs,
         };
 
         let (tx, rx) = oneshot::channel();

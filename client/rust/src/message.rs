@@ -89,7 +89,7 @@ pub enum ClientMessage {
         corr_id: u32,
         inferlet: String,
         arguments: Vec<String>,
-        detached: bool,
+        capture_outputs: bool,
     },
 
     #[serde(rename = "attach_instance")]

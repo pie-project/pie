@@ -143,7 +143,7 @@ impl Session {
         corr_id: u32,
         inferlet: String,
         arguments: Vec<String>,
-        detached: bool,
+        capture_outputs: bool,
     ) {
         let program_name = ProgramName::parse(&inferlet);
 
@@ -158,12 +158,12 @@ impl Session {
             self.username.clone(),
             program_name.to_string(),
             arguments,
-            detached,
+            capture_outputs,
         )
         .await
         {
             Ok(instance_id) => {
-                if !detached {
+                if capture_outputs {
                     // Register instance -> client mapping with Server
                     super::register_instance(instance_id, self.id)
                     .ok();

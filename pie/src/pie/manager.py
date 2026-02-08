@@ -1042,7 +1042,7 @@ async def _submit_inferlet_async(
             instance = await client.launch_instance(
                 inferlet_name,
                 arguments=arguments,
-                detached=False,
+                capture_outputs=True,
             )
             emit("info", f"Instance launched: {instance.instance_id}")
 
@@ -1190,7 +1190,7 @@ async def _submit_inferlet_from_registry_async(
             instance = await client.launch_instance_from_registry(
                 inferlet=inferlet_name,
                 arguments=arguments,
-                detached=False,
+                capture_outputs=True,
             )
 
             # Stream events until completion

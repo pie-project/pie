@@ -408,15 +408,15 @@ export class PieClient {
      *
      * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
      * @param {string[]} [args=[]] Optional command-line arguments.
-     * @param {boolean} [detached=false] If true, the instance runs in detached mode.
+     * @param {boolean} [captureOutputs=true] If true, instance outputs are streamed to the client.
      * @returns {Promise<Instance>}
      */
-    async launchInstance(inferlet, args = [], detached = false) {
+    async launchInstance(inferlet, args = [], captureOutputs = true) {
         const msg = {
             type: "launch_instance",
             inferlet: inferlet,
             arguments: args,
-            detached: detached,
+            capture_outputs: captureOutputs,
         };
         const { successful, result } = await this._sendMsgAndWait(msg);
         if (successful) {
@@ -441,15 +441,15 @@ export class PieClient {
      * 
      * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
      * @param {string[]} [args=[]] Optional command-line arguments.
-     * @param {boolean} [detached=false] If true, the instance runs in detached mode.
+     * @param {boolean} [captureOutputs=true] If true, instance outputs are streamed to the client.
      * @returns {Promise<Instance>}
      */
-    async launchInstanceFromRegistry(inferlet, args = [], detached = false) {
+    async launchInstanceFromRegistry(inferlet, args = [], captureOutputs = true) {
         const msg = {
             type: "launch_instance_from_registry",
             inferlet: inferlet,
             arguments: args,
-            detached: detached,
+            capture_outputs: captureOutputs,
         };
         const { successful, result } = await this._sendMsgAndWait(msg);
         if (successful) {

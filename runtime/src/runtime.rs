@@ -100,14 +100,14 @@ pub async fn launch_instance(
     username: String,
     program_name: String,
     arguments: Vec<String>,
-    detached: bool,
+    capture_outputs: bool,
 ) -> anyhow::Result<InstanceId> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::LaunchInstance {
         username,
         program_name,
         arguments,
-        detached,
+        detached: !capture_outputs,
         response: tx,
     })?;
     rx.await?
@@ -237,7 +237,7 @@ impl Runtime {
         username: String,
         program_name: String,
         arguments: Vec<String>,
-        detached: bool,
+        capture_outputs: bool,
     ) -> anyhow::Result<InstanceId> {
         let component = program::get_wasm_component(&program::ProgramName::parse(&program_name))
             .await
@@ -250,7 +250,7 @@ impl Runtime {
             username,
             program_name,
             arguments,
-            detached,
+            detached: !capture_outputs,
             component,
             engine: self.engine.clone(),
             linker: self.linker.clone(),
@@ -381,7 +381,7 @@ impl ServiceHandler for Runtime {
                 let _ = response.send(self.get_version());
             }
             Message::LaunchInstance { username, program_name, arguments, detached, response } => {
-                let _ = response.send(self.launch_instance(username, program_name, arguments, detached).await);
+                let _ = response.send(self.launch_instance(username, program_name, arguments, !detached).await);
             }
             Message::LaunchServerInstance { username, program_name, port, arguments, response } => {
                 let _ = response.send(self.launch_server_instance(username, program_name, port, arguments).await);
