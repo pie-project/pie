@@ -1,8 +1,22 @@
 use base64::{Engine as _, engine::general_purpose};
 use fancy_regex::Regex;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 pub type Rank = u32;
+
+/// JSON schema for a serialized tokenizer config file.
+#[derive(Deserialize)]
+struct TokenizerConfig {
+    num_vocab: usize,
+    /// Map from rank (as string key) to base64-encoded token bytes.
+    merge_table: HashMap<String, String>,
+    /// Map from special token string to its rank.
+    special_tokens: HashMap<String, Rank>,
+    split_regex: String,
+    escape_non_printable: bool,
+    sentencepiece_space: bool,
+}
 
 // The code below is copied from the tiktoken.
 // https://github.com/openai/tiktoken/blob/main/src/lib.rs
@@ -269,6 +283,47 @@ impl BytePairEncoder {
             escape_non_printable,
             sentencepiece_space,
         }
+    }
+
+    /// Load a tokenizer from a JSON config file.
+    ///
+    /// Expected JSON format:
+    /// ```json
+    /// {
+    ///   "num_vocab": 32000,
+    ///   "merge_table": { "0": "<base64>", "1": "<base64>", ... },
+    ///   "special_tokens": { "<eos>": 2, "<bos>": 1 },
+    ///   "split_regex": "...",
+    ///   "escape_non_printable": false,
+    ///   "sentencepiece_space": false
+    /// }
+    /// ```
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        let contents = fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read tokenizer file {path:?}: {e}"))?;
+
+        let config: TokenizerConfig = serde_json::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("Failed to parse tokenizer JSON {path:?}: {e}"))?;
+
+        // Decode base64 merge table entries into rank -> bytes
+        let mut decoder = HashMap::with_capacity(config.merge_table.len());
+        for (rank_str, b64_token) in &config.merge_table {
+            let rank: Rank = rank_str.parse()
+                .map_err(|e| anyhow::anyhow!("Invalid rank key {rank_str:?}: {e}"))?;
+            let token_bytes = general_purpose::STANDARD
+                .decode(b64_token)
+                .map_err(|e| anyhow::anyhow!("Invalid base64 for rank {rank}: {e}"))?;
+            decoder.insert(rank, token_bytes);
+        }
+
+        Ok(Self::new(
+            config.num_vocab,
+            decoder,
+            config.special_tokens,
+            &config.split_regex,
+            config.escape_non_printable,
+            config.sentencepiece_space,
+        ))
     }
 
     pub fn encode_with_special_tokens(&self, text: &str) -> Vec<Rank> {

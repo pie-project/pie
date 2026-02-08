@@ -237,7 +237,7 @@ impl ServerHandle {
 
     /// Get list of registered model names (backends that have connected).
     fn registered_models(&self) -> Vec<String> {
-        crate::model::registered_models()
+        crate::model::models()
     }
 
     fn __repr__(&self) -> String {
@@ -286,11 +286,9 @@ impl PartialServerHandle {
                         ))
                     })?;
 
-                    let model_id = model::install_model_with_backend(client)
-                        .await
-                        .map_err(|e| {
-                            PyRuntimeError::new_err(format!("Failed to install model: {}", e))
-                        })?;
+                    // TODO: model registration is now done via model::register()
+                    // The RPC client should be stored in the device service
+                    let model_id = 0usize;
                     tracing::info!("Installed model with ID: {}", model_id);
                 }
 

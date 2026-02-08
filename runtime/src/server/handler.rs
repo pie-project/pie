@@ -14,7 +14,7 @@ use crate::program::{self, Manifest, ProgramName};
 use crate::runtime::{self, AttachInstanceResult};
 
 use super::session::Session;
-use super::upload::{ChunkResult, InFlightUpload};
+use super::data_transfer::{ChunkResult, InFlightUpload};
 
 // =============================================================================
 // Query Handlers

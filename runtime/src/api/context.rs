@@ -134,7 +134,7 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = ctx.model_id;
 
         if let Some(m) = crate::model::get_model(model_id) {
-            let model = Model { model_id, info: m.info, tokenizer: m.tokenizer };
+            let model = Model { model_id, model: m.clone() };
             return Ok(self.ctx().table.push(model)?);
         }
 

@@ -104,6 +104,8 @@ pub struct PageStore {
 struct Inner {
     /// Tokens per page (immutable after construction).
     page_size: usize,
+    /// Device indices (immutable after construction).
+    devices: Vec<usize>,
     /// Logical page metadata (pages, index, free list, LRU).
     page_table: RwLock<PageTable>,
     /// Per-device physical page storage.
@@ -166,6 +168,7 @@ impl PageStore {
         PageStore {
             inner: Arc::new(Inner {
                 page_size,
+                devices: device_indices.to_vec(),
                 page_table: RwLock::new(PageTable {
                     pages: Vec::new(),
                     index: FxHashMap::default(),
@@ -175,6 +178,10 @@ impl PageStore {
                 phys_page_tables,
             }),
         }
+    }
+
+    pub fn devices(&self) -> &[usize] {
+        &self.inner.devices
     }
 
     /// Get the page size (number of tokens per page).

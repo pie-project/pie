@@ -5,275 +5,128 @@
 
 pub mod tokenizer;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, RwLock};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-
-use crate::device::RpcClient;
 use tokenizer::BytePairEncoder;
 
-/// Counter for generating unique model IDs.
-static MODEL_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-/// Global registry mapping model names to model IDs.
-static NAME_REGISTRY: LazyLock<RwLock<HashMap<String, ModelId>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
 /// Global cache for models (keyed by ModelId).
-static MODELS: LazyLock<RwLock<HashMap<ModelId, Model>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static MODELS: LazyLock<boxcar::Vec<Model>> =
+    LazyLock::new(|| boxcar::Vec::new());
 
 /// Type alias for model identifiers.
 pub type ModelId = usize;
 
 /// Looks up a model by name and returns its model ID.
-pub fn model_id(model_name: &str) -> Option<ModelId> {
-    NAME_REGISTRY.read().ok()?.get(model_name).copied()
+pub fn get_model_id(model_name: &str) -> Option<ModelId> {
+    for (model_id, model) in MODELS.iter() {
+        if model.name() == model_name {
+            return Some(model_id);
+        }
+    }
+    None
+}
+
+pub fn register(
+    name: String,
+    chat_template: String,
+    stop_tokens: Vec<u32>,
+    kv_page_size: u32,
+    tokenizer_path: PathBuf,
+) -> Result<()> {
+    let tokenizer = BytePairEncoder::load(&tokenizer_path)?;
+    let model = Model {
+        inner: Arc::new(Inner {
+            name,
+            chat_template,
+            stop_tokens,
+            kv_page_size,
+            tokenizer,
+        }),
+    };
+    MODELS.push(model);
+    Ok(())
 }
 
 /// Returns a list of all registered model names.
-pub fn registered_models() -> Vec<String> {
-    NAME_REGISTRY
-        .read()
-        .map(|r| r.keys().cloned().collect())
-        .unwrap_or_default()
+pub fn models() -> Vec<String> {
+    MODELS.iter().map(|(_, model)| model.name().to_string()).collect()
 }
 
 /// Gets cached model by model ID.
-pub fn get_model(model_id: ModelId) -> Option<Model> {
-    MODELS.read().ok()?.get(&model_id).cloned()
+pub fn get_model(model_id: ModelId) -> Option<&'static Model> {
+    MODELS.get(model_id)
 }
 
 // =============================================================================
-// Handshake Types
+// Model
 // =============================================================================
 
-/// Handshake request sent to Python backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HandshakeRequest {
-    pub version: String,
-}
-
-/// Handshake response from Python backend.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HandshakeResponse {
-    pub version: String,
-    pub model_name: String,
-    pub model_traits: Vec<String>,
-    pub model_description: String,
-    pub prompt_template: String,
-    pub prompt_template_type: String,
-    pub prompt_stop_tokens: Vec<String>,
-    pub kv_page_size: u32,
-    pub max_batch_tokens: usize,
-    pub max_batch_size: usize,
-    pub resources: HashMap<u32, u32>,
-    pub tokenizer_num_vocab: usize,
-    pub tokenizer_merge_table: HashMap<u32, Vec<u8>>,
-    pub tokenizer_special_tokens: HashMap<String, u32>,
-    pub tokenizer_split_regex: String,
-    pub tokenizer_escape_non_printable: bool,
-    pub tokenizer_sentencepiece_space: bool,
-}
-
-// =============================================================================
-// Public API
-// =============================================================================
-
-/// Installs a new model by performing handshake with the backend.
-/// Returns the global model ID that can be used to access the model.
-pub async fn install_model_with_backend(backend: RpcClient) -> Result<ModelId> {
-    let resp = Model::handshake(&backend).await?;
-    let model_name = resp.model_name.clone();
-    let model = Model::from_handshake(resp);
-
-    // Generate a unique model ID
-    let model_id = MODEL_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-
-    // Register the model name
-    if let Ok(mut registry) = NAME_REGISTRY.write() {
-        registry.insert(model_name, model_id);
-    }
-
-    // Store in the global cache
-    if let Ok(mut cache) = MODELS.write() {
-        cache.insert(model_id, model);
-    }
-
-    // Store the backend for RPC calls
-    if let Ok(mut backends) = BACKENDS.write() {
-        backends.insert(model_id, backend);
-    }
-
-    Ok(model_id)
-}
-
-/// Global storage for RPC backends (keyed by ModelId).
-static BACKENDS: LazyLock<RwLock<HashMap<ModelId, RpcClient>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
-
-// =============================================================================
-// Model Info
-// =============================================================================
-
-/// Model information.
-#[derive(Debug, Clone)]
-pub struct ModelInfo {
-    pub name: String,
-    pub traits: Vec<String>,
-    pub description: String,
-    pub prompt_template: String,
-    pub prompt_template_type: String,
-    pub stop_tokens: Vec<String>,
-    pub stop_token_ids: Vec<u32>,
-    pub kv_page_size: u32,
-    pub max_batch_tokens: usize,
-}
-
-impl Default for ModelInfo {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            traits: Vec::new(),
-            description: String::new(),
-            prompt_template: String::new(),
-            prompt_template_type: String::new(),
-            stop_tokens: Vec::new(),
-            stop_token_ids: Vec::new(),
-            kv_page_size: 0,
-            max_batch_tokens: 0,
-        }
-    }
-}
-
-/// Tokenizer information (for external queries).
-#[derive(Debug, Clone)]
-pub struct TokenizerInfo {
-    pub vocabs: (Vec<u32>, Vec<Vec<u8>>),
-    pub split_regex: String,
-    pub special_tokens: (Vec<u32>, Vec<Vec<u8>>),
-}
-
-// =============================================================================
-// Model - Business Logic
-// =============================================================================
-
-/// The model service handles model metadata and tokenization.
-///
-/// This is the core business logic, separate from the actor message handling.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Model {
-    pub info: Arc<ModelInfo>,
-    pub tokenizer: Arc<BytePairEncoder>,
+    inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Model")
+            .field("name", &self.inner.name)
+            .finish()
+    }
+}
+
+struct Inner {
+    name: String,
+    chat_template: String,
+    stop_tokens: Vec<u32>,
+    kv_page_size: u32,
+    tokenizer: BytePairEncoder,
 }
 
 impl Model {
-    /// Handshake timeout.
-    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-
-    /// Perform handshake with Python backend.
-    pub async fn handshake(backend: &RpcClient) -> Result<HandshakeResponse> {
-        let req = HandshakeRequest {
-            version: "0.1.0".to_string(),
-        };
-        let payload = rmp_serde::to_vec_named(&req)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize handshake: {e}"))?;
-        let response = tokio::time::timeout(Self::HANDSHAKE_TIMEOUT, backend.call("handshake", payload))
-            .await
-            .map_err(|_| anyhow::anyhow!("Handshake timed out"))??;
-        rmp_serde::from_slice(&response)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize handshake response: {e}"))
-    }
-
-    /// Create from handshake response.
-    pub fn from_handshake(resp: HandshakeResponse) -> Self {
-        let tokenizer = Arc::new(BytePairEncoder::new(
-            resp.tokenizer_num_vocab,
-            resp.tokenizer_merge_table.into_iter().collect(),
-            resp.tokenizer_special_tokens,
-            &resp.tokenizer_split_regex,
-            resp.tokenizer_escape_non_printable,
-            resp.tokenizer_sentencepiece_space,
-        ));
-
-        // Compute stop_token_ids by tokenizing the stop_tokens
-        let stop_token_ids: Vec<u32> = resp.prompt_stop_tokens
-            .iter()
-            .flat_map(|s| tokenizer.encode_with_special_tokens(s))
-            .collect();
-
-        let info = Arc::new(ModelInfo {
-            name: resp.model_name,
-            traits: resp.model_traits,
-            description: resp.model_description,
-            prompt_template: resp.prompt_template,
-            prompt_template_type: resp.prompt_template_type,
-            stop_tokens: resp.prompt_stop_tokens,
-            stop_token_ids,
-            kv_page_size: resp.kv_page_size,
-            max_batch_tokens: resp.max_batch_tokens,
-        });
-
-        Model { info, tokenizer }
-    }
-
     /// Gets the model name.
     pub fn name(&self) -> &str {
-        &self.info.name
+        &self.inner.name
     }
 
-    /// Gets the prompt template.
-    pub fn get_prompt_template(&self) -> String {
-        self.info.prompt_template.clone()
+    /// Gets the chat template.
+    pub fn chat_template(&self) -> &str {
+        &self.inner.chat_template
     }
 
     /// Tokenizes text into token IDs.
     pub fn tokenize(&self, text: &str) -> Vec<u32> {
-        self.tokenizer.encode_with_special_tokens(text)
+        self.inner.tokenizer.encode_with_special_tokens(text)
     }
 
     /// Detokenizes token IDs into text.
     pub fn detokenize(&self, tokens: &[u32]) -> String {
-        self.tokenizer.decode(tokens).unwrap_or_default()
+        self.inner.tokenizer.decode(tokens).unwrap_or_default()
     }
 
     /// Gets the vocabulary.
     pub fn get_vocabs(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        self.tokenizer.get_vocabs()
+        self.inner.tokenizer.get_vocabs()
     }
 
     /// Gets the split regex.
     pub fn get_split_regex(&self) -> String {
-        self.tokenizer.get_split_regex()
+        self.inner.tokenizer.get_split_regex()
     }
 
     /// Gets the special tokens.
     pub fn get_special_tokens(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        self.tokenizer.get_special_tokens()
-    }
-
-    /// Gets a clone of the tokenizer Arc.
-    pub fn tokenizer(&self) -> Arc<BytePairEncoder> {
-        Arc::clone(&self.tokenizer)
+        self.inner.tokenizer.get_special_tokens()
     }
 
     /// Gets the stop tokens.
-    pub fn get_stop_tokens(&self) -> Vec<u32> {
-        self.info.stop_token_ids.clone()
+    pub fn stop_tokens(&self) -> &[u32] {
+        &self.inner.stop_tokens
     }
 
     /// Gets the KV page size.
     pub fn kv_page_size(&self) -> u32 {
-        self.info.kv_page_size
-    }
-
-    /// Gets the max batch tokens.
-    pub fn max_batch_tokens(&self) -> usize {
-        self.info.max_batch_tokens
+        self.inner.kv_page_size
     }
 }

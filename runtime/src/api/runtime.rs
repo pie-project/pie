@@ -26,7 +26,7 @@ impl pie::core::runtime::Host for InstanceState {
     }
 
     async fn models(&mut self) -> Result<Vec<String>> {
-        Ok(model::registered_models())
+        Ok(model::models())
     }
 
     async fn spawn(

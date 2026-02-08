@@ -11,8 +11,8 @@ use crate::auth;
 use crate::context;
 use crate::device;
 use crate::inference;
-
 use crate::inference::kvcache::PageStore;
+use crate::model;
 use crate::program;
 use crate::runtime;
 use crate::server;
@@ -35,7 +35,7 @@ pub struct Config {
 pub struct ModelConfig {
     pub name: String,
     pub chat_template: String,
-    pub stop_tokens: Vec<String>,
+    pub stop_tokens: Vec<u32>,
     pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
     pub devices: Vec<DeviceConfig>,
@@ -96,6 +96,14 @@ pub async fn bootstrap(
 
     for cfg in config.models.iter() {
 
+        model::register(
+            cfg.name.clone(),
+            cfg.chat_template.clone(),
+            cfg.stop_tokens.clone(),
+            cfg.kv_page_size as u32,
+            cfg.tokenizer_path.clone(),
+        )?;
+
         let devices: Vec<usize> = cfg.devices.iter().map(|d| {
             device::spawn(&d.hostname, d.total_pages, d.max_batch_size, d.max_batch_tokens)
         }).collect();
@@ -103,7 +111,13 @@ pub async fn bootstrap(
         let page_store = PageStore::new(cfg.kv_page_size, &devices).await;
 
         context::spawn(page_store.clone());
-        inference::spawn(page_store, &cfg.scheduler);
+        inference::spawn(
+            page_store,
+            cfg.scheduler.max_in_flight_batches,
+            cfg.scheduler.request_timeout_secs,
+            cfg.scheduler.max_wait_ms,
+            cfg.scheduler.min_batch_for_optimization,
+        ).await;
         adapter::spawn(&devices);
     }
 
@@ -111,7 +125,6 @@ pub async fn bootstrap(
 }
 
 fn verify_config(config: &Config) -> Result<()> {
-    // --- Directories ---
 
     fs::create_dir_all(&config.cache_dir)
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
@@ -120,8 +133,6 @@ fn verify_config(config: &Config) -> Result<()> {
         fs::create_dir_all(&config.auth.authorized_users_dir)
             .with_context(|| format!("Could not create auth users dir: {:?}", config.auth.authorized_users_dir))?;
     }
-
-    // --- Models ---
 
     ensure!(!config.models.is_empty(), "No models configured");
 
@@ -138,14 +149,12 @@ fn verify_config(config: &Config) -> Result<()> {
             "Model {:?}: tokenizer not found at {:?}", model.name, model.tokenizer_path
         );
 
-        // Validate devices
         for (i, dev) in model.devices.iter().enumerate() {
             ensure!(dev.total_pages > 0, "Model {:?} device {i}: total_pages must be > 0", model.name);
             ensure!(dev.max_batch_size > 0, "Model {:?} device {i}: max_batch_size must be > 0", model.name);
             ensure!(dev.max_batch_tokens > 0, "Model {:?} device {i}: max_batch_tokens must be > 0", model.name);
         }
 
-        // Validate scheduler
         let sched = &model.scheduler;
         ensure!(sched.max_in_flight_batches > 0, "Model {:?}: max_in_flight_batches must be > 0", model.name);
         ensure!(sched.request_timeout_secs > 0, "Model {:?}: request_timeout_secs must be > 0", model.name);

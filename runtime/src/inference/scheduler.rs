@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-use crate::bootstrap::SchedulerConfig;
+
 use crate::inference::kvcache::{DeviceId, PhysicalPageId};
 
-use crate::device::{self, Device};
+use crate::device;
 
 use super::adaptive_policy::AdaptiveThroughputPolicy;
 use super::request::{
@@ -155,19 +155,20 @@ impl BatchScheduler {
     /// only stores the device index for routing calls.
     pub fn new(
         device_id: DeviceId,
-        config: &crate::bootstrap::DeviceConfig,
-        scheduler_config: &SchedulerConfig,
         device_idx: usize,
+        max_batch_size: usize,
+        max_batch_tokens: usize,
+        max_in_flight_batches: usize,
+        request_timeout_secs: u64,
+        max_wait_ms: u64,
+        min_batch_for_optimization: usize,
     ) -> Self {
-        let device = Device {
-            hostname: config.hostname.clone(),
-            num_kv_pages: config.total_pages,
-            max_batch_size: config.max_batch_size,
-            max_batch_tokens: config.max_batch_tokens,
-        };
-
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(Self::run(device, device_id, scheduler_config.clone(), device_idx, rx));
+        tokio::spawn(Self::run(
+            device_id, device_idx, rx,
+            max_batch_size, max_batch_tokens,
+            max_in_flight_batches, request_timeout_secs, max_wait_ms, min_batch_for_optimization,
+        ));
 
         Self { tx }
     }
@@ -193,24 +194,28 @@ impl BatchScheduler {
 
     /// Main scheduling loop for a single device.
     async fn run(
-        device: Device,
         device_id: DeviceId,
-        sched: SchedulerConfig,
         device_idx: usize,
         mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
+        max_batch_size: usize,
+        max_batch_tokens: usize,
+        max_in_flight_batches: usize,
+        request_timeout_secs: u64,
+        max_wait_ms: u64,
+        min_batch_for_optimization: usize,
     ) {
-        let max_wait_time = Duration::from_millis(sched.max_wait_ms);
-        let request_timeout = Duration::from_secs(sched.request_timeout_secs);
+        let max_wait_time = Duration::from_millis(max_wait_ms);
+        let request_timeout = Duration::from_secs(request_timeout_secs);
 
         // Per-device state
-        let mut batch = BatchAccumulator::new(device.max_batch_size, device.max_batch_tokens);
+        let mut batch = BatchAccumulator::new(max_batch_size, max_batch_tokens);
         let mut policy: Box<dyn SchedulingPolicy> =
             Box::new(AdaptiveThroughputPolicy::new(
-                device.max_batch_size,
+                max_batch_size,
                 max_wait_time,
-                sched.min_batch_for_optimization,
+                min_batch_for_optimization,
             ));
-        let in_flight = Arc::new(Semaphore::new(sched.max_in_flight_batches));
+        let in_flight = Arc::new(Semaphore::new(max_in_flight_batches));
 
         // Channel for batch completion stats (latency feedback only)
         let (stats_tx, mut stats_rx) = mpsc::unbounded_channel::<BatchStats>();
@@ -241,7 +246,7 @@ impl BatchScheduler {
 
             // Ask the policy what to do
             let in_flight_count =
-                sched.max_in_flight_batches - in_flight.available_permits();
+                max_in_flight_batches - in_flight.available_permits();
 
             match policy.decide(batch.len(), batch.total_tokens(), in_flight_count) {
                 Decision::Fire => {

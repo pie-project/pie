@@ -30,7 +30,7 @@ use crate::output::{OutputChannel, OutputDelivery};
 use crate::runtime::{self, TerminationCause};
 use crate::auth;
 
-use super::upload::InFlightUpload;
+use super::data_transfer::InFlightUpload;
 use super::{ClientId, ServerState};
 
 // =============================================================================

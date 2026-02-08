@@ -13,10 +13,10 @@
 
 mod session;
 mod handler;
-mod upload;
+mod data_transfer;
 
 pub use session::Session;
-pub use upload::InFlightUpload;
+pub use data_transfer::InFlightUpload;
 
 /// Re-export session helper functions for convenience.
 pub mod sessions {
