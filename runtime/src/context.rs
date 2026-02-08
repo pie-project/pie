@@ -12,7 +12,7 @@
 
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{LazyLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use anyhow::Result;
@@ -37,7 +37,7 @@ pub type LockId = u64;
 static SERVICE_ARRAY: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 
 /// Spawns a new context manager for a model.
-pub fn spawn(page_store: Arc<RwLock<PageStore>>) -> usize {
+pub fn spawn(page_store: PageStore) -> usize {
     SERVICE_ARRAY.spawn(move || ContextManager::new(page_store)).expect("Failed to spawn context manager")
 }
 
@@ -217,7 +217,7 @@ impl Context {
 /// This is the core business logic, separate from the actor message handling.
 #[derive(Debug)]
 pub struct ContextManager {
-    pub page_store: Arc<RwLock<PageStore>>,
+    pub page_store: PageStore,
     contexts: DashMap<ContextId, Context>,
     name_to_id: DashMap<(u32, String), ContextId>,
     next_id: AtomicU64,
@@ -225,8 +225,8 @@ pub struct ContextManager {
 }
 
 impl ContextManager {
-    pub fn new(page_store: Arc<RwLock<PageStore>>) -> Self {
-        let page_size = page_store.read().unwrap().page_size();
+    pub fn new(page_store: PageStore) -> Self {
+        let page_size = page_store.page_size();
         ContextManager {
             page_store,
             contexts: DashMap::new(),
@@ -256,16 +256,13 @@ impl ContextManager {
                 adapter: None,
             });
 
-            let mut page_store = self.page_store.write().unwrap();
+            let page_store = &self.page_store;
             
             // Lookup existing cached pages (longest prefix match)
             let matched_pages = page_store.lookup(&tokens);
             
             if let Some(pages) = matched_pages {
-                // Calculate how many tokens are covered by matched pages
                 let tokens_matched = pages.len() * page_store.page_size();
-                
-                // Acquire refcount for matched pages
                 page_store.acquire(&pages);
                 
                 // Place matched pages in pages_committed
@@ -362,7 +359,7 @@ impl ContextManager {
         
         drop(source_ctx); // Release the borrow
 
-        let mut page_store = self.page_store.write().unwrap();
+        let page_store = &self.page_store;
         
         // Increase refcount for committed pages
         page_store.acquire(&pages_committed);
@@ -493,7 +490,7 @@ impl ContextManager {
         let mut result: HashMap<DeviceId, Vec<PhysicalPageId>> = HashMap::new();
         
         if let Some(ctx) = self.contexts.get(&id) {
-            let page_store = self.page_store.read().unwrap();
+            let page_store = &self.page_store;
             
             // Get all committed pages and collect their physical mappings
             for &page_id in &ctx.pages_committed {
@@ -531,7 +528,7 @@ impl ContextManager {
         drop(ctx);
         
         // Allocate pages from page store
-        let new_pages = self.page_store.write().unwrap().allocate(num_pages as usize, affinity)?;
+        let new_pages = self.page_store.allocate(num_pages as usize, affinity)?;
         
         // Add to uncommitted pages
         let mut ctx = self.contexts.get_mut(&id)
@@ -573,7 +570,7 @@ impl ContextManager {
         drop(ctx);
         
         // Release pages back to page store
-        self.page_store.write().unwrap().release(&pages_to_free);
+        self.page_store.release(&pages_to_free);
         
         Ok(())
     }
@@ -687,7 +684,7 @@ impl ContextManager {
         drop(ctx); // Release borrow for page_store access
 
         // Commit to page store
-        let (final_page_ids, final_hash) = self.page_store.write().unwrap().commit(
+        let (final_page_ids, final_hash) = self.page_store.commit(
             &pages_to_commit,
             &tokens_to_commit,
             &positions_to_commit,

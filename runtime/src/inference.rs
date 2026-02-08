@@ -15,7 +15,7 @@ pub mod request;
 pub mod scheduler;
 mod adaptive_policy;
 
-use std::sync::{Arc, RwLock};
+
 
 use tokio::sync::oneshot;
 
@@ -36,7 +36,7 @@ static SERVICE_ARRAY: std::sync::LazyLock<ServiceArray<Message>> = std::sync::La
 
 /// Spawns a new inference service for a model.
 pub fn spawn(
-    page_store: Arc<RwLock<PageStore>>,
+    page_store: PageStore,
     scheduler_config: &crate::bootstrap::SchedulerConfig,
 ) -> usize {
     let scheduler_config = scheduler_config.clone();
@@ -59,7 +59,7 @@ pub async fn forward_pass(model_idx: usize, request: ForwardPassRequest) -> Resu
 /// Translates logical page IDs to physical page IDs and routes
 /// requests to the appropriate per-device `BatchScheduler`.
 pub struct InferenceService {
-    page_store: Arc<RwLock<PageStore>>,
+    page_store: PageStore,
     schedulers: Vec<BatchScheduler>,
 }
 
@@ -72,7 +72,7 @@ impl std::fmt::Debug for InferenceService {
 impl InferenceService {
 
     pub fn new(
-        page_store: Arc<RwLock<PageStore>>,
+        page_store: PageStore,
         scheduler_config: &crate::bootstrap::SchedulerConfig,
     ) -> Self {
         // TODO: schedulers should be created per device index
@@ -91,14 +91,10 @@ impl InferenceService {
         page_ids: &[PageId],
         device_id: DeviceId,
     ) -> Option<Vec<PhysicalPageId>> {
-        let page_store = self.page_store.read().unwrap_or_else(|e| {
-            tracing::warn!("PageStore RwLock poisoned, recovering: {e}");
-            e.into_inner()
-        });
         let mut result = Vec::with_capacity(page_ids.len());
 
         for &page_id in page_ids {
-            let mappings = page_store.get_physical_mappings(page_id);
+            let mappings = self.page_store.get_physical_mappings(page_id);
             // Find the mapping for this specific device
             if let Some((_, phys_id)) = mappings.into_iter().find(|(n, _)| *n == device_id) {
                 result.push(phys_id);
@@ -116,11 +112,7 @@ impl InferenceService {
             return None;
         }
 
-        let page_store = self.page_store.read().unwrap_or_else(|e| {
-            tracing::warn!("PageStore RwLock poisoned, recovering: {e}");
-            e.into_inner()
-        });
-        let mappings = page_store.get_physical_mappings(page_ids[0]);
+        let mappings = self.page_store.get_physical_mappings(page_ids[0]);
         mappings.into_iter().next().map(|(device_id, _)| device_id)
     }
 
