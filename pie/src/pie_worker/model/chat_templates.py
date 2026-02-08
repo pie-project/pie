@@ -295,7 +295,7 @@ _QWEN_3_TEMPLATE_CONTENT = """
 Qwen3Template = ChatTemplate(
     template_type="minijinja",
     template=_QWEN_3_TEMPLATE_CONTENT,
-    stop_tokens=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+    stop_tokens=["<|im_end|>", "<|endoftext|>"],
 )
 
 # Gemma 2 chat template
