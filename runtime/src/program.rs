@@ -20,13 +20,12 @@ pub use manifest::Manifest;
 pub use repository::Repository;
 
 // =============================================================================
-// Program Actor
+// Public API
 // =============================================================================
 
-/// Global singleton Program Manager actor.
-static ACTOR: LazyLock<Service<Message>> = LazyLock::new(Service::new);
+static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
-/// Spawns the Program Manager actor with configuration.
+/// Spawns the program manager service.
 pub fn spawn(wasm_engine: WasmEngine, registry_url: String, cache_dir: PathBuf) {
     let mut repository = Repository::new(
         registry_url,
@@ -36,19 +35,9 @@ pub fn spawn(wasm_engine: WasmEngine, registry_url: String, cache_dir: PathBuf) 
     // Scan disk on startup: load existing programs into index
     repository.load_program_cache();
 
-    ACTOR.spawn(|| {
-        ProgramManagerActor::new(wasm_engine, repository)
+    SERVICE.spawn(|| {
+        ProgramService::new(wasm_engine, repository)
     }).expect("Program manager already spawned");
-}
-
-/// Sends a message to the Program Manager actor.
-pub fn send(msg: Message) -> anyhow::Result<()> {
-    ACTOR.send(msg)
-}
-
-/// Check if the program manager actor is spawned.
-pub fn is_spawned() -> bool {
-    ACTOR.is_spawned()
 }
 
 /// Add a program with WASM binary and manifest. Stores in repository + disk (does NOT install).
@@ -58,178 +47,84 @@ pub async fn add(
     force_overwrite: bool,
 ) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    Message::Add {
+    SERVICE.send(Message::Add {
         wasm_binary,
         manifest,
         force_overwrite,
         response: tx,
-    }
-    .send()
-    .map_err(|_| anyhow!("Program manager not running"))?;
-    rx.await.map_err(|_| anyhow!("Program manager did not respond"))?
+    })?;
+    rx.await?
 }
 
 /// Add a program from registry by name. Downloads and stores in repository + disk (does NOT install).
 pub async fn add_from_registry(name: &ProgramName, force_overwrite: bool) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    Message::AddFromRegistry {
+    SERVICE.send(Message::AddFromRegistry {
         name: name.clone(),
         force_overwrite,
         response: tx,
-    }
-    .send()
-    .map_err(|_| anyhow!("Program manager not running"))?;
-    rx.await.map_err(|_| anyhow!("Program manager did not respond"))?
+    })?;
+    rx.await?
 }
 
 /// Check if a program is registered in repository.
 pub async fn is_registered(name: &ProgramName) -> bool {
     let (tx, rx) = oneshot::channel();
-    let _ = Message::Exists {
+    SERVICE.send(Message::Exists {
         name: name.clone(),
         response: tx,
-    }
-    .send();
+    }).ok();
     rx.await.unwrap_or(false)
 }
 
 /// Check if a program is installed (JIT compiled and ready to run).
 pub async fn is_installed(name: &ProgramName) -> bool {
     let (tx, rx) = oneshot::channel();
-    let _ = Message::IsInstalled {
+    SERVICE.send(Message::IsInstalled {
         name: name.clone(),
         response: tx,
-    }
-    .send();
+    }).ok();
     rx.await.unwrap_or(false)
 }
 
 /// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies.
 pub async fn install(name: &ProgramName) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    Message::Install {
+    SERVICE.send(Message::Install {
         name: name.clone(),
         response: tx,
-    }
-    .send()
-    .map_err(|_| anyhow!("Program manager not running"))?;
-    rx.await.map_err(|_| anyhow!("Program manager did not respond"))?
+    })?;
+    rx.await?
 }
 
 /// Uninstall a program: remove from installed programs (does NOT remove from cache).
 pub async fn uninstall(name: &ProgramName) -> bool {
     let (tx, rx) = oneshot::channel();
-    let _ = Message::Uninstall {
+    SERVICE.send(Message::Uninstall {
         name: name.clone(),
         response: tx,
-    }
-    .send();
+    }).ok();
     rx.await.unwrap_or(false)
 }
 
 /// Get program metadata by name.
 pub async fn fetch_manifest(name: &ProgramName) -> Option<Manifest> {
     let (tx, rx) = oneshot::channel();
-    let _ = Message::GetMetadata {
+    SERVICE.send(Message::GetMetadata {
         name: name.clone(),
         response: tx,
-    }
-    .send();
+    }).ok();
     rx.await.ok().flatten()
 }
 
 /// Get the compiled component for an installed program.
-pub async fn get_component(name: &ProgramName) -> Option<Component> {
+pub async fn get_wasm_component(name: &ProgramName) -> Option<Component> {
     let (tx, rx) = oneshot::channel();
-    let _ = Message::GetWasmComponent {
+    SERVICE.send(Message::GetWasmComponent {
         name: name.clone(),
         response: tx,
-    }
-    .send();
+    }).ok();
     rx.await.ok().flatten()
-}
-
-
-
-// =============================================================================
-// Messages
-// =============================================================================
-
-/// Messages for the Program Manager actor.
-///
-/// Note: Component doesn't implement Debug, so we manually implement it.
-pub enum Message {
-    /// Get program metadata by name
-    GetMetadata {
-        name: ProgramName,
-        response: oneshot::Sender<Option<Manifest>>,
-    },
-
-    /// Add a program with WASM binary and manifest: store in repository + disk (does NOT install)
-    Add {
-        wasm_binary: Vec<u8>,
-        manifest: Manifest,
-        force_overwrite: bool,
-        response: oneshot::Sender<Result<()>>,
-    },
-
-    /// Add a program from registry by name: download and store in repository + disk (does NOT install)
-    AddFromRegistry {
-        name: ProgramName,
-        force_overwrite: bool,
-        response: oneshot::Sender<Result<()>>,
-    },
-
-    /// Check if a program exists in repository
-    Exists {
-        name: ProgramName,
-        response: oneshot::Sender<bool>,
-    },
-
-    /// Check if a program is installed (JIT compiled and ready to run)
-    IsInstalled {
-        name: ProgramName,
-        response: oneshot::Sender<bool>,
-    },
-
-    /// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies
-    Install {
-        name: ProgramName,
-        response: oneshot::Sender<Result<()>>,
-    },
-
-    /// Uninstall a program: remove from installed programs (does NOT remove from cache)
-    Uninstall {
-        name: ProgramName,
-        response: oneshot::Sender<bool>,
-    },
-
-    /// Get the compiled component for an installed program
-    GetWasmComponent {
-        name: ProgramName,
-        response: oneshot::Sender<Option<Component>>,
-    },
-}
-
-impl std::fmt::Debug for Message {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Message::GetMetadata { name, .. } => write!(f, "GetMetadata {{ name: {:?} }}", name),
-            Message::Add { force_overwrite, .. } => write!(f, "Add {{ force_overwrite: {} }}", force_overwrite),
-            Message::AddFromRegistry { name, force_overwrite, .. } => write!(f, "AddFromRegistry {{ name: {:?}, force_overwrite: {} }}", name, force_overwrite),
-            Message::Exists { name, .. } => write!(f, "Exists {{ name: {:?} }}", name),
-            Message::IsInstalled { name, .. } => write!(f, "IsInstalled {{ name: {:?} }}", name),
-            Message::Install { name, .. } => write!(f, "Install {{ name: {:?} }}", name),
-            Message::Uninstall { name, .. } => write!(f, "Uninstall {{ name: {:?} }}", name),
-            Message::GetWasmComponent { name, .. } => write!(f, "GetWasmComponent {{ name: {:?} }}", name),
-        }
-    }
-}
-
-impl Message {
-    pub fn send(self) -> anyhow::Result<()> {
-        ACTOR.send(self)
-    }
 }
 
 // =============================================================================
@@ -267,12 +162,11 @@ impl std::fmt::Display for ProgramName {
     }
 }
 // =============================================================================
-// Program Manager (Service)
+// Program Service
 // =============================================================================
 
-/// The program service handles program caching, installation, and loading.
-/// This is the core business logic, separate from the actor message handling.
-struct ProgramManager {
+/// Program service: caching, installation, and loading of inferlet programs.
+struct ProgramService {
     wasm_engine: WasmEngine,
     repository: Repository,
     /// Installed (JIT compiled) programs, keyed by program name
@@ -281,9 +175,9 @@ struct ProgramManager {
     explicit_installs: std::collections::HashSet<ProgramName>,
 }
 
-impl ProgramManager {
+impl ProgramService {
     fn new(wasm_engine: WasmEngine, repository: Repository) -> Self {
-        ProgramManager {
+        ProgramService {
             wasm_engine,
             repository,
             installed: HashMap::new(),
@@ -457,57 +351,91 @@ impl ProgramManager {
 }
 
 // =============================================================================
-// Program Actor
+// ServiceHandler
 // =============================================================================
 
-struct ProgramManagerActor {
-    service: ProgramManager,
+enum Message {
+    /// Get program metadata by name
+    GetMetadata {
+        name: ProgramName,
+        response: oneshot::Sender<Option<Manifest>>,
+    },
+
+    /// Add a program with WASM binary and manifest: store in repository + disk (does NOT install)
+    Add {
+        wasm_binary: Vec<u8>,
+        manifest: Manifest,
+        force_overwrite: bool,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Add a program from registry by name: download and store in repository + disk (does NOT install)
+    AddFromRegistry {
+        name: ProgramName,
+        force_overwrite: bool,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Check if a program exists in repository
+    Exists {
+        name: ProgramName,
+        response: oneshot::Sender<bool>,
+    },
+
+    /// Check if a program is installed (JIT compiled and ready to run)
+    IsInstalled {
+        name: ProgramName,
+        response: oneshot::Sender<bool>,
+    },
+
+    /// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies
+    Install {
+        name: ProgramName,
+        response: oneshot::Sender<Result<()>>,
+    },
+
+    /// Uninstall a program: remove from installed programs (does NOT remove from cache)
+    Uninstall {
+        name: ProgramName,
+        response: oneshot::Sender<bool>,
+    },
+
+    /// Get the compiled component for an installed program
+    GetWasmComponent {
+        name: ProgramName,
+        response: oneshot::Sender<Option<Component>>,
+    },
 }
 
-impl ProgramManagerActor {
-    fn new(wasm_engine: WasmEngine, repository: Repository) -> Self {
-        ProgramManagerActor {
-            service: ProgramManager::new(wasm_engine, repository),
-        }
-    }
-}
 
-impl ServiceHandler for ProgramManagerActor {
+impl ServiceHandler for ProgramService {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::GetMetadata { name, response } => {
-                let result = self.service.get_manifest(&name);
-                let _ = response.send(result);
+                let _ = response.send(self.get_manifest(&name));
             }
             Message::Add { wasm_binary, manifest, force_overwrite, response } => {
-                let result = self.service.add(wasm_binary, manifest, force_overwrite).await;
-                let _ = response.send(result);
+                let _ = response.send(self.add(wasm_binary, manifest, force_overwrite).await);
             }
             Message::AddFromRegistry { name, force_overwrite, response } => {
-                let result = self.service.add_from_registry(&name, force_overwrite).await;
-                let _ = response.send(result);
+                let _ = response.send(self.add_from_registry(&name, force_overwrite).await);
             }
             Message::Exists { name, response } => {
-                let result = self.service.is_registered(&name);
-                let _ = response.send(result);
+                let _ = response.send(self.is_registered(&name));
             }
             Message::IsInstalled { name, response } => {
-                let result = self.service.is_installed(&name);
-                let _ = response.send(result);
+                let _ = response.send(self.is_installed(&name));
             }
             Message::Install { name, response } => {
-                let result = self.service.install(&name).await;
-                let _ = response.send(result);
+                let _ = response.send(self.install(&name).await);
             }
             Message::Uninstall { name, response } => {
-                let result = self.service.uninstall(&name);
-                let _ = response.send(result);
+                let _ = response.send(self.uninstall(&name));
             }
             Message::GetWasmComponent { name, response } => {
-                let result = self.service.get_component(&name);
-                let _ = response.send(result);
+                let _ = response.send(self.get_component(&name));
             }
         }
     }

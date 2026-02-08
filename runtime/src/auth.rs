@@ -77,7 +77,7 @@ pub async fn get_internal_auth_token() -> Result<String> {
 
 /// Core authentication state: authorized users, internal token, and RNG.
 #[derive(Debug)]
-pub struct Auth {
+struct Auth {
     enable_auth: bool,
     authorized_users: AuthorizedUsers,
     authorized_users_path: PathBuf,

@@ -12,6 +12,7 @@ use crate::context;
 use crate::device;
 use crate::inference;
 use crate::inference::kvcache::PageStore;
+use crate::messaging;
 use crate::model;
 use crate::program;
 use crate::runtime;
@@ -93,6 +94,7 @@ pub async fn bootstrap(
 
     runtime::spawn(wasm_engine);
     server::spawn(&config.host, config.port);
+    messaging::spawn();
 
     for cfg in config.models.iter() {
 

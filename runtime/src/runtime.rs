@@ -78,20 +78,21 @@ pub enum AttachInstanceResult {
 }
 
 // =============================================================================
-// Runtime Actor (Superactor)
+// Public API
 // =============================================================================
 
-/// Global singleton Runtime actor.
-static ACTOR: LazyLock<Service<Message>> = LazyLock::new(Service::new);
+static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
-/// Spawns the Runtime actor with the given engine.
+/// Spawns the runtime service.
 pub fn spawn(engine: Engine) {
-    ACTOR.spawn(|| RuntimeActor::with_engine(engine)).expect("Runtime already spawned");
+    SERVICE.spawn(|| Runtime::with_engine(engine)).expect("Runtime already spawned");
 }
 
-/// Check if the runtime actor is spawned.
-pub fn is_spawned() -> bool {
-    ACTOR.is_spawned()
+/// Gets the runtime version.
+pub async fn get_version() -> anyhow::Result<String> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::GetVersion { response: tx })?;
+    rx.await.map_err(|_| anyhow!("Runtime service channel closed"))
 }
 
 /// Launch an instance of a program.
@@ -102,16 +103,14 @@ pub async fn launch_instance(
     detached: bool,
 ) -> anyhow::Result<InstanceId> {
     let (tx, rx) = oneshot::channel();
-    Message::LaunchInstance {
+    SERVICE.send(Message::LaunchInstance {
         username,
         program_name,
         arguments,
         detached,
         response: tx,
-    }
-    .send()
-    .map_err(|_| anyhow!("Runtime actor not running"))?;
-    rx.await.map_err(|_| anyhow!("Runtime actor did not respond"))?
+    })?;
+    rx.await?
 }
 
 /// Launch a server instance (HTTP handler).
@@ -122,27 +121,57 @@ pub async fn launch_server_instance(
     arguments: Vec<String>,
 ) -> anyhow::Result<()> {
     let (tx, rx) = oneshot::channel();
-    Message::LaunchServerInstance {
+    SERVICE.send(Message::LaunchServerInstance {
         username,
         program_name,
         port,
         arguments,
         response: tx,
-    }
-    .send()
-    .map_err(|_| anyhow!("Runtime actor not running"))?;
-    rx.await.map_err(|_| anyhow!("Runtime actor did not respond"))?
+    })?;
+    rx.await?
 }
 
 /// List running instances for a user.
 pub async fn list_instances(username: String) -> Vec<message::InstanceInfo> {
     let (tx, rx) = oneshot::channel();
-    let _ = Message::ListInstances {
+    SERVICE.send(Message::ListInstances {
         username,
         response: tx,
-    }
-    .send();
+    }).ok();
     rx.await.unwrap_or_default()
+}
+
+/// Spawn a child inferlet.
+pub async fn spawn_child(package_name: String, args: Vec<String>) -> anyhow::Result<String> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::Spawn {
+        package_name,
+        args,
+        result: tx,
+    })?;
+    rx.await.map_err(|_| anyhow!("Runtime service channel closed"))
+}
+
+/// Spawn a child inferlet, returning the raw receiver for lazy polling.
+pub fn spawn_child_rx(package_name: String, args: Vec<String>) -> anyhow::Result<oneshot::Receiver<String>> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::Spawn {
+        package_name,
+        args,
+        result: tx,
+    })?;
+    Ok(rx)
+}
+
+
+/// Debug query for introspection.
+pub async fn debug_query(query: String) -> QueryResponse {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::DebugQuery {
+        query,
+        response: tx,
+    }).ok();
+    rx.await.unwrap_or(QueryResponse { value: "error".to_string() })
 }
 
 /// Attach to an instance (delegates to InstanceActor via Direct Addressing).
@@ -165,108 +194,44 @@ pub fn terminate_instance(inst_id: InstanceId, notification_to_client: Option<Te
     instance_actor::terminate(inst_id, notification_to_client);
 }
 
-// =============================================================================
-// Messages
-// =============================================================================
 
-/// Messages for the Runtime actor.
-///
-/// The Runtime actor now handles only lifecycle orchestration.
-/// Per-instance messages go directly to InstanceActor via instance_actor::send().
-#[derive(Debug)]
-pub enum Message {
-    /// Get the runtime version
-    GetVersion {
-        response: oneshot::Sender<String>,
-    },
-
-    /// Launch a program instance
-    LaunchInstance {
-        username: String,
-        program_name: String,
-        arguments: Vec<String>,
-        detached: bool,
-        response: oneshot::Sender<anyhow::Result<InstanceId>>,
-    },
-
-    /// Launch a server instance (HTTP handler)
-    LaunchServerInstance {
-        username: String,
-        program_name: String,
-        port: u32,
-        arguments: Vec<String>,
-        response: oneshot::Sender<anyhow::Result<()>>,
-    },
-
-    /// List running instances for a user
-    ListInstances {
-        username: String,
-        response: oneshot::Sender<Vec<message::InstanceInfo>>,
-    },
-
-    /// Debug query for introspection
-    DebugQuery {
-        query: String,
-        response: oneshot::Sender<QueryResponse>,
-    },
-
-    /// Spawn a child inferlet
-    Spawn {
-        package_name: String,
-        args: Vec<String>,
-        result: oneshot::Sender<String>,
-    },
-}
-
-impl Message {
-    /// Sends this message to the runtime actor.
-    pub fn send(self) -> anyhow::Result<()> {
-        ACTOR.send(self)
-    }
-}
 
 // =============================================================================
-// RuntimeActor (Superactor)
+// Runtime Service
 // =============================================================================
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Runtime superactor implementation.
+/// Runtime service: instance lifecycle orchestration.
 ///
 /// Spawns and coordinates child actors (InstanceActor, ServerInstanceActor).
 /// Delegates per-instance operations to child actors via Direct Addressing.
-struct RuntimeActor {
-    /// The Wasmtime engine (global)
+struct Runtime {
     engine: Engine,
-    /// Pre-configured linker with WASI and API bindings
     linker: Arc<Linker<InstanceState>>,
 }
 
-impl RuntimeActor {
+impl Runtime {
     fn with_engine(engine: Engine) -> Self {
         let mut linker = Linker::<InstanceState>::new(&engine);
 
-        // Add WASI and HTTP bindings
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .expect("Failed to link WASI");
         wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
             .expect("Failed to link WASI HTTP");
 
-        // Add custom API bindings
         api::add_to_linker(&mut linker).unwrap();
 
-        RuntimeActor {
+        Runtime {
             engine,
             linker: Arc::new(linker),
         }
     }
 
-    /// Gets the runtime version.
     fn get_version(&self) -> String {
         VERSION.to_string()
     }
 
-    /// Launches a program instance by spawning an InstanceActor.
     async fn launch_instance(
         &self,
         username: String,
@@ -274,14 +239,12 @@ impl RuntimeActor {
         arguments: Vec<String>,
         detached: bool,
     ) -> anyhow::Result<InstanceId> {
-        // Get the component from program manager
-        let component = program::get_component(&program::ProgramName::parse(&program_name))
+        let component = program::get_wasm_component(&program::ProgramName::parse(&program_name))
             .await
             .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
 
         let inst_id = Uuid::new_v4();
 
-        // Spawn the InstanceActor
         let config = InstanceConfig {
             inst_id,
             username,
@@ -296,7 +259,6 @@ impl RuntimeActor {
         instance_actor::InstanceActor::spawn(config).await
     }
 
-    /// Launches a server instance by spawning a ServerInstanceActor.
     async fn launch_server_instance(
         &self,
         username: String,
@@ -304,14 +266,12 @@ impl RuntimeActor {
         port: u32,
         arguments: Vec<String>,
     ) -> anyhow::Result<()> {
-        // Get the component from program manager
-        let component = program::get_component(&program::ProgramName::parse(&program_name))
+        let component = program::get_wasm_component(&program::ProgramName::parse(&program_name))
             .await
             .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
 
         let inst_id = Uuid::new_v4();
 
-        // Spawn the ServerInstanceActor
         let config = ServerInstanceConfig {
             inst_id,
             username,
@@ -327,7 +287,6 @@ impl RuntimeActor {
         Ok(())
     }
 
-    /// Lists instances by querying all registered InstanceActors.
     async fn list_instances(&self, username: &str) -> Vec<message::InstanceInfo> {
         let show_all = username == "internal";
         let ids = instance_actor::list_instance_ids();
@@ -353,7 +312,6 @@ impl RuntimeActor {
         instances
     }
 
-    /// Handles debug queries.
     fn debug_query(&self, query: &str) -> QueryResponse {
         let value = match query {
             "ping" => "pong".to_string(),
@@ -371,13 +329,50 @@ impl RuntimeActor {
         QueryResponse { value }
     }
 
-    /// Spawns a child inferlet (not yet implemented).
     fn spawn_child(&self, package_name: &str, args: Vec<String>) -> String {
         format!("spawn not yet implemented: {} {:?}", package_name, args)
     }
 }
 
-impl ServiceHandler for RuntimeActor {
+// =============================================================================
+// ServiceHandler
+// =============================================================================
+
+#[derive(Debug)]
+enum Message {
+    GetVersion {
+        response: oneshot::Sender<String>,
+    },
+    LaunchInstance {
+        username: String,
+        program_name: String,
+        arguments: Vec<String>,
+        detached: bool,
+        response: oneshot::Sender<anyhow::Result<InstanceId>>,
+    },
+    LaunchServerInstance {
+        username: String,
+        program_name: String,
+        port: u32,
+        arguments: Vec<String>,
+        response: oneshot::Sender<anyhow::Result<()>>,
+    },
+    ListInstances {
+        username: String,
+        response: oneshot::Sender<Vec<message::InstanceInfo>>,
+    },
+    DebugQuery {
+        query: String,
+        response: oneshot::Sender<QueryResponse>,
+    },
+    Spawn {
+        package_name: String,
+        args: Vec<String>,
+        result: oneshot::Sender<String>,
+    },
+}
+
+impl ServiceHandler for Runtime {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
@@ -385,29 +380,11 @@ impl ServiceHandler for RuntimeActor {
             Message::GetVersion { response } => {
                 let _ = response.send(self.get_version());
             }
-            Message::LaunchInstance {
-                username,
-                program_name,
-                arguments,
-                detached,
-                response,
-            } => {
-                let result = self
-                    .launch_instance(username, program_name, arguments, detached)
-                    .await;
-                let _ = response.send(result);
+            Message::LaunchInstance { username, program_name, arguments, detached, response } => {
+                let _ = response.send(self.launch_instance(username, program_name, arguments, detached).await);
             }
-            Message::LaunchServerInstance {
-                username,
-                program_name,
-                port,
-                arguments,
-                response,
-            } => {
-                let result = self
-                    .launch_server_instance(username, program_name, port, arguments)
-                    .await;
-                let _ = response.send(result);
+            Message::LaunchServerInstance { username, program_name, port, arguments, response } => {
+                let _ = response.send(self.launch_server_instance(username, program_name, port, arguments).await);
             }
             Message::ListInstances { username, response } => {
                 let _ = response.send(self.list_instances(&username).await);
@@ -415,11 +392,7 @@ impl ServiceHandler for RuntimeActor {
             Message::DebugQuery { query, response } => {
                 let _ = response.send(self.debug_query(&query));
             }
-            Message::Spawn {
-                package_name,
-                args,
-                result,
-            } => {
+            Message::Spawn { package_name, args, result } => {
                 let _ = result.send(self.spawn_child(&package_name, args));
             }
         }

@@ -22,7 +22,7 @@ pub mod server;
 pub use runtime::instance;
 pub use runtime::output;
 pub mod telemetry;
-pub mod utils;
+
 
 // FFI module for PyO3 bindings, IPC, and format types
 pub mod ffi;

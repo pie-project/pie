@@ -12,7 +12,6 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use crate::service::{Service, ServiceHandler};
-use crate::utils::IdPool;
 
 type ListenerId = usize;
 
@@ -101,7 +100,7 @@ struct MessageQueue {
     pubsub_tx: UnboundedSender<(String, String)>,
     _pubsub_handle: tokio::task::JoinHandle<()>,
     subscribers_by_topic: Arc<DashMap<String, Vec<(ListenerId, mpsc::Sender<String>)>>>,
-    sub_id_pool: IdPool<ListenerId>,
+    next_sub_id: ListenerId,
 
     // PushPull (string)
     string_tx: UnboundedSender<(String, String)>,
@@ -148,7 +147,7 @@ impl Default for MessageQueue {
             pubsub_tx,
             _pubsub_handle,
             subscribers_by_topic,
-            sub_id_pool: IdPool::new(ListenerId::MAX),
+            next_sub_id: 0,
             string_tx,
             _string_handle,
             string_queues,
@@ -171,7 +170,8 @@ impl ServiceHandler for MessageQueue {
                 self.pubsub_tx.send((topic, message)).unwrap();
             }
             Message::Subscribe { topic, sender, sub_id } => {
-                let id = self.sub_id_pool.acquire().unwrap();
+                let id = self.next_sub_id;
+                self.next_sub_id += 1;
                 self.subscribers_by_topic
                     .entry(topic)
                     .or_insert_with(Vec::new)
@@ -186,7 +186,7 @@ impl ServiceHandler for MessageQueue {
                         self.subscribers_by_topic.remove(&topic);
                     }
                 }
-                self.sub_id_pool.release(sub_id).unwrap();
+
             }
 
             // -- PushPull (string) --------------------------------------------

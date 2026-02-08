@@ -75,7 +75,7 @@ pub async fn forward_pass(model_idx: usize, request: ForwardPassRequest) -> Resu
 ///
 /// Translates logical page IDs to physical page IDs and routes
 /// requests to the appropriate per-device `BatchScheduler`.
-pub struct InferenceService {
+struct InferenceService {
     page_store: PageStore,
     schedulers: Vec<BatchScheduler>,
 }

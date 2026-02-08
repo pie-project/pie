@@ -212,7 +212,7 @@ impl Context {
 /// The context manager handles all context operations.
 /// This is the core business logic, separate from the actor message handling.
 #[derive(Debug)]
-pub struct ContextManager {
+struct ContextManager {
     pub page_store: PageStore,
     contexts: DashMap<ContextId, Context>,
     name_to_id: DashMap<(u32, String), ContextId>,
