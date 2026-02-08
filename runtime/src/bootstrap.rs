@@ -10,6 +10,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::adapter;
 use crate::auth;
 use crate::context;
+use crate::device;
 use crate::inference;
 
 use crate::kvcache::PageStore;
@@ -113,13 +114,24 @@ pub async fn bootstrap(
     runtime::spawn(wasm_engine);
     server::spawn(&config.host, config.port);
 
-    // Spawn per-model services: context, adapter, inference
+    // Spawn device services (flat across all models)
+    let mut device_indices_per_model: Vec<Vec<usize>> = Vec::new();
     for model_config in &config.models {
+        let mut model_device_ids = Vec::new();
+        for (i, dev_cfg) in model_config.devices.iter().enumerate() {
+            let idx = device::spawn(i as u8, dev_cfg);
+            model_device_ids.push(idx);
+        }
+        device_indices_per_model.push(model_device_ids);
+    }
+
+    // Spawn per-model services: context, adapter, inference
+    for (model_idx, model_config) in config.models.iter().enumerate() {
         let page_store = Arc::new(RwLock::new(PageStore::new(model_config.kv_page_size, &model_config.devices)));
 
         // Spawn services with shared page store
         context::spawn(page_store.clone());
-        inference::spawn(page_store, &model_config.devices);
+        inference::spawn(page_store, &model_config.devices, &device_indices_per_model[model_idx]);
         adapter::spawn(&model_config.devices);
     }
 

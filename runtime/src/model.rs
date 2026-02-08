@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::inference::rpc::RpcClient;
+use crate::device::RpcClient;
 use tokenizer::BytePairEncoder;
 
 /// Counter for generating unique model IDs.
@@ -181,9 +181,13 @@ impl Model {
         let req = HandshakeRequest {
             version: "0.1.0".to_string(),
         };
-        backend
-            .call_with_timeout("handshake", &req, Self::HANDSHAKE_TIMEOUT)
+        let payload = rmp_serde::to_vec_named(&req)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize handshake: {e}"))?;
+        let response = tokio::time::timeout(Self::HANDSHAKE_TIMEOUT, backend.call("handshake", payload))
             .await
+            .map_err(|_| anyhow::anyhow!("Handshake timed out"))??;
+        rmp_serde::from_slice(&response)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize handshake response: {e}"))
     }
 
     /// Create from handshake response.

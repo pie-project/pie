@@ -11,12 +11,10 @@
 
 pub mod brle;
 pub mod request;
-pub mod rpc;
 pub mod scheduler;
 mod adaptive_policy;
 
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use tokio::sync::oneshot;
 
@@ -39,9 +37,11 @@ static SERVICE_ARRAY: std::sync::LazyLock<ServiceArray<Message>> = std::sync::La
 pub fn spawn(
     page_store: Arc<RwLock<PageStore>>,
     device_configs: &[crate::bootstrap::DeviceConfig],
+    device_indices: &[usize],
 ) -> usize {
     let device_configs = device_configs.to_vec();
-    SERVICE_ARRAY.spawn(move || InferenceService::new(page_store, &device_configs)).expect("Failed to spawn inference service")
+    let device_indices = device_indices.to_vec();
+    SERVICE_ARRAY.spawn(move || InferenceService::new(page_store, &device_configs, &device_indices)).expect("Failed to spawn inference service")
 }
 
 /// Executes a forward pass and returns the output.
@@ -49,41 +49,6 @@ pub async fn forward_pass(model_idx: usize, request: ForwardPassRequest) -> Resu
     let (tx, rx) = oneshot::channel();
     SERVICE_ARRAY.send(model_idx, Message::ForwardPass { request, response: tx })?;
     Ok(rx.await?)
-}
-
-// =============================================================================
-// Device Configuration
-// =============================================================================
-
-/// Inference-local device configuration.
-///
-/// Derived from `bootstrap::DeviceConfig` with additional inference-specific
-/// defaults (timeouts, in-flight limits).
-pub(crate) struct Device {
-    pub id: DeviceId,
-    pub hostname: String,
-    pub max_batch_size: usize,
-    pub max_batch_tokens: usize,
-    pub max_in_flight_batches: usize,
-    pub request_timeout: Duration,
-    pub max_wait_time: Duration,
-    pub min_batch_for_optimization: usize,
-}
-
-impl Device {
-    /// Create a `Device` from a bootstrap `DeviceConfig` and its index.
-    pub fn from_config(id: DeviceId, config: &crate::bootstrap::DeviceConfig) -> Self {
-        Self {
-            id,
-            hostname: config.hostname.clone(),
-            max_batch_size: config.max_batch_size,
-            max_batch_tokens: config.max_batch_tokens,
-            max_in_flight_batches: config.max_in_flight_batches,
-            request_timeout: Duration::from_secs(config.request_timeout_secs),
-            max_wait_time: Duration::from_millis(config.max_wait_ms),
-            min_batch_for_optimization: config.min_batch_for_optimization,
-        }
-    }
 }
 
 // =============================================================================
@@ -110,19 +75,14 @@ impl InferenceService {
     pub fn new(
         page_store: Arc<RwLock<PageStore>>,
         device_configs: &[crate::bootstrap::DeviceConfig],
+        device_indices: &[usize],
     ) -> Self {
         let schedulers: Vec<BatchScheduler> = device_configs
             .iter()
+            .zip(device_indices.iter())
             .enumerate()
-            .filter_map(|(idx, config)| {
-                let device = Device::from_config(idx as DeviceId, config);
-                match BatchScheduler::new(device) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        tracing::error!("Failed to connect to device {idx}: {e:?}");
-                        None
-                    }
-                }
+            .map(|(idx, (config, &device_idx))| {
+                BatchScheduler::new(idx as DeviceId, config, device_idx)
             })
             .collect();
 

@@ -24,7 +24,7 @@ pub use format::{
 };
 
 // RPC types re-exported for convenience
-pub use crate::inference::rpc::{IpcRequest, IpcResponse};
+pub use crate::device::{IpcRequest, IpcResponse};
 
 pub use pybindings::{
     _pie, PartialServerHandle, ServerConfig, ServerHandle,

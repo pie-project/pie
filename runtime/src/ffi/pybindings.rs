@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 
 use crate::auth;
 use crate::bootstrap::{self, Config as BootstrapConfig};
-use crate::inference::rpc::{RpcClient, RpcServer};
+use crate::device::{RpcClient, RpcServer};
 use crate::bootstrap::{TelemetryConfig, AuthConfig as BootstrapAuthConfig};
 
 // =============================================================================
