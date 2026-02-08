@@ -3,7 +3,7 @@
 use crate::api::pie;
 use crate::api::types::FutureString;
 use crate::instance::InstanceState;
-use crate::messaging::{pubsub_send, pushpull_send, PubSubMessage, PushPullMessage};
+use crate::messaging;
 use crate::server;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -48,28 +48,24 @@ impl pie::core::messaging::Host for InstanceState {
 
     async fn receive(&mut self) -> Result<Resource<FutureString>> {
         let (tx, rx) = oneshot::channel();
-        pushpull_send(PushPullMessage::Pull {
-            topic: self.id().to_string(),
-            message: tx,
-        })?;
+        let topic = self.id().to_string();
+        tokio::spawn(async move {
+            if let Ok(msg) = messaging::pull(topic).await {
+                let _ = tx.send(msg);
+            }
+        });
         let future_string = FutureString::new(rx);
         Ok(self.ctx().table.push(future_string)?)
     }
 
     async fn broadcast(&mut self, topic: String, message: String) -> Result<()> {
-        pubsub_send(PubSubMessage::Publish { topic, message })?;
+        messaging::publish(topic, message)?;
         Ok(())
     }
 
     async fn subscribe(&mut self, topic: String) -> Result<Resource<Subscription>> {
         let (tx, rx) = mpsc::channel(64);
-        let (sub_tx, sub_rx) = oneshot::channel();
-        pubsub_send(PubSubMessage::Subscribe {
-            topic: topic.clone(),
-            sender: tx,
-            sub_id: sub_tx,
-        })?;
-        let sub_id = sub_rx.await?;
+        let sub_id = messaging::subscribe(topic.clone(), tx).await?;
         let sub = Subscription {
             id: sub_id,
             topic,
@@ -95,7 +91,7 @@ impl pie::core::messaging::HostSubscription for InstanceState {
         sub.done = true;
         let topic = sub.topic.clone();
         let sub_id = sub.id;
-        pubsub_send(PubSubMessage::Unsubscribe { topic, sub_id })?;
+        messaging::unsubscribe(topic, sub_id)?;
         Ok(())
     }
 

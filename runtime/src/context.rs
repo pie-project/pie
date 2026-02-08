@@ -34,45 +34,45 @@ pub type LockId = u64;
 // Public API
 // =============================================================================
 
-static SERVICE_ARRAY: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
+static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 
 /// Spawns a new context manager for a model.
 pub fn spawn(page_store: PageStore) -> usize {
-    SERVICE_ARRAY.spawn(move || ContextManager::new(page_store)).expect("Failed to spawn context manager")
+    SERVICES.spawn(move || ContextManager::new(page_store)).expect("Failed to spawn context manager")
 }
 
 /// Creates a new context with the given name.
 pub async fn create(model_idx: usize, user_id: u32, name: String, fill: Option<Vec<u32>>) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    send(model_idx, Message::Create { user_id, name, fill, response: tx })?;
+    SERVICES.send(model_idx, Message::Create { user_id, name, fill, response: tx })?;
     rx.await?
 }
 
 /// Destroys a context.
 pub async fn destroy(model_idx: usize, id: ContextId, lock_id: LockId) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    send(model_idx, Message::Destroy { id, lock_id, response: tx })?;
+    SERVICES.send(model_idx, Message::Destroy { id, lock_id, response: tx })?;
     rx.await?
 }
 
 /// Looks up a context by name.
 pub async fn lookup(model_idx: usize, user_id: u32, name: String) -> Option<ContextId> {
     let (tx, rx) = oneshot::channel();
-    send(model_idx, Message::Lookup { user_id, name, response: tx }).ok()?;
+    SERVICES.send(model_idx, Message::Lookup { user_id, name, response: tx }).ok()?;
     rx.await.ok()?
 }
 
 /// Forks a context into a new one.
 pub async fn fork(model_idx: usize, id: ContextId, user_id: u32, new_name: String) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    send(model_idx, Message::Fork { id, user_id, new_name, response: tx })?;
+    SERVICES.send(model_idx, Message::Fork { id, user_id, new_name, response: tx })?;
     rx.await?
 }
 
 /// Acquires a lock on the context.
 pub async fn acquire_lock(model_idx: usize, id: ContextId) -> LockId {
     let (tx, rx) = oneshot::channel();
-    if send(model_idx, Message::AcquireLock { id, response: tx }).is_err() {
+    if SERVICES.send(model_idx, Message::AcquireLock { id, response: tx }).is_err() {
         return 0;
     }
     rx.await.unwrap_or(0)
@@ -80,13 +80,13 @@ pub async fn acquire_lock(model_idx: usize, id: ContextId) -> LockId {
 
 /// Releases the lock on the context.
 pub fn release_lock(model_idx: usize, id: ContextId, lock_id: LockId) -> Result<()> {
-    send(model_idx, Message::ReleaseLock { id, lock_id })
+    SERVICES.send(model_idx, Message::ReleaseLock { id, lock_id })
 }
 
 /// Gets the number of tokens per page.
 pub async fn tokens_per_page(model_idx: usize, id: ContextId) -> u32 {
     let (tx, rx) = oneshot::channel();
-    if send(model_idx, Message::TokensPerPage { id, response: tx }).is_err() {
+    if SERVICES.send(model_idx, Message::TokensPerPage { id, response: tx }).is_err() {
         return 0;
     }
     rx.await.unwrap_or(0)
@@ -95,7 +95,7 @@ pub async fn tokens_per_page(model_idx: usize, id: ContextId) -> u32 {
 /// Gets the number of committed pages.
 pub async fn committed_page_count(model_idx: usize, id: ContextId) -> u32 {
     let (tx, rx) = oneshot::channel();
-    if send(model_idx, Message::CommittedPageCount { id, response: tx }).is_err() {
+    if SERVICES.send(model_idx, Message::CommittedPageCount { id, response: tx }).is_err() {
         return 0;
     }
     rx.await.unwrap_or(0)
@@ -104,26 +104,26 @@ pub async fn committed_page_count(model_idx: usize, id: ContextId) -> u32 {
 /// Commits pages to the context.
 pub async fn commit_pages(model_idx: usize, id: ContextId, lock_id: LockId, page_indices: Vec<u32>) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    send(model_idx, Message::CommitPages { id, lock_id, page_indices, response: tx })?;
+    SERVICES.send(model_idx, Message::CommitPages { id, lock_id, page_indices, response: tx })?;
     rx.await?
 }
 
 /// Reserves pages for the context.
 pub async fn reserve_pages(model_idx: usize, id: ContextId, lock_id: LockId, num_pages: u32) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    send(model_idx, Message::ReservePages { id, lock_id, num_pages, response: tx })?;
+    SERVICES.send(model_idx, Message::ReservePages { id, lock_id, num_pages, response: tx })?;
     rx.await?
 }
 
 /// Releases pages from the context.
 pub fn release_pages(model_idx: usize, id: ContextId, lock_id: LockId, num_pages: u32) -> Result<()> {
-    send(model_idx, Message::ReleasePages { id, lock_id, num_pages })
+    SERVICES.send(model_idx, Message::ReleasePages { id, lock_id, num_pages })
 }
 
 /// Gets the cursor position.
 pub async fn get_cursor(model_idx: usize, id: ContextId, lock_id: LockId) -> u32 {
     let (tx, rx) = oneshot::channel();
-    if send(model_idx, Message::GetCursor { id, lock_id, response: tx }).is_err() {
+    if SERVICES.send(model_idx, Message::GetCursor { id, lock_id, response: tx }).is_err() {
         return 0;
     }
     rx.await.unwrap_or(0)
@@ -131,13 +131,13 @@ pub async fn get_cursor(model_idx: usize, id: ContextId, lock_id: LockId) -> u32
 
 /// Sets the cursor position.
 pub fn set_cursor(model_idx: usize, id: ContextId, lock_id: LockId, cursor: u32) -> Result<()> {
-    send(model_idx, Message::SetCursor { id, lock_id, cursor })
+    SERVICES.send(model_idx, Message::SetCursor { id, lock_id, cursor })
 }
 
 /// Gets buffered tokens.
 pub async fn get_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId) -> Vec<u32> {
     let (tx, rx) = oneshot::channel();
-    if send(model_idx, Message::GetBufferedTokens { id, lock_id, response: tx }).is_err() {
+    if SERVICES.send(model_idx, Message::GetBufferedTokens { id, lock_id, response: tx }).is_err() {
         return Vec::new();
     }
     rx.await.unwrap_or_default()
@@ -145,16 +145,12 @@ pub async fn get_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockI
 
 /// Sets buffered tokens.
 pub fn set_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId, tokens: Vec<u32>) -> Result<()> {
-    send(model_idx, Message::SetBufferedTokens { id, lock_id, tokens })
+    SERVICES.send(model_idx, Message::SetBufferedTokens { id, lock_id, tokens })
 }
 
 /// Appends buffered tokens.
 pub fn append_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId, tokens: Vec<u32>) -> Result<()> {
-    send(model_idx, Message::AppendBufferedTokens { id, lock_id, tokens })
-}
-
-fn send(model_idx: usize, msg: Message) -> Result<()> {
-    SERVICE_ARRAY.send(model_idx, msg)
+    SERVICES.send(model_idx, Message::AppendBufferedTokens { id, lock_id, tokens })
 }
 
 
@@ -741,7 +737,7 @@ impl ContextManager {
 
 /// Messages handled by ContextManager.
 #[derive(Debug)]
-pub(crate) enum Message {
+enum Message {
     Create { user_id: u32, name: String, fill: Option<Vec<u32>>, response: oneshot::Sender<Result<ContextId>> },
     Destroy { id: ContextId, lock_id: LockId, response: oneshot::Sender<Result<()>> },
     Lookup { user_id: u32, name: String, response: oneshot::Sender<Option<ContextId>> },
@@ -759,8 +755,6 @@ pub(crate) enum Message {
     SetBufferedTokens { id: ContextId, lock_id: LockId, tokens: Vec<u32> },
     AppendBufferedTokens { id: ContextId, lock_id: LockId, tokens: Vec<u32> },
 }
-
-
 
 
 impl ServiceHandler for ContextManager {

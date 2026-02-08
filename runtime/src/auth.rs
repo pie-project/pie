@@ -1,7 +1,9 @@
-//! Auth Service - Authentication and authorization management
+//! Authentication and authorization.
 //!
-//! This module provides a singleton actor for managing user authentication,
-//! public key verification, and internal token validation.
+//! Exposes a singleton actor that owns the authorized-users list and handles
+//! challenge-response verification, user/key management, and internal token
+//! validation.  All public functions in this module send a message to the
+//! actor and await the reply.
 
 mod keys;
 mod users;
@@ -18,46 +20,37 @@ use tokio::sync::oneshot;
 
 use crate::service::{Service, ServiceHandler};
 
-// =============================================================================
-// Actor Setup (Singleton)
-// =============================================================================
+// ---- Singleton Actor --------------------------------------------------------
 
-/// Global singleton Auth actor.
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
-/// Spawns the Auth actor.
+/// Spawns the auth actor.
 pub fn spawn(enable_auth: bool, authorized_users_path: &Path) {
     SERVICE
-        .spawn(|| AuthService::new(enable_auth, authorized_users_path))
-        .expect("Auth already spawned");
+        .spawn(|| Auth::new(enable_auth, authorized_users_path))
+        .expect("auth already spawned");
 }
 
-// =============================================================================
-// Convenience Wrappers
-// =============================================================================
+// ---- Public API (message wrappers) -----------------------------------------
 
-/// Check if a user exists in the authorized users list.
 pub async fn user_exists(username: String) -> Result<bool> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::UserExists { username, response: tx })?;
     Ok(rx.await?)
 }
 
-/// Check if authentication is enabled.
 pub async fn is_auth_enabled() -> Result<bool> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::IsAuthEnabled { response: tx })?;
     Ok(rx.await?)
 }
 
-/// Generate a new challenge for authentication.
 pub async fn generate_challenge() -> Result<Vec<u8>> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::GenerateChallenge { response: tx })?;
     rx.await?
 }
 
-/// Verify a signature against all user keys.
 pub async fn verify_signature(
     username: String,
     challenge: Vec<u8>,
@@ -68,27 +61,23 @@ pub async fn verify_signature(
     Ok(rx.await?)
 }
 
-/// Verify internal auth token.
 pub async fn verify_internal_token(token: String) -> Result<bool> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::VerifyInternalToken { token, response: tx })?;
     Ok(rx.await?)
 }
 
-/// Get the internal auth token.
 pub async fn get_internal_auth_token() -> Result<String> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::GetInternalAuthToken { response: tx })?;
     Ok(rx.await?)
 }
 
-// =============================================================================
-// AuthService (Business Logic)
-// =============================================================================
+// ---- State ------------------------------------------------------------------
 
-/// The auth service handles all authentication operations.
+/// Core authentication state: authorized users, internal token, and RNG.
 #[derive(Debug)]
-pub struct AuthService {
+pub struct Auth {
     enable_auth: bool,
     authorized_users: AuthorizedUsers,
     authorized_users_path: PathBuf,
@@ -96,7 +85,7 @@ pub struct AuthService {
     rng: SystemRandom,
 }
 
-impl AuthService {
+impl Auth {
     pub fn new(enable_auth: bool, authorized_users_path: &Path) -> Self {
         let authorized_users = if enable_auth {
             AuthorizedUsers::load(authorized_users_path)
@@ -108,7 +97,7 @@ impl AuthService {
         let internal_auth_token =
             generate_internal_auth_token().expect("Failed to generate internal auth token");
 
-        AuthService {
+        Auth {
             enable_auth,
             authorized_users,
             authorized_users_path: authorized_users_path.to_path_buf(),
@@ -187,13 +176,10 @@ impl AuthService {
     }
 }
 
-// =============================================================================
-// Messages
-// =============================================================================
+// ---- Messages ---------------------------------------------------------------
 
-/// Messages for the Auth actor.
 #[derive(Debug)]
-pub enum Message {
+enum Message {
     UserExists {
         username: String,
         response: oneshot::Sender<bool>,
@@ -241,7 +227,7 @@ pub enum Message {
     },
 }
 
-impl ServiceHandler for AuthService {
+impl ServiceHandler for Auth {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
@@ -283,14 +269,9 @@ impl ServiceHandler for AuthService {
     }
 }
 
-// =============================================================================
-// Token Generation
-// =============================================================================
+// ---- Helpers ----------------------------------------------------------------
 
-/// Generates a URL-safe base64 token (64 characters) for internal authentication.
-///
-/// Uses `ring::rand::SystemRandom` for cryptographic randomness.
-/// 48 random bytes → 64 characters in base64url (no padding).
+/// 48 random bytes → 64-char URL-safe base64 token (no padding).
 fn generate_internal_auth_token() -> Result<String> {
     let mut bytes = [0u8; 48];
     SystemRandom::new()

@@ -1,7 +1,7 @@
-//! Messaging Service - PubSub and PushPull messaging patterns
+//! Message Queue Service
 //!
-//! This module provides actors for inter-process messaging using the
-//! modern actor model (Handle trait).
+//! Unified pub/sub and push/pull messaging over a single actor.
+//! Public functions send a message to the actor and (optionally) await replies.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
@@ -11,76 +11,166 @@ use dashmap::DashMap;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use crate::service::{Service, ServiceArray, ServiceHandler};
+use crate::service::{Service, ServiceHandler};
 use crate::utils::IdPool;
 
 type ListenerId = usize;
 
-// =============================================================================
-// PubSub Actor
-// =============================================================================
+// ---- Singleton Actor --------------------------------------------------------
 
-/// Global singleton PubSub actor.
-static PUBSUB_ACTOR: LazyLock<Service<PubSubMessage>> = LazyLock::new(Service::new);
+static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
-/// Spawns the PubSub actor.
-pub fn spawn_pubsub() {
-    PUBSUB_ACTOR.spawn(|| PubSubActor::default()).expect("PubSub already spawned");
+/// Spawns the message-queue actor.
+pub fn spawn() {
+    SERVICE.spawn(|| MessageQueue::default()).expect("messaging already spawned");
 }
 
-/// Sends a message to the PubSub actor.
-pub fn pubsub_send(msg: PubSubMessage) -> anyhow::Result<()> {
-    PUBSUB_ACTOR.send(msg)
+// ---- Public API (message wrappers) ------------------------------------------
+
+/// Broadcasts a message to all subscribers of a topic.
+pub fn publish(topic: String, message: String) -> anyhow::Result<()> {
+    SERVICE.send(Message::Publish { topic, message })
 }
 
-/// Messages for the PubSub actor.
+/// Subscribes to a topic. Returns a listener ID via the oneshot.
+pub async fn subscribe(
+    topic: String,
+    sender: mpsc::Sender<String>,
+) -> anyhow::Result<ListenerId> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::Subscribe { topic, sender, sub_id: tx })?;
+    Ok(rx.await?)
+}
+
+/// Unsubscribes from a topic using a previously returned listener ID.
+pub fn unsubscribe(topic: String, sub_id: ListenerId) -> anyhow::Result<()> {
+    SERVICE.send(Message::Unsubscribe { topic, sub_id })
+}
+
+/// Pushes a string message onto a topic queue.
+pub fn push(topic: String, message: String) -> anyhow::Result<()> {
+    SERVICE.send(Message::Push { topic, message })
+}
+
+/// Pulls the next string message from a topic queue.
+pub async fn pull(topic: String) -> anyhow::Result<String> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::Pull { topic, response: tx })?;
+    Ok(rx.await?)
+}
+
+/// Pushes a binary blob onto a topic queue.
+pub fn push_blob(topic: String, message: Bytes) -> anyhow::Result<()> {
+    SERVICE.send(Message::PushBlob { topic, message })
+}
+
+/// Pulls the next binary blob from a topic queue.
+pub async fn pull_blob(topic: String) -> anyhow::Result<Bytes> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::PullBlobMsg { topic, response: tx })?;
+    Ok(rx.await?)
+}
+
+// ---- Messages ---------------------------------------------------------------
+
 #[derive(Debug)]
-pub enum PubSubMessage {
-    /// Broadcast a message to all subscribers of a topic.
+enum Message {
+    // -- PubSub --
     Publish { topic: String, message: String },
-    /// Subscribe to a topic using a sender; returns a subscription id via the oneshot.
     Subscribe {
         topic: String,
         sender: mpsc::Sender<String>,
         sub_id: oneshot::Sender<ListenerId>,
     },
-    /// Unsubscribe from a topic using the subscription id.
     Unsubscribe { topic: String, sub_id: ListenerId },
+
+    // -- PushPull (string) --
+    Push { topic: String, message: String },
+    Pull { topic: String, response: oneshot::Sender<String> },
+
+    // -- PushPull (blob) --
+    PushBlob { topic: String, message: Bytes },
+    PullBlobMsg { topic: String, response: oneshot::Sender<Bytes> },
 }
 
-/// PubSub actor implementation.
-struct PubSubActor {
-    tx: UnboundedSender<(String, String)>,
-    _event_loop_handle: tokio::task::JoinHandle<()>,
+// ---- State ------------------------------------------------------------------
+
+/// Unified message-queue actor: pub/sub fanout + point-to-point push/pull.
+struct MessageQueue {
+    // PubSub
+    pubsub_tx: UnboundedSender<(String, String)>,
+    _pubsub_handle: tokio::task::JoinHandle<()>,
     subscribers_by_topic: Arc<DashMap<String, Vec<(ListenerId, mpsc::Sender<String>)>>>,
     sub_id_pool: IdPool<ListenerId>,
+
+    // PushPull (string)
+    string_tx: UnboundedSender<(String, String)>,
+    _string_handle: tokio::task::JoinHandle<()>,
+    string_queues: Arc<DashMap<String, StringQueue>>,
+
+    // PushPull (blob)
+    blob_tx: UnboundedSender<(String, Bytes)>,
+    _blob_handle: tokio::task::JoinHandle<()>,
+    blob_queues: Arc<DashMap<String, BlobQueue>>,
 }
 
-impl Default for PubSubActor {
-    fn default() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let subscribers_by_topic = Arc::new(DashMap::new());
-        let _event_loop_handle =
-            tokio::spawn(Self::event_loop(rx, Arc::clone(&subscribers_by_topic)));
+enum StringQueue {
+    Messages(VecDeque<String>),
+    PendingPulls(VecDeque<oneshot::Sender<String>>),
+}
 
-        PubSubActor {
-            tx,
-            _event_loop_handle,
+enum BlobQueue {
+    Messages(VecDeque<Bytes>),
+    PendingPulls(VecDeque<oneshot::Sender<Bytes>>),
+}
+
+impl Default for MessageQueue {
+    fn default() -> Self {
+        // PubSub event loop
+        let (pubsub_tx, pubsub_rx) = mpsc::unbounded_channel();
+        let subscribers_by_topic = Arc::new(DashMap::new());
+        let _pubsub_handle =
+            tokio::spawn(Self::pubsub_loop(pubsub_rx, Arc::clone(&subscribers_by_topic)));
+
+        // PushPull string event loop
+        let (string_tx, string_rx) = mpsc::unbounded_channel();
+        let string_queues = Arc::new(DashMap::new());
+        let _string_handle =
+            tokio::spawn(Self::string_push_loop(string_rx, Arc::clone(&string_queues)));
+
+        // PushPull blob event loop
+        let (blob_tx, blob_rx) = mpsc::unbounded_channel();
+        let blob_queues = Arc::new(DashMap::new());
+        let _blob_handle =
+            tokio::spawn(Self::blob_push_loop(blob_rx, Arc::clone(&blob_queues)));
+
+        MessageQueue {
+            pubsub_tx,
+            _pubsub_handle,
             subscribers_by_topic,
             sub_id_pool: IdPool::new(ListenerId::MAX),
+            string_tx,
+            _string_handle,
+            string_queues,
+            blob_tx,
+            _blob_handle,
+            blob_queues,
         }
     }
 }
 
-impl ServiceHandler for PubSubActor {
-    type Message = PubSubMessage;
+// ---- ServiceHandler ---------------------------------------------------------
 
-    async fn handle(&mut self, msg: PubSubMessage) {
+impl ServiceHandler for MessageQueue {
+    type Message = Message;
+
+    async fn handle(&mut self, msg: Message) {
         match msg {
-            PubSubMessage::Publish { topic, message } => {
-                self.tx.send((topic, message)).unwrap();
+            // -- PubSub -------------------------------------------------------
+            Message::Publish { topic, message } => {
+                self.pubsub_tx.send((topic, message)).unwrap();
             }
-            PubSubMessage::Subscribe { topic, sender, sub_id } => {
+            Message::Subscribe { topic, sender, sub_id } => {
                 let id = self.sub_id_pool.acquire().unwrap();
                 self.subscribers_by_topic
                     .entry(topic)
@@ -88,7 +178,7 @@ impl ServiceHandler for PubSubActor {
                     .push((id, sender));
                 let _ = sub_id.send(id).ok();
             }
-            PubSubMessage::Unsubscribe { topic, sub_id } => {
+            Message::Unsubscribe { topic, sub_id } => {
                 if let Some(mut subscribers) = self.subscribers_by_topic.get_mut(&topic) {
                     subscribers.retain(|(s, _)| *s != sub_id);
                     if subscribers.is_empty() {
@@ -98,245 +188,151 @@ impl ServiceHandler for PubSubActor {
                 }
                 self.sub_id_pool.release(sub_id).unwrap();
             }
+
+            // -- PushPull (string) --------------------------------------------
+            Message::Push { topic, message } => {
+                self.string_tx.send((topic, message)).unwrap();
+            }
+            Message::Pull { topic, response } => {
+                let mut queue = self
+                    .string_queues
+                    .entry(topic.clone())
+                    .or_insert(StringQueue::PendingPulls(VecDeque::new()));
+
+                let remove = match queue.value_mut() {
+                    StringQueue::Messages(q) => {
+                        if let Some(msg) = q.pop_front() {
+                            let _ = response.send(msg);
+                        }
+                        q.is_empty()
+                    }
+                    StringQueue::PendingPulls(q) => {
+                        q.push_back(response);
+                        false
+                    }
+                };
+
+                drop(queue);
+                if remove {
+                    self.string_queues.remove(&topic);
+                }
+            }
+
+            // -- PushPull (blob) ----------------------------------------------
+            Message::PushBlob { topic, message } => {
+                self.blob_tx.send((topic, message)).unwrap();
+            }
+            Message::PullBlobMsg { topic, response } => {
+                let mut queue = self
+                    .blob_queues
+                    .entry(topic.clone())
+                    .or_insert(BlobQueue::PendingPulls(VecDeque::new()));
+
+                let remove = match queue.value_mut() {
+                    BlobQueue::Messages(q) => {
+                        if let Some(msg) = q.pop_front() {
+                            let _ = response.send(msg);
+                        }
+                        q.is_empty()
+                    }
+                    BlobQueue::PendingPulls(q) => {
+                        q.push_back(response);
+                        false
+                    }
+                };
+
+                drop(queue);
+                if remove {
+                    self.blob_queues.remove(&topic);
+                }
+            }
         }
     }
 }
 
-impl PubSubActor {
-    async fn event_loop(
+// ---- Event Loops ------------------------------------------------------------
+
+impl MessageQueue {
+    /// Fanout loop: delivers published messages to all subscribers of a topic.
+    async fn pubsub_loop(
         mut rx: UnboundedReceiver<(String, String)>,
         subscribers_by_topic: Arc<DashMap<String, Vec<(ListenerId, mpsc::Sender<String>)>>>,
     ) {
         while let Some((topic, message)) = rx.recv().await {
-            let remove_topic = if let Some(mut subscribers) = subscribers_by_topic.get_mut(&topic) {
-                subscribers.retain(|(_, sender)| {
-                    match sender.try_send(message.clone()) {
-                        Ok(_) => true,
-                        Err(mpsc::error::TrySendError::Full(_)) => true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => false,
-                    }
+            let remove = if let Some(mut subs) = subscribers_by_topic.get_mut(&topic) {
+                subs.retain(|(_, sender)| match sender.try_send(message.clone()) {
+                    Ok(_) => true,
+                    Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
                 });
-                subscribers.is_empty()
+                subs.is_empty()
             } else {
                 false
             };
 
-            if remove_topic {
+            if remove {
                 subscribers_by_topic.remove(&topic);
             }
         }
     }
-}
 
-// =============================================================================
-// PushPull Actor
-// =============================================================================
-
-/// Global singleton PushPull actor.
-static PUSHPULL_ACTOR: LazyLock<Service<PushPullMessage>> = LazyLock::new(Service::new);
-
-/// Spawns the PushPull actor.
-pub fn spawn_pushpull() {
-    PUSHPULL_ACTOR.spawn(|| PushPullActor::default()).expect("PushPull already spawned");
-}
-
-/// Sends a message to the PushPull actor.
-pub fn pushpull_send(msg: PushPullMessage) -> anyhow::Result<()> {
-    PUSHPULL_ACTOR.send(msg)
-}
-
-/// Messages for the PushPull actor.
-#[derive(Debug)]
-pub enum PushPullMessage {
-    Push { topic: String, message: String },
-    Pull { topic: String, message: oneshot::Sender<String> },
-    PushBlob { topic: String, message: Bytes },
-    PullBlob { topic: String, message: oneshot::Sender<Bytes> },
-}
-
-/// A queue for a given topic, holding either waiting messages or pending pull requests.
-enum PushPullStringQueue {
-    Messages(VecDeque<String>),
-    PendingPulls(VecDeque<oneshot::Sender<String>>),
-}
-
-/// A queue for a given topic, holding either waiting blobs or pending pull requests for blobs.
-enum PushPullBlobQueue {
-    Messages(VecDeque<Bytes>),
-    PendingPulls(VecDeque<oneshot::Sender<Bytes>>),
-}
-
-/// PushPull actor implementation.
-struct PushPullActor {
-    tx_string: UnboundedSender<(String, String)>,
-    _event_loop_handle_string: tokio::task::JoinHandle<()>,
-    string_queue_by_topic: Arc<DashMap<String, PushPullStringQueue>>,
-
-    tx_blob: UnboundedSender<(String, Bytes)>,
-    _event_loop_handle_blob: tokio::task::JoinHandle<()>,
-    blob_queue_by_topic: Arc<DashMap<String, PushPullBlobQueue>>,
-}
-
-impl Default for PushPullActor {
-    fn default() -> Self {
-        let (tx_string, rx_string) = mpsc::unbounded_channel();
-        let string_queue_by_topic = Arc::new(DashMap::new());
-        let _event_loop_handle_string = tokio::spawn(Self::event_loop_string(
-            rx_string,
-            Arc::clone(&string_queue_by_topic),
-        ));
-
-        let (tx_blob, rx_blob) = mpsc::unbounded_channel();
-        let blob_queue_by_topic = Arc::new(DashMap::new());
-        let _event_loop_handle_blob = tokio::spawn(Self::event_loop_blob(
-            rx_blob,
-            Arc::clone(&blob_queue_by_topic),
-        ));
-
-        PushPullActor {
-            tx_string,
-            _event_loop_handle_string,
-            string_queue_by_topic,
-            tx_blob,
-            _event_loop_handle_blob,
-            blob_queue_by_topic,
-        }
-    }
-}
-
-impl ServiceHandler for PushPullActor {
-    type Message = PushPullMessage;
-
-    async fn handle(&mut self, msg: PushPullMessage) {
-        match msg {
-            PushPullMessage::Push { topic, message } => {
-                self.tx_string.send((topic, message)).unwrap();
-            }
-            PushPullMessage::Pull { topic, message } => {
-                let mut queue = self
-                    .string_queue_by_topic
-                    .entry(topic.clone())
-                    .or_insert(PushPullStringQueue::PendingPulls(VecDeque::new()));
-
-                let remove_queue = match queue.value_mut() {
-                    PushPullStringQueue::Messages(q) => {
-                        if let Some(sent_msg) = q.pop_front() {
-                            let _ = message.send(sent_msg);
-                        }
-                        q.is_empty()
-                    }
-                    PushPullStringQueue::PendingPulls(q) => {
-                        q.push_back(message);
-                        false
-                    }
-                };
-
-                drop(queue);
-
-                if remove_queue {
-                    self.string_queue_by_topic.remove(&topic);
-                }
-            }
-            PushPullMessage::PushBlob { topic, message } => {
-                self.tx_blob.send((topic, message)).unwrap();
-            }
-            PushPullMessage::PullBlob { topic, message } => {
-                let mut queue = self
-                    .blob_queue_by_topic
-                    .entry(topic.clone())
-                    .or_insert(PushPullBlobQueue::PendingPulls(VecDeque::new()));
-
-                let remove_queue = match queue.value_mut() {
-                    PushPullBlobQueue::Messages(q) => {
-                        if let Some(sent_msg) = q.pop_front() {
-                            let _ = message.send(sent_msg);
-                        }
-                        q.is_empty()
-                    }
-                    PushPullBlobQueue::PendingPulls(q) => {
-                        q.push_back(message);
-                        false
-                    }
-                };
-
-                drop(queue);
-
-                if remove_queue {
-                    self.blob_queue_by_topic.remove(&topic);
-                }
-            }
-        }
-    }
-}
-
-impl PushPullActor {
-    async fn event_loop_string(
+    /// Push loop for string messages: delivers to a waiting pull or enqueues.
+    async fn string_push_loop(
         mut rx: UnboundedReceiver<(String, String)>,
-        queue_by_topic: Arc<DashMap<String, PushPullStringQueue>>,
+        queues: Arc<DashMap<String, StringQueue>>,
     ) {
         while let Some((topic, message)) = rx.recv().await {
-            let mut queue = queue_by_topic
+            let mut queue = queues
                 .entry(topic.clone())
-                .or_insert(PushPullStringQueue::Messages(VecDeque::new()));
+                .or_insert(StringQueue::Messages(VecDeque::new()));
 
-            let remove_queue = match queue.value_mut() {
-                PushPullStringQueue::Messages(q) => {
+            let remove = match queue.value_mut() {
+                StringQueue::Messages(q) => {
                     q.push_back(message);
                     false
                 }
-                PushPullStringQueue::PendingPulls(q) => {
-                    if let Some(waiting_pull) = q.pop_front() {
-                        let _ = waiting_pull.send(message);
+                StringQueue::PendingPulls(q) => {
+                    if let Some(waiting) = q.pop_front() {
+                        let _ = waiting.send(message);
                     }
                     q.is_empty()
                 }
             };
 
             drop(queue);
-
-            if remove_queue {
-                queue_by_topic.remove(&topic);
+            if remove {
+                queues.remove(&topic);
             }
         }
     }
 
-    async fn event_loop_blob(
+    /// Push loop for blob messages: delivers to a waiting pull or enqueues.
+    async fn blob_push_loop(
         mut rx: UnboundedReceiver<(String, Bytes)>,
-        queue_by_topic: Arc<DashMap<String, PushPullBlobQueue>>,
+        queues: Arc<DashMap<String, BlobQueue>>,
     ) {
         while let Some((topic, message)) = rx.recv().await {
-            let mut queue = queue_by_topic
+            let mut queue = queues
                 .entry(topic.clone())
-                .or_insert(PushPullBlobQueue::Messages(VecDeque::new()));
+                .or_insert(BlobQueue::Messages(VecDeque::new()));
 
-            let remove_queue = match queue.value_mut() {
-                PushPullBlobQueue::Messages(q) => {
+            let remove = match queue.value_mut() {
+                BlobQueue::Messages(q) => {
                     q.push_back(message);
                     false
                 }
-                PushPullBlobQueue::PendingPulls(q) => {
-                    if let Some(waiting_pull) = q.pop_front() {
-                        let _ = waiting_pull.send(message);
+                BlobQueue::PendingPulls(q) => {
+                    if let Some(waiting) = q.pop_front() {
+                        let _ = waiting.send(message);
                     }
                     q.is_empty()
                 }
             };
 
             drop(queue);
-
-            if remove_queue {
-                queue_by_topic.remove(&topic);
+            if remove {
+                queues.remove(&topic);
             }
         }
     }
-}
-
-// =============================================================================
-// Public API
-// =============================================================================
-
-/// Spawns all messaging actors.
-pub fn spawn() {
-    spawn_pubsub();
-    spawn_pushpull();
 }

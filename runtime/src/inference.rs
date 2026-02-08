@@ -32,7 +32,7 @@ pub use request::{ForwardPassOutput as Output, Sampler};
 // Public API
 // =============================================================================
 
-static SERVICE_ARRAY: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLock::new(ServiceArray::new);
+static SERVICES: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLock::new(ServiceArray::new);
 
 /// Spawns a new inference service for a model.
 pub async fn spawn(
@@ -45,12 +45,12 @@ pub async fn spawn(
     // Fetch device info before entering the sync closure.
     let mut device_batch_limits = Vec::with_capacity(page_store.devices().len());
     for &device_idx in page_store.devices() {
-        let info = crate::device::get_info(device_idx).await
+        let info = crate::device::get_spec(device_idx).await
             .unwrap_or_else(|e| panic!("Failed to get device info for index {device_idx}: {e}"));
         device_batch_limits.push((info.max_batch_size, info.max_batch_tokens));
     }
 
-    SERVICE_ARRAY.spawn(move || InferenceService::new(
+    SERVICES.spawn(move || InferenceService::new(
         page_store,
         device_batch_limits,
         max_in_flight_batches,
@@ -63,7 +63,7 @@ pub async fn spawn(
 /// Executes a forward pass and returns the output.
 pub async fn forward_pass(model_idx: usize, request: ForwardPassRequest) -> Result<ForwardPassOutput> {
     let (tx, rx) = oneshot::channel();
-    SERVICE_ARRAY.send(model_idx, Message::ForwardPass { request, response: tx })?;
+    SERVICES.send(model_idx, Message::ForwardPass { request, response: tx })?;
     Ok(rx.await?)
 }
 
@@ -169,7 +169,7 @@ impl InferenceService {
 
 /// Messages handled by InferenceService.
 #[derive(Debug)]
-pub(crate) enum Message {
+enum Message {
     ForwardPass { request: ForwardPassRequest, response: oneshot::Sender<ForwardPassOutput> },
 }
 

@@ -10,7 +10,6 @@ pub mod api;
 pub mod auth;
 pub mod context;
 pub mod device;
-pub mod dummy;
 pub mod bootstrap;
 pub mod inference;
 pub mod messaging;

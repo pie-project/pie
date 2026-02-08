@@ -161,7 +161,7 @@ impl PageStore {
     pub async fn new(page_size: usize, device_indices: &[usize]) -> Self {
         let phys_page_tables = boxcar::Vec::new();
         for &idx in device_indices {
-            let info = crate::device::get_info(idx).await
+            let info = crate::device::get_spec(idx).await
                 .unwrap_or_else(|e| panic!("Failed to get device info for index {idx}: {e}"));
             phys_page_tables.push(Mutex::new(PhysicalPageStore::new(info.num_kv_pages)));
         }

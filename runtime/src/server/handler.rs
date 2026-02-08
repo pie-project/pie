@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::instance::InstanceId;
 use crate::output::{OutputChannel, OutputDelivery};
-use crate::messaging::{self, PushPullMessage};
+use crate::messaging;
 use crate::program::{self, Manifest, ProgramName};
 use crate::runtime::{self, AttachInstanceResult};
 
@@ -268,11 +268,7 @@ impl Session {
     pub async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.attached_instances.contains(&inst_id) {
-                messaging::pushpull_send(PushPullMessage::Push {
-                    topic: inst_id.to_string(),
-                    message,
-                })
-                .unwrap();
+                messaging::push(inst_id.to_string(), message).unwrap();
             }
         }
     }
@@ -382,11 +378,7 @@ impl Session {
                 }
 
                 // Send to instance
-                messaging::pushpull_send(PushPullMessage::PushBlob {
-                    topic: inst_id.to_string(),
-                    message: Bytes::from(buffer),
-                })
-                .unwrap();
+                messaging::push_blob(inst_id.to_string(), Bytes::from(buffer)).unwrap();
                 self.send_response(corr_id, true, "Blob sent to instance".to_string())
                     .await;
             }
