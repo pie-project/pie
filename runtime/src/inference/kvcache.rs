@@ -137,11 +137,13 @@ impl PhysicalPageStore {
 
 
 impl PageStore {
-    pub fn new(page_size: usize, device_configs: &[crate::bootstrap::DeviceConfig]) -> Self {
-        let devices = device_configs
-            .iter()
-            .map(|d| PhysicalPageStore::new(d.total_pages))
-            .collect();
+    pub async fn new(page_size: usize, device_indices: &[usize]) -> Self {
+        let mut devices = Vec::with_capacity(device_indices.len());
+        for &idx in device_indices {
+            let info = crate::device::get_info(idx).await
+                .unwrap_or_else(|e| panic!("Failed to get device info for index {idx}: {e}"));
+            devices.push(PhysicalPageStore::new(info.num_kv_pages));
+        }
         PageStore {
             page_size,
             pages: Vec::new(),

@@ -13,7 +13,6 @@ pub mod device;
 pub mod dummy;
 pub mod bootstrap;
 pub mod inference;
-pub mod kvcache;
 pub mod messaging;
 pub mod model;
 pub mod program;

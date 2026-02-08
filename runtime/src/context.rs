@@ -20,7 +20,7 @@ use anyhow::Result;
 use crate::service::{ServiceHandler, ServiceArray};
 use crate::adapter::AdapterId;
 use crate::inference::brle::Brle;
-use crate::kvcache::{PageId, PageStore, DeviceId, PhysicalPageId, PageHash};
+use crate::inference::kvcache::{PageId, PageStore, DeviceId, PhysicalPageId, PageHash};
 
 // =============================================================================
 // Public Types

@@ -13,7 +13,7 @@ use crate::context;
 use crate::device;
 use crate::inference;
 
-use crate::kvcache::PageStore;
+use crate::inference::kvcache::PageStore;
 use crate::program;
 use crate::runtime;
 use crate::server;
@@ -41,6 +41,7 @@ pub struct ModelConfig {
     pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
     pub devices: Vec<DeviceConfig>,
+    pub scheduler: SchedulerConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -49,13 +50,13 @@ pub struct DeviceConfig {
     pub total_pages: usize,
     pub max_batch_tokens: usize,
     pub max_batch_size: usize,
-    /// Maximum number of batches in flight per device (default: 3).
+}
+
+#[derive(Debug, Clone)]
+pub struct SchedulerConfig {
     pub max_in_flight_batches: usize,
-    /// RPC request timeout in seconds (default: 30).
     pub request_timeout_secs: u64,
-    /// Maximum wait time before forcing a batch fire, in ms (default: 50).
     pub max_wait_ms: u64,
-    /// Minimum batch size before considering throughput optimization (default: 8).
     pub min_batch_for_optimization: usize,
 }
 
@@ -98,8 +99,6 @@ pub async fn bootstrap(
     
     let wasm_engine = wasmtime::Engine::new(&wasm_config).unwrap();
 
-
-    // Spawn the auth actor
     auth::spawn(
         config.auth.enabled,
         &config.auth.authorized_users_dir,
@@ -114,25 +113,17 @@ pub async fn bootstrap(
     runtime::spawn(wasm_engine);
     server::spawn(&config.host, config.port);
 
-    // Spawn device services (flat across all models)
-    let mut device_indices_per_model: Vec<Vec<usize>> = Vec::new();
-    for model_config in &config.models {
-        let mut model_device_ids = Vec::new();
-        for (i, dev_cfg) in model_config.devices.iter().enumerate() {
-            let idx = device::spawn(i as u8, dev_cfg);
-            model_device_ids.push(idx);
-        }
-        device_indices_per_model.push(model_device_ids);
-    }
+    for cfg in config.models.iter() {
 
-    // Spawn per-model services: context, adapter, inference
-    for (model_idx, model_config) in config.models.iter().enumerate() {
-        let page_store = Arc::new(RwLock::new(PageStore::new(model_config.kv_page_size, &model_config.devices)));
+        let devices: Vec<usize> = cfg.devices.iter().map(|d| {
+            device::spawn(&d.hostname, d.total_pages, d.max_batch_size, d.max_batch_tokens)
+        }).collect();
 
-        // Spawn services with shared page store
+        let page_store = Arc::new(RwLock::new(PageStore::new(cfg.kv_page_size, &devices).await));
+
         context::spawn(page_store.clone());
-        inference::spawn(page_store, &model_config.devices, &device_indices_per_model[model_idx]);
-        adapter::spawn(&model_config.devices);
+        inference::spawn(page_store, &cfg.scheduler);
+        adapter::spawn(&devices);
     }
 
     Ok(auth::get_internal_auth_token().await?)

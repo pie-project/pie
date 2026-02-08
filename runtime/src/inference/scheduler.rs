@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-use crate::kvcache::{DeviceId, PhysicalPageId};
+use crate::bootstrap::SchedulerConfig;
+use crate::inference::kvcache::{DeviceId, PhysicalPageId};
 
-use crate::device::{self, DeviceInfo};
+use crate::device::{self, Device};
 
 use super::adaptive_policy::AdaptiveThroughputPolicy;
 use super::request::{
@@ -152,20 +153,21 @@ impl BatchScheduler {
     ///
     /// The RPC connection is owned by the device service; the scheduler
     /// only stores the device index for routing calls.
-    pub fn new(id: DeviceId, config: &crate::bootstrap::DeviceConfig, device_idx: usize) -> Self {
-        let device_info = DeviceInfo {
-            id,
+    pub fn new(
+        device_id: DeviceId,
+        config: &crate::bootstrap::DeviceConfig,
+        scheduler_config: &SchedulerConfig,
+        device_idx: usize,
+    ) -> Self {
+        let device = Device {
             hostname: config.hostname.clone(),
+            num_kv_pages: config.total_pages,
             max_batch_size: config.max_batch_size,
             max_batch_tokens: config.max_batch_tokens,
-            max_in_flight_batches: config.max_in_flight_batches,
-            request_timeout: Duration::from_secs(config.request_timeout_secs),
-            max_wait_time: Duration::from_millis(config.max_wait_ms),
-            min_batch_for_optimization: config.min_batch_for_optimization,
         };
 
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(Self::run(device_info, device_idx, rx));
+        tokio::spawn(Self::run(device, device_id, scheduler_config.clone(), device_idx, rx));
 
         Self { tx }
     }
@@ -191,19 +193,24 @@ impl BatchScheduler {
 
     /// Main scheduling loop for a single device.
     async fn run(
-        info: DeviceInfo,
+        device: Device,
+        device_id: DeviceId,
+        sched: SchedulerConfig,
         device_idx: usize,
         mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
     ) {
+        let max_wait_time = Duration::from_millis(sched.max_wait_ms);
+        let request_timeout = Duration::from_secs(sched.request_timeout_secs);
+
         // Per-device state
-        let mut batch = BatchAccumulator::new(info.max_batch_size, info.max_batch_tokens);
+        let mut batch = BatchAccumulator::new(device.max_batch_size, device.max_batch_tokens);
         let mut policy: Box<dyn SchedulingPolicy> =
             Box::new(AdaptiveThroughputPolicy::new(
-                info.max_batch_size,
-                info.max_wait_time,
-                info.min_batch_for_optimization,
+                device.max_batch_size,
+                max_wait_time,
+                sched.min_batch_for_optimization,
             ));
-        let in_flight = Arc::new(Semaphore::new(info.max_in_flight_batches));
+        let in_flight = Arc::new(Semaphore::new(sched.max_in_flight_batches));
 
         // Channel for batch completion stats (latency feedback only)
         let (stats_tx, mut stats_rx) = mpsc::unbounded_channel::<BatchStats>();
@@ -234,7 +241,7 @@ impl BatchScheduler {
 
             // Ask the policy what to do
             let in_flight_count =
-                info.max_in_flight_batches - in_flight.available_permits();
+                sched.max_in_flight_batches - in_flight.available_permits();
 
             match policy.decide(batch.len(), batch.total_tokens(), in_flight_count) {
                 Decision::Fire => {
@@ -252,8 +259,7 @@ impl BatchScheduler {
 
                     // Spawn batch execution
                     let stats_tx_clone = stats_tx.clone();
-                    let device_id = info.id;
-                    let timeout = info.request_timeout;
+                    let timeout = request_timeout;
 
                     tokio::spawn(async move {
                         let start = Instant::now();
@@ -304,8 +310,8 @@ impl BatchScheduler {
             Self::execute_batch(
                 device_idx,
                 requests,
-                info.id,
-                info.request_timeout,
+                device_id,
+                request_timeout,
             )
             .await;
         }

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use crate::adapter::AdapterId;
 use super::brle::Brle;
-use crate::kvcache::{DeviceId, PageId};
+use crate::inference::kvcache::{DeviceId, PageId};
 
 /// Sampler configuration for token generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

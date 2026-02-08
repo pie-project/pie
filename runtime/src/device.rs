@@ -15,74 +15,22 @@ use ipc_channel::ipc::{self, IpcOneShotServer, IpcReceiver, IpcSender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use crate::kvcache::DeviceId;
+use crate::inference::kvcache::DeviceId;
 use crate::service::{ServiceArray, ServiceHandler};
 
 // =============================================================================
 // Device Configuration
 // =============================================================================
 
-/// Inference-local device configuration.
+/// Device configuration.
 ///
-/// Derived from `bootstrap::DeviceConfig` with additional inference-specific
-/// defaults (timeouts, in-flight limits).
-pub(crate) struct Device {
-    pub id: DeviceId,
-    pub hostname: String,
-    pub max_batch_size: usize,
-    pub max_batch_tokens: usize,
-    pub max_in_flight_batches: usize,
-    pub request_timeout: Duration,
-    pub max_wait_time: Duration,
-    pub min_batch_for_optimization: usize,
-}
-
-impl Device {
-    /// Create a `Device` from a bootstrap `DeviceConfig` and its index.
-    pub fn from_config(id: DeviceId, config: &crate::bootstrap::DeviceConfig) -> Self {
-        Self {
-            id,
-            hostname: config.hostname.clone(),
-            max_batch_size: config.max_batch_size,
-            max_batch_tokens: config.max_batch_tokens,
-            max_in_flight_batches: config.max_in_flight_batches,
-            request_timeout: Duration::from_secs(config.request_timeout_secs),
-            max_wait_time: Duration::from_millis(config.max_wait_ms),
-            min_batch_for_optimization: config.min_batch_for_optimization,
-        }
-    }
-}
-
-// =============================================================================
-// Device Info (returned by GetInfo)
-// =============================================================================
-
-/// Snapshot of device configuration, returned by [`get_info()`].
+/// Derived from `bootstrap::DeviceConfig`.
 #[derive(Debug, Clone)]
-pub struct DeviceInfo {
-    pub id: DeviceId,
+pub struct Device {
     pub hostname: String,
+    pub num_kv_pages: usize,
     pub max_batch_size: usize,
     pub max_batch_tokens: usize,
-    pub max_in_flight_batches: usize,
-    pub request_timeout: Duration,
-    pub max_wait_time: Duration,
-    pub min_batch_for_optimization: usize,
-}
-
-impl Device {
-    fn info(&self) -> DeviceInfo {
-        DeviceInfo {
-            id: self.id,
-            hostname: self.hostname.clone(),
-            max_batch_size: self.max_batch_size,
-            max_batch_tokens: self.max_batch_tokens,
-            max_in_flight_batches: self.max_in_flight_batches,
-            request_timeout: self.request_timeout,
-            max_wait_time: self.max_wait_time,
-            min_batch_for_optimization: self.min_batch_for_optimization,
-        }
-    }
 }
 
 // =============================================================================
@@ -107,7 +55,7 @@ pub(crate) enum Message {
     },
     /// Query device configuration.
     GetInfo {
-        response: oneshot::Sender<DeviceInfo>,
+        response: oneshot::Sender<Device>,
     },
 }
 
@@ -132,7 +80,7 @@ impl ServiceHandler for DeviceService {
                 }
             }
             Message::GetInfo { response } => {
-                let _ = response.send(self.config.info());
+                let _ = response.send(self.config.clone());
             }
         }
     }
@@ -143,12 +91,21 @@ impl ServiceHandler for DeviceService {
 // =============================================================================
 
 /// Spawn a device service. Returns the device index in the global array.
-pub fn spawn(id: DeviceId, config: &crate::bootstrap::DeviceConfig) -> usize {
-    let config = config.clone();
+pub fn spawn(
+    hostname: &str,
+    num_kv_pages: usize,
+    max_batch_size: usize,
+    max_batch_tokens: usize,
+) -> usize {
     DEVICES.spawn(move || {
-        let device = Device::from_config(id, &config);
-        let rpc = RpcClient::connect(&device.hostname)
-            .unwrap_or_else(|e| panic!("Failed to connect to device {id}: {e}"));
+        let device = Device {
+            hostname: hostname.to_string(),
+            num_kv_pages,
+            max_batch_size,
+            max_batch_tokens,
+        };
+        let rpc = RpcClient::connect(hostname)
+            .unwrap_or_else(|e| panic!("Failed to connect to device {hostname}: {e}"));
         DeviceService { config: device, rpc }
     }).expect("Failed to spawn device service")
 }
@@ -196,7 +153,7 @@ pub fn notify<T: Serialize>(device_idx: usize, method: &str, args: &T) -> Result
 }
 
 /// Query a device's configuration.
-pub async fn get_info(device_idx: usize) -> Result<DeviceInfo> {
+pub async fn get_info(device_idx: usize) -> Result<Device> {
     let (tx, rx) = oneshot::channel();
     DEVICES.send(device_idx, Message::GetInfo { response: tx })?;
     rx.await.map_err(|_| anyhow!("Device service channel closed"))

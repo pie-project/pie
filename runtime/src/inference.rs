@@ -10,6 +10,7 @@
 //! by individual BatchScheduler instances (one per device).
 
 pub mod brle;
+pub mod kvcache;
 pub mod request;
 pub mod scheduler;
 mod adaptive_policy;
@@ -19,7 +20,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::oneshot;
 
 use crate::service::{ServiceArray, ServiceHandler};
-use crate::kvcache::{DeviceId, PageId, PageStore, PhysicalPageId};
+use crate::inference::kvcache::{DeviceId, PageId, PageStore, PhysicalPageId};
 use anyhow::Result;
 use request::{ForwardPassOutput, ForwardPassRequest};
 use scheduler::BatchScheduler;
@@ -36,12 +37,10 @@ static SERVICE_ARRAY: std::sync::LazyLock<ServiceArray<Message>> = std::sync::La
 /// Spawns a new inference service for a model.
 pub fn spawn(
     page_store: Arc<RwLock<PageStore>>,
-    device_configs: &[crate::bootstrap::DeviceConfig],
-    device_indices: &[usize],
+    scheduler_config: &crate::bootstrap::SchedulerConfig,
 ) -> usize {
-    let device_configs = device_configs.to_vec();
-    let device_indices = device_indices.to_vec();
-    SERVICE_ARRAY.spawn(move || InferenceService::new(page_store, &device_configs, &device_indices)).expect("Failed to spawn inference service")
+    let scheduler_config = scheduler_config.clone();
+    SERVICE_ARRAY.spawn(move || InferenceService::new(page_store, &scheduler_config)).expect("Failed to spawn inference service")
 }
 
 /// Executes a forward pass and returns the output.
@@ -74,17 +73,10 @@ impl InferenceService {
 
     pub fn new(
         page_store: Arc<RwLock<PageStore>>,
-        device_configs: &[crate::bootstrap::DeviceConfig],
-        device_indices: &[usize],
+        scheduler_config: &crate::bootstrap::SchedulerConfig,
     ) -> Self {
-        let schedulers: Vec<BatchScheduler> = device_configs
-            .iter()
-            .zip(device_indices.iter())
-            .enumerate()
-            .map(|(idx, (config, &device_idx))| {
-                BatchScheduler::new(idx as DeviceId, config, device_idx)
-            })
-            .collect();
+        // TODO: schedulers should be created per device index
+        let schedulers = Vec::new();
 
         InferenceService {
             page_store,
