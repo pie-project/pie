@@ -1,10 +1,10 @@
 //! Adapter Service - LoRA adapter management
 //!
-//! This module provides a model-specific actor for managing LoRA adapters
+//! Each model gets a dedicated AdapterService that manages LoRA adapters
 //! with support for loading, saving, and cloning.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use anyhow::Result;
@@ -15,75 +15,74 @@ use crate::service::{ServiceHandler, ServiceArray};
 pub type AdapterId = u64;
 pub type LockId = u64;
 
-/// Global table of adapter actors.
-static ACTOR: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
+// =============================================================================
+// Public API
+// =============================================================================
 
-/// Spawns a new adapter actor.
+static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
+
+/// Spawns a new adapter service for a model.
 pub(crate) fn spawn(_devices: &[usize]) -> usize {
-    ACTOR.spawn(|| AdapterActor::default()).expect("Failed to spawn adapter actor")
+    SERVICES.spawn(|| AdapterService::default()).expect("Failed to spawn adapter service")
 }
 
-/// Messages for the adapter actor.
-#[derive(Debug)]
-pub enum Message {
-    /// Creates a new adapter with the given name.
-    Create {
-        name: String,
-        response: oneshot::Sender<Result<AdapterId>>,
-    },
-
-    /// Destroys an adapter.
-    Destroy {
-        id: AdapterId,
-        response: oneshot::Sender<Result<()>>,
-    },
-
-    /// Retrieves an existing adapter by name.
-    Get {
-        name: String,
-        response: oneshot::Sender<Option<AdapterId>>,
-    },
-
-    /// Clones an adapter with a new name.
-    Clone {
-        id: AdapterId,
-        new_name: String,
-        response: oneshot::Sender<Option<AdapterId>>,
-    },
-
-    /// Acquires a lock on the adapter.
-    Lock {
-        id: AdapterId,
-        response: oneshot::Sender<LockId>,
-    },
-
-    /// Releases the lock on the adapter.
-    Unlock {
-        id: AdapterId,
-        lock_id: LockId,
-    },
-
-    /// Loads adapter weights from a path.
-    Load {
-        id: AdapterId,
-        path: String,
-        response: oneshot::Sender<Result<()>>,
-    },
-
-    /// Saves adapter weights to a path.
-    Save {
-        id: AdapterId,
-        path: String,
-        response: oneshot::Sender<Result<()>>,
-    },
+/// Creates a new adapter with the given name.
+pub async fn create(model_idx: usize, name: String) -> Result<AdapterId> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Create { name, response: tx })?;
+    rx.await?
 }
 
-impl Message {
-    /// Sends this message to the adapter actor for the given model.
-    pub fn send(self, model_idx: usize) -> anyhow::Result<()> {
-        ACTOR.send(model_idx, self)
-    }
+/// Destroys an adapter.
+pub async fn destroy(model_idx: usize, id: AdapterId) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Destroy { id, response: tx })?;
+    rx.await?
 }
+
+/// Retrieves an existing adapter by name.
+pub async fn get(model_idx: usize, name: String) -> Option<AdapterId> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Get { name, response: tx }).ok()?;
+    rx.await.ok()?
+}
+
+/// Clones an adapter with a new name.
+pub async fn clone_adapter(model_idx: usize, id: AdapterId, new_name: String) -> Option<AdapterId> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Clone { id, new_name, response: tx }).ok()?;
+    rx.await.ok()?
+}
+
+/// Acquires a lock on the adapter.
+pub async fn lock(model_idx: usize, id: AdapterId) -> LockId {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Lock { id, response: tx }).ok();
+    rx.await.unwrap_or(0)
+}
+
+/// Releases the lock on the adapter.
+pub fn unlock(model_idx: usize, id: AdapterId, lock_id: LockId) {
+    SERVICES.send(model_idx, Message::Unlock { id, lock_id }).ok();
+}
+
+/// Loads adapter weights from a path.
+pub async fn load(model_idx: usize, id: AdapterId, path: String) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Load { id, path, response: tx })?;
+    rx.await?
+}
+
+/// Saves adapter weights to a path.
+pub async fn save(model_idx: usize, id: AdapterId, path: String) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Save { id, path, response: tx })?;
+    rx.await?
+}
+
+// =============================================================================
+// Adapter
+// =============================================================================
 
 /// Internal representation of an adapter.
 #[derive(Debug, Clone)]
@@ -103,25 +102,51 @@ impl Adapter {
     }
 }
 
-/// The adapter actor manages LoRA adapters.
+// =============================================================================
+// AdapterService
+// =============================================================================
+
+/// Per-model adapter service managing LoRA adapters.
 #[derive(Debug)]
-struct AdapterActor {
+struct AdapterService {
     adapters: HashMap<AdapterId, Adapter>,
     name_to_id: HashMap<String, AdapterId>,
-    next_id: Arc<AtomicU64>,
+    next_id: AtomicU64,
 }
 
-impl Default for AdapterActor {
+impl Default for AdapterService {
     fn default() -> Self {
-        AdapterActor {
+        AdapterService {
             adapters: HashMap::new(),
             name_to_id: HashMap::new(),
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id: AtomicU64::new(1),
         }
     }
 }
 
-impl ServiceHandler for AdapterActor {
+impl AdapterService {
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+// =============================================================================
+// ServiceHandler
+// =============================================================================
+
+#[derive(Debug)]
+enum Message {
+    Create { name: String, response: oneshot::Sender<Result<AdapterId>> },
+    Destroy { id: AdapterId, response: oneshot::Sender<Result<()>> },
+    Get { name: String, response: oneshot::Sender<Option<AdapterId>> },
+    Clone { id: AdapterId, new_name: String, response: oneshot::Sender<Option<AdapterId>> },
+    Lock { id: AdapterId, response: oneshot::Sender<LockId> },
+    Unlock { id: AdapterId, lock_id: LockId },
+    Load { id: AdapterId, path: String, response: oneshot::Sender<Result<()>> },
+    Save { id: AdapterId, path: String, response: oneshot::Sender<Result<()>> },
+}
+
+impl ServiceHandler for AdapterService {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
@@ -209,11 +234,5 @@ impl ServiceHandler for AdapterActor {
                 let _ = response.send(result);
             }
         }
-    }
-}
-
-impl AdapterActor {
-    fn next_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 }

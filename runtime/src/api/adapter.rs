@@ -1,6 +1,6 @@
 //! pie:core/adapter - Adapter resource for LoRA/fine-tuning weights
 
-use crate::adapter::{AdapterId, LockId, Message};
+use crate::adapter::{self, AdapterId, LockId};
 use crate::api::pie;
 use crate::api::types::FutureBool;
 use crate::instance::InstanceState;
@@ -9,12 +9,12 @@ use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-/// Adapter resource - represents a LoRA adapter managed by the AdapterActor.
+/// Adapter resource - represents a LoRA adapter managed by the AdapterService.
 #[derive(Debug)]
 pub struct Adapter {
-    /// The adapter ID assigned by the AdapterActor
+    /// The adapter ID assigned by the AdapterService
     pub adapter_id: AdapterId,
-    /// The model service index (for routing to the correct AdapterActor)
+    /// The model service index (for routing to the correct AdapterService)
     pub model_idx: usize,
     /// Currently held lock ID (if any)
     pub lock_id: Option<LockId>,
@@ -25,12 +25,9 @@ impl pie::core::adapter::Host for InstanceState {}
 impl pie::core::adapter::HostAdapter for InstanceState {
     async fn create(&mut self, name: String) -> Result<Result<Resource<Adapter>, String>> {
         // TODO: Get model_idx from instance context or infer from current model
-        let model_idx = 0usize; // Placeholder - should be obtained from instance state
+        let model_idx = 0usize; // Placeholder
 
-        let (tx, rx) = oneshot::channel();
-        Message::Create { name, response: tx }.send(model_idx)?;
-
-        match rx.await? {
+        match adapter::create(model_idx, name).await {
             Ok(adapter_id) => {
                 let adapter = Adapter {
                     adapter_id,
@@ -48,27 +45,16 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         let adapter_id = adapter.adapter_id;
         let model_idx = adapter.model_idx;
 
-        let (tx, rx) = oneshot::channel();
-        Message::Destroy {
-            id: adapter_id,
-            response: tx,
-        }
-        .send(model_idx)?;
-
-        // Wait for response but ignore errors - destroy is void in WIT
-        let _ = rx.await;
+        let _ = adapter::destroy(model_idx, adapter_id).await;
         self.ctx().table.delete(this)?;
         Ok(())
     }
 
     async fn lookup(&mut self, name: String) -> Result<Option<Resource<Adapter>>> {
         // TODO: Get model_idx from instance context or infer from current model
-        let model_idx = 0usize; // Placeholder - should be obtained from instance state
+        let model_idx = 0usize; // Placeholder
 
-        let (tx, rx) = oneshot::channel();
-        Message::Get { name, response: tx }.send(model_idx)?;
-
-        match rx.await? {
+        match adapter::get(model_idx, name).await {
             Some(adapter_id) => {
                 let adapter = Adapter {
                     adapter_id,
@@ -86,15 +72,7 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         let adapter_id = adapter.adapter_id;
         let model_idx = adapter.model_idx;
 
-        let (tx, rx) = oneshot::channel();
-        Message::Clone {
-            id: adapter_id,
-            new_name: name,
-            response: tx,
-        }
-        .send(model_idx)?;
-
-        match rx.await? {
+        match adapter::clone_adapter(model_idx, adapter_id, name).await {
             Some(new_adapter_id) => {
                 let new_adapter = Adapter {
                     adapter_id: new_adapter_id,
@@ -108,31 +86,22 @@ impl pie::core::adapter::HostAdapter for InstanceState {
     }
 
     async fn drop(&mut self, this: Resource<Adapter>) -> Result<()> {
-        // Note: This doesn't destroy the adapter in the actor, just the local resource
         self.ctx().table.delete(this)?;
         Ok(())
     }
 
     async fn acquire_lock(&mut self, this: Resource<Adapter>) -> Result<Resource<FutureBool>> {
-        let adapter = self.ctx().table.get(&this)?;
-        let adapter_id = adapter.adapter_id;
-        let model_idx = adapter.model_idx;
+        let adapter_res = self.ctx().table.get(&this)?;
+        let adapter_id = adapter_res.adapter_id;
+        let model_idx = adapter_res.model_idx;
 
-        let (tx, rx) = oneshot::channel();
-        Message::Lock {
-            id: adapter_id,
-            response: tx,
-        }
-        .send(model_idx)?;
+        let lock_id = adapter::lock(model_idx, adapter_id);
 
-        // Create a channel to transform the LockId response into a bool
+        // Transform the LockId future into a bool
         let (bool_tx, bool_rx) = oneshot::channel();
-
         tokio::spawn(async move {
-            if let Ok(lock_id) = rx.await {
-                // Lock succeeded if lock_id != 0
-                let _ = bool_tx.send(lock_id != 0);
-            }
+            let id = lock_id.await;
+            let _ = bool_tx.send(id != 0);
         });
 
         let future_bool = FutureBool::new(bool_rx);
@@ -140,17 +109,12 @@ impl pie::core::adapter::HostAdapter for InstanceState {
     }
 
     async fn release_lock(&mut self, this: Resource<Adapter>) -> Result<Result<(), String>> {
-        let adapter = self.ctx().table.get_mut(&this)?;
-        let adapter_id = adapter.adapter_id;
-        let model_idx = adapter.model_idx;
-        let lock_id = adapter.lock_id.take().unwrap_or(0);
+        let adapter_res = self.ctx().table.get_mut(&this)?;
+        let adapter_id = adapter_res.adapter_id;
+        let model_idx = adapter_res.model_idx;
+        let lock_id = adapter_res.lock_id.take().unwrap_or(0);
 
-        Message::Unlock {
-            id: adapter_id,
-            lock_id,
-        }
-        .send(model_idx)?;
-
+        adapter::unlock(model_idx, adapter_id, lock_id);
         Ok(Ok(()))
     }
 
@@ -159,19 +123,11 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         this: Resource<Adapter>,
         path: String,
     ) -> Result<Result<(), String>> {
-        let adapter = self.ctx().table.get(&this)?;
-        let adapter_id = adapter.adapter_id;
-        let model_idx = adapter.model_idx;
+        let adapter_res = self.ctx().table.get(&this)?;
+        let adapter_id = adapter_res.adapter_id;
+        let model_idx = adapter_res.model_idx;
 
-        let (tx, rx) = oneshot::channel();
-        Message::Load {
-            id: adapter_id,
-            path,
-            response: tx,
-        }
-        .send(model_idx)?;
-
-        match rx.await? {
+        match adapter::load(model_idx, adapter_id, path).await {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
@@ -182,19 +138,11 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         this: Resource<Adapter>,
         path: String,
     ) -> Result<Result<(), String>> {
-        let adapter = self.ctx().table.get(&this)?;
-        let adapter_id = adapter.adapter_id;
-        let model_idx = adapter.model_idx;
+        let adapter_res = self.ctx().table.get(&this)?;
+        let adapter_id = adapter_res.adapter_id;
+        let model_idx = adapter_res.model_idx;
 
-        let (tx, rx) = oneshot::channel();
-        Message::Save {
-            id: adapter_id,
-            path,
-            response: tx,
-        }
-        .send(model_idx)?;
-
-        match rx.await? {
+        match adapter::save(model_idx, adapter_id, path).await {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
