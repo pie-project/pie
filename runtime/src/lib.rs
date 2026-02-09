@@ -19,6 +19,7 @@ pub mod runtime;
 pub mod server;
 pub mod linker;
 pub mod process;
+pub mod daemon;
 
 // Re-export instance and output types from runtime
 pub use runtime::instance;

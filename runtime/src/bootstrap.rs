@@ -93,8 +93,6 @@ pub async fn bootstrap(
     );
 
     linker::spawn(&wasm_engine);
-
-    runtime::spawn(wasm_engine);
     server::spawn(&config.host, config.port);
     messaging::spawn();
 
