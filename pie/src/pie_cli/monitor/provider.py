@@ -124,7 +124,7 @@ class PieMetricsProvider:
         while not self._stop_event.is_set():
             try:
                 async with PieClient(server_uri) as client:
-                    await client.internal_authenticate(self._token)
+                    await client.auth_by_token(self._token)
                     with self._lock:
                         self._connected = True
 
@@ -139,11 +139,11 @@ class PieMetricsProvider:
 
                             # Poll instances list
                             try:
-                                instances = await client.list_instances()
+                                instances = await client.list_processes()
                                 with self._lock:
                                     self._latest_instances = instances
                             except Exception as e:
-                                _log(f"[Monitor] list_instances error: {e}")
+                                _log(f"[Monitor] list_processes error: {e}")
 
                         except Exception as e:
                             _log(f"[Monitor] poll error: {e}")

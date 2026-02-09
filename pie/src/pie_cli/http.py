@@ -171,7 +171,7 @@ def _launch_server_inferlet(
         uri = f"ws://{host}:{engine_port}"
 
         async with PieClient(uri) as client:
-            await client.internal_authenticate(client_config["internal_auth_token"])
+            await client.auth_by_token(client_config["internal_auth_token"])
 
             # Read and hash the program
             program_bytes = path.read_bytes()
@@ -184,6 +184,6 @@ def _launch_server_inferlet(
 
             # Launch as server instance
             console.print(f"[dim]Starting server on port {port}...[/dim]")
-            await client.launch_server_instance(program_hash, port, arguments)
+            await client.launch_daemon(program_hash, port, arguments)
 
     asyncio.run(_launch())

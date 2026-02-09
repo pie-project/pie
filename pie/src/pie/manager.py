@@ -1028,7 +1028,7 @@ async def _submit_inferlet_async(
 
         async with PieClient(server_uri) as client:
             # Authenticate with internal token
-            await client.internal_authenticate(internal_token)
+            await client.auth_by_token(internal_token)
 
             # Check if program already exists, install if not
             if not await client.program_exists(inferlet_name, inferlet_path, manifest_path):
@@ -1039,7 +1039,7 @@ async def _submit_inferlet_async(
 
             # Launch the instance
             emit("info", f"Launching {inferlet_path.name}...")
-            instance = await client.launch_instance(
+            instance = await client.launch_process(
                 inferlet_name,
                 arguments=arguments,
                 capture_outputs=True,
@@ -1184,10 +1184,10 @@ async def _submit_inferlet_from_registry_async(
     try:
         async with PieClient(server_uri) as client:
             # Authenticate with internal token
-            await client.internal_authenticate(internal_token)
+            await client.auth_by_token(internal_token)
 
             # Launch the instance from registry
-            instance = await client.launch_instance_from_registry(
+            instance = await client.launch_process_from_registry(
                 inferlet=inferlet_name,
                 arguments=arguments,
                 capture_outputs=True,

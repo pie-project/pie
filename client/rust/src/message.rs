@@ -59,11 +59,11 @@ pub enum StreamingOutput {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    #[serde(rename = "identification")]
-    Identification { corr_id: u32, username: String },
+    #[serde(rename = "auth_request")]
+    AuthRequest { corr_id: u32, username: String },
 
-    #[serde(rename = "signature")]
-    Signature { corr_id: u32, signature: String },
+    #[serde(rename = "auth_response")]
+    AuthResponse { corr_id: u32, signature: String },
 
     #[serde(rename = "query")]
     Query {
@@ -84,27 +84,27 @@ pub enum ClientMessage {
         chunk_data: Vec<u8>,
     },
 
-    #[serde(rename = "launch_instance")]
-    LaunchInstance {
+    #[serde(rename = "launch_process")]
+    LaunchProcess {
         corr_id: u32,
         inferlet: String,
         arguments: Vec<String>,
         capture_outputs: bool,
     },
 
-    #[serde(rename = "attach_instance")]
-    AttachInstance { corr_id: u32, instance_id: String },
+    #[serde(rename = "attach_process")]
+    AttachProcess { corr_id: u32, instance_id: String },
 
-    #[serde(rename = "launch_server_instance")]
-    LaunchServerInstance {
+    #[serde(rename = "launch_daemon")]
+    LaunchDaemon {
         corr_id: u32,
         port: u32,
         inferlet: String,
         arguments: Vec<String>,
     },
 
-    #[serde(rename = "signal_instance")]
-    SignalInstance {
+    #[serde(rename = "signal_process")]
+    SignalProcess {
         instance_id: String,
         message: String,
     },
@@ -120,17 +120,17 @@ pub enum ClientMessage {
         chunk_data: Vec<u8>,
     },
 
-    #[serde(rename = "terminate_instance")]
-    TerminateInstance { corr_id: u32, instance_id: String },
+    #[serde(rename = "terminate_process")]
+    TerminateProcess { corr_id: u32, instance_id: String },
 
-    #[serde(rename = "internal_authenticate")]
-    InternalAuthenticate { corr_id: u32, token: String },
+    #[serde(rename = "auth_by_token")]
+    AuthByToken { corr_id: u32, token: String },
 
     #[serde(rename = "ping")]
     Ping { corr_id: u32 },
 
-    #[serde(rename = "list_instances")]
-    ListInstances { corr_id: u32 },
+    #[serde(rename = "list_processes")]
+    ListProcesses { corr_id: u32 },
 }
 
 /// Messages from server -> client
@@ -144,22 +144,22 @@ pub enum ServerMessage {
         result: String,
     },
 
-    #[serde(rename = "instance_launch_result")]
-    InstanceLaunchResult {
+    #[serde(rename = "process_launch_result")]
+    ProcessLaunchResult {
         corr_id: u32,
         successful: bool,
         message: String,
     },
 
-    #[serde(rename = "instance_attach_result")]
-    InstanceAttachResult {
+    #[serde(rename = "process_attach_result")]
+    ProcessAttachResult {
         corr_id: u32,
         successful: bool,
         message: String,
     },
 
-    #[serde(rename = "instance_event")]
-    InstanceEvent {
+    #[serde(rename = "process_event")]
+    ProcessEvent {
         instance_id: String,
         event: u32,
         message: String,
@@ -182,8 +182,8 @@ pub enum ServerMessage {
     #[serde(rename = "challenge")]
     Challenge { corr_id: u32, challenge: String },
 
-    #[serde(rename = "live_instances")]
-    LiveInstances {
+    #[serde(rename = "live_processes")]
+    LiveProcesses {
         corr_id: u32,
         instances: Vec<InstanceInfo>,
     },

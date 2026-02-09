@@ -215,6 +215,19 @@ impl Process {
         self.output_buffer.push_back(content);
     }
 
+    /// Flush buffered output to the attached client.
+    /// On failure, detaches the client and retains undelivered entries.
+    fn flush_output_buffer(&mut self) {
+        let Some(client_id) = self.client_id else { return };
+        while let Some(buffered) = self.output_buffer.pop_front() {
+            if server::sessions::streaming_output(client_id, self.process_id, buffered.clone()).is_err() {
+                self.client_id = None;
+                self.output_buffer.push_front(buffered);
+                break;
+            }
+        }
+    }
+
     /// Runs the WASM component: instantiate, find the `run` export, and call it.
     async fn run(
         process_id: ProcessId,
@@ -296,18 +309,13 @@ impl ServiceHandler for Process {
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::AttachClient { client_id, response } => {
-                self.client_id = Some(client_id);
-
-                // Flush buffered output to the newly attached client
-                while let Some(buffered) = self.output_buffer.pop_front() {
-                    if server::sessions::streaming_output(client_id, self.process_id, buffered.clone()).is_err() {
-                        self.client_id = None;
-                        self.output_buffer.push_front(buffered);
-                        break;
-                    }
+                if self.client_id.is_some() {
+                    let _ = response.send(Err(anyhow!("already attached")));
+                } else {
+                    self.client_id = Some(client_id);
+                    self.flush_output_buffer();
+                    let _ = response.send(Ok(()));
                 }
-
-                let _ = response.send(Ok(()));
             }
 
             Message::DetachClient => {

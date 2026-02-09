@@ -24,7 +24,7 @@ type CorrId = u32;
 
 /// A binary blob or a text-based event from an instance.
 #[derive(Debug)]
-pub enum InstanceEvent {
+pub enum ProcessEvent {
     /// An event from the server, like program completion or an error.
     Event { code: EventCode, message: String },
     /// A binary blob of data sent from the instance.
@@ -58,15 +58,15 @@ struct ClientInner {
     pending_requests: DashMap<CorrId, oneshot::Sender<(bool, String)>>,
     pending_list_requests: DashMap<CorrId, oneshot::Sender<Vec<InstanceInfo>>>,
     pending_launch_requests:
-        DashMap<CorrId, oneshot::Sender<Result<(InstanceId, mpsc::Receiver<InstanceEvent>)>>>,
+        DashMap<CorrId, oneshot::Sender<Result<(InstanceId, mpsc::Receiver<ProcessEvent>)>>>,
     pending_attach_requests: DashMap<
         CorrId,
         (
             InstanceId,
-            oneshot::Sender<Result<mpsc::Receiver<InstanceEvent>>>,
+            oneshot::Sender<Result<mpsc::Receiver<ProcessEvent>>>,
         ),
     >,
-    inst_event_tx: DashMap<InstanceId, mpsc::Sender<InstanceEvent>>,
+    inst_event_tx: DashMap<InstanceId, mpsc::Sender<ProcessEvent>>,
     // Use a Mutex per entry to avoid deadlocking the DashMap shard
     pending_downloads: DashMap<String, Mutex<DownloadState>>, // Key: blob_hash
 }
@@ -76,7 +76,7 @@ struct ClientInner {
 pub struct Instance {
     id: InstanceId,
     inner: Arc<ClientInner>,
-    event_rx: mpsc::Receiver<InstanceEvent>,
+    event_rx: mpsc::Receiver<ProcessEvent>,
 }
 
 /// Computes the blake3 hash for a slice of bytes.
@@ -91,7 +91,7 @@ impl Instance {
 
     /// Sends a string message to the instance (fire-and-forget).
     pub async fn send<T: ToString>(&self, message: T) -> Result<()> {
-        let msg = ClientMessage::SignalInstance {
+        let msg = ClientMessage::SignalProcess {
             instance_id: self.id.to_string(),
             message: message.to_string(),
         };
@@ -142,7 +142,7 @@ impl Instance {
     }
 
     /// Receives the next event or blob from the instance.
-    pub async fn recv(&mut self) -> Result<InstanceEvent> {
+    pub async fn recv(&mut self) -> Result<ProcessEvent> {
         self.event_rx
             .recv()
             .await
@@ -212,10 +212,10 @@ impl Client {
     async fn send_msg_and_wait(&self, mut msg: ClientMessage) -> Result<(bool, String)> {
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let corr_id_ref = match &mut msg {
-            ClientMessage::Identification { corr_id, .. }
-            | ClientMessage::Signature { corr_id, .. }
-            | ClientMessage::InternalAuthenticate { corr_id, .. }
-            | ClientMessage::TerminateInstance { corr_id, .. }
+            ClientMessage::AuthRequest { corr_id, .. }
+            | ClientMessage::AuthResponse { corr_id, .. }
+            | ClientMessage::AuthByToken { corr_id, .. }
+            | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
@@ -235,7 +235,7 @@ impl Client {
     async fn send_list_msg_and_wait(&self, mut msg: ClientMessage) -> Result<Vec<InstanceInfo>> {
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let corr_id_ref = match &mut msg {
-            ClientMessage::ListInstances { corr_id } => corr_id,
+            ClientMessage::ListProcesses { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for list helper"),
         };
         *corr_id_ref = *corr_id_guard;
@@ -257,7 +257,7 @@ impl Client {
         private_key: &Option<ParsedPrivateKey>,
     ) -> Result<()> {
         // Send the authentication request to the engine to get a challenge
-        let msg = ClientMessage::Identification {
+        let msg = ClientMessage::AuthRequest {
             corr_id: 0,
             username: username.to_string(),
         };
@@ -292,7 +292,7 @@ impl Client {
         let signature = base64::engine::general_purpose::STANDARD.encode(&signature_bytes);
 
         // Send the signature to the server to verify the authentication
-        let msg = ClientMessage::Signature {
+        let msg = ClientMessage::AuthResponse {
             corr_id: 0,
             signature,
         };
@@ -315,8 +315,8 @@ impl Client {
     /// Authenticates the client with the server using an internal token.
     /// This method is used for internal communication between the backend and the engine
     /// as well as between the Pie shell and the engine. This is not used for user authentication.
-    pub async fn internal_authenticate(&self, token: &str) -> Result<()> {
-        let msg = ClientMessage::InternalAuthenticate {
+    pub async fn auth_by_token(&self, token: &str) -> Result<()> {
+        let msg = ClientMessage::AuthByToken {
             corr_id: 0,
             token: token.to_string(),
         };
@@ -434,14 +434,14 @@ impl Client {
     /// The `inferlet` parameter can be:
     /// - Full name with version: `text-completion@0.1.0`
     /// - Without version (defaults to `latest`): `text-completion`
-    pub async fn launch_instance(
+    pub async fn launch_process(
         &self,
         inferlet: String,
         arguments: Vec<String>,
         capture_outputs: bool,
     ) -> Result<Instance> {
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
-        let msg = ClientMessage::LaunchInstance {
+        let msg = ClientMessage::LaunchProcess {
             corr_id: *corr_id_guard,
             inferlet,
             arguments,
@@ -466,10 +466,10 @@ impl Client {
     }
 
 
-    pub async fn attach_instance(&self, instance_id: &str) -> Result<Instance> {
+    pub async fn attach_process(&self, instance_id: &str) -> Result<Instance> {
         let instance_id = Uuid::parse_str(instance_id)?;
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
-        let msg = ClientMessage::AttachInstance {
+        let msg = ClientMessage::AttachProcess {
             corr_id: *corr_id_guard,
             instance_id: instance_id.to_string(),
         };
@@ -501,14 +501,14 @@ impl Client {
         }
     }
 
-    pub async fn list_instances(&self) -> Result<Vec<InstanceInfo>> {
-        let msg = ClientMessage::ListInstances { corr_id: 0 };
+    pub async fn list_processes(&self) -> Result<Vec<InstanceInfo>> {
+        let msg = ClientMessage::ListProcesses { corr_id: 0 };
         self.send_list_msg_and_wait(msg).await
     }
 
     /// Terminates an instance by its ID (fire-and-forget).
-    pub async fn terminate_instance(&self, instance_id: &str) -> Result<()> {
-        let msg = ClientMessage::TerminateInstance {
+    pub async fn terminate_process(&self, instance_id: &str) -> Result<()> {
+        let msg = ClientMessage::TerminateProcess {
             corr_id: 0,
             instance_id: instance_id.to_string(),
         };
@@ -537,7 +537,7 @@ async fn handle_server_message(
                 sender.send((successful, result)).ok();
             }
         }
-        ServerMessage::InstanceLaunchResult {
+        ServerMessage::ProcessLaunchResult {
             corr_id,
             successful,
             message: instance_id,
@@ -564,12 +564,12 @@ async fn handle_server_message(
                     }
                 } else {
                     sender
-                        .send(Err(anyhow!("Launch instance failed: {}", instance_id)))
+                        .send(Err(anyhow!("Launch process failed: {}", instance_id)))
                         .ok();
                 }
             }
         }
-        ServerMessage::InstanceAttachResult {
+        ServerMessage::ProcessAttachResult {
             corr_id,
             successful,
             message,
@@ -588,12 +588,12 @@ async fn handle_server_message(
                     sender.send(Ok(rx)).ok();
                 } else {
                     sender
-                        .send(Err(anyhow!("Attach instance failed: {}", message)))
+                        .send(Err(anyhow!("Attach process failed: {}", message)))
                         .ok();
                 }
             }
         }
-        ServerMessage::InstanceEvent {
+        ServerMessage::ProcessEvent {
             instance_id,
             event,
             message,
@@ -601,7 +601,7 @@ async fn handle_server_message(
             if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
                 if let Some(sender) = inner.inst_event_tx.get(&inst_id) {
                     sender
-                        .send(InstanceEvent::Event {
+                        .send(ProcessEvent::Event {
                             code: EventCode::from_u32(event).unwrap(),
                             message,
                         })
@@ -640,7 +640,7 @@ async fn handle_server_message(
                             if let Some(sender) = inner.inst_event_tx.get(&final_state.instance_id)
                             {
                                 sender
-                                    .send(InstanceEvent::Blob(final_state.buffer))
+                                    .send(ProcessEvent::Blob(final_state.buffer))
                                     .await
                                     .ok();
                             }
@@ -657,7 +657,7 @@ async fn handle_server_message(
                 sender.send((true, challenge)).ok();
             }
         }
-        ServerMessage::LiveInstances { corr_id, instances } => {
+        ServerMessage::LiveProcesses { corr_id, instances } => {
             if let Some((_, sender)) = inner.pending_list_requests.remove(&corr_id) {
                 sender.send(instances).ok();
             }
@@ -669,8 +669,8 @@ async fn handle_server_message(
             if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
                 if let Some(sender) = inner.inst_event_tx.get(&inst_id) {
                     let event = match output {
-                        StreamingOutput::Stdout(output) => InstanceEvent::Stdout(output),
-                        StreamingOutput::Stderr(output) => InstanceEvent::Stderr(output),
+                        StreamingOutput::Stdout(output) => ProcessEvent::Stdout(output),
+                        StreamingOutput::Stderr(output) => ProcessEvent::Stderr(output),
                     };
                     sender.send(event).await.ok();
                 }

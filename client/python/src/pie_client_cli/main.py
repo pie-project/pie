@@ -172,7 +172,7 @@ def ping(
 
 
 @app.command("list")
-def list_instances(
+def list_processes(
     config: ConfigOption = None,
     host: HostOption = None,
     port: PortOption = None,

@@ -20,7 +20,7 @@ pub use data_transfer::InFlightUpload;
 
 /// Re-export session helper functions for convenience.
 pub mod sessions {
-    pub use super::session::{send_msg, send_blob, terminate, streaming_output, exists};
+    pub use super::session::{send_msg, send_blob, terminate, streaming_output, exists, spawn};
 }
 
 use std::collections::HashMap;
@@ -118,7 +118,7 @@ impl Server {
         while let Ok((stream, _addr)) = listener.accept().await {
             let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
 
-            match Session::spawn(id, stream, state.clone()).await {
+            match session::spawn(id, stream, state.clone()).await {
                 Ok(()) => tracing::info!("Client {} connected", id),
                 Err(e) => tracing::error!("Failed to create session for client {}: {}", id, e),
             }

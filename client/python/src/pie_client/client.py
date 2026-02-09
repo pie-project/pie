@@ -51,7 +51,7 @@ class Instance:
 
     async def send(self, message: str):
         """Send a string message to the instance."""
-        await self.client.signal_instance(self.instance_id, message)
+        await self.client.signal_process(self.instance_id, message)
 
     async def upload_blob(self, blob_bytes: bytes):
         """Upload a blob of binary data to the instance."""
@@ -71,7 +71,7 @@ class Instance:
 
     async def terminate(self):
         """Request termination of the instance."""
-        await self.client.terminate_instance(self.instance_id)
+        await self.client.terminate_process(self.instance_id)
 
 
 class PieClient:
@@ -149,7 +149,7 @@ class PieClient:
                 # successful=True with challenge as the result
                 future.set_result((True, message.get("challenge")))
 
-        elif msg_type == "instance_launch_result":
+        elif msg_type == "process_launch_result":
             corr_id = message.get("corr_id")
             if corr_id in self.pending_launch_requests:
                 future = self.pending_launch_requests.pop(corr_id)
@@ -166,7 +166,7 @@ class PieClient:
                             await queue.put(event_tuple)
                 future.set_result((successful, instance_id))
 
-        elif msg_type == "instance_attach_result":
+        elif msg_type == "process_attach_result":
             corr_id = message.get("corr_id")
             if corr_id in self.pending_attach_requests:
                 future, instance_id = self.pending_attach_requests.pop(corr_id)
@@ -183,7 +183,7 @@ class PieClient:
                             await queue.put(event_tuple)
                 future.set_result((successful, result_msg))
 
-        elif msg_type == "live_instances":
+        elif msg_type == "live_processes":
             corr_id = message.get("corr_id")
             if corr_id in self.pending_list_requests:
                 future = self.pending_list_requests.pop(corr_id)
@@ -201,7 +201,7 @@ class PieClient:
                 ]
                 future.set_result(instances)
 
-        elif msg_type == "instance_event":
+        elif msg_type == "process_event":
             instance_id = message.get("instance_id")
             event_tuple = (message.get("event"), message.get("message"))
 
@@ -322,8 +322,8 @@ class PieClient:
                            Required if the server has authentication enabled.
         :raises Exception: If authentication fails.
         """
-        # Send identification request
-        msg = {"type": "identification", "username": username}
+        # Send auth request
+        msg = {"type": "auth_request", "username": username}
         successful, result = await self._send_msg_and_wait(msg)
 
         if not successful:
@@ -350,8 +350,8 @@ class PieClient:
         signature_bytes = private_key.sign(challenge)
         signature_b64 = base64.b64encode(signature_bytes).decode("utf-8")
 
-        # Send the signature
-        msg = {"type": "signature", "signature": signature_b64}
+        # Send the auth response
+        msg = {"type": "auth_response", "signature": signature_b64}
         successful, result = await self._send_msg_and_wait(msg)
 
         if not successful:
@@ -359,7 +359,7 @@ class PieClient:
                 f"Signature verification failed for username '{username}': {result}"
             )
 
-    async def internal_authenticate(self, token: str) -> None:
+    async def auth_by_token(self, token: str) -> None:
         """
         Authenticate the client with the server using an internal token.
         This is used for internal communication (backend <-> engine, shell <-> engine).
@@ -367,7 +367,7 @@ class PieClient:
         :param token: The internal authentication token.
         :raises Exception: If authentication fails.
         """
-        msg = {"type": "internal_authenticate", "token": token}
+        msg = {"type": "auth_by_token", "token": token}
         successful, result = await self._send_msg_and_wait(msg)
         if not successful:
             raise Exception(f"Internal authentication failed: {result}")
@@ -377,7 +377,7 @@ class PieClient:
         [DEPRECATED] Use authenticate() instead.
         Legacy method for simple username identification.
         """
-        msg = {"type": "identification", "username": username}
+        msg = {"type": "auth_request", "username": username}
         successful, result = await self._send_msg_and_wait(msg)
         return successful, result
 
@@ -510,7 +510,7 @@ class PieClient:
         """
         corr_id = self._get_next_corr_id()
         msg = {
-            "type": "launch_instance",
+            "type": "launch_process",
             "corr_id": corr_id,
             "inferlet": inferlet,
             "arguments": arguments or [],
@@ -526,7 +526,7 @@ class PieClient:
 
         if successful:
             return Instance(self, instance_id)
-        raise Exception(f"Failed to launch instance: {instance_id}")
+        raise Exception(f"Failed to launch process: {instance_id}")
 
     async def launch_instance_from_registry(
         self, inferlet: str, arguments: list[str] | None = None, capture_outputs: bool = True
@@ -549,7 +549,7 @@ class PieClient:
         """
         corr_id = self._get_next_corr_id()
         msg = {
-            "type": "launch_instance_from_registry",
+            "type": "launch_process_from_registry",
             "corr_id": corr_id,
             "inferlet": inferlet,
             "arguments": arguments or [],
@@ -565,9 +565,9 @@ class PieClient:
 
         if successful:
             return Instance(self, instance_id)
-        raise Exception(f"Failed to launch instance from registry: {instance_id}")
+        raise Exception(f"Failed to launch process from registry: {instance_id}")
 
-    async def attach_instance(self, instance_id: str) -> Instance:
+    async def attach_process(self, instance_id: str) -> Instance:
         """
         Attach to an existing detached instance.
 
@@ -577,7 +577,7 @@ class PieClient:
         """
         corr_id = self._get_next_corr_id()
         msg = {
-            "type": "attach_instance",
+            "type": "attach_process",
             "corr_id": corr_id,
             "instance_id": instance_id,
         }
@@ -591,16 +591,16 @@ class PieClient:
 
         if successful:
             return Instance(self, instance_id)
-        raise Exception(f"Failed to attach to instance: {result}")
+        raise Exception(f"Failed to attach to process: {result}")
 
-    async def list_instances(self) -> list[InstanceInfo]:
+    async def list_processes(self) -> list[InstanceInfo]:
         """
         Get a list of all running instances on the server.
 
         :return: List of InstanceInfo objects.
         """
         corr_id = self._get_next_corr_id()
-        msg = {"type": "list_instances", "corr_id": corr_id}
+        msg = {"type": "list_processes", "corr_id": corr_id}
 
         future = asyncio.get_event_loop().create_future()
         self.pending_list_requests[corr_id] = future
@@ -620,28 +620,28 @@ class PieClient:
         if not successful:
             raise Exception(f"Ping failed: {result}")
 
-    async def signal_instance(self, instance_id: str, message: str):
+    async def signal_process(self, instance_id: str, message: str):
         """Send a signal/message to a running instance (fire-and-forget)."""
         msg = {
-            "type": "signal_instance",
+            "type": "signal_process",
             "instance_id": instance_id,
             "message": message,
         }
         await self.ws.send(msgpack.packb(msg, use_bin_type=True))
 
-    async def terminate_instance(self, instance_id: str) -> None:
+    async def terminate_process(self, instance_id: str) -> None:
         """
         Request the server to terminate a running instance.
 
         :param instance_id: The UUID of the instance to terminate.
         :raises Exception: If termination fails.
         """
-        msg = {"type": "terminate_instance", "instance_id": instance_id}
+        msg = {"type": "terminate_process", "instance_id": instance_id}
         successful, result = await self._send_msg_and_wait(msg)
         if not successful:
-            raise Exception(f"Failed to terminate instance: {result}")
+            raise Exception(f"Failed to terminate process: {result}")
 
-    async def launch_server_instance(
+    async def launch_daemon(
         self,
         program_hash: str,
         port: int,
@@ -660,11 +660,11 @@ class PieClient:
         :raises Exception: If launch fails.
         """
         msg = {
-            "type": "launch_server_instance",
+            "type": "launch_daemon",
             "port": port,
             "program_hash": program_hash,
             "arguments": arguments or [],
         }
         successful, result = await self._send_msg_and_wait(msg)
         if not successful:
-            raise Exception(f"Failed to launch server instance: {result}")
+            raise Exception(f"Failed to launch daemon: {result}")

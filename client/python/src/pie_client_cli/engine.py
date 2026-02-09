@@ -236,7 +236,7 @@ async def _stream_inferlet_output_async(
                     f"\n[Instance {short_id}] Received Ctrl-C, terminating instance ..."
                 )
                 try:
-                    await client.terminate_instance(instance_id)
+                    await client.terminate_process(instance_id)
                 except Exception as e:
                     typer.echo(
                         f"[Instance {short_id}] Failed to send terminate request: {e}",
@@ -305,20 +305,20 @@ def ping(client: PieClient) -> None:
     asyncio.get_event_loop().run_until_complete(client.ping())
 
 
-def list_instances(client: PieClient) -> list[InstanceInfo]:
-    """List instances (sync wrapper)."""
-    return asyncio.get_event_loop().run_until_complete(client.list_instances())
+def list_processes(client: PieClient) -> list[InstanceInfo]:
+    """List processes (sync wrapper)."""
+    return asyncio.get_event_loop().run_until_complete(client.list_processes())
 
 
-def terminate_instance(client: PieClient, instance_id: str) -> None:
-    """Terminate an instance (sync wrapper)."""
-    asyncio.get_event_loop().run_until_complete(client.terminate_instance(instance_id))
+def terminate_process(client: PieClient, instance_id: str) -> None:
+    """Terminate a process (sync wrapper)."""
+    asyncio.get_event_loop().run_until_complete(client.terminate_process(instance_id))
 
 
-def attach_instance(client: PieClient, instance_id: str) -> Instance:
-    """Attach to an instance (sync wrapper)."""
+def attach_process(client: PieClient, instance_id: str) -> Instance:
+    """Attach to a process (sync wrapper)."""
     return asyncio.get_event_loop().run_until_complete(
-        client.attach_instance(instance_id)
+        client.attach_process(instance_id)
     )
 
 
@@ -359,13 +359,13 @@ def program_exists(
     )
 
 
-def launch_instance(
+def launch_process(
     client: PieClient,
     inferlet: str,
     arguments: list[str],
     capture_outputs: bool = True,
 ) -> Instance:
-    """Launch an instance (sync wrapper).
+    """Launch a process (sync wrapper).
 
     This function performs a two-level search for the inferlet:
     1. First, it searches for the program among client-uploaded programs.
@@ -376,19 +376,19 @@ def launch_instance(
     - Without version (defaults to "latest"): "text-completion"
     """
     return asyncio.get_event_loop().run_until_complete(
-        client.launch_instance(inferlet, arguments, capture_outputs)
+        client.launch_process(inferlet, arguments, capture_outputs)
     )
 
 
-def launch_instance_from_registry(
+def launch_process_from_registry(
     client: PieClient,
     inferlet: str,
     arguments: list[str],
     capture_outputs: bool = True,
 ) -> Instance:
-    """Launch an instance from the registry only (sync wrapper).
+    """Launch a process from the registry only (sync wrapper).
 
-    Unlike `launch_instance`, this function searches only the registry and does not
+    Unlike `launch_process`, this function searches only the registry and does not
     check client-uploaded programs. Use this when you explicitly want to launch
     an inferlet from the registry.
 
@@ -397,7 +397,7 @@ def launch_instance_from_registry(
     - Without version (defaults to "latest"): "text-completion"
     """
     return asyncio.get_event_loop().run_until_complete(
-        client.launch_instance_from_registry(inferlet, arguments, capture_outputs)
+        client.launch_process_from_registry(inferlet, arguments, capture_outputs)
     )
 
 

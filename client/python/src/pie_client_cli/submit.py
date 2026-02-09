@@ -222,7 +222,7 @@ def handle_submit_command(
                     typer.echo("Inferlet already exists on server.")
 
             # Launch the instance
-            instance = engine.launch_instance(
+            instance = engine.launch_process(
                 client,
                 inferlet_name,
                 arguments,
@@ -238,7 +238,7 @@ def handle_submit_command(
 
             typer.echo(f"Launching from registry: {inferlet}")
 
-            instance = engine.launch_instance_from_registry(
+            instance = engine.launch_process_from_registry(
                 client,
                 inferlet,
                 arguments,

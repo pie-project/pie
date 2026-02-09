@@ -57,7 +57,7 @@ impl Session {
         }
     }
 
-    pub async fn handle_list_instances(&self, corr_id: u32) {
+    pub async fn handle_list_processes(&self, corr_id: u32) {
         let instances = process::list()
             .into_iter()
             .map(|id| message::InstanceInfo {
@@ -69,7 +69,7 @@ impl Session {
                 kv_pages_used: 0,
             })
             .collect();
-        self.send(ServerMessage::LiveInstances { corr_id, instances })
+        self.send(ServerMessage::LiveProcesses { corr_id, instances })
             .await;
     }
 }
@@ -148,7 +148,7 @@ impl Session {
 // =============================================================================
 
 impl Session {
-    pub async fn handle_launch_instance(
+    pub async fn handle_launch_process(
         &mut self,
         corr_id: u32,
         inferlet: String,
@@ -159,7 +159,7 @@ impl Session {
 
         // Install program and dependencies (handles both uploaded and registry)
         if let Err(e) = program::install(&program_name).await {
-            self.send_launch_result(corr_id, false, e.to_string()).await;
+            self.send_process_launch_result(corr_id, false, e.to_string()).await;
             return;
         }
 
@@ -181,16 +181,16 @@ impl Session {
                     self.attached_instances.push(process_id);
                 }
 
-                self.send_launch_result(corr_id, true, process_id.to_string())
+                self.send_process_launch_result(corr_id, true, process_id.to_string())
                     .await;
             }
             Err(e) => {
-                self.send_launch_result(corr_id, false, e.to_string()).await;
+                self.send_process_launch_result(corr_id, false, e.to_string()).await;
             }
         }
     }
 
-    pub async fn handle_launch_server_instance(
+    pub async fn handle_launch_daemon(
         &mut self,
         corr_id: u32,
         port: u32,
@@ -227,11 +227,11 @@ impl Session {
 // =============================================================================
 
 impl Session {
-    pub async fn handle_attach_instance(&mut self, corr_id: u32, instance_id: String) {
+    pub async fn handle_attach_process(&mut self, corr_id: u32, instance_id: String) {
         let process_id: ProcessId = match instance_id.parse() {
             Ok(id) => id,
             Err(_) => {
-                self.send_attach_result(corr_id, false, "Invalid instance_id".to_string())
+                self.send_process_attach_result(corr_id, false, "Invalid instance_id".to_string())
                     .await;
                 return;
             }
@@ -239,7 +239,7 @@ impl Session {
 
         match process::attach(process_id, self.id).await {
             Ok(()) => {
-                self.send_attach_result(corr_id, true, "Instance attached".to_string())
+                self.send_process_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
 
                 // Register process → client mapping with Server
@@ -248,13 +248,13 @@ impl Session {
                 self.attached_instances.push(process_id);
             }
             Err(_) => {
-                self.send_attach_result(corr_id, false, "Instance not found".to_string())
+                self.send_process_attach_result(corr_id, false, "Instance not found".to_string())
                     .await;
             }
         }
     }
 
-    pub async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
+    pub async fn handle_signal_process(&mut self, instance_id: String, message: String) {
         if let Ok(process_id) = instance_id.parse::<ProcessId>() {
             if self.attached_instances.contains(&process_id) {
                 messaging::push(process_id.to_string(), message).unwrap();
@@ -262,7 +262,7 @@ impl Session {
         }
     }
 
-    pub async fn handle_terminate_instance(&mut self, corr_id: u32, instance_id: String) {
+    pub async fn handle_terminate_process(&mut self, corr_id: u32, instance_id: String) {
         if let Ok(process_id) = instance_id.parse::<ProcessId>() {
             process::terminate(process_id, Some("Signal".to_string()));
             self.send_response(corr_id, true, "Instance terminated".to_string())

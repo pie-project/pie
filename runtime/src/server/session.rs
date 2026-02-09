@@ -68,6 +68,17 @@ pub fn exists(client_id: ClientId) -> bool {
     SERVICE_MAP.contains(&client_id)
 }
 
+/// Spawns a new session actor for the given TCP connection.
+pub async fn spawn(
+    id: ClientId,
+    tcp_stream: TcpStream,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    let session = Session::new(id, tcp_stream, state).await?;
+    SERVICE_MAP.spawn(id, || session)?;
+    Ok(())
+}
+
 // =============================================================================
 // Messages
 // =============================================================================
@@ -114,12 +125,12 @@ pub struct Session {
 }
 
 impl Session {
-    /// Spawns a new session actor for the given TCP connection.
-    pub async fn spawn(
+    /// Creates a new Session, accepting the TCP connection and spawning WS pumps.
+    async fn new(
         id: ClientId,
         tcp_stream: TcpStream,
         state: Arc<ServerState>,
-    ) -> Result<()> {
+    ) -> Result<Self> {
         let (ws_msg_tx, mut ws_msg_rx) = mpsc::channel(1000);
 
         let ws_stream = accept_async(tcp_stream).await?;
@@ -165,8 +176,7 @@ impl Session {
             })
         };
 
-        // Spawn into the global ServiceMap
-        SERVICE_MAP.spawn(id, || Session {
+        Ok(Session {
             id,
             username: String::new(),
             state,
@@ -177,10 +187,9 @@ impl Session {
             recv_pump,
             authenticated: false,
             pending_auth: None,
-        })?;
-
-        Ok(())
+        })
     }
+
 
     /// Cleanup when session is terminated.
     fn cleanup(&mut self) {
@@ -223,7 +232,7 @@ impl ServiceHandler for Session {
                 }
             }
             Message::SendMsg { process_id, message } => {
-                self.send_inst_event(process_id, EventCode::Message, message).await;
+                self.send_process_event(process_id, EventCode::Message, message).await;
             }
             Message::SendBlob { process_id, data } => {
                 self.handle_send_blob(process_id, data).await;
@@ -232,7 +241,7 @@ impl ServiceHandler for Session {
                 self.handle_instance_termination(process_id, cause).await;
             }
             Message::StreamingOutput { process_id, content } => {
-                self.send_inst_event(process_id, EventCode::Message, content).await;
+                self.send_process_event(process_id, EventCode::Message, content).await;
             }
         }
     }
@@ -246,24 +255,24 @@ impl Session {
     /// Handle authentication message. Returns Ok(true) when fully authenticated.
     async fn handle_auth_message(&mut self, msg: ClientMessage) -> Result<bool> {
         match msg {
-            ClientMessage::Identification { corr_id, username } => {
-                self.handle_identification(corr_id, username).await
+            ClientMessage::AuthRequest { corr_id, username } => {
+                self.handle_auth_request(corr_id, username).await
             }
-            ClientMessage::InternalAuthenticate { corr_id, token } => {
-                self.internal_authenticate(corr_id, token).await?;
+            ClientMessage::AuthByToken { corr_id, token } => {
+                self.auth_by_token(corr_id, token).await?;
                 Ok(true)
             }
-            ClientMessage::Signature { corr_id, signature } => {
-                self.handle_signature(corr_id, signature).await
+            ClientMessage::AuthResponse { corr_id, signature } => {
+                self.handle_auth_response(corr_id, signature).await
             }
             _ => {
-                bail!("Expected Identification, InternalAuthenticate, or Signature message")
+                bail!("Expected AuthRequest, AuthByToken, or AuthResponse message")
             }
         }
     }
 
-    /// Handle identification message - starts external auth flow.
-    async fn handle_identification(&mut self, corr_id: u32, username: String) -> Result<bool> {
+    /// Handle auth request message - starts external auth flow.
+    async fn handle_auth_request(&mut self, corr_id: u32, username: String) -> Result<bool> {
         if !auth::is_auth_enabled().await? {
             self.username = username;
             self.send_response(corr_id, true, "Authenticated (Engine disabled authentication)".to_string()).await;
@@ -283,8 +292,8 @@ impl Session {
         Ok(false)
     }
 
-    /// Handle signature message - completes external auth flow.
-    async fn handle_signature(&mut self, corr_id: u32, signature_b64: String) -> Result<bool> {
+    /// Handle auth response message - completes external auth flow.
+    async fn handle_auth_response(&mut self, corr_id: u32, signature_b64: String) -> Result<bool> {
         let pending = match self.pending_auth.take() {
             Some(p) => p,
             None => {
@@ -315,7 +324,7 @@ impl Session {
 }
 
 impl Session {
-    async fn internal_authenticate(&mut self, corr_id: u32, token: String) -> Result<()> {
+    async fn auth_by_token(&mut self, corr_id: u32, token: String) -> Result<()> {
         // Verify token using auth actor
         if auth::verify_internal_token(token).await? {
             self.username = "internal".to_string();
@@ -355,8 +364,8 @@ impl Session {
         .await;
     }
 
-    pub async fn send_launch_result(&self, corr_id: u32, successful: bool, message: String) {
-        self.send(WireServerMessage::InstanceLaunchResult {
+    pub async fn send_process_launch_result(&self, corr_id: u32, successful: bool, message: String) {
+        self.send(WireServerMessage::ProcessLaunchResult {
             corr_id,
             successful,
             message,
@@ -364,8 +373,8 @@ impl Session {
         .await;
     }
 
-    pub async fn send_attach_result(&self, corr_id: u32, successful: bool, message: String) {
-        self.send(WireServerMessage::InstanceAttachResult {
+    pub async fn send_process_attach_result(&self, corr_id: u32, successful: bool, message: String) {
+        self.send(WireServerMessage::ProcessAttachResult {
             corr_id,
             successful,
             message,
@@ -373,8 +382,8 @@ impl Session {
         .await;
     }
 
-    pub async fn send_inst_event(&self, process_id: ProcessId, event: EventCode, message: String) {
-        self.send(WireServerMessage::InstanceEvent {
+    pub async fn send_process_event(&self, process_id: ProcessId, event: EventCode, message: String) {
+        self.send(WireServerMessage::ProcessEvent {
             instance_id: process_id.to_string(),
             event: event as u32,
             message,
@@ -390,18 +399,18 @@ impl Session {
 impl Session {
     pub async fn handle_client_message(&mut self, message: ClientMessage) {
         match message {
-            ClientMessage::Identification { corr_id, .. } => {
+            ClientMessage::AuthRequest { corr_id, .. } => {
                 self.send_response(corr_id, true, "Already authenticated".to_string())
                     .await;
             }
 
-            ClientMessage::Signature { corr_id, .. } => {
-                // Signature should only arrive during auth flow, not after authenticated
+            ClientMessage::AuthResponse { corr_id, .. } => {
+                // AuthResponse should only arrive during auth flow, not after authenticated
                 self.send_response(corr_id, false, "Already authenticated".to_string())
                     .await;
             }
             
-            ClientMessage::InternalAuthenticate { corr_id, token: _ } => {
+            ClientMessage::AuthByToken { corr_id, token: _ } => {
                 self.send_response(corr_id, true, "Already authenticated".to_string())
                     .await;
             }
@@ -431,40 +440,40 @@ impl Session {
                 )
                 .await
             }
-            ClientMessage::LaunchInstance {
+            ClientMessage::LaunchProcess {
                 corr_id,
                 inferlet,
                 arguments,
                 capture_outputs,
             } => {
-                self.handle_launch_instance(corr_id, inferlet, arguments, capture_outputs)
+                self.handle_launch_process(corr_id, inferlet, arguments, capture_outputs)
                     .await
             }
 
-            ClientMessage::AttachInstance {
+            ClientMessage::AttachProcess {
                 corr_id,
                 instance_id,
             } => {
-                self.handle_attach_instance(corr_id, instance_id).await;
+                self.handle_attach_process(corr_id, instance_id).await;
             }
-            ClientMessage::LaunchServerInstance {
+            ClientMessage::LaunchDaemon {
                 corr_id,
                 port,
                 inferlet,
                 arguments,
             } => {
-                self.handle_launch_server_instance(corr_id, port, inferlet, arguments)
+                self.handle_launch_daemon(corr_id, port, inferlet, arguments)
                     .await
             }
-            ClientMessage::SignalInstance {
+            ClientMessage::SignalProcess {
                 instance_id,
                 message,
-            } => self.handle_signal_instance(instance_id, message).await,
+            } => self.handle_signal_process(instance_id, message).await,
 
-            ClientMessage::TerminateInstance {
+            ClientMessage::TerminateProcess {
                 corr_id,
                 instance_id,
-            } => self.handle_terminate_instance(corr_id, instance_id).await,
+            } => self.handle_terminate_process(corr_id, instance_id).await,
 
             ClientMessage::UploadBlob {
                 corr_id,
@@ -487,8 +496,8 @@ impl Session {
             ClientMessage::Ping { corr_id } => {
                 self.send_response(corr_id, true, "Pong".to_string()).await;
             }
-            ClientMessage::ListInstances { corr_id } => {
-                self.handle_list_instances(corr_id).await;
+            ClientMessage::ListProcesses { corr_id } => {
+                self.handle_list_processes(corr_id).await;
             }
         }
     }
@@ -504,6 +513,6 @@ impl Session {
             TerminationCause::OutOfResources(message) => (EventCode::ServerError, message),
         };
 
-        self.send_inst_event(process_id, event_code, message).await;
+        self.send_process_event(process_id, event_code, message).await;
     }
 }

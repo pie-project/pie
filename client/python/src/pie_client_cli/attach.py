@@ -44,7 +44,7 @@ def handle_attach_command(
 
     try:
         # Query all running instances
-        instances = engine.list_instances(client)
+        instances = engine.list_processes(client)
 
         # Find matching instances
         matching = [
@@ -75,7 +75,7 @@ def handle_attach_command(
         instance_id = instance_info.id
 
         # Attach to the instance
-        instance = engine.attach_instance(client, instance_id)
+        instance = engine.attach_process(client, instance_id)
 
         typer.echo(f"✅ Attached to instance {instance_id}")
 

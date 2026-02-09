@@ -41,7 +41,7 @@ def handle_abort_command(
 
     try:
         # Query all running instances
-        instances = engine.list_instances(client)
+        instances = engine.list_processes(client)
 
         # Find matching instances
         matching = [
@@ -72,7 +72,7 @@ def handle_abort_command(
         instance_id = instance_info.id
 
         # Terminate the instance
-        engine.terminate_instance(client, instance_id)
+        engine.terminate_process(client, instance_id)
 
         typer.echo(f"✅ Sent termination request for instance {instance_id}")
 
