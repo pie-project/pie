@@ -29,7 +29,7 @@ pub mod server_instance;
 
 pub use instance::InstanceId;
 use instance::InstanceState;
-use instance_actor::InstanceConfig;
+
 use output::OutputDelivery;
 use server_instance::ServerInstanceConfig;
 
@@ -107,7 +107,7 @@ pub async fn launch_instance(
         username,
         program_name,
         arguments,
-        detached: !capture_outputs,
+        capture_outputs,
         response: tx,
     })?;
     rx.await?
@@ -189,6 +189,11 @@ pub fn set_output_delivery(inst_id: InstanceId, mode: OutputDelivery) {
     instance_actor::set_output_delivery(inst_id, mode);
 }
 
+/// Detach from an instance (fire-and-forget, via Direct Addressing).
+pub fn detach_instance(inst_id: InstanceId) {
+    instance_actor::detach(inst_id);
+}
+
 /// Terminate an instance (fire-and-forget, via Direct Addressing).
 pub fn terminate_instance(inst_id: InstanceId, notification_to_client: Option<TerminationCause>) {
     instance_actor::terminate(inst_id, notification_to_client);
@@ -245,18 +250,16 @@ impl Runtime {
 
         let inst_id = Uuid::new_v4();
 
-        let config = InstanceConfig {
+        instance_actor::spawn(
             inst_id,
             username,
             program_name,
             arguments,
-            detached: !capture_outputs,
+            capture_outputs,
             component,
-            engine: self.engine.clone(),
-            linker: self.linker.clone(),
-        };
-
-        instance_actor::InstanceActor::spawn(config).await
+            self.engine.clone(),
+            self.linker.clone(),
+        ).await
     }
 
     async fn launch_server_instance(
@@ -347,7 +350,7 @@ enum Message {
         username: String,
         program_name: String,
         arguments: Vec<String>,
-        detached: bool,
+        capture_outputs: bool,
         response: oneshot::Sender<anyhow::Result<InstanceId>>,
     },
     LaunchServerInstance {
@@ -380,8 +383,8 @@ impl ServiceHandler for Runtime {
             Message::GetVersion { response } => {
                 let _ = response.send(self.get_version());
             }
-            Message::LaunchInstance { username, program_name, arguments, detached, response } => {
-                let _ = response.send(self.launch_instance(username, program_name, arguments, !detached).await);
+            Message::LaunchInstance { username, program_name, arguments, capture_outputs, response } => {
+                let _ = response.send(self.launch_instance(username, program_name, arguments, capture_outputs).await);
             }
             Message::LaunchServerInstance { username, program_name, port, arguments, response } => {
                 let _ = response.send(self.launch_server_instance(username, program_name, port, arguments).await);

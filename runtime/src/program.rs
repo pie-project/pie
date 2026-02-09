@@ -26,7 +26,7 @@ pub use repository::Repository;
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Spawns the program manager service.
-pub fn spawn(wasm_engine: WasmEngine, registry_url: String, cache_dir: PathBuf) {
+pub fn spawn(wasm_engine: &WasmEngine, registry_url: String, cache_dir: PathBuf) {
     let mut repository = Repository::new(
         registry_url,
         cache_dir,
@@ -36,7 +36,7 @@ pub fn spawn(wasm_engine: WasmEngine, registry_url: String, cache_dir: PathBuf) 
     repository.load_program_cache();
 
     SERVICE.spawn(|| {
-        ProgramService::new(wasm_engine, repository)
+        ProgramService::new(&wasm_engine, repository)
     }).expect("Program manager already spawned");
 }
 
@@ -176,9 +176,9 @@ struct ProgramService {
 }
 
 impl ProgramService {
-    fn new(wasm_engine: WasmEngine, repository: Repository) -> Self {
+    fn new(wasm_engine: &WasmEngine, repository: Repository) -> Self {
         ProgramService {
-            wasm_engine,
+            wasm_engine: wasm_engine.clone(),
             repository,
             installed: HashMap::new(),
             explicit_installs: std::collections::HashSet::new(),

@@ -186,8 +186,8 @@ impl Session {
     /// Cleanup when session is terminated.
     fn cleanup(&mut self) {
         for inst_id in self.attached_instances.drain(..) {
-            runtime::instance_actor::set_output_delivery(inst_id, OutputDelivery::Buffered);
-            runtime::instance_actor::detach(inst_id);
+            runtime::set_output_delivery(inst_id, OutputDelivery::Buffered);
+            runtime::detach_instance(inst_id);
             super::unregister_instance(inst_id).ok();
         }
 

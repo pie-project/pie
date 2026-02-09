@@ -1,20 +1,19 @@
 //! Instance Actor - Per-instance lifecycle management
 //!
-//! This module provides the InstanceActor for managing individual WASM instances.
+//! This module provides the Instance actor for managing individual WASM instances.
 //! Following the Session pattern, instances are registered in a global registry
 //! for Direct Addressing, allowing messages to bypass the RuntimeActor.
 
 use std::sync::LazyLock;
 use std::time::Instant;
 
-use dashmap::DashMap;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Store};
 use std::sync::Arc;
 
-use crate::service::{Service, ServiceHandler};
+use crate::service::{ServiceMap, ServiceHandler};
 use crate::{program, server};
 
 use super::instance::{InstanceId, InstanceState};
@@ -26,35 +25,86 @@ use super::{AttachInstanceResult, InstanceRunningState, TerminationCause};
 // =============================================================================
 
 /// Global registry mapping InstanceId to instance actors.
-/// Allows direct message delivery to instances without routing through Runtime.
-static INSTANCE_REGISTRY: LazyLock<DashMap<InstanceId, Service<InstanceMessage>>> =
-    LazyLock::new(DashMap::new);
+static SERVICES: LazyLock<ServiceMap<InstanceId, Message>> =
+    LazyLock::new(ServiceMap::new);
 
-/// Sends a message directly to an instance by InstanceId.
-pub fn send(inst_id: InstanceId, msg: InstanceMessage) -> anyhow::Result<()> {
-    INSTANCE_REGISTRY
-        .get(&inst_id)
-        .ok_or_else(|| anyhow::anyhow!("Instance not found"))?
-        .send(msg)
-}
-
-/// Check if an instance exists for the given InstanceId.
-pub fn exists(inst_id: InstanceId) -> bool {
-    INSTANCE_REGISTRY.contains_key(&inst_id)
-}
 
 /// Remove an instance from the registry.
 fn unregister(inst_id: InstanceId) {
-    INSTANCE_REGISTRY.remove(&inst_id);
+    SERVICES.remove(&inst_id);
 }
 
 // =============================================================================
-// Instance Messages
+// Public API
 // =============================================================================
 
-/// Messages that can be sent directly to an InstanceActor.
+/// Spawn a new instance and register it in the global registry.
+pub async fn spawn(
+    inst_id: InstanceId,
+    username: String,
+    program_name: String,
+    arguments: Vec<String>,
+    capture_outputs: bool,
+    component: Component,
+    engine: Engine,
+    linker: Arc<Linker<InstanceState>>,
+) -> anyhow::Result<InstanceId> {
+    let instance = Instance::new(
+        inst_id, username, program_name, arguments,
+        capture_outputs, component, engine, linker,
+    ).await?;
+    SERVICES.spawn(inst_id, || instance)?;
+    Ok(inst_id)
+}
+
+/// Attach to an instance.
+pub async fn attach(inst_id: InstanceId) -> AttachInstanceResult {
+    let (tx, rx) = oneshot::channel();
+    if SERVICES.send(&inst_id, Message::Attach { response: tx }).is_err() {
+        return AttachInstanceResult::InstanceNotFound;
+    }
+    rx.await.unwrap_or(AttachInstanceResult::InstanceNotFound)
+}
+
+/// Detach from an instance (fire-and-forget).
+pub fn detach(inst_id: InstanceId) {
+    let _ = SERVICES.send(&inst_id, Message::Detach);
+}
+
+/// Allow output for an instance (fire-and-forget).
+pub fn allow_output(inst_id: InstanceId) {
+    let _ = SERVICES.send(&inst_id, Message::AllowOutput);
+}
+
+/// Set output delivery mode for an instance (fire-and-forget).
+pub fn set_output_delivery(inst_id: InstanceId, mode: OutputDelivery) {
+    let _ = SERVICES.send(&inst_id, Message::SetOutputDelivery { mode });
+}
+
+/// Terminate an instance (fire-and-forget).
+pub fn terminate(inst_id: InstanceId, notification_to_client: Option<TerminationCause>) {
+    let _ = SERVICES.send(&inst_id, Message::Terminate { notification_to_client });
+}
+
+/// Get instance info for listing.
+pub async fn get_info(inst_id: InstanceId) -> Option<InstanceInfo> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(&inst_id, Message::GetInfo { response: tx }).ok()?;
+    rx.await.ok()
+}
+
+/// List all registered instance IDs.
+pub fn list_instance_ids() -> Vec<InstanceId> {
+    SERVICES.keys()
+}
+
+// =============================================================================
+// Messages
+// =============================================================================
+
+/// Messages that can be sent directly to an Instance.
 #[derive(Debug)]
-pub enum InstanceMessage {
+enum Message {
     /// Attach a client to this instance
     Attach {
         response: oneshot::Sender<AttachInstanceResult>,
@@ -88,11 +138,11 @@ pub struct InstanceInfo {
 }
 
 // =============================================================================
-// InstanceActor
+// Instance
 // =============================================================================
 
 /// Actor managing a single WASM instance lifecycle.
-pub struct InstanceActor {
+struct Instance {
     inst_id: InstanceId,
     username: String,
     program_name: String,
@@ -103,47 +153,30 @@ pub struct InstanceActor {
     execution_handle: Option<JoinHandle<()>>,
 }
 
-/// Configuration for spawning a new instance
-pub struct InstanceConfig {
-    pub inst_id: InstanceId,
-    pub username: String,
-    pub program_name: String,
-    pub arguments: Vec<String>,
-    pub detached: bool,
-    pub component: Component,
-    pub engine: Engine,
-    pub linker: Arc<Linker<InstanceState>>,
-}
-
-impl InstanceActor {
-    /// Spawns a new InstanceActor and registers it in the global registry.
-    /// Returns the InstanceId on success.
-    pub async fn spawn(config: InstanceConfig) -> anyhow::Result<InstanceId> {
-        let inst_id = config.inst_id;
-        let username = config.username.clone();
-        let program_name = config.program_name.clone();
-        let arguments = config.arguments.clone();
-        let detached = config.detached;
-
-        // Create the actor entry in the registry first
-        let service = Service::new();
-        INSTANCE_REGISTRY.insert(inst_id, service);
-
-        // Get a reference to spawn with
-        let actor_ref = INSTANCE_REGISTRY.get(&inst_id).unwrap();
-
+impl Instance {
+    /// Creates a new Instance, starting its WASM execution task.
+    async fn new(
+        inst_id: InstanceId,
+        username: String,
+        program_name: String,
+        arguments: Vec<String>,
+        capture_outputs: bool,
+        component: Component,
+        engine: Engine,
+        linker: Arc<Linker<InstanceState>>,
+    ) -> anyhow::Result<Self> {
         // Create channels for synchronization
         let (output_ctrl_tx, output_ctrl_rx) = oneshot::channel();
 
         // Spawn WASM execution task
         let execution_handle = tokio::spawn(Self::run_wasm(
             inst_id,
-            config.username,
-            config.component,
-            config.arguments,
-            detached,
-            config.engine,
-            config.linker,
+            username.clone(),
+            component,
+            arguments.clone(),
+            capture_outputs,
+            engine,
+            linker,
             output_ctrl_tx,
         ));
 
@@ -152,14 +185,13 @@ impl InstanceActor {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to receive output controller"))?;
 
-        let running_state = if detached {
-            InstanceRunningState::Detached
-        } else {
+        let running_state = if capture_outputs {
             InstanceRunningState::Attached
+        } else {
+            InstanceRunningState::Detached
         };
 
-        // Spawn the actor with the initialized state
-        actor_ref.spawn(|| InstanceActor {
+        Ok(Instance {
             inst_id,
             username,
             program_name,
@@ -168,9 +200,7 @@ impl InstanceActor {
             output_delivery_ctrl,
             running_state,
             execution_handle: Some(execution_handle),
-        })?;
-
-        Ok(inst_id)
+        })
     }
 
     /// Runs the WASM component execution
@@ -179,7 +209,7 @@ impl InstanceActor {
         username: String,
         component: Component,
         arguments: Vec<String>,
-        detached: bool,
+        capture_outputs: bool,
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
         output_ctrl_tx: oneshot::Sender<OutputDeliveryCtrl>,
@@ -188,10 +218,10 @@ impl InstanceActor {
         let (inst_state, output_delivery_ctrl) =
             InstanceState::new(instance_id, username).await;
 
-        let output_delivery = if detached {
-            OutputDelivery::Buffered
-        } else {
+        let output_delivery = if capture_outputs {
             OutputDelivery::Streamed
+        } else {
+            OutputDelivery::Buffered
         };
 
         output_delivery_ctrl.set_output_delivery(output_delivery);
@@ -239,7 +269,7 @@ impl InstanceActor {
             }
         };
 
-        let _ = send(instance_id, InstanceMessage::ExecutionFinished { cause });
+        let _ = SERVICES.send(&instance_id, Message::ExecutionFinished { cause });
     }
 
     /// Cleanup and unregister this instance
@@ -262,12 +292,12 @@ impl InstanceActor {
     }
 }
 
-impl ServiceHandler for InstanceActor {
-    type Message = InstanceMessage;
+impl ServiceHandler for Instance {
+    type Message = Message;
 
-    async fn handle(&mut self, msg: InstanceMessage) {
+    async fn handle(&mut self, msg: Message) {
         match msg {
-            InstanceMessage::Attach { response } => {
+            Message::Attach { response } => {
                 let result = match &self.running_state {
                     InstanceRunningState::Attached => AttachInstanceResult::AlreadyAttached,
                     InstanceRunningState::Detached => {
@@ -283,28 +313,28 @@ impl ServiceHandler for InstanceActor {
                 let _ = response.send(result);
             }
 
-            InstanceMessage::Detach => {
+            Message::Detach => {
                 if matches!(self.running_state, InstanceRunningState::Attached) {
                     self.running_state = InstanceRunningState::Detached;
                 }
             }
 
-            InstanceMessage::AllowOutput => {
+            Message::AllowOutput => {
                 self.output_delivery_ctrl.allow_output();
             }
 
-            InstanceMessage::SetOutputDelivery { mode } => {
+            Message::SetOutputDelivery { mode } => {
                 self.output_delivery_ctrl.set_output_delivery(mode);
             }
 
-            InstanceMessage::Terminate { notification_to_client } => {
+            Message::Terminate { notification_to_client } => {
                 if let Some(cause) = notification_to_client {
                     self.notify_client_termination(cause);
                 }
                 self.cleanup();
             }
 
-            InstanceMessage::ExecutionFinished { cause } => {
+            Message::ExecutionFinished { cause } => {
                 match &self.running_state {
                     InstanceRunningState::Attached => {
                         // Client is attached, notify them and cleanup
@@ -322,7 +352,7 @@ impl ServiceHandler for InstanceActor {
                 }
             }
 
-            InstanceMessage::GetInfo { response } => {
+            Message::GetInfo { response } => {
                 let info = InstanceInfo {
                     username: self.username.clone(),
                     program_name: self.program_name.clone(),
@@ -334,49 +364,4 @@ impl ServiceHandler for InstanceActor {
             }
         }
     }
-}
-
-// =============================================================================
-// Async Helper Functions (Ergonomic Wrappers)
-// =============================================================================
-
-/// Attach to an instance.
-pub async fn attach(inst_id: InstanceId) -> AttachInstanceResult {
-    let (tx, rx) = oneshot::channel();
-    if send(inst_id, InstanceMessage::Attach { response: tx }).is_err() {
-        return AttachInstanceResult::InstanceNotFound;
-    }
-    rx.await.unwrap_or(AttachInstanceResult::InstanceNotFound)
-}
-
-/// Detach from an instance (fire-and-forget).
-pub fn detach(inst_id: InstanceId) {
-    let _ = send(inst_id, InstanceMessage::Detach);
-}
-
-/// Allow output for an instance (fire-and-forget).
-pub fn allow_output(inst_id: InstanceId) {
-    let _ = send(inst_id, InstanceMessage::AllowOutput);
-}
-
-/// Set output delivery mode for an instance (fire-and-forget).
-pub fn set_output_delivery(inst_id: InstanceId, mode: OutputDelivery) {
-    let _ = send(inst_id, InstanceMessage::SetOutputDelivery { mode });
-}
-
-/// Terminate an instance (fire-and-forget).
-pub fn terminate(inst_id: InstanceId, notification_to_client: Option<TerminationCause>) {
-    let _ = send(inst_id, InstanceMessage::Terminate { notification_to_client });
-}
-
-/// Get instance info for listing.
-pub async fn get_info(inst_id: InstanceId) -> Option<InstanceInfo> {
-    let (tx, rx) = oneshot::channel();
-    send(inst_id, InstanceMessage::GetInfo { response: tx }).ok()?;
-    rx.await.ok()
-}
-
-/// List all registered instance IDs.
-pub fn list_instance_ids() -> Vec<InstanceId> {
-    INSTANCE_REGISTRY.iter().map(|r| *r.key()).collect()
 }
