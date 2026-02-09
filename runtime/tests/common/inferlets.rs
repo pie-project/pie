@@ -4,6 +4,10 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+use pie::process::ProcessId;
+use pie::program::ProgramName;
 
 /// Root directory of the test inferlets workspace.
 fn inferlets_dir() -> PathBuf {
@@ -47,4 +51,29 @@ pub fn read_inferlet_manifest(name: &str) -> pie::program::Manifest {
         .unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e));
     pie::program::Manifest::parse(&content)
         .unwrap_or_else(|e| panic!("Failed to parse {}: {}", path.display(), e))
+}
+
+/// Add and install a test inferlet in one step (async).
+pub async fn add_and_install(name: &str) -> ProgramName {
+    let wasm = read_inferlet_wasm(name);
+    let manifest = read_inferlet_manifest(name);
+    let program_name = ProgramName::parse(&format!("{name}@0.1.0"));
+    pie::program::add(wasm, manifest, true).await.unwrap();
+    pie::program::install(&program_name).await.unwrap();
+    program_name
+}
+
+/// Wait for a process to complete (disappear from process::list()).
+/// Returns true if the process exited within the timeout, false otherwise.
+pub fn wait_for_process(id: ProcessId, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if !pie::process::list().contains(&id) {
+            return true;
+        }
+        if start.elapsed() > timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
