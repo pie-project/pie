@@ -25,7 +25,7 @@ use tokio_tungstenite::accept_async;
 use tungstenite::Message as WsMessage;
 
 use crate::service::ServiceMap;
-use crate::runtime::{self, TerminationCause};
+use crate::process::TerminationCause;
 use crate::auth;
 
 type ProcessId = usize;

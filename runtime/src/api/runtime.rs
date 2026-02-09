@@ -2,18 +2,17 @@
 
 use crate::api::pie;
 use crate::api::types::FutureString;
-use crate::instance::InstanceState;
+use crate::linker::InstanceState;
 use crate::model;
-use crate::runtime;
+use crate::process;
+use crate::program::ProgramName;
 
 use anyhow::Result;
-use tokio::sync::oneshot;
 use wasmtime::component::Resource;
-use wasmtime_wasi::WasiView;
 
 impl pie::core::runtime::Host for InstanceState {
     async fn version(&mut self) -> Result<String> {
-        runtime::get_version().await
+        Ok(env!("CARGO_PKG_VERSION").to_string())
     }
 
     async fn instance_id(&mut self) -> Result<String> {
@@ -33,8 +32,16 @@ impl pie::core::runtime::Host for InstanceState {
         package_name: String,
         args: Vec<String>,
     ) -> Result<Result<Resource<FutureString>, String>> {
-        let rx = runtime::spawn_child_rx(package_name, args)?;
-        let future_string = FutureString::new(rx);
-        Ok(Ok(self.ctx().table.push(future_string)?))
+        // TODO: wire up child process spawning with FutureString
+        let _process_id = process::spawn(
+            self.get_username(),
+            ProgramName::parse(&package_name),
+            args,
+            None,
+            Some(self.id()),
+            false,
+        )?;
+        // For now, return an error since we need to wire up result channel
+        Ok(Err("spawn not yet fully wired".to_string()))
     }
 }

@@ -3,7 +3,7 @@
 use crate::adapter::{self, AdapterId, LockId};
 use crate::api::pie;
 use crate::api::types::FutureBool;
-use crate::instance::InstanceState;
+use crate::linker::InstanceState;
 use anyhow::Result;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;

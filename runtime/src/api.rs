@@ -9,7 +9,7 @@ pub mod runtime;
 pub mod mcp;
 pub mod zo;
 
-use crate::instance::InstanceState;
+use crate::linker::InstanceState;
 use wasmtime::component::HasSelf;
 
 wasmtime::component::bindgen!({

@@ -1,7 +1,7 @@
 //! mcp:core/types - MCP shared types
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::linker::InstanceState;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::oneshot;

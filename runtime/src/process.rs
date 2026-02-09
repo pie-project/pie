@@ -22,7 +22,16 @@ use crate::service::{ServiceMap, ServiceHandler};
 // Process Registry
 // =============================================================================
 
-type ProcessId = usize;
+pub type ProcessId = usize;
+
+/// Reason a process was terminated.
+#[derive(Debug, Clone)]
+pub enum TerminationCause {
+    Normal(String),
+    Signal,
+    Exception(String),
+    OutOfResources(String),
+}
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -270,8 +279,8 @@ impl Process {
         if let Some(client_id) = self.client_id.take() {
             let process_id = self.process_id;
             let cause = match exception {
-                Some(msg) => crate::runtime::TerminationCause::Exception(msg),
-                None => crate::runtime::TerminationCause::Normal(String::new()),
+                Some(msg) => TerminationCause::Exception(msg),
+                None => TerminationCause::Normal(String::new()),
             };
             let _ = server::sessions::terminate(client_id, process_id, cause);
             let _ = server::unregister_instance(process_id);

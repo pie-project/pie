@@ -2,7 +2,7 @@
 
 use crate::api::pie;
 use crate::api::mcp::types::FutureJsonString;
-use crate::instance::InstanceState;
+use crate::linker::InstanceState;
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

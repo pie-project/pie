@@ -1,7 +1,7 @@
 //! pie:core/model - Model and Tokenizer resources
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::linker::InstanceState;
 use crate::model;
 use anyhow::Result;
 use wasmtime::component::Resource;

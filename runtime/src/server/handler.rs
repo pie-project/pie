@@ -6,9 +6,10 @@
 use bytes::Bytes;
 use pie_client::message::{self, ServerMessage};
 
+use crate::daemon;
 use crate::messaging;
+use crate::process::{self, TerminationCause};
 use crate::program::{self, Manifest, ProgramName};
-use crate::runtime::{self, AttachInstanceResult};
 
 use super::session::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
@@ -57,7 +58,17 @@ impl Session {
     }
 
     pub async fn handle_list_instances(&self, corr_id: u32) {
-        let instances = runtime::list_instances(self.username.clone()).await;
+        let instances = process::list()
+            .into_iter()
+            .map(|id| message::InstanceInfo {
+                id: id.to_string(),
+                arguments: vec![],
+                status: message::InstanceStatus::Attached,
+                username: String::new(),
+                elapsed_secs: 0,
+                kv_pages_used: 0,
+            })
+            .collect();
         self.send(ServerMessage::LiveInstances { corr_id, instances })
             .await;
     }
@@ -152,27 +163,26 @@ impl Session {
             return;
         }
 
-        // Launch the instance
-        match runtime::launch_instance(
+        // Launch the process
+        let client_id = if capture_outputs { Some(self.id) } else { None };
+        match process::spawn(
             self.username.clone(),
-            program_name.to_string(),
+            program_name,
             arguments,
+            client_id,
+            None,
             capture_outputs,
-        )
-        .await
-        {
-            Ok(instance_id) => {
+        ) {
+            Ok(process_id) => {
                 if capture_outputs {
-                    // Register instance -> client mapping with Server
-                    super::register_instance(instance_id, self.id)
+                    // Register process -> client mapping with Server
+                    super::register_instance(process_id, self.id)
                     .ok();
-                    self.attached_instances.push(instance_id);
+                    self.attached_instances.push(process_id);
                 }
 
-                self.send_launch_result(corr_id, true, instance_id.to_string())
+                self.send_launch_result(corr_id, true, process_id.to_string())
                     .await;
-
-                runtime::allow_output(instance_id);
             }
             Err(e) => {
                 self.send_launch_result(corr_id, false, e.to_string()).await;
@@ -195,15 +205,13 @@ impl Session {
             return;
         }
 
-        match runtime::launch_server_instance(
+        match daemon::spawn(
             self.username.clone(),
-            program_name.to_string(),
-            port,
+            program_name,
+            port as u16,
             arguments,
-        )
-        .await
-        {
-            Ok(()) => {
+        ) {
+            Ok(_daemon_id) => {
                 self.send_response(corr_id, true, "server launched".to_string())
                     .await;
             }
@@ -229,8 +237,8 @@ impl Session {
             }
         };
 
-        match runtime::attach_instance(process_id).await {
-            AttachInstanceResult::AttachedRunning => {
+        match process::attach(process_id, self.id).await {
+            Ok(()) => {
                 self.send_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
 
@@ -239,23 +247,8 @@ impl Session {
                 .ok();
                 self.attached_instances.push(process_id);
             }
-            AttachInstanceResult::AttachedFinished(cause) => {
-                self.send_attach_result(corr_id, true, "Instance attached".to_string())
-                    .await;
-
-                // Register process → client mapping with Server
-                super::register_instance(process_id, self.id)
-                .ok();
-                self.attached_instances.push(process_id);
-
-                runtime::terminate_instance(process_id, Some(cause));
-            }
-            AttachInstanceResult::InstanceNotFound => {
+            Err(_) => {
                 self.send_attach_result(corr_id, false, "Instance not found".to_string())
-                    .await;
-            }
-            AttachInstanceResult::AlreadyAttached => {
-                self.send_attach_result(corr_id, false, "Instance already attached".to_string())
                     .await;
             }
         }
@@ -271,7 +264,7 @@ impl Session {
 
     pub async fn handle_terminate_instance(&mut self, corr_id: u32, instance_id: String) {
         if let Ok(process_id) = instance_id.parse::<ProcessId>() {
-            runtime::terminate_instance(process_id, Some(runtime::TerminationCause::Signal));
+            process::terminate(process_id, Some("Signal".to_string()));
             self.send_response(corr_id, true, "Instance terminated".to_string())
                 .await;
         } else {

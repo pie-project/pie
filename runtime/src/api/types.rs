@@ -1,7 +1,7 @@
 //! pie:core/types - FutureBool, FutureString resources
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::linker::InstanceState;
 use anyhow::Result;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;

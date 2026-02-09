@@ -4,7 +4,7 @@ use crate::api::model::Model;
 use crate::api::pie;
 use crate::api::types::FutureBool;
 use crate::context::{self, ContextId, LockId};
-use crate::instance::InstanceState;
+use crate::linker::InstanceState;
 use crate::model::ModelId;
 use anyhow::Result;
 use tokio::sync::oneshot;
