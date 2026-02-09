@@ -42,12 +42,18 @@ pub async fn spawn(
     program_name: ProgramName,
     arguments: Vec<String>,
     client_id: Option<ClientId>,
-    _parent_id: Option<ProcessId>,
+    parent_id: Option<ProcessId>,
     _capture_outputs: bool,
 ) -> Result<ProcessId> {
     let process = Process::new(username, program_name, arguments, client_id);
     let id = process.process_id;
     SERVICES.spawn(id, || process)?;
+
+    // Register as child of parent so it terminates with the parent
+    if let Some(parent_id) = parent_id {
+        add_child(parent_id, id);
+    }
+
     Ok(id)
 }
 
@@ -66,6 +72,12 @@ pub fn detach(process_id: ProcessId) {
 /// Terminate a process (fire-and-forget).
 pub fn terminate(process_id: ProcessId, exception: Option<String>) {
     let _ = SERVICES.send(&process_id, Message::Terminate { exception });
+}
+
+/// Register a child process under a parent. The child will be terminated
+/// when the parent terminates or finishes.
+fn add_child(parent_id: ProcessId, child_id: ProcessId) {
+    let _ = SERVICES.send(&parent_id, Message::AddChild { child_id });
 }
 
 /// List all registered process IDs.
@@ -94,6 +106,10 @@ enum Message {
     ExecutionFinished {
         exception: Option<String>,
     },
+    /// Register a child process
+    AddChild {
+        child_id: ProcessId,
+    },
 }
 
 // =============================================================================
@@ -108,27 +124,40 @@ struct Process {
     program: ProgramName,
     arguments: Vec<String>,
     start_time: Instant,
-    handle: Option<JoinHandle<()>>,
+    handle: JoinHandle<()>,
     client_id: Option<ClientId>,
+    children: Vec<ProcessId>,
 }
 
 impl Process {
-    /// Creates a new Process. WASM execution starts when the actor is spawned.
+    /// Creates a new Process and spawns its WASM execution task.
     fn new(
         username: String,
         program: ProgramName,
         arguments: Vec<String>,
         client_id: Option<ClientId>,
     ) -> Self {
+        let process_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let instance_id = Uuid::new_v4();
+
+        let handle = tokio::spawn(Self::run(
+            process_id,
+            instance_id,
+            username.clone(),
+            program.clone(),
+            arguments.clone(),
+        ));
+
         Process {
-            process_id: NEXT_ID.fetch_add(1, Ordering::SeqCst),
-            instance_id: Uuid::new_v4(),
+            process_id,
+            instance_id,
             username,
             program,
             arguments,
             start_time: Instant::now(),
-            handle: None,
+            handle,
             client_id,
+            children: Vec::new(),
         }
     }
 
@@ -181,10 +210,14 @@ impl Process {
         }
     }
 
-    /// Abort the WASM execution task, notify any attached client, and unregister.
+    /// Abort the WASM execution task, notify any attached client, terminate
+    /// children, and unregister.
     fn cleanup(&mut self, cause: TerminationCause) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
+        self.handle.abort();
+
+        // Cascade: terminate all children
+        for child_id in self.children.drain(..) {
+            terminate(child_id, None);
         }
 
         // Notify attached client
@@ -203,18 +236,7 @@ impl Process {
 impl ServiceHandler for Process {
     type Message = Message;
 
-    async fn started(&mut self) {
-        // Spawn the WASM execution task
-        let process_id = self.process_id;
-        let instance_id = self.instance_id;
-        let username = self.username.clone();
-        let program = self.program.clone();
-        let arguments = self.arguments.clone();
 
-        self.handle = Some(tokio::spawn(Self::run(
-            process_id, instance_id, username, program, arguments,
-        )));
-    }
 
     async fn handle(&mut self, msg: Message) {
         match msg {
@@ -241,6 +263,10 @@ impl ServiceHandler for Process {
                     None => TerminationCause::Normal(String::new()),
                 };
                 self.cleanup(cause);
+            }
+
+            Message::AddChild { child_id } => {
+                self.children.push(child_id);
             }
         }
     }
