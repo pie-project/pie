@@ -1,0 +1,4 @@
+[package]
+name = "context"
+version = "0.1.0"
+description = "Test inferlet: exercises model, context, and tokenizer host APIs"

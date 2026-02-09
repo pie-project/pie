@@ -516,3 +516,154 @@ impl<'a> Iterator for RunIterator<'a> {
 }
 
 impl FusedIterator for RunIterator<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create Vec<bool> without type inference ambiguity (pyo3/serde_json).
+    fn bv(v: &[bool]) -> Vec<bool> { v.to_vec() }
+
+    // -- Encoding correctness -------------------------------------------------
+
+    #[test]
+    fn roundtrip_complex_pattern() {
+        let pattern = vec![
+            false, false, true, true, true, false, true, false, false, false,
+        ];
+        let b = Brle::from_slice(&pattern);
+        assert_eq!(b.to_vec(), pattern);
+        assert_eq!(b.len(), 10);
+        // Verify internal encoding: [2, 3, 1, 1, 3]
+        assert_eq!(b.buffer, vec![2, 3, 1, 1, 3]);
+    }
+
+    #[test]
+    fn from_slice_leading_true_run() {
+        // Leading true requires a zero-length false run prefix
+        let b = Brle::from_slice(&[true, true, false]);
+        assert_eq!(b.buffer, vec![0, 2, 1]);
+        assert_eq!(b.to_vec(), vec![true, true, false]);
+    }
+
+    #[test]
+    fn iter_runs_skips_zero_length_prefix() {
+        let b = Brle::from_slice(&[true, true, true]);
+        let runs: Vec<_> = b.iter_runs().collect();
+        // Zero-length false run at buffer[0] should be skipped
+        assert_eq!(runs, vec![(true, 0, 3)]);
+    }
+
+    // -- Masking (the complex algorithm) --------------------------------------
+
+    #[test]
+    fn mask_range_carves_hole_in_trues() {
+        let mut b = Brle::from_slice(&[true; 6]);
+        b.mask_range(1, 5, false);
+        assert_eq!(b.to_vec(), vec![true, false, false, false, false, true]);
+    }
+
+    #[test]
+    fn mask_overwrite_creates_sandwich() {
+        let mut b = Brle::new(10);
+        b.mask_range(0, 10, true);
+        b.mask_range(3, 7, false);
+        assert_eq!(
+            b.to_vec(),
+            vec![true, true, true, false, false, false, false, true, true, true]
+        );
+    }
+
+    #[test]
+    fn mask_scatter_coalesces_adjacent_indices() {
+        // Scattered indices [1,3,5,7] should produce alternating pattern
+        let mut b = Brle::new(8);
+        b.mask(&[7, 1, 5, 3], true); // intentionally unsorted
+        assert_eq!(
+            b.to_vec(),
+            vec![false, true, false, true, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn mask_scatter_deduplicates() {
+        let mut b = Brle::new(4);
+        b.mask(&[1, 1, 1], true);
+        assert_eq!(b.to_vec(), vec![false, true, false, false]);
+    }
+
+    // -- Queries --------------------------------------------------------------
+
+    #[test]
+    fn is_masked_preserves_input_order() {
+        let b = Brle::from_slice(&[false, true, true, false]);
+        assert_eq!(b.is_masked(&[3, 1, 0, 2]), bv(&[false, true, false, true]));
+    }
+
+    #[test]
+    fn is_range_all_value_boundary() {
+        let b = Brle::from_slice(&[false, false, true, true, false]);
+        assert!(b.is_range_all_value(2, 4, true));    // exact true run
+        assert!(!b.is_range_all_value(1, 4, true));   // bleeds into false
+        assert!(!b.is_range_all_value(0, 10, false));  // beyond total_size
+        assert!(b.is_range_all_value(5, 3, true));     // reversed → empty → true
+    }
+
+    // -- Structural mutations -------------------------------------------------
+
+    #[test]
+    fn extend_merges_matching_boundary_runs() {
+        let mut a = Brle::from_slice(&[false, true]); // ends with true
+        let b = Brle::from_slice(&[true, false]);      // starts with true
+        a.extend(&b);
+        assert_eq!(a.to_vec(), vec![false, true, true, false]);
+        // Middle true runs should be merged in the buffer
+        assert_eq!(a.buffer, vec![1, 2, 1]);
+    }
+
+    #[test]
+    fn remove_range_splices_correctly() {
+        let mut b = Brle::from_slice(&[false, true, true, true, false]);
+        b.remove_range(1, 4); // remove the true block
+        assert_eq!(b.to_vec(), vec![false, false]);
+    }
+
+    #[test]
+    fn append_creates_proper_prefix_for_leading_true() {
+        let mut b = Brle::new(0);
+        b.append(true);
+        assert_eq!(b.buffer, vec![0, 1]); // zero false prefix + one true
+        b.append(true);
+        assert_eq!(b.buffer, vec![0, 2]); // extends the true run
+        b.append(false);
+        assert_eq!(b.to_vec(), vec![true, true, false]);
+    }
+
+    // -- Stress ---------------------------------------------------------------
+
+    #[test]
+    fn large_mask_and_verify() {
+        let mut b = Brle::new(100);
+        b.mask_range(10, 20, true);
+        b.mask_range(50, 80, true);
+
+        for i in 0..100 {
+            let expected = (10..20).contains(&i) || (50..80).contains(&i);
+            assert_eq!(
+                b.is_masked(&[i]),
+                bv(&[expected]),
+                "mismatch at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_alternating_roundtrip() {
+        let pattern: Vec<bool> = (0..1000).map(|i| i % 2 == 0).collect();
+        let b = Brle::from_slice(&pattern);
+        assert_eq!(b.to_vec(), pattern);
+        // 1000 alternating values, starting with true → 1001 buffer entries
+        // (zero-length false prefix + 1000 singleton runs)
+        assert_eq!(b.buffer.len(), 1001);
+    }
+}

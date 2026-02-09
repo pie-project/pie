@@ -39,3 +39,12 @@ pub fn read_inferlet_wasm(name: &str) -> Vec<u8> {
     std::fs::read(&path)
         .unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e))
 }
+
+/// Read and parse the Pie.toml manifest for a test inferlet.
+pub fn read_inferlet_manifest(name: &str) -> pie::program::Manifest {
+    let path = inferlets_dir().join(name).join("Pie.toml");
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e));
+    pie::program::Manifest::parse(&content)
+        .unwrap_or_else(|e| panic!("Failed to parse {}: {}", path.display(), e))
+}

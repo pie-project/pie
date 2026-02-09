@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 mod common;
 use common::{create_mock_env, MockEnv, mock_device::EchoBehavior, inferlets};
 
-use pie::program::{self, Manifest, ProgramName};
+use pie::program::{self, ProgramName};
 
 /// Shared state: MockEnv + tokio runtime (must outlive the process).
 struct TestState {
@@ -34,19 +34,6 @@ fn state() -> &'static TestState {
     })
 }
 
-/// Helper: create a minimal manifest for a test inferlet.
-fn test_manifest(name: &str) -> Manifest {
-    let toml = format!(
-        r#"
-[package]
-name = "{name}"
-version = "0.1.0"
-description = "Test inferlet: {name}"
-"#
-    );
-    Manifest::parse(&toml).unwrap()
-}
-
 /// Helper: ProgramName for a test inferlet
 fn test_program_name(name: &str) -> ProgramName {
     ProgramName::parse(&format!("{name}@0.1.0"))
@@ -60,7 +47,7 @@ fn test_program_name(name: &str) -> ProgramName {
 fn add_and_register() {
     let s = state();
     let wasm = inferlets::read_inferlet_wasm("echo");
-    let manifest = test_manifest("echo");
+    let manifest = inferlets::read_inferlet_manifest("echo");
     let name = test_program_name("echo");
 
     s.rt.block_on(async {
@@ -73,7 +60,7 @@ fn add_and_register() {
 fn install_and_query() {
     let s = state();
     let wasm = inferlets::read_inferlet_wasm("echo");
-    let manifest = test_manifest("echo");
+    let manifest = inferlets::read_inferlet_manifest("echo");
     let name = test_program_name("echo");
 
     s.rt.block_on(async {
@@ -87,7 +74,7 @@ fn install_and_query() {
 fn fetch_manifest_after_add() {
     let s = state();
     let wasm = inferlets::read_inferlet_wasm("error");
-    let manifest = test_manifest("error");
+    let manifest = inferlets::read_inferlet_manifest("error");
     let name = test_program_name("error");
 
     s.rt.block_on(async {
@@ -103,7 +90,7 @@ fn fetch_manifest_after_add() {
 fn uninstall_removes_program() {
     let s = state();
     let wasm = inferlets::read_inferlet_wasm("error");
-    let manifest = test_manifest("error");
+    let manifest = inferlets::read_inferlet_manifest("error");
     let name = test_program_name("error");
 
     s.rt.block_on(async {
@@ -123,7 +110,7 @@ fn uninstall_removes_program() {
 fn install_context_inferlet() {
     let s = state();
     let wasm = inferlets::read_inferlet_wasm("context");
-    let manifest = test_manifest("context");
+    let manifest = inferlets::read_inferlet_manifest("context");
     let name = test_program_name("context");
 
     s.rt.block_on(async {
@@ -142,7 +129,7 @@ fn install_all_test_inferlets() {
     s.rt.block_on(async {
         for name in &inferlet_names {
             let wasm = inferlets::read_inferlet_wasm(name);
-            let manifest = test_manifest(name);
+            let manifest = inferlets::read_inferlet_manifest(name);
             let program_name = test_program_name(name);
 
             program::add(wasm, manifest, true).await.unwrap();

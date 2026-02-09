@@ -291,3 +291,39 @@ impl BatchedForwardPassRequest {
 pub struct BatchedForwardPassResponse {
     pub results: Vec<ForwardPassResponse>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytevec_u32_serde_roundtrip() {
+        let original = ByteVec(vec![0, 1, u32::MAX, 42, 0xDEAD_BEEF]);
+        let packed = rmp_serde::to_vec(&original).expect("serialize");
+        let decoded: ByteVec = rmp_serde::from_slice(&packed).expect("deserialize");
+        assert_eq!(original.0, decoded.0);
+    }
+
+    #[test]
+    fn bytevec_f32_serde_roundtrip() {
+        let original = ByteVecF32(vec![0.0, 1.0, -1.5, f32::INFINITY, f32::NAN]);
+        let packed = rmp_serde::to_vec(&original).expect("serialize");
+        let decoded: ByteVecF32 = rmp_serde::from_slice(&packed).expect("deserialize");
+        // NaN != NaN, so compare element-by-element
+        for (a, b) in original.0.iter().zip(decoded.0.iter()) {
+            if a.is_nan() {
+                assert!(b.is_nan(), "expected NaN, got {b}");
+            } else {
+                assert_eq!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn bytevec_empty_roundtrip() {
+        let original = ByteVec(vec![]);
+        let packed = rmp_serde::to_vec(&original).expect("serialize");
+        let decoded: ByteVec = rmp_serde::from_slice(&packed).expect("deserialize");
+        assert!(decoded.0.is_empty());
+    }
+}

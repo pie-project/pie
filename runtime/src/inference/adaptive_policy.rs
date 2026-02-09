@@ -273,3 +273,73 @@ impl LatencyModel {
         (self.base_latency + self.per_token_latency * total_tokens as f64).max(self.base_latency)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- LatencyModel ---------------------------------------------------------
+
+    #[test]
+    fn latency_model_fallback_is_linear() {
+        let model = LatencyModel::new(0.2, 32);
+        // No observations → uses base + per_token_latency * total_tokens
+        let est = model.estimate_latency(4, 100);
+        let expected = 0.01 + 0.001 * 100.0;
+        assert!((est - expected).abs() < 1e-9, "got {est}, expected {expected}");
+    }
+
+    #[test]
+    fn latency_model_table_overrides_fallback() {
+        let mut model = LatencyModel::new(0.2, 32);
+        // Record an observation for batch_size=4, 256 tokens (bucket = 256/4/64 = 1)
+        model.record_latency(4, 256, Duration::from_millis(50));
+        // Now lookup should use the table entry, not the linear fallback
+        let est = model.estimate_latency(4, 256);
+        assert!((est - 0.050).abs() < 1e-9, "first observation should be exact: {est}");
+
+        // After a second observation, EMA should blend
+        model.record_latency(4, 256, Duration::from_millis(100));
+        let est2 = model.estimate_latency(4, 256);
+        let expected = 0.2 * 0.1 + 0.8 * 0.05; // alpha * new + (1-alpha) * old
+        assert!((est2 - expected).abs() < 1e-9, "EMA blend: got {est2}, expected {expected}");
+    }
+
+    #[test]
+    fn latency_model_different_buckets_are_independent() {
+        let mut model = LatencyModel::new(0.5, 32);
+        model.record_latency(4, 256, Duration::from_millis(50));
+        model.record_latency(4, 1024, Duration::from_millis(200));
+        // Different token buckets → different table entries
+        let est_small = model.estimate_latency(4, 256);
+        let est_large = model.estimate_latency(4, 1024);
+        assert!(est_large > est_small, "larger token counts should have higher latency");
+    }
+
+    // -- ArrivalRateEstimator -------------------------------------------------
+
+    #[test]
+    fn arrival_rate_none_before_second_arrival() {
+        let mut est = ArrivalRateEstimator::new(0.3);
+        let now = Instant::now();
+        est.record_arrival(now);
+        assert!(est.arrival_rate().is_none(), "need ≥2 arrivals for a rate");
+        assert!(est.expected_wait_time().is_none());
+    }
+
+    #[test]
+    fn arrival_rate_converges_to_steady_state() {
+        let mut est = ArrivalRateEstimator::new(0.5); // high alpha → fast convergence
+        let start = Instant::now();
+        // Simulate 10 arrivals at 100ms intervals
+        for i in 0..10 {
+            est.record_arrival(start + Duration::from_millis(i * 100));
+        }
+        let rate = est.arrival_rate().expect("should have a rate after 10 arrivals");
+        // At 100ms inter-arrival → 10 req/sec
+        assert!((rate - 10.0).abs() < 1.0, "rate should converge near 10 req/s, got {rate}");
+        let wait = est.expected_wait_time().unwrap();
+        assert!(wait.as_millis() > 80 && wait.as_millis() < 120,
+            "expected ~100ms wait, got {}ms", wait.as_millis());
+    }
+}
