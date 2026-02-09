@@ -61,13 +61,13 @@ pub async fn get_client_id(process_id: ProcessId) -> Result<Option<ClientId>> {
 }
 
 /// Associates a process with a client (called when process is launched).
-pub fn register_instance(process_id: ProcessId, client_id: ClientId) -> Result<()> {
-    SERVICE.send(ServerMessage::RegisterInstance { process_id, client_id })
+pub fn register_process(process_id: ProcessId, client_id: ClientId) -> Result<()> {
+    SERVICE.send(ServerMessage::RegisterProcess { process_id, client_id })
 }
 
 /// Removes a process→client mapping (called when process terminates).
-pub fn unregister_instance(process_id: ProcessId) -> Result<()> {
-    SERVICE.send(ServerMessage::UnregisterInstance { process_id })
+pub fn unregister_process(process_id: ProcessId) -> Result<()> {
+    SERVICE.send(ServerMessage::UnregisterProcess { process_id })
 }
 
 /// Cleans up after a client disconnects.
@@ -83,17 +83,17 @@ static CLIENT_SERVICES: LazyLock<ServiceMap<ClientId, SessionMessage>> = LazyLoc
 
 /// Sends a text message to a client for a specific process.
 pub fn send_message_to_client(client_id: ClientId, process_id: ProcessId, message: String) -> Result<()> {
-    CLIENT_SERVICES.send(&client_id, SessionMessage::SendMsg { process_id, message })
+    CLIENT_SERVICES.send(&client_id, SessionMessage::Message { process_id, message })
 }
 
 /// Sends binary data to a client for a specific process.
 pub fn send_blob_to_client(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Result<()> {
-    CLIENT_SERVICES.send(&client_id, SessionMessage::SendBlob { process_id, data })
+    CLIENT_SERVICES.send(&client_id, SessionMessage::Blob { process_id, data })
 }
 
 /// Notifies a client that a process has terminated.
 pub fn send_process_event_to_client(client_id: ClientId, process_id: ProcessId, cause: ProcessEvent) -> Result<()> {
-    CLIENT_SERVICES.send(&client_id, SessionMessage::ProcessTerminated { process_id, cause })
+    CLIENT_SERVICES.send(&client_id, SessionMessage::ProcessEvent { process_id, cause })
 }
 
 /// Streams output to a client for a specific process.
@@ -102,7 +102,7 @@ pub fn send_output_to_client(
     process_id: ProcessId,
     content: String,
 ) -> Result<()> {
-    CLIENT_SERVICES.send(&client_id, SessionMessage::StreamingOutput { process_id, content })
+    CLIENT_SERVICES.send(&client_id, SessionMessage::Output { process_id, content })
 }
 
 /// Checks if a session exists for the given client.
@@ -130,7 +130,7 @@ struct ServerState {
     /// Counter for generating unique client IDs.
     next_client_id: AtomicU32,
     /// Active client sessions (for graceful shutdown).
-    pub clients: DashMap<ClientId, JoinHandle<()>>,
+    clients: DashMap<ClientId, JoinHandle<()>>,
 }
 
 // =============================================================================
@@ -181,9 +181,9 @@ impl Server {
 #[derive(Debug)]
 enum ServerMessage {
     /// Associate a process with a client.
-    RegisterInstance { process_id: ProcessId, client_id: ClientId },
+    RegisterProcess { process_id: ProcessId, client_id: ClientId },
     /// Remove a process mapping.
-    UnregisterInstance { process_id: ProcessId },
+    UnregisterProcess { process_id: ProcessId },
     /// Query which client owns a process.
     GetClientId { process_id: ProcessId, response: oneshot::Sender<Option<ClientId>> },
     /// Clean up after a client disconnects.
@@ -195,10 +195,10 @@ impl ServiceHandler for Server {
 
     async fn handle(&mut self, msg: ServerMessage) {
         match msg {
-            ServerMessage::RegisterInstance { process_id, client_id } => {
+            ServerMessage::RegisterProcess { process_id, client_id } => {
                 self.process_to_client.insert(process_id, client_id);
             }
-            ServerMessage::UnregisterInstance { process_id } => {
+            ServerMessage::UnregisterProcess { process_id } => {
                 self.process_to_client.remove(&process_id);
             }
             ServerMessage::GetClientId { process_id, response } => {
@@ -219,14 +219,14 @@ impl ServiceHandler for Server {
 /// Messages handled by Session actors.
 #[derive(Debug)]
 enum SessionMessage {
-    /// Send a text message to the client for a specific process.
-    SendMsg { process_id: ProcessId, message: String },
-    /// Send binary data to the client for a specific process.
-    SendBlob { process_id: ProcessId, data: Bytes },
-    /// Notify client of process termination.
-    ProcessTerminated { process_id: ProcessId, cause: ProcessEvent },
-    /// Stream stdout/stderr output to the client.
-    StreamingOutput { process_id: ProcessId, content: String },
+    /// Text message to the client for a specific process.
+    Message { process_id: ProcessId, message: String },
+    /// Binary data to the client for a specific process.
+    Blob { process_id: ProcessId, data: Bytes },
+    /// Process termination event.
+    ProcessEvent { process_id: ProcessId, cause: ProcessEvent },
+    /// Stdout/stderr output to the client.
+    Output { process_id: ProcessId, content: String },
     /// WebSocket message received from client.
     ClientRequest(ClientMessage),
 }
@@ -243,12 +243,12 @@ struct PendingAuth {
 
 /// A client session managing a WebSocket connection.
 struct Session {
-    pub id: ClientId,
-    pub username: String,
-    pub state: Arc<ServerState>,
-    pub inflight_uploads: DashMap<String, InFlightUpload>,
-    pub attached_instances: Vec<ProcessId>,
-    pub ws_msg_tx: mpsc::Sender<WsMessage>,
+    pub(super) id: ClientId,
+    pub(super) username: String,
+    state: Arc<ServerState>,
+    pub(super) inflight_uploads: DashMap<String, InFlightUpload>,
+    pub(super) attached_instances: Vec<ProcessId>,
+    ws_msg_tx: mpsc::Sender<WsMessage>,
     send_pump: JoinHandle<()>,
     recv_pump: JoinHandle<()>,
     authenticated: bool,
@@ -325,7 +325,7 @@ impl Session {
     /// Cleanup when session is terminated.
     fn cleanup(&mut self) {
         for process_id in self.attached_instances.drain(..) {
-            unregister_instance(process_id).ok();
+            unregister_process(process_id).ok();
         }
 
         self.recv_pump.abort();
@@ -362,16 +362,16 @@ impl ServiceHandler for Session {
                     self.handle_client_message(client_msg).await;
                 }
             }
-            SessionMessage::SendMsg { process_id, message } => {
+            SessionMessage::Message { process_id, message } => {
                 self.send_process_event(process_id, EventCode::Message, message).await;
             }
-            SessionMessage::SendBlob { process_id, data } => {
+            SessionMessage::Blob { process_id, data } => {
                 self.handle_send_blob(process_id, data).await;
             }
-            SessionMessage::ProcessTerminated { process_id, cause } => {
+            SessionMessage::ProcessEvent { process_id, cause } => {
                 self.handle_instance_termination(process_id, cause).await;
             }
-            SessionMessage::StreamingOutput { process_id, content } => {
+            SessionMessage::Output { process_id, content } => {
                 self.send_process_event(process_id, EventCode::Message, content).await;
             }
         }
@@ -452,9 +452,6 @@ impl Session {
         self.username = pending.username;
         Ok(true)
     }
-}
-
-impl Session {
     async fn auth_by_token(&mut self, corr_id: u32, token: String) -> Result<()> {
         // Verify token using auth actor
         if auth::verify_internal_token(token).await? {
@@ -472,8 +469,14 @@ impl Session {
             .await;
         bail!("Invalid token")
     }
+}
 
-    pub async fn send(&self, msg: WireServerMessage) {
+// =============================================================================
+// Session - Wire Helpers
+// =============================================================================
+
+impl Session {
+    async fn send(&self, msg: WireServerMessage) {
         if let Ok(encoded) = rmp_serde::to_vec_named(&msg) {
             if self
                 .ws_msg_tx
@@ -486,7 +489,7 @@ impl Session {
         }
     }
 
-    pub async fn send_response(&self, corr_id: u32, successful: bool, result: String) {
+    pub(super) async fn send_response(&self, corr_id: u32, successful: bool, result: String) {
         self.send(WireServerMessage::Response {
             corr_id,
             successful,
@@ -495,7 +498,7 @@ impl Session {
         .await;
     }
 
-    pub async fn send_process_launch_result(&self, corr_id: u32, successful: bool, message: String) {
+    pub(super) async fn send_process_launch_result(&self, corr_id: u32, successful: bool, message: String) {
         self.send(WireServerMessage::ProcessLaunchResult {
             corr_id,
             successful,
@@ -504,7 +507,7 @@ impl Session {
         .await;
     }
 
-    pub async fn send_process_attach_result(&self, corr_id: u32, successful: bool, message: String) {
+    pub(super) async fn send_process_attach_result(&self, corr_id: u32, successful: bool, message: String) {
         self.send(WireServerMessage::ProcessAttachResult {
             corr_id,
             successful,
@@ -513,7 +516,7 @@ impl Session {
         .await;
     }
 
-    pub async fn send_process_event(&self, process_id: ProcessId, event: EventCode, message: String) {
+    pub(super) async fn send_process_event(&self, process_id: ProcessId, event: EventCode, message: String) {
         self.send(WireServerMessage::ProcessEvent {
             instance_id: process_id.to_string(),
             event: event as u32,
@@ -528,7 +531,7 @@ impl Session {
 // =============================================================================
 
 impl Session {
-    pub async fn handle_client_message(&mut self, message: ClientMessage) {
+    async fn handle_client_message(&mut self, message: ClientMessage) {
         match message {
             ClientMessage::AuthRequest { corr_id, .. } => {
                 self.send_response(corr_id, true, "Already authenticated".to_string())
@@ -634,7 +637,7 @@ impl Session {
     }
 
 
-    pub async fn handle_instance_termination(&mut self, process_id: ProcessId, cause: ProcessEvent) {
+    async fn handle_instance_termination(&mut self, process_id: ProcessId, cause: ProcessEvent) {
         self.attached_instances.retain(|&id| id != process_id);
 
         let (event_code, message) = match cause {

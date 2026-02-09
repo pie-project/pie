@@ -296,7 +296,7 @@ impl Process {
                 None => ProcessEvent::Normal(String::new()),
             };
             let _ = server::send_process_event_to_client(client_id, process_id, cause);
-            let _ = server::unregister_instance(process_id);
+            let _ = server::unregister_process(process_id);
         }
 
         SERVICES.remove(&self.process_id);
