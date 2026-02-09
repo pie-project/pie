@@ -4,17 +4,17 @@
 //! including WASI context and dynamic linking support.
 
 use std::collections::HashMap;
-use uuid::Uuid;
 use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
-use super::output::{LogStream, OutputChannel, OutputDeliveryCtrl};
+use super::output::LogStream;
 
+type ProcessId = usize;
 
 pub struct InstanceState {
     // Wasm states
-    id: InstanceId,
+    id: ProcessId,
     username: String,
 
     // WASI states
@@ -51,24 +51,20 @@ impl WasiHttpView for InstanceState {
 }
 
 impl InstanceState {
-    pub async fn new(
-        id: InstanceId,
+    pub fn new(
+        id: ProcessId,
         username: String,
-    ) -> (Self, OutputDeliveryCtrl) {
+        capture_outputs: bool,
+    ) -> Self {
         let mut builder = WasiCtx::builder();
         builder.inherit_network(); // TODO: Replace with socket_addr_check later.
 
-        // Create LogStream instances and keep handles for delivery mode control
-        let stdout_stream = LogStream::new(OutputChannel::Stdout, id);
-        let stderr_stream = LogStream::new(OutputChannel::Stderr, id);
+        if capture_outputs {
+            builder.stdout(LogStream::new_stdout(id));
+            builder.stderr(LogStream::new_stderr(id));
+        }
 
-        // Clone the streams for the WASI context (LogStream is cheap to clone due to Arc)
-        builder.stdout(stdout_stream.clone());
-        builder.stderr(stderr_stream.clone());
-
-        let streaming_ctrl = OutputDeliveryCtrl::new(stdout_stream, stderr_stream);
-
-        let state = State {
+        InstanceState {
             id,
             username,
             wasi_ctx: builder.build(),
@@ -78,12 +74,10 @@ impl InstanceState {
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
-        };
-
-        (state, streaming_ctrl)
+        }
     }
 
-    pub fn id(&self) -> InstanceId {
+    pub fn id(&self) -> ProcessId {
         self.id
     }
 

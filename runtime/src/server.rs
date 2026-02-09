@@ -5,7 +5,7 @@
 //! ## Architecture
 //!
 //! The Server follows the Superactor pattern:
-//! - **Server** (singleton) - Manages the TCP listener and instance→client mappings
+//! - **Server** (singleton) - Manages the TCP listener and process→client mappings
 //! - **Session** (per-client) - Handles WebSocket framing and client requests
 //!
 //! Sessions register in a global registry and receive messages via Direct Addressing,
@@ -34,7 +34,8 @@ use tokio::sync::oneshot;
 use tokio::task::{self, JoinHandle};
 
 use crate::service::{Service, ServiceHandler};
-use crate::instance::InstanceId;
+
+type ProcessId = usize;
 
 /// Unique identifier for a connected client.
 pub type ClientId = u32;
@@ -51,21 +52,21 @@ pub fn spawn(host: &str, port: u16) {
     SERVICE.spawn::<Server, _>(|| Server::new(addr)).expect("Server already spawned");
 }
 
-/// Looks up which client owns an instance.
-pub async fn get_client_id(inst_id: InstanceId) -> Result<Option<ClientId>> {
+/// Looks up which client owns a process.
+pub async fn get_client_id(process_id: ProcessId) -> Result<Option<ClientId>> {
     let (tx, rx) = oneshot::channel();
-    SERVICE.send(Message::GetClientId { inst_id, response: tx })?;
+    SERVICE.send(Message::GetClientId { process_id, response: tx })?;
     Ok(rx.await.ok().flatten())
 }
 
-/// Associates an instance with a client (called when instance is launched).
-pub fn register_instance(inst_id: InstanceId, client_id: ClientId) -> Result<()> {
-    SERVICE.send(Message::RegisterInstance { inst_id, client_id })
+/// Associates a process with a client (called when process is launched).
+pub fn register_instance(process_id: ProcessId, client_id: ClientId) -> Result<()> {
+    SERVICE.send(Message::RegisterInstance { process_id, client_id })
 }
 
-/// Removes an instance→client mapping (called when instance terminates).
-pub fn unregister_instance(inst_id: InstanceId) -> Result<()> {
-    SERVICE.send(Message::UnregisterInstance { inst_id })
+/// Removes a process→client mapping (called when process terminates).
+pub fn unregister_instance(process_id: ProcessId) -> Result<()> {
+    SERVICE.send(Message::UnregisterInstance { process_id })
 }
 
 /// Cleans up after a client disconnects.
@@ -89,11 +90,11 @@ pub struct ServerState {
 // Server Implementation
 // =============================================================================
 
-/// The Server actor manages the TCP listener and instance routing.
+/// The Server actor manages the TCP listener and process routing.
 struct Server {
     state: Arc<ServerState>,
-    /// Maps instances to their owning clients for message routing.
-    inst_to_client: HashMap<InstanceId, ClientId>,
+    /// Maps processes to their owning clients for message routing.
+    process_to_client: HashMap<ProcessId, ClientId>,
 }
 
 impl Server {
@@ -107,7 +108,7 @@ impl Server {
         
         Server {
             state,
-            inst_to_client: HashMap::new(),
+            process_to_client: HashMap::new(),
         }
     }
 
@@ -132,12 +133,12 @@ impl Server {
 /// Messages handled by the Server actor.
 #[derive(Debug)]
 enum Message {
-    /// Associate an instance with a client.
-    RegisterInstance { inst_id: InstanceId, client_id: ClientId },
-    /// Remove an instance mapping.
-    UnregisterInstance { inst_id: InstanceId },
-    /// Query which client owns an instance.
-    GetClientId { inst_id: InstanceId, response: oneshot::Sender<Option<ClientId>> },
+    /// Associate a process with a client.
+    RegisterInstance { process_id: ProcessId, client_id: ClientId },
+    /// Remove a process mapping.
+    UnregisterInstance { process_id: ProcessId },
+    /// Query which client owns a process.
+    GetClientId { process_id: ProcessId, response: oneshot::Sender<Option<ClientId>> },
     /// Clean up after a client disconnects.
     SessionTerminated { client_id: ClientId },
 }
@@ -147,17 +148,17 @@ impl ServiceHandler for Server {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::RegisterInstance { inst_id, client_id } => {
-                self.inst_to_client.insert(inst_id, client_id);
+            Message::RegisterInstance { process_id, client_id } => {
+                self.process_to_client.insert(process_id, client_id);
             }
-            Message::UnregisterInstance { inst_id } => {
-                self.inst_to_client.remove(&inst_id);
+            Message::UnregisterInstance { process_id } => {
+                self.process_to_client.remove(&process_id);
             }
-            Message::GetClientId { inst_id, response } => {
-                let _ = response.send(self.inst_to_client.get(&inst_id).copied());
+            Message::GetClientId { process_id, response } => {
+                let _ = response.send(self.process_to_client.get(&process_id).copied());
             }
             Message::SessionTerminated { client_id } => {
-                self.inst_to_client.retain(|_, &mut cid| cid != client_id);
+                self.process_to_client.retain(|_, &mut cid| cid != client_id);
                 tracing::info!("Client {} disconnected", client_id);
             }
         }

@@ -25,10 +25,10 @@ use tokio_tungstenite::accept_async;
 use tungstenite::Message as WsMessage;
 
 use crate::service::ServiceMap;
-use crate::instance::InstanceId;
-use crate::output::{OutputChannel, OutputDelivery};
 use crate::runtime::{self, TerminationCause};
 use crate::auth;
+
+type ProcessId = usize;
 
 use super::data_transfer::InFlightUpload;
 use super::{ClientId, ServerState};
@@ -39,29 +39,28 @@ use super::{ClientId, ServerState};
 
 static SERVICE_MAP: LazyLock<ServiceMap<ClientId, Message>> = LazyLock::new(ServiceMap::new);
 
-/// Sends a text message to a client's instance.
-pub fn send_msg(client_id: ClientId, inst_id: InstanceId, message: String) -> Result<()> {
-    SERVICE_MAP.send(&client_id, Message::SendMsg { inst_id, message })
+/// Sends a text message to a client for a specific process.
+pub fn send_msg(client_id: ClientId, process_id: ProcessId, message: String) -> Result<()> {
+    SERVICE_MAP.send(&client_id, Message::SendMsg { process_id, message })
 }
 
-/// Sends binary data to a client's instance.
-pub fn send_blob(client_id: ClientId, inst_id: InstanceId, data: Bytes) -> Result<()> {
-    SERVICE_MAP.send(&client_id, Message::SendBlob { inst_id, data })
+/// Sends binary data to a client for a specific process.
+pub fn send_blob(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Result<()> {
+    SERVICE_MAP.send(&client_id, Message::SendBlob { process_id, data })
 }
 
-/// Notifies a client that an instance has terminated.
-pub fn terminate(client_id: ClientId, inst_id: InstanceId, cause: TerminationCause) -> Result<()> {
-    SERVICE_MAP.send(&client_id, Message::Terminate { inst_id, cause })
+/// Notifies a client that a process has terminated.
+pub fn terminate(client_id: ClientId, process_id: ProcessId, cause: TerminationCause) -> Result<()> {
+    SERVICE_MAP.send(&client_id, Message::Terminate { process_id, cause })
 }
 
-/// Streams output to a client's instance.
+/// Streams output to a client for a specific process.
 pub fn streaming_output(
     client_id: ClientId,
-    inst_id: InstanceId,
-    output_type: OutputChannel,
+    process_id: ProcessId,
     content: String,
 ) -> Result<()> {
-    SERVICE_MAP.send(&client_id, Message::StreamingOutput { inst_id, output_type, content })
+    SERVICE_MAP.send(&client_id, Message::StreamingOutput { process_id, content })
 }
 
 /// Checks if a session exists for the given client.
@@ -76,14 +75,14 @@ pub fn exists(client_id: ClientId) -> bool {
 /// Messages handled by Session actors.
 #[derive(Debug)]
 pub(crate) enum Message {
-    /// Send a text message to the client for a specific instance.
-    SendMsg { inst_id: InstanceId, message: String },
-    /// Send binary data to the client for a specific instance.
-    SendBlob { inst_id: InstanceId, data: Bytes },
-    /// Notify client of instance termination.
-    Terminate { inst_id: InstanceId, cause: TerminationCause },
+    /// Send a text message to the client for a specific process.
+    SendMsg { process_id: ProcessId, message: String },
+    /// Send binary data to the client for a specific process.
+    SendBlob { process_id: ProcessId, data: Bytes },
+    /// Notify client of process termination.
+    Terminate { process_id: ProcessId, cause: TerminationCause },
     /// Stream stdout/stderr output to the client.
-    StreamingOutput { inst_id: InstanceId, output_type: OutputChannel, content: String },
+    StreamingOutput { process_id: ProcessId, content: String },
     /// WebSocket message received from client.
     ClientRequest(ClientMessage),
 }
@@ -106,7 +105,7 @@ pub struct Session {
     pub username: String,
     pub state: Arc<ServerState>,
     pub inflight_uploads: DashMap<String, InFlightUpload>,
-    pub attached_instances: Vec<InstanceId>,
+    pub attached_instances: Vec<ProcessId>,
     pub ws_msg_tx: mpsc::Sender<WsMessage>,
     send_pump: JoinHandle<()>,
     recv_pump: JoinHandle<()>,
@@ -185,10 +184,8 @@ impl Session {
 
     /// Cleanup when session is terminated.
     fn cleanup(&mut self) {
-        for inst_id in self.attached_instances.drain(..) {
-            runtime::set_output_delivery(inst_id, OutputDelivery::Buffered);
-            runtime::detach_instance(inst_id);
-            super::unregister_instance(inst_id).ok();
+        for process_id in self.attached_instances.drain(..) {
+            super::unregister_instance(process_id).ok();
         }
 
         self.recv_pump.abort();
@@ -225,17 +222,17 @@ impl ServiceHandler for Session {
                     self.handle_client_message(client_msg).await;
                 }
             }
-            Message::SendMsg { inst_id, message } => {
-                self.send_inst_event(inst_id, EventCode::Message, message).await;
+            Message::SendMsg { process_id, message } => {
+                self.send_inst_event(process_id, EventCode::Message, message).await;
             }
-            Message::SendBlob { inst_id, data } => {
-                self.handle_send_blob(inst_id, data).await;
+            Message::SendBlob { process_id, data } => {
+                self.handle_send_blob(process_id, data).await;
             }
-            Message::Terminate { inst_id, cause } => {
-                self.handle_instance_termination(inst_id, cause).await;
+            Message::Terminate { process_id, cause } => {
+                self.handle_instance_termination(process_id, cause).await;
             }
-            Message::StreamingOutput { inst_id, output_type, content } => {
-                self.handle_streaming_output(inst_id, output_type, content).await;
+            Message::StreamingOutput { process_id, content } => {
+                self.send_inst_event(process_id, EventCode::Message, content).await;
             }
         }
     }
@@ -376,9 +373,9 @@ impl Session {
         .await;
     }
 
-    pub async fn send_inst_event(&self, inst_id: InstanceId, event: EventCode, message: String) {
+    pub async fn send_inst_event(&self, process_id: ProcessId, event: EventCode, message: String) {
         self.send(WireServerMessage::InstanceEvent {
-            instance_id: inst_id.to_string(),
+            instance_id: process_id.to_string(),
             event: event as u32,
             message,
         })
@@ -497,8 +494,8 @@ impl Session {
     }
 
 
-    pub async fn handle_instance_termination(&mut self, inst_id: InstanceId, cause: TerminationCause) {
-        self.attached_instances.retain(|&id| id != inst_id);
+    pub async fn handle_instance_termination(&mut self, process_id: ProcessId, cause: TerminationCause) {
+        self.attached_instances.retain(|&id| id != process_id);
 
         let (event_code, message) = match cause {
             TerminationCause::Normal(message) => (EventCode::Completed, message),
@@ -507,6 +504,6 @@ impl Session {
             TerminationCause::OutOfResources(message) => (EventCode::ServerError, message),
         };
 
-        self.send_inst_event(inst_id, event_code, message).await;
+        self.send_inst_event(process_id, event_code, message).await;
     }
 }

@@ -4,6 +4,7 @@
 //! Processes are registered in a global registry and receive messages via
 //! Direct Addressing.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -11,12 +12,9 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use uuid::Uuid;
 
 use crate::linker;
 use crate::program::ProgramName;
-use crate::runtime::instance::InstanceId;
-use crate::runtime::TerminationCause;
 use crate::server::{self, ClientId};
 use crate::service::{ServiceMap, ServiceHandler};
 
@@ -26,7 +24,7 @@ use crate::service::{ServiceMap, ServiceHandler};
 
 type ProcessId = usize;
 
-static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Global registry mapping ProcessId to process actors.
 static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> =
@@ -37,15 +35,15 @@ static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> =
 // =============================================================================
 
 /// Spawn a new process and register it in the global registry.
-pub async fn spawn(
+pub fn spawn(
     username: String,
     program_name: ProgramName,
     arguments: Vec<String>,
     client_id: Option<ClientId>,
     parent_id: Option<ProcessId>,
-    _capture_outputs: bool,
+    capture_outputs: bool,
 ) -> Result<ProcessId> {
-    let process = Process::new(username, program_name, arguments, client_id);
+    let process = Process::new(username, program_name, arguments, client_id, parent_id, capture_outputs);
     let id = process.process_id;
     SERVICES.spawn(id, || process)?;
 
@@ -72,6 +70,16 @@ pub fn detach(process_id: ProcessId) {
 /// Terminate a process (fire-and-forget).
 pub fn terminate(process_id: ProcessId, exception: Option<String>) {
     let _ = SERVICES.send(&process_id, Message::Terminate { exception });
+}
+
+/// Send stdout output from a WASM instance to its process (fire-and-forget).
+pub fn stdout(process_id: ProcessId, content: String) {
+    let _ = SERVICES.send(&process_id, Message::Stdout { content });
+}
+
+/// Send stderr output from a WASM instance to its process (fire-and-forget).
+pub fn stderr(process_id: ProcessId, content: String) {
+    let _ = SERVICES.send(&process_id, Message::Stderr { content });
 }
 
 /// Register a child process under a parent. The child will be terminated
@@ -110,16 +118,27 @@ enum Message {
     AddChild {
         child_id: ProcessId,
     },
+    /// Stdout output from the WASM instance
+    Stdout {
+        content: String,
+    },
+    /// Stderr output from the WASM instance
+    Stderr {
+        content: String,
+    },
 }
 
 // =============================================================================
 // Process
 // =============================================================================
 
+/// Maximum number of output entries kept in the ring buffer.
+const OUTPUT_BUFFER_CAP: usize = 4096;
+
 /// Actor managing a single WASM instance lifecycle.
 struct Process {
     process_id: ProcessId,
-    instance_id: InstanceId,
+    parent_id: Option<ProcessId>,
     username: String,
     program: ProgramName,
     arguments: Vec<String>,
@@ -127,6 +146,8 @@ struct Process {
     handle: JoinHandle<()>,
     client_id: Option<ClientId>,
     children: Vec<ProcessId>,
+    capture_outputs: bool,
+    output_buffer: VecDeque<String>,
 }
 
 impl Process {
@@ -136,21 +157,22 @@ impl Process {
         program: ProgramName,
         arguments: Vec<String>,
         client_id: Option<ClientId>,
+        parent_id: Option<ProcessId>,
+        capture_outputs: bool,
     ) -> Self {
         let process_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let instance_id = Uuid::new_v4();
 
         let handle = tokio::spawn(Self::run(
             process_id,
-            instance_id,
             username.clone(),
             program.clone(),
             arguments.clone(),
+            capture_outputs,
         ));
 
         Process {
             process_id,
-            instance_id,
+            parent_id,
             username,
             program,
             arguments,
@@ -158,18 +180,41 @@ impl Process {
             handle,
             client_id,
             children: Vec::new(),
+            capture_outputs,
+            output_buffer: VecDeque::new(),
         }
+    }
+
+    /// Deliver output to the attached client, or buffer it if capturing.
+    fn deliver_output(&mut self, content: String) {
+        if let Some(client_id) = self.client_id {
+            if server::sessions::streaming_output(client_id, self.process_id, content.clone()).is_err() {
+                // Client gone — detach and fall back to buffering
+                self.client_id = None;
+                self.buffer_output(content);
+            }
+        } else if self.capture_outputs {
+            self.buffer_output(content);
+        }
+    }
+
+    /// Push content into the ring buffer, evicting the oldest entry if full.
+    fn buffer_output(&mut self, content: String) {
+        if self.output_buffer.len() >= OUTPUT_BUFFER_CAP {
+            self.output_buffer.pop_front();
+        }
+        self.output_buffer.push_back(content);
     }
 
     /// Runs the WASM component: instantiate, find the `run` export, and call it.
     async fn run(
         process_id: ProcessId,
-        instance_id: InstanceId,
         username: String,
         program: ProgramName,
         arguments: Vec<String>,
+        capture_outputs: bool,
     ) {
-        let exception = match Self::run_inner(instance_id, username, &program, &arguments).await {
+        let exception = match Self::run_inner(process_id, username, &program, &arguments, capture_outputs).await {
             Ok(_output) => None,
             Err(err) => {
                 tracing::info!("Process {process_id} failed: {err}");
@@ -182,12 +227,13 @@ impl Process {
 
     /// Inner execution logic, returns the run result.
     async fn run_inner(
-        instance_id: InstanceId,
+        process_id: ProcessId,
         username: String,
         program: &ProgramName,
         arguments: &[String],
+        capture_outputs: bool,
     ) -> Result<String> {
-        let (mut store, instance) = linker::instantiate(instance_id, username, program).await?;
+        let (mut store, instance) = linker::instantiate(process_id, username, program, capture_outputs).await?;
 
         let run_interface = format!("pie:{}/run", program.name);
 
@@ -212,7 +258,7 @@ impl Process {
 
     /// Abort the WASM execution task, notify any attached client, terminate
     /// children, and unregister.
-    fn cleanup(&mut self, cause: TerminationCause) {
+    fn cleanup(&mut self, exception: Option<String>) {
         self.handle.abort();
 
         // Cascade: terminate all children
@@ -222,11 +268,13 @@ impl Process {
 
         // Notify attached client
         if let Some(client_id) = self.client_id.take() {
-            let instance_id = self.instance_id;
-            tokio::spawn(async move {
-                server::sessions::terminate(client_id, instance_id, cause).ok();
-                server::unregister_instance(instance_id).ok();
-            });
+            let process_id = self.process_id;
+            let cause = match exception {
+                Some(msg) => crate::runtime::TerminationCause::Exception(msg),
+                None => crate::runtime::TerminationCause::Normal(String::new()),
+            };
+            let _ = server::sessions::terminate(client_id, process_id, cause);
+            let _ = server::unregister_instance(process_id);
         }
 
         SERVICES.remove(&self.process_id);
@@ -236,12 +284,20 @@ impl Process {
 impl ServiceHandler for Process {
     type Message = Message;
 
-
-
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::AttachClient { client_id, response } => {
                 self.client_id = Some(client_id);
+
+                // Flush buffered output to the newly attached client
+                while let Some(buffered) = self.output_buffer.pop_front() {
+                    if server::sessions::streaming_output(client_id, self.process_id, buffered.clone()).is_err() {
+                        self.client_id = None;
+                        self.output_buffer.push_front(buffered);
+                        break;
+                    }
+                }
+
                 let _ = response.send(Ok(()));
             }
 
@@ -250,23 +306,19 @@ impl ServiceHandler for Process {
             }
 
             Message::Terminate { exception } => {
-                let cause = match exception {
-                    Some(msg) => TerminationCause::Exception(msg),
-                    None => TerminationCause::Signal,
-                };
-                self.cleanup(cause);
+                self.cleanup(exception);
             }
 
             Message::ExecutionFinished { exception } => {
-                let cause = match exception {
-                    Some(msg) => TerminationCause::Exception(msg),
-                    None => TerminationCause::Normal(String::new()),
-                };
-                self.cleanup(cause);
+                self.cleanup(exception);
             }
 
             Message::AddChild { child_id } => {
                 self.children.push(child_id);
+            }
+
+            Message::Stdout { content } | Message::Stderr { content } => {
+                self.deliver_output(content);
             }
         }
     }

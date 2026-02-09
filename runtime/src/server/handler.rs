@@ -4,17 +4,16 @@
 //! that process client requests like program upload, instance launch, etc.
 
 use bytes::Bytes;
-use pie_client::message::{self, ServerMessage, StreamingOutput};
-use uuid::Uuid;
+use pie_client::message::{self, ServerMessage};
 
-use crate::instance::InstanceId;
-use crate::output::{OutputChannel, OutputDelivery};
 use crate::messaging;
 use crate::program::{self, Manifest, ProgramName};
 use crate::runtime::{self, AttachInstanceResult};
 
 use super::session::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
+
+type ProcessId = usize;
 
 // =============================================================================
 // Query Handlers
@@ -221,7 +220,7 @@ impl Session {
 
 impl Session {
     pub async fn handle_attach_instance(&mut self, corr_id: u32, instance_id: String) {
-        let inst_id = match Uuid::parse_str(&instance_id) {
+        let process_id: ProcessId = match instance_id.parse() {
             Ok(id) => id,
             Err(_) => {
                 self.send_attach_result(corr_id, false, "Invalid instance_id".to_string())
@@ -230,29 +229,26 @@ impl Session {
             }
         };
 
-        match runtime::attach_instance(inst_id).await {
+        match runtime::attach_instance(process_id).await {
             AttachInstanceResult::AttachedRunning => {
                 self.send_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
 
-                // Register instance -> client mapping with Server
-                super::register_instance(inst_id, self.id)
+                // Register process → client mapping with Server
+                super::register_instance(process_id, self.id)
                 .ok();
-                self.attached_instances.push(inst_id);
-
-                runtime::set_output_delivery(inst_id, OutputDelivery::Streamed);
+                self.attached_instances.push(process_id);
             }
             AttachInstanceResult::AttachedFinished(cause) => {
                 self.send_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
 
-                // Register instance -> client mapping with Server
-                super::register_instance(inst_id, self.id)
+                // Register process → client mapping with Server
+                super::register_instance(process_id, self.id)
                 .ok();
-                self.attached_instances.push(inst_id);
+                self.attached_instances.push(process_id);
 
-                runtime::set_output_delivery(inst_id, OutputDelivery::Streamed);
-                runtime::terminate_instance(inst_id, Some(cause));
+                runtime::terminate_instance(process_id, Some(cause));
             }
             AttachInstanceResult::InstanceNotFound => {
                 self.send_attach_result(corr_id, false, "Instance not found".to_string())
@@ -266,16 +262,16 @@ impl Session {
     }
 
     pub async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
-        if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-            if self.attached_instances.contains(&inst_id) {
-                messaging::push(inst_id.to_string(), message).unwrap();
+        if let Ok(process_id) = instance_id.parse::<ProcessId>() {
+            if self.attached_instances.contains(&process_id) {
+                messaging::push(process_id.to_string(), message).unwrap();
             }
         }
     }
 
     pub async fn handle_terminate_instance(&mut self, corr_id: u32, instance_id: String) {
-        if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-            runtime::terminate_instance(inst_id, Some(runtime::TerminationCause::Signal));
+        if let Ok(process_id) = instance_id.parse::<ProcessId>() {
+            runtime::terminate_instance(process_id, Some(runtime::TerminationCause::Signal));
             self.send_response(corr_id, true, "Instance terminated".to_string())
                 .await;
         } else {
@@ -285,22 +281,6 @@ impl Session {
     }
 
 
-    pub async fn handle_streaming_output(
-        &mut self,
-        inst_id: InstanceId,
-        output_type: OutputChannel,
-        content: String,
-    ) {
-        let output = match output_type {
-            OutputChannel::Stdout => StreamingOutput::Stdout(content),
-            OutputChannel::Stderr => StreamingOutput::Stderr(content),
-        };
-        self.send(ServerMessage::StreamingOutput {
-            instance_id: inst_id.to_string(),
-            output,
-        })
-        .await;
-    }
 }
 
 // =============================================================================
@@ -317,7 +297,7 @@ impl Session {
         total_chunks: usize,
         chunk_data: Vec<u8>,
     ) {
-        let inst_id = match Uuid::parse_str(&instance_id) {
+        let process_id: ProcessId = match instance_id.parse() {
             Ok(id) => id,
             Err(_) => {
                 self.send_response(
@@ -329,7 +309,7 @@ impl Session {
                 return;
             }
         };
-        if !self.attached_instances.contains(&inst_id) {
+        if !self.attached_instances.contains(&process_id) {
             self.send_response(
                 corr_id,
                 false,
@@ -378,21 +358,21 @@ impl Session {
                 }
 
                 // Send to instance
-                messaging::push_blob(inst_id.to_string(), Bytes::from(buffer)).unwrap();
+                messaging::push_blob(process_id.to_string(), Bytes::from(buffer)).unwrap();
                 self.send_response(corr_id, true, "Blob sent to instance".to_string())
                     .await;
             }
         }
     }
 
-    pub async fn handle_send_blob(&mut self, inst_id: InstanceId, data: Bytes) {
+    pub async fn handle_send_blob(&mut self, process_id: ProcessId, data: Bytes) {
         let blob_hash = blake3::hash(&data).to_hex().to_string();
         let total_chunks = (data.len() + message::CHUNK_SIZE_BYTES - 1) / message::CHUNK_SIZE_BYTES;
 
         for (i, chunk) in data.chunks(message::CHUNK_SIZE_BYTES).enumerate() {
             self.send(ServerMessage::DownloadBlob {
                 corr_id: 0,
-                instance_id: inst_id.to_string(),
+                instance_id: process_id.to_string(),
                 blob_hash: blob_hash.clone(),
                 chunk_index: i,
                 total_chunks,
