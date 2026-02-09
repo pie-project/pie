@@ -185,6 +185,7 @@ impl From<ServerConfig> for BootstrapConfig {
                 service_name: cfg.telemetry_service_name,
             },
             models: vec![],
+            skip_tracing: false,
         }
     }
 }

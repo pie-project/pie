@@ -8,17 +8,14 @@ license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [lib]
-name = "_pie"
+name = "pie"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
+
 [dependencies]
 pie-client = { path = "../client/rust" }
-
-# PyO3 bindings
 pyo3 = { version = "0.23", features = ["extension-module"] }
-
-# Core dependencies
 tokio = { version = "1.38", features = ["full"] }
 anyhow = "1.0"
 futures-util = { version = "0.3", features = ["sink"] }
@@ -45,7 +42,6 @@ boxcar = "0.2.13"
 thiserror = "2.0.11"
 futures = "0.3.31"
 rmp-serde = "1.3.0"
-
 hyper = "1.6.0"
 blake3 = "1.8.2"
 tokio-tungstenite = "0.28.0"
@@ -70,6 +66,7 @@ crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 bytemuck = { version = "1.21", features = ["derive"] }
 ipc-channel = "0.19"
 rustc-hash = "2.1"
+
 
 [dev-dependencies]
 tempfile = "3"

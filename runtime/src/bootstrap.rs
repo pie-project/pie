@@ -30,6 +30,8 @@ pub struct Config {
     pub registry_url: String,
     pub telemetry: TelemetryConfig,
     pub models: Vec<ModelConfig>,
+    /// Skip tracing initialization (for tests — can only init once per process).
+    pub skip_tracing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -78,7 +80,9 @@ pub async fn bootstrap(
 
     verify_config(&config)?;
 
-    init_tracing(&config.log_dir, config.verbose, &config.telemetry)?;
+    if !config.skip_tracing {
+        init_tracing(&config.log_dir, config.verbose, &config.telemetry)?;
+    }
     let wasm_engine = init_wasmtime();
 
     auth::spawn(

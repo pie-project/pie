@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "echo",
+    "context",
+    "error",
+]
+
+[workspace.dependencies]
+inferlet = { path = "../../../sdk/rust/inferlet" }
+inferlet-macros = { path = "../../../sdk/rust/inferlet-macros" }

@@ -1,0 +1,28 @@
+{
+    "num_vocab": 16,
+    "merge_table": {
+        "0": "IA==",
+        "1": "IQ==",
+        "2": "Ig==",
+        "3": "Iw==",
+        "4": "JA==",
+        "5": "JQ==",
+        "6": "Jg==",
+        "7": "Jw==",
+        "8": "KA==",
+        "9": "KQ==",
+        "10": "Kg==",
+        "11": "aA==",
+        "12": "ZQ==",
+        "13": "bA==",
+        "14": "bw==",
+        "15": "aGVsbG8="
+    },
+    "special_tokens": {
+        "<eos>": 0,
+        "<bos>": 1
+    },
+    "split_regex": "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+",
+    "escape_non_printable": false,
+    "sentencepiece_space": false
+}

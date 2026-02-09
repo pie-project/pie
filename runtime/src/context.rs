@@ -321,6 +321,8 @@ impl ContextManager {
             if ctx.mutex == Some(lock_id) {
                 drop(ctx);
                 self.contexts.remove(&id);
+                // Clean up name_to_id reverse mapping
+                self.name_to_id.retain(|_, v| *v != id);
                 Ok(())
             } else {
                 Err(anyhow::anyhow!("Context not locked by this lock_id"))
