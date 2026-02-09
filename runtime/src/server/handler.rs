@@ -8,10 +8,10 @@ use pie_client::message::{self, ServerMessage};
 
 use crate::daemon;
 use crate::messaging;
-use crate::process::{self, TerminationCause};
+use crate::process::{self, ProcessEvent};
 use crate::program::{self, Manifest, ProgramName};
 
-use super::session::Session;
+use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
 
 type ProcessId = usize;
