@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
-use tokenizer::BytePairEncoder;
+use tokenizer::Tokenizer;
 
 /// Global cache for models (keyed by ModelId).
 static MODELS: LazyLock<boxcar::Vec<Model>> =
@@ -35,7 +35,7 @@ pub fn register(
     kv_page_size: u32,
     tokenizer_path: PathBuf,
 ) -> Result<()> {
-    let tokenizer = BytePairEncoder::load(&tokenizer_path)?;
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
     let model = Model {
         inner: Arc::new(Inner {
             name,
@@ -81,7 +81,7 @@ struct Inner {
     chat_template: String,
     stop_tokens: Vec<u32>,
     kv_page_size: u32,
-    tokenizer: BytePairEncoder,
+    tokenizer: Tokenizer,
 }
 
 impl Model {
@@ -97,20 +97,29 @@ impl Model {
 
     /// Tokenizes text into token IDs.
     pub fn tokenize(&self, text: &str) -> Vec<u32> {
-        self.inner.tokenizer.encode_with_special_tokens(text)
+        self.inner.tokenizer.encode(text)
     }
 
     /// Detokenizes token IDs into text.
     pub fn detokenize(&self, tokens: &[u32]) -> String {
-        self.inner.tokenizer.decode(tokens).unwrap_or_default()
+        self.inner.tokenizer.decode(tokens, false)
     }
 
-    /// Gets the vocabulary.
+    /// Gets the vocabulary as parallel vectors of (token IDs, token bytes).
     pub fn get_vocabs(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        self.inner.tokenizer.get_vocabs()
+        let size = self.inner.tokenizer.vocab_size();
+        let mut ids = Vec::with_capacity(size);
+        let mut bytes = Vec::with_capacity(size);
+        for id in 0..size as u32 {
+            if let Some(tok_bytes) = self.inner.tokenizer.id_to_token(id) {
+                ids.push(id);
+                bytes.push(tok_bytes);
+            }
+        }
+        (ids, bytes)
     }
 
-    /// Gets the split regex.
+    /// Gets the split regex pattern.
     pub fn get_split_regex(&self) -> String {
         self.inner.tokenizer.get_split_regex()
     }

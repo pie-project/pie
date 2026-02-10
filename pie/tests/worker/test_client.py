@@ -16,8 +16,6 @@ import msgspec
 import zmq
 
 from src.message import (
-    HandshakeRequest,
-    HandshakeResponse,
     QueryRequest,
     QueryResponse,
     ForwardPassRequest,
@@ -27,8 +25,6 @@ from src.message import (
 
 class HandlerId(IntEnum):
     """Handler message types matching server.py."""
-
-    HANDSHAKE = 0
 
     QUERY = 2
     FORWARD_PASS = 3
@@ -98,18 +94,6 @@ class TestClient:
 
         return response[2:]  # Skip corr_id and handler_id
 
-    def send_handshake(self, version: str = "1.0.0") -> list[HandshakeResponse]:
-        """Send a handshake request."""
-        req = HandshakeRequest(version=version)
-        print(f"[TestClient] Sending handshake with version={version}")
-
-        raw_responses = self._send_request(HandlerId.HANDSHAKE, [req])
-        decoder = msgspec.msgpack.Decoder(HandshakeResponse)
-        responses = [decoder.decode(r) for r in raw_responses]
-
-        for resp in responses:
-            print(f"[TestClient] Handshake response: model={resp.model_name}")
-        return responses
 
     def send_query(self, query: str) -> list[QueryResponse]:
         """Send a query request."""
@@ -213,24 +197,16 @@ def run_test_suite(endpoint: str):
         print("PIE Backend Test Suite")
         print("=" * 60)
 
-        # Test 1: Handshake
-        print("\n--- Test 1: Handshake ---")
-        try:
-            responses = client.send_handshake("1.0.0")
-            print(f"✓ Handshake successful, got {len(responses)} response(s)")
-        except Exception as e:
-            print(f"✗ Handshake failed: {e}")
-
-        # Test 3: Query
-        print("\n--- Test 3: Query ---")
+        # Test 1: Query
+        print("\n--- Test 1: Query ---")
         try:
             responses = client.send_query("Hello, world!")
             print(f"✓ Query successful, got {len(responses)} response(s)")
         except Exception as e:
             print(f"✗ Query failed: {e}")
 
-        # Test 4: Forward Pass
-        print("\n--- Test 4: Forward Pass ---")
+        # Test 2: Forward Pass
+        print("\n--- Test 2: Forward Pass ---")
         try:
             # Simple token sequence
             input_tokens = [1, 2, 3, 4, 5]
@@ -262,7 +238,7 @@ def main():
     parser.add_argument(
         "--test",
         type=str,
-        choices=["handshake", "query", "forward", "all"],
+        choices=["query", "forward", "all"],
         default="all",
         help="Which test to run",
     )
@@ -273,10 +249,7 @@ def main():
     else:
         client = TestClient(args.endpoint)
         try:
-            if args.test == "handshake":
-                client.send_handshake()
-
-            elif args.test == "query":
+            if args.test == "query":
                 client.send_query("Test query from test client")
             elif args.test == "forward":
                 client.send_forward_pass([1, 2, 3, 4, 5])

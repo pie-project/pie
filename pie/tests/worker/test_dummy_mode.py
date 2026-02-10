@@ -185,27 +185,7 @@ def test_metadata_accessors(runtime):
     print()
 
 
-def test_handshake(runtime):
-    """Test handshake RPC."""
-    print("=" * 60)
-    print("TEST 8: Handshake RPC")
-    print("=" * 60)
-    
-    from pie_backend.message import HandshakeRequest
-    
-    request = HandshakeRequest(version="1.0.0")
-    response = runtime.handshake(request)
-    
-    assert response.model_name is not None
-    assert response.kv_page_size > 0
-    # max_num_kv_pages is in resources dict with key 0
-    assert response.resources[0] > 0, "max_num_kv_pages should be > 0"
-    
-    print(f"  ✓ model_name: {response.model_name}")
-    print(f"  ✓ kv_page_size: {response.kv_page_size}")
-    print(f"  ✓ max_num_kv_pages (resources[0]): {response.resources[0]}")
-    print(f"  ✓ tokenizer_num_vocab: {response.tokenizer_num_vocab}")
-    print()
+
 
 
 def test_kv_cache_minimal():
@@ -257,7 +237,6 @@ def main():
         hidden_states = test_transform(runtime, embeds)
         test_sample(runtime, hidden_states)
         test_metadata_accessors(runtime)
-        test_handshake(runtime)
         test_kv_cache_minimal()
         
         print("=" * 60)

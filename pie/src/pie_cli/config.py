@@ -100,10 +100,6 @@ def config_update(
         "--verbose/--no-verbose",
         help="Enable/disable verbose logging",
     ),
-    cache_dir: Optional[str] = typer.Option(
-        None, "--cache-dir", help="Cache directory path"
-    ),
-    log_dir: Optional[str] = typer.Option(None, "--log-dir", help="Log directory path"),
     registry: Optional[str] = typer.Option(
         None, "--registry", help="Inferlet registry URL"
     ),
@@ -140,9 +136,6 @@ def config_update(
     max_adapter_rank: Optional[int] = typer.Option(
         None, "--max-adapter-rank", help="Maximum adapter rank"
     ),
-    adapter_path: Optional[str] = typer.Option(
-        None, "--adapter-path", help="Adapter storage path (absolute path)"
-    ),
     gpu_mem_utilization: Optional[float] = typer.Option(
         None, "--gpu-mem-utilization", help="GPU memory utilization (0.0-1.0)"
     ),
@@ -177,16 +170,20 @@ def config_update(
     engine_options = {
         "host": host,
         "port": port,
-        "enable_auth": enable_auth,
         "verbose": verbose,
-        "cache_dir": cache_dir,
-        "log_dir": log_dir,
         "registry": registry,
     }
     for key, value in engine_options.items():
         if value is not None:
             config[key] = value
             updates.append(f"{key}={value}")
+
+    # Auth section options
+    if enable_auth is not None:
+        if "auth" not in config:
+            config["auth"] = {}
+        config["auth"]["enabled"] = enable_auth
+        updates.append(f"auth.enabled={enable_auth}")
 
     # Model-level options (update first model)
     model_options = {
@@ -202,7 +199,6 @@ def config_update(
         "max_adapter_rank": max_adapter_rank,
         "gpu_mem_utilization": gpu_mem_utilization,
         "use_cuda_graphs": use_cuda_graphs,
-        "adapter_path": adapter_path,
     }
 
     model_updated = False

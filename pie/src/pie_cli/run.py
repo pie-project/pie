@@ -80,7 +80,6 @@ def run(
         engine_config, model_configs = serve_module.load_config(
             config,
             port=port,
-            log_dir=str(log.parent) if log else None,
             dummy_mode=dummy,
         )
     except typer.Exit:

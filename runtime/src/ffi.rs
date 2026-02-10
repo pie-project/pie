@@ -17,9 +17,9 @@ pub mod pybindings;
 pub use format::{
     BatchedForwardPassRequest, BatchedForwardPassResponse, ByteVec, ByteVecF32,
     DownloadAdapterRequest, EmbedImageRequest, ForwardPassRequest, ForwardPassResponse,
-    HandshakeRequest, HandshakeResponse, InitializeAdapterRequest, QueryRequest, QueryResponse,
+    InitializeAdapterRequest, QueryRequest, QueryResponse,
     Request, UpdateAdapterRequest, UploadAdapterRequest,
-    DOWNLOAD_ADAPTER_ID, EMBED_IMAGE_ID, FORWARD_PASS_ID, HANDSHAKE_ID, INITIALIZE_ADAPTER_ID,
+    DOWNLOAD_ADAPTER_ID, EMBED_IMAGE_ID, FORWARD_PASS_ID, INITIALIZE_ADAPTER_ID,
     QUERY_ID, UPDATE_ADAPTER_ID, UPLOAD_ADAPTER_ID,
 };
 
@@ -27,5 +27,5 @@ pub use format::{
 pub use crate::device::{IpcRequest, IpcResponse};
 
 pub use pybindings::{
-    _pie, PartialServerHandle, ServerConfig, ServerHandle,
+    _pie, Config, RuntimeHandle,
 };

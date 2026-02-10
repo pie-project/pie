@@ -454,7 +454,7 @@ class ConfigPanel(ScrollableContainer):
         add_item("host", self._config.get("host", "127.0.0.1"))
         add_item("port", str(self._config.get("port", 8080)))
         add_bool_item(
-            "auth", self._config.get("enable_auth", False), "enabled", "disabled"
+            "auth", self._config.get("auth", {}).get("enabled", False), "enabled", "disabled"
         )
         add_item("repo", self._config.get("hf_repo", "qwen3-32b"), highlight=True)
         add_item("device", str(self._config.get("device", [0])))

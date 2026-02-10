@@ -1,29 +1,30 @@
 //! PyO3 bindings for Python interop.
 //!
 //! This module contains all Python-exposed types and functions,
-//! including server configuration, handles, and IPC RPC types.
+//! including configuration, handles, and IPC RPC types.
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
+use std::sync::Arc;
 
-use crate::auth;
-use crate::bootstrap::{self, Config as BootstrapConfig};
-use crate::device::{RpcClient, RpcServer};
-use crate::bootstrap::{TelemetryConfig, AuthConfig as BootstrapAuthConfig};
+use crate::bootstrap::{
+    AuthConfig, Config as BootstrapConfig, DeviceConfig as BootstrapDeviceConfig,
+    ModelConfig as BootstrapModelConfig, SchedulerConfig as BootstrapSchedulerConfig,
+    TelemetryConfig,
+};
+use crate::device::RpcServer as InternalRpcServer;
 
 // =============================================================================
-// PyRpcServer - Thin PyO3 wrapper around RpcServer
+// RpcServer - Thin PyO3 wrapper around device::RpcServer
 // =============================================================================
 
 /// Python-hosted IPC server (thin wrapper around `RpcServer`).
 ///
 /// Usage from Python:
 /// ```python
-/// server = PyRpcServer.create()
+/// server = RpcServer.create()
 /// name = server.server_name()  # give this to Rust's RpcClient
 /// while True:
 ///     req = server.poll_blocking(timeout_ms=1000)
@@ -32,9 +33,9 @@ use crate::bootstrap::{TelemetryConfig, AuthConfig as BootstrapAuthConfig};
 ///         result = handle(method, payload)
 ///         server.respond(request_id, result)
 /// ```
-#[pyclass]
+#[pyclass(name = "RpcServer")]
 pub struct PyRpcServer {
-    inner: RpcServer,
+    inner: InternalRpcServer,
 }
 
 #[pymethods]
@@ -42,9 +43,9 @@ impl PyRpcServer {
     /// Create a new IPC server.
     #[staticmethod]
     fn create() -> PyResult<Self> {
-        let inner = RpcServer::create()
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{:?}", e)))?;
-        Ok(Self { inner })
+        let inner = InternalRpcServer::create()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create RPC server: {}", e)))?;
+        Ok(PyRpcServer { inner })
     }
 
     /// Get the server name for Rust clients to connect to.
@@ -60,20 +61,18 @@ impl PyRpcServer {
         py: Python<'_>,
         timeout_ms: u64,
     ) -> PyResult<Option<(u64, String, Py<PyBytes>)>> {
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-
-        // Release GIL while waiting
         let result = py.allow_threads(|| {
-            self.inner.poll(timeout)
+            self.inner
+                .poll(std::time::Duration::from_millis(timeout_ms))
         });
 
         match result {
-            Ok(Some(request)) => {
-                let py_bytes = PyBytes::new(py, &request.payload).into();
-                Ok(Some((request.request_id, request.method, py_bytes)))
+            Ok(Some(req)) => {
+                let py_bytes = PyBytes::new(py, &req.payload).into();
+                Ok(Some((req.request_id, req.method, py_bytes)))
             }
             Ok(None) => Ok(None),
-            Err(e) => Err(pyo3::exceptions::PyIOError::new_err(format!("{:?}", e))),
+            Err(e) => Err(PyRuntimeError::new_err(format!("Poll error: {}", e))),
         }
     }
 
@@ -81,8 +80,8 @@ impl PyRpcServer {
     fn respond(&self, request_id: u64, response: &[u8]) -> PyResult<bool> {
         self.inner
             .respond(request_id, response.to_vec())
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{:?}", e)))?;
-        Ok(true)
+            .map(|_| true)
+            .map_err(|e| PyRuntimeError::new_err(format!("Respond error: {}", e)))
     }
 
     /// Close the server.
@@ -96,214 +95,297 @@ impl PyRpcServer {
     }
 }
 
-
 // =============================================================================
-// Server Configuration
+// Configuration Types
 // =============================================================================
 
-/// Configuration for the PIE server, exposed to Python.
+/// Scheduler configuration for a model.
 #[pyclass]
 #[derive(Clone)]
-pub struct ServerConfig {
+pub struct PySchedulerConfig {
+    #[pyo3(get, set)]
+    pub max_in_flight_batches: usize,
+    #[pyo3(get, set)]
+    pub request_timeout_secs: u64,
+    #[pyo3(get, set)]
+    pub max_wait_ms: u64,
+    #[pyo3(get, set)]
+    pub min_batch_for_optimization: usize,
+}
+
+#[pymethods]
+impl PySchedulerConfig {
+    #[new]
+    #[pyo3(signature = (
+        max_in_flight_batches = 4,
+        request_timeout_secs = 120,
+        max_wait_ms = 50,
+        min_batch_for_optimization = 8,
+    ))]
+    fn new(
+        max_in_flight_batches: usize,
+        request_timeout_secs: u64,
+        max_wait_ms: u64,
+        min_batch_for_optimization: usize,
+    ) -> Self {
+        PySchedulerConfig {
+            max_in_flight_batches,
+            request_timeout_secs,
+            max_wait_ms,
+            min_batch_for_optimization,
+        }
+    }
+}
+
+/// Device configuration — one per Python RPC server (per TP group).
+#[pyclass]
+#[derive(Clone)]
+pub struct PyDeviceConfig {
+    /// IPC server name from `RpcServer.server_name()`
+    #[pyo3(get, set)]
+    pub hostname: String,
+    /// Total KV cache pages available on this device group
+    #[pyo3(get, set)]
+    pub total_pages: usize,
+    /// Maximum batch tokens this device can handle
+    #[pyo3(get, set)]
+    pub max_batch_tokens: usize,
+    /// Maximum batch size this device can handle
+    #[pyo3(get, set)]
+    pub max_batch_size: usize,
+}
+
+#[pymethods]
+impl PyDeviceConfig {
+    #[new]
+    fn new(hostname: String, total_pages: usize, max_batch_tokens: usize, max_batch_size: usize) -> Self {
+        PyDeviceConfig {
+            hostname,
+            total_pages,
+            max_batch_tokens,
+            max_batch_size,
+        }
+    }
+}
+
+/// Model configuration — one per `[[model]]` section.
+#[pyclass]
+#[derive(Clone)]
+pub struct PyModelConfig {
+    #[pyo3(get, set)]
+    pub name: String,
+    #[pyo3(get, set)]
+    pub chat_template: String,
+    #[pyo3(get, set)]
+    pub stop_tokens: Vec<u32>,
+    #[pyo3(get, set)]
+    pub kv_page_size: usize,
+    #[pyo3(get, set)]
+    pub tokenizer_path: String,
+    #[pyo3(get, set)]
+    pub devices: Vec<PyDeviceConfig>,
+    #[pyo3(get, set)]
+    pub scheduler: PySchedulerConfig,
+}
+
+#[pymethods]
+impl PyModelConfig {
+    #[new]
+    #[pyo3(signature = (
+        name,
+        chat_template,
+        stop_tokens,
+        kv_page_size,
+        tokenizer_path,
+        devices,
+        scheduler = None,
+    ))]
+    fn new(
+        name: String,
+        chat_template: String,
+        stop_tokens: Vec<u32>,
+        kv_page_size: usize,
+        tokenizer_path: String,
+        devices: Vec<PyDeviceConfig>,
+        scheduler: Option<PySchedulerConfig>,
+    ) -> Self {
+        PyModelConfig {
+            name,
+            chat_template,
+            stop_tokens,
+            kv_page_size,
+            tokenizer_path,
+            devices,
+            scheduler: scheduler.unwrap_or_else(|| PySchedulerConfig::new(4, 120, 50, 8)),
+        }
+    }
+}
+
+/// Top-level server configuration exposed to Python.
+/// Maps directly to `bootstrap::Config`.
+#[pyclass]
+#[derive(Clone)]
+pub struct Config {
     #[pyo3(get, set)]
     pub host: String,
     #[pyo3(get, set)]
     pub port: u16,
     #[pyo3(get, set)]
-    pub enable_auth: bool,
-    #[pyo3(get, set)]
-    pub cache_dir: String,
-    #[pyo3(get, set)]
     pub verbose: bool,
     #[pyo3(get, set)]
-    pub log_dir: Option<String>,
-    #[pyo3(get, set)]
     pub registry: String,
-    // Telemetry configuration
+    // Auth
+    #[pyo3(get, set)]
+    pub auth_enabled: bool,
+    #[pyo3(get, set)]
+    pub auth_dir: String,
+    // Program/cache directory
+    #[pyo3(get, set)]
+    pub program_dir: String,
+    // Log directory
+    #[pyo3(get, set)]
+    pub log_dir: String,
+    // Telemetry
     #[pyo3(get, set)]
     pub telemetry_enabled: bool,
     #[pyo3(get, set)]
     pub telemetry_endpoint: String,
     #[pyo3(get, set)]
     pub telemetry_service_name: String,
+    // Models
+    #[pyo3(get, set)]
+    pub models: Vec<PyModelConfig>,
 }
 
 #[pymethods]
-impl ServerConfig {
+impl Config {
     #[new]
-    #[pyo3(signature = (host, port, enable_auth, cache_dir, verbose, log_dir, registry, telemetry_enabled=false, telemetry_endpoint="http://localhost:4317".to_string(), telemetry_service_name="pie-runtime".to_string()))]
+    #[pyo3(signature = (
+        host,
+        port,
+        verbose = false,
+        registry = "https://registry.pie-project.org/".to_string(),
+        auth_enabled = false,
+        auth_dir = "".to_string(),
+        program_dir = "".to_string(),
+        log_dir = "".to_string(),
+        telemetry_enabled = false,
+        telemetry_endpoint = "http://localhost:4317".to_string(),
+        telemetry_service_name = "pie".to_string(),
+        models = vec![],
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         host: String,
         port: u16,
-        enable_auth: bool,
-        cache_dir: String,
         verbose: bool,
-        log_dir: String,
         registry: String,
+        auth_enabled: bool,
+        auth_dir: String,
+        program_dir: String,
+        log_dir: String,
         telemetry_enabled: bool,
         telemetry_endpoint: String,
         telemetry_service_name: String,
+        models: Vec<PyModelConfig>,
     ) -> Self {
-        ServerConfig {
+        Config {
             host,
             port,
-            enable_auth,
-            cache_dir,
             verbose,
-            log_dir: Some(log_dir),
             registry,
+            auth_enabled,
+            auth_dir,
+            program_dir,
+            log_dir,
             telemetry_enabled,
             telemetry_endpoint,
             telemetry_service_name,
+            models,
         }
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "ServerConfig(host='{}', port={}, enable_auth={}, cache_dir='{}', verbose={}, log_dir={:?}, registry='{}', telemetry_enabled={})",
-            self.host, self.port, self.enable_auth, self.cache_dir, self.verbose, self.log_dir, self.registry, self.telemetry_enabled
+            "Config(host='{}', port={}, verbose={}, models={})",
+            self.host,
+            self.port,
+            self.verbose,
+            self.models.len()
         )
     }
 }
 
-impl From<ServerConfig> for BootstrapConfig {
-    fn from(cfg: ServerConfig) -> Self {
+impl From<Config> for BootstrapConfig {
+    fn from(cfg: Config) -> Self {
         BootstrapConfig {
             host: cfg.host,
             port: cfg.port,
-            auth: BootstrapAuthConfig {
-                enabled: cfg.enable_auth,
-                authorized_users_dir: PathBuf::new(),
+            auth: AuthConfig {
+                enabled: cfg.auth_enabled,
+                authorized_users_dir: PathBuf::from(cfg.auth_dir),
             },
-            cache_dir: PathBuf::from(cfg.cache_dir),
+            cache_dir: PathBuf::from(cfg.program_dir),
             verbose: cfg.verbose,
-            log_dir: cfg.log_dir.map(PathBuf::from),
+            log_dir: if cfg.log_dir.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(cfg.log_dir))
+            },
             registry_url: cfg.registry,
             telemetry: TelemetryConfig {
                 enabled: cfg.telemetry_enabled,
                 endpoint: cfg.telemetry_endpoint,
                 service_name: cfg.telemetry_service_name,
             },
-            models: vec![],
+            models: cfg
+                .models
+                .into_iter()
+                .map(|m| BootstrapModelConfig {
+                    name: m.name,
+                    chat_template: m.chat_template,
+                    stop_tokens: m.stop_tokens,
+                    kv_page_size: m.kv_page_size,
+                    tokenizer_path: PathBuf::from(m.tokenizer_path),
+                    devices: m
+                        .devices
+                        .into_iter()
+                        .map(|d| BootstrapDeviceConfig {
+                            hostname: d.hostname,
+                            total_pages: d.total_pages,
+                            max_batch_tokens: d.max_batch_tokens,
+                            max_batch_size: d.max_batch_size,
+                        })
+                        .collect(),
+                    scheduler: BootstrapSchedulerConfig {
+                        max_in_flight_batches: m.scheduler.max_in_flight_batches,
+                        request_timeout_secs: m.scheduler.request_timeout_secs,
+                        max_wait_ms: m.scheduler.max_wait_ms,
+                        min_batch_for_optimization: m.scheduler.min_batch_for_optimization,
+                    },
+                })
+                .collect(),
             skip_tracing: false,
         }
     }
 }
 
 // =============================================================================
-// Server Handles
+// Runtime Handle
 // =============================================================================
 
-/// Handle to a running server, allowing graceful shutdown.
-#[pyclass]
-pub struct ServerHandle {
-    internal_token: String,
-    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    runtime: Arc<tokio::runtime::Runtime>,
-}
-
-#[pymethods]
-impl ServerHandle {
-    /// Get the internal authentication token.
-    #[getter]
-    fn internal_token(&self) -> String {
-        self.internal_token.clone()
-    }
-
-    /// Gracefully shut down the server.
-    fn shutdown(&self) -> PyResult<()> {
-        let mut guard = self.shutdown_tx.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Failed to acquire lock: {}", e))
-        })?;
-
-        if let Some(tx) = guard.take() {
-            tx.send(()).map_err(|_| {
-                PyRuntimeError::new_err(
-                    "Failed to send shutdown signal (server may already be stopped)",
-                )
-            })?;
-            Ok(())
-        } else {
-            Err(PyRuntimeError::new_err("Server already shut down"))
-        }
-    }
-
-    /// Check if the server is still running.
-    fn is_running(&self) -> bool {
-        self.shutdown_tx
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false)
-    }
-
-    /// Get list of registered model names (backends that have connected).
-    fn registered_models(&self) -> Vec<String> {
-        crate::model::models()
-    }
-
-    fn __repr__(&self) -> String {
-        let running = if self.is_running() {
-            "running"
-        } else {
-            "stopped"
-        };
-        format!(
-            "ServerHandle(status={}, token={}...)",
-            running,
-            &self.internal_token[..8]
-        )
-    }
-}
-
-/// Partial handle for two-phase server initialization.
+/// Handle to a running Pie runtime.
 ///
-/// Phase 1 starts the server and returns this handle.
-/// Python creates `PyRpcServer` instances and passes the server names.
-/// Phase 2 calls `complete()` with the server names — Rust connects via `RpcClient`.
+/// Holds the internal auth token and the tokio runtime that
+/// keeps background services alive.
 #[pyclass]
-pub struct PartialServerHandle {
+pub struct RuntimeHandle {
     internal_token: String,
-    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
 #[pymethods]
-impl PartialServerHandle {
-    /// Complete initialization by connecting to Python-hosted RPC servers.
-    ///
-    /// Python should create `PyRpcServer` instances first, then pass the
-    /// server names here. Rust connects via `RpcClient` and performs
-    /// the handshake to register each model.
-    fn complete(&self, py: Python<'_>, server_names: Vec<String>) -> PyResult<ServerHandle> {
-        use crate::model;
-
-        py.allow_threads(|| {
-            self.runtime.block_on(async {
-                for server_name in server_names {
-                    let client = RpcClient::connect(&server_name).map_err(|e| {
-                        PyRuntimeError::new_err(format!(
-                            "Failed to connect to RPC server '{}': {}",
-                            server_name, e
-                        ))
-                    })?;
-
-                    // TODO: model registration is now done via model::register()
-                    // The RPC client should be stored in the device service
-                    let model_id = 0usize;
-                    tracing::info!("Installed model with ID: {}", model_id);
-                }
-
-                Ok::<(), PyErr>(())
-            })?;
-
-            Ok(ServerHandle {
-                internal_token: self.internal_token.clone(),
-                shutdown_tx: Arc::clone(&self.shutdown_tx),
-                runtime: Arc::clone(&self.runtime),
-            })
-        })
-    }
-
+impl RuntimeHandle {
     /// Get the internal authentication token.
     #[getter]
     fn internal_token(&self) -> String {
@@ -312,55 +394,44 @@ impl PartialServerHandle {
 
     fn __repr__(&self) -> String {
         format!(
-            "PartialServerHandle(token={}...)",
-            &self.internal_token[..8]
+            "RuntimeHandle(token={}...)",
+            &self.internal_token[..self.internal_token.len().min(8)]
         )
     }
 }
 
 // =============================================================================
-// Phase 1 Server Initialization
+// Bootstrap
 // =============================================================================
 
-/// Phase 1: Start the Pie server.
+/// Bootstrap the Pie runtime with the given configuration.
 ///
-/// Returns a `PartialServerHandle`. Python then creates `PyRpcServer`
-/// instances and calls `handle.complete(server_names)` to finalize.
+/// This creates the tokio runtime, initializes all services (auth, program
+/// manager, linker, server, models, devices, schedulers), and returns a
+/// `RuntimeHandle` that keeps everything alive.
+///
+/// Call this AFTER Python workers have been spawned and their RPC servers
+/// are ready. The `Config.models` should include `DeviceConfig` entries
+/// with the `hostname` from each worker's `RpcServer.server_name()`.
 #[pyfunction]
-#[pyo3(signature = (config, authorized_users_path))]
-fn start_server_phase1(
-    py: Python<'_>,
-    config: ServerConfig,
-    authorized_users_path: Option<String>,
-) -> PyResult<PartialServerHandle> {
+#[pyo3(name = "bootstrap")]
+fn py_bootstrap(py: Python<'_>, config: Config) -> PyResult<RuntimeHandle> {
     py.allow_threads(|| {
         let rt = Arc::new(
             tokio::runtime::Runtime::new()
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?,
         );
 
-        let result = rt.block_on(async {
-            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let bootstrap_config: BootstrapConfig = config.into();
 
-            let mut bootstrap_config: BootstrapConfig = config.into();
-
-            // Set the authorized users path if provided
-            if let Some(path) = authorized_users_path {
-                bootstrap_config.auth.authorized_users_dir = PathBuf::from(path);
-            }
-
-            let internal_token = bootstrap::bootstrap(bootstrap_config)
+        let internal_token = rt.block_on(async {
+            crate::bootstrap::bootstrap(bootstrap_config)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Server failed to start: {}", e)))?;
-
-            Ok::<(String, oneshot::Sender<()>), PyErr>((internal_token, shutdown_tx))
+                .map_err(|e| PyRuntimeError::new_err(format!("Bootstrap failed: {}", e)))
         })?;
 
-        let (token, shutdown_tx) = result;
-
-        Ok(PartialServerHandle {
-            internal_token: token,
-            shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+        Ok(RuntimeHandle {
+            internal_token,
             runtime: rt,
         })
     })
@@ -373,10 +444,12 @@ fn start_server_phase1(
 /// Python module definition for _pie
 #[pymodule]
 pub fn _pie(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<ServerConfig>()?;
-    m.add_class::<ServerHandle>()?;
-    m.add_class::<PartialServerHandle>()?;
+    m.add_class::<Config>()?;
+    m.add_class::<PyModelConfig>()?;
+    m.add_class::<PyDeviceConfig>()?;
+    m.add_class::<PySchedulerConfig>()?;
+    m.add_class::<RuntimeHandle>()?;
     m.add_class::<PyRpcServer>()?;
-    m.add_function(wrap_pyfunction!(start_server_phase1, m)?)?;
+    m.add_function(wrap_pyfunction!(py_bootstrap, m)?)?;
     Ok(())
 }

@@ -11,7 +11,6 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-pub static HANDSHAKE_ID: u32 = 0;
 
 pub static QUERY_ID: u32 = 2;
 pub static FORWARD_PASS_ID: u32 = 3;
@@ -23,7 +22,6 @@ pub static DOWNLOAD_ADAPTER_ID: u32 = 8;
 
 #[derive(Debug)]
 pub enum Request {
-    Handshake(HandshakeRequest, oneshot::Sender<HandshakeResponse>),
     Query(QueryRequest, oneshot::Sender<QueryResponse>),
     Synchronize(oneshot::Sender<()>),
 
@@ -55,7 +53,6 @@ impl Request {
 
     pub fn has_response(&self) -> bool {
         match self {
-            Request::Handshake(_, _) => true,
             Request::Query(_, _) => true,
             Request::ForwardPass(_, r) => r.is_some(),
             _ => false,
@@ -64,7 +61,6 @@ impl Request {
 
     pub fn handler_id(&self) -> u32 {
         match self {
-            Request::Handshake(_, _) => HANDSHAKE_ID,
             Request::Query(_, _) => QUERY_ID,
             Request::Synchronize(_) => unreachable!("Synchronize request has no handler ID"),
 
@@ -79,7 +75,6 @@ impl Request {
 
     pub fn serialize_req(&self) -> Result<Bytes> {
         let b = match self {
-            Request::Handshake(req, _) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::Query(req, _) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::Synchronize(_) => bail!("cannot serialize synchronize request"),
             Request::ForwardPass(req, _) => Bytes::from(rmp_serde::to_vec_named(&req)?),
@@ -94,10 +89,6 @@ impl Request {
 
     pub fn deserialize_resp(self, b: Bytes) -> Result<()> {
         match self {
-            Request::Handshake(_, resp) => {
-                let r: HandshakeResponse = rmp_serde::from_slice(&b)?;
-                resp.send(r).ok();
-            }
             Request::Query(_, resp) => {
                 let r: QueryResponse = rmp_serde::from_slice(&b)?;
                 resp.send(r).ok();
@@ -116,31 +107,7 @@ impl Request {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HandshakeRequest {
-    pub version: String,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HandshakeResponse {
-    pub version: String,
-    pub model_name: String,
-    pub model_traits: Vec<String>,
-    pub model_description: String,
-    pub prompt_template: String,
-    pub prompt_template_type: String,
-    pub prompt_stop_tokens: Vec<String>,
-    pub kv_page_size: u32,
-    pub max_batch_tokens: usize,
-    pub max_batch_size: usize,
-    pub resources: HashMap<u32, u32>,
-    pub tokenizer_num_vocab: usize,
-    pub tokenizer_merge_table: HashMap<u32, Vec<u8>>,
-    pub tokenizer_special_tokens: HashMap<String, u32>,
-    pub tokenizer_split_regex: String,
-    pub tokenizer_escape_non_printable: bool,
-    pub tokenizer_sentencepiece_space: bool,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRequest {

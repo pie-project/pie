@@ -1,28 +1,76 @@
 {
-    "num_vocab": 16,
-    "merge_table": {
-        "0": "IA==",
-        "1": "IQ==",
-        "2": "Ig==",
-        "3": "Iw==",
-        "4": "JA==",
-        "5": "JQ==",
-        "6": "Jg==",
-        "7": "Jw==",
-        "8": "KA==",
-        "9": "KQ==",
-        "10": "Kg==",
-        "11": "aA==",
-        "12": "ZQ==",
-        "13": "bA==",
-        "14": "bw==",
-        "15": "aGVsbG8="
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [
+        {
+            "id": 0,
+            "content": "<eos>",
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true
+        },
+        {
+            "id": 1,
+            "content": "<bos>",
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true
+        }
+    ],
+    "normalizer": null,
+    "pre_tokenizer": {
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true,
+        "use_regex": true
     },
-    "special_tokens": {
-        "<eos>": 0,
-        "<bos>": 1
+    "post_processor": null,
+    "decoder": {
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true,
+        "use_regex": true
     },
-    "split_regex": "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+",
-    "escape_non_printable": false,
-    "sentencepiece_space": false
+    "model": {
+        "type": "BPE",
+        "dropout": null,
+        "unk_token": null,
+        "continuing_subword_prefix": null,
+        "end_of_word_suffix": null,
+        "fuse_unk": false,
+        "byte_fallback": false,
+        "vocab": {
+            "<eos>": 0,
+            "<bos>": 1,
+            "Ġ": 2,
+            "!": 3,
+            "\"": 4,
+            "#": 5,
+            "$": 6,
+            "%": 7,
+            "&": 8,
+            "'": 9,
+            "(": 10,
+            ")": 11,
+            "*": 12,
+            "h": 13,
+            "e": 14,
+            "l": 15,
+            "o": 16,
+            "he": 17,
+            "ll": 18,
+            "hello": 19
+        },
+        "merges": [
+            "h e",
+            "l l",
+            "he ll",
+            "hell o"
+        ]
+    }
 }

@@ -24,8 +24,6 @@ def load_config(
     enable_auth: bool | None = None,
     no_auth: bool = False,
     verbose: bool = False,
-    cache_dir: str | None = None,
-    log_dir: str | None = None,
     registry: str | None = None,
     dummy_mode: bool = False,
 ) -> tuple[dict, list[dict]]:
@@ -45,34 +43,30 @@ def load_config(
 
     # Extract engine config from [engine] section
     engine_section = config.get("engine", {})
+    auth_section = config.get("auth", {})
+
+    # Determine auth enabled state
+    if no_auth:
+        auth_enabled = False
+    elif enable_auth is not None:
+        auth_enabled = enable_auth
+    else:
+        auth_enabled = auth_section.get("enabled", engine_section.get("enable_auth", True))
 
     # Build engine config with CLI overrides
     engine_config = {
         "host": host or engine_section.get("host", config.get("host", "127.0.0.1")),
         "port": port or engine_section.get("port", config.get("port", 8080)),
-        "enable_auth": (
-            False
-            if no_auth
-            else (
-                enable_auth
-                if enable_auth is not None
-                else engine_section.get("enable_auth", config.get("enable_auth", True))
-            )
-        ),
-        "cache_dir": cache_dir
-        or engine_section.get(
-            "cache_dir", config.get("cache_dir", str(pie_path.get_pie_home() / "cache"))
-        ),
         "verbose": verbose
         or engine_section.get("verbose", config.get("verbose", False)),
-        "log_dir": log_dir
-        or engine_section.get(
-            "log_dir", config.get("log_dir", str(pie_path.get_pie_home() / "logs"))
-        ),
         "registry": registry
         or engine_section.get(
             "registry", config.get("registry", "https://registry.pie-project.org/")
         ),
+        # Auth config as nested dict
+        "auth": {
+            "enabled": auth_enabled,
+        },
         # Include telemetry configuration from [telemetry] section
         "telemetry": config.get("telemetry", {}),
     }
@@ -104,9 +98,11 @@ def serve(
         False, "--verbose", "-v", help="Enable verbose logging"
     ),
     cache_dir: str | None = typer.Option(
-        None, "--cache-dir", help="Cache directory path"
+        None, "--cache-dir", help="[DEPRECATED] Cache dir is now derived from PIE_HOME", hidden=True
     ),
-    log_dir: str | None = typer.Option(None, "--log-dir", help="Log directory path"),
+    log_dir: str | None = typer.Option(
+        None, "--log-dir", help="[DEPRECATED] Log dir is now derived from PIE_HOME", hidden=True
+    ),
     monitor: bool = typer.Option(
         False, "--monitor", "-m", help="Launch real-time TUI monitor"
     ),
@@ -119,6 +115,12 @@ def serve(
     This command starts the Pie engine server along with configured backend
     services. In interactive mode, it provides a shell for running inferlets.
     """
+    # Warn about deprecated options
+    if cache_dir is not None:
+        console.print("[yellow]![/yellow] --cache-dir is deprecated. Paths are derived from PIE_HOME.")
+    if log_dir is not None:
+        console.print("[yellow]![/yellow] --log-dir is deprecated. Paths are derived from PIE_HOME.")
+
     try:
         engine_config, model_configs = load_config(
             config,
@@ -126,8 +128,6 @@ def serve(
             port=port,
             no_auth=no_auth,
             verbose=verbose,
-            cache_dir=cache_dir,
-            log_dir=log_dir,
             dummy_mode=dummy,
         )
     except typer.Exit:

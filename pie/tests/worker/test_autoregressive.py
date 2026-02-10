@@ -230,16 +230,9 @@ def test_forward_pass_components(model_name: str = "openai/gpt-oss-20b"):
     print(f"    Runtime loaded: {runtime.model_config.num_layers} layers")
     print(f"    Architecture: {runtime.type}")
 
-    # Test handshake
-    print("\n[2] Testing handshake...")
-    from pie_backend import message
-
-    responses = runtime.handshake([message.HandshakeRequest(version="1.0")])
-    print(f"    ✓ model_name: {responses[0].model_name}")
-    print(f"    ✓ kv_page_size: {responses[0].kv_page_size}")
-
     # Test query
-    print("\n[3] Testing query (ping)...")
+    print("\n[2] Testing query (ping)...")
+    from pie_backend import message
     responses = runtime.query([message.QueryRequest(query="ping")])
     print(f"    ✓ Response: {responses[0].value}")
 

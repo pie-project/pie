@@ -11,7 +11,7 @@ from typing import List, Protocol, runtime_checkable
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "port": 8080,
-    "enable_auth": False,
+    "auth": {"enabled": False},
     "hf_repo": "qwen3-32b",
     "device": [0, 1],
     "tensor_parallel_size": 2,
