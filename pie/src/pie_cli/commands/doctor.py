@@ -97,18 +97,6 @@ def _check_libraries() -> list[tuple[str, str, str]]:
     except Exception as e:
         results.append(("flashinfer", f"Error: {e}", "warn"))
 
-    # # FBGEMM_GPU
-    # try:
-    #     import fbgemm_gpu  # noqa: F401
-    #     ver = importlib.metadata.version('fbgemm-gpu-genai')
-    #     results.append(("fbgemm_gpu", ver, "pass"))
-    # except ImportError:
-    #     try:
-    #         ver = importlib.metadata.version('fbgemm-gpu-genai')
-    #         results.append(("fbgemm_gpu", ver, "pass"))
-    #     except importlib.metadata.PackageNotFoundError:
-    #         results.append(("fbgemm_gpu", "Not installed", "warn"))
-
     return results
 
 

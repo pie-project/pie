@@ -57,14 +57,3 @@ def inferlet_panel(
     console.print(
         Panel(lines, title=title, title_align="left", border_style="dim")
     )
-
-
-def check_result(
-    name: str, value: str, passed: bool, *, console: Console | None = None
-) -> None:
-    """Display a single health check result (for doctor command)."""
-    if console is None:
-        console = Console()
-
-    icon = "[green]✓[/green]" if passed else "[red]✗[/red]"
-    console.print(f"  {icon} {name}: {value}")

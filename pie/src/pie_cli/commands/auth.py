@@ -6,7 +6,6 @@ Implements: pie auth add|remove|list
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -51,7 +50,7 @@ app = typer.Typer(help="Manage authorized clients")
 @app.command("add")
 def auth_add(
     username: str = typer.Argument(..., help="Username of the user"),
-    key_name: Optional[str] = typer.Argument(
+    key_name: str | None = typer.Argument(
         None, help="Optional name for this key (defaults to timestamp)"
     ),
 ) -> None:
@@ -117,7 +116,7 @@ def auth_add(
 @app.command("remove")
 def auth_remove(
     username: str = typer.Argument(..., help="Username of the user"),
-    key_name: Optional[str] = typer.Argument(
+    key_name: str | None = typer.Argument(
         None, help="Optional name of the specific key to remove"
     ),
 ) -> None:

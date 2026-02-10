@@ -18,7 +18,7 @@ runner = CliRunner()
 class TestConfigInit:
     """Tests for config init command."""
 
-    @patch("pie_cli.config.commands.scan_cache_dir")
+    @patch("huggingface_hub.scan_cache_dir")
     def test_init_creates_config_file(self, mock_scan, tmp_path):
         """Creates config file at specified path."""
         # Mock cache to contain default model
@@ -35,7 +35,7 @@ class TestConfigInit:
         assert "Configuration file created" in result.stdout
         assert "Warning" not in result.stdout
 
-    @patch("pie_cli.config.commands.scan_cache_dir")
+    @patch("huggingface_hub.scan_cache_dir")
     def test_init_warns_missing_model(self, mock_scan, tmp_path):
         """Warns when default model is missing."""
         mock_scan.return_value.repos = []

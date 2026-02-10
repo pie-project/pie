@@ -5,7 +5,6 @@ Runs an inferlet with a one-shot Pie engine instance.
 """
 
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -18,24 +17,24 @@ console = Console()
 
 
 def run(
-    inferlet: Optional[str] = typer.Argument(
+    inferlet: str | None = typer.Argument(
         None, help="Inferlet name from registry (e.g., 'text-completion@0.1.0')"
     ),
-    path: Optional[Path] = typer.Option(
+    path: Path | None = typer.Option(
         None, "--path", "-p", help="Path to a local .wasm inferlet file"
     ),
-    manifest: Optional[Path] = typer.Option(
+    manifest: Path | None = typer.Option(
         None, "--manifest", "-m", help="Path to the manifest TOML file (required with --path)"
     ),
-    config: Optional[Path] = typer.Option(
+    config: Path | None = typer.Option(
         None, "--config", "-c", help="Path to TOML configuration file"
     ),
-    port: Optional[int] = typer.Option(None, "--port", help="Override port"),
-    log: Optional[Path] = typer.Option(None, "--log", help="Path to log file"),
+    port: int | None = typer.Option(None, "--port", help="Override port"),
+    log: Path | None = typer.Option(None, "--log", help="Path to log file"),
     dummy: bool = typer.Option(
         False, "--dummy", help="Enable dummy mode (skip GPU weight loading, return random tokens)"
     ),
-    arguments: Optional[list[str]] = typer.Argument(
+    arguments: list[str] | None = typer.Argument(
         None, help="Arguments to pass to the inferlet"
     ),
 ) -> None:

@@ -1,13 +1,11 @@
 """Configuration loading and merging for Pie.
 
 Reads TOML config files and merges CLI overrides into typed Config.
-Extracted from serve.py's load_config().
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import toml
 
@@ -25,7 +23,6 @@ def load_config(
     *,
     host: str | None = None,
     port: int | None = None,
-    enable_auth: bool | None = None,
     no_auth: bool = False,
     verbose: bool = False,
     registry: str | None = None,
@@ -37,7 +34,6 @@ def load_config(
         config_path: Path to TOML config file (defaults to ~/.pie/config.toml).
         host: Override host address.
         port: Override port.
-        enable_auth: Explicitly enable/disable auth.
         no_auth: Shorthand to disable auth.
         verbose: Enable verbose logging.
         registry: Override registry URL.
@@ -56,21 +52,13 @@ def load_config(
 
     raw = toml.loads(file_path.read_text())
 
-    engine_section = raw.get("engine", {})
     auth_section = raw.get("auth", {})
     telemetry_section = raw.get("telemetry", {})
 
-    # --- Auth ---
-    if no_auth:
-        auth_enabled = False
-    elif enable_auth is not None:
-        auth_enabled = enable_auth
-    else:
-        auth_enabled = auth_section.get(
-            "enabled", engine_section.get("enable_auth", True)
-        )
+    # Auth
+    auth_enabled = not no_auth and auth_section.get("enabled", True)
 
-    # --- Models ---
+    # Models
     model_configs_raw = raw.get("model", [])
     if isinstance(model_configs_raw, dict):
         model_configs_raw = [model_configs_raw]
@@ -105,16 +93,10 @@ def load_config(
         models.append(m)
 
     return Config(
-        host=host or engine_section.get("host", raw.get("host", "127.0.0.1")),
-        port=port or engine_section.get("port", raw.get("port", 8080)),
-        verbose=verbose or engine_section.get("verbose", raw.get("verbose", False)),
-        registry=(
-            registry
-            or engine_section.get(
-                "registry",
-                raw.get("registry", "https://registry.pie-project.org/"),
-            )
-        ),
+        host=host or raw.get("host", "127.0.0.1"),
+        port=port or raw.get("port", 8080),
+        verbose=verbose or raw.get("verbose", False),
+        registry=registry or raw.get("registry", "https://registry.pie-project.org/"),
         auth=AuthConfig(enabled=auth_enabled),
         telemetry=TelemetryConfig(
             enabled=telemetry_section.get("enabled", False),

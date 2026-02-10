@@ -26,12 +26,6 @@ def serve(
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Enable verbose logging"
     ),
-    cache_dir: str | None = typer.Option(
-        None, "--cache-dir", help="[DEPRECATED] Cache dir is now derived from PIE_HOME", hidden=True
-    ),
-    log_dir: str | None = typer.Option(
-        None, "--log-dir", help="[DEPRECATED] Log dir is now derived from PIE_HOME", hidden=True
-    ),
     monitor: bool = typer.Option(
         False, "--monitor", "-m", help="Launch real-time TUI monitor"
     ),
@@ -40,11 +34,6 @@ def serve(
     ),
 ) -> None:
     """Start the Pie engine and enter an interactive session."""
-    if cache_dir is not None:
-        console.print("[yellow]![/yellow] --cache-dir is deprecated.")
-    if log_dir is not None:
-        console.print("[yellow]![/yellow] --log-dir is deprecated.")
-
     try:
         cfg = load_config(
             config, host=host, port=port, no_auth=no_auth,

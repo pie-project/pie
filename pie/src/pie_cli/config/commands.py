@@ -4,7 +4,6 @@ Implements: pie config init|show|set
 """
 
 from pathlib import Path
-from typing import Optional
 
 import toml
 import typer
@@ -14,7 +13,6 @@ from rich.syntax import Syntax
 
 from pie_cli import path as pie_path
 from pie_cli.config.defaults import create_default_config_content, DEFAULT_MODEL
-from huggingface_hub import scan_cache_dir
 
 console = Console()
 app = typer.Typer(help="Manage configuration")
@@ -22,7 +20,7 @@ app = typer.Typer(help="Manage configuration")
 
 @app.command("init")
 def config_init(
-    path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
+    path: str | None = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
     """Create a default config file."""
     config_path = Path(path) if path else pie_path.get_default_config_path()
@@ -38,6 +36,7 @@ def config_init(
 
     # Check if default model exists
     try:
+        from huggingface_hub import scan_cache_dir
         cache_info = scan_cache_dir()
         model_exists = False
         for repo in cache_info.repos:
@@ -57,7 +56,7 @@ def config_init(
 
 @app.command("show")
 def config_show(
-    path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
+    path: str | None = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
     """Show the content of the config file."""
     config_path = Path(path) if path else pie_path.get_default_config_path()
@@ -88,7 +87,7 @@ def config_show(
 def config_set(
     key: str = typer.Argument(..., help="Dot-path key (e.g., 'host', 'port', 'auth.enabled', 'model.0.hf_repo')"),
     value: str = typer.Argument(..., help="Value to set"),
-    path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
+    path: str | None = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
     """Set a config value by dot-path.
 

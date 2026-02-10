@@ -12,8 +12,6 @@ from rich.progress import (
     BarColumn,
     DownloadColumn,
     Progress,
-    ProgressColumn,
-    SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
     TimeRemainingColumn,
@@ -115,35 +113,6 @@ class TqdmProgress:
     def disable(self):
         pass
 
-
-class SmartDownloadColumn(ProgressColumn):
-    """Renders file size if unit is 'B', otherwise 'completed/total unit'."""
-
-    def render(self, task: "Task") -> Text:
-        unit = task.fields.get("unit", "it")
-        if unit == "B":
-            return DownloadColumn().render(task)
-
-        if task.total is None:
-            return Text(f"{int(task.completed)} {unit}", style="progress.download")
-
-        return Text(
-            f"{int(task.completed)}/{int(task.total)} {unit}", style="progress.download"
-        )
-
-
-class SmartTransferSpeedColumn(ProgressColumn):
-    """Renders transfer speed if unit is 'B', otherwise 'speed unit/s'."""
-
-    def render(self, task: "Task") -> Text:
-        unit = task.fields.get("unit", "it")
-        if unit == "B":
-            return TransferSpeedColumn().render(task)
-
-        if task.speed is None:
-            return Text("?", style="progress.data.speed")
-
-        return Text(f"{task.speed:.1f} {unit}/s", style="progress.data.speed")
 
 
 console = Console()
@@ -302,7 +271,6 @@ def model_download(
 def model_remove(
     repo_id: str = typer.Argument(..., help="HuggingFace repo ID to remove")
 ) -> None:
-    """Remove a locally cached model."""
     """Remove a locally cached model."""
     try:
         from huggingface_hub import scan_cache_dir
