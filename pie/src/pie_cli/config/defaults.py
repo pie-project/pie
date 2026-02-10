@@ -1,4 +1,8 @@
-"""Configuration utilities for Pie."""
+"""Default configuration for Pie.
+
+Moved from pie_cli.defaults — provides the default config template
+and platform-aware device detection.
+"""
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 

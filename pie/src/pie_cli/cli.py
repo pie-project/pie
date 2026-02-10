@@ -5,11 +5,11 @@ This module defines the main Typer application and registers all subcommands.
 
 import typer
 
-from . import config, model, auth
-from .serve import serve
-from .run import run
-from .http import http
-from .doctor import doctor
+from pie_cli import config
+from pie_cli.commands import serve, run, http
+from pie_cli.commands.model import app as model_app
+from pie_cli.commands.auth import app as auth_app
+from pie_cli.commands.doctor import doctor
 
 app = typer.Typer(
     name="pie",
@@ -25,8 +25,8 @@ app.command()(doctor)
 
 # Register subcommand groups
 app.add_typer(config.app, name="config")
-app.add_typer(model.app, name="model")
-app.add_typer(auth.app, name="auth")
+app.add_typer(model_app, name="model")
+app.add_typer(auth_app, name="auth")
 
 if __name__ == "__main__":
     app()

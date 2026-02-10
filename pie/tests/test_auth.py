@@ -8,7 +8,7 @@ import pytest
 import toml
 from typer.testing import CliRunner
 
-from pie_cli.auth import load_authorized_users, save_authorized_users
+from pie_cli.commands.auth import load_authorized_users, save_authorized_users
 from pie_cli.cli import app
 
 runner = CliRunner()

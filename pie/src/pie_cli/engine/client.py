@@ -3,6 +3,8 @@
 Provides `run()` — a synchronous, blocking call that connects to a Pie engine,
 optionally installs a local WASM program, launches the inferlet, and streams
 its output until completion.
+
+Moved from pie_cli.inferlet — now part of the engine package.
 """
 
 import sys
