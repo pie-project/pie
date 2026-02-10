@@ -4,9 +4,9 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 
 
 def get_default_device() -> str:
+    """Get the default device based on the platform."""
     import torch
 
-    """Get the default device based on the platform."""
     if torch.cuda.is_available():
         return "cuda:0"
     elif torch.backends.mps.is_available():
@@ -59,10 +59,6 @@ weight_dtype = "bfloat16"
 # KV cache configuration
 kv_page_size = 16
 
-# Batch size limits
-max_batch_tokens = 10240
-max_batch_size = 128
-
 # Distribution/sampling
 max_dist_size = 32
 
@@ -82,10 +78,4 @@ use_cuda_graphs = false
 # Random seed
 random_seed = 42
 
-# Scheduler settings
-[model.scheduler]
-max_in_flight_batches = 4
-request_timeout_secs = 120
-max_wait_ms = 50
-min_batch_for_optimization = 8
 """

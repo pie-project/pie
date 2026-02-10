@@ -123,12 +123,15 @@ def run(
         }
 
         if path is not None:
-            manager.submit_inferlet_and_wait(
+            from pie_runtime import inferlet as inferlet_mod
+
+            inferlet_mod.submit_and_wait(
                 client_config, path, manifest, arguments or [], server_handle, backend_processes
             )
         else:
-            # Launch from registry
-            manager.submit_inferlet_from_registry_and_wait(
+            from pie_runtime import inferlet as inferlet_mod
+
+            inferlet_mod.submit_from_registry_and_wait(
                 client_config,
                 inferlet,
                 arguments or [],
