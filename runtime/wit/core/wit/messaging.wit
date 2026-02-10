@@ -21,11 +21,11 @@ interface messaging {
     // Receives an incoming message from the remote user client
     receive: func() -> future-string;
 
-    // Sends a blob to the remote user client
-    send-blob: func(blob: blob);
+    // Transfers a file to the remote user client
+    transfer-file: func(data: blob);
 
-    // Receives an incoming blob from the remote user client
-    receive-blob: func() -> future-blob;
+    // Receives an incoming file from the remote user client
+    receive-file: func() -> future-blob;
 
     // Publishes a message to a topic (broadcast to all subscribers)
     broadcast: func(topic: string, message: string);

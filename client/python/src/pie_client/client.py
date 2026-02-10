@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import msgpack
 import websockets
 import blake3
@@ -12,66 +13,53 @@ from .crypto import ParsedPrivateKey
 
 
 class Event(Enum):
-    """Enumeration for events received from an instance."""
+    """Events received from a process."""
 
-    Message = 0
-    Completed = 1
-    Aborted = 2
-    Exception = 3
-    ServerError = 4
-    OutOfResources = 5
-    Blob = 6  # Represents a binary data blob
-    Stdout = 7  # Streaming stdout output
-    Stderr = 8  # Streaming stderr output
+    Stdout = "stdout"
+    Stderr = "stderr"
+    Message = "message"
+    File = "file"
+    Return = "return"
+    Error = "error"
 
 
-@dataclass
-class InstanceInfo:
-    """Information about a running instance."""
+class Process:
+    """Represents a running process on the server."""
 
-    id: str
-    arguments: list[str]
-    status: str  # "Attached", "Detached", or "Finished"
-    username: str = ""
-    elapsed_secs: int = 0
-    kv_pages_used: int = 0
-
-
-class Instance:
-    """Represents a running instance of a program on the server."""
-
-    def __init__(self, client, instance_id: str):
+    def __init__(self, client, process_id: str):
         self.client = client
-        self.instance_id = instance_id
-        self.event_queue = self.client.inst_event_queues.get(instance_id)
+        self.process_id = process_id
+        self.event_queue = self.client.process_event_queues.get(process_id)
         if self.event_queue is None:
             raise Exception(
-                f"Internal error: No event queue for instance {instance_id}"
+                f"Internal error: No event queue for process {process_id}"
             )
 
-    async def send(self, message: str):
-        """Send a string message to the instance."""
-        await self.client.signal_process(self.instance_id, message)
+    async def signal(self, message: str):
+        """Send a string message to the process (fire-and-forget)."""
+        await self.client.signal_process(self.process_id, message)
 
-    async def upload_blob(self, blob_bytes: bytes):
-        """Upload a blob of binary data to the instance."""
-        await self.client.upload_blob(self.instance_id, blob_bytes)
+    async def transfer_file(self, file_bytes: bytes):
+        """Transfer a file to the process (fire-and-forget, chunked)."""
+        await self.client._transfer_file(self.process_id, file_bytes)
 
     async def recv(self) -> tuple[Event, str | bytes]:
         """
-        Receive an event from the instance. Blocks until an event is available.
-        Returns a tuple of (Event, message), where message can be a string or bytes.
+        Receive an event from the process. Blocks until an event is available.
+        Returns a tuple of (Event, value), where value can be a string or bytes.
         """
         if self.event_queue is None:
-            raise Exception("Event queue is not available for this instance.")
-        event_code, msg = await self.event_queue.get()
-
-        event = Event(event_code)
-        return event, msg
+            raise Exception("Event queue is not available for this process.")
+        event_str, value = await self.event_queue.get()
+        return Event(event_str), value
 
     async def terminate(self):
-        """Request termination of the instance."""
-        await self.client.terminate_process(self.instance_id)
+        """Request termination of the process."""
+        await self.client.terminate_process(self.process_id)
+
+
+# Backward compatibility alias
+Instance = Process
 
 
 class PieClient:
@@ -90,14 +78,16 @@ class PieClient:
         self.listener_task = None
         self.corr_id_counter = 0
         self.pending_requests = {}
-        self.pending_launch_requests = {}
-        self.pending_attach_requests = {}
-        self.pending_list_requests = {}
-        self.inst_event_queues = {}
-        self.pending_downloads = {}  # For reassembling blob chunks
+        self.process_event_queues = {}
+        self.pending_downloads = {}  # For reassembling file chunks
 
         # Buffer for early events to prevent race conditions.
         self.orphan_events = {}
+
+    # Also keep old name for backward compat
+    @property
+    def inst_event_queues(self):
+        return self.process_event_queues
 
     async def __aenter__(self):
         """Enter the async context, establishing the connection."""
@@ -111,7 +101,6 @@ class PieClient:
     async def connect(self):
         """Establish a WebSocket connection and start the background listener."""
         self.ws = await websockets.connect(self.server_uri)
-
         self.listener_task = asyncio.create_task(self._listen_to_server())
 
     async def _listen_to_server(self):
@@ -139,148 +128,59 @@ class PieClient:
             corr_id = message.get("corr_id")
             if corr_id in self.pending_requests:
                 future = self.pending_requests.pop(corr_id)
-                future.set_result((message.get("successful"), message.get("result")))
-
-        elif msg_type == "challenge":
-            # Auth challenge response - treat like a regular response
-            corr_id = message.get("corr_id")
-            if corr_id in self.pending_requests:
-                future = self.pending_requests.pop(corr_id)
-                # successful=True with challenge as the result
-                future.set_result((True, message.get("challenge")))
-
-        elif msg_type == "process_launch_result":
-            corr_id = message.get("corr_id")
-            if corr_id in self.pending_launch_requests:
-                future = self.pending_launch_requests.pop(corr_id)
-                successful = message.get("successful")
-                instance_id = message.get("message")
-                if successful:
-                    # Create event queue before resolving to prevent race condition
-                    queue = asyncio.Queue()
-                    self.inst_event_queues[instance_id] = queue
-                    # Replay any orphan events
-                    if instance_id in self.orphan_events:
-                        early_events = self.orphan_events.pop(instance_id)
-                        for event_tuple in early_events:
-                            await queue.put(event_tuple)
-                future.set_result((successful, instance_id))
-
-        elif msg_type == "process_attach_result":
-            corr_id = message.get("corr_id")
-            if corr_id in self.pending_attach_requests:
-                future, instance_id = self.pending_attach_requests.pop(corr_id)
-                successful = message.get("successful")
-                result_msg = message.get("message")
-                if successful:
-                    # Create event queue before resolving to prevent race condition
-                    queue = asyncio.Queue()
-                    self.inst_event_queues[instance_id] = queue
-                    # Replay any orphan events
-                    if instance_id in self.orphan_events:
-                        early_events = self.orphan_events.pop(instance_id)
-                        for event_tuple in early_events:
-                            await queue.put(event_tuple)
-                future.set_result((successful, result_msg))
-
-        elif msg_type == "live_processes":
-            corr_id = message.get("corr_id")
-            if corr_id in self.pending_list_requests:
-                future = self.pending_list_requests.pop(corr_id)
-                instances_raw = message.get("instances", [])
-                instances = [
-                    InstanceInfo(
-                        id=inst.get("id"),
-                        arguments=inst.get("arguments", []),
-                        status=inst.get("status", "Unknown"),
-                        username=inst.get("username", ""),
-                        elapsed_secs=inst.get("elapsed_secs", 0),
-                        kv_pages_used=inst.get("kv_pages_used", 0),
-                    )
-                    for inst in instances_raw
-                ]
-                future.set_result(instances)
+                future.set_result((message.get("ok"), message.get("result")))
 
         elif msg_type == "process_event":
-            instance_id = message.get("instance_id")
-            event_tuple = (message.get("event"), message.get("message"))
+            process_id = message.get("process_id")
+            event = message.get("event")
+            value = message.get("value", "")
+            event_tuple = (event, value)
 
-            if instance_id in self.inst_event_queues:
-                await self.inst_event_queues[instance_id].put(event_tuple)
+            if process_id in self.process_event_queues:
+                await self.process_event_queues[process_id].put(event_tuple)
+                # Clean up on terminal events
+                if event in ("return", "error"):
+                    del self.process_event_queues[process_id]
             else:
                 # Queue doesn't exist yet, buffer the event
-                if instance_id not in self.orphan_events:
-                    self.orphan_events[instance_id] = []
-                self.orphan_events[instance_id].append(event_tuple)
+                if process_id not in self.orphan_events:
+                    self.orphan_events[process_id] = []
+                self.orphan_events[process_id].append(event_tuple)
 
-        elif msg_type == "streaming_output":
-            instance_id = message.get("instance_id")
-            output = message.get("output", {})
-            if instance_id in self.inst_event_queues:
-                # output is {"Stdout": text} or {"Stderr": text}
-                if "Stdout" in output:
-                    await self.inst_event_queues[instance_id].put(
-                        (Event.Stdout.value, output["Stdout"])
-                    )
-                elif "Stderr" in output:
-                    await self.inst_event_queues[instance_id].put(
-                        (Event.Stderr.value, output["Stderr"])
-                    )
+        elif msg_type == "file":
+            await self._handle_file_chunk(message)
 
-        elif msg_type == "download_blob":
-            await self._handle_blob_chunk(message)
-
-    async def _handle_blob_chunk(self, message: dict):
-        """Processes a chunk of a blob sent from the server, ensuring sequential order."""
-        blob_hash = message.get("blob_hash")
-        instance_id = message.get("instance_id")
+    async def _handle_file_chunk(self, message: dict):
+        """Processes a chunk of a file sent from the server."""
+        file_hash = message.get("file_hash")
+        process_id = message.get("process_id")
         chunk_index = message.get("chunk_index")
         total_chunks = message.get("total_chunks")
 
-        if instance_id not in self.inst_event_queues:
-            return  # Ignore blobs for unknown/terminated instances
-
-        # Initialize download on the first chunk (index 0)
-        if blob_hash not in self.pending_downloads:
-            if chunk_index != 0:
-
-                return
-            self.pending_downloads[blob_hash] = {
-                "buffer": bytearray(),
-                "total_chunks": total_chunks,
-                "next_chunk_index": 1,
-                "instance_id": instance_id,
-            }
-
-        download = self.pending_downloads[blob_hash]
-
-        # Validate chunk consistency and order
-        if (
-            total_chunks != download["total_chunks"]
-            or chunk_index != download["next_chunk_index"] - 1
-        ):
-            error_msg = (
-                "Chunk count mismatch"
-                if total_chunks != download["total_chunks"]
-                else "Out-of-order chunk"
-            )
-
-            del self.pending_downloads[blob_hash]
+        if process_id not in self.process_event_queues:
             return
 
+        if file_hash not in self.pending_downloads:
+            if chunk_index != 0:
+                return
+            self.pending_downloads[file_hash] = {
+                "buffer": bytearray(),
+                "total_chunks": total_chunks,
+                "process_id": process_id,
+            }
+
+        download = self.pending_downloads[file_hash]
         download["buffer"].extend(message.get("chunk_data"))
-        download["next_chunk_index"] += 1
 
-        # If all chunks are received, finalize the download
-        if download["next_chunk_index"] == download["total_chunks"]:
-            completed_blob = bytes(download["buffer"])
-            computed_hash = blake3.blake3(completed_blob).hexdigest()
-            if computed_hash == blob_hash:
-                await self.inst_event_queues[instance_id].put(
-                    (Event.Blob.value, completed_blob)
-                )
-
-            del self.pending_downloads[blob_hash]
+        if chunk_index == total_chunks - 1:
+            completed_file = bytes(download["buffer"])
+            computed_hash = blake3.blake3(completed_file).hexdigest()
+            if computed_hash == file_hash:
+                if process_id in self.process_event_queues:
+                    await self.process_event_queues[process_id].put(
+                        ("file", completed_file)
+                    )
+            del self.pending_downloads[file_hash]
 
     async def close(self):
         """Gracefully close the WebSocket connection and shut down background tasks."""
@@ -294,7 +194,7 @@ class PieClient:
                 self.listener_task.cancel()
                 await self.listener_task
             except asyncio.CancelledError:
-                pass  # Expected on cancellation
+                pass
 
     def _get_next_corr_id(self):
         """Generate a unique correlation ID for a request."""
@@ -302,7 +202,7 @@ class PieClient:
         return self.corr_id_counter
 
     async def _send_msg_and_wait(self, msg: dict) -> tuple[bool, str]:
-        """Send a message that expects a response and wait for it."""
+        """Send a message that expects a Response and wait for it."""
         corr_id = self._get_next_corr_id()
         msg["corr_id"] = corr_id
         future = asyncio.get_event_loop().create_future()
@@ -310,6 +210,10 @@ class PieClient:
         encoded = msgpack.packb(msg, use_bin_type=True)
         await self.ws.send(encoded)
         return await future
+
+    # =========================================================================
+    # Authentication
+    # =========================================================================
 
     async def authenticate(
         self, username: str, private_key: ParsedPrivateKey | None = None
@@ -322,71 +226,53 @@ class PieClient:
                            Required if the server has authentication enabled.
         :raises Exception: If authentication fails.
         """
-        # Send auth request
-        msg = {"type": "auth_request", "username": username}
-        successful, result = await self._send_msg_and_wait(msg)
+        msg = {"type": "auth_identify", "username": username}
+        ok, result = await self._send_msg_and_wait(msg)
 
-        if not successful:
+        if not ok:
             raise Exception(f"Username '{username}' rejected by server: {result}")
 
-        # Check if server has disabled authentication
         if result == "Authenticated (Engine disabled authentication)":
-
             return
 
-        # Server returned a challenge - we need to sign it
         if private_key is None:
             raise Exception(
                 "Server requires public key authentication but no private key provided"
             )
 
-        # Decode the base64-encoded challenge
         try:
             challenge = base64.b64decode(result)
         except Exception as e:
             raise Exception(f"Failed to decode challenge from server: {e}")
 
-        # Sign the challenge
         signature_bytes = private_key.sign(challenge)
         signature_b64 = base64.b64encode(signature_bytes).decode("utf-8")
 
-        # Send the auth response
-        msg = {"type": "auth_response", "signature": signature_b64}
-        successful, result = await self._send_msg_and_wait(msg)
+        msg = {"type": "auth_prove", "signature": signature_b64}
+        ok, result = await self._send_msg_and_wait(msg)
 
-        if not successful:
+        if not ok:
             raise Exception(
                 f"Signature verification failed for username '{username}': {result}"
             )
 
     async def auth_by_token(self, token: str) -> None:
-        """
-        Authenticate the client with the server using an internal token.
-        This is used for internal communication (backend <-> engine, shell <-> engine).
-
-        :param token: The internal authentication token.
-        :raises Exception: If authentication fails.
-        """
+        """Authenticate using an internal token (backend/shell ↔ engine)."""
         msg = {"type": "auth_by_token", "token": token}
-        successful, result = await self._send_msg_and_wait(msg)
-        if not successful:
+        ok, result = await self._send_msg_and_wait(msg)
+        if not ok:
             raise Exception(f"Internal authentication failed: {result}")
 
-    async def identify(self, username: str) -> tuple[bool, str]:
-        """
-        [DEPRECATED] Use authenticate() instead.
-        Legacy method for simple username identification.
-        """
-        msg = {"type": "auth_request", "username": username}
-        successful, result = await self._send_msg_and_wait(msg)
-        return successful, result
+    # =========================================================================
+    # Queries
+    # =========================================================================
 
     async def query(self, subject: str, record: str) -> tuple[bool, str]:
         """Send a generic query to the server."""
         msg = {"type": "query", "subject": subject, "record": record}
         return await self._send_msg_and_wait(msg)
 
-    async def program_exists(
+    async def check_program(
         self,
         inferlet: str,
         wasm_path: str | Path | None = None,
@@ -394,41 +280,64 @@ class PieClient:
     ) -> bool:
         """Check if a program exists on the server.
 
-        The inferlet parameter can be:
-        - Full name with version: "text-completion@0.1.0"
-        - Without version (defaults to "latest"): "text-completion"
-
         Args:
             inferlet: The inferlet name (e.g., "text-completion@0.1.0").
             wasm_path: Optional path to the WASM binary file for hash verification.
             manifest_path: Optional path to the manifest TOML file for hash verification.
-                If paths are provided, both must be specified together.
         """
         if (wasm_path is None) != (manifest_path is None):
             raise ValueError(
                 "wasm_path and manifest_path must both be provided or both be None"
             )
+
+        name = inferlet
+        version = None
+        if "@" in inferlet:
+            name, version = inferlet.rsplit("@", 1)
+
+        wasm_hash = None
+        manifest_hash = None
         if wasm_path and manifest_path:
             wasm_bytes = Path(wasm_path).read_bytes()
             manifest_content = Path(manifest_path).read_text()
             wasm_hash = blake3.blake3(wasm_bytes).hexdigest()
             manifest_hash = blake3.blake3(manifest_content.encode()).hexdigest()
-            query = f"{inferlet}#{wasm_hash}+{manifest_hash}"
-        else:
-            query = inferlet
-        successful, result = await self.query("program_exists", query)
-        if successful:
+
+        msg = {
+            "type": "check_program",
+            "name": name,
+        }
+        if version is not None:
+            msg["version"] = version
+        if wasm_hash is not None:
+            msg["wasm_hash"] = wasm_hash
+        if manifest_hash is not None:
+            msg["manifest_hash"] = manifest_hash
+
+        ok, result = await self._send_msg_and_wait(msg)
+        if ok:
             return result == "true"
-        raise Exception(f"Query for program_exists failed: {result}")
+        raise Exception(f"CheckProgram failed: {result}")
+
+    # Backward compatibility alias
+    async def program_exists(
+        self,
+        inferlet: str,
+        wasm_path: str | Path | None = None,
+        manifest_path: str | Path | None = None,
+    ) -> bool:
+        return await self.check_program(inferlet, wasm_path, manifest_path)
+
+    # =========================================================================
+    # Program Upload
+    # =========================================================================
 
     async def _upload_chunked(self, data_bytes: bytes, msg_template: dict):
-        """Internal helper to handle generic chunked uploads."""
-        data_hash = msg_template.get("program_hash") or msg_template.get("blob_hash")
-        upload_type = msg_template["type"]
+        """Internal helper to handle generic chunked uploads with response."""
+        data_hash = msg_template.get("program_hash") or msg_template.get("file_hash")
 
         chunk_size = 256 * 1024
         total_size = len(data_bytes)
-        # An empty upload is still one chunk of zero bytes
         total_chunks = (
             (total_size + chunk_size - 1) // chunk_size if total_size > 0 else 1
         )
@@ -453,218 +362,183 @@ class PieClient:
 
         future = asyncio.get_event_loop().create_future()
         self.pending_requests[corr_id] = future
-        successful, result = await future
+        ok, result = await future
 
-        if not successful:
-            raise Exception(f"{upload_type.replace('_', ' ').title()} failed: {result}")
-
+        if not ok:
+            raise Exception(f"Upload failed: {result}")
         return result
 
     async def install_program(self, wasm_path: str | Path, manifest_path: str | Path):
-        """Install a program to the server in chunks.
-
-        Args:
-            wasm_path: Path to the WASM binary file.
-            manifest_path: Path to the manifest TOML file.
-        """
+        """Install a program to the server in chunks."""
         program_bytes = Path(wasm_path).read_bytes()
         manifest = Path(manifest_path).read_text()
         program_hash = blake3.blake3(program_bytes).hexdigest()
         template = {
-            "type": "install_program",
+            "type": "add_program",
             "program_hash": program_hash,
             "manifest": manifest,
+            "force_overwrite": False,
         }
         await self._upload_chunked(program_bytes, template)
 
-    async def upload_blob(self, instance_id: str, blob_bytes: bytes):
-        """Upload a blob of data to a specific instance in chunks."""
-        blob_hash = blake3.blake3(blob_bytes).hexdigest()
-        template = {
-            "type": "upload_blob",
-            "instance_id": instance_id,
-            "blob_hash": blob_hash,
-        }
-        await self._upload_chunked(blob_bytes, template)
+    # =========================================================================
+    # File Transfer (fire-and-forget, no response expected)
+    # =========================================================================
 
+    async def _transfer_file(self, process_id: str, file_bytes: bytes):
+        """Transfer a file to a process (fire-and-forget, chunked)."""
+        file_hash = blake3.blake3(file_bytes).hexdigest()
+        chunk_size = 256 * 1024
+        total_size = len(file_bytes)
+        total_chunks = (
+            (total_size + chunk_size - 1) // chunk_size if total_size > 0 else 1
+        )
+
+        if total_size == 0:
+            msg = {
+                "type": "transfer_file",
+                "process_id": process_id,
+                "file_hash": file_hash,
+                "chunk_index": 0,
+                "total_chunks": 1,
+                "chunk_data": b"",
+            }
+            await self.ws.send(msgpack.packb(msg, use_bin_type=True))
+        else:
+            for chunk_index in range(total_chunks):
+                start = chunk_index * chunk_size
+                end = min(start + chunk_size, total_size)
+                msg = {
+                    "type": "transfer_file",
+                    "process_id": process_id,
+                    "file_hash": file_hash,
+                    "chunk_index": chunk_index,
+                    "total_chunks": total_chunks,
+                    "chunk_data": file_bytes[start:end],
+                }
+                await self.ws.send(msgpack.packb(msg, use_bin_type=True))
+
+    # Backward compatibility alias
+    async def upload_blob(self, instance_id: str, blob_bytes: bytes):
+        await self._transfer_file(instance_id, blob_bytes)
+
+    # =========================================================================
+    # Process Lifecycle
+    # =========================================================================
+
+    async def launch_process(
+        self,
+        inferlet: str,
+        arguments: list[str] | None = None,
+        capture_outputs: bool = True,
+    ) -> Process:
+        """Launch a process. Returns a Process object for interaction.
+
+        :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
+        :param arguments: Command-line arguments to pass to the inferlet.
+        :param capture_outputs: If True, process outputs are streamed to the client.
+        :return: A Process object for the launched inferlet.
+        """
+        msg = {
+            "type": "launch_process",
+            "inferlet": inferlet,
+            "arguments": arguments or [],
+            "capture_outputs": capture_outputs,
+        }
+        ok, result = await self._send_msg_and_wait(msg)
+
+        if not ok:
+            raise Exception(f"Failed to launch process: {result}")
+
+        process_id = result
+        queue = asyncio.Queue()
+        self.process_event_queues[process_id] = queue
+        # Replay any orphan events
+        if process_id in self.orphan_events:
+            for event_tuple in self.orphan_events.pop(process_id):
+                await queue.put(event_tuple)
+
+        return Process(self, process_id)
+
+    # Backward compatibility alias
     async def launch_instance(
         self,
         inferlet: str,
         arguments: list[str] | None = None,
         capture_outputs: bool = True,
-    ) -> Instance:
-        """Launch an instance of a program.
+    ) -> Process:
+        return await self.launch_process(inferlet, arguments, capture_outputs)
 
-        This method performs a two-level search for the inferlet:
-        1. First, it searches for the program among client-uploaded programs.
-        2. If not found, it falls back to searching the registry.
+    async def attach_process(self, process_id: str) -> Process:
+        """Attach to an existing process.
 
-        The inferlet parameter can be:
-        - Full name with version: "text-completion@0.1.0"
-        - Without version (defaults to "latest"): "text-completion"
-
-        :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
-        :param arguments: Command-line arguments to pass to the inferlet.
-        :param capture_outputs: If True, the instance outputs are streamed to the client.
-        :return: An Instance object for the launched inferlet.
+        :param process_id: The UUID of the process to attach to.
+        :return: A Process object for the attached process.
         """
-        corr_id = self._get_next_corr_id()
-        msg = {
-            "type": "launch_process",
-            "corr_id": corr_id,
-            "inferlet": inferlet,
-            "arguments": arguments or [],
-            "capture_outputs": capture_outputs,
-        }
-
-        future = asyncio.get_event_loop().create_future()
-        self.pending_launch_requests[corr_id] = future
-        encoded = msgpack.packb(msg, use_bin_type=True)
-        await self.ws.send(encoded)
-
-        successful, instance_id = await future
-
-        if successful:
-            return Instance(self, instance_id)
-        raise Exception(f"Failed to launch process: {instance_id}")
-
-    async def launch_instance_from_registry(
-        self, inferlet: str, arguments: list[str] | None = None, capture_outputs: bool = True
-    ) -> Instance:
-        """
-        Launch an instance of an inferlet from the registry only.
-
-        Unlike `launch_instance`, this method searches only the registry and does not
-        check client-uploaded programs. Use this when you explicitly want to launch
-        an inferlet from the registry.
-
-        The inferlet parameter can be:
-        - Full name with version: "text-completion@0.1.0"
-        - Without version (defaults to "latest"): "text-completion"
-
-        :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
-        :param arguments: Command-line arguments to pass to the inferlet.
-        :param capture_outputs: If True, the instance outputs are streamed to the client.
-        :return: An Instance object for the launched inferlet.
-        """
-        corr_id = self._get_next_corr_id()
-        msg = {
-            "type": "launch_process_from_registry",
-            "corr_id": corr_id,
-            "inferlet": inferlet,
-            "arguments": arguments or [],
-            "capture_outputs": capture_outputs,
-        }
-
-        future = asyncio.get_event_loop().create_future()
-        self.pending_launch_requests[corr_id] = future
-        encoded = msgpack.packb(msg, use_bin_type=True)
-        await self.ws.send(encoded)
-
-        successful, instance_id = await future
-
-        if successful:
-            return Instance(self, instance_id)
-        raise Exception(f"Failed to launch process from registry: {instance_id}")
-
-    async def attach_process(self, instance_id: str) -> Instance:
-        """
-        Attach to an existing detached instance.
-
-        :param instance_id: The UUID of the instance to attach to.
-        :return: An Instance object for the attached instance.
-        :raises Exception: If attachment fails.
-        """
-        corr_id = self._get_next_corr_id()
         msg = {
             "type": "attach_process",
-            "corr_id": corr_id,
-            "instance_id": instance_id,
+            "process_id": process_id,
         }
+        ok, result = await self._send_msg_and_wait(msg)
 
-        future = asyncio.get_event_loop().create_future()
-        self.pending_attach_requests[corr_id] = (future, instance_id)
-        encoded = msgpack.packb(msg, use_bin_type=True)
-        await self.ws.send(encoded)
+        if not ok:
+            raise Exception(f"Failed to attach to process: {result}")
 
-        successful, result = await future
+        queue = asyncio.Queue()
+        self.process_event_queues[process_id] = queue
+        if process_id in self.orphan_events:
+            for event_tuple in self.orphan_events.pop(process_id):
+                await queue.put(event_tuple)
 
-        if successful:
-            return Instance(self, instance_id)
-        raise Exception(f"Failed to attach to process: {result}")
+        return Process(self, process_id)
 
-    async def list_processes(self) -> list[InstanceInfo]:
-        """
-        Get a list of all running instances on the server.
-
-        :return: List of InstanceInfo objects.
-        """
-        corr_id = self._get_next_corr_id()
-        msg = {"type": "list_processes", "corr_id": corr_id}
-
-        future = asyncio.get_event_loop().create_future()
-        self.pending_list_requests[corr_id] = future
-        encoded = msgpack.packb(msg, use_bin_type=True)
-        await self.ws.send(encoded)
-
-        return await future
+    async def list_processes(self) -> list[str]:
+        """Get a list of running process UUID strings."""
+        msg = {"type": "list_processes"}
+        ok, result = await self._send_msg_and_wait(msg)
+        if ok:
+            try:
+                return json.loads(result)
+            except (json.JSONDecodeError, TypeError):
+                return [result] if result else []
+        raise Exception(f"List processes failed: {result}")
 
     async def ping(self) -> None:
-        """
-        Ping the server to check connectivity.
-
-        :raises Exception: If ping fails.
-        """
+        """Ping the server to check connectivity."""
         msg = {"type": "ping"}
-        successful, result = await self._send_msg_and_wait(msg)
-        if not successful:
+        ok, result = await self._send_msg_and_wait(msg)
+        if not ok:
             raise Exception(f"Ping failed: {result}")
 
-    async def signal_process(self, instance_id: str, message: str):
-        """Send a signal/message to a running instance (fire-and-forget)."""
+    async def signal_process(self, process_id: str, message: str):
+        """Send a signal/message to a running process (fire-and-forget)."""
         msg = {
             "type": "signal_process",
-            "instance_id": instance_id,
+            "process_id": process_id,
             "message": message,
         }
         await self.ws.send(msgpack.packb(msg, use_bin_type=True))
 
-    async def terminate_process(self, instance_id: str) -> None:
-        """
-        Request the server to terminate a running instance.
-
-        :param instance_id: The UUID of the instance to terminate.
-        :raises Exception: If termination fails.
-        """
-        msg = {"type": "terminate_process", "instance_id": instance_id}
-        successful, result = await self._send_msg_and_wait(msg)
-        if not successful:
+    async def terminate_process(self, process_id: str) -> None:
+        """Request the server to terminate a running process."""
+        msg = {"type": "terminate_process", "process_id": process_id}
+        ok, result = await self._send_msg_and_wait(msg)
+        if not ok:
             raise Exception(f"Failed to terminate process: {result}")
 
     async def launch_daemon(
         self,
-        program_hash: str,
+        inferlet: str,
         port: int,
         arguments: list[str] | None = None,
     ) -> None:
-        """
-        Launch a server inferlet that listens on a specific port.
-
-        Server inferlets implement the wasi:http/incoming-handler interface and
-        handle incoming HTTP requests. Unlike regular inferlets, they are long-running
-        and create a new WASM instance for each incoming request.
-
-        :param program_hash: The hash of the uploaded program.
-        :param port: The TCP port to listen on.
-        :param arguments: Command-line arguments to pass to the inferlet.
-        :raises Exception: If launch fails.
-        """
+        """Launch a daemon inferlet that listens on a specific port."""
         msg = {
             "type": "launch_daemon",
             "port": port,
-            "program_hash": program_hash,
+            "inferlet": inferlet,
             "arguments": arguments or [],
         }
-        successful, result = await self._send_msg_and_wait(msg)
-        if not successful:
+        ok, result = await self._send_msg_and_wait(msg)
+        if not ok:
             raise Exception(f"Failed to launch daemon: {result}")

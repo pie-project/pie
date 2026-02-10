@@ -5,18 +5,20 @@
 //! ## Architecture
 //!
 //! The Server follows the Superactor pattern:
-//! - **Server** (singleton) - Manages the TCP listener and process→client mappings
+//! - **Server** (singleton) - Manages the TCP listener
 //! - **Session** (per-client) - Handles WebSocket framing and client requests
 //!
 //! Sessions register in a global registry and receive messages via Direct Addressing,
 //! bypassing the Server actor for high-throughput communication.
+//!
+//! Process ↔ Client mappings and UUID ↔ ProcessId mappings use lock-free global
+//! DashMaps for zero-overhead lookups.
 
 mod handler;
 mod data_transfer;
 
 pub use data_transfer::InFlightUpload;
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -25,21 +27,35 @@ use base64::Engine as Base64Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use pie_client::message::{ClientMessage, EventCode, ServerMessage as WireServerMessage};
+use pie_client::message::{ClientMessage, ServerMessage as WireServerMessage};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 use tokio_tungstenite::accept_async;
 use tungstenite::Message as WsMessage;
+use uuid::Uuid;
 
 use crate::auth;
-use crate::process::ProcessEvent;
+use crate::process::TerminationCause;
 use crate::service::{Service, ServiceHandler, ServiceMap};
 
 type ProcessId = usize;
 
 /// Unique identifier for a connected client.
 pub type ClientId = u32;
+
+// =============================================================================
+// Global Mappings (lock-free DashMaps)
+// =============================================================================
+
+/// Maps ProcessId → ClientId (which client owns this process).
+static PROCESS_TO_CLIENT: LazyLock<DashMap<ProcessId, ClientId>> = LazyLock::new(DashMap::new);
+
+/// Maps external UUID → internal ProcessId.
+static UUID_TO_PID: LazyLock<DashMap<Uuid, ProcessId>> = LazyLock::new(DashMap::new);
+
+/// Maps internal ProcessId → external UUID.
+static PID_TO_UUID: LazyLock<DashMap<ProcessId, Uuid>> = LazyLock::new(DashMap::new);
 
 // =============================================================================
 // Server Public API
@@ -53,26 +69,49 @@ pub fn spawn(host: &str, port: u16) {
     SERVICE.spawn::<Server, _>(|| Server::new(addr)).expect("Server already spawned");
 }
 
+/// Registers a process with its owning client. Returns the external UUID.
+pub fn register_process(process_id: ProcessId, client_id: ClientId) -> Uuid {
+    let uuid = Uuid::new_v4();
+    PROCESS_TO_CLIENT.insert(process_id, client_id);
+    UUID_TO_PID.insert(uuid, process_id);
+    PID_TO_UUID.insert(process_id, uuid);
+    uuid
+}
+
+/// Removes all mappings for a process.
+pub fn unregister_process(process_id: ProcessId) {
+    PROCESS_TO_CLIENT.remove(&process_id);
+    if let Some((_, uuid)) = PID_TO_UUID.remove(&process_id) {
+        UUID_TO_PID.remove(&uuid);
+    }
+}
+
 /// Looks up which client owns a process.
-pub async fn get_client_id(process_id: ProcessId) -> Result<Option<ClientId>> {
-    let (tx, rx) = oneshot::channel();
-    SERVICE.send(ServerMessage::GetClientId { process_id, response: tx })?;
-    Ok(rx.await.ok().flatten())
+pub fn get_client_id(process_id: ProcessId) -> Option<ClientId> {
+    PROCESS_TO_CLIENT.get(&process_id).map(|r| *r)
 }
 
-/// Associates a process with a client (called when process is launched).
-pub fn register_process(process_id: ProcessId, client_id: ClientId) -> Result<()> {
-    SERVICE.send(ServerMessage::RegisterProcess { process_id, client_id })
+/// Resolves a wire UUID to an internal ProcessId.
+pub fn resolve_uuid(uuid: &Uuid) -> Option<ProcessId> {
+    UUID_TO_PID.get(uuid).map(|r| *r)
 }
 
-/// Removes a process→client mapping (called when process terminates).
-pub fn unregister_process(process_id: ProcessId) -> Result<()> {
-    SERVICE.send(ServerMessage::UnregisterProcess { process_id })
+/// Gets the external UUID for a ProcessId.
+pub fn get_uuid(process_id: ProcessId) -> Option<Uuid> {
+    PID_TO_UUID.get(&process_id).map(|r| *r)
 }
 
-/// Cleans up after a client disconnects.
-pub fn session_terminated(client_id: ClientId) -> Result<()> {
-    SERVICE.send(ServerMessage::SessionTerminated { client_id })
+/// Cleans up all process mappings for a disconnected client.
+pub fn cleanup_client(client_id: ClientId) {
+    // Collect PIDs owned by this client, then remove them
+    let pids: Vec<ProcessId> = PROCESS_TO_CLIENT
+        .iter()
+        .filter(|r| *r.value() == client_id)
+        .map(|r| *r.key())
+        .collect();
+    for pid in pids {
+        unregister_process(pid);
+    }
 }
 
 // =============================================================================
@@ -81,28 +120,29 @@ pub fn session_terminated(client_id: ClientId) -> Result<()> {
 
 static CLIENT_SERVICES: LazyLock<ServiceMap<ClientId, SessionMessage>> = LazyLock::new(ServiceMap::new);
 
-/// Sends a text message to a client for a specific process.
-pub fn send_message_to_client(client_id: ClientId, process_id: ProcessId, message: String) -> Result<()> {
-    CLIENT_SERVICES.send(&client_id, SessionMessage::Message { process_id, message })
+/// Sends a text event (stdout, stderr, message, return, error) to a client.
+pub fn send_event(client_id: ClientId, process_id: ProcessId, event: &str, value: String) -> Result<()> {
+    CLIENT_SERVICES.send(&client_id, SessionMessage::Event {
+        process_id,
+        event: event.to_string(),
+        value,
+    })
 }
 
-/// Sends binary data to a client for a specific process.
-pub fn send_blob_to_client(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Result<()> {
-    CLIENT_SERVICES.send(&client_id, SessionMessage::Blob { process_id, data })
+/// Sends a binary file to a client for a specific process.
+pub fn send_file(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Result<()> {
+    CLIENT_SERVICES.send(&client_id, SessionMessage::File { process_id, data })
 }
 
 /// Notifies a client that a process has terminated.
-pub fn send_process_event_to_client(client_id: ClientId, process_id: ProcessId, cause: ProcessEvent) -> Result<()> {
-    CLIENT_SERVICES.send(&client_id, SessionMessage::ProcessEvent { process_id, cause })
-}
-
-/// Streams output to a client for a specific process.
-pub fn send_output_to_client(
-    client_id: ClientId,
-    process_id: ProcessId,
-    content: String,
-) -> Result<()> {
-    CLIENT_SERVICES.send(&client_id, SessionMessage::Output { process_id, content })
+pub fn send_termination(client_id: ClientId, process_id: ProcessId, cause: TerminationCause) -> Result<()> {
+    let (event, value) = match cause {
+        TerminationCause::Normal(msg) => ("return", msg),
+        TerminationCause::Signal => ("error", "Signal termination".to_string()),
+        TerminationCause::Exception(msg) => ("error", msg),
+        TerminationCause::OutOfResources(msg) => ("error", msg),
+    };
+    send_event(client_id, process_id, event, value)
 }
 
 /// Checks if a session exists for the given client.
@@ -137,11 +177,9 @@ struct ServerState {
 // Server Implementation
 // =============================================================================
 
-/// The Server actor manages the TCP listener and process routing.
+/// The Server actor manages the TCP listener.
 struct Server {
     state: Arc<ServerState>,
-    /// Maps processes to their owning clients for message routing.
-    process_to_client: HashMap<ProcessId, ClientId>,
 }
 
 impl Server {   
@@ -153,10 +191,7 @@ impl Server {
 
         task::spawn(Self::listener_loop(addr, state.clone()));
         
-        Server {
-            state,
-            process_to_client: HashMap::new(),
-        }
+        Server { state }
     }
 
     /// Accepts incoming connections and spawns session actors.
@@ -178,14 +213,9 @@ impl Server {
 // =============================================================================
 
 /// Messages handled by the Server actor.
+/// Currently only used for lifecycle events — all routing uses lock-free DashMaps.
 #[derive(Debug)]
 enum ServerMessage {
-    /// Associate a process with a client.
-    RegisterProcess { process_id: ProcessId, client_id: ClientId },
-    /// Remove a process mapping.
-    UnregisterProcess { process_id: ProcessId },
-    /// Query which client owns a process.
-    GetClientId { process_id: ProcessId, response: oneshot::Sender<Option<ClientId>> },
     /// Clean up after a client disconnects.
     SessionTerminated { client_id: ClientId },
 }
@@ -195,21 +225,17 @@ impl ServiceHandler for Server {
 
     async fn handle(&mut self, msg: ServerMessage) {
         match msg {
-            ServerMessage::RegisterProcess { process_id, client_id } => {
-                self.process_to_client.insert(process_id, client_id);
-            }
-            ServerMessage::UnregisterProcess { process_id } => {
-                self.process_to_client.remove(&process_id);
-            }
-            ServerMessage::GetClientId { process_id, response } => {
-                let _ = response.send(self.process_to_client.get(&process_id).copied());
-            }
             ServerMessage::SessionTerminated { client_id } => {
-                self.process_to_client.retain(|_, &mut cid| cid != client_id);
+                cleanup_client(client_id);
                 tracing::info!("Client {} disconnected", client_id);
             }
         }
     }
+}
+
+/// Cleans up after a client disconnects.
+fn session_terminated(client_id: ClientId) -> Result<()> {
+    SERVICE.send(ServerMessage::SessionTerminated { client_id })
 }
 
 // =============================================================================
@@ -219,14 +245,10 @@ impl ServiceHandler for Server {
 /// Messages handled by Session actors.
 #[derive(Debug)]
 enum SessionMessage {
-    /// Text message to the client for a specific process.
-    Message { process_id: ProcessId, message: String },
-    /// Binary data to the client for a specific process.
-    Blob { process_id: ProcessId, data: Bytes },
-    /// Process termination event.
-    ProcessEvent { process_id: ProcessId, cause: ProcessEvent },
-    /// Stdout/stderr output to the client.
-    Output { process_id: ProcessId, content: String },
+    /// Text event to push to the client (stdout, stderr, message, return, error).
+    Event { process_id: ProcessId, event: String, value: String },
+    /// Binary file to push to the client.
+    File { process_id: ProcessId, data: Bytes },
     /// WebSocket message received from client.
     ClientRequest(ClientMessage),
 }
@@ -247,7 +269,7 @@ struct Session {
     pub(super) username: String,
     state: Arc<ServerState>,
     pub(super) inflight_uploads: DashMap<String, InFlightUpload>,
-    pub(super) attached_instances: Vec<ProcessId>,
+    pub(super) attached_processes: Vec<ProcessId>,
     ws_msg_tx: mpsc::Sender<WsMessage>,
     send_pump: JoinHandle<()>,
     recv_pump: JoinHandle<()>,
@@ -312,7 +334,7 @@ impl Session {
             username: String::new(),
             state,
             inflight_uploads: DashMap::new(),
-            attached_instances: Vec::new(),
+            attached_processes: Vec::new(),
             ws_msg_tx,
             send_pump,
             recv_pump,
@@ -324,8 +346,8 @@ impl Session {
 
     /// Cleanup when session is terminated.
     fn cleanup(&mut self) {
-        for process_id in self.attached_instances.drain(..) {
-            unregister_process(process_id).ok();
+        for process_id in self.attached_processes.drain(..) {
+            unregister_process(process_id);
         }
 
         self.recv_pump.abort();
@@ -362,17 +384,11 @@ impl ServiceHandler for Session {
                     self.handle_client_message(client_msg).await;
                 }
             }
-            SessionMessage::Message { process_id, message } => {
-                self.send_process_event(process_id, EventCode::Message, message).await;
+            SessionMessage::Event { process_id, event, value } => {
+                self.send_process_event(process_id, &event, value).await;
             }
-            SessionMessage::Blob { process_id, data } => {
-                self.handle_send_blob(process_id, data).await;
-            }
-            SessionMessage::ProcessEvent { process_id, cause } => {
-                self.handle_instance_termination(process_id, cause).await;
-            }
-            SessionMessage::Output { process_id, content } => {
-                self.send_process_event(process_id, EventCode::Message, content).await;
+            SessionMessage::File { process_id, data } => {
+                self.send_file_download(process_id, data).await;
             }
         }
     }
@@ -386,18 +402,18 @@ impl Session {
     /// Handle authentication message. Returns Ok(true) when fully authenticated.
     async fn handle_auth_message(&mut self, msg: ClientMessage) -> Result<bool> {
         match msg {
-            ClientMessage::AuthRequest { corr_id, username } => {
+            ClientMessage::AuthIdentify { corr_id, username } => {
                 self.handle_auth_request(corr_id, username).await
             }
             ClientMessage::AuthByToken { corr_id, token } => {
                 self.auth_by_token(corr_id, token).await?;
                 Ok(true)
             }
-            ClientMessage::AuthResponse { corr_id, signature } => {
+            ClientMessage::AuthProve { corr_id, signature } => {
                 self.handle_auth_response(corr_id, signature).await
             }
             _ => {
-                bail!("Expected AuthRequest, AuthByToken, or AuthResponse message")
+                bail!("Expected AuthIdentify, AuthByToken, or AuthProve message")
             }
         }
     }
@@ -489,38 +505,24 @@ impl Session {
         }
     }
 
-    pub(super) async fn send_response(&self, corr_id: u32, successful: bool, result: String) {
+    pub(super) async fn send_response(&self, corr_id: u32, ok: bool, result: String) {
         self.send(WireServerMessage::Response {
             corr_id,
-            successful,
+            ok,
             result,
         })
         .await;
     }
 
-    pub(super) async fn send_process_launch_result(&self, corr_id: u32, successful: bool, message: String) {
-        self.send(WireServerMessage::ProcessLaunchResult {
-            corr_id,
-            successful,
-            message,
-        })
-        .await;
-    }
-
-    pub(super) async fn send_process_attach_result(&self, corr_id: u32, successful: bool, message: String) {
-        self.send(WireServerMessage::ProcessAttachResult {
-            corr_id,
-            successful,
-            message,
-        })
-        .await;
-    }
-
-    pub(super) async fn send_process_event(&self, process_id: ProcessId, event: EventCode, message: String) {
+    pub(super) async fn send_process_event(&self, process_id: ProcessId, event: &str, value: String) {
+        let uuid_str = match get_uuid(process_id) {
+            Some(uuid) => uuid.to_string(),
+            None => process_id.to_string(), // fallback
+        };
         self.send(WireServerMessage::ProcessEvent {
-            instance_id: process_id.to_string(),
-            event: event as u32,
-            message,
+            process_id: uuid_str,
+            event: event.to_string(),
+            value,
         })
         .await;
     }
@@ -533,13 +535,12 @@ impl Session {
 impl Session {
     async fn handle_client_message(&mut self, message: ClientMessage) {
         match message {
-            ClientMessage::AuthRequest { corr_id, .. } => {
+            ClientMessage::AuthIdentify { corr_id, .. } => {
                 self.send_response(corr_id, true, "Already authenticated".to_string())
                     .await;
             }
 
-            ClientMessage::AuthResponse { corr_id, .. } => {
-                // AuthResponse should only arrive during auth flow, not after authenticated
+            ClientMessage::AuthProve { corr_id, .. } => {
                 self.send_response(corr_id, false, "Already authenticated".to_string())
                     .await;
             }
@@ -548,6 +549,15 @@ impl Session {
                 self.send_response(corr_id, true, "Already authenticated".to_string())
                     .await;
             }
+
+            ClientMessage::CheckProgram {
+                corr_id,
+                name,
+                version,
+                wasm_hash: _,
+                manifest_hash: _,
+            } => self.handle_check_program(corr_id, name, version).await,
+
             ClientMessage::Query {
                 corr_id,
                 subject,
@@ -584,12 +594,6 @@ impl Session {
                     .await
             }
 
-            ClientMessage::AttachProcess {
-                corr_id,
-                instance_id,
-            } => {
-                self.handle_attach_process(corr_id, instance_id).await;
-            }
             ClientMessage::LaunchDaemon {
                 corr_id,
                 port,
@@ -599,54 +603,48 @@ impl Session {
                 self.handle_launch_daemon(corr_id, port, inferlet, arguments)
                     .await
             }
-            ClientMessage::SignalProcess {
-                instance_id,
-                message,
-            } => self.handle_signal_process(instance_id, message).await,
+
+            ClientMessage::AttachProcess {
+                corr_id,
+                process_id,
+            } => {
+                self.handle_attach_process(corr_id, process_id).await;
+            }
 
             ClientMessage::TerminateProcess {
                 corr_id,
-                instance_id,
-            } => self.handle_terminate_process(corr_id, instance_id).await,
+                process_id,
+            } => self.handle_terminate_process(corr_id, process_id).await,
 
-            ClientMessage::UploadBlob {
-                corr_id,
-                instance_id,
-                blob_hash,
+            ClientMessage::ListProcesses { corr_id } => {
+                self.handle_list_processes(corr_id).await;
+            }
+
+            ClientMessage::SignalProcess {
+                process_id,
+                message,
+            } => self.handle_signal_process(process_id, message).await,
+
+            ClientMessage::TransferFile {
+                process_id,
+                file_hash,
                 chunk_index,
                 total_chunks,
                 chunk_data,
             } => {
-                self.handle_upload_blob(
-                    corr_id,
-                    instance_id,
-                    blob_hash,
+                self.handle_transfer_file(
+                    process_id,
+                    file_hash,
                     chunk_index,
                     total_chunks,
                     chunk_data,
                 )
                 .await;
             }
+
             ClientMessage::Ping { corr_id } => {
                 self.send_response(corr_id, true, "Pong".to_string()).await;
             }
-            ClientMessage::ListProcesses { corr_id } => {
-                self.handle_list_processes(corr_id).await;
-            }
         }
-    }
-
-
-    async fn handle_instance_termination(&mut self, process_id: ProcessId, cause: ProcessEvent) {
-        self.attached_instances.retain(|&id| id != process_id);
-
-        let (event_code, message) = match cause {
-            ProcessEvent::Normal(message) => (EventCode::Completed, message),
-            ProcessEvent::Signal => (EventCode::Aborted, "Signal termination".to_string()),
-            ProcessEvent::Exception(message) => (EventCode::Exception, message),
-            ProcessEvent::OutOfResources(message) => (EventCode::ServerError, message),
-        };
-
-        self.send_process_event(process_id, event_code, message).await;
     }
 }

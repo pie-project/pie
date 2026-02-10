@@ -26,7 +26,7 @@ pub type ProcessId = usize;
 
 /// Reason a process was terminated.
 #[derive(Debug, Clone)]
-pub enum ProcessEvent {
+pub enum TerminationCause {
     Normal(String),
     Signal,
     Exception(String),
@@ -197,7 +197,7 @@ impl Process {
     /// Deliver output to the attached client, or buffer it if capturing.
     fn deliver_output(&mut self, content: String) {
         if let Some(client_id) = self.client_id {
-            if server::send_output_to_client(client_id, self.process_id, content.clone()).is_err() {
+            if server::send_event(client_id, self.process_id, "stdout", content.clone()).is_err() {
                 // Client gone — detach and fall back to buffering
                 self.client_id = None;
                 self.buffer_output(content);
@@ -220,7 +220,7 @@ impl Process {
     fn flush_output_buffer(&mut self) {
         let Some(client_id) = self.client_id else { return };
         while let Some(buffered) = self.output_buffer.pop_front() {
-            if server::send_output_to_client(client_id, self.process_id, buffered.clone()).is_err() {
+            if server::send_event(client_id, self.process_id, "stdout", buffered.clone()).is_err() {
                 self.client_id = None;
                 self.output_buffer.push_front(buffered);
                 break;
@@ -292,11 +292,11 @@ impl Process {
         if let Some(client_id) = self.client_id.take() {
             let process_id = self.process_id;
             let cause = match exception {
-                Some(msg) => ProcessEvent::Exception(msg),
-                None => ProcessEvent::Normal(String::new()),
+                Some(msg) => TerminationCause::Exception(msg),
+                None => TerminationCause::Normal(String::new()),
             };
-            let _ = server::send_process_event_to_client(client_id, process_id, cause);
-            let _ = server::unregister_process(process_id);
+            let _ = server::send_termination(client_id, process_id, cause);
+            server::unregister_process(process_id);
         }
 
         SERVICES.remove(&self.process_id);

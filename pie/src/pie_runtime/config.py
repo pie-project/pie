@@ -20,19 +20,14 @@ def create_default_config_content() -> str:
     formatted_device = f'"{device}"'
 
     return f"""\
-# Pie Server Configuration
-
-# Network settings
 host = "127.0.0.1"
 port = 8080
 verbose = false
 registry = "https://registry.pie-project.org/"
 
-# Authentication
 [auth]
 enabled = false
 
-# Telemetry
 [telemetry]
 enabled = false
 endpoint = "http://localhost:4317"
@@ -40,7 +35,6 @@ service_name = "pie"
 
 # Model configuration (can have multiple [[model]] sections)
 [[model]]
-# HuggingFace model repository
 hf_repo = "{DEFAULT_MODEL}"
 
 # Device assignment (single GPU or list for tensor parallel)

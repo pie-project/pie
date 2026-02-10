@@ -4,11 +4,12 @@
 //! that process client requests like program upload, instance launch, etc.
 
 use bytes::Bytes;
-use pie_client::message::{self, ServerMessage};
+use pie_client::message::ServerMessage;
+use uuid::Uuid;
 
 use crate::daemon;
 use crate::messaging;
-use crate::process::{self, ProcessEvent};
+use crate::process;
 use crate::program::{self, Manifest, ProgramName};
 
 use super::Session;
@@ -21,15 +22,24 @@ type ProcessId = usize;
 // =============================================================================
 
 impl Session {
+    pub(super) async fn handle_check_program(
+        &self,
+        corr_id: u32,
+        name: String,
+        version: Option<String>,
+    ) {
+        let full_name = match version {
+            Some(v) => format!("{}@{}", name, v),
+            None => name,
+        };
+        let program_name = ProgramName::parse(&full_name);
+        let exists = program::is_registered(&program_name).await;
+        self.send_response(corr_id, true, exists.to_string()).await;
+    }
+
     pub(super) async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
         match subject.as_str() {
-            message::QUERY_PROGRAM_EXISTS => {
-                // Parse the record as "name@version"
-                let program_name = ProgramName::parse(&record);
-                let result = program::is_registered(&program_name).await;
-                self.send_response(corr_id, true, result.to_string()).await;
-            }
-            message::QUERY_MODEL_STATUS => {
+            pie_client::message::QUERY_MODEL_STATUS => {
                 // Model stats stubbed - the new model architecture uses per-actor stats
                 let runtime_stats: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
@@ -40,7 +50,7 @@ impl Session {
                 )
                 .await;
             }
-            message::QUERY_BACKEND_STATS => {
+            pie_client::message::QUERY_BACKEND_STATS => {
                 // Backend stats stubbed - the new model architecture uses per-actor stats
                 let runtime_stats: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
@@ -58,19 +68,16 @@ impl Session {
     }
 
     pub(super) async fn handle_list_processes(&self, corr_id: u32) {
-        let instances = process::list()
+        let processes: Vec<String> = process::list()
             .into_iter()
-            .map(|id| message::InstanceInfo {
-                id: id.to_string(),
-                arguments: vec![],
-                status: message::InstanceStatus::Attached,
-                username: String::new(),
-                elapsed_secs: 0,
-                kv_pages_used: 0,
+            .map(|id| {
+                super::get_uuid(id)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| id.to_string())
             })
             .collect();
-        self.send(ServerMessage::LiveProcesses { corr_id, instances })
-            .await;
+        let json = serde_json::to_string(&processes).unwrap();
+        self.send_response(corr_id, true, json).await;
     }
 }
 
@@ -144,7 +151,7 @@ impl Session {
 }
 
 // =============================================================================
-// Instance Launch Handlers
+// Process Launch Handlers
 // =============================================================================
 
 impl Session {
@@ -159,7 +166,7 @@ impl Session {
 
         // Install program and dependencies (handles both uploaded and registry)
         if let Err(e) = program::install(&program_name).await {
-            self.send_process_launch_result(corr_id, false, e.to_string()).await;
+            self.send_response(corr_id, false, e.to_string()).await;
             return;
         }
 
@@ -175,17 +182,16 @@ impl Session {
         ) {
             Ok(process_id) => {
                 if capture_outputs {
-                    // Register process -> client mapping with Server
-                    super::register_process(process_id, self.id)
-                    .ok();
-                    self.attached_instances.push(process_id);
+                    // Register process → client mapping and get UUID
+                    let uuid = super::register_process(process_id, self.id);
+                    self.attached_processes.push(process_id);
+                    self.send_response(corr_id, true, uuid.to_string()).await;
+                } else {
+                    self.send_response(corr_id, true, String::new()).await;
                 }
-
-                self.send_process_launch_result(corr_id, true, process_id.to_string())
-                    .await;
             }
             Err(e) => {
-                self.send_process_launch_result(corr_id, false, e.to_string()).await;
+                self.send_response(corr_id, false, e.to_string()).await;
             }
         }
     }
@@ -223,15 +229,21 @@ impl Session {
 }
 
 // =============================================================================
-// Instance Management Handlers
+// Process Management Handlers
 // =============================================================================
 
 impl Session {
-    pub(super) async fn handle_attach_process(&mut self, corr_id: u32, instance_id: String) {
-        let process_id: ProcessId = match instance_id.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                self.send_process_attach_result(corr_id, false, "Invalid instance_id".to_string())
+    /// Resolve a wire UUID string to an internal ProcessId.
+    fn resolve_process_id(&self, uuid_str: &str) -> Option<ProcessId> {
+        let uuid: Uuid = uuid_str.parse().ok()?;
+        super::resolve_uuid(&uuid)
+    }
+
+    pub(super) async fn handle_attach_process(&mut self, corr_id: u32, process_id_str: String) {
+        let process_id = match self.resolve_process_id(&process_id_str) {
+            Some(id) => id,
+            None => {
+                self.send_response(corr_id, false, "Invalid process_id".to_string())
                     .await;
                 return;
             }
@@ -239,134 +251,117 @@ impl Session {
 
         match process::attach(process_id, self.id).await {
             Ok(()) => {
-                self.send_process_attach_result(corr_id, true, "Instance attached".to_string())
-                    .await;
-
                 // Register process → client mapping with Server
-                super::register_process(process_id, self.id)
-                .ok();
-                self.attached_instances.push(process_id);
+                super::register_process(process_id, self.id);
+                self.attached_processes.push(process_id);
+                self.send_response(corr_id, true, "Process attached".to_string())
+                    .await;
             }
             Err(_) => {
-                self.send_process_attach_result(corr_id, false, "Instance not found".to_string())
+                self.send_response(corr_id, false, "Process not found".to_string())
                     .await;
             }
         }
     }
 
-    pub(super) async fn handle_signal_process(&mut self, instance_id: String, message: String) {
-        if let Ok(process_id) = instance_id.parse::<ProcessId>() {
-            if self.attached_instances.contains(&process_id) {
+    pub(super) async fn handle_signal_process(&mut self, process_id_str: String, message: String) {
+        if let Some(process_id) = self.resolve_process_id(&process_id_str) {
+            if self.attached_processes.contains(&process_id) {
                 messaging::push(process_id.to_string(), message).unwrap();
             }
         }
     }
 
-    pub(super) async fn handle_terminate_process(&mut self, corr_id: u32, instance_id: String) {
-        if let Ok(process_id) = instance_id.parse::<ProcessId>() {
+    pub(super) async fn handle_terminate_process(&mut self, corr_id: u32, process_id_str: String) {
+        if let Some(process_id) = self.resolve_process_id(&process_id_str) {
             process::terminate(process_id, Some("Signal".to_string()));
-            self.send_response(corr_id, true, "Instance terminated".to_string())
+            self.send_response(corr_id, true, "Process terminated".to_string())
                 .await;
         } else {
-            self.send_response(corr_id, false, "Malformed instance ID".to_string())
+            self.send_response(corr_id, false, "Invalid process ID".to_string())
                 .await;
         }
     }
-
-
 }
 
 // =============================================================================
-// Blob Upload/Download Handlers
+// File Transfer Handlers
 // =============================================================================
 
 impl Session {
-    pub(super) async fn handle_upload_blob(
+    /// Handle incoming file transfer from client (fire-and-forget, no corr_id).
+    pub(super) async fn handle_transfer_file(
         &mut self,
-        corr_id: u32,
-        instance_id: String,
-        blob_hash: String,
+        process_id_str: String,
+        file_hash: String,
         chunk_index: usize,
         total_chunks: usize,
         chunk_data: Vec<u8>,
     ) {
-        let process_id: ProcessId = match instance_id.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                self.send_response(
-                    corr_id,
-                    false,
-                    format!("Invalid instance_id: {}", instance_id),
-                )
-                .await;
+        let process_id = match self.resolve_process_id(&process_id_str) {
+            Some(id) => id,
+            None => {
+                tracing::error!("TransferFile: invalid process_id {}", process_id_str);
                 return;
             }
         };
-        if !self.attached_instances.contains(&process_id) {
-            self.send_response(
-                corr_id,
-                false,
-                format!("Instance not owned by client: {}", instance_id),
-            )
-            .await;
+
+        if !self.attached_processes.contains(&process_id) {
+            tracing::error!("TransferFile: process {} not owned by client", process_id_str);
             return;
         }
 
         // Initialize upload on first chunk
-        if !self.inflight_uploads.contains_key(&blob_hash) {
+        if !self.inflight_uploads.contains_key(&file_hash) {
             if chunk_index != 0 {
-                self.send_response(corr_id, false, "First chunk index must be 0".to_string())
-                    .await;
+                tracing::error!("TransferFile: first chunk index must be 0");
                 return;
             }
             self.inflight_uploads.insert(
-                blob_hash.clone(),
+                file_hash.clone(),
                 InFlightUpload::new(total_chunks, String::new(), false),
             );
         }
 
-        let mut inflight = self.inflight_uploads.get_mut(&blob_hash).unwrap();
+        let mut inflight = self.inflight_uploads.get_mut(&file_hash).unwrap();
 
         match inflight.process_chunk(chunk_index, total_chunks, chunk_data) {
             ChunkResult::InProgress => {}
             ChunkResult::Error(msg) => {
-                self.send_response(corr_id, false, msg).await;
+                tracing::error!("TransferFile error: {}", msg);
                 drop(inflight);
-                self.inflight_uploads.remove(&blob_hash);
+                self.inflight_uploads.remove(&file_hash);
             }
             ChunkResult::Complete { buffer, .. } => {
                 drop(inflight);
-                self.inflight_uploads.remove(&blob_hash);
+                self.inflight_uploads.remove(&file_hash);
 
                 // Verify hash matches
                 let final_hash = blake3::hash(&buffer).to_hex().to_string();
-                if final_hash != blob_hash {
-                    self.send_response(
-                        corr_id,
-                        false,
-                        format!("Hash mismatch: expected {}, got {}", blob_hash, final_hash),
-                    )
-                    .await;
+                if final_hash != file_hash {
+                    tracing::error!("TransferFile hash mismatch: expected {}, got {}", file_hash, final_hash);
                     return;
                 }
 
-                // Send to instance
+                // Send to process
                 messaging::push_blob(process_id.to_string(), Bytes::from(buffer)).unwrap();
-                self.send_response(corr_id, true, "Blob sent to instance".to_string())
-                    .await;
             }
         }
     }
 
-    pub(super) async fn handle_send_blob(&mut self, process_id: ProcessId, data: Bytes) {
-        let blob_hash = blake3::hash(&data).to_hex().to_string();
-        let total_chunks = (data.len() + message::CHUNK_SIZE_BYTES - 1) / message::CHUNK_SIZE_BYTES;
+    /// Send file chunks from server to client (inferlet → client download).
+    pub(super) async fn send_file_download(&mut self, process_id: ProcessId, data: Bytes) {
+        let file_hash = blake3::hash(&data).to_hex().to_string();
+        let total_chunks = (data.len() + pie_client::message::CHUNK_SIZE_BYTES - 1) / pie_client::message::CHUNK_SIZE_BYTES;
 
-        for (i, chunk) in data.chunks(message::CHUNK_SIZE_BYTES).enumerate() {
-            self.send(ServerMessage::DownloadBlob {
-                corr_id: 0,
-                instance_id: process_id.to_string(),
-                blob_hash: blob_hash.clone(),
+        let uuid_str = super::get_uuid(process_id)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| process_id.to_string());
+
+        for (i, chunk) in data.chunks(pie_client::message::CHUNK_SIZE_BYTES).enumerate() {
+            self.send(ServerMessage::File {
+                process_id: uuid_str.clone(),
+                file_hash: file_hash.clone(),
                 chunk_index: i,
                 total_chunks,
                 chunk_data: chunk.to_vec(),

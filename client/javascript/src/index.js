@@ -1,19 +1,16 @@
 /**
  * @file pie-client.js
- * A JavaScript client library for the Pie WebSocket server.
+ * A JavaScript client library for the Pie WebSocket server (Protocol v2).
  *
  * @requires msgpack-lite
  * @requires blake3
  */
 
-// If using in a browser with script tags, these would be global.
-// If using in Node.js or with a bundler, import them.
 import msgpack from 'msgpack-lite';
 import { blake3 } from 'blake3';
 
 /**
  * A simple asynchronous queue.
- * Producers can push values, and consumers can await until a value is available.
  */
 class AsyncQueue {
     constructor() {
@@ -21,10 +18,6 @@ class AsyncQueue {
         this._resolvers = [];
     }
 
-    /**
-     * Puts a value into the queue. If a consumer is waiting, it resolves their promise.
-     * @param {*} value The value to add to the queue.
-     */
     put(value) {
         if (this._resolvers.length > 0) {
             const resolve = this._resolvers.shift();
@@ -34,10 +27,6 @@ class AsyncQueue {
         }
     }
 
-    /**
-     * Gets a value from the queue. If the queue is empty, it waits until a value is added.
-     * @returns {Promise<*>} A promise that resolves with the next value in the queue.
-     */
     get() {
         return new Promise((resolve) => {
             if (this._values.length > 0) {
@@ -48,61 +37,68 @@ class AsyncQueue {
         });
     }
 
-    /**
-     * Checks if the queue is empty.
-     * @returns {boolean}
-     */
     isEmpty() {
         return this._values.length === 0;
     }
 }
 
+const CHUNK_SIZE = 256 * 1024; // 256 KiB
+
 /**
- * Represents a running instance of a program on the server.
+ * Represents a running process on the server.
  */
-export class Instance {
+export class Process {
     /**
-     * @param {PieClient} client The PieClient that owns this instance.
-     * @param {string} instanceId The unique ID of the instance.
+     * @param {PieClient} client The PieClient that owns this process.
+     * @param {string} processId The UUID of the process.
      */
-    constructor(client, instanceId) {
+    constructor(client, processId) {
         this.client = client;
-        this.instanceId = instanceId;
-        this.eventQueue = client.instEventQueues.get(instanceId);
+        this.processId = processId;
+        this.eventQueue = client.processEventQueues.get(processId);
         if (!this.eventQueue) {
-            throw new Error(`Internal error: No event queue for instance ${instanceId}`);
+            throw new Error(`Internal error: No event queue for process ${processId}`);
         }
     }
 
     /**
-     * Sends a message to the instance.
+     * Sends a signal/message to the process (fire-and-forget).
      * @param {string} message The message to send.
-     * @returns {Promise<void>}
      */
-    async send(message) {
-        await this.client.signalInstance(this.instanceId, message);
+    async signal(message) {
+        await this.client.signalProcess(this.processId, message);
     }
 
     /**
-     * Receives an event from the instance. Blocks until an event is available.
-     * @returns {Promise<{event: string, msg: string}>} An object containing the event type and message.
+     * Transfers a file to the process (fire-and-forget, chunked).
+     * @param {Uint8Array|Buffer} fileBytes The file data to transfer.
+     */
+    async transferFile(fileBytes) {
+        await this.client._transferFile(this.processId, fileBytes);
+    }
+
+    /**
+     * Receives an event from the process. Blocks until an event is available.
+     * @returns {Promise<{event: string, value: string|Uint8Array}>}
      */
     async recv() {
         if (!this.eventQueue) {
-            throw new Error("Event queue is not available for this instance.");
+            throw new Error("Event queue is not available for this process.");
         }
-        const [event, msg] = await this.eventQueue.get();
-        return { event, msg };
+        const [event, value] = await this.eventQueue.get();
+        return { event, value };
     }
 
     /**
-     * Requests termination of the instance on the server.
-     * @returns {Promise<void>}
+     * Requests termination of the process.
      */
     async terminate() {
-        await this.client.terminateInstance(this.instanceId);
+        await this.client.terminateProcess(this.processId);
     }
 }
+
+// Backward compatibility alias
+export const Instance = Process;
 
 /**
  * An asynchronous client for interacting with the Pie WebSocket server.
@@ -116,20 +112,25 @@ export class PieClient {
         this.ws = null;
         this.corrIdCounter = 0;
         this.pendingRequests = new Map();
-        this.instEventQueues = new Map();
+        this.processEventQueues = new Map();
+        this.pendingDownloads = new Map();
+        this.orphanEvents = new Map();
         this.connectionPromise = null;
     }
 
+    // Backward compatibility alias
+    get instEventQueues() {
+        return this.processEventQueues;
+    }
+
     /**
-     * Establishes a WebSocket connection and starts the background listener.
-     * @returns {Promise<void>} A promise that resolves when the connection is open.
+     * Establishes a WebSocket connection.
+     * @returns {Promise<void>}
      */
     connect() {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             return Promise.resolve();
         }
-
-        // If a connection is already in progress, return the existing promise
         if (this.connectionPromise) {
             return this.connectionPromise;
         }
@@ -137,22 +138,19 @@ export class PieClient {
         this.connectionPromise = new Promise((resolve, reject) => {
             try {
                 this.ws = new WebSocket(this.serverUri);
-                this.ws.binaryType = 'blob'; // Use blob for easier conversion to ArrayBuffer
+                this.ws.binaryType = 'blob';
 
                 this.ws.onopen = () => {
-                    console.log(`[PieClient] Connected to ${this.serverUri}`);
                     this._listen();
                     resolve();
                 };
 
                 this.ws.onerror = (error) => {
-                    console.error("[PieClient] WebSocket error:", error);
                     reject(new Error("WebSocket connection failed."));
-                    this.connectionPromise = null; // Reset for future connection attempts
+                    this.connectionPromise = null;
                 };
 
-                this.ws.onclose = (event) => {
-                    console.log(`[PieClient] Connection closed. Code: ${event.code}, Reason: ${event.reason}`);
+                this.ws.onclose = () => {
                     this.ws = null;
                     this.connectionPromise = null;
                 };
@@ -165,66 +163,92 @@ export class PieClient {
         return this.connectionPromise;
     }
 
-    /**
-     * Background listener to process all incoming server messages.
-     * @private
-     */
+    /** @private */
     async _listen() {
         this.ws.onmessage = async (event) => {
             if (event.data instanceof Blob) {
                 try {
                     const arrayBuffer = await event.data.arrayBuffer();
                     const message = msgpack.decode(new Uint8Array(arrayBuffer));
-                    this._processServerMessage(message);
+                    await this._processServerMessage(message);
                 } catch (e) {
                     console.error("[PieClient] Failed to decode messagepack:", e);
                 }
-            } else {
-                console.log(`[PieClient] Received non-binary message: ${event.data}`);
             }
         };
     }
 
     /**
-     * Routes incoming server messages based on their type.
+     * Routes incoming server messages (3 types: response, process_event, file).
      * @private
-     * @param {object} message The decoded message object.
      */
-    _processServerMessage(message) {
-        const { type, corr_id, instance_id, event, message: msg, successful, result } = message;
+    async _processServerMessage(message) {
+        const msgType = message.type;
 
-        switch (type) {
-            case 'response':
-                if (this.pendingRequests.has(corr_id)) {
-                    const promiseControls = this.pendingRequests.get(corr_id);
-                    promiseControls.resolve({ successful, result });
-                    this.pendingRequests.delete(corr_id);
+        if (msgType === 'response') {
+            const { corr_id, ok, result } = message;
+            if (this.pendingRequests.has(corr_id)) {
+                const promiseControls = this.pendingRequests.get(corr_id);
+                promiseControls.resolve({ ok, result });
+                this.pendingRequests.delete(corr_id);
+            }
+        } else if (msgType === 'process_event') {
+            const { process_id, event, value } = message;
+            const eventTuple = [event, value || ''];
+
+            if (this.processEventQueues.has(process_id)) {
+                this.processEventQueues.get(process_id).put(eventTuple);
+                // Clean up on terminal events
+                if (event === 'return' || event === 'error') {
+                    this.processEventQueues.delete(process_id);
                 }
-                break;
-            case 'instance_event':
-                if (this.instEventQueues.has(instance_id)) {
-                    this.instEventQueues.get(instance_id).put([event, msg]);
+            } else {
+                // Buffer orphan events
+                if (!this.orphanEvents.has(process_id)) {
+                    this.orphanEvents.set(process_id, []);
                 }
-                break;
-            case 'server_event':
-                console.log(`[PieClient] Received server event: ${msg}`);
-                break;
-            default:
-                console.warn(`[PieClient] Received unknown message type: ${type}`);
+                this.orphanEvents.get(process_id).push(eventTuple);
+            }
+        } else if (msgType === 'file') {
+            await this._handleFileChunk(message);
+        }
+    }
+
+    /** @private */
+    async _handleFileChunk(message) {
+        const { process_id, file_hash, chunk_index, total_chunks, chunk_data } = message;
+
+        if (!this.processEventQueues.has(process_id)) return;
+
+        if (!this.pendingDownloads.has(file_hash)) {
+            if (chunk_index !== 0) return;
+            this.pendingDownloads.set(file_hash, {
+                buffer: [],
+                totalChunks: total_chunks,
+                processId: process_id,
+            });
+        }
+
+        const download = this.pendingDownloads.get(file_hash);
+        download.buffer.push(chunk_data);
+
+        if (chunk_index === total_chunks - 1) {
+            this.pendingDownloads.delete(file_hash);
+            const completeData = Buffer.concat(download.buffer);
+            const computedHash = blake3(completeData).toString('hex');
+            if (computedHash === file_hash && this.processEventQueues.has(download.processId)) {
+                this.processEventQueues.get(download.processId).put(['file', completeData]);
+            }
         }
     }
 
     /**
      * Gracefully closes the WebSocket connection.
-     * @returns {Promise<void>}
      */
     close() {
         return new Promise((resolve) => {
             if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                this.ws.onclose = () => {
-                    console.log("[PieClient] Client has been shut down.");
-                    resolve();
-                };
+                this.ws.onclose = () => resolve();
                 this.ws.close();
             } else {
                 resolve();
@@ -232,28 +256,23 @@ export class PieClient {
         });
     }
 
-    /**
-     * Generates a unique correlation ID for a request.
-     * @private
-     */
+    /** @private */
     _getNextCorrId() {
         return ++this.corrIdCounter;
     }
 
     /**
-     * Sends a message that expects a response and waits for it.
+     * Send a command and wait for a Response.
      * @private
-     * @param {object} msg The message object to send.
-     * @returns {Promise<{successful: boolean, result: string}>}
+     * @returns {Promise<{ok: boolean, result: string}>}
      */
     _sendMsgAndWait(msg) {
-        return new Promise(async (resolve, reject) => {
+        return new Promise((resolve, reject) => {
             if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
                 return reject(new Error("WebSocket is not connected."));
             }
             const corr_id = this._getNextCorrId();
             msg.corr_id = corr_id;
-
             this.pendingRequests.set(corr_id, { resolve, reject });
 
             try {
@@ -266,11 +285,7 @@ export class PieClient {
         });
     }
 
-    /**
-     * Sends a fire-and-forget message.
-     * @private
-     * @param {object} msg The message object to send.
-     */
+    /** @private */
     async _sendMsg(msg) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             throw new Error("WebSocket is not connected.");
@@ -279,27 +294,31 @@ export class PieClient {
         this.ws.send(encoded);
     }
 
+    // =========================================================================
+    // Authentication
+    // =========================================================================
+
     /**
-     * Authenticates the client with the server using a token.
-     * @param {string} token The JWT token.
-     * @returns {Promise<{successful: boolean, result: string}>}
+     * Authenticate using an internal token.
+     * @param {string} token The internal authentication token.
      */
-    async authenticate(token) {
-        const msg = { type: "authenticate", token };
-        const { successful, result } = await this._sendMsgAndWait(msg);
-        if (successful) {
-            console.log("[PieClient] Authenticated successfully.");
-        } else {
-            console.error(`[PieClient] Authentication failed: ${result}`);
+    async authByToken(token) {
+        const msg = { type: "auth_by_token", token };
+        const { ok, result } = await this._sendMsgAndWait(msg);
+        if (!ok) {
+            throw new Error(`Authentication failed: ${result}`);
         }
-        return { successful, result };
     }
+
+    // =========================================================================
+    // Queries
+    // =========================================================================
 
     /**
      * Sends a generic query to the server.
      * @param {string} subject The query subject.
      * @param {string} record The query record.
-     * @returns {Promise<{successful: boolean, result: string}>}
+     * @returns {Promise<{ok: boolean, result: string}>}
      */
     async query(subject, record) {
         const msg = { type: "query", subject, record };
@@ -308,57 +327,45 @@ export class PieClient {
 
     /**
      * Check if a program exists on the server.
-     *
-     * The inferlet parameter can be:
-     * - Full name with version: "text-completion@0.1.0"
-     * - Without version (defaults to "latest"): "text-completion"
-     *
      * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
-     * @param {string|null} [wasmPath=null] Optional path to the WASM binary file for hash verification (Node.js only).
-     * @param {string|null} [manifestPath=null] Optional path to the manifest TOML file for hash verification (Node.js only).
-     *   If paths are provided, both must be specified together.
-     * @returns {Promise<boolean>} True if the program exists (and hashes match, if provided).
+     * @returns {Promise<boolean>}
      */
-    async programExists(inferlet, wasmPath = null, manifestPath = null) {
-        if ((wasmPath === null) !== (manifestPath === null)) {
-            throw new Error("wasmPath and manifestPath must both be provided or both be null");
+    async checkProgram(inferlet) {
+        let name = inferlet;
+        let version = undefined;
+        if (inferlet.includes('@')) {
+            const idx = inferlet.lastIndexOf('@');
+            name = inferlet.substring(0, idx);
+            version = inferlet.substring(idx + 1);
         }
-
-        let queryRecord;
-        if (wasmPath && manifestPath) {
-            // Node.js file reading - dynamically import fs
-            const fs = await import('fs');
-            const wasmBytes = fs.readFileSync(wasmPath);
-            const manifestContent = fs.readFileSync(manifestPath, 'utf-8');
-            const wasmHash = blake3(wasmBytes).toString('hex');
-            const tomlHash = blake3(Buffer.from(manifestContent)).toString('hex');
-            queryRecord = `${inferlet}#${wasmHash}+${tomlHash}`;
-        } else {
-            queryRecord = inferlet;
-        }
-
-        const { successful, result } = await this.query("program_exists", queryRecord);
-        if (successful) {
-            return result === "true";
-        }
-        throw new Error(`Query for program_exists failed: ${result}`);
+        const msg = { type: "check_program", name };
+        if (version) msg.version = version;
+        const { ok, result } = await this._sendMsgAndWait(msg);
+        if (ok) return result === "true";
+        throw new Error(`CheckProgram failed: ${result}`);
     }
+
+    // Backward compatibility alias
+    async programExists(inferlet) {
+        return await this.checkProgram(inferlet);
+    }
+
+    // =========================================================================
+    // Program Upload
+    // =========================================================================
 
     /**
      * Installs a program to the server in chunks.
      * @param {string} wasmPath Path to the WASM binary file (Node.js only).
      * @param {string} manifestPath Path to the manifest TOML file (Node.js only).
-     * @returns {Promise<void>}
      */
     async installProgram(wasmPath, manifestPath) {
-        // Node.js file reading - dynamically import fs
         const fs = await import('fs');
         const programBytes = fs.readFileSync(wasmPath);
         const manifest = fs.readFileSync(manifestPath, 'utf-8');
-
         const programHash = blake3(programBytes).toString('hex');
-        const chunkSize = 256 * 1024; // 256 KiB, must match server
-        const totalChunks = Math.ceil(programBytes.length / chunkSize);
+
+        const totalChunks = Math.max(1, Math.ceil(programBytes.length / CHUNK_SIZE));
         const corr_id = this._getNextCorrId();
 
         const installPromise = new Promise((resolve, reject) => {
@@ -366,168 +373,186 @@ export class PieClient {
         });
 
         for (let i = 0; i < totalChunks; i++) {
-            const start = i * chunkSize;
-            const end = Math.min(start + chunkSize, programBytes.length);
-            const chunkData = programBytes.slice(start, end);
+            const start = i * CHUNK_SIZE;
+            const end = Math.min(start + CHUNK_SIZE, programBytes.length);
             const msg = {
-                type: "install_program",
-                corr_id: corr_id,
+                type: "add_program",
+                corr_id,
                 program_hash: programHash,
-                manifest: manifest,
+                manifest,
+                force_overwrite: false,
                 chunk_index: i,
                 total_chunks: totalChunks,
-                chunk_data: chunkData,
+                chunk_data: programBytes.slice(start, end),
             };
             await this._sendMsg(msg);
         }
 
-        const { successful, result } = await installPromise;
-        if (successful) {
-            console.log(`[PieClient] Program installed successfully: ${result}`);
-        } else {
+        const { ok, result } = await installPromise;
+        if (!ok) {
             throw new Error(`Program install failed: ${result}`);
         }
     }
 
-    /**
-     * Launches an instance of a program.
-     * @param {string} programHash The hash of the program to launch.
-     * @param {string[]} [args=[]] Optional command-line arguments.
-     * @returns {Promise<Instance>}
-     */
-    /**
-     * Launches an instance of a program.
-     *
-     * This method performs a two-level search for the inferlet:
-     * 1. First, it searches for the program among client-uploaded programs.
-     * 2. If not found, it falls back to searching the registry.
-     *
-     * The inferlet parameter can be:
-     * - Full name with version: "text-completion@0.1.0"
-     * - Without version (defaults to "latest"): "text-completion"
-     *
-     * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
-     * @param {string[]} [args=[]] Optional command-line arguments.
-     * @param {boolean} [captureOutputs=true] If true, instance outputs are streamed to the client.
-     * @returns {Promise<Instance>}
-     */
-    async launchInstance(inferlet, args = [], captureOutputs = true) {
-        const msg = {
-            type: "launch_instance",
-            inferlet: inferlet,
-            arguments: args,
-            capture_outputs: captureOutputs,
-        };
-        const { successful, result } = await this._sendMsgAndWait(msg);
-        if (successful) {
-            const instanceId = result;
-            this.instEventQueues.set(instanceId, new AsyncQueue());
-            return new Instance(this, instanceId);
-        } else {
-            throw new Error(`Failed to launch instance: ${result}`);
+    // =========================================================================
+    // File Transfer (fire-and-forget)
+    // =========================================================================
+
+    /** @private */
+    async _transferFile(processId, fileBytes) {
+        const fileHash = blake3(fileBytes).toString('hex');
+        const totalChunks = Math.max(1, Math.ceil(fileBytes.length / CHUNK_SIZE));
+
+        for (let i = 0; i < totalChunks; i++) {
+            const start = i * CHUNK_SIZE;
+            const end = Math.min(start + CHUNK_SIZE, fileBytes.length);
+            const msg = {
+                type: "transfer_file",
+                process_id: processId,
+                file_hash: fileHash,
+                chunk_index: i,
+                total_chunks: totalChunks,
+                chunk_data: fileBytes.slice(start, end),
+            };
+            await this._sendMsg(msg);
         }
     }
 
+    // =========================================================================
+    // Process Lifecycle
+    // =========================================================================
+
     /**
-     * Launches an instance from an inferlet in the registry only.
-     *
-     * Unlike `launchInstance`, this method searches only the registry and does not
-     * check client-uploaded programs. Use this when you explicitly want to launch
-     * an inferlet from the registry.
-     * 
-     * The inferlet parameter can be:
-     * - Full name with version: "text-completion@0.1.0"
-     * - Without version (defaults to "latest"): "text-completion"
-     * 
+     * Launches a process. Returns a Process object for interaction.
      * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
-     * @param {string[]} [args=[]] Optional command-line arguments.
-     * @param {boolean} [captureOutputs=true] If true, instance outputs are streamed to the client.
-     * @returns {Promise<Instance>}
+     * @param {string[]} [args=[]] Command-line arguments.
+     * @param {boolean} [captureOutputs=true] Stream outputs to client.
+     * @returns {Promise<Process>}
      */
-    async launchInstanceFromRegistry(inferlet, args = [], captureOutputs = true) {
+    async launchProcess(inferlet, args = [], captureOutputs = true) {
         const msg = {
-            type: "launch_instance_from_registry",
-            inferlet: inferlet,
+            type: "launch_process",
+            inferlet,
             arguments: args,
             capture_outputs: captureOutputs,
         };
-        const { successful, result } = await this._sendMsgAndWait(msg);
-        if (successful) {
-            const instanceId = result;
-            this.instEventQueues.set(instanceId, new AsyncQueue());
-            return new Instance(this, instanceId);
-        } else {
-            throw new Error(`Failed to launch instance from registry: ${result}`);
+        const { ok, result } = await this._sendMsgAndWait(msg);
+        if (!ok) {
+            throw new Error(`Failed to launch process: ${result}`);
         }
-    }
 
-    /**
-     * Sends a signal/message to a running instance (fire-and-forget).
-     * @param {string} instanceId The ID of the instance.
-     * @param {string} message The message to send.
-     * @returns {Promise<void>}
-     */
-    async signalInstance(instanceId, message) {
-        const msg = { type: "signal_instance", instance_id: instanceId, message };
-        await this._sendMsg(msg);
-    }
-
-    /**
-     * Requests the server to terminate a running instance (fire-and-forget).
-     * @param {string} instanceId The ID of the instance.
-     * @returns {Promise<void>}
-     */
-    async terminateInstance(instanceId) {
-        const msg = { type: "terminate_instance", instance_id: instanceId };
-        await this._sendMsg(msg);
-    }
-}
-
-
-// ===============================================================
-// Example Usage:
-// ===============================================================
-// To run this example, you would do something like this in an async context:
-
-async function main() {
-    const client = new PieClient("ws://127.0.0.1:8080");
-
-    try {
-        await client.connect();
-
-        // 1. Authenticate (if needed)
-        // await client.authenticate("your-super-secret-jwt-token");
-
-        // 2. Upload a simple program with manifest
-        const programCode = new TextEncoder().encode('print("Hello from JavaScript instance!")');
-        const manifest = `[package]
-name = "hello-world"
-version = "0.1.0"
-`;
-        await client.uploadProgram(programCode, manifest);
-        console.log(`[Example] Uploaded program: hello-world@0.1.0`);
-
-        // 3. Launch the instance using inferlet name
-        console.log("[Example] Launching instance...");
-        const instance = await client.launchInstance("hello-world@0.1.0");
-        console.log(`[Example] Launched instance with ID: ${instance.instanceId}`);
-
-        // 4. Wait for the instance to finish
-        while (true) {
-            const { event, msg } = await instance.recv();
-            console.log(`[Example] Received event='${event}', message='${msg}'`);
-            if (event === "terminated") {
-                break;
+        const processId = result;
+        const queue = new AsyncQueue();
+        this.processEventQueues.set(processId, queue);
+        // Replay orphan events
+        if (this.orphanEvents.has(processId)) {
+            for (const tuple of this.orphanEvents.get(processId)) {
+                queue.put(tuple);
             }
+            this.orphanEvents.delete(processId);
         }
 
-    } catch (error) {
-        console.error("[Example] An error occurred:", error);
-    } finally {
-        console.log("[Example] Closing client connection.");
-        await client.close();
+        return new Process(this, processId);
+    }
+
+    // Backward compatibility alias
+    async launchInstance(inferlet, args = [], captureOutputs = true) {
+        return await this.launchProcess(inferlet, args, captureOutputs);
+    }
+
+    /**
+     * Attaches to an existing process.
+     * @param {string} processId The UUID of the process.
+     * @returns {Promise<Process>}
+     */
+    async attachProcess(processId) {
+        const msg = {
+            type: "attach_process",
+            process_id: processId,
+        };
+        const { ok, result } = await this._sendMsgAndWait(msg);
+        if (!ok) {
+            throw new Error(`Failed to attach to process: ${result}`);
+        }
+
+        const queue = new AsyncQueue();
+        this.processEventQueues.set(processId, queue);
+        if (this.orphanEvents.has(processId)) {
+            for (const tuple of this.orphanEvents.get(processId)) {
+                queue.put(tuple);
+            }
+            this.orphanEvents.delete(processId);
+        }
+
+        return new Process(this, processId);
+    }
+
+    /**
+     * Sends a signal/message to a running process (fire-and-forget).
+     * @param {string} processId The process UUID.
+     * @param {string} message The message to send.
+     */
+    async signalProcess(processId, message) {
+        const msg = { type: "signal_process", process_id: processId, message };
+        await this._sendMsg(msg);
+    }
+
+    /**
+     * Terminates a running process.
+     * @param {string} processId The process UUID.
+     */
+    async terminateProcess(processId) {
+        const msg = { type: "terminate_process", process_id: processId };
+        const { ok, result } = await this._sendMsgAndWait(msg);
+        if (!ok) {
+            throw new Error(`Failed to terminate process: ${result}`);
+        }
+    }
+
+    /**
+     * Lists running processes.
+     * @returns {Promise<string[]>} List of process UUID strings.
+     */
+    async listProcesses() {
+        const msg = { type: "list_processes" };
+        const { ok, result } = await this._sendMsgAndWait(msg);
+        if (!ok) {
+            throw new Error(`List processes failed: ${result}`);
+        }
+        try {
+            return JSON.parse(result);
+        } catch {
+            return result ? [result] : [];
+        }
+    }
+
+    /**
+     * Pings the server.
+     */
+    async ping() {
+        const msg = { type: "ping" };
+        const { ok, result } = await this._sendMsgAndWait(msg);
+        if (!ok) {
+            throw new Error(`Ping failed: ${result}`);
+        }
+    }
+
+    /**
+     * Launches a daemon inferlet on a specific port.
+     * @param {string} inferlet The inferlet name.
+     * @param {number} port The TCP port.
+     * @param {string[]} [args=[]] Command-line arguments.
+     */
+    async launchDaemon(inferlet, port, args = []) {
+        const msg = {
+            type: "launch_daemon",
+            port,
+            inferlet,
+            arguments: args,
+        };
+        const { ok, result } = await this._sendMsgAndWait(msg);
+        if (!ok) {
+            throw new Error(`Failed to launch daemon: ${result}`);
+        }
     }
 }
-
-// To run the main function:
-// main();
