@@ -30,7 +30,7 @@ def test_runtime_config():
     print("TEST 2: RuntimeConfig with dummy_mode")
     print("=" * 60)
     
-    from pie_device.config import RuntimeConfig
+    from pie_backend.config import RuntimeConfig
     
     config = RuntimeConfig.from_args(
         hf_repo='dummy-model',
@@ -51,8 +51,8 @@ def test_runtime_initialization():
     print("TEST 3: Runtime initialization in dummy mode")
     print("=" * 60)
     
-    from pie_device.config import RuntimeConfig
-    from pie_device.runtime import Runtime
+    from pie_backend.config import RuntimeConfig
+    from pie_backend.backend import Backend
     
     config = RuntimeConfig.from_args(
         hf_repo='dummy-model',
@@ -60,7 +60,7 @@ def test_runtime_initialization():
         device='cpu',
     )
     
-    runtime = Runtime(config)
+    runtime = Backend(config)
     
     assert runtime.type == "dummy", f"type should be 'dummy', got {runtime.type}"
     assert runtime.engine.__class__.__name__ == "DummyForwardPass", \
@@ -191,7 +191,7 @@ def test_handshake(runtime):
     print("TEST 8: Handshake RPC")
     print("=" * 60)
     
-    from pie_device.message import HandshakeRequest
+    from pie_backend.message import HandshakeRequest
     
     request = HandshakeRequest(version="1.0.0")
     response = runtime.handshake(request)
@@ -214,8 +214,8 @@ def test_kv_cache_minimal():
     print("TEST 9: KV cache is minimal")
     print("=" * 60)
     
-    from pie_device.config import RuntimeConfig
-    from pie_device.runtime import Runtime
+    from pie_backend.config import RuntimeConfig
+    from pie_backend.backend import Backend
     
     config = RuntimeConfig.from_args(
         hf_repo='dummy-model',
@@ -223,7 +223,7 @@ def test_kv_cache_minimal():
         device='cpu',
     )
     
-    runtime = Runtime(config)
+    runtime = Backend(config)
     
     # Check KV cache size
     total_kv_bytes = 0

@@ -24,7 +24,7 @@ except ImportError:
 # Add src to path for imports
 sys.path.insert(0, "src")
 
-from pie_device.runtime import Runtime, RuntimeConfig
+from pie_backend.backend import Backend, RuntimeConfig
 
 
 def format_chat_prompt(
@@ -81,7 +81,7 @@ def run_autoregressive_test(
     print(f"\n[2] Loading Runtime with model={model_name}...")
     config = RuntimeConfig.from_args(hf_repo=model_name)
     log_queue = queue.Queue()  # Mock log queue for testing
-    runtime = Runtime(config, log_queue=log_queue)
+    runtime = Backend(config, log_queue=log_queue)
     print(f"    Runtime loaded: {runtime.model_config.num_layers} layers")
     print(f"    Architecture: {runtime.type}")
 
@@ -225,14 +225,14 @@ def test_forward_pass_components(model_name: str = "openai/gpt-oss-20b"):
     print(f"\n[1] Loading Runtime with model={model_name}...")
     config = RuntimeConfig.from_args(hf_repo=model_name)
     log_queue = queue.Queue()  # Mock log queue for testing
-    runtime = Runtime(config, log_queue=log_queue)
+    runtime = Backend(config, log_queue=log_queue)
     device = config.device
     print(f"    Runtime loaded: {runtime.model_config.num_layers} layers")
     print(f"    Architecture: {runtime.type}")
 
     # Test handshake
     print("\n[2] Testing handshake...")
-    from pie_device import message
+    from pie_backend import message
 
     responses = runtime.handshake([message.HandshakeRequest(version="1.0")])
     print(f"    ✓ model_name: {responses[0].model_name}")

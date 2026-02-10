@@ -13,7 +13,7 @@ from dataclasses import dataclass, asdict
 
 import torch
 
-from .utils import resolve_cache_dir, resolve_adapter_path
+from pie_runtime.path import get_program_dir, get_adapter_dir
 
 # Valid weight dtype categories
 FLOAT_DTYPES = {"float32", "float16", "bfloat16", "auto"}
@@ -51,7 +51,8 @@ class RuntimeConfig:
     telemetry_endpoint: str
     telemetry_service_name: str
 
-    # Adapter storage path
+    # Derived paths (from PIE_HOME)
+    cache_dir: str
     adapter_path: str
 
     # Evaluated at runtime
@@ -132,7 +133,6 @@ class RuntimeConfig:
     def from_args(
         cls,
         hf_repo: str,
-        cache_dir: str | None = None,
         kv_page_size: int = 16,
         max_dist_size: int = 64,
         max_num_embeds: int = 128,
@@ -153,7 +153,6 @@ class RuntimeConfig:
         random_seed: int = 42,
         use_cuda_graphs: bool = True,
         tensor_parallel_size: int = 1,
-        adapter_path: str | None = None,
         dummy_mode: bool = False,
     ) -> "RuntimeConfig":
         """
@@ -184,8 +183,8 @@ class RuntimeConfig:
             Configured RuntimeConfig instance
         """
         # Resolution
-        resolved_cache_dir = resolve_cache_dir(cache_dir)
-        resolved_adapter_path = resolve_adapter_path(adapter_path)
+        resolved_cache_dir = str(get_program_dir())
+        resolved_adapter_path = str(get_adapter_dir())
 
         # Resolve devices
         resolved_devices: list[torch.device] = []

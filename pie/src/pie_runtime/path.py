@@ -36,3 +36,25 @@ def get_shell_history_path() -> Path:
 def expand_path(path_str: str) -> Path:
     """Expand ~ and environment variables in a path string."""
     return Path(os.path.expanduser(os.path.expandvars(path_str)))
+
+
+# ---- Derived paths (all under PIE_HOME) ----
+
+def get_log_dir() -> Path:
+    """Get the log directory ({PIE_HOME}/logs)."""
+    return get_pie_home() / "logs"
+
+
+def get_auth_dir() -> Path:
+    """Get the auth directory ({PIE_HOME}/auth)."""
+    return get_pie_home() / "auth"
+
+
+def get_adapter_dir() -> Path:
+    """Get the adapter storage directory ({PIE_HOME}/adapters)."""
+    return get_pie_home() / "adapters"
+
+
+def get_program_dir() -> Path:
+    """Get the program/cache directory ({PIE_HOME}/programs)."""
+    return get_pie_home() / "programs"

@@ -2,7 +2,7 @@ import torch
 from dataclasses import dataclass
 from typing import Callable, Any
 
-from pie_device.loader import Schema, Source, WeightStore
+from pie_backend.loader import Schema, Source, WeightStore
 
 
 @dataclass

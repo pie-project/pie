@@ -1,7 +1,7 @@
 """
-Runtime orchestrator for PIE backend.
+Backend for PIE inference.
 
-This module provides the main Runtime class that orchestrates inference
+This module provides the main Backend class that orchestrates inference
 by delegating to specialized components:
 - config.py: RuntimeConfig
 - batching.py: Batch
@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 
 # Re-export RuntimeConfig for backward compatibility
-__all__ = ["Runtime", "RuntimeConfig"]
+__all__ = ["Backend", "RuntimeConfig"]
 
 
 class StepTiming(NamedTuple):
@@ -112,7 +112,7 @@ class LatencyStats:
             pass  # span is closed automatically
 
 
-class Runtime:
+class Backend:
     """
     Main runtime orchestrator for PIE inference.
 
@@ -577,36 +577,6 @@ class Runtime:
     # Service Protocol Implementation
     # ========================================================================
 
-    def handshake(self, req: message.HandshakeRequest) -> message.HandshakeResponse:
-        """Handle handshake request returning model and tokenizer info."""
-        metadata = self.get_metadata()
-        template = self.get_chat_template()
-        tokenizer = self.get_tokenizer()
-
-        return message.HandshakeResponse(
-            version=metadata.get("version", "1.0.0"),
-            model_name=metadata["name"],
-            model_traits=[],
-            model_description=metadata.get("description", ""),
-            prompt_template=template["template_content"],
-            prompt_template_type=template["template_type"],
-            prompt_stop_tokens=template["stop_tokens"],
-            kv_page_size=self.config.kv_page_size,
-            max_batch_tokens=self.config.max_batch_tokens or 10240,
-            max_batch_size=self.config.max_batch_size or 128,
-            resources={
-                0: self.config.max_num_kv_pages or 0,
-                1: self.config.max_num_embeds,
-                2: self.config.max_num_adapters,
-            },
-            tokenizer_num_vocab=tokenizer["num_vocab"],
-            tokenizer_merge_table=tokenizer["merge_table"],
-            tokenizer_special_tokens=tokenizer["special_tokens"],
-            tokenizer_split_regex=tokenizer["split_regex"],
-            tokenizer_escape_non_printable=tokenizer["escape_non_printable"],
-            tokenizer_sentencepiece_space=tokenizer["sentencepiece_space"],
-        )
-
     def query(self, req: message.QueryRequest) -> message.QueryResponse:
         """Handle query request."""
         value = "unknown query"
@@ -1010,29 +980,7 @@ class Runtime:
     # RPC Method Wrappers
     # ========================================================================
 
-    def handshake_rpc(self, **kwargs) -> dict:
-        """Handle handshake RPC."""
-        req = message.HandshakeRequest(**kwargs)
-        resp = self.handshake(req)
-        return {
-            "version": resp.version,
-            "model_name": resp.model_name,
-            "model_traits": resp.model_traits,
-            "model_description": resp.model_description,
-            "prompt_template": resp.prompt_template,
-            "prompt_template_type": resp.prompt_template_type,
-            "prompt_stop_tokens": resp.prompt_stop_tokens,
-            "kv_page_size": resp.kv_page_size,
-            "max_batch_tokens": resp.max_batch_tokens,
-            "max_batch_size": resp.max_batch_size,
-            "resources": resp.resources,
-            "tokenizer_num_vocab": resp.tokenizer_num_vocab,
-            "tokenizer_merge_table": resp.tokenizer_merge_table,
-            "tokenizer_special_tokens": resp.tokenizer_special_tokens,
-            "tokenizer_split_regex": resp.tokenizer_split_regex,
-            "tokenizer_escape_non_printable": resp.tokenizer_escape_non_printable,
-            "tokenizer_sentencepiece_space": resp.tokenizer_sentencepiece_space,
-        }
+
 
     def query_rpc(self, **kwargs) -> dict:
         """Handle query RPC."""

@@ -25,9 +25,18 @@ def create_default_config_content() -> str:
 # Network settings
 host = "127.0.0.1"
 port = 8080
+verbose = false
+registry = "https://registry.pie-project.org/"
 
 # Authentication
-enable_auth = false
+[auth]
+enabled = false
+
+# Telemetry
+[telemetry]
+enabled = false
+endpoint = "http://localhost:4317"
+service_name = "pie"
 
 # Model configuration (can have multiple [[model]] sections)
 [[model]]
@@ -47,11 +56,12 @@ tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 weight_dtype = "bfloat16"
 
-# KV cache configuration  
+# KV cache configuration
 kv_page_size = 16
 
 # Batch size limits
 max_batch_tokens = 10240
+max_batch_size = 128
 
 # Distribution/sampling
 max_dist_size = 32
@@ -62,7 +72,6 @@ max_num_embeds = 128
 # Adapter (LoRA) settings
 max_num_adapters = 32
 max_adapter_rank = 8
-adapter_path = "~/.pie/adapters/"
 
 # Memory management
 gpu_mem_utilization = 0.8
@@ -70,9 +79,13 @@ gpu_mem_utilization = 0.8
 # CUDA graphs (experimental)
 use_cuda_graphs = false
 
-# Telemetry configuration
-[telemetry]
-enabled = false
-endpoint = "http://localhost:4317"
-service_name = "pie"
+# Random seed
+random_seed = 42
+
+# Scheduler settings
+[model.scheduler]
+max_in_flight_batches = 4
+request_timeout_secs = 120
+max_wait_ms = 50
+min_batch_for_optimization = 8
 """

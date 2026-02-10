@@ -15,34 +15,6 @@ import msgspec
 # ==============================================================================
 
 
-class HandshakeRequest(msgspec.Struct, gc=False):
-    """Request message for handshake with version information."""
-
-    version: str
-
-
-class HandshakeResponse(msgspec.Struct, gc=False):
-    """Response message containing model and tokenizer information."""
-
-    version: str
-    model_name: str
-    model_traits: list[str]  # Use built-in list
-    model_description: str
-    prompt_template: str
-    prompt_template_type: str
-    prompt_stop_tokens: list[str]
-    kv_page_size: int
-    max_batch_tokens: int
-    max_batch_size: int
-    resources: dict[int, int]  # Use built-in list and tuple
-    tokenizer_num_vocab: int
-    tokenizer_merge_table: dict[int, bytes]
-    tokenizer_special_tokens: dict[str, int]
-    tokenizer_split_regex: str
-    tokenizer_escape_non_printable: bool
-    tokenizer_sentencepiece_space: bool
-
-
 class QueryRequest(msgspec.Struct, gc=False):
     """Request message for querying the model."""
 

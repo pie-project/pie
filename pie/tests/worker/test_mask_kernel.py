@@ -5,7 +5,7 @@ import numpy as np
 import triton
 import triton.language as tl
 from numba import njit, prange
-from pie_device.batching import _decode_brle
+from pie_backend.batching import _decode_brle
 
 # =============================================================================
 # Numba JIT-Compiled BRLE Decoder

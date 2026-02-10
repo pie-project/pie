@@ -1,14 +1,14 @@
 import sys
 import torch
-from pie_device.runtime import Runtime, RuntimeConfig
-from pie_device import message
+from pie_backend.backend import Backend, RuntimeConfig
+from pie_backend import message
 
 
 def test_manual():
     print("Initializing Runtime...")
     try:
         config = RuntimeConfig.from_args(model="llama-3.2-1b-instruct")
-        runtime = Runtime(config)
+        runtime = Backend(config)
         print("Runtime initialized.")
     except Exception as e:
         print(f"Failed to initialize runtime: {e}")

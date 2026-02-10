@@ -56,7 +56,7 @@ def test_control_channel_group_targeting():
     print("Test: ControlChannel Group Targeting")
     print("=" * 60)
 
-    from pie_device.control_channel import ControlChannel, create_control_channels
+    from pie_backend.control_channel import ControlChannel, create_control_channels
 
     world_size = 4
     group_topology = [[0, 1], [2, 3]]  # 2 groups of 2
@@ -252,8 +252,8 @@ def _dp_integration_worker(
         device = TEST_DEVICES[rank] if rank < len(TEST_DEVICES) else f"cuda:{rank}"
         init_distributed(rank, world_size, port, device)
 
-        from pie_device.control_channel import ControlChannel
-        from pie_device import utils as pie_utils
+        from pie_backend.control_channel import ControlChannel
+        from pie_backend import utils as pie_utils
 
         # Setup control channel
         pie_utils._control_channel = ControlChannel(
@@ -329,7 +329,7 @@ def test_dp_integration():
         print(f"    [SKIP] Need {world_size} GPUs, have {torch.cuda.device_count()}")
         return True
 
-    from pie_device.control_channel import create_control_channels
+    from pie_backend.control_channel import create_control_channels
     import random
 
     port = 29500 + random.randint(0, 1000)

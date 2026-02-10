@@ -3,7 +3,7 @@ Minimal script to debug embedding weight shapes under tensor parallel loading.
 """
 
 import torch
-from pie_device.runtime import Runtime, RuntimeConfig
+from pie_backend.backend import Backend, RuntimeConfig
 
 MODEL = "qwen-3-0.6b"
 DEVICES = ["cuda:2", "cuda:3"]
@@ -15,7 +15,7 @@ print("=" * 60)
 # Single GPU test
 print("\n[1] Single GPU (cuda:2):")
 config1 = RuntimeConfig.from_args(model=MODEL, device=DEVICES[0])
-runtime1 = Runtime(config1)
+runtime1 = Backend(config1)
 
 embed_weight = runtime1.engine.weights.get("embed_token")
 print(f"    Config: rank={config1.rank}, world_size={config1.world_size}")
@@ -41,7 +41,7 @@ print(
 )
 
 # Load model with this config
-runtime2 = Runtime(config2_r0)
+runtime2 = Backend(config2_r0)
 embed_weight2 = runtime2.engine.weights.get("embed_token")
 print(f"    Embed weight shape: {embed_weight2.shape}")
 

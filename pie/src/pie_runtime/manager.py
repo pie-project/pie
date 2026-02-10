@@ -180,14 +180,12 @@ def _build_backend_config(
 
     config = {
         "hf_repo": model_config.get("hf_repo"),
-        "cache_dir": model_config.get("cache_dir"),
         "kv_page_size": model_config.get("kv_page_size", 16),
         "max_dist_size": model_config.get("max_dist_size", 64),
         "max_num_embeds": model_config.get("max_num_embeds", 128),
         "max_batch_tokens": model_config.get("max_batch_tokens", 10240),
         "max_num_adapters": model_config.get("max_num_adapters", 48),
         "max_adapter_rank": model_config.get("max_adapter_rank", 8),
-        "adapter_path": model_config.get("adapter_path"),
         "gpu_mem_utilization": model_config.get("gpu_mem_utilization", 0.9),
         "max_batch_size": model_config.get("max_batch_size", 128),
         "activation_dtype": model_config.get("activation_dtype", "bfloat16"),
@@ -433,7 +431,7 @@ def _start_multi_gpu_ffi_backend(
     ready_queue.close()
     ready_queue.join_thread()
 
-    # Phase 2: Complete initialization (blocks until handshake succeeds)
+    # Phase 2: Complete initialization
     # All workers are now connected via IPC
     server_handle = partial_handle.complete()
 
@@ -492,8 +490,8 @@ def _ipc_worker_process(
         ready_queue: Queue to signal when ready
     """
     from pie_runtime import _pie
-    from pie_device.runtime import Runtime
-    from pie_device.config import RuntimeConfig
+    from pie_backend.backend import Backend
+    from pie_backend.config import RuntimeConfig
     import torch.distributed as dist
     import torch
 
@@ -527,7 +525,7 @@ def _ipc_worker_process(
                 torch.cuda.set_device(device_str)
 
         # Setup process groups (collective ops - all ranks must participate)
-        # Capture the mappings to pass to Runtime
+        # Capture the mappings to pass to Backend
         if world_size > 1:
             pg_map = _setup_process_groups(rank, group_topology)
             compute_pg_map = _setup_compute_process_groups(rank, group_topology)
@@ -562,7 +560,7 @@ def _ipc_worker_process(
 
     # Create runtime (loads model on this GPU)
     # Pass process groups for TP communication
-    runtime = Runtime(
+    runtime = Backend(
         config,
         group_id=my_group_id,
         process_groups=pg_map,
@@ -607,10 +605,10 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
 
     Args:
         ipc_queue: FfiIpcQueue instance connected to Rust
-        runtime: Runtime instance to dispatch calls to
+        runtime: Backend instance to dispatch calls to
     """
     import msgpack
-    from pie_device.server import (
+    from pie_backend.server import (
         STATUS_OK,
         STATUS_METHOD_NOT_FOUND,
         STATUS_INTERNAL_ERROR,
@@ -618,7 +616,6 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
 
     # Method dispatch table
     methods = {
-        "handshake": runtime.handshake_rpc,
         "query": runtime.query_rpc,
         "fire_batch": runtime.fire_batch,
         "embed_image": runtime.embed_image_rpc,
@@ -716,8 +713,8 @@ def _ipc_group_worker(
         device: Device string (e.g., "cuda:0")
     """
     from pie_runtime import _pie
-    from pie_device.runtime import Runtime
-    from pie_device.config import RuntimeConfig
+    from pie_backend.backend import Backend
+    from pie_backend.config import RuntimeConfig
 
     # Create runtime config for this group
     filtered_config = {
@@ -732,7 +729,7 @@ def _ipc_group_worker(
     )
 
     # Create runtime (loads model on this GPU)
-    runtime = Runtime(config, group_id=group_id)
+    runtime = Backend(config, group_id=group_id)
 
     # Connect to IPC and run worker loop
     ipc_queue = _pie.FfiIpcQueue.connect(server_name, group_id)
@@ -849,7 +846,7 @@ def terminate_engine_and_backend(
         "ignore", message=".*leaked semaphore.*", category=UserWarning
     )
 
-    from pie_device import utils as pie_utils
+    from pie_backend import utils as pie_utils
 
     def log(msg: str):
         if on_message:
@@ -937,7 +934,7 @@ def terminate_engine_and_backend(
             pie_utils._control_channel = None
 
     except ImportError:
-        pass  # pie_device might not be installed or importable
+        pass  # pie_backend might not be installed or importable
     except Exception as e:
         log(f"Error cleaning up control channel: {e}")
 

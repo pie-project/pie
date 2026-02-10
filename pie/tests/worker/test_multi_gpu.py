@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from pie_device.runtime import Runtime, RuntimeConfig
+from pie_backend.backend import Backend, RuntimeConfig
 
 
 # Default test model - use a small model for faster testing
@@ -53,7 +53,7 @@ def test_single_gpu_embed_tokens():
     from multiprocessing import Queue
 
     mock_log_queue = Queue()
-    runtime = Runtime(config, log_queue=mock_log_queue)
+    runtime = Backend(config, log_queue=mock_log_queue)
     device = config.device
 
     print(f"\n[1] Testing embed_tokens on {device}...")
@@ -89,7 +89,7 @@ def test_single_gpu_embed_inputs():
     from multiprocessing import Queue
 
     mock_log_queue = Queue()
-    runtime = Runtime(config, log_queue=mock_log_queue)
+    runtime = Backend(config, log_queue=mock_log_queue)
     device = config.device
 
     print(f"\n[1] Testing embed_inputs on {device}...")
@@ -125,7 +125,7 @@ def test_single_gpu_forward_pass():
     from multiprocessing import Queue
 
     mock_log_queue = Queue()
-    runtime = Runtime(config, log_queue=mock_log_queue)
+    runtime = Backend(config, log_queue=mock_log_queue)
     device = config.device
 
     print(f"\n[1] Testing full forward pass on {device}...")
@@ -175,7 +175,7 @@ def _multi_gpu_worker(rank: int, world_size: int, port: int, test_fn: str):
         from multiprocessing import Queue
 
         mock_log_queue = Queue()
-        runtime = Runtime(config, log_queue=mock_log_queue)
+        runtime = Backend(config, log_queue=mock_log_queue)
         device = config.device
 
         if rank == 0:
