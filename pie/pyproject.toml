@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pie-server"
-version = "0.2.5"
+version = "0.3.0"
 description = "Programmable Inference Engine"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -136,8 +136,8 @@ flashinfer-jit-cache = [
 
 [tool.maturin]
 python-source = "src"
-python-packages = ["pie", "pie_cli", "pie_worker", "flashinfer_metal"]
-module-name = "pie._pie"
+python-packages = ["pie_runtime", "pie_cli", "pie_device", "flashinfer_metal"]
+module-name = "pie_runtime._pie"
 manifest-path = "../runtime/Cargo.toml"
 features = ["pyo3/extension-module"]
 

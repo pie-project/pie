@@ -1,6 +1,6 @@
 [package]
 name = "pie"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Pie Team"]
 description = "Programmable Inference Engine (Pie)"
@@ -66,7 +66,6 @@ crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 bytemuck = { version = "1.21", features = ["derive"] }
 ipc-channel = "0.19"
 rustc-hash = "2.1"
-
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,4 +1,4 @@
-"""Pie - Core logic for the Pie Inference Engine."""
+"""Pie Runtime - Core logic for the Pie Inference Engine."""
 
 __version__ = "0.1.0"
 

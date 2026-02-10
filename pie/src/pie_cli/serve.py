@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from pie import path as pie_path
+from pie_runtime import path as pie_path
 
 console = Console()
 
@@ -159,7 +159,7 @@ def serve(
 
     try:
         # Start engine and backends
-        from pie import manager
+        from pie_runtime import manager
 
         server_handle, backend_processes = manager.start_engine_and_backend(
             engine_config, model_configs, console=console
@@ -221,7 +221,7 @@ def serve(
             manager.terminate_engine_and_backend(server_handle, backend_processes)
         console.print("[green]✓[/green] Shutdown complete")
     except Exception as e:
-        from pie import manager
+        from pie_runtime import manager
 
         if isinstance(e, manager.EngineError):
             console.print(f"[red]✗[/red] {e}")

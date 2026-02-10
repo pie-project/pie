@@ -491,9 +491,9 @@ def _ipc_worker_process(
         ipc_server_names: IPC server names for each group
         ready_queue: Queue to signal when ready
     """
-    from pie import _pie
-    from pie_worker.runtime import Runtime
-    from pie_worker.config import RuntimeConfig
+    from pie_runtime import _pie
+    from pie_device.runtime import Runtime
+    from pie_device.config import RuntimeConfig
     import torch.distributed as dist
     import torch
 
@@ -610,7 +610,7 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
         runtime: Runtime instance to dispatch calls to
     """
     import msgpack
-    from pie_worker.server import (
+    from pie_device.server import (
         STATUS_OK,
         STATUS_METHOD_NOT_FOUND,
         STATUS_INTERNAL_ERROR,
@@ -715,9 +715,9 @@ def _ipc_group_worker(
         config_dict: Runtime configuration
         device: Device string (e.g., "cuda:0")
     """
-    from pie import _pie
-    from pie_worker.runtime import Runtime
-    from pie_worker.config import RuntimeConfig
+    from pie_runtime import _pie
+    from pie_device.runtime import Runtime
+    from pie_device.config import RuntimeConfig
 
     # Create runtime config for this group
     filtered_config = {
@@ -849,7 +849,7 @@ def terminate_engine_and_backend(
         "ignore", message=".*leaked semaphore.*", category=UserWarning
     )
 
-    from pie_worker import utils as pie_utils
+    from pie_device import utils as pie_utils
 
     def log(msg: str):
         if on_message:
@@ -937,7 +937,7 @@ def terminate_engine_and_backend(
             pie_utils._control_channel = None
 
     except ImportError:
-        pass  # pie_worker might not be installed or importable
+        pass  # pie_device might not be installed or importable
     except Exception as e:
         log(f"Error cleaning up control channel: {e}")
 

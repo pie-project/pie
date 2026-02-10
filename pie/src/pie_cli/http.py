@@ -102,7 +102,7 @@ def http(
 
     try:
         # Start engine and backends
-        from pie import manager
+        from pie_runtime import manager
 
         server_handle, backend_processes = manager.start_engine_and_backend(
             engine_config, model_configs, console=console
@@ -143,7 +143,7 @@ def http(
         console.print("[green]✓[/green] Server stopped")
         raise typer.Exit(0)
     except Exception as e:
-        from pie import manager
+        from pie_runtime import manager
 
         if isinstance(e, manager.EngineError):
             console.print(f"[red]✗[/red] {e}")

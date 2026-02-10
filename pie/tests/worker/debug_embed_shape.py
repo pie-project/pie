@@ -3,7 +3,7 @@ Minimal script to debug embedding weight shapes under tensor parallel loading.
 """
 
 import torch
-from pie_worker.runtime import Runtime, RuntimeConfig
+from pie_device.runtime import Runtime, RuntimeConfig
 
 MODEL = "qwen-3-0.6b"
 DEVICES = ["cuda:2", "cuda:3"]

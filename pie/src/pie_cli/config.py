@@ -13,8 +13,8 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
-from pie import path as pie_path
-from pie.config import create_default_config_content, DEFAULT_MODEL
+from pie_runtime import path as pie_path
+from pie_runtime.config import create_default_config_content, DEFAULT_MODEL
 from huggingface_hub import scan_cache_dir
 
 console = Console()

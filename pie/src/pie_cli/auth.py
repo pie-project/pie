@@ -13,8 +13,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from pie import path as pie_path
-from pie.auth import load_authorized_users, save_authorized_users
+from pie_runtime import path as pie_path
+from pie_runtime.auth import load_authorized_users, save_authorized_users
 
 console = Console()
 app = typer.Typer(help="Manage authorized clients")

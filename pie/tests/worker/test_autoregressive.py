@@ -24,7 +24,7 @@ except ImportError:
 # Add src to path for imports
 sys.path.insert(0, "src")
 
-from pie_worker.runtime import Runtime, RuntimeConfig
+from pie_device.runtime import Runtime, RuntimeConfig
 
 
 def format_chat_prompt(
@@ -232,7 +232,7 @@ def test_forward_pass_components(model_name: str = "openai/gpt-oss-20b"):
 
     # Test handshake
     print("\n[2] Testing handshake...")
-    from pie_worker import message
+    from pie_device import message
 
     responses = runtime.handshake([message.HandshakeRequest(version="1.0")])
     print(f"    ✓ model_name: {responses[0].model_name}")

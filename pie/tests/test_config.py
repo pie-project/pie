@@ -8,7 +8,7 @@ import pytest
 import toml
 from typer.testing import CliRunner
 
-from pie import config
+from pie_runtime import config
 from pie_cli.cli import app
 
 runner = CliRunner()

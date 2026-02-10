@@ -30,7 +30,7 @@ def test_runtime_config():
     print("TEST 2: RuntimeConfig with dummy_mode")
     print("=" * 60)
     
-    from pie_worker.config import RuntimeConfig
+    from pie_device.config import RuntimeConfig
     
     config = RuntimeConfig.from_args(
         hf_repo='dummy-model',
@@ -51,8 +51,8 @@ def test_runtime_initialization():
     print("TEST 3: Runtime initialization in dummy mode")
     print("=" * 60)
     
-    from pie_worker.config import RuntimeConfig
-    from pie_worker.runtime import Runtime
+    from pie_device.config import RuntimeConfig
+    from pie_device.runtime import Runtime
     
     config = RuntimeConfig.from_args(
         hf_repo='dummy-model',
@@ -191,7 +191,7 @@ def test_handshake(runtime):
     print("TEST 8: Handshake RPC")
     print("=" * 60)
     
-    from pie_worker.message import HandshakeRequest
+    from pie_device.message import HandshakeRequest
     
     request = HandshakeRequest(version="1.0.0")
     response = runtime.handshake(request)
@@ -214,8 +214,8 @@ def test_kv_cache_minimal():
     print("TEST 9: KV cache is minimal")
     print("=" * 60)
     
-    from pie_worker.config import RuntimeConfig
-    from pie_worker.runtime import Runtime
+    from pie_device.config import RuntimeConfig
+    from pie_device.runtime import Runtime
     
     config = RuntimeConfig.from_args(
         hf_repo='dummy-model',

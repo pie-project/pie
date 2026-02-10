@@ -1,6 +1,6 @@
 import torch
-from pie_worker.config import RuntimeConfig
-from pie_worker.model.llama3 import ModelConfig as Llama3Config
+from pie_device.config import RuntimeConfig
+from pie_device.model.llama3 import ModelConfig as Llama3Config
 
 
 def test_gpu_mem_utilization():
