@@ -27,7 +27,7 @@ def poll_rpc_server(
 
     This is the main worker loop that polls a Python-hosted RpcServer
     for incoming requests from the Rust runtime. The server was created
-    via `_pie.RpcServer.create()` and its `server_name` was passed to
+    via `pie_runtime.RpcServer.create()` and its `server_name` was passed to
     Rust through the Config so Rust can connect as an RpcClient.
 
     Args:

@@ -54,7 +54,7 @@ class ModelConfig:
 
 
 @dataclass
-class EngineConfig:
+class Config:
     """Top-level engine configuration.
 
     This is the single source of truth passed through the system,
@@ -76,27 +76,3 @@ class EngineConfig:
         if not self.models:
             raise ValueError("No model configuration found")
         return self.models[0]
-
-    def to_legacy_dicts(self) -> tuple[dict, list[dict]]:
-        """Convert to legacy (engine_dict, model_dicts) pair.
-
-        Temporary bridge until engine/process.py accepts EngineConfig directly.
-        """
-        from dataclasses import asdict
-
-        engine_dict = {
-            "host": self.host,
-            "port": self.port,
-            "verbose": self.verbose,
-            "registry": self.registry,
-            "auth": asdict(self.auth),
-            "telemetry": asdict(self.telemetry),
-        }
-
-        model_dicts = []
-        for m in self.models:
-            d = asdict(m)
-            d.pop("name", None)
-            model_dicts.append(d)
-
-        return engine_dict, model_dicts

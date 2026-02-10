@@ -12,7 +12,7 @@ from rich.console import Console
 
 from pie_cli.config import load_config
 from pie_cli.display import inferlet_panel
-from pie_cli.engine.lifecycle import run as engine_run, RunMode, InferletSpec
+from pie_cli.runtime import oneshot
 
 console = Console()
 
@@ -72,11 +72,11 @@ def run(
     inferlet_panel(cfg, inferlet_display, title="Pie Run", console=console)
     console.print()
 
-    spec = InferletSpec(
-        name=inferlet,
+    oneshot(
+        cfg,
+        program_name=inferlet,
+        arguments=arguments or [],
         wasm_path=path,
         manifest_path=manifest,
-        arguments=arguments or [],
+        console=console,
     )
-
-    engine_run(cfg, RunMode.RUN, inferlet=spec, console=console)

@@ -4,7 +4,7 @@ from pie_cli.config.schema import (
     AuthConfig,
     TelemetryConfig,
     ModelConfig,
-    EngineConfig,
+    Config,
 )
 from pie_cli.config.loader import load_config
 from pie_cli.config.defaults import DEFAULT_MODEL, create_default_config_content
@@ -14,7 +14,7 @@ __all__ = [
     "AuthConfig",
     "TelemetryConfig",
     "ModelConfig",
-    "EngineConfig",
+    "Config",
     "load_config",
     "DEFAULT_MODEL",
     "create_default_config_content",

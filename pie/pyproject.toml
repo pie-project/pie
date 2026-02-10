@@ -137,7 +137,7 @@ flashinfer-jit-cache = [
 [tool.maturin]
 python-source = "src"
 python-packages = ["pie_cli", "pie_backend", "flashinfer_metal"]
-module-name = "pie_backend._pie"
+module-name = "pie_runtime"
 manifest-path = "../runtime/Cargo.toml"
 features = ["pyo3/extension-module"]
 

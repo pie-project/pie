@@ -11,7 +11,7 @@ from rich.console import Console
 
 from pie_cli.config import load_config
 from pie_cli.display import engine_panel
-from pie_cli.engine.lifecycle import run, RunMode
+from pie_cli.runtime import serve as runtime_serve
 
 console = Console()
 
@@ -60,4 +60,4 @@ def serve(
     engine_panel(cfg, console=console)
     console.print()
 
-    run(cfg, RunMode.SERVE, monitor=monitor, console=console)
+    runtime_serve(cfg, monitor=monitor, console=console)

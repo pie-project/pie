@@ -135,7 +135,7 @@ def worker_main(
         group_topology: List of groups, each containing ranks
         ready_queue: Queue to signal readiness: (rank, server_name|None, metadata|None)
     """
-    from pie_backend import _pie
+    import pie_runtime
     from pie_backend.backend import Backend
     from pie_backend.config import RuntimeConfig
     from pie_backend.server import poll_rpc_server
@@ -208,7 +208,7 @@ def worker_main(
     try:
         if is_group_leader:
             # Create RPC server for Rust to connect to
-            server = _pie.RpcServer.create()
+            server = pie_runtime.RpcServer.create()
             server_name = server.server_name()
 
             chat_template_info = runtime.get_chat_template()

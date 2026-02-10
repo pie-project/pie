@@ -439,9 +439,9 @@ fn py_bootstrap(py: Python<'_>, config: Config) -> PyResult<RuntimeHandle> {
 // Python Module
 // =============================================================================
 
-/// Python module definition for _pie
+/// Python module definition for pie_runtime
 #[pymodule]
-pub fn _pie(m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn pie_runtime(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Config>()?;
     m.add_class::<ModelConfig>()?;
     m.add_class::<DeviceConfig>()?;

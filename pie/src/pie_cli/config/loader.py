@@ -1,6 +1,6 @@
 """Configuration loading and merging for Pie.
 
-Reads TOML config files and merges CLI overrides into typed EngineConfig.
+Reads TOML config files and merges CLI overrides into typed Config.
 Extracted from serve.py's load_config().
 """
 
@@ -14,7 +14,7 @@ import toml
 from pie_cli import path as pie_path
 from pie_cli.config.schema import (
     AuthConfig,
-    EngineConfig,
+    Config,
     ModelConfig,
     TelemetryConfig,
 )
@@ -30,7 +30,7 @@ def load_config(
     verbose: bool = False,
     registry: str | None = None,
     dummy_mode: bool = False,
-) -> EngineConfig:
+) -> Config:
     """Load configuration from TOML file and merge CLI overrides.
 
     Args:
@@ -44,7 +44,7 @@ def load_config(
         dummy_mode: Enable dummy mode on all models.
 
     Returns:
-        Fully resolved EngineConfig.
+        Fully resolved Config.
 
     Raises:
         FileNotFoundError: If config file does not exist.
@@ -104,7 +104,7 @@ def load_config(
         )
         models.append(m)
 
-    return EngineConfig(
+    return Config(
         host=host or engine_section.get("host", raw.get("host", "127.0.0.1")),
         port=port or engine_section.get("port", raw.get("port", 8080)),
         verbose=verbose or engine_section.get("verbose", raw.get("verbose", False)),

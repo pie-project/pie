@@ -6,7 +6,7 @@ This module defines the main Typer application and registers all subcommands.
 import typer
 
 from pie_cli import config
-from pie_cli.commands import serve, run, http
+from pie_cli.commands import serve, run
 from pie_cli.commands.model import app as model_app
 from pie_cli.commands.auth import app as auth_app
 from pie_cli.commands.doctor import doctor
@@ -20,7 +20,6 @@ app = typer.Typer(
 # Register top-level commands
 app.command()(serve)
 app.command()(run)
-app.command()(http)
 app.command()(doctor)
 
 # Register subcommand groups
