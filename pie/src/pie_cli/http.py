@@ -103,7 +103,7 @@ def http(
         # Start engine and backends
         from pie_runtime import manager
 
-        server_handle, backend_processes = manager.start_engine_and_backend(
+        server_handle, backend_processes = manager.start(
             engine_config, model_configs, console=console
         )
 
@@ -138,7 +138,7 @@ def http(
         console.print()
         console.print("[yellow]![/yellow] Interrupted")
         with console.status("[dim]Shutting down...[/dim]"):
-            manager.terminate_engine_and_backend(server_handle, backend_processes)
+            manager.terminate(server_handle, backend_processes)
         console.print("[green]✓[/green] Server stopped")
         raise typer.Exit(0)
     except Exception as e:
@@ -146,10 +146,10 @@ def http(
 
         if isinstance(e, manager.EngineError):
             console.print(f"[red]✗[/red] {e}")
-            manager.terminate_engine_and_backend(server_handle, backend_processes)
+            manager.terminate(server_handle, backend_processes)
             raise typer.Exit(1)
         console.print(f"[red]✗[/red] Error: {e}")
-        manager.terminate_engine_and_backend(server_handle, backend_processes)
+        manager.terminate(server_handle, backend_processes)
         raise typer.Exit(1)
 
 

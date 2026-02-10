@@ -2,7 +2,6 @@ import os
 import platform
 import sys
 import traceback
-from pathlib import Path
 import psutil
 from typing import Any
 

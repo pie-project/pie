@@ -502,14 +502,6 @@ class Backend:
     # Metadata Accessors
     # ========================================================================
 
-    def get_metadata(self) -> dict:
-        """Get model metadata."""
-        return {
-            "name": self.config.hf_repo,
-            "description": "",
-            "version": "1.0.0",
-        }
-
     def get_chat_template(self) -> dict:
         """Get chat template configuration based on model type."""
         template: ChatTemplate | None = None
@@ -545,33 +537,6 @@ class Backend:
             "stop_tokens": [],
         }
 
-    def get_tokenizer(self) -> dict:
-        """Get tokenizer configuration with merge table from HuggingFace."""
-        if self.snapshot_dir is None:
-            return {
-                "type": "bpe",
-                "num_vocab": self.engine.weights.get("embed_token").shape[0],
-                "merge_table": {},
-                "split_regex": "",
-                "special_tokens": {},
-                "escape_non_printable": False,
-                "sentencepiece_space": False,
-            }
-
-        # Load tokenizer info from HuggingFace
-        tokenizer_info = hf_utils.load_hf_tokenizer(self.snapshot_dir)
-
-        return {
-            "type": tokenizer_info.get("type", "bpe"),
-            "num_vocab": tokenizer_info.get(
-                "num_vocab", self.engine.weights.get("embed_token").shape[0]
-            ),
-            "merge_table": tokenizer_info.get("merge_table", {}),
-            "split_regex": tokenizer_info.get("split_regex", ""),
-            "special_tokens": tokenizer_info.get("special_tokens", {}),
-            "escape_non_printable": tokenizer_info.get("escape_non_printable", False),
-            "sentencepiece_space": tokenizer_info.get("sentencepiece_space", False),
-        }
 
     # ========================================================================
     # Service Protocol Implementation

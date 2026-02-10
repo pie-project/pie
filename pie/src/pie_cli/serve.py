@@ -161,7 +161,7 @@ def serve(
         # Start engine and backends
         from pie_runtime import manager
 
-        server_handle, backend_processes = manager.start_engine_and_backend(
+        server_handle, backend_processes = manager.start(
             engine_config, model_configs, console=console
         )
 
@@ -196,7 +196,7 @@ def serve(
             try:
                 # Keep running while processes are alive
                 while True:
-                    if not manager.check_backend_processes(backend_processes):
+                    if not manager.check(backend_processes):
                         typer.echo("[red]A backend process died. Shutting down.[/red]")
                         break
 
@@ -212,13 +212,13 @@ def serve(
         # Cleanup
         console.print()
         with console.status("[dim]Shutting down...[/dim]"):
-            manager.terminate_engine_and_backend(server_handle, backend_processes)
+            manager.terminate(server_handle, backend_processes)
         console.print("[green]✓[/green] Shutdown complete")
 
     except KeyboardInterrupt:
         console.print()
         with console.status("[dim]Shutting down...[/dim]"):
-            manager.terminate_engine_and_backend(server_handle, backend_processes)
+            manager.terminate(server_handle, backend_processes)
         console.print("[green]✓[/green] Shutdown complete")
     except Exception as e:
         from pie_runtime import manager
@@ -227,5 +227,5 @@ def serve(
             console.print(f"[red]✗[/red] {e}")
             raise typer.Exit(1)
         console.print(f"[red]✗[/red] Error: {e}")
-        manager.terminate_engine_and_backend(server_handle, backend_processes)
+        manager.terminate(server_handle, backend_processes)
         raise typer.Exit(1)

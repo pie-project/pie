@@ -1,4 +1,4 @@
-//! HuggingFace `tokenizer.json` → tokenizer-mini loader.
+//! HuggingFace `tokenizer.json` loader.
 //!
 //! # HF Tokenizer Architecture (reference: `tokenizers/tokenizers/src/`)
 //!
@@ -13,16 +13,17 @@
 //!
 //! ## How tokenizer-mini maps this
 //!
-//! tokenizer-mini collapses the first two stages into `Vec<PreStep>` and the
-//! last stage into `Vec<DecodeStep>`.  The `Model` is always BPE, stored as a
-//! [`BpeTable`].
+//! tokenizer-mini collapses the first two stages into `Vec<NormStep>` (text
+//! normalization) + `SplitStep` (splitting strategy) and the last stage into
+//! `Vec<DecodeStep>`.  The `Model` is always BPE, stored as a [`BpeTable`].
 //!
 //! There are two atom modes:
 //!
 //! | Mode            | HF source type     | How vocab is keyed        |
 //! |-----------------|--------------------|---------------------------|
-//! | `AtomMode::Byte`| `ByteLevel`        | Raw bytes (GPT-2 remap)   |
-//! | `AtomMode::Char`| `Metaspace` + others| UTF-8 strings            |
+//! | `VocabType::ByteLevel`    | `ByteLevel`        | Raw bytes (GPT-2 remap)   |
+//! | `VocabType::ByteFallback` | `Metaspace` + others| UTF-8 strings            |
+//! | `VocabType::CharLevel`    | `Metaspace` + others| UTF-8 strings            |
 //!
 //! ## JSON structure overview
 //!
@@ -49,7 +50,7 @@ use serde::Deserialize;
 
 use super::bpe::BpeTable;
 use super::{
-    AddedToken, AtomMode, DecodeStep, PreStep, Tokenizer,
+    AddedToken, DecodeStep, NormStep, SplitStep, Tokenizer, VocabType,
 };
 
 /// The classic GPT-2 regex.
@@ -112,8 +113,9 @@ struct HfModel {
     vocab: HashMap<String, u32>,
 
     /// Merge rules. Two formats exist:
-    /// - Legacy: `"a b"` (space-separated string)
-    /// - Tuple: `["a", "b"]`
+    ///   - Legacy: `"a b"` (space-separated string)
+    ///   - Tuple: `["a", "b"]`
+    ///
     /// HF ref: `models/bpe/serialization.rs` `MergeType` enum.
     #[serde(default)]
     merges: Vec<serde_json::Value>,
@@ -191,7 +193,9 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
     let normalizer_val = hf.normalizer.as_ref().unwrap_or(&serde_json::Value::Null);
     let decoder_val = hf.decoder.as_ref().unwrap_or(&serde_json::Value::Null);
 
-    let is_byte_level = has_type_in_tree(pre_tokenizer_val, "ByteLevel");
+    // Build encode pipeline (normalizer + pre-tokenizer → NormStep + SplitStep).
+    let (is_byte_level, norm_steps, split_step) =
+        build_pipeline(pre_tokenizer_val, normalizer_val)?;
 
     // Build BPE table.
     // For ByteLevel models, vocab keys are GPT-2-remapped unicode (e.g. "Ġ" = 0x20).
@@ -211,8 +215,14 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
         .as_ref()
         .and_then(|t| hf.model.vocab.get(t).copied());
 
-    // Build encode pipeline (normalizer + pre-tokenizer → Vec<PreStep>).
-    let (atom_mode, pre_steps) = build_pipeline(pre_tokenizer_val, normalizer_val)?;
+    // Derive VocabType from the two independent flags.
+    let vocab_type = if is_byte_level {
+        VocabType::ByteLevel
+    } else if byte_fallback {
+        VocabType::ByteFallback
+    } else {
+        VocabType::CharLevel
+    };
 
     // Build decode pipeline (decoder → Vec<DecodeStep>).
     // ByteLevel models need no decode steps — the raw-byte keying means
@@ -236,56 +246,51 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
 
     Ok(Tokenizer::new(
         bpe,
-        atom_mode,
-        pre_steps,
+        vocab_type,
+        norm_steps,
+        split_step,
         decode_steps,
-        byte_fallback,
         unk_token_id,
         added_tokens,
     ))
 }
 
 // ---------------------------------------------------------------------------
-// Unified pipeline builder (normalizer + pre-tokenizer → PreStep)
+// Pipeline builder (normalizer → NormStep, pre-tokenizer → SplitStep)
 // ---------------------------------------------------------------------------
 //
 // HF splits text processing into separate Normalizer and PreTokenizer traits,
 // each with many implementors (NFC, Replace, ByteLevel, Metaspace, Split, …).
-// We flatten both into a single ordered `Vec<PreStep>`.
 //
-// This function walks the flattened node list from both JSON subtrees and
-// emits the corresponding `PreStep` for each node type.
+// tokenizer-mini separates these into two phases:
+//   - `Vec<NormStep>`: text normalization (NFC, prepend space, replace)
+//   - `SplitStep`: exactly one splitting strategy (GPT-2 regex, isolated
+//     regex, metaspace, or none)
 
 fn build_pipeline(
     pre_tokenizer: &serde_json::Value,
     normalizer: &serde_json::Value,
-) -> Result<(AtomMode, Vec<PreStep>)> {
-    let mut steps = Vec::new();
-    let mut atom_mode = AtomMode::Char;
+) -> Result<(bool, Vec<NormStep>, SplitStep)> {
+    let mut norm_steps = Vec::new();
+    let mut split_step = SplitStep::None;
+    let mut is_byte_level = false;
 
     // ── Normalizer passes ──────────────────────────────────────────────
     //
     // HF ref: `normalizers/unicode.rs` `NFC` — applies Unicode NFC.
-    // We detect it by searching the normalizer tree for a node with
-    // `"type":"NFC"`.
     if has_type_in_tree(normalizer, "NFC") {
-        steps.push(PreStep::Nfc);
+        norm_steps.push(NormStep::Nfc);
     }
 
     // HF ref: `normalizers/replace.rs` `Replace`.
-    // Pattern can be `{"String":"..."}` or `{"Regex":"..."}`.
-    // tokenizer-mini only handles `String` patterns (sufficient for all
-    // models we support: Gemma, LLaMA, Mistral normalizers use string
-    // replacement, e.g. replacing `" "` → `"▁"`).
+    // Only `String` patterns are supported (sufficient for Gemma, LLaMA,
+    // Mistral normalizers).
     for (from, to) in collect_norm_replacements(normalizer) {
-        steps.push(PreStep::Replace { from, to });
+        norm_steps.push(NormStep::Replace { from, to });
     }
 
     // HF ref: `normalizers/prepend.rs` `Prepend`.
-    // Unconditionally prepends a string to the text.
-    // Llama-2 uses `{"type":"Prepend","prepend":"▁"}` in its normalizer
-    // (instead of a Metaspace pre-tokenizer). We detect this so the
-    // fallback MetaspaceSplit passthrough can use `prepend: Some(false)`.
+    // Llama-2 uses `{"type":"Prepend","prepend":"▁"}` in its normalizer.
     let normalizer_prepend = has_prepend_in_tree(normalizer);
 
     // ── Pre-tokenizer passes ───────────────────────────────────────────
@@ -300,25 +305,12 @@ fn build_pipeline(
             //
             // HF ref: `pre_tokenizers/byte_level.rs` `ByteLevel`.
             //
-            // In HF, ByteLevel serves three roles simultaneously:
-            //   1. PreTokenizer: optionally prepend space + split via GPT-2 regex
-            //   2. PostProcessor: trim offsets (we don't track offsets)
-            //   3. Decoder: invert GPT-2 byte mapping (we handle via raw-byte keying)
-            //
             // Fields:
-            //   - `add_prefix_space` (bool, default true in HF, false in modern models):
-            //       If true, prepend a space before the first word.
-            //       → maps to `PreStep::PrependSpace`
-            //   - `use_regex` (bool, default true):
-            //       If true, split text using the GPT-2 regex.
-            //       → maps to `PreStep::Gpt2RegexSplit`
-            //       If false, the text is NOT split by ByteLevel itself;
-            //       other Split nodes in the Sequence handle splitting
-            //       (e.g. LLaMA-3, Qwen3, DeepSeek).
-            //   - `trim_offsets` (bool): only relevant for offset tracking,
-            //       which tokenizer-mini does not implement → ignored.
+            //   - `add_prefix_space` → NormStep::PrependSpace
+            //   - `use_regex` (default true) → SplitStep::Gpt2RegexSplit
+            //     When false, a separate Split node handles splitting.
             "ByteLevel" => {
-                atom_mode = AtomMode::Byte;
+                is_byte_level = true;
 
                 let add_prefix_space = node
                     .get("add_prefix_space")
@@ -331,51 +323,25 @@ fn build_pipeline(
                     .unwrap_or(true);
 
                 if add_prefix_space {
-                    steps.push(PreStep::PrependSpace);
+                    norm_steps.push(NormStep::PrependSpace);
                 }
 
                 if use_regex {
-                    // Classic GPT-2 path: remap → split via regex → unmap.
-                    // tokenizer-mini fuses all three into a single PreStep.
                     let re = fancy_regex::Regex::new(GPT2_REGEX)
                         .context("compiling GPT-2 regex")?;
-                    steps.push(PreStep::Gpt2RegexSplit(re));
+                    split_step = SplitStep::Gpt2RegexSplit(re);
                 }
-                // When `use_regex: false`, no splits happen inside ByteLevel.
-                // The Sequence will contain separate Split nodes that we
-                // handle in the "Split" arm below.
             }
 
             // ── Metaspace ──────────────────────────────────────────
             //
             // HF ref: `pre_tokenizers/metaspace.rs` `Metaspace`.
             //
-            // In HF, Metaspace also serves as both PreTokenizer and Decoder.
-            // As a PreTokenizer it does two things:
-            //   1. Replace all spaces with `replacement` char (default `'▁'`)
-            //   2. Optionally prepend `replacement` + split on it
-            //
             // Fields:
-            //   - `replacement` (char, default '▁'): the metaspace character
-            //   - `prepend_scheme` (str, default "always"): one of:
-            //       "always" → prepend to every piece
-            //       "first"  → prepend only to the first piece
-            //                   (HF checks `offsets_original().0 == 0`)
-            //       "never"  → no prepending
-            //   - `add_prefix_space` (bool): legacy field, now redundant.
-            //       HF: if `false` AND `prepend_scheme != Never`, raises error.
-            //       We simplify: `add_prefix_space=false` → force `Never`.
-            //   - `split` (bool, default true):
-            //       If true, split on `replacement` with behavior
-            //       `MergedWithNext` (each piece includes leading `replacement`).
-            //
-            // tokenizer-mini maps to `PreStep::MetaspaceSplit`:
-            //   - `replacement` / `replacement_str`: the char and its string form
-            //   - `prepend: Option<bool>`:
-            //       None        → "never"  (no prepend)
-            //       Some(false) → "first"  (first piece only)
-            //       Some(true)  → "always" (all pieces)
-            //   - `split`: whether to split on the replacement char
+            //   - `replacement` (char, default '▁')
+            //   - `prepend_scheme`: "always" | "first" | "never"
+            //   - `add_prefix_space` (legacy): false → force never
+            //   - `split` (bool, default true)
             "Metaspace" => {
                 let replacement = node
                     .get("replacement")
@@ -388,15 +354,14 @@ fn build_pipeline(
                     .and_then(|v| v.as_str())
                     .unwrap_or("always");
 
-                // HF compat: `add_prefix_space: false` forces never-prepend.
                 let prepend =
                     if node.get("add_prefix_space").and_then(|v| v.as_bool()) == Some(false) {
-                        None // Never
+                        None
                     } else {
                         match scheme {
                             "first" => Some(false),
                             "never" => None,
-                            _ => Some(true), // "always" or default
+                            _ => Some(true),
                         }
                     };
 
@@ -405,66 +370,52 @@ fn build_pipeline(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
 
-                steps.push(PreStep::MetaspaceSplit {
+                split_step = SplitStep::MetaspaceSplit {
                     replacement,
                     replacement_str: replacement.to_string(),
                     prepend,
                     split,
-                });
+                };
             }
 
             // ── Split ──────────────────────────────────────────────
             //
             // HF ref: `pre_tokenizers/split.rs` `Split`.
             //
-            // Splits text on a pattern with configurable behavior:
-            //   - Pattern: `{"Regex":"..."}` or `{"String":"..."}`
-            //   - Behavior: `Isolated`, `MergedWithNext`, `Removed`, etc.
-            //   - Invert: if true, keep matches instead of gaps
-            //
-            // tokenizer-mini only handles `Regex` patterns with `Isolated`
-            // behavior (each match and each gap become separate pieces).
-            // This covers all known models:
-            //   - LLaMA-3, Qwen3, DeepSeek: `Split` with regex, `Isolated`
-            //   - Gemma: `Digits` pre-tokenizer → `Split` with `individual_digits`
-            //     (uses a String pattern or non-Regex, which we skip).
-            //
-            // String-based Split nodes are rare in practice and are silently
-            // skipped. Gemma's `Digits` pre-tokenizer appears as a `Split`
-            // node with non-Regex pattern — we skip it since Gemma encodes
-            // digits correctly without this step at the BPE level.
+            // Only Regex patterns with Isolated behavior are supported.
+            // String-based Split nodes are silently skipped.
             "Split" => {
                 if let Some(regex_str) = node
                     .get("pattern")
                     .and_then(|p| p.get("Regex"))
                     .and_then(|r| r.as_str())
                 {
-                    let re = fancy_regex::Regex::new(regex_str)
-                        .with_context(|| format!("compiling Split regex: {regex_str}"))?;
-                    steps.push(PreStep::RegexSplitIsolated(re));
+                    // Only set if no split step has been set yet (first wins).
+                    if matches!(split_step, SplitStep::None) {
+                        let re = fancy_regex::Regex::new(regex_str)
+                            .with_context(|| format!("compiling Split regex: {regex_str}"))?;
+                        split_step = SplitStep::RegexSplitIsolated(re);
+                    }
                 }
-                // Non-Regex patterns (String, Digits) are silently skipped.
             }
 
             _ => {} // Unknown pre-tokenizer types are silently skipped.
         }
     }
 
-    // If no Metaspace node was found for a char-level model, add a no-op
-    // MetaspaceSplit as a passthrough (e.g. Gemma2 encodes spaces in the
-    // normalizer via Replace, not via Metaspace pre-tokenizer).
-    if atom_mode == AtomMode::Char
-        && !steps.iter().any(|s| matches!(s, PreStep::MetaspaceSplit { .. }))
-    {
-        steps.push(PreStep::MetaspaceSplit {
+    // If no splitter was found for a char-level model, add a MetaspaceSplit
+    // passthrough (e.g. Gemma2 encodes spaces in the normalizer via Replace,
+    // not via Metaspace pre-tokenizer).
+    if !is_byte_level && matches!(split_step, SplitStep::None) {
+        split_step = SplitStep::MetaspaceSplit {
             replacement: '▁',
             replacement_str: "▁".to_string(),
             prepend: if normalizer_prepend { Some(false) } else { None },
             split: false,
-        });
+        };
     }
 
-    Ok((atom_mode, steps))
+    Ok((is_byte_level, norm_steps, split_step))
 }
 
 // ---------------------------------------------------------------------------
@@ -619,7 +570,7 @@ fn has_prepend_in_tree(normalizer: &serde_json::Value) -> bool {
     if let Some(node) = find_type_in_tree(normalizer, "Prepend") {
         node.get("prepend")
             .and_then(|v| v.as_str())
-            .map_or(false, |s| s.contains('▁'))
+            .is_some_and(|s| s.contains('▁'))
     } else {
         false
     }
@@ -682,40 +633,25 @@ fn flatten_sequence<'a>(value: &'a serde_json::Value, key: &str) -> Vec<&'a serd
 /// Only `{"pattern": {"String": "..."}}` patterns are extracted.
 /// Regex-based normalizer replacements are not supported.
 fn collect_norm_replacements(normalizer: &serde_json::Value) -> Vec<(String, String)> {
-    let mut result = Vec::new();
-    collect_norm_replacements_inner(normalizer, &mut result);
-    result
-}
-
-fn collect_norm_replacements_inner(
-    value: &serde_json::Value,
-    result: &mut Vec<(String, String)>,
-) {
-    if value.is_null() {
-        return;
-    }
-    let typ = node_type(value);
-    if typ == "Sequence" {
-        if let Some(arr) = value.get("normalizers").and_then(|v| v.as_array()) {
-            for item in arr {
-                collect_norm_replacements_inner(item, result);
+    flatten_sequence(normalizer, "normalizers")
+        .into_iter()
+        .filter(|node| node_type(node) == "Replace")
+        .filter_map(|node| {
+            let pattern = node
+                .get("pattern")
+                .and_then(|p| p.get("String").and_then(|s| s.as_str()))
+                .unwrap_or("");
+            let content = node
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if pattern.is_empty() {
+                None
+            } else {
+                Some((pattern.to_string(), content.to_string()))
             }
-        }
-        return;
-    }
-    if typ == "Replace" {
-        let pattern = value
-            .get("pattern")
-            .and_then(|p| p.get("String").and_then(|s| s.as_str()))
-            .unwrap_or("");
-        let content = value
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !pattern.is_empty() {
-            result.push((pattern.to_string(), content.to_string()));
-        }
-    }
+        })
+        .collect()
 }
 
 /// Parse a merge entry from the `model.merges` array.

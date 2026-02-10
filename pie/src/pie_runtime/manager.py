@@ -17,7 +17,7 @@ class EngineError(Exception):
     pass
 
 
-def start_engine_and_backend(
+def start(
     engine_config: dict,
     model_configs: list[dict],
     timeout: float = 300.0,
@@ -178,10 +178,13 @@ def start_engine_and_backend(
             )
         )
 
+    # Use group 0's metadata for model-level info (all groups load the same model)
+    group0_meta = device_metadata_by_group.get(0, {})
+
     py_model = _pie.PyModelConfig(
         name=model_config.get("hf_repo", "unknown"),
-        chat_template="",
-        stop_tokens=[],
+        chat_template=group0_meta.get("chat_template", ""),
+        stop_tokens=group0_meta.get("stop_tokens", []),
         kv_page_size=model_config.get("kv_page_size", 16),
         tokenizer_path="",
         devices=py_devices,
@@ -223,7 +226,7 @@ def start_engine_and_backend(
 # =============================================================================
 
 
-def check_backend_processes(
+def check(
     backend_processes: list, on_error: Optional[callable] = None
 ) -> bool:
     """Check if all backend processes are still alive.
@@ -248,7 +251,7 @@ def check_backend_processes(
     return True
 
 
-def terminate_engine_and_backend(
+def terminate(
     server_handle: Optional[Any],
     backend_processes: list,
     on_message: Optional[callable] = None,

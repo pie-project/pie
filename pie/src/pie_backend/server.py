@@ -92,24 +92,3 @@ def poll_rpc_server(
         service.shutdown()
 
 
-def start_rpc_worker(
-    server, service: Backend, thread_name: str = "pie-rpc-worker"
-) -> tuple[threading.Thread, threading.Event]:
-    """Start an RPC worker thread that polls the RpcServer.
-
-    Args:
-        server: _pie.RpcServer instance
-        service: Backend instance to dispatch calls to
-        thread_name: Name for the worker thread (for debugging)
-
-    Returns:
-        tuple (thread, stop_event) where thread is already started.
-    """
-    stop_event = threading.Event()
-
-    def worker():
-        poll_rpc_server(server, service, stop_event)
-
-    thread = threading.Thread(target=worker, name=thread_name, daemon=True)
-    thread.start()
-    return thread, stop_event

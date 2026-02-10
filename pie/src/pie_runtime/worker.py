@@ -211,10 +211,13 @@ def worker_main(
             server = _pie.RpcServer.create()
             server_name = server.server_name()
 
+            chat_template_info = runtime.get_chat_template()
             metadata = {
                 "total_pages": getattr(runtime, "total_pages", 0),
                 "max_batch_tokens": getattr(runtime, "max_batch_tokens", 10240),
                 "max_batch_size": getattr(runtime, "max_batch_size", 128),
+                "chat_template": chat_template_info.get("template_content", ""),
+                "stop_tokens": chat_template_info.get("stop_tokens", []),
             }
 
             ready_queue.put((rank, server_name, metadata))

@@ -521,25 +521,21 @@ fn bpe_merge_heap(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[TokenI
 }
 
 // ---------------------------------------------------------------------------
-// Public API: unified BPE encode
+// Public API: BPE encode
 // ---------------------------------------------------------------------------
 
-/// Encode a piece (byte slice + atom-boundary offsets) using BPE.
+/// Encode a raw byte slice using byte-level BPE (each byte is an atom).
 ///
-/// `offsets` defines where atoms start: for byte-level BPE, `[0, 1, 2, ..., len]`;
-/// for char-level BPE, character boundary offsets from `char_indices()`.
-///
-/// The merge algorithm works on token-ID pairs, avoiding byte concatenation
-/// in the inner loop.
-pub fn bpe_encode(
+/// Used by ByteLevel models (GPT-2, LLaMA, Qwen3).  Each byte maps to
+/// exactly one atom, so no offsets array is needed.
+pub fn bpe_encode_bytes(
     piece: &[u8],
-    offsets: &[usize],
     bpe: &BpeTable,
     byte_fallback: bool,
     unk_token_id: Option<TokenId>,
     out: &mut Vec<TokenId>,
 ) {
-    if piece.is_empty() || offsets.len() < 2 {
+    if piece.is_empty() {
         return;
     }
 
@@ -549,18 +545,105 @@ pub fn bpe_encode(
         return;
     }
 
-    let n_atoms = offsets.len() - 1;
+    let n = piece.len();
 
-    // Single atom, not in vocab → fallback.
-    if n_atoms == 1 {
+    // Single byte, not in vocab → fallback.
+    if n == 1 {
         fallback_into(piece, bpe, byte_fallback, unk_token_id, out);
         return;
     }
 
-    // Two-atom fast path: at most 1 merge possible (already tried whole piece).
-    if n_atoms == 2 {
+    // Two-byte fast path: at most 1 merge possible (already tried whole piece).
+    if n == 2 {
+        for i in 0..2 {
+            match bpe.bytes_to_id(&piece[i..i + 1]) {
+                Some(id) => out.push(id),
+                None => fallback_into(&piece[i..i + 1], bpe, byte_fallback, unk_token_id, out),
+            }
+        }
+        return;
+    }
+
+    // Build initial token IDs — each byte is an atom.
+    let mut initial_ids: SmallVec<[TokenId; 32]> = SmallVec::with_capacity(n);
+    let mut all_resolved = true;
+    for i in 0..n {
+        match bpe.bytes_to_id(&piece[i..i + 1]) {
+            Some(id) => initial_ids.push(id),
+            None => {
+                all_resolved = false;
+                initial_ids.push(TokenId::MAX);
+            }
+        }
+    }
+
+    if all_resolved {
+        let merged = bpe_merge(&initial_ids, bpe);
+        out.extend_from_slice(&merged);
+        return;
+    }
+
+    // Segment into runs of resolved vs unresolved atoms.
+    let mut i = 0;
+    while i < n {
+        if initial_ids[i] == TokenId::MAX {
+            fallback_into(&piece[i..i + 1], bpe, byte_fallback, unk_token_id, out);
+            i += 1;
+        } else {
+            let start = i;
+            while i < n && initial_ids[i] != TokenId::MAX {
+                i += 1;
+            }
+            let seg = &initial_ids[start..i];
+            if seg.len() == 1 {
+                out.push(seg[0]);
+            } else {
+                out.extend_from_slice(&bpe_merge(seg, bpe));
+            }
+        }
+    }
+}
+
+/// Encode a text fragment using char-level BPE (each Unicode char is an atom).
+///
+/// Used by SentencePiece/Metaspace models (Gemma).  Atom boundaries come
+/// from `char_indices()`.
+pub fn bpe_encode_chars(
+    piece: &str,
+    bpe: &BpeTable,
+    byte_fallback: bool,
+    unk_token_id: Option<TokenId>,
+    out: &mut Vec<TokenId>,
+) {
+    let bytes = piece.as_bytes();
+    if bytes.is_empty() {
+        return;
+    }
+
+    // Fast path: whole piece is a known token.
+    if let Some(id) = bpe.bytes_to_id(bytes) {
+        out.push(id);
+        return;
+    }
+
+    // Collect char boundary offsets: [0, first_char_end, ..., len].
+    let offsets: SmallVec<[usize; 32]> = piece
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(bytes.len()))
+        .collect();
+    let n = offsets.len() - 1; // number of atoms (chars)
+
+    // Single char, not in vocab → fallback.
+    if n == 1 {
+        fallback_into(bytes, bpe, byte_fallback, unk_token_id, out);
+        return;
+    }
+
+    // Two-char fast path.
+    if n == 2 {
         for w in offsets.windows(2) {
-            let span = &piece[w[0]..w[1]];
+            let span = &bytes[w[0]..w[1]];
             match bpe.bytes_to_id(span) {
                 Some(id) => out.push(id),
                 None => fallback_into(span, bpe, byte_fallback, unk_token_id, out),
@@ -569,51 +652,44 @@ pub fn bpe_encode(
         return;
     }
 
-    // Build initial token IDs from atom spans, tracking unresolved atoms.
-    let mut initial_ids: SmallVec<[TokenId; 32]> = SmallVec::with_capacity(n_atoms);
+    // Build initial token IDs from char spans.
+    let mut initial_ids: SmallVec<[TokenId; 32]> = SmallVec::with_capacity(n);
     let mut all_resolved = true;
     for w in offsets.windows(2) {
-        let span = &piece[w[0]..w[1]];
+        let span = &bytes[w[0]..w[1]];
         match bpe.bytes_to_id(span) {
             Some(id) => initial_ids.push(id),
             None => {
                 all_resolved = false;
-                initial_ids.push(TokenId::MAX); // sentinel for unresolved
+                initial_ids.push(TokenId::MAX);
             }
         }
     }
 
     if all_resolved {
-        // All atoms in vocab → run BPE merge on the full sequence.
         let merged = bpe_merge(&initial_ids, bpe);
         out.extend_from_slice(&merged);
         return;
     }
 
-    // Some atoms not in vocab. Segment into contiguous runs of resolved
-    // atoms (which get BPE-merged) and unresolved atoms (byte-fallback).
-    let mut run_start = 0;
-    while run_start < n_atoms {
-        if initial_ids[run_start] == TokenId::MAX {
-            // Unresolved atom → byte-fallback.
-            let span = &piece[offsets[run_start]..offsets[run_start + 1]];
+    // Segment into runs of resolved vs unresolved atoms.
+    let mut i = 0;
+    while i < n {
+        if initial_ids[i] == TokenId::MAX {
+            let span = &bytes[offsets[i]..offsets[i + 1]];
             fallback_into(span, bpe, byte_fallback, unk_token_id, out);
-            run_start += 1;
+            i += 1;
         } else {
-            // Find the end of this contiguous resolved run.
-            let mut run_end = run_start + 1;
-            while run_end < n_atoms && initial_ids[run_end] != TokenId::MAX {
-                run_end += 1;
+            let start = i;
+            while i < n && initial_ids[i] != TokenId::MAX {
+                i += 1;
             }
-            // BPE-merge this resolved segment.
-            let segment = &initial_ids[run_start..run_end];
-            if segment.len() == 1 {
-                out.push(segment[0]);
+            let seg = &initial_ids[start..i];
+            if seg.len() == 1 {
+                out.push(seg[0]);
             } else {
-                let merged = bpe_merge(segment, bpe);
-                out.extend_from_slice(&merged);
+                out.extend_from_slice(&bpe_merge(seg, bpe));
             }
-            run_start = run_end;
         }
     }
 }
@@ -636,50 +712,6 @@ fn fallback_into(
     } else if let Some(id) = unk_token_id {
         out.push(id);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Convenience wrappers (preserve existing call-site signatures)
-// ---------------------------------------------------------------------------
-
-/// Encode a raw byte slice using byte-level BPE (each byte is an atom).
-///
-/// Used by ByteLevel models (GPT-2, LLaMA, Qwen3).  Offsets are trivially
-/// `[0, 1, 2, …, len]` — no `char_indices()` needed.
-pub fn bpe_encode_bytes(
-    piece: &[u8],
-    bpe: &BpeTable,
-    byte_fallback: bool,
-    unk_token_id: Option<TokenId>,
-    out: &mut Vec<TokenId>,
-) {
-    if piece.is_empty() {
-        return;
-    }
-    let offsets: SmallVec<[usize; 32]> = (0..=piece.len()).collect();
-    bpe_encode(piece, &offsets, bpe, byte_fallback, unk_token_id, out);
-}
-
-/// Encode a text fragment using char-level BPE (each Unicode char is an atom).
-///
-/// Used by SentencePiece/Metaspace models (Gemma).  Offsets come from
-/// `char_indices()`.
-pub fn bpe_encode_chars(
-    piece: &str,
-    bpe: &BpeTable,
-    byte_fallback: bool,
-    unk_token_id: Option<TokenId>,
-    out: &mut Vec<TokenId>,
-) {
-    if piece.is_empty() {
-        return;
-    }
-    let offsets: SmallVec<[usize; 32]> = piece
-        .char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(piece.len()))
-        .collect();
-    bpe_encode(piece.as_bytes(), &offsets, bpe, byte_fallback, unk_token_id, out);
 }
 
 // ---------------------------------------------------------------------------

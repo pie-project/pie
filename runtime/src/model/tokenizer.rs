@@ -1,16 +1,18 @@
 //! Top-level Tokenizer struct.
 //!
 //! Provides `encode` / `decode` over a BPE vocabulary. Construction happens
-//! via [`hf_loader`] (HuggingFace `tokenizer.json` format).
+//! via [`hf_loader`](crate::hf_loader) (HuggingFace `tokenizer.json` format).
 //!
-//! The encode path is a **data-driven pipeline**:
-//!   1. `pre_steps` transforms input text into a list of pieces.
-//!   2. Each piece is BPE-encoded using `atom_mode` (Byte or Char atoms).
+//! The encode path is a **two-phase pipeline**:
+//!   1. **Normalize**: `norm_steps` transforms input text (NFC, prepend space, replace).
+//!   2. **Split + encode**: `split_step` splits text into pieces and BPE-encodes each.
 //!
 //! The decode path is a simple ordered list of `DecodeStep` transforms.
 
 pub mod bpe;
 pub mod hf_loader;
+
+use std::borrow::Cow;
 
 use aho_corasick::AhoCorasick;
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
@@ -40,32 +42,72 @@ enum Segment<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-tokenizer pipeline types
+// Vocabulary type
 // ---------------------------------------------------------------------------
 
-/// How BPE atoms are defined.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AtomMode {
-    /// Each byte is an atom (GPT-2, LLaMA, Qwen3).
-    Byte,
-    /// Each Unicode char is an atom (Gemma, SentencePiece).
-    Char,
+/// How the BPE vocabulary is encoded and how atoms are defined.
+///
+/// This single enum replaces the previous combination of `AtomMode`,
+/// `byte_fallback: bool`, and `raw_byte_keys: bool` — only three valid
+/// combinations of those flags exist, and this enum makes that explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VocabType {
+    /// Byte-level BPE (GPT-2 style).
+    ///
+    /// Atoms are bytes. Vocab keys are GPT-2 unicode → raw bytes.
+    /// Used by GPT-2, LLaMA-3, Qwen3, DeepSeek.
+    ByteLevel,
+    /// Char-level BPE with byte fallback (SentencePiece style).
+    ///
+    /// Atoms are Unicode chars. Unknown chars → `<0xHH>` byte tokens.
+    /// Used by Mistral, Llama-2.
+    ByteFallback,
+    /// Char-level BPE without byte fallback.
+    ///
+    /// Atoms are Unicode chars. Unknown chars → UNK token.
+    /// Used by Gemma-2, Gemma-3.
+    CharLevel,
 }
 
-/// A single pre-tokenizer step.
+impl VocabType {
+    /// Whether atoms are individual bytes (vs. Unicode chars).
+    #[inline]
+    pub fn is_byte_level(self) -> bool {
+        matches!(self, VocabType::ByteLevel)
+    }
+
+    /// Whether unknown atoms are encoded as `<0xHH>` byte-fallback tokens.
+    #[inline]
+    pub fn byte_fallback(self) -> bool {
+        matches!(self, VocabType::ByteFallback)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encode pipeline: normalize + split
+// ---------------------------------------------------------------------------
+
+/// A text normalization step (phase 1 of encoding).
 ///
-/// Steps are applied in order to transform input text into pieces
-/// suitable for BPE encoding.
+/// Normalizers transform text in-place without splitting.
+/// Applied in order before the split step.
 #[derive(Debug)]
-pub enum PreStep {
+pub enum NormStep {
     /// NFC unicode normalization.
     Nfc,
     /// Prepend a space before text if it doesn't start with one.
     PrependSpace,
-    /// String replacement in text (normalizer).
+    /// String replacement in text.
     Replace { from: String, to: String },
-    /// Remap bytes to GPT-2 unicode + apply regex + map back.
-    /// Combines Gpt2Remap + RegexSplit + Gpt2Unmap in one step for efficiency.
+}
+
+/// The text splitting step (phase 2 of encoding).
+///
+/// Exactly one split step runs per encode call. It consumes the normalized
+/// text, splits it into pieces, and BPE-encodes each piece.
+#[derive(Debug)]
+pub enum SplitStep {
+    /// Remap bytes to GPT-2 unicode, split via regex, encode each match.
     Gpt2RegexSplit(fancy_regex::Regex),
     /// Split on regex matches (HF `Split` with `behavior: Isolated`).
     /// Each match AND each gap become separate pieces.
@@ -78,6 +120,8 @@ pub enum PreStep {
         prepend: Option<bool>,
         split: bool,
     },
+    /// No splitting — encode the whole string as one piece.
+    None,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +141,22 @@ pub enum DecodeStep {
     StripFirst { content: Vec<u8> },
     /// Fuse all tokens into a single buffer.
     Fuse,
+}
+
+// ---------------------------------------------------------------------------
+// Encode scratch buffers (reused across pieces within one encode call)
+// ---------------------------------------------------------------------------
+
+/// Reusable buffers for the encode hot path.
+///
+/// Created once per `encode()` call and passed through to avoid
+/// per-piece allocations (especially for the GPT-2 byte remap).
+#[derive(Default)]
+struct EncodeScratch {
+    /// GPT-2 byte→unicode remapped string.
+    remap_buf: String,
+    /// Char byte offsets within `remap_buf`.
+    char_offsets: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,12 +180,12 @@ pub struct Tokenizer {
     bpe: BpeTable,
 
     // Pipeline
-    atom_mode: AtomMode,
-    pre_steps: Vec<PreStep>,
+    vocab_type: VocabType,
+    norm_steps: Vec<NormStep>,
+    split_step: SplitStep,
     decode_steps: Vec<DecodeStep>,
 
     // BPE model options
-    byte_fallback: bool,
     unk_token_id: Option<u32>,
 
     // Added / special tokens (sorted for binary_search)
@@ -139,13 +199,13 @@ impl Tokenizer {
     ///
     /// Prefer [`from_file`] for loading from HuggingFace JSON.
     /// This constructor is for use by format-specific loaders
-    /// (e.g. [`hf_loader`](crate::hf_loader)).
+    /// (e.g. [`hf_loader`]).
     pub fn new(
         bpe: BpeTable,
-        atom_mode: AtomMode,
-        pre_steps: Vec<PreStep>,
+        vocab_type: VocabType,
+        norm_steps: Vec<NormStep>,
+        split_step: SplitStep,
         decode_steps: Vec<DecodeStep>,
-        byte_fallback: bool,
         unk_token_id: Option<u32>,
         added_tokens: Vec<AddedToken>,
     ) -> Self {
@@ -171,10 +231,10 @@ impl Tokenizer {
 
         Tokenizer {
             bpe,
-            atom_mode,
-            pre_steps,
+            vocab_type,
+            norm_steps,
+            split_step,
             decode_steps,
-            byte_fallback,
             unk_token_id,
             special_token_ids,
             added_token_matcher,
@@ -203,12 +263,13 @@ impl Tokenizer {
 
         let segments = self.split_added_tokens(text);
         let mut ids = Vec::new();
+        let mut scratch = EncodeScratch::default();
         let mut is_first_text = true;
 
         for segment in segments {
             match segment {
                 Segment::Text(t) => {
-                    self.encode_text(t, is_first_text, &mut ids);
+                    self.encode_text(t, is_first_text, &mut ids, &mut scratch);
                     is_first_text = false;
                 }
                 Segment::AddedToken(id) => ids.push(id),
@@ -224,157 +285,187 @@ impl Tokenizer {
         if piece.is_empty() {
             return;
         }
-        match self.atom_mode {
-            AtomMode::Byte => bpe::bpe_encode_bytes(
+        let bf = self.vocab_type.byte_fallback();
+        if self.vocab_type.is_byte_level() {
+            bpe::bpe_encode_bytes(
                 piece.as_bytes(),
                 &self.bpe,
-                self.byte_fallback,
+                bf,
                 self.unk_token_id,
                 ids,
-            ),
-            AtomMode::Char => bpe::bpe_encode_chars(
+            );
+        } else {
+            bpe::bpe_encode_chars(
                 piece,
                 &self.bpe,
-                self.byte_fallback,
+                bf,
                 self.unk_token_id,
                 ids,
-            ),
+            );
         }
     }
 
     /// Encode a single text segment (no added tokens).
-    fn encode_text(&self, text: &str, is_first: bool, ids: &mut Vec<u32>) {
-        let mut buf = String::from(text);
+    ///
+    /// Phase 1: normalize the text (Cow — no allocation if unchanged).
+    /// Phase 2: split into pieces and BPE-encode each.
+    fn encode_text(
+        &self,
+        text: &str,
+        is_first: bool,
+        ids: &mut Vec<u32>,
+        scratch: &mut EncodeScratch,
+    ) {
+        let text = self.normalize(text);
+        self.split_and_encode(&text, is_first, ids, scratch);
+    }
 
-        for step in &self.pre_steps {
+    /// Phase 1: apply normalization steps.
+    ///
+    /// Returns `Cow::Borrowed` when no step modifies the text (common for
+    /// ByteLevel models), avoiding allocation entirely.
+    fn normalize<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        let mut text = Cow::Borrowed(text);
+        for step in &self.norm_steps {
             match step {
-                PreStep::Nfc => {
-                    if is_nfc_quick(buf.chars()) != IsNormalized::Yes {
-                        buf = buf.nfc().collect();
+                NormStep::Nfc => {
+                    if is_nfc_quick(text.chars()) != IsNormalized::Yes {
+                        text = Cow::Owned(text.nfc().collect());
                     }
                 }
-                PreStep::PrependSpace => {
-                    if !buf.starts_with(' ') {
-                        buf.insert(0, ' ');
+                NormStep::PrependSpace => {
+                    if !text.starts_with(' ') {
+                        text.to_mut().insert(0, ' ');
                     }
                 }
-                PreStep::Replace { from, to } => {
-                    if buf.contains(from.as_str()) {
-                        buf = buf.replace(from.as_str(), to.as_str());
+                NormStep::Replace { from, to } => {
+                    if text.contains(from.as_str()) {
+                        text = Cow::Owned(text.replace(from.as_str(), to.as_str()));
                     }
-                }
-                PreStep::Gpt2RegexSplit(regex) => {
-                    let bytes = buf.as_bytes();
-                    let lut = bpe::bytes_to_unicode();
-                    let remapped: String = bytes.iter().map(|&b| lut[b as usize]).collect();
-
-                    let char_byte_offsets: Vec<usize> = remapped
-                        .char_indices()
-                        .map(|(i, _)| i)
-                        .collect();
-                    let n_chars = char_byte_offsets.len();
-
-                    for m in regex.find_iter(&remapped) {
-                        let m = match m {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        let cs = char_byte_offsets.partition_point(|&o| o < m.start());
-                        let ce = char_byte_offsets.partition_point(|&o| o < m.end());
-                        if cs >= ce || ce > n_chars {
-                            continue;
-                        }
-                        bpe::bpe_encode_bytes(
-                            &bytes[cs..ce],
-                            &self.bpe,
-                            self.byte_fallback,
-                            self.unk_token_id,
-                            ids,
-                        );
-                    }
-                    return;
-                }
-                PreStep::RegexSplitIsolated(regex) => {
-                    let mut last_end = 0;
-                    for m in regex.find_iter(&buf) {
-                        let m = match m {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        if m.start() > last_end {
-                            self.encode_piece(&buf[last_end..m.start()], ids);
-                        }
-                        self.encode_piece(m.as_str(), ids);
-                        last_end = m.end();
-                    }
-                    if last_end < buf.len() {
-                        self.encode_piece(&buf[last_end..], ids);
-                    }
-                    return;
-                }
-                PreStep::MetaspaceSplit {
-                    replacement,
-                    replacement_str,
-                    prepend,
-                    split,
-                } => {
-                    let replaced = buf.replace(' ', replacement_str);
-
-                    let mut pieces: Vec<String> = if *split {
-                        let mut result = Vec::new();
-                        for (i, s) in replaced.split(*replacement).enumerate() {
-                            if s.is_empty() && i == 0 {
-                                continue;
-                            }
-                            let mut piece = String::with_capacity(
-                                replacement_str.len() + s.len(),
-                            );
-                            piece.push_str(replacement_str);
-                            piece.push_str(s);
-                            result.push(piece);
-                        }
-                        if result.is_empty() {
-                            vec![replacement_str.clone()]
-                        } else {
-                            result
-                        }
-                    } else {
-                        vec![replaced]
-                    };
-
-                    match prepend {
-                        Some(true) => {
-                            for p in pieces.iter_mut() {
-                                if !p.starts_with(*replacement) {
-                                    p.insert_str(0, replacement_str);
-                                }
-                            }
-                        }
-                        Some(false) => {
-                            // Prepend to the first piece, but only when this
-                            // text segment is the first in the input (not
-                            // after an added token like <s>).
-                            if is_first {
-                                if let Some(first) = pieces.first_mut() {
-                                    if !first.starts_with(*replacement) {
-                                        first.insert_str(0, replacement_str);
-                                    }
-                                }
-                            }
-                        }
-                        None => {}
-                    }
-
-                    for piece in &pieces {
-                        self.encode_piece(piece, ids);
-                    }
-                    return;
                 }
             }
         }
+        text
+    }
 
-        // Fallback: no split step in pipeline.
-        self.encode_piece(&buf, ids);
+    /// Phase 2: split text into pieces and BPE-encode each.
+    fn split_and_encode(
+        &self,
+        text: &str,
+        is_first: bool,
+        ids: &mut Vec<u32>,
+        scratch: &mut EncodeScratch,
+    ) {
+        match &self.split_step {
+            SplitStep::Gpt2RegexSplit(regex) => {
+                let bytes = text.as_bytes();
+                let lut = bpe::bytes_to_unicode();
+
+                // Remap bytes → GPT-2 unicode (reuse scratch buffer).
+                scratch.remap_buf.clear();
+                scratch.remap_buf.extend(bytes.iter().map(|&b| lut[b as usize]));
+
+                // Build char→byte offset table (reuse scratch buffer).
+                scratch.char_offsets.clear();
+                scratch.char_offsets.extend(
+                    scratch.remap_buf.char_indices().map(|(i, _)| i),
+                );
+                let n_chars = scratch.char_offsets.len();
+
+                for m in regex.find_iter(&scratch.remap_buf) {
+                    let m = match m {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let cs = scratch.char_offsets.partition_point(|&o| o < m.start());
+                    let ce = scratch.char_offsets.partition_point(|&o| o < m.end());
+                    if cs >= ce || ce > n_chars {
+                        continue;
+                    }
+                    bpe::bpe_encode_bytes(
+                        &bytes[cs..ce],
+                        &self.bpe,
+                        self.vocab_type.byte_fallback(),
+                        self.unk_token_id,
+                        ids,
+                    );
+                }
+            }
+            SplitStep::RegexSplitIsolated(regex) => {
+                let mut last_end = 0;
+                for m in regex.find_iter(text) {
+                    let m = match m {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if m.start() > last_end {
+                        self.encode_piece(&text[last_end..m.start()], ids);
+                    }
+                    self.encode_piece(m.as_str(), ids);
+                    last_end = m.end();
+                }
+                if last_end < text.len() {
+                    self.encode_piece(&text[last_end..], ids);
+                }
+            }
+            SplitStep::MetaspaceSplit {
+                replacement,
+                replacement_str,
+                prepend,
+                split,
+            } => {
+                let replaced = text.replace(' ', replacement_str);
+
+                let mut pieces: Vec<String> = if *split {
+                    let mut result = Vec::new();
+                    for (i, s) in replaced.split(*replacement).enumerate() {
+                        if s.is_empty() && i == 0 {
+                            continue;
+                        }
+                        let mut piece = String::with_capacity(
+                            replacement_str.len() + s.len(),
+                        );
+                        piece.push_str(replacement_str);
+                        piece.push_str(s);
+                        result.push(piece);
+                    }
+                    if result.is_empty() {
+                        vec![replacement_str.clone()]
+                    } else {
+                        result
+                    }
+                } else {
+                    vec![replaced]
+                };
+
+                match prepend {
+                    Some(true) => {
+                        for p in pieces.iter_mut() {
+                            if !p.starts_with(*replacement) {
+                                p.insert_str(0, replacement_str);
+                            }
+                        }
+                    }
+                    Some(false) => {
+                        if is_first {
+                            if let Some(first) = pieces.first_mut() {
+                                if !first.starts_with(*replacement) {
+                                    first.insert_str(0, replacement_str);
+                                }
+                            }
+                        }
+                    }
+                    None => {}
+                }
+
+                for piece in &pieces {
+                    self.encode_piece(piece, ids);
+                }
+            }
+            SplitStep::None => {
+                self.encode_piece(text, ids);
+            }
+        }
     }
 
     /// Split text on added/special tokens using the Aho-Corasick matcher.
@@ -545,23 +636,18 @@ impl Tokenizer {
     pub fn id_to_token_str(&self, id: u32) -> Option<String> {
         self.bpe
             .id_to_bytes(id)
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
     }
 
-    /// Get the split regex pattern (from the first regex-based pre-step).
+    /// Get the split regex pattern (from the split step).
     ///
-    /// Returns an empty string if no regex pre-step is configured.
+    /// Returns an empty string if no regex-based split step is configured.
     pub fn get_split_regex(&self) -> String {
-        for step in &self.pre_steps {
-            match step {
-                PreStep::Gpt2RegexSplit(re)
-                | PreStep::RegexSplitIsolated(re) => {
-                    return re.as_str().to_string();
-                }
-                _ => {}
-            }
+        match &self.split_step {
+            SplitStep::Gpt2RegexSplit(re)
+            | SplitStep::RegexSplitIsolated(re) => re.as_str().to_string(),
+            _ => String::new(),
         }
-        String::new()
     }
 
     /// Get the special token IDs and their byte representations.
@@ -590,8 +676,6 @@ impl std::str::FromStr for Tokenizer {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-
 
 /// Replace all occurrences of `needle` with `replacement` in `haystack`.
 ///
@@ -629,7 +713,8 @@ mod tests {
     fn make_byte_tokenizer(
         vocab: &[(&str, u32)],
         merges: &[(&str, &str)],
-        pre_steps: Vec<PreStep>,
+        norm_steps: Vec<NormStep>,
+        split_step: SplitStep,
         decode_steps: Vec<DecodeStep>,
         added_tokens: Vec<AddedToken>,
     ) -> Tokenizer {
@@ -645,13 +730,14 @@ mod tests {
         for at in &added_tokens {
             bpe.insert(at.content.as_bytes().to_vec(), at.id);
         }
-        Tokenizer::new(bpe, AtomMode::Byte, pre_steps, decode_steps, false, None, added_tokens)
+        Tokenizer::new(bpe, VocabType::ByteLevel, norm_steps, split_step, decode_steps, None, added_tokens)
     }
 
     fn make_char_tokenizer(
         vocab: &[(&str, u32)],
         merges: &[(&str, &str)],
-        pre_steps: Vec<PreStep>,
+        norm_steps: Vec<NormStep>,
+        split_step: SplitStep,
         decode_steps: Vec<DecodeStep>,
     ) -> Tokenizer {
         let vocab_map: HashMap<String, u32> =
@@ -663,7 +749,7 @@ mod tests {
         let bpe = bpe::BpeTable::from_vocab_and_merges(
             &vocab_map, &merge_pairs, "", false,
         );
-        Tokenizer::new(bpe, AtomMode::Char, pre_steps, decode_steps, false, None, vec![])
+        Tokenizer::new(bpe, VocabType::CharLevel, norm_steps, split_step, decode_steps, None, vec![])
     }
 
     #[test]
@@ -671,7 +757,7 @@ mod tests {
         let tok = make_byte_tokenizer(
             &[("h", 0), ("i", 1), ("hi", 2)],
             &[("h", "i")],
-            vec![], vec![], vec![],
+            vec![], SplitStep::None, vec![], vec![],
         );
         let ids = tok.encode("hi");
         assert_eq!(ids, vec![2]);
@@ -679,22 +765,22 @@ mod tests {
     }
 
     #[test]
-    fn test_prestep_nfc() {
+    fn test_normstep_nfc() {
         let tok = make_byte_tokenizer(
             &[("\u{00E9}", 0)], // NFC form
             &[],
-            vec![PreStep::Nfc],
+            vec![NormStep::Nfc], SplitStep::None,
             vec![], vec![],
         );
         assert_eq!(tok.encode("\u{0065}\u{0301}"), vec![0]); // NFD → NFC
     }
 
     #[test]
-    fn test_prestep_prepend_space() {
+    fn test_normstep_prepend_space() {
         let tok = make_byte_tokenizer(
             &[(" ", 0), ("h", 1), ("i", 2)],
             &[],
-            vec![PreStep::PrependSpace],
+            vec![NormStep::PrependSpace], SplitStep::None,
             vec![], vec![],
         );
         assert_eq!(tok.encode("hi"), vec![0, 1, 2]);
@@ -702,55 +788,58 @@ mod tests {
     }
 
     #[test]
-    fn test_prestep_replace() {
+    fn test_normstep_replace() {
         let tok = make_byte_tokenizer(
             &[("X", 0), ("!", 1)],
             &[],
-            vec![PreStep::Replace { from: "hello".into(), to: "X".into() }],
+            vec![NormStep::Replace { from: "hello".into(), to: "X".into() }],
+            SplitStep::None,
             vec![], vec![],
         );
         assert_eq!(tok.encode("hello!"), vec![0, 1]);
     }
 
     #[test]
-    fn test_prestep_metaspace_split() {
+    fn test_splitstep_metaspace_split() {
         let tok = make_char_tokenizer(
             &[("▁", 0), ("▁a", 1), ("▁b", 2), ("a", 3), ("b", 4)],
             &[("▁", "a"), ("▁", "b")],
-            vec![PreStep::MetaspaceSplit {
+            vec![],
+            SplitStep::MetaspaceSplit {
                 replacement: '▁',
                 replacement_str: "▁".into(),
                 prepend: Some(true),
                 split: true,
-            }],
+            },
             vec![],
         );
         assert_eq!(tok.encode("a b"), vec![1, 2]); // ▁a, ▁b
     }
 
     #[test]
-    fn test_prestep_metaspace_no_split() {
+    fn test_splitstep_metaspace_no_split() {
         let tok = make_char_tokenizer(
             &[("a", 0), ("▁", 1), ("b", 2), ("a▁b", 3)],
             &[("a", "▁"), ("a▁", "b")],
-            vec![PreStep::MetaspaceSplit {
+            vec![],
+            SplitStep::MetaspaceSplit {
                 replacement: '▁',
                 replacement_str: "▁".into(),
                 prepend: None,
                 split: false,
-            }],
+            },
             vec![],
         );
         assert_eq!(tok.encode("a b"), vec![3]); // a▁b as single token
     }
 
     #[test]
-    fn test_prestep_regex_split() {
+    fn test_splitstep_regex_split() {
         let re = fancy_regex::Regex::new(r"\d+").unwrap();
         let tok = make_byte_tokenizer(
             &[("a", 0), ("1", 1), ("2", 2), ("b", 3), ("12", 4)],
             &[("1", "2")],
-            vec![PreStep::RegexSplitIsolated(re)],
+            vec![], SplitStep::RegexSplitIsolated(re),
             vec![], vec![],
         );
         assert_eq!(tok.encode("a12b"), vec![0, 4, 3]);
@@ -761,12 +850,13 @@ mod tests {
         let tok = make_char_tokenizer(
             &[("▁hi", 0)],
             &[],
-            vec![PreStep::MetaspaceSplit {
+            vec![],
+            SplitStep::MetaspaceSplit {
                 replacement: '▁',
                 replacement_str: "▁".into(),
                 prepend: Some(true),
                 split: false,
-            }],
+            },
             vec![
                 DecodeStep::Replace { pattern: "▁".as_bytes().to_vec(), content: b" ".to_vec() },
                 DecodeStep::StripFirst { content: b" ".to_vec() },
@@ -781,7 +871,7 @@ mod tests {
         let tok = make_byte_tokenizer(
             &[("a", 0), ("<0xE5>", 1), ("<0x8F>", 2), ("<0xAB>", 3)],
             &[],
-            vec![],
+            vec![], SplitStep::None,
             vec![DecodeStep::ByteFallback],
             vec![],
         );
@@ -793,7 +883,7 @@ mod tests {
         let tok = make_byte_tokenizer(
             &[("h", 0), ("i", 1), ("hi", 2)],
             &[("h", "i")],
-            vec![], vec![],
+            vec![], SplitStep::None, vec![],
             vec![
                 AddedToken { id: 100, content: "<s>".into(), special: true },
                 AddedToken { id: 101, content: "</s>".into(), special: true },
@@ -804,4 +894,3 @@ mod tests {
         assert_eq!(tok.decode(&[100, 2], false), "<s>hi");  // include special
     }
 }
-
