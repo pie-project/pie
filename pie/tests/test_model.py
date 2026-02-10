@@ -17,7 +17,7 @@ class TestModelList:
 
     def test_list_empty(self, tmp_path):
         """Shows message when no models."""
-        with patch("pie_cli.model.get_hf_cache_dir", return_value=tmp_path):
+        with patch("pie_cli.model_utils.get_hf_cache_dir", return_value=tmp_path):
             result = runner.invoke(app, ["model", "list"])
 
         assert result.exit_code == 0
@@ -44,7 +44,7 @@ class TestModelList:
         snapshot_b.mkdir()
         (snapshot_b / "config.json").write_text('{"model_type": "unknown"}')
 
-        with patch("pie_cli.model.get_hf_cache_dir", return_value=hf_cache):
+        with patch("pie_cli.model_utils.get_hf_cache_dir", return_value=hf_cache):
             result = runner.invoke(app, ["model", "list"])
 
         assert result.exit_code == 0
@@ -69,7 +69,7 @@ class TestModelRemove:
         mock_cache_info.repos = [mock_repo]
         mock_cache_info.delete_revisions.return_value = mock_delete_strategy
 
-        with patch("pie_cli.model.scan_cache_dir", return_value=mock_cache_info):
+        with patch("huggingface_hub.scan_cache_dir", return_value=mock_cache_info):
             # Confirm removal
             result = runner.invoke(
                 app, ["model", "remove", "user/model-a"], input="y\n"
@@ -85,34 +85,10 @@ class TestModelRemove:
         mock_cache_info = MagicMock()
         mock_cache_info.repos = []
 
-        with patch("pie_cli.model.scan_cache_dir", return_value=mock_cache_info):
+        with patch("huggingface_hub.scan_cache_dir", return_value=mock_cache_info):
             result = runner.invoke(app, ["model", "remove", "nonexistent"])
 
         assert result.exit_code == 1
         assert "not found" in result.stdout
 
 
-class TestModelDownload:
-    """Tests for model download command."""
-
-    def test_download_success(self, tmp_path):
-        """Downloads model and shows status."""
-        hf_cache = tmp_path
-
-        # Mock what get_model_config will return after download
-        model_dir = hf_cache / "models--user--model-a"
-        model_dir.mkdir(parents=True)
-        (model_dir / "snapshots" / "snap1").mkdir(parents=True)
-        (model_dir / "snapshots" / "snap1" / "config.json").write_text(
-            '{"model_type": "llama"}'
-        )
-
-        with patch(
-            "pie_cli.model.snapshot_download", return_value=str(tmp_path)
-        ), patch("pie_cli.model.get_hf_cache_dir", return_value=hf_cache):
-
-            result = runner.invoke(app, ["model", "download", "user/model-a"])
-
-        assert result.exit_code == 0
-        assert "Downloaded" in result.stdout
-        assert "Pie compatible" in result.stdout

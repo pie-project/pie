@@ -35,9 +35,9 @@ def start(
     Raises:
         RuntimeError: If engine or backend fails to start
     """
-    from . import _pie
-    from . import path as pie_path
-    from . import worker
+    from pie_backend import _pie
+    from pie_cli import path as pie_path
+    from pie_backend import worker
     import torch
     import torch.multiprocessing as mp
 

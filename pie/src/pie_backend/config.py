@@ -13,7 +13,24 @@ from dataclasses import dataclass, asdict
 
 import torch
 
-from pie_runtime.path import get_program_dir, get_adapter_dir
+import os
+from pathlib import Path
+
+
+def _get_pie_home() -> Path:
+    if pie_home := os.environ.get("PIE_HOME"):
+        return Path(pie_home)
+    return Path.home() / ".pie"
+
+
+def get_program_dir() -> Path:
+    """Get the program/cache directory ({PIE_HOME}/programs)."""
+    return _get_pie_home() / "programs"
+
+
+def get_adapter_dir() -> Path:
+    """Get the adapter storage directory ({PIE_HOME}/adapters)."""
+    return _get_pie_home() / "adapters"
 
 # Valid weight dtype categories
 FLOAT_DTYPES = {"float32", "float16", "bfloat16", "auto"}

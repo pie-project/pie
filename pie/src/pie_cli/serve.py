@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from pie_runtime import path as pie_path
+from pie_cli import path as pie_path
 
 console = Console()
 
@@ -159,9 +159,9 @@ def serve(
 
     try:
         # Start engine and backends
-        from pie_runtime import manager
+        from pie_cli import engine
 
-        server_handle, backend_processes = manager.start(
+        server_handle, backend_processes = engine.start(
             engine_config, model_configs, console=console
         )
 
@@ -196,7 +196,7 @@ def serve(
             try:
                 # Keep running while processes are alive
                 while True:
-                    if not manager.check(backend_processes):
+                    if not engine.check(backend_processes):
                         typer.echo("[red]A backend process died. Shutting down.[/red]")
                         break
 
@@ -212,15 +212,15 @@ def serve(
         # Cleanup
         console.print()
         with console.status("[dim]Shutting down...[/dim]"):
-            manager.terminate(server_handle, backend_processes)
+            engine.terminate(server_handle, backend_processes)
         console.print("[green]✓[/green] Shutdown complete")
 
     except KeyboardInterrupt:
         console.print()
         with console.status("[dim]Shutting down...[/dim]"):
-            manager.terminate(server_handle, backend_processes)
+            engine.terminate(server_handle, backend_processes)
         console.print("[green]✓[/green] Shutdown complete")
     except Exception as e:
         console.print(f"[red]✗[/red] {e}")
-        manager.terminate(server_handle, backend_processes)
+        engine.terminate(server_handle, backend_processes)
         raise typer.Exit(1)

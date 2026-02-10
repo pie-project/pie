@@ -28,12 +28,5 @@ app.add_typer(config.app, name="config")
 app.add_typer(model.app, name="model")
 app.add_typer(auth.app, name="auth")
 
-
-@app.callback()
-def main() -> None:
-    """Pie CLI - CLI for the Pie Inference Engine."""
-    pass
-
-
 if __name__ == "__main__":
     app()

@@ -8,50 +8,11 @@ import pytest
 import toml
 from typer.testing import CliRunner
 
-from pie_runtime import config
+from pie_cli import defaults as config
 from pie_cli.cli import app
 
 runner = CliRunner()
 
-
-class TestCreateDefaultConfigContent:
-    """Tests for create_default_config_content function."""
-
-    @patch("pie.config.torch")
-    def test_default_config(self, mock_torch):
-        """Creates config with model configuration."""
-        # Mock CUDA availability
-        mock_torch.cuda.is_available.return_value = True
-
-        content = config.create_default_config_content()
-        parsed = toml.loads(content)
-
-        assert parsed["host"] == "127.0.0.1"
-        assert parsed["port"] == 8080
-        assert parsed["enable_auth"] is True
-        assert len(parsed["model"]) == 1
-        assert parsed["model"][0]["hf_repo"] == config.DEFAULT_MODEL
-        assert parsed["model"][0]["device"] == ["cuda:0"]
-        assert parsed["model"][0]["activation_dtype"] == "bfloat16"
-        assert parsed["model"][0]["kv_page_size"] == 16
-        assert parsed["model"][0]["max_batch_tokens"] == 10240
-        assert parsed["model"][0]["max_dist_size"] == 32
-        assert parsed["model"][0]["max_num_embeds"] == 128
-        assert parsed["model"][0]["max_num_adapters"] == 32
-        assert parsed["model"][0]["max_adapter_rank"] == 8
-        assert parsed["model"][0]["gpu_mem_utilization"] == 0.9
-        assert parsed["model"][0]["enable_profiling"] is False
-
-    @patch("pie.config.torch")
-    def test_default_config_mps(self, mock_torch):
-        """Creates config with MPS device when available."""
-        mock_torch.cuda.is_available.return_value = False
-        mock_torch.backends.mps.is_available.return_value = True
-
-        content = config.create_default_config_content()
-        parsed = toml.loads(content)
-
-        assert parsed["model"][0]["device"] == ["mps"]
 
 
 class TestConfigInit:

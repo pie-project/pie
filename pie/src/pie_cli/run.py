@@ -107,9 +107,9 @@ def run(
 
     try:
         # Start engine and backends
-        from pie_runtime import manager
+        from pie_cli import engine
 
-        server_handle, backend_processes = manager.start(
+        server_handle, backend_processes = engine.start(
             engine_config, model_configs, console=console
         )
 
@@ -122,7 +122,7 @@ def run(
             "internal_auth_token": server_handle.internal_token,
         }
 
-        from pie_runtime import inferlet as inferlet_mod
+        from pie_cli import inferlet as inferlet_mod
 
         if path is not None:
             import tomllib
@@ -146,16 +146,16 @@ def run(
         # Cleanup
         console.print()
         with console.status("[dim]Shutting down...[/dim]"):
-            manager.terminate(server_handle, backend_processes)
+            engine.terminate(server_handle, backend_processes)
         console.print("[green]✓[/green] Complete")
 
     except KeyboardInterrupt:
         console.print()
         console.print("[yellow]![/yellow] Interrupted")
         with console.status("[dim]Shutting down...[/dim]"):
-            manager.terminate(server_handle, backend_processes)
+            engine.terminate(server_handle, backend_processes)
         raise typer.Exit(130)
     except Exception as e:
         console.print(f"[red]✗[/red] {e}")
-        manager.terminate(server_handle, backend_processes)
+        engine.terminate(server_handle, backend_processes)
         raise typer.Exit(1)

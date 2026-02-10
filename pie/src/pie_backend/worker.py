@@ -135,7 +135,7 @@ def worker_main(
         group_topology: List of groups, each containing ranks
         ready_queue: Queue to signal readiness: (rank, server_name|None, metadata|None)
     """
-    from pie_runtime import _pie
+    from pie_backend import _pie
     from pie_backend.backend import Backend
     from pie_backend.config import RuntimeConfig
     from pie_backend.server import poll_rpc_server
