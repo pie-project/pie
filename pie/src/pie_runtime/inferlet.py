@@ -1,217 +1,129 @@
 """Inferlet submission and event streaming for Pie.
 
-Client-side module for submitting inferlets (local or from registry)
-and streaming their output events.
+Provides `run()` — a synchronous, blocking call that connects to a Pie engine,
+optionally installs a local WASM program, launches the inferlet, and streams
+its output until completion.
 """
 
 import sys
 import asyncio
 from pathlib import Path
-from typing import Optional, Any
+from typing import Any, Callable, Optional
 
 
-def submit_and_wait(
-    client_config: dict,
-    inferlet_path: Path,
-    manifest_path: Path,
-    arguments: list[str],
-    server_handle: Any = None,
-    backend_processes: list | None = None,
-    on_event: Optional[callable] = None,
-) -> None:
-    """Submit a local inferlet and wait for it to finish.
-
-    Args:
-        client_config: Client configuration with host, port, internal_auth_token
-        inferlet_path: Path to the .wasm inferlet file
-        manifest_path: Path to the manifest TOML file
-        arguments: Arguments to pass to the inferlet
-        server_handle: Optional server handle for process monitoring
-        backend_processes: Optional list of backend processes to monitor
-        on_event: Optional callback: (event_type: str, message: str) -> None
-    """
-    asyncio.run(
-        _submit_local_async(
-            client_config,
-            inferlet_path,
-            manifest_path,
-            arguments,
-            server_handle,
-            backend_processes,
-            on_event,
-        )
-    )
-
-
-def submit_from_registry_and_wait(
+def run(
     client_config: dict,
     inferlet_name: str,
     arguments: list[str],
+    *,
+    wasm_path: Path | None = None,
+    manifest_path: Path | None = None,
     server_handle: Any = None,
     backend_processes: list | None = None,
-    on_event: Optional[callable] = None,
+    on_event: Optional[Callable[[str, str], None]] = None,
 ) -> None:
-    """Submit an inferlet from the registry and wait for it to finish.
+    """Run an inferlet and block until it completes.
+
+    Connects to the Pie engine, optionally installs a local WASM program
+    (if wasm_path and manifest_path are provided), launches the process,
+    and streams output events until termination.
 
     Args:
-        client_config: Client configuration with host, port, internal_auth_token
-        inferlet_name: Inferlet name (e.g., "text-completion@0.1.0")
-        arguments: Arguments to pass to the inferlet
-        server_handle: Optional server handle for process monitoring
-        backend_processes: Optional list of backend processes to monitor
-        on_event: Optional callback: (event_type: str, message: str) -> None
+        client_config: Dict with ``host``, ``port``, ``internal_auth_token``.
+        inferlet_name: Inferlet identifier (e.g. ``"text-completion@0.1.0"``).
+        arguments: Command-line arguments forwarded to the inferlet.
+        wasm_path: Optional local ``.wasm`` binary. If provided together with
+            ``manifest_path``, the program is installed before launching.
+        manifest_path: Optional ``Pie.toml`` manifest (must pair with ``wasm_path``).
+        server_handle: Optional engine process handle for health monitoring.
+        backend_processes: Optional backend process list for health monitoring.
+        on_event: Callback ``(event_type, message) -> None``. Defaults to ``print``.
     """
     asyncio.run(
-        _submit_registry_async(
+        _run_async(
             client_config,
             inferlet_name,
             arguments,
-            server_handle,
-            backend_processes,
-            on_event,
+            wasm_path=wasm_path,
+            manifest_path=manifest_path,
+            server_handle=server_handle,
+            backend_processes=backend_processes,
+            on_event=on_event,
         )
     )
 
-
 # =============================================================================
-# Async Implementations
+# Internals
 # =============================================================================
 
 
-async def _submit_local_async(
+async def _run_async(
     client_config: dict,
-    inferlet_path: Path,
-    manifest_path: Path,
+    inferlet_name: str,
     arguments: list[str],
+    *,
+    wasm_path: Path | None,
+    manifest_path: Path | None,
     server_handle,
     backend_processes,
     on_event,
 ) -> None:
-    """Async implementation for local inferlet submission."""
-    import tomllib
     from pie_client import PieClient
 
-    def emit(event_type: str, msg: str):
+    def emit(kind: str, msg: str):
         if on_event:
-            on_event(event_type, msg)
+            on_event(kind, msg)
         else:
             print(msg)
 
-    if not inferlet_path.exists():
-        raise FileNotFoundError(f"Inferlet not found: {inferlet_path}")
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
-
     uri = _build_uri(client_config)
     token = client_config.get("internal_auth_token")
-
-    monitor_task = _start_monitor(server_handle, backend_processes)
+    monitor = _start_monitor(server_handle, backend_processes)
 
     try:
         async with PieClient(uri) as client:
             await client.auth_by_token(token)
 
-            # Parse manifest for inferlet name
-            manifest = tomllib.loads(manifest_path.read_text())
-            name = manifest["package"]["name"]
-            version = manifest["package"]["version"]
-            inferlet_name = f"{name}@{version}"
-            emit("info", f"Inferlet: {inferlet_name}")
+            # Install from local path if provided
+            if wasm_path is not None and manifest_path is not None:
+                if not wasm_path.exists():
+                    raise FileNotFoundError(f"Inferlet not found: {wasm_path}")
+                if not manifest_path.exists():
+                    raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
-            # Install if needed
-            if not await client.program_exists(inferlet_name, inferlet_path, manifest_path):
-                emit("info", "Installing inferlet...")
-                await client.install_program(inferlet_path, manifest_path)
-            else:
-                emit("info", "Inferlet already cached on server.")
+                if not await client.check_program(
+                    inferlet_name, wasm_path, manifest_path
+                ):
+                    emit("info", "Installing inferlet...")
+                    await client.install_program(wasm_path, manifest_path)
+                else:
+                    emit("info", "Inferlet already cached on server.")
 
             # Launch and stream
-            emit("info", f"Launching {inferlet_path.name}...")
-            instance = await client.launch_process(
+            emit("info", f"Launching {inferlet_name}...")
+            process = await client.launch_process(
                 inferlet_name,
                 arguments=arguments,
                 capture_outputs=True,
             )
-            emit("info", f"Instance launched: {instance.instance_id}")
+            emit("info", f"Process started: {process.process_id}")
 
-            await _stream_events(instance, monitor_task, emit)
+            await _stream_events(process, monitor, emit)
     finally:
-        _cancel_monitor(monitor_task)
-
-
-async def _submit_registry_async(
-    client_config: dict,
-    inferlet_name: str,
-    arguments: list[str],
-    server_handle,
-    backend_processes,
-    on_event,
-) -> None:
-    """Async implementation for registry inferlet submission."""
-    from pie_client import PieClient
-
-    def emit(event_type: str, msg: str):
-        if on_event:
-            on_event(event_type, msg)
-        else:
-            print(msg)
-
-    uri = _build_uri(client_config)
-    token = client_config.get("internal_auth_token")
-
-    monitor_task = _start_monitor(server_handle, backend_processes)
-
-    try:
-        async with PieClient(uri) as client:
-            await client.auth_by_token(token)
-
-            instance = await client.launch_process_from_registry(
-                inferlet=inferlet_name,
-                arguments=arguments,
-                capture_outputs=True,
-            )
-
-            await _stream_events(instance, monitor_task, emit)
-    finally:
-        _cancel_monitor(monitor_task)
+        _cancel_monitor(monitor)
 
 
 # =============================================================================
-# Shared Helpers
+# Event streaming
 # =============================================================================
 
 
-def _build_uri(client_config: dict) -> str:
-    """Build WebSocket URI from client config."""
-    host = client_config.get("host", "127.0.0.1")
-    port = client_config.get("port", 8080)
-    return f"ws://{host}:{port}"
-
-
-def _start_monitor(server_handle, backend_processes) -> asyncio.Task | None:
-    """Start process health monitor if processes are provided."""
-    if not backend_processes:
-        return None
-    return asyncio.create_task(
-        _monitor_processes_task(server_handle, backend_processes)
-    )
-
-
-def _cancel_monitor(monitor_task: asyncio.Task | None):
-    """Cancel the monitor task if running."""
-    if monitor_task and not monitor_task.done():
-        monitor_task.cancel()
-
-
-async def _stream_events(instance, monitor_task, emit) -> None:
-    """Stream events from an inferlet instance until completion.
-
-    This is the shared event loop used by both local and registry submissions.
-    """
+async def _stream_events(process, monitor_task, emit) -> None:
+    """Stream events from a process until it returns or errors."""
     from pie_client import Event
 
     while True:
-        recv_task = asyncio.create_task(instance.recv())
+        recv_task = asyncio.create_task(process.recv())
         tasks = [recv_task]
         if monitor_task:
             tasks.append(monitor_task)
@@ -220,46 +132,56 @@ async def _stream_events(instance, monitor_task, emit) -> None:
 
         if monitor_task in done:
             recv_task.cancel()
-            monitor_task.result()  # Propagate any exception
+            monitor_task.result()
 
         if recv_task not in done:
             continue
-        event, message = recv_task.result()
+
+        event, value = recv_task.result()
 
         if event == Event.Stdout:
-            print(message, end="", flush=True)
+            print(value, end="", flush=True)
         elif event == Event.Stderr:
-            print(message, end="", file=sys.stderr, flush=True)
+            print(value, end="", file=sys.stderr, flush=True)
         elif event == Event.Message:
-            emit("message", f"[Message] {message}")
-        elif event == Event.Completed:
-            emit("completed", f"{message}")
+            emit("message", f"[Message] {value}")
+        elif event == Event.Return:
+            emit("completed", f"{value}")
             break
-        elif event == Event.Aborted:
-            emit("aborted", f"⚠️ Instance aborted: {message}")
+        elif event == Event.Error:
+            emit("error", f"❌ {value}")
             break
-        elif event == Event.Exception:
-            emit("exception", f"❌ Instance exception: {message}")
-            break
-        elif event == Event.ServerError:
-            emit("error", f"❌ Server error: {message}")
-            break
-        elif event == Event.OutOfResources:
-            emit("error", f"❌ Out of resources: {message}")
-            break
-        elif event == Event.Blob:
-            emit("blob", f"[Received blob: {len(message)} bytes]")
-        else:
-            emit("unknown", f"[Unknown event {event}]: {message}")
+        elif event == Event.File:
+            emit("file", f"[Received file: {len(value)} bytes]")
 
 
-async def _monitor_processes_task(server_handle, backend_processes):
-    """Async task to monitor backend process health."""
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
+def _build_uri(client_config: dict) -> str:
+    host = client_config.get("host", "127.0.0.1")
+    port = client_config.get("port", 8080)
+    return f"ws://{host}:{port}"
+
+
+def _start_monitor(server_handle, backend_processes) -> asyncio.Task | None:
     if not backend_processes:
-        return
+        return None
+    return asyncio.create_task(
+        _monitor_processes(server_handle, backend_processes)
+    )
 
+
+def _cancel_monitor(task: asyncio.Task | None):
+    if task and not task.done():
+        task.cancel()
+
+
+async def _monitor_processes(server_handle, backend_processes):
+    """Poll backend process health. Raises on unexpected death."""
     while True:
-        # Check SpawnContext processes
         for ctx in backend_processes:
             if hasattr(ctx, "processes"):
                 for p in ctx.processes:

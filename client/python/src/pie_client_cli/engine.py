@@ -15,7 +15,7 @@ from typing import Optional
 
 import typer
 
-from pie_client import PieClient, Event, Instance, InstanceInfo
+from pie_client import PieClient, Event, Process
 from pie_client.crypto import ParsedPrivateKey
 
 from . import path as path_utils
@@ -171,7 +171,7 @@ def _write_with_prefix(
 
 
 async def _stream_inferlet_output_async(
-    instance: Instance,
+    instance: Process,
     client: PieClient,
 ) -> None:
     """Stream output from an inferlet with signal handling (async version).
@@ -180,7 +180,7 @@ async def _stream_inferlet_output_async(
     - Ctrl-C (SIGINT): Sends terminate request to the server
     - Ctrl-D (EOF on stdin): Detaches from the inferlet (continues running)
     """
-    instance_id = instance.instance_id
+    instance_id = instance.process_id
     short_id = instance_id[: min(8, len(instance_id))]
     at_line_start_stdout = True
     at_line_start_stderr = True
@@ -260,18 +260,13 @@ async def _stream_inferlet_output_async(
                 if event == Event.Message:
                     typer.echo(f"[Instance {short_id}] Message: {message}")
 
-                elif event == Event.Completed:
+                elif event == Event.Return:
                     typer.echo(f"[Instance {short_id}] Completed: {message}")
                     return
 
-                elif event in (
-                    Event.Aborted,
-                    Event.Exception,
-                    Event.ServerError,
-                    Event.OutOfResources,
-                ):
-                    typer.echo(f"[Instance {short_id}] {event.name}: {message}")
-                    raise RuntimeError(f"inferlet terminated with status {event.name}")
+                elif event == Event.Error:
+                    typer.echo(f"[Instance {short_id}] Error: {message}")
+                    raise RuntimeError(f"inferlet terminated with error: {message}")
 
                 elif event == Event.Stdout:
                     at_line_start_stdout = _write_with_prefix(
@@ -283,8 +278,7 @@ async def _stream_inferlet_output_async(
                         True, message, short_id, at_line_start_stderr
                     )
 
-                elif event == Event.Blob:
-                    # Ignore binary blobs
+                elif event == Event.File:
                     pass
 
     finally:
@@ -292,7 +286,7 @@ async def _stream_inferlet_output_async(
         signal.signal(signal.SIGINT, original_handler)
 
 
-def stream_inferlet_output(instance: Instance, client: PieClient) -> None:
+def stream_inferlet_output(instance: Process, client: PieClient) -> None:
     """Stream output from an inferlet with signal handling (sync wrapper)."""
     asyncio.get_event_loop().run_until_complete(
         _stream_inferlet_output_async(instance, client)
@@ -305,7 +299,7 @@ def ping(client: PieClient) -> None:
     asyncio.get_event_loop().run_until_complete(client.ping())
 
 
-def list_processes(client: PieClient) -> list[InstanceInfo]:
+def list_processes(client: PieClient) -> list[str]:
     """List processes (sync wrapper)."""
     return asyncio.get_event_loop().run_until_complete(client.list_processes())
 
@@ -315,7 +309,7 @@ def terminate_process(client: PieClient, instance_id: str) -> None:
     asyncio.get_event_loop().run_until_complete(client.terminate_process(instance_id))
 
 
-def attach_process(client: PieClient, instance_id: str) -> Instance:
+def attach_process(client: PieClient, instance_id: str) -> Process:
     """Attach to a process (sync wrapper)."""
     return asyncio.get_event_loop().run_until_complete(
         client.attach_process(instance_id)
@@ -335,7 +329,7 @@ def install_program(client: PieClient, wasm_path: str, manifest_path: str) -> No
     )
 
 
-def program_exists(
+def check_program(
     client: PieClient,
     inferlet: str,
     wasm_path: str | None = None,
@@ -355,7 +349,7 @@ def program_exists(
             If paths are provided, both must be specified together.
     """
     return asyncio.get_event_loop().run_until_complete(
-        client.program_exists(inferlet, wasm_path, manifest_path)
+        client.check_program(inferlet, wasm_path, manifest_path)
     )
 
 
@@ -364,7 +358,7 @@ def launch_process(
     inferlet: str,
     arguments: list[str],
     capture_outputs: bool = True,
-) -> Instance:
+) -> Process:
     """Launch a process (sync wrapper).
 
     This function performs a two-level search for the inferlet:
@@ -380,24 +374,8 @@ def launch_process(
     )
 
 
-def launch_process_from_registry(
-    client: PieClient,
-    inferlet: str,
-    arguments: list[str],
-    capture_outputs: bool = True,
-) -> Instance:
-    """Launch a process from the registry only (sync wrapper).
-
-    Unlike `launch_process`, this function searches only the registry and does not
-    check client-uploaded programs. Use this when you explicitly want to launch
-    an inferlet from the registry.
-
-    The inferlet parameter can be:
-    - Full name with version: "text-completion@0.1.0"
-    - Without version (defaults to "latest"): "text-completion"
-    """
     return asyncio.get_event_loop().run_until_complete(
-        client.launch_process_from_registry(inferlet, arguments, capture_outputs)
+        client.launch_process(inferlet, arguments, capture_outputs)
     )
 
 

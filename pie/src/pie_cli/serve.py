@@ -221,11 +221,6 @@ def serve(
             manager.terminate(server_handle, backend_processes)
         console.print("[green]✓[/green] Shutdown complete")
     except Exception as e:
-        from pie_runtime import manager
-
-        if isinstance(e, manager.EngineError):
-            console.print(f"[red]✗[/red] {e}")
-            raise typer.Exit(1)
-        console.print(f"[red]✗[/red] Error: {e}")
+        console.print(f"[red]✗[/red] {e}")
         manager.terminate(server_handle, backend_processes)
         raise typer.Exit(1)

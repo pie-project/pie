@@ -58,9 +58,6 @@ class Process:
         await self.client.terminate_process(self.process_id)
 
 
-# Backward compatibility alias
-Instance = Process
-
 
 class PieClient:
     """
@@ -319,15 +316,6 @@ class PieClient:
             return result == "true"
         raise Exception(f"CheckProgram failed: {result}")
 
-    # Backward compatibility alias
-    async def program_exists(
-        self,
-        inferlet: str,
-        wasm_path: str | Path | None = None,
-        manifest_path: str | Path | None = None,
-    ) -> bool:
-        return await self.check_program(inferlet, wasm_path, manifest_path)
-
     # =========================================================================
     # Program Upload
     # =========================================================================
@@ -418,10 +406,6 @@ class PieClient:
                 }
                 await self.ws.send(msgpack.packb(msg, use_bin_type=True))
 
-    # Backward compatibility alias
-    async def upload_blob(self, instance_id: str, blob_bytes: bytes):
-        await self._transfer_file(instance_id, blob_bytes)
-
     # =========================================================================
     # Process Lifecycle
     # =========================================================================
@@ -459,15 +443,6 @@ class PieClient:
                 await queue.put(event_tuple)
 
         return Process(self, process_id)
-
-    # Backward compatibility alias
-    async def launch_instance(
-        self,
-        inferlet: str,
-        arguments: list[str] | None = None,
-        capture_outputs: bool = True,
-    ) -> Process:
-        return await self.launch_process(inferlet, arguments, capture_outputs)
 
     async def attach_process(self, process_id: str) -> Process:
         """Attach to an existing process.

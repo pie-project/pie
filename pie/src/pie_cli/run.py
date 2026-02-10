@@ -122,21 +122,25 @@ def run(
             "internal_auth_token": server_handle.internal_token,
         }
 
-        if path is not None:
-            from pie_runtime import inferlet as inferlet_mod
+        from pie_runtime import inferlet as inferlet_mod
 
-            inferlet_mod.submit_and_wait(
-                client_config, path, manifest, arguments or [], server_handle, backend_processes
+        if path is not None:
+            import tomllib
+
+            manifest_content = tomllib.loads(manifest.read_text())
+            name = manifest_content["package"]["name"]
+            version = manifest_content["package"]["version"]
+            inferlet_name = f"{name}@{version}"
+
+            inferlet_mod.run(
+                client_config, inferlet_name, arguments or [],
+                wasm_path=path, manifest_path=manifest,
+                server_handle=server_handle, backend_processes=backend_processes,
             )
         else:
-            from pie_runtime import inferlet as inferlet_mod
-
-            inferlet_mod.submit_from_registry_and_wait(
-                client_config,
-                inferlet,
-                arguments or [],
-                server_handle,
-                backend_processes,
+            inferlet_mod.run(
+                client_config, inferlet, arguments or [],
+                server_handle=server_handle, backend_processes=backend_processes,
             )
 
         # Cleanup
@@ -152,13 +156,6 @@ def run(
             manager.terminate(server_handle, backend_processes)
         raise typer.Exit(130)
     except Exception as e:
-        from pie_runtime import manager
-
-        if isinstance(e, manager.EngineError):
-            console.print(f"[red]✗[/red] {e}")
-            manager.terminate(server_handle, backend_processes)
-            raise typer.Exit(1)
-    except Exception as e:
-        console.print(f"[red]✗[/red] Error: {e}")
+        console.print(f"[red]✗[/red] {e}")
         manager.terminate(server_handle, backend_processes)
         raise typer.Exit(1)

@@ -215,7 +215,7 @@ def handle_submit_command(
                 typer.echo("✅ Inferlet installed successfully.")
             # No composition - check if program already exists before installing
             else:
-                if not engine.program_exists(client, inferlet_name, path, manifest):
+                if not engine.check_program(client, inferlet_name, path, manifest):
                     engine.install_program(client, path, manifest)
                     typer.echo("✅ Inferlet installed successfully.")
                 else:
@@ -238,14 +238,14 @@ def handle_submit_command(
 
             typer.echo(f"Launching from registry: {inferlet}")
 
-            instance = engine.launch_process_from_registry(
+            instance = engine.launch_process(
                 client,
                 inferlet,
                 arguments,
                 capture_outputs,
             )
 
-        typer.echo(f"✅ Inferlet launched with ID: {instance.instance_id}")
+        typer.echo(f"✅ Inferlet launched with ID: {instance.process_id}")
 
         if capture_outputs:
             engine.stream_inferlet_output(instance, client)

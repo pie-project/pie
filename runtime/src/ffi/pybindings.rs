@@ -100,9 +100,9 @@ impl PyRpcServer {
 // =============================================================================
 
 /// Scheduler configuration for a model.
-#[pyclass]
+#[pyclass(name = "SchedulerConfig")]
 #[derive(Clone)]
-pub struct PySchedulerConfig {
+pub struct SchedulerConfig {
     #[pyo3(get, set)]
     pub max_in_flight_batches: usize,
     #[pyo3(get, set)]
@@ -114,7 +114,7 @@ pub struct PySchedulerConfig {
 }
 
 #[pymethods]
-impl PySchedulerConfig {
+impl SchedulerConfig {
     #[new]
     #[pyo3(signature = (
         max_in_flight_batches = 4,
@@ -128,7 +128,7 @@ impl PySchedulerConfig {
         max_wait_ms: u64,
         min_batch_for_optimization: usize,
     ) -> Self {
-        PySchedulerConfig {
+        SchedulerConfig {
             max_in_flight_batches,
             request_timeout_secs,
             max_wait_ms,
@@ -137,10 +137,9 @@ impl PySchedulerConfig {
     }
 }
 
-/// Device configuration — one per Python RPC server (per TP group).
-#[pyclass]
+#[pyclass(name = "DeviceConfig")]
 #[derive(Clone)]
-pub struct PyDeviceConfig {
+pub struct DeviceConfig {
     /// IPC server name from `RpcServer.server_name()`
     #[pyo3(get, set)]
     pub hostname: String,
@@ -156,10 +155,10 @@ pub struct PyDeviceConfig {
 }
 
 #[pymethods]
-impl PyDeviceConfig {
+impl DeviceConfig {
     #[new]
     fn new(hostname: String, total_pages: usize, max_batch_tokens: usize, max_batch_size: usize) -> Self {
-        PyDeviceConfig {
+        DeviceConfig {
             hostname,
             total_pages,
             max_batch_tokens,
@@ -168,10 +167,9 @@ impl PyDeviceConfig {
     }
 }
 
-/// Model configuration — one per `[[model]]` section.
-#[pyclass]
+#[pyclass(name = "ModelConfig")]
 #[derive(Clone)]
-pub struct PyModelConfig {
+pub struct ModelConfig {
     #[pyo3(get, set)]
     pub name: String,
     #[pyo3(get, set)]
@@ -183,13 +181,13 @@ pub struct PyModelConfig {
     #[pyo3(get, set)]
     pub tokenizer_path: String,
     #[pyo3(get, set)]
-    pub devices: Vec<PyDeviceConfig>,
+    pub devices: Vec<DeviceConfig>,
     #[pyo3(get, set)]
-    pub scheduler: PySchedulerConfig,
+    pub scheduler: SchedulerConfig,
 }
 
 #[pymethods]
-impl PyModelConfig {
+impl ModelConfig {
     #[new]
     #[pyo3(signature = (
         name,
@@ -206,17 +204,17 @@ impl PyModelConfig {
         stop_tokens: Vec<u32>,
         kv_page_size: usize,
         tokenizer_path: String,
-        devices: Vec<PyDeviceConfig>,
-        scheduler: Option<PySchedulerConfig>,
+        devices: Vec<DeviceConfig>,
+        scheduler: Option<SchedulerConfig>,
     ) -> Self {
-        PyModelConfig {
+        ModelConfig {
             name,
             chat_template,
             stop_tokens,
             kv_page_size,
             tokenizer_path,
             devices,
-            scheduler: scheduler.unwrap_or_else(|| PySchedulerConfig::new(4, 120, 50, 8)),
+            scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(4, 120, 50, 8)),
         }
     }
 }
@@ -254,7 +252,7 @@ pub struct Config {
     pub telemetry_service_name: String,
     // Models
     #[pyo3(get, set)]
-    pub models: Vec<PyModelConfig>,
+    pub models: Vec<ModelConfig>,
 }
 
 #[pymethods]
@@ -287,7 +285,7 @@ impl Config {
         telemetry_enabled: bool,
         telemetry_endpoint: String,
         telemetry_service_name: String,
-        models: Vec<PyModelConfig>,
+        models: Vec<ModelConfig>,
     ) -> Self {
         Config {
             host,
@@ -445,9 +443,9 @@ fn py_bootstrap(py: Python<'_>, config: Config) -> PyResult<RuntimeHandle> {
 #[pymodule]
 pub fn _pie(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Config>()?;
-    m.add_class::<PyModelConfig>()?;
-    m.add_class::<PyDeviceConfig>()?;
-    m.add_class::<PySchedulerConfig>()?;
+    m.add_class::<ModelConfig>()?;
+    m.add_class::<DeviceConfig>()?;
+    m.add_class::<SchedulerConfig>()?;
     m.add_class::<RuntimeHandle>()?;
     m.add_class::<PyRpcServer>()?;
     m.add_function(wrap_pyfunction!(py_bootstrap, m)?)?;

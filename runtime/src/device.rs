@@ -324,7 +324,7 @@ impl RpcServer {
 // RpcClient — sends requests, receives responses
 // =============================================================================
 
-/// IPC client that connects to an `RpcServer` (or `PyRpcServer`).
+/// IPC client that connects to an `RpcServer`.
 ///
 /// After the handshake, the client sends `IpcRequest` messages and
 /// receives `IpcResponse` messages. A background thread routes incoming

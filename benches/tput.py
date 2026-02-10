@@ -48,7 +48,7 @@ async def run_benchmark(args):
         await client.authenticate("benchmark-user")
 
         # 3. Install program (check both name and hashes match)
-        if not await client.program_exists(inferlet_name, wasm_path, manifest_path):
+        if not await client.check_program(inferlet_name, wasm_path, manifest_path):
             print("Installing program...")
             await client.install_program(wasm_path, manifest_path)
         else:
@@ -95,12 +95,12 @@ async def run_benchmark(args):
                 # Launch instance
                 try:
                     inferlet_name = f"{namespace}/{name}@{version}"
-                    instance = await client.launch_instance(
+                    instance = await client.launch_process(
                         inferlet_name, arguments=inferlet_args
                     )
                     while True:
                         event, msg = await instance.recv()
-                        if event == Event.Completed:
+                        if event == Event.Return:
                             text = msg
                             chars = len(text)
                             tokens = chars / 4.0
@@ -110,18 +110,8 @@ async def run_benchmark(args):
                             completed += 1
                             print(".", end="", flush=True)
                             break
-                        elif event == Event.Exception:
+                        elif event == Event.Error:
                             print(f"[{worker_id}] Req {req_id} failed: {msg}")
-                            break
-                        # Handle other potential closing events
-                        elif event in (
-                            Event.Aborted,
-                            Event.ServerError,
-                            Event.OutOfResources,
-                        ):
-                            print(
-                                f"[{worker_id}] Req {req_id} aborted/failed: {event} {msg}"
-                            )
                             break
                 except Exception as e:
                     print(f"[{worker_id}] Error: {e}")

@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 
 #os.environ["HF_DATASETS_OFFLINE"] = "1"
 # Assume pie is an installed library
-from pie_client import PieClient, Instance, Event
+from pie_client import PieClient, Event
 
 # Use the refactored dataset imports
 from countdown import CountdownDataset
@@ -95,27 +95,22 @@ async def launch_and_get_result(
     """Launches an inferlet and returns the final message."""
     if verbose:
         tqdm.write(f"🚀 Worker {worker_id}: Launching {inferlet_name}...")
-    instance = await client.launch_instance_from_registry(
+    instance = await client.launch_process(
         inferlet_name, arguments=arguments
     )
     final_payload = None
     while True:
         event, message = await instance.recv()
-        if event in (Event.Completed, Event.Message):
+        if event in (Event.Return, Event.Message):
             final_payload = message
-            if event == Event.Completed:
+            if event == Event.Return:
                 if verbose:
                     tqdm.write(
-                        f"✅ Worker {worker_id}: Instance {instance.instance_id} finished."
+                        f"✅ Worker {worker_id}: Instance {instance.process_id} finished."
                     )
                 break
-        elif event in (
-            Event.Aborted,
-            Event.Exception,
-            Event.ServerError,
-            Event.OutOfResources,
-        ):
-            # tqdm.write(f"⚠️ Worker {worker_id}: Instance {instance.instance_id} failed with event {event}. Msg: {message}")
+        elif event == Event.Error:
+            # tqdm.write(f"⚠️ Worker {worker_id}: Instance {instance.process_id} failed. Msg: {message}")
             break
     return final_payload
 

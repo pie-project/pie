@@ -27,6 +27,9 @@ def http(
     port: int = typer.Option(
         ..., "--port", help="TCP port for the server to listen on"
     ),
+    manifest: Optional[Path] = typer.Option(
+        None, "--manifest", "-m", help="Path to the manifest TOML file (required with --path)"
+    ),
     config: Optional[Path] = typer.Option(
         None, "--config", "-c", help="Path to TOML configuration file"
     ),
@@ -65,6 +68,15 @@ def http(
     # Verify inferlet exists if using path
     if path is not None and not path.exists():
         console.print(f"[red]✗[/red] File not found: {path}")
+        raise typer.Exit(1)
+
+    # Manifest is required when using --path
+    if path is not None and manifest is None:
+        console.print("[red]✗[/red] --manifest is required when using --path")
+        raise typer.Exit(1)
+
+    if manifest is not None and not manifest.exists():
+        console.print(f"[red]✗[/red] Manifest not found: {manifest}")
         raise typer.Exit(1)
 
     try:
@@ -118,7 +130,7 @@ def http(
 
         if path is not None:
             _launch_server_inferlet(
-                client_config, path, port, arguments or []
+                client_config, path, manifest, port, arguments or []
             )
         else:
             # TODO: Support launching from registry
@@ -142,26 +154,21 @@ def http(
         console.print("[green]✓[/green] Server stopped")
         raise typer.Exit(0)
     except Exception as e:
-        from pie_runtime import manager
-
-        if isinstance(e, manager.EngineError):
-            console.print(f"[red]✗[/red] {e}")
-            manager.terminate(server_handle, backend_processes)
-            raise typer.Exit(1)
-        console.print(f"[red]✗[/red] Error: {e}")
+        console.print(f"[red]✗[/red] {e}")
         manager.terminate(server_handle, backend_processes)
         raise typer.Exit(1)
 
 
 def _launch_server_inferlet(
     client_config: dict,
-    path: Path,
+    wasm_path: Path,
+    manifest_path: Path,
     port: int,
     arguments: list[str],
 ) -> None:
-    """Upload and launch a server inferlet from a local path."""
+    """Install and launch a server inferlet from a local path."""
     import asyncio
-    import blake3
+    import tomllib
     from pie_client import PieClient
 
     async def _launch():
@@ -169,20 +176,23 @@ def _launch_server_inferlet(
         engine_port = client_config["port"]
         uri = f"ws://{host}:{engine_port}"
 
+        manifest = tomllib.loads(manifest_path.read_text())
+        name = manifest["package"]["name"]
+        version = manifest["package"]["version"]
+        inferlet_name = f"{name}@{version}"
+
         async with PieClient(uri) as client:
             await client.auth_by_token(client_config["internal_auth_token"])
 
-            # Read and hash the program
-            program_bytes = path.read_bytes()
-            program_hash = blake3.blake3(program_bytes).hexdigest()
+            if not await client.check_program(inferlet_name, wasm_path, manifest_path):
+                console.print(f"[dim]Installing {wasm_path.name}...[/dim]")
+                await client.install_program(wasm_path, manifest_path)
 
-            # Install if needed
-            if not await client.program_exists(program_hash):
-                console.print(f"[dim]Installing {path.name}...[/dim]")
-                await client.install_program(program_bytes)
-
-            # Launch as server instance
             console.print(f"[dim]Starting server on port {port}...[/dim]")
-            await client.launch_daemon(program_hash, port, arguments)
+            await client.launch_process(
+                inferlet_name,
+                arguments=["--port", str(port)] + arguments,
+                capture_outputs=False,
+            )
 
     asyncio.run(_launch())

@@ -11,10 +11,6 @@ import warnings
 from typing import Optional, Any
 
 
-class EngineError(Exception):
-    """Exception raised for engine/backend errors."""
-
-    pass
 
 
 def start(
@@ -37,7 +33,7 @@ def start(
         Tuple of (RuntimeHandle, list of worker contexts)
 
     Raises:
-        EngineError: If engine or backend fails to start
+        RuntimeError: If engine or backend fails to start
     """
     from . import _pie
     from . import path as pie_path
@@ -48,10 +44,6 @@ def start(
     def status(msg: str):
         if on_status:
             on_status(msg)
-
-    # Currently supports single-model configurations
-    if len(model_configs) > 1:
-        raise EngineError("Currently only single-model configurations are supported")
 
     model_config = model_configs[0]
 
@@ -72,7 +64,7 @@ def start(
         if device and device.startswith("cuda:"):
             device_idx = int(device.split(":")[1])
             if device_idx >= available_gpus:
-                raise EngineError(
+                raise RuntimeError(
                     f"Device '{device}' is not accessible. "
                     f"Only {available_gpus} GPU(s) are visible (cuda:0 to cuda:{available_gpus - 1}). "
                     f"Check CUDA_VISIBLE_DEVICES environment variable."
@@ -170,7 +162,7 @@ def start(
     for gid in range(num_groups):
         meta = device_metadata_by_group.get(gid, {})
         py_devices.append(
-            _pie.PyDeviceConfig(
+            _pie.DeviceConfig(
                 hostname=server_names_by_group[gid],
                 total_pages=meta.get("total_pages", 0),
                 max_batch_tokens=meta.get("max_batch_tokens", 10240),
@@ -181,14 +173,14 @@ def start(
     # Use group 0's metadata for model-level info (all groups load the same model)
     group0_meta = device_metadata_by_group.get(0, {})
 
-    py_model = _pie.PyModelConfig(
+    py_model = _pie.ModelConfig(
         name=model_config.get("hf_repo", "unknown"),
         chat_template=group0_meta.get("chat_template", ""),
         stop_tokens=group0_meta.get("stop_tokens", []),
         kv_page_size=model_config.get("kv_page_size", 16),
         tokenizer_path="",
         devices=py_devices,
-        scheduler=_pie.PySchedulerConfig(
+        scheduler=_pie.SchedulerConfig(
             max_in_flight_batches=4,
             request_timeout_secs=120,
             max_wait_ms=50,
