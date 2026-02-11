@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use crate::structured::bitmask::{self, set_bit};
 use crate::structured::compiled_grammar::CompiledGrammar;
 use crate::structured::fsm::StateId;
-use crate::structured::tokenizer::TokenizerInfo;
+use crate::tokenizer::Tokenizer;
 
 pub(super) struct SingleDfaEngine {
     pub(super) rule_idx: usize,
@@ -102,7 +102,7 @@ impl SingleDfaEngine {
     pub(super) fn fill_bitmask(
         &self,
         compiled: &CompiledGrammar,
-        tokenizer_info: &TokenizerInfo,
+        tokenizer_info: &Tokenizer,
         bitmask: &mut [u32],
         scratch_stack: &mut Vec<u16>,
         scratch_prefix: &mut Vec<u8>,
@@ -140,7 +140,7 @@ impl SingleDfaEngine {
     fn fill_bitmask_trie_walk(
         &self,
         compiled: &CompiledGrammar,
-        tokenizer_info: &TokenizerInfo,
+        tokenizer_info: &Tokenizer,
         bitmask: &mut [u32],
         stack: &mut Vec<u16>,
         active_prefix: &mut Vec<u8>,

@@ -10,7 +10,7 @@ use anyhow::Result;
 use crate::tokenizer::Tokenizer;
 
 /// Global cache for models (keyed by ModelId).
-static MODELS: LazyLock<boxcar::Vec<Model>> =
+static MODELS: LazyLock<boxcar::Vec<Arc<Model>>> =
     LazyLock::new(|| boxcar::Vec::new());
 
 /// Type alias for model identifiers.
@@ -33,16 +33,14 @@ pub fn register(
     kv_page_size: u32,
     tokenizer_path: PathBuf,
 ) -> Result<()> {
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
-    let model = Model {
-        inner: Arc::new(Inner {
-            name,
-            chat_template,
-            stop_tokens,
-            kv_page_size,
-            tokenizer,
-        }),
-    };
+    let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
+    let model = Arc::new(Model {
+        name,
+        chat_template,
+        stop_tokens,
+        kv_page_size,
+        tokenizer,
+    });
     MODELS.push(model);
     Ok(())
 }
@@ -53,7 +51,7 @@ pub fn models() -> Vec<String> {
 }
 
 /// Gets cached model by model ID.
-pub fn get_model(model_id: ModelId) -> Option<&'static Model> {
+pub fn get_model(model_id: ModelId) -> Option<&'static Arc<Model>> {
     MODELS.get(model_id)
 }
 
@@ -61,55 +59,55 @@ pub fn get_model(model_id: ModelId) -> Option<&'static Model> {
 // Model
 // =============================================================================
 
-#[derive(Clone)]
 pub struct Model {
-    inner: Arc<Inner>,
+    name: String,
+    chat_template: String,
+    stop_tokens: Vec<u32>,
+    kv_page_size: u32,
+    tokenizer: Arc<Tokenizer>,
 }
 
 impl std::fmt::Debug for Model {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Model")
-            .field("name", &self.inner.name)
+            .field("name", &self.name)
             .finish()
     }
-}
-
-struct Inner {
-    name: String,
-    chat_template: String,
-    stop_tokens: Vec<u32>,
-    kv_page_size: u32,
-    tokenizer: Tokenizer,
 }
 
 impl Model {
     /// Gets the model name.
     pub fn name(&self) -> &str {
-        &self.inner.name
+        &self.name
     }
 
     /// Gets the chat template.
     pub fn chat_template(&self) -> &str {
-        &self.inner.chat_template
+        &self.chat_template
+    }
+
+    /// Gets the tokenizer.
+    pub fn tokenizer(&self) -> &Arc<Tokenizer> {
+        &self.tokenizer
     }
 
     /// Tokenizes text into token IDs.
     pub fn tokenize(&self, text: &str) -> Vec<u32> {
-        self.inner.tokenizer.encode(text)
+        self.tokenizer.encode(text)
     }
 
     /// Detokenizes token IDs into text.
     pub fn detokenize(&self, tokens: &[u32]) -> String {
-        self.inner.tokenizer.decode(tokens, false)
+        self.tokenizer.decode(tokens, false)
     }
 
     /// Gets the vocabulary as parallel vectors of (token IDs, token bytes).
     pub fn get_vocabs(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        let size = self.inner.tokenizer.vocab_size();
+        let size = self.tokenizer.vocab_size();
         let mut ids = Vec::with_capacity(size);
         let mut bytes = Vec::with_capacity(size);
         for id in 0..size as u32 {
-            if let Some(tok_bytes) = self.inner.tokenizer.id_to_token(id) {
+            if let Some(tok_bytes) = self.tokenizer.id_to_token(id) {
                 ids.push(id);
                 bytes.push(tok_bytes);
             }
@@ -119,21 +117,21 @@ impl Model {
 
     /// Gets the split regex pattern.
     pub fn get_split_regex(&self) -> String {
-        self.inner.tokenizer.get_split_regex()
+        self.tokenizer.get_split_regex()
     }
 
     /// Gets the special tokens.
     pub fn get_special_tokens(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        self.inner.tokenizer.get_special_tokens()
+        self.tokenizer.get_special_tokens()
     }
 
     /// Gets the stop tokens.
     pub fn stop_tokens(&self) -> &[u32] {
-        &self.inner.stop_tokens
+        &self.stop_tokens
     }
 
     /// Gets the KV page size.
     pub fn kv_page_size(&self) -> u32 {
-        self.inner.kv_page_size
+        self.kv_page_size
     }
 }

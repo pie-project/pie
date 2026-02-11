@@ -176,12 +176,12 @@ mod tests {
     use std::sync::Arc;
 
     use crate::structured::matcher::GrammarMatcher;
-    use crate::structured::tokenizer::{TokenizerInfo, VocabType};
+    use crate::tokenizer::Tokenizer;
 
     fn accepts(grammar: &Grammar, input: &str) -> bool {
         let vocab: Vec<String> = vec!["dummy".into()];
-        let tok = TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap();
-        let mut m = GrammarMatcher::new(Arc::new(grammar.clone()), Arc::new(tok), vec![], 10);
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
+        let mut m = GrammarMatcher::new(Arc::new(grammar.clone()), tok, vec![], 10);
         if input.is_empty() {
             return m.can_terminate();
         }

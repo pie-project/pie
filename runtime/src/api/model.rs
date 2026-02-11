@@ -1,5 +1,6 @@
 //! pie:core/model - Model and Tokenizer resources
 
+use std::sync::Arc;
 use crate::api::pie;
 use crate::linker::InstanceState;
 use crate::model;
@@ -13,14 +14,14 @@ pub struct Model {
     /// The model ID (for routing to the correct backend)
     pub model_id: usize,
     /// Cached model handle
-    pub model: model::Model,
+    pub model: Arc<model::Model>,
 }
 
 /// Tokenizer resource - for tokenization operations.
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
     /// The model handle (contains tokenizer + stop tokens)
-    pub model: model::Model,
+    pub model: Arc<model::Model>,
 }
 
 impl pie::core::model::Host for InstanceState {}

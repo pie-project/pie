@@ -40,6 +40,87 @@ impl Brle {
         }
     }
 
+    /// Creates a `Brle` from a packed bitmask (`&[u32]`).
+    ///
+    /// Each bit in the bitmask represents a boolean value (bit set = `true`).
+    /// Bit 0 of word 0 is index 0, bit 31 of word 0 is index 31, etc.
+    ///
+    /// Uses word-level bit manipulation (`trailing_zeros`/`trailing_ones`) to
+    /// skip entire runs, making this O(transitions) rather than O(total_bits).
+    ///
+    /// # Arguments
+    /// * `bitmask` - The packed bitmask words.
+    /// * `total_size` - The total number of boolean values (may be less than
+    ///   `bitmask.len() * 32` if the last word is partial).
+    pub fn from_bitmask(bitmask: &[u32], total_size: usize) -> Self {
+        if total_size == 0 {
+            return Self::new(0);
+        }
+
+        let mut buffer = Vec::new();
+        let mut current_val = false;
+        let mut run_len: u32 = 0;
+        let mut pos = 0usize;
+
+        for &word in bitmask {
+            let bits_in_word = (total_size - pos).min(32);
+            if bits_in_word == 0 {
+                break;
+            }
+
+            // Mask off unused high bits in the last word
+            let word = if bits_in_word < 32 {
+                word & ((1u32 << bits_in_word) - 1)
+            } else {
+                word
+            };
+
+            // Process runs within this word using bit tricks
+            let mut bit = 0u32;
+            while (bit as usize) < bits_in_word {
+                let remaining_bits = bits_in_word as u32 - bit;
+                // Extract the portion of the word we haven't consumed yet
+                let shifted = word >> bit;
+
+                let run = if current_val {
+                    // Count consecutive 1-bits: trailing_ones of shifted
+                    // trailing_ones = trailing_zeros of inverted
+                    let ones = (!shifted).trailing_zeros().min(remaining_bits);
+                    ones
+                } else {
+                    // Count consecutive 0-bits
+                    let zeros = shifted.trailing_zeros().min(remaining_bits);
+                    zeros
+                };
+
+                if run == 0 {
+                    // Value flipped — commit current run and switch
+                    if !current_val && buffer.is_empty() {
+                        buffer.push(0); // zero-length false prefix
+                    } else {
+                        buffer.push(run_len);
+                    }
+                    current_val = !current_val;
+                    run_len = 0;
+                } else {
+                    run_len += run;
+                    bit += run;
+                }
+            }
+            pos += bits_in_word;
+        }
+
+        // Push the final run
+        if run_len > 0 || buffer.is_empty() {
+            if buffer.is_empty() && current_val {
+                buffer.push(0);
+            }
+            buffer.push(run_len);
+        }
+
+        Self { buffer, total_size }
+    }
+
     /// Creates a `Brle` from a slice of booleans.
     ///
     /// This method efficiently scans the slice and constructs the run-length encoded buffer.

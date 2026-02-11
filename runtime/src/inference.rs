@@ -9,7 +9,6 @@
 //! Batch scheduling, RPC execution, and response notification are handled
 //! by individual BatchScheduler instances (one per device).
 
-pub mod brle;
 pub mod request;
 pub mod scheduler;
 mod adaptive_policy;

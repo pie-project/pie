@@ -15,7 +15,7 @@ use crate::structured::fsm::{
 };
 use crate::structured::grammar::Grammar;
 use crate::structured::grammar::normalize::normalize_grammar;
-use crate::structured::tokenizer::TokenizerInfo;
+use crate::tokenizer::Tokenizer;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -120,7 +120,7 @@ impl CompiledGrammar {
     /// 2. Per-rule NFA→DFA conversion
     /// 3. DFA state info pre-computation
     /// 4. Adaptive token mask pre-computation
-    pub fn new(grammar: &Grammar, tokenizer_info: &TokenizerInfo) -> Self {
+    pub fn new(grammar: &Grammar, tokenizer_info: &Tokenizer) -> Self {
         let normalized = Arc::new(normalize_grammar(grammar));
 
         // Build per-rule NFAs and convert to DFAs
@@ -327,7 +327,7 @@ fn hash_dfa(dfa: &Automaton<DfaTable>) -> u64 {
 /// the masks are cloned instead of recomputed over the full vocabulary.
 fn precompute_token_masks(
     rule_dfas: &[Automaton<DfaTable>],
-    tokenizer_info: &TokenizerInfo,
+    tokenizer_info: &Tokenizer,
     state_actions: &[StateAction],
     state_action_offsets: &[u32],
 ) -> HashMap<(u32, u32), AdaptiveTokenMask> {

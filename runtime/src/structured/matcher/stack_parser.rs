@@ -1054,7 +1054,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::structured::compiled_grammar::CompiledGrammar;
-    use crate::structured::tokenizer::{TokenizerInfo, VocabType};
+    use crate::tokenizer::Tokenizer;
 
     #[test]
     #[ignore] // Run with: cargo test diagnostic_per_byte_stats -- --ignored --nocapture
@@ -1087,7 +1087,7 @@ mod tests {
         let grammar = Arc::new(crate::structured::json_schema::json_schema_to_grammar(json_schema, &crate::structured::json_schema::JsonSchemaOptions::default()).unwrap());
         let vocab: Vec<String> = (0..256u16).map(|b| String::from(b as u8 as char)).collect();
         let tokenizer = Arc::new(
-            TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap(),
+            Tokenizer::from_vocab(&vocab),
         );
         let compiled = Arc::new(CompiledGrammar::new(&grammar, &tokenizer));
         let mut parser = StackParser::new(compiled.clone());

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use pie::structured::matcher::GrammarMatcher;
 use pie::structured::regex::regex_to_grammar;
-use pie::structured::tokenizer::{TokenizerInfo, VocabType};
+use pie::tokenizer::Tokenizer;
 
 fn is_regex_accept_string(pattern: &str, input: &str) -> bool {
     let grammar = match regex_to_grammar(pattern) {
@@ -17,8 +17,8 @@ fn is_regex_accept_string(pattern: &str, input: &str) -> bool {
         }
     };
     let vocab: Vec<String> = vec!["dummy".into()];
-    let tok = TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap();
-    let mut m = GrammarMatcher::new(Arc::new(grammar), Arc::new(tok), vec![], 10);
+    let tok = Arc::new(Tokenizer::from_vocab(&vocab));
+    let mut m = GrammarMatcher::new(Arc::new(grammar), tok, vec![], 10);
 
     if input.is_empty() {
         return m.can_terminate();

@@ -7,12 +7,12 @@ use std::sync::Arc;
 use pie::structured::grammar::Grammar;
 use pie::structured::json_schema::{builtin_json_grammar, json_schema_to_grammar, JsonSchemaOptions};
 use pie::structured::matcher::GrammarMatcher;
-use pie::structured::tokenizer::{TokenizerInfo, VocabType};
+use pie::tokenizer::Tokenizer;
 
 fn is_grammar_accept_string_g(grammar: &Grammar, input: &str) -> bool {
     let vocab: Vec<String> = vec!["dummy".into()];
-    let tok = TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap();
-    let mut m = GrammarMatcher::new(Arc::new(grammar.clone()), Arc::new(tok), vec![], 10);
+    let tok = Arc::new(Tokenizer::from_vocab(&vocab));
+    let mut m = GrammarMatcher::new(Arc::new(grammar.clone()), tok, vec![], 10);
 
     if input.is_empty() {
         return m.can_terminate();

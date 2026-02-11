@@ -9,7 +9,7 @@ use pie::structured::bitmask;
 use pie::structured::grammar::Grammar;
 use pie::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
 use pie::structured::matcher::GrammarMatcher;
-use pie::structured::tokenizer::{TokenizerInfo, VocabType};
+use pie::tokenizer::Tokenizer;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -25,8 +25,8 @@ fn is_grammar_accept_string(grammar_ebnf: &str, input: &str) -> bool {
 
 fn is_grammar_accept_string_g(grammar: &Grammar, input: &str) -> bool {
     let vocab: Vec<String> = vec!["dummy".into()];
-    let tok = TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap();
-    let mut m = GrammarMatcher::new(Arc::new(grammar.clone()), Arc::new(tok), vec![], 10);
+    let tok = Arc::new(Tokenizer::from_vocab(&vocab));
+    let mut m = GrammarMatcher::new(Arc::new(grammar.clone()), tok, vec![], 10);
 
     if input.is_empty() {
         return m.can_terminate();
@@ -50,9 +50,7 @@ fn schema_accepts(schema: &str, input: &str) -> bool {
 fn make_matcher(ebnf: &str, root: &str, vocab: &[&str]) -> GrammarMatcher {
     let grammar = Arc::new(Grammar::from_ebnf(ebnf, root).unwrap());
     let encoded: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-    let tokenizer = Arc::new(
-        TokenizerInfo::new(&encoded, VocabType::Raw, None).unwrap(),
-    );
+    let tokenizer = Arc::new(Tokenizer::from_vocab(&encoded));
     GrammarMatcher::new(grammar, tokenizer, vec![], 10)
 }
 

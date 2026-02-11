@@ -12,11 +12,12 @@ mod stack_parser;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::brle::Brle;
 use crate::structured::bitmask::{self, set_bit};
 use crate::structured::compiled_grammar::CompiledGrammar;
 use crate::structured::fsm::{FsmEdge, StateId};
 use crate::structured::grammar::Grammar;
-use crate::structured::tokenizer::TokenizerInfo;
+use crate::tokenizer::Tokenizer;
 
 use single_dfa::SingleDfaEngine;
 use stack_parser::{SmallDedup, StackParser, StackState};
@@ -44,7 +45,7 @@ enum ParserEngine {
 pub struct GrammarMatcher {
     engine: ParserEngine,
     compiled: Arc<CompiledGrammar>,
-    tokenizer_info: Arc<TokenizerInfo>,
+    tokenizer: Arc<Tokenizer>,
     /// Token IDs that signal end of generation.
     stop_token_ids: Vec<u32>,
     /// Length of each accepted token (in bytes), for rollback.
@@ -55,6 +56,8 @@ pub struct GrammarMatcher {
     max_rollback_tokens: usize,
     /// Reusable scratch buffers for trie walk (avoids per-call heap allocations).
     trie_scratch: TrieWalkScratch,
+    /// Scratch bitmask for `fill_next_token_brle`.
+    bitmask_scratch: Vec<u32>,
 }
 
 /// Reusable scratch buffers for the trie walk in `fill_next_token_bitmask`.
@@ -96,7 +99,7 @@ impl GrammarMatcher {
     /// Create a new grammar matcher.
     pub fn new(
         grammar: Arc<Grammar>,
-        tokenizer_info: Arc<TokenizerInfo>,
+        tokenizer_info: Arc<Tokenizer>,
         stop_token_ids: Vec<u32>,
         max_rollback_tokens: usize,
     ) -> Self {
@@ -107,7 +110,7 @@ impl GrammarMatcher {
     /// Create a grammar matcher from a pre-compiled grammar.
     pub fn with_compiled(
         compiled: Arc<CompiledGrammar>,
-        tokenizer_info: Arc<TokenizerInfo>,
+        tokenizer_info: Arc<Tokenizer>,
         stop_token_ids: Vec<u32>,
         max_rollback_tokens: usize,
     ) -> Self {
@@ -122,15 +125,17 @@ impl GrammarMatcher {
         } else {
             ParserEngine::Stack(parser)
         };
+        let vocab_size = tokenizer_info.vocab_size();
         Self {
             engine,
             compiled,
-            tokenizer_info,
+            tokenizer: tokenizer_info,
             stop_token_ids,
             token_length_history: VecDeque::new(),
             terminated: false,
             max_rollback_tokens,
             trie_scratch: TrieWalkScratch::new(),
+            bitmask_scratch: vec![0u32; bitmask::bitmask_size(vocab_size)],
         }
     }
 
@@ -148,18 +153,14 @@ impl GrammarMatcher {
             return false;
         }
 
-        if self.tokenizer_info.special_token_ids().contains(&token_id) {
+        if self.tokenizer.special_token_ids().contains(&token_id) {
             return false;
         }
 
-        let decoded = match self.tokenizer_info.decode_token(token_id) {
-            Some(s) => s.to_string(),
-            None => return false,
+        let decoded = match self.tokenizer.decoded_vocab().get(token_id as usize) {
+            Some(s) if !s.is_empty() => s,
+            _ => return false,
         };
-
-        if decoded.is_empty() {
-            return false;
-        }
 
         let ok = match &mut self.engine {
             ParserEngine::SingleDfa(e) => e.advance_bytes(&self.compiled, decoded.as_bytes()),
@@ -215,7 +216,7 @@ impl GrammarMatcher {
             return;
         }
 
-        let vocab_size = self.tokenizer_info.vocab_size();
+        let vocab_size = self.tokenizer.vocab_size();
 
         // Allow stop tokens if grammar can terminate here
         if self.can_terminate() {
@@ -229,7 +230,7 @@ impl GrammarMatcher {
         match &self.engine {
             ParserEngine::SingleDfa(e) => {
                 e.fill_bitmask(
-                    &self.compiled, &self.tokenizer_info, bitmask,
+                    &self.compiled, &self.tokenizer, bitmask,
                     &mut self.trie_scratch.dfa_stack,
                     &mut self.trie_scratch.dfa_active_prefix,
                 );
@@ -238,6 +239,15 @@ impl GrammarMatcher {
                 self.fill_bitmask_stack(bitmask);
             }
         }
+    }
+
+    /// Fill the next-token bitmask and return it as a [`Brle`].
+    pub fn fill_next_token_brle(&mut self) -> Brle {
+        let mut scratch = std::mem::take(&mut self.bitmask_scratch);
+        self.fill_next_token_bitmask(&mut scratch);
+        let brle = Brle::from_bitmask(&scratch, self.tokenizer.vocab_size());
+        self.bitmask_scratch = scratch;
+        brle
     }
 
     /// Fill bitmask using the stack parser (multi-rule path).
@@ -303,8 +313,8 @@ impl GrammarMatcher {
             _ => unreachable!(),
         };
 
-        let sorted = self.tokenizer_info.sorted_vocab();
-        let trie_end = self.tokenizer_info.trie_subtree_end();
+        let sorted = self.tokenizer.sorted_vocab();
+        let trie_end = self.tokenizer.trie_subtree_end();
 
         // Reuse scratch buffers (clear but keep allocated capacity)
         let s = &mut self.trie_scratch;
@@ -551,15 +561,12 @@ mod tests {
     use super::*;
     use crate::structured::bitmask::bitmask_size;
     use crate::structured::grammar::Grammar;
-    use crate::structured::tokenizer::VocabType;
 
     /// Helper to build a grammar matcher with a small test vocabulary.
     fn make_matcher(ebnf: &str, root: &str, vocab: &[&str]) -> GrammarMatcher {
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, root).unwrap());
         let encoded: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-        let tokenizer = Arc::new(
-            TokenizerInfo::new(&encoded, VocabType::Raw, None).unwrap(),
-        );
+        let tokenizer = Arc::new(Tokenizer::from_vocab(&encoded));
         GrammarMatcher::new(grammar, tokenizer, vec![], 10)
     }
 
@@ -572,9 +579,7 @@ mod tests {
     ) -> GrammarMatcher {
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, root).unwrap());
         let encoded: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-        let tokenizer = Arc::new(
-            TokenizerInfo::new(&encoded, VocabType::Raw, None).unwrap(),
-        );
+        let tokenizer = Arc::new(Tokenizer::from_vocab(&encoded));
         GrammarMatcher::new(grammar, tokenizer, stop_ids, 10)
     }
 
@@ -586,7 +591,7 @@ mod tests {
             Grammar::from_ebnf(r#"root ::= "hello""#, "root").unwrap(),
         );
         let vocab: Vec<String> = vec!["hello".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
 
         assert!(m.accept_string("hello"));
@@ -599,7 +604,7 @@ mod tests {
             Grammar::from_ebnf(r#"root ::= "hello""#, "root").unwrap(),
         );
         let vocab: Vec<String> = vec!["hello".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
 
         assert!(!m.accept_string("world"));
@@ -613,7 +618,7 @@ mod tests {
             Grammar::from_ebnf(r#"root ::= "yes" | "no""#, "root").unwrap(),
         );
         let vocab: Vec<String> = vec!["yes".into(), "no".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar.clone(), tok.clone(), vec![], 10);
         assert!(m.accept_string("yes"));
@@ -633,7 +638,7 @@ mod tests {
         "#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["test".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.accept_string("hi alice"));
@@ -645,7 +650,7 @@ mod tests {
         let ebnf = r#"root ::= [a-z]"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.accept_string("a"));
@@ -657,7 +662,7 @@ mod tests {
         let ebnf = r#"root ::= [a-z]*"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["abc".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.can_terminate()); // star allows empty
@@ -670,7 +675,7 @@ mod tests {
         let ebnf = r#"root ::= [a-z]"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["A".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(!m.accept_string("A"));
@@ -856,7 +861,7 @@ mod tests {
         let ebnf = r#"root ::= "a"*"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into(), "b".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.can_terminate()); // * allows empty
@@ -871,7 +876,7 @@ mod tests {
         let ebnf = r#"root ::= "a"+"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(!m.can_terminate()); // + requires at least one
@@ -884,7 +889,7 @@ mod tests {
         let ebnf = r#"root ::= "a"?"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.can_terminate()); // ? allows empty
@@ -900,7 +905,7 @@ mod tests {
         let ebnf = r#"root ::= [\u00e0-\u00ff]"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         // 'à' is U+00E0, UTF-8: 0xC3 0xA0
@@ -913,7 +918,7 @@ mod tests {
         let ebnf = r#"root ::= [\u00e0-\u00ff]"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         // 'a' is U+0061, should not match
@@ -926,7 +931,7 @@ mod tests {
         let ebnf = r#"root ::= [\u4e00-\u9fff]+"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.accept_string("\u{4e00}")); // 一 (CJK first)
@@ -943,7 +948,7 @@ mod tests {
         let ebnf = r#"root ::= [\U0001f600-\U0001f64f]"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         // 😀 is U+1F600, UTF-8: F0 9F 98 80
@@ -957,7 +962,7 @@ mod tests {
         let ebnf = r#"root ::= [\u0041-\u00ff]+"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.accept_string("A")); // U+0041 (1-byte)
@@ -987,7 +992,7 @@ mod tests {
         while vocab_strs.len() < 1000 { vocab_strs.push(format!("tok_{}", vocab_strs.len())); }
         vocab_strs.truncate(1000);
 
-        let tok = Arc::new(TokenizerInfo::new(&vocab_strs, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab_strs));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.accept_string(r#"{"name":"test","age":42}"#));
@@ -1002,7 +1007,7 @@ mod tests {
         "#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["1".into(), "23".into(), "a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.accept_string("123"));
@@ -1040,7 +1045,7 @@ mod tests {
         let ebnf = r#"root ::= "a" ("b" | "c") "d""#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.accept_string("abd"));
@@ -1060,7 +1065,7 @@ mod tests {
         let ebnf = r#"root ::= "\"" [^"\\]* "\""  "#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         // Parse opening quote
@@ -1078,7 +1083,7 @@ mod tests {
         let ebnf = r#"root ::= "\"" [^"\\]* "\""  "#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         assert!(m.accept_string("\"")); // opening quote (token 0)
@@ -1100,7 +1105,7 @@ mod tests {
 
         let vocab: Vec<String> = (32u8..=126).map(|c| String::from(c as char)).collect();
         let tok = Arc::new(
-            TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap(),
+            Tokenizer::from_vocab(&vocab),
         );
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
@@ -1131,7 +1136,7 @@ ws ::= [ \t\n\r]*
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["dummy".into()];
         let tok = Arc::new(
-            TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap(),
+            Tokenizer::from_vocab(&vocab),
         );
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         let input = r#"{"name": "John", "age": 30}"#;
@@ -1148,7 +1153,7 @@ ws ::= [ \t\n\r]*
 
         let vocab: Vec<String> = (0u16..256).map(|i| String::from(i as u8 as char)).collect();
         let tok = Arc::new(
-            TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap(),
+            Tokenizer::from_vocab(&vocab),
         );
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         // 200-char string — without chain short-circuit this would be O(N^2)

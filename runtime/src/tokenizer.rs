@@ -274,6 +274,29 @@ impl Tokenizer {
     // Loading (convenience delegates to hf_loader)
     // -----------------------------------------------------------------------
 
+    /// Build a minimal tokenizer from raw token strings.
+    ///
+    /// Each string becomes a token with ID = its index. No BPE merges, no
+    /// normalization, no special tokens. Uses `CharLevel` vocab type.
+    pub fn from_vocab(vocab: &[String]) -> Self {
+        use std::collections::HashMap;
+        let map: HashMap<u32, Vec<u8>> = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i as u32, s.as_bytes().to_vec()))
+            .collect();
+        let bpe = bpe::BpeTable::from_decoder_map(map);
+        Self::new(
+            bpe,
+            VocabType::CharLevel,
+            vec![],
+            SplitStep::None,
+            vec![],
+            None,
+            vec![],
+        )
+    }
+
     /// Load a tokenizer from an HF `tokenizer.json` file.
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         hf_loader::from_file(path)
@@ -716,6 +739,11 @@ impl Tokenizer {
     /// Enables O(1) subtree skipping during token mask generation.
     pub fn trie_subtree_end(&self) -> &[usize] {
         &self.trie_subtree_end
+    }
+
+    /// Sorted list of special token IDs.
+    pub fn special_token_ids(&self) -> &[u32] {
+        &self.special_token_ids
     }
 }
 

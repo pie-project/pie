@@ -8,15 +8,13 @@ use std::sync::Arc;
 use pie::structured::bitmask;
 use pie::structured::grammar::Grammar;
 use pie::structured::matcher::GrammarMatcher;
-use pie::structured::tokenizer::{TokenizerInfo, VocabType};
+use pie::tokenizer::Tokenizer;
 
 /// Build a matcher with a given vocabulary.
 fn make_matcher(ebnf: &str, root: &str, vocab: &[&str]) -> GrammarMatcher {
     let grammar = Arc::new(Grammar::from_ebnf(ebnf, root).unwrap());
     let encoded: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-    let tokenizer = Arc::new(
-        TokenizerInfo::new(&encoded, VocabType::Raw, None).unwrap(),
-    );
+    let tokenizer = Arc::new(Tokenizer::from_vocab(&encoded));
     GrammarMatcher::new(grammar, tokenizer, vec![], 10)
 }
 
@@ -29,9 +27,7 @@ fn make_matcher_with_stop(
 ) -> GrammarMatcher {
     let grammar = Arc::new(Grammar::from_ebnf(ebnf, root).unwrap());
     let encoded: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-    let tokenizer = Arc::new(
-        TokenizerInfo::new(&encoded, VocabType::Raw, None).unwrap(),
-    );
+    let tokenizer = Arc::new(Tokenizer::from_vocab(&encoded));
     GrammarMatcher::new(grammar, tokenizer, stop_ids, 10)
 }
 

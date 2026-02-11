@@ -21,7 +21,7 @@
 //! use pie::structured::bitmask;
 //! use pie::structured::grammar::Grammar;
 //! use pie::structured::matcher::GrammarMatcher;
-//! use pie::structured::tokenizer::{TokenizerInfo, VocabType};
+//! use pie::tokenizer::Tokenizer;
 //!
 //! // Create grammar from EBNF
 //! let grammar = Arc::new(
@@ -30,9 +30,7 @@
 //!
 //! // Build tokenizer from vocabulary
 //! let vocab: Vec<String> = vec!["yes".into(), "no".into(), "maybe".into()];
-//! let tokenizer = Arc::new(
-//!     TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap()
-//! );
+//! let tokenizer = Arc::new(Tokenizer::from_vocab(&vocab));
 //!
 //! // Create matcher (compiles grammar for this tokenizer)
 //! let mut matcher = GrammarMatcher::new(grammar, tokenizer, vec![], 10);
@@ -83,11 +81,11 @@
 //! use pie::structured::compiled_grammar::CompiledGrammar;
 //! use pie::structured::grammar::Grammar;
 //! use pie::structured::matcher::GrammarMatcher;
-//! use pie::structured::tokenizer::{TokenizerInfo, VocabType};
+//! use pie::tokenizer::Tokenizer;
 //!
 //! let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= [a-z]+"#, "root").unwrap());
 //! let vocab: Vec<String> = (0..128u16).map(|b| String::from(b as u8 as char)).collect();
-//! let tokenizer = Arc::new(TokenizerInfo::new(&vocab, VocabType::Raw, None).unwrap());
+//! let tokenizer = Arc::new(Tokenizer::from_vocab(&vocab));
 //!
 //! // Compile once (builds DFAs + token masks)
 //! let compiled = Arc::new(CompiledGrammar::new(&grammar, &tokenizer));
@@ -105,7 +103,6 @@
 //! - [`grammar`] -- Core grammar types and construction (EBNF, builder)
 //! - [`json_schema`] -- JSON Schema to grammar conversion
 //! - [`regex`] -- Regex to grammar conversion
-//! - [`tokenizer`] -- Tokenizer vocabulary handling
 //! - [`compiled_grammar`] -- Pre-compiled grammar with DFAs and token masks
 //! - [`matcher`] -- Runtime matcher (accept tokens, generate bitmasks, rollback)
 //! - [`bitmask`] -- Token bitmask utilities
@@ -117,4 +114,4 @@ pub mod grammar;
 pub mod json_schema;
 pub mod matcher;
 pub mod regex;
-pub mod tokenizer;
+
