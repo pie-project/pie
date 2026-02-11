@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use pie::model::tokenizer::Tokenizer as MiniTokenizer;
+use pie::tokenizer::Tokenizer as MiniTokenizer;
 use tokenizers::Tokenizer as HfTokenizer;
 
 // ---------------------------------------------------------------------------

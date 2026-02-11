@@ -14,6 +14,7 @@ pub mod bootstrap;
 pub mod inference;
 pub mod messaging;
 pub mod model;
+pub mod tokenizer;
 pub mod program;
 pub mod server;
 pub mod linker;
@@ -25,6 +26,3 @@ pub mod telemetry;
 
 // FFI module for PyO3 bindings, IPC, and format types
 pub mod ffi;
-
-// Re-export the Python module entry point
-pub use ffi::_pie;

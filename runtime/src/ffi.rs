@@ -27,5 +27,5 @@ pub use format::{
 pub use crate::device::{IpcRequest, IpcResponse};
 
 pub use pybindings::{
-    _pie, Config, RuntimeHandle,
+    Config, RuntimeHandle,
 };

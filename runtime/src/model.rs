@@ -3,13 +3,11 @@
 //! This module provides model metadata and tokenizer management via a global cache.
 //! All model and tokenizer operations access the cache directly without message passing.
 
-pub mod tokenizer;
-
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
-use tokenizer::Tokenizer;
+use crate::tokenizer::Tokenizer;
 
 /// Global cache for models (keyed by ModelId).
 static MODELS: LazyLock<boxcar::Vec<Model>> =
