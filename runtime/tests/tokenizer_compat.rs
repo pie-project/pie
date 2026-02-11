@@ -1,4 +1,4 @@
-//! Strict compatibility tests: tokenizer-mini vs HuggingFace `tokenizers` crate.
+//! Strict compatibility tests: Pie tokenizer vs HuggingFace `tokenizers` crate.
 //!
 //! Auto-discovers all locally cached HuggingFace models with a `tokenizer.json`
 //! and compares encode/decode output token-by-token.

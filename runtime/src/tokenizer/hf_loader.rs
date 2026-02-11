@@ -6,14 +6,14 @@
 //!
 //! ```text
 //! ┌──────────────┐    ┌────────────────┐    ┌───────┐    ┌──────────┐
-//! │  Normalizer   │ →  │ Pre-tokenizer  │ →  │ Model │ →  │ Decoder  │
-//! │  (text→text)  │    │ (text→pieces)  │    │ (BPE) │    │ (ids→text│
+//! │  Normalizer   │ → │ Pre-tokenizer  │ →  │ Model │ →  │ Decoder  │
+//! │  (text→text)  │   │ (text→pieces)  │    │ (BPE) │    │ (ids→text│
 //! └──────────────┘    └────────────────┘    └───────┘    └──────────┘
 //! ```
 //!
-//! ## How tokenizer-mini maps this
+//! ## How Pie tokenizer maps this
 //!
-//! tokenizer-mini collapses the first two stages into `Vec<NormStep>` (text
+//! Pie tokenizer collapses the first two stages into `Vec<NormStep>` (text
 //! normalization) + `SplitStep` (splitting strategy) and the last stage into
 //! `Vec<DecodeStep>`.  The `Model` is always BPE, stored as a [`BpeTable`].
 //!
@@ -262,7 +262,7 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
 // HF splits text processing into separate Normalizer and PreTokenizer traits,
 // each with many implementors (NFC, Replace, ByteLevel, Metaspace, Split, …).
 //
-// tokenizer-mini separates these into two phases:
+// Pie tokenizer separates these into two phases:
 //   - `Vec<NormStep>`: text normalization (NFC, prepend space, replace)
 //   - `SplitStep`: exactly one splitting strategy (GPT-2 regex, isolated
 //     regex, metaspace, or none)
@@ -453,7 +453,7 @@ fn build_decode_steps(decoder: &serde_json::Value) -> Result<Vec<DecodeStep>> {
             //   2. If `add_prefix_space`, strip the leading space from
             //      the first token
             //
-            // tokenizer-mini maps this to:
+            // Pie tokenizer maps this to:
             //   - `DecodeStep::Replace { pattern: "▁", content: " " }`
             //   - `DecodeStep::StripFirst { content: " " }` (conditional)
             "Metaspace" => {
