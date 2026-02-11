@@ -179,6 +179,7 @@ impl Session {
             client_id,
             None,
             capture_outputs,
+            None,
         ) {
             Ok(process_id) => {
                 if capture_outputs {

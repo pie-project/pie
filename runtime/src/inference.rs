@@ -10,7 +10,6 @@
 //! by individual BatchScheduler instances (one per device).
 
 pub mod brle;
-pub mod kvcache;
 pub mod request;
 pub mod scheduler;
 mod adaptive_policy;
@@ -19,8 +18,9 @@ mod adaptive_policy;
 
 use tokio::sync::oneshot;
 
+use crate::context;
 use crate::service::{ServiceArray, ServiceHandler};
-use crate::inference::kvcache::{DeviceId, PageId, PageStore, PhysicalPageId};
+use crate::device::DeviceId;
 use anyhow::Result;
 use request::{ForwardPassOutput, ForwardPassRequest};
 use scheduler::BatchScheduler;
@@ -36,22 +36,25 @@ static SERVICES: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLoc
 
 /// Spawns a new inference service for a model.
 pub async fn spawn(
-    page_store: PageStore,
+    device_indices: &[usize],
     max_in_flight_batches: usize,
     request_timeout_secs: u64,
     max_wait_ms: u64,
     min_batch_for_optimization: usize,
 ) -> usize {
     // Fetch device info before entering the sync closure.
-    let mut device_batch_limits = Vec::with_capacity(page_store.devices().len());
-    for &device_idx in page_store.devices() {
+    let device_ids: Vec<DeviceId> = device_indices.to_vec();
+    let mut device_batch_limits = Vec::with_capacity(device_indices.len());
+    for &device_idx in device_indices {
         let info = crate::device::get_spec(device_idx).await
             .unwrap_or_else(|e| panic!("Failed to get device info for index {device_idx}: {e}"));
         device_batch_limits.push((info.max_batch_size, info.max_batch_tokens));
     }
 
+    let model_idx = SERVICES.len();
     SERVICES.spawn(move || InferenceService::new(
-        page_store,
+        model_idx,
+        device_ids,
         device_batch_limits,
         max_in_flight_batches,
         request_timeout_secs,
@@ -73,10 +76,11 @@ pub async fn forward_pass(model_idx: usize, request: ForwardPassRequest) -> Resu
 
 /// The inference service handles forward pass operations.
 ///
-/// Translates logical page IDs to physical page IDs and routes
-/// requests to the appropriate per-device `BatchScheduler`.
+/// Routes requests to the appropriate per-device `BatchScheduler`
+/// based on physical page affinity from the context service.
 struct InferenceService {
-    page_store: PageStore,
+    model_idx: usize,
+    num_devices: usize,
     schedulers: Vec<BatchScheduler>,
 }
 
@@ -89,17 +93,19 @@ impl std::fmt::Debug for InferenceService {
 impl InferenceService {
 
     fn new(
-        page_store: PageStore,
+        model_idx: usize,
+        device_ids: Vec<DeviceId>,
         device_batch_limits: Vec<(usize, usize)>,
         max_in_flight_batches: usize,
         request_timeout_secs: u64,
         max_wait_ms: u64,
         min_batch_for_optimization: usize,
     ) -> Self {
-        let schedulers = page_store.devices().iter().enumerate().map(|(device_idx, &device_id)| {
+        let num_devices = device_ids.len();
+        let schedulers = device_ids.iter().enumerate().map(|(device_idx, &device_id)| {
             let (max_batch_size, max_batch_tokens) = device_batch_limits[device_idx];
             BatchScheduler::new(
-                device_id as DeviceId,
+                device_id,
                 device_idx,
                 max_batch_size,
                 max_batch_tokens,
@@ -111,55 +117,38 @@ impl InferenceService {
         }).collect();
 
         InferenceService {
-            page_store,
+            model_idx,
+            num_devices,
             schedulers,
         }
     }
 
-    /// Translate logical page IDs to physical page IDs for a specific device.
-    /// Returns None if the page has no mapping on the given device.
-    fn translate_page_ids_for_device(
-        &self,
-        page_ids: &[PageId],
-        device_id: DeviceId,
-    ) -> Option<Vec<PhysicalPageId>> {
-        let mut result = Vec::with_capacity(page_ids.len());
+    /// Resolves physical pages from context and queues the forward pass.
+    async fn forward_pass(&self, request: ForwardPassRequest, response_tx: oneshot::Sender<ForwardPassOutput>) -> Result<()> {
+        // Resolve physical page IDs from context
+        let (pages_by_device, last_page_len) = if let Some(ctx_id) = request.context_id {
+            context::get_physical_page_ids(self.model_idx, ctx_id).await?
+        } else {
+            (Default::default(), 0)
+        };
 
-        for &page_id in page_ids {
-            let mappings = self.page_store.get_physical_mappings(page_id);
-            // Find the mapping for this specific device
-            if let Some((_, phys_id)) = mappings.into_iter().find(|(n, _)| *n == device_id) {
-                result.push(phys_id);
-            } else {
-                return None; // Page not available on this device
-            }
+        // Context parallelism not yet supported — pages must reside on a single device
+        if pages_by_device.len() > 1 {
+            anyhow::bail!(
+                "Context pages span {} devices; context parallelism is not yet supported",
+                pages_by_device.len()
+            );
         }
 
-        Some(result)
-    }
-
-    /// Get the primary device for a set of pages (based on first page).
-    fn get_primary_device(&self, page_ids: &[PageId]) -> Option<DeviceId> {
-        if page_ids.is_empty() {
-            return None;
-        }
-
-        let mappings = self.page_store.get_physical_mappings(page_ids[0]);
-        mappings.into_iter().next().map(|(device_id, _)| device_id)
-    }
-
-    /// Queues a forward pass request for execution.
-    fn forward_pass(&self, request: ForwardPassRequest, response_tx: oneshot::Sender<ForwardPassOutput>) -> Result<()> {
-        // Determine target device based on page affinity
-        let device_id = self.get_primary_device(&request.page_ids).unwrap_or(0);
-
-        // Translate page IDs
-        let physical_page_ids = self
-            .translate_page_ids_for_device(&request.page_ids, device_id)
-            .unwrap_or_default();
+        // Extract the single device entry, or default to device 0
+        let (device_id, physical_page_ids) = pages_by_device
+            .into_iter()
+            .next()
+            .unwrap_or((0, vec![]));
 
         // Route to the appropriate BatchScheduler
-        self.schedulers[device_id as usize].submit(request, response_tx, physical_page_ids)
+        let device_idx = device_id.min(self.num_devices.saturating_sub(1));
+        self.schedulers[device_idx].submit(request, response_tx, physical_page_ids, last_page_len)
     }
 }
 
@@ -180,10 +169,11 @@ impl ServiceHandler for InferenceService {
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::ForwardPass { request, response } => {
-                if let Err(e) = self.forward_pass(request, response) {
+                if let Err(e) = self.forward_pass(request, response).await {
                     tracing::error!("Failed to queue forward pass: {}", e);
                 }
             }
         }
     }
 }
+

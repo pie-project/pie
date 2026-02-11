@@ -1,25 +1,26 @@
 interface adapter {
     use wasi:io/poll@0.2.4.{pollable};
 
-    use types.{queue, error, future-bool};
+    use types.{error, future-bool};
+    use model.{model};
     
     resource adapter {
 
-        create: static func(name:string) -> result<adapter, error>;
+        create: static func(model: borrow<model>, name:string) -> result<adapter, error>;
 
-        destroy: func() -> result<_, error>;
+        destroy: func();
 
-        get: static func(name:string) -> option<adapter>;
+        lookup: static func(model: borrow<model>, name:string) -> option<adapter>;
 
         clone: func(name:string) -> adapter;
 
-        lock: func() -> future-bool;
+        acquire-lock: func() -> future-bool;
 
-        unlock: func();
+        release-lock: func() -> result<_, error>;
 
-        load: func(queue: borrow<queue>, path:string) -> result<_, error>;
+        load: func(path:string) -> result<_, error>;
 
-        save: func(queue: borrow<queue>, path:string) -> result<_, error>;
+        save: func(path:string) -> result<_, error>;
 
     }
 

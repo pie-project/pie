@@ -51,8 +51,9 @@ pub fn spawn(
     client_id: Option<ClientId>,
     parent_id: Option<ProcessId>,
     capture_outputs: bool,
+    result_tx: Option<oneshot::Sender<String>>,
 ) -> Result<ProcessId> {
-    let process = Process::new(username, program_name, arguments, client_id, parent_id, capture_outputs);
+    let process = Process::new(username, program_name, arguments, client_id, parent_id, capture_outputs, result_tx);
     let id = process.process_id;
     SERVICES.spawn(id, || process)?;
 
@@ -119,10 +120,6 @@ enum Message {
     Terminate {
         exception: Option<String>,
     },
-    /// Internal: WASM execution has finished
-    ExecutionFinished {
-        exception: Option<String>,
-    },
     /// Register a child process
     AddChild {
         child_id: ProcessId,
@@ -168,6 +165,7 @@ impl Process {
         client_id: Option<ClientId>,
         parent_id: Option<ProcessId>,
         capture_outputs: bool,
+        result_tx: Option<oneshot::Sender<String>>,
     ) -> Self {
         let process_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
 
@@ -177,6 +175,7 @@ impl Process {
             program.clone(),
             arguments.clone(),
             capture_outputs,
+            result_tx,
         ));
 
         Process {
@@ -235,52 +234,51 @@ impl Process {
         program: ProgramName,
         arguments: Vec<String>,
         capture_outputs: bool,
+        result_tx: Option<oneshot::Sender<String>>,
     ) {
-        let exception = match Self::run_inner(process_id, username, &program, &arguments, capture_outputs).await {
-            Ok(_output) => None,
+        let result = async {
+            let (mut store, instance) = linker::instantiate(process_id, username, &program, capture_outputs).await?;
+
+            let run_interface = format!("pie:{}/run", program.name);
+
+            let (_, run_export) = instance
+                .get_export(&mut store, None, &run_interface)
+                .ok_or_else(|| anyhow!("No 'run' interface found"))?;
+
+            let (_, run_func_export) = instance
+                .get_export(&mut store, Some(&run_export), "run")
+                .ok_or_else(|| anyhow!("No 'run' function found"))?;
+
+            let run_func = instance
+                .get_typed_func::<(&[String],), (Result<String, String>,)>(&mut store, &run_func_export)
+                .map_err(|e| anyhow!("Failed to get 'run' function: {e}"))?;
+
+            match run_func.call_async(&mut store, (&arguments[..],)).await {
+                Ok((Ok(output),)) => Ok(output),
+                Ok((Err(runtime_err),)) => Err(anyhow!(runtime_err)),
+                Err(call_err) => Err(anyhow!("Call error: {call_err}")),
+            }
+        }.await;
+
+        let exception = match &result {
+            Ok(_) => None,
             Err(err) => {
                 tracing::info!("Process {process_id} failed: {err}");
                 Some(err.to_string())
             }
         };
 
-        let _ = SERVICES.send(&process_id, Message::ExecutionFinished { exception });
-    }
-
-    /// Inner execution logic, returns the run result.
-    async fn run_inner(
-        process_id: ProcessId,
-        username: String,
-        program: &ProgramName,
-        arguments: &[String],
-        capture_outputs: bool,
-    ) -> Result<String> {
-        let (mut store, instance) = linker::instantiate(process_id, username, program, capture_outputs).await?;
-
-        let run_interface = format!("pie:{}/run", program.name);
-
-        let (_, run_export) = instance
-            .get_export(&mut store, None, &run_interface)
-            .ok_or_else(|| anyhow!("No 'run' interface found"))?;
-
-        let (_, run_func_export) = instance
-            .get_export(&mut store, Some(&run_export), "run")
-            .ok_or_else(|| anyhow!("No 'run' function found"))?;
-
-        let run_func = instance
-            .get_typed_func::<(&[String],), (Result<String, String>,)>(&mut store, &run_func_export)
-            .map_err(|e| anyhow!("Failed to get 'run' function: {e}"))?;
-
-        match run_func.call_async(&mut store, (arguments,)).await {
-            Ok((Ok(output),)) => Ok(output),
-            Ok((Err(runtime_err),)) => Err(anyhow!(runtime_err)),
-            Err(call_err) => Err(anyhow!("Call error: {call_err}")),
+        // Fire result channel if a parent is waiting
+        if let Some(tx) = result_tx {
+            let _ = tx.send(result.unwrap_or_default());
         }
+
+        let _ = SERVICES.send(&process_id, Message::Terminate { exception });
     }
 
     /// Abort the WASM execution task, notify any attached client, terminate
     /// children, and unregister.
-    fn cleanup(&mut self, exception: Option<String>) {
+    fn terminate(&mut self, exception: Option<String>) {
         self.handle.abort();
 
         // Cascade: terminate all children
@@ -323,11 +321,7 @@ impl ServiceHandler for Process {
             }
 
             Message::Terminate { exception } => {
-                self.cleanup(exception);
-            }
-
-            Message::ExecutionFinished { exception } => {
-                self.cleanup(exception);
+                self.terminate(exception);
             }
 
             Message::AddChild { child_id } => {

@@ -320,8 +320,8 @@ class Engine:
         if torch.cuda.is_available():
             torch.cuda.synchronize(self.config.device)
 
-    def upload_adapter(self, adapter_ptr: int, name: str, data: bytes) -> None:
-        """Upload (save) adapter weights."""
+    def load_adapter(self, adapter_ptr: int, name: str, data: bytes) -> None:
+        """Load adapter weights from file."""
         if adapter_ptr in self.adapters:
             adapter = self.adapters[adapter_ptr]
             if isinstance(adapter, CmaesAdapter):
@@ -329,8 +329,8 @@ class Engine:
                     name = f"{name}_rank{self.config.rank}"
                 adapter.upload(name, data)
 
-    def download_adapter(self, adapter_ptr: int, name: str) -> bytes:
-        """Download (load) adapter weights."""
+    def save_adapter(self, adapter_ptr: int, name: str) -> bytes:
+        """Save adapter weights to file."""
         if adapter_ptr in self.adapters:
             adapter = self.adapters[adapter_ptr]
             if isinstance(adapter, CmaesAdapter):

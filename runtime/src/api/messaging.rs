@@ -77,15 +77,19 @@ impl pie::core::messaging::Host for InstanceState {
     }
 
     async fn transfer_file(&mut self, data: Vec<u8>) -> Result<()> {
-        // TODO: send file data to the client
-        let _ = data;
+        let topic = format!("blob:{}", self.id());
+        messaging::push_blob(topic, data.into())?;
         Ok(())
     }
 
     async fn receive_file(&mut self) -> Result<Resource<crate::api::types::FutureBlob>> {
-        // TODO: receive file from the client
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
-        drop(tx); // immediately close — no file expected yet
+        let topic = format!("blob:{}", self.id());
+        tokio::spawn(async move {
+            if let Ok(data) = messaging::pull_blob(topic).await {
+                let _ = tx.send(data.to_vec());
+            }
+        });
         let future_blob = crate::api::types::FutureBlob::new(rx);
         Ok(self.ctx().table.push(future_blob)?)
     }

@@ -329,8 +329,8 @@ def _leader_loop(
             )
         engine.update_adapter(**args)
 
-    def _handle_upload_adapter(**kwargs) -> None:
-        req = message.UploadAdapterRequest(**kwargs)
+    def _handle_load_adapter(**kwargs) -> None:
+        req = message.LoadAdapterRequest(**kwargs)
         data = req.adapter_data
         if isinstance(data, list):
             data = bytes(data)
@@ -338,25 +338,25 @@ def _leader_loop(
         if config.world_size > 1 and compute_pg is not None:
             leader_global_rank = group_topology[group_id][0]
             utils.broadcast_struct(
-                {"type": "UPLOAD_ADAPTER", "kwargs": args},
+                {"type": "LOAD_ADAPTER", "kwargs": args},
                 src=leader_global_rank,
                 device=config.device,
                 group=compute_pg,
             )
-        engine.upload_adapter(**args)
+        engine.load_adapter(**args)
 
-    def _handle_download_adapter(**kwargs) -> None:
-        req = message.DownloadAdapterRequest(**kwargs)
+    def _handle_save_adapter(**kwargs) -> None:
+        req = message.SaveAdapterRequest(**kwargs)
         args = {"adapter_ptr": req.adapter_ptr, "name": req.name}
         if config.world_size > 1 and compute_pg is not None:
             leader_global_rank = group_topology[group_id][0]
             utils.broadcast_struct(
-                {"type": "DOWNLOAD_ADAPTER", "kwargs": args},
+                {"type": "SAVE_ADAPTER", "kwargs": args},
                 src=leader_global_rank,
                 device=config.device,
                 group=compute_pg,
             )
-        engine.download_adapter(**args)
+        engine.save_adapter(**args)
 
     def _handle_fire_batch(**kwargs) -> dict:
         t_start = time.perf_counter()
@@ -460,8 +460,8 @@ def _leader_loop(
         "embed_image": _handle_embed_image,
         "initialize_adapter": _handle_init_adapter,
         "update_adapter": _handle_update_adapter,
-        "upload_adapter": _handle_upload_adapter,
-        "download_adapter": _handle_download_adapter,
+        "load_adapter": _handle_load_adapter,
+        "save_adapter": _handle_save_adapter,
     }
 
     try:
@@ -595,8 +595,8 @@ def _follower_loop(
             elif msg_type == "UPDATE_ADAPTER":
                 engine.update_adapter(**msg["kwargs"])
 
-            elif msg_type == "UPLOAD_ADAPTER":
-                engine.upload_adapter(**msg["kwargs"])
+            elif msg_type == "LOAD_ADAPTER":
+                engine.load_adapter(**msg["kwargs"])
 
-            elif msg_type == "DOWNLOAD_ADAPTER":
-                engine.download_adapter(**msg["kwargs"])
+            elif msg_type == "SAVE_ADAPTER":
+                engine.save_adapter(**msg["kwargs"])

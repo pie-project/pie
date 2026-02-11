@@ -2,6 +2,7 @@
 
 use crate::adapter::{self, AdapterId, LockId};
 use crate::api::pie;
+use crate::api::model::Model;
 use crate::api::types::FutureBool;
 use crate::linker::InstanceState;
 use anyhow::Result;
@@ -23,9 +24,9 @@ pub struct Adapter {
 impl pie::core::adapter::Host for InstanceState {}
 
 impl pie::core::adapter::HostAdapter for InstanceState {
-    async fn create(&mut self, name: String) -> Result<Result<Resource<Adapter>, String>> {
-        // TODO: Get model_idx from instance context or infer from current model
-        let model_idx = 0usize; // Placeholder
+    async fn create(&mut self, model: Resource<Model>, name: String) -> Result<Result<Resource<Adapter>, String>> {
+        let model = self.ctx().table.get(&model)?;
+        let model_idx = model.model_id;
 
         match adapter::create(model_idx, name).await {
             Ok(adapter_id) => {
@@ -50,9 +51,9 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         Ok(())
     }
 
-    async fn lookup(&mut self, name: String) -> Result<Option<Resource<Adapter>>> {
-        // TODO: Get model_idx from instance context or infer from current model
-        let model_idx = 0usize; // Placeholder
+    async fn lookup(&mut self, model: Resource<Model>, name: String) -> Result<Option<Resource<Adapter>>> {
+        let model = self.ctx().table.get(&model)?;
+        let model_idx = model.model_id;
 
         match adapter::get(model_idx, name).await {
             Some(adapter_id) => {

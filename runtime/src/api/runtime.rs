@@ -9,6 +9,7 @@ use crate::program::ProgramName;
 
 use anyhow::Result;
 use wasmtime::component::Resource;
+use wasmtime_wasi::WasiView;
 
 impl pie::core::runtime::Host for InstanceState {
     async fn version(&mut self) -> Result<String> {
@@ -32,16 +33,21 @@ impl pie::core::runtime::Host for InstanceState {
         package_name: String,
         args: Vec<String>,
     ) -> Result<Result<Resource<FutureString>, String>> {
-        // TODO: wire up child process spawning with FutureString
-        let _process_id = process::spawn(
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match process::spawn(
             self.get_username(),
             ProgramName::parse(&package_name),
             args,
             None,
             Some(self.id()),
             false,
-        )?;
-        // For now, return an error since we need to wire up result channel
-        Ok(Err("spawn not yet fully wired".to_string()))
+            Some(tx),
+        ) {
+            Ok(_process_id) => {
+                let future_string = FutureString::new(rx);
+                Ok(Ok(self.ctx().table.push(future_string)?))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
     }
 }

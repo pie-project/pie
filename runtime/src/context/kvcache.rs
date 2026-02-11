@@ -4,12 +4,11 @@
 //! using content-addressable storage. Pages are identified by their content hash,
 //! enabling efficient deduplication and sharing across contexts.
 //!
-//! `PageStore` uses interior mutability via `Arc<Inner>`, so it is `Clone` and
-//! all public methods take `&self`.
+//! `PageStore` is exclusively owned by a `ContextManager` actor, so no
+//! interior mutability or locking is needed.
 
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHasher};
 use anyhow::Result;
 
@@ -23,8 +22,7 @@ pub type PageId = usize;
 /// Physical page index in GPU memory
 pub type PhysicalPageId = u32;
 
-/// Device identifier
-pub type DeviceId = u8;
+
 
 /// Load threshold for spillover (fraction of capacity)
 const LOAD_THRESHOLD: f64 = 0.8;
@@ -32,8 +30,8 @@ const LOAD_THRESHOLD: f64 = 0.8;
 
 #[derive(Debug)]
 pub enum Mapping {
-    Single(DeviceId, PhysicalPageId),
-    Replicated(Vec<(DeviceId, PhysicalPageId)>),
+    Single(u8, PhysicalPageId),
+    Replicated(Vec<(u8, PhysicalPageId)>),
 }
 
 #[derive(Debug)]
@@ -49,7 +47,7 @@ impl Page {
         self.hash.is_none()
     }
 
-    fn device_id(&self) -> DeviceId {
+    fn device_id(&self) -> u8 {
         match &self.mapping {
             Mapping::Single(device_id, _) => *device_id,
             Mapping::Replicated(mappings) => mappings[0].0,
@@ -58,7 +56,7 @@ impl Page {
 
     /// Add mapping from another page, deduplicating by device.
     /// Returns redundant physical pages that should be freed.
-    fn add_mapping(&mut self, other: Mapping) -> Vec<(DeviceId, PhysicalPageId)> {
+    fn add_mapping(&mut self, other: Mapping) -> Vec<(u8, PhysicalPageId)> {
         let new_entries = match other {
             Mapping::Single(n, p) => vec![(n, p)],
             Mapping::Replicated(v) => v,
@@ -92,42 +90,10 @@ impl Page {
 }
 
 // ============================================================================
-// PageStore: Centralized logical page storage with interior mutability
+// PageStore: Centralized logical page storage
 // ============================================================================
 
-/// Handle to the shared page store. Cheap to clone.
-#[derive(Clone)]
-pub struct PageStore {
-    inner: Arc<Inner>,
-}
-
-struct Inner {
-    /// Tokens per page (immutable after construction).
-    page_size: usize,
-    /// Device indices (immutable after construction).
-    devices: Vec<usize>,
-    /// Logical page metadata (pages, index, free list, LRU).
-    page_table: RwLock<PageTable>,
-    /// Per-device physical page storage.
-    phys_page_tables: boxcar::Vec<Mutex<PhysicalPageStore>>,
-}
-
-struct PageTable {
-    pages: Vec<Option<Page>>,
-    index: FxHashMap<PageHash, PageId>,
-    free_page_ids: Vec<PageId>,
-    lru: VecDeque<PageId>,
-}
-
-impl std::fmt::Debug for PageStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PageStore")
-            .field("page_size", &self.inner.page_size)
-            .finish()
-    }
-}
-
-// Per-device physical page storage
+/// Per-device physical page storage
 #[derive(Debug)]
 struct PhysicalPageStore {
     total_pages: usize,
@@ -156,46 +122,51 @@ impl PhysicalPageStore {
     }
 }
 
+/// Manages logical-to-physical KV cache page mappings.
+///
+/// Owned exclusively by a single `ContextManager` actor — no locking required.
+#[derive(Debug)]
+pub struct PageStore {
+    /// Tokens per page.
+    page_size: usize,
+    /// Logical page metadata.
+    pages: Vec<Option<Page>>,
+    /// Hash → PageId index for content-addressable deduplication.
+    index: FxHashMap<PageHash, PageId>,
+    /// Recycled page ID slots.
+    free_page_ids: Vec<PageId>,
+    /// LRU queue for eviction (pages with refcount=0).
+    lru: VecDeque<PageId>,
+    /// Per-device physical page storage.
+    phys_page_tables: Vec<PhysicalPageStore>,
+}
 
 impl PageStore {
-    pub async fn new(page_size: usize, device_indices: &[usize]) -> Self {
-        let phys_page_tables = boxcar::Vec::new();
-        for &idx in device_indices {
-            let info = crate::device::get_spec(idx).await
-                .unwrap_or_else(|e| panic!("Failed to get device info for index {idx}: {e}"));
-            phys_page_tables.push(Mutex::new(PhysicalPageStore::new(info.num_kv_pages)));
-        }
+    pub fn new(page_size: usize, num_kv_pages: &[usize]) -> Self {
+        let phys_page_tables = num_kv_pages.iter()
+            .map(|&n| PhysicalPageStore::new(n))
+            .collect();
         PageStore {
-            inner: Arc::new(Inner {
-                page_size,
-                devices: device_indices.to_vec(),
-                page_table: RwLock::new(PageTable {
-                    pages: Vec::new(),
-                    index: FxHashMap::default(),
-                    free_page_ids: Vec::new(),
-                    lru: VecDeque::new(),
-                }),
-                phys_page_tables,
-            }),
+            page_size,
+            pages: Vec::new(),
+            index: FxHashMap::default(),
+            free_page_ids: Vec::new(),
+            lru: VecDeque::new(),
+            phys_page_tables,
         }
-    }
-
-    pub fn devices(&self) -> &[usize] {
-        &self.inner.devices
     }
 
     /// Get the page size (number of tokens per page).
     pub fn page_size(&self) -> usize {
-        self.inner.page_size
+        self.page_size
     }
 
     /// Compute hash chain from tokens.
     fn compute_hashes(&self, tokens: &[u32]) -> Vec<PageHash> {
-        let page_size = self.inner.page_size;
         let mut hashes = Vec::new();
         let mut prev_hash: PageHash = 0;
 
-        for chunk in tokens.chunks(page_size) {
+        for chunk in tokens.chunks(self.page_size) {
             let mut hasher = FxHasher::default();
             chunk.hash(&mut hasher);
             let content_hash = hasher.finish();
@@ -214,25 +185,24 @@ impl PageStore {
 
     /// Lookup cached pages by token prefix (longest prefix match).
     /// Automatically increments refcount for matched pages.
-    pub fn lookup(&self, tokens: &[u32]) -> Option<Vec<PageId>> {
+    pub fn lookup(&mut self, tokens: &[u32]) -> Option<Vec<PageId>> {
         if tokens.is_empty() {
             return None;
         }
 
         let hashes = self.compute_hashes(tokens);
-        let mut pt = self.inner.page_table.write().unwrap();
         let mut matched_pages = Vec::new();
 
         for hash in &hashes {
-            if let Some(&page_id) = pt.index.get(hash) {
-                // Check refcount via shared ref first
-                let needs_lru_remove = pt.pages[page_id]
+            if let Some(&page_id) = self.index.get(hash) {
+                // Remove from LRU if transitioning from refcount 0
+                let needs_lru_remove = self.pages[page_id]
                     .as_ref()
                     .map_or(false, |p| p.refcount == 0);
                 if needs_lru_remove {
-                    pt.lru.retain(|&id| id != page_id);
+                    self.lru.retain(|&id| id != page_id);
                 }
-                if let Some(page) = pt.pages[page_id].as_mut() {
+                if let Some(page) = self.pages[page_id].as_mut() {
                     page.refcount += 1;
                     matched_pages.push(page_id);
                 }
@@ -252,7 +222,7 @@ impl PageStore {
     /// Hash chain includes tokens, positions, and masks.
     /// Returns (final_page_ids, final_hash) for continued chaining.
     pub fn commit(
-        &self,
+        &mut self,
         page_ids: &[PageId],
         tokens: &[u32],
         positions: &[u32],
@@ -268,15 +238,13 @@ impl PageStore {
             );
         }
 
-        let page_size = self.inner.page_size;
-
         // Compute hashes with position and mask info
         let mut hashes = Vec::new();
         let mut max_positions = Vec::new();
         let mut running_hash = prev_hash;
 
-        for (chunk_idx, chunk) in tokens.chunks(page_size).enumerate() {
-            let start = chunk_idx * page_size;
+        for (chunk_idx, chunk) in tokens.chunks(self.page_size).enumerate() {
+            let start = chunk_idx * self.page_size;
             let end = start + chunk.len();
             let chunk_positions = &positions[start..end];
             let chunk_masks = &masks[start..end];
@@ -311,46 +279,44 @@ impl PageStore {
             );
         }
 
-        let mut pt = self.inner.page_table.write().unwrap();
         let mut final_page_ids = Vec::with_capacity(page_ids.len());
 
         for (i, (&page_id, &hash)) in page_ids.iter().zip(hashes.iter()).enumerate() {
             let max_pos = max_positions[i];
 
             // Check for existing canonical page
-            if let Some(&canonical_id) = pt.index.get(&hash) {
+            if let Some(&canonical_id) = self.index.get(&hash) {
                 if canonical_id != page_id {
                     // Deduplicate: merge current page into canonical
-                    if let Some(page) = pt.pages[page_id].take() {
+                    if let Some(page) = self.pages[page_id].take() {
                         // Check canonical page refcount before mutable borrow
-                        let needs_lru_remove = pt.pages[canonical_id]
+                        let needs_lru_remove = self.pages[canonical_id]
                             .as_ref()
                             .map_or(false, |p| p.refcount == 0);
                         if needs_lru_remove {
-                            pt.lru.retain(|&id| id != canonical_id);
+                            self.lru.retain(|&id| id != canonical_id);
                         }
-                        if let Some(canonical_page) = pt.pages[canonical_id].as_mut() {
+                        if let Some(canonical_page) = self.pages[canonical_id].as_mut() {
                             let redundant = canonical_page.add_mapping(page.mapping);
                             for (device_id, phys_id) in redundant {
-                                self.inner.phys_page_tables[device_id as usize]
-                                    .lock().unwrap()
+                                self.phys_page_tables[device_id as usize]
                                     .free_pages.push(phys_id);
                             }
                             canonical_page.refcount += 1;
                         }
                     }
-                    pt.free_page_ids.push(page_id);
+                    self.free_page_ids.push(page_id);
                     final_page_ids.push(canonical_id);
                     continue;
                 }
             }
 
             // Normal commit
-            let page = pt.pages[page_id].as_mut().unwrap();
+            let page = self.pages[page_id].as_mut().unwrap();
             debug_assert!(page.is_mutable(), "Page {} is already committed", page_id);
             page.hash = Some(hash);
             page.max_position = max_pos;
-            pt.index.insert(hash, page_id);
+            self.index.insert(hash, page_id);
             final_page_ids.push(page_id);
         }
 
@@ -359,25 +325,23 @@ impl PageStore {
 
     /// Select the best device for allocation.
     /// If affinity is specified, use that device. Otherwise, use the device with lowest load.
-    ///
-    /// Caller must hold the page_table lock (passed as `pt`).
-    fn select_device(&self, pt: &PageTable, affinity: Option<PageId>) -> Option<DeviceId> {
-        if self.inner.phys_page_tables.count() == 0 {
+    fn select_device(&self, affinity: Option<PageId>) -> Option<u8> {
+        if self.phys_page_tables.is_empty() {
             return None;
         }
 
         if let Some(affinity_page_id) = affinity {
-            if let Some(page) = pt.pages.get(affinity_page_id).and_then(|p| p.as_ref()) {
+            if let Some(page) = self.pages.get(affinity_page_id).and_then(|p| p.as_ref()) {
                 return Some(page.device_id());
             }
         }
 
         // Select device with lowest load
-        let mut best: Option<(DeviceId, f64)> = None;
-        for (idx, dev) in self.inner.phys_page_tables.iter() {
-            let load = dev.lock().unwrap().load_factor();
+        let mut best: Option<(u8, f64)> = None;
+        for (idx, dev) in self.phys_page_tables.iter().enumerate() {
+            let load = dev.load_factor();
             if best.is_none() || load < best.unwrap().1 {
-                best = Some((idx as DeviceId, load));
+                best = Some((idx as u8, load));
             }
         }
         best.map(|(id, _)| id)
@@ -385,12 +349,10 @@ impl PageStore {
 
     /// Try to evict one page from the LRU (must have refcount=0).
     /// Returns true if a page was evicted.
-    ///
-    /// Caller must hold the page_table write lock (passed as `pt`).
-    fn evict_one(&self, pt: &mut PageTable, target_device: DeviceId) -> bool {
+    fn evict_one(&mut self, target_device: u8) -> bool {
         let mut evict_idx = None;
-        for (i, &page_id) in pt.lru.iter().enumerate() {
-            if let Some(page) = pt.pages[page_id].as_ref() {
+        for (i, &page_id) in self.lru.iter().enumerate() {
+            if let Some(page) = self.pages[page_id].as_ref() {
                 if page.device_id() == target_device && page.refcount == 0 {
                     evict_idx = Some(i);
                     break;
@@ -399,8 +361,8 @@ impl PageStore {
         }
 
         if let Some(idx) = evict_idx {
-            let page_id = pt.lru.remove(idx).unwrap();
-            self.free_page(pt, page_id);
+            let page_id = self.lru.remove(idx).unwrap();
+            self.free_page(page_id);
             true
         } else {
             false
@@ -408,15 +370,13 @@ impl PageStore {
     }
 
     /// Free a page, returning its physical page to the device.
-    ///
-    /// Caller must hold the page_table write lock (passed as `pt`).
-    fn free_page(&self, pt: &mut PageTable, page_id: PageId) {
-        if let Some(page) = pt.pages[page_id].take() {
+    fn free_page(&mut self, page_id: PageId) {
+        if let Some(page) = self.pages[page_id].take() {
             // Remove from index if committed
             if let Some(hash) = page.hash {
-                if let Some(&id) = pt.index.get(&hash) {
+                if let Some(&id) = self.index.get(&hash) {
                     if id == page_id {
-                        pt.index.remove(&hash);
+                        self.index.remove(&hash);
                     }
                 }
             }
@@ -424,57 +384,51 @@ impl PageStore {
             // Return physical page to device
             match page.mapping {
                 Mapping::Single(device_id, phys_id) => {
-                    self.inner.phys_page_tables[device_id as usize]
-                        .lock().unwrap()
+                    self.phys_page_tables[device_id as usize]
                         .free_pages.push(phys_id);
                 }
                 Mapping::Replicated(mappings) => {
                     for (device_id, phys_id) in mappings {
-                        self.inner.phys_page_tables[device_id as usize]
-                            .lock().unwrap()
+                        self.phys_page_tables[device_id as usize]
                             .free_pages.push(phys_id);
                     }
                 }
             }
 
             // Recycle the page ID
-            pt.free_page_ids.push(page_id);
+            self.free_page_ids.push(page_id);
         }
     }
 
     /// Allocate pages on a specific device.
-    pub fn allocate(&self, num_pages: usize, affinity: Option<PageId>) -> Result<Vec<PageId>> {
-        let mut pt = self.inner.page_table.write().unwrap();
-
-        let device_id = self.select_device(&pt, affinity)
+    pub fn allocate(&mut self, num_pages: usize, affinity: Option<PageId>) -> Result<Vec<PageId>> {
+        let device_id = self.select_device(affinity)
             .ok_or_else(|| anyhow::anyhow!("No devices registered"))?;
 
         let mut allocated = Vec::with_capacity(num_pages);
 
         for _ in 0..num_pages {
             let phys_id = loop {
-                let mut dev = self.inner.phys_page_tables[device_id as usize].lock().unwrap();
-                if let Some(phys_id) = dev.free_pages.pop() {
+                if let Some(phys_id) = self.phys_page_tables[device_id as usize].free_pages.pop() {
                     break phys_id;
                 }
-                drop(dev); // release device lock before eviction
-                if !self.evict_one(&mut pt, device_id) {
+                if !self.evict_one(device_id) {
                     for page_id in allocated {
-                        self.free_page(&mut pt, page_id);
+                        self.free_page(page_id);
                     }
                     anyhow::bail!("Out of memory on device {}", device_id);
                 }
             };
 
-            let page_id = if let Some(id) = pt.free_page_ids.pop() {
+            let page_id = if let Some(id) = self.free_page_ids.pop() {
                 id
             } else {
-                let id = pt.pages.len();
-                pt.pages.push(None);
+                let id = self.pages.len();
+                self.pages.push(None);
                 id
             };
 
-            pt.pages[page_id] = Some(Page {
+            self.pages[page_id] = Some(Page {
                 mapping: Mapping::Single(device_id, phys_id),
                 hash: None,
                 refcount: 1,
@@ -488,17 +442,15 @@ impl PageStore {
     }
 
     /// Release pages (decrease refcount).
-    pub fn release(&self, page_ids: &[PageId]) {
-        let mut pt = self.inner.page_table.write().unwrap();
+    pub fn release(&mut self, page_ids: &[PageId]) {
         for &page_id in page_ids {
-            // Check if the page needs freeing before calling free_page
-            let should_free = if let Some(page) = pt.pages[page_id].as_mut() {
+            let should_free = if let Some(page) = self.pages[page_id].as_mut() {
                 page.refcount = page.refcount.saturating_sub(1);
                 if page.refcount == 0 {
                     if page.is_mutable() {
                         true // will free below
                     } else {
-                        pt.lru.push_back(page_id);
+                        self.lru.push_back(page_id);
                         false
                     }
                 } else {
@@ -508,33 +460,31 @@ impl PageStore {
                 false
             };
             if should_free {
-                self.free_page(&mut pt, page_id);
+                self.free_page(page_id);
             }
         }
     }
 
     /// Acquire pages (increase refcount).
     /// Used when forking contexts to share committed pages.
-    pub fn acquire(&self, page_ids: &[PageId]) {
-        let mut pt = self.inner.page_table.write().unwrap();
+    pub fn acquire(&mut self, page_ids: &[PageId]) {
         for &page_id in page_ids {
-            let needs_lru_remove = pt.pages[page_id]
+            let needs_lru_remove = self.pages[page_id]
                 .as_ref()
                 .map_or(false, |p| p.refcount == 0);
             if needs_lru_remove {
-                pt.lru.retain(|&id| id != page_id);
+                self.lru.retain(|&id| id != page_id);
             }
-            if let Some(page) = pt.pages[page_id].as_mut() {
+            if let Some(page) = self.pages[page_id].as_mut() {
                 page.refcount += 1;
             }
         }
     }
 
     /// Get physical page mappings for a logical page.
-    /// Returns the (DeviceId, PhysicalPageId) pairs for a page.
-    pub fn get_physical_mappings(&self, page_id: PageId) -> Vec<(DeviceId, PhysicalPageId)> {
-        let pt = self.inner.page_table.read().unwrap();
-        if let Some(Some(page)) = pt.pages.get(page_id) {
+    /// Returns the (device_id, PhysicalPageId) pairs for a page.
+    pub fn get_physical_mappings(&self, page_id: PageId) -> Vec<(u8, PhysicalPageId)> {
+        if let Some(Some(page)) = self.pages.get(page_id) {
             match &page.mapping {
                 Mapping::Single(device_id, phys_id) => vec![(*device_id, *phys_id)],
                 Mapping::Replicated(mappings) => mappings.clone(),

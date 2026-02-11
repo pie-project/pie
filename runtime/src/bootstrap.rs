@@ -11,7 +11,7 @@ use crate::auth;
 use crate::context;
 use crate::device;
 use crate::inference;
-use crate::inference::kvcache::PageStore;
+
 use crate::linker;
 use crate::messaging;
 use crate::model;
@@ -114,11 +114,11 @@ pub async fn bootstrap(
             device::spawn(&d.hostname, d.total_pages, d.max_batch_size, d.max_batch_tokens)
         }).collect();
 
-        let page_store = PageStore::new(cfg.kv_page_size, &devices).await;
+        let num_kv_pages: Vec<usize> = cfg.devices.iter().map(|d| d.total_pages).collect();
 
-        context::spawn(page_store.clone());
+        context::spawn(cfg.kv_page_size, num_kv_pages);
         inference::spawn(
-            page_store,
+            &devices,
             cfg.scheduler.max_in_flight_batches,
             cfg.scheduler.request_timeout_secs,
             cfg.scheduler.max_wait_ms,

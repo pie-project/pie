@@ -15,9 +15,11 @@ use ipc_channel::ipc::{self, IpcOneShotServer, IpcReceiver, IpcSender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use crate::inference::kvcache::DeviceId;
+
 use crate::service::{ServiceArray, ServiceHandler};
 
+/// Device identifier.
+pub type DeviceId = usize;
 
 static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 

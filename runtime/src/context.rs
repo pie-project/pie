@@ -9,6 +9,7 @@
 //! - Token buffering and cursor tracking
 //!
 //! Contexts are stored per-model via a ServiceArray, accessed by model index.
+pub mod kvcache;
 
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -20,7 +21,8 @@ use anyhow::Result;
 use crate::service::{ServiceHandler, ServiceArray};
 use crate::adapter::AdapterId;
 use crate::inference::brle::Brle;
-use crate::inference::kvcache::{PageId, PageStore, DeviceId, PhysicalPageId, PageHash};
+use kvcache::{PageId, PageStore, PhysicalPageId, PageHash};
+use crate::device::DeviceId;
 
 // =============================================================================
 // Public Types
@@ -37,14 +39,14 @@ pub type LockId = u64;
 static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 
 /// Spawns a new context manager for a model.
-pub fn spawn(page_store: PageStore) -> usize {
-    SERVICES.spawn(move || ContextManager::new(page_store)).expect("Failed to spawn context manager")
+pub fn spawn(page_size: usize, num_kv_pages: Vec<usize>) -> usize {
+    SERVICES.spawn(move || ContextManager::new(page_size, &num_kv_pages)).expect("Failed to spawn context manager")
 }
 
 /// Creates a new context with the given name.
-pub async fn create(model_idx: usize, user_id: u32, name: String, fill: Option<Vec<u32>>) -> Result<ContextId> {
+pub async fn create(model_idx: usize, username: String, name: String, fill: Option<Vec<u32>>) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Create { user_id, name, fill, response: tx })?;
+    SERVICES.send(model_idx, Message::Create { username, name, fill, response: tx })?;
     rx.await?
 }
 
@@ -56,16 +58,16 @@ pub async fn destroy(model_idx: usize, id: ContextId, lock_id: LockId) -> Result
 }
 
 /// Looks up a context by name.
-pub async fn lookup(model_idx: usize, user_id: u32, name: String) -> Option<ContextId> {
+pub async fn lookup(model_idx: usize, username: String, name: String) -> Option<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Lookup { user_id, name, response: tx }).ok()?;
+    SERVICES.send(model_idx, Message::Lookup { username, name, response: tx }).ok()?;
     rx.await.ok()?
 }
 
 /// Forks a context into a new one.
-pub async fn fork(model_idx: usize, id: ContextId, user_id: u32, new_name: String) -> Result<ContextId> {
+pub async fn fork(model_idx: usize, id: ContextId, username: String, new_name: String) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Fork { id, user_id, new_name, response: tx })?;
+    SERVICES.send(model_idx, Message::Fork { id, username, new_name, response: tx })?;
     rx.await?
 }
 
@@ -154,6 +156,14 @@ pub fn append_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId, 
 }
 
 
+/// Gets physical page IDs grouped by device, plus the last page length.
+pub async fn get_physical_page_ids(model_idx: usize, id: ContextId) -> Result<(HashMap<DeviceId, Vec<PhysicalPageId>>, u32)> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::GetPhysicalPageIds { id, response: tx })?;
+    Ok(rx.await?)
+}
+
+
 
 /// Record of operations on a context (for lineage tracking).
 #[derive(Debug, Clone)]
@@ -215,16 +225,15 @@ impl Context {
 struct ContextManager {
     pub page_store: PageStore,
     contexts: DashMap<ContextId, Context>,
-    name_to_id: DashMap<(u32, String), ContextId>,
+    name_to_id: DashMap<(String, String), ContextId>,
     next_id: AtomicU64,
     pub page_size: usize,
 }
 
 impl ContextManager {
-    pub fn new(page_store: PageStore) -> Self {
-        let page_size = page_store.page_size();
+    pub fn new(page_size: usize, num_kv_pages: &[usize]) -> Self {
         ContextManager {
-            page_store,
+            page_store: PageStore::new(page_size, num_kv_pages),
             contexts: DashMap::new(),
             name_to_id: DashMap::new(),
             next_id: AtomicU64::new(1),
@@ -238,7 +247,7 @@ impl ContextManager {
 
     // ==================== Core Operations ====================
 
-    pub fn create(&mut self, user_id: u32, name: String, fill: Option<Vec<u32>>) -> Result<ContextId> {
+    pub fn create(&mut self, username: String, name: String, fill: Option<Vec<u32>>) -> Result<ContextId> {
         let id = self.next_id();
         let mut ctx = Context::new();
 
@@ -252,7 +261,7 @@ impl ContextManager {
                 adapter: None,
             });
 
-            let page_store = &self.page_store;
+            let page_store = &mut self.page_store;
             
             // Lookup existing cached pages (longest prefix match)
             let matched_pages = page_store.lookup(&tokens);
@@ -312,7 +321,7 @@ impl ContextManager {
         }
 
         self.contexts.insert(id, ctx);
-        self.name_to_id.insert((user_id, name), id);
+        self.name_to_id.insert((username, name), id);
         Ok(id)
     }
 
@@ -332,13 +341,13 @@ impl ContextManager {
         }
     }
 
-    pub fn get(&self, user_id: u32, name: String) -> Option<ContextId> {
-        self.name_to_id.get(&(user_id, name)).map(|v| *v.value())
+    pub fn get(&self, username: String, name: String) -> Option<ContextId> {
+        self.name_to_id.get(&(username, name)).map(|v| *v.value())
     }
 
-    pub fn fork(&mut self, id: ContextId, user_id: u32, new_name: String) -> Result<ContextId> {
-        // Check if name already exists
-        if self.name_to_id.contains_key(&(user_id, new_name.clone())) {
+    pub fn fork(&mut self, id: ContextId, username: String, new_name: String) -> Result<ContextId> {
+        // Check for name collision
+        if self.name_to_id.contains_key(&(username.clone(), new_name.clone())) {
             anyhow::bail!("Context name already exists: {}", new_name);
         }
 
@@ -357,7 +366,7 @@ impl ContextManager {
         
         drop(source_ctx); // Release the borrow
 
-        let page_store = &self.page_store;
+        let page_store = &mut self.page_store;
         
         // Increase refcount for committed pages
         page_store.acquire(&pages_committed);
@@ -386,7 +395,7 @@ impl ContextManager {
         };
 
         self.contexts.insert(new_id, new_ctx);
-        self.name_to_id.insert((user_id, new_name), new_id);
+        self.name_to_id.insert((username, new_name), new_id);
 
         Ok(new_id)
     }
@@ -484,7 +493,7 @@ impl ContextManager {
         }
     }
 
-    pub fn get_physical_page_ids(&self, id: ContextId) -> HashMap<DeviceId, Vec<PhysicalPageId>> {
+    pub fn get_physical_page_ids(&self, id: ContextId) -> (HashMap<DeviceId, Vec<PhysicalPageId>>, u32) {
         let mut result: HashMap<DeviceId, Vec<PhysicalPageId>> = HashMap::new();
         
         if let Some(ctx) = self.contexts.get(&id) {
@@ -493,19 +502,32 @@ impl ContextManager {
             // Get all committed pages and collect their physical mappings
             for &page_id in &ctx.pages_committed {
                 for (device_id, phys_id) in page_store.get_physical_mappings(page_id) {
-                    result.entry(device_id).or_default().push(phys_id);
+                    result.entry(device_id as DeviceId).or_default().push(phys_id);
                 }
             }
             // Also include uncommitted pages
             for &page_id in &ctx.pages_uncommitted {
                 for (device_id, phys_id) in page_store.get_physical_mappings(page_id) {
-                    result.entry(device_id).or_default().push(phys_id);
+                    result.entry(device_id as DeviceId).or_default().push(phys_id);
                 }
             }
+
+            let last_page_len = if ctx.pages_uncommitted.is_empty() {
+                self.page_size as u32
+            } else {
+                let total_uncommitted_tokens = ctx.tokens_uncommitted.len();
+                let full_pages = ctx.pages_uncommitted.len().saturating_sub(1);
+                let tokens_in_last = total_uncommitted_tokens.saturating_sub(full_pages * self.page_size);
+                if tokens_in_last == 0 { self.page_size as u32 } else { tokens_in_last as u32 }
+            };
+
+            (result, last_page_len)
+        } else {
+            (result, 0)
         }
-        
-        result
     }
+
+
 
     // ==================== Page Management ====================
 
@@ -740,10 +762,10 @@ impl ContextManager {
 /// Messages handled by ContextManager.
 #[derive(Debug)]
 enum Message {
-    Create { user_id: u32, name: String, fill: Option<Vec<u32>>, response: oneshot::Sender<Result<ContextId>> },
+    Create { username: String, name: String, fill: Option<Vec<u32>>, response: oneshot::Sender<Result<ContextId>> },
     Destroy { id: ContextId, lock_id: LockId, response: oneshot::Sender<Result<()>> },
-    Lookup { user_id: u32, name: String, response: oneshot::Sender<Option<ContextId>> },
-    Fork { id: ContextId, user_id: u32, new_name: String, response: oneshot::Sender<Result<ContextId>> },
+    Lookup { username: String, name: String, response: oneshot::Sender<Option<ContextId>> },
+    Fork { id: ContextId, username: String, new_name: String, response: oneshot::Sender<Result<ContextId>> },
     AcquireLock { id: ContextId, response: oneshot::Sender<LockId> },
     ReleaseLock { id: ContextId, lock_id: LockId },
     TokensPerPage { id: ContextId, response: oneshot::Sender<u32> },
@@ -756,6 +778,8 @@ enum Message {
     GetBufferedTokens { id: ContextId, lock_id: LockId, response: oneshot::Sender<Vec<u32>> },
     SetBufferedTokens { id: ContextId, lock_id: LockId, tokens: Vec<u32> },
     AppendBufferedTokens { id: ContextId, lock_id: LockId, tokens: Vec<u32> },
+
+    GetPhysicalPageIds { id: ContextId, response: oneshot::Sender<(HashMap<DeviceId, Vec<PhysicalPageId>>, u32)> },
 }
 
 
@@ -764,17 +788,17 @@ impl ServiceHandler for ContextManager {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Create { user_id, name, fill, response } => {
-                let _ = response.send(self.create(user_id, name, fill));
+            Message::Create { username, name, fill, response } => {
+                let _ = response.send(self.create(username, name, fill));
             }
             Message::Destroy { id, lock_id, response } => {
                 let _ = response.send(self.destroy(id, lock_id));
             }
-            Message::Lookup { user_id, name, response } => {
-                let _ = response.send(self.get(user_id, name));
+            Message::Lookup { username, name, response } => {
+                let _ = response.send(self.get(username, name));
             }
-            Message::Fork { id, user_id, new_name, response } => {
-                let _ = response.send(self.fork(id, user_id, new_name));
+            Message::Fork { id, username, new_name, response } => {
+                let _ = response.send(self.fork(id, username, new_name));
             }
             Message::AcquireLock { id, response } => {
                 let _ = response.send(self.lock(id));
@@ -811,6 +835,10 @@ impl ServiceHandler for ContextManager {
             }
             Message::AppendBufferedTokens { id, lock_id: _, tokens } => {
                 let _ = self.append_buffered_tokens(id, tokens);
+            }
+
+            Message::GetPhysicalPageIds { id, response } => {
+                let _ = response.send(self.get_physical_page_ids(id));
             }
         }
     }

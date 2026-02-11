@@ -18,8 +18,8 @@ pub struct Context {
     pub context_id: ContextId,
     /// The model ID (for routing to the correct ContextManager).
     pub model_id: ModelId,
-    /// The user ID associated with this context.
-    pub user_id: u32,
+    /// The username associated with this context.
+    pub username: String,
     /// Currently held lock ID (if any).
     pub lock_id: Option<LockId>,
 }
@@ -35,11 +35,11 @@ impl pie::core::context::HostContext for InstanceState {
     ) -> Result<Result<Resource<Context>, String>> {
         let model = self.ctx().table.get(&model)?;
         let model_id = model.model_id;
-        let user_id = 0u32; // TODO: Get from InstanceState
+        let username = self.get_username();
 
-        match context::create(model_id, user_id, name, fill).await {
+        match context::create(model_id, username.clone(), name, fill).await {
             Ok(context_id) => {
-                let ctx = Context { context_id, model_id, user_id, lock_id: None };
+                let ctx = Context { context_id, model_id, username, lock_id: None };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -64,11 +64,11 @@ impl pie::core::context::HostContext for InstanceState {
     ) -> Result<Option<Resource<Context>>> {
         let model = self.ctx().table.get(&model)?;
         let model_id = model.model_id;
-        let user_id = 0u32; // TODO: Get from InstanceState
+        let username = self.get_username();
 
-        match context::lookup(model_id, user_id, name).await {
+        match context::lookup(model_id, username.clone(), name).await {
             Some(context_id) => {
-                let ctx = Context { context_id, model_id, user_id, lock_id: None };
+                let ctx = Context { context_id, model_id, username, lock_id: None };
                 Ok(Some(self.ctx().table.push(ctx)?))
             }
             None => Ok(None),
@@ -83,11 +83,11 @@ impl pie::core::context::HostContext for InstanceState {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
-        let user_id = ctx.user_id;
+        let username = ctx.username.clone();
 
-        match context::fork(model_id, context_id, user_id, new_name).await {
+        match context::fork(model_id, context_id, username.clone(), new_name).await {
             Ok(new_context_id) => {
-                let new_ctx = Context { context_id: new_context_id, model_id, user_id, lock_id: None };
+                let new_ctx = Context { context_id: new_context_id, model_id, username, lock_id: None };
                 Ok(Ok(self.ctx().table.push(new_ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),

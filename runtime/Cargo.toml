@@ -79,3 +79,7 @@ tokenizers = "0.21"
 [[bench]]
 name = "inferlet_bench"
 harness = false
+
+#[profile.release]
+#lto = "fat"
+#codegen-units = 1

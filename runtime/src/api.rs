@@ -6,7 +6,7 @@ pub mod messaging;
 pub mod adapter;
 pub mod runtime;
 
-pub mod grammar;
+pub mod structured;
 pub mod mcp;
 pub mod zo;
 
@@ -35,8 +35,8 @@ wasmtime::component::bindgen!({
         // pie:core/adapter
         "pie:core/adapter/adapter": adapter::Adapter,
         // pie:structured
-        "pie:structured/grammar/grammar": grammar::Grammar,
-        "pie:structured/matcher/matcher": grammar::Matcher,
+        "pie:structured/grammar/grammar": structured::grammar::Grammar,
+        "pie:structured/matcher/matcher": structured::matcher::Matcher,
         // pie:mcp/client
         "pie:mcp/client/session": mcp::Session,
     },

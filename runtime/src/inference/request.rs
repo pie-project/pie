@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use crate::adapter::AdapterId;
+use crate::context::ContextId;
 use super::brle::Brle;
-use crate::inference::kvcache::{DeviceId, PageId};
+use crate::device::DeviceId;
 
 /// Sampler configuration for token generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,10 +79,8 @@ impl Sampler {
 /// Forward pass request for a single sequence.
 #[derive(Debug, Clone)]
 pub struct ForwardPassRequest {
-    /// Logical page IDs for KV cache.
-    pub page_ids: Vec<PageId>,
-    /// Length of last page (for partial pages).
-    pub last_page_len: u32,
+    /// Context ID for KV cache page resolution (resolved by inference service).
+    pub context_id: Option<ContextId>,
     /// Input token IDs.
     pub tokens: Vec<u32>,
     /// Token positions.
@@ -240,7 +239,7 @@ impl BatchedForwardPassRequest {
     }
 
     /// Add a request to the batch.
-    pub fn add_request(&mut self, req: &ForwardPassRequest, physical_page_ids: &[u32]) {
+    pub fn add_request(&mut self, req: &ForwardPassRequest, physical_page_ids: &[u32], last_page_len: u32) {
         // Tokens and positions
         self.token_ids.0.extend(&req.tokens);
         self.position_ids.0.extend(&req.positions);
@@ -248,7 +247,7 @@ impl BatchedForwardPassRequest {
         // KV cache layout
         self.kv_page_indices.0.extend(physical_page_ids);
         self.kv_page_indptr.0.push(self.kv_page_indices.0.len() as u32);
-        self.kv_last_page_lens.0.push(req.last_page_len);
+        self.kv_last_page_lens.0.push(last_page_len);
 
         // Query/output indirection
         self.qo_indptr.0.push(self.token_ids.0.len() as u32);

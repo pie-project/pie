@@ -12,7 +12,8 @@ use anyhow::Result;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 
-use crate::inference::kvcache::{DeviceId, PhysicalPageId};
+use crate::device::DeviceId;
+use crate::context::kvcache::PhysicalPageId;
 
 use crate::device;
 
@@ -81,6 +82,7 @@ struct PendingRequest {
     request: ForwardPassRequest,
     response_tx: oneshot::Sender<ForwardPassOutput>,
     physical_page_ids: Vec<PhysicalPageId>,
+    last_page_len: u32,
 }
 
 // =============================================================================
@@ -179,11 +181,13 @@ impl BatchScheduler {
         request: ForwardPassRequest,
         response_tx: oneshot::Sender<ForwardPassOutput>,
         physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
     ) -> Result<()> {
         self.tx.send(PendingRequest {
             request,
             response_tx,
             physical_page_ids,
+            last_page_len,
         })?;
         Ok(())
     }
@@ -338,6 +342,7 @@ impl BatchScheduler {
                     .iter()
                     .map(|&p| p as u32)
                     .collect::<Vec<_>>(),
+                req.last_page_len,
             );
         }
 

@@ -4,11 +4,7 @@ interface types {
 
     type error = string;
 
-    // Queue resource with methods for synchronization and priority control
-    resource queue {
-        constructor();
-        synchronize: func() -> future-bool; // Begin synchronization process
-    }
+    type blob = list<u8>;
 
     // Result of a synchronization attempt
     resource future-bool {
@@ -23,6 +19,11 @@ interface types {
 
         // Retrieves the message if available; None if not ready
         get: func() -> option<string>;
+    }
+
+    resource future-blob {
+        pollable: func() -> pollable;
+        get: func() -> option<blob>;
     }
 
 }
