@@ -11,19 +11,7 @@ from pathlib import Path
 
 from huggingface_hub.constants import HF_HUB_CACHE
 
-
-# Mapping from HuggingFace model_type to PIE architecture
-HF_TO_PIE_ARCH = {
-    "llama": "llama3",
-    "qwen2": "qwen2",
-    "qwen3": "qwen3",
-    "olmo3": "olmo3",
-    "gptoss": "gptoss",
-    "gpt_oss": "gptoss",  # HuggingFace config may use underscore variant
-    "gemma2": "gemma2",
-    "gemma3_text": "gemma3",
-    "mistral3": "mistral3",  # Ministral models (e.g., Ministral-3-3B-Instruct-2512)
-}
+from .model import HF_TO_PIE_ARCH
 
 
 

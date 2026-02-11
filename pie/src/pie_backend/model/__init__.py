@@ -64,8 +64,18 @@ REGISTRY: dict[str, ModuleType] = {}
 TEMPLATES: dict[str, object] = {}
 """Architecture name → ChatTemplate instance."""
 
+HF_TO_PIE_ARCH: dict[str, str] = {}
+"""HuggingFace model_type → PIE architecture name."""
 
-def register(name: str, module: ModuleType, chat_template=None, *, aliases: tuple[str, ...] = ()):
+
+def register(
+    name: str,
+    module: ModuleType,
+    chat_template=None,
+    *,
+    aliases: tuple[str, ...] = (),
+    hf_model_types: tuple[str, ...] = (),
+):
     """Register a model architecture.
 
     Args:
@@ -73,6 +83,7 @@ def register(name: str, module: ModuleType, chat_template=None, *, aliases: tupl
         module: Module containing ModelConfig, ForwardPass, create_kv_cache, create_adapter_cache
         chat_template: Optional ChatTemplate instance
         aliases: Additional names that map to the same module
+        hf_model_types: HuggingFace model_type strings that map to this architecture
     """
     REGISTRY[name] = module
     for alias in aliases:
@@ -81,6 +92,8 @@ def register(name: str, module: ModuleType, chat_template=None, *, aliases: tupl
         TEMPLATES[name] = chat_template
         for alias in aliases:
             TEMPLATES[alias] = chat_template
+    for hf_type in hf_model_types:
+        HF_TO_PIE_ARCH[hf_type] = name
 
 
 def get_module(arch_name: str) -> ModuleType:
@@ -134,16 +147,16 @@ from .chat_templates import (
     Olmo3Template,
 )
 
-register("llama3", llama3, Llama3Template, aliases=("l4ma",))
-register("qwen2", qwen2, Qwen2_5Template)
-register("qwen3", qwen3, Qwen3Template)
-register("gemma2", gemma2, Gemma2Template)
-register("gemma3", gemma3, Gemma3Template)
-register("mistral3", mistral3, Mistral3Template)
-register("olmo3", olmo3, Olmo3Template)
+register("llama3", llama3, Llama3Template, aliases=("l4ma",), hf_model_types=("llama",))
+register("qwen2", qwen2, Qwen2_5Template, hf_model_types=("qwen2",))
+register("qwen3", qwen3, Qwen3Template, hf_model_types=("qwen3",))
+register("gemma2", gemma2, Gemma2Template, hf_model_types=("gemma2",))
+register("gemma3", gemma3, Gemma3Template, hf_model_types=("gemma3_text",))
+register("mistral3", mistral3, Mistral3Template, hf_model_types=("mistral3",))
+register("olmo3", olmo3, Olmo3Template, hf_model_types=("olmo3",))
 
 # gpt_oss requires CUDA-only features
 if torch.cuda.is_available():
     from . import gpt_oss
     from .chat_templates import GPTOSSTemplate
-    register("gptoss", gpt_oss, GPTOSSTemplate)
+    register("gptoss", gpt_oss, GPTOSSTemplate, hf_model_types=("gptoss", "gpt_oss"))
