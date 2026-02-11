@@ -192,6 +192,12 @@ pub struct Tokenizer {
     special_token_ids: Vec<u32>,
     added_token_matcher: Option<AhoCorasick>,
     added_token_ids: Vec<u32>,
+
+    // Decoded & sorted vocabulary with trie subtree ranges
+    // (built once at construction for grammar-guided generation)
+    decoded_vocab: Vec<String>,
+    sorted_vocab: Vec<(u32, String)>,
+    trie_subtree_end: Vec<usize>,
 }
 
 impl Tokenizer {
@@ -229,6 +235,25 @@ impl Tokenizer {
             (None, vec![])
         };
 
+        // Build decoded vocabulary + sorted vocab + trie subtree ranges.
+        let vocab_size = bpe.vocab_size();
+        let mut decoded_vocab = Vec::with_capacity(vocab_size);
+        let mut sorted_vocab = Vec::with_capacity(vocab_size);
+
+        for id in 0..vocab_size as u32 {
+            let decoded = match bpe.id_to_bytes(id) {
+                Some(raw) => String::from_utf8_lossy(raw).into_owned(),
+                None => String::new(),
+            };
+            if !decoded.is_empty() {
+                sorted_vocab.push((id, decoded.clone()));
+            }
+            decoded_vocab.push(decoded);
+        }
+
+        sorted_vocab.sort_by(|a, b| a.1.cmp(&b.1));
+        let trie_subtree_end = build_subtree_ranges(&sorted_vocab);
+
         Tokenizer {
             bpe,
             vocab_type,
@@ -239,6 +264,9 @@ impl Tokenizer {
             special_token_ids,
             added_token_matcher,
             added_token_ids,
+            decoded_vocab,
+            sorted_vocab,
+            trie_subtree_end,
         }
     }
 
@@ -662,6 +690,33 @@ impl Tokenizer {
         }
         (ids, bytes)
     }
+
+    // -----------------------------------------------------------------------
+    // Trie (for grammar-guided generation)
+    // -----------------------------------------------------------------------
+
+    /// The decoded vocabulary: `decoded_vocab[token_id]` = decoded string.
+    ///
+    /// Empty strings indicate special/unmapped tokens.
+    pub fn decoded_vocab(&self) -> &[String] {
+        &self.decoded_vocab
+    }
+
+    /// Vocabulary sorted lexicographically by decoded string: `(token_id, decoded_string)`.
+    ///
+    /// Only contains tokens with non-empty decoded strings (special tokens excluded).
+    pub fn sorted_vocab(&self) -> &[(u32, String)] {
+        &self.sorted_vocab
+    }
+
+    /// Trie subtree ranges over [`sorted_vocab`](Self::sorted_vocab).
+    ///
+    /// `trie_subtree_end[i]` is the index of the first entry in `sorted_vocab`
+    /// whose decoded string does **not** start with `sorted_vocab[i].1`.
+    /// Enables O(1) subtree skipping during token mask generation.
+    pub fn trie_subtree_end(&self) -> &[usize] {
+        &self.trie_subtree_end
+    }
 }
 
 /// Implement FromStr so `"json".parse::<Tokenizer>()` works idiomatically.
@@ -676,6 +731,34 @@ impl std::str::FromStr for Tokenizer {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build trie subtree ranges for a sorted vocabulary.
+///
+/// For each entry `sorted[i]`, returns an array where `result[i]` is the
+/// index of the first entry whose string does **not** start with `sorted[i].1`.
+fn build_subtree_ranges(sorted: &[(u32, String)]) -> Vec<usize> {
+    let n = sorted.len();
+    let mut ranges = vec![n; n];
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+
+    for i in 0..n {
+        let s = sorted[i].1.as_str();
+        while let Some(&(idx, prefix)) = stack.last() {
+            if s.starts_with(prefix) {
+                break;
+            }
+            ranges[idx] = i;
+            stack.pop();
+        }
+        stack.push((i, s));
+    }
+
+    while let Some((idx, _)) = stack.pop() {
+        ranges[idx] = n;
+    }
+
+    ranges
+}
 
 /// Replace all occurrences of `needle` with `replacement` in `haystack`.
 ///
