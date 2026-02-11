@@ -1,43 +1,32 @@
-/// Shared data types used by both Client and Server interfaces.
+/// Shared MCP data types.
 interface types {
-    use wasi:io/poll@0.2.4.{pollable};
 
-    /// A flexible representation of JSON data.
-    /// Essential because MCP is schema-driven.
-    type json-string = string;
+    /// Opaque JSON carried as a string.
+    type json = string;
 
-    /// The fundamental unit of content in MCP.
+    /// MCP error, mirrors JSON-RPC error shape.
+    record error {
+        code: s32,
+        message: string,
+        data: option<json>,
+    }
+
+    /// The fundamental unit of content in MCP responses.
     variant content {
-        text(json-string),
-        image(image-data),
-        embedded-resource(resource-data)
+        text(string),
+        image(image-content),
+        resource(resource-content),
     }
 
-    record image-data {
+    record image-content {
         mime-type: string,
-        data: list<u8>
+        data: list<u8>,
     }
 
-    record resource-data {
+    record resource-content {
         uri: string,
         mime-type: option<string>,
         text: option<string>,
-        blob: option<list<u8>>
-    }
-
-    record error {
-        code: s32,
-        message: json-string,
-        data: option<json-string>
-    }
-
-    resource future-content {
-        pollable: func() -> pollable;
-        get: func() -> option<result<content, error>>; // Returns the content string or error
-    }
-
-    resource future-json-string {
-        pollable: func() -> pollable;
-        get: func() -> option<result<json-string, error>>;
+        blob: option<list<u8>>,
     }
 }

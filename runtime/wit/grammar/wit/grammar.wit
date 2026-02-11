@@ -1,0 +1,46 @@
+interface grammar {
+
+    use pie:core/types.{error};
+    use pie:core/model.{tokenizer};
+    use pie:core/inference.{brle};
+
+    /// Describes the structure that the LLM output must conform to.
+    /// Constructed via static factory methods for each supported format.
+    resource grammar {
+        /// Construct from a JSON Schema string.
+        from-json-schema: static func(schema: string) -> result<grammar, error>;
+
+        /// Construct a built-in free-form JSON grammar (any valid JSON).
+        json: static func() -> grammar;
+
+        /// Construct from a regular expression pattern.
+        from-regex: static func(pattern: string) -> result<grammar, error>;
+
+        /// Construct from an EBNF grammar string.
+        from-ebnf: static func(ebnf: string) -> result<grammar, error>;
+    }
+
+
+    /// Stateful matcher that walks the grammar automaton as tokens are
+    /// accepted, producing a bitmask of valid next tokens at each step.
+    /// The host compiles the grammar on construction and may cache the
+    /// compiled result internally.
+    resource matcher {
+        /// Create a new matcher from a grammar and tokenizer.
+        constructor(grammar: borrow<grammar>, tokenizer: borrow<tokenizer>);
+
+        /// Accept one or more decoded tokens, advancing the matcher state.
+        /// Returns an error if any token violates the grammar.
+        accept-tokens: func(token-ids: list<u32>) -> result<_, error>;
+
+        /// Fill the next-token bitmask.  The returned BRLE encodes which
+        /// token ids in the vocabulary are allowed at the current position.
+        next-token-logit-mask: func() -> brle;
+
+        /// Check whether the matcher has reached a terminal state.
+        is-terminated: func() -> bool;
+
+        /// Reset the matcher to its initial state so it can be reused.
+        reset: func();
+    }
+}
