@@ -1,0 +1,27 @@
+interface adapter {
+    use wasi:io/poll@0.2.4.{pollable};
+
+    use types.{error, future-bool};
+    
+    resource adapter {
+
+        create: static func(name:string) -> result<adapter, error>;
+
+        destroy: func();
+
+        lookup: static func(name:string) -> option<adapter>;
+
+        clone: func(name:string) -> adapter;
+
+        acquire-lock: func() -> future-bool;
+
+        release-lock: func() -> result<_, error>;
+
+        load: func(path:string) -> result<_, error>;
+
+        save: func(path:string) -> result<_, error>;
+
+    }
+
+
+}

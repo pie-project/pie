@@ -32,9 +32,6 @@ wasmtime::component::bindgen!({
         "pie:core/messaging/subscription": messaging::Subscription,
         // pie:core/adapter
         "pie:core/adapter/adapter": adapter::Adapter,
-        // pie:mcp/types
-        "pie:mcp/types/future-content": mcp::FutureContent,
-        "pie:mcp/types/future-json-string": mcp::FutureJsonString,
         // pie:mcp/client
         "pie:mcp/client/session": mcp::Session,
     },

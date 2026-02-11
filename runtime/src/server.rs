@@ -19,6 +19,7 @@ mod data_transfer;
 
 pub use data_transfer::InFlightUpload;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -150,6 +151,38 @@ pub fn exists(client_id: ClientId) -> bool {
     CLIENT_SERVICES.contains(&client_id)
 }
 
+/// Returns the list of MCP server names registered for a client session.
+pub fn get_mcp_servers(client_id: ClientId) -> Vec<String> {
+    MCP_REGISTRATIONS
+        .get(&client_id)
+        .map(|r| r.value().iter().map(|e| e.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Sends an MCP relay request to a client and awaits the response.
+pub async fn send_mcp_request(
+    client_id: ClientId,
+    process_id: ProcessId,
+    server_name: String,
+    method: String,
+    params: String,
+) -> Result<String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    CLIENT_SERVICES.send(&client_id, SessionMessage::McpRelay {
+        process_id,
+        server_name,
+        method,
+        params,
+        response: tx,
+    })?;
+    let (ok, result) = rx.await?;
+    if ok {
+        Ok(result)
+    } else {
+        bail!("MCP request failed: {}", result)
+    }
+}
+
 /// Spawns a new session actor for the given TCP connection.
 async fn spawn_session(
     id: ClientId,
@@ -242,6 +275,20 @@ fn session_terminated(client_id: ClientId) -> Result<()> {
 // Session Messages
 // =============================================================================
 
+/// MCP server entry registered by a client session.
+#[derive(Clone, Debug)]
+struct McpServerEntry {
+    name: String,
+    transport: String,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    url: Option<String>,
+}
+
+/// Per-client MCP server registrations (shared with public API).
+static MCP_REGISTRATIONS: LazyLock<DashMap<ClientId, Vec<McpServerEntry>>> =
+    LazyLock::new(DashMap::new);
+
 /// Messages handled by Session actors.
 #[derive(Debug)]
 enum SessionMessage {
@@ -251,6 +298,14 @@ enum SessionMessage {
     File { process_id: ProcessId, data: Bytes },
     /// WebSocket message received from client.
     ClientRequest(ClientMessage),
+    /// MCP relay: inferlet wants to call an MCP server through this client.
+    McpRelay {
+        process_id: ProcessId,
+        server_name: String,
+        method: String,
+        params: String,
+        response: tokio::sync::oneshot::Sender<(bool, String)>,
+    },
 }
 
 // =============================================================================
@@ -275,6 +330,10 @@ struct Session {
     recv_pump: JoinHandle<()>,
     authenticated: bool,
     pending_auth: Option<PendingAuth>,
+    /// Pending MCP relay requests awaiting client response.
+    pending_mcp: HashMap<u32, tokio::sync::oneshot::Sender<(bool, String)>>,
+    /// Counter for server-initiated MCP correlation IDs.
+    mcp_corr_id: u32,
 }
 
 impl Session {
@@ -340,6 +399,8 @@ impl Session {
             recv_pump,
             authenticated: false,
             pending_auth: None,
+            pending_mcp: HashMap::new(),
+            mcp_corr_id: 1,
         })
     }
 
@@ -353,6 +414,7 @@ impl Session {
         self.recv_pump.abort();
         self.state.clients.remove(&self.id);
         CLIENT_SERVICES.remove(&self.id);
+        MCP_REGISTRATIONS.remove(&self.id);
     }
 }
 
@@ -389,6 +451,12 @@ impl ServiceHandler for Session {
             }
             SessionMessage::File { process_id, data } => {
                 self.send_file_download(process_id, data).await;
+            }
+            SessionMessage::McpRelay { process_id, server_name, method, params, response } => {
+                let corr_id = self.mcp_corr_id;
+                self.mcp_corr_id += 1;
+                self.pending_mcp.insert(corr_id, response);
+                self.send_mcp_request_ws(corr_id, process_id, server_name, method, params).await;
             }
         }
     }
@@ -526,6 +594,28 @@ impl Session {
         })
         .await;
     }
+
+    async fn send_mcp_request_ws(
+        &self,
+        corr_id: u32,
+        process_id: ProcessId,
+        server_name: String,
+        method: String,
+        params: String,
+    ) {
+        let uuid_str = match get_uuid(process_id) {
+            Some(uuid) => uuid.to_string(),
+            None => process_id.to_string(),
+        };
+        self.send(WireServerMessage::McpRequest {
+            corr_id,
+            process_id: uuid_str,
+            server_name,
+            method,
+            params,
+        })
+        .await;
+    }
 }
 
 // =============================================================================
@@ -644,6 +734,34 @@ impl Session {
 
             ClientMessage::Ping { corr_id } => {
                 self.send_response(corr_id, true, "Pong".to_string()).await;
+            }
+
+            ClientMessage::RegisterMcpServer {
+                corr_id,
+                name,
+                transport,
+                command,
+                args,
+                url,
+            } => {
+                let entry = McpServerEntry { name, transport, command, args, url };
+                MCP_REGISTRATIONS
+                    .entry(self.id)
+                    .or_insert_with(Vec::new)
+                    .push(entry);
+                self.send_response(corr_id, true, "MCP server registered".to_string()).await;
+            }
+
+            ClientMessage::McpResponse {
+                corr_id,
+                ok,
+                result,
+            } => {
+                if let Some(sender) = self.pending_mcp.remove(&corr_id) {
+                    let _ = sender.send((ok, result));
+                } else {
+                    tracing::warn!("MCP response for unknown corr_id {}", corr_id);
+                }
             }
         }
     }

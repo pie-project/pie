@@ -1,0 +1,33 @@
+interface model {
+
+    use types.{error};
+
+    // Resource representing a specific model instance
+    resource model {
+        load: static func(name: string) -> result<model, error>;
+        chat-template: func() -> string;       // Returns the prompt formatting template in Tera
+        tokenizer: func() -> tokenizer;
+    }
+
+    // Tokenizer resource for encoding and decoding text
+    resource tokenizer {
+
+        // Converts input text into a list of token IDs
+        encode: func(text: string) -> list<u32>;
+
+        // Converts token IDs back into a decoded string
+        decode: func(tokens: list<u32>) -> result<string, error>;
+
+        // Returns the tokenizer's vocabulary as a list of byte sequences (tokens)
+        vocabs: func() -> tuple<list<u32>, list<list<u8>>>;
+
+        // Returns the split regular expression used by the tokenizer
+        split-regex: func() -> string;
+
+        // Returns the special tokens recognized by the tokenizer
+        special-tokens: func() -> tuple<list<u32>, list<list<u8>>>;
+
+        // Returns the stop tokens recognized by the tokenizer
+        stop-tokens: func() -> list<u32>;
+    }
+}

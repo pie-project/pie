@@ -15,7 +15,7 @@ interface types {
     variant content {
         text(string),
         image(image-content),
-        resource(resource-content),
+        embedded-resource(resource-content),
     }
 
     record image-content {

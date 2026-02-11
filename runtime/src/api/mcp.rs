@@ -3,5 +3,4 @@
 pub mod types;
 pub mod client;
 
-pub use types::{FutureContent, FutureJsonString};
 pub use client::Session;

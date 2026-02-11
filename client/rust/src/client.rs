@@ -199,6 +199,7 @@ impl Client {
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::AddProgram { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }
+            | ClientMessage::RegisterMcpServer { corr_id, .. }
             | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
@@ -479,6 +480,32 @@ impl Client {
             anyhow::bail!("Terminate process failed: {}", result)
         }
     }
+
+    /// Registers an MCP server for this session.
+    /// All inferlets launched in this session can discover and connect to it.
+    pub async fn register_mcp_server(
+        &self,
+        name: &str,
+        transport: &str,
+        command: Option<&str>,
+        args: Option<Vec<String>>,
+        url: Option<&str>,
+    ) -> Result<()> {
+        let msg = ClientMessage::RegisterMcpServer {
+            corr_id: 0,
+            name: name.to_string(),
+            transport: transport.to_string(),
+            command: command.map(|s| s.to_string()),
+            args,
+            url: url.map(|s| s.to_string()),
+        };
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if ok {
+            Ok(())
+        } else {
+            anyhow::bail!("Register MCP server failed: {}", result)
+        }
+    }
 }
 
 // =============================================================================
@@ -553,6 +580,31 @@ async fn handle_server_message(
                         }
                     }
                 }
+            }
+        }
+        ServerMessage::McpRequest {
+            corr_id,
+            process_id: _,
+            server_name,
+            method,
+            params,
+        } => {
+            // TODO: Forward to local MCP server and send real response.
+            // For now, return a stub error so the protocol is wired.
+            eprintln!(
+                "MCP request received: server={}, method={}, params={}",
+                server_name, method, params
+            );
+            let response = ClientMessage::McpResponse {
+                corr_id,
+                ok: false,
+                result: "Client-side MCP bridge not yet implemented".to_string(),
+            };
+            if let Ok(encoded) = rmp_serde::encode::to_vec_named(&response) {
+                inner
+                    .ws_writer_tx
+                    .send(Message::Binary(Bytes::from(encoded)))
+                    .ok();
             }
         }
     }
