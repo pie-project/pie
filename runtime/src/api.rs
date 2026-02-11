@@ -6,6 +6,7 @@ pub mod messaging;
 pub mod adapter;
 pub mod runtime;
 
+pub mod grammar;
 pub mod mcp;
 pub mod zo;
 
@@ -20,6 +21,7 @@ wasmtime::component::bindgen!({
         // pie:core/types
         "pie:core/types/future-bool": types::FutureBool,
         "pie:core/types/future-string": types::FutureString,
+        "pie:core/types/future-blob": types::FutureBlob,
         // pie:core/context
         "pie:core/context/context": context::Context,
         // pie:core/model
@@ -32,6 +34,9 @@ wasmtime::component::bindgen!({
         "pie:core/messaging/subscription": messaging::Subscription,
         // pie:core/adapter
         "pie:core/adapter/adapter": adapter::Adapter,
+        // pie:structured
+        "pie:structured/grammar/grammar": grammar::Grammar,
+        "pie:structured/matcher/matcher": grammar::Matcher,
         // pie:mcp/client
         "pie:mcp/client/session": mcp::Session,
     },
@@ -48,6 +53,8 @@ where
         + pie::core::messaging::Host
         + pie::core::adapter::Host
         + pie::core::runtime::Host
+        + pie::structured::grammar::Host
+        + pie::structured::matcher::Host
         + pie::mcp::types::Host
         + pie::mcp::client::Host
         + pie::zo::zo::Host,
@@ -59,6 +66,8 @@ where
     pie::core::messaging::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::adapter::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::runtime::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::structured::grammar::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::structured::matcher::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::client::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::zo::zo::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;

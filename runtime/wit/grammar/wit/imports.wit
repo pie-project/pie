@@ -1,5 +1,0 @@
-package pie:grammar;
-
-world imports {
-    import grammar;
-}

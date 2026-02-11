@@ -1,0 +1,20 @@
+interface grammar {
+
+    use pie:core/types.{error};
+
+    /// Describes the structure that the LLM output must conform to.
+    /// Constructed via static factory methods for each supported format.
+    resource grammar {
+        /// Construct from a JSON Schema string.
+        from-json-schema: static func(schema: string) -> result<grammar, error>;
+
+        /// Construct a built-in free-form JSON grammar (any valid JSON).
+        json: static func() -> grammar;
+
+        /// Construct from a regular expression pattern.
+        from-regex: static func(pattern: string) -> result<grammar, error>;
+
+        /// Construct from an EBNF grammar string.
+        from-ebnf: static func(ebnf: string) -> result<grammar, error>;
+    }
+}

@@ -1,25 +1,9 @@
-interface grammar {
+interface matcher {
 
     use pie:core/types.{error};
     use pie:core/model.{tokenizer};
     use pie:core/inference.{brle};
-
-    /// Describes the structure that the LLM output must conform to.
-    /// Constructed via static factory methods for each supported format.
-    resource grammar {
-        /// Construct from a JSON Schema string.
-        from-json-schema: static func(schema: string) -> result<grammar, error>;
-
-        /// Construct a built-in free-form JSON grammar (any valid JSON).
-        json: static func() -> grammar;
-
-        /// Construct from a regular expression pattern.
-        from-regex: static func(pattern: string) -> result<grammar, error>;
-
-        /// Construct from an EBNF grammar string.
-        from-ebnf: static func(ebnf: string) -> result<grammar, error>;
-    }
-
+    use grammar.{grammar};
 
     /// Stateful matcher that walks the grammar automaton as tokens are
     /// accepted, producing a bitmask of valid next tokens at each step.
