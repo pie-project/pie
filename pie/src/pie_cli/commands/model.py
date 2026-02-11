@@ -122,10 +122,11 @@ app = typer.Typer(help="Manage models from HuggingFace")
 @app.command("list")
 def model_list() -> None:
     """List locally cached HuggingFace models."""
-    from pie_cli.model_utils import (
+    from pie_backend.hf_utils import (
         get_hf_cache_dir,
+        get_hf_snapshot_dir,
+        load_hf_config,
         parse_repo_id_from_dirname,
-        get_model_config,
         check_pie_compatibility,
     )
 
@@ -152,7 +153,11 @@ def model_list() -> None:
         if repo_id is None:
             continue
 
-        config = get_model_config(cache_dir, repo_id)
+        try:
+            snapshot = get_hf_snapshot_dir(repo_id)
+            config = load_hf_config(snapshot)
+        except (ValueError, OSError):
+            config = None
         compatible, info = check_pie_compatibility(config)
         models.append((repo_id, compatible, info))
 
@@ -244,14 +249,17 @@ def model_download(
         console.print(f"[green]✓[/green] Downloaded to {local_path}")
 
         # Check compatibility
-        from pie_cli.model_utils import (
-            get_hf_cache_dir,
-            get_model_config,
+        from pie_backend.hf_utils import (
+            get_hf_snapshot_dir,
+            load_hf_config,
             check_pie_compatibility,
         )
 
-        cache_dir = get_hf_cache_dir()
-        config = get_model_config(cache_dir, repo_id)
+        try:
+            snapshot = get_hf_snapshot_dir(repo_id)
+            config = load_hf_config(snapshot)
+        except (ValueError, OSError):
+            config = None
         compatible, info = check_pie_compatibility(config)
 
         console.print()

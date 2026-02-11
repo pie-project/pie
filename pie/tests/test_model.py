@@ -17,7 +17,7 @@ class TestModelList:
 
     def test_list_empty(self, tmp_path):
         """Shows message when no models."""
-        with patch("pie_cli.model_utils.get_hf_cache_dir", return_value=tmp_path):
+        with patch("pie_backend.hf_utils.get_hf_cache_dir", return_value=tmp_path):
             result = runner.invoke(app, ["model", "list"])
 
         assert result.exit_code == 0
@@ -44,7 +44,7 @@ class TestModelList:
         snapshot_b.mkdir()
         (snapshot_b / "config.json").write_text('{"model_type": "unknown"}')
 
-        with patch("pie_cli.model_utils.get_hf_cache_dir", return_value=hf_cache):
+        with patch("pie_backend.hf_utils.get_hf_cache_dir", return_value=hf_cache):
             result = runner.invoke(app, ["model", "list"])
 
         assert result.exit_code == 0

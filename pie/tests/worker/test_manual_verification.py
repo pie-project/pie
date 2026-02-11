@@ -1,6 +1,7 @@
 import sys
 import torch
-from pie_backend.backend import Backend, RuntimeConfig
+from pie_backend.engine import Engine
+from pie_backend.config import RuntimeConfig
 from pie_backend import message
 
 
@@ -8,7 +9,7 @@ def test_manual():
     print("Initializing Runtime...")
     try:
         config = RuntimeConfig.from_args(model="llama-3.2-1b-instruct")
-        runtime = Backend(config)
+        engine = Engine.load(config)
         print("Runtime initialized.")
     except Exception as e:
         print(f"Failed to initialize runtime: {e}")
@@ -37,7 +38,7 @@ def test_manual():
 
     print("Sending ForwardPassRequest...")
     try:
-        responses = runtime.forward_pass_handler([req])
+        responses = engine.forward_pass_handler([req])
         print(f"Received {len(responses)} responses.")
 
         if responses:

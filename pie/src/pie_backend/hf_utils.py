@@ -105,3 +105,35 @@ def get_safetensor_files(snapshot_dir: Path) -> list[str]:
         if f.suffix == ".safetensors":
             files.append(f.name)
     return sorted(files)
+
+
+def parse_repo_id_from_dirname(dirname: str) -> str | None:
+    """Parse HuggingFace repo ID from cache directory name.
+
+    HF cache uses format: models--{org}--{repo}
+    Returns: org/repo or None if not a valid model directory
+    """
+    if not dirname.startswith("models--"):
+        return None
+    parts = dirname[8:].split("--")  # Remove "models--" prefix
+    if len(parts) == 2:
+        return f"{parts[0]}/{parts[1]}"
+    elif len(parts) == 1:
+        return parts[0]  # No org, just repo name
+    return None
+
+
+def check_pie_compatibility(config: dict | None) -> tuple[bool, str]:
+    """Check if a model is compatible with Pie.
+
+    Returns: (is_compatible, arch_name or reason)
+    """
+    if config is None:
+        return False, "no config"
+
+    model_type = config.get("model_type", "")
+    if model_type in HF_TO_PIE_ARCH:
+        return True, HF_TO_PIE_ARCH[model_type]
+
+    return False, f"unsupported type: {model_type}"
+

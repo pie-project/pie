@@ -3,7 +3,8 @@ Minimal script to debug embedding weight shapes under tensor parallel loading.
 """
 
 import torch
-from pie_backend.backend import Backend, RuntimeConfig
+from pie_backend.engine import Engine
+from pie_backend.config import RuntimeConfig
 
 MODEL = "qwen-3-0.6b"
 DEVICES = ["cuda:2", "cuda:3"]
@@ -15,18 +16,18 @@ print("=" * 60)
 # Single GPU test
 print("\n[1] Single GPU (cuda:2):")
 config1 = RuntimeConfig.from_args(model=MODEL, device=DEVICES[0])
-runtime1 = Backend(config1)
+runtime1 = Engine.load(configEngine.load(config1))
 
-embed_weight = runtime1.engine.weights.get("embed_token")
+embed_weight = engine1.engine.weights.get("embed_token")
 print(f"    Config: rank={config1.rank}, world_size={config1.world_size}")
 print(f"    Embed weight shape: {embed_weight.shape}")
 print(
-    f"    Expected full: [vocab_size, hidden_size] = [{runtime1.model_config.num_vocabs}, {runtime1.model_config.dim_hidden}]"
+    f"    Expected full: [vocab_size, hidden_size] = [{engine1.model_config.num_vocabs}, {engine1.model_config.dim_hidden}]"
 )
 
 # Test embedding
 token_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32, device=config1.device)
-embeddings = runtime1.engine.embed_tokens(token_ids)
+embeddings = engine1.engine.embed_tokens(token_ids)
 print(f"    embed_tokens output shape: {embeddings.shape}")
 
 # Clean up
@@ -41,8 +42,8 @@ print(
 )
 
 # Load model with this config
-runtime2 = Backend(config2_r0)
-embed_weight2 = runtime2.engine.weights.get("embed_token")
+runtime2 = Engine.load(config2_r0)
+embed_weight2 = engine2.engine.weights.get("embed_token")
 print(f"    Embed weight shape: {embed_weight2.shape}")
 
 # Test embedding - but without distributed, all_reduce won't work
@@ -56,15 +57,15 @@ print(f"    Raw embedding from sharded weight: {raw_embed.shape}")
 
 print("\n" + "=" * 60)
 print("Analysis:")
-if embed_weight2.shape[1] == runtime2.model_config.dim_hidden:
+if embed_weight2.shape[1] == engine2.model_config.dim_hidden:
     print("    ✓ Embedding weight has FULL hidden_size (row parallel)")
     print("    -> embed_tokens should work with all_reduce to combine vocab shards")
 else:
-    expected_shard = runtime2.model_config.dim_hidden // config2_r0.world_size
+    expected_shard = engine2.model_config.dim_hidden // config2_r0.world_size
     if embed_weight2.shape[1] == expected_shard:
         print("    ✗ Embedding weight has SHARDED hidden_size (column parallel)")
         print(
-            f"    -> hidden_size is {embed_weight2.shape[1]} instead of {runtime2.model_config.dim_hidden}"
+            f"    -> hidden_size is {embed_weight2.shape[1]} instead of {engine2.model_config.dim_hidden}"
         )
         print("    -> Need all_gather after embedding, not all_reduce")
     else:
