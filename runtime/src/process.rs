@@ -289,11 +289,11 @@ impl Process {
         // Notify attached client
         if let Some(client_id) = self.client_id.take() {
             let process_id = self.process_id;
-            let cause = match exception {
-                Some(msg) => TerminationCause::Exception(msg),
-                None => TerminationCause::Normal(String::new()),
+            let (event, value) = match exception {
+                Some(msg) => ("error", msg),
+                None => ("return", String::new()),
             };
-            let _ = server::send_termination(client_id, process_id, cause);
+            let _ = server::send_event(client_id, process_id, event, value);
             server::unregister_process(process_id);
         }
 

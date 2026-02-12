@@ -344,8 +344,12 @@ impl Session {
                     return;
                 }
 
-                // Send to process
-                messaging::push_blob(process_id.to_string(), Bytes::from(buffer)).unwrap();
+                // Deliver to waiting process
+                if let Some(sender) = self.file_waiters.remove(&process_id) {
+                    let _ = sender.send(Bytes::from(buffer));
+                } else {
+                    tracing::warn!("TransferFile: no waiter for process {}", process_id);
+                }
             }
         }
     }

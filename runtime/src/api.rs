@@ -3,6 +3,7 @@ pub mod context;
 pub mod model;
 pub mod inference;
 pub mod messaging;
+pub mod session;
 pub mod adapter;
 pub mod runtime;
 
@@ -51,6 +52,7 @@ where
         + pie::core::model::Host
         + pie::core::inference::Host
         + pie::core::messaging::Host
+        + pie::core::session::Host
         + pie::core::adapter::Host
         + pie::core::runtime::Host
         + pie::structured::grammar::Host
@@ -64,6 +66,7 @@ where
     pie::core::model::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::inference::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::messaging::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::session::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::adapter::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::runtime::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::structured::grammar::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;

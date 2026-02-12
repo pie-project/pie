@@ -37,7 +37,6 @@ use tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
 use crate::auth;
-use crate::process::TerminationCause;
 use crate::service::{Service, ServiceHandler, ServiceMap};
 
 type ProcessId = usize;
@@ -135,15 +134,11 @@ pub fn send_file(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Res
     CLIENT_SERVICES.send(&client_id, SessionMessage::File { process_id, data })
 }
 
-/// Notifies a client that a process has terminated.
-pub fn send_termination(client_id: ClientId, process_id: ProcessId, cause: TerminationCause) -> Result<()> {
-    let (event, value) = match cause {
-        TerminationCause::Normal(msg) => ("return", msg),
-        TerminationCause::Signal => ("error", "Signal termination".to_string()),
-        TerminationCause::Exception(msg) => ("error", msg),
-        TerminationCause::OutOfResources(msg) => ("error", msg),
-    };
-    send_event(client_id, process_id, event, value)
+/// Registers a file waiter for a process. Returns the file bytes when the client delivers them.
+pub async fn receive_file(client_id: ClientId, process_id: ProcessId) -> Result<Bytes> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    CLIENT_SERVICES.send(&client_id, SessionMessage::ReceiveFile { process_id, sender: tx })?;
+    Ok(rx.await?)
 }
 
 /// Checks if a session exists for the given client.
@@ -298,6 +293,8 @@ enum SessionMessage {
     File { process_id: ProcessId, data: Bytes },
     /// WebSocket message received from client.
     ClientRequest(ClientMessage),
+    /// Register a file waiter for a process (client → process delivery).
+    ReceiveFile { process_id: ProcessId, sender: tokio::sync::oneshot::Sender<Bytes> },
     /// MCP relay: inferlet wants to call an MCP server through this client.
     McpRelay {
         process_id: ProcessId,
@@ -325,6 +322,8 @@ struct Session {
     state: Arc<ServerState>,
     pub(super) inflight_uploads: DashMap<String, InFlightUpload>,
     pub(super) attached_processes: Vec<ProcessId>,
+    /// Per-process file delivery waiters (client → process).
+    pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
     ws_msg_tx: mpsc::Sender<WsMessage>,
     send_pump: JoinHandle<()>,
     recv_pump: JoinHandle<()>,
@@ -394,6 +393,7 @@ impl Session {
             state,
             inflight_uploads: DashMap::new(),
             attached_processes: Vec::new(),
+            file_waiters: HashMap::new(),
             ws_msg_tx,
             send_pump,
             recv_pump,
@@ -451,6 +451,9 @@ impl ServiceHandler for Session {
             }
             SessionMessage::File { process_id, data } => {
                 self.send_file_download(process_id, data).await;
+            }
+            SessionMessage::ReceiveFile { process_id, sender } => {
+                self.file_waiters.insert(process_id, sender);
             }
             SessionMessage::McpRelay { process_id, server_name, method, params, response } => {
                 let corr_id = self.mcp_corr_id;
