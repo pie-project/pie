@@ -390,6 +390,17 @@ impl RuntimeHandle {
         self.internal_token.clone()
     }
 
+    /// Force-shutdown the runtime by exiting the process.
+    fn shutdown(&self) {
+        std::process::exit(0);
+    }
+
+    /// Returns true if the runtime is running.
+    /// Always true — there is no intermediate "shutting down" state.
+    fn is_running(&self) -> bool {
+        true
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "RuntimeHandle(token={}...)",

@@ -127,6 +127,13 @@ pub async fn bootstrap(
         adapter::spawn(&devices);
     }
 
+    // Force-shutdown on CTRL+C
+    tokio::spawn(async {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("Shutdown signal received, exiting");
+        std::process::exit(0);
+    });
+
     Ok(auth::get_internal_auth_token().await?)
 }
 
