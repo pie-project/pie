@@ -134,6 +134,19 @@ pub use context_ext::{
     TokenStream, Speculate, Speculation, Constrain,
 };
 
+// =============================================================================
+// Argument Parsing (re-exported from pico_args)
+// =============================================================================
+
+/// Re-export of `pico_args::Arguments` for ergonomic CLI argument parsing.
+pub use pico_args::Arguments;
+
+/// Parses a `Vec<String>` (as received from the WIT entry point) into
+/// a `pico_args::Arguments` for flag/option extraction.
+pub fn parse_args(args: Vec<String>) -> Arguments {
+    Arguments::from_vec(args.into_iter().map(std::ffi::OsString::from).collect())
+}
+
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::main;

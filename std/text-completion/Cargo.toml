@@ -8,7 +8,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 inferlet = { path = "../../sdk/rust/inferlet" }
-inferlet-macros = { path = "../../sdk/rust/inferlet-macros" }
 
 [profile.release]
 lto = true
