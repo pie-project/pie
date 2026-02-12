@@ -57,7 +57,7 @@ pub fn read_inferlet_manifest(name: &str) -> pie::program::Manifest {
 pub async fn add_and_install(name: &str) -> ProgramName {
     let wasm = read_inferlet_wasm(name);
     let manifest = read_inferlet_manifest(name);
-    let program_name = ProgramName::parse(&format!("{name}@0.1.0"));
+    let program_name = ProgramName::parse(&format!("{name}@0.1.0")).unwrap();
     pie::program::add(wasm, manifest, true).await.unwrap();
     pie::program::install(&program_name).await.unwrap();
     program_name

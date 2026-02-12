@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use tokio::sync::oneshot;
 use wasmtime::Engine as WasmEngine;
 use wasmtime::component::Component;
@@ -144,15 +144,30 @@ impl ProgramName {
     /// Supported formats:
     /// - `name@version` -> (name, version)
     /// - `name` -> (name, "latest")
-    pub fn parse(s: &str) -> Self {
-        // Split on @ to get name and version
+    ///
+    /// Rejects names/versions containing path separators or traversal sequences.
+    pub fn parse(s: &str) -> Result<Self> {
         let (name, version) = if let Some((n, v)) = s.split_once('@') {
             (n.to_string(), v.to_string())
         } else {
             (s.to_string(), "latest".to_string())
         };
 
-        Self { name, version }
+        Self::validate_component(&name, "name")?;
+        Self::validate_component(&version, "version")?;
+
+        Ok(Self { name, version })
+    }
+
+    /// Validates that a name/version component contains only safe characters.
+    fn validate_component(s: &str, label: &str) -> Result<()> {
+        if s.is_empty() {
+            bail!("Program {} cannot be empty", label);
+        }
+        if s.contains('/') || s.contains('\\') || s.contains("..") {
+            bail!("Program {} contains invalid characters: {}", label, s);
+        }
+        Ok(())
     }
 }
 

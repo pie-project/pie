@@ -36,7 +36,7 @@ fn state() -> &'static TestState {
 
 /// Helper: ProgramName for a test inferlet
 fn test_program_name(name: &str) -> ProgramName {
-    ProgramName::parse(&format!("{name}@0.1.0"))
+    ProgramName::parse(&format!("{name}@0.1.0")).unwrap()
 }
 
 // =============================================================================

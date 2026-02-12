@@ -36,7 +36,7 @@ impl pie::core::runtime::Host for InstanceState {
         let (tx, rx) = tokio::sync::oneshot::channel();
         match process::spawn(
             self.get_username(),
-            ProgramName::parse(&package_name),
+            ProgramName::parse(&package_name)?,
             args,
             None,
             Some(self.id()),

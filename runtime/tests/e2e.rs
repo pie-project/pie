@@ -40,7 +40,7 @@ fn state() -> &'static TestState {
 }
 
 fn program_name(name: &str) -> ProgramName {
-    ProgramName::parse(&format!("{name}@0.1.0"))
+    ProgramName::parse(&format!("{name}@0.1.0")).unwrap()
 }
 
 /// Spawn a process within the tokio runtime and wait for it to complete.

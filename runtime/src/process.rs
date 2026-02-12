@@ -155,7 +155,7 @@ struct Process {
     client_id: Option<ClientId>,
     children: Vec<ProcessId>,
     capture_outputs: bool,
-    output_buffer: VecDeque<String>,
+    output_buffer: VecDeque<(&'static str, String)>,
 }
 
 impl Process {
@@ -196,34 +196,34 @@ impl Process {
     }
 
     /// Deliver output to the attached client, or buffer it if capturing.
-    fn deliver_output(&mut self, content: String) {
+    fn deliver_output(&mut self, stream: &'static str, content: String) {
         if let Some(client_id) = self.client_id {
-            if server::send_event(client_id, self.process_id, "stdout", content.clone()).is_err() {
+            if server::send_event(client_id, self.process_id, stream, content.clone()).is_err() {
                 // Client gone — detach and fall back to buffering
                 self.client_id = None;
-                self.buffer_output(content);
+                self.buffer_output(stream, content);
             }
         } else if self.capture_outputs {
-            self.buffer_output(content);
+            self.buffer_output(stream, content);
         }
     }
 
     /// Push content into the ring buffer, evicting the oldest entry if full.
-    fn buffer_output(&mut self, content: String) {
+    fn buffer_output(&mut self, stream: &'static str, content: String) {
         if self.output_buffer.len() >= OUTPUT_BUFFER_CAP {
             self.output_buffer.pop_front();
         }
-        self.output_buffer.push_back(content);
+        self.output_buffer.push_back((stream, content));
     }
 
     /// Flush buffered output to the attached client.
     /// On failure, detaches the client and retains undelivered entries.
     fn flush_output_buffer(&mut self) {
         let Some(client_id) = self.client_id else { return };
-        while let Some(buffered) = self.output_buffer.pop_front() {
-            if server::send_event(client_id, self.process_id, "stdout", buffered.clone()).is_err() {
+        while let Some((stream, content)) = self.output_buffer.pop_front() {
+            if server::send_event(client_id, self.process_id, stream, content.clone()).is_err() {
                 self.client_id = None;
-                self.output_buffer.push_front(buffered);
+                self.output_buffer.push_front((stream, content));
                 break;
             }
         }
@@ -330,9 +330,8 @@ impl ServiceHandler for Process {
                 self.children.push(child_id);
             }
 
-            Message::Stdout { content } | Message::Stderr { content } => {
-                self.deliver_output(content);
-            }
+            Message::Stdout { content } => self.deliver_output("stdout", content),
+            Message::Stderr { content } => self.deliver_output("stderr", content),
 
             Message::GetUsername { response } => {
                 let _ = response.send(Ok(self.username.clone()));

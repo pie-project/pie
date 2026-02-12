@@ -40,7 +40,7 @@ fn state() -> &'static BenchState {
 }
 
 fn program_name() -> ProgramName {
-    ProgramName::parse("echo@0.1.0")
+    ProgramName::parse("echo@0.1.0").unwrap()
 }
 
 /// Spawn N concurrent echo inferlets and wait for all to complete.

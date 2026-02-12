@@ -32,7 +32,13 @@ impl Session {
             Some(v) => format!("{}@{}", name, v),
             None => name,
         };
-        let program_name = ProgramName::parse(&full_name);
+        let program_name = match ProgramName::parse(&full_name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+        };
         let exists = program::is_registered(&program_name).await;
         self.send_response(corr_id, true, exists.to_string()).await;
     }
@@ -165,7 +171,13 @@ impl Session {
         arguments: Vec<String>,
         capture_outputs: bool,
     ) {
-        let program_name = ProgramName::parse(&inferlet);
+        let program_name = match ProgramName::parse(&inferlet) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+        };
 
         // Install program and dependencies (handles both uploaded and registry)
         if let Err(e) = program::install(&program_name).await {
@@ -207,7 +219,13 @@ impl Session {
         inferlet: String,
         arguments: Vec<String>,
     ) {
-        let program_name = ProgramName::parse(&inferlet);
+        let program_name = match ProgramName::parse(&inferlet) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+        };
 
         // Install program and dependencies (handles both uploaded and registry)
         if let Err(e) = program::install(&program_name).await {
