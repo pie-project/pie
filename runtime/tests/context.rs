@@ -27,17 +27,17 @@ fn state() -> &'static TestState {
 }
 
 const MODEL: usize = 0;
-const USER: u32 = 1;
+const USER: &str = "test-user";
 
 #[test]
 fn create_and_lookup() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, USER, "test-ctx".into(), None)
+        let id = pie::context::create(MODEL, USER.to_string(), "test-ctx".into(), None)
             .await
             .unwrap();
 
-        let found = pie::context::lookup(MODEL, USER, "test-ctx".into()).await;
+        let found = pie::context::lookup(MODEL, USER.to_string(), "test-ctx".into()).await;
         assert_eq!(found, Some(id));
     });
 }
@@ -47,7 +47,7 @@ fn create_with_fill() {
     let s = state();
     s.rt.block_on(async {
         let fill_tokens = vec![10, 20, 30];
-        let id = pie::context::create(MODEL, USER, "fill-ctx".into(), Some(fill_tokens.clone()))
+        let id = pie::context::create(MODEL, USER.to_string(), "fill-ctx".into(), Some(fill_tokens.clone()))
             .await
             .unwrap();
 
@@ -63,14 +63,14 @@ fn create_with_fill() {
 fn destroy_removes_context() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, USER, "destroy-ctx".into(), None)
+        let id = pie::context::create(MODEL, USER.to_string(), "destroy-ctx".into(), None)
             .await
             .unwrap();
 
         let lock = pie::context::acquire_lock(MODEL, id).await;
         pie::context::destroy(MODEL, id, lock).await.unwrap();
 
-        let found = pie::context::lookup(MODEL, USER, "destroy-ctx".into()).await;
+        let found = pie::context::lookup(MODEL, USER.to_string(), "destroy-ctx".into()).await;
         assert_eq!(found, None);
     });
 }
@@ -79,7 +79,7 @@ fn destroy_removes_context() {
 fn cursor_ops() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, USER, "cursor-ctx".into(), None)
+        let id = pie::context::create(MODEL, USER.to_string(), "cursor-ctx".into(), None)
             .await
             .unwrap();
 
@@ -97,7 +97,7 @@ fn cursor_ops() {
 fn buffered_token_lifecycle() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, USER, "buf-tok-ctx".into(), None)
+        let id = pie::context::create(MODEL, USER.to_string(), "buf-tok-ctx".into(), None)
             .await
             .unwrap();
 
@@ -121,19 +121,19 @@ fn buffered_token_lifecycle() {
 fn fork_context() {
     let s = state();
     s.rt.block_on(async {
-        let parent_id = pie::context::create(MODEL, USER, "parent-ctx".into(), None)
+        let parent_id = pie::context::create(MODEL, USER.to_string(), "parent-ctx".into(), None)
             .await
             .unwrap();
 
-        let child_id = pie::context::fork(MODEL, parent_id, USER, "child-ctx".into())
+        let child_id = pie::context::fork(MODEL, parent_id, USER.to_string(), "child-ctx".into())
             .await
             .unwrap();
 
         assert_ne!(parent_id, child_id);
 
         // Both should be findable
-        let found_parent = pie::context::lookup(MODEL, USER, "parent-ctx".into()).await;
-        let found_child = pie::context::lookup(MODEL, USER, "child-ctx".into()).await;
+        let found_parent = pie::context::lookup(MODEL, USER.to_string(), "parent-ctx".into()).await;
+        let found_child = pie::context::lookup(MODEL, USER.to_string(), "child-ctx".into()).await;
         assert_eq!(found_parent, Some(parent_id));
         assert_eq!(found_child, Some(child_id));
     });

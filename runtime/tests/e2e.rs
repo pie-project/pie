@@ -59,6 +59,7 @@ fn spawn_and_wait(
             None,
             None,
             false,
+            None,
         )
         .expect("spawn")
     });
@@ -129,6 +130,7 @@ fn concurrent_spawns() {
                     None,
                     None,
                     false,
+                    None,
                 )
                 .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"))
             })
@@ -164,6 +166,7 @@ fn rapid_sequential_spawns() {
                 None,
                 None,
                 false,
+                None,
             )
             .unwrap_or_else(|e| panic!("sequential spawn {i} failed: {e}"));
 
@@ -207,6 +210,7 @@ fn mixed_success_and_error() {
                 None,
                 None,
                 false,
+                None,
             )
             .unwrap_or_else(|e| panic!("mixed spawn {i} ({name}) failed: {e}"));
             pids.push((i, name, pid));
@@ -242,6 +246,7 @@ fn spawn_after_termination() {
             None,
             None,
             false,
+            None,
         )
         .expect("spawn for termination");
 
@@ -267,6 +272,7 @@ fn spawn_after_termination() {
             None,
             None,
             false,
+            None,
         )
         .expect("spawn after termination");
 

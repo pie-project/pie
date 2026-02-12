@@ -9,7 +9,7 @@ mod common;
 
 use common::{create_mock_env, MockEnv, mock_device::EchoBehavior};
 use pie::inference::request::{ForwardPassRequest, ForwardPassOutput, Sampler};
-use pie::inference::brle::Brle;
+use pie::brle::Brle;
 
 struct TestState {
     env: MockEnv,
@@ -31,20 +31,24 @@ fn state() -> &'static TestState {
 }
 
 const MODEL: usize = 0;
-const USER: u32 = 1;
+const USER: &str = "test-user";
 
 /// Build a minimal forward pass request.
-fn make_request(page_ids: Vec<usize>, tokens: Vec<u32>) -> ForwardPassRequest {
+fn make_request(tokens: Vec<u32>) -> ForwardPassRequest {
     let n = tokens.len();
     ForwardPassRequest {
-        page_ids,
-        last_page_len: 1,
+        context_id: None,
         tokens,
         positions: (0..n as u32).collect(),
+        speculative_tokens: vec![],
+        speculative_positions: vec![],
+        output_speculative_tokens: false,
         masks: (0..n).map(|_| Brle::new(0)).collect(),
+        logit_mask: None,
         sampling_indices: vec![(n - 1) as u32],
-        samplers: vec![Sampler::Multinomial { temperature: 1.0 }],
+        samplers: vec![Sampler::Multinomial { temperature: 1.0, seed: None }],
         adapter_id: None,
+        adapter_seed: None,
         arrival_time: Some(Instant::now()),
     }
 }
@@ -54,7 +58,7 @@ fn single_forward_pass() {
     let s = state();
     s.rt.block_on(async {
         // Create a context and reserve pages to get valid page IDs
-        let ctx_id = pie::context::create(MODEL, USER, "infer-ctx".into(), None)
+        let ctx_id = pie::context::create(MODEL, USER.to_string(), "infer-ctx".into(), None)
             .await
             .unwrap();
         let lock = pie::context::acquire_lock(MODEL, ctx_id).await;
@@ -62,7 +66,7 @@ fn single_forward_pass() {
         pie::context::release_lock(MODEL, ctx_id, lock).unwrap();
 
         // Submit a forward pass
-        let req = make_request(vec![0], vec![10, 20, 30]);
+        let req = make_request(vec![10, 20, 30]);
         let output = pie::inference::forward_pass(MODEL, req).await.unwrap();
 
         // EchoBehavior(42) should return token 42
@@ -91,14 +95,14 @@ fn multiple_forward_passes() {
         let mut handles = Vec::new();
         for i in 0..3u32 {
             let ctx_name = format!("multi-infer-{i}");
-            let ctx_id = pie::context::create(MODEL, USER, ctx_name, None)
+            let ctx_id = pie::context::create(MODEL, USER.to_string(), ctx_name, None)
                 .await
                 .unwrap();
             let lock = pie::context::acquire_lock(MODEL, ctx_id).await;
             pie::context::reserve_pages(MODEL, ctx_id, lock, 1).await.unwrap();
             pie::context::release_lock(MODEL, ctx_id, lock).unwrap();
 
-            let req = make_request(vec![0], vec![100 + i]);
+            let req = make_request(vec![100 + i]);
             handles.push(tokio::spawn(async move {
                 pie::inference::forward_pass(MODEL, req).await
             }));

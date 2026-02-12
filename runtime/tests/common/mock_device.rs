@@ -41,6 +41,8 @@ impl Behavior for EchoBehavior {
                 .map(|_| ForwardPassResponse {
                     tokens: vec![self.0],
                     dists: vec![],
+                    spec_tokens: vec![],
+                    spec_positions: vec![],
                 })
                 .collect(),
         }
@@ -70,6 +72,8 @@ impl Behavior for CounterBehavior {
                     ForwardPassResponse {
                         tokens: vec![token],
                         dists: vec![],
+                        spec_tokens: vec![],
+                        spec_positions: vec![],
                     }
                 })
                 .collect(),

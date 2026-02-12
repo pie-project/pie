@@ -1,9 +1,5 @@
-//! Pie Runtime - Programmable Inference Engine
-//!
-//! This crate provides the core runtime for the Pie inference engine.
-//! It exposes functionality via PyO3 bindings for integration with Python.
+//! Pie - Programmable Inference Engine
 
-// Public modules (core engine logic)
 pub mod brle;
 pub mod service;
 pub mod adapter;
@@ -23,7 +19,4 @@ pub mod process;
 pub mod daemon;
 pub mod structured;
 pub mod telemetry;
-
-
-// FFI module for PyO3 bindings, IPC, and format types
 pub mod ffi;

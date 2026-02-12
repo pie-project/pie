@@ -149,7 +149,8 @@ impl pie::core::context::HostContext for InstanceState {
     async fn uncommitted_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         let tokens = context::get_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0)).await;
-        Ok((tokens.len() as u32 + 255) / 256)
+        let page_size = context::tokens_per_page(ctx.model_id, ctx.context_id).await;
+        Ok((tokens.len() as u32 + page_size - 1) / page_size)
     }
 
     async fn commit_pages(

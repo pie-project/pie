@@ -50,6 +50,8 @@ class ForwardPassResponse(msgspec.Struct, gc=False):
 
     tokens: list[int]
     dists: list[tuple[list[int], list[float]]]
+    spec_tokens: list[int] = msgspec.field(default_factory=list)
+    spec_positions: list[int] = msgspec.field(default_factory=list)
 
 
 class EmbedImageRequest(msgspec.Struct, gc=False):

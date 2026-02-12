@@ -9,7 +9,7 @@ mod common;
 
 use common::{create_mock_env, MockEnv, mock_device::DelayedBehavior, mock_device::EchoBehavior};
 use pie::inference::request::{ForwardPassRequest, ForwardPassOutput, Sampler};
-use pie::inference::brle::Brle;
+use pie::brle::Brle;
 
 struct TestState {
     #[allow(dead_code)]
@@ -43,19 +43,23 @@ fn state() -> &'static TestState {
 }
 
 const MODEL: usize = 0;
-const USER: u32 = 1;
+const USER: &str = "test-user";
 
 fn make_request(tokens: Vec<u32>) -> ForwardPassRequest {
     let n = tokens.len();
     ForwardPassRequest {
-        page_ids: vec![0],
-        last_page_len: 1,
+        context_id: None,
         tokens,
         positions: (0..n as u32).collect(),
+        speculative_tokens: vec![],
+        speculative_positions: vec![],
+        output_speculative_tokens: false,
         masks: (0..n).map(|_| Brle::new(0)).collect(),
+        logit_mask: None,
         sampling_indices: vec![(n - 1) as u32],
-        samplers: vec![Sampler::Multinomial { temperature: 1.0 }],
+        samplers: vec![Sampler::Multinomial { temperature: 1.0, seed: None }],
         adapter_id: None,
+        adapter_seed: None,
         arrival_time: Some(Instant::now()),
     }
 }
@@ -65,7 +69,7 @@ fn device_timeout_returns_none() {
     let s = state();
     s.rt.block_on(async {
         // Reserve a page
-        let ctx_id = pie::context::create(MODEL, USER, "timeout-ctx".into(), None)
+        let ctx_id = pie::context::create(MODEL, USER.to_string(), "timeout-ctx".into(), None)
             .await
             .unwrap();
         let lock = pie::context::acquire_lock(MODEL, ctx_id).await;

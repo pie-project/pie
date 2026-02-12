@@ -366,7 +366,15 @@ impl BatchScheduler {
                 for req in requests {
                     if let Some(resp) = resp_iter.next() {
                         let output = if !resp.tokens.is_empty() {
-                            ForwardPassOutput::Tokens(resp.tokens)
+                            if !resp.spec_tokens.is_empty() {
+                                ForwardPassOutput::TokensWithSpeculation(
+                                    resp.tokens,
+                                    resp.spec_tokens,
+                                    resp.spec_positions,
+                                )
+                            } else {
+                                ForwardPassOutput::Tokens(resp.tokens)
+                            }
                         } else if !resp.dists.is_empty() {
                             ForwardPassOutput::Distributions(resp.dists)
                         } else {

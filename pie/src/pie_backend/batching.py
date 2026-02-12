@@ -221,6 +221,23 @@ class Batch:
 
         self.timing["sampler_loop"] = time.perf_counter() - t0
 
+        # ===== SPECULATIVE DECODING INPUTS =====
+        self.spec_token_ids = _decode_i64(args["spec_token_ids"])
+        self.spec_position_ids = _decode_u32(args["spec_position_ids"]).astype(np.int32)
+        self.spec_indptr = _decode_u32(args["spec_indptr"]).astype(np.int32)
+        self.output_spec_flags = args["output_spec_flags"]
+        self.sampler_seeds_arr = _decode_u32(args["sampler_seeds"])
+
+        # ===== LOGIT MASKS (BRLE per request → bool matrix) =====
+        logit_masks_u32 = _decode_u32(args["logit_masks"]).astype(np.int32)
+        logit_mask_indptr = _decode_u32(args["logit_mask_indptr"]).astype(np.int32)
+        if len(logit_masks_u32) > 0 and vocab_size is not None:
+            self.logit_masks = decode_sampling_masks(
+                logit_masks_u32, logit_mask_indptr, num_requests, vocab_size
+            )
+        else:
+            self.logit_masks = None
+
     def get_model_inputs(self, device: torch.device) -> dict[str, Any]:
         """
         Finalize batch preparation and create input tensors for the model.
@@ -264,6 +281,21 @@ class Batch:
                 else None
             ),
             "total_pages_cpu": self.kv_page_indptr[-1],
+            "spec_token_ids": (
+                torch.as_tensor(self.spec_token_ids, device=device, dtype=torch.long)
+                if len(self.spec_token_ids) > 0
+                else None
+            ),
+            "spec_position_ids": (
+                torch.as_tensor(self.spec_position_ids, device=device, dtype=torch.int32)
+                if len(self.spec_position_ids) > 0
+                else None
+            ),
+            "spec_indptr": (
+                torch.as_tensor(self.spec_indptr, device=device, dtype=torch.int32)
+                if len(self.spec_indptr) > 1
+                else None
+            ),
         }
 
     def get_sampling_metadata(
@@ -316,6 +348,15 @@ class Batch:
                 if self.sampling_masks is not None
                 else None
             ),
+            "logit_masks": (
+                torch.as_tensor(
+                    np.repeat(self.logit_masks, indices_per_request, axis=0),
+                    device=device,
+                    dtype=torch.bool,
+                )
+                if self.logit_masks is not None
+                else None
+            ),
         }
 
     def create_responses(
@@ -341,6 +382,8 @@ class Batch:
 
         final_dists = sampling_results["dists"]
         final_tokens_list = sampling_results["tokens"]
+        spec_tokens_all = sampling_results.get("spec_tokens", None)
+        spec_positions_all = sampling_results.get("spec_positions", None)
 
         responses = []
         cursor = 0
@@ -359,9 +402,17 @@ class Batch:
                     # Sampling request
                     request_tokens.append(final_tokens_list[i])
 
-            responses.append(
-                message.ForwardPassResponse(dists=request_dists, tokens=request_tokens)
-            )
+            # Build response with optional speculation
+            resp = message.ForwardPassResponse(dists=request_dists, tokens=request_tokens)
+            if (
+                spec_tokens_all is not None
+                and self.output_spec_flags[req_idx]
+                and spec_tokens_all[req_idx] is not None
+            ):
+                resp.spec_tokens = spec_tokens_all[req_idx]
+                resp.spec_positions = spec_positions_all[req_idx]
+
+            responses.append(resp)
             cursor += num_outputs
 
         return responses
