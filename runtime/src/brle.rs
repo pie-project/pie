@@ -42,84 +42,175 @@ impl Brle {
 
     /// Creates a `Brle` from a packed bitmask (`&[u32]`).
     ///
+    /// Allocates a new buffer each call. For hot paths, prefer
+    /// [`fill_from_bitmask`] which reuses an existing buffer.
+    pub fn from_bitmask(bitmask: &[u32], total_size: usize) -> Self {
+        let mut brle = Self {
+            buffer: Vec::with_capacity(32),
+            total_size: 0,
+        };
+        brle.fill_from_bitmask(bitmask, total_size);
+        brle
+    }
+
+    /// Fills this `Brle` from a packed bitmask (`&[u32]`), reusing the
+    /// internal buffer to avoid allocation.
+    ///
     /// Each bit in the bitmask represents a boolean value (bit set = `true`).
     /// Bit 0 of word 0 is index 0, bit 31 of word 0 is index 31, etc.
     ///
-    /// Uses word-level bit manipulation (`trailing_zeros`/`trailing_ones`) to
-    /// skip entire runs, making this O(transitions) rather than O(total_bits).
+    /// Uses XOR-based transition detection on `u64` chunks with 8-wide batch
+    /// skipping: groups of 8 u64s (512 bits) are OR/AND-reduced and checked
+    /// in a single branch. Uniform batches cost ~4 ops for 512 bits.
     ///
     /// # Arguments
     /// * `bitmask` - The packed bitmask words.
     /// * `total_size` - The total number of boolean values (may be less than
     ///   `bitmask.len() * 32` if the last word is partial).
-    pub fn from_bitmask(bitmask: &[u32], total_size: usize) -> Self {
+    pub fn fill_from_bitmask(&mut self, bitmask: &[u32], total_size: usize) {
+        self.buffer.clear();
+        self.total_size = total_size;
+
         if total_size == 0 {
-            return Self::new(0);
+            return;
         }
 
-        let mut buffer = Vec::new();
-        let mut current_val = false;
-        let mut run_len: u32 = 0;
-        let mut pos = 0usize;
+        let num_words = (total_size + 31) / 32;
+        let words = &bitmask[..num_words];
 
-        for &word in bitmask {
-            let bits_in_word = (total_size - pos).min(32);
-            if bits_in_word == 0 {
-                break;
+        let mut prev_pos: u32 = 0;
+        let mut prev_msb: u64 = 0;
+
+        // Fuse two adjacent u32s into a u64 (little-endian layout).
+        // On x86_64, LLVM optimises this to a single 64-bit load.
+        #[inline(always)]
+        fn fuse(lo: u32, hi: u32) -> u64 {
+            lo as u64 | ((hi as u64) << 32)
+        }
+
+        // Process u32 words in groups of 16 (= 8 u64s = 512 bits).
+        // `chunks_exact` guarantees each chunk has exactly 16 elements,
+        // so all indexing within the chunk is bounds-check-free.
+        let full_u32s = total_size / 32;
+        let batch_u32s = full_u32s & !15; // round down to multiple of 16
+
+        for (batch_nr, chunk) in words[..batch_u32s].chunks_exact(16).enumerate() {
+            let w0 = fuse(chunk[0],  chunk[1]);
+            let w1 = fuse(chunk[2],  chunk[3]);
+            let w2 = fuse(chunk[4],  chunk[5]);
+            let w3 = fuse(chunk[6],  chunk[7]);
+            let w4 = fuse(chunk[8],  chunk[9]);
+            let w5 = fuse(chunk[10], chunk[11]);
+            let w6 = fuse(chunk[12], chunk[13]);
+            let w7 = fuse(chunk[14], chunk[15]);
+
+            // Fast uniform check via OR-reduction.
+            let or_all = w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7;
+
+            if or_all == 0 && prev_msb == 0 {
+                continue;
             }
 
-            // Mask off unused high bits in the last word
-            let word = if bits_in_word < 32 {
-                word & ((1u32 << bits_in_word) - 1)
-            } else {
-                word
-            };
-
-            // Process runs within this word using bit tricks
-            let mut bit = 0u32;
-            while (bit as usize) < bits_in_word {
-                let remaining_bits = bits_in_word as u32 - bit;
-                // Extract the portion of the word we haven't consumed yet
-                let shifted = word >> bit;
-
-                let run = if current_val {
-                    // Count consecutive 1-bits: trailing_ones of shifted
-                    // trailing_ones = trailing_zeros of inverted
-                    let ones = (!shifted).trailing_zeros().min(remaining_bits);
-                    ones
-                } else {
-                    // Count consecutive 0-bits
-                    let zeros = shifted.trailing_zeros().min(remaining_bits);
-                    zeros
-                };
-
-                if run == 0 {
-                    // Value flipped — commit current run and switch
-                    if !current_val && buffer.is_empty() {
-                        buffer.push(0); // zero-length false prefix
-                    } else {
-                        buffer.push(run_len);
-                    }
-                    current_val = !current_val;
-                    run_len = 0;
-                } else {
-                    run_len += run;
-                    bit += run;
+            // Lazy AND: only compute if or_all suggests possible all-ones.
+            if or_all == u64::MAX {
+                let and_all = w0 & w1 & w2 & w3 & w4 & w5 & w6 & w7;
+                if and_all == u64::MAX && prev_msb == 1 {
+                    prev_msb = 1;
+                    continue;
                 }
             }
-            pos += bits_in_word;
-        }
 
-        // Push the final run
-        if run_len > 0 || buffer.is_empty() {
-            if buffer.is_empty() && current_val {
-                buffer.push(0);
+            // Slow path: process each u64 individually.
+            let batch = [w0, w1, w2, w3, w4, w5, w6, w7];
+            let batch_base = (batch_nr as u32) * 512;
+            for k in 0..8u32 {
+                let w64 = batch[k as usize];
+                let shifted = (w64 << 1) | prev_msb;
+                let mut tr = w64 ^ shifted;
+                prev_msb = w64 >> 63;
+
+                if tr == 0 {
+                    continue;
+                }
+
+                let base = batch_base + k * 64;
+                while tr != 0 {
+                    let bit = tr.trailing_zeros() as u32;
+                    let global = base + bit;
+                    self.buffer.push(global - prev_pos);
+                    prev_pos = global;
+                    tr &= tr.wrapping_sub(1);
+                }
             }
-            buffer.push(run_len);
         }
 
-        Self { buffer, total_size }
+        // Process remaining u32 pairs that didn't fill a batch of 16.
+        let remaining_pairs = &words[batch_u32s..full_u32s];
+        let rem_base_bits = (batch_u32s as u32) * 32;
+        for (p, pair) in remaining_pairs.chunks_exact(2).enumerate() {
+            let w64 = fuse(pair[0], pair[1]);
+            let shifted = (w64 << 1) | prev_msb;
+            let mut tr = w64 ^ shifted;
+            prev_msb = w64 >> 63;
+
+            if tr == 0 {
+                continue;
+            }
+
+            let base = rem_base_bits + (p as u32) * 64;
+            while tr != 0 {
+                let bit = tr.trailing_zeros() as u32;
+                let global = base + bit;
+                self.buffer.push(global - prev_pos);
+                prev_pos = global;
+                tr &= tr.wrapping_sub(1);
+            }
+        }
+
+
+        // Handle the remaining 0-1 u32 words (possibly partial last word).
+        let u32_processed = batch_u32s + (remaining_pairs.len() & !1);
+        let mut i = u32_processed;
+        while i < num_words {
+            let is_last = i == num_words - 1;
+            let bits_in_word = if is_last && total_size % 32 != 0 {
+                total_size % 32
+            } else {
+                32
+            };
+
+            let w = if bits_in_word < 32 {
+                words[i] & ((1u32 << bits_in_word) - 1)
+            } else {
+                words[i]
+            };
+
+            let shifted = (w << 1) | prev_msb as u32;
+            let mut transitions = w ^ shifted;
+            if bits_in_word < 32 {
+                transitions &= (1u32 << bits_in_word) - 1;
+            }
+
+            let base = (i as u32) * 32;
+            while transitions != 0 {
+                let bit = transitions.trailing_zeros();
+                let global = base + bit;
+                self.buffer.push(global - prev_pos);
+                prev_pos = global;
+                transitions &= transitions.wrapping_sub(1);
+            }
+
+            prev_msb = (w >> 31) as u64;
+            i += 1;
+        }
+
+        // Final run: remaining bits after the last transition.
+        let final_run = total_size as u32 - prev_pos;
+        if final_run > 0 || self.buffer.is_empty() {
+            self.buffer.push(final_run);
+        }
     }
+
 
     /// Creates a `Brle` from a slice of booleans.
     ///
@@ -746,5 +837,217 @@ mod tests {
         // 1000 alternating values, starting with true → 1001 buffer entries
         // (zero-length false prefix + 1000 singleton runs)
         assert_eq!(b.buffer.len(), 1001);
+    }
+
+    // -- from_bitmask correctness ------------------------------------------------
+
+    /// Naive reference: expand bitmask to bools, feed to from_slice.
+    fn naive_from_bitmask(bm: &[u32], total: usize) -> Brle {
+        let bools: Vec<bool> = (0..total)
+            .map(|i| (bm[i / 32] >> (i % 32)) & 1 != 0)
+            .collect();
+        Brle::from_slice(&bools)
+    }
+
+    fn assert_bitmask_matches_naive(bm: &[u32], total: usize) {
+        let fast = Brle::from_bitmask(bm, total);
+        let naive = naive_from_bitmask(bm, total);
+        assert_eq!(fast.buffer, naive.buffer,
+            "buffer mismatch for total_size={total}");
+        assert_eq!(fast.total_size, naive.total_size);
+    }
+
+    #[test]
+    fn from_bitmask_roundtrip_simple() {
+        // 0b1011 = bits 0,1,3 set → [true, true, false, true]
+        let bm = [0b1011u32];
+        let b = Brle::from_bitmask(&bm, 4);
+        assert_eq!(b.to_vec(), vec![true, true, false, true]);
+    }
+
+    #[test]
+    fn from_bitmask_roundtrip_all_false() {
+        let bm = [0u32; 4];
+        let b = Brle::from_bitmask(&bm, 128);
+        assert_eq!(b.len(), 128);
+        assert_eq!(b.buffer, vec![128]); // single false run
+    }
+
+    #[test]
+    fn from_bitmask_roundtrip_all_true() {
+        let bm = [u32::MAX; 4];
+        let b = Brle::from_bitmask(&bm, 128);
+        assert_eq!(b.len(), 128);
+        assert_eq!(b.buffer, vec![0, 128]); // zero false prefix + 128 true
+    }
+
+    #[test]
+    fn from_bitmask_partial_last_word() {
+        // 10 bits: word = 0b11_1111_1111 (all set)
+        let bm = [0x3FFu32];
+        let b = Brle::from_bitmask(&bm, 10);
+        assert_eq!(b.len(), 10);
+        assert!(b.to_vec().iter().all(|&v| v));
+    }
+
+    #[test]
+    fn from_bitmask_vs_naive_knuth_hash() {
+        // Deterministic pseudo-random pattern (128 words = 4096 bits)
+        let mut bm = [0u32; 128];
+        for i in 0..128 {
+            bm[i] = (i as u32).wrapping_mul(2654435761);
+        }
+        assert_bitmask_matches_naive(&bm, 4000); // partial last word
+    }
+
+    #[test]
+    fn from_bitmask_vs_naive_edge_sizes() {
+        // Test sizes that hit every batch/u64/u32 boundary edge:
+        //   BATCH=8 u64 = 512 bits = 16 u32 words
+        let bm = [0xA5A5A5A5u32; 256]; // 256 words = 8192 bits
+        for &total in &[
+            1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129,         // u32/u64 edges
+            511, 512, 513, 1023, 1024, 1025,                      // batch edges
+            4096, 8191, 8192,                                     // full buffer
+        ] {
+            assert_bitmask_matches_naive(&bm, total);
+        }
+    }
+
+    #[test]
+    fn from_bitmask_vs_naive_all_zeros_128k() {
+        let bm = vec![0u32; 4000];
+        assert_bitmask_matches_naive(&bm, 128_000);
+    }
+
+    #[test]
+    fn from_bitmask_vs_naive_all_ones_128k() {
+        let bm = vec![u32::MAX; 4000];
+        assert_bitmask_matches_naive(&bm, 128_000);
+    }
+
+    #[test]
+    fn from_bitmask_vs_naive_sparse_128k() {
+        let mut bm = vec![0u32; 4000];
+        // Set ~100 scattered single bits
+        for i in (0..128_000usize).step_by(1280) {
+            bm[i / 32] |= 1u32 << (i % 32);
+        }
+        assert_bitmask_matches_naive(&bm, 128_000);
+    }
+
+    #[test]
+    fn from_bitmask_vs_naive_dense_random_128k() {
+        let mut bm = vec![0u32; 4000];
+        let mut rng = 0x12345678u64;
+        for w in bm.iter_mut() {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *w = (rng >> 32) as u32;
+        }
+        assert_bitmask_matches_naive(&bm, 128_000);
+    }
+
+    #[test]
+    fn from_bitmask_vs_naive_alternating_words() {
+        let bm: Vec<u32> = (0..4000).map(|i| if i % 2 == 0 { 0 } else { u32::MAX }).collect();
+        assert_bitmask_matches_naive(&bm, 128_000);
+    }
+
+    #[test]
+    fn fill_from_bitmask_reuses_buffer() {
+        let bm1 = [0xFFu32; 4]; // 128 bits
+        let bm2 = [0u32; 4];
+        let mut brle = Brle::from_bitmask(&bm1, 128);
+        let cap_after_first = brle.buffer.capacity();
+        brle.fill_from_bitmask(&bm2, 128);
+        // Buffer should be reused, not reallocated
+        assert!(brle.buffer.capacity() >= cap_after_first);
+        assert_eq!(brle.buffer, vec![128]); // all false
+    }
+
+    // -- benchmark ---------------------------------------------------------------
+
+    #[test]
+    #[ignore] // cargo test --lib -- brle::tests::bench_from_bitmask --ignored --nocapture
+    fn bench_from_bitmask() {
+        use std::time::Instant;
+
+        const VOCAB: usize = 128_000;
+        const WORDS: usize = (VOCAB + 31) / 32;
+        const ITERS: usize = 10_000;
+
+        // Pattern 1: all zeros (one run)
+        let bm_zeros = vec![0u32; WORDS];
+
+        // Pattern 2: all ones (one run)
+        let bm_ones = vec![u32::MAX; WORDS];
+
+        // Pattern 3: sparse — ~100 tokens allowed (scattered single bits)
+        let mut bm_sparse = vec![0u32; WORDS];
+        for i in (0..VOCAB).step_by(VOCAB / 100) {
+            bm_sparse[i / 32] |= 1u32 << (i % 32);
+        }
+
+        // Pattern 4: dense — ~50% random fill
+        let mut bm_dense = vec![0u32; WORDS];
+        let mut rng = 0x12345678u64;
+        for w in bm_dense.iter_mut() {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *w = (rng >> 32) as u32;
+        }
+
+        // Pattern 5: word-aligned blocks (alternating 0x0000/0xFFFF words)
+        let bm_blocks: Vec<u32> = (0..WORDS)
+            .map(|i| if i % 2 == 0 { 0 } else { u32::MAX })
+            .collect();
+
+        let patterns: &[(&str, &[u32])] = &[
+            ("all_zeros", &bm_zeros),
+            ("all_ones", &bm_ones),
+            ("sparse_100", &bm_sparse),
+            ("dense_50pct", &bm_dense),
+            ("word_blocks", &bm_blocks),
+        ];
+
+        // --- Benchmark from_bitmask (allocating) ---
+        eprintln!("\n=== Brle::from_bitmask [alloc] (vocab={VOCAB}, iters={ITERS}) ===");
+        eprintln!("{:<15} {:>10} {:>10} {:>8}", "pattern", "total", "per_call", "runs");
+
+        for &(name, bm) in patterns {
+            for _ in 0..100 {
+                std::hint::black_box(Brle::from_bitmask(bm, VOCAB));
+            }
+
+            let t = Instant::now();
+            let mut last = Brle::new(0);
+            for _ in 0..ITERS {
+                last = std::hint::black_box(Brle::from_bitmask(
+                    std::hint::black_box(bm), VOCAB,
+                ));
+            }
+            let elapsed = t.elapsed();
+            let per_call = elapsed / ITERS as u32;
+            eprintln!("{:<15} {:>10?} {:>10?} {:>8}", name, elapsed, per_call, last.buffer.len());
+        }
+
+        // --- Benchmark fill_from_bitmask (warm buffer, no alloc) ---
+        eprintln!("\n=== Brle::fill_from_bitmask [warm] (vocab={VOCAB}, iters={ITERS}) ===");
+        eprintln!("{:<15} {:>10} {:>10} {:>8}", "pattern", "total", "per_call", "runs");
+
+        for &(name, bm) in patterns {
+            let mut brle = Brle::from_bitmask(bm, VOCAB); // warm up buffer
+            for _ in 0..100 {
+                brle.fill_from_bitmask(bm, VOCAB);
+            }
+
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                brle.fill_from_bitmask(std::hint::black_box(bm), VOCAB);
+                std::hint::black_box(&brle);
+            }
+            let elapsed = t.elapsed();
+            let per_call = elapsed / ITERS as u32;
+            eprintln!("{:<15} {:>10?} {:>10?} {:>8}", name, elapsed, per_call, brle.buffer.len());
+        }
     }
 }

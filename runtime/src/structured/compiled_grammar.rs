@@ -5,8 +5,10 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, RwLock};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
+use lru::LruCache;
 use rustc_hash::FxHasher;
 
 use crate::structured::bitmask;
@@ -16,6 +18,51 @@ use crate::structured::fsm::{
 use crate::structured::grammar::Grammar;
 use crate::structured::grammar::normalize::normalize_grammar;
 use crate::tokenizer::Tokenizer;
+
+// ---------------------------------------------------------------------------
+// Compilation cache
+// ---------------------------------------------------------------------------
+
+/// Cache key: (grammar source string, tokenizer pointer identity).
+#[derive(Hash, Eq, PartialEq)]
+struct CacheKey {
+    grammar_source: String,
+    tokenizer_ptr: usize,
+}
+
+/// Maximum number of compiled grammars to keep in cache.
+const CACHE_CAPACITY: usize = 64;
+
+/// Global LRU cache of compiled grammars, keyed by (source, tokenizer).
+static CACHE: LazyLock<Mutex<LruCache<CacheKey, Arc<CompiledGrammar>>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap())));
+
+impl CompiledGrammar {
+    /// Get a previously compiled grammar from cache, or compile and cache a new one.
+    ///
+    /// The cache is keyed by the original grammar source string and the
+    /// tokenizer's `Arc` pointer identity. Two identical source strings
+    /// compiled against the same tokenizer will share the same `Arc<CompiledGrammar>`.
+    pub fn get_or_compile(
+        source: &str,
+        grammar: &Grammar,
+        tokenizer: &Arc<Tokenizer>,
+    ) -> Arc<Self> {
+        let key = CacheKey {
+            grammar_source: source.to_owned(),
+            tokenizer_ptr: Arc::as_ptr(tokenizer) as usize,
+        };
+
+        let mut cache = CACHE.lock().unwrap();
+        if let Some(compiled) = cache.get(&key) {
+            return compiled.clone();
+        }
+
+        let compiled = Arc::new(CompiledGrammar::new(grammar, tokenizer));
+        cache.put(key, compiled.clone());
+        compiled
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Types

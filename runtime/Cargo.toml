@@ -70,6 +70,7 @@ aho-corasick = "1"
 memchr = "2"
 unicode-normalization = "0.1"
 smallvec = "1"
+lru = "0.16.3"
 
 [dev-dependencies]
 tempfile = "3"
