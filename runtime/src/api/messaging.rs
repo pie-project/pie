@@ -38,11 +38,13 @@ impl Pollable for Subscription {
 
 impl pie::core::messaging::Host for InstanceState {
     async fn push(&mut self, topic: String, message: String) -> Result<()> {
+        let topic = format!("{}:{}", self.get_username(), topic);
         messaging::push(topic, message)?;
         Ok(())
     }
 
     async fn pull(&mut self, topic: String) -> Result<Resource<FutureString>> {
+        let topic = format!("{}:{}", self.get_username(), topic);
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             if let Ok(msg) = messaging::pull(topic).await {
@@ -54,11 +56,13 @@ impl pie::core::messaging::Host for InstanceState {
     }
 
     async fn broadcast(&mut self, topic: String, message: String) -> Result<()> {
+        let topic = format!("{}:{}", self.get_username(), topic);
         messaging::publish(topic, message)?;
         Ok(())
     }
 
     async fn subscribe(&mut self, topic: String) -> Result<Resource<Subscription>> {
+        let topic = format!("{}:{}", self.get_username(), topic);
         let (tx, rx) = mpsc::channel(64);
         let sub_id = messaging::subscribe(topic.clone(), tx).await?;
         let sub = Subscription {

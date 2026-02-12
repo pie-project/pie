@@ -24,15 +24,6 @@ use crate::service::{ServiceMap, ServiceHandler};
 
 pub type ProcessId = usize;
 
-/// Reason a process was terminated.
-#[derive(Debug, Clone)]
-pub enum TerminationCause {
-    Normal(String),
-    Signal,
-    Exception(String),
-    OutOfResources(String),
-}
-
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Global registry mapping ProcessId to process actors.
@@ -98,6 +89,13 @@ fn add_child(parent_id: ProcessId, child_id: ProcessId) {
     let _ = SERVICES.send(&parent_id, Message::AddChild { child_id });
 }
 
+/// Get the username of a process.
+pub async fn get_username(process_id: ProcessId) -> Result<String> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(&process_id, Message::GetUsername { response: tx })?;
+    Ok(rx.await??)
+}
+
 /// List all registered process IDs.
 pub fn list() -> Vec<ProcessId> {
     SERVICES.keys()
@@ -127,6 +125,10 @@ enum Message {
     /// Stdout output from the WASM instance
     Stdout {
         content: String,
+    },
+    /// Query the process username
+    GetUsername {
+        response: oneshot::Sender<Result<String>>,
     },
     /// Stderr output from the WASM instance
     Stderr {
@@ -330,6 +332,10 @@ impl ServiceHandler for Process {
 
             Message::Stdout { content } | Message::Stderr { content } => {
                 self.deliver_output(content);
+            }
+
+            Message::GetUsername { response } => {
+                let _ = response.send(Ok(self.username.clone()));
             }
         }
     }
