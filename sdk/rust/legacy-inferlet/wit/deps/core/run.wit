@@ -1,3 +1,0 @@
-interface run {
-  run: func() -> result<_, string>;
-}

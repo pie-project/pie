@@ -1,5 +1,0 @@
-core = "../../../../runtime/wit/core/wit"
-adapter = "../../../../runtime/wit/adapter/wit"
-image = "../../../../runtime/wit/image/wit"
-zo = "../../../../runtime/wit/zo/wit"
-actor = "../../../../runtime/wit/actor/wit"
