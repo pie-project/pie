@@ -9,6 +9,9 @@ pub type Result<T> = std::result::Result<T, String>;
 // Re-export wstd for the macro to use
 pub use wstd;
 
+// Re-export wit_bindgen so the macro-generated inline WIT can reference it
+pub use wit_bindgen;
+
 // Re-export the main attribute macro
 pub use inferlet_macros::main;
 

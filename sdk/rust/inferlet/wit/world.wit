@@ -10,5 +10,4 @@ world inferlet {
     include pie:core/imports;
     include pie:mcp/imports;
     include pie:zo/imports;
-    export pie:core/run;
 }

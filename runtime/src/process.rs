@@ -253,7 +253,7 @@ impl Process {
         let result = async {
             let (mut store, instance) = linker::instantiate(process_id, username, &program, capture_outputs).await?;
 
-            let run_interface = "pie:core/run";
+            let run_interface = format!("pie:{}/run", program.name);
 
             let (_, run_export) = instance
                 .get_export(&mut store, None, &run_interface)
