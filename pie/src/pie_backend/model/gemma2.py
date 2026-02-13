@@ -32,7 +32,7 @@ from . import ModelConfig as ModelConfigBase
 from ..config import RuntimeConfig
 from ..adapter import AdapterSubpass
 from ..utils import is_apple_silicon, get_available_memory
-from ..loader import Schema, Source, WeightStore
+from ..schema import Schema, Source, WeightStore
 
 if is_apple_silicon():
     import flashinfer_metal as ops  # type: ignore[import-not-found]

@@ -5,6 +5,7 @@
 
 use crate::api::pie;
 use crate::linker::InstanceState;
+use crate::process::{self, ProcessId};
 use crate::server;
 use anyhow::{Result, anyhow};
 use serde_json::json;
@@ -16,18 +17,18 @@ use wasmtime_wasi::WasiView;
 pub struct Session {
     pub server_name: String,
     pub client_id: server::ClientId,
-    pub process_id: usize,
+    pub process_id: ProcessId,
 }
 
 impl pie::mcp::client::Host for InstanceState {
     async fn available_servers(&mut self) -> Result<Vec<String>> {
-        let client_id = server::get_client_id(self.id())
+        let client_id = process::get_client_id(self.id()).await?
             .ok_or_else(|| anyhow!("No client session for process {}", self.id()))?;
         Ok(server::get_mcp_servers(client_id))
     }
 
     async fn connect(&mut self, server_name: String) -> Result<Result<Resource<Session>, pie::mcp::types::Error>> {
-        let client_id = server::get_client_id(self.id())
+        let client_id = process::get_client_id(self.id()).await?
             .ok_or_else(|| anyhow!("No client session for process {}", self.id()))?;
 
         // Validate the server is registered

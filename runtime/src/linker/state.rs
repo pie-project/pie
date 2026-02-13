@@ -10,7 +10,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 use super::output::LogStream;
 
-type ProcessId = usize;
+use crate::process::ProcessId;
 
 pub struct InstanceState {
     // Wasm states

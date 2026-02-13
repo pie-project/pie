@@ -10,6 +10,7 @@ and the two worker roles:
 from __future__ import annotations
 
 import warnings
+import sys
 
 
 # =============================================================================
@@ -139,15 +140,18 @@ def worker_main(
         group_topology: List of groups, each containing ranks
         ready_queue: Queue to signal readiness: (rank, server_name|None, metadata|None)
     """
+    rank = local_rank
+
+
+    import torch
     import pie_runtime
     from pie_backend.engine import Engine
     from pie_backend.config import RuntimeConfig
     from pie_backend.model import get_chat_template
-    import torch
     import torch.distributed as dist
     import threading
 
-    rank = local_rank
+    # — Determine group membership —
 
     # — Determine group membership —
     my_group_id = 0
@@ -183,7 +187,8 @@ def worker_main(
     # Filter out device/devices keys since we pass them explicitly.
     filtered_config = {
         k: v for k, v in model_config.items()
-        if k not in ("device", "devices", "scheduler")
+        if k not in ("device", "devices", "scheduler", "tensor_parallel_size")
+        and v is not None
     }
 
     config = RuntimeConfig.from_args(
@@ -211,12 +216,14 @@ def worker_main(
             server_name = server.server_name()
 
             chat_template_info = engine.chat_template()
+
             metadata = {
                 "total_pages": getattr(config, "max_num_kv_pages", 0),
                 "max_batch_tokens": getattr(config, "max_batch_tokens", 10240),
                 "max_batch_size": getattr(config, "max_batch_size", 128),
                 "chat_template": chat_template_info.get("template_content", ""),
                 "stop_tokens": chat_template_info.get("stop_tokens", []),
+                "snapshot_dir": str(engine.snapshot_dir) if engine.snapshot_dir else "",
             }
 
             ready_queue.put((rank, server_name, metadata))
@@ -426,7 +433,12 @@ def _leader_loop(
         t0 = time.perf_counter()
         responses = batch.create_responses(sampling_results)
         results = [
-            {"tokens": resp.tokens, "dists": resp.dists}
+            {
+                "tokens": resp.tokens,
+                "dists": resp.dists,
+                "spec_tokens": getattr(resp, "spec_tokens", []) or [],
+                "spec_positions": getattr(resp, "spec_positions", []) or [],
+            }
             for resp in responses
         ]
         t_create_responses = time.perf_counter() - t0

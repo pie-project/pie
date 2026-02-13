@@ -320,17 +320,23 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         };
 
         // Submit to inference service
-        match inference::forward_pass(model_id, request).await {
-            Ok(output) => {
-                let future_output = FutureOutput {
-                    result: Some(convert_output(output)),
-                    rx: None,
-                    done: true,
-                };
-                Ok(Ok(self.ctx().table.push(future_output)?))
-            }
-            Err(e) => Ok(Err(e.to_string())),
+    // eprintln!("[HOST execute] tokens={}, positions={:?}, sampling_indices={:?}, context_id={:?}",
+    //     request.tokens.len(), &request.positions, &request.sampling_indices, request.context_id);
+    match inference::forward_pass(model_id, request).await {
+        Ok(output) => {
+            // eprintln!("[HOST execute] OK -> {:?}", &output);
+            let future_output = FutureOutput {
+                result: Some(convert_output(output)),
+                rx: None,
+                done: true,
+            };
+            Ok(Ok(self.ctx().table.push(future_output)?))
         }
+        Err(e) => {
+            // eprintln!("[HOST execute] ERR -> {}", e);
+            Ok(Err(e.to_string()))
+        },
+    }
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {

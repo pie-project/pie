@@ -250,7 +250,8 @@ impl<'a> TokenStream<'a> {
             self.pending_tokens = tokens[1..].iter().copied().rev().collect();
         }
 
-        Ok(Some(tokens[0]))
+        self.tokens_generated += 1;
+        Ok(Some(first))
     }
 
     /// Collects all tokens from the stream (until stop token or max_tokens limit).
@@ -278,12 +279,12 @@ impl<'a> TokenStream<'a> {
             return Err("generate requires at least one buffered token".to_string());
         }
         
-        let cursor = self.ctx.cursor();
+        let seq_len = self.ctx.last_position().map(|p| p + 1).unwrap_or(0);
         
         let pass = ForwardPass::new(&self.model);
         pass.context(self.ctx);
         
-        let positions: Vec<u32> = (cursor..cursor + buffered.len() as u32).collect();
+        let positions: Vec<u32> = (seq_len..seq_len + buffered.len() as u32).collect();
         pass.input_tokens(&buffered, &positions);
         
         let (draft_tokens, draft_positions) = self.speculation.draft();
@@ -315,7 +316,7 @@ impl<'a> TokenStream<'a> {
             return Ok(vec![]);
         }
 
-        let new_cursor = cursor + buffered.len() as u32;
+        let new_cursor = self.ctx.cursor() + buffered.len() as u32;
         let pages_to_commit = new_cursor / self.page_size;
         
         if pages_to_commit > 0 {
@@ -448,21 +449,23 @@ impl ContextExt for Context {
         let num_tokens = tokens_to_flush.len() as u32;
         
         let page_size = self.tokens_per_page();
-        let uncommitted_pages = self.uncommitted_page_count();
-        let cursor = self.cursor();
-        let available_capacity = page_size * uncommitted_pages - cursor;
+        let seq_len = self.last_position().map(|p| p + 1).unwrap_or(0);
         
-        if available_capacity < num_tokens {
-            let tokens_needed = num_tokens - available_capacity;
-            let pages_needed = (tokens_needed + page_size - 1) / page_size;
-            self.reserve_pages(pages_needed)
+        // Calculate total pages needed to hold cursor + tokens_to_flush
+        let cursor = self.cursor();
+        let total_tokens_after = cursor + num_tokens;
+        let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
+        
+        // Always reserve the pages we need — the host will handle dedup
+        if total_pages_needed > 0 {
+            self.reserve_pages(total_pages_needed)
                 .map_err(|e| format!("Failed to reserve pages: {}", e))?;
         }
         
         let pass = ForwardPass::new(&model);
         pass.context(self);
         
-        let positions: Vec<u32> = (cursor..cursor + num_tokens).collect();
+        let positions: Vec<u32> = (seq_len..seq_len + num_tokens).collect();
         pass.input_tokens(tokens_to_flush, &positions);
         
         pass.execute_async().await

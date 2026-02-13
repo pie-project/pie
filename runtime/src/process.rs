@@ -5,11 +5,11 @@
 //! Direct Addressing.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
+use uuid::Uuid;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -22,9 +22,7 @@ use crate::service::{ServiceMap, ServiceHandler};
 // Process Registry
 // =============================================================================
 
-pub type ProcessId = usize;
-
-static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+pub type ProcessId = Uuid;
 
 /// Global registry mapping ProcessId to process actors.
 static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> =
@@ -46,6 +44,7 @@ pub fn spawn(
 ) -> Result<ProcessId> {
     let process = Process::new(username, program_name, arguments, client_id, parent_id, capture_outputs, result_tx);
     let id = process.process_id;
+
     SERVICES.spawn(id, || process)?;
 
     // Register as child of parent so it terminates with the parent
@@ -96,6 +95,13 @@ pub async fn get_username(process_id: ProcessId) -> Result<String> {
     Ok(rx.await??)
 }
 
+/// Get the client ID attached to a process, if any.
+pub async fn get_client_id(process_id: ProcessId) -> Result<Option<ClientId>> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(&process_id, Message::GetClientId { response: tx })?;
+    Ok(rx.await??)
+}
+
 /// List all registered process IDs.
 pub fn list() -> Vec<ProcessId> {
     SERVICES.keys()
@@ -134,6 +140,10 @@ enum Message {
     Stderr {
         content: String,
     },
+    /// Query the attached client ID
+    GetClientId {
+        response: oneshot::Sender<Result<Option<ClientId>>>,
+    },
 }
 
 // =============================================================================
@@ -159,7 +169,7 @@ struct Process {
 }
 
 impl Process {
-    /// Creates a new Process and spawns its WASM execution task.
+    /// Creates a new Process, generating a UUID, and spawns its WASM execution task.
     fn new(
         username: String,
         program: ProgramName,
@@ -169,7 +179,7 @@ impl Process {
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<String>>,
     ) -> Self {
-        let process_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let process_id = Uuid::new_v4();
 
         let handle = tokio::spawn(Self::run(
             process_id,
@@ -197,6 +207,7 @@ impl Process {
 
     /// Deliver output to the attached client, or buffer it if capturing.
     fn deliver_output(&mut self, stream: &'static str, content: String) {
+
         if let Some(client_id) = self.client_id {
             if server::send_event(client_id, self.process_id, stream, content.clone()).is_err() {
                 // Client gone — detach and fall back to buffering
@@ -238,10 +249,11 @@ impl Process {
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<String>>,
     ) {
+
         let result = async {
             let (mut store, instance) = linker::instantiate(process_id, username, &program, capture_outputs).await?;
 
-            let run_interface = format!("pie:{}/run", program.name);
+            let run_interface = "pie:core/run";
 
             let (_, run_export) = instance
                 .get_export(&mut store, None, &run_interface)
@@ -263,7 +275,9 @@ impl Process {
         }.await;
 
         let exception = match &result {
-            Ok(_) => None,
+            Ok(output) => {
+                None
+            }
             Err(err) => {
                 tracing::info!("Process {process_id} failed: {err}");
                 Some(err.to_string())
@@ -275,12 +289,14 @@ impl Process {
             let _ = tx.send(result.unwrap_or_default());
         }
 
+
         let _ = SERVICES.send(&process_id, Message::Terminate { exception });
     }
 
     /// Abort the WASM execution task, notify any attached client, terminate
     /// children, and unregister.
     fn terminate(&mut self, exception: Option<String>) {
+
         self.handle.abort();
 
         // Cascade: terminate all children
@@ -295,8 +311,8 @@ impl Process {
                 Some(msg) => ("error", msg),
                 None => ("return", String::new()),
             };
+
             let _ = server::send_event(client_id, process_id, event, value);
-            server::unregister_process(process_id);
         }
 
         SERVICES.remove(&self.process_id);
@@ -335,6 +351,10 @@ impl ServiceHandler for Process {
 
             Message::GetUsername { response } => {
                 let _ = response.send(Ok(self.username.clone()));
+            }
+
+            Message::GetClientId { response } => {
+                let _ = response.send(Ok(self.client_id));
             }
         }
     }

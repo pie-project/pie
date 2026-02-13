@@ -29,11 +29,18 @@ pub fn get_model_id(model_name: &str) -> Option<ModelId> {
 pub fn register(
     name: String,
     chat_template: String,
-    stop_tokens: Vec<u32>,
+    stop_token_strings: Vec<String>,
     kv_page_size: u32,
     tokenizer_path: PathBuf,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
+
+    // Convert stop token strings to IDs using the tokenizer's vocabulary.
+    let stop_tokens: Vec<u32> = stop_token_strings
+        .iter()
+        .filter_map(|s| tokenizer.token_to_id(s))
+        .collect();
+
     let model = Arc::new(Model {
         name,
         chat_template,

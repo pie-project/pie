@@ -91,7 +91,9 @@ impl pie::core::model::HostTokenizer for InstanceState {
 
     async fn stop_tokens(&mut self, this: Resource<Tokenizer>) -> Result<Vec<u32>> {
         let tokenizer = self.ctx().table.get(&this)?;
-        Ok(tokenizer.model.stop_tokens().to_vec())
+        let tokens = tokenizer.model.stop_tokens().to_vec();
+        // eprintln!("[HOST] stop_tokens -> {:?}", tokens);
+        Ok(tokens)
     }
 
     async fn drop(&mut self, this: Resource<Tokenizer>) -> Result<()> {

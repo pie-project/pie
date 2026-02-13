@@ -15,7 +15,7 @@ use wasmtime_wasi::p2::{OutputStream, Pollable, StreamResult};
 
 use crate::process;
 
-type ProcessId = usize;
+use crate::process::ProcessId;
 
 /// A WASI-compatible output stream that routes to the process actor.
 #[derive(Clone)]

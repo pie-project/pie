@@ -21,7 +21,7 @@ use crate::service::{Service, ServiceHandler};
 
 pub use state::InstanceState;
 
-type ProcessId = usize;
+use crate::process::ProcessId;
 
 // ---- Singleton Actor --------------------------------------------------------
 

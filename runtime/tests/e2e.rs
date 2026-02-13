@@ -110,6 +110,15 @@ fn context_inferlet_exercises_host_apis() {
     );
 }
 
+#[test]
+fn generate_inferlet_exercises_forward_pass() {
+    let s = state();
+    assert!(
+        spawn_and_wait(s, "generate", vec![]),
+        "generate inferlet should complete (exercises flush + generate pipeline)"
+    );
+}
+
 // =============================================================================
 // Stress & Concurrency
 // =============================================================================
@@ -123,7 +132,7 @@ fn concurrent_spawns() {
         let count = 10;
         let pids: Vec<_> = (0..count)
             .map(|i| {
-                process::spawn(
+                let pid = process::spawn(
                     "stress-user".into(),
                     program_name("echo"),
                     vec![format!("batch-{i}")],
@@ -132,7 +141,8 @@ fn concurrent_spawns() {
                     false,
                     None,
                 )
-                .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"))
+                .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"));
+                pid
             })
             .collect();
 

@@ -5,17 +5,15 @@
 
 use bytes::Bytes;
 use pie_client::message::ServerMessage;
-use uuid::Uuid;
+
 
 use crate::daemon;
 use crate::messaging;
-use crate::process;
+use crate::process::{self, ProcessId};
 use crate::program::{self, Manifest, ProgramName};
 
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
-
-type ProcessId = usize;
 
 // =============================================================================
 // Query Handlers
@@ -78,10 +76,7 @@ impl Session {
         for id in process::list() {
             if let Ok(owner) = process::get_username(id).await {
                 if owner == self.username {
-                    let label = super::get_uuid(id)
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|| id.to_string());
-                    processes.push(label);
+                    processes.push(id.to_string());
                 }
             }
         }
@@ -198,10 +193,9 @@ impl Session {
         ) {
             Ok(process_id) => {
                 if capture_outputs {
-                    // Register process → client mapping and get UUID
-                    let uuid = super::register_process(process_id, self.id);
+                    // Client mapping was pre-registered by process::spawn
                     self.attached_processes.push(process_id);
-                    self.send_response(corr_id, true, uuid.to_string()).await;
+                    self.send_response(corr_id, true, process_id.to_string()).await;
                 } else {
                     self.send_response(corr_id, true, String::new()).await;
                 }
@@ -255,14 +249,12 @@ impl Session {
 // =============================================================================
 
 impl Session {
-    /// Resolve a wire UUID string to an internal ProcessId.
-    fn resolve_process_id(&self, uuid_str: &str) -> Option<ProcessId> {
-        let uuid: Uuid = uuid_str.parse().ok()?;
-        super::resolve_uuid(&uuid)
+    fn parse_process_id(uuid_str: &str) -> Option<ProcessId> {
+        uuid_str.parse().ok()
     }
 
     pub(super) async fn handle_attach_process(&mut self, corr_id: u32, process_id_str: String) {
-        let process_id = match self.resolve_process_id(&process_id_str) {
+        let process_id = match Self::parse_process_id(&process_id_str) {
             Some(id) => id,
             None => {
                 self.send_response(corr_id, false, "Invalid process_id".to_string())
@@ -288,8 +280,6 @@ impl Session {
 
         match process::attach(process_id, self.id).await {
             Ok(()) => {
-                // Register process → client mapping with Server
-                super::register_process(process_id, self.id);
                 self.attached_processes.push(process_id);
                 self.send_response(corr_id, true, "Process attached".to_string())
                     .await;
@@ -302,7 +292,7 @@ impl Session {
     }
 
     pub(super) async fn handle_signal_process(&mut self, process_id_str: String, message: String) {
-        if let Some(process_id) = self.resolve_process_id(&process_id_str) {
+        if let Some(process_id) = Self::parse_process_id(&process_id_str) {
             if self.attached_processes.contains(&process_id) {
                 messaging::push(process_id.to_string(), message).unwrap();
             }
@@ -310,7 +300,7 @@ impl Session {
     }
 
     pub(super) async fn handle_terminate_process(&mut self, corr_id: u32, process_id_str: String) {
-        let process_id = match self.resolve_process_id(&process_id_str) {
+        let process_id = match Self::parse_process_id(&process_id_str) {
             Some(id) => id,
             None => {
                 self.send_response(corr_id, false, "Invalid process ID".to_string())
@@ -354,7 +344,7 @@ impl Session {
         total_chunks: usize,
         chunk_data: Vec<u8>,
     ) {
-        let process_id = match self.resolve_process_id(&process_id_str) {
+        let process_id = match Self::parse_process_id(&process_id_str) {
             Some(id) => id,
             None => {
                 tracing::error!("TransferFile: invalid process_id {}", process_id_str);
@@ -414,9 +404,7 @@ impl Session {
         let file_hash = blake3::hash(&data).to_hex().to_string();
         let total_chunks = (data.len() + pie_client::message::CHUNK_SIZE_BYTES - 1) / pie_client::message::CHUNK_SIZE_BYTES;
 
-        let uuid_str = super::get_uuid(process_id)
-            .map(|u| u.to_string())
-            .unwrap_or_else(|| process_id.to_string());
+        let uuid_str = process_id.to_string();
 
         for (i, chunk) in data.chunks(pie_client::message::CHUNK_SIZE_BYTES).enumerate() {
             self.send(ServerMessage::File {

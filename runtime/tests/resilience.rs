@@ -72,7 +72,7 @@ fn device_timeout_returns_none() {
         let ctx_id = pie::context::create(MODEL, USER.to_string(), "timeout-ctx".into(), None)
             .await
             .unwrap();
-        let lock = pie::context::acquire_lock(MODEL, ctx_id).await;
+        let lock = pie::context::acquire_lock(MODEL, ctx_id);
         pie::context::reserve_pages(MODEL, ctx_id, lock, 1).await.unwrap();
         pie::context::release_lock(MODEL, ctx_id, lock).unwrap();
 

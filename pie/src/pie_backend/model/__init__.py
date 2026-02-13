@@ -138,6 +138,7 @@ def get_chat_template(arch_name: str) -> dict:
 import torch
 from . import llama3, qwen2, qwen3, gemma2, gemma3, mistral3, olmo3
 from .chat_templates import (
+    ChatTemplate,
     Llama3Template,
     Qwen2_5Template,
     Qwen3Template,
@@ -160,3 +161,23 @@ if torch.cuda.is_available():
     from . import gpt_oss
     from .chat_templates import GPTOSSTemplate
     register("gptoss", gpt_oss, GPTOSSTemplate, hf_model_types=("gptoss", "gpt_oss"))
+
+# Dummy mode: simple ChatML template compatible with most tokenizers
+_DUMMY_CHAT_TEMPLATE = (
+    "{%- for m in messages -%}"
+    "{%- if m.role == 'system' -%}<|im_start|>system\n{{ m.content }}<|im_end|>\n"
+    "{%- elif m.role == 'user' -%}<|im_start|>user\n{{ m.content }}<|im_end|>\n"
+    "{%- elif m.role == 'assistant' -%}<|im_start|>assistant\n{{ m.content }}<|im_end|>\n"
+    "{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}"
+)
+from . import dummy as _dummy_mod
+register(
+    "dummy", _dummy_mod,
+    ChatTemplate(
+        template_type="minijinja",
+        template=_DUMMY_CHAT_TEMPLATE,
+        stop_tokens=["<|im_end|>", "<|endoftext|>"]
+    ),
+)

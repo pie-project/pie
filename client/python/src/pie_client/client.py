@@ -356,7 +356,7 @@ class PieClient:
             raise Exception(f"Upload failed: {result}")
         return result
 
-    async def install_program(self, wasm_path: str | Path, manifest_path: str | Path):
+    async def install_program(self, wasm_path: str | Path, manifest_path: str | Path, force_overwrite: bool = False):
         """Install a program to the server in chunks."""
         program_bytes = Path(wasm_path).read_bytes()
         manifest = Path(manifest_path).read_text()
@@ -365,7 +365,7 @@ class PieClient:
             "type": "add_program",
             "program_hash": program_hash,
             "manifest": manifest,
-            "force_overwrite": False,
+            "force_overwrite": force_overwrite,
         }
         await self._upload_chunked(program_bytes, template)
 

@@ -123,13 +123,23 @@ impl InferenceService {
     }
 
     /// Resolves physical pages from context and queues the forward pass.
-    async fn forward_pass(&self, request: ForwardPassRequest, response_tx: oneshot::Sender<ForwardPassOutput>) -> Result<()> {
+    async fn forward_pass(&self, mut request: ForwardPassRequest, response_tx: oneshot::Sender<ForwardPassOutput>) -> Result<()> {
         // Resolve physical page IDs from context
         let (pages_by_device, last_page_len) = if let Some(ctx_id) = request.context_id {
             context::get_physical_page_ids(self.model_idx, ctx_id).await?
+            // tracing::info!(
+            //     context_id = ctx_id,
+            //     num_devices = result.0.len(),
+            //     last_page_len = result.1,
+            //     total_pages = result.0.values().map(|v| v.len()).sum::<usize>(),
+            //     num_tokens = request.tokens.len(),
+            //     "resolved physical pages from context"
+            // );
         } else {
+            //tracing::info!("forward_pass: no context_id, using empty pages");
             (Default::default(), 0)
         };
+
 
         // Context parallelism not yet supported — pages must reside on a single device
         if pages_by_device.len() > 1 {
@@ -144,6 +154,13 @@ impl InferenceService {
             .into_iter()
             .next()
             .unwrap_or((0, vec![]));
+
+        // tracing::info!(
+        //     device_id = device_id,
+        //     num_physical_pages = physical_page_ids.len(),
+        //     last_page_len = last_page_len,
+        //     "submitting forward pass to scheduler"
+        // );
 
         // Route to the appropriate BatchScheduler
         let device_idx = device_id.min(self.num_devices.saturating_sub(1));

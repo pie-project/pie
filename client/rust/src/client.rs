@@ -563,20 +563,28 @@ async fn handle_server_message(
                     .insert(file_hash.clone(), Mutex::new(state));
             }
 
+            // Accumulate chunk data, then drop all guards before any remove().
+            // SAFETY: We must drop the DashMap Ref guard before calling .remove(),
+            // because .get() holds a shard read-lock and .remove() needs a write-lock
+            // on the same shard — holding both would deadlock.
+            let is_last = chunk_index == total_chunks - 1;
             if let Some(state_mutex) = inner.pending_downloads.get(&file_hash) {
                 let mut state = state_mutex.lock().await;
                 state.buffer.extend_from_slice(&chunk_data);
+                drop(state);        // release Mutex guard
+            }
+            // DashMap Ref dropped here (end of `if let` scope)
 
-                if chunk_index == total_chunks - 1 {
-                    if let Some((_, state_mutex)) = inner.pending_downloads.remove(&file_hash) {
-                        let final_state = state_mutex.into_inner();
-                        if hash_blob(&final_state.buffer) == file_hash {
-                            if let Some(sender) = inner.process_event_tx.get(&final_state.process_id) {
-                                sender
-                                    .send(ProcessEvent::File(final_state.buffer))
-                                    .await
-                                    .ok();
-                            }
+            // Finalize on last chunk — no guards held
+            if is_last {
+                if let Some((_, state_mutex)) = inner.pending_downloads.remove(&file_hash) {
+                    let final_state = state_mutex.into_inner();
+                    if hash_blob(&final_state.buffer) == file_hash {
+                        if let Some(sender) = inner.process_event_tx.get(&final_state.process_id) {
+                            sender
+                                .send(ProcessEvent::File(final_state.buffer))
+                                .await
+                                .ok();
                         }
                     }
                 }

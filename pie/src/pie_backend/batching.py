@@ -157,10 +157,10 @@ class Batch:
         )
 
         # Load flattened output token indices
-        flat_output_indices = _decode_u32(args["flat_output_token_indices"]).astype(
+        flat_output_indices = _decode_u32(args["sampling_indices"]).astype(
             np.int32
         )
-        output_token_indptr = _decode_u32(args["output_token_indptr"]).astype(np.int32)
+        output_token_indptr = _decode_u32(args["sampling_indptr"]).astype(np.int32)
 
         # ===== VECTORIZED OUTPUT INDICES OFFSET CALCULATION =====
         # Each request's indices are relative to its token range, we need global offsets
@@ -169,6 +169,7 @@ class Batch:
         # For each index in flat_output_indices, add the corresponding request's token offset
         # Create an array mapping each flat index to its request's token offset
         indices_per_request = np.diff(output_token_indptr)
+        self.indices_per_request = indices_per_request
         request_token_offsets = self.qo_indptr[:-1]  # Token offset for each request
 
         # Expand offsets to match each output index
@@ -350,7 +351,7 @@ class Batch:
             ),
             "logit_masks": (
                 torch.as_tensor(
-                    np.repeat(self.logit_masks, indices_per_request, axis=0),
+                    np.repeat(self.logit_masks, self.indices_per_request, axis=0) if self.logit_masks is not None else [],
                     device=device,
                     dtype=torch.bool,
                 )

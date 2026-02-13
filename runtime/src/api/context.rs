@@ -18,8 +18,6 @@ pub struct Context {
     pub context_id: ContextId,
     /// The model ID (for routing to the correct ContextManager).
     pub model_id: ModelId,
-    /// The username associated with this context.
-    pub username: String,
     /// Currently held lock ID (if any).
     pub lock_id: Option<LockId>,
 }
@@ -37,9 +35,9 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = model.model_id;
         let username = self.get_username();
 
-        match context::create(model_id, username.clone(), name, fill).await {
+        match context::create(model_id, username, name, fill).await {
             Ok(context_id) => {
-                let ctx = Context { context_id, model_id, username, lock_id: None };
+                let ctx = Context { context_id, model_id, lock_id: None };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -66,9 +64,9 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = model.model_id;
         let username = self.get_username();
 
-        match context::lookup(model_id, username.clone(), name).await {
+        match context::lookup(model_id, username, name).await {
             Some(context_id) => {
-                let ctx = Context { context_id, model_id, username, lock_id: None };
+                let ctx = Context { context_id, model_id, lock_id: None };
                 Ok(Some(self.ctx().table.push(ctx)?))
             }
             None => Ok(None),
@@ -83,11 +81,11 @@ impl pie::core::context::HostContext for InstanceState {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
-        let username = ctx.username.clone();
+        let username = self.get_username();
 
-        match context::fork(model_id, context_id, username.clone(), new_name).await {
+        match context::fork(model_id, context_id, username, new_name).await {
             Ok(new_context_id) => {
-                let new_ctx = Context { context_id: new_context_id, model_id, username, lock_id: None };
+                let new_ctx = Context { context_id: new_context_id, model_id, lock_id: None };
                 Ok(Ok(self.ctx().table.push(new_ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -104,11 +102,18 @@ impl pie::core::context::HostContext for InstanceState {
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
 
+        // Acquire the lock synchronously so we can store the lock_id
+        let lock_id = context::acquire_lock(model_id, context_id);
+        let success = lock_id != 0;
+
+        if success {
+            let ctx = self.ctx().table.get_mut(&this)?;
+            ctx.lock_id = Some(lock_id);
+        }
+
+        // Return a pre-resolved future
         let (bool_tx, bool_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let lock_id = context::acquire_lock(model_id, context_id).await;
-            let _ = bool_tx.send(lock_id != 0);
-        });
+        let _ = bool_tx.send(success);
 
         let future_bool = FutureBool::new(bool_rx);
         Ok(self.ctx().table.push(future_bool)?)
@@ -126,7 +131,7 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn tokens_per_page(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::tokens_per_page(ctx.model_id, ctx.context_id).await)
+        Ok(context::tokens_per_page(ctx.model_id, ctx.context_id))
     }
 
     async fn model(&mut self, this: Resource<Context>) -> Result<Resource<Model>> {
@@ -143,13 +148,18 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn committed_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::committed_page_count(ctx.model_id, ctx.context_id).await)
+        let count = context::committed_page_count(ctx.model_id, ctx.context_id);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/pie_api_debug.log") {
+            use std::io::Write;
+            let _ = writeln!(f, "[API] committed_page_count ctx={} -> {}", ctx.context_id, count);
+        }
+        Ok(count)
     }
 
     async fn uncommitted_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        let tokens = context::get_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0)).await;
-        let page_size = context::tokens_per_page(ctx.model_id, ctx.context_id).await;
+        let tokens = context::get_buffered_tokens(ctx.model_id, ctx.context_id);
+        let page_size = context::tokens_per_page(ctx.model_id, ctx.context_id);
         Ok((tokens.len() as u32 + page_size - 1) / page_size)
     }
 
@@ -185,7 +195,7 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn cursor(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::get_cursor(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0)).await)
+        Ok(context::get_cursor(ctx.model_id, ctx.context_id))
     }
 
     async fn set_cursor(&mut self, this: Resource<Context>, cursor: u32) -> Result<()> {
@@ -196,7 +206,7 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn buffered_tokens(&mut self, this: Resource<Context>) -> Result<Vec<u32>> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::get_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0)).await)
+        Ok(context::get_buffered_tokens(ctx.model_id, ctx.context_id))
     }
 
     async fn set_buffered_tokens(&mut self, this: Resource<Context>, tokens: Vec<u32>) -> Result<()> {
@@ -209,5 +219,10 @@ impl pie::core::context::HostContext for InstanceState {
         let ctx = self.ctx().table.get(&this)?;
         context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
         Ok(())
+    }
+
+    async fn last_position(&mut self, this: Resource<Context>) -> Result<Option<u32>> {
+        let ctx = self.ctx().table.get(&this)?;
+        Ok(context::last_position(ctx.model_id, ctx.context_id))
     }
 }

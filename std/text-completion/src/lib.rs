@@ -37,12 +37,32 @@ async fn main(args: Vec<String>) -> Result<String> {
         .flush()
         .await?;
 
-    // Generate
-    let generated = context
-        .generate(Sampler::TopP((temperature, top_p)))
-        .with_max_tokens(max_tokens)
-        .collect_text()
-        .await?;
+    eprintln!("[INFERLET] flush done, starting generate (max_tokens={})", max_tokens);
 
+    // Generate output stream
+    let mut stream = context
+        .generate(Sampler::TopP((temperature, top_p)))
+        .with_max_tokens(max_tokens);
+    
+    let mut all_tokens = Vec::new();
+    let tokenizer = model.tokenizer();
+
+    // Stream tokens
+    use std::io::Write;
+    while let Some(token) = stream.next().await? {
+        all_tokens.push(token);
+        
+        // Decode and print (simple partial decoding for now)
+        // In real app we'd handle accumulation properly
+        let text = tokenizer.decode(&[token])?;
+        print!("{}", text);
+        std::io::stdout().flush().ok();
+        
+        eprintln!("[INFERLET] token: {} {:?}", token, text);
+    }
+    
+    let generated = tokenizer.decode(&all_tokens)?;
+    eprintln!("[INFERLET] generated {} bytes", generated.len());
+    
     Ok(generated)
 }

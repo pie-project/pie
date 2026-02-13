@@ -55,6 +55,8 @@ interface context {
 
         append-buffered-tokens: func(tokens: list<u32>);
 
+        last-position: func() -> option<u32>;
+
     }
 
 }

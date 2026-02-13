@@ -4,6 +4,7 @@ members = [
     "echo",
     "context",
     "error",
+    "generate",
 ]
 
 [workspace.dependencies]

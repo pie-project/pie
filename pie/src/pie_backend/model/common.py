@@ -5,6 +5,7 @@ Common modeling components for PIE backend.
 from __future__ import annotations
 
 import torch
+import sys
 import math
 
 from typing import Callable, Any
@@ -320,7 +321,7 @@ def _execute_sampler(
     """Execute the appropriate sampling operation.
 
     Args:
-        sampler_idx: Sampler type (1=uniform, 2=top_p, 3=top_k, 4=min_p, 5=top_k_top_p)
+        sampler_idx: Sampler type (1=uniform, 2=top_k, 3=top_p, 4=min_p, 5=top_k_top_p)
         group_probs: Probability tensor for this group
         top_k: Pre-indexed top_k tensor for this group
         top_p: Pre-indexed top_p tensor for this group
@@ -330,22 +331,24 @@ def _execute_sampler(
         Sampled token indices
     """
     if sampler_idx == 1:
-        return sampling_from_probs(group_probs)
+        result = sampling_from_probs(group_probs)
 
     elif sampler_idx == 2:
-        return top_p_sampling_from_probs(group_probs, top_p=top_p)
+        result = top_k_sampling_from_probs(group_probs, top_k=top_k)
 
     elif sampler_idx == 3:
-        return top_k_sampling_from_probs(group_probs, top_k=top_k)
+        result = top_p_sampling_from_probs(group_probs, top_p=top_p)
 
     elif sampler_idx == 4:
-        return min_p_sampling_from_probs(group_probs, min_p=min_p)
+        result = min_p_sampling_from_probs(group_probs, min_p=min_p)
 
     elif sampler_idx == 5:
-        return top_k_top_p_sampling_from_probs(group_probs, top_k=top_k, top_p=top_p)
+        result = top_k_top_p_sampling_from_probs(group_probs, top_k=top_k, top_p=top_p)
 
     else:
         raise ValueError(f"Unknown sampler index: {sampler_idx}")
+
+    return result
 
 
 def estimate_flashinfer_workspace_size(

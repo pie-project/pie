@@ -30,7 +30,7 @@ from .gpt_oss_utils import (
 from ..config import RuntimeConfig
 from ..adapter import AdapterSubpass
 from ..utils import is_apple_silicon, get_available_memory
-from ..loader import Schema, Source, WeightStore
+from ..schema import Schema, Source, WeightStore
 
 # GPT-OSS requires CUDA-only FlashInfer features (attention sinks, MoE kernels)
 # These are not available in flashinfer_metal

@@ -11,8 +11,8 @@
 //! Sessions register in a global registry and receive messages via Direct Addressing,
 //! bypassing the Server actor for high-throughput communication.
 //!
-//! Process ↔ Client mappings and UUID ↔ ProcessId mappings use lock-free global
-//! DashMaps for zero-overhead lookups.
+//! Process ↔ Client mappings are managed by the Process actor itself.
+//! Session state uses lock-free global DashMaps for zero-overhead lookups.
 
 mod handler;
 mod data_transfer;
@@ -34,28 +34,14 @@ use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 use tokio_tungstenite::accept_async;
 use tungstenite::Message as WsMessage;
-use uuid::Uuid;
+
 
 use crate::auth;
 use crate::service::{Service, ServiceHandler, ServiceMap};
-
-type ProcessId = usize;
+use crate::process::{self, ProcessId};
 
 /// Unique identifier for a connected client.
 pub type ClientId = u32;
-
-// =============================================================================
-// Global Mappings (lock-free DashMaps)
-// =============================================================================
-
-/// Maps ProcessId → ClientId (which client owns this process).
-static PROCESS_TO_CLIENT: LazyLock<DashMap<ProcessId, ClientId>> = LazyLock::new(DashMap::new);
-
-/// Maps external UUID → internal ProcessId.
-static UUID_TO_PID: LazyLock<DashMap<Uuid, ProcessId>> = LazyLock::new(DashMap::new);
-
-/// Maps internal ProcessId → external UUID.
-static PID_TO_UUID: LazyLock<DashMap<ProcessId, Uuid>> = LazyLock::new(DashMap::new);
 
 // =============================================================================
 // Server Public API
@@ -67,51 +53,6 @@ static SERVICE: LazyLock<Service<ServerMessage>> = LazyLock::new(Service::new);
 pub fn spawn(host: &str, port: u16) {
     let addr = format!("{}:{}", host, port);
     SERVICE.spawn::<Server, _>(|| Server::new(addr)).expect("Server already spawned");
-}
-
-/// Registers a process with its owning client. Returns the external UUID.
-pub fn register_process(process_id: ProcessId, client_id: ClientId) -> Uuid {
-    let uuid = Uuid::new_v4();
-    PROCESS_TO_CLIENT.insert(process_id, client_id);
-    UUID_TO_PID.insert(uuid, process_id);
-    PID_TO_UUID.insert(process_id, uuid);
-    uuid
-}
-
-/// Removes all mappings for a process.
-pub fn unregister_process(process_id: ProcessId) {
-    PROCESS_TO_CLIENT.remove(&process_id);
-    if let Some((_, uuid)) = PID_TO_UUID.remove(&process_id) {
-        UUID_TO_PID.remove(&uuid);
-    }
-}
-
-/// Looks up which client owns a process.
-pub fn get_client_id(process_id: ProcessId) -> Option<ClientId> {
-    PROCESS_TO_CLIENT.get(&process_id).map(|r| *r)
-}
-
-/// Resolves a wire UUID to an internal ProcessId.
-pub fn resolve_uuid(uuid: &Uuid) -> Option<ProcessId> {
-    UUID_TO_PID.get(uuid).map(|r| *r)
-}
-
-/// Gets the external UUID for a ProcessId.
-pub fn get_uuid(process_id: ProcessId) -> Option<Uuid> {
-    PID_TO_UUID.get(&process_id).map(|r| *r)
-}
-
-/// Cleans up all process mappings for a disconnected client.
-pub fn cleanup_client(client_id: ClientId) {
-    // Collect PIDs owned by this client, then remove them
-    let pids: Vec<ProcessId> = PROCESS_TO_CLIENT
-        .iter()
-        .filter(|r| *r.value() == client_id)
-        .map(|r| *r.key())
-        .collect();
-    for pid in pids {
-        unregister_process(pid);
-    }
 }
 
 // =============================================================================
@@ -254,7 +195,6 @@ impl ServiceHandler for Server {
     async fn handle(&mut self, msg: ServerMessage) {
         match msg {
             ServerMessage::SessionTerminated { client_id } => {
-                cleanup_client(client_id);
                 tracing::info!("Client {} disconnected", client_id);
             }
         }
@@ -408,7 +348,7 @@ impl Session {
     /// Cleanup when session is terminated.
     fn cleanup(&mut self) {
         for process_id in self.attached_processes.drain(..) {
-            unregister_process(process_id);
+            process::detach(process_id);
         }
 
         self.recv_pump.abort();
@@ -586,10 +526,7 @@ impl Session {
     }
 
     pub(super) async fn send_process_event(&self, process_id: ProcessId, event: &str, value: String) {
-        let uuid_str = match get_uuid(process_id) {
-            Some(uuid) => uuid.to_string(),
-            None => process_id.to_string(), // fallback
-        };
+        let uuid_str = process_id.to_string();
         self.send(WireServerMessage::ProcessEvent {
             process_id: uuid_str,
             event: event.to_string(),
@@ -606,10 +543,7 @@ impl Session {
         method: String,
         params: String,
     ) {
-        let uuid_str = match get_uuid(process_id) {
-            Some(uuid) => uuid.to_string(),
-            None => process_id.to_string(),
-        };
+        let uuid_str = process_id.to_string();
         self.send(WireServerMessage::McpRequest {
             corr_id,
             process_id: uuid_str,

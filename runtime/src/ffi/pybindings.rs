@@ -175,7 +175,7 @@ pub struct ModelConfig {
     #[pyo3(get, set)]
     pub chat_template: String,
     #[pyo3(get, set)]
-    pub stop_tokens: Vec<u32>,
+    pub stop_tokens: Vec<String>,
     #[pyo3(get, set)]
     pub kv_page_size: usize,
     #[pyo3(get, set)]
@@ -201,7 +201,7 @@ impl ModelConfig {
     fn new(
         name: String,
         chat_template: String,
-        stop_tokens: Vec<u32>,
+        stop_tokens: Vec<String>,
         kv_page_size: usize,
         tokenizer_path: String,
         devices: Vec<DeviceConfig>,
@@ -391,8 +391,11 @@ impl RuntimeHandle {
     }
 
     /// Force-shutdown the runtime by exiting the process.
+    /// Force-shutdown the runtime by exiting the process.
     fn shutdown(&self) {
-        std::process::exit(0);
+        // std::process::exit(0);
+        // Do nothing - runtime shuts down when handle is dropped
+        tracing::info!("RuntimeHandle::shutdown called - ignoring (shutdown on drop)");
     }
 
     /// Returns true if the runtime is running.

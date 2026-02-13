@@ -33,14 +33,33 @@ pub type ContextId = u64;
 pub type LockId = u64;
 
 // =============================================================================
-// Public API
+// Globals
 // =============================================================================
 
 static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
+static CONTEXTS: LazyLock<DashMap<(usize, ContextId), Context>> = LazyLock::new(DashMap::new);
+static NEXT_LOCK_ID: AtomicU64 = AtomicU64::new(1);
+static PAGE_SIZES: LazyLock<boxcar::Vec<usize>> = LazyLock::new(boxcar::Vec::new);
+
+// =============================================================================
+// Public API
+// =============================================================================
 
 /// Spawns a new context manager for a model.
 pub fn spawn(page_size: usize, num_kv_pages: Vec<usize>) -> usize {
-    SERVICES.spawn(move || ContextManager::new(page_size, &num_kv_pages)).expect("Failed to spawn context manager")
+    let model_idx = PAGE_SIZES.push(page_size);
+    let idx = SERVICES.spawn(move || ContextManager::new(model_idx, page_size, &num_kv_pages)).expect("Failed to spawn context manager");
+    assert_eq!(idx, model_idx);
+    idx
+}
+
+// ---------- Actor-routed (needs PageStore) ----------
+
+/// Looks up a context by name.
+pub async fn lookup(model_idx: usize, username: String, name: String) -> Option<ContextId> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Lookup { username, name, response: tx }).ok()?;
+    rx.await.ok().flatten()
 }
 
 /// Creates a new context with the given name.
@@ -57,50 +76,11 @@ pub async fn destroy(model_idx: usize, id: ContextId, lock_id: LockId) -> Result
     rx.await?
 }
 
-/// Looks up a context by name.
-pub async fn lookup(model_idx: usize, username: String, name: String) -> Option<ContextId> {
-    let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Lookup { username, name, response: tx }).ok()?;
-    rx.await.ok()?
-}
-
 /// Forks a context into a new one.
 pub async fn fork(model_idx: usize, id: ContextId, username: String, new_name: String) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Fork { id, username, new_name, response: tx })?;
     rx.await?
-}
-
-/// Acquires a lock on the context.
-pub async fn acquire_lock(model_idx: usize, id: ContextId) -> LockId {
-    let (tx, rx) = oneshot::channel();
-    if SERVICES.send(model_idx, Message::AcquireLock { id, response: tx }).is_err() {
-        return 0;
-    }
-    rx.await.unwrap_or(0)
-}
-
-/// Releases the lock on the context.
-pub fn release_lock(model_idx: usize, id: ContextId, lock_id: LockId) -> Result<()> {
-    SERVICES.send(model_idx, Message::ReleaseLock { id, lock_id })
-}
-
-/// Gets the number of tokens per page.
-pub async fn tokens_per_page(model_idx: usize, id: ContextId) -> u32 {
-    let (tx, rx) = oneshot::channel();
-    if SERVICES.send(model_idx, Message::TokensPerPage { id, response: tx }).is_err() {
-        return 0;
-    }
-    rx.await.unwrap_or(0)
-}
-
-/// Gets the number of committed pages.
-pub async fn committed_page_count(model_idx: usize, id: ContextId) -> u32 {
-    let (tx, rx) = oneshot::channel();
-    if SERVICES.send(model_idx, Message::CommittedPageCount { id, response: tx }).is_err() {
-        return 0;
-    }
-    rx.await.unwrap_or(0)
 }
 
 /// Commits pages to the context.
@@ -122,40 +102,6 @@ pub fn release_pages(model_idx: usize, id: ContextId, lock_id: LockId, num_pages
     SERVICES.send(model_idx, Message::ReleasePages { id, lock_id, num_pages })
 }
 
-/// Gets the cursor position.
-pub async fn get_cursor(model_idx: usize, id: ContextId, lock_id: LockId) -> u32 {
-    let (tx, rx) = oneshot::channel();
-    if SERVICES.send(model_idx, Message::GetCursor { id, lock_id, response: tx }).is_err() {
-        return 0;
-    }
-    rx.await.unwrap_or(0)
-}
-
-/// Sets the cursor position.
-pub fn set_cursor(model_idx: usize, id: ContextId, lock_id: LockId, cursor: u32) -> Result<()> {
-    SERVICES.send(model_idx, Message::SetCursor { id, lock_id, cursor })
-}
-
-/// Gets buffered tokens.
-pub async fn get_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId) -> Vec<u32> {
-    let (tx, rx) = oneshot::channel();
-    if SERVICES.send(model_idx, Message::GetBufferedTokens { id, lock_id, response: tx }).is_err() {
-        return Vec::new();
-    }
-    rx.await.unwrap_or_default()
-}
-
-/// Sets buffered tokens.
-pub fn set_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId, tokens: Vec<u32>) -> Result<()> {
-    SERVICES.send(model_idx, Message::SetBufferedTokens { id, lock_id, tokens })
-}
-
-/// Appends buffered tokens.
-pub fn append_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId, tokens: Vec<u32>) -> Result<()> {
-    SERVICES.send(model_idx, Message::AppendBufferedTokens { id, lock_id, tokens })
-}
-
-
 /// Gets physical page IDs grouped by device, plus the last page length.
 pub async fn get_physical_page_ids(model_idx: usize, id: ContextId) -> Result<(HashMap<DeviceId, Vec<PhysicalPageId>>, u32)> {
     let (tx, rx) = oneshot::channel();
@@ -163,6 +109,82 @@ pub async fn get_physical_page_ids(model_idx: usize, id: ContextId) -> Result<(H
     Ok(rx.await?)
 }
 
+
+
+// ---------- Direct (no actor, uses global CONTEXTS DashMap) ----------
+
+
+/// Acquires a lock on the context.
+pub fn acquire_lock(model_idx: usize, id: ContextId) -> LockId {
+    let lock_id = NEXT_LOCK_ID.fetch_add(1, Ordering::Relaxed);
+    if let Some(mut ctx) = CONTEXTS.get_mut(&(model_idx, id)) {
+        if ctx.acquire_lock(lock_id) {
+            return lock_id;
+        }
+    }
+    0
+}
+
+/// Releases the lock on the context.
+pub fn release_lock(model_idx: usize, id: ContextId, lock_id: LockId) -> Result<()> {
+    if let Some(mut ctx) = CONTEXTS.get_mut(&(model_idx, id)) {
+        ctx.release_lock(lock_id);
+    }
+    Ok(())
+}
+
+pub fn tokens_per_page(model_idx: usize, _id: ContextId) -> u32 {
+    PAGE_SIZES.get(model_idx).map(|v| *v as u32).unwrap_or(0)
+}
+
+pub fn committed_page_count(model_idx: usize, id: ContextId) -> u32 {
+    CONTEXTS.get(&(model_idx, id)).map(|ctx| ctx.committed_page_count()).unwrap_or(0)
+}
+
+pub fn get_cursor(model_idx: usize, id: ContextId) -> u32 {
+    CONTEXTS.get(&(model_idx, id)).map(|ctx| ctx.cursor()).unwrap_or(0)
+}
+
+pub fn set_cursor(model_idx: usize, id: ContextId, lock_id: LockId, cursor: u32) -> Result<()> {
+    let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
+        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+    ctx.set_cursor(lock_id, cursor)
+}
+
+pub fn last_position(model_idx: usize, id: ContextId) -> Option<u32> {
+    CONTEXTS.get(&(model_idx, id)).and_then(|ctx| ctx.last_position())
+}
+
+pub fn get_buffered_tokens(model_idx: usize, id: ContextId) -> Vec<u32> {
+    CONTEXTS.get(&(model_idx, id)).map(|ctx| ctx.buffered_tokens()).unwrap_or_default()
+}
+
+pub fn set_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId, tokens: Vec<u32>) -> Result<()> {
+    let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
+        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+    ctx.set_buffered_tokens(lock_id, tokens)
+}
+
+pub fn append_buffered_tokens(model_idx: usize, id: ContextId, lock_id: LockId, tokens: Vec<u32>) -> Result<()> {
+    let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
+        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+    ctx.append_buffered_tokens(lock_id, tokens)
+}
+
+/// Marks the first `n` buffered tokens as forwarded, moving them to filled state.
+/// Called by the inference service after a forward pass completes.
+pub fn fill(
+    model_idx: usize,
+    id: ContextId,
+    n: usize,
+    positions: Vec<u32>,
+    masks: Vec<Brle>,
+    adapter: Option<AdapterId>,
+) -> Result<()> {
+    let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
+        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+    ctx.fill(n, positions, masks, adapter)
+}
 
 
 /// Record of operations on a context (for lineage tracking).
@@ -192,9 +214,11 @@ struct Context {
     lineage: Vec<Record>,
     pages_committed: Vec<PageId>,
     pages_uncommitted: Vec<PageId>,
-    tokens_uncommitted: Vec<TokenInfo>,
+    /// Tokens with KV already computed (forwarded), awaiting commit.
+    tokens_filled: Vec<TokenInfo>,
+    /// Token IDs queued for the next forward pass, no KV yet.
+    tokens_buffered: Vec<u32>,
 
-    pointer: usize,
     mutex: Option<LockId>,
     
     /// Highest position ID among all committed pages
@@ -210,39 +234,150 @@ impl Context {
             lineage: Vec::new(),
             pages_committed: Vec::new(),
             pages_uncommitted: Vec::new(),
-            tokens_uncommitted: Vec::new(),
-            pointer: 0,
+            tokens_filled: Vec::new(),
+            tokens_buffered: Vec::new(),
             mutex: None,
             max_committed_position: None,
             last_committed_hash: 0,
         }
     }
-}
 
-/// The context manager handles all context operations.
-/// This is the core business logic, separate from the actor message handling.
-#[derive(Debug)]
-struct ContextManager {
-    pub page_store: PageStore,
-    contexts: DashMap<ContextId, Context>,
-    name_to_id: DashMap<(String, String), ContextId>,
-    next_id: AtomicU64,
-    pub page_size: usize,
-}
-
-impl ContextManager {
-    pub fn new(page_size: usize, num_kv_pages: &[usize]) -> Self {
-        ContextManager {
-            page_store: PageStore::new(page_size, num_kv_pages),
-            contexts: DashMap::new(),
-            name_to_id: DashMap::new(),
-            next_id: AtomicU64::new(1),
-            page_size,
+    /// Check if the given lock_id is valid for this context.
+    /// Allows lock_id=0 when the context is unlocked (no mutex held).
+    fn check_lock(&self, lock_id: LockId) -> Result<()> {
+        match (self.mutex, lock_id) {
+            (None, 0) => Ok(()),         // Unlocked context, no lock requested
+            (Some(held), id) if held == id => Ok(()), // Lock matches
+            (None, _) => anyhow::bail!("Context is not locked"),
+            (Some(_), 0) => anyhow::bail!("Context is locked; lock_id required"),
+            (Some(_), _) => anyhow::bail!("Invalid lock_id"),
         }
     }
 
-    fn next_id(&self) -> ContextId {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+    fn acquire_lock(&mut self, lock_id: LockId) -> bool {
+        if self.mutex.is_none() {
+            self.mutex = Some(lock_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release_lock(&mut self, lock_id: LockId) {
+        if self.mutex == Some(lock_id) {
+            self.mutex = None;
+        }
+    }
+
+    fn committed_page_count(&self) -> u32 {
+        self.pages_committed.len() as u32
+    }
+
+    /// Cursor is derived from the number of filled (forwarded) tokens.
+    fn cursor(&self) -> u32 {
+        self.tokens_filled.len() as u32
+    }
+
+    /// Validates range 0..=tokens_filled.len() and truncates tokens_filled to n.
+    fn set_cursor(&mut self, lock_id: LockId, cursor: u32) -> Result<()> {
+        self.check_lock(lock_id)?;
+        let max = self.tokens_filled.len();
+        if cursor as usize > max {
+            anyhow::bail!("cursor {} out of range 0..={}", cursor, max);
+        }
+        self.tokens_filled.truncate(cursor as usize);
+        Ok(())
+    }
+
+    fn last_position(&self) -> Option<u32> {
+        let max_filled = self.tokens_filled.iter()
+            .map(|t| t.position)
+            .max();
+        match (self.max_committed_position, max_filled) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    fn buffered_tokens(&self) -> Vec<u32> {
+        self.tokens_buffered.clone()
+    }
+
+    fn set_buffered_tokens(&mut self, lock_id: LockId, tokens: Vec<u32>) -> Result<()> {
+        self.check_lock(lock_id)?;
+        self.tokens_buffered = tokens;
+        Ok(())
+    }
+
+    fn append_buffered_tokens(&mut self, lock_id: LockId, tokens: Vec<u32>) -> Result<()> {
+        self.check_lock(lock_id)?;
+        self.tokens_buffered.extend(tokens);
+        Ok(())
+    }
+
+    /// Marks the first `n` buffered tokens as forwarded, moving them to tokens_filled
+    /// with the given positions, masks, and adapter.
+    fn fill(
+        &mut self,
+        n: usize,
+        positions: Vec<u32>,
+        masks: Vec<Brle>,
+        adapter: Option<AdapterId>,
+    ) -> Result<()> {
+        if n > self.tokens_buffered.len() {
+            anyhow::bail!(
+                "cannot mark {} tokens as forwarded, only {} buffered",
+                n, self.tokens_buffered.len()
+            );
+        }
+        if positions.len() != n {
+            anyhow::bail!("positions length {} != n {}", positions.len(), n);
+        }
+        if !masks.is_empty() && masks.len() != n {
+            anyhow::bail!("masks length {} != n {}", masks.len(), n);
+        }
+
+        let tokens: Vec<u32> = self.tokens_buffered.drain(..n).collect();
+        for (i, token) in tokens.into_iter().enumerate() {
+            self.tokens_filled.push(TokenInfo {
+                token,
+                position: positions[i],
+                mask: if masks.is_empty() { Brle::new(0) } else { masks[i].clone() },
+                adapter,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The context manager handles page-store operations.
+/// Context metadata lives in global CONTEXTS DashMap.
+#[derive(Debug)]
+struct ContextManager {
+    page_store: PageStore,
+    page_size: usize,
+    model_idx: usize,
+    name_to_id: HashMap<(String, String), ContextId>,
+    next_id: u64,
+}
+
+impl ContextManager {
+    pub fn new(model_idx: usize, page_size: usize, num_kv_pages: &[usize]) -> Self {
+        ContextManager {
+            page_store: PageStore::new(page_size, num_kv_pages),
+            page_size,
+            model_idx,
+            name_to_id: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    fn next_id(&mut self) -> ContextId {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     // ==================== Core Operations ====================
@@ -273,10 +408,7 @@ impl ContextManager {
                 // Place matched pages in pages_committed
                 ctx.pages_committed = pages.clone();
                 
-                // Set pointer to end of committed tokens
-                ctx.pointer = tokens_matched;
-                
-                // Remaining tokens become tokens_uncommitted
+                // Remaining tokens become buffered (need forward pass)
                 if tokens_matched < tokens.len() {
                     let remaining_tokens = tokens.len() - tokens_matched;
                     let page_size = page_store.page_size();
@@ -286,19 +418,10 @@ impl ContextManager {
                     let affinity = pages.first().copied();
                     ctx.pages_uncommitted = page_store.allocate(pages_needed, affinity)?;
                     
-                    ctx.tokens_uncommitted = tokens[tokens_matched..]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &token)| TokenInfo { 
-                            token, 
-                            position: (tokens_matched + i) as u32, 
-                            mask: Brle::new(0),
-                            adapter: None,
-                        })
-                        .collect();
+                    ctx.tokens_buffered = tokens[tokens_matched..].to_vec();
                 }
             } else {
-                // No match: all tokens become tokens_uncommitted
+                // No match: all tokens become buffered (need forward pass)
                 let page_size = page_store.page_size();
                 let pages_needed = (tokens.len() + page_size - 1) / page_size;
                 
@@ -307,42 +430,26 @@ impl ContextManager {
                     ctx.pages_uncommitted = page_store.allocate(pages_needed, None)?;
                 }
                 
-                ctx.tokens_uncommitted = tokens
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, token)| TokenInfo { 
-                        token, 
-                        position: i as u32, 
-                        mask: Brle::new(0),
-                        adapter: None,
-                    })
-                    .collect();
+                ctx.tokens_buffered = tokens;
             }
         }
 
-        self.contexts.insert(id, ctx);
+        CONTEXTS.insert((self.model_idx, id), ctx);
         self.name_to_id.insert((username, name), id);
         Ok(id)
     }
 
     pub fn destroy(&mut self, id: ContextId, lock_id: LockId) -> Result<()> {
-        if let Some(ctx) = self.contexts.get(&id) {
-            if ctx.mutex == Some(lock_id) {
-                drop(ctx);
-                self.contexts.remove(&id);
-                // Clean up name_to_id reverse mapping
-                self.name_to_id.retain(|_, v| *v != id);
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("Context not locked by this lock_id"))
-            }
+        if let Some(ctx) = CONTEXTS.get(&(self.model_idx, id)) {
+            ctx.check_lock(lock_id)?;
+            drop(ctx);
+            CONTEXTS.remove(&(self.model_idx, id));
+            // Clean up name_to_id reverse mapping
+            self.name_to_id.retain(|_, v| *v != id);
+            Ok(())
         } else {
             Err(anyhow::anyhow!("Context not found"))
         }
-    }
-
-    pub fn get(&self, username: String, name: String) -> Option<ContextId> {
-        self.name_to_id.get(&(username, name)).map(|v| *v.value())
     }
 
     pub fn fork(&mut self, id: ContextId, username: String, new_name: String) -> Result<ContextId> {
@@ -352,17 +459,34 @@ impl ContextManager {
         }
 
         // Get the source context
-        let source_ctx = self.contexts.get(&id)
+        let source_ctx = CONTEXTS.get(&(self.model_idx, id))
             .ok_or_else(|| anyhow::anyhow!("Source context not found"))?;
 
-        // Clone committed pages and collect info we need
+        // Validate filled token positions are sequential from max_committed_position
+        if !source_ctx.tokens_filled.is_empty() {
+            let base = source_ctx.max_committed_position.map(|p| p + 1).unwrap_or(0);
+            for (i, info) in source_ctx.tokens_filled.iter().enumerate() {
+                let expected = base + i as u32;
+                if info.position != expected {
+                    anyhow::bail!(
+                        "Cannot fork: filled token {} has position {}, expected {}",
+                        i, info.position, expected
+                    );
+                }
+            }
+        }
+
+        // Collect info from source — only committed pages are cloned
         let pages_committed = source_ctx.pages_committed.clone();
-        let num_uncommitted = source_ctx.pages_uncommitted.len();
-        let tokens_uncommitted = source_ctx.tokens_uncommitted.clone();
         let lineage = source_ctx.lineage.clone();
         let affinity = pages_committed.first().copied();
         let source_max_position = source_ctx.max_committed_position;
         let source_last_hash = source_ctx.last_committed_hash;
+
+        // Convert filled tokens back to buffered (prepend to existing buffered)
+        let filled_as_buffered: Vec<u32> = source_ctx.tokens_filled.iter().map(|t| t.token).collect();
+        let mut new_buffered = filled_as_buffered;
+        new_buffered.extend_from_slice(&source_ctx.tokens_buffered);
         
         drop(source_ctx); // Release the borrow
 
@@ -371,174 +495,44 @@ impl ContextManager {
         // Increase refcount for committed pages
         page_store.acquire(&pages_committed);
 
-        // Allocate new uncommitted pages
-        let new_uncommitted = if num_uncommitted > 0 {
-            page_store.allocate(num_uncommitted, affinity)?
+        // Preallocate pages to hold all buffered tokens
+        let page_size = page_store.page_size();
+        let pages_needed = (new_buffered.len() + page_size - 1) / page_size;
+        let new_uncommitted = if pages_needed > 0 {
+            page_store.allocate(pages_needed, affinity)?
         } else {
             Vec::new()
         };
 
-        // Calculate pointer
-        let pointer = pages_committed.len() * page_store.page_size();
-
-        // Create the new context
+        // Create the new context — tokens_filled is empty
         let new_id = self.next_id();
         let new_ctx = Context {
             lineage,
             pages_committed,
             pages_uncommitted: new_uncommitted,
-            tokens_uncommitted,
-            pointer,
+            tokens_filled: Vec::new(),
+            tokens_buffered: new_buffered,
             mutex: None,
             max_committed_position: source_max_position,
             last_committed_hash: source_last_hash,
         };
 
-        self.contexts.insert(new_id, new_ctx);
+        CONTEXTS.insert((self.model_idx, new_id), new_ctx);
         self.name_to_id.insert((username, new_name), new_id);
 
         Ok(new_id)
     }
 
-    // ==================== Locking ====================
-
-    pub fn lock(&self, id: ContextId) -> LockId {
-        let lock_id = self.next_id();
-        if let Some(mut ctx) = self.contexts.get_mut(&id) {
-            if ctx.mutex.is_none() {
-                ctx.mutex = Some(lock_id);
-                return lock_id;
-            }
-        }
-        0 // Lock failed
-    }
-
-    pub fn unlock(&self, id: ContextId, lock_id: LockId) {
-        if let Some(mut ctx) = self.contexts.get_mut(&id) {
-            if ctx.mutex == Some(lock_id) {
-                ctx.mutex = None;
-            }
-        }
-    }
-
-    // ==================== Queries ====================
-
-    pub fn page_size(&self) -> u32 {
-        self.page_size as u32
-    }
-
-    pub fn num_total_pages(&self, id: ContextId) -> u32 {
-        self.contexts.get(&id)
-            .map(|ctx| ctx.pages_committed.len() as u32)
-            .unwrap_or(0)
-    }
-
-    pub fn num_total_tokens(&self, id: ContextId) -> u32 {
-        self.contexts.get(&id)
-            .map(|ctx| ctx.pointer as u32 + ctx.tokens_uncommitted.len() as u32)
-            .unwrap_or(0)
-    }
-
-    pub fn get_pointer(&self, id: ContextId) -> u32 {
-        self.contexts.get(&id)
-            .map(|ctx| ctx.pointer as u32)
-            .unwrap_or(0)
-    }
-
-    pub fn set_pointer(&self, id: ContextId, pointer: u32) -> Result<()> {
-        if let Some(mut ctx) = self.contexts.get_mut(&id) {
-            ctx.pointer = pointer as usize;
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Context not found"))
-        }
-    }
-
-    pub fn get_buffered_tokens(&self, id: ContextId) -> Vec<u32> {
-        self.contexts.get(&id)
-            .map(|ctx| ctx.tokens_uncommitted.iter().map(|t| t.token).collect())
-            .unwrap_or_default()
-    }
-
-    pub fn set_buffered_tokens(&self, id: ContextId, tokens: Vec<u32>) -> Result<()> {
-        if let Some(mut ctx) = self.contexts.get_mut(&id) {
-            ctx.tokens_uncommitted = tokens.into_iter().enumerate().map(|(i, token)| {
-                TokenInfo {
-                    token,
-                    position: i as u32,
-                    mask: Brle::new(0),
-                    adapter: None,
-                }
-            }).collect();
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Context not found"))
-        }
-    }
-
-    pub fn append_buffered_tokens(&self, id: ContextId, tokens: Vec<u32>) -> Result<()> {
-        if let Some(mut ctx) = self.contexts.get_mut(&id) {
-            let start_pos = ctx.tokens_uncommitted.len();
-            ctx.tokens_uncommitted.extend(tokens.into_iter().enumerate().map(|(i, token)| {
-                TokenInfo {
-                    token,
-                    position: (start_pos + i) as u32,
-                    mask: Brle::new(0),
-                    adapter: None,
-                }
-            }));
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Context not found"))
-        }
-    }
-
-    pub fn get_physical_page_ids(&self, id: ContextId) -> (HashMap<DeviceId, Vec<PhysicalPageId>>, u32) {
-        let mut result: HashMap<DeviceId, Vec<PhysicalPageId>> = HashMap::new();
-        
-        if let Some(ctx) = self.contexts.get(&id) {
-            let page_store = &self.page_store;
-            
-            // Get all committed pages and collect their physical mappings
-            for &page_id in &ctx.pages_committed {
-                for (device_id, phys_id) in page_store.get_physical_mappings(page_id) {
-                    result.entry(device_id as DeviceId).or_default().push(phys_id);
-                }
-            }
-            // Also include uncommitted pages
-            for &page_id in &ctx.pages_uncommitted {
-                for (device_id, phys_id) in page_store.get_physical_mappings(page_id) {
-                    result.entry(device_id as DeviceId).or_default().push(phys_id);
-                }
-            }
-
-            let last_page_len = if ctx.pages_uncommitted.is_empty() {
-                self.page_size as u32
-            } else {
-                let total_uncommitted_tokens = ctx.tokens_uncommitted.len();
-                let full_pages = ctx.pages_uncommitted.len().saturating_sub(1);
-                let tokens_in_last = total_uncommitted_tokens.saturating_sub(full_pages * self.page_size);
-                if tokens_in_last == 0 { self.page_size as u32 } else { tokens_in_last as u32 }
-            };
-
-            (result, last_page_len)
-        } else {
-            (result, 0)
-        }
-    }
-
-
-
     // ==================== Page Management ====================
 
     pub fn allocate_pages(&mut self, id: ContextId, lock_id: LockId, num_pages: u32) -> Result<()> {
-        let ctx = self.contexts.get(&id)
+        //eprintln!("[ALLOC] allocate_pages called: ctx={}, lock_id={}, num_pages={}", id, lock_id, num_pages);
+        let ctx = CONTEXTS.get(&(self.model_idx, id))
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         
-        // Verify lock
-        if ctx.mutex != Some(lock_id) {
-            anyhow::bail!("Invalid lock");
-        }
+        //eprintln!("[ALLOC] ctx.mutex={:?}", ctx.mutex);
+        ctx.check_lock(lock_id)?;
+        //eprintln!("[ALLOC] lock check passed");
         
         // Get affinity from existing pages (committed first, then uncommitted)
         let affinity = ctx.pages_committed.first()
@@ -549,23 +543,22 @@ impl ContextManager {
         
         // Allocate pages from page store
         let new_pages = self.page_store.allocate(num_pages as usize, affinity)?;
+        //eprintln!("[ALLOC] allocated {} pages: {:?}", new_pages.len(), new_pages);
         
         // Add to uncommitted pages
-        let mut ctx = self.contexts.get_mut(&id)
+        let mut ctx = CONTEXTS.get_mut(&(self.model_idx, id))
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         ctx.pages_uncommitted.extend(new_pages);
+        //eprintln!("[ALLOC] pages_uncommitted now has {} pages", ctx.pages_uncommitted.len());
         
         Ok(())
     }
 
     pub fn free_pages(&mut self, id: ContextId, lock_id: LockId, num_pages: u32) -> Result<()> {
-        let mut ctx = self.contexts.get_mut(&id)
+        let mut ctx = CONTEXTS.get_mut(&(self.model_idx, id))
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         
-        // Verify lock
-        if ctx.mutex != Some(lock_id) {
-            anyhow::bail!("Invalid lock");
-        }
+        ctx.check_lock(lock_id)?;
         
         let num_to_free = (num_pages as usize).min(ctx.pages_uncommitted.len());
         if num_to_free == 0 {
@@ -580,11 +573,12 @@ impl ContextManager {
         ctx.pages_uncommitted.truncate(start_idx);
         
         // Remove corresponding tokens from the end
+        // Remove corresponding filled tokens from the end
         let tokens_to_remove = num_to_free * self.page_size;
-        let tokens_len = ctx.tokens_uncommitted.len();
+        let tokens_len = ctx.tokens_filled.len();
         if tokens_to_remove > 0 && tokens_len > 0 {
             let new_tokens_len = tokens_len.saturating_sub(tokens_to_remove);
-            ctx.tokens_uncommitted.truncate(new_tokens_len);
+            ctx.tokens_filled.truncate(new_tokens_len);
         }
         
         drop(ctx);
@@ -598,13 +592,10 @@ impl ContextManager {
     pub fn commit_pages(&mut self, id: ContextId, lock_id: LockId, indices: Vec<u32>) -> Result<()> {
         let page_size = self.page_size;
         
-        let mut ctx = self.contexts.get_mut(&id)
+        let mut ctx = CONTEXTS.get_mut(&(self.model_idx, id))
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         
-        // Verify lock
-        if ctx.mutex != Some(lock_id) {
-            anyhow::bail!("Context not locked by this lock_id");
-        }
+        ctx.check_lock(lock_id)?;
 
         // Validate indices
         for &idx in &indices {
@@ -630,16 +621,16 @@ impl ContextManager {
             let token_end = (idx + 1) * page_size;
 
             // Validate page is fully filled
-            if token_end > ctx.tokens_uncommitted.len() {
+            if token_end > ctx.tokens_filled.len() {
                 anyhow::bail!(
                     "Page {} not fully filled: need {} tokens but only have {}",
-                    idx, token_end, ctx.tokens_uncommitted.len()
+                    idx, token_end, ctx.tokens_filled.len()
                 );
             }
 
-            // Collect token info
+            // Collect token info from filled tokens
             for i in token_start..token_end {
-                let info = &ctx.tokens_uncommitted[i];
+                let info = &ctx.tokens_filled[i];
                 tokens_to_commit.push(info.token);
                 positions_to_commit.push(info.position);
                 masks_to_commit.push(info.mask.clone());
@@ -713,7 +704,7 @@ impl ContextManager {
         )?;
 
         // Re-acquire context and update state
-        let mut ctx = self.contexts.get_mut(&id)
+        let mut ctx = CONTEXTS.get_mut(&(self.model_idx, id))
             .ok_or_else(|| anyhow::anyhow!("Context lost during commit"))?;
 
         // Add committed pages
@@ -724,11 +715,11 @@ impl ContextManager {
         sorted_indices.sort_by(|a, b| b.cmp(a)); // Reverse sort
         for idx in sorted_indices {
             ctx.pages_uncommitted.remove(idx);
-            // Remove corresponding tokens
+            // Remove corresponding filled tokens
             let token_start = idx * page_size;
             let token_end = (idx + 1) * page_size;
-            let tokens_len = ctx.tokens_uncommitted.len();
-            ctx.tokens_uncommitted.drain(token_start..token_end.min(tokens_len));
+            let tokens_len = ctx.tokens_filled.len();
+            ctx.tokens_filled.drain(token_start..token_end.min(tokens_len));
         }
 
         // Update max_committed_position
@@ -740,9 +731,6 @@ impl ContextManager {
         // Update hash chain
         ctx.last_committed_hash = final_hash;
 
-        // Update pointer
-        ctx.pointer = ctx.pages_committed.len() * page_size;
-
         // Add lineage record
         ctx.lineage.push(Record::Fill {
             tokens: lineage_tokens,
@@ -753,6 +741,50 @@ impl ContextManager {
 
         Ok(())
     }
+
+    pub fn get_physical_page_ids(&self, id: ContextId) -> (HashMap<DeviceId, Vec<PhysicalPageId>>, u32) {
+        let mut result: HashMap<DeviceId, Vec<PhysicalPageId>> = HashMap::new();
+        
+        if let Some(ctx) = CONTEXTS.get(&(self.model_idx, id)) {
+            //eprintln!("[PAGES] get_physical_page_ids: ctx={}, committed={}, uncommitted={}, tokens_filled={}",
+            //    id, ctx.pages_committed.len(), ctx.pages_uncommitted.len(), ctx.tokens_filled.len());
+            let page_store = &self.page_store;
+            
+            // Get all committed pages and collect their physical mappings
+            for &page_id in &ctx.pages_committed {
+                for (device_id, phys_id) in page_store.get_physical_mappings(page_id) {
+                    result.entry(device_id as DeviceId).or_default().push(phys_id);
+                }
+            }
+            // Also include uncommitted pages
+            for &page_id in &ctx.pages_uncommitted {
+                for (device_id, phys_id) in page_store.get_physical_mappings(page_id) {
+                    result.entry(device_id as DeviceId).or_default().push(phys_id);
+                }
+            }
+
+            let last_page_len = if ctx.pages_uncommitted.is_empty() {
+                if ctx.pages_committed.is_empty() {
+                    0 // No pages at all
+                } else {
+                    self.page_size as u32 // All committed pages are full
+                }
+            } else {
+                // tokens_filled contains all forwarded tokens on uncommitted pages.
+                let total_filled = ctx.tokens_filled.len();
+                let full_pages = ctx.pages_uncommitted.len().saturating_sub(1);
+                let tokens_in_last = total_filled.saturating_sub(full_pages * self.page_size);
+                if tokens_in_last == 0 { self.page_size as u32 } else { tokens_in_last as u32 }
+            };
+
+            //eprintln!("[PAGES] result: total_phys_pages={}, last_page_len={}",
+            //    result.values().map(|v| v.len()).sum::<usize>(), last_page_len);
+            (result, last_page_len)
+        } else {
+            //eprintln!("[PAGES] get_physical_page_ids: context {} NOT FOUND", id);
+            (result, 0)
+        }
+    }
 }
 
 // =============================================================================
@@ -762,23 +794,13 @@ impl ContextManager {
 /// Messages handled by ContextManager.
 #[derive(Debug)]
 enum Message {
+    Lookup { username: String, name: String, response: oneshot::Sender<Option<ContextId>> },
     Create { username: String, name: String, fill: Option<Vec<u32>>, response: oneshot::Sender<Result<ContextId>> },
     Destroy { id: ContextId, lock_id: LockId, response: oneshot::Sender<Result<()>> },
-    Lookup { username: String, name: String, response: oneshot::Sender<Option<ContextId>> },
     Fork { id: ContextId, username: String, new_name: String, response: oneshot::Sender<Result<ContextId>> },
-    AcquireLock { id: ContextId, response: oneshot::Sender<LockId> },
-    ReleaseLock { id: ContextId, lock_id: LockId },
-    TokensPerPage { id: ContextId, response: oneshot::Sender<u32> },
-    CommittedPageCount { id: ContextId, response: oneshot::Sender<u32> },
     CommitPages { id: ContextId, lock_id: LockId, page_indices: Vec<u32>, response: oneshot::Sender<Result<()>> },
     ReservePages { id: ContextId, lock_id: LockId, num_pages: u32, response: oneshot::Sender<Result<()>> },
     ReleasePages { id: ContextId, lock_id: LockId, num_pages: u32 },
-    GetCursor { id: ContextId, lock_id: LockId, response: oneshot::Sender<u32> },
-    SetCursor { id: ContextId, lock_id: LockId, cursor: u32 },
-    GetBufferedTokens { id: ContextId, lock_id: LockId, response: oneshot::Sender<Vec<u32>> },
-    SetBufferedTokens { id: ContextId, lock_id: LockId, tokens: Vec<u32> },
-    AppendBufferedTokens { id: ContextId, lock_id: LockId, tokens: Vec<u32> },
-
     GetPhysicalPageIds { id: ContextId, response: oneshot::Sender<(HashMap<DeviceId, Vec<PhysicalPageId>>, u32)> },
 }
 
@@ -788,29 +810,17 @@ impl ServiceHandler for ContextManager {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
+            Message::Lookup { username, name, response } => {
+                let _ = response.send(self.name_to_id.get(&(username, name)).copied());
+            }
             Message::Create { username, name, fill, response } => {
                 let _ = response.send(self.create(username, name, fill));
             }
             Message::Destroy { id, lock_id, response } => {
                 let _ = response.send(self.destroy(id, lock_id));
             }
-            Message::Lookup { username, name, response } => {
-                let _ = response.send(self.get(username, name));
-            }
             Message::Fork { id, username, new_name, response } => {
                 let _ = response.send(self.fork(id, username, new_name));
-            }
-            Message::AcquireLock { id, response } => {
-                let _ = response.send(self.lock(id));
-            }
-            Message::ReleaseLock { id, lock_id } => {
-                self.unlock(id, lock_id);
-            }
-            Message::TokensPerPage { id: _, response } => {
-                let _ = response.send(self.page_size());
-            }
-            Message::CommittedPageCount { id, response } => {
-                let _ = response.send(self.num_total_pages(id));
             }
             Message::CommitPages { id, lock_id, page_indices, response } => {
                 let _ = response.send(self.commit_pages(id, lock_id, page_indices));
@@ -821,22 +831,6 @@ impl ServiceHandler for ContextManager {
             Message::ReleasePages { id, lock_id, num_pages } => {
                 let _ = self.free_pages(id, lock_id, num_pages);
             }
-            Message::GetCursor { id, lock_id: _, response } => {
-                let _ = response.send(self.get_pointer(id));
-            }
-            Message::SetCursor { id, lock_id: _, cursor } => {
-                let _ = self.set_pointer(id, cursor);
-            }
-            Message::GetBufferedTokens { id, lock_id: _, response } => {
-                let _ = response.send(self.get_buffered_tokens(id));
-            }
-            Message::SetBufferedTokens { id, lock_id: _, tokens } => {
-                let _ = self.set_buffered_tokens(id, tokens);
-            }
-            Message::AppendBufferedTokens { id, lock_id: _, tokens } => {
-                let _ = self.append_buffered_tokens(id, tokens);
-            }
-
             Message::GetPhysicalPageIds { id, response } => {
                 let _ = response.send(self.get_physical_page_ids(id));
             }

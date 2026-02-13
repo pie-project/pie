@@ -202,7 +202,7 @@ impl Daemon {
         // Instantiate a fresh WASM component (store + instance) per request.
         // Daemons don't capture outputs — they serve HTTP responses directly.
         let (mut store, instance) =
-            linker::instantiate(0, username, &program, false).await?;
+            linker::instantiate(uuid::Uuid::new_v4(), username, &program, false).await?;
 
         // Convert the hyper request into WASI HTTP resources
         let (sender, receiver) = oneshot::channel();

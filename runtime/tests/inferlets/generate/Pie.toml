@@ -1,0 +1,4 @@
+[package]
+name = "generate"
+version = "0.1.0"
+description = "Test inferlet: exercises forward pass pipeline (flush + generate)"

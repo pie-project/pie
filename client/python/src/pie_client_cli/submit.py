@@ -140,6 +140,7 @@ def handle_submit_command(
     capture_outputs: bool = True,
     link: Optional[list[Path]] = None,
     arguments: Optional[list[str]] = None,
+    force_overwrite: bool = False,
 ) -> None:
     """Handle the `pie-cli submit` command.
 
@@ -209,14 +210,14 @@ def handle_submit_command(
                     composed_path = Path(tmp.name)
                     try:
                         compose_components(path, link, composed_path)
-                        engine.install_program(client, composed_path, manifest)
+                        engine.install_program(client, composed_path, manifest, force_overwrite=force_overwrite)
                     finally:
                         composed_path.unlink(missing_ok=True)
                 typer.echo("✅ Inferlet installed successfully.")
             # No composition - check if program already exists before installing
             else:
                 if not engine.check_program(client, inferlet_name, path, manifest):
-                    engine.install_program(client, path, manifest)
+                    engine.install_program(client, path, manifest, force_overwrite=force_overwrite)
                     typer.echo("✅ Inferlet installed successfully.")
                 else:
                     typer.echo("Inferlet already exists on server.")

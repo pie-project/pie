@@ -38,7 +38,7 @@ pub struct Config {
 pub struct ModelConfig {
     pub name: String,
     pub chat_template: String,
-    pub stop_tokens: Vec<u32>,
+    pub stop_tokens: Vec<String>,
     pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
     pub devices: Vec<DeviceConfig>,
@@ -128,11 +128,13 @@ pub async fn bootstrap(
     }
 
     // Force-shutdown on CTRL+C
-    tokio::spawn(async {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("Shutdown signal received, exiting");
-        std::process::exit(0);
-    });
+    // Removed to allow Python to handle signals and proper cleanup
+    // tokio::spawn(async {
+    //     tokio::signal::ctrl_c().await.ok();
+    //     eprintln!("[BOOTSTRAP] ctrl_c received! Calling std::process::exit(0)");
+    //     tracing::info!("Shutdown signal received, exiting");
+    //     std::process::exit(0);
+    // });
 
     Ok(auth::get_internal_auth_token().await?)
 }
