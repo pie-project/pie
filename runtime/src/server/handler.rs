@@ -24,12 +24,9 @@ impl Session {
         &self,
         corr_id: u32,
         name: String,
-        version: Option<String>,
+        version: String,
     ) {
-        let full_name = match version {
-            Some(v) => format!("{}@{}", name, v),
-            None => name,
-        };
+        let full_name = format!("{}@{}", name, version);
         let program_name = match ProgramName::parse(&full_name) {
             Ok(p) => p,
             Err(e) => {

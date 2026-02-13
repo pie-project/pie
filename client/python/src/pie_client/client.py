@@ -269,6 +269,26 @@ class PieClient:
         msg = {"type": "query", "subject": subject, "record": record}
         return await self._send_msg_and_wait(msg)
 
+    async def resolve_version(self, name: str, registry_url: str) -> str:
+        """Resolve a bare program name to name@version using the registry.
+
+        If already versioned (contains @), returns as-is.
+
+        :param name: Program name, e.g. "text-completion" or "text-completion@0.1.0".
+        :param registry_url: Registry base URL, e.g. "https://registry.pie-project.org".
+        :return: Fully qualified name@version string.
+        """
+        if "@" in name:
+            return name
+        import urllib.request
+        url = f"{registry_url.rstrip('/')}/api/v1/inferlets/{name}"
+        with urllib.request.urlopen(url) as resp:
+            data = json.loads(resp.read())
+        version = data.get("latest_version")
+        if not version:
+            raise Exception(f"No version found for '{name}' in registry")
+        return f"{name}@{version}"
+
     async def check_program(
         self,
         inferlet: str,
@@ -276,6 +296,8 @@ class PieClient:
         manifest_path: str | Path | None = None,
     ) -> bool:
         """Check if a program exists on the server.
+
+        The inferlet must be in name@version format (e.g., "text-completion@0.1.0").
 
         Args:
             inferlet: The inferlet name (e.g., "text-completion@0.1.0").
@@ -287,10 +309,9 @@ class PieClient:
                 "wasm_path and manifest_path must both be provided or both be None"
             )
 
-        name = inferlet
-        version = None
-        if "@" in inferlet:
-            name, version = inferlet.rsplit("@", 1)
+        if "@" not in inferlet:
+            raise ValueError("Version required: use 'name@version' format")
+        name, version = inferlet.rsplit("@", 1)
 
         wasm_hash = None
         manifest_hash = None
@@ -303,9 +324,8 @@ class PieClient:
         msg = {
             "type": "check_program",
             "name": name,
+            "version": version,
         }
-        if version is not None:
-            msg["version"] = version
         if wasm_hash is not None:
             msg["wasm_hash"] = wasm_hash
         if manifest_hash is not None:

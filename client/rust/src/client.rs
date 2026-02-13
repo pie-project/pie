@@ -299,17 +299,27 @@ impl Client {
     }
 
     /// Check if a program exists on the server.
+    ///
+    /// The `inferlet` must be in `name@version` format (e.g., "text-completion@0.1.0").
     pub async fn check_program(
         &self,
         inferlet: &str,
         wasm_path: Option<&Path>,
         manifest_path: Option<&Path>,
     ) -> Result<bool> {
-        let (name, version) = if let Some((n, v)) = inferlet.split_once('@') {
-            (n.to_string(), Some(v.to_string()))
-        } else {
-            (inferlet.to_string(), None)
-        };
+        use std::sync::LazyLock;
+        use regex::Regex;
+
+        static RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"^([a-zA-Z0-9][a-zA-Z0-9_-]*)@(\d+\.\d+\.\d+)$").unwrap()
+        });
+
+        let caps = RE.captures(inferlet)
+            .ok_or_else(|| anyhow!(
+                "Invalid program identifier '{}': expected 'name@major.minor.patch'", inferlet
+            ))?;
+        let name = caps[1].to_string();
+        let version = caps[2].to_string();
 
         let (wasm_hash, manifest_hash) = match (wasm_path, manifest_path) {
             (Some(wasm_p), Some(manifest_p)) => {

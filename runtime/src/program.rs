@@ -139,35 +139,24 @@ pub struct ProgramName {
 }
 
 impl ProgramName {
-    /// Parses an inferlet identifier from a string.
+    /// Parses an inferlet identifier from a `name@major.minor.patch` string.
     ///
-    /// Supported formats:
-    /// - `name@version` -> (name, version)
-    /// - `name` -> (name, "latest")
-    ///
-    /// Rejects names/versions containing path separators or traversal sequences.
+    /// The name must contain only alphanumeric characters, hyphens, and underscores.
+    /// The version must be valid semver (e.g., `1.0.0`).
     pub fn parse(s: &str) -> Result<Self> {
-        let (name, version) = if let Some((n, v)) = s.split_once('@') {
-            (n.to_string(), v.to_string())
-        } else {
-            (s.to_string(), "latest".to_string())
-        };
+        static RE: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
+            fancy_regex::Regex::new(r"^([a-zA-Z0-9][a-zA-Z0-9_-]*)@(\d+\.\d+\.\d+)$").unwrap()
+        });
 
-        Self::validate_component(&name, "name")?;
-        Self::validate_component(&version, "version")?;
+        let caps = RE.captures(s)?
+            .ok_or_else(|| anyhow!(
+                "Invalid program identifier '{}': expected 'name@major.minor.patch'", s
+            ))?;
 
-        Ok(Self { name, version })
-    }
-
-    /// Validates that a name/version component contains only safe characters.
-    fn validate_component(s: &str, label: &str) -> Result<()> {
-        if s.is_empty() {
-            bail!("Program {} cannot be empty", label);
-        }
-        if s.contains('/') || s.contains('\\') || s.contains("..") {
-            bail!("Program {} contains invalid characters: {}", label, s);
-        }
-        Ok(())
+        Ok(Self {
+            name: caps.get(1).unwrap().as_str().to_string(),
+            version: caps.get(2).unwrap().as_str().to_string(),
+        })
     }
 }
 
@@ -467,5 +456,74 @@ pub async fn compile_wasm_component(engine: &WasmEngine, wasm_binary: Vec<u8>) -
         Ok(Ok(component)) => Ok(component),
         Ok(Err(e)) => Err(anyhow!("Failed to compile WASM: {}", e)),
         Err(e) => Err(anyhow!("Compilation task failed: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn program_name_parse_validation() {
+        // ── Valid inputs ──────────────────────────────────────────────
+        let valid = [
+            ("text-completion@0.1.0",  "text-completion", "0.1.0"),
+            ("my_inferlet@1.2.3",      "my_inferlet",     "1.2.3"),
+            ("a@0.0.0",               "a",               "0.0.0"),
+            ("X@99.99.99",            "X",               "99.99.99"),
+            ("foo-bar_baz@10.20.30",  "foo-bar_baz",     "10.20.30"),
+            ("A1-b2_C3@0.0.1",       "A1-b2_C3",        "0.0.1"),
+        ];
+        for (input, expected_name, expected_version) in valid {
+            let p = ProgramName::parse(input)
+                .unwrap_or_else(|e| panic!("Expected '{}' to be valid, got: {}", input, e));
+            assert_eq!(p.name, expected_name, "name mismatch for '{}'", input);
+            assert_eq!(p.version, expected_version, "version mismatch for '{}'", input);
+            // Display roundtrip
+            assert_eq!(p.to_string(), input, "Display roundtrip failed for '{}'", input);
+        }
+
+        // ── Invalid inputs ───────────────────────────────────────────
+        let invalid = [
+            // Missing version (bare name)
+            "text-completion",
+            "foo",
+            // Missing name
+            "@0.1.0",
+            // Empty string
+            "",
+            // No semver
+            "foo@latest",
+            "foo@v1.0.0",
+            "foo@1.0",
+            "foo@1",
+            "foo@1.0.0.0",
+            "foo@abc",
+            "foo@1.0.0-beta",
+            // Path traversal / unsafe characters
+            "../evil@0.1.0",
+            "foo/bar@0.1.0",
+            "foo\\bar@0.1.0",
+            "foo@../0.1.0",
+            // Special characters in name
+            "foo bar@0.1.0",
+            "foo!@0.1.0",
+            "foo.bar@0.1.0",
+            // Name starting with hyphen or underscore
+            "-foo@0.1.0",
+            "_foo@0.1.0",
+            // Multiple @
+            "foo@bar@0.1.0",
+            // Whitespace
+            " foo@0.1.0",
+            "foo@0.1.0 ",
+            "foo @0.1.0",
+        ];
+        for input in invalid {
+            assert!(
+                ProgramName::parse(input).is_err(),
+                "Expected '{}' to be rejected, but it was accepted", input
+            );
+        }
     }
 }

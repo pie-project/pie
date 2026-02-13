@@ -337,9 +337,7 @@ def check_program(
 ) -> bool:
     """Check if a program exists (sync wrapper).
 
-    The inferlet parameter can be:
-    - Full name with version: "text-completion@0.1.0"
-    - Without version (defaults to "latest"): "text-completion"
+    The inferlet must be in name@version format (e.g., "text-completion@0.1.0").
 
     Args:
         client: The Pie client.
@@ -361,23 +359,11 @@ def launch_process(
 ) -> Process:
     """Launch a process (sync wrapper).
 
-    This function performs a two-level search for the inferlet:
-    1. First, it searches for the program among client-uploaded programs.
-    2. If not found, it falls back to searching the registry.
-
-    The inferlet parameter can be:
-    - Full name with version: "text-completion@0.1.0"
-    - Without version (defaults to "latest"): "text-completion"
+    The inferlet must be in name@version format (e.g., "text-completion@0.1.0").
     """
     return asyncio.get_event_loop().run_until_complete(
         client.launch_process(inferlet, arguments, capture_outputs)
     )
-
-
-    return asyncio.get_event_loop().run_until_complete(
-        client.launch_process(inferlet, arguments, capture_outputs)
-    )
-
 
 def close_client(client: PieClient) -> None:
     """Close the client (sync wrapper)."""

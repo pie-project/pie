@@ -326,20 +326,33 @@ export class PieClient {
     }
 
     /**
+     * Resolve a bare program name to name@version using the registry.
+     * If already versioned (contains @), returns as-is.
+     * @param {string} name The program name.
+     * @param {string} registryUrl The registry base URL.
+     * @returns {Promise<string>} Fully qualified name@version.
+     */
+    async resolveVersion(name, registryUrl) {
+        if (name.includes('@')) return name;
+        const resp = await fetch(`${registryUrl.replace(/\/+$/, '')}/api/v1/inferlets/${name}`);
+        if (!resp.ok) throw new Error(`Failed to resolve '${name}': ${resp.status}`);
+        const data = await resp.json();
+        if (!data.latest_version) throw new Error(`No version found for '${name}'`);
+        return `${name}@${data.latest_version}`;
+    }
+
+    /**
      * Check if a program exists on the server.
+     * The inferlet must be in name@version format (e.g., "text-completion@0.1.0").
      * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
      * @returns {Promise<boolean>}
      */
     async checkProgram(inferlet) {
-        let name = inferlet;
-        let version = undefined;
-        if (inferlet.includes('@')) {
-            const idx = inferlet.lastIndexOf('@');
-            name = inferlet.substring(0, idx);
-            version = inferlet.substring(idx + 1);
-        }
-        const msg = { type: "check_program", name };
-        if (version) msg.version = version;
+        const idx = inferlet.lastIndexOf('@');
+        if (idx === -1) throw new Error("Version required: use 'name@version' format");
+        const name = inferlet.substring(0, idx);
+        const version = inferlet.substring(idx + 1);
+        const msg = { type: "check_program", name, version };
         const { ok, result } = await this._sendMsgAndWait(msg);
         if (ok) return result === "true";
         throw new Error(`CheckProgram failed: ${result}`);
@@ -359,7 +372,7 @@ export class PieClient {
      * @param {string} wasmPath Path to the WASM binary file (Node.js only).
      * @param {string} manifestPath Path to the manifest TOML file (Node.js only).
      */
-    async installProgram(wasmPath, manifestPath) {
+    async installProgram(wasmPath, manifestPath, forceOverwrite = false) {
         const fs = await import('fs');
         const programBytes = fs.readFileSync(wasmPath);
         const manifest = fs.readFileSync(manifestPath, 'utf-8');
@@ -380,7 +393,7 @@ export class PieClient {
                 corr_id,
                 program_hash: programHash,
                 manifest,
-                force_overwrite: false,
+                force_overwrite: forceOverwrite,
                 chunk_index: i,
                 total_chunks: totalChunks,
                 chunk_data: programBytes.slice(start, end),

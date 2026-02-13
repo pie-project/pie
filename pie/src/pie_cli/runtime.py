@@ -155,7 +155,7 @@ def oneshot(
                         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
                     print("Installing program (force overwrite)...")
-                    await client.install_program(wasm_path, manifest_path, force_overwrite=True)
+                    await client.install_program(wasm_path, manifest_path, force_overwrite=force_overwrite)
 
                 # Launch and stream
                 print(f"Launching {name}...")

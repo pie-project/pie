@@ -21,8 +21,7 @@ pub enum ClientMessage {
     CheckProgram {
         corr_id: u32,
         name: String,
-        #[serde(default)]
-        version: Option<String>,
+        version: String,
         #[serde(default)]
         wasm_hash: Option<String>,
         #[serde(default)]
