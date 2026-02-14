@@ -526,13 +526,18 @@ impl ContextManager {
     // ==================== Page Management ====================
 
     pub fn allocate_pages(&mut self, id: ContextId, lock_id: LockId, num_pages: u32) -> Result<()> {
-        //eprintln!("[ALLOC] allocate_pages called: ctx={}, lock_id={}, num_pages={}", id, lock_id, num_pages);
         let ctx = CONTEXTS.get(&(self.model_idx, id))
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         
-        //eprintln!("[ALLOC] ctx.mutex={:?}", ctx.mutex);
         ctx.check_lock(lock_id)?;
-        //eprintln!("[ALLOC] lock check passed");
+        
+        // Only allocate the deficit: pages needed minus pages already uncommitted
+        let existing_uncommitted = ctx.pages_uncommitted.len() as u32;
+        let pages_to_allocate = num_pages.saturating_sub(existing_uncommitted);
+        
+        if pages_to_allocate == 0 {
+            return Ok(()); // Already have enough uncommitted pages
+        }
         
         // Get affinity from existing pages (committed first, then uncommitted)
         let affinity = ctx.pages_committed.first()
@@ -542,14 +547,12 @@ impl ContextManager {
         drop(ctx);
         
         // Allocate pages from page store
-        let new_pages = self.page_store.allocate(num_pages as usize, affinity)?;
-        //eprintln!("[ALLOC] allocated {} pages: {:?}", new_pages.len(), new_pages);
+        let new_pages = self.page_store.allocate(pages_to_allocate as usize, affinity)?;
         
         // Add to uncommitted pages
         let mut ctx = CONTEXTS.get_mut(&(self.model_idx, id))
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         ctx.pages_uncommitted.extend(new_pages);
-        //eprintln!("[ALLOC] pages_uncommitted now has {} pages", ctx.pages_uncommitted.len());
         
         Ok(())
     }
@@ -742,12 +745,15 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Returns physical page IDs and the number of tokens already written to the KV cache.
+    ///
+    /// The second element `kv_len` = committed_pages * page_size + tokens_filled.len().
+    /// This does NOT include input tokens for the current forward pass.
+    /// The caller must add input_tokens to compute FlashInfer's `last_page_len`.
     pub fn get_physical_page_ids(&self, id: ContextId) -> (HashMap<DeviceId, Vec<PhysicalPageId>>, u32) {
         let mut result: HashMap<DeviceId, Vec<PhysicalPageId>> = HashMap::new();
         
         if let Some(ctx) = CONTEXTS.get(&(self.model_idx, id)) {
-            //eprintln!("[PAGES] get_physical_page_ids: ctx={}, committed={}, uncommitted={}, tokens_filled={}",
-            //    id, ctx.pages_committed.len(), ctx.pages_uncommitted.len(), ctx.tokens_filled.len());
             let page_store = &self.page_store;
             
             // Get all committed pages and collect their physical mappings
@@ -763,25 +769,11 @@ impl ContextManager {
                 }
             }
 
-            let last_page_len = if ctx.pages_uncommitted.is_empty() {
-                if ctx.pages_committed.is_empty() {
-                    0 // No pages at all
-                } else {
-                    self.page_size as u32 // All committed pages are full
-                }
-            } else {
-                // tokens_filled contains all forwarded tokens on uncommitted pages.
-                let total_filled = ctx.tokens_filled.len();
-                let full_pages = ctx.pages_uncommitted.len().saturating_sub(1);
-                let tokens_in_last = total_filled.saturating_sub(full_pages * self.page_size);
-                if tokens_in_last == 0 { self.page_size as u32 } else { tokens_in_last as u32 }
-            };
+            // kv_len = total tokens already written to KV cache
+            let kv_len = (ctx.pages_committed.len() * self.page_size + ctx.tokens_filled.len()) as u32;
 
-            //eprintln!("[PAGES] result: total_phys_pages={}, last_page_len={}",
-            //    result.values().map(|v| v.len()).sum::<usize>(), last_page_len);
-            (result, last_page_len)
+            (result, kv_len)
         } else {
-            //eprintln!("[PAGES] get_physical_page_ids: context {} NOT FOUND", id);
             (result, 0)
         }
     }

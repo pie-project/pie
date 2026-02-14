@@ -215,14 +215,11 @@ def worker_main(
             server = pie_runtime.RpcServer.create()
             server_name = server.server_name()
 
-            chat_template_info = engine.chat_template()
-
             metadata = {
                 "total_pages": getattr(config, "max_num_kv_pages", 0),
                 "max_batch_tokens": getattr(config, "max_batch_tokens", 10240),
                 "max_batch_size": getattr(config, "max_batch_size", 128),
-                "chat_template": chat_template_info.get("template_content", ""),
-                "stop_tokens": chat_template_info.get("stop_tokens", []),
+                "arch_name": engine.arch_type,
                 "snapshot_dir": str(engine.snapshot_dir) if engine.snapshot_dir else "",
             }
 

@@ -44,7 +44,7 @@ pub mod adapter {
 }
 
 pub mod model {
-    pub use crate::pie::core::model::{Model, Tokenizer};
+    pub use crate::pie::core::model::{Model, Tokenizer, ChatTemplate, SystemHandling};
 }
 
 pub mod runtime {
@@ -133,7 +133,7 @@ pub use context_ext::{
     // ContextExt trait (has Fill + Generate + async operations)
     ContextExt,
     // Supporting types
-    Message, ToolCall, render_template,
+    Message, ToolCall, ChatTemplate, SystemHandling, render_template,
     TokenStream, Speculate, Speculation, Constrain,
 };
 

@@ -32,8 +32,8 @@ async fn main(args: Vec<String>) -> Result<String> {
     // Create context and fill with messages
     let context = Context::new(&model)?;
     context
-        .system(&system_message)
-        .user(&prompt)
+        .fill_sys(&system_message)
+        .fill_user(&prompt)
         .flush()
         .await?;
 

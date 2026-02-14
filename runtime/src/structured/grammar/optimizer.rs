@@ -176,7 +176,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::structured::matcher::GrammarMatcher;
-    use crate::tokenizer::Tokenizer;
+    use crate::model::tokenizer::Tokenizer;
 
     fn accepts(grammar: &Grammar, input: &str) -> bool {
         let vocab: Vec<String> = vec!["dummy".into()];

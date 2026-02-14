@@ -11,7 +11,6 @@ pub mod bootstrap;
 pub mod inference;
 pub mod messaging;
 pub mod model;
-pub mod tokenizer;
 pub mod program;
 pub mod server;
 pub mod linker;

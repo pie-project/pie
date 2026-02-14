@@ -105,31 +105,6 @@ def oneshot(
 ) -> None:
     """Run a single program then shut down."""
     import asyncio
-    import faulthandler
-    import signal
-    import threading
-    import traceback as tb_module
-    import os as _os
-
-    # Enable faulthandler to catch segfaults/aborts
-    faulthandler.enable(file=sys.stderr)
-
-    # Monkey-patch os._exit to trace where it's called from
-    _real_exit = _os._exit
-    def _traced_exit(code):
-        print(f"[TRAP] os._exit({code}) called!", file=sys.stderr, flush=True)
-        tb_module.print_stack(file=sys.stderr)
-        sys.stderr.flush()
-        _real_exit(code)
-    _os._exit = _traced_exit
-
-    # Catch signals
-    def _sig_handler(signum, frame):
-        print(f"[SIGNAL] received signal {signum}", file=sys.stderr, flush=True)
-        tb_module.print_stack(frame, file=sys.stderr)
-        sys.stderr.flush()
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _sig_handler)
 
     with runtime(config, console=console) as (handle, workers):
         name = program_name
@@ -171,23 +146,9 @@ def oneshot(
                 )
                 print(f"Process started: {process.process_id}")
 
-                # Override asyncio.run()'s SIGINT handler to trace it
-                import asyncio as _aio
-                loop = _aio.get_running_loop()
-                def _sigint_trace():
-                    print(f"[SIGINT] SIGINT received inside asyncio.run()!", file=sys.stderr, flush=True)
-                    tb_module.print_stack(file=sys.stderr)
-                    sys.stderr.flush()
-                    # Re-raise as KeyboardInterrupt to mimic default
-                    raise KeyboardInterrupt
-                loop.add_signal_handler(signal.SIGINT, _sigint_trace)
-
-                print(f"[DEBUG] About to enter event loop", file=sys.stderr, flush=True)
                 try:
                     while True:
-                        print(f"[DEBUG] Calling process.recv()...", file=sys.stderr, flush=True)
                         event, value = await process.recv()
-                        print(f"[EVENT] {event} len={len(str(value))}", file=sys.stderr, flush=True)
                         if event == Event.Stdout:
                             print(value, end="", flush=True)
                         elif event == Event.Stderr:
@@ -206,7 +167,6 @@ def oneshot(
                     import traceback
                     print(f"[RECV ERROR] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
                     traceback.print_exc(file=sys.stderr)
-                print(f"[DEBUG] Event loop exited", file=sys.stderr, flush=True)
 
         asyncio.run(_run())
 
@@ -345,8 +305,7 @@ def _bootstrap(
 
     py_model = pie_runtime.ModelConfig(
         name=model.hf_repo,
-        chat_template=group0_meta.get("chat_template", ""),
-        stop_tokens=group0_meta.get("stop_tokens", []),
+        arch_name=group0_meta.get("arch_name", "dummy"),
         kv_page_size=model.kv_page_size,
         tokenizer_path=str(Path(group0_meta.get("snapshot_dir", "")) / "tokenizer.json"),
         devices=py_devices,

@@ -7,7 +7,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
-use crate::tokenizer::Tokenizer;
+
+pub mod chat_templates;
+pub mod tokenizer;
+
+use chat_templates::ChatTemplate;
+use tokenizer::Tokenizer;
 
 /// Global cache for models (keyed by ModelId).
 static MODELS: LazyLock<boxcar::Vec<Arc<Model>>> =
@@ -28,15 +33,18 @@ pub fn get_model_id(model_name: &str) -> Option<ModelId> {
 
 pub fn register(
     name: String,
-    chat_template: String,
-    stop_token_strings: Vec<String>,
+    arch_name: &str,
     kv_page_size: u32,
     tokenizer_path: PathBuf,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
 
+    let chat_template = chat_templates::lookup(arch_name)
+        .unwrap_or_else(|| chat_templates::lookup("dummy").unwrap());
+
     // Convert stop token strings to IDs using the tokenizer's vocabulary.
-    let stop_tokens: Vec<u32> = stop_token_strings
+    let stop_tokens: Vec<u32> = chat_template
+        .stop_tokens
         .iter()
         .filter_map(|s| tokenizer.token_to_id(s))
         .collect();
@@ -68,7 +76,7 @@ pub fn get_model(model_id: ModelId) -> Option<&'static Arc<Model>> {
 
 pub struct Model {
     name: String,
-    chat_template: String,
+    chat_template: &'static ChatTemplate,
     stop_tokens: Vec<u32>,
     kv_page_size: u32,
     tokenizer: Arc<Tokenizer>,
@@ -89,8 +97,8 @@ impl Model {
     }
 
     /// Gets the chat template.
-    pub fn chat_template(&self) -> &str {
-        &self.chat_template
+    pub fn chat_template(&self) -> &'static ChatTemplate {
+        self.chat_template
     }
 
     /// Gets the tokenizer.

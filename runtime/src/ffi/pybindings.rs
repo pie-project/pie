@@ -173,9 +173,7 @@ pub struct ModelConfig {
     #[pyo3(get, set)]
     pub name: String,
     #[pyo3(get, set)]
-    pub chat_template: String,
-    #[pyo3(get, set)]
-    pub stop_tokens: Vec<String>,
+    pub arch_name: String,
     #[pyo3(get, set)]
     pub kv_page_size: usize,
     #[pyo3(get, set)]
@@ -191,8 +189,7 @@ impl ModelConfig {
     #[new]
     #[pyo3(signature = (
         name,
-        chat_template,
-        stop_tokens,
+        arch_name,
         kv_page_size,
         tokenizer_path,
         devices,
@@ -200,8 +197,7 @@ impl ModelConfig {
     ))]
     fn new(
         name: String,
-        chat_template: String,
-        stop_tokens: Vec<String>,
+        arch_name: String,
         kv_page_size: usize,
         tokenizer_path: String,
         devices: Vec<DeviceConfig>,
@@ -209,8 +205,7 @@ impl ModelConfig {
     ) -> Self {
         ModelConfig {
             name,
-            chat_template,
-            stop_tokens,
+            arch_name,
             kv_page_size,
             tokenizer_path,
             devices,
@@ -341,8 +336,7 @@ impl From<Config> for BootstrapConfig {
                 .into_iter()
                 .map(|m| BootstrapModelConfig {
                     name: m.name,
-                    chat_template: m.chat_template,
-                    stop_tokens: m.stop_tokens,
+                    arch_name: m.arch_name,
                     kv_page_size: m.kv_page_size,
                     tokenizer_path: PathBuf::from(m.tokenizer_path),
                     devices: m

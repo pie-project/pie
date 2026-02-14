@@ -37,8 +37,7 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub name: String,
-    pub chat_template: String,
-    pub stop_tokens: Vec<String>,
+    pub arch_name: String,
     pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
     pub devices: Vec<DeviceConfig>,
@@ -104,8 +103,7 @@ pub async fn bootstrap(
 
         model::register(
             cfg.name.clone(),
-            cfg.chat_template.clone(),
-            cfg.stop_tokens.clone(),
+            &cfg.arch_name,
             cfg.kv_page_size as u32,
             cfg.tokenizer_path.clone(),
         )?;

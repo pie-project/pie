@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use crate::structured::bitmask::{self, set_bit};
 use crate::structured::compiled_grammar::CompiledGrammar;
 use crate::structured::fsm::StateId;
-use crate::tokenizer::Tokenizer;
+use crate::model::tokenizer::Tokenizer;
 
 pub(super) struct SingleDfaEngine {
     pub(super) rule_idx: usize,

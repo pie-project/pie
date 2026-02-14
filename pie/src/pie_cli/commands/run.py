@@ -78,4 +78,5 @@ def run(
         wasm_path=path,
         manifest_path=manifest,
         console=console,
+        force_overwrite=path is not None,
     )

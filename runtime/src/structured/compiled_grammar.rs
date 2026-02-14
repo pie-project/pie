@@ -17,7 +17,7 @@ use crate::structured::fsm::{
 };
 use crate::structured::grammar::Grammar;
 use crate::structured::grammar::normalize::normalize_grammar;
-use crate::tokenizer::Tokenizer;
+use crate::model::tokenizer::Tokenizer;
 
 // ---------------------------------------------------------------------------
 // Compilation cache

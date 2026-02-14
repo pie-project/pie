@@ -124,22 +124,12 @@ impl InferenceService {
 
     /// Resolves physical pages from context and queues the forward pass.
     async fn forward_pass(&self, mut request: ForwardPassRequest, response_tx: oneshot::Sender<ForwardPassOutput>) -> Result<()> {
-        // Resolve physical page IDs from context
-        let (pages_by_device, last_page_len) = if let Some(ctx_id) = request.context_id {
+        // Resolve physical page IDs and existing KV length from context
+        let (pages_by_device, kv_len) = if let Some(ctx_id) = request.context_id {
             context::get_physical_page_ids(self.model_idx, ctx_id).await?
-            // tracing::info!(
-            //     context_id = ctx_id,
-            //     num_devices = result.0.len(),
-            //     last_page_len = result.1,
-            //     total_pages = result.0.values().map(|v| v.len()).sum::<usize>(),
-            //     num_tokens = request.tokens.len(),
-            //     "resolved physical pages from context"
-            // );
         } else {
-            //tracing::info!("forward_pass: no context_id, using empty pages");
             (Default::default(), 0)
         };
-
 
         // Context parallelism not yet supported — pages must reside on a single device
         if pages_by_device.len() > 1 {
@@ -155,12 +145,21 @@ impl InferenceService {
             .next()
             .unwrap_or((0, vec![]));
 
-        // tracing::info!(
-        //     device_id = device_id,
-        //     num_physical_pages = physical_page_ids.len(),
-        //     last_page_len = last_page_len,
-        //     "submitting forward pass to scheduler"
-        // );
+        // Compute FlashInfer's last_page_len: number of tokens in the last page
+        // AFTER writing the current input tokens.
+        // FlashInfer equation: seq_len = (num_pages - 1) * page_size + last_page_len
+        let num_pages = physical_page_ids.len() as u32;
+        let num_input_tokens = request.tokens.len() as u32;
+        let total_kv = kv_len + num_input_tokens;
+        let last_page_len = if num_pages == 0 {
+            0
+        } else {
+            let remainder = total_kv - (num_pages - 1) * context::tokens_per_page(
+                self.model_idx,
+                request.context_id.unwrap_or(0),
+            );
+            remainder
+        };
 
         // Route to the appropriate BatchScheduler
         let device_idx = device_id.min(self.num_devices.saturating_sub(1));
