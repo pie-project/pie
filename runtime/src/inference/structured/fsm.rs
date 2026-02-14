@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use crate::structured::grammar::{
+use crate::inference::structured::grammar::{
     Expr, ExprId, Grammar, RuleId,
 };
 
@@ -918,7 +918,7 @@ pub fn build_rule_fsms(grammar: &Grammar) -> Vec<Automaton<NfaGraph>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structured::grammar::builder::GrammarBuilder;
+    use crate::inference::structured::grammar::builder::GrammarBuilder;
 
     #[test]
     fn test_fsm_basic_construction() {

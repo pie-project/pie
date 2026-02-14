@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use crate::adapter::AdapterId;
 use crate::context::ContextId;
-use crate::brle::Brle;
+use crate::inference::brle::Brle;
 use crate::device::DeviceId;
 
 /// Sampler configuration for token generation.

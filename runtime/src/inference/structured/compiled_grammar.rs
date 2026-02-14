@@ -11,12 +11,12 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use lru::LruCache;
 use rustc_hash::FxHasher;
 
-use crate::structured::bitmask;
-use crate::structured::fsm::{
+use crate::inference::structured::bitmask;
+use crate::inference::structured::fsm::{
     build_rule_fsms, DfaTable, FsmEdge, Automaton, StateId,
 };
-use crate::structured::grammar::Grammar;
-use crate::structured::grammar::normalize::normalize_grammar;
+use crate::inference::structured::grammar::Grammar;
+use crate::inference::structured::grammar::normalize::normalize_grammar;
 use crate::model::tokenizer::Tokenizer;
 
 // ---------------------------------------------------------------------------

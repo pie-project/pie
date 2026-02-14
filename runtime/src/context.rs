@@ -20,7 +20,7 @@ use anyhow::Result;
 
 use crate::service::{ServiceHandler, ServiceArray};
 use crate::adapter::AdapterId;
-use crate::brle::Brle;
+use crate::inference::brle::Brle;
 use kvcache::{PageId, PageStore, PhysicalPageId, PageHash};
 use crate::device::DeviceId;
 

@@ -18,9 +18,9 @@
 //!
 //! ```rust
 //! use std::sync::Arc;
-//! use pie::structured::bitmask;
-//! use pie::structured::grammar::Grammar;
-//! use pie::structured::matcher::GrammarMatcher;
+//! use pie::inference::structured::bitmask;
+//! use pie::inference::structured::grammar::Grammar;
+//! use pie::inference::structured::matcher::GrammarMatcher;
 //! use pie::tokenizer::Tokenizer;
 //!
 //! // Create grammar from EBNF
@@ -51,7 +51,7 @@
 //! # JSON Schema
 //!
 //! ```rust
-//! use pie::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
+//! use pie::inference::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
 //!
 //! let grammar = json_schema_to_grammar(r#"{
 //!     "type": "object",
@@ -67,7 +67,7 @@
 //! # Regex
 //!
 //! ```rust
-//! use pie::structured::regex::regex_to_grammar;
+//! use pie::inference::structured::regex::regex_to_grammar;
 //!
 //! let grammar = regex_to_grammar(r"[a-z]+@[a-z]+\.[a-z]{2,4}").unwrap();
 //! ```
@@ -78,9 +78,9 @@
 //!
 //! ```rust
 //! use std::sync::Arc;
-//! use pie::structured::compiled_grammar::CompiledGrammar;
-//! use pie::structured::grammar::Grammar;
-//! use pie::structured::matcher::GrammarMatcher;
+//! use pie::inference::structured::compiled_grammar::CompiledGrammar;
+//! use pie::inference::structured::grammar::Grammar;
+//! use pie::inference::structured::matcher::GrammarMatcher;
 //! use pie::tokenizer::Tokenizer;
 //!
 //! let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= [a-z]+"#, "root").unwrap());

@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use rustc_hash::{FxHashMap, FxHasher};
 use anyhow::Result;
 
-use crate::brle::Brle;
+use crate::inference::brle::Brle;
 
 /// Hash key for content-addressable pages
 pub type PageHash = u64;

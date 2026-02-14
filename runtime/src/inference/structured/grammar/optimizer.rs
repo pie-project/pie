@@ -171,11 +171,11 @@ impl Grammar {
 
 #[cfg(test)]
 mod tests {
-    use crate::structured::grammar::builder::GrammarBuilder;
-    use crate::structured::grammar::{Expr, Grammar};
+    use crate::inference::structured::grammar::builder::GrammarBuilder;
+    use crate::inference::structured::grammar::{Expr, Grammar};
     use std::sync::Arc;
 
-    use crate::structured::matcher::GrammarMatcher;
+    use crate::inference::structured::matcher::GrammarMatcher;
     use crate::model::tokenizer::Tokenizer;
 
     fn accepts(grammar: &Grammar, input: &str) -> bool {

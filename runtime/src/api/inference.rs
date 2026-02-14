@@ -5,7 +5,7 @@ use crate::api::context::Context;
 use crate::api::model::Model;
 use crate::api::adapter::Adapter;
 use crate::linker::InstanceState;
-use crate::brle::Brle;
+use crate::inference::brle::Brle;
 use crate::inference::request::{ForwardPassRequest, ForwardPassOutput};
 use crate::{context, inference};
 use anyhow::Result;

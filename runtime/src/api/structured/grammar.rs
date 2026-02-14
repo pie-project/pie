@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use crate::api::pie;
 use crate::linker::InstanceState;
-use crate::structured::grammar::Grammar as InternalGrammar;
-use crate::structured::json_schema::{builtin_json_grammar, json_schema_to_grammar, JsonSchemaOptions};
-use crate::structured::regex::regex_to_grammar;
+use crate::inference::structured::grammar::Grammar as InternalGrammar;
+use crate::inference::structured::json_schema::{builtin_json_grammar, json_schema_to_grammar, JsonSchemaOptions};
+use crate::inference::structured::regex::regex_to_grammar;
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

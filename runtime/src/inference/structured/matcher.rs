@@ -12,11 +12,11 @@ mod stack_parser;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::brle::Brle;
-use crate::structured::bitmask::{self, set_bit};
-use crate::structured::compiled_grammar::CompiledGrammar;
-use crate::structured::fsm::{FsmEdge, StateId};
-use crate::structured::grammar::Grammar;
+use crate::inference::brle::Brle;
+use crate::inference::structured::bitmask::{self, set_bit};
+use crate::inference::structured::compiled_grammar::CompiledGrammar;
+use crate::inference::structured::fsm::{FsmEdge, StateId};
+use crate::inference::structured::grammar::Grammar;
 use crate::model::tokenizer::Tokenizer;
 
 use single_dfa::SingleDfaEngine;
@@ -559,8 +559,8 @@ fn deterministic_byte(edges: &[FsmEdge]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structured::bitmask::bitmask_size;
-    use crate::structured::grammar::Grammar;
+    use crate::inference::structured::bitmask::bitmask_size;
+    use crate::inference::structured::grammar::Grammar;
 
     /// Helper to build a grammar matcher with a small test vocabulary.
     fn make_matcher(ebnf: &str, root: &str, vocab: &[&str]) -> GrammarMatcher {
@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_smoke() {
-        use crate::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
+        use crate::inference::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
         let schema = r#"{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}"#;
         let opts = JsonSchemaOptions { any_whitespace: false, ..JsonSchemaOptions::default() };
         let grammar = Arc::new(json_schema_to_grammar(schema, &opts).unwrap());
@@ -1098,7 +1098,7 @@ mod tests {
     #[test]
     fn test_steady_state_json_schema() {
         // Test with actual JSON schema grammar (the primary use case)
-        use crate::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
+        use crate::inference::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
         let schema = r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
         let opts = JsonSchemaOptions { any_whitespace: false, ..JsonSchemaOptions::default() };
         let grammar = Arc::new(json_schema_to_grammar(schema, &opts).unwrap());
@@ -1146,7 +1146,7 @@ ws ::= [ \t\n\r]*
     #[test]
     fn test_chain_shortcircuit_long_string() {
         // Verify chain short-circuit handles long strings without O(N^2) blowup
-        use crate::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
+        use crate::inference::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
         let schema = r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
         let opts = JsonSchemaOptions { any_whitespace: false, ..JsonSchemaOptions::default() };
         let grammar = Arc::new(json_schema_to_grammar(schema, &opts).unwrap());

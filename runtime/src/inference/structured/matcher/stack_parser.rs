@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashSet, FxHasher};
 
-use crate::structured::compiled_grammar::CompiledGrammar;
-use crate::structured::fsm::{FsmEdge, StateId};
-use crate::structured::grammar::RuleId;
+use crate::inference::structured::compiled_grammar::CompiledGrammar;
+use crate::inference::structured::fsm::{FsmEdge, StateId};
+use crate::inference::structured::grammar::RuleId;
 
 // ---------------------------------------------------------------------------
 // Stack state
@@ -1053,7 +1053,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::structured::compiled_grammar::CompiledGrammar;
+    use crate::inference::structured::compiled_grammar::CompiledGrammar;
     use crate::model::tokenizer::Tokenizer;
 
     #[test]
@@ -1084,7 +1084,7 @@ mod tests {
             "required": ["id", "name", "status", "address", "scores"],
             "additionalProperties": false
         }"#;
-        let grammar = Arc::new(crate::structured::json_schema::json_schema_to_grammar(json_schema, &crate::structured::json_schema::JsonSchemaOptions::default()).unwrap());
+        let grammar = Arc::new(crate::inference::structured::json_schema::json_schema_to_grammar(json_schema, &crate::inference::structured::json_schema::JsonSchemaOptions::default()).unwrap());
         let vocab: Vec<String> = (0..256u16).map(|b| String::from(b as u8 as char)).collect();
         let tokenizer = Arc::new(
             Tokenizer::from_vocab(&vocab),

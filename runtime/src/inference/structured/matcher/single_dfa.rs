@@ -6,9 +6,9 @@
 
 use std::collections::VecDeque;
 
-use crate::structured::bitmask::{self, set_bit};
-use crate::structured::compiled_grammar::CompiledGrammar;
-use crate::structured::fsm::StateId;
+use crate::inference::structured::bitmask::{self, set_bit};
+use crate::inference::structured::compiled_grammar::CompiledGrammar;
+use crate::inference::structured::fsm::StateId;
 use crate::model::tokenizer::Tokenizer;
 
 pub(super) struct SingleDfaEngine {

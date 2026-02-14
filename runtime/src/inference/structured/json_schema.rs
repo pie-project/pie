@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-use crate::structured::grammar::Grammar;
-use crate::structured::regex::regex_to_ebnf;
+use crate::inference::structured::grammar::Grammar;
+use crate::inference::structured::regex::regex_to_ebnf;
 
 /// Options for JSON schema to grammar conversion.
 #[derive(Debug, Clone)]

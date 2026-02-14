@@ -20,7 +20,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::structured::grammar::Grammar;
+use crate::inference::structured::grammar::Grammar;
 
 /// Convert a regex pattern to a Grammar.
 ///

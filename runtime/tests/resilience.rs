@@ -9,7 +9,7 @@ mod common;
 
 use common::{create_mock_env, MockEnv, mock_device::DelayedBehavior, mock_device::EchoBehavior};
 use pie::inference::request::{ForwardPassRequest, ForwardPassOutput, Sampler};
-use pie::brle::Brle;
+use pie::inference::brle::Brle;
 
 struct TestState {
     #[allow(dead_code)]

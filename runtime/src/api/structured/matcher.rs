@@ -3,8 +3,8 @@
 use crate::api::pie;
 use crate::api::structured::grammar::Grammar;
 use crate::linker::InstanceState;
-use crate::structured::compiled_grammar::CompiledGrammar;
-use crate::structured::matcher::GrammarMatcher;
+use crate::inference::structured::compiled_grammar::CompiledGrammar;
+use crate::inference::structured::matcher::GrammarMatcher;
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

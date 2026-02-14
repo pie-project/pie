@@ -3,7 +3,7 @@
 //! Item 1: Round-trip tests (EBNF → Grammar → Display → verify).
 //! Item 2: Error case tests (malformed EBNF → Err with message).
 
-use pie::structured::grammar::Grammar;
+use pie::inference::structured::grammar::Grammar;
 
 fn parse_and_display(input: &str) -> String {
     Grammar::from_ebnf(input, "root").unwrap().to_string()
