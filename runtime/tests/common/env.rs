@@ -93,8 +93,7 @@ pub fn create_mock_env(
         },
         models: vec![ModelConfig {
             name: model_name.to_string(),
-            chat_template: String::new(),
-            stop_tokens: vec!["<eos>".to_string()],
+            arch_name: String::new(),
             kv_page_size: 16,
             tokenizer_path,
             devices,

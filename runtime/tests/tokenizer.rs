@@ -11,7 +11,7 @@
 /// ```
 
 use std::path::Path;
-use pie::tokenizer::Tokenizer;
+use pie::model::tokenizer::Tokenizer;
 
 // ---------------------------------------------------------------------------
 // Helper

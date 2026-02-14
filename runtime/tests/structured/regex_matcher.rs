@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use pie::inference::structured::matcher::GrammarMatcher;
 use pie::inference::structured::regex::regex_to_grammar;
-use pie::tokenizer::Tokenizer;
+use pie::model::tokenizer::Tokenizer;
 
 fn is_regex_accept_string(pattern: &str, input: &str) -> bool {
     let grammar = match regex_to_grammar(pattern) {

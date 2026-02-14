@@ -9,7 +9,7 @@ use pie::inference::structured::bitmask;
 use pie::inference::structured::grammar::Grammar;
 use pie::inference::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
 use pie::inference::structured::matcher::GrammarMatcher;
-use pie::tokenizer::Tokenizer;
+use pie::model::tokenizer::Tokenizer;
 
 // ---------------------------------------------------------------------------
 // Helpers

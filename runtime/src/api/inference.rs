@@ -7,11 +7,17 @@ use crate::api::adapter::Adapter;
 use crate::linker::InstanceState;
 use crate::inference::brle::Brle;
 use crate::inference::request::{ForwardPassRequest, ForwardPassOutput};
+use crate::inference::structured::grammar::Grammar as InternalGrammar;
+use crate::inference::structured::json_schema::{builtin_json_grammar, json_schema_to_grammar, JsonSchemaOptions};
+use crate::inference::structured::regex::regex_to_grammar;
+use crate::inference::structured::compiled_grammar::CompiledGrammar;
+use crate::inference::structured::matcher::GrammarMatcher;
 use crate::{context, inference};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::iter;
 use std::mem::take;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
@@ -372,3 +378,161 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
     }
 }
 
+// =============================================================================
+// Grammar resource
+// =============================================================================
+
+/// A compiled grammar that describes valid output structure.
+#[derive(Debug)]
+pub struct Grammar {
+    /// The original source string (for compiled grammar cache keying).
+    pub source: String,
+    /// The parsed grammar AST.
+    pub inner: Arc<InternalGrammar>,
+}
+
+impl pie::core::inference::HostGrammar for InstanceState {
+    async fn from_json_schema(
+        &mut self,
+        schema: String,
+    ) -> Result<Result<Resource<Grammar>, String>> {
+        match json_schema_to_grammar(&schema, &JsonSchemaOptions::default()) {
+            Ok(g) => {
+                let grammar = Grammar {
+                    source: schema,
+                    inner: Arc::new(g),
+                };
+                Ok(Ok(self.ctx().table.push(grammar)?))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn json(&mut self) -> Result<Resource<Grammar>> {
+        let g = builtin_json_grammar()?;
+        let grammar = Grammar {
+            source: "__builtin_json__".into(),
+            inner: Arc::new(g),
+        };
+        Ok(self.ctx().table.push(grammar)?)
+    }
+
+    async fn from_regex(
+        &mut self,
+        pattern: String,
+    ) -> Result<Result<Resource<Grammar>, String>> {
+        match regex_to_grammar(&pattern) {
+            Ok(g) => {
+                let grammar = Grammar {
+                    source: pattern,
+                    inner: Arc::new(g),
+                };
+                Ok(Ok(self.ctx().table.push(grammar)?))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn from_ebnf(
+        &mut self,
+        ebnf: String,
+    ) -> Result<Result<Resource<Grammar>, String>> {
+        match InternalGrammar::from_ebnf(&ebnf, "root") {
+            Ok(g) => {
+                let grammar = Grammar {
+                    source: ebnf,
+                    inner: Arc::new(g),
+                };
+                Ok(Ok(self.ctx().table.push(grammar)?))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn drop(&mut self, this: Resource<Grammar>) -> Result<()> {
+        self.ctx().table.delete(this)?;
+        Ok(())
+    }
+}
+
+// =============================================================================
+// Matcher resource
+// =============================================================================
+
+/// Stateful matcher that walks the grammar automaton, producing token masks.
+pub struct Matcher {
+    inner: GrammarMatcher,
+}
+
+impl std::fmt::Debug for Matcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Matcher").finish()
+    }
+}
+
+impl pie::core::inference::HostMatcher for InstanceState {
+    async fn new(
+        &mut self,
+        grammar: Resource<Grammar>,
+        tokenizer: Resource<crate::api::model::Tokenizer>,
+    ) -> Result<Resource<Matcher>> {
+        let grammar_res = self.ctx().table.get(&grammar)?;
+        let source = grammar_res.source.clone();
+        let grammar_inner = grammar_res.inner.clone();
+
+        let tokenizer_res = self.ctx().table.get(&tokenizer)?;
+        let tok = tokenizer_res.model.tokenizer().clone();
+        let stop_tokens = tokenizer_res.model.stop_tokens().to_vec();
+
+        let compiled = CompiledGrammar::get_or_compile(&source, &grammar_inner, &tok);
+        let inner = GrammarMatcher::with_compiled(compiled, tok, stop_tokens, 10);
+
+        let matcher = Matcher { inner };
+        Ok(self.ctx().table.push(matcher)?)
+    }
+
+    async fn accept_tokens(
+        &mut self,
+        this: Resource<Matcher>,
+        token_ids: Vec<u32>,
+    ) -> Result<Result<(), String>> {
+        let matcher = self.ctx().table.get_mut(&this)?;
+        for &id in &token_ids {
+            if !matcher.inner.accept_token(id) {
+                return Ok(Err(format!("token {} rejected by grammar", id)));
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    async fn next_token_logit_mask(
+        &mut self,
+        this: Resource<Matcher>,
+    ) -> Result<Vec<u32>> {
+        let matcher = self.ctx().table.get_mut(&this)?;
+        let brle = matcher.inner.fill_next_token_brle();
+        Ok(brle.buffer)
+    }
+
+    async fn is_terminated(
+        &mut self,
+        this: Resource<Matcher>,
+    ) -> Result<bool> {
+        let matcher = self.ctx().table.get(&this)?;
+        Ok(matcher.inner.is_terminated())
+    }
+
+    async fn reset(
+        &mut self,
+        this: Resource<Matcher>,
+    ) -> Result<()> {
+        let matcher = self.ctx().table.get_mut(&this)?;
+        matcher.inner.reset();
+        Ok(())
+    }
+
+    async fn drop(&mut self, this: Resource<Matcher>) -> Result<()> {
+        self.ctx().table.delete(this)?;
+        Ok(())
+    }
+}

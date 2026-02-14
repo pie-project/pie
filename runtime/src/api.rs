@@ -7,11 +7,9 @@ pub mod session;
 pub mod adapter;
 pub mod runtime;
 
-pub mod structured;
 pub mod mcp;
 pub mod zo;
 
-use crate::linker::InstanceState;
 use wasmtime::component::HasSelf;
 
 wasmtime::component::bindgen!({
@@ -31,13 +29,12 @@ wasmtime::component::bindgen!({
         // pie:core/inference
         "pie:core/inference/forward-pass": inference::ForwardPass,
         "pie:core/inference/future-output": inference::FutureOutput,
+        "pie:core/inference/grammar": inference::Grammar,
+        "pie:core/inference/matcher": inference::Matcher,
         // pie:core/messaging
         "pie:core/messaging/subscription": messaging::Subscription,
         // pie:core/adapter
         "pie:core/adapter/adapter": adapter::Adapter,
-        // pie:structured
-        "pie:structured/grammar/grammar": structured::grammar::Grammar,
-        "pie:structured/matcher/matcher": structured::matcher::Matcher,
         // pie:mcp/client
         "pie:mcp/client/session": mcp::Session,
     },
@@ -55,8 +52,6 @@ where
         + pie::core::session::Host
         + pie::core::adapter::Host
         + pie::core::runtime::Host
-        + pie::structured::grammar::Host
-        + pie::structured::matcher::Host
         + pie::mcp::types::Host
         + pie::mcp::client::Host
         + pie::zo::zo::Host,
@@ -69,8 +64,6 @@ where
     pie::core::session::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::adapter::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::runtime::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    pie::structured::grammar::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    pie::structured::matcher::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::client::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::zo::zo::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
