@@ -193,26 +193,15 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     }
 
     async fn attention_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<Vec<u32>>) -> Result<()> {
-        let mut brle_masks = Vec::with_capacity(mask.len());
-        for buffer in mask {
-            let total_size = buffer.iter().map(|&x| x as usize).sum();
-            brle_masks.push(Brle {
-                buffer,
-                total_size,
-            });
-        }
-        
+        let brle_masks: Vec<Brle> = mask.into_iter().map(Brle::from_vec).collect();
+
         let pass = self.ctx().table.get_mut(&this)?;
         pass.mask = brle_masks;
         Ok(())
     }
 
     async fn logit_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<u32>) -> Result<()> {
-        let total_size = mask.iter().map(|&x| x as usize).sum();
-        let brle = Brle {
-            buffer: mask,
-            total_size,
-        };
+        let brle = Brle::from_vec(mask);
 
         let pass = self.ctx().table.get_mut(&this)?;
         pass.logit_mask = Some(brle);
@@ -292,6 +281,13 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let speculative_positions = take(&mut pass.speculative_positions);
         let output_speculative_tokens = pass.output_speculative_tokens;
         let masks = take(&mut pass.mask);
+
+        // WIT spec: "if not provided, fallback to causal mask"
+        let masks = if masks.is_empty() && !positions.is_empty() {
+            positions.iter().map(|&pos| Brle::new((pos + 1) as usize)).collect()
+        } else {
+            masks
+        };
         let logit_mask = pass.logit_mask.take();
         let sampling_indices = take(&mut pass.output_token_indices);
         let sampler_maps = take(&mut pass.output_token_samplers);
@@ -301,6 +297,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let samplers: Vec<inference::Sampler> = sampler_maps.iter()
             .map(convert_sampler)
             .collect();
+
+        // Save data needed for context::fill() before moving into request
+        let num_input_tokens = tokens.len();
+        let fill_positions = positions.clone();
+        let fill_masks = masks.clone();
 
         // Build the forward pass request
         let request = ForwardPassRequest {
@@ -320,11 +321,18 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         };
 
         // Submit to inference service
-    // eprintln!("[HOST execute] tokens={}, positions={:?}, sampling_indices={:?}, context_id={:?}",
-    //     request.tokens.len(), &request.positions, &request.sampling_indices, request.context_id);
     match inference::forward_pass(model_id, request).await {
         Ok(output) => {
-            // eprintln!("[HOST execute] OK -> {:?}", &output);
+            // Mark input tokens as forwarded in the context
+            if let Some(ctx_id) = context_id {
+                if num_input_tokens > 0 {
+                    context::fill(
+                        model_id, ctx_id, num_input_tokens,
+                        fill_positions, fill_masks, adapter_id,
+                    )?;
+                }
+            }
+
             let future_output = FutureOutput {
                 result: Some(convert_output(output)),
                 rx: None,
@@ -333,7 +341,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             Ok(Ok(self.ctx().table.push(future_output)?))
         }
         Err(e) => {
-            // eprintln!("[HOST execute] ERR -> {}", e);
             Ok(Err(e.to_string()))
         },
     }

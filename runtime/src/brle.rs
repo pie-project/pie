@@ -40,6 +40,12 @@ impl Brle {
         }
     }
 
+    /// Creates a `Brle` from an owned run-length buffer.
+    pub fn from_vec(buffer: Vec<u32>) -> Self {
+        let total_size = buffer.iter().map(|&x| x as usize).sum();
+        Self { buffer, total_size }
+    }
+
     /// Creates a `Brle` from a packed bitmask (`&[u32]`).
     ///
     /// Allocates a new buffer each call. For hot paths, prefer

@@ -142,6 +142,7 @@ def oneshot(
             name = f"{pkg_name}@{version}"
 
         async def _run():
+            nonlocal name
             from pie_client import PieClient, Event
 
             async with PieClient(f"ws://{config.host}:{config.port}") as client:
@@ -156,6 +157,10 @@ def oneshot(
 
                     print("Installing program (force overwrite)...")
                     await client.install_program(wasm_path, manifest_path, force_overwrite=force_overwrite)
+
+                # Resolve bare name to name@version if needed
+                if "@" not in name:
+                    name = await client.resolve_version(name, config.registry)
 
                 # Launch and stream
                 print(f"Launching {name}...")

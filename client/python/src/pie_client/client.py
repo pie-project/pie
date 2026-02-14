@@ -284,9 +284,10 @@ class PieClient:
         url = f"{registry_url.rstrip('/')}/api/v1/inferlets/{name}"
         with urllib.request.urlopen(url) as resp:
             data = json.loads(resp.read())
-        version = data.get("latest_version")
-        if not version:
+        versions = data.get("versions", [])
+        if not versions:
             raise Exception(f"No version found for '{name}' in registry")
+        version = versions[0]["num"]
         return f"{name}@{version}"
 
     async def check_program(
