@@ -5,11 +5,12 @@
 
 use std::sync::Arc;
 use crate::model::instruct::{
-    ChatDecoder, ChatEvent,
+    ChatDecoder,
     Instruct,
-    ReasoningDecoder, ReasoningEvent,
+    ReasoningDecoder,
     ToolDecoder, ToolEvent,
 };
+use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::model::tokenizer::Tokenizer;
 
 
@@ -239,30 +240,28 @@ impl Instruct for R1Instruct {
     }
 
     fn answer(&self, _name: &str, value: &str) -> Vec<u32> {
-        // Reference: <｜tool▁output▁begin｜> + content + <｜tool▁output▁end｜>
-        let mut tokens = self.tool_output_begin.clone();
+        // Reference: <｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>content<｜tool▁output▁end｜>
+        //            ... <｜tool▁outputs▁end｜> (emitted on transition to assistant)
+        // Note: for multiple consecutive tool outputs, the container delimiters
+        // should wrap the group. The per-message API emits them per-call.
+        let mut tokens = self.tool_outputs_begin.clone();
+        tokens.extend(&self.tool_output_begin);
         tokens.extend(self.tokenizer.encode(value));
         tokens.extend(&self.tool_output_end);
+        tokens.extend(&self.tool_outputs_end);
         tokens
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(R1ChatDecoder {
-            tokenizer: self.tokenizer.clone(),
-            stop_ids: self.eos_ids.clone(),
-            accumulated: String::new(),
-        })
+        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.eos_ids.clone()))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
-        Box::new(R1ReasoningDecoder {
-            tokenizer: self.tokenizer.clone(),
-            think_prefix_ids: self.think_prefix_ids.clone(),
-            think_suffix_ids: self.think_suffix_ids.clone(),
-            state: R1State::Outside,
-            accumulated: String::new(),
-            match_pos: 0,
-        })
+        Box::new(ThinkingDecoder::new(
+            self.tokenizer.clone(),
+            self.think_prefix_ids.clone(),
+            self.think_suffix_ids.clone(),
+        ))
     }
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
@@ -322,94 +321,6 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
 }
 
 // ─── Decoders ───────────────────────────────────────────────
-
-struct R1ChatDecoder {
-    tokenizer: Arc<Tokenizer>,
-    stop_ids: Vec<u32>,
-    accumulated: String,
-}
-
-impl ChatDecoder for R1ChatDecoder {
-    fn feed(&mut self, tokens: &[u32]) -> ChatEvent {
-        for &t in tokens {
-            if self.stop_ids.contains(&t) {
-                let text = std::mem::take(&mut self.accumulated);
-                return ChatEvent::Done(text);
-            }
-        }
-        let delta = self.tokenizer.decode(tokens, false);
-        self.accumulated.push_str(&delta);
-        ChatEvent::Delta(delta)
-    }
-
-    fn reset(&mut self) {
-        self.accumulated.clear();
-    }
-}
-
-enum R1State {
-    Outside,
-    Inside,
-}
-
-struct R1ReasoningDecoder {
-    tokenizer: Arc<Tokenizer>,
-    think_prefix_ids: Vec<u32>,
-    think_suffix_ids: Vec<u32>,
-    state: R1State,
-    accumulated: String,
-    match_pos: usize,
-}
-
-impl ReasoningDecoder for R1ReasoningDecoder {
-    fn feed(&mut self, tokens: &[u32]) -> ReasoningEvent {
-        match self.state {
-            R1State::Outside => {
-                for &t in tokens {
-                    if self.match_pos < self.think_prefix_ids.len()
-                        && t == self.think_prefix_ids[self.match_pos]
-                    {
-                        self.match_pos += 1;
-                        if self.match_pos == self.think_prefix_ids.len() {
-                            self.state = R1State::Inside;
-                            self.match_pos = 0;
-                            return ReasoningEvent::Start;
-                        }
-                    } else {
-                        self.match_pos = 0;
-                    }
-                }
-                ReasoningEvent::Delta(String::new())
-            }
-            R1State::Inside => {
-                for &t in tokens {
-                    if self.match_pos < self.think_suffix_ids.len()
-                        && t == self.think_suffix_ids[self.match_pos]
-                    {
-                        self.match_pos += 1;
-                        if self.match_pos == self.think_suffix_ids.len() {
-                            self.state = R1State::Outside;
-                            self.match_pos = 0;
-                            let text = std::mem::take(&mut self.accumulated);
-                            return ReasoningEvent::Complete(text);
-                        }
-                    } else {
-                        self.match_pos = 0;
-                    }
-                }
-                let delta = self.tokenizer.decode(tokens, false);
-                self.accumulated.push_str(&delta);
-                ReasoningEvent::Delta(delta)
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        self.state = R1State::Outside;
-        self.accumulated.clear();
-        self.match_pos = 0;
-    }
-}
 
 struct R1ToolDecoder {
     tokenizer: Arc<Tokenizer>,
@@ -492,31 +403,33 @@ mod tests {
         Arc::new(Tokenizer::from_vocab(&v))
     }
 
-    fn make_inst() -> R1Instruct {
+    fn r1() -> R1Instruct {
         let tok = make_tok(&[
             "<｜end▁of▁sentence｜>", "<|EOT|>", "<｜User｜>", "<｜Assistant｜>",
-            "Hello", "\\n", "<think>", "</think>", "<｜begin▁of▁sentence｜>",
+            "Hello", "\n", "<think>", "</think>", "<｜begin▁of▁sentence｜>",
+            "<｜tool▁outputs▁begin｜>", "<｜tool▁outputs▁end｜>",
+            "<｜tool▁output▁begin｜>", "<｜tool▁output▁end｜>",
         ]);
         R1Instruct::new(tok)
     }
 
     #[test]
     fn has_correct_stop_tokens() {
-        let inst = make_inst();
+        let inst = r1();
         let stop = inst.seal();
         assert!(stop.contains(&0)); // <｜end▁of▁sentence｜>
     }
 
     #[test]
     fn user_starts_with_prefix() {
-        let inst = make_inst();
+        let inst = r1();
         let tokens = inst.user("Hello");
         assert_eq!(tokens[..inst.user_prefix.len()], inst.user_prefix[..]);
     }
 
     #[test]
     fn system_is_bare_text() {
-        let inst = make_inst();
+        let inst = r1();
         let sys = inst.system("Hello");
         // Bare prepend: should NOT start with user or assistant prefix
         if !inst.user_prefix.is_empty() {
@@ -527,7 +440,7 @@ mod tests {
 
     #[test]
     fn cue_is_assistant_prefix_only() {
-        let inst = make_inst();
+        let inst = r1();
         let cue = inst.cue();
         // cue should be exactly <｜Assistant｜> — no <think> prefix
         assert_eq!(cue, inst.assistant_prefix);
@@ -551,7 +464,7 @@ mod tests {
 
     #[test]
     fn tool_call_grammar_returns_ebnf() {
-        let inst = make_inst();
+        let inst = r1();
         let tools = vec![r#"{"function":{"name":"get_weather","parameters":{}}}"#.to_string()];
         let grammar = inst.tool_call_grammar(&tools);
         assert!(grammar.is_some());
@@ -562,7 +475,41 @@ mod tests {
 
     #[test]
     fn tool_call_grammar_none_for_empty() {
-        let inst = make_inst();
+        let inst = r1();
         assert!(inst.tool_call_grammar(&[]).is_none());
+    }
+
+    #[test]
+    fn full_conversation() {
+        let inst = r1();
+        let mut tokens = Vec::new();
+        tokens.extend(inst.system("Hello"));
+        tokens.extend(inst.user("Hello"));
+        tokens.extend(inst.assistant("Hello"));
+        tokens.extend(inst.user("Hello"));
+        tokens.extend(inst.cue());
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "Hello\
+             <｜User｜>Hello\
+             <｜Assistant｜>Hello<｜end▁of▁sentence｜>\
+             <｜User｜>Hello\
+             <｜Assistant｜>"
+        );
+    }
+
+    #[test]
+    fn answer_format() {
+        let inst = r1();
+        let tokens = inst.answer("fn", "Hello");
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<｜tool▁outputs▁begin｜>\
+             <｜tool▁output▁begin｜>Hello\
+             <｜tool▁output▁end｜>\
+             <｜tool▁outputs▁end｜>"
+        );
     }
 }

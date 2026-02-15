@@ -5,11 +5,12 @@
 
 use std::sync::Arc;
 use crate::model::instruct::{
-    ChatDecoder, ChatEvent,
+    ChatDecoder,
     Instruct,
-    ReasoningDecoder, ReasoningEvent,
+    ReasoningDecoder,
     ToolDecoder, ToolEvent,
 };
+use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::model::tokenizer::Tokenizer;
 
 static TEMPLATE: &str = r#"
@@ -131,13 +132,13 @@ impl LlamaInstruct {
         // This ensures mock tokenizers (and real ones) don't get confused by concatenated headers
         let start_header = encode("<|start_header_id|>");
         let end_header = encode("<|end_header_id|>");
-        let nl = encode("\n");
+        let double_nl = encode("\n\n");
 
         let make_role = |role: &str| -> Vec<u32> {
             let mut v = start_header.clone();
             v.extend(encode(role));
             v.extend(&end_header);
-            v.extend(&nl);
+            v.extend(&double_nl);
             v
         };
 
@@ -145,10 +146,9 @@ impl LlamaInstruct {
         let user_prefix = make_role("user");
         let assistant_prefix = make_role("assistant");
         let ipython_prefix = make_role("ipython");
-        
-        // Turn suffix: <|eot_id|>\n
-        let mut turn_suffix = encode("<|eot_id|>");
-        turn_suffix.extend(&nl);
+
+        // Turn suffix: <|eot_id|>
+        let turn_suffix = encode("<|eot_id|>");
 
         Self {
             system_prefix,
@@ -258,22 +258,15 @@ ws ::= [ \t\n]*
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(LlamaChatDecoder {
-            tokenizer: self.tokenizer.clone(),
-            stop_ids: self.stop_ids.clone(),
-            accumulated: String::new(),
-        })
+        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
-        Box::new(LlamaReasoningDecoder {
-            tokenizer: self.tokenizer.clone(),
-            think_prefix_ids: self.think_prefix_ids.clone(),
-            think_suffix_ids: self.think_suffix_ids.clone(),
-            state: LlamaReasoningState::Outside,
-            accumulated: String::new(),
-            match_pos: 0,
-        })
+        Box::new(ThinkingDecoder::new(
+            self.tokenizer.clone(),
+            self.think_prefix_ids.clone(),
+            self.think_suffix_ids.clone(),
+        ))
     }
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
@@ -285,94 +278,6 @@ ws ::= [ \t\n]*
 }
 
 // ─── Decoders ───────────────────────────────────────────────
-
-struct LlamaChatDecoder {
-    tokenizer: Arc<Tokenizer>,
-    stop_ids: Vec<u32>,
-    accumulated: String,
-}
-
-impl ChatDecoder for LlamaChatDecoder {
-    fn feed(&mut self, tokens: &[u32]) -> ChatEvent {
-        for &t in tokens {
-            if self.stop_ids.contains(&t) {
-                let text = std::mem::take(&mut self.accumulated);
-                return ChatEvent::Done(text);
-            }
-        }
-        let delta = self.tokenizer.decode(tokens, false);
-        self.accumulated.push_str(&delta);
-        ChatEvent::Delta(delta)
-    }
-
-    fn reset(&mut self) {
-        self.accumulated.clear();
-    }
-}
-
-enum LlamaReasoningState {
-    Outside,
-    Inside,
-}
-
-struct LlamaReasoningDecoder {
-    tokenizer: Arc<Tokenizer>,
-    think_prefix_ids: Vec<u32>,
-    think_suffix_ids: Vec<u32>,
-    state: LlamaReasoningState,
-    accumulated: String,
-    match_pos: usize,
-}
-
-impl ReasoningDecoder for LlamaReasoningDecoder {
-    fn feed(&mut self, tokens: &[u32]) -> ReasoningEvent {
-        match self.state {
-            LlamaReasoningState::Outside => {
-                for &t in tokens {
-                    if self.match_pos < self.think_prefix_ids.len()
-                        && t == self.think_prefix_ids[self.match_pos]
-                    {
-                        self.match_pos += 1;
-                        if self.match_pos == self.think_prefix_ids.len() {
-                            self.state = LlamaReasoningState::Inside;
-                            self.match_pos = 0;
-                            return ReasoningEvent::Start;
-                        }
-                    } else {
-                        self.match_pos = 0;
-                    }
-                }
-                ReasoningEvent::Delta(String::new())
-            }
-            LlamaReasoningState::Inside => {
-                for &t in tokens {
-                    if self.match_pos < self.think_suffix_ids.len()
-                        && t == self.think_suffix_ids[self.match_pos]
-                    {
-                        self.match_pos += 1;
-                        if self.match_pos == self.think_suffix_ids.len() {
-                            self.state = LlamaReasoningState::Outside;
-                            self.match_pos = 0;
-                            let text = std::mem::take(&mut self.accumulated);
-                            return ReasoningEvent::Complete(text);
-                        }
-                    } else {
-                        self.match_pos = 0;
-                    }
-                }
-                let delta = self.tokenizer.decode(tokens, false);
-                self.accumulated.push_str(&delta);
-                ReasoningEvent::Delta(delta)
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        self.state = LlamaReasoningState::Outside;
-        self.accumulated.clear();
-        self.match_pos = 0;
-    }
-}
 
 struct LlamaToolDecoder {
     tokenizer: Arc<Tokenizer>,
@@ -471,5 +376,36 @@ mod tests {
         // Check for single brace (escaped in string literal as \")
         assert!(g.contains("tool-call ::= \"{\" ws \"name\""));
         assert!(g.contains("foo"));
+    }
+
+    #[test]
+    fn full_conversation() {
+        let inst = llama3();
+        let mut tokens = Vec::new();
+        tokens.extend(inst.system("Hello"));
+        tokens.extend(inst.user("Hello"));
+        tokens.extend(inst.assistant("Hello"));
+        tokens.extend(inst.user("Hello"));
+        tokens.extend(inst.cue());
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|start_header_id|>system<|end_header_id|>\n\nHello<|eot_id|>\
+             <|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>\
+             <|start_header_id|>assistant<|end_header_id|>\n\nHello<|eot_id|>\
+             <|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>\
+             <|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    #[test]
+    fn answer_format() {
+        let inst = llama3();
+        let tokens = inst.answer("fn1", "Hello");
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|start_header_id|>ipython<|end_header_id|>\n\nHello<|eot_id|>"
+        );
     }
 }
