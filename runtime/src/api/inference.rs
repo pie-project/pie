@@ -461,7 +461,7 @@ impl pie::core::inference::HostGrammar for InstanceState {
 
 /// Stateful matcher that walks the grammar automaton, producing token masks.
 pub struct Matcher {
-    inner: GrammarMatcher,
+    pub(crate) inner: GrammarMatcher,
 }
 
 impl std::fmt::Debug for Matcher {

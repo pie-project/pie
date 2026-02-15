@@ -9,12 +9,6 @@ use std::sync::{Arc, LazyLock};
 use anyhow::Result;
 
 pub mod instruct;
-pub mod qwen;
-pub mod llama;
-pub mod r1;
-pub mod gptoss;
-pub mod gemma;
-pub mod mistral;
 pub mod tokenizer;
 
 use instruct::Instruct;

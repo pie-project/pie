@@ -9,7 +9,11 @@ use crate::context;
 use crate::model;
 use crate::linker::InstanceState;
 use crate::model::instruct::{ToolDecoder, ToolEvent};
+use crate::inference::structured::grammar::Grammar as InternalGrammar;
+use crate::inference::structured::compiled_grammar::CompiledGrammar;
+use crate::inference::structured::matcher::GrammarMatcher;
 use anyhow::Result;
+use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -62,10 +66,26 @@ impl pie::instruct::tool_use::Host for InstanceState {
 
     async fn create_matcher(
         &mut self,
-        _model: Resource<crate::api::model::Model>,
-        _tools: Vec<String>,
+        model: Resource<crate::api::model::Model>,
+        tools: Vec<String>,
     ) -> Result<Resource<crate::api::inference::Matcher>> {
-        todo!("tool_use::create_matcher — requires grammar compilation")
+        let model_res = self.ctx().table.get(&model)?;
+        let instruct = model_res.model.instruct();
+        let tok = model_res.model.tokenizer().clone();
+        let stop_tokens = instruct.seal();
+
+        let ebnf = instruct.tool_call_grammar(&tools)
+            .ok_or_else(|| anyhow::anyhow!("model does not support constrained tool-call generation"))?;
+
+        let grammar = InternalGrammar::from_ebnf(&ebnf, "root")
+            .map_err(|e| anyhow::anyhow!("failed to compile tool-call grammar: {}", e))?;
+        let grammar_arc = Arc::new(grammar);
+
+        let compiled = CompiledGrammar::get_or_compile(&ebnf, &grammar_arc, &tok);
+        let inner = GrammarMatcher::with_compiled(compiled, tok, stop_tokens, 10);
+
+        let matcher = crate::api::inference::Matcher { inner };
+        Ok(self.ctx().table.push(matcher)?)
     }
 }
 

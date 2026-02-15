@@ -6,6 +6,19 @@
 use std::sync::Arc;
 use crate::model::tokenizer::Tokenizer;
 
+// Model implementations
+
+pub mod gemma2;
+pub mod gemma3;
+pub mod gptoss;
+pub mod llama2;
+pub mod llama3;
+pub mod mistral3;
+pub mod olmo3;
+pub mod qwen2;
+pub mod qwen3;
+pub mod r1;
+
 /// Events emitted by the chat decoder.
 #[derive(Debug, Clone)]
 pub enum ChatEvent {
@@ -70,40 +83,36 @@ pub trait Instruct: Send + Sync {
     fn chat_decoder(&self) -> Box<dyn ChatDecoder>;
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder>;
     fn tool_decoder(&self) -> Box<dyn ToolDecoder>;
+
+    /// Returns an EBNF grammar string that constrains generation to valid
+    /// tool-call format for this architecture, given a list of tool schemas.
+    /// Returns `None` if the architecture doesn't support constrained tool calling.
+    fn tool_call_grammar(&self, _tools: &[String]) -> Option<String> {
+        None
+    }
 }
 
 /// Create the appropriate instruct implementation for the given architecture.
 pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
-    use super::qwen::{QwenInstruct, ChatMLConfig};
+    use self::qwen3::{QwenInstruct, ChatMLConfig};
 
     match arch_name {
         "qwen3" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
             has_thinking: true,
             has_tools: true,
-            wrap_tools_xml: false,
             stop_tokens: &["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
         })),
-        "qwen2" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
-            has_thinking: false,
-            has_tools: true,
-            wrap_tools_xml: true,
-            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
-        })),
-        "olmo3" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
-            has_thinking: true,
-            has_tools: false,
-            wrap_tools_xml: false,
-            stop_tokens: &["<|im_end|>"],
-        })),
-        "llama3" | "l4ma" => Arc::new(super::llama::LlamaInstruct::new(tokenizer)),
-        "r1" | "deepseek_v3" => Arc::new(super::r1::R1Instruct::new(tokenizer)),
-        "gptoss" | "gpt_oss" => Arc::new(super::gptoss::GptOssInstruct::new(tokenizer)),
-        "gemma2" | "gemma3" => Arc::new(super::gemma::GemmaInstruct::new(tokenizer)),
-        "mistral3" => Arc::new(super::mistral::MistralInstruct::new(tokenizer)),
+        "qwen2" => Arc::new(self::qwen2::new(tokenizer)),
+        "llama2" => Arc::new(self::llama2::LlamaInstruct::new(tokenizer)),
+        "llama3" | "l4ma" => Arc::new(self::llama3::LlamaInstruct::new(tokenizer)),
+        "r1" | "deepseek_v3" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
+        "gptoss" | "gpt_oss" => Arc::new(self::gptoss::GptOssInstruct::new(tokenizer)),
+        "gemma2" | "gemma3" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
+        "mistral3" | "ministral3" => Arc::new(self::mistral3::MistralInstruct::new(tokenizer)),
+        "olmo3" => Arc::new(self::olmo3::OlmoInstruct::new(tokenizer)),
         _ => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
             has_thinking: false,
             has_tools: false,
-            wrap_tools_xml: false,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         })),
     }
