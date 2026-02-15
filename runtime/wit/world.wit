@@ -4,10 +4,12 @@ world imports {
     include pie:core/imports;
     include pie:mcp/imports;
     include pie:zo/imports;
+    include pie:instruct/imports;
 }
 
 world inferlet {
     include pie:core/imports;
     include pie:mcp/imports;
     include pie:zo/imports;
+    include pie:instruct/imports;
 }

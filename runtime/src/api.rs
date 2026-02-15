@@ -9,6 +9,7 @@ pub mod runtime;
 
 pub mod mcp;
 pub mod zo;
+pub mod instruct;
 
 use wasmtime::component::HasSelf;
 
@@ -37,6 +38,10 @@ wasmtime::component::bindgen!({
         "pie:core/adapter/adapter": adapter::Adapter,
         // pie:mcp/client
         "pie:mcp/client/session": mcp::Session,
+        // pie:instruct
+        "pie:instruct/chat/decoder": instruct::chat::Decoder,
+        "pie:instruct/tool-use/decoder": instruct::tool_use::Decoder,
+        "pie:instruct/reasoning/decoder": instruct::reasoning::Decoder,
     },
     imports: { default: async | trappable },
     exports: { default: async },
@@ -54,7 +59,10 @@ where
         + pie::core::runtime::Host
         + pie::mcp::types::Host
         + pie::mcp::client::Host
-        + pie::zo::zo::Host,
+        + pie::zo::zo::Host
+        + pie::instruct::chat::Host
+        + pie::instruct::tool_use::Host
+        + pie::instruct::reasoning::Host,
 {
     pie::core::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::context::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
@@ -67,6 +75,9 @@ where
     pie::mcp::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::client::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::zo::zo::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::instruct::chat::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::instruct::tool_use::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::instruct::reasoning::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
 
     Ok(())
 }
