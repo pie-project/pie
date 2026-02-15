@@ -44,6 +44,7 @@ Run a test prompt (you will be prompted for configuration and model download if 
 
 ```bash
 pie run text-completion -- --prompt "Hello world!"
+pie run beam-search -- --prompt "What is the capital of France?" --beam-size 2
 ```
 
 > **Note:** The first run may take longer due to JIT compilation.
