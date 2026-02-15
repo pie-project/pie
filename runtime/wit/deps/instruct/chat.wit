@@ -23,6 +23,9 @@ interface chat {
     /// Seal the current turn (insert stop token)
     seal: func(ctx: borrow<context>);
 
+    /// Returns the stop token IDs for the model
+    stop-tokens: func(model: borrow<model>) -> list<u32>;
+
     /// Create a decoder to classify generated tokens
     create-decoder: func(model: borrow<model>) -> decoder;
 

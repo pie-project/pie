@@ -65,6 +65,11 @@ impl pie::instruct::chat::Host for InstanceState {
         Ok(())
     }
 
+    async fn stop_tokens(&mut self, model_res: Resource<crate::api::model::Model>) -> Result<Vec<u32>> {
+        let model = self.ctx().table.get(&model_res)?;
+        Ok(model.model.instruct().seal())
+    }
+
     async fn create_decoder(&mut self, model: Resource<crate::api::model::Model>) -> Result<Resource<Decoder>> {
         let model = self.ctx().table.get(&model)?;
         let inner = model.model.instruct().chat_decoder();

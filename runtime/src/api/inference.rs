@@ -482,7 +482,7 @@ impl pie::core::inference::HostMatcher for InstanceState {
 
         let tokenizer_res = self.ctx().table.get(&tokenizer)?;
         let tok = tokenizer_res.model.tokenizer().clone();
-        let stop_tokens = tokenizer_res.model.stop_tokens().to_vec();
+        let stop_tokens = tokenizer_res.model.instruct().seal();
 
         let compiled = CompiledGrammar::get_or_compile(&source, &grammar_inner, &tok);
         let inner = GrammarMatcher::with_compiled(compiled, tok, stop_tokens, 10);
