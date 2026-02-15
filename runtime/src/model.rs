@@ -9,9 +9,17 @@ use std::sync::{Arc, LazyLock};
 use anyhow::Result;
 
 pub mod chat_templates;
+pub mod instruct;
+pub mod qwen;
+pub mod llama;
+pub mod r1;
+pub mod gptoss;
+pub mod gemma;
+pub mod mistral;
 pub mod tokenizer;
 
 use chat_templates::ChatTemplate;
+use instruct::Instruct;
 use tokenizer::Tokenizer;
 
 /// Global cache for models (keyed by ModelId).
@@ -49,9 +57,12 @@ pub fn register(
         .filter_map(|s| tokenizer.token_to_id(s))
         .collect();
 
+    let instruct = instruct::create(arch_name, tokenizer.clone());
+
     let model = Arc::new(Model {
         name,
         chat_template,
+        instruct,
         stop_tokens,
         kv_page_size,
         tokenizer,
@@ -77,6 +88,7 @@ pub fn get_model(model_id: ModelId) -> Option<&'static Arc<Model>> {
 pub struct Model {
     name: String,
     chat_template: &'static ChatTemplate,
+    instruct: Arc<dyn Instruct>,
     stop_tokens: Vec<u32>,
     kv_page_size: u32,
     tokenizer: Arc<Tokenizer>,
@@ -99,6 +111,11 @@ impl Model {
     /// Gets the chat template.
     pub fn chat_template(&self) -> &'static ChatTemplate {
         self.chat_template
+    }
+
+    /// Gets the instruct implementation for this model.
+    pub fn instruct(&self) -> &dyn Instruct {
+        &*self.instruct
     }
 
     /// Gets the tokenizer.
