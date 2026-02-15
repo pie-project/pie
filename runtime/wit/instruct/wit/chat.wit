@@ -1,0 +1,36 @@
+interface chat {
+    use pie:core/context.{context};
+    use pie:core/model.{model};
+    use pie:core/types.{error};
+
+    variant event {
+        /// Generated text chunk
+        delta(string),
+        /// Special token encountered (token ID)
+        interrupt(u32),
+        /// Generation complete (full accumulated text)
+        done(string),
+    }
+
+    /// Open a conversation
+    open: func(name: string) -> result<context, error>;
+
+    /// Fill roles for history replay
+    system: func(ctx: borrow<context>, message: string);
+    user: func(ctx: borrow<context>, message: string);
+    assistant: func(ctx: borrow<context>, message: string);
+
+    /// Cue the model to generate (fills generation header)
+    cue: func(ctx: borrow<context>);
+
+    /// Seal the current turn (insert stop token)
+    seal: func(ctx: borrow<context>);
+
+    /// Create a decoder to classify generated tokens
+    decoder: func(model: borrow<model>) -> decoder;
+
+    resource decoder {
+        feed: func(tokens: list<u32>) -> result<event, error>;
+        reset: func();
+    }
+}

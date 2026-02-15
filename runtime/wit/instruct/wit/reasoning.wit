@@ -1,0 +1,21 @@
+interface reasoning {
+    use pie:core/model.{model};
+    use pie:core/types.{error};
+
+    variant event {
+        /// Reasoning block started
+        start,
+        /// Reasoning text chunk
+        delta(string),
+        /// Reasoning complete (full reasoning text)
+        complete(string),
+    }
+
+    /// Create a decoder to detect reasoning blocks in generated tokens
+    decoder: func(model: borrow<model>) -> decoder;
+
+    resource decoder {
+        feed: func(tokens: list<u32>) -> result<event, error>;
+        reset: func();
+    }
+}

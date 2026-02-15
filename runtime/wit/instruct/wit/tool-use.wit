@@ -1,0 +1,30 @@
+interface tool-use {
+    use pie:core/context.{context};
+    use pie:core/model.{model};
+    use pie:core/inference.{matcher};
+    use pie:core/types.{error};
+
+    variant event {
+        /// Tool call detected
+        start,
+        /// Complete tool call: (name, arguments-json)
+        call(tuple<string, string>),
+    }
+
+    /// Register available tools (list of JSON schema strings)
+    equip: func(ctx: borrow<context>, tools: list<string>) -> result<_, error>;
+
+    /// Provide a tool result (after a tool-call reply)
+    answer: func(ctx: borrow<context>, name: string, result: string);
+
+    /// Create a decoder to detect tool calls in generated tokens
+    decoder: func(model: borrow<model>) -> decoder;
+
+    /// Create a grammar matcher to force-generate tool calls
+    matcher: func(model: borrow<model>, tools: list<string>) -> matcher;
+
+    resource decoder {
+        feed: func(tokens: list<u32>) -> result<event, error>;
+        reset: func();
+    }
+}

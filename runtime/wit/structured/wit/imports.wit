@@ -1,6 +1,0 @@
-package pie:structured;
-
-world imports {
-    import grammar;
-    import matcher;
-}
