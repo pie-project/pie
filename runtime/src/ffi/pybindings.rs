@@ -33,19 +33,19 @@ use crate::device::RpcServer as InternalRpcServer;
 ///         result = handle(method, payload)
 ///         server.respond(request_id, result)
 /// ```
-#[pyclass(name = "RpcServer")]
-pub struct PyRpcServer {
+#[pyclass]
+pub struct RpcServer {
     inner: InternalRpcServer,
 }
 
 #[pymethods]
-impl PyRpcServer {
+impl RpcServer {
     /// Create a new IPC server.
     #[staticmethod]
     fn create() -> PyResult<Self> {
         let inner = InternalRpcServer::create()
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create RPC server: {}", e)))?;
-        Ok(PyRpcServer { inner })
+        Ok(RpcServer { inner })
     }
 
     /// Get the server name for Rust clients to connect to.
@@ -447,15 +447,15 @@ fn py_bootstrap(py: Python<'_>, config: Config) -> PyResult<RuntimeHandle> {
 // Python Module
 // =============================================================================
 
-/// Python module definition for pie_runtime
+/// Python module definition — compiled as `pie._runtime`
 #[pymodule]
-pub fn pie_runtime(m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn _runtime(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Config>()?;
     m.add_class::<ModelConfig>()?;
     m.add_class::<DeviceConfig>()?;
     m.add_class::<SchedulerConfig>()?;
     m.add_class::<RuntimeHandle>()?;
-    m.add_class::<PyRpcServer>()?;
+    m.add_class::<RpcServer>()?;
     m.add_function(wrap_pyfunction!(py_bootstrap, m)?)?;
     Ok(())
 }

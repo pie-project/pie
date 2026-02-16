@@ -1,15 +1,16 @@
-"""Runtime lifecycle for Pie.
+"""Pie server lifecycle.
 
 Handles the full lifecycle: spawn workers → bootstrap Rust runtime →
-run workload → shut down. Core abstraction is the `runtime` context
-manager. Public functions `serve` and `oneshot` implement the two
-CLI modes on top of it.
+run workload → shut down. The ``Server`` async context manager is
+the public programmatic API. Functions ``serve`` and ``oneshot``
+implement CLI modes on top of the ``runtime`` context manager.
 """
 
 from __future__ import annotations
 
-
+import asyncio
 import queue
+import socket
 import sys
 import time
 import random
@@ -18,10 +19,97 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Generator
 
-import typer
 from rich.console import Console
 
-from pie_cli.config.schema import Config
+from pie.config import Config
+
+
+# -- Public API ---------------------------------------------------------------
+
+
+def _find_free_port() -> int:
+    """Find a free TCP port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+class Server:
+    """Async context manager that starts a Pie runtime and returns an authenticated client.
+
+    Usage::
+
+        from pie.server import Server
+
+        async with Server(model="Qwen/Qwen3-0.6B") as client:
+            await client.install_program(wasm_path, manifest_path)
+            await client.launch_daemon("my-inferlet@0.1.0", 8080)
+    """
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        device: str | list[str] = "cuda:0",
+        port: int = 0,
+        dummy: bool = False,
+        tensor_parallel_size: int | None = None,
+        no_auth: bool = True,
+    ):
+        from pie.config import AuthConfig, ModelConfig
+
+        self._config = Config(
+            host="127.0.0.1",
+            port=port or _find_free_port(),
+            auth=AuthConfig(enabled=not no_auth),
+            models=[
+                ModelConfig(
+                    hf_repo=model,
+                    device=[device] if isinstance(device, str) else list(device),
+                    tensor_parallel_size=tensor_parallel_size,
+                    dummy_mode=dummy,
+                )
+            ],
+        )
+
+        # Filled during __aenter__
+        self._handle: Any = None
+        self._workers: list = []
+        self._client: Any = None
+
+    async def __aenter__(self):
+        from pie_client import PieClient
+
+        console = Console(quiet=True)
+
+        # _bootstrap is synchronous (mp.spawn + queue.get), run on thread
+        self._handle, self._workers = await asyncio.to_thread(
+            _bootstrap, self._config, console
+        )
+
+        # Connect and authenticate
+        client = PieClient(f"ws://{self._config.host}:{self._config.port}")
+        await client.connect()
+        await client.auth_by_token(self._handle.internal_token)
+        self._client = client
+
+        return client
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # Close client connection
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:
+                pass
+
+        # Shut down server and workers
+        _terminate(self._handle, self._workers)
+
+        return False
+
+
+# -- CLI lifecycle wrappers ---------------------------------------------------
 
 
 @contextmanager
@@ -48,9 +136,8 @@ def runtime(
         yield server_handle, backend_processes
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        console.print(f"[red]✗[/red] {e}")
-        raise typer.Exit(1)
+    except Exception:
+        raise
     finally:
         console.print()
         with console.status("[dim]Shutting down...[/dim]"):
@@ -180,8 +267,8 @@ def _bootstrap(
     timeout: float = 300.0,
 ) -> tuple[Any, list]:
     """Spawn workers, collect ready signals, bootstrap the Rust runtime."""
-    import pie_runtime
-    from pie_cli import path as pie_path
+    from pie import _runtime as pie_runtime
+    from pie import path as pie_path
     from pie_backend import worker
     import torch
     import torch.multiprocessing as mp

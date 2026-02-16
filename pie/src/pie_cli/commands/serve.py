@@ -9,9 +9,11 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from pie_cli.config import load_config
-from pie_cli.display import engine_panel
-from pie_cli.runtime import serve as runtime_serve
+from rich.panel import Panel
+from rich.text import Text
+
+from pie.config import load_config
+from pie.server import serve as runtime_serve
 
 console = Console()
 
@@ -45,8 +47,17 @@ def serve(
             console.print("[dim]Run 'pie config init' first.[/dim]")
         raise typer.Exit(1)
 
+    model = cfg.primary_model
+    lines = Text()
+    lines.append(f"{'Host':<15}", style="white")
+    lines.append(f"{cfg.host}:{cfg.port}\n", style="dim")
+    lines.append(f"{'Model':<15}", style="white")
+    lines.append(f"{model.hf_repo}\n", style="dim")
+    lines.append(f"{'Device':<15}", style="white")
+    lines.append(", ".join(model.device), style="dim")
+
     console.print()
-    engine_panel(cfg, console=console)
+    console.print(Panel(lines, title="Pie Engine", title_align="left", border_style="dim"))
     console.print()
 
     runtime_serve(cfg, monitor=monitor, console=console)

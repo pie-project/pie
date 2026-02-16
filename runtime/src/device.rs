@@ -174,7 +174,7 @@ impl ServiceHandler for Device {
 // - `RpcClient`: Connects to an existing `IpcOneShotServer` and
 //   exposes async `call()` / `notify()` for sending requests.
 //
-// In the inference pattern, Python wraps `RpcServer` (via `PyRpcServer`)
+// In the inference pattern, Python wraps `RpcServer`
 // and Rust connects via `RpcClient`.
 // =============================================================================
 

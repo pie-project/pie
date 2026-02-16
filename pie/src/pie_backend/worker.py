@@ -151,7 +151,7 @@ def worker_main(
 
 
     import torch
-    import pie_runtime
+    from pie import _runtime as pie_runtime
     from pie_backend.engine import Engine
     from pie_backend.config import RuntimeConfig
     import torch.distributed as dist

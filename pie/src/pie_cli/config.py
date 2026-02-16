@@ -1,6 +1,10 @@
 """Configuration CLI commands for Pie.
 
 Implements: pie config init|show|set
+
+Re-exports from pie.config for backward compatibility:
+    Config, AuthConfig, TelemetryConfig, ModelConfig,
+    load_config, DEFAULT_MODEL, create_default_config_content
 """
 
 from pathlib import Path
@@ -11,8 +15,16 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 
-from pie_cli import path as pie_path
-from pie_cli.config.defaults import create_default_config_content, DEFAULT_MODEL
+from pie import path as pie_path
+from pie.config import (  # noqa: F401
+    AuthConfig,
+    TelemetryConfig,
+    ModelConfig,
+    Config,
+    load_config,
+    DEFAULT_MODEL,
+    create_default_config_content,
+)
 
 console = Console()
 app = typer.Typer(help="Manage configuration")
@@ -93,7 +105,7 @@ def config_set(
 
     Examples:
 
-    \b
+    \\b
         pie config set host 0.0.0.0
         pie config set port 9090
         pie config set auth.enabled true

@@ -9,9 +9,11 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from pie_cli.config import load_config
-from pie_cli.display import inferlet_panel
-from pie_cli.runtime import oneshot
+from rich.panel import Panel
+from rich.text import Text
+
+from pie.config import load_config
+from pie.server import oneshot
 
 console = Console()
 
@@ -66,9 +68,18 @@ def run(
         console.print(f"[red]✗[/red] {e}")
         raise typer.Exit(1)
 
-    console.print()
+    model = cfg.primary_model
     inferlet_display = str(path) if path else inferlet
-    inferlet_panel(cfg, inferlet_display, title="Pie Run", console=console)
+    lines = Text()
+    lines.append(f"{'Inferlet':<15}", style="white")
+    lines.append(f"{inferlet_display}\n", style="dim")
+    lines.append(f"{'Model':<15}", style="white")
+    lines.append(f"{model.hf_repo}\n", style="dim")
+    lines.append(f"{'Device':<15}", style="white")
+    lines.append(", ".join(model.device), style="dim")
+
+    console.print()
+    console.print(Panel(lines, title="Pie Run", title_align="left", border_style="dim"))
     console.print()
 
     oneshot(

@@ -7,13 +7,9 @@ import json
 import sys
 import traceback
 
-# Debug log file
-_LOG_FILE = "/tmp/pie_monitor.log"
+import logging
 
-
-def _log(msg):
-    with open(_LOG_FILE, "a") as f:
-        f.write(f"{msg}\n")
+logger = logging.getLogger(__name__)
 
 
 import threading
@@ -143,15 +139,15 @@ class PieMetricsProvider:
                                 with self._lock:
                                     self._latest_instances = instances
                             except Exception as e:
-                                _log(f"[Monitor] list_processes error: {e}")
+                                logger.debug("list_processes error: %s", e)
 
                         except Exception as e:
-                            _log(f"[Monitor] poll error: {e}")
+                            logger.debug("poll error: %s", e)
 
                         await asyncio.sleep(self._poll_interval)
 
             except Exception as e:
-                _log(f"[Monitor] connection error: {e}")
+                logger.debug("connection error: %s", e)
                 with self._lock:
                     self._connected = False
                 await asyncio.sleep(1.0)
@@ -245,7 +241,7 @@ class PieMetricsProvider:
         # Debug: print instance KV keys for troubleshooting
         kv_keys = [k for k in stats.keys() if "kv_pages" in k]
         if kv_keys:
-            _log(f"[Monitor] Instance KV keys: {kv_keys[:5]}...")
+            logger.debug("Instance KV keys: %s...", kv_keys[:5])
         for key, value in stats.items():
             if key.startswith("instance.") and key.endswith(".kv_pages"):
                 try:

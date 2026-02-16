@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from pie_cli import path as pie_path
+from pie import path as pie_path
 
 import toml
 
