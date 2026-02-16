@@ -1,5 +1,5 @@
 [package]
-name = "openresponses-server"
+name = "openresponses"
 version = "0.1.0"
 edition = "2024"
 description = "OpenResponses-compliant HTTP server inferlet for Pie"

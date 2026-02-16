@@ -131,6 +131,13 @@ impl StreamEmitter {
         })
     }
 
+    /// Emit response.failed
+    pub fn response_failed(&mut self, response: &ResponseResource) -> String {
+        self.format_event("response.failed", ResponseCompletedData {
+            response: clone_response(response),
+        })
+    }
+
     /// Final [DONE] marker
     pub fn done() -> String {
         "data: [DONE]\n\n".to_string()
@@ -143,8 +150,9 @@ fn clone_response(r: &ResponseResource) -> ResponseResource {
         id: r.id.clone(),
         response_type: r.response_type.clone(),
         status: r.status.clone(),
+        model: r.model.clone(),
         output: r.output.clone(),
-        error: None, // Don't include error in normal events
+        error: r.error.clone(),
         usage: None, // Usage is typically only in final response
     }
 }

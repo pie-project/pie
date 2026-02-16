@@ -6,7 +6,12 @@ use wstd::http::body::BodyForthcoming;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
 use wstd::io::AsyncWrite;
-use inferlet::stop_condition::StopCondition;
+
+use inferlet::context::Context;
+use inferlet::inference::Sampler;
+use inferlet::model::Model;
+use inferlet::runtime;
+use inferlet::{ContextExt, InstructExt};
 
 /// Generate a unique ID for responses and messages
 fn generate_id(prefix: &str) -> String {
@@ -24,7 +29,7 @@ pub async fn handle_responses<B>(
     let request: CreateResponseBody = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(e) => {
-            return error_response(responder, 400, "invalid_request", &format!("Invalid JSON: {}", e)).await;
+            return error_response(responder, 400, "invalid_request", &format!("Invalid JSON: {}", e), None, None).await;
         }
     };
 
@@ -63,7 +68,7 @@ pub async fn handle_responses<B>(
     }
 
     if user_messages.is_empty() {
-        return error_response(responder, 400, "invalid_request", "No user message provided").await;
+        return error_response(responder, 400, "invalid_request", "No user message provided", None, None).await;
     }
 
     // Get sampling parameters
@@ -102,9 +107,6 @@ async fn handle_streaming_response(
     temperature: f32,
     top_p: f32,
 ) -> Finished {
-    use inferlet::stop_condition::{max_len, ends_with_any};
-    use inferlet::Sampler;
-
     // Create IDs
     let response_id = generate_id("resp");
     let message_id = generate_id("msg");
@@ -132,8 +134,12 @@ async fn handle_streaming_response(
         }};
     }
 
+    // Set up model
+    let models = runtime::models();
+    let model_name = models.first().map(|m| m.to_string()).unwrap_or_else(|| "unknown".to_string());
+
     // Create initial response object
-    let mut response = ResponseResource::new(response_id.clone());
+    let mut response = ResponseResource::new(response_id.clone(), model_name.clone());
 
     // Emit response.created
     emit!(emitter.response_created(&response));
@@ -162,45 +168,85 @@ async fn handle_streaming_response(
     // Emit response.content_part.added
     emit!(emitter.content_part_added(&message_id, 0, 0, &content_part));
 
-    // Set up model and generate token by token
-    let model = inferlet::get_auto_model();
-    let mut ctx = model.create_context();
-    let tokenizer = model.get_tokenizer();
+    // Load model
+    let model = match Model::load(&models[0]) {
+        Ok(m) => m,
+        Err(e) => {
+            response.status = ResponseStatus::Failed;
+            response.error = Some(ErrorPayload {
+                error_type: "server_error".to_string(),
+                code: Some("model_load_failed".to_string()),
+                message: format!("Failed to load model: {}", e),
+                param: None,
+            });
+            emit!(emitter.response_failed(&response));
+            emit!(StreamEmitter::done());
+            return Finished::finish(body, Ok(()), None);
+        }
+    };
+    let tokenizer = model.tokenizer();
 
-    // Fill context
+    let ctx = match Context::new(&model) {
+        Ok(c) => c,
+        Err(e) => {
+            response.status = ResponseStatus::Failed;
+            response.error = Some(ErrorPayload {
+                error_type: "server_error".to_string(),
+                code: Some("context_creation_failed".to_string()),
+                message: format!("Failed to create context: {}", e),
+                param: None,
+            });
+            emit!(emitter.response_failed(&response));
+            emit!(StreamEmitter::done());
+            return Finished::finish(body, Ok(()), None);
+        }
+    };
+
+    // Fill context using InstructExt
     if let Some(sys) = &system_message {
-        ctx.fill_system(sys);
+        ctx.system(sys);
     }
     for msg in &user_messages {
-        ctx.fill_user(msg);
+        ctx.user(msg);
+    }
+    ctx.cue();
+
+    // Flush the prompt
+    if let Err(e) = ctx.flush().await {
+        response.status = ResponseStatus::Failed;
+        response.error = Some(ErrorPayload {
+            error_type: "server_error".to_string(),
+            code: Some("flush_failed".to_string()),
+            message: format!("Flush failed: {}", e),
+            param: None,
+        });
+        emit!(emitter.response_failed(&response));
+        emit!(StreamEmitter::done());
+        return Finished::finish(body, Ok(()), None);
     }
 
-    let sampler = Sampler::top_p(temperature, top_p);
-    let stop_cond = max_len(max_tokens).or(ends_with_any(model.eos_tokens()));
+    let sampler = Sampler::TopP((temperature, top_p));
 
-    let mut generated_token_ids = Vec::new();
     let mut full_text = String::new();
+    let mut tokens_generated: usize = 0;
 
     // Token-by-token generation loop with TRUE streaming
-    loop {
-        let next_token_id = ctx.decode_step(&sampler).await;
-        ctx.fill_token(next_token_id);
-        generated_token_ids.push(next_token_id);
+    let mut stream = ctx.generate(sampler).with_max_tokens(max_tokens);
+    while let Ok(Some(tokens)) = stream.next().await {
+        tokens_generated += tokens.len();
+        let delta_text = tokenizer.decode(&tokens).unwrap_or_default();
 
-        // Decode just this token to get the delta text
-        let delta_text = tokenizer.detokenize(&[next_token_id]);
-
-        // Emit response.output_text.delta for this token (with flush!)
+        // Emit response.output_text.delta for this batch (with flush!)
         if !delta_text.is_empty() {
             emit!(emitter.output_text_delta(&message_id, 0, 0, &delta_text));
             full_text.push_str(&delta_text);
         }
-
-        // Check stop condition
-        if stop_cond.check(&generated_token_ids) {
-            break;
-        }
     }
+
+    // Determine if we hit max_tokens (incomplete) or finished naturally (completed)
+    let hit_max = tokens_generated >= max_tokens;
+    let item_status = if hit_max { ItemStatus::Incomplete } else { ItemStatus::Completed };
+    let response_status = if hit_max { ResponseStatus::Incomplete } else { ResponseStatus::Completed };
 
     // Emit response.output_text.done
     emit!(emitter.output_text_done(&message_id, 0, 0, &full_text));
@@ -218,7 +264,7 @@ async fn handle_streaming_response(
     let final_output_item = OutputItem::Message(OutputMessage {
         id: message_id.clone(),
         role: Role::Assistant,
-        status: ItemStatus::Completed,
+        status: item_status,
         content: vec![final_content_part],
     });
 
@@ -226,9 +272,13 @@ async fn handle_streaming_response(
     emit!(emitter.output_item_done(0, &final_output_item));
 
     // Update and emit response.completed
-    response.status = ResponseStatus::Completed;
+    response.status = response_status;
     response.output = vec![final_output_item];
-    emit!(emitter.response_completed(&response));
+    if hit_max {
+        emit!(emitter.response_completed(&response));
+    } else {
+        emit!(emitter.response_completed(&response));
+    }
 
     // Emit [DONE]
     emit!(StreamEmitter::done());
@@ -245,38 +295,66 @@ async fn handle_non_streaming_response(
     temperature: f32,
     top_p: f32,
 ) -> Finished {
-    use inferlet::stop_condition::{max_len, ends_with_any};
-    use inferlet::Sampler;
-
     // Create IDs
     let response_id = generate_id("resp");
     let message_id = generate_id("msg");
 
     // Set up model and generate
-    let model = inferlet::get_auto_model();
-    let mut ctx = model.create_context();
+    let models = runtime::models();
+    let model_name = models.first().map(|m| m.to_string()).unwrap_or_else(|| "unknown".to_string());
+    let model = match Model::load(&models[0]) {
+        Ok(m) => m,
+        Err(e) => {
+            return error_response(responder, 500, "server_error", &format!("Failed to load model: {}", e), None, None).await;
+        }
+    };
+    let tokenizer = model.tokenizer();
 
-    // Fill context
+    let ctx = match Context::new(&model) {
+        Ok(c) => c,
+        Err(e) => {
+            return error_response(responder, 500, "server_error", &format!("Failed to create context: {}", e), None, None).await;
+        }
+    };
+
+    // Fill context using InstructExt
     if let Some(sys) = &system_message {
-        ctx.fill_system(sys);
+        ctx.system(sys);
     }
     for msg in &user_messages {
-        ctx.fill_user(msg);
+        ctx.user(msg);
+    }
+    ctx.cue();
+
+    // Flush the prompt
+    if let Err(e) = ctx.flush().await {
+        return error_response(responder, 500, "server_error", &format!("Flush failed: {}", e), None, None).await;
     }
 
-    // Generate
-    let sampler = Sampler::top_p(temperature, top_p);
-    let stop_cond = max_len(max_tokens).or(ends_with_any(model.eos_tokens()));
+    // Generate token by token to count tokens for incomplete detection
+    let sampler = Sampler::TopP((temperature, top_p));
+    let mut stream = ctx.generate(sampler).with_max_tokens(max_tokens);
+    let mut full_text = String::new();
+    let mut tokens_generated: usize = 0;
 
-    let generated = ctx.generate(sampler, stop_cond).await;
+    while let Ok(Some(tokens)) = stream.next().await {
+        tokens_generated += tokens.len();
+        let text = tokenizer.decode(&tokens).unwrap_or_default();
+        full_text.push_str(&text);
+    }
+
+    // Determine if we hit max_tokens
+    let hit_max = tokens_generated >= max_tokens;
+    let item_status = if hit_max { ItemStatus::Incomplete } else { ItemStatus::Completed };
+    let response_status = if hit_max { ResponseStatus::Incomplete } else { ResponseStatus::Completed };
 
     // Build response
     let output_item = OutputItem::Message(OutputMessage {
         id: message_id,
         role: Role::Assistant,
-        status: ItemStatus::Completed,
+        status: item_status,
         content: vec![OutputContentPart::OutputText {
-            text: generated,
+            text: full_text,
             annotations: vec![],
         }],
     });
@@ -284,7 +362,8 @@ async fn handle_non_streaming_response(
     let response = ResponseResource {
         id: response_id,
         response_type: "response".to_string(),
-        status: ResponseStatus::Completed,
+        status: response_status,
+        model: model_name,
         output: vec![output_item],
         error: None,
         usage: None,
@@ -300,17 +379,21 @@ async fn handle_non_streaming_response(
     responder.respond(http_response).await
 }
 
-/// Return an error response
+/// Return an error response per OpenResponses spec
 async fn error_response(
     responder: Responder,
     status_code: u16,
     error_type: &str,
     message: &str,
+    code: Option<&str>,
+    param: Option<&str>,
 ) -> Finished {
     let error = serde_json::json!({
         "error": {
             "type": error_type,
             "message": message,
+            "code": code,
+            "param": param,
         }
     });
 

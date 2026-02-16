@@ -181,6 +181,8 @@ pub struct ResponseResource {
 
     pub status: ResponseStatus,
 
+    pub model: String,
+
     pub output: Vec<OutputItem>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,11 +193,12 @@ pub struct ResponseResource {
 }
 
 impl ResponseResource {
-    pub fn new(id: String) -> Self {
+    pub fn new(id: String, model: String) -> Self {
         Self {
             id,
             response_type: "response".to_string(),
             status: ResponseStatus::InProgress,
+            model,
             output: Vec::new(),
             error: None,
             usage: None,
@@ -274,7 +277,7 @@ pub struct Usage {
 }
 
 /// Error payload
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ErrorPayload {
     #[serde(rename = "type")]
     pub error_type: String,
