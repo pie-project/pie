@@ -1,14 +1,14 @@
-//! Simple text completion inferlet using chat-style prompting.
+//! Simple text completion inferlet.
 //!
-//! Demonstrates text generation with a system prompt and user message
-//! using the ContextExt high-level API.
+//! Demonstrates chat-style generation using the `InstructExt` +
+//! `EventStream` high-level API.
 
 use inferlet::{
     context::Context,
     inference::Sampler,
     model::Model,
     runtime,
-    ContextExt,
+    ContextExt, Event, InstructExt,
     Result,
 };
 
@@ -29,40 +29,41 @@ async fn main(args: Vec<String>) -> Result<String> {
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
 
-    // Create context and fill with messages
-    let context = Context::new(&model)?;
-    context
-        .fill_sys(&system_message)
-        .fill_user(&prompt)
-        .flush()
-        .await?;
+    // Create context and fill with instruct messages
+    let ctx = Context::new(&model)?;
+    ctx.system(&system_message);
+    ctx.user(&prompt);
+    ctx.cue();
 
-    eprintln!("[INFERLET] flush done, starting generate (max_tokens={})", max_tokens);
-
-    // Generate output stream
-    let mut stream = context
+    // Generate
+    let mut events = ctx
         .generate(Sampler::TopP((temperature, top_p)))
-        .with_max_tokens(max_tokens);
-    
-    let mut all_tokens = Vec::new();
-    let tokenizer = model.tokenizer();
+        .with_max_tokens(max_tokens)
+        .decode()
+        .with_reasoning();
 
-    // Stream tokens
+    let mut output = String::new();
+
     use std::io::Write;
-    while let Some(token) = stream.next().await? {
-        all_tokens.push(token);
-        
-        // Decode and print (simple partial decoding for now)
-        // In real app we'd handle accumulation properly
-        let text = tokenizer.decode(&[token])?;
-        print!("{}", text);
-        std::io::stdout().flush().ok();
-        
-        eprintln!("[INFERLET] token: {} {:?}", token, text);
+    while let Some(event) = events.next().await? {
+        match event {
+            Event::Thinking(s) => {
+                eprint!("{}", s);
+            }
+            Event::ThinkingDone(_) => {
+                eprintln!("\n--- end thinking ---");
+            }
+            Event::Text(s) => {
+                print!("{}", s);
+                std::io::stdout().flush().ok();
+            }
+            Event::Done(s) => {
+                output = s;
+                break;
+            }
+            _ => {}
+        }
     }
-    
-    let generated = tokenizer.decode(&all_tokens)?;
-    eprintln!("[INFERLET] generated {} bytes", generated.len());
-    
-    Ok(generated)
+
+    Ok(output)
 }

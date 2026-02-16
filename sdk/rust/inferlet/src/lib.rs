@@ -59,6 +59,18 @@ pub mod inference {
     pub use crate::pie::core::inference::*;
 }
 
+pub mod instruct {
+    pub mod chat {
+        pub use crate::pie::instruct::chat::*;
+    }
+    pub mod tool_use {
+        pub use crate::pie::instruct::tool_use::*;
+    }
+    pub mod reasoning {
+        pub use crate::pie::instruct::reasoning::*;
+    }
+}
+
 // =============================================================================
 // Async Extension Traits
 // =============================================================================
@@ -133,9 +145,46 @@ pub use context_ext::{
     // ContextExt trait (has Fill + Generate + async operations)
     ContextExt,
     // Supporting types
-    Message, ToolCall, ChatTemplate, SystemHandling, render_template,
-    TokenStream, Speculate, Speculation, Constrain,
+    TokenStream, EventStream, Speculate, Speculation, Constrain,
 };
+
+// =============================================================================
+// Instruct Extension Trait
+// =============================================================================
+
+mod instruct_ext;
+
+pub use instruct_ext::{
+    InstructExt,
+    // Unified decoder
+    Decoder, Event,
+    // Re-exported WIT decoder / event types
+    ChatDecoder, ChatEvent,
+    ToolDecoder, ToolEvent,
+    ReasoningDecoder, ReasoningEvent,
+};
+
+// =============================================================================
+// Model Extension Trait
+// =============================================================================
+
+/// Extension trait that adds convenience methods to [`Model`].
+pub trait ModelExt {
+    /// Create a [`Decoder`] for this model.
+    ///
+    /// ```ignore
+    /// let mut decoder = model.decoder()
+    ///     .with_reasoning()
+    ///     .with_tool_use();
+    /// ```
+    fn decoder(&self) -> Decoder;
+}
+
+impl ModelExt for model::Model {
+    fn decoder(&self) -> Decoder {
+        Decoder::new(self)
+    }
+}
 
 // =============================================================================
 // Argument Parsing (re-exported from pico_args)
@@ -162,6 +211,8 @@ pub mod prelude {
     
     // Extension traits
     pub use crate::ContextExt;
+    pub use crate::InstructExt;
+    pub use crate::ModelExt;
     pub use crate::AdapterExt;
     pub use crate::ForwardPassExt;
     pub use crate::SubscriptionExt;

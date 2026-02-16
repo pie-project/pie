@@ -2,12 +2,14 @@ package pie:inferlet;
 
 world imports {
     include pie:core/imports;
+    include pie:instruct/imports;
     include pie:mcp/imports;
     include pie:zo/imports;
 }
 
 world inferlet {
     include pie:core/imports;
+    include pie:instruct/imports;
     include pie:mcp/imports;
     include pie:zo/imports;
 }

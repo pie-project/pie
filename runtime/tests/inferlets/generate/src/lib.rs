@@ -39,9 +39,9 @@ async fn main(_args: Vec<String>) -> Result<String> {
         .with_max_tokens(max_tokens);
 
     let mut generated = Vec::new();
-    while let Some(token) = stream.next().await? {
-        eprintln!("[GENERATE] got token: {}", token);
-        generated.push(token);
+    while let Some(tokens) = stream.next().await? {
+        eprintln!("[GENERATE] got tokens: {:?}", tokens);
+        generated.extend(tokens);
     }
 
     let result = format!("generated {} tokens: {:?}", generated.len(), generated);

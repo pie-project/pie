@@ -2,7 +2,7 @@
 //!
 //! Provides high-level APIs for:
 //! - Acquiring context lock asynchronously
-//! - Filling context with prompt tokens
+//! - Filling context with raw tokens
 //! - Generating tokens with speculative decoding
 
 use crate::context::Context;
@@ -10,164 +10,10 @@ use crate::model::Model;
 use crate::inference::{ForwardPass, Output, Sampler};
 use crate::ForwardPassExt;
 use crate::Result;
-use serde::Serialize;
-use serde_json::Value;
 use wstd::io::AsyncPollable;
-use std::cell::RefCell;
 
 /// Simple counter for generating unique context names.
 static CONTEXT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Pending system message buffered by `fill_sys`.
-/// Drained by the next `fill_role` or `fill_user` call so that
-/// system + first message are rendered together in a single template call.
-thread_local! {
-    static PENDING_SYSTEM: RefCell<Option<Message>> = RefCell::new(None);
-}
-
-
-// =============================================================================
-// Supporting Types
-// =============================================================================
-
-/// Represents a single tool call.
-#[derive(Serialize, Clone, Debug)]
-pub struct ToolCall {
-    pub name: String,
-    pub arguments: Value,
-}
-
-/// Represents a message in the conversation for template rendering.
-#[derive(Serialize, Clone, Debug)]
-pub struct Message {
-    pub role: String,
-    pub content: String,
-    
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
-    
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
-}
-
-/// Re-export the WIT ChatTemplate and SystemHandling types.
-pub use crate::pie::core::model::{ChatTemplate, SystemHandling};
-
-/// Look up the role prefix for a given role in a ChatTemplate.
-fn prefix_for<'a>(ct: &'a ChatTemplate, role: &str) -> &'a str {
-    ct.role_prefixes
-        .iter()
-        .find(|(r, _)| r == role)
-        .map(|(_, p)| p.as_str())
-        .unwrap_or("")
-}
-
-/// Look up the role suffix for a given role in a ChatTemplate.
-fn suffix_for<'a>(ct: &'a ChatTemplate, role: &str) -> &'a str {
-    ct.role_suffixes
-        .iter()
-        .find(|(r, _)| r == role)
-        .map(|(_, s)| s.as_str())
-        .unwrap_or("")
-}
-
-/// Renders a conversation using a structured ChatTemplate.
-///
-/// Each message is rendered as: prefix(role) + content + suffix(role).
-/// System messages are handled according to `system_handling`:
-///   - Standalone: rendered as a regular turn with prefix/suffix.
-///   - MergeWithUser: content prepended to first user message.
-///   - BarePrepend: content placed raw before all turns.
-pub fn render_template(
-    ct: &ChatTemplate,
-    messages: &[Message],
-    add_generation_prompt: bool,
-    begin_of_sequence: bool,
-) -> String {
-    let mut out = String::new();
-
-    if begin_of_sequence {
-        out.push_str(&ct.start_token);
-    }
-
-    // Collect system content (for merge/bare-prepend modes).
-    let system_content: Option<&str> = match ct.system_handling {
-        SystemHandling::Standalone => None,
-        _ => messages.iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.as_str()),
-    };
-
-    // For bare-prepend, output system content immediately.
-    if ct.system_handling == SystemHandling::BarePrepend {
-        if let Some(sys) = system_content {
-            out.push_str(sys);
-        }
-    }
-
-    let mut first_user = true;
-
-    for msg in messages {
-        if msg.role == "system" {
-            match ct.system_handling {
-                SystemHandling::Standalone => {
-                    out.push_str(prefix_for(ct, "system"));
-                    out.push_str(&msg.content);
-                    out.push_str(suffix_for(ct, "system"));
-                }
-                _ => { /* handled via merge or bare-prepend */ }
-            }
-            continue;
-        }
-
-        let role = msg.role.as_str();
-        out.push_str(prefix_for(ct, role));
-
-        // Merge system content into first user message if needed.
-        if role == "user" && first_user && ct.system_handling == SystemHandling::MergeWithUser {
-            if let Some(sys) = system_content {
-                out.push_str(sys);
-                out.push_str(&ct.system_separator);
-            }
-            first_user = false;
-        }
-
-        // Render reasoning content if present.
-        if let Some(ref reasoning) = msg.reasoning_content {
-            if !ct.thinking_prefix.is_empty() {
-                out.push_str(&ct.thinking_prefix);
-                out.push_str(reasoning.trim());
-                out.push_str(&ct.thinking_suffix);
-            }
-        }
-
-        // Render tool calls if present.
-        if let Some(ref tool_calls) = msg.tool_calls {
-            if !ct.tool_calls_prefix.is_empty() {
-                out.push_str(&ct.tool_calls_prefix);
-            }
-            for tc in tool_calls {
-                let rendered = ct.tool_call_template
-                    .replace("{name}", &tc.name)
-                    .replace("{arguments}", &tc.arguments.to_string());
-                out.push_str(&rendered);
-            }
-            if !ct.tool_calls_suffix.is_empty() {
-                out.push_str(&ct.tool_calls_suffix);
-            }
-        } else {
-            out.push_str(&msg.content);
-        }
-
-        out.push_str(suffix_for(ct, role));
-    }
-
-    if add_generation_prompt {
-        out.push_str(&ct.generation_header);
-    }
-
-    out
-}
 
 // =============================================================================
 // Speculation Types
@@ -287,7 +133,6 @@ pub struct TokenStream<'a> {
     sampler: Sampler,
     speculation: Speculation,
     constraint: Option<Box<dyn Constrain>>,
-    pending_tokens: Vec<u32>,
     done: bool,
     max_tokens: Option<usize>,
     tokens_generated: usize,
@@ -313,7 +158,6 @@ impl<'a> TokenStream<'a> {
             sampler,
             speculation: Speculation::system(),
             constraint: None,
-            pending_tokens: Vec::new(),
             done: false,
             max_tokens: None,
             tokens_generated: 0,
@@ -337,8 +181,12 @@ impl<'a> TokenStream<'a> {
         self.max_tokens = Some(max_tokens);
         self
     }
-    /// Gets the next token from the stream.
-    pub async fn next(&mut self) -> Result<Option<u32>> {
+    /// Gets the next batch of generated tokens.
+    ///
+    /// Returns `Some(tokens)` with one or more tokens (speculative decoding
+    /// may accept multiple tokens per step), or `None` when generation is
+    /// complete (stop token or max tokens reached).
+    pub async fn next(&mut self) -> Result<Option<Vec<u32>>> {
         // Check max tokens limit
         if let Some(max) = self.max_tokens {
             if self.tokens_generated >= max {
@@ -346,48 +194,50 @@ impl<'a> TokenStream<'a> {
             }
         }
 
-        if let Some(token) = self.pending_tokens.pop() {
-            self.tokens_generated += 1;
-            return Ok(Some(token));
-        }
-
         if self.done {
             return Ok(None);
         }
 
-        let tokens = self.step().await?;
-        let first = tokens[0];
-        
-        // Check if first token is a stop token
-        if self.stop_tokens.contains(&first) {
-            self.done = true;
+        let mut tokens = self.step().await?;
+        if tokens.is_empty() {
             return Ok(None);
         }
 
-        if tokens.len() > 1 {
-            self.pending_tokens = tokens[1..].iter().copied().rev().collect();
+        // Truncate at the first stop token
+        if let Some(pos) = tokens.iter().position(|t| self.stop_tokens.contains(t)) {
+            tokens.truncate(pos);
+            self.done = true;
+            if tokens.is_empty() {
+                return Ok(None);
+            }
         }
 
-        self.tokens_generated += 1;
-        Ok(Some(first))
+        // Enforce max tokens limit
+        if let Some(max) = self.max_tokens {
+            let remaining = max - self.tokens_generated;
+            if tokens.len() > remaining {
+                tokens.truncate(remaining);
+                self.done = true;
+            }
+        }
+
+        self.tokens_generated += tokens.len();
+        Ok(Some(tokens))
     }
 
     /// Collects all tokens from the stream (until stop token or max_tokens limit).
     pub async fn collect_tokens(mut self) -> Result<Vec<u32>> {
-        let mut tokens = Vec::new();
-        while let Some(token) = self.next().await? {
-            tokens.push(token);
+        let mut all = Vec::new();
+        while let Some(tokens) = self.next().await? {
+            all.extend(tokens);
         }
-        Ok(tokens)
+        Ok(all)
     }
 
     /// Collects all tokens and decodes them to text.
-    pub async fn collect_text(mut self) -> Result<String> {
-        let mut tokens = Vec::new();
-        while let Some(token) = self.next().await? {
-            tokens.push(token);
-        }
+    pub async fn collect_text(self) -> Result<String> {
         let tokenizer = self.model.tokenizer();
+        let tokens = self.collect_tokens().await?;
         tokenizer.decode(&tokens)
     }
 
@@ -463,6 +313,74 @@ impl<'a> TokenStream<'a> {
 
         Ok(new_tokens)
     }
+
+    /// Transition into an [`EventStream`] by attaching a [`Decoder`].
+    ///
+    /// The resulting stream returns [`Event`]s directly — no raw token
+    /// IDs are exposed.
+    ///
+    /// ```ignore
+    /// let mut events = ctx.generate(sampler)
+    ///     .with_max_tokens(256)
+    ///     .decode()
+    ///     .with_reasoning()
+    ///     .with_tool_use();
+    ///
+    /// while let Some(event) = events.next().await? {
+    ///     match event {
+    ///         Event::Text(s) => print!("{}", s),
+    ///         Event::Done(_) => break,
+    ///         _ => {}
+    ///     }
+    /// }
+    /// ```
+    pub fn decode(self) -> EventStream<'a> {
+        EventStream::new(self)
+    }
+}
+
+// =============================================================================
+// EventStream
+// =============================================================================
+
+/// Fused token stream + decoder that yields [`Event`]s directly.
+///
+/// Created by calling [`TokenStream::decode()`]. Optionally chain
+/// [`.with_reasoning()`](EventStream::with_reasoning) and/or
+/// [`.with_tool_use()`](EventStream::with_tool_use) to enable
+/// additional decoding modes.
+pub struct EventStream<'a> {
+    stream: TokenStream<'a>,
+    decoder: crate::instruct_ext::Decoder,
+}
+
+impl<'a> EventStream<'a> {
+    fn new(stream: TokenStream<'a>) -> Self {
+        let decoder = crate::instruct_ext::Decoder::new(&stream.model);
+        Self { stream, decoder }
+    }
+
+    /// Enable reasoning (thinking block) decoding.
+    pub fn with_reasoning(mut self) -> Self {
+        self.decoder = self.decoder.with_reasoning();
+        self
+    }
+
+    /// Enable tool-use decoding.
+    pub fn with_tool_use(mut self) -> Self {
+        self.decoder = self.decoder.with_tool_use();
+        self
+    }
+
+    /// Get the next event from the stream.
+    ///
+    /// Returns `None` when generation is complete.
+    pub async fn next(&mut self) -> Result<Option<crate::instruct_ext::Event>> {
+        match self.stream.next().await? {
+            Some(tokens) => self.decoder.feed(&tokens).map(Some),
+            None => Ok(None),
+        }
+    }
 }
 
 // =============================================================================
@@ -492,29 +410,6 @@ pub trait ContextExt {
     
     // --- Fill Operations ---
     
-    /// Adds a message with the specified role to the context.
-    /// Renders with `add_generation_prompt=false` — use for conversation history replay.
-    fn fill_role(&self, role: &str, message: &str) -> &Self;
-    
-    /// Adds a user message and the generation prompt (e.g. `<|im_start|>assistant\n`).
-    /// Use this as the **last** fill call before `generate()`.
-    fn fill_user(&self, message: &str) -> &Self;
-    
-    /// Buffers a system message to be rendered together with the next message.
-    /// This ensures correct output for templates that extract system content
-    /// (e.g. Gemma2 prepends system to first user via `loop.first`).
-    fn fill_sys(&self, message: &str) -> &Self;
-    
-    /// Adds an assistant message to the context (no generation prompt).
-    fn fill_assistant(&self, message: &str) -> &Self {
-        self.fill_role("assistant", message)
-    }
-    
-    /// Adds a tool message to the context (no generation prompt).
-    fn fill_tool(&self, message: &str) -> &Self {
-        self.fill_role("tool", message)
-    }
-    
     /// Fills the context with raw token IDs (appends to buffered tokens).
     fn fill_tokens(&self, tokens: &[u32]) -> &Self;
     
@@ -542,67 +437,6 @@ impl ContextExt for Context {
     }
     
     // --- Fill Operations ---
-    
-    fn fill_sys(&self, message: &str) -> &Self {
-        let msg = Message {
-            role: "system".to_string(),
-            content: message.to_string(),
-            reasoning_content: None,
-            tool_calls: None,
-        };
-        PENDING_SYSTEM.with(|cell| {
-            *cell.borrow_mut() = Some(msg);
-        });
-        self
-    }
-    
-    fn fill_role(&self, role: &str, message: &str) -> &Self {
-        let model = self.model();
-        let ct = model.chat_template();
-        let tokenizer = model.tokenizer();
-        
-        let msg = Message {
-            role: role.to_string(),
-            content: message.to_string(),
-            reasoning_content: None,
-            tool_calls: None,
-        };
-        let bos = self.buffered_tokens().is_empty();
-        // If there's a pending system message, batch it with this message.
-        let pending_sys = PENDING_SYSTEM.with(|cell| cell.borrow_mut().take());
-        let messages: Vec<Message> = match pending_sys {
-            Some(sys) => vec![sys, msg],
-            None => vec![msg],
-        };
-        let formatted = render_template(&ct, &messages, false, bos);
-        let tokens = tokenizer.encode(&formatted);
-        self.append_buffered_tokens(&tokens);
-        self
-    }
-    
-    fn fill_user(&self, message: &str) -> &Self {
-        let model = self.model();
-        let ct = model.chat_template();
-        let tokenizer = model.tokenizer();
-        
-        let msg = Message {
-            role: "user".to_string(),
-            content: message.to_string(),
-            reasoning_content: None,
-            tool_calls: None,
-        };
-        let bos = self.buffered_tokens().is_empty();
-        // If there's a pending system message, batch it with this message.
-        let pending_sys = PENDING_SYSTEM.with(|cell| cell.borrow_mut().take());
-        let messages: Vec<Message> = match pending_sys {
-            Some(sys) => vec![sys, msg],
-            None => vec![msg],
-        };
-        let formatted = render_template(&ct, &messages, true, bos);
-        let tokens = tokenizer.encode(&formatted);
-        self.append_buffered_tokens(&tokens);
-        self
-    }
     
     fn fill_tokens(&self, tokens: &[u32]) -> &Self {
         self.append_buffered_tokens(tokens);
@@ -668,362 +502,3 @@ impl ContextExt for Context {
     }
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn msg(role: &str, content: &str) -> Message {
-        Message {
-            role: role.into(),
-            content: content.into(),
-            reasoning_content: None,
-            tool_calls: None,
-        }
-    }
-
-    fn qwen3() -> ChatTemplate {
-        ChatTemplate {
-            start_token: "".into(),
-            stop_tokens: vec!["<|im_end|>".into(), "<|im_start|>".into(), "<|endoftext|>".into()],
-            role_prefixes: vec![("system".into(), "<|im_start|>system
-".into()), ("user".into(), "<|im_start|>user
-".into()), ("assistant".into(), "<|im_start|>assistant
-".into())],
-            role_suffixes: vec![("system".into(), "<|im_end|>
-".into()), ("user".into(), "<|im_end|>
-".into()), ("assistant".into(), "<|im_end|>
-".into())],
-            system_handling: SystemHandling::Standalone,
-            system_separator: "".into(),
-            generation_header: "<|im_start|>assistant
-".into(),
-            thinking_prefix: "<think>
-".into(),
-            thinking_suffix: "</think>
-".into(),
-            tool_call_template: "<tool_call>\\n{\"name\":\"{name}\",\"arguments\": {arguments}}\\n</tool_call>".into(),
-            tool_calls_prefix: "".into(),
-            tool_calls_suffix: "".into(),
-            tool_response_role: "user".into(),
-            tool_response_prefix: "<tool_response>
-".into(),
-            tool_response_suffix: "
-</tool_response>".into(),
-        }
-    }
-
-    fn llama3() -> ChatTemplate {
-        ChatTemplate {
-            start_token: "".into(),
-            stop_tokens: vec!["<|eot_id|>".into(), "<|end_of_text|>".into()],
-            role_prefixes: vec![("system".into(), "<|start_header_id|>system<|end_header_id|>
-".into()), ("user".into(), "<|start_header_id|>user<|end_header_id|>
-".into()), ("assistant".into(), "<|start_header_id|>assistant<|end_header_id|>
-".into()), ("ipython".into(), "<|start_header_id|>ipython<|end_header_id|>
-".into())],
-            role_suffixes: vec![("system".into(), "<|eot_id|>
-".into()), ("user".into(), "<|eot_id|>
-".into()), ("assistant".into(), "<|eot_id|>
-".into()), ("ipython".into(), "<|eot_id|>
-".into())],
-            system_handling: SystemHandling::Standalone,
-            system_separator: "".into(),
-            generation_header: "<|start_header_id|>assistant<|end_header_id|>
-".into(),
-            thinking_prefix: "<think>
-".into(),
-            thinking_suffix: "</think>
-".into(),
-            tool_call_template: "".into(),
-            tool_calls_prefix: "".into(),
-            tool_calls_suffix: "".into(),
-            tool_response_role: "".into(),
-            tool_response_prefix: "".into(),
-            tool_response_suffix: "".into(),
-        }
-    }
-
-    fn r1() -> ChatTemplate {
-        ChatTemplate {
-            start_token: "<｜begin▁of▁sentence｜>".into(),
-            stop_tokens: vec!["<｜end▁of▁sentence｜>".into()],
-            role_prefixes: vec![("user".into(), "<｜User｜>".into()), ("assistant".into(), "<｜Assistant｜>".into())],
-            role_suffixes: vec![("user".into(), "".into()), ("assistant".into(), "<｜end▁of▁sentence｜>".into())],
-            system_handling: SystemHandling::BarePrepend,
-            system_separator: "".into(),
-            generation_header: "<｜Assistant｜><think>
-".into(),
-            thinking_prefix: "".into(),
-            thinking_suffix: "".into(),
-            tool_call_template: "".into(),
-            tool_calls_prefix: "".into(),
-            tool_calls_suffix: "".into(),
-            tool_response_role: "".into(),
-            tool_response_prefix: "".into(),
-            tool_response_suffix: "".into(),
-        }
-    }
-
-    fn gemma2() -> ChatTemplate {
-        ChatTemplate {
-            start_token: "<bos>
-".into(),
-            stop_tokens: vec!["<end_of_turn>".into(), "<eos>".into()],
-            role_prefixes: vec![("user".into(), "<start_of_turn>user
-".into()), ("assistant".into(), "<start_of_turn>model
-".into())],
-            role_suffixes: vec![("user".into(), "<end_of_turn>
-".into()), ("assistant".into(), "<end_of_turn>
-".into())],
-            system_handling: SystemHandling::MergeWithUser,
-            system_separator: "
-
-".into(),
-            generation_header: "<start_of_turn>model
-".into(),
-            thinking_prefix: "".into(),
-            thinking_suffix: "".into(),
-            tool_call_template: "".into(),
-            tool_calls_prefix: "".into(),
-            tool_calls_suffix: "".into(),
-            tool_response_role: "".into(),
-            tool_response_prefix: "".into(),
-            tool_response_suffix: "".into(),
-        }
-    }
-
-    fn mistral3() -> ChatTemplate {
-        ChatTemplate {
-            start_token: "<s>
-".into(),
-            stop_tokens: vec!["</s>".into()],
-            role_prefixes: vec![("user".into(), "[INST] ".into()), ("assistant".into(), "".into())],
-            role_suffixes: vec![("user".into(), " [/INST]".into()), ("assistant".into(), "</s>".into())],
-            system_handling: SystemHandling::MergeWithUser,
-            system_separator: "
-
-".into(),
-            generation_header: "".into(),
-            thinking_prefix: "".into(),
-            thinking_suffix: "".into(),
-            tool_call_template: "".into(),
-            tool_calls_prefix: "".into(),
-            tool_calls_suffix: "".into(),
-            tool_response_role: "".into(),
-            tool_response_prefix: "".into(),
-            tool_response_suffix: "".into(),
-        }
-    }
-
-    fn olmo3() -> ChatTemplate {
-        ChatTemplate {
-            start_token: "".into(),
-            stop_tokens: vec!["<|im_end|>".into()],
-            role_prefixes: vec![("system".into(), "<|im_start|>system
-".into()), ("user".into(), "<|im_start|>user
-".into()), ("assistant".into(), "<|im_start|>assistant
-".into())],
-            role_suffixes: vec![("system".into(), "<|im_end|>
-".into()), ("user".into(), "<|im_end|>
-".into()), ("assistant".into(), "<|im_end|>
-".into())],
-            system_handling: SystemHandling::Standalone,
-            system_separator: "".into(),
-            generation_header: "<|im_start|>assistant
-".into(),
-            thinking_prefix: "<think>
-".into(),
-            thinking_suffix: "</think>
-".into(),
-            tool_call_template: "".into(),
-            tool_calls_prefix: "".into(),
-            tool_calls_suffix: "".into(),
-            tool_response_role: "".into(),
-            tool_response_prefix: "".into(),
-            tool_response_suffix: "".into(),
-        }
-    }
-
-    // ── Qwen 3 ──────────────────────────────────────────────────────
-
-    #[test]
-    fn qwen3_system_user() {
-        let ct = qwen3();
-        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.ends_with("<|im_start|>assistant\n"), "got: {:?}", out);
-        assert!(out.contains("<|im_start|>system\nYou are helpful.<|im_end|>"));
-        assert!(out.contains("<|im_start|>user\nHello<|im_end|>"));
-    }
-
-    #[test]
-    fn qwen3_multi_turn() {
-        let ct = qwen3();
-        let messages = vec![msg("system", "You are helpful."), msg("user", "What is 2+2?"), msg("assistant", "4"), msg("user", "And 3+3?")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.ends_with("<|im_start|>assistant\n"), "got: {:?}", out);
-        assert!(out.contains("<|im_start|>assistant\n4<|im_end|>"));
-        assert!(out.contains("<|im_start|>user\nAnd 3+3?<|im_end|>"));
-    }
-
-    #[test]
-    fn qwen3_no_generation_prompt() {
-        let ct = qwen3();
-        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
-        let out = render_template(&ct, &messages, false, false);
-        assert!(!out.ends_with("<|im_start|>assistant\n"), "should not end with gen prompt: {:?}", out);
-    }
-
-    #[test]
-    fn qwen3_incremental_matches_full() {
-        let ct = qwen3();
-        let sys = render_template(&ct, &[msg("system", "Be concise.")], false, false);
-        let usr = render_template(&ct, &[msg("user", "Hi")], true, false);
-        let incremental = format!("{}{}", sys, usr);
-        let full = render_template(&ct, &[msg("system", "Be concise."), msg("user", "Hi")], true, false);
-        assert_eq!(incremental, full, "\nincremental:\n{}\nfull:\n{}", incremental, full);
-    }
-
-    #[test]
-    fn qwen3_incremental_multi_turn() {
-        let ct = qwen3();
-        let sys = render_template(&ct, &[msg("system", "Be concise.")], false, false);
-        let u1 = render_template(&ct, &[msg("user", "What is 2+2?")], false, false);
-        let a1 = render_template(&ct, &[msg("assistant", "4")], false, false);
-        let u2 = render_template(&ct, &[msg("user", "And 3+3?")], true, false);
-        let incremental = format!("{}{}{}{}", sys, u1, a1, u2);
-        let full = render_template(&ct, &[msg("system", "Be concise."), msg("user", "What is 2+2?"), msg("assistant", "4"), msg("user", "And 3+3?")], true, false);
-        assert_eq!(incremental, full);
-    }
-
-    // ── Llama 3 ─────────────────────────────────────────────────────
-
-    #[test]
-    fn llama3_system_user() {
-        let ct = llama3();
-        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.contains("<|start_header_id|>system<|end_header_id|>"));
-        assert!(out.contains("<|start_header_id|>user<|end_header_id|>"));
-        assert!(out.contains("<|start_header_id|>assistant<|end_header_id|>"), "got: {:?}", out);
-    }
-
-    #[test]
-    fn llama3_multi_turn() {
-        let ct = llama3();
-        let messages = vec![msg("system", "Be brief."), msg("user", "Hi"), msg("assistant", "Hello!"), msg("user", "Bye")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.contains("Hello!"));
-        assert!(out.contains("<|eot_id|>"));
-        assert!(out.contains("<|start_header_id|>assistant<|end_header_id|>"));
-    }
-
-    #[test]
-    fn llama3_incremental_matches_full() {
-        let ct = llama3();
-        let sys = render_template(&ct, &[msg("system", "Be brief.")], false, false);
-        let usr = render_template(&ct, &[msg("user", "Hi")], true, false);
-        let incremental = format!("{}{}", sys, usr);
-        let full = render_template(&ct, &[msg("system", "Be brief."), msg("user", "Hi")], true, false);
-        assert_eq!(incremental, full);
-    }
-
-    // ── DeepSeek R1 ─────────────────────────────────────────────────
-
-    #[test]
-    fn r1_system_user() {
-        let ct = r1();
-        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.contains("You are helpful."));
-        assert!(out.contains("<｜User｜>Hello"));
-        assert!(out.ends_with("<｜Assistant｜><think>\n"), "got: {:?}", out);
-    }
-
-    #[test]
-    fn r1_with_bos() {
-        let ct = r1();
-        let messages = vec![msg("system", "Sys"), msg("user", "Hi")];
-        let out = render_template(&ct, &messages, true, true);
-        assert!(out.starts_with("<｜begin▁of▁sentence｜>"), "got: {:?}", out);
-    }
-
-    #[test]
-    fn r1_multi_turn() {
-        let ct = r1();
-        let messages = vec![msg("system", "Sys"), msg("user", "Q1"), msg("assistant", "A1"), msg("user", "Q2")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.contains("<｜User｜>Q1"));
-        assert!(out.contains("<｜Assistant｜>A1<｜end▁of▁sentence｜>"));
-        assert!(out.contains("<｜User｜>Q2"));
-        assert!(out.ends_with("<｜Assistant｜><think>\n"));
-    }
-
-    // ── Gemma 2/3 ───────────────────────────────────────────────────
-
-    #[test]
-    fn gemma2_system_user() {
-        let ct = gemma2();
-        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.contains("<start_of_turn>user"), "got: {:?}", out);
-        assert!(out.contains("Hello"));
-        assert!(out.contains("<start_of_turn>model"));
-    }
-
-    #[test]
-    fn gemma2_multi_turn() {
-        let ct = gemma2();
-        let messages = vec![msg("system", "Sys"), msg("user", "Q1"), msg("assistant", "A1"), msg("user", "Q2")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.contains("<start_of_turn>model\nA1<end_of_turn>"));
-        assert!(out.contains("Q2<end_of_turn>"));
-        assert!(out.ends_with("<start_of_turn>model\n"), "got: {:?}", out);
-    }
-
-    // ── Mistral 3 ───────────────────────────────────────────────────
-
-    #[test]
-    fn mistral3_system_user() {
-        let ct = mistral3();
-        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.contains("[INST]"), "got: {:?}", out);
-        assert!(out.contains("Hello"));
-    }
-
-    #[test]
-    fn mistral3_multi_turn() {
-        let ct = mistral3();
-        let messages = vec![msg("system", "Sys"), msg("user", "Q1"), msg("assistant", "A1"), msg("user", "Q2")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.contains("A1</s>"));
-        assert!(out.contains("Q2 [/INST]"));
-    }
-
-    // ── OLMo 3 ──────────────────────────────────────────────────────
-
-    #[test]
-    fn olmo3_system_user() {
-        let ct = olmo3();
-        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.contains("<|im_start|>system\nYou are helpful.<|im_end|>"));
-        assert!(out.contains("<|im_start|>user\nHello<|im_end|>"));
-        assert!(out.contains("<|im_start|>assistant\n"));
-    }
-
-    #[test]
-    fn olmo3_multi_turn() {
-        let ct = olmo3();
-        let messages = vec![msg("system", "Sys"), msg("user", "Q1"), msg("assistant", "A1"), msg("user", "Q2")];
-        let out = render_template(&ct, &messages, true, false);
-        assert!(out.contains("<|im_start|>assistant\nA1<|im_end|>"));
-        assert!(out.contains("<|im_start|>user\nQ2<|im_end|>"));
-    }
-
-}
