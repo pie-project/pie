@@ -1,127 +1,91 @@
 """
-Sampler configuration for token generation.
+Sampler presets mapping to the WIT sampler variant.
+
+The WIT sampler is a discriminated union:
+  - multinomial(temperature, seed)
+  - top-k(temperature, k)
+  - top-p(temperature, p)
+  - min-p(temperature, p)
+  - top-k-top-p(temperature, k, p)
+  - embedding
+  - dist(temperature, seed)
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from wit_world.imports.inference import (
+    Sampler_Dist,
+    Sampler_Embedding,
+    Sampler_MinP,
+    Sampler_Multinomial,
+    Sampler_TopK,
+    Sampler_TopKTopP,
+    Sampler_TopP,
+)
+from wit_world.imports.inference import Sampler as WitSampler
 
 
-@dataclass
 class Sampler:
-    """
-    Sampling configuration for token generation.
+    """Sampler presets.
 
-    Attributes:
-        temperature: Controls randomness. 0 = deterministic, higher = more random.
-        top_p: Nucleus sampling threshold (0-1). Only consider tokens with
-               cumulative probability <= top_p.
-        top_k: Only consider the top k most probable tokens.
-        min_p: Minimum probability threshold (0-1).
+    Usage::
+
+        Sampler.greedy()
+        Sampler.top_p(temperature=0.8, top_p=0.9)
+        Sampler.top_k(temperature=0.7, top_k=40)
     """
 
-    temperature: float = 1.0
-    top_p: float = 1.0
-    top_k: int = 0
-    min_p: float = 0.0
+    __slots__ = ("_variant",)
+
+    def __init__(self, variant: WitSampler) -> None:
+        self._variant = variant
+
+    # --- Presets ---
 
     @classmethod
-    def greedy(cls) -> "Sampler":
-        """
-        Create a greedy sampler (always picks most probable token).
-        """
-        return cls(temperature=0.0)
+    def greedy(cls) -> Sampler:
+        """Deterministic (greedy) sampling."""
+        return cls(Sampler_Multinomial((0.0, 1)))
 
     @classmethod
-    def default(cls) -> "Sampler":
-        """
-        Create a sampler with balanced defaults.
-        """
-        return cls(temperature=0.7, top_p=0.95)
+    def top_p(cls, temperature: float = 0.6, top_p: float = 0.95) -> Sampler:
+        """Nucleus (top-p) sampling."""
+        return cls(Sampler_TopP((temperature, top_p)))
 
     @classmethod
-    def creative(cls) -> "Sampler":
-        """
-        Create a more creative/diverse sampler.
-        """
-        return cls(temperature=1.0, top_p=0.95)
+    def top_k(cls, temperature: float = 0.6, top_k: int = 50) -> Sampler:
+        """Top-k sampling."""
+        return cls(Sampler_TopK((temperature, top_k)))
 
     @classmethod
-    def top_p_sampling(cls, p: float = 0.95, temperature: float = 0.7) -> "Sampler":
-        """
-        Create a top-p (nucleus) sampler.
-
-        Args:
-            p: Cumulative probability threshold
-            temperature: Temperature for sampling
-        """
-        return cls(top_p=p, temperature=temperature)
+    def min_p(cls, temperature: float = 0.6, min_p: float = 0.1) -> Sampler:
+        """Min-p sampling."""
+        return cls(Sampler_MinP((temperature, min_p)))
 
     @classmethod
-    def top_k_sampling(cls, k: int = 40, temperature: float = 0.7) -> "Sampler":
-        """
-        Create a top-k sampler.
-
-        Args:
-            k: Number of top tokens to consider
-            temperature: Temperature for sampling
-        """
-        return cls(top_k=k, temperature=temperature)
-
-    @classmethod
-    def min_p_sampling(cls, min_p: float = 0.1, temperature: float = 0.7) -> "Sampler":
-        """
-        Create a min-p sampler.
-
-        Min-p sampling filters out tokens with probability below min_p * max_prob,
-        where max_prob is the probability of the most likely token.
-
-        Args:
-            min_p: Minimum probability threshold (relative to max probability)
-            temperature: Temperature for sampling
-        """
-        return cls(min_p=min_p, temperature=temperature)
+    def top_k_top_p(
+        cls,
+        temperature: float = 0.6,
+        top_k: int = 50,
+        top_p: float = 0.95,
+    ) -> Sampler:
+        """Combined top-k + top-p sampling."""
+        return cls(Sampler_TopKTopP((temperature, top_k, top_p)))
 
     @classmethod
-    def reasoning(cls) -> "Sampler":
-        """
-        Create a sampler optimized for reasoning tasks.
+    def multinomial(cls, temperature: float = 1.0, seed: int = 0) -> Sampler:
+        """Plain multinomial sampling."""
+        return cls(Sampler_Multinomial((temperature, seed)))
 
-        Uses conservative sampling settings (top_k=20, top_p=0.95, temperature=0.6)
-        to produce coherent, focused outputs suitable for chain-of-thought reasoning.
-        """
-        return cls(temperature=0.6, top_k=20, top_p=0.95)
+    @classmethod
+    def embedding(cls) -> Sampler:
+        """Embedding output mode (no sampling — returns hidden states)."""
+        return cls(Sampler_Embedding())
 
-    def with_temperature(self, temperature: float) -> "Sampler":
-        """Return a new sampler with updated temperature."""
-        return Sampler(
-            temperature=temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            min_p=self.min_p,
-        )
+    @classmethod
+    def dist(cls, temperature: float = 1.0, seed: int = 0) -> Sampler:
+        """Distribution output mode (returns full probability distribution)."""
+        return cls(Sampler_Dist((temperature, seed)))
 
-    def with_top_p(self, top_p: float) -> "Sampler":
-        """Return a new sampler with updated top_p."""
-        return Sampler(
-            temperature=self.temperature,
-            top_p=top_p,
-            top_k=self.top_k,
-            min_p=self.min_p,
-        )
-
-    def with_top_k(self, top_k: int) -> "Sampler":
-        """Return a new sampler with updated top_k."""
-        return Sampler(
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=top_k,
-            min_p=self.min_p,
-        )
-
-    def with_min_p(self, min_p: float) -> "Sampler":
-        """Return a new sampler with updated min_p."""
-        return Sampler(
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            min_p=min_p,
-        )
+    def __repr__(self) -> str:
+        return f"Sampler({self._variant})"

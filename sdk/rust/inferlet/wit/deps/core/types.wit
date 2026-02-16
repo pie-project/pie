@@ -4,6 +4,8 @@ interface types {
 
     type error = string;
 
+    type blob = list<u8>;
+
     // Result of a synchronization attempt
     resource future-bool {
         pollable: func() -> pollable;               // Returns a pollable for async readiness checks
@@ -17,6 +19,11 @@ interface types {
 
         // Retrieves the message if available; None if not ready
         get: func() -> option<string>;
+    }
+
+    resource future-blob {
+        pollable: func() -> pollable;
+        get: func() -> option<blob>;
     }
 
 }

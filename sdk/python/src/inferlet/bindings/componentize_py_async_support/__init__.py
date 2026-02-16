@@ -11,20 +11,13 @@ from typing import Any, Optional, TypeVar, TypeVarTuple, Callable, IO, Literal, 
 from contextvars import ContextVar, Context
 from collections.abc import Coroutine, Awaitable, Sequence
 from asyncio.protocols import BaseProtocol
-from asyncio.transports import (
-    Transport,
-    WriteTransport,
-    DatagramTransport,
-    SubprocessTransport,
-    ReadTransport,
-)
+from asyncio.transports import Transport, WriteTransport, DatagramTransport, SubprocessTransport, ReadTransport
 from asyncio.base_events import Server
 
 try:
     from ssl import SSLContext
 except:
     pass
-
 
 @dataclass
 class _FutureState:
@@ -33,19 +26,16 @@ class _FutureState:
     handles: list[asyncio.Handle]
     pending_count: int
 
-
 class _ReturnCode:
     COMPLETED = 0
     DROPPED = 1
     CANCELLED = 2
-
 
 class _CallbackCode:
     EXIT = 0
     YIELD = 1
     WAIT = 2
     POLL = 3
-
 
 class _Event:
     NONE = 0
@@ -56,7 +46,6 @@ class _Event:
     FUTURE_WRITE = 5
     CANCELLED = 6
 
-
 class _Status:
     STARTING = 0
     STARTED = 1
@@ -64,16 +53,13 @@ class _Status:
     START_CANCELLED = 3
     RETURN_CANCELLED = 4
 
-
 _T = TypeVar("_T")
 _Ts = TypeVarTuple("_Ts")
 _ProtocolT = TypeVar("_ProtocolT", bound=BaseProtocol)
 
-
 async def _noop() -> None:
     pass
-
-
+    
 class _Loop(asyncio.AbstractEventLoop):
     def __init__(self) -> None:
         self.running: bool = False
@@ -86,13 +72,13 @@ class _Loop(asyncio.AbstractEventLoop):
             for handle in handles:
                 if not handle._cancelled:
                     handle._run()
-
+                
             if self.exception is not None:
                 raise self.exception
 
             if len(handles) == 0 and len(future_state.handles) == 0:
                 return
-
+    
     def get_debug(self) -> bool:
         return False
 
@@ -112,14 +98,12 @@ class _Loop(asyncio.AbstractEventLoop):
         return _noop()
 
     def call_exception_handler(self, context: dict[str, Any]) -> None:
-        self.exception = context.get("exception", None)
+        self.exception = context.get('exception', None)
 
-    def call_soon(
-        self,
-        callback: Callable[[*_Ts], object],
-        *args: *_Ts,
-        context: Context | None = None,
-    ) -> asyncio.Handle:
+    def call_soon(self,
+                  callback: Callable[[*_Ts], object],
+                  *args: *_Ts,
+                  context: Context | None = None) -> asyncio.Handle:
         global _future_state
 
         if context is not None:
@@ -130,12 +114,7 @@ class _Loop(asyncio.AbstractEventLoop):
         else:
             raise AssertionError
 
-    def create_task(
-        self,
-        coroutine: Coroutine[Any, Any, _T],
-        name: str | None = None,
-        context: Context | None = None,
-    ) -> asyncio.Task[_T]:
+    def create_task(self, coroutine: Coroutine[Any, Any, _T], name: str | None = None, context: Context | None = None) -> asyncio.Task[_T]:
         return asyncio.Task(coroutine, loop=self, context=context)
 
     def create_future(self) -> asyncio.Future[Any]:
@@ -152,194 +131,180 @@ class _Loop(asyncio.AbstractEventLoop):
     async def shutdown_default_executor(self) -> None:
         raise NotImplementedError
 
-    def call_later(
-        self,
-        delay: float,
-        callback: Callable[[*_Ts], object],
-        *args: *_Ts,
-        context: Context | None = None,
-    ) -> asyncio.TimerHandle:
+    def call_later(self,
+                   delay: float,
+                   callback: Callable[[*_Ts], object],
+                   *args: *_Ts,
+                   context: Context | None = None) -> asyncio.TimerHandle:
         raise NotImplementedError
 
-    def call_at(
-        self,
-        when: float,
-        callback: Callable[[*_Ts], object],
-        *args: *_Ts,
-        context: Context | None = None,
-    ) -> asyncio.TimerHandle:
+    def call_at(self,
+                when: float,
+                callback: Callable[[*_Ts], object],
+                *args: *_Ts,
+                context: Context | None = None) -> asyncio.TimerHandle:
         raise NotImplementedError
 
     def time(self) -> float:
         raise NotImplementedError
 
-    def call_soon_threadsafe(
-        self,
-        callback: Callable[[*_Ts], object],
-        *args: *_Ts,
-        context: Context | None = None,
-    ) -> asyncio.Handle:
+    def call_soon_threadsafe(self,
+                             callback: Callable[[*_Ts], object],
+                             *args: *_Ts,
+                             context: Context | None = None) -> asyncio.Handle:
         raise NotImplementedError
 
-    def run_in_executor(
-        self, executor: Executor | None, func: Callable[[*_Ts], _T], *args: *_Ts
-    ) -> asyncio.Future[_T]:
+    def run_in_executor(self,
+                        executor: Executor | None,
+                        func: Callable[[*_Ts], _T],
+                        *args: *_Ts) -> asyncio.Future[_T]:
         raise NotImplementedError
 
     def set_default_executor(self, executor: Executor) -> None:
         raise NotImplementedError
 
     async def getaddrinfo(
-        self,
-        host: bytes | str | None,
-        port: bytes | str | int | None,
-        *,
-        family: int = 0,
-        type: int = 0,
-        proto: int = 0,
-        flags: int = 0,
-    ) -> list[
-        tuple[
-            AddressFamily,
-            SocketKind,
-            int,
-            str,
-            tuple[str, int] | tuple[str, int, int, int],
-        ]
-    ]:
+            self,
+            host: bytes | str | None,
+            port: bytes | str | int | None,
+            *,
+            family: int = 0,
+            type: int = 0,
+            proto: int = 0,
+            flags: int = 0,
+    ) -> list[tuple[AddressFamily, SocketKind, int, str, tuple[str, int] | tuple[str, int, int, int]]]:
         raise NotImplementedError
 
-    async def getnameinfo(
-        self, sockaddr: tuple[str, int] | tuple[str, int, int, int], flags: int = 0
-    ) -> tuple[str, str]:
+    async def getnameinfo(self,
+                          sockaddr: tuple[str, int] | tuple[str, int, int, int],
+                          flags: int = 0) -> tuple[str, str]:
         raise NotImplementedError
-
+    
     async def create_connection(
-        self,
-        protocol_factory: Callable[[], _ProtocolT],
-        host: str | None = ...,
-        port: int | None = ...,
-        *,
-        ssl: bool | SSLContext | None = None,
-        family: int = 0,
-        proto: int = 0,
-        flags: int = 0,
-        sock: socket | None = None,
-        local_addr: tuple[str, int] | None = None,
-        server_hostname: str | None = None,
-        ssl_handshake_timeout: float | None = None,
-        ssl_shutdown_timeout: float | None = None,
-        happy_eyeballs_delay: float | None = None,
-        interleave: int | None = None,
+            self,
+            protocol_factory: Callable[[], _ProtocolT],
+            host: str | None = ...,
+            port: int | None = ...,
+            *,
+            ssl: bool | SSLContext | None = None,
+            family: int = 0,
+            proto: int = 0,
+            flags: int = 0,
+            sock: socket | None = None,
+            local_addr: tuple[str, int] | None = None,
+            server_hostname: str | None = None,
+            ssl_handshake_timeout: float | None = None,
+            ssl_shutdown_timeout: float | None = None,
+            happy_eyeballs_delay: float | None = None,
+            interleave: int | None = None,
     ) -> tuple[Transport, _ProtocolT]:
         raise NotImplementedError
-
+    
     async def create_server(
-        self,
-        protocol_factory: Callable[[], BaseProtocol],
-        host: str | Sequence[str] | None = None,
-        port: int | None = None,
-        *,
-        family: int = AddressFamily.AF_UNSPEC,
-        flags: int = AddressInfo.AI_PASSIVE,
-        sock: socket | None = ...,
-        backlog: int = 100,
-        ssl: bool | SSLContext | None = None,
-        reuse_address: bool | None = None,
-        reuse_port: bool | None = None,
-        keep_alive: bool | None = None,
-        ssl_handshake_timeout: float | None = None,
-        ssl_shutdown_timeout: float | None = None,
-        start_serving: bool = True,
+            self,
+            protocol_factory: Callable[[], BaseProtocol],
+            host: str | Sequence[str] | None = None,
+            port: int | None = None,
+            *,
+            family: int = AddressFamily.AF_UNSPEC,
+            flags: int = AddressInfo.AI_PASSIVE,
+            sock: socket | None = ...,
+            backlog: int = 100,
+            ssl: bool | SSLContext | None = None,
+            reuse_address: bool | None = None,
+            reuse_port: bool | None = None,
+            keep_alive: bool | None = None,
+            ssl_handshake_timeout: float | None = None,
+            ssl_shutdown_timeout: float | None = None,
+            start_serving: bool = True,
     ) -> Server:
         raise NotImplementedError
 
-    async def sendfile(
-        self,
-        transport: WriteTransport,
-        file: IO[bytes],
-        offset: int = 0,
-        count: int | None = None,
-        *,
-        fallback: bool = True,
+    async def sendfile(self,
+                       transport: WriteTransport,
+                       file: IO[bytes],
+                       offset: int = 0,
+                       count: int | None = None,
+                       *,
+                       fallback: bool = True
     ) -> int:
         raise NotImplementedError
 
     async def start_tls(
-        self,
-        transport: WriteTransport,
-        protocol: BaseProtocol,
-        sslcontext: SSLContext,
-        *,
-        server_side: bool = False,
-        server_hostname: str | None = None,
-        ssl_handshake_timeout: float | None = None,
-        ssl_shutdown_timeout: float | None = None,
-    ) -> Transport | None:
+            self,
+            transport: WriteTransport,
+            protocol: BaseProtocol,
+            sslcontext: SSLContext,
+            *,
+            server_side: bool = False,
+            server_hostname: str | None = None,
+            ssl_handshake_timeout: float | None = None,
+            ssl_shutdown_timeout: float | None = None,
+        ) -> Transport | None:
         raise NotImplementedError
 
     async def create_unix_connection(
-        self,
-        protocol_factory: Callable[[], _ProtocolT],
-        path: str | None = None,
-        *,
-        ssl: bool | SSLContext | None = None,
-        sock: socket | None = None,
-        server_hostname: str | None = None,
-        ssl_handshake_timeout: float | None = None,
-        ssl_shutdown_timeout: float | None = None,
-    ) -> tuple[Transport, _ProtocolT]:
+            self,
+            protocol_factory: Callable[[], _ProtocolT],
+            path: str | None = None,
+            *,
+            ssl: bool | SSLContext | None = None,
+            sock: socket | None = None,
+            server_hostname: str | None = None,
+            ssl_handshake_timeout: float | None = None,
+            ssl_shutdown_timeout: float | None = None,
+        ) -> tuple[Transport, _ProtocolT]:
         raise NotImplementedError
 
     async def create_unix_server(
-        self,
-        protocol_factory: Callable[[], BaseProtocol],
-        path: str | PathLike[str] | None = None,
-        *,
-        sock: socket | None = None,
-        backlog: int = 100,
-        ssl: bool | SSLContext | None = None,
-        ssl_handshake_timeout: float | None = None,
-        ssl_shutdown_timeout: float | None = None,
-        start_serving: bool = True,
+            self,
+            protocol_factory: Callable[[], BaseProtocol],
+            path: str | PathLike[str] | None = None,
+            *,
+            sock: socket | None = None,
+            backlog: int = 100,
+            ssl: bool | SSLContext | None = None,
+            ssl_handshake_timeout: float | None = None,
+            ssl_shutdown_timeout: float | None = None,
+            start_serving: bool = True,
     ) -> Server:
         raise NotImplementedError
 
     async def connect_accepted_socket(
-        self,
-        protocol_factory: Callable[[], _ProtocolT],
-        sock: socket,
-        *,
-        ssl: bool | SSLContext | None = None,
-        ssl_handshake_timeout: float | None = None,
-        ssl_shutdown_timeout: float | None = None,
-    ) -> tuple[Transport, _ProtocolT]:
+            self,
+            protocol_factory: Callable[[], _ProtocolT],
+            sock: socket,
+            *,
+            ssl: bool | SSLContext | None = None,
+            ssl_handshake_timeout: float | None = None,
+            ssl_shutdown_timeout: float | None = None,
+        ) -> tuple[Transport, _ProtocolT]:
         raise NotImplementedError
 
     async def create_datagram_endpoint(
-        self,
-        protocol_factory: Callable[[], _ProtocolT],
-        local_addr: tuple[str, int] | str | None = None,
-        remote_addr: tuple[str, int] | str | None = None,
-        *,
-        family: int = 0,
-        proto: int = 0,
-        flags: int = 0,
-        reuse_address: bool | None = None,
-        reuse_port: bool | None = None,
-        allow_broadcast: bool | None = None,
-        sock: socket | None = None,
+            self,
+            protocol_factory: Callable[[], _ProtocolT],
+            local_addr: tuple[str, int] | str | None = None,
+            remote_addr: tuple[str, int] | str | None = None,
+            *,
+            family: int = 0,
+            proto: int = 0,
+            flags: int = 0,
+            reuse_address: bool | None = None,
+            reuse_port: bool | None = None,
+            allow_broadcast: bool | None = None,
+            sock: socket | None = None,
     ) -> tuple[DatagramTransport, _ProtocolT]:
         raise NotImplementedError
 
-    async def connect_read_pipe(
-        self, protocol_factory: Callable[[], _ProtocolT], pipe: Any
-    ) -> tuple[ReadTransport, _ProtocolT]:
+    async def connect_read_pipe(self,
+                                protocol_factory: Callable[[], _ProtocolT],
+                                pipe: Any) ->  tuple[ReadTransport, _ProtocolT]:
         raise NotImplementedError
 
-    async def connect_write_pipe(
-        self, protocol_factory: Callable[[], _ProtocolT], pipe: Any
-    ) -> tuple[WriteTransport, _ProtocolT]:
+    async def connect_write_pipe(self,
+                                 protocol_factory: Callable[[], _ProtocolT],
+                                 pipe: Any) -> tuple[WriteTransport, _ProtocolT]:
         raise NotImplementedError
 
     async def subprocess_shell(
@@ -398,9 +363,7 @@ class _Loop(asyncio.AbstractEventLoop):
     async def sock_recvfrom(self, sock: socket, bufsize: int) -> tuple[bytes, Any]:
         raise NotImplementedError
 
-    async def sock_recvfrom_into(
-        self, sock: socket, buf: Any, nbytes: int = 0
-    ) -> tuple[int, Any]:
+    async def sock_recvfrom_into(self, sock: socket, buf: Any, nbytes: int = 0) -> tuple[int, Any]:
         raise NotImplementedError
 
     async def sock_sendall(self, sock: socket, data: Any) -> None:
@@ -416,19 +379,17 @@ class _Loop(asyncio.AbstractEventLoop):
         raise NotImplementedError
 
     async def sock_sendfile(
-        self,
-        sock: socket,
-        file: IO[bytes],
-        offset: int = 0,
-        count: int | None = None,
-        *,
-        fallback: bool | None = None,
+            self,
+            sock: socket,
+            file: IO[bytes],
+            offset: int = 0,
+            count: int | None = None,
+            *,
+            fallback: bool | None = None
     ) -> int:
         raise NotImplementedError
 
-    def add_signal_handler(
-        self, sig: int, callback: Callable[[*_Ts], object], *args: *_Ts
-    ) -> None:
+    def add_signal_handler(self, sig: int, callback: Callable[[*_Ts], object], *args: *_Ts) -> None:
         raise NotImplementedError
 
     def remove_signal_handler(self, sig: int) -> bool:
@@ -451,20 +412,17 @@ class _Loop(asyncio.AbstractEventLoop):
 
     def set_debug(self, enabled: bool) -> None:
         raise NotImplementedError
-
-
+        
 _future_state: ContextVar[_FutureState] = ContextVar("_future_state")
 _loop = _Loop()
 asyncio.set_event_loop(_loop)
 _loop.running = True
 asyncio.events._set_running_loop(_loop)
 
-
 def _set_future_state(future_state: _FutureState) -> None:
     global _future_state
 
     _future_state.set(future_state)
-
 
 async def _return_result(export_index: int, borrows: int, coroutine: Any) -> None:
     global _future_state
@@ -482,16 +440,12 @@ async def _return_result(export_index: int, borrows: int, coroutine: Any) -> Non
     assert _future_state.get().pending_count > 0
     _future_state.get().pending_count -= 1
 
-
 def first_poll(export_index: int, borrows: int, coroutine: Any) -> int:
     context = Context()
     future_state = _FutureState(None, {}, [], 1)
     context.run(_set_future_state, future_state)
-    asyncio.create_task(
-        _return_result(export_index, borrows, coroutine), context=context
-    )
+    asyncio.create_task(_return_result(export_index, borrows, coroutine), context=context)
     return _poll(future_state)
-
 
 def _poll(future_state: _FutureState) -> int:
     global _loop
@@ -501,7 +455,7 @@ def _poll(future_state: _FutureState) -> int:
     if future_state.pending_count == 0:
         if future_state.waitable_set is not None:
             componentize_py_runtime.waitable_set_drop(future_state.waitable_set)
-
+        
         return _CallbackCode.EXIT
     else:
         waitable_set = future_state.waitable_set
@@ -509,11 +463,10 @@ def _poll(future_state: _FutureState) -> int:
         componentize_py_runtime.context_set(future_state)
         return _CallbackCode.WAIT | (waitable_set << 4)
 
-
 def callback(event0: int, event1: int, event2: int) -> int:
     future_state = componentize_py_runtime.context_get()
     componentize_py_runtime.context_set(None)
-
+    
     match event0:
         case _Event.NONE:
             pass
@@ -530,12 +483,7 @@ def callback(event0: int, event1: int, event2: int) -> int:
                 case _:
                     # todo
                     raise NotImplementedError
-        case (
-            _Event.STREAM_READ
-            | _Event.STREAM_WRITE
-            | _Event.FUTURE_READ
-            | _Event.FUTURE_WRITE
-        ):
+        case _Event.STREAM_READ | _Event.STREAM_WRITE | _Event.FUTURE_READ | _Event.FUTURE_WRITE:
             componentize_py_runtime.waitable_join(event1, 0)
             future_state.futures.pop(event1).set_result(event2)
         case _:
@@ -543,12 +491,11 @@ def callback(event0: int, event1: int, event2: int) -> int:
             raise NotImplementedError
 
     return _poll(future_state)
-
-
+    
 async def await_result[T](result: Result[T, tuple[int, int]]) -> T:
     global _loop
     global _future_state
-
+    
     if isinstance(result, Ok):
         return result.value
     else:
@@ -556,15 +503,12 @@ async def await_result[T](result: Result[T, tuple[int, int]]) -> T:
         waitable, promise = result.value
         future = _loop.create_future()
         future_state.futures[waitable] = future
-
+        
         if future_state.waitable_set is None:
             future_state.waitable_set = componentize_py_runtime.waitable_set_new()
         componentize_py_runtime.waitable_join(waitable, future_state.waitable_set)
-
-        return cast(
-            T, componentize_py_runtime.promise_get_result(await future, promise)
-        )
-
+        
+        return cast(T, componentize_py_runtime.promise_get_result(await future, promise))
 
 async def _wrap_spawned(coroutine: Any) -> None:
     global _future_state
@@ -577,10 +521,9 @@ async def _wrap_spawned(coroutine: Any) -> None:
     assert _future_state.get().pending_count > 0
     _future_state.get().pending_count -= 1
 
-
 def spawn(coroutine: Any) -> None:
     global _future_state
 
     _future_state.get().pending_count += 1
-
+    
     asyncio.create_task(_wrap_spawned(coroutine))

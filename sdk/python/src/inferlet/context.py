@@ -1,985 +1,645 @@
-"""
-Context class for managing conversation state and text generation.
+"""Context, TokenStream, EventStream — the core of the inferlet SDK.
+
+Usage::
+
+    from inferlet import Model, Context, Sampler, Event, runtime
+
+    model = Model.load(runtime.models()[0])
+    ctx = Context(model)
+
+    ctx.system("You are helpful.")
+    ctx.user("Hello!")
+
+    # One-shot generation
+    text = await ctx.generate_text(Sampler.top_p())
+
+    # Streaming with events
+    async for event in await ctx.generate(Sampler.top_p(), decode=True):
+        match event:
+            case Event.Text(text=t):
+                print(t, end="")
+            case Event.Done():
+                break
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterator
+from typing import AsyncIterator
 
-from .model import Model, Queue
-from .tokenizer import Tokenizer
-from .chat import ChatFormatter
-from .kv_page import KvPageManager
+from wit_world.imports import context as _ctx
+from wit_world.imports import inference as _inf
+from wit_world.imports import chat as _chat
+from wit_world.imports import tool_use as _tool
+from wit_world.imports import reasoning as _reasoning
+
+from ._async import await_future
+from .model import Model, Tokenizer
 from .sampler import Sampler
-from .brle import Brle
 
-if TYPE_CHECKING:
-    from .forward import ForwardPass
-    from .drafter import Drafter
+# Global counter for auto-generated context names
+_NAME_SEQ = 0
 
 
-@dataclass
-class GenerateResult:
-    """Result of text generation."""
+def _next_name() -> str:
+    global _NAME_SEQ
+    _NAME_SEQ += 1
+    return f"ctx-{_NAME_SEQ:08x}"
 
-    text: str
-    tokens: list[int]
-    finish_reason: str  # "stop", "max_tokens", "eos"
+
+# =============================================================================
+# Event types
+# =============================================================================
+
+
+class Event:
+    """Discriminated union of generation events.
+
+    Match with ``match``/``case``::
+
+        match event:
+            case Event.Text(text=t):
+                print(t, end="")
+            case Event.Done(text=full):
+                break
+    """
+
+    __slots__ = ()
+
+    @dataclass(slots=True)
+    class Text:
+        """A chunk of generated text."""
+        text: str
+
+    @dataclass(slots=True)
+    class Thinking:
+        """A chunk of reasoning / thinking text."""
+        text: str
+
+    @dataclass(slots=True)
+    class ThinkingDone:
+        """Reasoning complete — ``text`` is the full accumulated reasoning."""
+        text: str
+
+    @dataclass(slots=True)
+    class ToolCallStart:
+        """A tool call has been detected (more tokens expected)."""
+        pass
+
+    @dataclass(slots=True)
+    class ToolCall:
+        """A complete tool call."""
+        name: str
+        arguments: str
+
+    @dataclass(slots=True)
+    class Done:
+        """Generation complete — ``text`` is the full accumulated text."""
+        text: str
+
+
+# Type alias for event instances
+AnyEvent = (
+    Event.Text
+    | Event.Thinking
+    | Event.ThinkingDone
+    | Event.ToolCallStart
+    | Event.ToolCall
+    | Event.Done
+)
+
+
+# =============================================================================
+# Decoder (unified mux of chat + reasoning + tool-use decoders)
+# =============================================================================
+
+
+class Decoder:
+    """Unified decoder muxing chat, reasoning, and tool-use WIT decoders.
+
+    Event priority:
+    1. Reasoning transitions (start/complete) override chat deltas.
+    2. Tool calls override chat deltas.
+    3. Chat done is always forwarded.
+    4. Otherwise, chat deltas are forwarded as ``Event.Text``.
+    """
+
+    __slots__ = ("_chat_dec", "_reasoning_dec", "_tool_dec", "_in_reasoning")
+
+    def __init__(
+        self,
+        model: Model,
+        *,
+        reasoning: bool = False,
+        tool_use: bool = False,
+    ) -> None:
+        self._chat_dec = _chat.create_decoder(model._handle)
+        self._reasoning_dec = _reasoning.create_decoder(model._handle) if reasoning else None
+        self._tool_dec = _tool.create_decoder(model._handle) if tool_use else None
+        self._in_reasoning = False
+
+    def feed(self, tokens: list[int]) -> AnyEvent:
+        """Feed a batch of token IDs and return a unified event."""
+        # Always feed the chat decoder
+        chat_event = self._chat_dec.feed(tokens)
+
+        # Check reasoning first (highest priority)
+        if self._reasoning_dec is not None:
+            reasoning_event = self._reasoning_dec.feed(tokens)
+            if isinstance(reasoning_event, _reasoning.Event_Start):
+                self._in_reasoning = True
+                return Event.Thinking("")
+            elif isinstance(reasoning_event, _reasoning.Event_Delta):
+                if self._in_reasoning and reasoning_event.value:
+                    return Event.Thinking(reasoning_event.value)
+            elif isinstance(reasoning_event, _reasoning.Event_Complete):
+                self._in_reasoning = False
+                return Event.ThinkingDone(reasoning_event.value)
+
+        # Check tool use (second priority)
+        if self._tool_dec is not None:
+            tool_event = self._tool_dec.feed(tokens)
+            if isinstance(tool_event, _tool.Event_Start):
+                return Event.ToolCallStart()
+            elif isinstance(tool_event, _tool.Event_Call):
+                name, args = tool_event.value
+                return Event.ToolCall(name=name, arguments=args)
+
+        # Fall through to chat events
+        if isinstance(chat_event, _chat.Event_Done):
+            return Event.Done(chat_event.value)
+        elif isinstance(chat_event, _chat.Event_Delta):
+            return Event.Text(chat_event.value)
+        elif isinstance(chat_event, _chat.Event_Interrupt):
+            return Event.Done("")
+
+        # Should not reach here
+        return Event.Text("")
+
+    def reset(self) -> None:
+        """Reset all sub-decoders."""
+        self._chat_dec.reset()
+        self._in_reasoning = False
+        if self._reasoning_dec is not None:
+            self._reasoning_dec.reset()
+        if self._tool_dec is not None:
+            self._tool_dec.reset()
+
+
+# =============================================================================
+# Page management helpers
+# =============================================================================
+
+
+async def _reserve_and_run(
+    ctx_handle,
+    model_handle,
+    tokens: list[int],
+    seq_start: int,
+    cursor: int,
+    page_size: int,
+    sampler_variant=None,
+    logit_mask: list[int] | None = None,
+):
+    """Reserve pages, run a forward pass, commit pages, update cursor.
+
+    If ``sampler_variant`` is provided, sampling is applied at the last
+    position.  Returns the Output (or None if no sampler was given).
+    """
+    num_tokens = len(tokens)
+
+    # Reserve pages
+    total_tokens = cursor + num_tokens
+    pages_needed = (total_tokens + page_size - 1) // page_size
+    if pages_needed > 0:
+        ctx_handle.reserve_pages(pages_needed)
+
+    # Build forward pass
+    fwd = _inf.ForwardPass(model_handle)
+    fwd.context(ctx_handle)
+    fwd.input_tokens(tokens, list(range(seq_start, seq_start + num_tokens)))
+
+    if sampler_variant is not None:
+        fwd.sampler([num_tokens - 1], sampler_variant)
+
+    if logit_mask is not None:
+        fwd.logit_mask(logit_mask)
+
+    # Execute
+    future = fwd.execute()
+    output = await await_future(future, "Forward pass failed")
+
+    # Commit pages and update cursor
+    new_cursor_abs = cursor + num_tokens
+    pages_to_commit = new_cursor_abs // page_size
+    if pages_to_commit > 0:
+        ctx_handle.commit_pages(list(range(pages_to_commit)))
+
+    ctx_handle.set_cursor(new_cursor_abs % page_size)
+
+    return output
+
+
+# =============================================================================
+# TokenStream
+# =============================================================================
+
+
+class TokenStream:
+    """Async iterator of generated token batches.
+
+    Created by ``Context.generate(sampler)``. Handles the full generation
+    loop internally: page reservation, forward pass, page commit, cursor
+    update.
+
+    Usage::
+
+        async for tokens in await ctx.generate(Sampler.top_p(), max_tokens=256):
+            print(tokens)
+    """
+
+    __slots__ = (
+        "_ctx",
+        "_model_handle",
+        "_page_size",
+        "_stop_tokens",
+        "_sampler",
+        "_logit_mask",
+        "_done",
+        "_max_tokens",
+        "_tokens_generated",
+    )
+
+    def __init__(
+        self,
+        ctx: Context,
+        sampler: Sampler,
+        *,
+        max_tokens: int | None = None,
+        logit_mask: list[int] | None = None,
+    ) -> None:
+        self._ctx = ctx
+        self._model_handle = ctx._handle.model()
+        self._page_size: int = ctx._handle.tokens_per_page()
+        self._stop_tokens: frozenset[int] = frozenset(_chat.stop_tokens(self._model_handle))
+        self._sampler = sampler
+        self._logit_mask = logit_mask
+        self._done = False
+        self._max_tokens = max_tokens
+        self._tokens_generated = 0
+
+    # --- Generation ---
+
+    async def _step(self) -> list[int]:
+        """One generation step: forward pass → sample → commit."""
+        raw = self._ctx._handle
+        buffered = raw.buffered_tokens()
+        if not buffered:
+            raise RuntimeError("generate requires at least one buffered token")
+
+        last_pos = raw.last_position()
+        seq_start = (last_pos + 1) if last_pos is not None else 0
+
+        output = await _reserve_and_run(
+            raw,
+            self._model_handle,
+            buffered,
+            seq_start,
+            raw.cursor(),
+            self._page_size,
+            sampler_variant=self._sampler._variant,
+            logit_mask=self._logit_mask,
+        )
+
+        # Extract tokens from output
+        new_tokens = self._extract_tokens(output)
+        if not new_tokens:
+            return []
+
+        # Set the last generated token as the next input
+        raw.set_buffered_tokens([new_tokens[-1]])
+
+        return new_tokens
+
+    @staticmethod
+    def _extract_tokens(output) -> list[int]:
+        """Pull token IDs from the ``Output`` variant."""
+        if isinstance(output, _inf.Output_Tokens):
+            return list(output.value)
+        elif isinstance(output, _inf.Output_TokensWithSpeculation):
+            accepted, _, _ = output.value
+            return list(accepted)
+        return []
+
+    # --- Convenience ---
+
+    async def text(self) -> str:
+        """Consume the stream, decode, and return full text."""
+        tokenizer = Tokenizer(self._model_handle.tokenizer())
+        return tokenizer.decode(await self.tokens())
+
+    async def tokens(self) -> list[int]:
+        """Consume the stream and return all tokens as a flat list."""
+        all_tokens: list[int] = []
+        async for batch in self:
+            all_tokens.extend(batch)
+        return all_tokens
+
+    # Deprecated aliases
+    collect_text = text
+    collect_tokens = tokens
+
+    # --- Iterator protocol ---
+
+    def __aiter__(self) -> AsyncIterator[list[int]]:
+        return self
+
+    async def __anext__(self) -> list[int]:
+        if self._done:
+            raise StopAsyncIteration
+
+        if self._max_tokens is not None and self._tokens_generated >= self._max_tokens:
+            raise StopAsyncIteration
+
+        tokens = await self._step()
+        if not tokens:
+            raise StopAsyncIteration
+
+        # Truncate at stop token
+        for i, t in enumerate(tokens):
+            if t in self._stop_tokens:
+                tokens = tokens[:i]
+                self._done = True
+                if not tokens:
+                    raise StopAsyncIteration
+                break
+
+        # Enforce max tokens
+        if self._max_tokens is not None:
+            remaining = self._max_tokens - self._tokens_generated
+            if len(tokens) > remaining:
+                tokens = tokens[:remaining]
+                self._done = True
+
+        self._tokens_generated += len(tokens)
+        return tokens
+
+
+# =============================================================================
+# EventStream
+# =============================================================================
+
+
+class EventStream:
+    """Async decoded event stream wrapping a ``TokenStream`` + ``Decoder``.
+
+    Created by ``Context.generate(sampler, decode=True)``.
+
+    Usage::
+
+        async for event in await ctx.generate(Sampler.top_p(), decode=True, reasoning=True):
+            match event:
+                case Event.Text(text=t):
+                    print(t, end="")
+    """
+
+    __slots__ = ("_stream", "_decoder")
+
+    def __init__(
+        self,
+        stream: TokenStream,
+        *,
+        reasoning: bool = False,
+        tool_use: bool = False,
+    ) -> None:
+        self._stream = stream
+        model = Model(stream._model_handle)
+        self._decoder = Decoder(model, reasoning=reasoning, tool_use=tool_use)
+
+    def __aiter__(self) -> AsyncIterator[AnyEvent]:
+        return self
+
+    async def __anext__(self) -> AnyEvent:
+        tokens = await self._stream.__anext__()
+        return self._decoder.feed(tokens)
+
+
+# =============================================================================
+# Context
+# =============================================================================
 
 
 class Context:
+    """Host-managed conversation context.
+
+    Wraps ``pie:core/context`` and ``pie:instruct/*``.
+
+    Usage::
+
+        ctx = Context(model)
+        ctx.system("You are helpful.")
+        ctx.user("Tell me a joke.")
+
+        async for event in await ctx.generate(Sampler.top_p(), decode=True):
+            ...
     """
-    High-level context for managing conversation and text generation.
 
-    Provides a fluent API for building prompts and generating text.
+    __slots__ = ("_handle", "_model")
 
-    Example:
-        model = get_auto_model()
-        with Context(model) as ctx:
-            ctx.system("You are a helpful assistant.")
-            ctx.user("What is Python?")
-            result = ctx.generate(max_tokens=100)
-            print(result.text)
-    """
+    def __init__(
+        self,
+        model: Model,
+        name: str | None = None,
+        fill: list[int] | None = None,
+    ) -> None:
+        """Create a new context.
 
-    def __init__(self, model: Model) -> None:
+        Args:
+            model: The model to create a context for.
+            name: Optional name (auto-generated if omitted).
+            fill: Optional initial token IDs.
+        """
+        ctx_name = name or _next_name()
+        self._handle = _ctx.Context.create(model._handle, ctx_name, fill)
         self._model = model
-        self._queue = model.create_queue()
-        self._tokenizer = model.tokenizer
-        self._formatter = ChatFormatter(model)
-        self._kv_manager = KvPageManager(self._queue, model.kv_page_size)
-
-        self._messages: list[tuple[str, str]] = []
-        self._token_ids: list[int] = []
-        self._pending_tokens: list[int] = []
-
-        # Attention mask tracking (mirrors JS/Rust implementation)
-        self._token_mask_current = Brle.new(0)
-        self._token_mask_pending: list[Brle] = []
-
-        self._position_ids: list[int] = []
-        self._begin_of_sequence = True
-
-        # Adapter state for LoRA inference
-        self._adapter_ptr: int | None = None
-        self._adapter_random_seed: int | None = None
 
     @classmethod
-    def from_imported_state(
-        cls,
-        model: Model,
-        kv_page_ptrs: list[int],
-        prefix_tokens: list[int],
-        kv_page_last_len: int,
-    ) -> "Context":
+    def lookup(cls, model: Model, name: str) -> Context | None:
+        """Look up an existing context by name."""
+        raw = _ctx.Context.lookup(model._handle, name)
+        if raw is None:
+            return None
+        obj = object.__new__(cls)
+        obj._handle = raw
+        obj._model = model
+        return obj
+
+    # --- Fill (ContextExt) ---
+
+    def fill(self, text: str) -> None:
+        """Fill the context buffer with text (encodes to tokens)."""
+        tokenizer = self._model.tokenizer()
+        tokens = tokenizer.encode(text)
+        self._handle.append_buffered_tokens(tokens)
+
+    def fill_tokens(self, tokens: list[int]) -> None:
+        """Fill the context buffer with raw token IDs."""
+        self._handle.append_buffered_tokens(tokens)
+
+    async def flush(self) -> None:
+        """Flush buffered tokens: run forward pass and commit pages.
+
+        Processes all buffered tokens except the last one (which stays
+        as the seed for the next generation step).
         """
-        Creates a new Context from previously exported and now imported KV pages.
-        This is used to restore a context's state from a cache.
-
-        Args:
-            model: The model to use
-            kv_page_ptrs: Imported KV page pointers
-            prefix_tokens: Token IDs that are already in the KV cache
-            kv_page_last_len: Length of the last KV page
-
-        Returns:
-            A new Context with the imported state
-        """
-        kv_page_size = model.kv_page_size
-
-        # Validate kv_page_last_len is within valid range
-        if kv_page_last_len < 0 or kv_page_last_len > kv_page_size:
-            raise ValueError(
-                f"kv_page_last_len out of range: expected 0..{kv_page_size}, "
-                f"got {kv_page_last_len}"
-            )
-
-        # Handle empty state and validate kv_page_ptrs/kv_page_last_len consistency
-        if len(kv_page_ptrs) == 0:
-            if kv_page_last_len != 0:
-                raise ValueError(
-                    f"Invalid state: kv_page_ptrs is empty but kv_page_last_len is "
-                    f"{kv_page_last_len} (must be 0 when kv_page_ptrs is empty)"
-                )
-            expected_tokens = 0
-        else:
-            expected_tokens = (len(kv_page_ptrs) - 1) * kv_page_size + kv_page_last_len
-
-        # Verify the token count matches the KV page state
-        if len(prefix_tokens) != expected_tokens:
-            raise ValueError(
-                f"Token count mismatch: expected {expected_tokens}, "
-                f"got {len(prefix_tokens)} (kv_page_ptrs.length={len(kv_page_ptrs)}, "
-                f"kv_page_last_len={kv_page_last_len}, kv_page_size={kv_page_size})"
-            )
-
-        ctx = cls(model)
-        ctx._token_ids = list(prefix_tokens)
-        ctx._position_ids = list(range(len(prefix_tokens)))
-
-        # Import pages into manager
-        ctx._kv_manager.import_pages_from_state(kv_page_ptrs, kv_page_last_len)
-
-        ctx._token_mask_current = Brle.new(len(prefix_tokens))
-        ctx._begin_of_sequence = False
-
-        return ctx
-
-    @property
-    def model(self) -> Model:
-        """The model being used."""
-        return self._model
-
-    @property
-    def queue(self) -> Queue:
-        """The command queue."""
-        return self._queue
-
-    @property
-    def tokenizer(self) -> Tokenizer:
-        """The tokenizer."""
-        return self._tokenizer
-
-    @property
-    def token_ids(self) -> list[int]:
-        """All committed token IDs."""
-        return self._token_ids.copy()
-
-    @property
-    def kv_page_ptrs(self) -> list[int]:
-        """The KV page pointers currently in use."""
-        return self._kv_manager.page_ptrs
-
-    @property
-    def kv_page_last_len(self) -> int:
-        """The length of the last KV page."""
-        return self._kv_manager.last_page_len
-
-    @property
-    def text(self) -> str:
-        """The text representation of all tokens."""
-        return self._tokenizer.decode(self._token_ids)
-
-    # ==============================
-    # Adapter methods (LoRA support)
-    # ==============================
-
-    def set_adapter(self, adapter_ptr: int) -> None:
-        """
-        Set the adapter pointer for LoRA inference.
-
-        Args:
-            adapter_ptr: Pointer to an allocated adapter resource
-        """
-        self._adapter_ptr = adapter_ptr
-
-    def remove_adapter(self) -> None:
-        """Remove the current adapter."""
-        self._adapter_ptr = None
-
-    def set_adapter_random_seed(self, seed: int) -> None:
-        """
-        Set the random seed for adapter perturbation.
-
-        Args:
-            seed: Random seed for deterministic perturbation
-        """
-        self._adapter_random_seed = seed
-
-    def __enter__(self) -> "Context":
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self.clear()
-
-    # ==============================
-    # Message building (fluent API)
-    # ==============================
-
-    def system(self, content: str) -> "Context":
-        """
-        Add a system message.
-
-        Args:
-            content: The system message content
-
-        Returns:
-            self for method chaining
-        """
-        self._messages.append(("system", content))
-        return self
-
-    def user(self, content: str) -> "Context":
-        """
-        Add a user message.
-
-        Args:
-            content: The user message content
-
-        Returns:
-            self for method chaining
-        """
-        self._messages.append(("user", content))
-        return self
-
-    def assistant(self, content: str) -> "Context":
-        """
-        Add an assistant message.
-
-        Args:
-            content: The assistant message content
-
-        Returns:
-            self for method chaining
-        """
-        self._messages.append(("assistant", content))
-        return self
-
-    def fill(self, text: str) -> "Context":
-        """
-        Fill with raw text (tokenizes and adds to pending).
-
-        Args:
-            text: Text to add
-
-        Returns:
-            self for method chaining
-        """
-        tokens = self._tokenizer.encode(text)
-        self.fill_tokens(tokens)
-        return self
-
-    def fill_tokens(self, tokens: list[int]) -> "Context":
-        """
-        Fill with raw token IDs.
-
-        Args:
-            tokens: Token IDs to add
-
-        Returns:
-            self for method chaining
-        """
-        n = len(tokens)
-        self._pending_tokens.extend(tokens)
-
-        # Build attention masks incrementally (false = can attend)
-        for _ in range(n):
-            self._token_mask_current.append(False)
-            self._token_mask_pending.append(self._token_mask_current.clone())
-
-        self._begin_of_sequence = False
-        return self
-
-    def fill_token(self, token_id: int) -> "Context":
-        """
-        Fill with a single token ID.
-
-        Args:
-            token_id: Token ID to add
-
-        Returns:
-            self for method chaining
-        """
-        self._pending_tokens.append(token_id)
-        self._token_mask_current.append(False)
-        self._token_mask_pending.append(self._token_mask_current.clone())
-        self._begin_of_sequence = False
-        return self
-
-    def fill_user_only(self, text: str) -> "Context":
-        """
-        Add a user message without generation prompt.
-
-        Unlike fill_user(), this method does not add the assistant turn prefix.
-        Useful when you want to append user content without triggering generation.
-
-        Args:
-            text: User message content
-
-        Returns:
-            self for method chaining
-        """
-        self._formatter.user(text)
-        formatted = self._formatter.render(
-            self._model.prompt_template,
-            add_generation_prompt=False,
-            begin_of_sequence=self._begin_of_sequence,
-        )
-        self._formatter.clear()
-        self.fill(formatted)
-        return self
-
-    # ==============================
-    # Token Masking
-    # ==============================
-
-    def mask_tokens(self, indices: list[int], mask: bool) -> None:
-        """
-        Mask specific token indices.
-
-        Args:
-            indices: Token indices to mask
-            mask: True to mask (cannot attend), False to unmask
-        """
-        self._token_mask_current.mask(indices, mask)
-
-    def mask_token_range(self, start: int, end: int, mask: bool) -> None:
-        """
-        Mask a range of tokens.
-
-        Args:
-            start: Start index (inclusive)
-            end: End index (exclusive)
-            mask: True to mask (cannot attend), False to unmask
-        """
-        self._token_mask_current.mask_range(start, end, mask)
-
-    def mask_token(self, index: int, mask: bool) -> None:
-        """
-        Mask a single token.
-
-        Args:
-            index: Token index
-            mask: True to mask (cannot attend), False to unmask
-        """
-        self._token_mask_current.mask([index], mask)
-
-    # ==============================
-    # KV Cache Management
-    # ==============================
-
-    def shrink_kv_pages(self, num_tokens: int) -> None:
-        """
-        Shrink the KV cache by the specified number of tokens.
-
-        Args:
-            num_tokens: Number of tokens to remove from the cache
-        """
-        self._kv_manager.shrink(num_tokens)
-
-    def drop_masked_kv_pages(self) -> None:
-        """
-        Drops fully masked KV pages to save memory, supporting non-contiguous
-        dropping for optimizations like attention sink.
-
-        The function iterates through all committed pages and checks if the tokens
-        corresponding to a page are all masked as `true`. If so, it deallocates
-        the page and removes the corresponding token ranges from the context's state.
-
-        Warning:
-            This operation modifies the token history non-contiguously, which can
-            break the assumptions of a standard causal attention model. It should
-            only be used with models and systems (like StreamingLLM) designed to
-            handle a KV cache with logical gaps.
-        """
-        kv_page_size = self._model.kv_page_size
-        num_committed_pages = len(self._token_ids) // kv_page_size
-
-        # Iterate backwards to safely remove elements from lists by index.
-        # We only consider dropping full pages, not the last (potentially partial) page.
-        for i in range(num_committed_pages - 1, -1, -1):
-            page_start_token_idx = i * kv_page_size
-            page_end_token_idx = (i + 1) * kv_page_size
-
-            if self._token_mask_current.is_range_all_value(
-                page_start_token_idx,
-                page_end_token_idx,
-                True,
-            ):
-                # This page is fully masked and can be dropped.
-
-                # 1. Remove the page ID and deallocate the physical page.
-                self._kv_manager.remove_page_at(i)
-
-                # 2. Remove the corresponding token range from the main token list.
-                del self._token_ids[page_start_token_idx:page_end_token_idx]
-
-                # 3. Remove the corresponding position IDs.
-                del self._position_ids[page_start_token_idx:page_end_token_idx]
-
-                # 4. Remove the same range from the current mask.
-                self._token_mask_current.remove_range(
-                    page_start_token_idx, page_end_token_idx
-                )
-
-                # 5. Remove the range from all historical pending masks.
-                for mask in self._token_mask_pending:
-                    mask.remove_range(page_start_token_idx, page_end_token_idx)
-
-        # Recalculate the last page length after dropping pages.
-        self._kv_manager.recalculate_last_page_len(len(self._token_ids))
-
-    def flush(self) -> None:
-        """
-        Process all pending tokens to update the model's internal KV cache state.
-
-        This commits pending tokens without sampling new ones. Useful for
-        prefilling context before starting generation, or for processing
-        input tokens in batches.
-        """
-        if not self._pending_tokens:
+        buffered = self._handle.buffered_tokens()
+        if len(buffered) <= 1:
             return
 
-        # Take all pending tokens
-        pending_token_ids = self._pending_tokens.copy()
-        self._pending_tokens.clear()
+        tokens_to_flush = buffered[:-1]
+        last_token = buffered[-1]
 
-        # Take all pending masks
-        pending_masks = self._token_mask_pending.copy()
-        self._token_mask_pending.clear()
-        mask_buffers = [m.buffer for m in pending_masks]
+        last_pos = self._handle.last_position()
+        seq_start = (last_pos + 1) if last_pos is not None else 0
 
-        # Calculate positions
-        last_pos = self._position_ids[-1] + 1 if self._position_ids else 0
-        position_ids = list(range(last_pos, last_pos + len(pending_token_ids)))
+        await _reserve_and_run(
+            self._handle,
+            self._model._handle,
+            tokens_to_flush,
+            seq_start,
+            self._handle.cursor(),
+            self._handle.tokens_per_page(),
+        )
 
-        # Grow KV cache
-        self._kv_manager.grow(len(pending_token_ids))
+        self._handle.set_buffered_tokens([last_token])
 
-        # Create and execute forward pass
-        fwd = self._queue.create_forward_pass()
-        fwd.input_tokens(pending_token_ids, position_ids)
-        fwd.kv_cache(self._kv_manager.page_ptrs, self._kv_manager.last_page_len)
-        fwd.attention_mask(mask_buffers)
+    # --- Instruct (pie:instruct/chat) ---
 
-        # Execute forward pass to populate KV cache only (no output request needed)
-        # Note: Rust flush() does NOT set adapter - only decode_step() does
-        # This matches JS/Rust implementations which don't request token output in flush()
-        fwd.execute()
+    def system(self, message: str) -> None:
+        """Fill a system message."""
+        _chat.system(self._handle, message)
 
-        # Commit tokens and positions
-        self._token_ids.extend(pending_token_ids)
-        self._position_ids.extend(position_ids)
+    def user(self, message: str) -> None:
+        """Fill a user message."""
+        _chat.user(self._handle, message)
 
-    # ==============================
-    # Generation
-    # ==============================
+    def assistant(self, message: str) -> None:
+        """Fill a (previous) assistant message."""
+        _chat.assistant(self._handle, message)
 
-    def _prepare_prompt(self) -> None:
-        """Flush messages to tokens if needed."""
-        if self._messages:
-            formatted = self._formatter.format(
-                [
-                    {"role": role, "content": content}
-                    for role, content in self._messages
-                ],
-                add_generation_prompt=True,
-            )
-            self._messages.clear()
-            tokens = self._tokenizer.encode(formatted)
-            self.fill_tokens(tokens)
+    def cue(self) -> None:
+        """Cue the model to generate (fills the generation header)."""
+        _chat.cue(self._handle)
 
-    def _check_stop(
+    def seal(self) -> None:
+        """Seal the current turn (inserts stop token)."""
+        _chat.seal(self._handle)
+
+    def stop_tokens(self) -> list[int]:
+        """Get the stop token IDs for this model."""
+        return list(_chat.stop_tokens(self._model._handle))
+
+    # --- Tool Use (pie:instruct/tool-use) ---
+
+    def equip_tools(self, tools: list[str]) -> None:
+        """Register available tools (list of JSON schema strings)."""
+        _tool.equip(self._handle, tools)
+
+    def answer_tool(self, name: str, value: str) -> None:
+        """Provide a tool call result."""
+        _tool.answer(self._handle, name, value)
+
+    # --- Generate (ContextExt) ---
+
+    async def generate(
         self,
-        generated: list[int],
-        max_tokens: int | None,
-        stop_sequences: list[list[int]] | None,
-    ) -> str | None:
-        """Check if generation should stop. Returns finish reason or None."""
-        if max_tokens is not None and len(generated) >= max_tokens:
-            return "max_tokens"
-
-        if stop_sequences:
-            for seq in stop_sequences:
-                if len(seq) > 0 and len(generated) >= len(seq):
-                    if generated[-len(seq) :] == seq:
-                        return "stop"
-
-        return None
-
-    def generate(
-        self,
+        sampler: Sampler,
         *,
-        max_tokens: int = 256,
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-        top_k: int = 0,
-        stop: list[str] | None = None,
-        stream: bool = False,
-    ) -> GenerateResult | Iterator[str]:
-        """
-        Generate text completion.
+        max_tokens: int | None = None,
+        logit_mask: list[int] | None = None,
+        decode: bool = False,
+        reasoning: bool = False,
+        tool_use: bool = False,
+        auto_flush: bool = True,
+    ) -> TokenStream | EventStream:
+        """Start generating tokens.
+
+        By default, calls ``cue()`` + ``flush()`` before starting
+        the generation stream. Set ``auto_flush=False`` to skip this.
 
         Args:
-            max_tokens: Maximum tokens to generate
-            temperature: Sampling temperature (0 = greedy)
-            top_p: Nucleus sampling threshold
-            top_k: Top-k sampling (0 = disabled)
-            stop: Stop sequences (strings)
-            stream: If True, returns an iterator yielding tokens
+            sampler: The sampling strategy to use.
+            max_tokens: Maximum tokens to generate.
+            logit_mask: Optional BRLE logit mask.
+            decode: If ``True``, return an ``EventStream`` instead of ``TokenStream``.
+            reasoning: Enable reasoning/thinking decoding (requires ``decode=True``).
+            tool_use: Enable tool-use decoding (requires ``decode=True``).
+            auto_flush: Auto-call ``cue()`` + ``flush()`` before generation (default ``True``).
 
         Returns:
-            GenerateResult if stream=False, Iterator[str] if stream=True
+            ``TokenStream`` (default) or ``EventStream`` (when ``decode=True``).
         """
-        self._prepare_prompt()
+        if auto_flush:
+            self.cue()
+            await self.flush()
 
-        # Build stop sequences from model EOS + custom stop strings
-        stop_sequences: list[list[int]] = []
-        for stop_token in self._model.stop_tokens:
-            stop_sequences.append(self._tokenizer.encode(stop_token))
-        if stop:
-            for s in stop:
-                stop_sequences.append(self._tokenizer.encode(s))
+        stream = TokenStream(self, sampler, max_tokens=max_tokens, logit_mask=logit_mask)
 
-        sampler = Sampler(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-        )
+        if decode or reasoning or tool_use:
+            return EventStream(stream, reasoning=reasoning, tool_use=tool_use)
 
-        if stream:
-            return self._generate_stream(max_tokens, sampler, stop_sequences)
-        else:
-            return self._generate_sync(max_tokens, sampler, stop_sequences)
+        return stream
 
-    def _generate_sync(
+    async def generate_text(
         self,
-        max_tokens: int,
         sampler: Sampler,
-        stop_sequences: list[list[int]],
-    ) -> GenerateResult:
-        """Synchronous generation."""
-        generated_tokens: list[int] = []
-        finish_reason = "max_tokens"
+        *,
+        max_tokens: int | None = None,
+        logit_mask: list[int] | None = None,
+        auto_flush: bool = True,
+    ) -> str:
+        """Generate and return the full response text (one-shot).
 
-        for _ in range(max_tokens):
-            token = self._decode_step(sampler)
-            generated_tokens.append(token)
-
-            reason = self._check_stop(generated_tokens, max_tokens, stop_sequences)
-            if reason:
-                finish_reason = reason
-                break
-
-        text = self._tokenizer.decode(generated_tokens)
-        return GenerateResult(
-            text=text, tokens=generated_tokens, finish_reason=finish_reason
-        )
-
-    def _generate_stream(
-        self,
-        max_tokens: int,
-        sampler: Sampler,
-        stop_sequences: list[list[int]],
-    ) -> Iterator[str]:
-        """Streaming generation - yields decoded tokens."""
-        generated_tokens: list[int] = []
-
-        for _ in range(max_tokens):
-            token = self._decode_step(sampler)
-            generated_tokens.append(token)
-
-            # Yield decoded token
-            yield self._tokenizer.decode([token])
-
-            if self._check_stop(generated_tokens, max_tokens, stop_sequences):
-                break
-
-    def _decode_step(self, sampler: Sampler) -> int:
+        Convenience wrapper that calls ``generate(decode=True)`` and
+        collects all ``Event.Text`` chunks into a single string.
         """
-        Perform a single autoregressive decoding step.
-        Returns the sampled token ID.
+        parts: list[str] = []
+        async for event in await self.generate(
+            sampler,
+            max_tokens=max_tokens,
+            logit_mask=logit_mask,
+            decode=True,
+            auto_flush=auto_flush,
+        ):
+            if isinstance(event, Event.Text):
+                parts.append(event.text)
+            elif isinstance(event, Event.Done):
+                break
+        return "".join(parts)
+
+    # --- Lifecycle ---
+
+    def fork(self, name: str | None = None) -> Context:
+        """Fork this context into a new one.
+
+        The forked context shares committed KV pages with the parent.
         """
-        # Ensure we have tokens to process
-        if not self._pending_tokens:
-            raise RuntimeError("No pending tokens for decoding")
-
-        # Take all pending tokens
-        pending_token_ids = self._pending_tokens.copy()
-        self._pending_tokens.clear()
-
-        # Take all pending masks
-        pending_masks = self._token_mask_pending.copy()
-        self._token_mask_pending.clear()
-        mask_buffers = [m.buffer for m in pending_masks]
-
-        # Calculate positions
-        last_pos = self._position_ids[-1] + 1 if self._position_ids else 0
-        position_ids = list(range(last_pos, last_pos + len(pending_token_ids)))
-
-        # Grow KV cache by number of tokens
-        self._kv_manager.grow(len(pending_token_ids))
-
-        # Create and execute forward pass
-        fwd = self._queue.create_forward_pass()
-        fwd.input_tokens(pending_token_ids, position_ids)
-        fwd.kv_cache(self._kv_manager.page_ptrs, self._kv_manager.last_page_len)
-        fwd.attention_mask(mask_buffers)
-
-        # Set adapter if configured
-        if self._adapter_ptr is not None:
-            fwd.set_adapter(self._adapter_ptr)
-        if self._adapter_random_seed is not None:
-            fwd.set_adapter_seed(self._adapter_random_seed)
-
-        # Configure sampling
-        output_idx = [len(pending_token_ids) - 1]
-        if sampler.temperature == 0:
-            fwd.output_tokens(output_idx, 0.0)
-        elif sampler.top_k > 0 and sampler.top_p < 1.0:
-            fwd.output_tokens_top_k_top_p(
-                output_idx, sampler.temperature, sampler.top_k, sampler.top_p
-            )
-        elif sampler.top_k > 0:
-            fwd.output_tokens_top_k(output_idx, sampler.temperature, sampler.top_k)
-        elif sampler.top_p < 1.0:
-            fwd.output_tokens_top_p(output_idx, sampler.temperature, sampler.top_p)
-        else:
-            fwd.output_tokens(output_idx, sampler.temperature)
-
-        # Execute
-        result = fwd.execute()
-        if not result.tokens:
-            raise RuntimeError("No token generated")
-
-        sampled_token = result.tokens[0]
-
-        # Commit tokens and positions
-        self._token_ids.extend(pending_token_ids)
-        self._position_ids.extend(position_ids)
-
-        # Add the sampled token to pending for next step
-        self.fill_token(sampled_token)
-
-        return sampled_token
-
-    def clear(self) -> None:
-        """Clear conversation history and release resources."""
-        self._messages.clear()
-        self._token_ids.clear()
-        self._pending_tokens.clear()
-        self._token_mask_pending.clear()
-        self._token_mask_current = Brle.new(0)
-        self._position_ids.clear()
-        self._kv_manager.release_all()
-        self._begin_of_sequence = True
+        fork_name = name or _next_name()
+        raw = self._handle.fork(fork_name)
+        obj = object.__new__(Context)
+        obj._handle = raw
+        obj._model = self._model
+        return obj
 
     def release(self) -> None:
-        """
-        Release all KV pages held by this context.
+        """Explicitly release this context's resources."""
+        self._handle.destroy()
 
-        Call this when the context is no longer needed to free resources.
-        Safe to call multiple times. Used in beam search for cleanup.
-        """
-        self._kv_manager.release_all()
+    def __enter__(self) -> Context:
+        return self
 
-    def fork(self) -> "Context":
-        """
-        Creates a safe, copy-on-write fork of the context.
+    def __exit__(self, *args) -> None:
+        self.release()
 
-        Shares only FULL KV pages. Partial pages are dropped and their
-        tokens moved to pending buffer for recomputation. This ensures
-        state isolation - shared pages are read-only, writable pages
-        are unique per context.
-
-        Returns:
-            A new Context that shares immutable history with this one.
-        """
-        forked = Context(self._model)
-
-        # Fork the KV page manager (only keeps full pages)
-        forked_kv_manager, dropped_token_count = self._kv_manager.fork()
-        forked._kv_manager = forked_kv_manager
-
-        kept_tokens_len = forked._kv_manager.total_tokens
-
-        # Copy committed tokens and positions (up to kept length)
-        forked._token_ids = self._token_ids[:kept_tokens_len]
-        forked._position_ids = self._position_ids[:kept_tokens_len]
-
-        # Combine dropped tokens with pending tokens
-        forked._pending_tokens = (
-            self._token_ids[kept_tokens_len:] + self._pending_tokens.copy()
-        )
-
-        # Rebuild the mask for pending tokens
-        # Start with a mask covering committed tokens
-        mask_builder = self._token_mask_current.clone()
-        parent_total_mask_len = len(self._token_ids) + len(self._pending_tokens)
-        mask_builder.remove_range(kept_tokens_len, parent_total_mask_len)
-
-        # Build masks for each pending token
-        pending_count = len(forked._pending_tokens)
-        forked._token_mask_pending = []
-        for _ in range(pending_count):
-            mask_builder.append(False)
-            forked._token_mask_pending.append(mask_builder.clone())
-
-        forked._token_mask_current = mask_builder
-
-        forked._begin_of_sequence = self._begin_of_sequence
-        forked._messages = []  # Don't copy pending messages
-
-        # Copy adapter state
-        forked._adapter_ptr = self._adapter_ptr
-        forked._adapter_random_seed = self._adapter_random_seed
-
-        return forked
-
-    def decode_step_dist(self) -> tuple[list[int], list[float]]:
-        """
-        Perform a single decoding step and return the probability distribution.
-
-        Unlike _decode_step which samples a token, this returns the full
-        distribution for use in beam search.
-
-        Returns:
-            (token_ids, probabilities) - sorted by probability descending
-        """
-        if not self._pending_tokens:
-            raise RuntimeError("No pending tokens for decoding")
-
-        # Take all pending tokens
-        pending_token_ids = self._pending_tokens.copy()
-        self._pending_tokens.clear()
-
-        # Take all pending masks
-        pending_masks = self._token_mask_pending.copy()
-        self._token_mask_pending.clear()
-        mask_buffers = [m.buffer for m in pending_masks]
-
-        # Calculate positions
-        last_pos = self._position_ids[-1] + 1 if self._position_ids else 0
-        position_ids = list(range(last_pos, last_pos + len(pending_token_ids)))
-
-        # Grow KV cache
-        self._kv_manager.grow(len(pending_token_ids))
-
-        # Create forward pass
-        fwd = self._queue.create_forward_pass()
-        fwd.input_tokens(pending_token_ids, position_ids)
-        fwd.kv_cache(self._kv_manager.page_ptrs, self._kv_manager.last_page_len)
-        fwd.attention_mask(mask_buffers)
-
-        # Set adapter if configured
-        if self._adapter_ptr is not None:
-            fwd.set_adapter(self._adapter_ptr)
-        if self._adapter_random_seed is not None:
-            fwd.set_adapter_seed(self._adapter_random_seed)
-
-        # Request distribution output at the last position
-        output_idx = [len(pending_token_ids) - 1]
-        fwd.output_distributions(output_idx, 1.0, None)
-
-        # Execute
-        result = fwd.execute()
-        if not result.distributions:
-            raise RuntimeError("No distribution returned")
-
-        dist = result.distributions[0]
-
-        # Commit tokens and positions
-        self._token_ids.extend(pending_token_ids)
-        self._position_ids.extend(position_ids)
-
-        return dist
-
-    def generate_with_beam(
-        self,
-        *,
-        beam_size: int,
-        max_tokens: int = 256,
-        stop: list[str] | None = None,
-    ) -> str:
-        """
-        Generate text using beam search decoding.
-
-        Beam search maintains multiple candidate sequences (beams) at each step,
-        selecting the most likely overall sequences rather than greedily choosing
-        the best token at each position.
-
-        Args:
-            beam_size: Number of candidate sequences to maintain at each step.
-            max_tokens: Maximum tokens to generate.
-            stop: Optional stop sequences (strings).
-
-        Returns:
-            The generated text from the winning beam.
-        """
-        import math
-
-        self._prepare_prompt()
-
-        # Build stop sequences from model EOS + custom stop strings
-        stop_sequences: list[list[int]] = []
-        for stop_token in self._model.stop_tokens:
-            stop_sequences.append(self._tokenizer.encode(stop_token))
-        if stop:
-            for s in stop:
-                stop_sequences.append(self._tokenizer.encode(s))
-
-        def check_stop(generated: list[int]) -> bool:
-            """Check if generation should stop."""
-            if len(generated) >= max_tokens:
-                return True
-            for seq in stop_sequences:
-                if len(seq) > 0 and len(generated) >= len(seq):
-                    if generated[-len(seq) :] == seq:
-                        return True
-            return False
-
-        # Type alias for beam state: (context, generated_tokens, score)
-        BeamState = tuple["Context", list[int], float]
-
-        # Initialize with a single beam (forked from self)
-        beams: list[BeamState] = [(self.fork(), [], 0.0)]
-
-        while True:
-            # Check if any beam satisfies the stop condition
-            # Beams are sorted by score, so first match is best
-            for beam_ctx, generated_tokens, score in beams:
-                if check_stop(generated_tokens):
-                    # Adopt state from winning beam
-                    self._kv_manager.adopt(beam_ctx._kv_manager)
-                    self._token_ids = beam_ctx._token_ids.copy()
-                    self._position_ids = beam_ctx._position_ids.copy()
-                    self._pending_tokens = beam_ctx._pending_tokens.copy()
-
-                    # Release all beams
-                    for ctx, _, _ in beams:
-                        ctx.release()
-
-                    return self._tokenizer.decode(generated_tokens)
-
-            # Get distributions from all beams
-            next_dists = []
-            for beam_ctx, _, _ in beams:
-                dist = beam_ctx.decode_step_dist()
-                next_dists.append(dist)
-
-            # Expand beams
-            next_beams: list[BeamState] = []
-            for i, (beam_ctx, generated, score) in enumerate(beams):
-                token_ids, probs = next_dists[i]
-
-                # Expand with top candidates
-                expand_count = min(beam_size, len(token_ids))
-                for j in range(expand_count):
-                    prob = probs[j]
-                    # Skip zero-probability tokens
-                    if prob <= 0:
-                        continue
-
-                    next_beam = beam_ctx.fork()
-                    token_id = token_ids[j]
-                    next_beam.fill_token(token_id)
-
-                    next_generated = generated + [token_id]
-                    next_score = score + math.log(prob)
-
-                    next_beams.append((next_beam, next_generated, next_score))
-
-                # Release the old beam after forking
-                beam_ctx.release()
-
-            # Prune: Sort by score (descending) and keep top beam_size
-            next_beams.sort(key=lambda x: x[2], reverse=True)
-
-            # Release pruned beams
-            for ctx, _, _ in next_beams[beam_size:]:
-                ctx.release()
-
-            beams = next_beams[:beam_size]
-
-    def generate_with_drafter(
-        self,
-        drafter: "Drafter",
-        *,
-        max_tokens: int = 256,
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-        stop: list[str] | None = None,
-    ) -> str:
-        """
-        Generate text using speculative decoding with a drafter model.
-
-        Speculative decoding accelerates text generation by using a small, fast
-        drafter model to propose candidate tokens. These are then verified by
-        the main model, allowing multiple tokens to be generated per forward pass
-        when the drafter's predictions are correct.
-
-        Args:
-            drafter: The drafter that proposes candidate tokens.
-            max_tokens: Maximum tokens to generate.
-            temperature: Sampling temperature.
-            top_p: Top-p sampling threshold.
-            stop: Stop sequences (strings).
-
-        Returns:
-            Generated text.
-        """
-        self._prepare_prompt()
-
-        # Initialize drafter with current context
-        drafter.update(self._token_ids + self._pending_tokens)
-
-        # Build stop sequences from model EOS + custom stop strings
-        stop_sequences: list[list[int]] = []
-        for stop_token in self._model.stop_tokens:
-            stop_sequences.append(self._tokenizer.encode(stop_token))
-        if stop:
-            for s in stop:
-                stop_sequences.append(self._tokenizer.encode(s))
-
-        sampler = Sampler(temperature=temperature, top_p=top_p)
-        generated_tokens: list[int] = []
-
-        while True:
-            # Get draft tokens
-            draft_tokens, draft_pos_ids = drafter.draft()
-
-            if not draft_tokens:
-                # No drafts - fall back to regular decode
-                token = self._decode_step(sampler)
-                generated_tokens.append(token)
-                drafter.update([token])
-            else:
-                # Verify drafts with main model
-                accepted = self._verify_drafts(draft_tokens, draft_pos_ids, sampler)
-                generated_tokens.extend(accepted)
-                drafter.update(accepted)
-
-            # Check stop conditions
-            if len(generated_tokens) >= max_tokens:
-                break
-            if self._check_stop(generated_tokens, max_tokens, stop_sequences):
-                break
-
-        return self._tokenizer.decode(generated_tokens)
-
-    def _verify_drafts(
-        self,
-        draft_tokens: list[int],
-        draft_pos_ids: list[int],
-        sampler: Sampler,
-    ) -> list[int]:
-        """
-        Verify draft tokens with the main model.
-
-        Returns the tokens that were accepted.
-
-        Args:
-            draft_tokens: Proposed token IDs in DFS order.
-            draft_pos_ids: Depth of each token in the trie.
-            sampler: Sampler for fallback token selection.
-
-        Returns:
-            List of accepted token IDs.
-        """
-        accepted: list[int] = []
-
-        for i, draft_token in enumerate(draft_tokens):
-            token_ids, probs = self.decode_step_dist()
-            predicted_token = token_ids[0]  # Most likely token
-
-            if predicted_token == draft_token:
-                accepted.append(predicted_token)
-                self.fill_token(predicted_token)
-            else:
-                # Draft rejected - use model's prediction
-                accepted.append(predicted_token)
-                self.fill_token(predicted_token)
-                break
-
-        return accepted
+    def __repr__(self) -> str:
+        return f"Context({id(self._handle):#x})"

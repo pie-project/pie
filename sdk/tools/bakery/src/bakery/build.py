@@ -217,7 +217,7 @@ import inferlet as _inferlet
 import {module_name} as _user_module
 
 class Run(exports.Run):
-    def run(self) -> None:
+    def run(self, args: list[str]) -> exports.Result[str, str]:
         # Call the user's main function if it exists
         if hasattr(_user_module, 'main'):
             _user_module.main()
@@ -225,8 +225,10 @@ class Run(exports.Run):
             # Module execution happens at import time for scripts without main()
             pass
         # Signal completion if user code didn't call set_return()
-        if not _inferlet.was_return_set():
+        if _inferlet.get_return_value() is None:
             _inferlet.set_return("")
+        
+        return exports.Ok(_inferlet.get_return_value())
 """
 
     output_path.write_text(wrapper_content)
@@ -289,7 +291,7 @@ def generate_dynamic_wit(
 
 // Dynamic run interface for this inferlet
 interface run {{
-    run: func() -> result<_, string>;
+    run: func(args: list<string>) -> result<string, string>;
 }}
 
 // Exec world with imports and dynamic export
@@ -512,6 +514,7 @@ def run_esbuild_user_code(entry_point: Path, output_file: Path) -> None:
     """Bundle user code with esbuild (keeps inferlet imports external)."""
     cmd = [
         "npx",
+        "-y",
         "esbuild",
         str(entry_point),
         "--bundle",
@@ -573,6 +576,7 @@ def run_esbuild(
 
     cmd = [
         "npx",
+        "-y",
         "esbuild",
         str(entry_point),
         "--bundle",
@@ -590,7 +594,7 @@ def run_esbuild(
         cmd.append("--minify")
 
     # External WIT imports
-    cmd.extend(["--external:wasi:*", "--external:inferlet:*"])
+    cmd.extend(["--external:wasi:*", "--external:inferlet:*", "--external:pie:*"])
 
     # External Node.js built-ins
     nodejs_builtins = [
@@ -629,6 +633,7 @@ def run_componentize_js(
 
     cmd = [
         "npx",
+        "-y",
         "@bytecodealliance/componentize-js",
         str(input_js),
         "-o",
@@ -868,15 +873,9 @@ if (typeof globalThis.Intl === 'undefined') {
 {intl_polyfill}
 // WIT interface export (inferlet:core/run)
 export const run = {{
-  run: async () => {{
-    try {{
-      await import('./{user_bundle_name}');
-      return {{ tag: 'ok' }};
-    }} catch (e) {{
-      const msg = e instanceof Error ? `${{e.message}}\\n${{e.stack}}` : String(e);
-      console.log(`\\nERROR: ${{msg}}\\n`);
-      return {{ tag: 'err', val: msg }};
-    }}
+  async run(args) {{
+    await import('./{user_bundle_name}');
+    return '';
   }},
 }};
 """
@@ -988,10 +987,14 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
             "npx is required but not found. Please install Node.js (v18+)."
         )
 
+    # Read package name from Pie.toml
+    project_dir = input_path if input_path.is_dir() else input_path.parent
+    package_name = read_package_name(project_dir)
+
     # Resolve paths
     with console.status("[bold green]Resolving paths...[/bold green]"):
         inferlet_js_path = path_utils.get_inferlet_js_path()
-        wit_path = path_utils.get_wit_path()
+        wit_path = get_inferlet_wit_path()
 
     # Ensure npm dependencies
     ensure_npm_dependencies(inferlet_js_path)
@@ -1035,11 +1038,18 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
             status.update("[bold green]📦 Bundling final output...[/bold green]")
             run_esbuild(wrapper_js, final_bundle, inferlet_js_path, debug)
 
-            # Step 6: Compile to WASM
+            # Step 6: Generate dynamic WIT directory with exec world
+            status.update(
+                "[bold green]🔧 Generating dynamic WIT...[/bold green]"
+            )
+            temp_wit_dir = temp_path / "wit"
+            generate_dynamic_wit(wit_path, temp_wit_dir, package_name)
+
+            # Step 7: Compile to WASM
             status.update(
                 "[bold green]🔧 Compiling to WebAssembly component...[/bold green]"
             )
-            run_componentize_js(final_bundle, output, wit_path, debug)
+            run_componentize_js(final_bundle, output, temp_wit_dir, debug)
 
     # Success
     wasm_size = output.stat().st_size if output.exists() else 0

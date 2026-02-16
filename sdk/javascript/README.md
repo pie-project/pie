@@ -1,188 +1,251 @@
-# inferlet-js
+# inferlet
 
-JavaScript/TypeScript library for writing Pie inferlets.
+JavaScript/TypeScript SDK for writing Pie inferlets.
 
-## Quick Start with Examples
+## Quick Start
 
-Examples live under `inferlets/javascript`:
+```js
+import { Model, Context, Sampler, session, runtime } from 'inferlet';
 
-- **text-completion** - Basic text generation with sampling
-- **beam-search** - Beam search decoding
+const model = Model.load(runtime.models()[0]);
+const ctx = Context.create(model);
 
-Install dependencies:
+ctx.system('You are a helpful assistant.');
+ctx.user('Hello, world!');
 
-```bash
-cd sdk/javascript
-npm install
-```
-
-## How to Create My Own Inferlet
-
-```bash
-# Create a new inferlet with TypeScript
-bakery create my-inferlet --ts
-```
-
-Note: The default is Rust. Use `--ts` for TypeScript/JavaScript projects.
-
-This generates:
-- `index.ts` - Your inferlet code (or `index.js` for JavaScript)
-- `package.json` - Package manifest
-- `tsconfig.json` - TypeScript configuration with path mappings (TypeScript only)
-
-### Build
-
-```bash
-cd my-inferlet
-# With venv activated
-bakery build "$PWD" -o "$PWD/my-inferlet.wasm"
-```
-
-### Run
-
-Make sure the Pie engine is running, then submit the compiled inferlet:
-
-```bash
-pie-cli submit my-inferlet.wasm
-```
-
-## Writing Inferlets
-
-Inferlets use **top-level await**. Import the APIs you need from `'inferlet'`:
-
-```typescript
-// my-inferlet/index.ts
-
-import { Context, getAutoModel, getArguments, send } from 'inferlet';
-
-const args = getArguments();
-const prompt = (args.prompt as string) ?? 'Hello, world!';
-
-const model = getAutoModel();
-const ctx = new Context(model);
-
-ctx.fillSystem('You are a helpful assistant.');
-ctx.fillUser(prompt);
-
-const result = await ctx.generate({
-  sampling: { topP: 0.95, temperature: 0.6 },
-  stop: { maxTokens: 256, sequences: model.eosTokens }
+const text = ctx.generateText({
+  sampler: Sampler.topP(0.6, 0.95),
+  maxTokens: 256,
 });
 
-send(result);
+session.send(text);
 ```
 
-The build system automatically:
-- Resolves imports from the `inferlet` package
-- Wraps your code in the WIT interface
-- Handles error reporting
+## Examples
 
-## Available APIs
+Examples live under `sdk/examples/javascript/`:
 
-Import the APIs you need from the `'inferlet'` package:
+| Example | Demonstrates |
+|---------|-------------|
+| **hello-world** | Streaming with `on().run()` callback pattern |
+| **text-completion** | One-shot `generateText()` convenience |
+| **beam-search** | Forked contexts, `stream.text()`, `using` auto-dispose |
+
+Build and run an example:
+
+```bash
+# Build to WASM
+bakery build sdk/examples/javascript/hello-world/ -o hello-world.wasm
+
+# Run with dummy model
+pie run --dummy --path hello-world.wasm --manifest sdk/examples/javascript/hello-world/Pie.toml
+```
+
+## API Reference
+
+Import everything from `'inferlet'`:
 
 ```typescript
 import {
-  Context,
-  getAutoModel,
-  getArguments,
-  send,
-  // ... other APIs as needed
+  Model, Tokenizer,         // Model loading & tokenization
+  Context,                   // Generation context (KV cache)
+  TokenStream, EventStream,  // Streaming iterators
+  Sampler,                   // Sampling strategies
+  ForwardPass,               // Low-level forward pass
+  Grammar, Matcher,          // Structured generation
+  Adapter,                   // LoRA adapters
+  session,                   // Client communication
+  runtime,                   // Runtime info & spawning
+  messaging,                 // Pub/sub messaging
+  mcp,                       // MCP tool server client
 } from 'inferlet';
 ```
 
-### Core Functions
-- `getAutoModel()` - Returns the model instance
-- `getArguments()` - Returns command-line arguments as an object
-- `send(text)` - Sends output to the client
+### Context
 
-### Classes
-- `Context` - Generation context with KV cache
-- `Sampler` - Token sampling strategies (`.greedy()`, `.topP()`, `.topK()`)
-- `ChatFormatter` - Chat template formatting
-- `Tokenizer` - Text tokenization
+The main entry point for chat-based generation:
 
-### Stop Conditions
-Stop conditions are configured in the `generate()` options object:
+```js
+const ctx = Context.create(model);       // auto-named
+const ctx = Context.create(model, 'my-ctx');  // explicit name
 
-```typescript
-const result = await ctx.generate({
-  sampling: { topP: 0.95, temperature: 0.6 },
-  stop: {
-    maxTokens: 256,
-    sequences: model.eosTokens  // Array of token sequences
-  }
+// Chat formatting (pie:instruct/chat)
+ctx.system('You are helpful.');
+ctx.user('Hello!');
+ctx.assistant('Hi there!');   // history replay
+ctx.cue();                    // start generation header
+ctx.seal();                   // insert stop token
+
+// Text-level buffer fill
+ctx.fill('arbitrary text');          // encodes via tokenizer
+ctx.fillTokens(new Uint32Array([1, 2, 3]));  // raw tokens
+
+// Forking
+const fork = ctx.fork();              // auto-named
+const fork = ctx.fork('beam-0');      // explicit name
+
+// Cleanup
+ctx.destroy();          // manual
+using _ = ctx;          // auto-dispose via TC39 `using`
+```
+
+### Generation
+
+Three ways to generate:
+
+```js
+// 1. One-shot (simplest)
+const text = ctx.generateText({
+  sampler: Sampler.topP(0.6, 0.95),
+  maxTokens: 256,
 });
+
+// 2. Streaming with callbacks
+ctx.generate({
+  sampler: Sampler.topP(0.6, 0.95),
+  maxTokens: 256,
+  decode: {},
+})
+.on('text', text => session.send(text))
+.on('tool-call', (name, args) => { /* ... */ })
+.run();
+
+// 3. Iterator (advanced)
+for (const event of ctx.generate({ ..., decode: {} })) {
+  if (event.type === 'text') session.send(event.text);
+}
+
+// 4. Raw tokens (lowest level)
+for (const tokens of ctx.generate({ sampler, maxTokens: 128 })) {
+  // tokens: Uint32Array
+}
+const allText = stream.text();      // collect decoded text
+const allTokens = stream.tokens();  // collect token batches
 ```
 
-## CLI Reference
+Stop tokens default to the model's stop tokens when omitted.
 
-### Create
+### Sampler
+
+```js
+Sampler.greedy()                          // temperature=0, top-k=1
+Sampler.topP(temperature, topP)           // nucleus sampling
+Sampler.topK(temperature, topK)           // top-k sampling
+Sampler.minP(temperature, minP)           // min-p sampling
+Sampler.multinomial(temperature, topK)    // multinomial
+Sampler.topKTopP(temperature, topK, topP) // combined
+Sampler.embedding()                       // embedding extraction
+Sampler.dist(temperature, topK)           // full distribution
+```
+
+### Event Types
+
+When using `decode: {}` in generate options, events have a `type` discriminant:
+
+| `event.type` | Fields | Description |
+|--------------|--------|-------------|
+| `'text'` | `text` | Generated text chunk |
+| `'thinking'` | `text` | Reasoning/thinking chunk |
+| `'thinking-done'` | `text` | Reasoning complete (full text) |
+| `'tool-call-start'` | — | Tool call detected |
+| `'tool-call'` | `name`, `arguments` | Complete tool call |
+| `'done'` | `text` | Generation finished (full text) |
+
+Enable reasoning/tool-use detection via decoder options:
+
+```js
+ctx.generate({
+  sampler, maxTokens: 256,
+  decode: { reasoning: true, toolUse: true },
+})
+```
+
+### Tool Use
+
+```js
+ctx.equipTools([toolSchemaJson1, toolSchemaJson2]);
+// ... generate and detect tool calls ...
+ctx.answerTool('get_weather', '{"temp": 72}');
+```
+
+### Structured Generation
+
+```js
+const grammar = Grammar.fromJsonSchema('{"type":"object",...}');
+const matcher = new Matcher(grammar, model.tokenizer());
+
+// Use in generation loop for constrained decoding
+const mask = matcher.nextTokenLogitMask();
+// pass mask as logitMask option to generate()
+```
+
+### Session & Runtime
+
+```js
+session.send('Hello');              // send text to client
+const msg = session.receive();      // receive text from client
+session.sendFile(data);             // send binary
+const file = session.receiveFile(); // receive binary
+
+runtime.version();                  // runtime version
+runtime.models();                   // available model names
+runtime.username();                 // invoking user
+runtime.spawn('pkg@1.0.0', args);   // spawn another inferlet
+```
+
+### Messaging
+
+```js
+messaging.push('topic', 'message');       // queue push
+const msg = messaging.pull('topic');      // queue pull (blocking)
+messaging.broadcast('topic', 'message');  // broadcast
+
+const sub = messaging.subscribe('topic');
+for (const msg of sub) {                  // infinite iterator
+  // process msg
+  if (done) break;
+}
+sub.unsubscribe();
+```
+
+## Project Structure
+
+```
+sdk/javascript/
+├── src/
+│   ├── index.ts          # Public API exports
+│   ├── context.ts        # Context, TokenStream, EventStream, Decoder
+│   ├── model.ts          # Model, Tokenizer
+│   ├── sampler.ts        # Sampler constructors
+│   ├── forward.ts        # ForwardPass (low-level)
+│   ├── grammar.ts        # Grammar, Matcher
+│   ├── adapter.ts        # LoRA Adapter
+│   ├── session.ts        # Client communication
+│   ├── runtime.ts        # Runtime info
+│   ├── messaging.ts      # Pub/sub messaging
+│   ├── mcp.ts            # MCP client
+│   ├── zo.ts             # Zeroth-order optimization
+│   ├── _async.ts         # Internal WASI future utilities
+│   └── bindings/         # Auto-generated WIT type declarations
+├── package.json
+├── tsconfig.json
+└── README.md
+```
+
+## Development
 
 ```bash
-bakery create <name> [OPTIONS]
+cd sdk/javascript
 
-Options:
-  --ts, -t           Create a TypeScript project instead of Rust
-  -o, --output <dir> Output directory (default: current directory)
+# Install dependencies
+npm install
+
+# Type-check
+npx tsc --noEmit
+
+# Regenerate WIT bindings (after runtime WIT changes)
+npm run generate-bindings
+
+# Build
+npm run build
 ```
-
-Note: TypeScript projects support both `.ts` and `.js` files. The default (without `--ts`) creates a Rust project.
-
-### Build
-
-```bash
-bakery build <input> -o <output.wasm> [OPTIONS]
-
-Options:
-  --debug    Use debug build of StarlingMonkey runtime
-```
-
-## TypeScript Support
-
-The generated `tsconfig.json` provides full IDE support:
-- Auto-completion for all inferlet APIs
-- Type checking for your code
-- Import resolution via path mappings
-
-Path mappings point to `inferlet-js/src/` for type definitions.
-
-## Testing
-
-```bash
-npm test              # Unit tests + mock-based WASM tests
-npm run test:unit     # Unit tests only (fast)
-npm run test:wasm     # Mock-based WASM tests
-npm run test:integration  # Real WASM execution tests (requires pie-cli)
-npm run test:all      # Everything
-npm run test:watch    # Watch mode
-```
-
-### Test Structure
-
-- **Unit tests** (`src/__tests__/`) - Fast tests for individual modules (sampler, chat, args, etc.)
-- **Mock WASM tests** (`test/wasm/__tests__/`) - Tests using vitest aliases to mock WIT imports
-- **Integration tests** (`test/integration/__tests__/`) - Real WASM execution tests
-
-### Integration Tests
-
-Integration tests verify the full pipeline: TypeScript → WASM → JS execution.
-
-```
-TypeScript source → bakery build → .wasm → jco transpile → Node.js execution
-```
-
-These tests require `pie-cli` in PATH. They:
-1. Build test fixtures to WASM using `bakery build`
-2. Transpile WASM to JS using `jco transpile`
-3. Execute the transpiled component with mock host functions
-4. Verify outputs are captured correctly
-
-Test fixtures are in `test/integration/fixtures/`. To add a new fixture:
-
-```bash
-mkdir test/integration/fixtures/my-test
-# Create index.ts and package.json
-```
-
-Then add tests in `test/integration/__tests__/`.

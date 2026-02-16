@@ -1,131 +1,76 @@
 """
-inferlet-py - Python SDK for writing Pie inferlets
+Pie Inferlet SDK — Python bindings for the Pie runtime.
 
-This mirrors the inferlet-js library API with Pythonic idioms.
+Usage::
+
+    from inferlet import Model, Context, Sampler, Event, runtime
+
+    model = Model.load(runtime.models()[0])
+    ctx = Context(model)
+
+    ctx.system("You are helpful.")
+    ctx.user("Hello!")
+
+    async for event in await ctx.generate(Sampler.top_p(), decode=True):
+        match event:
+            case Event.Text(text=t):
+                print(t, end="")
+            case Event.Done():
+                break
 """
 
-__version__ = "0.1.0"
+from __future__ import annotations
 
-# Runtime functions
-from .runtime import (
-    get_version,
-    get_instance_id,
-    get_arguments,
-    set_return,
-    was_return_set,
-    debug_query,
-)
-
-# KVS functions
-from .kvs import (
-    store_get,
-    store_set,
-    store_delete,
-    store_exists,
-    store_list_keys,
-)
-
-# Messaging functions
-from .messaging import (
-    send,
-    receive,
-    send_blob,
-    receive_blob,
-    broadcast,
-    subscribe,
-    Blob,
-    Subscription,
-)
-
-# Model and Queue
-from .model import (
-    Model,
-    Queue,
-    get_model,
-    get_all_models,
-    get_auto_model,
-    get_all_models_with_traits,
-)
-
-# Tokenizer
-from .tokenizer import Tokenizer
-
-# Sampler
+# --- Core ---
+from .model import Model, Tokenizer
 from .sampler import Sampler
+from .context import Context, TokenStream, EventStream, Event, Decoder
 
-# ForwardPass
-from .forward import ForwardPass, ForwardPassResult
+# --- Runtime ---
+from . import runtime
+from . import messaging
+from . import session
+from . import mcp
+from . import zo
 
-# KV Page management
-from .kv_page import KvPage, KvPageManager
-
-# Chat formatting
-from .chat import ChatFormatter, format_messages, ToolCall, Message
-
-# BRLE (attention mask encoding)
-from .brle import Brle, causal_mask, causal_mask_raw
-
-# Context (main high-level API)
-from .context import Context, GenerateResult
-
-# Drafter (speculative decoding)
-from .drafter import Drafter, EmptyDrafter
+# --- Inference ---
+from .forward import ForwardPass
+from .adapter import Adapter
+from .grammar import Grammar, Matcher
 
 __all__ = [
-    # Version
-    "__version__",
-    # Runtime
-    "get_version",
-    "get_instance_id",
-    "get_arguments",
-    "set_return",
-    "was_return_set",
-    "debug_query",
-    # KVS
-    "store_get",
-    "store_set",
-    "store_delete",
-    "store_exists",
-    "store_list_keys",
-    # Messaging
-    "send",
-    "receive",
-    "send_blob",
-    "receive_blob",
-    "broadcast",
-    "subscribe",
-    "Blob",
-    "Subscription",
-    # Model
+    # Core
     "Model",
-    "Queue",
-    "get_model",
-    "get_all_models",
-    "get_auto_model",
-    "get_all_models_with_traits",
-    # Tokenizer
     "Tokenizer",
-    # Sampler
     "Sampler",
-    # ForwardPass
-    "ForwardPass",
-    "ForwardPassResult",
-    # KV Page
-    "KvPage",
-    "KvPageManager",
-    # Chat
-    "ChatFormatter",
-    "format_messages",
-    "ToolCall",
-    "Message",
-    # BRLE
-    "Brle",
-    "causal_mask",
-    "causal_mask_raw",
-    # Context
     "Context",
-    "GenerateResult",
-    # Drafter
-    "Drafter",
-    "EmptyDrafter",
+    "TokenStream",
+    "EventStream",
+    "Event",
+    "Decoder",
+    # Runtime
+    "runtime",
+    "messaging",
+    "session",
+    "mcp",
+    "zo",
+    # Inference
+    "ForwardPass",
+    "Adapter",
+    "Grammar",
+    "Matcher",
 ]
+
+# --- Internal: return value plumbing for bakery wrapper ---
+_return_value: str | None = None
+
+
+def set_return(value: str) -> None:
+    """Set the return value for the inferlet (internal use by bakery wrapper)."""
+    global _return_value
+    _return_value = value
+
+
+def get_return_value() -> str | None:
+    """Get the return value for the inferlet (internal use by bakery wrapper)."""
+    return _return_value

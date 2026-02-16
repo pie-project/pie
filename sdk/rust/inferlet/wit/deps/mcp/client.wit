@@ -1,37 +1,39 @@
+/// MCP client interface — lets inferlets discover and call MCP servers.
 interface client {
-    use types.{error, content, json-string, future-json-string};
+    use types.{error, json, content};
 
+    /// An active connection to an MCP server.
+    /// Dropping the resource closes the connection.
     resource session {
-        
-        // List tools available on this server.
-        list-tools: func() -> result<json-string, error>;
 
-        // List resources available on this server.
-        list-resources: func() -> result<json-string, error>;
+        /// List tools exposed by this server.
+        list-tools: func() -> result<json, error>;
 
-        // List prompts available on this server.
-        list-prompts: func() -> result<json-string, error>;
+        /// Call a tool by name with JSON arguments.
+        call-tool: func(
+            name: string,
+            args: json,
+        ) -> result<list<content>, error>;
 
-        // Execute a tool.
-        call-tool: func(name: string, args: json-string) -> result<json-string, error>;
+        /// List resources exposed by this server.
+        list-resources: func() -> result<json, error>;
 
-        // Read a resource.
+        /// Read a resource by URI.
         read-resource: func(uri: string) -> result<list<content>, error>;
 
-        // Get a prompt.
-        get-prompt: func(name: string, args: json-string) -> result<list<content>, error>;
+        /// List prompts exposed by this server.
+        list-prompts: func() -> result<json, error>;
 
-        // --- Lifecycle ---
-        receive-request: func() -> future-json-string;
-        send-response: func(response: json-string);
-        close: func();
+        /// Render a prompt template with the given arguments.
+        get-prompt: func(
+            name: string,
+            args: json,
+        ) -> result<json, error>;
     }
 
-    // Discover available MCP servers (both runtime-provided and user-provided).
-    // Returns a list of server names/identities.
+    /// Discover available MCP servers.
     available-servers: func() -> list<string>;
 
-    // Establish a handshake with a specific server.
+    /// Connect to a named MCP server, performing the MCP handshake.
     connect: func(server-name: string) -> result<session, error>;
-
 }
