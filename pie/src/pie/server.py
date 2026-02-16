@@ -1,85 +1,66 @@
 """Pie server lifecycle.
 
-Handles the full lifecycle: spawn workers → bootstrap Rust runtime →
-run workload → shut down. The ``Server`` async context manager is
-the public programmatic API. Functions ``serve`` and ``oneshot``
-implement CLI modes on top of the ``runtime`` context manager.
+Manages the full lifecycle: spawn workers → bootstrap Rust runtime →
+run workload → shut down.  The ``Server`` async context manager is the
+sole public API.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
+import logging
 import queue
 import socket
-import sys
 import time
 import random
-from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Generator
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pie_client import PieClient
 
 from rich.console import Console
 
 from pie.config import Config
 
+log = logging.getLogger(__name__)
+
 
 # -- Public API ---------------------------------------------------------------
 
 
-def _find_free_port() -> int:
-    """Find a free TCP port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
 class Server:
-    """Async context manager that starts a Pie runtime and returns an authenticated client.
+    """Async context manager that owns a Pie runtime.
 
     Usage::
 
         from pie.server import Server
+        from pie.config import Config, ModelConfig, AuthConfig
 
-        async with Server(model="Qwen/Qwen3-0.6B") as client:
+        cfg = Config(
+            auth=AuthConfig(enabled=False),
+            models=[ModelConfig(hf_repo="Qwen/Qwen3-0.6B")],
+        )
+        async with Server(cfg) as server:
+            client = await server.connect()
             await client.install_program(wasm_path, manifest_path)
             await client.launch_daemon("my-inferlet@0.1.0", 8080)
     """
 
-    def __init__(
-        self,
-        model: str,
-        *,
-        device: str | list[str] = "cuda:0",
-        port: int = 0,
-        dummy: bool = False,
-        tensor_parallel_size: int | None = None,
-        no_auth: bool = True,
-    ):
-        from pie.config import AuthConfig, ModelConfig
-
-        self._config = Config(
-            host="127.0.0.1",
-            port=port or _find_free_port(),
-            auth=AuthConfig(enabled=not no_auth),
-            models=[
-                ModelConfig(
-                    hf_repo=model,
-                    device=[device] if isinstance(device, str) else list(device),
-                    tensor_parallel_size=tensor_parallel_size,
-                    dummy_mode=dummy,
-                )
-            ],
-        )
+    def __init__(self, config: Config):
+        self._config = copy.copy(config)
+        # Auto-assign a free port if not specified.
+        if self._config.port == 0:
+            self._config.port = _find_free_port()
 
         # Filled during __aenter__
         self._handle: Any = None
         self._workers: list = []
-        self._client: Any = None
+        self._clients: list[Any] = []
 
-    async def __aenter__(self):
-        from pie_client import PieClient
-
+    async def __aenter__(self) -> Server:
         console = Console(quiet=True)
 
         # _bootstrap is synchronous (mp.spawn + queue.get), run on thread
@@ -87,178 +68,69 @@ class Server:
             _bootstrap, self._config, console
         )
 
-        # Connect and authenticate
-        client = PieClient(f"ws://{self._config.host}:{self._config.port}")
-        await client.connect()
-        await client.auth_by_token(self._handle.internal_token)
-        self._client = client
-
-        return client
+        return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # Close client connection
-        if self._client is not None:
+        # Close all clients created via connect()
+        for client in self._clients:
             try:
-                await self._client.close()
+                await client.close()
             except Exception:
                 pass
+        self._clients.clear()
 
-        # Shut down server and workers
-        _terminate(self._handle, self._workers)
-
+        # Shut down server and workers (blocking, run on thread)
+        await asyncio.to_thread(_terminate, self._handle, self._workers)
         return False
 
+    async def connect(self) -> PieClient:
+        """Create and return an authenticated ``PieClient``."""
+        from pie_client import PieClient as _PieClient
 
-# -- CLI lifecycle wrappers ---------------------------------------------------
+        client = _PieClient(self.url)
+        await client.connect()
+        await client.auth_by_token(self.token)
+        self._clients.append(client)
+        return client
 
+    async def wait(self):
+        """Block until the runtime exits or a worker dies."""
+        while True:
+            if not _check(self._workers):
+                break
+            if (
+                self._handle
+                and hasattr(self._handle, "is_running")
+                and not self._handle.is_running()
+            ):
+                break
+            await asyncio.sleep(1.0)
 
-@contextmanager
-def runtime(
-    config: Config,
-    console: Console | None = None,
-) -> Generator[tuple[Any, list], None, None]:
-    """Start the runtime, yield (handle, workers), shut down on exit.
+    @property
+    def url(self) -> str:
+        """WebSocket URL for client connections."""
+        return f"ws://{self._config.host}:{self._config.port}"
 
-    Usage::
+    @property
+    def token(self) -> str:
+        """Internal auth token (available after ``__aenter__``)."""
+        if self._handle is None:
+            raise RuntimeError("Server is not started; use 'async with Server(cfg) as server:'")
+        return self._handle.internal_token
 
-        with runtime(cfg, console=console) as (handle, workers):
-            # do work ...
-    """
-    if console is None:
-        console = Console()
-
-    server_handle = None
-    backend_processes = []
-
-    try:
-        server_handle, backend_processes = _bootstrap(config, console)
-        console.print()
-        yield server_handle, backend_processes
-    except KeyboardInterrupt:
-        pass
-    except Exception:
-        raise
-    finally:
-        console.print()
-        with console.status("[dim]Shutting down...[/dim]"):
-            _terminate(server_handle, backend_processes)
-        console.print("[green]✓[/green] Shutdown complete")
-
-
-def serve(
-    config: Config,
-    monitor: bool = False,
-    console: Console | None = None,
-) -> None:
-    """Persistent serving mode: poll or TUI monitor."""
-    with runtime(config, console=console) as (handle, workers):
-        if monitor:
-            from pie_cli.monitor.app import LLMMonitorApp
-            from pie_cli.monitor.provider import PieMetricsProvider
-
-            model = config.primary_model
-            provider = PieMetricsProvider(
-                host=config.host,
-                port=config.port,
-                internal_token=handle.internal_token,
-                config={
-                    "model": model.name or model.hf_repo,
-                    "tp_size": model.tensor_parallel_size or len(model.device),
-                    "max_batch": model.max_batch_tokens or 32,
-                },
-            )
-            provider.start()
-            try:
-                LLMMonitorApp(provider=provider).run()
-            finally:
-                provider.stop()
-        else:
-            while True:
-                if not _check(workers):
-                    break
-                if handle and hasattr(handle, "is_running") and not handle.is_running():
-                    break
-                time.sleep(1.0)
-
-
-def oneshot(
-    config: Config,
-    program_name: str | None = None,
-    arguments: list[str] | None = None,
-    wasm_path: Path | None = None,
-    manifest_path: Path | None = None,
-    console: Console | None = None,
-    force_overwrite: bool = False,
-) -> None:
-    """Run a single program then shut down."""
-    import asyncio
-
-    with runtime(config, console=console) as (handle, workers):
-        name = program_name
-        if wasm_path is not None and manifest_path is not None:
-            import tomllib
-
-            manifest = tomllib.loads(manifest_path.read_text())
-            pkg_name = manifest["package"]["name"]
-            version = manifest["package"]["version"]
-            name = f"{pkg_name}@{version}"
-
-        async def _run():
-            nonlocal name
-            from pie_client import PieClient, Event
-
-            async with PieClient(f"ws://{config.host}:{config.port}") as client:
-                await client.auth_by_token(handle.internal_token)
-
-                # Install from local path if provided
-                if wasm_path is not None and manifest_path is not None:
-                    if not wasm_path.exists():
-                        raise FileNotFoundError(f"Program not found: {wasm_path}")
-                    if not manifest_path.exists():
-                        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
-
-                    print("Installing program (force overwrite)...")
-                    await client.install_program(wasm_path, manifest_path, force_overwrite=force_overwrite)
-
-                # Resolve bare name to name@version if needed
-                if "@" not in name:
-                    name = await client.resolve_version(name, config.registry)
-
-                # Launch and stream
-                print(f"Launching {name}...")
-                process = await client.launch_process(
-                    name,
-                    arguments=arguments or [],
-                    capture_outputs=True,
-                )
-                print(f"Process started: {process.process_id}")
-
-                try:
-                    while True:
-                        event, value = await process.recv()
-                        if event == Event.Stdout:
-                            print(value, end="", flush=True)
-                        elif event == Event.Stderr:
-                            print(value, end="", file=sys.stderr, flush=True)
-                        elif event == Event.Message:
-                            print(f"[Message] {value}")
-                        elif event == Event.Return:
-                            print(value)
-                            break
-                        elif event == Event.Error:
-                            print(f"❌ {value}", file=sys.stderr)
-                            break
-                        elif event == Event.File:
-                            print(f"[Received file: {len(value)} bytes]")
-                except Exception as e:
-                    import traceback
-                    print(f"[RECV ERROR] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-                    traceback.print_exc(file=sys.stderr)
-
-        asyncio.run(_run())
+    @property
+    def config(self) -> Config:
+        return self._config
 
 
 # -- Internal -----------------------------------------------------------------
+
+
+def _find_free_port() -> int:
+    """Find a free TCP port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
 def _bootstrap(
@@ -428,15 +300,14 @@ def _bootstrap(
     return runtime_handle, [ctx]
 
 
+
+
 def _check(backend_processes: list) -> bool:
     """Check if all backend processes are still alive."""
     for ctx in backend_processes:
         for p in ctx.processes:
             if not p.is_alive() and p.exitcode != 0:
-                print(
-                    f"❌ Backend process exited unexpectedly (exit code {p.exitcode})",
-                    file=sys.stderr,
-                )
+                log.error("Backend process exited unexpectedly (exit code %s)", p.exitcode)
                 return False
     return True
 

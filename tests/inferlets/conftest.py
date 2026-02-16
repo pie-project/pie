@@ -113,6 +113,7 @@ TestFn = Callable[..., Coroutine]
 
 async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     from pie.server import Server
+    from pie.config import Config, ModelConfig, AuthConfig
 
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else args.device
 
@@ -121,7 +122,17 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     print(f"Dummy:  {args.dummy}")
     print()
 
-    async with Server(model=args.model, device=device, dummy=args.dummy) as client:
+    cfg = Config(
+        port=0,
+        auth=AuthConfig(enabled=False),
+        models=[ModelConfig(
+            hf_repo=args.model,
+            device=[device] if isinstance(device, str) else device,
+            dummy_mode=args.dummy,
+        )],
+    )
+    async with Server(cfg) as server:
+        client = await server.connect()
         results: list[tuple[str, str, str]] = []
 
         for test_fn in tests:

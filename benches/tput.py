@@ -22,6 +22,7 @@ from pie_client import Event
 
 async def run_benchmark(args):
     from pie.server import Server
+    from pie.config import Config, ModelConfig, AuthConfig
 
     # -- Resolve paths --------------------------------------------------------
 
@@ -54,7 +55,7 @@ async def run_benchmark(args):
 
     # -- Parse device list ----------------------------------------------------
 
-    device = [d.strip() for d in args.device.split(",")] if "," in args.device else args.device
+    device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
 
     # -- Start server ---------------------------------------------------------
 
@@ -66,11 +67,13 @@ async def run_benchmark(args):
     print(f"Prompt:      {args.prompt!r}")
     print()
 
-    async with Server(
-        model=args.model,
-        device=device,
-        dummy=args.dummy,
-    ) as client:
+    cfg = Config(
+        port=0,
+        auth=AuthConfig(enabled=False),
+        models=[ModelConfig(hf_repo=args.model, device=device, dummy_mode=args.dummy)],
+    )
+    async with Server(cfg) as server:
+        client = await server.connect()
         # -- Install program --------------------------------------------------
 
         if not await client.check_program(inferlet_name, wasm_path, manifest_path):

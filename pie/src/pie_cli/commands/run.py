@@ -4,6 +4,8 @@ Implements: pie run <inferlet> [args]
 Runs an inferlet with a one-shot Pie engine instance.
 """
 
+import asyncio
+import sys
 from pathlib import Path
 
 import typer
@@ -13,7 +15,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from pie.config import load_config
-from pie.server import oneshot
+from pie.server import Server
 
 console = Console()
 
@@ -82,12 +84,61 @@ def run(
     console.print(Panel(lines, title="Pie Run", title_align="left", border_style="dim"))
     console.print()
 
-    oneshot(
-        cfg,
-        program_name=inferlet,
-        arguments=arguments or [],
-        wasm_path=path,
-        manifest_path=manifest,
-        console=console,
-        force_overwrite=path is not None,
-    )
+    # Resolve program name
+    name = inferlet
+    force_overwrite = path is not None
+    if path is not None and manifest is not None:
+        import tomllib
+        manifest_data = tomllib.loads(manifest.read_text())
+        pkg_name = manifest_data["package"]["name"]
+        version = manifest_data["package"]["version"]
+        name = f"{pkg_name}@{version}"
+
+    async def _run():
+        from pie_client import Event
+
+        async with Server(cfg) as server:
+            client = await server.connect()
+
+            # Install from local path if provided
+            if path is not None and manifest is not None:
+                print("Installing program (force overwrite)...")
+                await client.install_program(path, manifest, force_overwrite=force_overwrite)
+
+            # Resolve bare name to name@version if needed
+            resolved = name
+            if "@" not in resolved:
+                resolved = await client.resolve_version(resolved, cfg.registry)
+
+            # Launch and stream
+            print(f"Launching {resolved}...")
+            process = await client.launch_process(
+                resolved,
+                arguments=arguments or [],
+                capture_outputs=True,
+            )
+            print(f"Process started: {process.process_id}")
+
+            try:
+                while True:
+                    event, value = await process.recv()
+                    if event == Event.Stdout:
+                        print(value, end="", flush=True)
+                    elif event == Event.Stderr:
+                        print(value, end="", file=sys.stderr, flush=True)
+                    elif event == Event.Message:
+                        print(f"[Message] {value}")
+                    elif event == Event.Return:
+                        print(value)
+                        break
+                    elif event == Event.Error:
+                        print(f"❌ {value}", file=sys.stderr)
+                        break
+                    elif event == Event.File:
+                        print(f"[Received file: {len(value)} bytes]")
+            except Exception as e:
+                import traceback
+                print(f"[RECV ERROR] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                traceback.print_exc(file=sys.stderr)
+
+    asyncio.run(_run())

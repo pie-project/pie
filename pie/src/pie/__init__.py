@@ -3,8 +3,11 @@
 Public API::
 
     from pie import Server
+    from pie.config import Config, ModelConfig
 
-    async with Server(model="Qwen/Qwen3-0.6B") as client:
+    cfg = Config(models=[ModelConfig(hf_repo="Qwen/Qwen3-0.6B")])
+    async with Server(cfg) as server:
+        client = await server.connect()
         process = await client.launch_process(
             "text-completion@0.2.11",
             arguments=["--prompt", "Hello"],

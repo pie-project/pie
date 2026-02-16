@@ -4,6 +4,7 @@ Implements: pie serve
 Starts the Pie engine and optionally provides a real-time TUI monitor.
 """
 
+import asyncio
 from pathlib import Path
 
 import typer
@@ -13,7 +14,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from pie.config import load_config
-from pie.server import serve as runtime_serve
+from pie.server import Server
 
 console = Console()
 
@@ -60,4 +61,36 @@ def serve(
     console.print(Panel(lines, title="Pie Engine", title_align="left", border_style="dim"))
     console.print()
 
-    runtime_serve(cfg, monitor=monitor, console=console)
+    async def _run():
+        server = Server(cfg)
+        async with server:
+            if monitor:
+                from pie_cli.monitor.app import LLMMonitorApp
+                from pie_cli.monitor.provider import PieMetricsProvider
+
+                model_cfg = cfg.primary_model
+                provider = PieMetricsProvider(
+                    host=cfg.host,
+                    port=cfg.port,
+                    internal_token=server.token,
+                    config={
+                        "model": model_cfg.name or model_cfg.hf_repo,
+                        "tp_size": model_cfg.tensor_parallel_size or len(model_cfg.device),
+                        "max_batch": model_cfg.max_batch_tokens or 32,
+                    },
+                )
+                provider.start()
+                try:
+                    LLMMonitorApp(provider=provider).run()
+                finally:
+                    provider.stop()
+            else:
+                await server.wait()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        console.print()
+        console.print("[green]✓[/green] Shutdown complete")
