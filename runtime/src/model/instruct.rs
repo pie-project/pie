@@ -6,8 +6,10 @@
 use std::sync::Arc;
 use crate::model::tokenizer::Tokenizer;
 
-// Model implementations
+// Shared decoders
+pub mod decoders;
 
+// Model implementations
 pub mod gemma2;
 pub mod gemma3;
 pub mod gptoss;

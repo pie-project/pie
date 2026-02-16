@@ -7,11 +7,12 @@
 
 use std::sync::Arc;
 use crate::model::instruct::{
-    ChatDecoder, ChatEvent,
+    ChatDecoder,
     Instruct,
-    ReasoningDecoder, ReasoningEvent,
+    ReasoningDecoder,
     ToolDecoder, ToolEvent,
 };
+use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder, NoopReasoningDecoder};
 use crate::model::tokenizer::Tokenizer;
 
 // =============================================================================
@@ -158,17 +159,42 @@ impl QwenInstruct {
             .iter()
             .filter_map(|s| tokenizer.token_to_id(s))
             .collect();
+
+        let im_start = encode("<|im_start|>");
+        let im_end = encode("<|im_end|>");
+        let newline = encode("\n");
+
+        let make_prefix = |role: &str| -> Vec<u32> {
+            let mut v = im_start.clone();
+            v.extend(encode(role));
+            v.extend(&newline);
+            v
+        };
+
+        let mut turn_suffix = im_end;
+        turn_suffix.extend(&newline);
+
+        let mut think_prefix = encode("<think>");
+        think_prefix.extend(&newline);
+        let mut think_suffix = encode("</think>");
+        think_suffix.extend(&newline);
+
+        let mut tool_resp_prefix = encode("<tool_response>");
+        tool_resp_prefix.extend(&newline);
+        let mut tool_resp_suffix = newline.clone();
+        tool_resp_suffix.extend(encode("</tool_response>"));
+
         Self {
-            system_prefix: encode("<|im_start|>system\n"),
-            user_prefix: encode("<|im_start|>user\n"),
-            assistant_prefix: encode("<|im_start|>assistant\n"),
-            turn_suffix: encode("<|im_end|>\n"),
-            generation_header: encode("<|im_start|>assistant\n"),
+            system_prefix: make_prefix("system"),
+            user_prefix: make_prefix("user"),
+            assistant_prefix: make_prefix("assistant"),
+            generation_header: make_prefix("assistant"),
+            turn_suffix,
             stop_ids,
-            think_prefix_ids: encode("<think>\n"),
-            think_suffix_ids: encode("</think>\n"),
-            tool_response_prefix_tokens: encode("<tool_response>\n"),
-            tool_response_suffix_tokens: encode("\n</tool_response>"),
+            think_prefix_ids: think_prefix,
+            think_suffix_ids: think_suffix,
+            tool_response_prefix_tokens: tool_resp_prefix,
+            tool_response_suffix_tokens: tool_resp_suffix,
             tokenizer,
             config,
         }
@@ -202,7 +228,7 @@ impl QwenInstruct {
     /// Both Qwen3 and Qwen2.5 use identical `<tools>` XML + `<tool_call>` format.
     fn build_tool_system_prompt(tools: &[String]) -> String {
         let mut prompt = String::from(
-            "# Tools\n\n\
+            " # Tools\n\n\
              You may call one or more functions to assist with the user query.\n\n\
              You are provided with function signatures within <tools></tools> XML tags:\n\
              <tools>"
@@ -314,23 +340,18 @@ impl Instruct for QwenInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(QwenChatDecoder {
-            tokenizer: self.tokenizer.clone(),
-            stop_ids: self.stop_ids.clone(),
-            accumulated: String::new(),
-        })
+        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
-        Box::new(QwenReasoningDecoder {
-            tokenizer: self.tokenizer.clone(),
-            think_prefix_ids: self.think_prefix_ids.clone(),
-            think_suffix_ids: self.think_suffix_ids.clone(),
-            state: ReasoningState::Outside,
-            accumulated: String::new(),
-            match_pos: 0,
-            has_thinking: self.config.has_thinking,
-        })
+        if !self.config.has_thinking {
+            return Box::new(NoopReasoningDecoder);
+        }
+        Box::new(ThinkingDecoder::new(
+            self.tokenizer.clone(),
+            self.think_prefix_ids.clone(),
+            self.think_suffix_ids.clone(),
+        ))
     }
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
@@ -347,106 +368,6 @@ impl Instruct for QwenInstruct {
             return None;
         }
         Self::build_tool_call_grammar(tools)
-    }
-}
-
-// =============================================================================
-// Chat Decoder
-// =============================================================================
-
-struct QwenChatDecoder {
-    tokenizer: Arc<Tokenizer>,
-    stop_ids: Vec<u32>,
-    accumulated: String,
-}
-
-impl ChatDecoder for QwenChatDecoder {
-    fn feed(&mut self, tokens: &[u32]) -> ChatEvent {
-        for &t in tokens {
-            if self.stop_ids.contains(&t) {
-                let text = std::mem::take(&mut self.accumulated);
-                return ChatEvent::Done(text);
-            }
-        }
-        let delta = self.tokenizer.decode(tokens, false);
-        self.accumulated.push_str(&delta);
-        ChatEvent::Delta(delta)
-    }
-
-    fn reset(&mut self) {
-        self.accumulated.clear();
-    }
-}
-
-// =============================================================================
-// Reasoning Decoder
-// =============================================================================
-
-enum ReasoningState {
-    Outside,
-    Inside,
-}
-
-struct QwenReasoningDecoder {
-    tokenizer: Arc<Tokenizer>,
-    think_prefix_ids: Vec<u32>,
-    think_suffix_ids: Vec<u32>,
-    state: ReasoningState,
-    accumulated: String,
-    match_pos: usize,
-    has_thinking: bool,
-}
-
-impl ReasoningDecoder for QwenReasoningDecoder {
-    fn feed(&mut self, tokens: &[u32]) -> ReasoningEvent {
-        if !self.has_thinking {
-            return ReasoningEvent::Delta(String::new());
-        }
-        match self.state {
-            ReasoningState::Outside => {
-                for &t in tokens {
-                    if self.match_pos < self.think_prefix_ids.len()
-                        && t == self.think_prefix_ids[self.match_pos]
-                    {
-                        self.match_pos += 1;
-                        if self.match_pos == self.think_prefix_ids.len() {
-                            self.state = ReasoningState::Inside;
-                            self.match_pos = 0;
-                            return ReasoningEvent::Start;
-                        }
-                    } else {
-                        self.match_pos = 0;
-                    }
-                }
-                ReasoningEvent::Delta(String::new())
-            }
-            ReasoningState::Inside => {
-                for &t in tokens {
-                    if self.match_pos < self.think_suffix_ids.len()
-                        && t == self.think_suffix_ids[self.match_pos]
-                    {
-                        self.match_pos += 1;
-                        if self.match_pos == self.think_suffix_ids.len() {
-                            self.state = ReasoningState::Outside;
-                            self.match_pos = 0;
-                            let text = std::mem::take(&mut self.accumulated);
-                            return ReasoningEvent::Complete(text);
-                        }
-                    } else {
-                        self.match_pos = 0;
-                    }
-                }
-                let delta = self.tokenizer.decode(tokens, false);
-                self.accumulated.push_str(&delta);
-                ReasoningEvent::Delta(delta)
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        self.state = ReasoningState::Outside;
-        self.accumulated.clear();
-        self.match_pos = 0;
     }
 }
 
@@ -612,5 +533,65 @@ mod tests {
     fn tool_call_grammar_none_when_disabled() {
         let inst = olmo3();
         assert!(inst.tool_call_grammar(&["{}".to_string()]).is_none());
+    }
+
+    #[test]
+    fn full_conversation() {
+        let inst = qwen3();
+        let mut tokens = Vec::new();
+        tokens.extend(inst.system("Hello"));
+        tokens.extend(inst.user("Hello"));
+        tokens.extend(inst.assistant("Hello"));
+        tokens.extend(inst.user("Hello"));
+        tokens.extend(inst.cue());
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|im_start|>system\nHello<|im_end|>\n\
+             <|im_start|>user\nHello<|im_end|>\n\
+             <|im_start|>assistant\nHello<|im_end|>\n\
+             <|im_start|>user\nHello<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn answer_format() {
+        let inst = qwen3();
+        let tokens = inst.answer("fn1", "Hello");
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|im_start|>user\n<tool_response>\nHello\n</tool_response><|im_end|>\n"
+        );
+    }
+
+    #[test]
+    fn tool_decoder_parses_call() {
+        // Build vocab with the JSON content as a single entry
+        let mut v: Vec<String> = vec![
+            "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+            "system", "\n", "user", "assistant", "Hello", " world",
+            "<think>", "</think>", "<tool_call>", "</tool_call>",
+            "<tool_response>", "</tool_response>", "<tools>", "</tools>",
+            r#"{"name": "f", "arguments": {}}"#,
+        ].into_iter().map(String::from).collect();
+        let tok = Arc::new(Tokenizer::from_vocab(&v));
+        let inst = QwenInstruct::new(tok, ChatMLConfig {
+            has_thinking: true, has_tools: true,
+            stop_tokens: &["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+        });
+        let mut dec = inst.tool_decoder();
+        // Feed: <tool_call> \n JSON \n </tool_call>
+        dec.feed(&[11]); // <tool_call> → enters inside, returns Start
+        dec.feed(&[4]);  // \n
+        let event = dec.feed(&[17, 4, 12]); // JSON + \n + </tool_call>
+        match event {
+            ToolEvent::Call(name, args) => {
+                assert_eq!(name, "f");
+                assert_eq!(args, "{}");
+            }
+            other => panic!("expected Call, got {:?}", other),
+        }
     }
 }

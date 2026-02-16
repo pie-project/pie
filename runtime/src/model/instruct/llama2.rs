@@ -4,20 +4,20 @@
 //! - [INST]...[/INST] for instructions
 //! - <<SYS>>...<</SYS>> for system prompts (embedded in first instruction)
 //!
-//! Note: This implementation emits system prompts as standalone [INST] blocks
-//! wrapping the system message, effectively creating a system turn.
+//! `system()` returns the bare <<SYS>> wrapper. The caller should embed
+//! this at the start of the first user turn's [INST] content.
 //!
 //! Reference: Llama 2 paper/HuggingFace template.
 
 use std::sync::Arc;
 use crate::model::instruct::{
-    ChatDecoder, ChatEvent,
+    ChatDecoder,
     Instruct,
-    ReasoningDecoder, ReasoningEvent,
-    ToolDecoder, ToolEvent,
+    ReasoningDecoder,
+    ToolDecoder,
 };
+use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::model::tokenizer::Tokenizer;
-use crate::model::instruct::gemma2::{NoopReasoningDecoder, NoopToolDecoder};
 
 // =============================================================================
 // LlamaInstruct
@@ -72,12 +72,12 @@ impl LlamaInstruct {
 
 impl Instruct for LlamaInstruct {
     fn system(&self, msg: &str) -> Vec<u32> {
-        // Wrap system message in <<SYS>>...<</SYS>> and put inside [INST]...[/INST]
-        let mut tokens = self.inst_start.clone();
-        tokens.extend(&self.sys_wrapper_start);
+        // Llama 2 reference: <<SYS>> block is embedded inside the first
+        // [INST]...[/INST] user turn. Return the inner wrapper; the caller
+        // should embed this at the start of the first user turn content.
+        let mut tokens = self.sys_wrapper_start.clone();
         tokens.extend(self.tokenizer.encode(msg));
         tokens.extend(&self.sys_wrapper_end);
-        tokens.extend(&self.inst_end);
         tokens
     }
 
@@ -111,11 +111,7 @@ impl Instruct for LlamaInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(LlamaChatDecoder {
-            tokenizer: self.tokenizer.clone(),
-            stop_ids: self.stop_ids.clone(),
-            accumulated: String::new(),
-        })
+        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
@@ -124,34 +120,6 @@ impl Instruct for LlamaInstruct {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(NoopToolDecoder)
-    }
-}
-
-// =============================================================================
-// Chat Decoder
-// =============================================================================
-
-struct LlamaChatDecoder {
-    tokenizer: Arc<Tokenizer>,
-    stop_ids: Vec<u32>,
-    accumulated: String,
-}
-
-impl ChatDecoder for LlamaChatDecoder {
-    fn feed(&mut self, tokens: &[u32]) -> ChatEvent {
-        for &t in tokens {
-            if self.stop_ids.contains(&t) {
-                let text = std::mem::take(&mut self.accumulated);
-                return ChatEvent::Done(text);
-            }
-        }
-        let delta = self.tokenizer.decode(tokens, false);
-        self.accumulated.push_str(&delta);
-        ChatEvent::Delta(delta)
-    }
-
-    fn reset(&mut self) {
-        self.accumulated.clear();
     }
 }
 
@@ -183,12 +151,11 @@ mod tests {
         let inst = llama2();
         let tokens = inst.system("Hello");
         let text = inst.tokenizer.decode(&tokens, false);
-        // Expect: [INST] <<SYS>>\nHello\n<</SYS>>\n\n [/INST]
-        assert!(text.contains("[INST]"));
+        // Returns <<SYS>> wrapper without [INST]; caller embeds in first user turn
+        assert!(!text.contains("[INST]"));
         assert!(text.contains("<<SYS>>"));
         assert!(text.contains("Hello"));
         assert!(text.contains("<</SYS>>"));
-        assert!(text.contains("[/INST]"));
     }
 
     #[test]
@@ -197,5 +164,34 @@ mod tests {
         let tokens = inst.user("Hello");
         let text = inst.tokenizer.decode(&tokens, false);
         assert_eq!(text, "[INST] Hello [/INST]");
+    }
+
+    #[test]
+    fn full_conversation() {
+        let inst = llama2();
+        let mut tokens = Vec::new();
+        tokens.extend(inst.system("Hello"));
+        tokens.extend(inst.user("Hello"));
+        tokens.extend(inst.assistant("Hello"));
+        tokens.extend(inst.user("Hello"));
+        tokens.extend(inst.cue());
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<<SYS>>\nHello\n<</SYS>>\n\n\
+             [INST] Hello [/INST]\
+             Hello</s>\
+             [INST] Hello [/INST]"
+        );
+    }
+
+    #[test]
+    fn equip_is_noop() {
+        assert!(llama2().equip(&["tool".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn answer_is_noop() {
+        assert!(llama2().answer("fn1", "42").is_empty());
     }
 }

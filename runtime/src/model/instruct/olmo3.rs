@@ -9,11 +9,12 @@
 
 use std::sync::Arc;
 use crate::model::instruct::{
-    ChatDecoder, ChatEvent,
+    ChatDecoder,
     Instruct,
-    ReasoningDecoder, ReasoningEvent,
+    ReasoningDecoder,
     ToolDecoder, ToolEvent,
 };
+use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::model::tokenizer::Tokenizer;
 
 static TEMPLATE: &str = r#"
@@ -148,21 +149,16 @@ impl Instruct for OlmoInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(OlmoChatDecoder {
-            tokenizer: self.tokenizer.clone(),
-            stop_ids: self.im_end.clone(), 
-            accumulated: String::new(),
-        })
+        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.im_end.clone()))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
-        Box::new(OlmoReasoningDecoder {
-            tokenizer: self.tokenizer.clone(),
-            end_ids: self.think_end.clone(),
-            state: ReasoningState::Inside, // Starts inside because of cue <think>
-            accumulated: String::new(),
-            match_pos: 0,
-        })
+        // Starts inside because cue() includes <think>; empty start_ids = starts inside
+        Box::new(ThinkingDecoder::new(
+            self.tokenizer.clone(),
+            vec![],
+            self.think_end.clone(),
+        ))
     }
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
@@ -176,76 +172,6 @@ impl Instruct for OlmoInstruct {
 }
 
 // ─── Decoders ───────────────────────────────────────────────
-
-struct OlmoChatDecoder {
-    tokenizer: Arc<Tokenizer>,
-    stop_ids: Vec<u32>,
-    accumulated: String,
-}
-
-impl ChatDecoder for OlmoChatDecoder {
-    fn feed(&mut self, tokens: &[u32]) -> ChatEvent {
-         for t in tokens {
-             if self.stop_ids.contains(t) {
-                 return ChatEvent::Done(std::mem::take(&mut self.accumulated));
-             }
-         }
-         let delta = self.tokenizer.decode(tokens, false);
-         self.accumulated.push_str(&delta);
-         ChatEvent::Delta(delta)
-    }
-    
-    fn reset(&mut self) { self.accumulated.clear(); }
-}
-
-enum ReasoningState {
-    Outside,
-    Inside,
-}
-
-struct OlmoReasoningDecoder {
-    tokenizer: Arc<Tokenizer>,
-    end_ids: Vec<u32>,
-    state: ReasoningState,
-    accumulated: String,
-    match_pos: usize,
-}
-
-impl ReasoningDecoder for OlmoReasoningDecoder {
-    fn feed(&mut self, tokens: &[u32]) -> ReasoningEvent {
-        match self.state {
-             ReasoningState::Outside => {
-                 // Should not happen if started correct, or if re-entered?
-                 // For now, no-op
-                 ReasoningEvent::Delta(String::new())
-             }
-             ReasoningState::Inside => {
-                for &t in tokens {
-                    if self.match_pos < self.end_ids.len() && t == self.end_ids[self.match_pos] {
-                        self.match_pos += 1;
-                        if self.match_pos == self.end_ids.len() {
-                            self.state = ReasoningState::Outside;
-                            self.match_pos = 0;
-                            let text = std::mem::take(&mut self.accumulated);
-                            return ReasoningEvent::Complete(text);
-                        }
-                    } else {
-                        self.match_pos = 0;
-                    }
-                }
-                let delta = self.tokenizer.decode(tokens, false);
-                self.accumulated.push_str(&delta);
-                ReasoningEvent::Delta(delta)
-             }
-        }
-    }
-
-    fn reset(&mut self) {
-        self.state = ReasoningState::Inside;
-        self.accumulated.clear();
-        self.match_pos = 0;
-    }
-}
 
 struct OlmoToolDecoder {
     tokenizer: Arc<Tokenizer>,
@@ -338,11 +264,21 @@ mod tests {
 
     #[test]
     fn equip_format() {
-        let tok = make_tok(&["<|im_start|>", "<|im_end|>", "\n", "system", "<functions>", "</functions>", "foo", "bar"]);
+        // Build the exact content string that equip() will encode so the
+        // mock tokenizer's fast-path recognizes it as a single token.
+        let tools = &["foo".to_string(), "bar".to_string()];
+        let preamble = "You are OLMo, a helpful function-calling AI assistant built by Ai2. Your date cutoff is November 2024. ";
+        let content = format!("{}<functions>{}</functions>", preamble, tools.join("\n"));
+        let mut vocab: Vec<String> = vec![
+            "<|im_start|>", "<|im_end|>", "\n", "system",
+            "<functions>", "</functions>", "foo", "bar",
+        ].into_iter().map(String::from).collect();
+        vocab.push(content);
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
         let inst = OlmoInstruct::new(tok);
-        let tokens = inst.equip(&["foo".to_string(), "bar".to_string()]);
+        let tokens = inst.equip(tools);
         let text = inst.tokenizer.decode(&tokens, false);
-        // assert!(text.contains("<functions>"));
+        assert!(text.contains("<functions>"));
         assert!(text.contains("foo"));
         assert!(text.contains("bar"));
         assert!(text.contains("</functions>"));
@@ -364,5 +300,47 @@ mod tests {
         let tokens = inst.cue();
         let text = inst.tokenizer.decode(&tokens, false);
         assert!(text.contains("<|im_start|>assistant\n<think>"));
+    }
+
+    fn olmo() -> OlmoInstruct {
+        let tok = make_tok(&[
+            "<|im_start|>", "<|im_end|>", "\n", "system", "Hello",
+            "user", "assistant", "environment", "<|endoftext|>",
+            "<functions>", "</functions>",
+            "<function_calls>", "</function_calls>",
+            "<think>", "</think>",
+        ]);
+        OlmoInstruct::new(tok)
+    }
+
+    #[test]
+    fn full_conversation() {
+        let inst = olmo();
+        let mut tokens = Vec::new();
+        tokens.extend(inst.system("Hello"));
+        tokens.extend(inst.user("Hello"));
+        tokens.extend(inst.assistant("Hello"));
+        tokens.extend(inst.user("Hello"));
+        tokens.extend(inst.cue());
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|im_start|>system\nHello<|im_end|>\n\
+             <|im_start|>user\nHello<|im_end|>\n\
+             <|im_start|>assistant\nHello<|im_end|>\n\
+             <|im_start|>user\nHello<|im_end|>\n\
+             <|im_start|>assistant\n<think>"
+        );
+    }
+
+    #[test]
+    fn answer_uses_environment_role() {
+        let inst = olmo();
+        let tokens = inst.answer("fn", "Hello");
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|im_start|>environment\nHello<|im_end|>\n"
+        );
     }
 }

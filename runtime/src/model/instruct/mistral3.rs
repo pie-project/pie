@@ -11,13 +11,13 @@
 
 use std::sync::Arc;
 use crate::model::instruct::{
-    ChatDecoder, ChatEvent,
+    ChatDecoder,
     Instruct,
     ReasoningDecoder,
     ToolDecoder, ToolEvent,
 };
+use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder};
 use crate::model::tokenizer::Tokenizer;
-use crate::model::instruct::gemma2::NoopReasoningDecoder;
 
 static TEMPLATE: &str = r#"
 {#- Default system message if no system prompt is passed. #}
@@ -162,13 +162,8 @@ impl MistralInstruct {
             .filter_map(|s| tokenizer.token_to_id(s))
             .collect();
 
-        // Safe encoding: ensure special tokens are encoded as themselves, not merged with spaces
-        // if the tokenizer deals with them that way.
-        let mut inst_start = encode("[INST]");
-        inst_start.extend(encode(" "));
-        
-        let mut inst_end = encode(" ");
-        inst_end.extend(encode("[/INST]"));
+        let inst_start = encode("[INST]");
+        let inst_end = encode("[/INST]");
 
         Self {
             bos_token: encode("<s>"),
@@ -236,11 +231,7 @@ impl Instruct for MistralInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(MistralChatDecoder {
-            tokenizer: self.tokenizer.clone(),
-            stop_ids: self.stop_ids.clone(),
-            accumulated: String::new(),
-        })
+        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
@@ -295,34 +286,6 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
             name_alt = name_alt
         );
         Some(grammar)
-    }
-}
-
-// =============================================================================
-// Chat Decoder
-// =============================================================================
-
-struct MistralChatDecoder {
-    tokenizer: Arc<Tokenizer>,
-    stop_ids: Vec<u32>,
-    accumulated: String,
-}
-
-impl ChatDecoder for MistralChatDecoder {
-    fn feed(&mut self, tokens: &[u32]) -> ChatEvent {
-        for &t in tokens {
-            if self.stop_ids.contains(&t) {
-                let text = std::mem::take(&mut self.accumulated);
-                return ChatEvent::Done(text);
-            }
-        }
-        let delta = self.tokenizer.decode(tokens, false);
-        self.accumulated.push_str(&delta);
-        ChatEvent::Delta(delta)
-    }
-
-    fn reset(&mut self) {
-        self.accumulated.clear();
     }
 }
 
@@ -449,7 +412,7 @@ mod tests {
         let inst = mistral();
         let tokens = inst.user("Hi");
         let text = inst.tokenizer.decode(&tokens, false);
-        assert_eq!(text, "[INST] Hi [/INST]");
+        assert_eq!(text, "[INST]Hi[/INST]");
     }
 
     #[test]
@@ -475,5 +438,41 @@ mod tests {
         let g = inst.tool_call_grammar(&tools).unwrap();
         assert!(g.contains("tool-call ::= \"[TOOL_CALLS]\""));
         assert!(g.contains("foo"));
+    }
+
+    #[test]
+    fn full_conversation() {
+        let inst = mistral();
+        let mut tokens = Vec::new();
+        tokens.extend(inst.system("Hi"));
+        tokens.extend(inst.user("Hi"));
+        tokens.extend(inst.assistant("Hi"));
+        tokens.extend(inst.user("Hi"));
+        tokens.extend(inst.cue());
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "[SYSTEM_PROMPT]Hi[/SYSTEM_PROMPT]\
+             [INST]Hi[/INST]\
+             Hi</s>\
+             [INST]Hi[/INST]"
+        );
+    }
+
+    #[test]
+    fn tool_decoder_parses_call() {
+        let inst = mistral();
+        let mut dec = inst.tool_decoder();
+        dec.feed(&[9]);  // [TOOL_CALLS]
+        dec.feed(&[22]); // "f"
+        dec.feed(&[10]); // [ARGS]
+        let event = dec.feed(&[16, 17, 1]); // "{}" + "</s>"
+        match event {
+            ToolEvent::Call(name, args) => {
+                assert_eq!(name, "f");
+                assert_eq!(args, "{}");
+            }
+            other => panic!("expected Call, got {:?}", other),
+        }
     }
 }
