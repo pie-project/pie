@@ -11,7 +11,6 @@ use crate::auth;
 use crate::context;
 use crate::device;
 use crate::inference;
-
 use crate::linker;
 use crate::messaging;
 use crate::model;

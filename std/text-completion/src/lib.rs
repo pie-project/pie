@@ -44,18 +44,15 @@ async fn main(args: Vec<String>) -> Result<String> {
 
     let mut output = String::new();
 
-    use std::io::Write;
     while let Some(event) = events.next().await? {
         match event {
             Event::Thinking(s) => {
-                eprint!("{}", s);
+                print!("{}", s);
             }
             Event::ThinkingDone(_) => {
-                eprintln!("\n--- end thinking ---");
             }
             Event::Text(s) => {
                 print!("{}", s);
-                std::io::stdout().flush().ok();
             }
             Event::Done(s) => {
                 output = s;

@@ -44,7 +44,7 @@ pub mod adapter {
 }
 
 pub mod model {
-    pub use crate::pie::core::model::{Model, Tokenizer, ChatTemplate, SystemHandling};
+    pub use crate::pie::core::model::{Model, Tokenizer};
 }
 
 pub mod runtime {

@@ -343,10 +343,6 @@ class Engine:
     # Metadata
     # ========================================================================
 
-    def chat_template(self) -> dict:
-        """Get chat template for this model's architecture."""
-        return model_registry.get_chat_template(self.arch_type)
-
     def query(self, query: str) -> str:
         """Handle a simple query."""
         match query:

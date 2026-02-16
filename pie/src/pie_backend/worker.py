@@ -147,7 +147,6 @@ def worker_main(
     import pie_runtime
     from pie_backend.engine import Engine
     from pie_backend.config import RuntimeConfig
-    from pie_backend.model import get_chat_template
     import torch.distributed as dist
     import threading
 

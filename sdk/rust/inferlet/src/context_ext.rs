@@ -144,12 +144,7 @@ impl<'a> TokenStream<'a> {
     pub fn new(ctx: &'a Context, sampler: Sampler) -> Self {
         let model = ctx.model();
         let page_size = ctx.tokens_per_page();
-        let ct = model.chat_template();
-        let tokenizer = model.tokenizer();
-        let stop_tokens: Vec<u32> = ct.stop_tokens
-            .iter()
-            .filter_map(|s| tokenizer.encode(s).into_iter().next())
-            .collect();
+        let stop_tokens = crate::pie::instruct::chat::stop_tokens(&model);
         Self {
             ctx,
             model,
