@@ -23,7 +23,7 @@ Inferlets compile to WASM. Target: `wasm32-wasip2`.
 
 ```bash
 # Build a single inferlet
-cd std/text-completion
+cd inferlets/text-completion
 cargo build --release --target wasm32-wasip2
 
 # Publish to registry
@@ -59,7 +59,7 @@ cd runtime && cargo test
 cd sdk/rust/inferlet && cargo check --target wasm32-wasip2
 
 # Specific inferlet check
-cd std/text-completion && cargo check --target wasm32-wasip2
+cd inferlets/text-completion && cargo check --target wasm32-wasip2
 ```
 
 # Key Directories
@@ -70,7 +70,7 @@ cd std/text-completion && cargo check --target wasm32-wasip2
 | `runtime/wit/` | Runtime-side WIT interfaces |
 | `sdk/rust/inferlet/` | Rust SDK for writing inferlets |
 | `sdk/rust/inferlet/wit/` | SDK-side WIT interfaces (must match runtime) |
-| `std/` | Standard inferlets (text-completion, etc.) |
+| `inferlets/` | Standard inferlets (text-completion, etc.) |
 | `pie/src/pie_cli/` | Python CLI (`pie run`, `pie serve`) |
 | `pie/src/pie_backend/` | Python GPU backend (model loading, inference engine) |
 | `pie/pyproject.toml` | Build config (maturin + uv) |

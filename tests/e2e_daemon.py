@@ -34,14 +34,14 @@ import httpx
 REPO = Path(__file__).resolve().parent.parent
 WASM_PATH = (
     REPO
-    / "std"
+    / "inferlets"
     / "openresponses"
     / "target"
     / "wasm32-wasip2"
     / "debug"
     / "openresponses.wasm"
 )
-MANIFEST_PATH = REPO / "std" / "openresponses" / "Pie.toml"
+MANIFEST_PATH = REPO / "inferlets" / "openresponses" / "Pie.toml"
 
 PIE_PORT = 9999
 DAEMON_PORT = 9998
@@ -485,7 +485,7 @@ async def main() -> int:
     # --- Sanity checks ---
     if not WASM_PATH.exists():
         log(f"WASM not found at {WASM_PATH}")
-        log("Build first:  cargo build --target wasm32-wasip2  (from std/openresponses-server)")
+        log("Build first:  cargo build --target wasm32-wasip2  (from inferlets/openresponses)")
         return 1
     if not MANIFEST_PATH.exists():
         log(f"Manifest not found at {MANIFEST_PATH}")
