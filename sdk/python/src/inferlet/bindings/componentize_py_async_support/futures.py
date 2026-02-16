@@ -6,16 +6,13 @@ from typing import TypeVar, Generic, cast, Self, Any, Callable
 from types import TracebackType
 from componentize_py_async_support import _ReturnCode
 
-T = TypeVar("T")
-
+T = TypeVar('T')
 
 class FutureReader(Generic[T]):
     def __init__(self, type_: int, handle: int):
         self.type_ = type_
         self.handle: int | None = handle
-        self.finalizer = weakref.finalize(
-            self, componentize_py_runtime.future_drop_readable, type_, handle
-        )
+        self.finalizer = weakref.finalize(self, componentize_py_runtime.future_drop_readable, type_, handle)
 
     async def read(self) -> T:
         self.finalizer.detach()
@@ -32,13 +29,11 @@ class FutureReader(Generic[T]):
 
     def __enter__(self) -> Self:
         return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> bool | None:
+        
+    def __exit__(self,
+                 exc_type: type[BaseException] | None,
+                 exc_value: BaseException | None,
+                 traceback: TracebackType | None) -> bool | None:
         if self.handle is not None:
             self.finalizer.detach()
             handle = self.handle
@@ -47,18 +42,15 @@ class FutureReader(Generic[T]):
 
         return None
 
-
 async def write(type_: int, handle: int, value: Any) -> None:
     await componentize_py_async_support.await_result(
         componentize_py_runtime.future_write(type_, handle, value)
     )
-    componentize_py_runtime.future_drop_writable(type_, handle)
-
+    componentize_py_runtime.future_drop_writable(type_, handle)    
 
 def write_default(type_: int, handle: int, default: Callable[[], Any]) -> None:
     componentize_py_async_support.spawn(write(type_, handle, default()))
-
-
+            
 class FutureWriter(Generic[T]):
     def __init__(self, type_: int, handle: int, default: Callable[[], T]):
         self.type_ = type_
@@ -90,13 +82,11 @@ class FutureWriter(Generic[T]):
 
     def __enter__(self) -> Self:
         return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> bool | None:
+        
+    def __exit__(self,
+                 exc_type: type[BaseException] | None,
+                 exc_value: BaseException | None,
+                 traceback: TracebackType | None) -> bool | None:
         if self.handle is not None:
             componentize_py_async_support.spawn(self.write(self.default()))
 

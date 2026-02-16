@@ -2,125 +2,235 @@
 
 Python SDK for writing Pie inferlets.
 
-## Setup (One-Time)
-
-From the pie repository root:
-
-```bash
-cd sdk/python
-uv venv
-source .venv/bin/activate
-uv pip install -e ".[dev]"
-uv pip install -e ../tools/bakery
-
-# Verify
-componentize-py --version
-bakery --help
-```
-
-## Building Python Inferlets
-
-Activate the venv, then use Bakery to build inferlets:
-
-```bash
-# If needed, activate Python venv (e.g., sdk/python/.venv)
-# source .venv/bin/activate
-
-# Build inferlet
-bakery build "$PWD/<input>" -o "$PWD/<output.wasm>"
-```
-
-### Example
-
-```bash
-# From pie root
-bakery build "$PWD/sdk/examples/python/text-completion" \
-    -o "$PWD/text-completion.wasm"
-```
-
-## Run (Requires Pie Engine)
-
-When a Pie engine is running, submit the built inferlet:
-
-```bash
-pie-cli submit text-completion.wasm -- --prompt "What is Python?"
-```
-
-## Writing an Inferlet
-
-Create `main.py`:
+## Quick Start
 
 ```python
-from inferlet import Context, get_auto_model, get_arguments, send
+from inferlet import Model, Context, Sampler, session, runtime
 
-args = get_arguments()
-prompt = args.get("prompt", "Hello!")
+model = Model.load(runtime.models()[0])
+ctx = Context(model)
 
-model = get_auto_model()
+ctx.system("You are a helpful assistant.")
+ctx.user("Hello, world!")
 
-with Context(model) as ctx:
-    ctx.system("You are a helpful assistant.")
-    ctx.user(prompt)
-
-    for token in ctx.generate(stream=True):
-        send(token, streaming=True)
+text = ctx.generate_text(Sampler.top_p())
+session.send(text)
 ```
 
-### Beam Search Example
+## Examples
 
-```python
-from inferlet import Context, get_auto_model, get_arguments, set_return
+Examples live under `sdk/examples/python/`:
 
-args = get_arguments()
-prompt = args.get("prompt", "Hello!")
+| Example | Demonstrates |
+|---------|-------------|
+| **hello-world** | One-shot `generate_text()` |
+| **text-completion** | Streaming with `Event` pattern matching |
+| **beam-search** | Forked contexts, `generate_text()` per beam |
 
-model = get_auto_model()
+Build and run an example:
 
-with Context(model) as ctx:
-    ctx.system("You are a helpful assistant.")
-    ctx.user(prompt)
+```bash
+# Build to WASM
+bakery build sdk/examples/python/hello-world/ -o hello-world.wasm
 
-    # Generate with beam search for higher quality output
-    result = ctx.generate_with_beam(beam_size=4, max_tokens=256)
-    set_return(result)
+# Run with dummy model
+pie run --dummy --path hello-world.wasm --manifest sdk/examples/python/hello-world/Pie.toml
 ```
 
 ## API Reference
 
-### Runtime
-- `get_version()` - Get Pie runtime version
-- `get_instance_id()` - Get unique instance ID
-- `get_arguments()` - Get CLI arguments as dict
-- `set_return(value)` - Set return value
+Import everything from `inferlet`:
 
-### Messaging
-- `send(message, streaming=False)` - Send output
-- `receive()` - Receive input
-- `broadcast(topic, message)` - Broadcast to topic
-
-### Model
-- `get_auto_model()` - Get default model
-- `get_model(service_id)` - Get specific model
-- `get_all_models()` - List available models
+```python
+from inferlet import (
+    Model, Tokenizer,         # Model loading & tokenization
+    Context,                  # Generation context (KV cache)
+    TokenStream, EventStream, # Streaming iterators
+    Sampler,                  # Sampling strategies
+    Event, Decoder,           # Event types & unified decoder
+    ForwardPass,              # Low-level forward pass
+    Grammar, Matcher,         # Structured generation
+    Adapter,                  # LoRA adapters
+    session,                  # Client communication
+    runtime,                  # Runtime info & spawning
+    messaging,                # Pub/sub messaging
+    mcp,                      # MCP tool server client
+    zo,                       # Zeroth-order optimization
+)
+```
 
 ### Context
-- `system(content)` - Add system message
-- `user(content)` - Add user message
-- `assistant(content)` - Add assistant message
-- `generate(...)` - Generate text (supports streaming)
-- `generate_with_beam(beam_size, max_tokens, stop)` - Generate with beam search
 
-## Limitations
+The main entry point for chat-based generation:
 
-Python inferlets run in WASM. These are **not available**:
-- Network libraries (requests, httpx)
-- Native extensions (numpy, pandas)
-- Threading/multiprocessing
-- File system (limited)
+```python
+ctx = Context(model)                     # auto-named
+ctx = Context(model, name="my-ctx")      # explicit name
 
-Check compatibility:
+# Chat formatting (pie:instruct/chat)
+ctx.system("You are helpful.")
+ctx.user("Hello!")
+ctx.assistant("Hi there!")    # history replay
+ctx.cue()                     # start generation header
+ctx.seal()                    # insert stop token
+
+# Text-level buffer fill
+ctx.fill("arbitrary text")          # encodes via tokenizer
+ctx.fill_tokens([1, 2, 3])         # raw tokens
+
+# Forking
+fork = ctx.fork()                   # auto-named
+fork = ctx.fork("beam-0")          # explicit name
+
+# Cleanup
+ctx.release()             # manual
+with Context(model) as ctx:  # auto-release via context manager
+    ...
+```
+
+### Generation
+
+Three ways to generate:
+
+```python
+# 1. One-shot (simplest)
+text = ctx.generate_text(Sampler.top_p(), max_tokens=256)
+
+# 2. Streaming events
+for event in ctx.generate(Sampler.top_p(), decode=True):
+    match event:
+        case Event.Text(text=t):
+            session.send(t)
+        case Event.Done():
+            break
+
+# 3. Raw tokens (lowest level)
+for tokens in ctx.generate(Sampler.top_p(), max_tokens=128, auto_flush=False):
+    # tokens: list[int]
+    pass
+stream = ctx.generate(Sampler.top_p())
+all_text = stream.text()        # collect decoded text
+all_tokens = stream.tokens()    # collect token IDs
+```
+
+`generate()` auto-calls `cue()` + `flush()` by default. Pass `auto_flush=False` to skip.
+
+### Sampler
+
+```python
+Sampler.greedy()                                    # deterministic
+Sampler.top_p(temperature=0.6, top_p=0.95)          # nucleus sampling
+Sampler.top_k(temperature=0.6, top_k=50)            # top-k sampling
+Sampler.min_p(temperature=0.6, min_p=0.1)           # min-p sampling
+Sampler.multinomial(temperature=1.0, seed=0)        # multinomial
+Sampler.top_k_top_p(temperature=0.6, top_k=50, top_p=0.95)  # combined
+Sampler.embedding()                                  # embedding extraction
+Sampler.dist(temperature=1.0, seed=0)               # full distribution
+```
+
+### Event Types
+
+When using `decode=True` in generate, events are dataclasses:
+
+| Event class | Fields | Description |
+|-------------|--------|-------------|
+| `Event.Text` | `text` | Generated text chunk |
+| `Event.Thinking` | `text` | Reasoning/thinking chunk |
+| `Event.ThinkingDone` | `text` | Reasoning complete (full text) |
+| `Event.ToolCallStart` | — | Tool call detected |
+| `Event.ToolCall` | `name`, `arguments` | Complete tool call |
+| `Event.Done` | `text` | Generation finished (full text) |
+
+Enable reasoning/tool-use detection:
+
+```python
+for event in ctx.generate(Sampler.top_p(), decode=True, reasoning=True, tool_use=True):
+    ...
+```
+
+### Tool Use
+
+```python
+ctx.equip_tools([tool_schema_json_1, tool_schema_json_2])
+# ... generate and detect tool calls ...
+ctx.answer_tool("get_weather", '{"temp": 72}')
+```
+
+### Structured Generation
+
+```python
+grammar = Grammar.from_json_schema('{"type":"object",...}')
+matcher = Matcher(grammar, model.tokenizer())
+
+# Use in generation loop for constrained decoding
+mask = matcher.next_token_logit_mask()
+# pass mask as logit_mask to generate()
+```
+
+### Session & Runtime
+
+```python
+session.send("Hello")               # send text to client
+msg = session.receive()             # receive text (blocking)
+session.send_file(data)             # send binary
+file = session.receive_file()       # receive binary
+
+runtime.version()                   # runtime version
+runtime.models()                    # available model names
+runtime.username()                  # invoking user
+runtime.spawn("pkg@1.0.0", args)    # spawn another inferlet
+```
+
+### Messaging
+
+```python
+messaging.push("topic", "message")        # queue push
+msg = messaging.pull("topic")             # queue pull (blocking)
+messaging.broadcast("topic", "message")   # broadcast
+
+with messaging.subscribe("topic") as sub:
+    for msg in sub:                       # infinite iterator
+        # process msg
+        break
+```
+
+## Project Structure
+
+```
+sdk/python/
+├── src/inferlet/
+│   ├── __init__.py       # Public API exports
+│   ├── context.py        # Context, TokenStream, EventStream, Decoder, Event
+│   ├── model.py          # Model, Tokenizer
+│   ├── sampler.py        # Sampler presets
+│   ├── forward.py        # ForwardPass (low-level)
+│   ├── grammar.py        # Grammar, Matcher
+│   ├── adapter.py        # LoRA Adapter
+│   ├── session.py        # Client communication
+│   ├── runtime.py        # Runtime info
+│   ├── messaging.py      # Pub/sub messaging
+│   ├── mcp.py            # MCP client
+│   ├── zo.py             # Zeroth-order optimization
+│   └── _async.py         # Internal WASI future utilities
+├── tests/
+├── scripts/
+├── pyproject.toml
+└── README.md
+```
+
+## Development
 
 ```bash
-# With venv activated
-python scripts/validate_imports.py <your-app>/
+cd sdk/python
+
+# Create virtualenv and install
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
+uv pip install -e ../tools/bakery
+
+# Run tests
+pytest tests/
+
+# Regenerate WIT bindings (after runtime WIT changes)
+python scripts/generate_bindings.py
 ```

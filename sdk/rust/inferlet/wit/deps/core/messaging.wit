@@ -15,11 +15,11 @@ interface messaging {
         unsubscribe: func();
     }
 
-    // Sends a message to the remote user client
-    send: func(message: string);
+    // Pushes a message onto a topic queue
+    push: func(topic: string, message: string);
 
-    // Receives an incoming message from the remote user client
-    receive: func() -> future-string;
+    // Pulls the next message from a topic queue
+    pull: func(topic: string) -> future-string;
 
     // Publishes a message to a topic (broadcast to all subscribers)
     broadcast: func(topic: string, message: string);

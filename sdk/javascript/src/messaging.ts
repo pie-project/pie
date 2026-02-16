@@ -1,101 +1,68 @@
-// Messaging functions for communicating with the remote user client.
-// Mirrors the Rust messaging functions from inferlet/src/lib.rs
+// Messaging functions — wraps pie:core/messaging WIT interface.
 
-import * as message from 'inferlet:core/message';
-import { awaitFuture } from './async-utils.js';
+import * as _msg from 'pie:core/messaging';
+import type { Subscription as _Subscription } from 'pie:core/messaging';
+import { awaitFuture } from './_async.js';
+import { pollLoop } from './_poll_loop.js';
+
+/** Pushes a message onto a topic queue. */
+export function push(topic: string, message: string): void {
+  _msg.push(topic, message);
+}
+
+/** Pulls the next message from a topic queue. */
+export async function pull(topic: string): Promise<string> {
+  return awaitFuture(_msg.pull(topic), 'pull() returned undefined');
+}
+
+/** Broadcasts a message to all subscribers of a topic. */
+export function broadcast(topic: string, message: string): void {
+  _msg.broadcast(topic, message);
+}
+
+/** Subscribes to a topic, returning a `Subscription` handle. */
+export function subscribe(topic: string): Subscription {
+  return new Subscription(_msg.subscribe(topic));
+}
 
 /**
- * Represents a binary blob that can be sent/received.
+ * A subscription to a broadcast topic.
+ *
+ * Async iterable — use `for await...of` to consume messages.
+ * Implements `Disposable` for use with `using`.
  */
-export class Blob {
-  private inner: message.Blob;
+export class Subscription implements AsyncIterable<string>, Disposable {
+  /** @internal */
+  readonly _handle: _Subscription;
 
-  private constructor(inner: message.Blob) {
-    this.inner = inner;
+  /** @internal */
+  constructor(handle: _Subscription) {
+    this._handle = handle;
   }
 
-  /**
-   * Create a new Blob from binary data
-   */
-  static new(data: Uint8Array): Blob {
-    return new Blob(new message.Blob(data));
+  /** Waits until a message arrives, then returns it. */
+  async next(): Promise<string | undefined> {
+    const pollable = this._handle.pollable();
+    await pollLoop.register(pollable);
+    return this._handle.get();
   }
 
-  /**
-   * Create a Blob from a WIT message.Blob resource (internal use)
-   * @internal
-   */
-  static fromWit(inner: message.Blob): Blob {
-    return new Blob(inner);
+  /** Cancels the subscription. */
+  unsubscribe(): void {
+    this._handle.unsubscribe();
   }
 
-  /**
-   * Get the inner blob resource (for internal use)
-   */
-  getInner(): message.Blob {
-    return this.inner;
+  /** Disposable protocol — calls `unsubscribe()`. */
+  [Symbol.dispose](): void {
+    this.unsubscribe();
   }
 
-  /**
-   * Get the data from the blob
-   */
-  getData(): Uint8Array {
-    // Note: The actual method depends on the WIT binding
-    // This may need adjustment based on the actual binding API
-    return this.inner.data;
+  /** Async iterate over incoming messages (infinite — break manually). */
+  async *[Symbol.asyncIterator](): AsyncIterableIterator<string> {
+    while (true) {
+      const msg = await this.next();
+      if (msg === undefined) break;
+      yield msg;
+    }
   }
-}
-
-/**
- * Sends a message to the remote user client.
- * @param msg The message to send
- */
-export function send(msg: string): void {
-  message.send(msg);
-}
-
-/**
- * Receives an incoming message from the remote user client.
- * This is an asynchronous operation.
- * @returns A promise that resolves to the received message
- */
-export async function receive(): Promise<string> {
-  return awaitFuture(message.receive(), 'receive() returned undefined');
-}
-
-/**
- * Sends a blob to the remote user client.
- * @param blob The blob to send
- */
-export function sendBlob(blob: Blob): void {
-  message.sendBlob(blob.getInner());
-}
-
-/**
- * Receives an incoming blob from the remote user client.
- * This is an asynchronous operation.
- * @returns A promise that resolves to the received blob
- */
-export async function receiveBlob(): Promise<Blob> {
-  const result = awaitFuture(message.receiveBlob(), 'receiveBlob() returned undefined');
-  return Blob.fromWit(result);
-}
-
-/**
- * Publishes a message to a topic, broadcasting it to all subscribers.
- * @param topic The topic to broadcast to
- * @param msg The message to broadcast
- */
-export function broadcast(topic: string, msg: string): void {
-  message.broadcast(topic, msg);
-}
-
-/**
- * Subscribes to a topic and waits for a message.
- * This is an asynchronous operation.
- * @param topic The topic to subscribe to
- * @returns A promise that resolves to the received message
- */
-export async function subscribe(topic: string): Promise<string> {
-  return awaitFuture(message.subscribe(topic), 'subscribe() returned undefined');
 }

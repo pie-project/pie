@@ -157,7 +157,7 @@ class DummyForwardPass:
         Returns:
             Dictionary with random tokens and empty distributions
         """
-        indices_for_logits = sampling_metadata.get("indices_for_logits", [])
+        indices_for_logits = sampling_metadata.get("indices_for_logits") or []
         num_samples = len(indices_for_logits)
 
         if num_samples == 0:

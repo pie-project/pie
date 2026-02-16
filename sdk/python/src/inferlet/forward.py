@@ -1,216 +1,76 @@
 """
-ForwardPass class for low-level model inference.
+Forward pass wrapper for ``pie:core/inference``.
+
+Low-level access to model inference. Most users should prefer
+``Context.generate()`` instead.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from wit_world.imports import forward as _forward
-from .async_utils import await_future
+from wit_world.imports import inference as _inf
+
+from ._async import await_future
 
 if TYPE_CHECKING:
-    from .model import Queue
-
-
-@dataclass
-class ForwardPassResult:
-    """Result of a forward pass execution."""
-
-    tokens: list[int] | None
-    distributions: list[tuple[list[int], list[float]]] | None
+    from .model import Model
+    from .sampler import Sampler
 
 
 class ForwardPass:
-    """
-    Low-level forward pass for advanced model inference.
+    """Low-level forward pass over a model.
 
-    Provides fine-grained control over input tokens, KV cache,
-    attention masks, and output sampling.
+    Usage::
+
+        fp = ForwardPass(model)
+        fp.context(ctx)
+        fp.input_tokens(tokens, positions)
+        fp.sampler([last_idx], Sampler.greedy())
+        output = fp.execute()
     """
 
-    def __init__(self, inner: _forward.ForwardPass, queue: "Queue") -> None:
-        self._inner = inner
-        self._queue = queue
+    __slots__ = ("_handle",)
+
+    def __init__(self, model: Model) -> None:
+        self._handle = _inf.ForwardPass(model._handle)
+
+    def context(self, ctx) -> None:
+        """Bind a context (KV cache) to this forward pass."""
+        self._handle.context(ctx._handle)
 
     def input_tokens(self, tokens: list[int], positions: list[int]) -> None:
-        """
-        Set input tokens with their positions.
+        """Set the input token IDs and their absolute positions."""
+        self._handle.input_tokens(tokens, positions)
 
-        Args:
-            tokens: Token IDs to process
-            positions: Position indices for each token
-        """
-        _forward.input_tokens(self._inner, tokens, positions)
+    def speculative_tokens(self, tokens: list[int], positions: list[int]) -> None:
+        """Set speculative (draft) tokens and their positions."""
+        self._handle.input_speculative_tokens(tokens, positions)
 
-    def input_embeddings(self, emb_ptrs: list[int], positions: list[int]) -> None:
-        """
-        Set input embeddings with their positions.
-
-        Args:
-            emb_ptrs: Pointers to embedding resources
-            positions: Position indices for each embedding
-        """
-        _forward.input_embeddings(self._inner, emb_ptrs, positions)
-
-    def kv_cache(self, kv_page_ptrs: list[int], last_kv_page_len: int) -> None:
-        """
-        Set the KV cache pages for the forward pass.
-
-        Args:
-            kv_page_ptrs: Pointers to KV cache pages
-            last_kv_page_len: Length of the last KV page
-        """
-        _forward.kv_cache(self._inner, kv_page_ptrs, last_kv_page_len)
+    def enable_speculative_output(self, flag: bool = True) -> None:
+        """Enable/disable speculative output (enabled by default)."""
+        self._handle.output_speculative_tokens(flag)
 
     def attention_mask(self, mask: list[list[int]]) -> None:
+        """Set a custom BRLE attention mask (default: causal)."""
+        self._handle.attention_mask(mask)
+
+    def logit_mask(self, mask: list[int]) -> None:
+        """Set a BRLE-encoded logit mask for constrained generation."""
+        self._handle.logit_mask(mask)
+
+    def sampler(self, indices: list[int], sampler: Sampler) -> None:
+        """Set which token positions to sample from and the sampler to use."""
+        self._handle.sampler(indices, sampler._variant)
+
+    def adapter(self, adapter) -> None:
+        """Attach an adapter (e.g. LoRA) for this pass."""
+        self._handle.adapter(adapter._handle)
+
+    async def execute(self):
+        """Execute the forward pass.
+
+        Returns the ``Output`` variant from the WIT bindings.
         """
-        Set the attention mask for the forward pass.
-
-        Args:
-            mask: 2D attention mask (list of lists)
-        """
-        _forward.attention_mask(self._inner, mask)
-
-    def output_tokens(self, indices: list[int], temperature: float) -> None:
-        """
-        Request token sampling at specific indices.
-
-        Args:
-            indices: Indices at which to sample tokens
-            temperature: Sampling temperature
-        """
-        _forward.output_tokens(self._inner, indices, temperature)
-
-    def output_tokens_top_p(
-        self, indices: list[int], temperature: float, top_p: float
-    ) -> None:
-        """
-        Request token sampling with top-p (nucleus) sampling.
-
-        Args:
-            indices: Indices at which to sample tokens
-            temperature: Sampling temperature
-            top_p: Nucleus sampling threshold
-        """
-        _forward.output_tokens_top_p(self._inner, indices, temperature, top_p)
-
-    def output_tokens_top_k(
-        self, indices: list[int], temperature: float, top_k: int
-    ) -> None:
-        """
-        Request token sampling with top-k sampling.
-
-        Args:
-            indices: Indices at which to sample tokens
-            temperature: Sampling temperature
-            top_k: Number of top tokens to consider
-        """
-        _forward.output_tokens_top_k(self._inner, indices, temperature, top_k)
-
-    def output_tokens_top_k_top_p(
-        self, indices: list[int], temperature: float, top_k: int, top_p: float
-    ) -> None:
-        """
-        Request token sampling with combined top-k and top-p.
-
-        Args:
-            indices: Indices at which to sample tokens
-            temperature: Sampling temperature
-            top_k: Number of top tokens to consider
-            top_p: Nucleus sampling threshold
-        """
-        _forward.output_tokens_top_k_top_p(
-            self._inner, indices, temperature, top_k, top_p
-        )
-
-    def output_tokens_min_p(
-        self, indices: list[int], temperature: float, min_p: float
-    ) -> None:
-        """
-        Request token sampling with min-p threshold.
-
-        Args:
-            indices: Indices at which to sample tokens
-            temperature: Sampling temperature
-            min_p: Minimum probability threshold
-        """
-        _forward.output_tokens_min_p(self._inner, indices, temperature, min_p)
-
-    def output_distributions(
-        self, indices: list[int], temperature: float, top_k: int | None = None
-    ) -> None:
-        """
-        Request logit distributions at specific indices.
-
-        Args:
-            indices: Indices at which to get distributions
-            temperature: Temperature for softmax
-            top_k: Optional top-k limit for distributions
-        """
-        _forward.output_distributions(self._inner, indices, temperature, top_k)
-
-    def output_embeddings(self, emb_ptrs: list[int], indices: list[int]) -> None:
-        """
-        Request output embeddings at specific indices.
-
-        Args:
-            emb_ptrs: Pointers to embedding resources to fill
-            indices: Indices at which to extract embeddings
-        """
-        _forward.output_embeddings(self._inner, emb_ptrs, indices)
-
-    def set_adapter(self, adapter_ptr: int) -> None:
-        """
-        Set the adapter for this forward pass (LoRA inference).
-
-        Args:
-            adapter_ptr: Pointer to the adapter resource
-        """
-        from wit_world.imports import inferlet_adapter_common as _adapter
-
-        _adapter.set_adapter(self._inner, adapter_ptr)
-
-    def set_adapter_seed(self, seed: int) -> None:
-        """
-        Set the random seed for adapter perturbation (ZO optimization).
-
-        Args:
-            seed: Random seed for deterministic perturbation
-        """
-        from wit_world.imports import inferlet_zo_evolve as _zo
-
-        _zo.set_adapter_seed(self._inner, seed)
-
-    def execute(self) -> ForwardPassResult:
-        """
-        Execute the forward pass and wait for results.
-
-        Returns:
-            ForwardPassResult containing tokens and/or distributions
-        """
-        result_resource = self._inner.execute()
-
-        # When no output is requested (e.g., flush()), the result may be None.
-        # This is valid - return empty result like JS SDK does.
-        if result_resource is None:
-            return ForwardPassResult(tokens=None, distributions=None)
-
-        # Wait for result to be ready
-        pollable = result_resource.pollable()
-        pollable.block()
-
-        tokens = result_resource.get_tokens()
-        distributions = result_resource.get_distributions()
-
-        return ForwardPassResult(
-            tokens=list(tokens) if tokens else None,
-            distributions=list(distributions) if distributions else None,
-        )
-
-    def __enter__(self) -> "ForwardPass":
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        pass  # Resources managed by WASM runtime
+        future = self._handle.execute()
+        return await await_future(future, "Forward pass execution failed")

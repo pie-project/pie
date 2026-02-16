@@ -1,114 +1,54 @@
-// Sampler types and configurations for text generation
-// Used for backend integration with the Pie runtime
+// Sampler configuration — maps to pie:core/inference.Sampler WIT variant.
+
+import type { Sampler as WitSampler } from 'pie:core/inference';
 
 /**
- * Internal sampler type discriminated union (used by the runtime)
- */
-export type SamplerType =
-  | { type: 'Custom'; temperature: number; sampler: object }
-  | { type: 'Multinomial'; temperature: number }
-  | { type: 'TopP'; temperature: number; top_p: number }
-  | { type: 'TopK'; temperature: number; top_k: number }
-  | { type: 'MinP'; temperature: number; min_p: number }
-  | { type: 'TopKTopP'; temperature: number; top_k: number; top_p: number };
-
-/**
- * User-friendly sampling configuration object.
- * All properties are optional - unspecified values use defaults.
+ * Sampler constructors for controlling token selection during generation.
  *
- * @example
- * { topP: 0.95, temperature: 0.6 }
- * { topK: 50, temperature: 0.8 }
- * { topK: 40, topP: 0.92, temperature: 0.9 }
- */
-export interface SamplingConfig {
-  /** Controls randomness (0.0 = greedy, higher = more random). Default: 1.0 */
-  temperature?: number;
-  /** Top-p (nucleus) sampling threshold (typically 0.9-0.95) */
-  topP?: number;
-  /** Top-k sampling - number of top tokens to consider */
-  topK?: number;
-  /** Min-p sampling - minimum probability relative to top token */
-  minP?: number;
-}
-
-/**
- * Sampler presets for common use cases
+ * Each method returns a WIT-compatible discriminated union value
+ * that can be passed to `ForwardPass.sampler()`.
  */
 export const Sampler = {
-  /**
-   * Greedy sampling - always picks the most probable token.
-   */
-  greedy(): SamplingConfig {
-    return { temperature: 0 };
+  /** Greedy decoding (temperature=0, top-k=1). */
+  greedy(): WitSampler {
+    return { tag: 'multinomial', val: [0.0, 1] };
   },
 
-  /**
-   * Balanced default settings for general text generation.
-   */
-  default(): SamplingConfig {
-    return { temperature: 0.7, topP: 0.95 };
+  /** Multinomial sampling with temperature and top-k. */
+  multinomial(temperature: number, topK: number): WitSampler {
+    return { tag: 'multinomial', val: [temperature, topK] };
   },
 
-  /**
-   * Creative/diverse sampling with higher temperature.
-   */
-  creative(): SamplingConfig {
-    return { temperature: 1.0, topP: 0.95 };
+  /** Top-k sampling. */
+  topK(temperature: number, topK: number): WitSampler {
+    return { tag: 'top-k', val: [temperature, topK] };
   },
 
-  /**
-   * Optimized for reasoning tasks.
-   * Uses conservative sampling settings (topK=20, topP=0.95, temperature=0.6)
-   * to produce coherent, focused outputs suitable for chain-of-thought reasoning.
-   */
-  reasoning(): SamplingConfig {
-    return { temperature: 0.6, topK: 20, topP: 0.95 };
+  /** Top-p (nucleus) sampling. */
+  topP(temperature: number, topP: number): WitSampler {
+    return { tag: 'top-p', val: [temperature, topP] };
   },
 
-  /**
-   * Top-p (nucleus) sampling preset.
-   */
-  topP(p: number = 0.95, temperature: number = 0.7): SamplingConfig {
-    return { topP: p, temperature };
+  /** Min-p sampling. */
+  minP(temperature: number, minP: number): WitSampler {
+    return { tag: 'min-p', val: [temperature, minP] };
   },
 
-  /**
-   * Top-k sampling preset.
-   */
-  topK(k: number = 40, temperature: number = 0.7): SamplingConfig {
-    return { topK: k, temperature };
+  /** Combined top-k + top-p sampling. */
+  topKTopP(temperature: number, topK: number, topP: number): WitSampler {
+    return { tag: 'top-k-top-p', val: [temperature, topK, topP] };
   },
 
-  /**
-   * Min-p sampling preset.
-   * Filters out tokens with probability below minP * max_prob.
-   */
-  minP(minP: number = 0.1, temperature: number = 0.7): SamplingConfig {
-    return { minP, temperature };
+  /** Embedding extraction (no sampling). */
+  embedding(): WitSampler {
+    return { tag: 'embedding' };
+  },
+
+  /** Full distribution output. */
+  dist(temperature: number, topK: number): WitSampler {
+    return { tag: 'dist', val: [temperature, topK] };
   },
 } as const;
 
-/**
- * Convert a SamplingConfig to the internal SamplerType for backend integration
- */
-export function toSamplerType(config: SamplingConfig): SamplerType {
-  const temp = config.temperature ?? 1.0;
-
-  // Determine which sampler type to use based on provided options
-  if (config.topK !== undefined && config.topP !== undefined) {
-    return { type: 'TopKTopP', temperature: temp, top_k: config.topK, top_p: config.topP };
-  }
-  if (config.topP !== undefined) {
-    return { type: 'TopP', temperature: temp, top_p: config.topP };
-  }
-  if (config.topK !== undefined) {
-    return { type: 'TopK', temperature: temp, top_k: config.topK };
-  }
-  if (config.minP !== undefined) {
-    return { type: 'MinP', temperature: temp, min_p: config.minP };
-  }
-
-  // Default: multinomial (greedy if temp is 0)
-  return { type: 'Multinomial', temperature: temp };
-}
+/** Re-export the WIT sampler type for external use. */
+export type { WitSampler as SamplerType };

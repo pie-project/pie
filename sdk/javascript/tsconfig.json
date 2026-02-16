@@ -3,14 +3,70 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "lib": [
+      "ES2022",
+      "ESNext.Disposable"
+    ],
     "declaration": true,
     "outDir": "dist",
     "rootDir": "src",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "paths": {
+      "pie:core/model": [
+        "./src/bindings/interfaces/pie-core-model.js"
+      ],
+      "pie:core/context": [
+        "./src/bindings/interfaces/pie-core-context.js"
+      ],
+      "pie:core/inference": [
+        "./src/bindings/interfaces/pie-core-inference.js"
+      ],
+      "pie:core/runtime": [
+        "./src/bindings/interfaces/pie-core-runtime.js"
+      ],
+      "pie:core/messaging": [
+        "./src/bindings/interfaces/pie-core-messaging.js"
+      ],
+      "pie:core/session": [
+        "./src/bindings/interfaces/pie-core-session.js"
+      ],
+      "pie:core/adapter": [
+        "./src/bindings/interfaces/pie-core-adapter.js"
+      ],
+      "pie:core/types": [
+        "./src/bindings/interfaces/pie-core-types.js"
+      ],
+      "pie:instruct/chat": [
+        "./src/bindings/interfaces/pie-instruct-chat.js"
+      ],
+      "pie:instruct/reasoning": [
+        "./src/bindings/interfaces/pie-instruct-reasoning.js"
+      ],
+      "pie:instruct/tool-use": [
+        "./src/bindings/interfaces/pie-instruct-tool-use.js"
+      ],
+      "pie:mcp/client": [
+        "./src/bindings/interfaces/pie-mcp-client.js"
+      ],
+      "pie:mcp/types": [
+        "./src/bindings/interfaces/pie-mcp-types.js"
+      ],
+      "pie:zo/zo": [
+        "./src/bindings/interfaces/pie-zo-zo.js"
+      ],
+      "wasi:io/poll@0.2.4": [
+        "./src/bindings/interfaces/wasi-io-poll.js"
+      ]
+    }
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
 }

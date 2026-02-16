@@ -18,9 +18,10 @@ def main() -> int:
     # Get paths relative to script location
     script_dir = Path(__file__).parent
     project_root = script_dir.parent
-    repo_root = project_root.parent
+    sdk_root = project_root.parent
+    pie_root = sdk_root.parent
 
-    wit_path = repo_root / "inferlet" / "wit"
+    wit_path = pie_root / "runtime" / "wit"
     output_path = project_root / "src" / "inferlet" / "bindings"
 
     if not wit_path.exists():
@@ -31,13 +32,13 @@ def main() -> int:
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Generate bindings using componentize-py
-    # The world is "exec" as defined in inferlet/wit/world.wit
+    # The world is "inferlet" as defined in runtime/wit/world.wit
     cmd = [
         "componentize-py",
         "-d",
         str(wit_path),
         "-w",
-        "exec",
+        "inferlet",
         "bindings",
         str(output_path),
     ]
