@@ -293,9 +293,15 @@ def _process_distributions(
     final_dists: list[tuple[list[int], list[float]] | None],
     group_top_k: torch.Tensor,
 ) -> None:
-    """Process distribution requests."""
-    # group_top_k is already indexed for this group
-    top_k_list = group_top_k.tolist()
+    """Process distribution requests.
+
+    top_k=0 means "return full distribution" (all vocab tokens).
+    """
+    vocab_size = group_probs.shape[-1]
+    # Replace 0 with vocab_size (0 = return all)
+    effective_k = group_top_k.clone()
+    effective_k[effective_k == 0] = vocab_size
+    top_k_list = effective_k.tolist()
     max_k = max(top_k_list) if top_k_list else 0
 
     if max_k > 0:

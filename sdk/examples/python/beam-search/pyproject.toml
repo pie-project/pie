@@ -1,5 +1,0 @@
-[project]
-name = "beam-search"
-version = "0.1.0"
-description = "Beam search decoding example using inferlet"
-requires-python = ">=3.10"

@@ -1,0 +1,15 @@
+[package]
+name = "agent-react"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet = { path = "../../sdk/rust/inferlet" }
+evalexpr = "11.3"
+chrono = "0.4"
+
+[profile.release]
+lto = true

@@ -4,23 +4,16 @@ JavaScript/TypeScript library for writing Pie inferlets.
 
 ## Quick Start with Examples
 
-Examples live under `sdk/examples/javascript`:
+Examples live under `inferlets/javascript`:
 
 - **text-completion** - Basic text generation with sampling
 - **beam-search** - Beam search decoding
 
-Install dependencies and build an example:
+Install dependencies:
 
 ```bash
 cd sdk/javascript
 npm install
-
-# If needed, activate Python venv (e.g., sdk/python/.venv)
-# cd ../python && source .venv/bin/activate && cd ../javascript
-
-# Build example
-bakery build "$PWD/../examples/javascript/text-completion" \
-  -o "$PWD/../text-completion.wasm"
 ```
 
 ## How to Create My Own Inferlet

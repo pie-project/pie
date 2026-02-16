@@ -34,8 +34,8 @@ bakery build "$PWD/<input>" -o "$PWD/<output.wasm>"
 
 ```bash
 # From pie root
-bakery build "$PWD/sdk/examples/python/text-completion" \
-    -o "$PWD/text-completion.wasm"
+bakery build "$PWD/path/to/your-inferlet" \
+    -o "$PWD/your-inferlet.wasm"
 ```
 
 ## Run (Requires Pie Engine)
