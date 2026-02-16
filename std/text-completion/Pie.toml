@@ -1,6 +1,6 @@
 [package]
 name = "text-completion"
-version = "0.2.7"
+version = "0.2.11"
 description = "Simple text completion inferlet"
 authors = ["In Gim <in.gim@yale.edu>"]
 repository = "https://github.com/pie-project/pie"

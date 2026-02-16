@@ -9,7 +9,7 @@ description = "Programmable Inference Engine"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "Apache-2.0"
-authors = [{ name = "In Gim", email = "in.gim@yale.edu" }]
+authors = [{ name = "In Gim", email = "in.gim@icloud.com" }]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",

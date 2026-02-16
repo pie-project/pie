@@ -174,10 +174,8 @@ impl QwenInstruct {
         let mut turn_suffix = im_end;
         turn_suffix.extend(&newline);
 
-        let mut think_prefix = encode("<think>");
-        think_prefix.extend(&newline);
-        let mut think_suffix = encode("</think>");
-        think_suffix.extend(&newline);
+        let think_prefix = encode("<think>");
+        let think_suffix = encode("</think>");
 
         let mut tool_resp_prefix = encode("<tool_response>");
         tool_resp_prefix.extend(&newline);

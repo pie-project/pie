@@ -114,7 +114,10 @@ world inferlet {{
 
         impl __pie_export::exports::pie::#package_ident::run::Guest for __PieMain {
             fn run(args: Vec<String>) -> std::result::Result<String, String> {
-                inferlet::wstd::runtime::block_on(async { #inner_fn_name(args).await })
+                let result = inferlet::wstd::runtime::block_on(async { #inner_fn_name(args).await });
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                result
             }
         }
 
