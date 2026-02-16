@@ -8,11 +8,11 @@ CLI modes on top of it.
 
 from __future__ import annotations
 
+
 import queue
 import sys
 import time
 import random
-import warnings
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -359,9 +359,6 @@ def _terminate(
     backend_processes: list,
 ) -> None:
     """Terminate the runtime and backend processes."""
-    warnings.filterwarnings(
-        "ignore", message=".*leaked semaphore.*", category=UserWarning
-    )
 
     if server_handle is not None:
         try:
