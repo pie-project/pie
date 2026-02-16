@@ -1,0 +1,148 @@
+---
+title: Tool Calling
+description: Equip tools, detect tool calls, and build agent loops
+sidebar_position: 7
+---
+
+# Tool Calling
+
+Pie's tool-calling API lets inferlets equip the model with tools, detect when the model invokes them, execute the tools, and feed results back into the conversation. This enables autonomous agent workflows like ReAct.
+
+## Equipping Tools
+
+Define tools and make them available to the model:
+
+```rust
+use inferlet::InstructExt;
+
+ctx.system("You are a helpful assistant with access to tools.");
+
+// Equip tools with JSON schema definitions
+ctx.equip_tools(&[
+    serde_json::json!({
+        "name": "calculator",
+        "description": "Evaluate a mathematical expression",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "Math expression to evaluate"
+                }
+            },
+            "required": ["expression"]
+        }
+    }).to_string(),
+])?;
+
+ctx.user("What is 15 * 37?");
+ctx.cue();
+```
+
+## Detecting Tool Calls
+
+Use the `EventStream` with `.with_tool_use()` to detect tool calls in the generated output:
+
+```rust
+use inferlet::Event;
+
+let mut events = ctx
+    .generate(sampler)
+    .with_max_tokens(256)
+    .decode()
+    .with_tool_use();
+
+while let Some(event) = events.next().await? {
+    match event {
+        Event::ToolCall(name, arguments) => {
+            // name — tool name (e.g., "calculator")
+            // arguments — JSON string of arguments
+            handle_tool_call(&name, &arguments);
+        }
+        Event::Text(s) => print!("{}", s),
+        Event::Done(_) => break,
+        _ => {}
+    }
+}
+```
+
+## Answering Tool Calls
+
+After executing a tool, feed the result back using the tool **name**:
+
+```rust
+// Execute the tool
+let result = execute_calculator(&arguments);
+
+// Feed the result back to the model
+ctx.answer_tool(&name, &result);
+
+// Continue generation
+ctx.cue();
+```
+
+## Agent Loop Pattern (ReAct)
+
+Combine these primitives into an autonomous agent loop:
+
+```rust
+let max_iterations = 10;
+
+for _ in 0..max_iterations {
+    // Generate until the model produces a tool call or final answer
+    let mut events = ctx
+        .generate(sampler.clone())
+        .with_max_tokens(512)
+        .decode()
+        .with_reasoning()
+        .with_tool_use();
+
+    let mut tool_call = None;
+
+    while let Some(event) = events.next().await? {
+        match event {
+            Event::ToolCall(name, args) => {
+                tool_call = Some((name, args));
+                break;
+            }
+            Event::Text(s) => print!("{}", s),
+            Event::Done(_) => return Ok(()),  // Model finished without tool call
+            _ => {}
+        }
+    }
+
+    if let Some((name, args)) = tool_call {
+        // Execute the tool
+        let result = dispatch_tool(&name, &args)?;
+
+        // Feed result back
+        ctx.answer_tool(&name, &result);
+        ctx.cue();
+    } else {
+        break;  // No tool call, generation is complete
+    }
+}
+```
+
+## Tool Matcher
+
+For structured generation that forces the model to produce a valid tool call, use `create_tool_matcher`:
+
+```rust
+use inferlet::InstructExt;
+
+// Create a grammar matcher constrained to valid tool calls
+let matcher = Context::create_tool_matcher(&model, &tool_schemas);
+
+// Use as a constraint during generation
+let output = ctx.generate(sampler)
+    .with_constraint(matcher)
+    .collect_text()
+    .await?;
+```
+
+## Next Steps
+
+- **[Chat & Instruct](./chat-instruct)** — The decoder that powers tool call detection
+- **[MCP Integration](./mcp)** — Connect to external tool servers via MCP
+- **[Structured Generation](./structured-generation)** — Constrain output format

@@ -1,0 +1,165 @@
+---
+title: KV Cache Control
+description: Page-level cache management, forking, and prefix caching
+sidebar_position: 8
+---
+
+# KV Cache Control
+
+Pie exposes the KV cache as a page-based, copy-on-write data structure. This gives inferlets fine-grained control over memory, enabling patterns like prefix caching, context forking, and cache eviction.
+
+## Page Model
+
+The KV cache is organized into fixed-size **pages**, each holding `tokens_per_page` tokens:
+
+```
+┌─────────┐ ┌─────────┐ ┌─────────┐ ┌───────┐
+│ Page 0  │ │ Page 1  │ │ Page 2  │ │Page 3 │ ← active (partial)
+│ (full)  │ │ (full)  │ │ (full)  │ │cursor │
+└─────────┘ └─────────┘ └─────────┘ └───────┘
+ committed   committed   committed   in-progress
+```
+
+```rust
+let page_size = ctx.tokens_per_page();       // Tokens per page
+let cursor = ctx.cursor();                    // Position within active page
+let committed = ctx.committed_page_count();   // Number of committed pages
+let uncommitted = ctx.uncommitted_page_count(); // Pages not yet committed
+```
+
+## Page Operations
+
+### Reserve
+
+Allocate pages before filling them:
+
+```rust
+let pages_needed = (total_tokens + page_size - 1) / page_size;
+ctx.reserve_pages(pages_needed)?;
+```
+
+### Commit
+
+Mark pages as finalized — their KV data can now be shared and reused:
+
+```rust
+let page_indices: Vec<u32> = (0..num_full_pages).collect();
+ctx.commit_pages(&page_indices)?;
+```
+
+### Release
+
+Free pages you no longer need:
+
+```rust
+// Release the last N pages
+ctx.release_pages(num_pages);
+```
+
+## Forking
+
+Fork creates a copy-on-write clone. The forked context shares all committed pages with the parent — new tokens are written to new pages:
+
+```rust
+let forked = ctx.fork("forked-session")?;
+
+// forked shares parent's KV cache
+// New tokens go to new pages
+forked.fill_tokens(&continuation_tokens);
+```
+
+Fork is O(1) and is the basis for:
+- **Branching generation** — Try multiple continuations from the same prefix
+- **Tree of Thought** — Explore reasoning paths
+- **Parallel generation** — Multiple beams sharing a common prompt
+
+```
+ Fork (copy-on-write):
+
+ Original ctx ─── Page 0 ─── Page 1 ─── Page 2 ─── Page 3 (active)
+                    │           │           │
+ Forked ctx   ─────┘───────────┘───────────┘──── Page 3' (new)
+
+ ● Pages 0–2 are shared (read-only, committed)
+ ● Page 3' is a new copy — writes go here
+ ● O(1) fork, O(1) memory until divergence
+```
+
+## Prefix Caching
+
+Reuse a cached prompt's KV state across requests by using named contexts:
+
+### Cache a prefix
+
+```rust
+// First request: compute and cache the system prompt in a named context
+let prefix = Context::create(&model, "system-prompt-v1", None)?;
+prefix.system("You are a helpful assistant. [long system prompt...]");
+prefix.flush().await?;
+// Pages are now committed and cached under "system-prompt-v1"
+```
+
+### Reuse the cached prefix
+
+```rust
+// Subsequent requests: look up and fork the cached context
+let prefix = Context::lookup(&model, "system-prompt-v1")
+    .ok_or("Prefix not found")?;
+
+let ctx = prefix.fork("request-123")?;
+
+// Continue from where the cache left off — no re-prefill needed
+ctx.user("New user question");
+ctx.cue();
+let response = ctx.generate(sampler).collect_text().await?;
+```
+
+This avoids recomputing the KV cache for the system prompt on every request.
+
+```
+ Prefix caching:
+ ┌─────── "system-prompt-v1" (cached) ──────┐
+ │  Page 0  │  Page 1  │  Page 2  │  Page 3 │
+ └──────────┴──────────┴──────────┴─────────┘
+      │          │          │          │
+      ▼          ▼          ▼          ▼
+ ┌─ fork("req-1") ──┐  ┌─ fork("req-2") ──┐
+ │ + user question 1 │  │ + user question 2 │
+ └───────────────────┘  └───────────────────┘
+```
+
+## Context Lookup
+
+Contexts persist within an inferlet instance. Look one up by name to resume state:
+
+```rust
+let ctx = match Context::lookup(&model, "session-123") {
+    Some(ctx) => ctx,                     // Resume existing session
+    None => {
+        let ctx = Context::create(&model, "session-123", None)?;
+        ctx.system("You are a helpful assistant.");
+        ctx
+    }
+};
+```
+
+## Low-Level State Control
+
+For advanced patterns (windowed attention, cursor manipulation):
+
+```rust
+// Set cursor position within the active page
+ctx.set_cursor(new_position);
+
+// Replace buffered tokens entirely
+ctx.set_buffered_tokens(&[last_token]);
+
+// Append to buffered tokens
+ctx.append_buffered_tokens(&new_tokens);
+```
+
+## Next Steps
+
+- **[Custom Forward Pass](./custom-forward-pass)** — Windowed attention uses page eviction
+- **[Speculative Decoding](./speculative-decoding)** — Speculation interacts with page commits
+- **[Model & Context](./model-context)** — Context creation and state

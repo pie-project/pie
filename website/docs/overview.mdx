@@ -14,11 +14,11 @@ sidebar_position: 1
 
 **Fast.** Cut end‑to‑end latency and boost throughput by using application‑aware optimization with integrated I/O and fine‑grained KV‑cache control. (*Measured on Llama 3.2 1B using L40 GPU*)
 
-![Agentic workflows](./agent_latency_tput.svg)
+![Agentic workflows](./overview/agent_latency_tput.svg)
 
 **Flexible.** Compose APIs to implement custom decoding, resource policies, and per‑request optimizations—without patching or forking your serving stack.
 
-![Benchmarks](./bench_latency_tput.svg)
+![Benchmarks](./overview/bench_latency_tput.svg)
 
 ---
 
@@ -26,7 +26,7 @@ sidebar_position: 1
 
 Existing LLM serving systems run a **single monolithic decode loop** with global policies (e.g., cache management, speculative decoding). **Pie** splits this into **fine‑grained handlers**—embed, forward, sample, KV‑page alloc/free, etc.—and lets your **inferlets** define custom decoding logic and application‑specific resource management.
 
-![Pie architecture diagram](./pie-arch.svg)
+![Pie architecture diagram](./overview/pie-arch.svg)
 
 Inferlets compile to **WebAssembly**, so you can write them in **Rust**, **C++**, **Go**, and more.
 
@@ -53,24 +53,26 @@ Modern LLM apps demand LLM usage beyond simple text completion. They're interact
 **1) Write inferlets** with Pie APIs to control LLM resources (KV, embeddings), run inference (embed, forward, sample), and do lightweight I/O (HTTP, message bus).
 
 ```rust
-use inferlet::stop_condition::{StopCondition, ends_with_any, max_len};
-use inferlet::{Args, Result, Sampler, get_auto_model};
+use inferlet::{Args, Result, ContextExt, InstructExt};
+use inferlet::model::Model;
+use inferlet::context::Context;
+use inferlet::inference::Sampler;
 
 #[inferlet::main]
-async fn main(mut args: Args) -> Result<String> {
+async fn main(args: Args) -> Result<String> {
+    let model = Model::load(&inferlet::runtime::models()[0])?;
+    let ctx = Context::new(&model)?;
 
-    let model = get_auto_model();
-    let mut ctx = model.create_context();
+    ctx.system("You are a helpful, respectful and honest assistant.");
+    ctx.user("How are you?");
+    ctx.cue();
 
-    ctx.fill_system("You are a helpful, respectful and honest assistant.");
-    ctx.fill_user("How are you?");
+    let response = ctx
+        .generate(Sampler::TopP((0.6, 0.95)))
+        .collect_text()
+        .await?;
 
-    let sampler = Sampler::top_p(0.6, 0.95);
-    let stop_cond = max_len(max_num_outputs).or(ends_with_any(model.eos_tokens()));
-
-    let final_text = ctx.generate(sampler, stop_cond).await;
-
-    Ok(final_text)
+    Ok(response)
 }
 ```
 
@@ -84,7 +86,7 @@ async fn main(mut args: Args) -> Result<String> {
 
 Pie is a three-layered system where each layer separates concerns.
 
-![Pie system diagram](./system.svg)
+![Pie system diagram](./overview/system.svg)
 
 | Layer | Responsibility |
 |-------|----------------|
@@ -101,7 +103,7 @@ Pie provides client libraries for:
 - **JavaScript** — `npm install @pie-project/client`
 - **Rust** — `cargo add pie-client`
 
-See the [Client API](../client-api/python.mdx) documentation for details.
+See the [Client API](./client-api/python) documentation for details.
 
 ---
 
@@ -129,6 +131,6 @@ pie run chat
 
 ## Next Steps
 
-- Follow the [Tutorial](../tutorial/1-quickstart.mdx) to build your first app
-- Explore the [CLI Reference](../cli.mdx) for all commands
-- Read the [Client API](../client-api/python.mdx) docs
+- Follow the [Getting Started](./getting-started) guide to install and run Pie
+- Explore the [CLI Reference](./cli) for all commands
+- Read the [Client API](./client-api/python) docs

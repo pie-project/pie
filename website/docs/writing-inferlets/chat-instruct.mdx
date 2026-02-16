@@ -1,0 +1,183 @@
+---
+title: Chat & Instruct
+description: Build chat applications with instruct templates and decoders
+sidebar_position: 4
+---
+
+# Chat & Instruct Templates
+
+The `InstructExt` trait provides a high-level API for building chat-style conversations. It handles model-specific chat templates automatically — you write the conversation structure, and Pie formats the tokens correctly for each model architecture.
+
+## Building a Conversation
+
+```rust
+use inferlet::InstructExt;
+
+// System message
+ctx.system("You are a helpful assistant.");
+
+// User turn
+ctx.user("What is the capital of France?");
+
+// Cue the model to start generating
+ctx.cue();
+```
+
+### Available Methods
+
+| Method | Description |
+|--------|-------------|
+| `ctx.system(text)` | Add a system message |
+| `ctx.user(text)` | Add a user message |
+| `ctx.assistant(text)` | Add a pre-filled assistant response |
+| `ctx.cue()` | Signal the model to begin generating |
+| `ctx.seal()` | Close the current assistant turn |
+
+### Multi-turn Conversations
+
+Build multi-turn dialogs by alternating user and assistant messages:
+
+```rust
+ctx.system("You are a math tutor.");
+
+// Turn 1
+ctx.user("What is 2+2?");
+ctx.cue();
+
+let answer = ctx.generate(sampler)
+    .with_max_tokens(64)
+    .collect_text().await?;
+
+ctx.seal();  // Close the assistant turn
+
+// Turn 2
+ctx.user("Can you explain why?");
+ctx.cue();
+// ... generate again
+```
+
+## The Decoder
+
+The `Decoder` is the bridge between raw token generation and structured events. It parses model-specific formatting (thinking tags, tool call syntax, etc.) into a normalized `Event` enum.
+
+```
+ Encoding (InstructExt):              Decoding (Decoder):
+
+ ctx.system("...")  ──┐               raw tokens ──► Decoder ──► Events
+ ctx.user("...")    ──┤── template                     ├── Text("...")
+ ctx.cue()          ──┘   formatting                   ├── Thinking("...")
+        │                                              ├── ToolCall(n, args)
+        ▼                                              └── Done(full_text)
+ model-specific tokens                 model-agnostic events
+```
+
+
+```rust
+use inferlet::Event;
+
+let mut events = ctx
+    .generate(sampler)
+    .decode()              // Create EventStream with chat decoder
+    .with_reasoning()      // Enable reasoning/thinking detection
+    .with_tool_use();      // Enable tool call detection
+```
+
+### Event Types
+
+```rust
+pub enum Event {
+    /// Raw token with no semantic significance (yet)
+    Token,
+
+    /// Regular assistant text
+    Text(String),
+
+    /// Content inside a thinking/reasoning block
+    Thinking(String),
+
+    /// End of a thinking block, contains full thinking text
+    ThinkingDone(String),
+
+    /// Detected tool call: (name, arguments_json)
+    ToolCall(String, String),
+
+    /// Generation complete, contains full accumulated text
+    Done(String),
+}
+```
+
+### Decoder Modes
+
+| Mode | What it detects |
+|------|----------------|
+| Base (default) | `Text` and `Done` events |
+| `.with_reasoning()` | Additionally detects `Thinking` / `ThinkingDone` blocks |
+| `.with_tool_use()` | Additionally detects `ToolCall` events |
+
+Modes are additive — you can enable both reasoning and tool-use together.
+
+### Alternative: `ModelExt::decoder()`
+
+You can also construct a `Decoder` directly from the model for use with raw `TokenStream`:
+
+```rust
+use inferlet::ModelExt;
+
+let mut decoder = model.decoder()
+    .with_reasoning()
+    .with_tool_use();
+
+let mut stream = ctx.generate(sampler);
+while let Some(tokens) = stream.next().await? {
+    match decoder.feed(&tokens)? {
+        Event::Text(s) => print!("{}", s),
+        Event::Done(_) => break,
+        _ => {}
+    }
+}
+```
+
+This is useful when you need the `Decoder` independently of the `EventStream`.
+
+## Example: Chat with Reasoning
+
+```rust
+#[inferlet::main]
+async fn main(args: Vec<String>) -> Result<String> {
+    let mut args = inferlet::parse_args(args);
+    let prompt: String = args.value_from_str(["-p", "--prompt"])?;
+
+    let model = Model::load(runtime::models().first().ok_or("No model")?)?;
+    let ctx = Context::new(&model)?;
+
+    ctx.system("You are a helpful assistant.");
+    ctx.user(&prompt);
+    ctx.cue();
+
+    let mut events = ctx
+        .generate(Sampler::TopP((0.6, 0.95)))
+        .with_max_tokens(512)
+        .decode()
+        .with_reasoning();
+
+    let mut output = String::new();
+
+    while let Some(event) = events.next().await? {
+        match event {
+            Event::Thinking(s)     => eprint!("{}", s),     // stderr for thinking
+            Event::ThinkingDone(_) => eprintln!(),
+            Event::Text(s)         => { print!("{}", s); output.push_str(&s); }
+            Event::Done(_)         => break,
+            _                      => {}
+        }
+    }
+
+    Ok(output)
+}
+```
+
+## Next Steps
+
+- **[Custom Forward Pass](./custom-forward-pass)** — Manual control over the forward pass
+- **[Tool Calling](./tool-calling)** — Handle tool calls detected by the decoder
+- **[Generation](./generation)** — More on `TokenStream` configuration

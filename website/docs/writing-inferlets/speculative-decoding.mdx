@@ -1,0 +1,143 @@
+---
+title: Speculative Decoding
+description: Accelerate generation with draft-and-verify strategies
+sidebar_position: 9
+---
+
+# Speculative Decoding
+
+Speculative decoding accelerates autoregressive generation by drafting multiple tokens and verifying them in a single forward pass. Pie makes this a first-class feature with built-in system speculation and a pluggable `Speculate` trait for custom strategies.
+
+## System Speculation
+
+The simplest way — let the runtime handle drafting:
+
+```rust
+let text = ctx
+    .generate(sampler)
+    .with_speculation(Speculation::system())
+    .with_max_tokens(256)
+    .collect_text()
+    .await?;
+```
+
+`Speculation::system()` is the default — the runtime provides speculative tokens from a small draft model. Each `TokenStream::next()` call may return **multiple** accepted tokens.
+
+## Custom Speculation
+
+Implement the `Speculate` trait for custom draft strategies:
+
+```rust
+use inferlet::context_ext::Speculate;
+
+pub trait Speculate {
+    /// Generate draft tokens and their positions
+    fn draft(&self) -> (Vec<u32>, Vec<u32>);
+
+    /// Called with the accepted prefix of draft tokens
+    fn accept(&mut self, tokens: &[u32]);
+
+    /// Reset to initial state
+    fn reset(&mut self);
+
+    /// Roll back the last N accepted tokens
+    fn rollback(&mut self, num_tokens: usize);
+}
+```
+
+### Example: N-gram Speculation
+
+```rust
+struct NgramSpeculator {
+    history: Vec<u32>,
+    n: usize,
+}
+
+impl Speculate for NgramSpeculator {
+    fn draft(&self) -> (Vec<u32>, Vec<u32>) {
+        // Look for the last (n-1) tokens in history
+        // and predict what followed them before
+        if self.history.len() < self.n {
+            return (vec![], vec![]);
+        }
+
+        let pattern = &self.history[self.history.len() - (self.n - 1)..];
+
+        // Search for this pattern in earlier history
+        for window in self.history.windows(self.n) {
+            if &window[..self.n - 1] == pattern {
+                let draft = vec![window[self.n - 1]];
+                let pos = vec![self.history.len() as u32];
+                return (draft, pos);
+            }
+        }
+
+        (vec![], vec![])
+    }
+
+    fn accept(&mut self, tokens: &[u32]) {
+        self.history.extend_from_slice(tokens);
+    }
+
+    fn reset(&mut self) { self.history.clear(); }
+    fn rollback(&mut self, n: usize) {
+        self.history.truncate(self.history.len().saturating_sub(n));
+    }
+}
+```
+
+### Using Custom Speculation
+
+```rust
+let speculator = NgramSpeculator { history: vec![], n: 4 };
+
+let text = ctx
+    .generate(sampler)
+    .with_speculation(Speculation::custom(speculator))
+    .with_max_tokens(256)
+    .collect_text()
+    .await?;
+```
+
+## How It Works
+
+1. Before each forward pass, `Speculate::draft()` provides draft tokens
+2. These are sent as `ForwardPass::input_speculative_tokens()`
+3. The model verifies all tokens in a single forward pass
+4. `Speculate::accept()` is called with the accepted prefix
+5. Rejected tokens are discarded — no rollback of committed KV state needed
+
+```
+ Standard autoregressive (4 forward passes for 4 tokens):
+ Step 1: [A] →  Step 2: [B] →  Step 3: [C] →  Step 4: [D]
+
+ Speculative decoding (2 forward passes for 7 tokens):
+ Step 1: [A, b', c', d'] → verify → accept [A, B, C] reject [d']
+         ↑real  ↑──draft──╯
+
+ Step 2: [D, e', f', g'] → verify → accept [D, E, F, G]
+
+ Pipeline: draft() → speculative_tokens() → execute → accept()
+```
+
+When using `Speculation::system()`, the runtime also requests new draft tokens via `output_speculative_tokens(true)`, creating a pipeline where each step both verifies the current draft and produces the next one.
+
+## Combining with Constraints
+
+Speculative decoding works with the `Constrain` trait. When a grammar constraint is active and draft tokens are partially rejected, the constraint is rolled back to match:
+
+```rust
+let text = ctx
+    .generate(sampler)
+    .with_speculation(Speculation::system())
+    .with_constraint(grammar_matcher)
+    .with_max_tokens(256)
+    .collect_text()
+    .await?;
+```
+
+## Next Steps
+
+- **[Generation](./generation)** — `TokenStream` fundamentals
+- **[Custom Forward Pass](./custom-forward-pass)** — The underlying `ForwardPass` API
+- **[Structured Generation](./structured-generation)** — Grammar constraints

@@ -1,0 +1,132 @@
+---
+title: Your First Inferlet
+description: Create, build, and run your first inferlet
+sidebar_position: 1
+---
+
+# Your First Inferlet
+
+This guide walks you through creating a minimal inferlet from scratch — from project setup to running it on a model.
+
+## Prerequisites
+
+Install the Wasm target for Rust:
+
+```bash
+rustup target add wasm32-wasip2
+```
+
+## Project Setup
+
+Create a new Rust library project:
+
+```bash
+cargo new --lib my-inferlet
+cd my-inferlet
+```
+
+Update `Cargo.toml`:
+
+```toml
+[package]
+name = "my-inferlet"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet = "0.1"
+```
+
+## Write the Inferlet
+
+Replace `src/lib.rs` with:
+
+```rust
+use inferlet::{
+    context::Context,
+    inference::Sampler,
+    model::Model,
+    runtime,
+    ContextExt, InstructExt,
+    Result,
+};
+
+#[inferlet::main]
+async fn main(args: Vec<String>) -> Result<String> {
+    // Parse arguments
+    let mut args = inferlet::parse_args(args);
+    let prompt: String = args.value_from_str(["-p", "--prompt"])
+        .unwrap_or_else(|_| "Hello!".to_string());
+
+    // Load the first available model
+    let models = runtime::models();
+    let model = Model::load(models.first().ok_or("No models available")?)?;
+
+    // Create a context and fill with chat messages
+    let ctx = Context::new(&model)?;
+    ctx.system("You are a helpful assistant.");
+    ctx.user(&prompt);
+    ctx.cue();
+
+    // Generate a response
+    let response = ctx
+        .generate(Sampler::TopP((0.6, 0.95)))
+        .with_max_tokens(256)
+        .collect_text()
+        .await?;
+
+    Ok(response)
+}
+```
+
+### What's happening here?
+
+1. **`#[inferlet::main]`** — Macro that sets up the Wasm entry point and async runtime
+2. **`Model::load`** — Loads an LLM from the Pie runtime
+3. **`Context::new`** — Creates a fresh KV cache context for the model
+4. **`system` / `user` / `cue`** — Templates the chat conversation ([InstructExt](./chat-instruct))
+5. **`generate().collect_text()`** — Runs autoregressive generation and decodes to text
+
+## Notes
+
+### Error Handling
+
+Inferlet functions return `Result<T>`, which is `Result<T, String>` — errors are plain strings. Use `?` to propagate them:
+
+```rust
+let model = Model::load(&model_names[0])?;  // Returns Err("...") on failure
+```
+
+### Debugging
+
+Use `eprintln!()` for debug output — it writes to stderr, which is visible in `pie run` output:
+
+```rust
+eprintln!("[debug] loaded model, generating...");
+```
+
+## Build
+
+```bash
+cargo build --target wasm32-wasip2 --release
+```
+
+This produces `target/wasm32-wasip2/release/my_inferlet.wasm`.
+
+## Run
+
+```bash
+pie run --path target/wasm32-wasip2/release/my_inferlet.wasm \
+    -- --prompt "What is the capital of France?"
+```
+
+You should see the model's response streamed to your terminal.
+
+## Next Steps
+
+- **[Model & Context](./model-context)** — Understand models, contexts, and tokenizers
+- **[Generation](./generation)** — Learn about `TokenStream`, `EventStream`, and generation options
+- **[Building & Publishing](./building-publishing)** — Package and publish your inferlet to the registry

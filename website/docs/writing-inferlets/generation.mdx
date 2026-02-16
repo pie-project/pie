@@ -1,0 +1,136 @@
+---
+title: Generation
+description: Token generation with TokenStream and EventStream
+sidebar_position: 3
+---
+
+# Generation
+
+Once a context has been filled with tokens, you can generate new ones. The Inferlet SDK provides two layers of abstraction:
+
+- **`TokenStream`** — Raw token-level generation with full control
+- **`EventStream`** — Decoded events (text deltas, thinking blocks, tool calls)
+
+## Basic Generation
+
+```rust
+use inferlet::{inference::Sampler, ContextExt};
+
+let mut stream = ctx
+    .generate(Sampler::TopP((0.6, 0.95)))
+    .with_max_tokens(256);
+```
+
+`ctx.generate()` returns a `TokenStream` — call `.next()` to get batches of tokens:
+
+```rust
+while let Some(tokens) = stream.next().await? {
+    let text = model.tokenizer().decode(&tokens)?;
+    print!("{}", text);
+}
+```
+
+### Convenience Methods
+
+Collect all tokens or text at once:
+
+```rust
+// Collect all generated tokens
+let all_tokens = ctx.generate(sampler).collect_tokens().await?;
+
+// Collect and decode to text
+let text = ctx.generate(sampler)
+    .with_max_tokens(512)
+    .collect_text()
+    .await?;
+```
+
+## Samplers
+
+The `Sampler` enum controls how tokens are selected from the model's output distribution:
+
+```rust
+use inferlet::inference::Sampler;
+
+// Top-P (nucleus) — temperature + probability threshold
+Sampler::TopP((temperature, top_p))
+
+// Top-K — temperature + top-K candidates
+Sampler::TopK((temperature, k))
+
+// Min-P — temperature + min probability ratio
+Sampler::MinP((temperature, min_p))
+
+// Top-K + Top-P combined — temperature, top-K, then top-P
+Sampler::TopKTopP((temperature, k, top_p))
+
+// Multinomial — temperature + seed, sample from full distribution
+Sampler::Multinomial((temperature, seed))
+
+// Distribution — temperature + seed for reproducible sampling
+Sampler::Dist((temperature, seed))
+
+// Embedding — return embeddings instead of token IDs
+Sampler::Embedding
+```
+
+:::tip
+For near-deterministic (greedy) decoding, use `Sampler::TopP((0.0, 1.0))` with zero temperature.
+:::
+
+## EventStream (Decoded Generation)
+
+For chat applications, decode raw tokens into structured events:
+
+```rust
+use inferlet::Event;
+
+let mut events = ctx
+    .generate(Sampler::TopP((0.6, 0.95)))
+    .with_max_tokens(256)
+    .decode()           // TokenStream → EventStream
+    .with_reasoning()   // Enable thinking blocks
+    .with_tool_use();   // Enable tool call detection
+
+while let Some(event) = events.next().await? {
+    match event {
+        Event::Text(s)         => print!("{}", s),
+        Event::Thinking(s)     => print!("[think] {}", s),
+        Event::ThinkingDone(_) => println!("[/think]"),
+        Event::ToolCall(tc)    => handle_tool(tc),
+        Event::Done(full_text) => break,
+    }
+}
+```
+
+The `EventStream` is created by chaining `TokenStream::decode()`. It fuses a `TokenStream` with a `Decoder` that parses chat template structure.
+
+See [Chat & Instruct](./chat-instruct) for the `Decoder` details and [Tool Calling](./tool-calling) for handling `ToolCall` events.
+
+## Generation Options
+
+Configure the `TokenStream` with builder methods:
+
+| Method | Description |
+|--------|-------------|
+| `.with_max_tokens(n)` | Stop after generating `n` tokens |
+| `.with_speculation(s)` | Use a custom [speculation strategy](./speculative-decoding) |
+| `.with_constraint(c)` | Apply a logit [constraint](./structured-generation) (e.g., grammar mask) |
+
+## How It Works
+
+Each call to `stream.next()` runs one forward pass:
+
+1. **Buffered tokens** are sent through the model with their position IDs
+2. If **speculation** is enabled, draft tokens are included for parallel verification
+3. The **sampler** selects from the output logits (optionally masked by a constraint)
+4. Accepted tokens are committed to the KV cache
+5. Stop tokens trigger stream completion
+
+For direct control over forward passes, see [Custom Forward Pass](./custom-forward-pass).
+
+## Next Steps
+
+- **[Chat & Instruct](./chat-instruct)** — Template-driven chat with the `Decoder`
+- **[Structured Generation](./structured-generation)** — Constrain output with grammars
+- **[Speculative Decoding](./speculative-decoding)** — Accelerate generation with draft models

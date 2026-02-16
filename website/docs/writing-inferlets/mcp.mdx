@@ -1,0 +1,100 @@
+---
+title: MCP Integration
+description: Connect to Model Context Protocol servers for tools and resources
+sidebar_position: 12
+---
+
+# MCP Integration
+
+The [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) is an open standard for connecting LLM applications to external tools, resources, and prompts. Pie's MCP client lets inferlets discover and interact with MCP servers.
+
+## Connecting to an MCP Server
+
+```rust
+use inferlet::pie::mcp::client;
+
+// List available MCP servers
+let servers = client::available_servers();
+
+// Connect to a server
+let session = client::connect(&servers[0])?;
+```
+
+## Tools
+
+Discover and call tools provided by the MCP server:
+
+```rust
+// List available tools
+let tools = session.list_tools();
+
+for tool in &tools {
+    println!("{}: {}", tool.name, tool.description);
+}
+
+// Call a tool
+let result = session.call_tool("search", &serde_json::json!({
+    "query": "Rust programming"
+}).to_string())?;
+
+match result {
+    Content::Text(text) => println!("Result: {}", text),
+    Content::Image(data) => { /* handle image */ }
+    Content::Resource(r) => { /* handle resource */ }
+}
+```
+
+## Resources
+
+Read resources exposed by the server:
+
+```rust
+// List available resources
+let resources = session.list_resources();
+
+// Read a resource
+let content = session.read_resource(&resources[0].uri)?;
+```
+
+## Prompts
+
+Use prompt templates provided by the server:
+
+```rust
+// List available prompts
+let prompts = session.list_prompts();
+
+// Render a prompt with arguments
+let rendered = session.render_prompt(
+    &prompts[0].name,
+    &serde_json::json!({ "topic": "Rust" }).to_string()
+)?;
+```
+
+## Combining with Tool Calling
+
+Use MCP tools alongside Pie's tool-calling API for a complete agent:
+
+```rust
+// Discover tools from MCP
+let tools = session.list_tools();
+
+// Convert to tool definitions for equip_tools
+let tool_defs: Vec<String> = tools.iter()
+    .map(|t| t.schema.clone())
+    .collect();
+
+ctx.equip_tools(&tool_defs);
+ctx.user("Search for the latest Rust release");
+ctx.cue();
+
+// When the model calls a tool, dispatch to MCP
+let event = /* ... get ToolCall event ... */;
+let result = session.call_tool(&event.name, &event.arguments)?;
+ctx.answer_tool(&event.id, &result.to_string());
+```
+
+## Next Steps
+
+- **[Tool Calling](./tool-calling)** — The tool-calling API that drives MCP tool dispatch
+- **[I/O](./io)** — HTTP and file I/O for other external integrations

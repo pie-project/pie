@@ -1,0 +1,43 @@
+---
+title: Examples
+description: Annotated inferlet implementations
+sidebar_position: 7
+---
+
+# Examples
+
+A curated collection of inferlet implementations demonstrating Pie's capabilities. Each example is a complete, runnable project.
+
+:::note Coming Soon
+Detailed annotated walkthroughs are being added. In the meantime, browse the source code in [`sdk/examples/`](https://github.com/nicepie/pie/tree/main/sdk/examples) and [`inferlets/`](https://github.com/nicepie/pie/tree/main/inferlets).
+:::
+
+## By Category
+
+### Chat & Generation
+- **Text Completion** — Basic chat-style generation with `InstructExt` + `EventStream`
+- **Multi-turn Chat** — Multi-turn conversation with context management
+
+### Agents
+- **ReAct Agent** — Reasoning + Acting loop with tool execution
+
+### Structured Output
+- **Constrained JSON** — Grammar-constrained decoding with Lark grammars
+
+### Performance
+- **Prefix Caching** — Reuse KV cache across requests
+- **Speculative Decoding** — Jacobi decoding, CacheBack decoding
+- **Parallel Generation** — Multiple generation streams on shared context
+
+### Advanced Attention
+- **Windowed Attention** — Sliding window KV cache management
+- **Attention Sink** — Fixed sink + sliding window for long sequences
+
+### Reasoning
+- **Tree of Thought** — Branching exploration of reasoning paths
+- **Graph of Thought** — DAG-based reasoning with merging
+
+### System Integration
+- **HTTP Server** — WASI HTTP incoming handler with SSE streaming
+- **Image Fetch** — HTTP client for fetching external resources
+- **OpenAI-Compatible Server** — Drop-in OpenAI API replacement

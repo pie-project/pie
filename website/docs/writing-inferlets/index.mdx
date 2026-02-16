@@ -1,0 +1,42 @@
+---
+title: Writing Inferlets
+description: Learn to build custom inference logic with Pie's Inferlet SDK
+sidebar_position: 4
+---
+
+# Writing Inferlets
+
+Inferlets are WebAssembly programs that run custom logic directly inside Pie's serving engine. They have direct access to the model, its KV cache, the token stream, and the forward pass — enabling capabilities that are impossible with traditional API wrappers.
+
+This guide covers the Rust Inferlet SDK. Each page focuses on one area of the API, building from simple to advanced.
+
+## Learning Path
+
+### Getting Started
+1. **[Your First Inferlet](./first-inferlet)** — Scaffold a project, build to Wasm, and run it
+2. **[Model & Context](./model-context)** — Load models, create contexts, and manage token state
+
+### Generating Text
+3. **[Generation](./generation)** — Generate tokens with `TokenStream` and `EventStream`
+4. **[Chat & Instruct](./chat-instruct)** — Build chat applications with instruct templates
+5. **[Tool Calling](./tool-calling)** — Equip tools and build agent loops
+6. **[Structured Generation](./structured-generation)** — Constrain output to grammars (JSON, regex, EBNF)
+
+### Advanced Techniques
+7. **[Custom Forward Pass](./custom-forward-pass)** — Control attention masks, position IDs, and logit masking
+8. **[KV Cache Control](./kv-cache)** — Page-level cache management, forking, and prefix caching
+9. **[Speculative Decoding](./speculative-decoding)** — Implement custom speculation strategies
+10. **[Adapters & Fine-tuning](./adapters)** — Manage adapters and run zeroth-order optimization
+
+### System Integration
+11. **[I/O & Messaging](./io)** — HTTP, file I/O, client messaging, broadcast/subscribe, and spawning
+12. **[MCP Integration](./mcp)** — Connect to Model Context Protocol servers
+
+### Deployment
+13. **[Building & Publishing](./building-publishing)** — Build pipeline, bakery, and the registry
+
+## Prerequisites
+
+- **Rust toolchain** with the `wasm32-wasip2` target installed
+- **Pie** installed and configured (see [Getting Started](../getting-started))
+- Basic familiarity with async Rust

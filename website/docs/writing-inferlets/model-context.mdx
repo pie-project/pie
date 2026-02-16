@@ -1,0 +1,148 @@
+---
+title: Model & Context
+description: Loading models, creating contexts, and managing token state
+sidebar_position: 2
+---
+
+# Model & Context
+
+The `Model` and `Context` are the two foundational types in every inferlet. A **Model** represents a loaded LLM with its weights and tokenizer. A **Context** represents a sequence of tokens with associated KV cache state.
+
+## Loading a Model
+
+```rust
+use inferlet::{model::Model, runtime};
+
+// List available models
+let model_names = runtime::models();
+
+// Load a model by name
+let model = Model::load(&model_names[0])?;
+```
+
+The runtime manages model lifecycle — multiple inferlets can share the same model.
+
+## The Tokenizer
+
+Every model has a tokenizer for converting between text and token IDs:
+
+```rust
+let tokenizer = model.tokenizer();
+
+// Encode text → tokens
+let tokens = tokenizer.encode("Hello, world!");
+
+// Decode tokens → text
+let text = tokenizer.decode(&tokens)?;
+
+// Access vocabulary
+let vocab_size = tokenizer.vocabs().len();
+let special_tokens = tokenizer.special_tokens();
+```
+
+## Creating a Context
+
+A `Context` holds the token sequence and its KV cache. Use `ContextExt` for the high-level API:
+
+```rust
+use inferlet::{context::Context, ContextExt};
+
+// Create a new context (auto-generated unique name)
+let ctx = Context::new(&model)?;
+```
+
+Under the hood, `Context::new` calls `Context::create` with a unique name. You can also create named contexts:
+
+```rust
+let ctx = Context::create(&model, "my-session", None)?;
+```
+
+## Filling a Context
+
+Before generating, you need to fill the context with tokens. The simplest way is through [InstructExt](./chat-instruct), but you can also work with raw tokens:
+
+```rust
+// Append raw token IDs
+ctx.fill_tokens(&token_ids);
+
+// Flush: runs the forward pass on buffered tokens to populate the KV cache
+ctx.flush().await?;
+```
+
+**`flush()`** processes all buffered tokens except the last one (which is kept as the "seed" for generation). This is a prefill step — it populates the KV cache without sampling.
+
+```
+  fill_tokens()       flush()            generate()
+  ┌──────────┐   ┌──────────────┐   ┌──────────────────┐
+  │ Append   │──►│ Prefill:     │──►│ Autoregressive:  │
+  │ tokens   │   │ KV computed, │   │ sample one token │
+  │ to buffer│   │ pages filled │   │ per step         │
+  └──────────┘   └──────────────┘   └──────────────────┘
+       ▼                ▼                    ▼
+  [buffered_tokens]  [committed pages]   [new tokens emitted]
+```
+
+## Forking a Context
+
+Fork creates a copy-on-write clone of an existing context's KV cache. This is the basis for prefix caching and branching:
+
+```rust
+// Fork shares all committed KV pages with the original
+let forked = ctx.fork("forked-session")?;
+
+// Changes to forked don't affect the original
+forked.fill_tokens(&new_tokens);
+```
+
+Forking is O(1) — it references the same KV cache pages until new tokens are committed.
+
+## Looking Up a Context
+
+Contexts persist across function calls within the same inferlet instance. Look one up by name:
+
+```rust
+if let Some(ctx) = Context::lookup(&model, "my-session") {
+    // Resume from existing KV state
+}
+```
+
+## Context State
+
+Track the current state of a context:
+
+```
+                   committed pages                     active page
+ ┌──────────┬──────────┬──────────┬──────────┬──────────────────────┐
+ │  Page 0  │  Page 1  │  Page 2  │  Page 3  │       Page 4        │
+ │ ████████ │ ████████ │ ████████ │ ████████ │ █████░░░░░░░░░░░░░░ │
+ └──────────┴──────────┴──────────┴──────────┴───────↑─────────────┘
+                                                   cursor
+ ◄──────── committed_page_count = 4 ────────►
+                                              ◄── tokens_per_page ──►
+
+ Buffered tokens: [t1, t2, t3]     (queued, not yet in KV cache)
+ Last position:   4 × page_size + cursor
+```
+
+```rust
+// The model this context belongs to
+let model = ctx.model();
+
+// Current cursor position within the active page
+let cursor = ctx.cursor();
+
+// Last committed position (None if empty)
+let last_pos = ctx.last_position();
+
+// Tokens waiting to be processed
+let buffered = ctx.buffered_tokens();
+
+// Page size (tokens per KV page)
+let page_size = ctx.tokens_per_page();
+```
+
+## Next Steps
+
+- **[Generation](./generation)** — Generate tokens from a filled context
+- **[KV Cache Control](./kv-cache)** — Page-level cache operations
+- **[Chat & Instruct](./chat-instruct)** — High-level chat template API
