@@ -1,0 +1,122 @@
+---
+title: Adapters & Fine-tuning
+description: Manage LoRA adapters and run zeroth-order optimization
+sidebar_position: 13
+---
+
+# Adapters & Fine-tuning
+
+Pie supports runtime adapter management (LoRA) and zeroth-order optimization for on-the-fly model customization without requiring full fine-tuning.
+
+## Adapters
+
+Adapters are lightweight parameter overlays (e.g., LoRA) that modify model behavior without changing base weights.
+
+### Creating and Managing Adapters
+
+```rust
+use inferlet::adapter::Adapter;
+
+// Create a new adapter
+let adapter = Adapter::create("my-adapter")?;
+
+// Look up an existing adapter
+if let Some(adapter) = Adapter::lookup("my-adapter") {
+    // Use existing adapter
+}
+
+// Clone an adapter
+let new_adapter = adapter.clone("my-adapter-v2");
+```
+
+### Loading and Saving
+
+Adapters are loaded from and saved to file paths:
+
+```rust
+// Load adapter weights from a file
+adapter.load("/data/adapters/my-adapter.bin")?;
+
+// Save current adapter state to a file
+adapter.save("/data/adapters/my-adapter-updated.bin")?;
+```
+
+### Using with Forward Pass
+
+Apply an adapter during inference:
+
+```rust
+use inferlet::inference::ForwardPass;
+
+let pass = ForwardPass::new(&model);
+pass.context(&ctx);
+pass.adapter(&adapter);  // Use adapter for this pass
+pass.input_tokens(&tokens, &positions);
+let output = pass.execute_async().await?;
+```
+
+### Locking
+
+Coordinate adapter access across concurrent requests:
+
+```rust
+use inferlet::AdapterExt;
+
+// Acquire an exclusive lock (async)
+let locked = adapter.acquire_lock_async().await;
+if locked {
+    // Safe to modify adapter
+    adapter.load("/data/adapters/new-weights.bin")?;
+    adapter.release_lock()?;
+}
+```
+
+## Zeroth-Order Optimization (Zo)
+
+The Zo interface enables gradient-free optimization of adapters at runtime. It uses a population-based evolutionary strategy (CMA-ES variant) where gradients are estimated by evaluating the model at perturbed parameter points.
+
+### Initialization
+
+```rust
+use inferlet::zo;
+
+// Initialize Zo optimization for an adapter
+zo::initialize(
+    &adapter,
+    16,       // rank: LoRA rank
+    1.0,      // alpha: LoRA scaling factor
+    8,        // population_size: number of perturbations per step
+    0.5,      // mu_fraction: fraction of top candidates to keep
+    0.01,     // initial_sigma: initial perturbation scale
+)?;
+```
+
+### Evaluation Loop
+
+Each optimization step involves evaluating multiple perturbation seeds:
+
+```rust
+// During forward pass, set the perturbation seed
+zo::adapter_seed(&pass, seed);
+
+// After evaluating each member of the population,
+// collect their scores and seeds
+let scores: Vec<f32> = population_scores;
+let seeds: Vec<s64> = population_seeds;
+
+// Update the adapter based on population fitness
+zo::update(
+    &adapter,
+    &scores,       // Fitness score for each population member
+    &seeds,        // Seed used for each member's perturbation
+    0.1,           // max_sigma: upper bound on perturbation scale
+)?;
+```
+
+Zo is suitable for scenarios where backpropagation is unavailable (e.g., within the Wasm sandbox) but online adaptation is desired.
+
+## Next Steps
+
+- **[Model & Context](./model-context)** — Loading models
+- **[Custom Forward Pass](./custom-forward-pass)** — Using adapters with ForwardPass
+- **[Building & Publishing](./building-publishing)** — Package your inferlet

@@ -1,0 +1,117 @@
+---
+title: Building & Publishing
+description: Build, package, and publish your inferlet
+sidebar_position: 14
+---
+
+# Building & Publishing
+
+This page covers the complete lifecycle from source code to a published inferlet available in the Pie registry.
+
+## Building
+
+Inferlets compile to WebAssembly (WASI Preview 2):
+
+```bash
+# Install the target (one-time)
+rustup target add wasm32-wasip2
+
+# Build
+cargo build --target wasm32-wasip2 --release
+```
+
+The output is at `target/wasm32-wasip2/release/your_inferlet.wasm`.
+
+### Cargo.toml Requirements
+
+```toml
+[package]
+name = "your-inferlet"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]  # Required for Wasm component
+
+[dependencies]
+inferlet = "0.1"
+```
+
+The `cdylib` crate type is required — it produces a Wasm component rather than a Rust library.
+
+## Running Locally
+
+Test your inferlet directly:
+
+```bash
+# Run with a prompt
+pie run --path target/wasm32-wasip2/release/your_inferlet.wasm \
+    -- --prompt "Hello, world!"
+
+# Run from registry (after publishing)
+pie run your-inferlet -- --prompt "Hello!"
+```
+
+## Packaging with Bakery
+
+The `pie bakery` tool packages your inferlet for the registry:
+
+```bash
+# Build and package
+pie bakery build
+
+# This creates a distributable package with metadata
+```
+
+### Manifest
+
+A `pie.toml` manifest describes your inferlet:
+
+```toml
+[inferlet]
+name = "my-inferlet"
+version = "0.1.0"
+description = "A helpful chat assistant"
+
+[build]
+target = "wasm32-wasip2"
+```
+
+## Publishing to Registry
+
+Publish your packaged inferlet to the Pie registry:
+
+```bash
+# Authenticate
+pie auth login
+
+# Publish
+pie bakery publish
+```
+
+Once published, anyone with access can run your inferlet:
+
+```bash
+pie run my-inferlet@0.1.0 -- --prompt "Hello!"
+```
+
+## Version Resolution
+
+Clients automatically resolve the latest version:
+
+```python
+# Python client
+client = PieClient()
+instance = client.launch("my-inferlet")  # Resolves to latest version
+```
+
+You can also pin to a specific version:
+
+```python
+instance = client.launch("my-inferlet@0.1.0")
+```
+
+## Next Steps
+
+- **[Your First Inferlet](./first-inferlet)** — Start from scratch
+- **[I/O](./io)** — Build HTTP server inferlets

@@ -1,9 +1,51 @@
-import React from 'react';
+import React, { useState } from 'react';
 import clsx from 'clsx';
 import Layout from '@theme/Layout';
 import Link from '@docusaurus/Link';
+import CodeBlock from '@theme/CodeBlock';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import styles from './index.module.css';
+
+const CODE_EXAMPLES = {
+    agent: {
+        label: 'Tool-Calling Agent',
+        code: `// An inferlet that runs a tool-calling agent loop
+// — tools execute inside the engine, no round-trips
+loop {
+    let events = ctx.generate(sampler.clone())
+        .decode()
+        .with_tool_use();
+
+    match events.next().await? {
+        Event::ToolCall(name, args) => {
+            let result = http::get(&api_url(&name, &args)).await?;
+            ctx.answer_tool(&name, &result);
+            ctx.cue();       // continue generation
+        }
+        Event::Done(text) => return Ok(text),
+        _ => {}
+    }
+}`,
+    },
+    kvcache: {
+        label: 'KV Cache Control',
+        code: `// Prefix caching: process the prompt once, fork per request
+let base = Context::new(&model)?;
+ctx.system("You are a helpful assistant.");
+ctx.flush().await?;
+
+// Each request forks the cached prefix — O(1), no recompute
+let session = base.fork("req-42")?;
+session.user(&request.prompt);
+
+let response = session.generate(sampler)
+    .with_speculation(Speculation::system())  // speculative decoding
+    .decode()
+    .collect().await?;`,
+    },
+} as const;
+
+type ExampleKey = keyof typeof CODE_EXAMPLES;
 
 // --- Hero Section Component ---
 function HomepageHeader() {
@@ -26,6 +68,37 @@ function HomepageHeader() {
                 </div>
             </div>
         </header>
+    );
+}
+
+// --- Code Snippet Section ---
+function CodeSnippetSection() {
+    const [active, setActive] = useState<ExampleKey>('agent');
+    const example = CODE_EXAMPLES[active];
+
+    return (
+        <section className={clsx(styles.section, styles.codeSection)}>
+            <div className="container">
+                <h2 className={styles.sectionTitle}>Code That Runs Inside the Engine</h2>
+                <p className={styles.sectionSubtitle}>
+                    Inferlets execute alongside the model — no HTTP round-trips,<br />direct access to the KV cache, decoding pipeline, and tool execution.
+                </p>
+                <div className={styles.codeContainer}>
+                    <div className={styles.codeTabs}>
+                        {(Object.keys(CODE_EXAMPLES) as ExampleKey[]).map((key) => (
+                            <button
+                                key={key}
+                                className={clsx(styles.codeTab, active === key && styles.codeTabActive)}
+                                onClick={() => setActive(key)}
+                            >
+                                {CODE_EXAMPLES[key].label}
+                            </button>
+                        ))}
+                    </div>
+                    <CodeBlock language="rust">{example.code}</CodeBlock>
+                </div>
+            </div>
+        </section>
     );
 }
 
@@ -72,6 +145,8 @@ export default function Home(): JSX.Element {
                     </div>
                 </section>
 
+                {/* Code Snippet Section */}
+                <CodeSnippetSection />
 
                 {/* Contrast Section: Weakness → Pie Strength */}
                 <section className={clsx(styles.section, styles.contrastSection)}>
@@ -197,6 +272,35 @@ export default function Home(): JSX.Element {
                     </div>
                 </section>
 
+                {/* How It Works */}
+                <section className={clsx(styles.section, styles.howSection)}>
+                    <div className="container">
+                        <h2 className={styles.sectionTitle}>How It Works</h2>
+                        <p className={styles.sectionSubtitle}>
+                            Pie programs are self-contained WebAssembly binaries that run inside the serving engine.
+                        </p>
+                        <div className={styles.stepsGrid}>
+                            <div className={styles.stepCard}>
+                                <div className={styles.stepNumber}>1</div>
+                                <h3>Write</h3>
+                                <p>Write your inference logic in Rust, Python, or JavaScript using Pie's SDK.</p>
+                            </div>
+                            <div className={styles.stepArrow} aria-hidden="true">→</div>
+                            <div className={styles.stepCard}>
+                                <div className={styles.stepNumber}>2</div>
+                                <h3>Build</h3>
+                                <p>Compile to a portable WebAssembly component with <code>pie build</code>.</p>
+                            </div>
+                            <div className={styles.stepArrow} aria-hidden="true">→</div>
+                            <div className={styles.stepCard}>
+                                <div className={styles.stepNumber}>3</div>
+                                <h3>Deploy</h3>
+                                <p>Publish and run on any Pie-compatible serving engine with <code>pie run</code>.</p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
                 {/* CTA Section */}
                 <section className={clsx(styles.section, styles.ctaSection)}>
                     <div className="container text--center">
@@ -205,7 +309,7 @@ export default function Home(): JSX.Element {
                             Ready to see how it works? Check out our documentation and get started with Pie today.
                         </p>
                         <div className={styles.ctaActions}>
-                            <Link className="button button--primary button--lg" to="/docs/installation">
+                            <Link className="button button--primary button--lg" to="/docs/getting-started">
                                 Getting Started
                             </Link>
 

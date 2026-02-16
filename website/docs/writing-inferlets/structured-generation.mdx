@@ -1,0 +1,138 @@
+---
+title: Structured Generation
+description: Constrain output to grammars, JSON schemas, and regular expressions
+sidebar_position: 6
+---
+
+# Structured Generation
+
+Structured generation constrains model output to match a formal grammar. Pie provides two components for this:
+
+- **`Grammar`** — A compiled grammar specification (JSON schema, EBNF, regex)
+- **`Matcher`** — A stateful object that tracks progress through the grammar and produces logit masks
+
+These integrate with the `TokenStream` via the **`Constrain`** trait.
+
+## Grammar Types
+
+Create grammars from different source formats:
+
+```rust
+use inferlet::inference::{Grammar, Matcher};
+
+// From a JSON Schema
+let grammar = Grammar::from_json_schema(&schema_string)?;
+
+// From a JSON object/array type directly
+let grammar = Grammar::json()?;
+
+// From a regular expression
+let grammar = Grammar::from_regex(&pattern)?;
+
+// From an EBNF grammar (Lark format)
+let grammar = Grammar::from_ebnf(&ebnf_string)?;
+```
+
+## The Matcher
+
+A `Matcher` is instantiated from a compiled `Grammar` and tracks generation state:
+
+```rust
+let matcher = grammar.matcher(&model)?;
+
+// Check if tokens are valid continuations
+matcher.accept_tokens(&tokens);
+
+// Get BRLE-encoded logit mask for next token
+let mask = matcher.next_token_logit_mask();
+
+// Check if the grammar is fully satisfied
+let terminated = matcher.is_terminated();
+```
+
+## The Constrain Trait
+
+To plug structured generation into `TokenStream`, implement the `Constrain` trait:
+
+```rust
+use inferlet::context_ext::Constrain;
+
+pub trait Constrain {
+    /// Returns BRLE-encoded logit mask for the current state
+    fn mask(&self) -> Vec<u32>;
+
+    /// Update state with accepted tokens
+    fn accept(&mut self, tokens: &[u32]);
+
+    /// Reset to initial state
+    fn reset(&mut self);
+
+    /// Roll back the last N accepted tokens
+    fn rollback(&mut self, num_tokens: usize);
+}
+```
+
+### Using with TokenStream
+
+```rust
+let grammar = Grammar::from_json_schema(&schema)?;
+let matcher = grammar.matcher(&model)?;
+
+let output = ctx
+    .generate(Sampler::TopP((0.0, 1.0))) // Low temperature for structured output
+    .with_constraint(matcher)
+    .with_max_tokens(256)
+    .collect_text()
+    .await?;
+
+// `output` is guaranteed to match the grammar
+```
+
+## Example: JSON Output
+
+```rust
+const JSON_GRAMMAR: &str = r#"
+?start: value
+?value: object | array | string | SIGNED_NUMBER -> number
+        | "true" -> true | "false" -> false | "null" -> null
+array  : "[" [value ("," value)*] "]"
+object : "{" [pair ("," pair)*] "}"
+pair   : string ":" value
+string : ESCAPED_STRING
+%import common.ESCAPED_STRING
+%import common.SIGNED_NUMBER
+%import common.WS
+%ignore WS
+"#;
+
+let grammar = Grammar::from_ebnf(JSON_GRAMMAR)?;
+let matcher = grammar.matcher(&model)?;
+
+ctx.user("What is the capital of France? Output only JSON.");
+ctx.cue();
+
+let json_output = ctx
+    .generate(Sampler::TopP((0.0, 1.0)))  // Deterministic for structured output
+    .with_constraint(matcher)
+    .with_max_tokens(128)
+    .collect_text()
+    .await?;
+
+// json_output will be valid JSON
+```
+
+## How It Works
+
+On each generation step:
+
+1. The `Constrain::mask()` method returns a logit mask based on the grammar's current parse state
+2. The logit mask is passed to `ForwardPass::logit_mask()` to zero out invalid tokens before sampling
+3. After sampling, `Constrain::accept()` updates the parse state
+4. If speculative decoding accepts multiple tokens, some may need to be rolled back via `rollback()`
+
+This runs entirely within the forward pass — no post-hoc rejection or retry loops.
+
+## Next Steps
+
+- **[Tool Calling](./tool-calling)** — Detect and handle tool calls
+- **[Custom Forward Pass](./custom-forward-pass)** — Manual logit masking at the ForwardPass level

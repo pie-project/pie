@@ -1,0 +1,10 @@
+{
+  "label": "Writing Inferlets",
+  "position": 4,
+  "collapsible": true,
+  "collapsed": false,
+  "link": {
+    "type": "doc",
+    "id": "writing-inferlets/index"
+  }
+}
