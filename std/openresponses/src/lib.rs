@@ -11,10 +11,10 @@
 //!
 //! ```bash
 //! # Build
-//! cargo build -p openresponses-server --target wasm32-wasip2 --release
+//! cargo build -p openresponses --target wasm32-wasip2 --release
 //!
 //! # Run
-//! pie http --path ./openresponses_server.wasm --port 8080
+//! pie http --path ./openresponses.wasm --port 8080
 //!
 //! # Test (non-streaming)
 //! curl -X POST http://localhost:8080/responses \
@@ -103,12 +103,14 @@ async fn read_body(body: &mut IncomingBody, buf: &mut Vec<u8>) -> Result<(), ()>
     Ok(())
 }
 
-/// Return an error response
+/// Return an error response per OpenResponses spec
 async fn error_response(res: Responder, status: u16, message: &str) -> Finished {
     let error = serde_json::json!({
         "error": {
             "type": "invalid_request",
             "message": message,
+            "code": null,
+            "param": null,
         }
     });
 
@@ -127,6 +129,8 @@ async fn not_found(res: Responder) -> Finished {
         "error": {
             "type": "not_found",
             "message": "Endpoint not found",
+            "code": null,
+            "param": null,
         }
     });
 

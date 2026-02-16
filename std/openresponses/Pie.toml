@@ -1,8 +1,8 @@
 [package]
-name = "openresponses-server"
+name = "openresponses"
 version = "0.1.0"
-description = "OpenResponses-compliant HTTP server for LLM inference"
-authors = ["Pie Team"]
+description = "openresponses-compliant server"
+authors = ["In Gim <in.gim@icloud.com>"]
 
 [runtime]
 core = "^0.2.0"
