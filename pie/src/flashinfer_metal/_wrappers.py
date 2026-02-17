@@ -270,6 +270,9 @@ def apply_rope_with_cos_sin_cache_inplace(
 ) -> None:
     """Apply RoPE using a precomputed cos/sin cache, in-place (Metal kernel).
 
+    Uses a fused kernel that processes both Q and K in a single dispatch,
+    halving dispatch overhead (24 dispatches/step instead of 48).
+
     Args:
         positions: [num_tokens] int32/int64 position indices.
         query: [num_tokens, num_heads, head_dim] or [num_tokens, num_heads * head_dim].
@@ -284,17 +287,16 @@ def apply_rope_with_cos_sin_cache_inplace(
 
     compiler = MetalCompiler()
 
-    def _apply(x: torch.Tensor) -> None:
-        if x.ndim == 2:
-            x_3d = x.view(x.shape[0], -1, head_size)
-        else:
-            x_3d = x
-        compiler.run_rope_cos_sin(x_3d, positions, cos_sin_cache, head_size, is_neox)
-        if x.ndim == 2 and x.data_ptr() != x_3d.data_ptr():
-            x.copy_(x_3d.view(x.shape))
+    # Reshape to 3D if needed
+    q_3d = query.view(query.shape[0], -1, head_size) if query.ndim == 2 else query
+    k_3d = key.view(key.shape[0], -1, head_size) if key.ndim == 2 else key
 
-    _apply(query)
-    _apply(key)
+    compiler.run_rope_cos_sin_fused(q_3d, k_3d, positions, cos_sin_cache, head_size, is_neox)
+
+    if query.ndim == 2 and query.data_ptr() != q_3d.data_ptr():
+        query.copy_(q_3d.view(query.shape))
+    if key.ndim == 2 and key.data_ptr() != k_3d.data_ptr():
+        key.copy_(k_3d.view(key.shape))
 
 
 def mm_fp8(
@@ -361,6 +363,7 @@ def trtllm_fp4_block_scale_moe(
     gated_act_type: int,
     do_finalize: bool,
     tune_max_num_tokens: int,
+    profiler=None,
 ) -> Tuple[torch.Tensor]:
     """MoE for Apple Silicon with FP4 packed weights via Metal kernels.
 
@@ -378,6 +381,11 @@ def trtllm_fp4_block_scale_moe(
             "trtllm_fp4_block_scale_moe requires FP4 packed (uint8) weights on MPS"
         )
 
+    def _sync_record(name):
+        if profiler is not None:
+            torch.mps.synchronize()
+            profiler.record(name)
+
     # --- Routing ---
     logits = routing_logits.float()
     if routing_bias is not None:
@@ -388,80 +396,139 @@ def trtllm_fp4_block_scale_moe(
     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_weights = topk_weights.to(dtype)
 
-    # --- Batched expert computation ---
-    # Flatten top-k assignments: each (token, k_slot) becomes one "task"
-    flat_expert_ids = topk_indices.view(-1)  # [num_tokens * top_k]
-    flat_weights = topk_weights.view(-1)     # [num_tokens * top_k]
-    flat_token_ids = torch.arange(num_tokens, device=device).unsqueeze(1).expand(
-        -1, top_k
-    ).reshape(-1)  # [num_tokens * top_k]
-
-    # Sort by expert for batched processing
-    sorted_order = flat_expert_ids.argsort()
-    sorted_expert_ids = flat_expert_ids[sorted_order]
-    sorted_token_ids = flat_token_ids[sorted_order]
-    sorted_weights = flat_weights[sorted_order]
-
-    # Count tokens per expert using bincount
-    expert_counts = torch.bincount(
-        sorted_expert_ids, minlength=local_expert_offset + local_num_experts
-    )
-    # Cumulative offsets for slicing
-    expert_offsets = torch.zeros(
-        local_num_experts + 1, dtype=torch.int64, device=device
-    )
-    local_counts = expert_counts[local_expert_offset:local_expert_offset + local_num_experts]
-    expert_offsets[1:] = local_counts.cumsum(0)
-    # Offset into sorted array: skip tokens assigned to experts before local_expert_offset
-    base_offset = expert_counts[:local_expert_offset].sum().item()
-
-    # --- Metal kernel path: per-expert FP4 GEMM with inline dequant ---
+    # --- Metal kernel path ---
     compiler = MetalCompiler()
 
-    # Accumulate into float32 for accuracy, convert at end
-    output_f32 = torch.zeros(num_tokens, hidden_dim, dtype=torch.float32, device=device)
+    if num_tokens == 1:
+        # --- Batched decode fast-path: all K experts in 2 dispatches ---
+        # Skip routing prep (argsort/bincount/cumsum) — not needed for decode.
+        _sync_record("moe_routing")
 
-    for local_idx in range(local_num_experts):
-        start = base_offset + expert_offsets[local_idx].item()
-        end = base_offset + expert_offsets[local_idx + 1].item()
-        if start == end:
-            continue
+        expert_ids_global = topk_indices[0]  # [top_k]
+        weights_k = topk_weights[0]  # [top_k]
 
-        token_ids = sorted_token_ids[start:end]
-        expert_w = sorted_weights[start:end]
-        x = hidden_states[token_ids]  # [count, hidden_dim]
+        # Convert global expert IDs to local indices for weight tensor indexing
+        local_ids = (expert_ids_global - local_expert_offset).to(torch.int32)
 
-        # Per-expert scalar params (may be float or per-expert tensor)
-        expert_idx = local_expert_offset + local_idx
+        # Build per-expert params lists — avoid .item() GPU sync when already scalar
+        K = top_k
 
-        # GEMM1 with fused SwiGLU via Metal kernel
-        activated = compiler.run_moe_gemm1_fp4(
-            input=x,
-            w_blocks=gemm1_weights[local_idx],
-            w_scales=gemm1_weights_scale[local_idx],
-            bias=gemm1_bias[local_idx] if gemm1_bias is not None else None,
+        def _scalar_list(v):
+            if isinstance(v, (int, float)):
+                return [float(v)] * K
+            return [_to_scalar(v, expert_ids_global[i].item()) for i in range(K)]
+
+        e_alphas = _scalar_list(gemm1_alpha)
+        e_betas = _scalar_list(gemm1_beta)
+        e_clamps = _scalar_list(gemm1_clamp_limit)
+        e_sg = _scalar_list(output1_scale_gate_scalar)
+        e_su = _scalar_list(output1_scale_scalar)
+
+        # Batched GEMM1: single dispatch for all K experts → [K, I]
+        activated = compiler.run_moe_batched_gemm1_fp4(
+            input=hidden_states,  # [1, H]
+            all_w_blocks=gemm1_weights,
+            all_w_scales=gemm1_weights_scale,
+            all_bias=gemm1_bias,
             intermediate_size=intermediate_size,
-            alpha=_to_scalar(gemm1_alpha, expert_idx),
-            beta=_to_scalar(gemm1_beta, expert_idx),
-            clamp_limit=_to_scalar(gemm1_clamp_limit, expert_idx),
-            scale_gate=_to_scalar(output1_scale_gate_scalar, expert_idx),
-            scale_up=_to_scalar(output1_scale_scalar, expert_idx),
+            expert_ids=local_ids,
+            expert_alphas=e_alphas,
+            expert_betas=e_betas,
+            expert_clamp_limits=e_clamps,
+            expert_scale_gates=e_sg,
+            expert_scale_ups=e_su,
         )
+        _sync_record("moe_gemm1")
 
-        # GEMM2 via Metal kernel
-        g2 = compiler.run_moe_gemm2_fp4(
-            input=activated,
-            w_blocks=gemm2_weights[local_idx],
-            w_scales=gemm2_weights_scale[local_idx],
-            bias=gemm2_bias[local_idx] if gemm2_bias is not None else None,
+        # Fused GEMM2 + weighted scatter → [1, H] float32 directly
+        if isinstance(output2_scale_scalar, (int, float)):
+            fused_scales = weights_k.float() * float(output2_scale_scalar)
+        elif hasattr(output2_scale_scalar, 'dim') and output2_scale_scalar.dim() >= 1:
+            fused_scales = weights_k.float() * output2_scale_scalar[expert_ids_global].float()
+        else:
+            fused_scales = weights_k.float() * float(output2_scale_scalar)
+        output_f32 = compiler.run_moe_batched_gemm2_fused_fp4(
+            input=activated,  # [K, I]
+            all_w_blocks=gemm2_weights,
+            all_w_scales=gemm2_weights_scale,
+            all_bias=gemm2_bias,
             out_dim=hidden_dim,
-            scale=_to_scalar(output2_scale_scalar, expert_idx),
+            expert_ids=local_ids,
+            fused_scales=fused_scales,
         )
+        _sync_record("moe_gemm2")
+    else:
+        # --- Prefill path: per-expert FP4 GEMM with inline dequant ---
+        # Routing prep: sort/bincount/cumsum for batched per-expert processing
+        flat_expert_ids = topk_indices.view(-1)  # [num_tokens * top_k]
+        flat_weights = topk_weights.view(-1)     # [num_tokens * top_k]
+        flat_token_ids = torch.arange(num_tokens, device=device).unsqueeze(1).expand(
+            -1, top_k
+        ).reshape(-1)  # [num_tokens * top_k]
 
-        # Weighted scatter-add back (PyTorch — small relative to GEMM cost)
-        output_f32.index_add_(
-            0, token_ids, (g2 * expert_w.unsqueeze(-1)).float(),
+        sorted_order = flat_expert_ids.argsort()
+        sorted_expert_ids = flat_expert_ids[sorted_order]
+        sorted_token_ids = flat_token_ids[sorted_order]
+        sorted_weights = flat_weights[sorted_order]
+
+        expert_counts = torch.bincount(
+            sorted_expert_ids, minlength=local_expert_offset + local_num_experts
         )
+        expert_offsets = torch.zeros(
+            local_num_experts + 1, dtype=torch.int64, device=device
+        )
+        local_counts = expert_counts[local_expert_offset:local_expert_offset + local_num_experts]
+        expert_offsets[1:] = local_counts.cumsum(0)
+        base_offset = expert_counts[:local_expert_offset].sum().item()
+        _sync_record("moe_routing")
+
+        # Accumulate into float32 for accuracy, convert at end
+        output_f32 = torch.zeros(num_tokens, hidden_dim, dtype=torch.float32, device=device)
+
+        for local_idx in range(local_num_experts):
+            start = base_offset + expert_offsets[local_idx].item()
+            end = base_offset + expert_offsets[local_idx + 1].item()
+            if start == end:
+                continue
+
+            token_ids = sorted_token_ids[start:end]
+            expert_w = sorted_weights[start:end]
+            x = hidden_states[token_ids]  # [count, hidden_dim]
+
+            # Per-expert scalar params (may be float or per-expert tensor)
+            expert_idx = local_expert_offset + local_idx
+
+            # GEMM1 with fused SwiGLU via Metal kernel
+            activated = compiler.run_moe_gemm1_fp4(
+                input=x,
+                w_blocks=gemm1_weights[local_idx],
+                w_scales=gemm1_weights_scale[local_idx],
+                bias=gemm1_bias[local_idx] if gemm1_bias is not None else None,
+                intermediate_size=intermediate_size,
+                alpha=_to_scalar(gemm1_alpha, expert_idx),
+                beta=_to_scalar(gemm1_beta, expert_idx),
+                clamp_limit=_to_scalar(gemm1_clamp_limit, expert_idx),
+                scale_gate=_to_scalar(output1_scale_gate_scalar, expert_idx),
+                scale_up=_to_scalar(output1_scale_scalar, expert_idx),
+            )
+            _sync_record("moe_gemm1")
+
+            # GEMM2 via Metal kernel
+            g2 = compiler.run_moe_gemm2_fp4(
+                input=activated,
+                w_blocks=gemm2_weights[local_idx],
+                w_scales=gemm2_weights_scale[local_idx],
+                bias=gemm2_bias[local_idx] if gemm2_bias is not None else None,
+                out_dim=hidden_dim,
+                scale=_to_scalar(output2_scale_scalar, expert_idx),
+            )
+            _sync_record("moe_gemm2")
+
+            # Weighted scatter-add back (PyTorch — small relative to GEMM cost)
+            output_f32.index_add_(
+                0, token_ids, (g2 * expert_w.unsqueeze(-1)).float(),
+            )
+            _sync_record("moe_scatter")
 
     output = output_f32.to(dtype)
 

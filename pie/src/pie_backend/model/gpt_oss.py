@@ -8,6 +8,7 @@ This model implements the GPT-OSS architecture with:
 
 from __future__ import annotations
 
+import gc
 import math
 from dataclasses import dataclass
 from typing import Optional, Any
@@ -432,28 +433,67 @@ class ForwardPass:
             head_dim_vo=model_config.dim_head,
         )
 
-        # Pre-compute MoE activation parameters
-        num_experts = model_config.num_experts
-        device = runtime_config.device
+        # Pre-compute MoE activation parameters as plain Python floats.
+        # _scalar_list in _wrappers.py short-circuits for float/int,
+        # avoiding GPU→CPU .item() syncs (960 per step eliminated).
+        self._output1_scale = 1.0
+        self._output1_scale_gate = 1.0
+        self._output2_scale = 1.0
+        self._gemm1_alpha = float(model_config.swiglu_alpha)
+        self._gemm1_beta = float(model_config.swiglu_beta)
+        self._gemm1_clamp_limit = float(model_config.swiglu_limit)
 
-        self._output1_scale = torch.full((num_experts,), 1.0, device=device)
-        self._output1_scale_gate = torch.full((num_experts,), 1.0, device=device)
-        self._output2_scale = torch.full((num_experts,), 1.0, device=device)
-        self._gemm1_alpha = torch.full(
-            (num_experts,),
-            model_config.swiglu_alpha,
-            device=device,
-            dtype=torch.float32,
-        )
-        self._gemm1_beta = torch.full(
-            (num_experts,), model_config.swiglu_beta, device=device, dtype=torch.float32
-        )
-        self._gemm1_clamp_limit = torch.full(
-            (num_experts,),
-            model_config.swiglu_limit,
-            device=device,
-            dtype=torch.float32,
-        )
+        # Pre-resolve per-layer weight references.  Avoids f-string + dict
+        # lookups per call and enables compact_weights() to replace the
+        # scattered safetensors-loaded tensors with a layer-local layout.
+        self._layer_weights: list[dict] = []
+        for i in range(model_config.num_layers):
+            self._layer_weights.append({
+                "norm_attn": self.weights.get(f"layers.{i}.norm_attn"),
+                "proj_qkv.weight": self.weights.get(f"layers.{i}.proj_qkv.weight"),
+                "proj_qkv.bias": self.weights.get(f"layers.{i}.proj_qkv.bias"),
+                "proj_o": self.weights.get(f"layers.{i}.proj_o"),
+                "attn_sinks": self.weights.get(f"layers.{i}.attn_sinks"),
+                "norm_mlp": self.weights.get(f"layers.{i}.norm_mlp"),
+                "router.weight": self.weights.get(f"layers.{i}.router.weight"),
+                "router.bias": self.weights.get(f"layers.{i}.router.bias"),
+                "moe.gemm1_weights": self.weights.get(f"layers.{i}.moe.gemm1_weights"),
+                "moe.gemm1_scales": self.weights.get(f"layers.{i}.moe.gemm1_scales"),
+                "moe.gemm1_bias": self.weights.get(f"layers.{i}.moe.gemm1_bias"),
+                "moe.gemm2_weights": self.weights.get(f"layers.{i}.moe.gemm2_weights"),
+                "moe.gemm2_scales": self.weights.get(f"layers.{i}.moe.gemm2_scales"),
+                "moe.gemm2_bias": self.weights.get(f"layers.{i}.moe.gemm2_bias"),
+            })
+
+        # Pre-resolve non-layer weights
+        self._embed_token = self.weights.get("embed_token")
+        self._norm_last = self.weights.get("norm_last")
+        self._lm_head = self.weights.get("lm_head")
+
+        # Optional profiler: set externally to enable per-op timing
+        self.profiler = None
+
+    def compact_weights(self) -> None:
+        """Compact weight memory layout for GPU locality.
+
+        Safetensors loading scatters weight tensors across the GPU address
+        space (ordered by file, not by layer).  At 24 layers the combined
+        attention + MoE working set (~12 GB) exceeds GPU TLB capacity,
+        causing a ~7× slowdown.  Cloning in layer-sequential order
+        re-allocates tensors with good spatial locality.
+
+        Call once after model loading completes.
+        """
+        for lw in self._layer_weights:
+            for key, val in lw.items():
+                if isinstance(val, torch.Tensor):
+                    lw[key] = val.clone()
+        self._embed_token = self._embed_token.clone()
+        self._norm_last = self._norm_last.clone()
+        self._lm_head = self._lm_head.clone()
+        # Free original scattered weights
+        self.weights.clear()
+        gc.collect()
 
     def sample(
         self,
@@ -562,10 +602,10 @@ class ForwardPass:
     def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Embed token IDs into hidden states with TP support."""
         if self.tp_size == 1:
-            return fun.embedding(token_ids, self.weights.get("embed_token"))
+            return fun.embedding(token_ids, self._embed_token)
 
         # Column-parallel: each rank computes partial embeddings, then gathered
-        local_embeds = fun.embedding(token_ids, self.weights.get("embed_token"))
+        local_embeds = fun.embedding(token_ids, self._embed_token)
 
         # All-gather
         gathered_list = [
@@ -582,12 +622,12 @@ class ForwardPass:
         normed = fun.rms_norm(
             hidden_states,
             normalized_shape=[self.model_config.dim_hidden],
-            weight=self.weights.get("norm_last"),
+            weight=self._norm_last,
             eps=self.model_config.rms_norm_eps,
         )
 
         if self.tp_size == 1:
-            return fun.linear(normed, self.weights.get("lm_head"))
+            return fun.linear(normed, self._lm_head)
 
         # Multi-GPU: Column-parallel projection of LM head
         # 1. Split input along hidden dimension
@@ -597,12 +637,18 @@ class ForwardPass:
         local_normed = normed[:, start_idx:end_idx]
 
         # 2. Project local part
-        local_logits = fun.linear(local_normed, self.weights.get("lm_head"))
+        local_logits = fun.linear(local_normed, self._lm_head)
 
         # 3. All-reduce
         dist.all_reduce(local_logits, group=self.compute_process_group)
 
         return local_logits
+
+    def _sync_record(self, name: str) -> None:
+        """Sync MPS and record timing if profiler is active."""
+        if self.profiler is not None:
+            torch.mps.synchronize()
+            self.profiler.record(name)
 
     def attention(
         self,
@@ -620,6 +666,7 @@ class ForwardPass:
     ) -> torch.Tensor:
         """Execute the attention block for a single layer."""
         cfg = self.model_config
+        lw = self._layer_weights[layer_idx]
         n = hidden_states.size(0)
 
         # Save for residual
@@ -629,16 +676,18 @@ class ForwardPass:
         normed = fun.rms_norm(
             hidden_states,
             normalized_shape=[cfg.dim_hidden],
-            weight=self.weights.get(f"layers.{layer_idx}.norm_attn"),
+            weight=lw["norm_attn"],
             eps=cfg.rms_norm_eps,
         )
+        self._sync_record("attn_rms_norm")
 
         # 2. QKV projection with bias
         qkv_proj = fun.linear(
             normed,
-            weight=self.weights.get(f"layers.{layer_idx}.proj_qkv.weight"),
-            bias=self.weights.get(f"layers.{layer_idx}.proj_qkv.bias"),
+            weight=lw["proj_qkv.weight"],
+            bias=lw["proj_qkv.bias"],
         )
+        self._sync_record("attn_qkv_proj")
 
         # Calculate local dimensions
         local_num_q_heads = cfg.num_q_heads // self.tp_size
@@ -663,13 +712,14 @@ class ForwardPass:
 
         # Apply YaRN RoPE
         ops.apply_rope_with_cos_sin_cache_inplace(
-            positions=position_ids.to(torch.int32),
+            positions=position_ids,
             query=q,
             key=k,
             head_size=cfg.dim_head,
             cos_sin_cache=self._rope_cos_sin_cache,
             is_neox=True,
         )
+        self._sync_record("attn_rope")
 
         # Append to KV cache (local)
         ops.append_paged_kv_cache(
@@ -683,31 +733,37 @@ class ForwardPass:
             kv_last_page_len=kv_last_page_lens,
             kv_layout="NHD",
         )
+        self._sync_record("attn_kv_append")
 
         # Compute attention with sinks
         # Sinks are sharded (column) so they match local heads
-        sinks = self.weights.get(f"layers.{layer_idx}.attn_sinks")
+        sinks = lw["attn_sinks"]
         scaling = cfg.dim_head**-0.5
         attn_output = wrapper.run(q, kv_cache_layer, sinks, scaling)
         attn_output = attn_output.reshape(n, -1)
+        self._sync_record("attn_compute")
 
         # Output projection
         attn_proj = fun.linear(
             attn_output,
-            weight=self.weights.get(f"layers.{layer_idx}.proj_o"),
+            weight=lw["proj_o"],
             bias=None,
         )
+        self._sync_record("attn_o_proj")
 
         # All-reduce output projection
         if self.tp_size > 1:
             dist.all_reduce(attn_proj, group=self.compute_process_group)
 
         # Residual
-        return residual + attn_proj
+        result = residual + attn_proj
+        self._sync_record("attn_residual")
+        return result
 
     def moe(self, hidden_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Execute the MoE MLP block for a single layer."""
         cfg = self.model_config
+        lw = self._layer_weights[layer_idx]
 
         # Save for residual
         residual = hidden_states
@@ -716,16 +772,18 @@ class ForwardPass:
         normed = fun.rms_norm(
             hidden_states,
             normalized_shape=[cfg.dim_hidden],
-            weight=self.weights.get(f"layers.{layer_idx}.norm_mlp"),
+            weight=lw["norm_mlp"],
             eps=cfg.rms_norm_eps,
         )
+        self._sync_record("moe_rms_norm")
 
         # 2. Router logits
         router_logits = fun.linear(
             normed.reshape(-1, cfg.dim_hidden),
-            weight=self.weights.get(f"layers.{layer_idx}.router.weight"),
-            bias=self.weights.get(f"layers.{layer_idx}.router.bias"),
+            weight=lw["router.weight"],
+            bias=lw["router.bias"],
         )
+        self._sync_record("moe_router")
 
         # 3. Prepare input for MoE kernel
         hidden_bf16 = normed.to(torch.bfloat16)
@@ -748,19 +806,15 @@ class ForwardPass:
             routing_bias=None,
             hidden_states=hidden_bf16,
             hidden_states_scale=None,
-            gemm1_weights=self.weights.get(f"layers.{layer_idx}.moe.gemm1_weights"),
-            gemm1_weights_scale=self.weights.get(
-                f"layers.{layer_idx}.moe.gemm1_scales"
-            ),
-            gemm1_bias=self.weights.get(f"layers.{layer_idx}.moe.gemm1_bias"),
+            gemm1_weights=lw["moe.gemm1_weights"],
+            gemm1_weights_scale=lw["moe.gemm1_scales"],
+            gemm1_bias=lw["moe.gemm1_bias"],
             gemm1_alpha=self._gemm1_alpha,
             gemm1_beta=self._gemm1_beta,
             gemm1_clamp_limit=self._gemm1_clamp_limit,
-            gemm2_weights=self.weights.get(f"layers.{layer_idx}.moe.gemm2_weights"),
-            gemm2_weights_scale=self.weights.get(
-                f"layers.{layer_idx}.moe.gemm2_scales"
-            ),
-            gemm2_bias=self.weights.get(f"layers.{layer_idx}.moe.gemm2_bias"),
+            gemm2_weights=lw["moe.gemm2_weights"],
+            gemm2_weights_scale=lw["moe.gemm2_scales"],
+            gemm2_bias=lw["moe.gemm2_bias"],
             output1_scale_scalar=self._output1_scale,
             output1_scale_gate_scalar=self._output1_scale_gate,
             output2_scale_scalar=self._output2_scale,
@@ -776,6 +830,7 @@ class ForwardPass:
             gated_act_type=0,  # SwiGlu
             do_finalize=True,
             tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+            profiler=self.profiler,
         )
 
         output = output[0]
@@ -792,7 +847,9 @@ class ForwardPass:
             dist.all_reduce(output, group=self.compute_process_group)
 
         # Residual
-        return residual + output
+        result = residual + output
+        self._sync_record("moe_residual")
+        return result
 
     def transform(
         self,
@@ -863,6 +920,9 @@ class ForwardPass:
             non_blocking=True,
         )
 
+        # Cast position_ids to int32 once (avoids per-layer .to(torch.int32) in attention)
+        position_ids_i32 = position_ids.to(torch.int32)
+
         for layer_idx in range(cfg.num_layers):
             # Select wrapper: even layers use sliding window, odd use full
             wrapper = self.wrapper_window if layer_idx % 2 == 0 else self.wrapper_full
@@ -871,7 +931,7 @@ class ForwardPass:
             hidden_states = self.attention(
                 hidden_states=hidden_states,
                 layer_idx=layer_idx,
-                position_ids=position_ids,
+                position_ids=position_ids_i32,
                 kv_cache_layer=kv_cache_at_layer[layer_idx],
                 kv_page_indices=kv_page_indices,
                 kv_page_indptr=kv_page_indptr,

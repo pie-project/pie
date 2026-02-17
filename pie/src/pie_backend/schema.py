@@ -252,6 +252,10 @@ class WeightStore:
             raise KeyError(f"Weight '{name}' not found in store")
         return self._weights[name]
 
+    def clear(self) -> None:
+        """Release all stored weight tensors."""
+        self._weights.clear()
+
     def get_list(self, pattern: str, count: int) -> list[torch.Tensor]:
         """
         Retrieve a list of tensors matching a pattern.

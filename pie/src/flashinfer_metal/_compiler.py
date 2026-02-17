@@ -100,6 +100,26 @@ class MetalCompiler:
         self._page_size = int(os.environ.get("PIE_METAL_PAGE_SIZE", "16"))
         _validate_page_size(self._page_size)
         self._libs: dict[str, object] = {}
+        # Pre-allocated buffers for MoE dispatch (avoids per-call tensor allocs)
+        self._moe_params9: torch.Tensor | None = None  # gemm1 (9 floats)
+        self._moe_params5: torch.Tensor | None = None  # gemm2 (5 floats)
+        self._moe_dummy_bias: dict[torch.dtype, torch.Tensor] = {}  # keyed by dtype
+        # Pre-allocated buffers for batched MoE dispatch
+        self._moe_batched_params4: torch.Tensor | None = None  # batched params (4 floats)
+        self._moe_batched_expert_params: torch.Tensor | None = None  # [K, 5] float32
+        self._moe_batched_expert_scales: torch.Tensor | None = None  # [K] float32
+        self._moe_batched_expert_ids: torch.Tensor | None = None  # [K] int32
+        # Pre-allocated buffer for KV append params (avoids per-call tensor alloc)
+        self._append_kv_params: torch.Tensor | None = None  # 10 floats
+        # Cached attention decode params tensors keyed by
+        # (num_heads, head_dim, num_kv_heads, page_size, id(sinks))
+        self._attn_decode_params: dict[tuple, torch.Tensor] = {}
+        # Pre-allocated RoPE params buffers (avoids per-call tensor alloc)
+        self._rope_params: torch.Tensor | None = None  # 4 floats
+        self._rope_params_fused: torch.Tensor | None = None  # 5 floats
+        # Cached cos_sin_cache f32 conversion
+        self._rope_cache_id: int | None = None
+        self._rope_cache_f32: torch.Tensor | None = None
 
     def _ensure_env(self) -> None:
         if not self._env_checked:
@@ -176,22 +196,29 @@ class MetalCompiler:
         if num_tokens == 1:
             # Decode path — v2/v3 kernels use head_dim (head_size) directly
             # for Q/output addressing, so no padding needed.
-            params_list = [
-                num_tokens,
-                num_heads * head_dim,
-                num_kv_heads * head_dim,
-                head_dim,
-                page_size,
-                num_heads,
-                num_kv_heads,
-                scale,
-            ]
-            if sinks is not None:
-                params_list.append(1.0)
-                params_list.extend(sinks.to(torch.float32).cpu().tolist())
-            else:
-                params_list.append(0.0)
-            params = torch.tensor(params_list, dtype=torch.float32, device="mps")
+            # Cache params tensor to avoid GPU→CPU sync (.cpu().tolist()) every call.
+            cache_key = (num_heads, head_dim, num_kv_heads, page_size,
+                         id(sinks) if sinks is not None else None)
+            if cache_key not in self._attn_decode_params:
+                params_list = [
+                    num_tokens,
+                    num_heads * head_dim,
+                    num_kv_heads * head_dim,
+                    head_dim,
+                    page_size,
+                    num_heads,
+                    num_kv_heads,
+                    scale,
+                ]
+                if sinks is not None:
+                    params_list.append(1.0)
+                    params_list.extend(sinks.to(torch.float32).cpu().tolist())
+                else:
+                    params_list.append(0.0)
+                self._attn_decode_params[cache_key] = torch.tensor(
+                    params_list, dtype=torch.float32, device="mps"
+                )
+            params = self._attn_decode_params[cache_key]
 
             q_flat = query.contiguous().view(-1)
             output = torch.empty(
@@ -385,13 +412,20 @@ class MetalCompiler:
             contiguous_copy = input_qk.contiguous()
             flat = contiguous_copy.view(-1)
 
-        params = torch.tensor(
-            [num_tokens, num_heads, head_size, 1 if is_neox else 0],
-            dtype=torch.float32,
-            device="mps",
-        )
+        if self._rope_params is None:
+            self._rope_params = torch.empty(4, dtype=torch.float32, device="mps")
+        p = self._rope_params
+        p[0] = num_tokens
+        p[1] = num_heads
+        p[2] = head_size
+        p[3] = 1 if is_neox else 0
+        params = p
 
-        cache_f32 = cos_sin_cache.to(device="mps", dtype=torch.float32).contiguous()
+        cid = id(cos_sin_cache)
+        if cid != self._rope_cache_id:
+            self._rope_cache_f32 = cos_sin_cache.to(device="mps", dtype=torch.float32).contiguous()
+            self._rope_cache_id = cid
+        cache_f32 = self._rope_cache_f32
 
         _KERNELS = {
             torch.float16: "metal_rope_cos_sin_cache_float16",
@@ -413,6 +447,90 @@ class MetalCompiler:
 
         if not was_contiguous:
             input_qk.copy_(contiguous_copy)
+
+    # -------------------------------------------------------------------
+    # Fused Q+K RoPE with cos/sin cache
+    # -------------------------------------------------------------------
+
+    def run_rope_cos_sin_fused(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        head_size: int,
+        is_neox: bool = True,
+    ) -> None:
+        """Apply RoPE to both Q and K in a single kernel dispatch.
+
+        Args:
+            query: [num_tokens, num_q_heads, head_size] — modified in-place
+            key: [num_tokens, num_kv_heads, head_size] — modified in-place
+            positions: [num_tokens] int32 position indices
+            cos_sin_cache: [max_pos, head_dim] float32
+            head_size: head dimension
+            is_neox: True for NeoX-style (split halves)
+        """
+        lib = self._ensure_rope_cos_sin()
+
+        num_tokens = query.shape[0]
+        num_q_heads = query.shape[1]
+        num_kv_heads = key.shape[1]
+
+        q_was_contiguous = query.is_contiguous()
+        k_was_contiguous = key.is_contiguous()
+        if q_was_contiguous:
+            q_flat = query.view(-1)
+        else:
+            q_copy = query.contiguous()
+            q_flat = q_copy.view(-1)
+        if k_was_contiguous:
+            k_flat = key.view(-1)
+        else:
+            k_copy = key.contiguous()
+            k_flat = k_copy.view(-1)
+
+        if self._rope_params_fused is None:
+            self._rope_params_fused = torch.empty(5, dtype=torch.float32, device="mps")
+        p = self._rope_params_fused
+        p[0] = num_tokens
+        p[1] = num_q_heads
+        p[2] = num_kv_heads
+        p[3] = head_size
+        p[4] = 1 if is_neox else 0
+        params = p
+
+        cid = id(cos_sin_cache)
+        if cid != self._rope_cache_id:
+            self._rope_cache_f32 = cos_sin_cache.to(device="mps", dtype=torch.float32).contiguous()
+            self._rope_cache_id = cid
+        cache_f32 = self._rope_cache_f32
+
+        _FUSED_KERNELS = {
+            torch.float16: "metal_rope_cos_sin_cache_fused_float16",
+            torch.bfloat16: "metal_rope_cos_sin_cache_fused_bfloat16",
+            torch.float32: "metal_rope_cos_sin_cache_fused_float32",
+        }
+        kernel_name = _FUSED_KERNELS.get(query.dtype)
+        if kernel_name is None:
+            raise ValueError(f"Unsupported dtype {query.dtype}")
+
+        max_heads = max(num_q_heads, num_kv_heads)
+
+        getattr(lib, kernel_name)(
+            q_flat,
+            k_flat,
+            positions.to(device="mps", dtype=torch.int32),
+            cache_f32,
+            params,
+            threads=(num_tokens, max_heads, head_size // 2),
+            group_size=(8, 8, 4),
+        )
+
+        if not q_was_contiguous:
+            query.copy_(q_copy)
+        if not k_was_contiguous:
+            key.copy_(k_copy)
 
     # -------------------------------------------------------------------
     # Append KV cache
@@ -454,22 +572,19 @@ class MetalCompiler:
             2 * page_size * num_kv_heads * head_size
         )
 
-        params = torch.tensor(
-            [
-                num_tokens,
-                num_kv_heads,
-                head_size,
-                page_size,
-                max_num_pages,
-                batch_size,
-                num_kv_heads * head_size,  # k_stride_token
-                head_size,                  # k_stride_head
-                num_kv_heads * head_size,  # v_stride_token
-                head_size,                  # v_stride_head
-            ],
-            dtype=torch.int32,
-            device="mps",
-        )
+        if self._append_kv_params is None:
+            self._append_kv_params = torch.empty(10, dtype=torch.float32, device="mps")
+        p = self._append_kv_params
+        p[0] = num_tokens
+        p[1] = num_kv_heads
+        p[2] = head_size
+        p[3] = page_size
+        p[4] = max_num_pages
+        p[5] = batch_size
+        p[6] = num_kv_heads * head_size  # k_stride_token
+        p[7] = head_size                  # k_stride_head
+        p[8] = num_kv_heads * head_size  # v_stride_token
+        p[9] = head_size                  # v_stride_head
 
         _APPEND_KV_KERNELS = {
             torch.bfloat16: "metal_append_paged_kv_cache_bfloat16",
@@ -483,16 +598,19 @@ class MetalCompiler:
                 f"Supported: float32, float16, bfloat16."
             )
 
+        def _i32(t: torch.Tensor) -> torch.Tensor:
+            return t if t.dtype == torch.int32 else t.to(torch.int32)
+
         getattr(lib, kernel_name)(
             k_input,
             v_input,
             paged_kv_cache,
-            kv_batch_indices.to(torch.int32),
-            kv_positions.to(torch.int32),
-            kv_page_indices.to(torch.int32),
-            kv_page_indptr.to(torch.int32),
-            kv_last_page_lens.to(torch.int32),
-            params.float(),
+            _i32(kv_batch_indices),
+            _i32(kv_positions),
+            _i32(kv_page_indices),
+            _i32(kv_page_indptr),
+            _i32(kv_last_page_lens),
+            p,
             threads=(num_tokens, num_kv_heads, head_size),
             group_size=(8, 8, 8),
         )
@@ -541,16 +659,28 @@ class MetalCompiler:
 
         output = torch.empty(count, intermediate_size, dtype=input.dtype, device="mps")
 
-        params = torch.tensor([
-            count, hidden_dim, intermediate_size,
-            alpha, beta, clamp_limit,
-            scale_gate, scale_up,
-            1.0 if bias is not None else 0.0,
-        ], dtype=torch.float32, device="mps")
+        # Reuse pre-allocated params buffer to avoid per-dispatch tensor alloc
+        if self._moe_params9 is None:
+            self._moe_params9 = torch.empty(9, dtype=torch.float32, device="mps")
+        self._moe_params9[0] = count
+        self._moe_params9[1] = hidden_dim
+        self._moe_params9[2] = intermediate_size
+        self._moe_params9[3] = alpha
+        self._moe_params9[4] = beta
+        self._moe_params9[5] = clamp_limit
+        self._moe_params9[6] = scale_gate
+        self._moe_params9[7] = scale_up
+        self._moe_params9[8] = 1.0 if bias is not None else 0.0
+        params = self._moe_params9
 
-        bias_buf = bias.to(input.dtype) if bias is not None else torch.zeros(
-            1, dtype=input.dtype, device="mps",
-        )
+        if bias is not None:
+            bias_buf = bias if bias.dtype == input.dtype else bias.to(input.dtype)
+        else:
+            if input.dtype not in self._moe_dummy_bias:
+                self._moe_dummy_bias[input.dtype] = torch.zeros(
+                    1, dtype=input.dtype, device="mps",
+                )
+            bias_buf = self._moe_dummy_bias[input.dtype]
 
         kernel = "moe_matmul_swiglu" if count == 1 else "moe_dense_matmul_swiglu"
 
@@ -612,14 +742,24 @@ class MetalCompiler:
 
         output = torch.empty(count, out_dim, dtype=input.dtype, device="mps")
 
-        params = torch.tensor([
-            count, in_dim, out_dim, scale,
-            1.0 if bias is not None else 0.0,
-        ], dtype=torch.float32, device="mps")
+        # Reuse pre-allocated params buffer to avoid per-dispatch tensor alloc
+        if self._moe_params5 is None:
+            self._moe_params5 = torch.empty(5, dtype=torch.float32, device="mps")
+        self._moe_params5[0] = count
+        self._moe_params5[1] = in_dim
+        self._moe_params5[2] = out_dim
+        self._moe_params5[3] = scale
+        self._moe_params5[4] = 1.0 if bias is not None else 0.0
+        params = self._moe_params5
 
-        bias_buf = bias.to(input.dtype) if bias is not None else torch.zeros(
-            1, dtype=input.dtype, device="mps",
-        )
+        if bias is not None:
+            bias_buf = bias if bias.dtype == input.dtype else bias.to(input.dtype)
+        else:
+            if input.dtype not in self._moe_dummy_bias:
+                self._moe_dummy_bias[input.dtype] = torch.zeros(
+                    1, dtype=input.dtype, device="mps",
+                )
+            bias_buf = self._moe_dummy_bias[input.dtype]
 
         kernel = "moe_matmul" if count == 1 else "moe_dense_matmul"
 
@@ -652,3 +792,238 @@ class MetalCompiler:
             )
 
         return output
+
+    # -------------------------------------------------------------------
+    # Batched MoE FP4 matmul (all K active experts in one dispatch)
+    # -------------------------------------------------------------------
+
+    def _ensure_batched_bufs(self, K: int) -> None:
+        """Ensure pre-allocated buffers are large enough for K experts."""
+        if self._moe_batched_params4 is None:
+            self._moe_batched_params4 = torch.empty(4, dtype=torch.float32, device="mps")
+        if self._moe_batched_expert_params is None or self._moe_batched_expert_params.shape[0] < K:
+            self._moe_batched_expert_params = torch.empty(K, 5, dtype=torch.float32, device="mps")
+        if self._moe_batched_expert_scales is None or self._moe_batched_expert_scales.shape[0] < K:
+            self._moe_batched_expert_scales = torch.empty(K, dtype=torch.float32, device="mps")
+        if self._moe_batched_expert_ids is None or self._moe_batched_expert_ids.shape[0] < K:
+            self._moe_batched_expert_ids = torch.empty(K, dtype=torch.int32, device="mps")
+
+    def run_moe_batched_gemm1_fp4(
+        self,
+        input: torch.Tensor,
+        all_w_blocks: torch.Tensor,
+        all_w_scales: torch.Tensor,
+        all_bias: "torch.Tensor | None",
+        intermediate_size: int,
+        expert_ids: torch.Tensor,
+        expert_alphas: list[float],
+        expert_betas: list[float],
+        expert_clamp_limits: list[float],
+        expert_scale_gates: list[float],
+        expert_scale_ups: list[float],
+    ) -> torch.Tensor:
+        """Batched GEMM1 with fused SwiGLU for K active experts (single token).
+
+        Args:
+            input: [1, hidden_dim] bfloat16
+            all_w_blocks: [E, 2*I, H/2] uint8 — all experts
+            all_w_scales: [E, 2*I, H/32] uint8 — all experts
+            all_bias: [E, 2*I] bfloat16 or None
+            intermediate_size: I
+            expert_ids: [K] int32 — active expert indices
+            expert_alphas/betas/clamp_limits/scale_gates/scale_ups: per-expert params
+
+        Returns:
+            [K, I] bfloat16
+        """
+        lib = self._ensure_moe_matmul()
+        hidden_dim = input.shape[1]
+        K = expert_ids.shape[0]
+
+        self._ensure_batched_bufs(K)
+
+        output = torch.empty(K, intermediate_size, dtype=input.dtype, device="mps")
+
+        # Fill params
+        self._moe_batched_params4[0] = hidden_dim
+        self._moe_batched_params4[1] = intermediate_size
+        self._moe_batched_params4[2] = 1.0 if all_bias is not None else 0.0
+        self._moe_batched_params4[3] = K
+
+        # Fill per-expert params [K, 5]
+        for i in range(K):
+            self._moe_batched_expert_params[i, 0] = expert_alphas[i]
+            self._moe_batched_expert_params[i, 1] = expert_betas[i]
+            self._moe_batched_expert_params[i, 2] = expert_clamp_limits[i]
+            self._moe_batched_expert_params[i, 3] = expert_scale_gates[i]
+            self._moe_batched_expert_params[i, 4] = expert_scale_ups[i]
+
+        # Fill expert_ids
+        self._moe_batched_expert_ids[:K] = expert_ids
+
+        if all_bias is not None:
+            bias_buf = all_bias if all_bias.dtype == input.dtype else all_bias.to(input.dtype)
+        else:
+            if input.dtype not in self._moe_dummy_bias:
+                self._moe_dummy_bias[input.dtype] = torch.zeros(
+                    1, dtype=input.dtype, device="mps",
+                )
+            bias_buf = self._moe_dummy_bias[input.dtype]
+
+        # SIMD-cooperative kernel: 8 output cols per threadgroup, 256 threads
+        cols_per_tg = 8
+        tg_size = 256
+        num_col_groups = (intermediate_size + cols_per_tg - 1) // cols_per_tg
+
+        lib.moe_batched_matmul_swiglu_simd(
+            input.contiguous().view(-1),
+            all_w_blocks.contiguous().view(-1),
+            all_w_scales.contiguous().view(-1),
+            bias_buf.contiguous().view(-1),
+            output.view(-1),
+            self._moe_batched_params4,
+            self._moe_batched_expert_ids[:K],
+            self._moe_batched_expert_params[:K].contiguous().view(-1),
+            threads=(K * 1, num_col_groups * tg_size, 1),
+            group_size=(1, tg_size, 1),
+        )
+        return output
+
+    def run_moe_batched_gemm2_fp4(
+        self,
+        input: torch.Tensor,
+        all_w_blocks: torch.Tensor,
+        all_w_scales: torch.Tensor,
+        all_bias: "torch.Tensor | None",
+        out_dim: int,
+        expert_ids: torch.Tensor,
+        expert_scales_list: list[float],
+    ) -> torch.Tensor:
+        """Batched GEMM2 for K active experts.
+
+        Args:
+            input: [K, in_dim] bfloat16
+            all_w_blocks: [E, out_dim, in_dim/2] uint8 — all experts
+            all_w_scales: [E, out_dim, in_dim/32] uint8 — all experts
+            all_bias: [E, out_dim] bfloat16 or None
+            out_dim: output dimension
+            expert_ids: [K] int32 — active expert indices
+            expert_scales_list: [K] float — output scale per expert
+
+        Returns:
+            [K, out_dim] bfloat16
+        """
+        lib = self._ensure_moe_matmul()
+        K = input.shape[0]
+        in_dim = input.shape[1]
+
+        self._ensure_batched_bufs(K)
+
+        output = torch.empty(K, out_dim, dtype=input.dtype, device="mps")
+
+        # Fill params
+        self._moe_batched_params4[0] = in_dim
+        self._moe_batched_params4[1] = out_dim
+        self._moe_batched_params4[2] = 1.0 if all_bias is not None else 0.0
+        self._moe_batched_params4[3] = K
+
+        # Fill expert_ids and scales
+        self._moe_batched_expert_ids[:K] = expert_ids
+        for i in range(K):
+            self._moe_batched_expert_scales[i] = expert_scales_list[i]
+
+        if all_bias is not None:
+            bias_buf = all_bias if all_bias.dtype == input.dtype else all_bias.to(input.dtype)
+        else:
+            if input.dtype not in self._moe_dummy_bias:
+                self._moe_dummy_bias[input.dtype] = torch.zeros(
+                    1, dtype=input.dtype, device="mps",
+                )
+            bias_buf = self._moe_dummy_bias[input.dtype]
+
+        # SIMD-cooperative kernel: 8 output cols per threadgroup, 256 threads
+        cols_per_tg = 8
+        tg_size = 256
+        num_col_groups = (out_dim + cols_per_tg - 1) // cols_per_tg
+
+        lib.moe_batched_matmul_simd(
+            input.contiguous().view(-1),
+            all_w_blocks.contiguous().view(-1),
+            all_w_scales.contiguous().view(-1),
+            bias_buf.contiguous().view(-1),
+            output.view(-1),
+            self._moe_batched_params4,
+            self._moe_batched_expert_ids[:K],
+            self._moe_batched_expert_scales[:K],
+            threads=(K * 1, num_col_groups * tg_size, 1),
+            group_size=(1, tg_size, 1),
+        )
+        return output
+
+    def run_moe_batched_gemm2_fused_fp4(
+        self,
+        input: torch.Tensor,
+        all_w_blocks: torch.Tensor,
+        all_w_scales: torch.Tensor,
+        all_bias: "torch.Tensor | None",
+        out_dim: int,
+        expert_ids: torch.Tensor,
+        fused_scales: torch.Tensor,
+    ) -> torch.Tensor:
+        """Batched GEMM2 with fused weighted scatter.
+
+        Accumulates (dot * fused_scale) across all K experts directly into
+        [1, out_dim] float32 output. Eliminates separate weighted-sum step.
+
+        Args:
+            input: [K, in_dim] bfloat16
+            fused_scales: [K] float32 tensor — output_scale * routing_weight per expert
+
+        Returns:
+            [1, out_dim] float32
+        """
+        lib = self._ensure_moe_matmul()
+        K = input.shape[0]
+        in_dim = input.shape[1]
+
+        self._ensure_batched_bufs(K)
+
+        output = torch.zeros(1, out_dim, dtype=torch.float32, device="mps")
+
+        # Fill params
+        self._moe_batched_params4[0] = in_dim
+        self._moe_batched_params4[1] = out_dim
+        self._moe_batched_params4[2] = 1.0 if all_bias is not None else 0.0
+        self._moe_batched_params4[3] = K
+
+        # Fill expert_ids
+        self._moe_batched_expert_ids[:K] = expert_ids
+
+        if all_bias is not None:
+            bias_buf = all_bias if all_bias.dtype == input.dtype else all_bias.to(input.dtype)
+        else:
+            if input.dtype not in self._moe_dummy_bias:
+                self._moe_dummy_bias[input.dtype] = torch.zeros(
+                    1, dtype=input.dtype, device="mps",
+                )
+            bias_buf = self._moe_dummy_bias[input.dtype]
+
+        # Grid: (1, ceil(out_dim/8), 1) — iterate over K experts inside kernel
+        cols_per_tg = 8
+        tg_size = 256
+        num_col_groups = (out_dim + cols_per_tg - 1) // cols_per_tg
+
+        lib.moe_batched_matmul_simd_fused(
+            input.contiguous().view(-1),
+            all_w_blocks.contiguous().view(-1),
+            all_w_scales.contiguous().view(-1),
+            bias_buf.contiguous().view(-1),
+            output.view(-1),
+            self._moe_batched_params4,
+            self._moe_batched_expert_ids[:K],
+            fused_scales.contiguous(),
+            threads=(1, num_col_groups * tg_size, 1),
+            group_size=(1, tg_size, 1),
+        )
+        return output
+
