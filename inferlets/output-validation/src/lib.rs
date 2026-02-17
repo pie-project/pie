@@ -32,7 +32,7 @@ pub async fn validate_outputs(
     let mut log_probs = Vec::new();
 
     for (i, candidate) in candidates.iter().enumerate() {
-        let candidate_ctx = ctx.fork(&format!("candidate-{}", i))?;
+        let candidate_ctx = ctx.fork()?;
 
         let candidate_tokens = tokenizer.encode(candidate);
         let mut current_log_prob = 0.0f32;
@@ -143,7 +143,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
 
-    let ctx = Context::create(&model, "validation", None)?;
+    let ctx = Context::create(&model)?;
 
     // Set up the initial context using InstructExt
     ctx.system("You are an expert at information extraction.");

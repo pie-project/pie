@@ -79,7 +79,7 @@ number ::= [0-9]+
     let grammar = Grammar::from_ebnf(grammar_str)?;
     let constraint = GrammarConstraint::new(&grammar, &model);
 
-    let ctx = Context::create(&model, "constrained", None)?;
+    let ctx = Context::create(&model)?;
 
     ctx.system(
         "You are a helpful assistant that outputs structured data in JSON format."

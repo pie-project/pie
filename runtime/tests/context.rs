@@ -1,6 +1,6 @@
 //! Context management integration tests.
 //!
-//! Tests context CRUD, forking, locking, cursor, and buffered tokens.
+//! Tests context CRUD, saving, opening, forking, locking, cursor, and buffered tokens.
 
 use std::sync::{Arc, OnceLock};
 mod common;
@@ -30,32 +30,23 @@ const MODEL: usize = 0;
 const USER: &str = "test-user";
 
 #[test]
-fn create_and_lookup() {
+fn create_and_save_and_open() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, USER.to_string(), "test-ctx".into(), None)
+        let id = pie::context::create(MODEL)
             .await
             .unwrap();
 
-        let found = pie::context::lookup(MODEL, USER.to_string(), "test-ctx".into()).await;
+        // Anonymous context is not findable by name
+        let found = pie::context::open(MODEL, USER.to_string(), "test-ctx".into()).await;
+        assert_eq!(found, None);
+
+        // Save it with a name
+        pie::context::save(MODEL, id, USER.to_string(), "test-ctx".into()).await.unwrap();
+
+        // Now it should be findable
+        let found = pie::context::open(MODEL, USER.to_string(), "test-ctx".into()).await;
         assert_eq!(found, Some(id));
-    });
-}
-
-#[test]
-fn create_with_fill() {
-    let s = state();
-    s.rt.block_on(async {
-        let fill_tokens = vec![10, 20, 30];
-        let id = pie::context::create(MODEL, USER.to_string(), "fill-ctx".into(), Some(fill_tokens.clone()))
-            .await
-            .unwrap();
-
-        let lock = pie::context::acquire_lock(MODEL, id);
-        let tokens = pie::context::get_buffered_tokens(MODEL, id);
-        // Fill tokens go to tokens_buffered (awaiting forward pass)
-        assert!(!tokens.is_empty(), "fill tokens should appear as buffered tokens");
-        pie::context::release_lock(MODEL, id, lock).unwrap();
     });
 }
 
@@ -63,15 +54,38 @@ fn create_with_fill() {
 fn destroy_removes_context() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, USER.to_string(), "destroy-ctx".into(), None)
+        let id = pie::context::create(MODEL)
             .await
             .unwrap();
 
-        let lock = pie::context::acquire_lock(MODEL, id);
-        pie::context::destroy(MODEL, id, lock).await.unwrap();
+        // Save first, so we can verify it's gone
+        pie::context::save(MODEL, id, USER.to_string(), "destroy-ctx".into()).await.unwrap();
 
-        let found = pie::context::lookup(MODEL, USER.to_string(), "destroy-ctx".into()).await;
+        let lock = pie::context::acquire_lock(MODEL, id);
+        pie::context::destroy(MODEL, id, lock, false).await.unwrap();
+
+        let found = pie::context::open(MODEL, USER.to_string(), "destroy-ctx".into()).await;
         assert_eq!(found, None);
+    });
+}
+
+#[test]
+fn force_destroy_bypasses_lock() {
+    let s = state();
+    s.rt.block_on(async {
+        let id = pie::context::create(MODEL)
+            .await
+            .unwrap();
+
+        // Acquire lock but don't release it
+        let _lock = pie::context::acquire_lock(MODEL, id);
+
+        // Normal destroy should fail with wrong lock
+        let err = pie::context::destroy(MODEL, id, 0, false).await;
+        assert!(err.is_err(), "destroy without correct lock should fail");
+
+        // Force destroy should succeed
+        pie::context::destroy(MODEL, id, 0, true).await.unwrap();
     });
 }
 
@@ -79,7 +93,7 @@ fn destroy_removes_context() {
 fn cursor_ops() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, USER.to_string(), "cursor-ctx".into(), None)
+        let id = pie::context::create(MODEL)
             .await
             .unwrap();
 
@@ -114,7 +128,7 @@ fn cursor_ops() {
 fn buffered_token_lifecycle() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, USER.to_string(), "buf-tok-ctx".into(), None)
+        let id = pie::context::create(MODEL)
             .await
             .unwrap();
 
@@ -138,28 +152,22 @@ fn buffered_token_lifecycle() {
 fn fork_context() {
     let s = state();
     s.rt.block_on(async {
-        let parent_id = pie::context::create(MODEL, USER.to_string(), "parent-ctx".into(), None)
+        let parent_id = pie::context::create(MODEL)
             .await
             .unwrap();
 
-        let child_id = pie::context::fork(MODEL, parent_id, USER.to_string(), "child-ctx".into())
+        let child_id = pie::context::fork(MODEL, parent_id)
             .await
             .unwrap();
 
         assert_ne!(parent_id, child_id);
-
-        // Both should be findable
-        let found_parent = pie::context::lookup(MODEL, USER.to_string(), "parent-ctx".into()).await;
-        let found_child = pie::context::lookup(MODEL, USER.to_string(), "child-ctx".into()).await;
-        assert_eq!(found_parent, Some(parent_id));
-        assert_eq!(found_child, Some(child_id));
     });
 }
 
 /// Comprehensive test simulating a realistic multi-turn inference lifecycle.
 ///
 /// Timeline:
-///   1. Prompt fill with 32 tokens → buffered
+///   1. Create anonymous context, buffer 32 tokens
 ///   2. Mark forwarded → promotes buffered to filled
 ///   3. Commit first page → verify cursor, position, buffer drainage
 ///   4. Commit second page → verify fully committed state
@@ -172,11 +180,9 @@ fn full_page_lifecycle() {
     s.rt.block_on(async {
         const PAGE_SIZE: u32 = 16;
 
-        // ── Phase 1: Create with prompt fill (32 tokens = 2 full pages) ──
+        // ── Phase 1: Create anonymous context and buffer prompt tokens ──
         let prompt: Vec<u32> = (1000..1032).collect(); // 32 tokens
-        let id = pie::context::create(
-            MODEL, USER.to_string(), "lifecycle-ctx".into(), Some(prompt.clone()),
-        ).await.unwrap();
+        let id = pie::context::create(MODEL).await.unwrap();
 
         let lock = pie::context::acquire_lock(MODEL, id);
         assert_ne!(lock, 0, "lock acquisition should succeed");
@@ -187,9 +193,11 @@ fn full_page_lifecycle() {
             "tokens_per_page should be 16"
         );
 
-        // All fill tokens are buffered; nothing committed or filled yet
+        // Buffer the prompt tokens manually (fill param removed)
+        pie::context::set_buffered_tokens(MODEL, id, lock, prompt.clone()).unwrap();
+
         let buf = pie::context::get_buffered_tokens(MODEL, id);
-        assert_eq!(buf.len(), 32, "all 32 fill tokens should be buffered");
+        assert_eq!(buf.len(), 32, "all 32 tokens should be buffered");
         assert_eq!(buf, prompt);
 
         assert_eq!(pie::context::committed_page_count(MODEL, id), 0);
@@ -208,6 +216,9 @@ fn full_page_lifecycle() {
         assert!(pie::context::get_buffered_tokens(MODEL, id).is_empty());
         // last_position = max filled position = 31
         assert_eq!(pie::context::last_position(MODEL, id), Some(31));
+
+        // Reserve 2 pages (32 tokens / 16 per page) before committing
+        pie::context::reserve_pages(MODEL, id, lock, 2).await.unwrap();
 
         // ── Phase 3: Commit first page (positions 0..15) ──
         pie::context::commit_pages(MODEL, id, lock, vec![0]).await.unwrap();
@@ -252,9 +263,7 @@ fn full_page_lifecycle() {
 
         pie::context::release_lock(MODEL, id, lock).unwrap();
 
-        let child_id = pie::context::fork(
-            MODEL, id, USER.to_string(), "lifecycle-child".into(),
-        ).await.unwrap();
+        let child_id = pie::context::fork(MODEL, id).await.unwrap();
 
         assert_ne!(id, child_id);
 

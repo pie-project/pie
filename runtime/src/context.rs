@@ -55,31 +55,38 @@ pub fn spawn(page_size: usize, num_kv_pages: Vec<usize>) -> usize {
 
 // ---------- Actor-routed (needs PageStore) ----------
 
-/// Looks up a context by name.
-pub async fn lookup(model_idx: usize, username: String, name: String) -> Option<ContextId> {
+/// Opens a saved (named) context.
+pub async fn open(model_idx: usize, username: String, name: String) -> Option<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Lookup { username, name, response: tx }).ok()?;
+    SERVICES.send(model_idx, Message::Open { username, name, response: tx }).ok()?;
     rx.await.ok().flatten()
 }
 
-/// Creates a new context with the given name.
-pub async fn create(model_idx: usize, username: String, name: String, fill: Option<Vec<u32>>) -> Result<ContextId> {
+/// Creates a new anonymous context (auto-destroyed on process exit).
+pub async fn create(model_idx: usize) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Create { username, name, fill, response: tx })?;
+    SERVICES.send(model_idx, Message::Create { response: tx })?;
     rx.await?
 }
 
-/// Destroys a context.
-pub async fn destroy(model_idx: usize, id: ContextId, lock_id: LockId) -> Result<()> {
+/// Saves (names) a context, making it persistent.
+pub async fn save(model_idx: usize, id: ContextId, username: String, name: String) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Destroy { id, lock_id, response: tx })?;
+    SERVICES.send(model_idx, Message::Save { id, username, name, response: tx })?;
     rx.await?
 }
 
-/// Forks a context into a new one.
-pub async fn fork(model_idx: usize, id: ContextId, username: String, new_name: String) -> Result<ContextId> {
+/// Destroys a context. If `force` is true, bypasses lock check (for auto-cleanup).
+pub async fn destroy(model_idx: usize, id: ContextId, lock_id: LockId, force: bool) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Fork { id, username, new_name, response: tx })?;
+    SERVICES.send(model_idx, Message::Destroy { id, lock_id, force, response: tx })?;
+    rx.await?
+}
+
+/// Forks a context into a new anonymous context.
+pub async fn fork(model_idx: usize, id: ContextId) -> Result<ContextId> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Fork { id, response: tx })?;
     rx.await?
 }
 
@@ -388,68 +395,41 @@ impl ContextManager {
 
     // ==================== Core Operations ====================
 
-    pub fn create(&mut self, username: String, name: String, fill: Option<Vec<u32>>) -> Result<ContextId> {
+    /// Creates a new anonymous context (no name, auto-destroyed on process exit).
+    pub fn create(&mut self) -> Result<ContextId> {
         let id = self.next_id();
-        let mut ctx = Context::new();
-
-        // Process fill tokens if provided
-        if let Some(tokens) = fill {
-            // Add lineage record
-            ctx.lineage.push(Record::Fill {
-                tokens: tokens.clone(),
-                positions: Vec::new(),
-                mask: Vec::new(),
-                adapter: None,
-            });
-
-            let page_store = &mut self.page_store;
-            
-            // Lookup existing cached pages (longest prefix match)
-            let matched_pages = page_store.lookup(&tokens);
-            
-            if let Some(pages) = matched_pages {
-                let tokens_matched = pages.len() * page_store.page_size();
-                page_store.acquire(&pages);
-                
-                // Place matched pages in pages_committed
-                ctx.pages_committed = pages.clone();
-                
-                // Remaining tokens become buffered (need forward pass)
-                if tokens_matched < tokens.len() {
-                    let remaining_tokens = tokens.len() - tokens_matched;
-                    let page_size = page_store.page_size();
-                    let pages_needed = (remaining_tokens + page_size - 1) / page_size;
-                    
-                    // Allocate uncommitted pages
-                    let affinity = pages.first().copied();
-                    ctx.pages_uncommitted = page_store.allocate(pages_needed, affinity)?;
-                    
-                    ctx.tokens_buffered = tokens[tokens_matched..].to_vec();
-                }
-            } else {
-                // No match: all tokens become buffered (need forward pass)
-                let page_size = page_store.page_size();
-                let pages_needed = (tokens.len() + page_size - 1) / page_size;
-                
-                // Allocate uncommitted pages (no affinity)
-                if pages_needed > 0 {
-                    ctx.pages_uncommitted = page_store.allocate(pages_needed, None)?;
-                }
-                
-                ctx.tokens_buffered = tokens;
-            }
-        }
-
+        let ctx = Context::new();
         CONTEXTS.insert((self.model_idx, id), ctx);
-        self.name_to_id.insert((username, name), id);
         Ok(id)
     }
 
-    pub fn destroy(&mut self, id: ContextId, lock_id: LockId) -> Result<()> {
+    /// Saves (names) an anonymous context, making it persistent.
+    pub fn save(&mut self, id: ContextId, username: String, name: String) -> Result<()> {
+        if !CONTEXTS.contains_key(&(self.model_idx, id)) {
+            anyhow::bail!("Context not found");
+        }
+        // Check for name collision
+        if self.name_to_id.contains_key(&(username.clone(), name.clone())) {
+            anyhow::bail!("Context name already exists: {}", name);
+        }
+        self.name_to_id.insert((username, name), id);
+        Ok(())
+    }
+
+    /// Destroys a context. If `force` is true, bypasses lock check.
+    pub fn destroy(&mut self, id: ContextId, lock_id: LockId, force: bool) -> Result<()> {
         if let Some(ctx) = CONTEXTS.get(&(self.model_idx, id)) {
-            ctx.check_lock(lock_id)?;
+            if !force {
+                ctx.check_lock(lock_id)?;
+            }
+            // Release pages back to page store
+            let pages_committed = ctx.pages_committed.clone();
+            let pages_uncommitted = ctx.pages_uncommitted.clone();
             drop(ctx);
             CONTEXTS.remove(&(self.model_idx, id));
+            // Release all pages
+            self.page_store.release(&pages_committed);
+            self.page_store.release(&pages_uncommitted);
             // Clean up name_to_id reverse mapping
             self.name_to_id.retain(|_, v| *v != id);
             Ok(())
@@ -458,12 +438,8 @@ impl ContextManager {
         }
     }
 
-    pub fn fork(&mut self, id: ContextId, username: String, new_name: String) -> Result<ContextId> {
-        // Check for name collision
-        if self.name_to_id.contains_key(&(username.clone(), new_name.clone())) {
-            anyhow::bail!("Context name already exists: {}", new_name);
-        }
-
+    /// Forks a context into a new anonymous context.
+    pub fn fork(&mut self, id: ContextId) -> Result<ContextId> {
         // Get the source context
         let source_ctx = CONTEXTS.get(&(self.model_idx, id))
             .ok_or_else(|| anyhow::anyhow!("Source context not found"))?;
@@ -510,7 +486,7 @@ impl ContextManager {
             Vec::new()
         };
 
-        // Create the new context — tokens_filled is empty
+        // Create the new anonymous context — tokens_filled is empty
         let new_id = self.next_id();
         let new_ctx = Context {
             lineage,
@@ -524,7 +500,6 @@ impl ContextManager {
         };
 
         CONTEXTS.insert((self.model_idx, new_id), new_ctx);
-        self.name_to_id.insert((username, new_name), new_id);
 
         Ok(new_id)
     }
@@ -792,10 +767,11 @@ impl ContextManager {
 /// Messages handled by ContextManager.
 #[derive(Debug)]
 enum Message {
-    Lookup { username: String, name: String, response: oneshot::Sender<Option<ContextId>> },
-    Create { username: String, name: String, fill: Option<Vec<u32>>, response: oneshot::Sender<Result<ContextId>> },
-    Destroy { id: ContextId, lock_id: LockId, response: oneshot::Sender<Result<()>> },
-    Fork { id: ContextId, username: String, new_name: String, response: oneshot::Sender<Result<ContextId>> },
+    Open { username: String, name: String, response: oneshot::Sender<Option<ContextId>> },
+    Create { response: oneshot::Sender<Result<ContextId>> },
+    Save { id: ContextId, username: String, name: String, response: oneshot::Sender<Result<()>> },
+    Destroy { id: ContextId, lock_id: LockId, force: bool, response: oneshot::Sender<Result<()>> },
+    Fork { id: ContextId, response: oneshot::Sender<Result<ContextId>> },
     CommitPages { id: ContextId, lock_id: LockId, page_indices: Vec<u32>, response: oneshot::Sender<Result<()>> },
     ReservePages { id: ContextId, lock_id: LockId, num_pages: u32, response: oneshot::Sender<Result<()>> },
     ReleasePages { id: ContextId, lock_id: LockId, num_pages: u32 },
@@ -809,17 +785,20 @@ impl ServiceHandler for ContextManager {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Lookup { username, name, response } => {
+            Message::Open { username, name, response } => {
                 let _ = response.send(self.name_to_id.get(&(username, name)).copied());
             }
-            Message::Create { username, name, fill, response } => {
-                let _ = response.send(self.create(username, name, fill));
+            Message::Create { response } => {
+                let _ = response.send(self.create());
             }
-            Message::Destroy { id, lock_id, response } => {
-                let _ = response.send(self.destroy(id, lock_id));
+            Message::Save { id, username, name, response } => {
+                let _ = response.send(self.save(id, username, name));
             }
-            Message::Fork { id, username, new_name, response } => {
-                let _ = response.send(self.fork(id, username, new_name));
+            Message::Destroy { id, lock_id, force, response } => {
+                let _ = response.send(self.destroy(id, lock_id, force));
+            }
+            Message::Fork { id, response } => {
+                let _ = response.send(self.fork(id));
             }
             Message::CommitPages { id, lock_id, page_indices, response } => {
                 let _ = response.send(self.commit_pages(id, lock_id, page_indices));

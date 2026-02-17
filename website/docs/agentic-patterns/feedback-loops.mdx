@@ -33,7 +33,7 @@ let threshold = 0.8;
 
 for attempt in 0..max_iterations {
     // Fork so we can roll back if quality is low
-    let draft_ctx = ctx.fork(&format!("draft-{attempt}"))?;
+    let draft_ctx = ctx.fork()?;
     draft_ctx.user(&task);
     draft_ctx.cue();
 
@@ -42,7 +42,7 @@ for attempt in 0..max_iterations {
         .collect_text().await?;
 
     // Evaluate using a critique prompt
-    let eval_ctx = ctx.fork(&format!("eval-{attempt}"))?;
+    let eval_ctx = ctx.fork()?;
     eval_ctx.user(&format!(
         "Rate this response 0-1 and explain issues:\n\n{draft}"
     ));
@@ -93,7 +93,7 @@ Represent reasoning as a directed graph where thoughts can branch, aggregate fro
 // Generate diverse thoughts in parallel
 let mut thoughts = Vec::new();
 for i in 0..3 {
-    let t = ctx.fork(&format!("thought-{i}"))?;
+    let t = ctx.fork()?;
     t.user(&format!("Approach this from perspective {i}: {problem}"));
     t.cue();
     let text = t.generate(sampler.clone())
@@ -103,7 +103,7 @@ for i in 0..3 {
 }
 
 // Aggregate: merge insights into a new context
-let agg = ctx.fork("aggregate")?;
+let agg = ctx.fork()?;
 agg.user(&format!(
     "Combine these perspectives into a unified solution:\n\n\
      Perspective 1: {}\n\nPerspective 2: {}\n\nPerspective 3: {}",
@@ -115,7 +115,7 @@ let merged = agg.generate(sampler.clone())
     .collect_text().await?;
 
 // Refine
-let refine = ctx.fork("refine")?;
+let refine = ctx.fork()?;
 refine.user(&format!("Improve this solution:\n\n{merged}"));
 refine.cue();
 let final_answer = refine.generate(sampler.clone())
@@ -206,7 +206,7 @@ Generate multiple candidates, have the model judge them with reasoning traces, a
 // Generate candidates
 let mut candidates = Vec::new();
 for i in 0..3 {
-    let branch = ctx.fork(&format!("candidate-{i}"))?;
+    let branch = ctx.fork()?;
     branch.cue();
     let text = branch.generate(sampler.clone())
         .with_max_tokens(512)
@@ -215,7 +215,7 @@ for i in 0..3 {
 }
 
 // Self-critique: judge with reasoning
-let judge = ctx.fork("judge")?;
+let judge = ctx.fork()?;
 judge.user(&format!(
     "Compare these responses and select the best one. \
      Explain your reasoning.\n\n\

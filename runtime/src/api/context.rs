@@ -28,17 +28,72 @@ impl pie::core::context::HostContext for InstanceState {
     async fn create(
         &mut self,
         model: Resource<Model>,
-        name: String,
-        fill: Option<Vec<u32>>,
     ) -> Result<Result<Resource<Context>, String>> {
+        let model = self.ctx().table.get(&model)?;
+        let model_id = model.model_id;
+
+        match context::create(model_id).await {
+            Ok(context_id) => {
+                self.track_context(model_id, context_id);
+                let ctx = Context { context_id, model_id, lock_id: None };
+                Ok(Ok(self.ctx().table.push(ctx)?))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn open(
+        &mut self,
+        model: Resource<Model>,
+        name: String,
+    ) -> Result<Option<Resource<Context>>> {
         let model = self.ctx().table.get(&model)?;
         let model_id = model.model_id;
         let username = self.get_username();
 
-        match context::create(model_id, username, name, fill).await {
-            Ok(context_id) => {
+        match context::open(model_id, username, name).await {
+            Some(context_id) => {
+                // Opened contexts are NOT tracked for auto-cleanup (they're persistent)
                 let ctx = Context { context_id, model_id, lock_id: None };
-                Ok(Ok(self.ctx().table.push(ctx)?))
+                Ok(Some(self.ctx().table.push(ctx)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn fork(
+        &mut self,
+        this: Resource<Context>,
+    ) -> Result<Result<Resource<Context>, String>> {
+        let ctx = self.ctx().table.get(&this)?;
+        let context_id = ctx.context_id;
+        let model_id = ctx.model_id;
+
+        match context::fork(model_id, context_id).await {
+            Ok(new_context_id) => {
+                self.track_context(model_id, new_context_id);
+                let new_ctx = Context { context_id: new_context_id, model_id, lock_id: None };
+                Ok(Ok(self.ctx().table.push(new_ctx)?))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn save(
+        &mut self,
+        this: Resource<Context>,
+        name: String,
+    ) -> Result<Result<(), String>> {
+        let ctx = self.ctx().table.get(&this)?;
+        let context_id = ctx.context_id;
+        let model_id = ctx.model_id;
+        let username = self.get_username();
+
+        match context::save(model_id, context_id, username, name).await {
+            Ok(()) => {
+                // Context is now named/persistent — stop tracking for auto-cleanup
+                self.untrack_context(model_id, context_id);
+                Ok(Ok(()))
             }
             Err(e) => Ok(Err(e.to_string())),
         }
@@ -50,49 +105,21 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = ctx.model_id;
         let lock_id = ctx.lock_id.unwrap_or(0);
 
-        let _ = context::destroy(model_id, context_id, lock_id).await;
+        self.untrack_context(model_id, context_id);
+        let _ = context::destroy(model_id, context_id, lock_id, false).await;
         self.ctx().table.delete(this)?;
         Ok(())
     }
 
-    async fn lookup(
-        &mut self,
-        model: Resource<Model>,
-        name: String,
-    ) -> Result<Option<Resource<Context>>> {
-        let model = self.ctx().table.get(&model)?;
-        let model_id = model.model_id;
-        let username = self.get_username();
-
-        match context::lookup(model_id, username, name).await {
-            Some(context_id) => {
-                let ctx = Context { context_id, model_id, lock_id: None };
-                Ok(Some(self.ctx().table.push(ctx)?))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn fork(
-        &mut self,
-        this: Resource<Context>,
-        new_name: String,
-    ) -> Result<Result<Resource<Context>, String>> {
+    async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
-        let username = self.get_username();
-
-        match context::fork(model_id, context_id, username, new_name).await {
-            Ok(new_context_id) => {
-                let new_ctx = Context { context_id: new_context_id, model_id, lock_id: None };
-                Ok(Ok(self.ctx().table.push(new_ctx)?))
-            }
-            Err(e) => Ok(Err(e.to_string())),
+        // Only destroy anonymous contexts (ones still tracked).
+        // Named/saved contexts survive handle drop.
+        if self.untrack_context(model_id, context_id) {
+            let _ = context::destroy(model_id, context_id, 0, true).await;
         }
-    }
-
-    async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
     }
@@ -148,12 +175,7 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn committed_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        let count = context::committed_page_count(ctx.model_id, ctx.context_id);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/pie_api_debug.log") {
-            use std::io::Write;
-            let _ = writeln!(f, "[API] committed_page_count ctx={} -> {}", ctx.context_id, count);
-        }
-        Ok(count)
+        Ok(context::committed_page_count(ctx.model_id, ctx.context_id))
     }
 
     async fn uncommitted_page_count(&mut self, this: Resource<Context>) -> Result<u32> {

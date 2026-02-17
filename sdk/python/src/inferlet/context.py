@@ -37,14 +37,6 @@ from ._async import await_future
 from .model import Model, Tokenizer
 from .sampler import Sampler
 
-# Global counter for auto-generated context names
-_NAME_SEQ = 0
-
-
-def _next_name() -> str:
-    global _NAME_SEQ
-    _NAME_SEQ += 1
-    return f"ctx-{_NAME_SEQ:08x}"
 
 
 # =============================================================================
@@ -449,30 +441,30 @@ class Context:
     def __init__(
         self,
         model: Model,
-        name: str | None = None,
-        fill: list[int] | None = None,
     ) -> None:
-        """Create a new context.
+        """Create a new anonymous context.
 
         Args:
             model: The model to create a context for.
-            name: Optional name (auto-generated if omitted).
-            fill: Optional initial token IDs.
         """
-        ctx_name = name or _next_name()
-        self._handle = _ctx.Context.create(model._handle, ctx_name, fill)
+        self._handle = _ctx.Context.create(model._handle)
         self._model = model
 
     @classmethod
-    def lookup(cls, model: Model, name: str) -> Context | None:
-        """Look up an existing context by name."""
-        raw = _ctx.Context.lookup(model._handle, name)
+    def open(cls, model: Model, name: str) -> Context | None:
+        """Open a saved (named) context."""
+        raw = _ctx.Context.open(model._handle, name)
         if raw is None:
             return None
         obj = object.__new__(cls)
         obj._handle = raw
         obj._model = model
         return obj
+
+    @classmethod
+    def lookup(cls, model: Model, name: str) -> Context | None:
+        """Look up an existing context by name. Alias for open()."""
+        return cls.open(model, name)
 
     # --- Fill (ContextExt) ---
 
@@ -619,17 +611,20 @@ class Context:
 
     # --- Lifecycle ---
 
-    def fork(self, name: str | None = None) -> Context:
-        """Fork this context into a new one.
+    def fork(self) -> Context:
+        """Fork this context into a new anonymous one.
 
         The forked context shares committed KV pages with the parent.
         """
-        fork_name = name or _next_name()
-        raw = self._handle.fork(fork_name)
+        raw = self._handle.fork()
         obj = object.__new__(Context)
         obj._handle = raw
         obj._model = self._model
         return obj
+
+    def save(self, name: str) -> None:
+        """Save this context with a name, making it persistent."""
+        self._handle.save(name)
 
     def release(self) -> None:
         """Explicitly release this context's resources."""

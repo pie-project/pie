@@ -44,7 +44,7 @@ let extraction = ctx.generate(sampler.clone())
 ctx.release_pages(ctx.committed_page_count() - untrusted_page_count);
 
 // Continue with only the safe extraction
-let safe_ctx = Context::create(&model, "safe", None)?;
+let safe_ctx = Context::new(&model)?;
 safe_ctx.system("You are a task manager.");
 safe_ctx.user(&format!("Process this extracted data:\n{extraction}"));
 safe_ctx.cue();
@@ -130,7 +130,7 @@ Use a search sub-agent to find the most relevant code snippets, then inject only
 
 ```rust
 // Search agent: find relevant code
-let searcher = Context::create(&model, "searcher", None)?;
+let searcher = Context::new(&model)?;
 searcher.system("Given a task, output the 3 most relevant file paths.");
 searcher.user(&format!(
     "Task: {task}\n\nAvailable files:\n{file_list}"
@@ -182,7 +182,7 @@ ctx.user(&format!("Primary file ({primary_path}):\n```\n{primary}\n```"));
 
 // Tier 2: Related files — summaries only
 for path in &related_paths {
-    let summary_ctx = Context::create(&model, "summary", None)?;
+    let summary_ctx = Context::new(&model)?;
     summary_ctx.system("Summarize this file in 2-3 sentences.");
     summary_ctx.user(&read_file(path).await?);
     summary_ctx.cue();

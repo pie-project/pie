@@ -153,7 +153,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let tokenizer = model.tokenizer();
     let stop_tokens = Context::stop_tokens(&model);
 
-    let ctx = Context::create(&model, "watermark", None)?;
+    let ctx = Context::create(&model)?;
 
     ctx.system("You are a helpful, respectful and honest assistant.");
     ctx.user(&prompt);

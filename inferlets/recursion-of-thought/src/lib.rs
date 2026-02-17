@@ -12,7 +12,6 @@ use inferlet::{
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 const HELP: &str = "\
@@ -53,11 +52,6 @@ const SOLVE_PROMPT: &str =
 const MERGE_PROMPT: &str =
     "Now, please merge the two solutions into one. Make your response short.";
 
-static FORK_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn next_fork_name() -> String {
-    format!("fork-{}", FORK_COUNTER.fetch_add(1, Ordering::Relaxed))
-}
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
@@ -98,7 +92,7 @@ fn divide_and_conquer<'a>(
     Box::pin(async move {
         // Base Case: If max depth is reached, solve the problem directly.
         if path.len() >= max_depth {
-            let solve_ctx = ctx.fork(&next_fork_name())?;
+            let solve_ctx = ctx.fork()?;
             let solve_prompt = format!("{} {}", SOLVE_PROMPT, question);
             solve_ctx.user(&solve_prompt);
             solve_ctx.cue();
@@ -117,7 +111,7 @@ fn divide_and_conquer<'a>(
 
         // Recursive Step: Try to divide the problem.
         verbose_println!(verbose, "Analysing problem at path {:?}", path);
-        let divide_ctx = ctx.fork(&next_fork_name())?;
+        let divide_ctx = ctx.fork()?;
         let divide_prompt = DIVIDE_PROMPT_TEMPLATE.replace("{}", question);
         divide_ctx.user(&divide_prompt);
         divide_ctx.cue();
@@ -177,7 +171,7 @@ fn divide_and_conquer<'a>(
                 }
 
                 verbose_println!(verbose, "Merging solutions at path {:?}", path);
-                let merge_ctx = ctx.fork(&next_fork_name())?;
+                let merge_ctx = ctx.fork()?;
                 let merge_prompt = format!(
                     "Subtask 1 solution: {}\nSubtask 2 solution: {}\n{}",
                     solution1, solution2, MERGE_PROMPT

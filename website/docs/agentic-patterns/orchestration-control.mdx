@@ -41,7 +41,7 @@ ctx.flush().await?;
 // Branch: generate N candidate first steps
 let mut branches = Vec::new();
 for i in 0..num_branches {
-    let branch = ctx.fork(&format!("branch-{i}"))?;
+    let branch = ctx.fork()?;
     let step = branch.generate(sampler.clone())
         .with_max_tokens(256)
         .collect_text().await?;
@@ -51,7 +51,7 @@ for i in 0..num_branches {
 // Evaluate: score each branch
 let mut best = (f32::MIN, 0);
 for (i, (branch, step)) in branches.iter().enumerate() {
-    let eval = ctx.fork(&format!("eval-{i}"))?;
+    let eval = ctx.fork()?;
     eval.user(&format!("Rate this reasoning step 0-1:\n{step}"));
     eval.cue();
     let score_text = eval.generate(sampler.clone())
@@ -120,7 +120,7 @@ for _ in 0..iterations {
 
     // Expand: generate candidate actions via LLM
     for i in 0..breadth {
-        let child_ctx = leaf.ctx.fork(&format!("expand-{i}"))?;
+        let child_ctx = leaf.ctx.fork()?;
         child_ctx.cue();
         let _action = child_ctx.generate(sampler.clone())
             .with_max_tokens(128)
@@ -169,7 +169,7 @@ let mut candidates = Vec::new();
 
 for i in 0..n {
     // All candidates share the prompt's KV cache
-    let branch = ctx.fork(&format!("candidate-{i}"))?;
+    let branch = ctx.fork()?;
     branch.cue();
     let text = branch.generate(sampler.clone())
         .with_max_tokens(512)
@@ -209,7 +209,7 @@ After each episode, the agent reflects on what worked and proposes edits to its 
 
 ```rust
 // Run episode
-let episode_ctx = ctx.fork("episode")?;
+let episode_ctx = ctx.fork()?;
 episode_ctx.user(&task);
 episode_ctx.cue();
 let result = episode_ctx.generate(sampler.clone())
@@ -217,7 +217,7 @@ let result = episode_ctx.generate(sampler.clone())
     .collect_text().await?;
 
 // Reflect and propose prompt edits
-let reflect = ctx.fork("reflect")?;
+let reflect = ctx.fork()?;
 reflect.user(&format!(
     "You just completed a task. Result:\n{result}\n\n\
      Propose improvements to the system prompt to handle \
@@ -263,7 +263,7 @@ for round in 0..max_rounds {
     let strategy = sample_weighted(&beliefs);
 
     // Execute with sampled strategy
-    let trial = ctx.fork(&format!("trial-{round}"))?;
+    let trial = ctx.fork()?;
     trial.system(&format!("Use this strategy: {strategy}"));
     trial.user(&task);
     trial.cue();
@@ -555,11 +555,11 @@ Split a monolithic tool into reader/processor/writer micro-tools with separate p
 
 ```rust
 // Reader context: can access data, no write tools
-let reader = Context::create(&model, "reader", None)?;
+let reader = Context::new(&model)?;
 reader.equip_tools(&[read_email_tool, search_tool])?;
 
 // Writer context: can send, no data access
-let writer = Context::create(&model, "writer", None)?;
+let writer = Context::new(&model)?;
 writer.equip_tools(&[send_email_tool, create_ticket_tool])?;
 
 // Reader extracts info (sandboxed)
@@ -668,7 +668,7 @@ let mut results = Vec::new();
 
 for (i, item) in items.iter().enumerate() {
     // Each sub-agent gets a fresh context
-    let sub = Context::create(&model, &format!("sub-{i}"), None)?;
+    let sub = Context::new(&model)?;
     sub.system("You are a document summarizer.");
     sub.user(&format!("Summarize this document:\n{}", load_file(item).await?));
     sub.cue();
@@ -716,11 +716,11 @@ Spawn opposing agents with different perspectives. They challenge each other's r
 ```
 
 ```rust
-let advocate = Context::create(&model, "advocate", None)?;
+let advocate = Context::new(&model)?;
 advocate.system("You are a strong advocate for the proposed solution. \
     Argue persuasively for why it's the best approach.");
 
-let critic = Context::create(&model, "critic", None)?;
+let critic = Context::new(&model)?;
 critic.system("You are a rigorous critic. Find flaws, risks, and \
     unconsidered alternatives in the proposed solution.");
 
@@ -784,7 +784,7 @@ Use a fast, cheap model for routine tasks. Escalate to a powerful, expensive mod
 ```rust
 // Worker: fast model for routine work
 let worker_model = Model::load_by_name("worker-model")?;
-let worker = Context::create(&worker_model, "worker", None)?;
+let worker = Context::new(&worker_model)?;
 worker.system("Solve the task. If you are uncertain, respond with [ESCALATE].");
 worker.user(&task);
 worker.cue();
@@ -796,7 +796,7 @@ let result = worker.generate(sampler_fast.clone())
 if result.contains("[ESCALATE]") {
     // Oracle: powerful model for hard problems
     let oracle_model = Model::load_by_name("oracle-model")?;
-    let oracle = Context::create(&oracle_model, "oracle", None)?;
+    let oracle = Context::new(&oracle_model)?;
     oracle.system("Provide a detailed strategy for solving this problem.");
     oracle.user(&format!(
         "The worker couldn't solve this. Provide guidance:\n\n{task}"
@@ -843,7 +843,7 @@ Separate the agent into a Privileged LLM (has tools, cannot see raw data) and a 
 
 ```rust
 // Quarantined: reads untrusted data, outputs structured symbols
-let quarantined = Context::create(&model, "quarantined", None)?;
+let quarantined = Context::new(&model)?;
 quarantined.system(
     "Extract info as JSON. Never output raw content. \
      Use symbolic references like [EMAIL_SENDER], [SUBJECT]."
@@ -857,7 +857,7 @@ let symbols = quarantined.generate(sampler.clone())
     .collect_text().await?;
 
 // Privileged: acts on symbols, never sees raw data
-let privileged = Context::create(&model, "privileged", None)?;
+let privileged = Context::new(&model)?;
 privileged.system("You are an email assistant with calendar access.");
 privileged.equip_tools(&[calendar_tool, notification_tool])?;
 privileged.user(&format!(
@@ -904,7 +904,7 @@ let mut summaries = Vec::new();
 
 // Map: each document in an isolated context
 for (i, doc) in documents.iter().enumerate() {
-    let sandbox = Context::create(&model, &format!("map-{i}"), None)?;
+    let sandbox = Context::new(&model)?;
     sandbox.system("Classify this document. Output: category, confidence, \
         one-line summary. No other text.");
     sandbox.user(doc);
@@ -961,7 +961,7 @@ let perspectives = vec![
 let mut ideas = Vec::new();
 
 for (i, perspective) in perspectives.iter().enumerate() {
-    let agent = Context::create(&model, &format!("brainstorm-{i}"), None)?;
+    let agent = Context::new(&model)?;
     agent.system(&format!("You are a software architect. {perspective}"));
     agent.user(&format!("Propose a design for: {task}"));
     agent.cue();
@@ -1009,9 +1009,7 @@ let files = find_files("**/*.test.js").await?;
 let batch_size = 10;
 
 for (batch_idx, batch) in files.chunks(batch_size).enumerate() {
-    let agent = Context::create(
-        &model, &format!("swarm-{batch_idx}"), None
-    )?;
+    let agent = Context::new(&model)?;
     agent.system(
         "Migrate test files from Jest to Vitest. \
          Change imports and update assertion syntax."
@@ -1044,25 +1042,26 @@ Use two specialized agents: an Initializer creates the project foundation once, 
 - When context loss between sessions is costly
 
 ```
- Session 1:  Initializer ──▶ Create ctx ──▶ Scaffold ──▶ [named ctx saved]
+ Session 1:  Initializer ──▶ Create ctx ──▶ Scaffold ──▶ [save → named ctx]
                                                               │
- Session N:  Maintainer  ──▶ lookup(ctx)  ──▶ Add Feature ──▶ [ctx updated]
+ Session N:  Maintainer  ──▶ open(ctx)   ──▶ Add Feature ──▶ [ctx updated]
 ```
 
 ```rust
-// Initializer: runs once, creates named context
-let init = Context::create(&model, "project-state", None)?;
+// Initializer: runs once, creates and saves a named context
+let init = Context::new(&model)?;
 init.system("You are a project initializer.");
 init.user("Set up the project structure for a REST API.");
 init.cue();
 let scaffold = init.generate(sampler.clone())
     .with_max_tokens(1024)
     .collect_text().await?;
+init.save("project-state")?;
 
 // ... later, in a new session:
 
 // Maintainer: resumes from named context
-let state = Context::lookup(&model, "project-state")
+let state = Context::open(&model, "project-state")
     .expect("Project state should exist");
 
 state.user("Add authentication middleware to the API.");
@@ -1073,7 +1072,7 @@ let update = state.generate(sampler)
 ```
 
 :::tip[Why Pie]
-`Context::lookup()` retrieves a named context with its full KV cache intact. The Maintainer resumes with complete memory of the initialization — no re-prompting or state serialization needed.
+`Context::open()` retrieves a named context with its full KV cache intact. The Maintainer resumes with complete memory of the initialization — no re-prompting or state serialization needed.
 :::
 
 ---
@@ -1097,7 +1096,7 @@ Pipeline multiple models: a retrieval model gathers context, a generation model 
 ```rust
 // Stage 1: Retrieval model gathers relevant context
 let retrieval_model = Model::load_by_name("small-model")?;
-let retriever = Context::create(&retrieval_model, "retrieval", None)?;
+let retriever = Context::new(&retrieval_model)?;
 retriever.system("Extract the most relevant code snippets for this task.");
 retriever.user(&task);
 retriever.cue();
@@ -1107,7 +1106,7 @@ let context = retriever.generate(sampler_fast.clone())
 
 // Stage 2: Large model generates solution using retrieved context
 let gen_model = Model::load_by_name("large-model")?;
-let generator = Context::create(&gen_model, "generation", None)?;
+let generator = Context::new(&gen_model)?;
 generator.system("You are an expert programmer.");
 generator.user(&format!("Context:\n{context}\n\nTask: {task}"));
 generator.cue();
@@ -1136,7 +1135,7 @@ Break a workflow into isolated phases (Research → Plan → Execute), each with
 
 ```rust
 // Phase 1: Research (fresh context)
-let research = Context::create(&model, "research", None)?;
+let research = Context::new(&model)?;
 research.system("You are a researcher. Be thorough and cite sources.");
 research.user(&format!("Research how to implement: {feature}"));
 research.cue();
@@ -1145,7 +1144,7 @@ let findings = research.generate(sampler.clone())
     .collect_text().await?;
 
 // Phase 2: Plan (fresh context, distilled input)
-let planning = Context::create(&model, "plan", None)?;
+let planning = Context::new(&model)?;
 planning.system("You are a technical architect. Be concise and specific.");
 planning.user(&format!("Based on these findings, create a plan:\n{findings}"));
 planning.cue();
@@ -1154,7 +1153,7 @@ let plan = planning.generate(sampler.clone())
     .collect_text().await?;
 
 // Phase 3: Execute (fresh context, only the plan)
-let execution = Context::create(&model, "execute", None)?;
+let execution = Context::new(&model)?;
 execution.system("You are an expert implementer. Follow the plan exactly.");
 execution.user(&format!("Implement step 1 of this plan:\n{plan}"));
 execution.cue();
@@ -1187,7 +1186,7 @@ Separate the agent workflow into Perception (input normalization), Processing (r
 
 ```rust
 // Stage 1: Perception — normalize input
-let perceive = Context::create(&model, "perceive", None)?;
+let perceive = Context::new(&model)?;
 perceive.system(
     "Extract structured information from the input. \
      Output JSON with: intent, entities, sentiment."
@@ -1200,7 +1199,7 @@ let perception = perceive.generate(sampler.clone())
     .collect_text().await?;
 
 // Stage 2: Processing — reason and decide
-let process = Context::create(&model, "process", None)?;
+let process = Context::new(&model)?;
 process.system("You are a decision engine. Given structured input, \
     decide the best action.");
 process.user(&perception);

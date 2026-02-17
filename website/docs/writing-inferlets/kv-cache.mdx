@@ -61,7 +61,7 @@ ctx.release_pages(num_pages);
 Fork creates a copy-on-write clone. The forked context shares all committed pages with the parent — new tokens are written to new pages:
 
 ```rust
-let forked = ctx.fork("forked-session")?;
+let forked = ctx.fork()?;
 
 // forked shares parent's KV cache
 // New tokens go to new pages
@@ -92,21 +92,22 @@ Reuse a cached prompt's KV state across requests by using named contexts:
 ### Cache a prefix
 
 ```rust
-// First request: compute and cache the system prompt in a named context
-let prefix = Context::create(&model, "system-prompt-v1", None)?;
+// First request: compute and cache the system prompt
+let prefix = Context::new(&model)?;
 prefix.system("You are a helpful assistant. [long system prompt...]");
 prefix.flush().await?;
-// Pages are now committed and cached under "system-prompt-v1"
+// Save it so it persists across requests
+prefix.save("system-prompt-v1")?;
 ```
 
 ### Reuse the cached prefix
 
 ```rust
-// Subsequent requests: look up and fork the cached context
-let prefix = Context::lookup(&model, "system-prompt-v1")
+// Subsequent requests: open the cached context and fork it
+let prefix = Context::open(&model, "system-prompt-v1")
     .ok_or("Prefix not found")?;
 
-let ctx = prefix.fork("request-123")?;
+let ctx = prefix.fork()?;
 
 // Continue from where the cache left off — no re-prefill needed
 ctx.user("New user question");
@@ -123,21 +124,22 @@ This avoids recomputing the KV cache for the system prompt on every request.
  └──────────┴──────────┴──────────┴─────────┘
       │          │          │          │
       ▼          ▼          ▼          ▼
- ┌─ fork("req-1") ──┐  ┌─ fork("req-2") ──┐
- │ + user question 1 │  │ + user question 2 │
- └───────────────────┘  └───────────────────┘
+ ┌─ fork() (req-1) ──┐  ┌─ fork() (req-2) ──┐
+ │ + user question 1  │  │ + user question 2  │
+ └────────────────────┘  └────────────────────┘
 ```
 
-## Context Lookup
+## Opening Saved Contexts
 
-Contexts persist within an inferlet instance. Look one up by name to resume state:
+Saved contexts persist across inferlet instances. Open one by name to resume state:
 
 ```rust
-let ctx = match Context::lookup(&model, "session-123") {
+let ctx = match Context::open(&model, "session-123") {
     Some(ctx) => ctx,                     // Resume existing session
     None => {
-        let ctx = Context::create(&model, "session-123", None)?;
+        let ctx = Context::new(&model)?;
         ctx.system("You are a helpful assistant.");
+        ctx.save("session-123")?;
         ctx
     }
 };

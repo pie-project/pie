@@ -11,7 +11,6 @@ use inferlet::{
     context::Context, inference::Sampler, model::Model,
     runtime, ContextExt, InstructExt, Result,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 const HELP: &str = "\
@@ -37,11 +36,6 @@ const AGGREGATE_PROMPT: &str = "\
 Please compare the following solution with the one you just provided \
 and aggregate their ideas into a single, improved solution:\n";
 
-static FORK_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn next_fork_name() -> String {
-    format!("fork-{}", FORK_COUNTER.fetch_add(1, Ordering::Relaxed))
-}
 
 /// Main logic for running the hierarchical aggregation workflow.
 async fn run_hierarchical_aggregation(
@@ -58,7 +52,7 @@ async fn run_hierarchical_aggregation(
     let mut proposal_tasks = proposal_tokens
         .into_iter()
         .map(|max_tokens| {
-            let ctx = base_context.fork(&next_fork_name())?;
+            let ctx = base_context.fork()?;
             Ok(async move {
                 ctx.cue();
                 let proposal_text = ctx

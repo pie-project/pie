@@ -12,8 +12,7 @@ use crate::ForwardPassExt;
 use crate::Result;
 use wstd::io::AsyncPollable;
 
-/// Simple counter for generating unique context names.
-static CONTEXT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 
 // =============================================================================
 // Speculation Types
@@ -409,18 +408,10 @@ impl<'a> EventStream<'a> {
 pub trait ContextExt {
     // --- Creation ---
     
-    /// Creates a new context with an auto-generated globally unique name.
+    /// Creates a new context.
     fn new(model: &Model) -> Result<Context> {
-        // Combine counter with address-based entropy for global uniqueness
-        let counter = CONTEXT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Use stack address as additional entropy source
-        let stack_addr = &counter as *const _ as u64;
-        // Simple mixing function
-        let mixed = counter.wrapping_mul(0x517cc1b727220a95) ^ stack_addr;
-        let name = format!("ctx-{:016x}", mixed);
-        Context::create(model, &name, None)
-    }
-    
+        Context::create(model)
+    }    
     // --- Async Operations ---
     
     /// Acquires a lock on the context asynchronously.

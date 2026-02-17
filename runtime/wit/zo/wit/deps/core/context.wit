@@ -8,16 +8,20 @@ interface context {
 
     resource context {
 
-        // Creates a new context, optionally with a name
-        create: static func(model:borrow<model>, name: string, fill: option<list<u32>>) -> result<context, error>;
+        // Creates an anonymous context (auto-destroyed on process exit)
+        create: static func(model: borrow<model>) -> result<context, error>;
 
+        // Opens a saved (named) context
+        open: static func(model: borrow<model>, name: string) -> option<context>;
+
+        // Forks into a new anonymous context
+        fork: func() -> result<context, error>;
+
+        // Saves with a name (becomes persistent, survives process exit)
+        save: func(name: string) -> result<_, error>;
+
+        // Force-destroys immediately
         destroy: func();
-
-        // Retrieves an existing context by name
-        lookup: static func(model:borrow<model>, name: string) -> option<context>;
-
-        // Forks this context into a new one with the given name
-        fork: func(new-name: string) -> result<context, error>;
 
         // Acquires a lock on the context, returning a lock result
         acquire-lock: func() -> future-bool;
@@ -54,6 +58,8 @@ interface context {
         set-buffered-tokens: func(tokens: list<u32>);
 
         append-buffered-tokens: func(tokens: list<u32>);
+
+        last-position: func() -> option<u32>;
 
     }
 

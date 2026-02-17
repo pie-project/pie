@@ -58,7 +58,7 @@ fn single_forward_pass() {
     let s = state();
     s.rt.block_on(async {
         // Create a context and reserve pages to get valid page IDs
-        let ctx_id = pie::context::create(MODEL, USER.to_string(), "infer-ctx".into(), None)
+        let ctx_id = pie::context::create(MODEL)
             .await
             .unwrap();
         let lock = pie::context::acquire_lock(MODEL, ctx_id);
@@ -94,8 +94,7 @@ fn multiple_forward_passes() {
         // Fire 3 concurrent forward passes
         let mut handles = Vec::new();
         for i in 0..3u32 {
-            let ctx_name = format!("multi-infer-{i}");
-            let ctx_id = pie::context::create(MODEL, USER.to_string(), ctx_name, None)
+            let ctx_id = pie::context::create(MODEL)
                 .await
                 .unwrap();
             let lock = pie::context::acquire_lock(MODEL, ctx_id);
