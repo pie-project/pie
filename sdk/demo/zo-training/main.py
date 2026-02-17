@@ -33,13 +33,13 @@ class TrainingConfig:
     """Configuration settings for the ES training run."""
 
     # --- Server and Paths ---
-    SERVER_URIS: List[str] = field(default_factory=lambda: ["ws://127.0.0.1:8080"])
+    SERVER_URIS: List[str] = field(default_factory=lambda: ["ws://127.0.0.1:8081"])
     # --- Registry Inferlet Names ---
     INFERLET_NAMES: Dict[str, str] = field(
         default_factory=lambda: {
-            "es-init": "ingim/es-init",
-            "es-rollout": "ingim/es-rollout",
-            "es-update": "ingim/es-update",
+            "es-init": "es-init@0.1.0",
+            "es-rollout": "es-rollout@0.1.0",
+            "es-update": "es-update@0.1.0",
         }
     )
 
