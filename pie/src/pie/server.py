@@ -289,6 +289,7 @@ def _bootstrap(
         telemetry_endpoint=config.telemetry.endpoint,
         telemetry_service_name=config.telemetry.service_name,
         models=[py_model],
+        allow_filesystem=config.allow_filesystem,
     )
 
     runtime_handle = pie_runtime.bootstrap(rust_config)

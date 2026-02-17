@@ -29,6 +29,8 @@ pub struct Config {
     pub registry_url: String,
     pub telemetry: TelemetryConfig,
     pub models: Vec<ModelConfig>,
+    /// Allow inferlets to access a sandboxed scratch filesystem.
+    pub allow_filesystem: bool,
     /// Skip tracing initialization (for tests — can only init once per process).
     pub skip_tracing: bool,
 }
@@ -94,7 +96,7 @@ pub async fn bootstrap(
         config.cache_dir.clone(),
     );
 
-    linker::spawn(&wasm_engine);
+    linker::spawn(&wasm_engine, config.allow_filesystem);
     server::spawn(&config.host, config.port);
     messaging::spawn();
 
