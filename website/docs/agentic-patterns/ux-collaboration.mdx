@@ -1,0 +1,167 @@
+---
+title: UX & Collaboration
+description: Patterns for human oversight, reasoning transparency, and user interaction
+sidebar_position: 6
+---
+
+# UX & Collaboration
+
+These patterns put humans in control. They surface reasoning for transparency, pause at critical decision points, and enable real-time monitoring — all powered by Pie's streaming `EventStream` API.
+
+---
+
+## Chain-of-Thought Monitoring
+
+Monitor the model's reasoning tokens in real-time and interrupt generation if the reasoning goes off-track before it produces a final answer.
+
+*[Reference →](https://agentic-patterns.com/patterns/chain-of-thought-monitoring-interruption/)*
+
+**When to use:**
+- Long reasoning chains that might drift
+- Want to detect and correct errors early
+- Need to enforce reasoning constraints
+
+```
+ LLM ──▶ [thinking tokens] ──▶ Monitor ──┬──▶ [answer tokens]
+                                          │
+                                      [off-track?]
+                                          │
+                                       Redirect
+```
+
+```rust
+use inferlet::Event;
+
+let mut events = ctx.generate(sampler)
+    .with_max_tokens(1024)
+    .decode()
+    .with_reasoning();
+
+let mut reasoning_text = String::new();
+
+while let Some(event) = events.next().await? {
+    match event {
+        Event::Reasoning(s) => {
+            reasoning_text.push_str(&s);
+
+            // Monitor: check for problematic patterns
+            if reasoning_text.contains("I don't know")
+                || reasoning_text.len() > 2000
+            {
+                // Interrupt and redirect
+                drop(events);
+                ctx.user("Let me rephrase. Focus specifically on...");
+                ctx.cue();
+                break;
+            }
+        }
+        Event::Text(s) => print!("{}", s),
+        Event::Done(_) => break,
+        _ => {}
+    }
+}
+```
+
+:::tip[Why Pie]
+`EventStream` gives you reasoning tokens *as they're generated*. You can inspect, filter, or interrupt mid-generation — impossible with APIs that only return the final result. The KV cache is preserved up to the interruption point, so redirecting is cheap.
+:::
+
+---
+
+## Verbose Reasoning Transparency
+
+Surface the model's internal reasoning (thinking tokens) to the user for transparency and debugging, while separating it from the final answer.
+
+*[Reference →](https://agentic-patterns.com/patterns/verbose-reasoning-transparency/)*
+
+**When to use:**
+- Users need to understand *why* the model answered a certain way
+- Debugging agent behavior
+- Compliance/audit requirements
+
+```
+ LLM ──▶ EventStream ──┬──▶ Reasoning(s) ──▶ collapsible UI
+                        │
+                        └──▶ Text(s)      ──▶ final answer
+```
+
+```rust
+let mut events = ctx.generate(sampler)
+    .with_max_tokens(512)
+    .decode()
+    .with_reasoning();
+
+while let Some(event) = events.next().await? {
+    match event {
+        Event::Reasoning(s) => {
+            // Stream reasoning to client in a collapsible section
+            send_reasoning(&s).await;
+        }
+        Event::Text(s) => {
+            // Stream final answer
+            send_text(&s).await;
+        }
+        Event::Done(_) => break,
+        _ => {}
+    }
+}
+```
+
+:::tip[Why Pie]
+`.with_reasoning()` separates thinking tokens from output tokens at the event level. The inferlet controls exactly what gets surfaced — you can log reasoning, stream it, or discard it, all in real-time.
+:::
+
+---
+
+## Human-in-the-Loop
+
+Pause generation at critical decision points, send the proposed action to the client for approval, and resume only after confirmation.
+
+*[Reference →](https://agentic-patterns.com/patterns/human-in-loop-approval-framework/)*
+
+**When to use:**
+- High-stakes actions (deletions, payments, deployments)
+- Regulated domains requiring audit trails
+- Progressive trust building
+
+```rust
+use inferlet::Event;
+
+let mut events = ctx.generate(sampler)
+    .with_max_tokens(512)
+    .decode()
+    .with_tool_use();
+
+while let Some(event) = events.next().await? {
+    match event {
+        Event::ToolCall(name, args) => {
+            if is_high_risk(&name) {
+                // Pause: send approval request to client
+                let approved = request_approval(&name, &args).await?;
+                if !approved {
+                    ctx.answer_tool(&name, "Action denied by user.");
+                    ctx.cue();
+                    continue;
+                }
+            }
+            let result = dispatch_tool(&name, &args)?;
+            ctx.answer_tool(&name, &result);
+            ctx.cue();
+        }
+        Event::Done(_) => break,
+        _ => {}
+    }
+}
+```
+
+:::tip[Why Pie]
+The KV cache is preserved while waiting for human approval. The agent resumes exactly where it left off — no re-processing. Client messaging is built into the inferlet I/O system.
+:::
+
+---
+
+## Next Steps
+
+- **[Orchestration & Control](./orchestration-control)** — Patterns for coordinating agents and execution
+- **[Tool Use & Environment](./tool-use-environment)** — Patterns for tool calling and code execution
+- **[I/O & Messaging](../writing-inferlets/io)** — Client communication and HTTP

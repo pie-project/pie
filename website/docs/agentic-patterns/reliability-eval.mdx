@@ -1,0 +1,70 @@
+---
+title: Reliability & Eval
+description: Patterns for ensuring output correctness and format compliance
+sidebar_position: 4
+---
+
+# Reliability & Eval
+
+These patterns ensure outputs are correct, well-formatted, and verifiable. Pie's constrained decoding enforces structure at the token level — no retries needed.
+
+---
+
+## Structured Output
+
+Force the model's output to conform to a grammar (JSON schema, regex, EBNF) using constrained decoding.
+
+*[Reference →](https://agentic-patterns.com/patterns/structured-output-specification/)*
+
+**When to use:**
+- API responses requiring valid JSON
+- Form filling, data extraction
+- Any task where output format must be guaranteed
+
+```
+ Prompt ──▶ LLM + Grammar Constraint ──▶ Guaranteed Valid JSON
+                   │
+             (logit masking at
+              every token step)
+```
+
+```rust
+use inferlet::InstructExt;
+
+// JSON schema constraint
+let schema = serde_json::json!({
+    "type": "object",
+    "properties": {
+        "name": { "type": "string" },
+        "age": { "type": "integer" },
+        "interests": {
+            "type": "array",
+            "items": { "type": "string" }
+        }
+    },
+    "required": ["name", "age"]
+});
+
+let matcher = create_json_schema_matcher(&model, &schema);
+
+ctx.user("Extract person info: John is 30, likes hiking and chess.");
+ctx.cue();
+
+let json = ctx.generate(sampler)
+    .with_constraint(matcher)
+    .with_max_tokens(256)
+    .collect_text().await?;
+// Guaranteed valid JSON matching the schema
+```
+
+:::tip[Why Pie]
+Constraints are applied at the logit level during decoding — every token is guaranteed valid. No retries, no parsing failures, no "please try again in JSON format." See [Structured Generation](../writing-inferlets/structured-generation) for details.
+:::
+
+---
+
+## Next Steps
+
+- **[Orchestration & Control](./orchestration-control)** — Patterns for coordinating agents and execution
+- **[Tool Use & Environment](./tool-use-environment)** — Patterns for tool calling and code execution
+- **[Structured Generation](../writing-inferlets/structured-generation)** — Grammar constraints reference
