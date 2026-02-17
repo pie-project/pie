@@ -116,11 +116,7 @@ register("gemma2", gemma2, hf_model_types=("gemma2",))
 register("gemma3", gemma3, hf_model_types=("gemma3_text",))
 register("mistral3", mistral3, hf_model_types=("mistral3",))
 register("olmo3", olmo3, hf_model_types=("olmo3",))
-
-# gpt_oss requires CUDA-only features
-if torch.cuda.is_available():
-    from . import gpt_oss
-    register("gptoss", gpt_oss, hf_model_types=("gptoss", "gpt_oss"))
+register("gptoss", gpt_oss, hf_model_types=("gptoss", "gpt_oss"))
 
 from . import dummy as _dummy_mod
 register("dummy", _dummy_mod)

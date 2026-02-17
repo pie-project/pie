@@ -6,7 +6,6 @@ Provides drop-in replacements for FlashInfer wrapper classes and functions.
 from typing import Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from ._compiler import MetalCompiler, _validate_mps_device
 
@@ -177,14 +176,14 @@ class BatchAttentionWithAttentionSinkWrapper:
         sinks: Optional[torch.Tensor] = None,
         scaling: Optional[float] = None,
     ) -> torch.Tensor:
-        """Run attention with optional attention sink tokens.
+        """Run attention with optional attention sink logits.
 
         Args:
             query: [num_tokens, num_heads, head_dim]
             kv_cache: paged KV cache tensor.
-            sinks: optional sink token KV tensor. Ignored in current Metal
-                   implementation (no native support).
-            scaling: attention scale factor. Ignored (Metal kernel computes its own).
+            sinks: optional [num_qo_heads] float32 tensor of per-head sink logits.
+                   Injects a virtual sink token into the softmax denominator.
+            scaling: attention scale factor. If None, uses 1/sqrt(head_dim).
 
         Returns:
             [num_tokens, num_heads * head_dim] attention output.
@@ -201,6 +200,8 @@ class BatchAttentionWithAttentionSinkWrapper:
             kv_page_indptr=self._planned["kv_page_indptr"],
             kv_last_page_lens=self._planned["kv_last_page_lens"],
             qo_indptr=self._planned["qo_indptr"],
+            sinks=sinks,
+            scaling=scaling,
         )
 
 
@@ -267,7 +268,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
 ) -> None:
-    """Apply RoPE using a precomputed cos/sin cache, in-place.
+    """Apply RoPE using a precomputed cos/sin cache, in-place (Metal kernel).
 
     Args:
         positions: [num_tokens] int32/int64 position indices.
@@ -277,43 +278,20 @@ def apply_rope_with_cos_sin_cache_inplace(
         cos_sin_cache: [max_pos, head_dim] — first half cols are cos, second half sin.
         is_neox: True for GPT-NeoX style (non-interleaved halves).
     """
-    half_dim = head_size // 2
+    _validate_mps_device(query, "query")
+    _validate_mps_device(key, "key")
+    _validate_mps_device(positions, "positions")
 
-    # Extract cos and sin for the given positions
-    cos = cos_sin_cache[positions.long(), :half_dim]  # [num_tokens, half_dim]
-    sin = cos_sin_cache[positions.long(), half_dim:]   # [num_tokens, half_dim]
+    compiler = MetalCompiler()
 
     def _apply(x: torch.Tensor) -> None:
-        orig_shape = x.shape
         if x.ndim == 2:
-            # [num_tokens, num_heads * head_dim] -> [num_tokens, num_heads, head_dim]
             x_3d = x.view(x.shape[0], -1, head_size)
         else:
             x_3d = x
-
-        # cos/sin: [num_tokens, 1, half_dim] for broadcasting over heads
-        c = cos.unsqueeze(1).to(x_3d.dtype)
-        s = sin.unsqueeze(1).to(x_3d.dtype)
-
-        if is_neox:
-            # GPT-NeoX: split into first half and second half
-            x1 = x_3d[..., :half_dim]
-            x2 = x_3d[..., half_dim:]
-            r1 = x1 * c - x2 * s
-            r2 = x2 * c + x1 * s
-            x_3d[..., :half_dim] = r1
-            x_3d[..., half_dim:] = r2
-        else:
-            # Interleaved: pairs (x[0], x[1]), (x[2], x[3]), ...
-            x1 = x_3d[..., 0::2]
-            x2 = x_3d[..., 1::2]
-            r1 = x1 * c - x2 * s
-            r2 = x2 * c + x1 * s
-            x_3d[..., 0::2] = r1
-            x_3d[..., 1::2] = r2
-
-        if x.ndim == 2 and orig_shape != x_3d.shape:
-            x.copy_(x_3d.view(orig_shape))
+        compiler.run_rope_cos_sin(x_3d, positions, cos_sin_cache, head_size, is_neox)
+        if x.ndim == 2 and x.data_ptr() != x_3d.data_ptr():
+            x.copy_(x_3d.view(x.shape))
 
     _apply(query)
     _apply(key)
@@ -340,6 +318,17 @@ def mm_fp8(
         [m, n] tensor in out_dtype.
     """
     return (input.to(out_dtype) @ weight.to(out_dtype).T) * alpha
+
+
+def _to_scalar(v, idx=None):
+    """Extract a Python float from a scalar, 0-d tensor, or per-expert 1-d tensor."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    if v.dim() == 0:
+        return v.item()
+    if idx is not None:
+        return v[idx].item()
+    return v[0].item()
 
 
 def trtllm_fp4_block_scale_moe(
@@ -373,10 +362,9 @@ def trtllm_fp4_block_scale_moe(
     do_finalize: bool,
     tune_max_num_tokens: int,
 ) -> Tuple[torch.Tensor]:
-    """Decomposed PyTorch MoE fallback for TensorRT-LLM FP4 block-scale MoE.
+    """MoE for Apple Silicon with FP4 packed weights via Metal kernels.
 
-    Apple Silicon lacks FP4 hardware. This provides a functional (not optimized)
-    fallback that dequantizes weights and performs the MoE computation in bf16.
+    Requires FP4 packed (uint8) weights on an MPS device.
 
     Returns:
         Tuple where [0] is the output tensor of shape [num_tokens, hidden_dim].
@@ -385,69 +373,97 @@ def trtllm_fp4_block_scale_moe(
     device = hidden_states.device
     num_tokens, hidden_dim = hidden_states.shape
 
+    if gemm1_weights.is_floating_point() or device.type != "mps":
+        raise RuntimeError(
+            "trtllm_fp4_block_scale_moe requires FP4 packed (uint8) weights on MPS"
+        )
+
     # --- Routing ---
     logits = routing_logits.float()
     if routing_bias is not None:
         logits = logits + routing_bias.float()
 
-    # routing_method_type=1 => TopK then Softmax (renormalize)
     scores = torch.softmax(logits, dim=-1)
     topk_weights, topk_indices = torch.topk(scores, top_k, dim=-1)
-    # Renormalize top-k weights
     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_weights = topk_weights.to(dtype)
 
-    # --- Dequantize weights ---
-    # Weights may be packed FP4 (int8 with block scales) or pre-dequantized.
-    # We handle both: if integral dtype, multiply by scale; otherwise use as-is.
-    def _dequant(w: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        if w.is_floating_point():
-            return w.to(dtype)
-        # Packed FP4 in int8: treat each byte as a scaled value
-        return w.to(dtype) * scale.to(dtype)
+    # --- Batched expert computation ---
+    # Flatten top-k assignments: each (token, k_slot) becomes one "task"
+    flat_expert_ids = topk_indices.view(-1)  # [num_tokens * top_k]
+    flat_weights = topk_weights.view(-1)     # [num_tokens * top_k]
+    flat_token_ids = torch.arange(num_tokens, device=device).unsqueeze(1).expand(
+        -1, top_k
+    ).reshape(-1)  # [num_tokens * top_k]
 
-    # gemm1_weights: [num_experts, 2 * intermediate_size, hidden_dim] (gate+up fused)
-    # gemm2_weights: [num_experts, hidden_dim, intermediate_size]
-    w1 = _dequant(gemm1_weights, gemm1_weights_scale)
-    w2 = _dequant(gemm2_weights, gemm2_weights_scale)
+    # Sort by expert for batched processing
+    sorted_order = flat_expert_ids.argsort()
+    sorted_expert_ids = flat_expert_ids[sorted_order]
+    sorted_token_ids = flat_token_ids[sorted_order]
+    sorted_weights = flat_weights[sorted_order]
 
-    # --- Per-token expert computation ---
-    output = torch.zeros(num_tokens, hidden_dim, dtype=dtype, device=device)
+    # Count tokens per expert using bincount
+    expert_counts = torch.bincount(
+        sorted_expert_ids, minlength=local_expert_offset + local_num_experts
+    )
+    # Cumulative offsets for slicing
+    expert_offsets = torch.zeros(
+        local_num_experts + 1, dtype=torch.int64, device=device
+    )
+    local_counts = expert_counts[local_expert_offset:local_expert_offset + local_num_experts]
+    expert_offsets[1:] = local_counts.cumsum(0)
+    # Offset into sorted array: skip tokens assigned to experts before local_expert_offset
+    base_offset = expert_counts[:local_expert_offset].sum().item()
 
-    for k_idx in range(top_k):
-        expert_ids = topk_indices[:, k_idx]   # [num_tokens]
-        weights = topk_weights[:, k_idx]      # [num_tokens]
+    # --- Metal kernel path: per-expert FP4 GEMM with inline dequant ---
+    compiler = MetalCompiler()
 
-        for expert_id in range(local_expert_offset, local_expert_offset + local_num_experts):
-            mask = expert_ids == expert_id
-            if not mask.any():
-                continue
+    # Accumulate into float32 for accuracy, convert at end
+    output_f32 = torch.zeros(num_tokens, hidden_dim, dtype=torch.float32, device=device)
 
-            x = hidden_states[mask]  # [sel, hidden_dim]
-            local_idx = expert_id - local_expert_offset
+    for local_idx in range(local_num_experts):
+        start = base_offset + expert_offsets[local_idx].item()
+        end = base_offset + expert_offsets[local_idx + 1].item()
+        if start == end:
+            continue
 
-            # GEMM1: gate+up projection
-            g1 = F.linear(x, w1[local_idx])  # [sel, 2 * intermediate_size]
-            if gemm1_bias is not None:
-                g1 = g1 + gemm1_bias[local_idx]
+        token_ids = sorted_token_ids[start:end]
+        expert_w = sorted_weights[start:end]
+        x = hidden_states[token_ids]  # [count, hidden_dim]
 
-            # Apply output1 scales
-            gate_part = g1[:, :intermediate_size] * output1_scale_gate_scalar
-            up_part = g1[:, intermediate_size:] * output1_scale_scalar
+        # Per-expert scalar params (may be float or per-expert tensor)
+        expert_idx = local_expert_offset + local_idx
 
-            # SwiGLU activation (gated_act_type=0)
-            activated = (F.silu(gate_part * gemm1_alpha + gemm1_beta)).clamp(
-                -gemm1_clamp_limit, gemm1_clamp_limit
-            ) * up_part
+        # GEMM1 with fused SwiGLU via Metal kernel
+        activated = compiler.run_moe_gemm1_fp4(
+            input=x,
+            w_blocks=gemm1_weights[local_idx],
+            w_scales=gemm1_weights_scale[local_idx],
+            bias=gemm1_bias[local_idx] if gemm1_bias is not None else None,
+            intermediate_size=intermediate_size,
+            alpha=_to_scalar(gemm1_alpha, expert_idx),
+            beta=_to_scalar(gemm1_beta, expert_idx),
+            clamp_limit=_to_scalar(gemm1_clamp_limit, expert_idx),
+            scale_gate=_to_scalar(output1_scale_gate_scalar, expert_idx),
+            scale_up=_to_scalar(output1_scale_scalar, expert_idx),
+        )
 
-            # GEMM2: down projection
-            g2 = F.linear(activated, w2[local_idx])  # [sel, hidden_dim]
-            if gemm2_bias is not None:
-                g2 = g2 + gemm2_bias[local_idx]
-            g2 = g2 * output2_scale_scalar
+        # GEMM2 via Metal kernel
+        g2 = compiler.run_moe_gemm2_fp4(
+            input=activated,
+            w_blocks=gemm2_weights[local_idx],
+            w_scales=gemm2_weights_scale[local_idx],
+            bias=gemm2_bias[local_idx] if gemm2_bias is not None else None,
+            out_dim=hidden_dim,
+            scale=_to_scalar(output2_scale_scalar, expert_idx),
+        )
 
-            # Weighted contribution
-            output[mask] += g2 * weights[mask].unsqueeze(-1)
+        # Weighted scatter-add back (PyTorch — small relative to GEMM cost)
+        output_f32.index_add_(
+            0, token_ids, (g2 * expert_w.unsqueeze(-1)).float(),
+        )
+
+    output = output_f32.to(dtype)
 
     if routed_scaling_factor is not None:
         output = output * routed_scaling_factor
