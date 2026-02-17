@@ -1,5 +1,5 @@
 [package]
-name = "ingim/es-init"
+name = "es-init"
 version = "0.1.0"
 description = "Initialize an Evolution Strategies adapter"
 authors = ["In Gim <in.gim@yale.edu>"]

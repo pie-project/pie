@@ -136,6 +136,8 @@ pub struct TokenStream<'a> {
     done: bool,
     max_tokens: Option<usize>,
     tokens_generated: usize,
+    adapter: Option<&'a crate::adapter::Adapter>,
+    zo_seed: Option<i64>,
 }
 
 impl<'a> TokenStream<'a> {
@@ -156,6 +158,8 @@ impl<'a> TokenStream<'a> {
             done: false,
             max_tokens: None,
             tokens_generated: 0,
+            adapter: None,
+            zo_seed: None,
         }
     }
 
@@ -174,6 +178,18 @@ impl<'a> TokenStream<'a> {
     /// Sets the maximum number of tokens to generate.
     pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Sets an adapter to apply on every forward pass.
+    pub fn with_adapter(mut self, adapter: &'a crate::adapter::Adapter) -> Self {
+        self.adapter = Some(adapter);
+        self
+    }
+
+    /// Sets a zo (Evolution Strategies) seed on every forward pass.
+    pub fn with_zo_seed(mut self, seed: i64) -> Self {
+        self.zo_seed = Some(seed);
         self
     }
     /// Gets the next batch of generated tokens.
@@ -255,6 +271,13 @@ impl<'a> TokenStream<'a> {
         
         let pass = ForwardPass::new(&self.model);
         pass.context(self.ctx);
+
+        if let Some(adapter) = self.adapter {
+            pass.adapter(adapter);
+        }
+        if let Some(seed) = self.zo_seed {
+            crate::pie::zo::zo::adapter_seed(&pass, seed);
+        }
         
         let positions: Vec<u32> = (seq_len..seq_len + buffered.len() as u32).collect();
         pass.input_tokens(&buffered, &positions);
