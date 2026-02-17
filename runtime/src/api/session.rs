@@ -4,7 +4,7 @@ use crate::api::pie;
 use crate::api::types::FutureString;
 use crate::linker::InstanceState;
 use crate::messaging;
-use crate::process;
+use crate::process::{self, ProcessEvent};
 use crate::server;
 use anyhow::Result;
 use tokio::sync::oneshot;
@@ -15,7 +15,7 @@ impl pie::core::session::Host for InstanceState {
     async fn send(&mut self, message: String) -> Result<()> {
         let inst_id = self.id();
         if let Ok(Some(client_id)) = process::get_client_id(inst_id).await {
-            server::send_event(client_id, inst_id, "message", message).ok();
+            server::send_event(client_id, inst_id, &ProcessEvent::Message(message)).ok();
         }
         Ok(())
     }

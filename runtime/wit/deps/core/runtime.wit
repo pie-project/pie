@@ -1,6 +1,6 @@
 interface runtime {
 
-    use types.{error, future-string};
+    use types.{error, future-string-result};
 
     // Returns the runtime version string
     version: func() -> string;
@@ -16,6 +16,6 @@ interface runtime {
 
     // Spawns a new inferlet with the given package name and arguments
     // Returns the result of the spawned inferlet
-    spawn: func(package-name: string, args: list<string>) -> result<future-string, error>;
+    spawn: func(package-name: string, args: list<string>) -> result<future-string-result, error>;
 
 }

@@ -1,7 +1,7 @@
 //! pie:core/runtime - Runtime information and control functions
 
 use crate::api::pie;
-use crate::api::types::FutureString;
+use crate::api::types::FutureStringResult;
 use crate::linker::InstanceState;
 use crate::model;
 use crate::process;
@@ -32,7 +32,7 @@ impl pie::core::runtime::Host for InstanceState {
         &mut self,
         package_name: String,
         args: Vec<String>,
-    ) -> Result<Result<Resource<FutureString>, String>> {
+    ) -> Result<Result<Resource<FutureStringResult>, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         match process::spawn(
             self.get_username(),
@@ -44,8 +44,8 @@ impl pie::core::runtime::Host for InstanceState {
             Some(tx),
         ) {
             Ok(_process_id) => {
-                let future_string = FutureString::new(rx);
-                Ok(Ok(self.ctx().table.push(future_string)?))
+                let future = FutureStringResult::new(rx);
+                Ok(Ok(self.ctx().table.push(future)?))
             }
             Err(e) => Ok(Err(e.to_string())),
         }

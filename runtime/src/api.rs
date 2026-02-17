@@ -21,6 +21,7 @@ wasmtime::component::bindgen!({
         // pie:core/types
         "pie:core/types/future-bool": types::FutureBool,
         "pie:core/types/future-string": types::FutureString,
+        "pie:core/types/future-string-result": types::FutureStringResult,
         "pie:core/types/future-blob": types::FutureBlob,
         // pie:core/context
         "pie:core/context/context": context::Context,
