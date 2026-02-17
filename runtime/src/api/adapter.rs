@@ -51,11 +51,11 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         Ok(())
     }
 
-    async fn lookup(&mut self, model: Resource<Model>, name: String) -> Result<Option<Resource<Adapter>>> {
+    async fn open(&mut self, model: Resource<Model>, name: String) -> Result<Option<Resource<Adapter>>> {
         let model = self.ctx().table.get(&model)?;
         let model_idx = model.model_id;
 
-        match adapter::get(model_idx, name).await {
+        match adapter::open(model_idx, name).await {
             Some(adapter_id) => {
                 let adapter = Adapter {
                     adapter_id,
@@ -68,12 +68,12 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         }
     }
 
-    async fn clone(&mut self, this: Resource<Adapter>, name: String) -> Result<Resource<Adapter>> {
+    async fn fork(&mut self, this: Resource<Adapter>, name: String) -> Result<Resource<Adapter>> {
         let adapter = self.ctx().table.get(&this)?;
         let adapter_id = adapter.adapter_id;
         let model_idx = adapter.model_idx;
 
-        match adapter::clone_adapter(model_idx, adapter_id, name).await {
+        match adapter::fork(model_idx, adapter_id, name).await {
             Some(new_adapter_id) => {
                 let new_adapter = Adapter {
                     adapter_id: new_adapter_id,
@@ -82,7 +82,7 @@ impl pie::core::adapter::HostAdapter for InstanceState {
                 };
                 Ok(self.ctx().table.push(new_adapter)?)
             }
-            None => anyhow::bail!("Failed to clone adapter"),
+            None => anyhow::bail!("Failed to fork adapter"),
         }
     }
 

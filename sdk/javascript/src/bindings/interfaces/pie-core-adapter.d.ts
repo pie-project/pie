@@ -11,8 +11,8 @@ export class Adapter {
   private constructor();
   static create(model: Model, name: string): Adapter;
   destroy(): void;
-  static lookup(model: Model, name: string): Adapter | undefined;
-  clone(name: string): Adapter;
+  static open(model: Model, name: string): Adapter | undefined;
+  fork(name: string): Adapter;
   acquireLock(): FutureBool;
   releaseLock(): void;
   load(path: string): void;
