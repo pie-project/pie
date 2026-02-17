@@ -71,6 +71,37 @@ impl Pollable for FutureString {
     }
 }
 
+/// Future for string result (e.g., spawn results that may fail)
+#[derive(Debug)]
+pub struct FutureStringResult {
+    receiver: oneshot::Receiver<Result<String, String>>,
+    result: Option<Result<String, String>>,
+    done: bool,
+}
+
+impl FutureStringResult {
+    pub fn new(receiver: oneshot::Receiver<Result<String, String>>) -> Self {
+        Self {
+            receiver,
+            result: None,
+            done: false,
+        }
+    }
+}
+
+#[async_trait]
+impl Pollable for FutureStringResult {
+    async fn ready(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Ok(res) = (&mut self.receiver).await {
+            self.result = Some(res);
+        }
+        self.done = true;
+    }
+}
+
 /// Future for blob (byte vector) results (e.g., file transfers)
 #[derive(Debug)]
 pub struct FutureBlob {
@@ -139,6 +170,26 @@ impl pie::core::types::HostFutureString for InstanceState {
     }
 
     async fn drop(&mut self, this: Resource<FutureString>) -> Result<()> {
+        self.ctx().table.delete(this)?;
+        Ok(())
+    }
+}
+
+impl pie::core::types::HostFutureStringResult for InstanceState {
+    async fn pollable(&mut self, this: Resource<FutureStringResult>) -> Result<Resource<DynPollable>> {
+        subscribe(self.ctx().table, this)
+    }
+
+    async fn get(&mut self, this: Resource<FutureStringResult>) -> Result<Option<Result<String, String>>> {
+        let result = self.ctx().table.get(&this)?;
+        if result.done {
+            Ok(result.result.clone())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn drop(&mut self, this: Resource<FutureStringResult>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
     }

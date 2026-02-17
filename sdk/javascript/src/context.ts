@@ -309,19 +309,26 @@ export class TokenStream implements AsyncIterable<Uint32Array> {
 
     // Process output
     if (output.tag === 'tokens') {
-      const tokens = output.val;
-      this._generated += tokens.length;
+      let tokens = output.val;
 
-      // Check for stop tokens
-      for (const t of tokens) {
-        if (this._stopTokens.has(t)) {
+      // Truncate at the first stop token (exclude it)
+      for (let i = 0; i < tokens.length; i++) {
+        if (this._stopTokens.has(tokens[i])) {
+          tokens = tokens.subarray(0, i);
           this._done = true;
-          return tokens;
+          break;
         }
       }
 
-      // Set as input for next step
-      ctxHandle.setBufferedTokens(tokens);
+      if (tokens.length === 0) {
+        this._done = true;
+        return undefined;
+      }
+
+      this._generated += tokens.length;
+
+      // Seed the next step with only the LAST generated token
+      ctxHandle.setBufferedTokens(new Uint32Array([tokens[tokens.length - 1]]));
       return tokens;
     }
 

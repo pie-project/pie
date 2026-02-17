@@ -1,11 +1,10 @@
-use futures::future::join_all;
-use inferlet::stop_condition::{StopCondition, ends_with_any, max_len};
-use inferlet::{self, Adapter, Args, Result, Sampler, bail, store_delete, store_get, store_set};
+use inferlet::prelude::*;
+use inferlet::{adapter::Adapter, parse_args, runtime, ContextExt, InstructExt, Result};
+use inferlet::inference::Sampler;
 use serde::Deserialize;
-use std::future::Future;
-use std::pin::Pin;
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct Rollout {
     uid: String,
     task: String,
@@ -13,65 +12,44 @@ struct Rollout {
 }
 
 #[inferlet::main]
-async fn main(mut args: Args) -> Result<String> {
-    // Parse required arguments.
-    let name: String = args.value_from_str("--name")?;
-    let system_prompt: String = args.value_from_str("--system-prompt")?;
-    let max_num_outputs: usize = args.value_from_str("--max-num-outputs")?;
+async fn main(args: Vec<String>) -> Result<String> {
+    let mut args = parse_args(args);
+    let name: String = args.value_from_str("--name").map_err(|e| e.to_string())?;
+    let system_prompt: String = args.value_from_str("--system-prompt").map_err(|e| e.to_string())?;
+    let max_num_outputs: usize = args.value_from_str("--max-num-outputs").map_err(|e| e.to_string())?;
+    let rollouts_str: String = args.value_from_str("--rollouts").map_err(|e| e.to_string())?;
+    let rollouts: Vec<Rollout> = serde_json::from_str(&rollouts_str)
+        .map_err(|e| e.to_string())?;
 
-    // Parse the tasks from a JSON string.
-    let rollouts_str: String = args.value_from_str("--rollouts")?;
-    let rollouts: Vec<Rollout> = serde_json::from_str(&rollouts_str)?;
+    // Load model and adapter.
+    let model_name = runtime::models().into_iter().next()
+        .ok_or_else(|| "No models available".to_string())?;
+    let model = Model::load(&model_name)?;
+    let adapter = Adapter::lookup(&model, &name)
+        .ok_or_else(|| format!("Adapter '{}' not found", name))?;
 
-    // The futures vector for a single-threaded (Wasm) environment does not need the `Send` bound.
-    let mut futures: Vec<Pin<Box<dyn Future<Output = String>>>> = vec![];
+    let sampler = Sampler::TopP((0.6, 0.95));
 
-    // import the main adapter
-    let model = inferlet::get_auto_model();
-    let queue = model.create_queue();
+    // Run rollouts and collect results.
+    // Each rollout creates a context, fills chat template, and generates.
+    let mut results: Vec<String> = Vec::with_capacity(rollouts.len());
 
-    let es_adapter = queue.import_adapter(&name);
+    for rollout in &rollouts {
+        let ctx = <Context as ContextExt>::new(&model)?;
+        ctx.system(&system_prompt);
+        ctx.user(&rollout.task);
+        ctx.cue();
 
-    let stop_cond = max_len(max_num_outputs).or(ends_with_any(model.eos_tokens()));
+        let tokens = ctx.generate(sampler.clone())
+            .with_adapter(&adapter)
+            .with_zo_seed(rollout.seed)
+            .with_max_tokens(max_num_outputs)
+            .collect_tokens()
+            .await?;
 
-    // println!("🚀 Starting parallel rollout...");
-    for rollout in rollouts {
-        let stop_cond_ = stop_cond.clone();
-        let sampler = Sampler::top_p(0.6, 0.95);
-
-        let mut ctx = model.create_context();
-        ctx.set_adapter(es_adapter);
-        ctx.set_adapter_random_seed(rollout.seed);
-        ctx.fill_system(&system_prompt);
-        ctx.fill_user(&rollout.task);
-
-        let generation_future = async move {
-            let mut generated_token_ids = Vec::new();
-
-            loop {
-                let next_token_id = ctx.decode_step(&sampler).await;
-                ctx.fill_token(next_token_id);
-                generated_token_ids.push(next_token_id);
-                if stop_cond_.check(&generated_token_ids) {
-                    break;
-                }
-
-            }
-
-            // clear up the cache
-            // store_delete(&rollout.uid);
-
-            ctx.tokenizer.detokenize(&generated_token_ids)
-        };
-
-        futures.push(Box::pin(generation_future));
+        let text = model.tokenizer().decode(&tokens)?;
+        results.push(text);
     }
 
-    // println!("⏳ Waiting for {} tasks to complete...", futures.len());
-    let results: Vec<String> = join_all(futures).await;
-
-    // Serialize the collected text outputs into a JSON string array.
-    let response_json = serde_json::to_string(&results)?;
-
-    Ok(response_json)   
+    serde_json::to_string(&results).map_err(|e| e.to_string())
 }

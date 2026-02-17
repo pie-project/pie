@@ -1,5 +1,5 @@
 [package]
-name = "ingim/es-update"
+name = "es-update"
 version = "0.1.0"
 description = "Update an Evolution Strategies adapter"
 authors = ["In Gim <in.gim@yale.edu>"]

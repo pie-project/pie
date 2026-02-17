@@ -1,0 +1,5 @@
+[project]
+name = "python-example"
+version = "0.1.0"
+description = "Simple text completion example in Python"
+requires-python = ">=3.10"

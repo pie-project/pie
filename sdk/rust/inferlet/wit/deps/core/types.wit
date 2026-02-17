@@ -21,6 +21,12 @@ interface types {
         get: func() -> option<string>;
     }
 
+    // Result of an async operation that may fail
+    resource future-string-result {
+        pollable: func() -> pollable;
+        get: func() -> option<result<string, error>>;
+    }
+
     resource future-blob {
         pollable: func() -> pollable;
         get: func() -> option<blob>;

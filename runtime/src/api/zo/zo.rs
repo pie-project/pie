@@ -11,8 +11,8 @@ use wasmtime_wasi::WasiView;
 
 impl pie::zo::zo::Host for InstanceState {
     async fn adapter_seed(&mut self, pass: Resource<ForwardPass>, seed: i64) -> Result<()> {
-        // TODO: Add `seed: Option<i64>` field to ForwardPass and plumb through inference
-        let _ = (pass, seed);
+        let pass = self.ctx().table.get_mut(&pass)?;
+        pass.adapter_seed = Some(seed);
         Ok(())
     }
 

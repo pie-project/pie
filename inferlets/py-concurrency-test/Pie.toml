@@ -1,0 +1,9 @@
+[package]
+name = "py-concurrency-test"
+version = "0.1.0"
+description = "Concurrency test for Python inferlet"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"

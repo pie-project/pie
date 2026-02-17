@@ -1,0 +1,16 @@
+[package]
+name = "js-example"
+version = "0.1.0"
+description = "Simple text completion example in JavaScript"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", description = "The user message to complete"}
+system = {type = "string", optional = true, description = "System prompt to set assistant behavior"}
+max_tokens = {type = "int", optional = true, description = "Maximum number of tokens to generate (default: 256)"}
+temperature = {type = "float", optional = true, description = "Sampling temperature (default: 0.6)"}
+top_p = {type = "float", optional = true, description = "Top-p nucleus sampling threshold (default: 0.95)"}

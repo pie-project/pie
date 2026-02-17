@@ -321,7 +321,7 @@ impl Session {
             _ => {}
         }
 
-        process::terminate(process_id, Some("Signal".to_string()));
+        process::terminate(process_id, Err("Signal".to_string()));
         self.send_response(corr_id, true, "Process terminated".to_string())
             .await;
     }
