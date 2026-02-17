@@ -64,6 +64,7 @@ def serve(
     async def _run():
         server = Server(cfg)
         async with server:
+            console.print(f"[bold green]✓[/bold green] Server ready at {server.url}")
             if monitor:
                 from pie_cli.monitor.app import LLMMonitorApp
                 from pie_cli.monitor.provider import PieMetricsProvider

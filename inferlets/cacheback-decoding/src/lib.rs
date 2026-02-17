@@ -36,7 +36,7 @@ struct GreedyDrafter {
 
 impl GreedyDrafter {
     fn new(_model: &Model, source_ctx: &Context, draft_length: usize) -> Result<Self> {
-        let draft_ctx = source_ctx.fork("drafter")?;
+        let draft_ctx = source_ctx.fork()?;
         let page_size = draft_ctx.tokens_per_page();
         Ok(Self {
             model: Model::load(&runtime::models()[0])?,
@@ -156,7 +156,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let model = Model::load(models.first().ok_or("No models available")?)?;
     let _tokenizer = model.tokenizer();
 
-    let ctx = Context::create(&model, "cacheback", None)?;
+    let ctx = Context::create(&model)?;
 
     ctx.system("You are a helpful assistant.");
     ctx.user(&prompt);

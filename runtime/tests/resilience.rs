@@ -69,7 +69,7 @@ fn device_timeout_returns_none() {
     let s = state();
     s.rt.block_on(async {
         // Reserve a page
-        let ctx_id = pie::context::create(MODEL, USER.to_string(), "timeout-ctx".into(), None)
+        let ctx_id = pie::context::create(MODEL)
             .await
             .unwrap();
         let lock = pie::context::acquire_lock(MODEL, ctx_id);

@@ -25,9 +25,22 @@ use crate::device::DeviceId;
 use anyhow::Result;
 use request::{ForwardPassOutput, ForwardPassRequest};
 use scheduler::BatchScheduler;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 
 // Re-export public types
 pub use request::{ForwardPassOutput as Output, Sampler};
+pub use scheduler::SchedulerStats;
+
+/// Aggregated inference stats for a single model (across all devices).
+#[derive(Debug, Default, serde::Serialize)]
+pub struct InferenceStats {
+    pub total_batches: u64,
+    pub total_tokens_processed: u64,
+    pub last_batch_latency_us: u64,
+    pub avg_batch_latency_us: u64,
+    pub in_flight_batches: u64,
+}
 
 // =============================================================================
 // Public API
@@ -71,6 +84,13 @@ pub async fn forward_pass(model_idx: usize, request: ForwardPassRequest) -> Resu
     Ok(rx.await?)
 }
 
+/// Returns aggregated inference stats for a model (lock-free, non-blocking).
+pub async fn get_stats(model_idx: usize) -> InferenceStats {
+    let (tx, rx) = oneshot::channel();
+    let _ = SERVICES.send(model_idx, Message::GetStats { response: tx });
+    rx.await.unwrap_or_default()
+}
+
 // =============================================================================
 // Inference Service
 // =============================================================================
@@ -83,6 +103,7 @@ struct InferenceService {
     model_idx: usize,
     num_devices: usize,
     schedulers: Vec<BatchScheduler>,
+    scheduler_stats: Vec<Arc<SchedulerStats>>,
 }
 
 impl std::fmt::Debug for InferenceService {
@@ -103,7 +124,7 @@ impl InferenceService {
         min_batch_for_optimization: usize,
     ) -> Self {
         let num_devices = device_ids.len();
-        let schedulers = device_ids.iter().enumerate().map(|(device_idx, &device_id)| {
+        let schedulers: Vec<BatchScheduler> = device_ids.iter().enumerate().map(|(device_idx, &device_id)| {
             let (max_batch_size, max_batch_tokens) = device_batch_limits[device_idx];
             BatchScheduler::new(
                 device_id,
@@ -117,10 +138,44 @@ impl InferenceService {
             )
         }).collect();
 
+        let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
+
         InferenceService {
             model_idx,
             num_devices,
             schedulers,
+            scheduler_stats,
+        }
+    }
+
+    /// Aggregate stats from all per-device schedulers.
+    fn aggregate_stats(&self) -> InferenceStats {
+        let mut total_batches = 0u64;
+        let mut total_tokens = 0u64;
+        let mut last_latency = 0u64;
+        let mut cumulative_latency = 0u64;
+        let mut in_flight = 0u64;
+
+        for s in &self.scheduler_stats {
+            total_batches += s.total_batches.load(Relaxed);
+            total_tokens += s.total_tokens_processed.load(Relaxed);
+            last_latency = last_latency.max(s.last_batch_latency_us.load(Relaxed));
+            cumulative_latency += s.cumulative_latency_us.load(Relaxed);
+            in_flight += s.in_flight_batches.load(Relaxed);
+        }
+
+        let avg_latency = if total_batches > 0 {
+            cumulative_latency / total_batches
+        } else {
+            0
+        };
+
+        InferenceStats {
+            total_batches,
+            total_tokens_processed: total_tokens,
+            last_batch_latency_us: last_latency,
+            avg_batch_latency_us: avg_latency,
+            in_flight_batches: in_flight,
         }
     }
 
@@ -177,6 +232,7 @@ impl InferenceService {
 #[derive(Debug)]
 enum Message {
     ForwardPass { request: ForwardPassRequest, response: oneshot::Sender<ForwardPassOutput> },
+    GetStats { response: oneshot::Sender<InferenceStats> },
 }
 
 
@@ -189,6 +245,9 @@ impl ServiceHandler for InferenceService {
                 if let Err(e) = self.forward_pass(request, response).await {
                     tracing::error!("Failed to queue forward pass: {}", e);
                 }
+            }
+            Message::GetStats { response } => {
+                let _ = response.send(self.aggregate_stats());
             }
         }
     }

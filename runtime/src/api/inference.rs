@@ -39,6 +39,7 @@ pub struct ForwardPass {
     output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     output_speculative_tokens: bool,
     adapter: Option<u32>,
+    pub adapter_seed: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -152,6 +153,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             output_token_samplers: vec![],
             output_speculative_tokens: true, // enabled by default
             adapter: None,
+            adapter_seed: None,
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -298,6 +300,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let sampling_indices = take(&mut pass.output_token_indices);
         let sampler_maps = take(&mut pass.output_token_samplers);
         let adapter_id = pass.adapter.map(|id| id as u64);
+        let adapter_seed = pass.adapter_seed;
 
         // Convert sampler maps to request::Sampler enums
         let samplers: Vec<inference::Sampler> = sampler_maps.iter()
@@ -322,7 +325,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             sampling_indices,
             samplers,
             adapter_id,
-            adapter_seed: None,
+            adapter_seed,
             arrival_time: Some(Instant::now()),
         };
 

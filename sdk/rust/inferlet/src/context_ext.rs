@@ -12,8 +12,7 @@ use crate::ForwardPassExt;
 use crate::Result;
 use wstd::io::AsyncPollable;
 
-/// Simple counter for generating unique context names.
-static CONTEXT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 
 // =============================================================================
 // Speculation Types
@@ -136,6 +135,8 @@ pub struct TokenStream<'a> {
     done: bool,
     max_tokens: Option<usize>,
     tokens_generated: usize,
+    adapter: Option<&'a crate::adapter::Adapter>,
+    zo_seed: Option<i64>,
 }
 
 impl<'a> TokenStream<'a> {
@@ -156,6 +157,8 @@ impl<'a> TokenStream<'a> {
             done: false,
             max_tokens: None,
             tokens_generated: 0,
+            adapter: None,
+            zo_seed: None,
         }
     }
 
@@ -174,6 +177,18 @@ impl<'a> TokenStream<'a> {
     /// Sets the maximum number of tokens to generate.
     pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Sets an adapter to apply on every forward pass.
+    pub fn with_adapter(mut self, adapter: &'a crate::adapter::Adapter) -> Self {
+        self.adapter = Some(adapter);
+        self
+    }
+
+    /// Sets a zo (Evolution Strategies) seed on every forward pass.
+    pub fn with_zo_seed(mut self, seed: i64) -> Self {
+        self.zo_seed = Some(seed);
         self
     }
     /// Gets the next batch of generated tokens.
@@ -255,6 +270,13 @@ impl<'a> TokenStream<'a> {
         
         let pass = ForwardPass::new(&self.model);
         pass.context(self.ctx);
+
+        if let Some(adapter) = self.adapter {
+            pass.adapter(adapter);
+        }
+        if let Some(seed) = self.zo_seed {
+            crate::pie::zo::zo::adapter_seed(&pass, seed);
+        }
         
         let positions: Vec<u32> = (seq_len..seq_len + buffered.len() as u32).collect();
         pass.input_tokens(&buffered, &positions);
@@ -386,18 +408,10 @@ impl<'a> EventStream<'a> {
 pub trait ContextExt {
     // --- Creation ---
     
-    /// Creates a new context with an auto-generated globally unique name.
+    /// Creates a new context.
     fn new(model: &Model) -> Result<Context> {
-        // Combine counter with address-based entropy for global uniqueness
-        let counter = CONTEXT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Use stack address as additional entropy source
-        let stack_addr = &counter as *const _ as u64;
-        // Simple mixing function
-        let mixed = counter.wrapping_mul(0x517cc1b727220a95) ^ stack_addr;
-        let name = format!("ctx-{:016x}", mixed);
-        Context::create(model, &name, None)
-    }
-    
+        Context::create(model)
+    }    
     // --- Async Operations ---
     
     /// Acquires a lock on the context asynchronously.

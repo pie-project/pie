@@ -69,7 +69,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
 
-    let ctx = Context::create(&model, "attn-sink", None)?;
+    let ctx = Context::create(&model)?;
     let page_size = ctx.tokens_per_page();
     let stop_tokens = Context::stop_tokens(&model);
 

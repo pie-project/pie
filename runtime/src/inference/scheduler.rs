@@ -6,6 +6,7 @@
 //! scheduling decisions.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -71,6 +72,20 @@ pub(super) struct BatchStats {
     pub batch_size: usize,
     pub total_tokens: usize,
     pub latency: Duration,
+}
+
+// =============================================================================
+// SchedulerStats (lock-free snapshot for monitoring)
+// =============================================================================
+
+/// Cumulative stats exposed for monitoring. Updated atomically after each batch.
+#[derive(Debug, Default)]
+pub struct SchedulerStats {
+    pub total_batches: AtomicU64,
+    pub total_tokens_processed: AtomicU64,
+    pub last_batch_latency_us: AtomicU64,
+    pub cumulative_latency_us: AtomicU64,
+    pub in_flight_batches: AtomicU64,
 }
 
 // =============================================================================
@@ -148,6 +163,7 @@ impl BatchAccumulator {
 /// runs the batch accumulation and firing loop.
 pub(crate) struct BatchScheduler {
     tx: mpsc::UnboundedSender<PendingRequest>,
+    stats: Arc<SchedulerStats>,
 }
 
 impl BatchScheduler {
@@ -166,13 +182,20 @@ impl BatchScheduler {
         min_batch_for_optimization: usize,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let stats = Arc::new(SchedulerStats::default());
         tokio::spawn(Self::run(
             device_id, device_idx, rx,
             max_batch_size, max_batch_tokens,
             max_in_flight_batches, request_timeout_secs, max_wait_ms, min_batch_for_optimization,
+            stats.clone(),
         ));
 
-        Self { tx }
+        Self { tx, stats }
+    }
+
+    /// Get a handle to the cumulative scheduler stats (lock-free).
+    pub fn stats(&self) -> &Arc<SchedulerStats> {
+        &self.stats
     }
 
     /// Submit a pre-translated forward pass request.
@@ -207,6 +230,7 @@ impl BatchScheduler {
         request_timeout_secs: u64,
         max_wait_ms: u64,
         min_batch_for_optimization: usize,
+        stats: Arc<SchedulerStats>,
     ) {
         let max_wait_time = Duration::from_millis(max_wait_ms);
         let request_timeout = Duration::from_secs(request_timeout_secs);
@@ -268,8 +292,10 @@ impl BatchScheduler {
 
                     // Spawn batch execution
                     let stats_tx_clone = stats_tx.clone();
+                    let stats_clone = stats.clone();
                     let timeout = request_timeout;
 
+                    stats_clone.in_flight_batches.fetch_add(1, Relaxed);
                     tokio::spawn(async move {
                         let start = Instant::now();
                         Self::execute_batch(
@@ -280,6 +306,14 @@ impl BatchScheduler {
                         )
                         .await;
                         let latency = start.elapsed();
+
+                        // Update cumulative atomic counters
+                        stats_clone.total_batches.fetch_add(1, Relaxed);
+                        stats_clone.total_tokens_processed.fetch_add(total_tokens as u64, Relaxed);
+                        stats_clone.last_batch_latency_us.store(latency.as_micros() as u64, Relaxed);
+                        stats_clone.cumulative_latency_us.fetch_add(latency.as_micros() as u64, Relaxed);
+                        stats_clone.in_flight_batches.fetch_sub(1, Relaxed);
+
                         stats_tx_clone
                             .send(BatchStats {
                                 batch_size,

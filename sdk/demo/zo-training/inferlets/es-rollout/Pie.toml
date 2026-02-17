@@ -1,5 +1,5 @@
 [package]
-name = "ingim/es-rollout"
+name = "es-rollout"
 version = "0.1.0"
 description = "Perform parallel rollouts for evaluation"
 authors = ["In Gim <in.gim@yale.edu>"]

@@ -260,7 +260,7 @@ fn spawn_after_termination() {
         )
         .expect("spawn for termination");
 
-        process::terminate(pid1, Some("test termination".into()));
+        process::terminate(pid1, Err("test termination".into()));
 
         let completed = tokio::time::timeout(PROCESS_TIMEOUT, async {
             loop {

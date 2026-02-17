@@ -47,7 +47,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let tokenizer = model.tokenizer();
     let stop_tokens = Context::stop_tokens(&model);
 
-    let ctx = Context::create(&model, "jacobi", None)?;
+    let ctx = Context::create(&model)?;
     let page_size = ctx.tokens_per_page();
 
     ctx.system("You are a helpful assistant.");

@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 pub const CHUNK_SIZE_BYTES: usize = 256 * 1024; // 256 KiB
 pub const QUERY_MODEL_STATUS: &str = "model_status";
-pub const QUERY_BACKEND_STATS: &str = "backend_stats";
 
 /// Messages from client -> server
 #[derive(Debug, Serialize, Deserialize)]

@@ -207,8 +207,11 @@ def generate_py_wrapper(
 # This wrapper provides the WIT interface for the inferlet
 # Package: {package_name}
 
+import asyncio
+
 # Import WIT bindings for the run export
 from wit_world import exports
+from wit_world.imports.poll import poll as _wasi_poll
 
 # Import inferlet at top level so componentize-py bundles it
 import inferlet as _inferlet
@@ -216,19 +219,122 @@ import inferlet as _inferlet
 # Import user module at top level so componentize-py bundles it
 import {module_name} as _user_module
 
+
+# Minimal PollLoop — custom asyncio event loop backed by wasi:io/poll.
+class _PollLoop(asyncio.AbstractEventLoop):
+    def __init__(self):
+        self.wakers = []
+        self.running = False
+        self.handles = []
+        self.exception = None
+
+    def get_debug(self):
+        return False
+
+    def run_until_complete(self, future):
+        future = asyncio.ensure_future(future, loop=self)
+        self.running = True
+        asyncio.events._set_running_loop(self)
+        while self.running and not future.done():
+            handles = self.handles
+            self.handles = []
+            for handle in handles:
+                if not handle._cancelled:
+                    handle._run()
+            if self.wakers:
+                [pollables, wakers] = list(map(list, zip(*self.wakers)))
+                new_wakers = []
+                ready = [False] * len(pollables)
+                for index in _wasi_poll(pollables):
+                    ready[index] = True
+                for (r, p), w in zip(zip(ready, pollables), wakers):
+                    if r:
+                        p.__exit__(None, None, None)
+                        w.set_result(None)
+                    else:
+                        new_wakers.append((p, w))
+                self.wakers = new_wakers
+            if self.exception is not None:
+                raise self.exception
+        return future.result()
+
+    def is_running(self):
+        return self.running
+
+    def is_closed(self):
+        return not self.running
+
+    def stop(self):
+        self.running = False
+
+    def close(self):
+        self.running = False
+
+    def shutdown_asyncgens(self):
+        pass
+
+    def call_exception_handler(self, context):
+        self.exception = context.get("exception", None)
+
+    def call_soon(self, callback, *args, context=None):
+        handle = asyncio.Handle(callback, args, self, context)
+        self.handles.append(handle)
+        return handle
+
+    def create_task(self, coroutine):
+        return asyncio.Task(coroutine, loop=self)
+
+    def create_future(self):
+        return asyncio.Future(loop=self)
+
+    def run_forever(self):
+        raise NotImplementedError
+
+    async def shutdown_default_executor(self):
+        raise NotImplementedError
+
+    def _timer_handle_cancelled(self, handle):
+        raise NotImplementedError
+
+    def call_later(self, delay, callback, *args, context=None):
+        raise NotImplementedError
+
+    def call_at(self, when, callback, *args, context=None):
+        raise NotImplementedError
+
+    def time(self):
+        raise NotImplementedError
+
+    def call_soon_threadsafe(self, callback, *args, context=None):
+        raise NotImplementedError
+
+    def run_in_executor(self, executor, func, *args):
+        raise NotImplementedError
+
+    def set_default_executor(self, executor):
+        raise NotImplementedError
+
+
 class Run(exports.Run):
-    def run(self, args: list[str]) -> exports.Result[str, str]:
-        # Call the user's main function if it exists
+    def run(self, args: list[str]) -> str:
+        # Install PollLoop as the asyncio event loop (drives wasi:io/poll)
+        loop = _PollLoop()
+        asyncio.set_event_loop(loop)
+
+        # Call the user's main function, passing args
         if hasattr(_user_module, 'main'):
-            _user_module.main()
+            result = _user_module.main(args)
+            # Support both sync and async main()
+            if asyncio.iscoroutine(result):
+                result = loop.run_until_complete(result)
+            # Use the return value from main() if it returned a string
+            if isinstance(result, str):
+                return result
         else:
             # Module execution happens at import time for scripts without main()
             pass
-        # Signal completion if user code didn't call set_return()
-        if _inferlet.get_return_value() is None:
-            _inferlet.set_return("")
         
-        return exports.Ok(_inferlet.get_return_value())
+        return _inferlet.get_return_value() or ""
 """
 
     output_path.write_text(wrapper_content)
@@ -788,10 +894,6 @@ for (const node of ast.body) {
             console.error("FORBIDDEN:run");
             process.exit(1);
         }
-        if (name === "main") {
-            console.error("FORBIDDEN:main");
-            process.exit(1);
-        }
     }
 }
 console.log("OK");
@@ -827,11 +929,7 @@ console.log("OK");
                     "To fix: Remove the 'export const run = { ... }' block from your code.\n"
                     "The WIT interface is now automatically created by bakery build."
                 )
-            elif stderr.startswith("FORBIDDEN:main"):
-                raise RuntimeError(
-                    "User code must not export 'main' - use top-level code instead.\n\n"
-                    "To fix: Move your code from inside main() to the top level."
-                )
+
             else:
                 raise RuntimeError(f"Validation failed: {stderr}")
     finally:
@@ -871,10 +969,16 @@ if (typeof globalThis.Intl === 'undefined') {
     wrapper_content = f"""// Auto-generated by bakery build
 // This wrapper provides the WIT interface for the inferlet
 {intl_polyfill}
+// Import user's main function
+import {{ main as userMain }} from './{user_bundle_name}';
+
 // WIT interface export (inferlet:core/run)
 export const run = {{
   async run(args) {{
-    await import('./{user_bundle_name}');
+    if (typeof userMain === 'function') {{
+      const result = await userMain(args);
+      return typeof result === 'string' ? result : '';
+    }}
     return '';
   }},
 }};

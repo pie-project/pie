@@ -9,7 +9,6 @@ use inferlet::{
     context::Context, inference::Sampler, model::Model,
     runtime, ContextExt, InstructExt, Result,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 const HELP: &str = "\
@@ -25,11 +24,6 @@ Options:
   -e, --elab-tokens <TOKENS>   Sets the max tokens for each elaboration generation [default: 256]
   -h, --help                   Prints this help message";
 
-static FORK_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn next_fork_name() -> String {
-    format!("fork-{}", FORK_COUNTER.fetch_add(1, Ordering::Relaxed))
-}
 
 /// Generates a high-level plan and elaborates on each point in parallel.
 async fn plan_and_generate_parallel(
@@ -40,7 +34,7 @@ async fn plan_and_generate_parallel(
     elab_max_tokens: usize,
 ) -> Result<Vec<String>> {
     // 1. Fork a context for generating the plan.
-    let plan_ctx = ctx.fork(&next_fork_name())?;
+    let plan_ctx = ctx.fork()?;
     let plan_prompt = format!(
         "Generate up to {} key points that outline the answer to the following question: {}. \
         Each point must be enclosed between the <point> and </point> tags.",
@@ -72,7 +66,7 @@ async fn plan_and_generate_parallel(
     let leaf_futures = points
         .into_iter()
         .map(|point| {
-            let elab_ctx = ctx.fork(&next_fork_name())?;
+            let elab_ctx = ctx.fork()?;
             let complete_prompt = format!(
                 "Elaborate on the following point: {}. \
                 Your response should be complete and only concerned with this point.",

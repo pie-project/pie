@@ -19,12 +19,6 @@ import { awaitFuture } from './_async.js';
 import type { Model } from './model.js';
 import type { Adapter } from './adapter.js';
 
-// ─── Auto-naming ────────────────────────────────────────────────────────
-
-let _nameSeq = 0;
-function _nextName(): string {
-  return `ctx-${String(++_nameSeq).padStart(8, '0')}`;
-}
 
 // ─── Event Types ────────────────────────────────────────────────────────
 
@@ -309,19 +303,26 @@ export class TokenStream implements AsyncIterable<Uint32Array> {
 
     // Process output
     if (output.tag === 'tokens') {
-      const tokens = output.val;
-      this._generated += tokens.length;
+      let tokens = output.val;
 
-      // Check for stop tokens
-      for (const t of tokens) {
-        if (this._stopTokens.has(t)) {
+      // Truncate at the first stop token (exclude it)
+      for (let i = 0; i < tokens.length; i++) {
+        if (this._stopTokens.has(tokens[i])) {
+          tokens = tokens.subarray(0, i);
           this._done = true;
-          return tokens;
+          break;
         }
       }
 
-      // Set as input for next step
-      ctxHandle.setBufferedTokens(tokens);
+      if (tokens.length === 0) {
+        this._done = true;
+        return undefined;
+      }
+
+      this._generated += tokens.length;
+
+      // Seed the next step with only the LAST generated token
+      ctxHandle.setBufferedTokens(new Uint32Array([tokens[tokens.length - 1]]));
       return tokens;
     }
 
@@ -463,20 +464,30 @@ export class Context implements Disposable {
     this._handle = handle;
   }
 
-  /** Create a new context for a model. Name is auto-generated if omitted. */
-  static create(model: Model, name?: string, fill?: Uint32Array): Context {
-    return new Context(_Context.create(model._handle, name ?? _nextName(), fill));
+  /** Create a new anonymous context. Name is NOT needed. */
+  static create(model: Model): Context {
+    return new Context(_Context.create(model._handle));
   }
 
-  /** Look up an existing context by name. */
-  static lookup(model: Model, name: string): Context | undefined {
-    const handle = _Context.lookup(model._handle, name);
+  /** Open a saved (named) context. */
+  static open(model: Model, name: string): Context | undefined {
+    const handle = _Context.open(model._handle, name);
     return handle !== undefined ? new Context(handle) : undefined;
   }
 
-  /** Fork this context into a new one. Name is auto-generated if omitted. */
-  fork(newName?: string): Context {
-    return new Context(this._handle.fork(newName ?? _nextName()));
+  /** Look up an existing context by name. Alias for open(). */
+  static lookup(model: Model, name: string): Context | undefined {
+    return Context.open(model, name);
+  }
+
+  /** Fork this context into a new anonymous one. */
+  fork(): Context {
+    return new Context(this._handle.fork());
+  }
+
+  /** Save this context with a name, making it persistent. */
+  save(name: string): void {
+    this._handle.save(name);
   }
 
   /** Destroy the context and release its KV resources. */

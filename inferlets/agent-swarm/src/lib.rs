@@ -129,7 +129,7 @@ async fn main(args: Vec<String>) -> Result<String> {
         (initial_prompt, String::new())
     };
 
-    let ctx = Context::create(&model, &format!("agent-{}", my_role), None)?;
+    let ctx = Context::create(&model)?;
     ctx.system(config.system_message);
     ctx.user(&format!(
         "{}\nPlease start with \"### {}\"",

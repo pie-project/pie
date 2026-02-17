@@ -1,0 +1,89 @@
+---
+title: Agentic Patterns
+description: A catalog of agentic design patterns implemented with Pie inferlets
+sidebar_position: 5
+---
+
+# Agentic Patterns
+
+Agentic patterns are reusable design strategies for building LLM-powered agents — systems that reason, use tools, coordinate with other agents, and manage their own context. Pie's programmable serving loop makes these patterns *native*: instead of orchestrating around a black-box API, inferlets implement them directly inside the engine with access to the KV cache, token stream, and forward pass.
+
+## Categories
+
+### [Context & Memory](./context-memory)
+Patterns for managing context windows, injecting data on demand, and persisting state across sessions.
+
+> Context-Minimization · Dynamic Context Injection · Curated Code Context · Curated File Context · Episodic Memory · Filesystem-Based State
+
+### [Feedback Loops](./feedback-loops)
+Patterns for iterative refinement, self-evaluation, and learning from outputs.
+
+> Reflection Loop · Graph of Thoughts · Self-Discover · Self-Critique · Rich Feedback Loops
+
+### [Orchestration & Control](./orchestration-control)
+Patterns for coordinating agents, managing execution flow, and scaling reasoning.
+
+> Tree-of-Thought · LATS · Best-of-N · Self-Rewriting Prompt · Posterior Sampling · ReAct · Plan-Then-Execute · Action-Selector · Stop Hook · Parallel Tool Calls · Tool Compartmentalization · Agent-Driven Research · Sub-Agent Spawning · Multi-Agent Debate · Oracle & Worker · Dual LLM · Map-Reduce · Brainstorming · Swarm Migration · Initializer-Maintainer · Multi-Model Pipeline · Discrete Phase Separation · Three-Stage Perception
+
+### [Reliability & Eval](./reliability-eval)
+Patterns for ensuring output correctness and format compliance.
+
+> Structured Output
+
+### [Tool Use & Environment](./tool-use-environment)
+Patterns for tool discovery, code execution, and environment interaction.
+
+> Progressive Tool Discovery · Code-Then-Execute · Visual AI Multimodal
+
+### [UX & Collaboration](./ux-collaboration)
+Patterns for human oversight, reasoning transparency, and user interaction.
+
+> Chain-of-Thought Monitoring · Verbose Reasoning Transparency · Human-in-the-Loop
+
+---
+
+## Quick Reference
+
+| Pattern | Category | Pie Advantage |
+|---------|----------|---------------|
+| [Context-Minimization](./context-memory#context-minimization) | Context & Memory | Purge tainted tokens via KV cache ops |
+| [Dynamic Context Injection](./context-memory#dynamic-context-injection) | Context & Memory | I/O fetch + `fill_tokens()` on demand |
+| [Curated Code Context](./context-memory#curated-code-context) | Context & Memory | Search + selective token injection |
+| [Curated File Context](./context-memory#curated-file-context) | Context & Memory | Ranked file loading into context |
+| [Episodic Memory](./context-memory#episodic-memory) | Context & Memory | I/O to vector DB + context injection |
+| [Filesystem-Based State](./context-memory#filesystem-based-state) | Context & Memory | I/O for checkpoint/resume |
+| [Reflection Loop](./feedback-loops#reflection-loop) | Feedback Loops | Fork context for critique, rollback on retry |
+| [Graph of Thoughts](./feedback-loops#graph-of-thoughts) | Feedback Loops | Fork + merge via cross-context token injection |
+| [Self-Discover](./feedback-loops#self-discover-reasoning-structures) | Feedback Loops | Structured output for module selection |
+| [Self-Critique](./feedback-loops#self-critique-evaluator) | Feedback Loops | Fork → critique → re-generate |
+| [Rich Feedback Loops](./feedback-loops#rich-feedback-loops) | Feedback Loops | Context append + re-generate with KV reuse |
+| [Tree-of-Thought](./orchestration-control#tree-of-thought) | Orchestration & Control | `fork()` = native tree branching with KV reuse |
+| [LATS](./orchestration-control#language-agent-tree-search-lats) | Orchestration & Control | Fork + parallel eval + MCTS with KV cache |
+| [Best-of-N](./orchestration-control#inference-time-scaling-best-of-n) | Orchestration & Control | Parallel generation on shared prefix |
+| [Self-Rewriting Prompt](./orchestration-control#self-rewriting-meta-prompt) | Orchestration & Control | Context manipulation between episodes |
+| [Posterior Sampling](./orchestration-control#posterior-sampling-planner) | Orchestration & Control | Fork + score + select loop |
+| [ReAct](./orchestration-control#react-reasoning--acting) | Orchestration & Control | KV cache reuse across tool turns |
+| [Plan-Then-Execute](./orchestration-control#plan-then-execute) | Orchestration & Control | Structured gen for plan, tool loop for exec |
+| [Action-Selector](./orchestration-control#action-selector) | Orchestration & Control | Constrained decoding to allowlisted actions |
+| [Stop Hook Auto-Continue](./orchestration-control#stop-hook-auto-continue) | Orchestration & Control | Outer loop with success criteria |
+| [Parallel Tool Calls](./orchestration-control#parallel-tool-calls) | Orchestration & Control | Multiple tool calls in single generation |
+| [Tool Compartmentalization](./orchestration-control#tool-compartmentalization) | Orchestration & Control | Separate contexts with different tool sets |
+| [Agent-Driven Research](./orchestration-control#agent-driven-research) | Orchestration & Control | Iterative search loop with KV reuse |
+| [Sub-Agent Spawning](./orchestration-control#sub-agent-spawning) | Orchestration & Control | Multiple contexts sharing the model |
+| [Multi-Agent Debate](./orchestration-control#multi-agent-debate) | Orchestration & Control | Cross-feed outputs between contexts |
+| [Oracle & Worker](./orchestration-control#oracle--worker) | Orchestration & Control | Two models with routing logic |
+| [Dual LLM](./orchestration-control#dual-llm) | Orchestration & Control | Two contexts with different permissions |
+| [LLM Map-Reduce](./orchestration-control#llm-map-reduce) | Orchestration & Control | Parallel sandboxed contexts + merge |
+| [Brainstorming](./orchestration-control#iterative-brainstorming) | Orchestration & Control | Parallel gen with different system prompts |
+| [Swarm Migration](./orchestration-control#swarm-migration) | Orchestration & Control | N parallel contexts for batch processing |
+| [Initializer-Maintainer](./orchestration-control#initializer-maintainer) | Orchestration & Control | Named contexts with `Context::open()` |
+| [Multi-Model Pipeline](./orchestration-control#multi-model-orchestration) | Orchestration & Control | Chain inferlets across models |
+| [Discrete Phase Separation](./orchestration-control#discrete-phase-separation) | Orchestration & Control | Separate contexts per phase |
+| [Three-Stage Perception](./orchestration-control#three-stage-perception) | Orchestration & Control | Chained inferlet pipeline |
+| [Structured Output](./reliability-eval#structured-output) | Reliability & Eval | Grammar-constrained decoding |
+| [Progressive Tool Discovery](./tool-use-environment#progressive-tool-discovery) | Tool Use & Environment | Dynamic `equip_tools()` calls |
+| [Code-Then-Execute](./tool-use-environment#code-then-execute) | Tool Use & Environment | Generate code + I/O to run it |
+| [Visual AI Multimodal](./tool-use-environment#visual-ai-multimodal) | Tool Use & Environment | Multimodal model input handling |
+| [CoT Monitoring](./ux-collaboration#chain-of-thought-monitoring) | UX & Collaboration | `EventStream` interception mid-generation |
+| [Verbose Reasoning](./ux-collaboration#verbose-reasoning-transparency) | UX & Collaboration | `.with_reasoning()` on EventStream |
+| [Human-in-the-Loop](./ux-collaboration#human-in-the-loop) | UX & Collaboration | Pause generation, await client approval |

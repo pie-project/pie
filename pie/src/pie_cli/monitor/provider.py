@@ -184,43 +184,49 @@ class PieMetricsProvider:
 
         gpu_metrics = self._get_gpu_metrics()
 
-        # Parse server stats
+        # Parse server stats (new flat key format: "model_name.kv_pages_used", etc.)
         kv_pages_used = 0
         kv_pages_total = 0
-        active_instances = 0
-        real_throughput = None
-        real_latency = None
+        in_flight_batches = 0
+        total_tokens = 0
+        last_latency_us = 0
+        avg_latency_us = 0
 
         if stats:
             for key, value in stats.items():
                 try:
-                    if ".resource.g" in key and ".0.used" in key:
+                    if key.endswith(".kv_pages_used"):
                         kv_pages_used += int(value)
-                    elif ".resource.g" in key and ".0.capacity" in key:
+                    elif key.endswith(".kv_pages_total"):
                         kv_pages_total += int(value)
-                    elif "instances.active_count" in key:
-                        active_instances = int(value)
-                    elif "model.throughput.tokens_per_second" in key:
-                        real_throughput = float(value)
-                    elif "model.latency.avg_ms" in key:
-                        real_latency = float(value)
+                    elif key.endswith(".in_flight_batches"):
+                        in_flight_batches += int(value)
+                    elif key.endswith(".total_tokens_processed"):
+                        total_tokens += int(value)
+                    elif key.endswith(".last_batch_latency_us"):
+                        last_latency_us = max(last_latency_us, int(value))
+                    elif key.endswith(".avg_batch_latency_us"):
+                        avg_latency_us = max(avg_latency_us, int(value))
                 except (ValueError, TypeError):
                     pass
 
-        # Use real throughput/latency if available, else estimate
-        if real_throughput is not None:
-            self._estimated_tput = real_throughput
-        elif active_instances > 0:
-            self._estimated_tput = active_instances * 50.0  # Fallback estimate
-        else:
+        # Throughput: compute from total_tokens and elapsed time
+        now = time.monotonic()
+        dt = now - self._last_poll_time if hasattr(self, "_last_poll_time") else 0
+        prev_tokens = getattr(self, "_prev_total_tokens", 0)
+
+        if dt > 0 and total_tokens > prev_tokens:
+            self._estimated_tput = (total_tokens - prev_tokens) / dt
+        elif in_flight_batches == 0:
             self._estimated_tput = 0.0
 
-        if real_latency is not None:
-            self._estimated_latency = real_latency
-        elif active_instances > 0 and gpu_metrics:
-            avg_util = sum(g.utilization for g in gpu_metrics) / len(gpu_metrics)
-            self._estimated_latency = 20.0 + (avg_util * 0.5)
-        else:
+        self._last_poll_time = now
+        self._prev_total_tokens = total_tokens
+
+        # Latency: use avg_batch_latency_us converted to ms
+        if avg_latency_us > 0:
+            self._estimated_latency = avg_latency_us / 1000.0
+        elif in_flight_batches == 0:
             self._estimated_latency = 0.0
 
         # KV cache usage
@@ -234,71 +240,48 @@ class PieMetricsProvider:
             for g in gpu_metrics
         ]
 
-        self._prev_active_batches = active_instances
-
-        # Build map of instance ID -> KV pages from stats
-        inst_kv_map = {}
-        # Debug: print instance KV keys for troubleshooting
-        kv_keys = [k for k in stats.keys() if "kv_pages" in k]
-        if kv_keys:
-            logger.debug("Instance KV keys: %s...", kv_keys[:5])
-        for key, value in stats.items():
-            if key.startswith("instance.") and key.endswith(".kv_pages"):
-                try:
-                    inst_kv_map[key] = int(value)
-                except (ValueError, TypeError):
-                    pass
-
-        # Convert instances to Inferlet objects
+        # Convert instances (now list[dict]) to Inferlet objects
         inferlets = []
         for inst in instances:
             try:
-                inst_id = getattr(inst, "id", str(inst))
-                args = getattr(inst, "arguments", [])
-                status = getattr(inst, "status", "unknown")
-                username = getattr(inst, "username", "user")
-                elapsed_secs = getattr(inst, "elapsed_secs", 0)
+                if isinstance(inst, dict):
+                    inst_id = inst.get("id", "")
+                    username = inst.get("username", "user")
+                    program = inst.get("program", "inferlet")
+                    elapsed_secs = inst.get("elapsed_secs", 0)
+                else:
+                    # Fallback for old format (bare UUID strings)
+                    inst_id = str(inst)
+                    username = "user"
+                    program = "inferlet"
+                    elapsed_secs = 0
 
-                # Look up KV pages from stats (format: instance.InstanceId(uuid).kv_pages)
-                inst_kv_pages = 0
-                for key, val in inst_kv_map.items():
-                    if inst_id in key:
-                        inst_kv_pages = val
-                        break
-
-                program = args[0] if args else "inferlet"
                 elapsed_str = (
                     f"{elapsed_secs // 60}m{elapsed_secs % 60}s"
                     if elapsed_secs > 0
                     else "-"
-                )
-                inst_kv_pct = (
-                    (inst_kv_pages / kv_pages_total) * 100
-                    if kv_pages_total > 0
-                    else 0.0
                 )
 
                 inferlets.append(
                     Inferlet(
                         id=inst_id[:12] if len(inst_id) > 12 else inst_id,
                         program=program,
-                        user=username or "user",
-                        status=str(status).lower().replace("instancestatus.", ""),
+                        user=username,
+                        status="running",
                         elapsed=elapsed_str,
-                        kv_cache=inst_kv_pct,
+                        kv_cache=0.0,
                     )
                 )
             except Exception:
                 pass
 
-        # Sort by KV cache usage (descending) and limit to top 50
-        inferlets.sort(key=lambda x: x.kv_cache, reverse=True)
+        # Sort by elapsed (descending) and limit to top 50
         inferlets = inferlets[:50]
 
         self.kv_cache_history.append(kv_cache_usage)
         self.token_tput_history.append(self._estimated_tput)
         self.latency_history.append(self._estimated_latency)
-        self.batch_history.append(float(active_instances))
+        self.batch_history.append(float(in_flight_batches))
 
         # Trim history
         if len(self.kv_cache_history) > self._max_history:
@@ -313,7 +296,7 @@ class PieMetricsProvider:
             kv_pages_total=kv_pages_total if kv_pages_total > 0 else 600,
             token_throughput=self._estimated_tput,
             latency_ms=self._estimated_latency,
-            active_batches=active_instances,
+            active_batches=in_flight_batches,
             tp_groups=tp_groups,
             inferlets=inferlets,
         )

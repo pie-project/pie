@@ -488,15 +488,15 @@ class PieClient:
 
         return Process(self, process_id)
 
-    async def list_processes(self) -> list[str]:
-        """Get a list of running process UUID strings."""
+    async def list_processes(self) -> list[dict]:
+        """Get a list of running process stats (dicts with id, username, program, arguments, elapsed_secs)."""
         msg = {"type": "list_processes"}
         ok, result = await self._send_msg_and_wait(msg)
         if ok:
             try:
                 return json.loads(result)
             except (json.JSONDecodeError, TypeError):
-                return [result] if result else []
+                return []
         raise Exception(f"List processes failed: {result}")
 
     async def ping(self) -> None:

@@ -11,6 +11,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 use super::output::LogStream;
 
+use crate::context::{self, ContextId};
 use crate::process::ProcessId;
 
 pub struct InstanceState {
@@ -33,11 +34,20 @@ pub struct InstanceState {
     guest_resource_map: Vec<(ResourceAny, u32)>,
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
+
+    /// Anonymous contexts owned by this instance, auto-destroyed on Drop.
+    owned_contexts: Vec<(usize, ContextId)>,
 }
 
 impl Drop for InstanceState {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
+        // Auto-destroy all anonymous contexts owned by this instance
+        for (model_idx, context_id) in self.owned_contexts.drain(..) {
+            tokio::spawn(async move {
+                let _ = context::destroy(model_idx, context_id, 0, true).await;
+            });
+        }
     }
 }
 
@@ -103,6 +113,8 @@ impl InstanceState {
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
+            // Context lifecycle tracking
+            owned_contexts: Vec::new(),
         }
     }
 
@@ -155,5 +167,22 @@ impl InstanceState {
         } else {
             None
         }
+    }
+
+    // ========================================================================
+    // Context Lifecycle Tracking
+    // ========================================================================
+
+    /// Track an anonymous context for auto-cleanup on instance drop.
+    pub fn track_context(&mut self, model_idx: usize, context_id: ContextId) {
+        self.owned_contexts.push((model_idx, context_id));
+    }
+
+    /// Stop tracking a context (e.g. after save or explicit destroy).
+    /// Returns true if the context was tracked (i.e., was anonymous).
+    pub fn untrack_context(&mut self, model_idx: usize, context_id: ContextId) -> bool {
+        let before = self.owned_contexts.len();
+        self.owned_contexts.retain(|&(m, c)| !(m == model_idx && c == context_id));
+        self.owned_contexts.len() < before
     }
 }

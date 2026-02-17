@@ -18,7 +18,7 @@ async fn main(_args: Vec<String>) -> Result<String> {
     let encoded = tokenizer.encode("hello world");
 
     // Create a context
-    let ctx = Context::create(&model, "test-ctx", None)?;
+    let ctx = Context::create(&model)?;
 
     // Stage some buffered tokens
     ctx.set_buffered_tokens(&encoded);

@@ -1,0 +1,144 @@
+---
+title: Tool Use & Environment
+description: Patterns for tool discovery, code execution, and environment interaction
+sidebar_position: 5
+---
+
+# Tool Use & Environment
+
+These patterns define how agents discover, select, and interact with tools and the execution environment. Pie's tool-calling API and I/O system make these interactions native to the inferlet.
+
+---
+
+## Progressive Tool Discovery
+
+Start with a minimal tool set and dynamically add tools as the agent discovers it needs them, keeping the prompt lean.
+
+*[Reference →](https://agentic-patterns.com/patterns/progressive-tool-discovery/)*
+
+**When to use:**
+- Large tool catalogs where upfront loading is wasteful
+- Want to minimize prompt size
+- Tools are contextually relevant
+
+```
+ [search] ──▶ Tool Call ──▶ Result ──▶ Discover New Tools ──┐
+                                                             │
+ [search, db, calc] ──▶ Tool Call ──▶ Result ──▶ …          │
+    ▲                                                        │
+    └── equip_tools() ◀──────────────────────────────────────┘
+```
+
+```rust
+// Start with basic tools
+let mut active_tools = vec![search_tool.clone()];
+ctx.equip_tools(&tool_schemas(&active_tools))?;
+
+for _ in 0..max_iterations {
+    ctx.cue();
+    let mut events = ctx.generate(sampler.clone())
+        .with_max_tokens(256)
+        .decode()
+        .with_tool_use();
+
+    while let Some(event) = events.next().await? {
+        match event {
+            Event::ToolCall(name, args) => {
+                let result = dispatch_tool(&name, &args)?;
+                ctx.answer_tool(&name, &result);
+
+                // Discover new tools based on results
+                if let Some(new_tools) = discover_tools(&result) {
+                    active_tools.extend(new_tools);
+                    ctx.equip_tools(&tool_schemas(&active_tools))?;
+                }
+            }
+            Event::Done(_) => return Ok(()),
+            _ => {}
+        }
+    }
+}
+```
+
+---
+
+## Code-Then-Execute
+
+Generate executable code, then run it via I/O. The execution result can feed back into the conversation.
+
+*[Reference →](https://agentic-patterns.com/patterns/code-then-execute-pattern/)*
+
+**When to use:**
+- Data analysis tasks
+- Mathematical computations
+- Tasks requiring deterministic execution
+
+```
+ Task ──▶ LLM ──▶ Code ──▶ Execute ──▶ Output ──▶ LLM ──▶ Interpret
+```
+
+```rust
+ctx.system("Write Python code to solve the task. Output only code.");
+ctx.user(&analysis_task);
+ctx.cue();
+
+let code = ctx.generate(sampler.clone())
+    .with_max_tokens(512)
+    .collect_text().await?;
+
+// Execute via I/O
+let output = execute_code(&code).await?;
+
+// Feed result back
+ctx.user(&format!("Code output:\n```\n{output}\n```\n\nInterpret the results."));
+ctx.cue();
+let interpretation = ctx.generate(sampler)
+    .with_max_tokens(256)
+    .collect_text().await?;
+```
+
+---
+
+## Visual AI Multimodal
+
+Incorporate visual inputs (screenshots, diagrams, photos) into the agent's reasoning alongside text.
+
+*[Reference →](https://agentic-patterns.com/patterns/visual-ai-multimodal-integration/)*
+
+**When to use:**
+- UI testing and debugging
+- Document analysis with images
+- Robotics or visual inspection tasks
+
+```
+ Image ──▶ Model (vision) ──▶ Analysis ──▶ Follow-up (free, cached)
+```
+
+```rust
+// Load image through I/O
+let screenshot = io::fs::read_bytes("screenshot.png").await?;
+
+// Models with vision capability can process images
+ctx.system("You are a UI testing assistant.");
+ctx.user_with_image(
+    "Analyze this screenshot. Are there any visual bugs?",
+    &screenshot,
+);
+ctx.cue();
+
+let analysis = ctx.generate(sampler)
+    .with_max_tokens(512)
+    .collect_text().await?;
+```
+
+:::tip[Why Pie]
+Multimodal processing runs inside the inferlet with full access to the model's attention — no external vision API needed. The KV cache retains the processed image, so follow-up questions about the same image are free.
+:::
+
+---
+
+## Next Steps
+
+- **[Orchestration & Control](./orchestration-control)** — Patterns for coordinating agents and execution
+- **[Tool Calling](../writing-inferlets/tool-calling)** — Pie's tool-calling API reference
+- **[MCP Integration](../writing-inferlets/mcp)** — Connect to external tool servers

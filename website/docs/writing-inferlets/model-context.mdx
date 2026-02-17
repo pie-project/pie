@@ -42,19 +42,19 @@ let special_tokens = tokenizer.special_tokens();
 
 ## Creating a Context
 
-A `Context` holds the token sequence and its KV cache. Use `ContextExt` for the high-level API:
+A `Context` holds the token sequence and its KV cache. Contexts are **anonymous by default** — they are automatically cleaned up when the inferlet exits:
 
 ```rust
 use inferlet::{context::Context, ContextExt};
 
-// Create a new context (auto-generated unique name)
+// Create a new anonymous context
 let ctx = Context::new(&model)?;
 ```
 
-Under the hood, `Context::new` calls `Context::create` with a unique name. You can also create named contexts:
+To make a context **persistent** (survives process exit), save it with a name:
 
 ```rust
-let ctx = Context::create(&model, "my-session", None)?;
+ctx.save("my-session")?;
 ```
 
 ## Filling a Context
@@ -84,11 +84,11 @@ ctx.flush().await?;
 
 ## Forking a Context
 
-Fork creates a copy-on-write clone of an existing context's KV cache. This is the basis for prefix caching and branching:
+Fork creates a copy-on-write clone of an existing context's KV cache. The fork is anonymous by default:
 
 ```rust
 // Fork shares all committed KV pages with the original
-let forked = ctx.fork("forked-session")?;
+let forked = ctx.fork()?;
 
 // Changes to forked don't affect the original
 forked.fill_tokens(&new_tokens);
@@ -96,12 +96,12 @@ forked.fill_tokens(&new_tokens);
 
 Forking is O(1) — it references the same KV cache pages until new tokens are committed.
 
-## Looking Up a Context
+## Opening a Saved Context
 
-Contexts persist across function calls within the same inferlet instance. Look one up by name:
+Saved (named) contexts persist across inferlet instances. Open one by name:
 
 ```rust
-if let Some(ctx) = Context::lookup(&model, "my-session") {
+if let Some(ctx) = Context::open(&model, "my-session") {
     // Resume from existing KV state
 }
 ```
