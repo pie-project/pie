@@ -107,7 +107,7 @@ def get_module(arch_name: str) -> ModuleType:
 # =============================================================================
 
 import torch
-from . import llama3, qwen2, qwen3, gemma2, gemma3, mistral3, olmo3
+from . import llama3, qwen2, qwen3, gemma2, gemma3, mistral3, olmo3, gpt_oss
 
 register("llama3", llama3, aliases=("l4ma",), hf_model_types=("llama",))
 register("qwen2", qwen2, hf_model_types=("qwen2",))

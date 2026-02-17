@@ -132,6 +132,10 @@ class Engine:
         if hasattr(forward_pass, "warmup_cuda_graphs"):
             forward_pass.warmup_cuda_graphs(kv_cache_at_layer)
 
+        # Compact weight memory layout for GPU locality (MPS TLB optimization)
+        if hasattr(forward_pass, "compact_weights"):
+            forward_pass.compact_weights()
+
         return cls(
             config=config,
             model_config=model_config,
