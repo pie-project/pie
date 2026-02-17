@@ -1,0 +1,314 @@
+---
+title: Context & Memory
+description: Patterns for managing context windows, injecting data, and persisting state
+sidebar_position: 1
+---
+
+# Context & Memory
+
+These patterns control *what the model sees and remembers*. They manage context windows, inject data on demand, and persist state across sessions — all leveraging Pie's direct access to the KV cache and I/O system.
+
+---
+
+## Context-Minimization
+
+After processing untrusted input, purge the raw tokens from context and retain only a safe, model-generated intermediate representation.
+
+*[Reference →](https://agentic-patterns.com/patterns/context-minimization-pattern/)*
+
+**When to use:**
+- Parsing untrusted emails, documents, or user submissions
+- Preventing indirect prompt injection
+- Long-running agents that accumulate untrusted context
+
+```
+ [Untrusted Input] ──▶ LLM Extract ──▶ [Structured Data]
+        │                                      │
+   (purge from cache)                    (retained)
+```
+
+```rust
+// Process untrusted content
+let untrusted_page_count = ctx.committed_page_count();
+
+ctx.user(&format!("Extract sender, subject, and action items:\n{email}"));
+ctx.cue();
+
+let extraction = ctx.generate(sampler.clone())
+    .with_constraint(extraction_schema.clone())
+    .with_max_tokens(128)
+    .collect_text().await?;
+
+// Purge the untrusted input from KV cache
+// Release all pages that contained the raw email
+ctx.release_pages(ctx.committed_page_count() - untrusted_page_count);
+
+// Continue with only the safe extraction
+let safe_ctx = Context::create(&model, "safe", None)?;
+safe_ctx.system("You are a task manager.");
+safe_ctx.user(&format!("Process this extracted data:\n{extraction}"));
+safe_ctx.cue();
+```
+
+:::tip[Why Pie]
+You can surgically remove token ranges from the KV cache. The untrusted email's tokens are physically purged — not just ignored by the prompt, but removed from memory. No API wrapper can do this.
+:::
+
+---
+
+## Dynamic Context Injection
+
+Load external data (files, API responses, database records) into the context on demand, rather than including everything upfront.
+
+*[Reference →](https://agentic-patterns.com/patterns/dynamic-context-injection/)*
+
+**When to use:**
+- Large knowledge bases that don't fit in context
+- On-demand retrieval (RAG-like patterns)
+- Minimizing initial prompt size
+
+```
+ Question ──▶ LLM ──▶ "need file X" ──▶ Fetch X ──▶ Inject ──▶ Continue
+                           ▲                                      │
+                           └──────────────────────────────────────┘
+```
+
+```rust
+use inferlet::pie::io;
+
+// Start with minimal context
+ctx.system("You are a codebase expert. Ask for files as needed.");
+ctx.user(&question);
+ctx.cue();
+
+loop {
+    let mut events = ctx.generate(sampler.clone())
+        .with_max_tokens(256)
+        .decode()
+        .with_tool_use();
+
+    while let Some(event) = events.next().await? {
+        match event {
+            Event::ToolCall(name, args) if name == "read_file" => {
+                // Fetch file via I/O and inject into context
+                let path: String = serde_json::from_str(&args)?;
+                let content = io::http::get(&format!(
+                    "http://localhost:8080/files/{path}"
+                )).await?;
+
+                ctx.answer_tool(&name, &content);
+            }
+            Event::Text(s) => send_text(&s).await,
+            Event::Done(_) => return Ok(()),
+            _ => {}
+        }
+    }
+}
+```
+
+:::tip[Why Pie]
+Injected content benefits from KV cache persistence — once a file is loaded, subsequent references to it are free. The I/O system fetches data without leaving the inferlet, keeping latency low.
+:::
+
+---
+
+## Curated Code Context
+
+Use a search sub-agent to find the most relevant code snippets, then inject only the top-K results into the main agent's context.
+
+*[Reference →](https://agentic-patterns.com/patterns/curated-code-context-window/)*
+
+**When to use:**
+- Large codebases (1000+ files)
+- Tasks requiring specific implementation details
+- Want to keep context focused and relevant
+
+```
+ Codebase ──▶ Search Agent ──▶ Top-K files ──▶ Main Agent ──▶ Solution
+ (1000+ files)               (3 relevant)     (focused ctx)
+```
+
+```rust
+// Search agent: find relevant code
+let searcher = Context::create(&model, "searcher", None)?;
+searcher.system("Given a task, output the 3 most relevant file paths.");
+searcher.user(&format!(
+    "Task: {task}\n\nAvailable files:\n{file_list}"
+));
+searcher.cue();
+let relevant_files = searcher.generate(sampler.clone())
+    .with_max_tokens(128)
+    .collect_text().await?;
+
+// Load only relevant files into main context
+let mut code_context = String::new();
+for path in parse_file_list(&relevant_files) {
+    let content = read_file(&path).await?;
+    code_context.push_str(&format!("### {path}\n```\n{content}\n```\n\n"));
+}
+
+ctx.user(&format!(
+    "Relevant code:\n{code_context}\n\nTask: {task}"
+));
+ctx.cue();
+let solution = ctx.generate(sampler)
+    .with_max_tokens(1024)
+    .collect_text().await?;
+```
+
+---
+
+## Curated File Context
+
+Rank files by relevance and load them progressively: full content for the primary file, summaries for secondary files, names only for tertiary files.
+
+*[Reference →](https://agentic-patterns.com/patterns/curated-file-context-window/)*
+
+**When to use:**
+- Multi-file tasks with a clear primary target
+- Context window budget management
+- Want maximum breadth without overflow
+
+```
+ Tier 1: Primary ──▶ full content   ──┐
+ Tier 2: Related ──▶ summaries      ──┼──▶ Combined ctx ──▶ LLM
+ Tier 3: Others  ──▶ names only     ──┘
+```
+
+```rust
+// Tier 1: Primary file — full content
+let primary = read_file(&primary_path).await?;
+ctx.user(&format!("Primary file ({primary_path}):\n```\n{primary}\n```"));
+
+// Tier 2: Related files — summaries only
+for path in &related_paths {
+    let summary_ctx = Context::create(&model, "summary", None)?;
+    summary_ctx.system("Summarize this file in 2-3 sentences.");
+    summary_ctx.user(&read_file(path).await?);
+    summary_ctx.cue();
+    let summary = summary_ctx.generate(sampler.clone())
+        .with_max_tokens(64)
+        .collect_text().await?;
+
+    ctx.user(&format!("Related ({path}): {summary}"));
+}
+
+// Tier 3: Peripheral files — names only
+ctx.user(&format!(
+    "Other files in the project: {}",
+    peripheral_paths.join(", ")
+));
+
+ctx.user(&format!("\n\nTask: {task}"));
+ctx.cue();
+```
+
+---
+
+## Episodic Memory
+
+Store and retrieve past interactions using a vector database. The agent retrieves relevant episodes to inform current decisions.
+
+*[Reference →](https://agentic-patterns.com/patterns/episodic-memory-retrieval-injection/)*
+
+**When to use:**
+- Long-running agents spanning many sessions
+- Personalization based on history
+- Learning from past failures
+
+```
+ Task ──▶ Embed ──▶ Vector Search ──▶ Top-K Episodes ──▶ Inject ──▶ LLM
+                                                              │
+                        Store ◀── Summarize ◀── Response ◀────┘
+```
+
+```rust
+use inferlet::pie::io;
+
+// Retrieve relevant past episodes
+let query_embedding = embed(&current_task).await?;
+let episodes = vector_search(&query_embedding, top_k: 5).await?;
+
+// Inject relevant memories into context
+ctx.system("You are a helpful assistant with memory of past interactions.");
+
+if !episodes.is_empty() {
+    ctx.user(&format!(
+        "Relevant past interactions:\n{}",
+        episodes.iter()
+            .map(|e| format!("- [{}]: {}", e.timestamp, e.summary))
+            .collect::<Vec<_>>().join("\n")
+    ));
+}
+
+ctx.user(&current_task);
+ctx.cue();
+let response = ctx.generate(sampler.clone())
+    .with_max_tokens(512)
+    .collect_text().await?;
+
+// Store this interaction for future retrieval
+let summary = summarize(&current_task, &response).await?;
+store_episode(&summary, &embed(&summary).await?).await?;
+```
+
+:::tip[Why Pie]
+The I/O system handles vector DB queries within the inferlet. Retrieved episodes are injected via normal context operations, benefiting from KV cache persistence. Memory management logic lives in Rust code, not in prompt engineering.
+:::
+
+---
+
+## Filesystem-Based State
+
+Persist agent state (plans, decisions, progress) to files between sessions for checkpoint/resume workflows.
+
+*[Reference →](https://agentic-patterns.com/patterns/filesystem-based-agent-state/)*
+
+**When to use:**
+- Long-running tasks spanning multiple sessions
+- Multi-step workflows needing checkpoints
+- Crash recovery requirements
+
+```
+ Start ──▶ Load checkpoint? ──┬── Yes ──▶ Resume from state
+                               │
+                               └── No  ──▶ Init new state
+                                                │
+           Save checkpoint ◀── Complete step ◀──┘
+```
+
+```rust
+use inferlet::pie::io;
+
+// Check for existing checkpoint
+let checkpoint_path = "agent_state.json";
+let state: AgentState = match io::fs::read(checkpoint_path).await {
+    Ok(data) => serde_json::from_str(&data)?,
+    Err(_) => AgentState::new(&task),
+};
+
+// Resume from checkpoint
+ctx.system("You are continuing a task. Here's your progress.");
+ctx.user(&format!("Current state:\n{}", serde_json::to_string(&state)?));
+ctx.user(&format!("Next step: {}", state.next_step()));
+ctx.cue();
+
+let result = ctx.generate(sampler)
+    .with_max_tokens(512)
+    .collect_text().await?;
+
+// Update and save checkpoint
+state.complete_step(&result);
+io::fs::write(
+    checkpoint_path,
+    &serde_json::to_string(&state)?
+).await?;
+```
+
+---
+
+## Next Steps
+
+- **[Orchestration & Control](./orchestration-control)** — Patterns for coordinating agents and execution
+- **[KV Cache Control](../writing-inferlets/kv-cache)** — Page-level cache management
+- **[I/O & Messaging](../writing-inferlets/io)** — HTTP, file I/O, and client communication

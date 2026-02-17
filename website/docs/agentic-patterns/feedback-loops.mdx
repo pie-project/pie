@@ -1,0 +1,290 @@
+---
+title: Feedback Loops
+description: Patterns for iterative refinement, self-evaluation, and learning from outputs
+sidebar_position: 2
+---
+
+# Feedback Loops
+
+These patterns generate, evaluate, and refine outputs iteratively. They leverage Pie's copy-on-write KV cache to make each iteration cheap — forking context preserves all prior computation.
+
+---
+
+## Reflection Loop
+
+Generate a draft, evaluate it, incorporate feedback, and re-generate until a quality threshold is met.
+
+*[Reference →](https://agentic-patterns.com/patterns/reflection/)*
+
+**When to use:**
+- Output quality matters more than latency
+- You have a scoring function or can use a self-critique prompt
+- Code generation, writing, or reasoning tasks
+
+```
+ Input ──▶ Generate ──▶ Evaluate ──▶ [score ≥ θ?] ──▶ Done
+               ▲                         │ No
+               │         Feedback        │
+               └─────────────────────────┘
+```
+
+```rust
+let threshold = 0.8;
+
+for attempt in 0..max_iterations {
+    // Fork so we can roll back if quality is low
+    let draft_ctx = ctx.fork(&format!("draft-{attempt}"))?;
+    draft_ctx.user(&task);
+    draft_ctx.cue();
+
+    let draft = draft_ctx.generate(sampler.clone())
+        .with_max_tokens(512)
+        .collect_text().await?;
+
+    // Evaluate using a critique prompt
+    let eval_ctx = ctx.fork(&format!("eval-{attempt}"))?;
+    eval_ctx.user(&format!(
+        "Rate this response 0-1 and explain issues:\n\n{draft}"
+    ));
+    eval_ctx.cue();
+    let critique = eval_ctx.generate(sampler.clone())
+        .with_max_tokens(256)
+        .collect_text().await?;
+
+    let score = parse_score(&critique);
+    if score >= threshold {
+        send_text(&draft).await;
+        return Ok(());
+    }
+
+    // Feed critique back for next attempt
+    ctx.user(&format!(
+        "Previous attempt scored {score:.1}. Feedback: {critique}\n\nTry again."
+    ));
+}
+```
+
+:::tip[Why Pie]
+Each iteration shares the original prompt's KV cache via `fork()`. The draft and evaluation contexts are O(1) to create and only allocate new pages for new tokens. With a standard API, every retry resends the full conversation.
+:::
+
+---
+
+## Graph of Thoughts
+
+Represent reasoning as a directed graph where thoughts can branch, aggregate from multiple parents, and refine iteratively.
+
+*[Reference →](https://agentic-patterns.com/patterns/graph-of-thoughts/)*
+
+**When to use:**
+- Complex interdependent reasoning
+- Tasks requiring insight aggregation from multiple paths
+- Problems needing iterative refinement
+
+```
+ ┌── Thought A ──┐
+ │               ▼
+ Problem ──── Thought B ──▶ Aggregate ──▶ Refine ──▶ Solution
+ │               ▲
+ └── Thought C ──┘
+```
+
+```rust
+// Generate diverse thoughts in parallel
+let mut thoughts = Vec::new();
+for i in 0..3 {
+    let t = ctx.fork(&format!("thought-{i}"))?;
+    t.user(&format!("Approach this from perspective {i}: {problem}"));
+    t.cue();
+    let text = t.generate(sampler.clone())
+        .with_max_tokens(256)
+        .collect_text().await?;
+    thoughts.push(text);
+}
+
+// Aggregate: merge insights into a new context
+let agg = ctx.fork("aggregate")?;
+agg.user(&format!(
+    "Combine these perspectives into a unified solution:\n\n\
+     Perspective 1: {}\n\nPerspective 2: {}\n\nPerspective 3: {}",
+    thoughts[0], thoughts[1], thoughts[2]
+));
+agg.cue();
+let merged = agg.generate(sampler.clone())
+    .with_max_tokens(512)
+    .collect_text().await?;
+
+// Refine
+let refine = ctx.fork("refine")?;
+refine.user(&format!("Improve this solution:\n\n{merged}"));
+refine.cue();
+let final_answer = refine.generate(sampler.clone())
+    .with_max_tokens(512)
+    .collect_text().await?;
+```
+
+:::tip[Why Pie]
+Each thought node is a forked context sharing the problem prefix. Aggregation merges text from sibling contexts — something impossible with stateless APIs where each call is independent. KV cache sharing means the cost scales with *divergence*, not total tokens.
+:::
+
+---
+
+## Self-Discover Reasoning Structures
+
+Let the model analyze a problem, select relevant reasoning modules (e.g., "break into steps", "work backwards", "find patterns"), and compose a task-specific reasoning structure before solving.
+
+*[Reference →](https://agentic-patterns.com/patterns/self-discover-reasoning-structures/)*
+
+**When to use:**
+- Diverse reasoning tasks where fixed CoT underperforms
+- Novel problem types
+- Want adaptive thinking strategies
+
+```
+ Modules: [Steps] [Backwards] [Patterns] [Edges] [Eliminate]
+    │
+ Problem ──▶ Select ──▶ Compose Structure ──▶ Solve ──▶ Answer
+```
+
+```rust
+let modules = vec![
+    "Break the problem into smaller sub-problems",
+    "Work backwards from the desired outcome",
+    "Look for patterns or analogies",
+    "Consider edge cases first",
+    "Use elimination to narrow possibilities",
+];
+
+// Step 1: Select relevant modules
+ctx.system("You are a reasoning strategist.");
+ctx.user(&format!(
+    "Which of these reasoning strategies are most relevant for this problem?\n\n\
+     Problem: {problem}\n\nStrategies:\n{}",
+    modules.iter().enumerate()
+        .map(|(i, m)| format!("{i}. {m}"))
+        .collect::<Vec<_>>().join("\n")
+));
+ctx.cue();
+let selected = ctx.generate(sampler.clone())
+    .with_max_tokens(128)
+    .collect_text().await?;
+
+// Step 2: Solve using discovered structure
+ctx.user(&format!(
+    "Now solve the problem using these strategies:\n{selected}\n\nProblem: {problem}"
+));
+ctx.cue();
+let solution = ctx.generate(sampler.clone())
+    .with_max_tokens(512)
+    .collect_text().await?;
+```
+
+:::tip[Why Pie]
+The strategy selection step's KV cache is reused for the solving step — no round-trip to an external API between phases. The entire flow is one continuous inferlet execution.
+:::
+
+---
+
+## Self-Critique Evaluator
+
+Generate multiple candidates, have the model judge them with reasoning traces, and select the best. Can iterate to improve the evaluator itself.
+
+*[Reference →](https://agentic-patterns.com/patterns/self-critique-evaluator-loop/)*
+
+**When to use:**
+- Need automated quality gates
+- Human labels are too expensive to scale
+- Want the model to learn from its own evaluations
+
+```
+              ┌── Candidate A ──┐
+ Prompt ──────┼── Candidate B ──┼──▶ Judge ──▶ Best + Reasoning
+              └── Candidate C ──┘
+```
+
+```rust
+// Generate candidates
+let mut candidates = Vec::new();
+for i in 0..3 {
+    let branch = ctx.fork(&format!("candidate-{i}"))?;
+    branch.cue();
+    let text = branch.generate(sampler.clone())
+        .with_max_tokens(512)
+        .collect_text().await?;
+    candidates.push(text);
+}
+
+// Self-critique: judge with reasoning
+let judge = ctx.fork("judge")?;
+judge.user(&format!(
+    "Compare these responses and select the best one. \
+     Explain your reasoning.\n\n\
+     A: {}\n\nB: {}\n\nC: {}",
+    candidates[0], candidates[1], candidates[2]
+));
+judge.cue();
+let judgment = judge.generate(sampler.clone())
+    .with_max_tokens(256)
+    .collect_text().await?;
+```
+
+:::tip[Why Pie]
+All candidates and the judge share the original prompt's KV cache. The judge sees only the distilled outputs, not the full generation contexts — natural isolation via separate forked contexts.
+:::
+
+---
+
+## Rich Feedback Loops
+
+After every tool call, feed machine-readable feedback (compiler errors, test failures, lint) back into the context. The agent self-debugs by iterating on diagnostics.
+
+*[Reference →](https://agentic-patterns.com/patterns/rich-feedback-loops/)*
+
+**When to use:**
+- Code generation tasks
+- Any task with verifiable output
+- When tests, linters, or validators are available
+
+```
+ Agent ──▶ Generate Code ──▶ Run Tests ──▶ Feedback ──┐
+   ▲                                                    │
+   │              Parse errors, fix, retry              │
+   └────────────────────────────────────────────────────┘
+```
+
+```rust
+for attempt in 0..max_retries {
+    ctx.user(&format!("Write a function that {task_description}"));
+    ctx.cue();
+
+    let code = ctx.generate(sampler.clone())
+        .with_max_tokens(512)
+        .collect_text().await?;
+
+    // Run tests via I/O
+    let diagnostics = run_tests(&code).await?;
+
+    if diagnostics.all_passed() {
+        send_text(&code).await;
+        return Ok(());
+    }
+
+    // Feed diagnostics back — KV cache keeps full history
+    ctx.user(&format!(
+        "Tests failed:\n```\n{}\n```\nFix the issues.",
+        diagnostics.summary()
+    ));
+}
+```
+
+:::tip[Why Pie]
+Each retry builds on the existing context — the model sees its previous attempts and the exact errors. The KV cache retains everything, so the model doesn't re-process the task description and prior attempts from scratch.
+:::
+
+---
+
+## Next Steps
+
+- **[Orchestration & Control](./orchestration-control)** — Patterns for coordinating agents and execution
+- **[Tool Use & Environment](./tool-use-environment)** — Patterns for tool calling and code execution
+- **[Generation](../writing-inferlets/generation)** — `TokenStream` and `EventStream` fundamentals
