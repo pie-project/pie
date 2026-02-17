@@ -161,6 +161,13 @@ impl PageStore {
         self.page_size
     }
 
+    /// Returns (used_pages, total_pages) per device.
+    pub fn stats(&self) -> Vec<(usize, usize)> {
+        self.phys_page_tables.iter().map(|pt| {
+            (pt.total_pages - pt.free_pages.len(), pt.total_pages)
+        }).collect()
+    }
+
     /// Compute hash chain from tokens.
     fn compute_hashes(&self, tokens: &[u32]) -> Vec<PageHash> {
         let mut hashes = Vec::new();

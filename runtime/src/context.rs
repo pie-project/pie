@@ -109,6 +109,12 @@ pub async fn get_physical_page_ids(model_idx: usize, id: ContextId) -> Result<(H
     Ok(rx.await?)
 }
 
+/// Returns KV page pool stats as `(used, total)` per device.
+pub async fn get_stats(model_idx: usize) -> Vec<(usize, usize)> {
+    let (tx, rx) = oneshot::channel();
+    let _ = SERVICES.send(model_idx, Message::GetStats { response: tx });
+    rx.await.unwrap_or_default()
+}
 
 
 // ---------- Direct (no actor, uses global CONTEXTS DashMap) ----------
@@ -794,6 +800,7 @@ enum Message {
     ReservePages { id: ContextId, lock_id: LockId, num_pages: u32, response: oneshot::Sender<Result<()>> },
     ReleasePages { id: ContextId, lock_id: LockId, num_pages: u32 },
     GetPhysicalPageIds { id: ContextId, response: oneshot::Sender<(HashMap<DeviceId, Vec<PhysicalPageId>>, u32)> },
+    GetStats { response: oneshot::Sender<Vec<(usize, usize)>> },
 }
 
 
@@ -825,6 +832,9 @@ impl ServiceHandler for ContextManager {
             }
             Message::GetPhysicalPageIds { id, response } => {
                 let _ = response.send(self.get_physical_page_ids(id));
+            }
+            Message::GetStats { response } => {
+                let _ = response.send(self.page_store.stats());
             }
         }
     }

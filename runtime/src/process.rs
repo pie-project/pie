@@ -145,9 +145,26 @@ pub async fn get_client_id(process_id: ProcessId) -> Result<Option<ClientId>> {
     Ok(rx.await??)
 }
 
+/// Returns stats/metadata for a single process.
+pub async fn get_stats(process_id: ProcessId) -> Result<ProcessStats> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(&process_id, Message::GetStats { response: tx })?;
+    rx.await?
+}
+
 /// List all registered process IDs.
 pub fn list() -> Vec<ProcessId> {
     SERVICES.keys()
+}
+
+/// Stats snapshot for a single process (serialized in list_processes responses).
+#[derive(Debug, serde::Serialize)]
+pub struct ProcessStats {
+    pub id: String,
+    pub username: String,
+    pub program: String,
+    pub arguments: Vec<String>,
+    pub elapsed_secs: u64,
 }
 
 // =============================================================================
@@ -186,6 +203,10 @@ enum Message {
     /// Query the attached client ID
     GetClientId {
         response: oneshot::Sender<Result<Option<ClientId>>>,
+    },
+    /// Query process stats/metadata
+    GetStats {
+        response: oneshot::Sender<Result<ProcessStats>>,
     },
 }
 
@@ -387,6 +408,16 @@ impl ServiceHandler for Process {
 
             Message::GetClientId { response } => {
                 let _ = response.send(Ok(self.client_id));
+            }
+
+            Message::GetStats { response } => {
+                let _ = response.send(Ok(ProcessStats {
+                    id: self.process_id.to_string(),
+                    username: self.username.clone(),
+                    program: self.program.to_string(),
+                    arguments: self.arguments.clone(),
+                    elapsed_secs: self.start_time.elapsed().as_secs(),
+                }));
             }
         }
     }

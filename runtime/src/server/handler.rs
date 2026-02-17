@@ -7,8 +7,11 @@ use bytes::Bytes;
 use pie_client::message::ServerMessage;
 
 
+use crate::context;
 use crate::daemon;
+use crate::inference;
 use crate::messaging;
+use crate::model;
 use crate::process::{self, ProcessId};
 use crate::program::{self, Manifest, ProgramName};
 
@@ -38,31 +41,33 @@ impl Session {
         self.send_response(corr_id, true, exists.to_string()).await;
     }
 
-    pub(super) async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
+    pub(super) async fn handle_query(&mut self, corr_id: u32, subject: String, _record: String) {
         match subject.as_str() {
             pie_client::message::QUERY_MODEL_STATUS => {
-                // Model stats stubbed - the new model architecture uses per-actor stats
-                let runtime_stats: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
+                let mut stats = serde_json::Map::new();
+
+                for (model_idx, model_name) in model::models().iter().enumerate() {
+                    // KV page pool stats
+                    let kv = context::get_stats(model_idx).await;
+                    let (used, total) = kv.iter().fold((0u64, 0u64), |(u, t), &(a, b)| (u + a as u64, t + b as u64));
+                    stats.insert(format!("{}.kv_pages_used", model_name), serde_json::Value::from(used));
+                    stats.insert(format!("{}.kv_pages_total", model_name), serde_json::Value::from(total));
+
+                    // Inference stats (throughput, latency, batch count)
+                    let inf = inference::get_stats(model_idx).await;
+                    stats.insert(format!("{}.total_batches", model_name), serde_json::Value::from(inf.total_batches));
+                    stats.insert(format!("{}.total_tokens_processed", model_name), serde_json::Value::from(inf.total_tokens_processed));
+                    stats.insert(format!("{}.last_batch_latency_us", model_name), serde_json::Value::from(inf.last_batch_latency_us));
+                    stats.insert(format!("{}.avg_batch_latency_us", model_name), serde_json::Value::from(inf.avg_batch_latency_us));
+                    stats.insert(format!("{}.in_flight_batches", model_name), serde_json::Value::from(inf.in_flight_batches));
+                }
+
                 self.send_response(
                     corr_id,
                     true,
-                    serde_json::to_string(&runtime_stats).unwrap(),
+                    serde_json::Value::Object(stats).to_string(),
                 )
                 .await;
-            }
-            pie_client::message::QUERY_BACKEND_STATS => {
-                // Backend stats stubbed - the new model architecture uses per-actor stats
-                let runtime_stats: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                let mut sorted_stats: Vec<_> = runtime_stats.iter().collect();
-                sorted_stats.sort_by_key(|(k, _)| *k);
-
-                let mut stats_str = String::new();
-                for (key, value) in sorted_stats {
-                    stats_str.push_str(&format!("{:<40} | {}\n", key, value));
-                }
-                self.send_response(corr_id, true, stats_str).await;
             }
             _ => println!("Unknown query subject: {}", subject),
         }
@@ -71,9 +76,9 @@ impl Session {
     pub(super) async fn handle_list_processes(&self, corr_id: u32) {
         let mut processes = Vec::new();
         for id in process::list() {
-            if let Ok(owner) = process::get_username(id).await {
-                if owner == self.username {
-                    processes.push(id.to_string());
+            if let Ok(stats) = process::get_stats(id).await {
+                if stats.username == self.username {
+                    processes.push(stats);
                 }
             }
         }
