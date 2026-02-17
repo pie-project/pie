@@ -1,9 +1,9 @@
-"""Tests for apply_rope_with_cos_sin_cache_inplace (pure PyTorch)."""
+"""Tests for apply_rope_with_cos_sin_cache_inplace (Metal kernel)."""
 
 import pytest
 import torch
 
-from .conftest import BenchmarkTimer
+from .conftest import requires_mps, BenchmarkTimer
 
 
 def build_cos_sin_cache(max_pos: int, head_dim: int, theta: float = 10000.0) -> torch.Tensor:
@@ -35,21 +35,22 @@ def reference_rope_neox_from_cache(
     return out
 
 
+@requires_mps
 class TestApplyRopeWithCosSinCache:
     """Accuracy tests for apply_rope_with_cos_sin_cache_inplace."""
 
-    def test_accuracy_neox_3d(self, device):
+    def test_accuracy_neox_3d(self, mps_device):
         """NeoX-style RoPE with 3D input matches reference."""
         from flashinfer_metal import apply_rope_with_cos_sin_cache_inplace
 
         num_tokens, num_heads, head_dim = 16, 8, 128
         max_pos = 1024
 
-        cache = build_cos_sin_cache(max_pos, head_dim).to(device)
-        positions = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        cache = build_cos_sin_cache(max_pos, head_dim).to(mps_device)
+        positions = torch.arange(num_tokens, dtype=torch.int32, device=mps_device)
 
-        q = torch.randn(num_tokens, num_heads, head_dim, device=device)
-        k = torch.randn(num_tokens, num_heads, head_dim, device=device)
+        q = torch.randn(num_tokens, num_heads, head_dim, device=mps_device)
+        k = torch.randn(num_tokens, num_heads, head_dim, device=mps_device)
 
         q_ref = reference_rope_neox_from_cache(q, positions, cache, head_dim)
         k_ref = reference_rope_neox_from_cache(k, positions, cache, head_dim)
@@ -62,23 +63,23 @@ class TestApplyRopeWithCosSinCache:
         torch.testing.assert_close(q, q_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(k, k_ref, atol=1e-5, rtol=1e-5)
 
-    def test_accuracy_neox_2d(self, device):
+    def test_accuracy_neox_2d(self, mps_device):
         """NeoX-style RoPE with 2D (flattened) input matches reference."""
         from flashinfer_metal import apply_rope_with_cos_sin_cache_inplace
 
         num_tokens, num_heads, head_dim = 16, 4, 64
         max_pos = 256
 
-        cache = build_cos_sin_cache(max_pos, head_dim).to(device)
-        positions = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        cache = build_cos_sin_cache(max_pos, head_dim).to(mps_device)
+        positions = torch.arange(num_tokens, dtype=torch.int32, device=mps_device)
 
-        q_3d = torch.randn(num_tokens, num_heads, head_dim, device=device)
+        q_3d = torch.randn(num_tokens, num_heads, head_dim, device=mps_device)
         q_2d = q_3d.reshape(num_tokens, num_heads * head_dim).clone()
         q_ref = reference_rope_neox_from_cache(q_3d.clone(), positions, cache, head_dim)
 
         apply_rope_with_cos_sin_cache_inplace(
             positions=positions, query=q_2d,
-            key=torch.randn(num_tokens, num_heads * head_dim, device=device),
+            key=torch.randn(num_tokens, num_heads * head_dim, device=mps_device),
             head_size=head_dim, cos_sin_cache=cache, is_neox=True,
         )
 
@@ -87,38 +88,38 @@ class TestApplyRopeWithCosSinCache:
             q_ref, atol=1e-5, rtol=1e-5,
         )
 
-    def test_interleaved_style(self, device):
+    def test_interleaved_style(self, mps_device):
         """Interleaved RoPE (is_neox=False) should rotate even/odd pairs."""
         from flashinfer_metal import apply_rope_with_cos_sin_cache_inplace
 
         num_tokens, num_heads, head_dim = 4, 2, 8
         max_pos = 32
 
-        cache = build_cos_sin_cache(max_pos, head_dim).to(device)
-        positions = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        cache = build_cos_sin_cache(max_pos, head_dim).to(mps_device)
+        positions = torch.arange(num_tokens, dtype=torch.int32, device=mps_device)
 
-        q = torch.randn(num_tokens, num_heads, head_dim, device=device)
+        q = torch.randn(num_tokens, num_heads, head_dim, device=mps_device)
         q_orig = q.clone()
 
         apply_rope_with_cos_sin_cache_inplace(
             positions=positions, query=q,
-            key=torch.randn(num_tokens, num_heads, head_dim, device=device),
+            key=torch.randn(num_tokens, num_heads, head_dim, device=mps_device),
             head_size=head_dim, cos_sin_cache=cache, is_neox=False,
         )
 
         # Should have been modified
         assert not torch.allclose(q, q_orig)
 
-    def test_inplace_modification(self, device):
+    def test_inplace_modification(self, mps_device):
         """Verify that query and key are modified in-place."""
         from flashinfer_metal import apply_rope_with_cos_sin_cache_inplace
 
         head_dim = 64
-        cache = build_cos_sin_cache(32, head_dim).to(device)
-        positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+        cache = build_cos_sin_cache(32, head_dim).to(mps_device)
+        positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=mps_device)
 
-        q = torch.randn(4, 2, head_dim, device=device)
-        k = torch.randn(4, 2, head_dim, device=device)
+        q = torch.randn(4, 2, head_dim, device=mps_device)
+        k = torch.randn(4, 2, head_dim, device=mps_device)
         q_data_ptr = q.data_ptr()
         k_data_ptr = k.data_ptr()
 
@@ -131,16 +132,16 @@ class TestApplyRopeWithCosSinCache:
         assert k.data_ptr() == k_data_ptr
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-    def test_dtypes(self, device, dtype):
+    def test_dtypes(self, mps_device, dtype):
         """Should work for all standard dtypes."""
         from flashinfer_metal import apply_rope_with_cos_sin_cache_inplace
 
         head_dim = 64
-        cache = build_cos_sin_cache(32, head_dim).to(device)
-        positions = torch.arange(4, dtype=torch.int32, device=device)
+        cache = build_cos_sin_cache(32, head_dim).to(mps_device)
+        positions = torch.arange(4, dtype=torch.int32, device=mps_device)
 
-        q = torch.randn(4, 2, head_dim, dtype=dtype, device=device)
-        k = torch.randn(4, 2, head_dim, dtype=dtype, device=device)
+        q = torch.randn(4, 2, head_dim, dtype=dtype, device=mps_device)
+        k = torch.randn(4, 2, head_dim, dtype=dtype, device=mps_device)
 
         apply_rope_with_cos_sin_cache_inplace(
             positions=positions, query=q, key=k,
@@ -149,16 +150,16 @@ class TestApplyRopeWithCosSinCache:
         assert q.dtype == dtype
 
     @pytest.mark.parametrize("num_tokens", [1, 32, 256])
-    def test_various_seq_lengths(self, device, num_tokens):
+    def test_various_seq_lengths(self, mps_device, num_tokens):
         """Should handle different sequence lengths."""
         from flashinfer_metal import apply_rope_with_cos_sin_cache_inplace
 
         num_heads, head_dim = 8, 128
-        cache = build_cos_sin_cache(512, head_dim).to(device)
-        positions = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        cache = build_cos_sin_cache(512, head_dim).to(mps_device)
+        positions = torch.arange(num_tokens, dtype=torch.int32, device=mps_device)
 
-        q = torch.randn(num_tokens, num_heads, head_dim, device=device)
-        k = torch.randn(num_tokens, num_heads, head_dim, device=device)
+        q = torch.randn(num_tokens, num_heads, head_dim, device=mps_device)
+        k = torch.randn(num_tokens, num_heads, head_dim, device=mps_device)
 
         q_ref = reference_rope_neox_from_cache(q.clone(), positions, cache, head_dim)
 
@@ -169,18 +170,18 @@ class TestApplyRopeWithCosSinCache:
 
         torch.testing.assert_close(q, q_ref, atol=1e-5, rtol=1e-5)
 
-    def test_benchmark(self, device):
+    def test_benchmark(self, mps_device):
         """Benchmark cos/sin cache RoPE."""
         from flashinfer_metal import apply_rope_with_cos_sin_cache_inplace
 
         num_tokens, num_heads, head_dim = 512, 32, 128
-        cache = build_cos_sin_cache(4096, head_dim).to(device)
-        positions = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        cache = build_cos_sin_cache(4096, head_dim).to(mps_device)
+        positions = torch.arange(num_tokens, dtype=torch.int32, device=mps_device)
 
-        q = torch.randn(num_tokens, num_heads, head_dim, device=device)
-        k = torch.randn(num_tokens, num_heads, head_dim, device=device)
+        q = torch.randn(num_tokens, num_heads, head_dim, device=mps_device)
+        k = torch.randn(num_tokens, num_heads, head_dim, device=mps_device)
 
-        timer = BenchmarkTimer("rope_cos_sin_cache", device)
+        timer = BenchmarkTimer("rope_cos_sin_cache", mps_device)
 
         def run():
             apply_rope_with_cos_sin_cache_inplace(

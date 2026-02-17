@@ -4,8 +4,6 @@ This model implements the GPT-OSS architecture with:
 - Mixture of Experts (MoE) using FlashInfer's fused MXFP4 kernel
 - Attention sinks with sliding window (even layers) and full attention (odd layers)
 - YaRN-style RoPE scaling
-
-Note: This model requires CUDA and FlashInfer. Apple Silicon is not supported.
 """
 
 from __future__ import annotations
@@ -32,16 +30,12 @@ from ..adapter import AdapterSubpass
 from ..utils import is_apple_silicon, get_available_memory
 from ..schema import Schema, Source, WeightStore
 
-# GPT-OSS requires CUDA-only FlashInfer features (attention sinks, MoE kernels)
-# These are not available in flashinfer_metal
 if is_apple_silicon():
-    raise ImportError(
-        "GPT-OSS model requires CUDA. Apple Silicon is not supported. "
-        "Please use llama3, qwen2, or qwen3 models instead."
-    )
-
-import flashinfer as ops  # type: ignore[import]
-from flashinfer.attention import BatchAttentionWithAttentionSinkWrapper  # type: ignore[import]
+    import flashinfer_metal as ops  # type: ignore[import]
+    from flashinfer_metal import BatchAttentionWithAttentionSinkWrapper  # type: ignore[import]
+else:
+    import flashinfer as ops  # type: ignore[import]
+    from flashinfer.attention import BatchAttentionWithAttentionSinkWrapper  # type: ignore[import]
 
 
 # =============================================================================

@@ -130,8 +130,8 @@ class TestBatchAttentionWithAttentionSink:
             result = wrapper.run(q, kv_cache)
             assert result.shape == (seq_len, num_q_heads * head_dim)
 
-    def test_sinks_accepted(self, mps_device):
-        """run() should accept sinks parameter without error (even if ignored)."""
+    def test_sinks_changes_output(self, mps_device):
+        """Sinks should modify the attention output (reduced attention weight sum)."""
         from flashinfer_metal import BatchAttentionWithAttentionSinkWrapper
 
         seq_len, num_q_heads, num_kv_heads, head_dim = 4, 4, 4, 128
@@ -151,9 +151,21 @@ class TestBatchAttentionWithAttentionSink:
             num_q_heads, num_kv_heads, head_dim, page_size,
         )
 
-        sinks = torch.randn(2, num_kv_heads, head_dim, dtype=torch.float16, device=mps_device)
-        result = wrapper.run(q, kv_cache, sinks=sinks, scaling=head_dim**-0.5)
-        assert result.shape == (seq_len, num_q_heads * head_dim)
+        # Without sinks
+        result_no_sink = wrapper.run(q, kv_cache, sinks=None)
+
+        # With sinks: [num_qo_heads] float32 per-head sink logits
+        # Large positive sinks → large virtual token → absorbs most attention
+        sinks = torch.full((num_q_heads,), 5.0, dtype=torch.float32, device=mps_device)
+        result_with_sink = wrapper.run(q, kv_cache, sinks=sinks)
+
+        assert result_with_sink.shape == (seq_len, num_q_heads * head_dim)
+
+        # Output should differ when sinks are active
+        assert not torch.allclose(result_no_sink.cpu(), result_with_sink.cpu(), atol=1e-3)
+
+        # With large sinks, output magnitude should be smaller (attention absorbed by sink)
+        assert result_with_sink.abs().mean() < result_no_sink.abs().mean()
 
     def test_benchmark(self, mps_device):
         """Benchmark attention sink wrapper."""

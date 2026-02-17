@@ -376,6 +376,19 @@ kernel void batch_prefill_attention_unified_fp16_simdgroup_kernel(
         }
     }
 
+    // Attention sink injection (modifies softmax denominator)
+    if (params_raw[8] > 0.0f) {
+        float log_sink = params_raw[9 + head_idx] * M_LOG2E_F;
+        float sink_max = max(max_score, log_sink);
+        float sink_factor = fast::exp2(max_score - sink_max);
+        float exp_sink = fast::exp2(log_sink - sink_max);
+        max_score = sink_max;
+        sum_score = sum_score * sink_factor + exp_sink;
+        for (int i = 0; i < TD * kElemsPerFrag; i++) {
+            O_acc[i] *= sink_factor;
+        }
+    }
+
     // Normalize and write output
     float inv_sum = (sum_score > 0.0f) ? (1.0f / sum_score) : 0.0f;
     for (int i = 0; i < TD * kElemsPerFrag; i++) {
@@ -522,6 +535,22 @@ template <typename T, int HEAD_DIM>
         device const T* v_ptr = paged_kv_cache + v_off + simd_lid * v_per_thread;
         for (int i = 0; i < v_per_thread; i++) {
             o[i] = o[i] * factor + exp_score * float(v_ptr[i]);
+        }
+    }
+
+    // Attention sink injection (v2, natural exp)
+    // Only inject in simd_gid 0 — idle simdgroups must not add sink to
+    // their softmax state, otherwise the sink is counted DECODE_BN times
+    // in the final cross-simdgroup reduction.
+    if (params_raw[8] > 0.0f && simd_gid == 0) {
+        float log_sink = params_raw[9 + head_idx];
+        float sink_max = max(max_score, log_sink);
+        float sink_factor = fast::exp(max_score - sink_max);
+        float exp_sink = fast::exp(log_sink - sink_max);
+        max_score = sink_max;
+        sum_exp_score = sum_exp_score * sink_factor + exp_sink;
+        for (int i = 0; i < v_per_thread; i++) {
+            o[i] *= sink_factor;
         }
     }
 
@@ -693,6 +722,20 @@ template <typename T, int HEAD_DIM>
         o[3] = o[3] * factor + exp_score * float(v_vec[3]);
     }
 
+    // Attention sink injection (v3, exp2/log2 space)
+    // Only inject in simd_gid 0 to avoid counting the sink DECODE_BN times.
+    if (params_raw[8] > 0.0f && simd_gid == 0) {
+        float log_sink = params_raw[9 + head_idx] * M_LOG2E_F;
+        float sink_max = max(max_score, log_sink);
+        float sink_factor = fast::exp2(max_score - sink_max);
+        float exp_sink = fast::exp2(log_sink - sink_max);
+        max_score = sink_max;
+        sum_exp_score = sum_exp_score * sink_factor + exp_sink;
+        for (int i = 0; i < v_per_thread; i++) {
+            o[i] *= sink_factor;
+        }
+    }
+
     // Final reduction across simdgroups
     if (simd_lid == 0) {
         max_scores_smem[simd_gid] = max_score;
@@ -830,6 +873,20 @@ template <int HEAD_DIM>
         o[1] = o[1] * factor + exp_score * float(as_type<bfloat>(v_raw[1]));
         o[2] = o[2] * factor + exp_score * float(as_type<bfloat>(v_raw[2]));
         o[3] = o[3] * factor + exp_score * float(as_type<bfloat>(v_raw[3]));
+    }
+
+    // Attention sink injection (v3 bf16, exp2/log2 space)
+    // Only inject in simd_gid 0 to avoid counting the sink DECODE_BN times.
+    if (params_raw[8] > 0.0f && simd_gid == 0) {
+        float log_sink = params_raw[9 + head_idx] * M_LOG2E_F;
+        float sink_max = max(max_score, log_sink);
+        float sink_factor = fast::exp2(max_score - sink_max);
+        float exp_sink = fast::exp2(log_sink - sink_max);
+        max_score = sink_max;
+        sum_exp_score = sum_exp_score * sink_factor + exp_sink;
+        for (int i = 0; i < v_per_thread; i++) {
+            o[i] *= sink_factor;
+        }
     }
 
     // Final reduction across simdgroups
@@ -1159,6 +1216,19 @@ kernel void batch_prefill_attention_unified_bfloat16_simdgroup_kernel(
         }
     }
 
+    // Attention sink injection (bf16 prefill, exp2/log2 space)
+    if (params_raw[8] > 0.0f) {
+        float log_sink = params_raw[9 + head_idx] * M_LOG2E_F;
+        float sink_max = max(max_score, log_sink);
+        float sink_factor = fast::exp2(max_score - sink_max);
+        float exp_sink = fast::exp2(log_sink - sink_max);
+        max_score = sink_max;
+        sum_score = sum_score * sink_factor + exp_sink;
+        for (int i = 0; i < TD * kElemsPerFrag; i++) {
+            O_acc[i] *= sink_factor;
+        }
+    }
+
     // Normalize and write output as BF16
     float inv_sum = (sum_score > 0.0f) ? (1.0f / sum_score) : 0.0f;
     for (int i = 0; i < TD * kElemsPerFrag; i++) {
@@ -1279,6 +1349,20 @@ template <int HEAD_DIM>
         device const ushort* v_ptr = paged_kv_cache + v_off + simd_lid * v_per_thread;
         for (int i = 0; i < v_per_thread; i++) {
             o[i] = o[i] * factor + exp_score * float(as_type<bfloat>(v_ptr[i]));
+        }
+    }
+
+    // Attention sink injection (v2 bf16, natural exp)
+    // Only inject in simd_gid 0 to avoid counting the sink DECODE_BN times.
+    if (params_raw[8] > 0.0f && simd_gid == 0) {
+        float log_sink = params_raw[9 + head_idx];
+        float sink_max = max(max_score, log_sink);
+        float sink_factor = fast::exp(max_score - sink_max);
+        float exp_sink = fast::exp(log_sink - sink_max);
+        max_score = sink_max;
+        sum_exp_score = sum_exp_score * sink_factor + exp_sink;
+        for (int i = 0; i < v_per_thread; i++) {
+            o[i] *= sink_factor;
         }
     }
 

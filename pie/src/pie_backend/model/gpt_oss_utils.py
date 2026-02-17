@@ -13,8 +13,7 @@ from typing import Any
 
 import torch
 
-# Note: These imports require FlashInfer (CUDA only)
-# Import lazily in functions that need them to allow module loading on CPU
+from ..utils import is_apple_silicon
 
 
 # Mapping from fp4 (e2m1) to float values
@@ -223,6 +222,135 @@ def pad_down_bias(
     )
     padded[:, :hidden_size] = bias
     return padded
+
+
+def deinterleave_gate_up_fp4(
+    blocks: torch.Tensor,
+    scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    De-interleave gate_up in FP4 packed domain (no dequant needed).
+
+    GPT OSS stores gate_up as interleaved rows: [gate[0], linear[0], gate[1], linear[1], ...]
+    FlashInfer expects: [linear[0], linear[1], ..., gate[0], gate[1], ...]
+
+    This is a pure row permutation — works identically on uint8 packed data.
+
+    Args:
+        blocks: [E, 2*I, H/2] uint8 packed FP4
+        scales: [E, 2*I, H/32] uint8 E8M0 exponents
+
+    Returns:
+        Reordered (blocks, scales) with same shapes
+    """
+    gate_blocks = blocks[:, 0::2, :]
+    linear_blocks = blocks[:, 1::2, :]
+    reordered_blocks = torch.cat([linear_blocks, gate_blocks], dim=1)
+
+    gate_scales = scales[:, 0::2, :]
+    linear_scales = scales[:, 1::2, :]
+    reordered_scales = torch.cat([linear_scales, gate_scales], dim=1)
+
+    return reordered_blocks, reordered_scales
+
+
+def pad_gate_up_fp4(
+    blocks: torch.Tensor,
+    scales: torch.Tensor,
+    padded_H: int,
+    padded_I: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pad gate_up FP4 packed blocks and scales.
+
+    Splits into linear/gate halves, pads each separately, re-concatenates.
+    Blocks padded with 0x00 (FP4 +0.0), scales padded with 0x7F (E8M0 exp=127 → scale=1.0).
+
+    Args:
+        blocks: [E, 2*I, H/2] uint8
+        scales: [E, 2*I, H/32] uint8
+        padded_H: target hidden size (must be even for blocks, divisible by 32 for scales)
+        padded_I: target intermediate size per half
+
+    Returns:
+        blocks [E, 2*padded_I, padded_H/2], scales [E, 2*padded_I, padded_H/32]
+    """
+    E = blocks.shape[0]
+    I = blocks.shape[1] // 2
+    H_half = blocks.shape[2]          # H/2
+    H_scale = scales.shape[2]         # H/32
+
+    padded_H_half = padded_H // 2
+    padded_H_scale = padded_H // 32
+
+    if I == padded_I and H_half == padded_H_half:
+        return blocks, scales
+
+    # Split into linear and gate halves
+    lin_b, gate_b = blocks[:, :I, :], blocks[:, I:, :]
+    lin_s, gate_s = scales[:, :I, :], scales[:, I:, :]
+
+    # Pad blocks with 0x00
+    def _pad_blocks(t: torch.Tensor) -> torch.Tensor:
+        padded = torch.zeros(
+            (E, padded_I, padded_H_half), dtype=torch.uint8, device=t.device,
+        )
+        padded[:, :I, :H_half] = t
+        return padded
+
+    # Pad scales with 0x7F (E8M0 exponent=127 → scale=1.0)
+    def _pad_scales(t: torch.Tensor) -> torch.Tensor:
+        padded = torch.full(
+            (E, padded_I, padded_H_scale), 0x7F, dtype=torch.uint8, device=t.device,
+        )
+        padded[:, :I, :H_scale] = t
+        return padded
+
+    out_blocks = torch.cat([_pad_blocks(lin_b), _pad_blocks(gate_b)], dim=1)
+    out_scales = torch.cat([_pad_scales(lin_s), _pad_scales(gate_s)], dim=1)
+    return out_blocks, out_scales
+
+
+def pad_down_fp4(
+    blocks: torch.Tensor,
+    scales: torch.Tensor,
+    padded_H: int,
+    padded_I: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pad down projection FP4 packed blocks and scales.
+
+    Args:
+        blocks: [E, H, I/2] uint8
+        scales: [E, H, I/32] uint8
+        padded_H: target hidden size (rows)
+        padded_I: target intermediate size (cols before packing)
+
+    Returns:
+        blocks [E, padded_H, padded_I/2], scales [E, padded_H, padded_I/32]
+    """
+    E, H, I_half = blocks.shape
+    I_scale = scales.shape[2]          # I/32
+
+    padded_I_half = padded_I // 2
+    padded_I_scale = padded_I // 32
+
+    if H == padded_H and I_half == padded_I_half:
+        return blocks, scales
+
+    # Pad blocks with 0x00
+    padded_blocks = torch.zeros(
+        (E, padded_H, padded_I_half), dtype=torch.uint8, device=blocks.device,
+    )
+    padded_blocks[:, :H, :I_half] = blocks
+
+    # Pad scales with 0x7F
+    padded_scales = torch.full(
+        (E, padded_H, padded_I_scale), 0x7F, dtype=torch.uint8, device=scales.device,
+    )
+    padded_scales[:, :H, :I_scale] = scales
+
+    return padded_blocks, padded_scales
 
 
 def dequantize_from_mxfp4(
@@ -520,11 +648,82 @@ def prepare_gptoss_moe_gate_up(
     rank = config.get("rank", 0)
     world_size = config.get("world_size", 1)
 
-    # Step 1: Dequantize MXFP4 to bfloat16 (FULL tensor)
+    if is_apple_silicon():
+        # --- Apple Silicon: keep FP4 packed, skip dequantization ---
+        # Handle E8M0 scale dtype
+        if scales.dtype == torch.float8_e4m3fn:
+            scales = scales.view(torch.uint8)
+
+        # Reshape to [E, 2*I, H/2] and [E, 2*I, H/32]
+        blocks = blocks.reshape(num_experts, intermediate_size * 2, hidden_size // 2)
+        scales = scales.reshape(num_experts, intermediate_size * 2, hidden_size // 32)
+
+        # Deinterleave in FP4 domain (pure row permutation)
+        blocks, scales = deinterleave_gate_up_fp4(blocks, scales)
+
+        # TP sharding: row slicing in FP4 domain (rows are independent)
+        if world_size > 1:
+            if intermediate_size % world_size != 0:
+                raise ValueError(
+                    f"intermediate_size {intermediate_size} not divisible by world_size {world_size}"
+                )
+            local_intermediate = intermediate_size // world_size
+            local_padded_intermediate = padded_intermediate_size // world_size
+            start_idx = rank * local_intermediate
+            end_idx = (rank + 1) * local_intermediate
+
+            # Slice both linear and gate halves
+            lin_b = blocks[:, :intermediate_size, :]
+            gate_b = blocks[:, intermediate_size:, :]
+            blocks = torch.cat(
+                [lin_b[:, start_idx:end_idx, :].contiguous(),
+                 gate_b[:, start_idx:end_idx, :].contiguous()], dim=1,
+            )
+
+            lin_s = scales[:, :intermediate_size, :]
+            gate_s = scales[:, intermediate_size:, :]
+            scales = torch.cat(
+                [lin_s[:, start_idx:end_idx, :].contiguous(),
+                 gate_s[:, start_idx:end_idx, :].contiguous()], dim=1,
+            )
+
+            intermediate_size = local_intermediate
+            padded_intermediate_size = local_padded_intermediate
+
+        # Pad in FP4 domain
+        blocks, scales = pad_gate_up_fp4(
+            blocks, scales, padded_hidden_size, padded_intermediate_size,
+        )
+
+        # Prepare bias (de-interleave + TP shard + pad, same as before)
+        bias_deinterleaved = deinterleave_gate_up_bias(bias.to(device))
+        if world_size > 1:
+            orig_I = config["intermediate_size"]
+            local_I = orig_I // world_size
+            lin_bias = bias_deinterleaved[:, :orig_I]
+            gate_bias = bias_deinterleaved[:, orig_I:]
+            bias_deinterleaved = torch.cat(
+                [lin_bias[:, rank * local_I:(rank + 1) * local_I].contiguous(),
+                 gate_bias[:, rank * local_I:(rank + 1) * local_I].contiguous()],
+                dim=1,
+            )
+        bias_padded = pad_gate_up_bias(
+            bias_deinterleaved, padded_intermediate_size,
+        ).to(torch.float32)
+
+        return {
+            "weights": blocks.to(device),
+            "scales": scales.to(device),
+            "bias": bias_padded,
+        }
+
+    # --- CUDA path: dequantize to bf16, then quantize/shuffle ---
+
+    # Step 1: Dequantize MXFP4 to bfloat16
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, intermediate_size * 2, hidden_size]
     weights_bf16 = weights_bf16.reshape(num_experts, intermediate_size * 2, hidden_size)
-    
+
     # Free input tensors early to reduce memory pressure
     del blocks, scales
 
@@ -536,9 +735,6 @@ def prepare_gptoss_moe_gate_up(
 
     # Step 3: Apply TP sharding AFTER de-interleaving (on float tensor)
     if world_size > 1:
-        # After de-interleaving, weights are [num_experts, 2*intermediate, hidden]
-        # First half is linear, second half is gate
-        # We need to slice BOTH halves consistently
         if intermediate_size % world_size != 0:
             raise ValueError(
                 f"intermediate_size {intermediate_size} not divisible by world_size {world_size}"
@@ -550,16 +746,14 @@ def prepare_gptoss_moe_gate_up(
         start_idx = rank * local_intermediate
         end_idx = (rank + 1) * local_intermediate
 
-        # Slice both linear and gate parts
-        linear_part = weights_deinterleaved[:, :intermediate_size, :]  # [E, I, H]
-        gate_part = weights_deinterleaved[:, intermediate_size:, :]  # [E, I, H]
+        linear_part = weights_deinterleaved[:, :intermediate_size, :]
+        gate_part = weights_deinterleaved[:, intermediate_size:, :]
 
         local_linear = linear_part[:, start_idx:end_idx, :].contiguous()
         local_gate = gate_part[:, start_idx:end_idx, :].contiguous()
 
         weights_deinterleaved = torch.cat([local_linear, local_gate], dim=1)
 
-        # Slice bias similarly
         linear_bias = bias_deinterleaved[:, :intermediate_size]
         gate_bias = bias_deinterleaved[:, intermediate_size:]
 
@@ -568,7 +762,6 @@ def prepare_gptoss_moe_gate_up(
 
         bias_deinterleaved = torch.cat([local_linear_bias, local_gate_bias], dim=1)
 
-        # Update sizes
         intermediate_size = local_intermediate
         padded_intermediate_size = local_padded_intermediate
 
@@ -585,6 +778,7 @@ def prepare_gptoss_moe_gate_up(
 
     # Step 5: Quantize and shuffle
     del weights_deinterleaved  # Free before final transform
+
     weights_shuffled, scales_shuffled, bias_shuffled = quantize_shuffle_gate_up_weights(
         weights_padded,
         padded_hidden_size,
@@ -593,7 +787,7 @@ def prepare_gptoss_moe_gate_up(
         gate_up_bias=bias_padded,
     )
     del weights_padded, bias_padded  # Free after quantization
-    
+
     # Force CUDA memory cleanup
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -636,11 +830,59 @@ def prepare_gptoss_moe_down(
     rank = config.get("rank", 0)
     world_size = config.get("world_size", 1)
 
-    # Step 1: Dequantize MXFP4 to bfloat16 (FULL tensor)
+    if is_apple_silicon():
+        # --- Apple Silicon: keep FP4 packed, skip dequantization ---
+        if scales.dtype == torch.float8_e4m3fn:
+            scales = scales.view(torch.uint8)
+
+        # Reshape to [E, H, I/2] and [E, H, I/32]
+        blocks = blocks.reshape(num_experts, hidden_size, intermediate_size // 2)
+        scales = scales.reshape(num_experts, hidden_size, intermediate_size // 32)
+
+        # TP sharding: slice columns in FP4 packed domain
+        if world_size > 1:
+            if intermediate_size % world_size != 0:
+                raise ValueError(
+                    f"intermediate_size {intermediate_size} not divisible by world_size {world_size}"
+                )
+            local_intermediate = intermediate_size // world_size
+            local_padded_intermediate = padded_intermediate_size // world_size
+            start_half = rank * (local_intermediate // 2)
+            end_half = (rank + 1) * (local_intermediate // 2)
+            start_scale = rank * (local_intermediate // 32)
+            end_scale = (rank + 1) * (local_intermediate // 32)
+
+            blocks = blocks[:, :, start_half:end_half].contiguous()
+            scales = scales[:, :, start_scale:end_scale].contiguous()
+
+            # Bias for Down proj: divide by world_size to avoid over-counting
+            bias = bias / world_size
+
+            intermediate_size = local_intermediate
+            padded_intermediate_size = local_padded_intermediate
+
+        # Pad in FP4 domain
+        blocks, scales = pad_down_fp4(
+            blocks, scales, padded_hidden_size, padded_intermediate_size,
+        )
+
+        bias_padded = pad_down_bias(
+            bias.to(device), padded_hidden_size,
+        ).to(torch.float32)
+
+        return {
+            "weights": blocks.to(device),
+            "scales": scales.to(device),
+            "bias": bias_padded,
+        }
+
+    # --- CUDA path: dequantize to bf16, then quantize/shuffle ---
+
+    # Step 1: Dequantize MXFP4 to bfloat16
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, hidden_size, intermediate_size]
     weights_bf16 = weights_bf16.reshape(num_experts, hidden_size, intermediate_size)
-    
+
     # Free input tensors early to reduce memory pressure
     del blocks, scales
 
@@ -657,15 +899,10 @@ def prepare_gptoss_moe_down(
         start_idx = rank * local_intermediate
         end_idx = (rank + 1) * local_intermediate
 
-        # Slice weights along intermediate dimension (dim 2)
         weights_bf16 = weights_bf16[:, :, start_idx:end_idx].contiguous()
 
-        # Bias for Down proj is [num_experts, hidden_size] -> Not sharded on that dim
-        # But since each rank produces partial output that gets summed,
-        # we need to divide bias by world_size to avoid over-counting
         bias = bias / world_size
 
-        # Update sizes
         intermediate_size = local_intermediate
         padded_intermediate_size = local_padded_intermediate
 
@@ -691,7 +928,7 @@ def prepare_gptoss_moe_down(
         down_bias=bias_padded,
     )
     del weights_padded, bias_padded  # Free after quantization
-    
+
     # Force CUDA memory cleanup
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
