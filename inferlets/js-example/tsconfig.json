@@ -1,0 +1,24 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "moduleDetection": "force",
+        "strict": true,
+        "skipLibCheck": true,
+        "noEmit": true,
+        "baseUrl": ".",
+        "paths": {
+            "inferlet": [
+                "../../sdk/javascript/src/index.ts"
+            ],
+            "inferlet/*": [
+                "../../sdk/javascript/src/*"
+            ]
+        }
+    },
+    "include": [
+        "*.ts",
+        "../../sdk/javascript/src/globals.d.ts"
+    ]
+}
