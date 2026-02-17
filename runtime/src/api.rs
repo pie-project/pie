@@ -18,6 +18,13 @@ wasmtime::component::bindgen!({
     world: "inferlet",
     with: {
         "wasi:io/poll": wasmtime_wasi::p2::bindings::io::poll,
+        "wasi:filesystem/types": wasmtime_wasi::p2::bindings::filesystem::types,
+        "wasi:filesystem/preopens": wasmtime_wasi::p2::bindings::filesystem::preopens,
+        "wasi:clocks/wall-clock": wasmtime_wasi::p2::bindings::clocks::wall_clock,
+        "wasi:io/streams": wasmtime_wasi::p2::bindings::io::streams,
+        "wasi:random/random": wasmtime_wasi::p2::bindings::random::random,
+        "wasi:random/insecure": wasmtime_wasi::p2::bindings::random::insecure,
+        "wasi:random/insecure-seed": wasmtime_wasi::p2::bindings::random::insecure_seed,
         // pie:core/types
         "pie:core/types/future-bool": types::FutureBool,
         "pie:core/types/future-string": types::FutureString,

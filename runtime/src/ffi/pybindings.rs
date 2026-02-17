@@ -248,6 +248,9 @@ pub struct Config {
     // Models
     #[pyo3(get, set)]
     pub models: Vec<ModelConfig>,
+    // WASI capabilities
+    #[pyo3(get, set)]
+    pub allow_filesystem: bool,
 }
 
 #[pymethods]
@@ -266,6 +269,7 @@ impl Config {
         telemetry_endpoint = "http://localhost:4317".to_string(),
         telemetry_service_name = "pie".to_string(),
         models = vec![],
+        allow_filesystem = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -281,6 +285,7 @@ impl Config {
         telemetry_endpoint: String,
         telemetry_service_name: String,
         models: Vec<ModelConfig>,
+        allow_filesystem: bool,
     ) -> Self {
         Config {
             host,
@@ -295,6 +300,7 @@ impl Config {
             telemetry_endpoint,
             telemetry_service_name,
             models,
+            allow_filesystem,
         }
     }
 
@@ -358,6 +364,7 @@ impl From<Config> for BootstrapConfig {
                 })
                 .collect(),
             skip_tracing: false,
+            allow_filesystem: cfg.allow_filesystem,
         }
     }
 }

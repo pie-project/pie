@@ -28,9 +28,9 @@ use crate::process::ProcessId;
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Spawns the linker service with the given engine.
-pub fn spawn(engine: &Engine) {
+pub fn spawn(engine: &Engine, allow_filesystem: bool) {
     SERVICE
-        .spawn(|| Linker::new(engine))
+        .spawn(|| Linker::new(engine, allow_filesystem))
         .expect("linker already spawned");
 }
 
@@ -58,11 +58,12 @@ pub async fn instantiate(
 
 struct Linker {
     engine: Engine,
+    allow_filesystem: bool,
 }
 
 impl Linker {
-    fn new(engine: &Engine) -> Self {
-        Linker { engine: engine.clone() }
+    fn new(engine: &Engine, allow_filesystem: bool) -> Self {
+        Linker { engine: engine.clone(), allow_filesystem }
     }
 
     async fn instantiate(
@@ -81,7 +82,7 @@ impl Linker {
         let dependency_components = self.resolve_dependency_components(program_name).await?;
 
         // 3. Create instance state and store
-        let inst_state = InstanceState::new(process_id, username, capture_outputs);
+        let inst_state = InstanceState::new(process_id, username, capture_outputs, self.allow_filesystem);
         let mut store = Store::new(&self.engine, inst_state);
 
         // 4. Create and configure linker

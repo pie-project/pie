@@ -76,6 +76,7 @@ class Config:
     auth: AuthConfig = field(default_factory=AuthConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     models: list[ModelConfig] = field(default_factory=list)
+    allow_filesystem: bool = False
 
     @property
     def primary_model(self) -> ModelConfig:
@@ -251,4 +252,5 @@ def load_config(
             service_name=telemetry_section.get("service_name", "pie"),
         ),
         models=models,
+        allow_filesystem=raw.get("allow_filesystem", False),
     )

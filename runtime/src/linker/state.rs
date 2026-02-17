@@ -4,8 +4,9 @@
 //! including WASI context and dynamic linking support.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use wasmtime::component::{ResourceAny, ResourceTable};
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 use super::output::LogStream;
@@ -22,6 +23,9 @@ pub struct InstanceState {
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
 
+    /// Per-instance scratch directory, deleted on Drop.
+    scratch_dir: PathBuf,
+
     // Dynamic linking support for proxy resources
     /// Maps host rep → guest ResourceAny for dynamic linking
     dynamic_resource_map: HashMap<u32, ResourceAny>,
@@ -29,6 +33,12 @@ pub struct InstanceState {
     guest_resource_map: Vec<(ResourceAny, u32)>,
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
+}
+
+impl Drop for InstanceState {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.scratch_dir);
+    }
 }
 
 impl WasiView for InstanceState {
@@ -55,6 +65,7 @@ impl InstanceState {
         id: ProcessId,
         username: String,
         capture_outputs: bool,
+        allow_filesystem: bool,
     ) -> Self {
         let mut builder = WasiCtx::builder();
         builder.inherit_network(); // TODO: Replace with socket_addr_check later.
@@ -64,12 +75,30 @@ impl InstanceState {
             builder.stderr(LogStream::new_stderr(id));
         }
 
+        // Cross-platform temp dir: /tmp on Linux, %TEMP% on Windows, etc.
+        let scratch_dir = std::env::temp_dir()
+            .join("pie")
+            .join(id.to_string());
+
+        if allow_filesystem {
+            std::fs::create_dir_all(&scratch_dir)
+                .expect("failed to create scratch dir");
+
+            builder.preopened_dir(
+                &scratch_dir,
+                "/scratch",
+                DirPerms::all(),
+                FilePerms::all(),
+            ).expect("failed to preopen scratch dir");
+        }
+
         InstanceState {
             id,
             username,
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
+            scratch_dir,
             // Dynamic linking support
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
