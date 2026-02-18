@@ -25,7 +25,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let model_name = runtime::models().into_iter().next()
         .ok_or_else(|| "No models available".to_string())?;
     let model = Model::load(&model_name)?;
-    let adapter = Adapter::lookup(&model, &name)
+    let adapter = Adapter::open(&model, &name)
         .ok_or_else(|| format!("Adapter '{}' not found", name))?;
 
     let sampler = Sampler::TopP((0.6, 0.95));

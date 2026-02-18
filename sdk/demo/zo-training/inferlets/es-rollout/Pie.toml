@@ -1,6 +1,6 @@
 [package]
 name = "es-rollout"
-version = "0.1.0"
+version = "0.1.2"
 description = "Perform parallel rollouts for evaluation"
 authors = ["In Gim <in.gim@yale.edu>"]
 repository = "https://github.com/pie-project/pie"
