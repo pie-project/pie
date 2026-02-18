@@ -119,11 +119,40 @@ class MetalCompiler:
         self._rope_cache_f32: torch.Tensor | None = None
         # Pre-allocated buffer for MoE routing params (4 floats)
         self._moe_routing_params: torch.Tensor | None = None
+        # Pre-allocated buffer for RMS norm params (2 floats: H, eps)
+        self._rms_norm_params: torch.Tensor | None = None
+        # Cached params tensors: keyed by (method_name, value_tuple) → GPU tensor.
+        # Eliminates ~63 μs/write per-element GPU tensor writes for constant params.
+        self._params_cache: dict[tuple, torch.Tensor] = {}
+        # Cached kernel function references to avoid repeated getattr()
+        self._kernel_fn_cache: dict[str, object] = {}
 
     def _ensure_env(self) -> None:
         if not self._env_checked:
             _check_environment()
             self._env_checked = True
+
+    def _get_params(self, key: tuple, values: list[float]) -> torch.Tensor:
+        """Get or create a cached params tensor on MPS.
+
+        Using element-by-element GPU tensor writes (tensor[i] = float) costs
+        ~63 μs PER WRITE due to CPU→GPU command encoding.  For constant params
+        (model dimensions, eps, etc. that never change during decode), caching
+        the tensor eliminates this overhead entirely.
+        """
+        t = self._params_cache.get(key)
+        if t is None:
+            t = torch.tensor(values, dtype=torch.float32, device="mps")
+            self._params_cache[key] = t
+        return t
+
+    def _get_kernel_fn(self, lib: object, name: str) -> object:
+        """Cache kernel function reference to avoid repeated getattr()."""
+        fn = self._kernel_fn_cache.get(name)
+        if fn is None:
+            fn = getattr(lib, name)
+            self._kernel_fn_cache[name] = fn
+        return fn
 
     def _read_metal(self, filename: str) -> str:
         return (_KERNEL_DIR / filename).read_text()
@@ -411,14 +440,11 @@ class MetalCompiler:
             contiguous_copy = input_qk.contiguous()
             flat = contiguous_copy.view(-1)
 
-        if self._rope_params is None:
-            self._rope_params = torch.empty(4, dtype=torch.float32, device="mps")
-        p = self._rope_params
-        p[0] = num_tokens
-        p[1] = num_heads
-        p[2] = head_size
-        p[3] = 1 if is_neox else 0
-        params = p
+        params = self._get_params(
+            ("rope_cos_sin", num_tokens, num_heads, head_size, is_neox),
+            [float(num_tokens), float(num_heads), float(head_size),
+             1.0 if is_neox else 0.0],
+        )
 
         cid = id(cos_sin_cache)
         if cid != self._rope_cache_id:
@@ -489,15 +515,11 @@ class MetalCompiler:
             k_copy = key.contiguous()
             k_flat = k_copy.view(-1)
 
-        if self._rope_params_fused is None:
-            self._rope_params_fused = torch.empty(5, dtype=torch.float32, device="mps")
-        p = self._rope_params_fused
-        p[0] = num_tokens
-        p[1] = num_q_heads
-        p[2] = num_kv_heads
-        p[3] = head_size
-        p[4] = 1 if is_neox else 0
-        params = p
+        params = self._get_params(
+            ("rope_fused", num_tokens, num_q_heads, num_kv_heads, head_size, is_neox),
+            [float(num_tokens), float(num_q_heads), float(num_kv_heads),
+             float(head_size), 1.0 if is_neox else 0.0],
+        )
 
         cid = id(cos_sin_cache)
         if cid != self._rope_cache_id:
@@ -516,7 +538,7 @@ class MetalCompiler:
 
         max_heads = max(num_q_heads, num_kv_heads)
 
-        getattr(lib, kernel_name)(
+        self._get_kernel_fn(lib, kernel_name)(
             q_flat,
             k_flat,
             positions.to(device="mps", dtype=torch.int32),
@@ -571,19 +593,15 @@ class MetalCompiler:
             2 * page_size * num_kv_heads * head_size
         )
 
-        if self._append_kv_params is None:
-            self._append_kv_params = torch.empty(10, dtype=torch.float32, device="mps")
-        p = self._append_kv_params
-        p[0] = num_tokens
-        p[1] = num_kv_heads
-        p[2] = head_size
-        p[3] = page_size
-        p[4] = max_num_pages
-        p[5] = batch_size
-        p[6] = num_kv_heads * head_size  # k_stride_token
-        p[7] = head_size                  # k_stride_head
-        p[8] = num_kv_heads * head_size  # v_stride_token
-        p[9] = head_size                  # v_stride_head
+        kv_stride = num_kv_heads * head_size
+        p = self._get_params(
+            ("append_kv", num_tokens, num_kv_heads, head_size, page_size,
+             max_num_pages, batch_size),
+            [float(num_tokens), float(num_kv_heads), float(head_size),
+             float(page_size), float(max_num_pages), float(batch_size),
+             float(kv_stride), float(head_size),
+             float(kv_stride), float(head_size)],
+        )
 
         _APPEND_KV_KERNELS = {
             torch.bfloat16: "metal_append_paged_kv_cache_bfloat16",
@@ -600,7 +618,7 @@ class MetalCompiler:
         def _i32(t: torch.Tensor) -> torch.Tensor:
             return t if t.dtype == torch.int32 else t.to(torch.int32)
 
-        getattr(lib, kernel_name)(
+        self._get_kernel_fn(lib, kernel_name)(
             k_input,
             v_input,
             paged_kv_cache,
@@ -650,23 +668,20 @@ class MetalCompiler:
         """
         lib = self._ensure_moe_routing()
 
-        # Lazily allocate params buffer (4 floats)
-        if self._moe_routing_params is None:
-            self._moe_routing_params = torch.empty(4, dtype=torch.float32, device="mps")
-
-        self._moe_routing_params[0] = float(num_experts)
-        self._moe_routing_params[1] = float(top_k)
-        self._moe_routing_params[2] = float(output2_scale)
-        self._moe_routing_params[3] = float(local_expert_offset)
+        params = self._get_params(
+            ("moe_routing", num_experts, top_k, output2_scale, local_expert_offset),
+            [float(num_experts), float(top_k), float(output2_scale),
+             float(local_expert_offset)],
+        )
 
         # Flatten logits to 1D for kernel
         logits_flat = logits.contiguous().view(-1)
 
         # Select kernel based on dtype
         if logits.dtype == torch.bfloat16:
-            kernel_fn = lib.moe_route_topk_bf16
+            kernel_fn = self._get_kernel_fn(lib, "moe_route_topk_bf16")
         elif logits.dtype == torch.float16:
-            kernel_fn = lib.moe_route_topk_f16
+            kernel_fn = self._get_kernel_fn(lib, "moe_route_topk_f16")
         else:
             raise ValueError(f"Unsupported routing logits dtype: {logits.dtype}")
 
@@ -674,7 +689,7 @@ class MetalCompiler:
             logits_flat,
             expert_ids_out,
             fused_scales_out,
-            self._moe_routing_params,
+            params,
             threads=(1, 1, 1),
             group_size=(1, 1, 1),
         )
@@ -723,19 +738,14 @@ class MetalCompiler:
 
         output = torch.empty(count, intermediate_size, dtype=input.dtype, device="mps")
 
-        # Reuse pre-allocated params buffer to avoid per-dispatch tensor alloc
-        if self._moe_params9 is None:
-            self._moe_params9 = torch.empty(9, dtype=torch.float32, device="mps")
-        self._moe_params9[0] = count
-        self._moe_params9[1] = hidden_dim
-        self._moe_params9[2] = intermediate_size
-        self._moe_params9[3] = alpha
-        self._moe_params9[4] = beta
-        self._moe_params9[5] = clamp_limit
-        self._moe_params9[6] = scale_gate
-        self._moe_params9[7] = scale_up
-        self._moe_params9[8] = 1.0 if bias is not None else 0.0
-        params = self._moe_params9
+        has_bias = 1.0 if bias is not None else 0.0
+        params = self._get_params(
+            ("prefill_gemm1", count, hidden_dim, intermediate_size, alpha, beta,
+             clamp_limit, scale_gate, scale_up, has_bias),
+            [float(count), float(hidden_dim), float(intermediate_size),
+             float(alpha), float(beta), float(clamp_limit),
+             float(scale_gate), float(scale_up), float(has_bias)],
+        )
 
         if bias is not None:
             bias_buf = bias if bias.dtype == input.dtype else bias.to(input.dtype)
@@ -806,15 +816,12 @@ class MetalCompiler:
 
         output = torch.empty(count, out_dim, dtype=input.dtype, device="mps")
 
-        # Reuse pre-allocated params buffer to avoid per-dispatch tensor alloc
-        if self._moe_params5 is None:
-            self._moe_params5 = torch.empty(5, dtype=torch.float32, device="mps")
-        self._moe_params5[0] = count
-        self._moe_params5[1] = in_dim
-        self._moe_params5[2] = out_dim
-        self._moe_params5[3] = scale
-        self._moe_params5[4] = 1.0 if bias is not None else 0.0
-        params = self._moe_params5
+        has_bias = 1.0 if bias is not None else 0.0
+        params = self._get_params(
+            ("prefill_gemm2", count, in_dim, out_dim, scale, has_bias),
+            [float(count), float(in_dim), float(out_dim),
+             float(scale), float(has_bias)],
+        )
 
         if bias is not None:
             bias_buf = bias if bias.dtype == input.dtype else bias.to(input.dtype)
@@ -893,16 +900,11 @@ class MetalCompiler:
 
         has_bias = 1.0 if all_bias is not None else 0.0
 
-        # params: [H_PAD, I, alpha, clamp_limit, has_bias]
-        if not hasattr(self, '_decode_gemm1_swiglu_params'):
-            self._decode_gemm1_swiglu_params = torch.zeros(5, dtype=torch.float32, device="mps")
-        self._decode_gemm1_swiglu_params[0] = hidden_dim
-        self._decode_gemm1_swiglu_params[1] = I
-        self._decode_gemm1_swiglu_params[2] = alpha
-        self._decode_gemm1_swiglu_params[3] = clamp_limit
-        self._decode_gemm1_swiglu_params[4] = has_bias
-
-        self._moe_batched_expert_ids[:K] = expert_ids
+        params = self._get_params(
+            ("decode_gemm1_swiglu", hidden_dim, I, alpha, clamp_limit, has_bias),
+            [float(hidden_dim), float(I), float(alpha),
+             float(clamp_limit), float(has_bias)],
+        )
 
         if all_bias is not None:
             bias_buf = all_bias if all_bias.dtype == input.dtype else all_bias.to(input.dtype)
@@ -915,14 +917,14 @@ class MetalCompiler:
 
         # Grid: (ceil(I/2), K) threadgroups, each (32, 2) threads
         num_col_tiles = (I + 1) // 2
-        lib.moe_decode_gemm1_swiglu(
+        self._get_kernel_fn(lib, "moe_decode_gemm1_swiglu")(
             input.contiguous().view(-1),
             all_w_blocks.contiguous().view(-1),
             all_w_scales.contiguous().view(-1),
             bias_buf.contiguous().view(-1),
             output.view(-1),
-            self._moe_batched_expert_ids[:K],
-            self._decode_gemm1_swiglu_params,
+            expert_ids,
+            params,
             threads=(num_col_tiles * 32, K * 2, 1),
             group_size=(32, 2, 1),
         )
@@ -950,23 +952,20 @@ class MetalCompiler:
             self._decode_gemm1_out = torch.empty(K, N, dtype=input.dtype, device="mps")
         output = self._decode_gemm1_out
 
-        # params: [H_PAD, N]
-        if not hasattr(self, '_decode_gemm1_params'):
-            self._decode_gemm1_params = torch.zeros(2, dtype=torch.float32, device="mps")
-        self._decode_gemm1_params[0] = hidden_dim
-        self._decode_gemm1_params[1] = N
-
-        self._moe_batched_expert_ids[:K] = expert_ids
+        params = self._get_params(
+            ("decode_gemm1", hidden_dim, N),
+            [float(hidden_dim), float(N)],
+        )
 
         # Grid: (ceil(N/4), K) threadgroups, each (32, 2) threads
         num_row_tiles = (N + 3) // 4
-        lib.moe_decode_gemm1(
+        self._get_kernel_fn(lib, "moe_decode_gemm1")(
             input.contiguous().view(-1),
             all_w_blocks.contiguous().view(-1),
             all_w_scales.contiguous().view(-1),
             output.view(-1),
-            self._moe_batched_expert_ids[:K],
-            self._decode_gemm1_params,
+            expert_ids,
+            params,
             threads=(num_row_tiles * 32, K * 2, 1),
             group_size=(32, 2, 1),
         )
@@ -997,15 +996,10 @@ class MetalCompiler:
 
         has_bias = 1.0 if all_bias is not None else 0.0
 
-        # params: [out_dim, in_dim, K_active, has_bias]
-        if not hasattr(self, '_decode_gemm2_params'):
-            self._decode_gemm2_params = torch.zeros(4, dtype=torch.float32, device="mps")
-        self._decode_gemm2_params[0] = out_dim
-        self._decode_gemm2_params[1] = in_dim
-        self._decode_gemm2_params[2] = K
-        self._decode_gemm2_params[3] = has_bias
-
-        self._moe_batched_expert_ids[:K] = expert_ids
+        params = self._get_params(
+            ("decode_gemm2_fused", out_dim, in_dim, K, has_bias),
+            [float(out_dim), float(in_dim), float(K), float(has_bias)],
+        )
 
         if all_bias is not None:
             bias_buf = all_bias if all_bias.dtype == input.dtype else all_bias.to(input.dtype)
@@ -1018,17 +1012,74 @@ class MetalCompiler:
 
         # Grid: (ceil(out_dim/4), 1) threadgroups, each (32, 2) threads
         num_row_tiles = (out_dim + 3) // 4
-        lib.moe_decode_gemm2_fused(
+        self._get_kernel_fn(lib, "moe_decode_gemm2_fused")(
             input.contiguous().view(-1),
             all_w_blocks.contiguous().view(-1),
             all_w_scales.contiguous().view(-1),
             bias_buf.contiguous().view(-1),
             output.view(-1),
-            self._moe_batched_expert_ids[:K],
+            expert_ids,
             fused_scales.contiguous(),
-            self._decode_gemm2_params,
+            params,
             threads=(num_row_tiles * 32, 2, 1),
             group_size=(32, 2, 1),
         )
         return output
+
+    # -------------------------------------------------------------------
+    # RMS Norm
+    # -------------------------------------------------------------------
+
+    def _ensure_rms_norm(self) -> object:
+        if "rms_norm" in self._libs:
+            return self._libs["rms_norm"]
+        self._ensure_env()
+        source = self._read_metal("metal_rms_norm.metal")
+        return self._compile(source, "rms_norm")
+
+    def run_rms_norm(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+        eps: float,
+    ) -> None:
+        """RMS norm + weight multiply. Writes to pre-allocated output."""
+        lib = self._ensure_rms_norm()
+        H = input.shape[-1]
+        params = self._get_params(("rms_norm", H, eps), [float(H), eps])
+        kernel = "rms_norm_bf16" if input.dtype == torch.bfloat16 else "rms_norm_f16"
+        self._get_kernel_fn(lib, kernel)(
+            input.contiguous().view(-1),
+            weight.contiguous().view(-1),
+            output.view(-1),
+            params,
+            threads=(256, 1, 1),
+            group_size=(256, 1, 1),
+        )
+
+    def run_residual_rms_norm(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        weight: torch.Tensor,
+        res_out: torch.Tensor,
+        norm_out: torch.Tensor,
+        eps: float,
+    ) -> None:
+        """Fused residual add + RMS norm + weight multiply."""
+        lib = self._ensure_rms_norm()
+        H = a.shape[-1]
+        params = self._get_params(("residual_rms_norm", H, eps), [float(H), eps])
+        kernel = "residual_rms_norm_bf16" if a.dtype == torch.bfloat16 else "residual_rms_norm_f16"
+        self._get_kernel_fn(lib, kernel)(
+            a.contiguous().view(-1),
+            b.contiguous().view(-1),
+            weight.contiguous().view(-1),
+            res_out.view(-1),
+            norm_out.view(-1),
+            params,
+            threads=(256, 1, 1),
+            group_size=(256, 1, 1),
+        )
 
