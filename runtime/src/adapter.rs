@@ -46,16 +46,16 @@ pub async fn destroy(model_idx: usize, id: AdapterId) -> Result<()> {
 }
 
 /// Retrieves an existing adapter by name.
-pub async fn get(model_idx: usize, name: String) -> Option<AdapterId> {
+pub async fn open(model_idx: usize, name: String) -> Option<AdapterId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Get { name, response: tx }).ok()?;
+    SERVICES.send(model_idx, Message::Open { name, response: tx }).ok()?;
     rx.await.ok()?
 }
 
-/// Clones an adapter with a new name.
-pub async fn clone_adapter(model_idx: usize, id: AdapterId, new_name: String) -> Option<AdapterId> {
+/// Forks an adapter with a new name.
+pub async fn fork(model_idx: usize, id: AdapterId, new_name: String) -> Option<AdapterId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Clone { id, new_name, response: tx }).ok()?;
+    SERVICES.send(model_idx, Message::Fork { id, new_name, response: tx }).ok()?;
     rx.await.ok()?
 }
 
@@ -222,8 +222,8 @@ impl AdapterService {
 enum Message {
     Create { name: String, response: oneshot::Sender<Result<AdapterId>> },
     Destroy { id: AdapterId, response: oneshot::Sender<Result<()>> },
-    Get { name: String, response: oneshot::Sender<Option<AdapterId>> },
-    Clone { id: AdapterId, new_name: String, response: oneshot::Sender<Option<AdapterId>> },
+    Open { name: String, response: oneshot::Sender<Option<AdapterId>> },
+    Fork { id: AdapterId, new_name: String, response: oneshot::Sender<Option<AdapterId>> },
     Lock { id: AdapterId, response: oneshot::Sender<LockId> },
     Unlock { id: AdapterId, lock_id: LockId },
     Load { id: AdapterId, path: String, response: oneshot::Sender<Result<()>> },
@@ -271,11 +271,11 @@ impl ServiceHandler for AdapterService {
                 };
                 let _ = response.send(result);
             }
-            Message::Get { name, response } => {
+            Message::Open { name, response } => {
                 let id = self.name_to_id.get(&name).copied();
                 let _ = response.send(id);
             }
-            Message::Clone { id, new_name, response } => {
+            Message::Fork { id, new_name, response } => {
                 let result = if let Some(adapter) = self.adapters.get(&id) {
                     if self.name_to_id.contains_key(&new_name) {
                         None

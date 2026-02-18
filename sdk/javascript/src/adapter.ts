@@ -22,9 +22,9 @@ export class Adapter {
         return new Adapter(_Adapter.create(model._handle, name));
     }
 
-    /** Look up an existing adapter by name. Returns `undefined` if not found. */
-    static lookup(model: Model, name: string): Adapter | undefined {
-        const handle = _Adapter.lookup(model._handle, name);
+    /** Open an existing adapter by name. Returns `undefined` if not found. */
+    static open(model: Model, name: string): Adapter | undefined {
+        const handle = _Adapter.open(model._handle, name);
         return handle !== undefined ? new Adapter(handle) : undefined;
     }
 
@@ -33,9 +33,9 @@ export class Adapter {
         this._handle.destroy();
     }
 
-    /** Clone this adapter with a new name. */
-    clone(name: string): Adapter {
-        return new Adapter(this._handle.clone(name));
+    /** Fork this adapter with a new name. */
+    fork(name: string): Adapter {
+        return new Adapter(this._handle.fork(name));
     }
 
     /** Acquire an exclusive lock on the adapter. */

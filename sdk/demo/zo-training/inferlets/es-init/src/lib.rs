@@ -19,7 +19,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let model = Model::load(&model_name)?;
 
     // Check if the adapter already exists; create + initialize if not.
-    let adapter = if let Some(existing) = Adapter::lookup(&model, &name) {
+    let adapter = if let Some(existing) = Adapter::open(&model, &name) {
         println!("🔧 Existing adapter found. Using adapter '{}'.", name);
         existing
     } else {

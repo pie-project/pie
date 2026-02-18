@@ -20,13 +20,13 @@ use inferlet::adapter::Adapter;
 // Create a new adapter
 let adapter = Adapter::create("my-adapter")?;
 
-// Look up an existing adapter
-if let Some(adapter) = Adapter::lookup("my-adapter") {
+// Open an existing adapter
+if let Some(adapter) = Adapter::open("my-adapter") {
     // Use existing adapter
 }
 
-// Clone an adapter
-let new_adapter = adapter.clone("my-adapter-v2");
+// Fork an adapter
+let new_adapter = adapter.fork("my-adapter-v2");
 ```
 
 ### Loading and Saving

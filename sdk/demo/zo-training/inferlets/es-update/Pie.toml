@@ -1,6 +1,6 @@
 [package]
 name = "es-update"
-version = "0.1.0"
+version = "0.1.2"
 description = "Update an Evolution Strategies adapter"
 authors = ["In Gim <in.gim@yale.edu>"]
 repository = "https://github.com/pie-project/pie"

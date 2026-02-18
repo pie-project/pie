@@ -38,16 +38,16 @@ class Adapter:
         return Adapter(_adapter.Adapter.create(model._handle, name))
 
     @staticmethod
-    def lookup(model: Model, name: str) -> Adapter | None:
-        """Look up an existing adapter by name."""
-        raw = _adapter.Adapter.lookup(model._handle, name)
+    def open(model: Model, name: str) -> Adapter | None:
+        """Open an existing adapter by name."""
+        raw = _adapter.Adapter.open(model._handle, name)
         if raw is None:
             return None
         return Adapter(raw)
 
-    def clone(self, new_name: str) -> Adapter:
-        """Clone this adapter with a new name."""
-        return Adapter(self._handle.clone(new_name))
+    def fork(self, new_name: str) -> Adapter:
+        """Fork this adapter with a new name."""
+        return Adapter(self._handle.fork(new_name))
 
     async def acquire_lock(self) -> bool:
         """Acquire an exclusive lock on this adapter."""
