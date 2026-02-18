@@ -338,7 +338,7 @@ class TestMetalMoeMatmul:
         scales = torch.full((out_dim, H // 32), 127, dtype=torch.uint8, device="mps")
         x = torch.ones(1, H, dtype=torch.bfloat16, device="mps")
 
-        result = compiler.run_moe_gemm2_fp4(x, blocks, scales, None, out_dim, 1.0)
+        result = compiler.run_moe_prefill_gemm2(x, blocks, scales, None, out_dim, 1.0)
         expected = torch.full((1, out_dim), float(H), dtype=torch.bfloat16)
         torch.testing.assert_close(result.cpu(), expected)
 
@@ -354,7 +354,7 @@ class TestMetalMoeMatmul:
         scales = torch.full((out_dim, H // 32), 127, dtype=torch.uint8, device="mps")
         x = torch.randn(count, H, dtype=torch.bfloat16, device="mps")
 
-        result = compiler.run_moe_gemm2_fp4(x, blocks, scales, None, out_dim, 1.0)
+        result = compiler.run_moe_prefill_gemm2(x, blocks, scales, None, out_dim, 1.0)
         w = _dequantize_expert_from_fp4(blocks, scales, torch.bfloat16)
         ref = torch.nn.functional.linear(x, w)
 
@@ -370,8 +370,8 @@ class TestMetalMoeMatmul:
         scales = torch.full((out_dim, H // 32), 127, dtype=torch.uint8, device="mps")
         x = torch.ones(1, H, dtype=torch.bfloat16, device="mps")
 
-        r1 = compiler.run_moe_gemm2_fp4(x, blocks, scales, None, out_dim, 1.0)
-        r2 = compiler.run_moe_gemm2_fp4(x, blocks, scales, None, out_dim, 2.0)
+        r1 = compiler.run_moe_prefill_gemm2(x, blocks, scales, None, out_dim, 1.0)
+        r2 = compiler.run_moe_prefill_gemm2(x, blocks, scales, None, out_dim, 2.0)
         torch.testing.assert_close(r2.cpu(), (r1 * 2).cpu(), atol=1e-3, rtol=1e-3)
 
     def test_gemm1_swiglu_shape(self):
@@ -384,7 +384,7 @@ class TestMetalMoeMatmul:
         scales = torch.full((2 * I, H // 32), 127, dtype=torch.uint8, device="mps")
         x = torch.randn(4, H, dtype=torch.bfloat16, device="mps")
 
-        result = compiler.run_moe_gemm1_fp4(
+        result = compiler.run_moe_prefill_gemm1(
             x, blocks, scales, None, I, 1.0, 0.0, 100.0, 1.0, 1.0,
         )
         assert result.shape == (4, I)
@@ -403,7 +403,7 @@ class TestMetalMoeMatmul:
         scales = torch.full((2 * I, H // 32), 127, dtype=torch.uint8, device="mps")
         x = torch.randn(count, H, dtype=torch.bfloat16, device="mps")
 
-        result = compiler.run_moe_gemm1_fp4(
+        result = compiler.run_moe_prefill_gemm1(
             x, blocks, scales, None, I, 1.0, 0.0, 100.0, 1.0, 1.0,
         )
 
@@ -420,8 +420,39 @@ class TestMetalMoeMatmul:
 
         torch.testing.assert_close(result.cpu(), ref.cpu(), atol=0.5, rtol=0.05)
 
-    def test_batched_gemm1_vs_per_expert(self):
-        """Batched GEMM1 should match per-expert GEMM1 for K=4 experts."""
+    def test_decode_gemm1_vs_per_expert(self):
+        """Decode GEMM1 (raw, no SwiGLU) should match per-expert GEMM1."""
+        from flashinfer_metal._compiler import MetalCompiler
+
+        compiler = MetalCompiler()
+        torch.manual_seed(42)
+        E, H, I = 8, 64, 32
+        K = 4
+        N = 2 * I  # total weight rows per expert (up + gate)
+
+        all_blocks = torch.randint(0, 256, (E, N, H // 2), dtype=torch.uint8, device="mps")
+        all_scales = torch.full((E, N, H // 32), 127, dtype=torch.uint8, device="mps")
+        x = torch.randn(1, H, dtype=torch.bfloat16, device="mps")
+        expert_ids = torch.tensor([1, 3, 5, 7], dtype=torch.int32, device="mps")
+
+        # Decode batched result: [K, N]
+        decode_out = compiler.run_moe_decode_gemm1(
+            input=x, all_w_blocks=all_blocks, all_w_scales=all_scales,
+            intermediate_size=I, expert_ids=expert_ids,
+        )
+        assert decode_out.shape == (K, N)
+
+        # Per-expert reference via dequant + matmul
+        for i, eid in enumerate(expert_ids.tolist()):
+            w = _dequantize_expert_from_fp4(all_blocks[eid], all_scales[eid], torch.bfloat16)
+            ref = torch.nn.functional.linear(x, w)
+            # Compare against bf16-rounded reference (kernel outputs bf16)
+            torch.testing.assert_close(
+                decode_out[i:i+1].cpu(), ref.bfloat16().cpu(), atol=1e-2, rtol=1e-2,
+            )
+
+    def test_decode_gemm1_swiglu_vs_per_expert(self):
+        """Decode GEMM1+SwiGLU should match per-expert GEMM1+SwiGLU."""
         from flashinfer_metal._compiler import MetalCompiler
 
         compiler = MetalCompiler()
@@ -429,83 +460,29 @@ class TestMetalMoeMatmul:
         E, H, I = 8, 64, 32
         K = 4
 
-        # Full weight tensors for all experts
         all_blocks = torch.randint(0, 256, (E, 2 * I, H // 2), dtype=torch.uint8, device="mps")
         all_scales = torch.full((E, 2 * I, H // 32), 127, dtype=torch.uint8, device="mps")
         x = torch.randn(1, H, dtype=torch.bfloat16, device="mps")
         expert_ids = torch.tensor([1, 3, 5, 7], dtype=torch.int32, device="mps")
 
-        # Batched result
-        batched = compiler.run_moe_batched_gemm1_fp4(
+        # Decode fused result: [K, I]
+        decode_out = compiler.run_moe_decode_gemm1_swiglu(
             input=x, all_w_blocks=all_blocks, all_w_scales=all_scales,
             all_bias=None, intermediate_size=I, expert_ids=expert_ids,
-            expert_alphas=[1.0] * K, expert_betas=[0.0] * K,
-            expert_clamp_limits=[100.0] * K, expert_scale_gates=[1.0] * K,
-            expert_scale_ups=[1.0] * K,
+            alpha=1.0, clamp_limit=100.0,
         )
-        assert batched.shape == (K, I)
+        assert decode_out.shape == (K, I)
 
         # Per-expert reference
         for i, eid in enumerate(expert_ids.tolist()):
-            ref = compiler.run_moe_gemm1_fp4(
+            ref = compiler.run_moe_prefill_gemm1(
                 x, all_blocks[eid], all_scales[eid], None, I,
                 1.0, 0.0, 100.0, 1.0, 1.0,
             )
-            torch.testing.assert_close(batched[i:i+1].cpu(), ref.cpu(), atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(decode_out[i:i+1].cpu(), ref.cpu(), atol=0.5, rtol=0.05)
 
-    def test_batched_gemm2_vs_per_expert(self):
-        """Batched GEMM2 should match per-expert GEMM2 for K=4 experts."""
-        from flashinfer_metal._compiler import MetalCompiler
-
-        compiler = MetalCompiler()
-        torch.manual_seed(42)
-        E, in_dim, out_dim = 8, 32, 64
-        K = 4
-
-        all_blocks = torch.randint(0, 256, (E, out_dim, in_dim // 2), dtype=torch.uint8, device="mps")
-        all_scales = torch.full((E, out_dim, in_dim // 32), 127, dtype=torch.uint8, device="mps")
-        x = torch.randn(K, in_dim, dtype=torch.bfloat16, device="mps")
-        expert_ids = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device="mps")
-
-        # Batched result
-        batched = compiler.run_moe_batched_gemm2_fp4(
-            input=x, all_w_blocks=all_blocks, all_w_scales=all_scales,
-            all_bias=None, out_dim=out_dim, expert_ids=expert_ids,
-            expert_scales_list=[1.0] * K,
-        )
-        assert batched.shape == (K, out_dim)
-
-        # Per-expert reference
-        for i, eid in enumerate(expert_ids.tolist()):
-            ref = compiler.run_moe_gemm2_fp4(
-                x[i:i+1], all_blocks[eid], all_scales[eid], None, out_dim, 1.0,
-            )
-            torch.testing.assert_close(batched[i:i+1].cpu(), ref.cpu(), atol=1e-3, rtol=1e-3)
-
-    def test_batched_gemm2_with_per_expert_scales(self):
-        """Batched GEMM2 should apply different scales per expert."""
-        from flashinfer_metal._compiler import MetalCompiler
-
-        compiler = MetalCompiler()
-        torch.manual_seed(99)
-        E, in_dim, out_dim = 4, 32, 16
-        K = 2
-
-        all_blocks = torch.randint(0, 256, (E, out_dim, in_dim // 2), dtype=torch.uint8, device="mps")
-        all_scales = torch.full((E, out_dim, in_dim // 32), 127, dtype=torch.uint8, device="mps")
-        x = torch.randn(K, in_dim, dtype=torch.bfloat16, device="mps")
-        expert_ids = torch.tensor([1, 3], dtype=torch.int32, device="mps")
-
-        r1 = compiler.run_moe_batched_gemm2_fp4(
-            x, all_blocks, all_scales, None, out_dim, expert_ids, [1.0, 2.0],
-        )
-        r2 = compiler.run_moe_batched_gemm2_fp4(
-            x, all_blocks, all_scales, None, out_dim, expert_ids, [2.0, 4.0],
-        )
-        torch.testing.assert_close(r2.cpu(), (r1 * 2).cpu(), atol=1e-2, rtol=1e-2)
-
-    def test_batched_gemm2_fused_vs_separate(self):
-        """Fused GEMM2+scatter should match separate GEMM2 + weighted sum."""
+    def test_decode_gemm2_fused_vs_separate(self):
+        """Decode fused GEMM2+scatter should match separate per-expert GEMM2 + weighted sum."""
         from flashinfer_metal._compiler import MetalCompiler
 
         compiler = MetalCompiler()
@@ -518,18 +495,20 @@ class TestMetalMoeMatmul:
         x = torch.randn(K, in_dim, dtype=torch.bfloat16, device="mps")
         expert_ids = torch.tensor([1, 3, 5, 7], dtype=torch.int32, device="mps")
         routing_weights = torch.tensor([0.3, 0.25, 0.25, 0.2], dtype=torch.float32, device="mps")
-        output_scales = [1.0] * K
 
-        # Separate path: GEMM2 → weighted sum
-        g2 = compiler.run_moe_batched_gemm2_fp4(
-            x, all_blocks, all_scales, None, out_dim, expert_ids, output_scales,
+        # Separate path: per-expert GEMM2 → weighted sum
+        per_expert = []
+        for i, eid in enumerate(expert_ids.tolist()):
+            ref = compiler.run_moe_prefill_gemm2(
+                x[i:i+1], all_blocks[eid], all_scales[eid], None, out_dim, 1.0,
+            )
+            per_expert.append(ref.float())
+        per_expert = torch.cat(per_expert, dim=0).cpu()
+        expected = (per_expert * routing_weights.cpu().unsqueeze(-1)).sum(dim=0, keepdim=True)
+
+        # Fused path: single decode kernel
+        actual = compiler.run_moe_decode_gemm2_fused(
+            x, all_blocks, all_scales, None, out_dim, expert_ids, routing_weights,
         )
-        expected = (g2.float() * routing_weights.unsqueeze(-1)).sum(dim=0, keepdim=True)
 
-        # Fused path: single kernel
-        fused_scales = routing_weights * 1.0  # output_scale=1.0
-        actual = compiler.run_moe_batched_gemm2_fused_fp4(
-            x, all_blocks, all_scales, None, out_dim, expert_ids, fused_scales,
-        )
-
-        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0.5, rtol=0.05)

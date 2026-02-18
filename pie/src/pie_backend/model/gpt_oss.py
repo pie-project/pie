@@ -470,6 +470,18 @@ class ForwardPass:
         self._norm_last = self.weights.get("norm_last")
         self._lm_head = self.weights.get("lm_head")
 
+        # Pre-allocated decode buffers (num_tokens==1).  Reused every step
+        # to eliminate per-step MPS allocations in the MoE path.
+        act = runtime_config.activation_dtype
+        dev = runtime_config.device
+        K = model_config.experts_per_token
+        I = self.padded_intermediate_size
+        H_pad = self.padded_hidden_size
+        H = model_config.dim_hidden
+        self._buf_moe_padded = torch.zeros(1, H_pad, dtype=act, device=dev)
+        self._buf_gemm1_out = torch.empty(K, I, dtype=act, device=dev)
+        self._buf_gemm2_out = torch.zeros(1, H, dtype=torch.float32, device=dev)
+
         # Optional profiler: set externally to enable per-op timing
         self.profiler = None
 
@@ -479,20 +491,58 @@ class ForwardPass:
         Safetensors loading scatters weight tensors across the GPU address
         space (ordered by file, not by layer).  At 24 layers the combined
         attention + MoE working set (~12 GB) exceeds GPU TLB capacity,
-        causing a ~7× slowdown.  Cloning in layer-sequential order
-        re-allocates tensors with good spatial locality.
+        causing a ~7× slowdown.
 
-        Call once after model loading completes.
+        Uses a CPU roundtrip to re-allocate tensors: download all weights
+        to CPU, free all GPU memory (so MPS releases pages), then re-upload
+        in layer-sequential order.  The MPS bump allocator places the new
+        tensors contiguously, giving good spatial locality.
+
+        Direct GPU cloning is unsafe: MPS silently corrupts async clones
+        when total GPU memory exceeds ~85% of device capacity.  The CPU
+        roundtrip avoids this by never exceeding original weight memory.
         """
-        for lw in self._layer_weights:
-            for key, val in lw.items():
+        n = len(self._layer_weights)
+        device = self._embed_token.device
+
+        # Phase 1: Copy all weights to CPU.
+        cpu_data: dict[tuple[int, str], torch.Tensor] = {}
+        for i in range(n):
+            for key, val in self._layer_weights[i].items():
                 if isinstance(val, torch.Tensor):
-                    lw[key] = val.clone()
-        self._embed_token = self._embed_token.clone()
-        self._norm_last = self._norm_last.clone()
-        self._lm_head = self._lm_head.clone()
-        # Free original scattered weights
+                    cpu_data[(i, key)] = val.cpu()
+        cpu_embed = self._embed_token.cpu()
+        cpu_norm = self._norm_last.cpu()
+        cpu_lm = self._lm_head.cpu()
+
+        # Phase 2: Free all GPU weight memory.
         self.weights.clear()
+        for i in range(n):
+            self._layer_weights[i].clear()
+        self._embed_token = None
+        self._norm_last = None
+        self._lm_head = None
+        gc.collect()
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
+
+        # Phase 3: Re-allocate on GPU in layer-sequential order.
+        # Iterate layers in order so MPS bump allocator places them contiguously.
+        weight_keys = [
+            "norm_attn", "proj_qkv.weight", "proj_qkv.bias", "proj_o",
+            "attn_sinks", "norm_mlp", "router.weight", "router.bias",
+            "moe.gemm1_weights", "moe.gemm1_scales", "moe.gemm1_bias",
+            "moe.gemm2_weights", "moe.gemm2_scales", "moe.gemm2_bias",
+        ]
+        for i in range(n):
+            for key in weight_keys:
+                if (i, key) in cpu_data:
+                    self._layer_weights[i][key] = cpu_data[(i, key)].to(device)
+        self._embed_token = cpu_embed.to(device)
+        self._norm_last = cpu_norm.to(device)
+        self._lm_head = cpu_lm.to(device)
+        torch.mps.synchronize()
+        del cpu_data, cpu_embed, cpu_norm, cpu_lm
         gc.collect()
 
     def sample(
@@ -778,6 +828,7 @@ class ForwardPass:
         self._sync_record("moe_rms_norm")
 
         # 2. Router logits
+        n = normed.shape[0]
         router_logits = fun.linear(
             normed.reshape(-1, cfg.dim_hidden),
             weight=lw["router.weight"],
@@ -788,21 +839,25 @@ class ForwardPass:
         # 3. Prepare input for MoE kernel
         hidden_bf16 = normed.to(torch.bfloat16)
 
-        # Pad hidden states if needed
+        # Pad hidden states if needed (reuse pre-allocated buffer for decode)
         if cfg.dim_hidden != self.padded_hidden_size:
-            num_tokens = hidden_bf16.shape[0]
-            padded = torch.zeros(
-                (num_tokens, self.padded_hidden_size),
-                dtype=hidden_bf16.dtype,
-                device=hidden_bf16.device,
-            )
-            padded[:, : cfg.dim_hidden] = hidden_bf16
-            hidden_bf16 = padded
+            n = hidden_bf16.shape[0]
+            if n == 1:
+                self._buf_moe_padded[0, : cfg.dim_hidden] = hidden_bf16[0]
+                hidden_bf16 = self._buf_moe_padded
+            else:
+                padded = torch.zeros(
+                    (n, self.padded_hidden_size),
+                    dtype=hidden_bf16.dtype,
+                    device=hidden_bf16.device,
+                )
+                padded[:, : cfg.dim_hidden] = hidden_bf16
+                hidden_bf16 = padded
 
         # 4. FlashInfer fused MoE kernel
         # intermediate_size matches local shard size
         output = ops.trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits.to(torch.bfloat16),
+            routing_logits=router_logits,
             routing_bias=None,
             hidden_states=hidden_bf16,
             hidden_states_scale=None,
