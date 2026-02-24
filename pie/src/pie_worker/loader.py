@@ -620,7 +620,7 @@ class ModelLoader:
                 from .model import qwen3
 
                 model_config = qwen3.ModelConfig.from_dict(hf_config)
-                schema = qwen3.QWEN3_SCHEMA
+                schema = qwen3.create_schema(model_config)
                 num_layers = model_config.num_layers
 
             case "gptoss":
