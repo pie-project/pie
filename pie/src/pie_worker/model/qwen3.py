@@ -104,6 +104,20 @@ QWEN3_SCHEMA = (
 )
 
 
+def create_schema(config: "ModelConfig") -> Schema:
+    """Create weight schema for Qwen3, handling tied/untied embeddings."""
+    schema = QWEN3_SCHEMA
+
+    # Handle untied embeddings (lm_head separate from embed_token)
+    if not config.tie_word_embeddings:
+        schema = schema.define(
+            "lm_head",
+            Source("lm_head.weight").shard("row"),
+        )
+
+    return schema
+
+
 @dataclass
 class ModelConfig(ModelConfigBase):
     """
@@ -129,6 +143,7 @@ class ModelConfig(ModelConfigBase):
     rms_norm_eps: float
 
     rope_theta: float
+    tie_word_embeddings: bool
 
     @staticmethod
     def from_dict(spec: dict) -> "ModelConfig":
@@ -148,6 +163,7 @@ class ModelConfig(ModelConfigBase):
             num_vocabs=int(spec["vocab_size"]),
             rms_norm_eps=float(spec["rms_norm_eps"]),
             rope_theta=float(spec.get("rope_theta", 1000000.0)),
+            tie_word_embeddings=bool(spec.get("tie_word_embeddings", True)),
         )
 
     def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
@@ -456,9 +472,12 @@ class ForwardPass:
         return self.embed_tokens(token_ids_tensor)
 
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project hidden states to vocabulary logits (weight-tied with embed_tokens).
+        """Project hidden states to vocabulary logits.
 
-        The embedding weight is column-sharded: [vocab_size, hidden_size/world_size]
+        Uses embed_token when tie_word_embeddings=True, otherwise uses
+        a separate lm_head weight.
+
+        The weight is column-sharded: [vocab_size, hidden_size/world_size]
         For lm_head (linear projection), this is effectively [hidden_size/world_size, vocab_size]
         when transposed.
 
@@ -467,9 +486,6 @@ class ForwardPass:
         2. Each rank computes partial logits with its weight shard
         3. All-reduce sums the partial logits to get full result
         """
-        # world_size = self.runtime_config.world_size
-        # rank = self.runtime_config.rank
-
         # Apply final layer norm
         normed = fun.rms_norm(
             hidden_states,
@@ -480,7 +496,12 @@ class ForwardPass:
 
         if self.tp_size == 1:
             # Single GPU: simple linear projection
-            return fun.linear(normed, self.weights.get("embed_token"))
+            weight = (
+                self.weights.get("embed_token")
+                if self.model_config.tie_word_embeddings
+                else self.weights.get("lm_head")
+            )
+            return fun.linear(normed, weight)
 
         # Multi-GPU: Column-parallel projection
         # 1. Split input along hidden dimension - each rank uses its slice
@@ -489,11 +510,13 @@ class ForwardPass:
         end_idx = start_idx + hidden_per_rank
         local_normed = normed[:, start_idx:end_idx]  # [seq, hidden/world_size]
 
-        # 2. Project with local weight shard: [seq, hidden/world_size] @ [hidden/world_size, vocab]
-        # embed_token has shape [vocab, hidden/world_size], so we use linear which transposes
-        local_logits = fun.linear(
-            local_normed, self.weights.get("embed_token")
-        )  # [seq, vocab]
+        # 2. Project with local weight shard
+        weight = (
+            self.weights.get("embed_token")
+            if self.model_config.tie_word_embeddings
+            else self.weights.get("lm_head")
+        )
+        local_logits = fun.linear(local_normed, weight)  # [seq, vocab]
 
         # 3. All-reduce to combine partial logits (sum of partial projections = full projection)
         dist.all_reduce(local_logits, group=self.compute_process_group)
