@@ -718,7 +718,7 @@ impl Model {
                 };
 
                 if self.forward_pass_tx.send((fp_req, resp_tx, group_id)).is_err() {
-                    eprintln!("[Error] Forward pass channel closed");
+                    tracing::error!("Forward pass channel closed — inference worker has exited");
                 }
             }
             Request::Query(query_req, resp_tx) => {
