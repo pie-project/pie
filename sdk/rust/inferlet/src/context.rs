@@ -555,16 +555,14 @@ impl Context {
                     .into_iter()
                     .next()
                     .expect("Forward pass returned empty distributions");
-                let sampled = sampler.sample(&dist.ids, &dist.probs);
-                sampled
+                sampler.sample(&dist.ids, &dist.probs)
             }
             _ => {
-                let sampled = res.tokens
+                res.tokens
                     .expect("Forward pass failed: no tokens returned")
                     .into_iter()
                     .next()
-                    .expect("Forward pass returned empty token list");
-                sampled
+                    .expect("Forward pass returned empty token list")
             }
         };
 

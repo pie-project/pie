@@ -706,7 +706,7 @@ impl Model {
 
     pub fn submit(&self, _cmd_queue_id: CmdQueueId, _priority: u32, req: Request) {
         match req {
-            Request::ForwardPass(mut fp_req, resp_tx) => {
+            Request::ForwardPass(fp_req, resp_tx) => {
                 // Capture arrival time before queuing to avoid measurement distortion
                 // when requests pile up behind the in-flight limit.
                 
