@@ -38,6 +38,7 @@ pub struct ForwardPassResult {
     pub distributions: Vec<(Vec<u32>, Vec<f32>)>,
     pub tokens: Vec<u32>,
     pub done: bool,
+    pub error: bool,
 }
 
 enum Sampler {
@@ -56,9 +57,14 @@ impl Pollable for ForwardPassResult {
             return;
         }
 
-        if let Ok(res) = (&mut self.receiver).await {
-            self.distributions = res.dists;
-            self.tokens = res.tokens;
+        match (&mut self.receiver).await {
+            Ok(res) => {
+                self.distributions = res.dists;
+                self.tokens = res.tokens;
+            }
+            Err(_) => {
+                self.error = true;
+            }
         }
 
         self.done = true;
@@ -398,6 +404,7 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
                 distributions: vec![],
                 tokens: vec![],
                 done: false,
+                error: false,
             };
 
             Ok(Some(self.ctx().table.push(res)?))
@@ -429,6 +436,10 @@ impl inferlet::core::forward::HostForwardPassResult for InstanceState {
     ) -> Result<Option<Vec<(Vec<u32>, Vec<f32>)>>> {
         let result = self.ctx().table.get_mut(&this)?;
 
+        if result.error {
+            bail!("Forward pass failed: response sender was dropped (fire_batch RPC error)");
+        }
+
         if result.done {
             Ok(Some(take(&mut result.distributions)))
         } else {
@@ -438,6 +449,10 @@ impl inferlet::core::forward::HostForwardPassResult for InstanceState {
 
     async fn get_tokens(&mut self, this: Resource<ForwardPassResult>) -> Result<Option<Vec<u32>>> {
         let result = self.ctx().table.get_mut(&this)?;
+
+        if result.error {
+            bail!("Forward pass failed: response sender was dropped (fire_batch RPC error)");
+        }
 
         if result.done {
             Ok(Some(take(&mut result.tokens)))

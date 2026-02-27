@@ -688,7 +688,12 @@ impl Model {
                 }
             }
             Err(e) => {
-                eprintln!("[Error] fire_batch failed: {:?}", e);
+                tracing::error!(
+                    group_id = group_id,
+                    request_count = requests.len(),
+                    "fire_batch RPC failed: {:?} — response senders dropped, inferlets will see forward pass errors",
+                    e
+                );
             }
         }
     }
