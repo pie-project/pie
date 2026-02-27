@@ -680,8 +680,10 @@ impl Model {
             Ok(batch_resp) => {
                 let mut resp_iter = batch_resp.results.into_iter();
                 for (_, resp_tx) in requests {
+                    // Always advance iterator — Python returns one result per request
+                    let resp = resp_iter.next();
                     if let Some(tx) = resp_tx {
-                        if let Some(resp) = resp_iter.next() {
+                        if let Some(resp) = resp {
                             tx.send(resp).ok();
                         }
                     }
