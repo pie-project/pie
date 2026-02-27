@@ -133,8 +133,16 @@ class Engine:
             weights,
             compute_process_group=compute_process_group,
         )
+
         adapter_at_layer = mod.create_adapter_cache(model_config, config)
         kv_cache_at_layer = mod.create_kv_cache(model_config, config)
+
+        # Compact weight memory layout for GPU locality (MPS TLB optimization).
+        # Must run AFTER KV cache allocation: the CPU roundtrip inside
+        # compact_weights() frees all GPU weights and re-uploads them into
+        # the address space above the KV cache, giving contiguous layout.
+        if hasattr(forward_pass, "compact_weights"):
+            forward_pass.compact_weights()
 
         # Warmup CUDA graphs if supported
         if hasattr(forward_pass, "warmup_cuda_graphs"):
