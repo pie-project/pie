@@ -329,6 +329,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             arrival_time: Some(Instant::now()),
         };
 
+
         // Submit to inference service
     match inference::forward_pass(model_id, request).await {
         Ok(output) => {

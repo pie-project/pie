@@ -22,7 +22,7 @@ use super::kvcache::PhysicalPageId;
 /// descending — highest first. Aging prevents starvation: every waiter's
 /// effective priority grows over time until it is eventually served.
 pub(crate) enum PageWaiter {
-    /// Waiting for `allocate_pages` to succeed.
+    /// Waiting for `reserve_pages` to succeed.
     Allocate {
         context_id: ContextId,
         device: DeviceId,
@@ -151,7 +151,7 @@ impl ContextManager {
             for waiter in waiters {
                 match waiter {
                     PageWaiter::Allocate { context_id, device, num_pages, requester, enqueued_at, response, .. } => {
-                        match self.allocate_pages(context_id, num_pages as u32).await {
+                        match self.reserve_pages(context_id, num_pages as u32).await {
                             Ok(()) => {
                                 let _ = response.send(Ok(()));
                             }

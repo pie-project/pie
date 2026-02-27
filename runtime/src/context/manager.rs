@@ -246,15 +246,20 @@ impl ContextManager {
 
     // ==================== Page Management ====================
 
-    pub(crate) async fn allocate_pages(&mut self, id: ContextId, num_pages: u32) -> Result<(), WaitNeeded> {
+    pub(crate) async fn reserve_pages(&mut self, id: ContextId, num_pages: u32) -> Result<(), WaitNeeded> {
         if num_pages == 0 { return Ok(()); }
 
         let ctx = self.ctx(id).map_err(WaitNeeded::Fatal)?;
+        let current_working = ctx.working_pages.len() as u32;
         let dev_idx = self.select_device_for_context(&ctx);
         let owner = ctx.owner;
         drop(ctx);
 
-        let new_pages = self.allocate_working_with_suspension(dev_idx, num_pages as usize, owner).await?;
+        // Only allocate the additional pages needed beyond what we already have
+        let additional = num_pages.saturating_sub(current_working);
+        if additional == 0 { return Ok(()); }
+
+        let new_pages = self.allocate_working_with_suspension(dev_idx, additional as usize, owner).await?;
 
         {
             let mut ctx = self.ctx_mut(id).map_err(WaitNeeded::Fatal)?;
@@ -263,7 +268,7 @@ impl ContextManager {
         }
 
         if let Some(pid) = owner {
-            self.arbiter.add_working(pid, dev_idx, num_pages as usize);
+            self.arbiter.add_working(pid, dev_idx, additional as usize);
         }
         Ok(())
     }
@@ -373,6 +378,11 @@ impl ContextManager {
         let old_tip = ctx.committed_tip;
         let lineage_adapter = ctx.tokens_filled.first().and_then(|t| t.adapter);
 
+        // Collect working page physical IDs for the pages being committed
+        let working_phys: Vec<PhysicalPageId> = indices.iter()
+            .map(|&idx| ctx.working_pages[idx as usize])
+            .collect();
+
         drop(ctx);
 
         let dev = &mut self.devices[dev_idx];
@@ -380,8 +390,8 @@ impl ContextManager {
 
         let mut new_phys = Vec::new();
         let mut running_prev = prev_hash;
-        for &hash in &hashes {
-            let (phys, _is_new) = dev.commit_page(hash, running_prev)?;
+        for (i, &hash) in hashes.iter().enumerate() {
+            let (phys, _freed) = dev.commit_working_page(hash, running_prev, working_phys[i]);
             new_phys.push(phys);
             running_prev = hash;
         }

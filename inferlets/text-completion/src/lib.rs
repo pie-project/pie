@@ -71,12 +71,14 @@ async fn main(input: Input) -> Result<Output> {
     while let Some(event) = events.next().await? {
         match event {
             Event::Thinking(s) => {
-                print!("{}", s);
+                eprint!("{}", s);
             }
             Event::ThinkingDone(_) => {
+                eprintln!();
             }
             Event::Text(s) => {
                 print!("{}", s);
+                output.push_str(&s);
             }
             Event::Done(s) => {
                 output = s;
@@ -88,3 +90,4 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output { text: output })
 }
+

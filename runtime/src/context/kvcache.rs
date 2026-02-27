@@ -185,35 +185,37 @@ impl DevicePageCache {
     // Commit
     // =========================================================================
 
-    /// Commit a single page to the cache.
+
+    /// Promote a working page to a committed page.
     ///
-    /// If the hash already exists (dedup hit), just increments refcount and
-    /// returns the existing physical page. Otherwise allocates a new GPU page.
+    /// Like `commit_page`, but reuses the working page's physical ID instead
+    /// of allocating a new one. This is essential because the KV cache data
+    /// was written to the working page during the forward pass.
     ///
-    /// Does NOT update `index_cache` — call `update_index_cache` after committing
-    /// all pages for a context.
+    /// If the hash is a dedup hit, the working page is freed back to the pool
+    /// since the existing physical page already has the correct data.
     ///
-    /// Returns `(physical_page_id, is_new)`.
-    pub fn commit_page(
+    /// Returns `(physical_page_id, working_page_freed)`.
+    pub fn commit_working_page(
         &mut self,
         hash: PageHash,
         prev_hash: PageHash,
-    ) -> Result<(PhysicalPageId, bool)> {
+        working_phys: PhysicalPageId,
+    ) -> (PhysicalPageId, bool) {
         // Dedup: page already exists on GPU
         if let Some(&phys) = self.pages.get(&hash) {
             *self.refcount.entry(hash).or_insert(0) += 1;
-            return Ok((phys, false));
+            // Free the working page since we'll use the existing committed copy
+            self.gpu.free(working_phys);
+            return (phys, true);
         }
 
-        // Allocate GPU page
-        let gpu_phys = self.gpu.alloc()
-            .ok_or_else(|| anyhow::anyhow!("No free GPU pages"))?;
-
-        self.pages.insert(hash, gpu_phys);
+        // Promote: register the working page's physical ID as the committed page
+        self.pages.insert(hash, working_phys);
         self.chain.insert(hash, prev_hash);
         *self.refcount.entry(hash).or_insert(0) += 1;
 
-        Ok((gpu_phys, true))
+        (working_phys, false)
     }
 
     /// Update the index_cache for a context's new committed_tip.
@@ -535,6 +537,13 @@ mod tests {
         (0..n).map(|_| Brle::new(0)).collect()
     }
 
+    /// Test helper: allocate a working page, then promote it via commit_working_page.
+    fn alloc_and_commit(cache: &mut DevicePageCache, hash: PageHash, prev: PageHash) -> PhysicalPageId {
+        let working = cache.allocate_working(1).unwrap()[0];
+        let (phys, _freed) = cache.commit_working_page(hash, prev, working);
+        phys
+    }
+
     #[test]
     fn test_commit_and_resolve() {
         let mut cache = DevicePageCache::new(4, 100, 10);
@@ -547,13 +556,11 @@ mod tests {
         assert_eq!(hashes.len(), 2);
 
         // Commit page 1
-        let (phys1, is_new1) = cache.commit_page(hashes[0], 0).unwrap();
-        assert!(is_new1);
+        let phys1 = alloc_and_commit(&mut cache, hashes[0], 0);
         assert!(cache.is_gpu_resident(hashes[0]));
 
         // Commit page 2
-        let (phys2, is_new2) = cache.commit_page(hashes[1], hashes[0]).unwrap();
-        assert!(is_new2);
+        let phys2 = alloc_and_commit(&mut cache, hashes[1], hashes[0]);
 
         // Update index cache
         cache.update_index_cache(hashes[1], None, &[phys1, phys2]);
@@ -573,13 +580,13 @@ mod tests {
         let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
 
         // First commit
-        let (phys1, is_new1) = cache.commit_page(hashes[0], 0).unwrap();
-        assert!(is_new1);
+        let phys1 = alloc_and_commit(&mut cache, hashes[0], 0);
         assert_eq!(cache.refcount(hashes[0]), 1);
 
-        // Second commit of same hash (dedup)
-        let (phys2, is_new2) = cache.commit_page(hashes[0], 0).unwrap();
-        assert!(!is_new2);
+        // Second commit of same hash (dedup) — working page should be freed
+        let working2 = cache.allocate_working(1).unwrap()[0];
+        let (phys2, freed) = cache.commit_working_page(hashes[0], 0, working2);
+        assert!(freed); // dedup hit frees the working page
         assert_eq!(phys1, phys2); // Same physical page
         assert_eq!(cache.refcount(hashes[0]), 2);
     }
@@ -593,8 +600,8 @@ mod tests {
         let masks = make_brle(8);
         let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
 
-        cache.commit_page(hashes[0], 0).unwrap();
-        cache.commit_page(hashes[1], hashes[0]).unwrap();
+        alloc_and_commit(&mut cache, hashes[0], 0);
+        alloc_and_commit(&mut cache, hashes[1], hashes[0]);
 
         // Initial refcount: 1 each (from commit)
         assert_eq!(cache.refcount(hashes[0]), 1);
@@ -627,8 +634,8 @@ mod tests {
         let masks = make_brle(8);
         let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
 
-        cache.commit_page(hashes[0], 0).unwrap();
-        cache.commit_page(hashes[1], hashes[0]).unwrap();
+        alloc_and_commit(&mut cache, hashes[0], 0);
+        alloc_and_commit(&mut cache, hashes[1], hashes[0]);
 
         // Simulate fork: acquire chain
         cache.acquire_chain(hashes[1]);
@@ -654,7 +661,7 @@ mod tests {
         let masks = make_brle(4);
         let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
 
-        cache.commit_page(hashes[0], 0).unwrap();
+        alloc_and_commit(&mut cache, hashes[0], 0);
 
         // Release chain → refcount=0
         cache.release_chain(hashes[0]);
@@ -703,8 +710,8 @@ mod tests {
         let masks = make_brle(8);
         let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
 
-        cache.commit_page(hashes[0], 0).unwrap();
-        cache.commit_page(hashes[1], hashes[0]).unwrap();
+        alloc_and_commit(&mut cache, hashes[0], 0);
+        alloc_and_commit(&mut cache, hashes[1], hashes[0]);
 
         // Both on GPU
         let (gpu, disc) = cache.classify_chain(hashes[1]);
@@ -731,8 +738,8 @@ mod tests {
         assert_eq!(hashes.len(), 3);
 
         // Commit first 2 pages
-        cache.commit_page(hashes[0], 0).unwrap();
-        cache.commit_page(hashes[1], hashes[0]).unwrap();
+        alloc_and_commit(&mut cache, hashes[0], 0);
+        alloc_and_commit(&mut cache, hashes[1], hashes[0]);
 
         // Lookup all 3 — should match first 2
         let matched = cache.longest_prefix_match(&hashes);
@@ -751,11 +758,11 @@ mod tests {
         let masks = make_brle(8);
         let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
 
-        let (phys1, _) = cache.commit_page(hashes[0], 0).unwrap();
+        let phys1 = alloc_and_commit(&mut cache, hashes[0], 0);
         cache.update_index_cache(hashes[0], None, &[phys1]);
 
         // Now commit page 2 — index_cache should move from h0 to h1
-        let (phys2, _) = cache.commit_page(hashes[1], hashes[0]).unwrap();
+        let phys2 = alloc_and_commit(&mut cache, hashes[1], hashes[0]);
         cache.update_index_cache(hashes[1], Some(hashes[0]), &[phys2]);
 
         // h0 entry should be gone

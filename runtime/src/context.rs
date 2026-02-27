@@ -449,7 +449,7 @@ impl ServiceHandler for ContextManager {
                         priority_floor: floor, enqueued_at: Instant::now(), response,
                     });
                 } else {
-                    match self.allocate_pages(id, num_pages).await {
+                    match self.reserve_pages(id, num_pages).await {
                         Ok(()) => { let _ = response.send(Ok(())); }
                         Err(WaitNeeded::NeedPages) => {
                             tracing::info!("Enqueuing ReservePages waiter for ctx {id} on dev {dev_idx} (floor={floor:.1})");
