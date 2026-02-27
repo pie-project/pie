@@ -786,7 +786,7 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
 
                 tb = traceback.format_exc()
                 print(f"[IPC Worker Error] {method}: {e}\n{tb}")
-                response = msgpack.packb(str(e))
+                response = msgpack.packb({"__error__": str(e), "__traceback__": tb})
                 ipc_queue.respond(request_id, response)
     finally:
         # Ensure cleanup when loop stops
