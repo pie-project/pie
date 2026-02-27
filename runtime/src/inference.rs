@@ -180,13 +180,52 @@ impl InferenceService {
     }
 
     /// Resolves physical pages from context and queues the forward pass.
-    async fn forward_pass(&self, mut request: ForwardPassRequest, response_tx: oneshot::Sender<ForwardPassOutput>) -> Result<()> {
-        // Resolve physical page IDs and existing KV length from context
-        let (pages_by_device, kv_len) = if let Some(ctx_id) = request.context_id {
-            context::get_physical_page_ids(self.model_idx, ctx_id).await?
-        } else {
-            (Default::default(), 0)
-        };
+    /// Transparently handles swap-in and replay via the unified replay path.
+    async fn forward_pass(&self, request: ForwardPassRequest, response_tx: oneshot::Sender<ForwardPassOutput>) -> Result<()> {
+        let ctx_id = request.context_id;
+
+        // Step 1: Ensure all pages are GPU-resident (swap-in from CPU, replay discarded)
+        let replay_plan = context::ensure_resident(self.model_idx, ctx_id).await?;
+
+        // Execute replay plan if pages were discarded and need rebuilding
+        if let Some(replay_chunks) = replay_plan {
+            for chunk in replay_chunks {
+                let device_idx = (chunk.device_id as usize)
+                    .min(self.num_devices.saturating_sub(1));
+
+                let replay_fwd = request::ForwardPassRequest {
+                    context_id: ctx_id,
+                    tokens: chunk.tokens,
+                    positions: chunk.positions,
+                    masks: chunk.masks,
+                    speculative_tokens: vec![],
+                    speculative_positions: vec![],
+                    output_speculative_tokens: false,
+                    logit_mask: None,
+                    sampling_indices: vec![],
+                    samplers: vec![],
+                    adapter_id: chunk.adapter,
+                    adapter_seed: None,
+                    arrival_time: None,
+                };
+
+                let (replay_tx, replay_rx) = oneshot::channel();
+                self.schedulers[device_idx].submit(
+                    replay_fwd, replay_tx,
+                    chunk.physical_page_ids, chunk.last_page_len,
+                )?;
+                let _ = replay_rx.await;
+
+                context::commit_replay_chunk(
+                    self.model_idx, ctx_id, chunk.num_pages,
+                ).await?;
+            }
+
+            context::finish_restore(self.model_idx, ctx_id)?;
+        }
+
+        // Step 2: Resolve physical page IDs (pure lookup — all pages must be GPU-resident)
+        let pages_by_device = context::get_physical_page_ids(self.model_idx, ctx_id).await?;
 
         // Context parallelism not yet supported — pages must reside on a single device
         if pages_by_device.len() > 1 {
@@ -202,21 +241,13 @@ impl InferenceService {
             .next()
             .unwrap_or((0, vec![]));
 
-        // Compute FlashInfer's last_page_len: number of tokens in the last page
-        // AFTER writing the current input tokens.
-        // FlashInfer equation: seq_len = (num_pages - 1) * page_size + last_page_len
+        // Compute FlashInfer's last_page_len
         let num_pages = physical_page_ids.len() as u32;
         let num_input_tokens = request.tokens.len() as u32;
+        let kv_len = context::kv_len(self.model_idx, ctx_id);
+        let page_size = context::tokens_per_page(self.model_idx, ctx_id);
         let total_kv = kv_len + num_input_tokens;
-        let last_page_len = if num_pages == 0 {
-            0
-        } else {
-            let remainder = total_kv - (num_pages - 1) * context::tokens_per_page(
-                self.model_idx,
-                request.context_id.unwrap_or(0),
-            );
-            remainder
-        };
+        let last_page_len = context::kvcache::compute_last_page_len(total_kv, num_pages, page_size);
 
         // Route to the appropriate BatchScheduler
         let device_idx = device_id.min(self.num_devices.saturating_sub(1));

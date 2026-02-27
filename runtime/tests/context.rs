@@ -39,14 +39,14 @@ fn create_and_save_and_open() {
 
         // Anonymous context is not findable by name
         let found = pie::context::open(MODEL, USER.to_string(), "test-ctx".into()).await;
-        assert_eq!(found, None);
+        assert!(found.is_err());
 
         // Save it with a name
         pie::context::save(MODEL, id, USER.to_string(), "test-ctx".into()).await.unwrap();
 
-        // Now it should be findable
+        // Now it should be findable (open returns a fork, so different id)
         let found = pie::context::open(MODEL, USER.to_string(), "test-ctx".into()).await;
-        assert_eq!(found, Some(id));
+        assert!(found.is_ok());
     });
 }
 
@@ -58,34 +58,24 @@ fn destroy_removes_context() {
             .await
             .unwrap();
 
-        // Save first, so we can verify it's gone
-        pie::context::save(MODEL, id, USER.to_string(), "destroy-ctx".into()).await.unwrap();
+        pie::context::destroy(MODEL, id, false).await.unwrap();
 
-        let lock = pie::context::acquire_lock(MODEL, id);
-        pie::context::destroy(MODEL, id, lock, false).await.unwrap();
-
-        let found = pie::context::open(MODEL, USER.to_string(), "destroy-ctx".into()).await;
-        assert_eq!(found, None);
+        // Fork from destroyed context should fail
+        let fork_result = pie::context::fork(MODEL, id).await;
+        assert!(fork_result.is_err(), "fork from destroyed context should fail");
     });
 }
 
 #[test]
-fn force_destroy_bypasses_lock() {
+fn force_destroy() {
     let s = state();
     s.rt.block_on(async {
         let id = pie::context::create(MODEL)
             .await
             .unwrap();
 
-        // Acquire lock but don't release it
-        let _lock = pie::context::acquire_lock(MODEL, id);
-
-        // Normal destroy should fail with wrong lock
-        let err = pie::context::destroy(MODEL, id, 0, false).await;
-        assert!(err.is_err(), "destroy without correct lock should fail");
-
-        // Force destroy should succeed
-        pie::context::destroy(MODEL, id, 0, true).await.unwrap();
+        // Force destroy should succeed even on a fresh context
+        pie::context::destroy(MODEL, id, true).await.unwrap();
     });
 }
 
@@ -97,10 +87,8 @@ fn cursor_ops() {
             .await
             .unwrap();
 
-        let lock = pie::context::acquire_lock(MODEL, id);
-
         // Buffer some tokens and mark them forwarded so cursor advances
-        pie::context::set_buffered_tokens(MODEL, id, lock, vec![1, 2, 3, 4, 5]).unwrap();
+        pie::context::set_buffered_tokens(MODEL, id, vec![1, 2, 3, 4, 5]).unwrap();
         pie::context::fill(
             MODEL, id, 5,
             vec![0, 1, 2, 3, 4],
@@ -113,14 +101,12 @@ fn cursor_ops() {
         assert_eq!(cursor, 5);
 
         // set_cursor truncates filled tokens
-        pie::context::set_cursor(MODEL, id, lock, 3).unwrap();
+        pie::context::set_cursor(MODEL, id, 3).unwrap();
         assert_eq!(pie::context::get_cursor(MODEL, id), 3);
 
         // set_cursor out of range should fail
-        let err = pie::context::set_cursor(MODEL, id, lock, 10);
+        let err = pie::context::set_cursor(MODEL, id, 10);
         assert!(err.is_err(), "set_cursor beyond filled tokens should error");
-
-        pie::context::release_lock(MODEL, id, lock).unwrap();
     });
 }
 
@@ -132,19 +118,15 @@ fn buffered_token_lifecycle() {
             .await
             .unwrap();
 
-        let lock = pie::context::acquire_lock(MODEL, id);
-
         // Set initial tokens
-        pie::context::set_buffered_tokens(MODEL, id, lock, vec![1, 2, 3]).unwrap();
+        pie::context::set_buffered_tokens(MODEL, id, vec![1, 2, 3]).unwrap();
 
         // Append more
-        pie::context::append_buffered_tokens(MODEL, id, lock, vec![4, 5]).unwrap();
+        pie::context::append_buffered_tokens(MODEL, id, vec![4, 5]).unwrap();
 
         // Read back
         let tokens = pie::context::get_buffered_tokens(MODEL, id);
         assert_eq!(tokens, vec![1, 2, 3, 4, 5]);
-
-        pie::context::release_lock(MODEL, id, lock).unwrap();
     });
 }
 
@@ -184,17 +166,14 @@ fn full_page_lifecycle() {
         let prompt: Vec<u32> = (1000..1032).collect(); // 32 tokens
         let id = pie::context::create(MODEL).await.unwrap();
 
-        let lock = pie::context::acquire_lock(MODEL, id);
-        assert_ne!(lock, 0, "lock acquisition should succeed");
-
         // Tokens per page should match the model config
         assert_eq!(
             pie::context::tokens_per_page(MODEL, id), PAGE_SIZE,
             "tokens_per_page should be 16"
         );
 
-        // Buffer the prompt tokens manually (fill param removed)
-        pie::context::set_buffered_tokens(MODEL, id, lock, prompt.clone()).unwrap();
+        // Buffer the prompt tokens manually
+        pie::context::set_buffered_tokens(MODEL, id, prompt.clone()).unwrap();
 
         let buf = pie::context::get_buffered_tokens(MODEL, id);
         assert_eq!(buf.len(), 32, "all 32 tokens should be buffered");
@@ -218,10 +197,10 @@ fn full_page_lifecycle() {
         assert_eq!(pie::context::last_position(MODEL, id), Some(31));
 
         // Reserve 2 pages (32 tokens / 16 per page) before committing
-        pie::context::reserve_pages(MODEL, id, lock, 2).await.unwrap();
+        pie::context::reserve_pages(MODEL, id, 2).await.unwrap();
 
         // ── Phase 3: Commit first page (positions 0..15) ──
-        pie::context::commit_pages(MODEL, id, lock, vec![0]).await.unwrap();
+        pie::context::commit_pages(MODEL, id, vec![0]).await.unwrap();
 
         assert_eq!(pie::context::committed_page_count(MODEL, id), 1);
         // 16 filled tokens remain (second page's worth)
@@ -230,7 +209,7 @@ fn full_page_lifecycle() {
         assert_eq!(pie::context::last_position(MODEL, id), Some(31));
 
         // ── Phase 4: Commit second page (positions 16..31) ──
-        pie::context::commit_pages(MODEL, id, lock, vec![0]).await.unwrap();
+        pie::context::commit_pages(MODEL, id, vec![0]).await.unwrap();
 
         assert_eq!(pie::context::committed_page_count(MODEL, id), 2);
         assert_eq!(pie::context::get_cursor(MODEL, id), 0, "cursor is 0 after full commit");
@@ -238,7 +217,7 @@ fn full_page_lifecycle() {
         assert_eq!(pie::context::last_position(MODEL, id), Some(31));
 
         // ── Phase 5: Simulate generation — append new tokens, mark forwarded ──
-        pie::context::append_buffered_tokens(MODEL, id, lock, vec![2000, 2001, 2002]).unwrap();
+        pie::context::append_buffered_tokens(MODEL, id, vec![2000, 2001, 2002]).unwrap();
 
         let buf = pie::context::get_buffered_tokens(MODEL, id);
         assert_eq!(buf, vec![2000, 2001, 2002], "generation tokens buffered");
@@ -253,24 +232,19 @@ fn full_page_lifecycle() {
 
         // ── Phase 6: Prepare state with filled + buffered tokens, then fork ──
         // Clear filled tokens from Phase 5
-        pie::context::set_cursor(MODEL, id, lock, 0).unwrap();
+        pie::context::set_cursor(MODEL, id, 0).unwrap();
         // Buffer tokens and mark first 2 forwarded with positions sequential from max_committed (31)
-        pie::context::set_buffered_tokens(MODEL, id, lock, vec![3000, 3001, 3002, 3003]).unwrap();
+        pie::context::set_buffered_tokens(MODEL, id, vec![3000, 3001, 3002, 3003]).unwrap();
         pie::context::fill(MODEL, id, 2, vec![32, 33], vec![], None).unwrap();
         assert_eq!(pie::context::get_cursor(MODEL, id), 2);
         // Remaining buffered: [3002, 3003]
         assert_eq!(pie::context::get_buffered_tokens(MODEL, id), vec![3002, 3003]);
-
-        pie::context::release_lock(MODEL, id, lock).unwrap();
 
         let child_id = pie::context::fork(MODEL, id).await.unwrap();
 
         assert_ne!(id, child_id);
 
         // Verify child state
-        let child_lock = pie::context::acquire_lock(MODEL, child_id);
-        assert_ne!(child_lock, 0);
-
         assert_eq!(
             pie::context::committed_page_count(MODEL, child_id), 2,
             "child inherits committed pages"
@@ -294,13 +268,11 @@ fn full_page_lifecycle() {
         assert_eq!(child_pos, Some(31), "child inherits max_committed_position = 31");
 
         // Mutating child buffer doesn't affect parent
-        pie::context::append_buffered_tokens(MODEL, child_id, child_lock, vec![9999]).unwrap();
+        pie::context::append_buffered_tokens(MODEL, child_id, vec![9999]).unwrap();
         let parent_buf = pie::context::get_buffered_tokens(MODEL, id);
         assert_eq!(parent_buf, vec![3002, 3003], "parent buffer unchanged after child mutation");
 
         let child_buf = pie::context::get_buffered_tokens(MODEL, child_id);
         assert_eq!(child_buf, vec![3000, 3001, 3002, 3003, 9999], "child buffer has the appended token");
-
-        pie::context::release_lock(MODEL, child_id, child_lock).unwrap();
     });
 }

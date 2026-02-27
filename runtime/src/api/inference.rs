@@ -282,7 +282,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
         // Extract accumulated state
         let model_id = pass.model_id;
-        let context_id = pass.context_id;
         let tokens = take(&mut pass.input_tokens);
         let positions = take(&mut pass.input_token_positions);
         let speculative_tokens = take(&mut pass.speculative_tokens);
@@ -312,7 +311,8 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let fill_positions = positions.clone();
         let fill_masks = masks.clone();
 
-        // Build the forward pass request
+        let context_id = pass.context_id
+            .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
         let request = ForwardPassRequest {
             context_id,
             tokens,
@@ -333,13 +333,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     match inference::forward_pass(model_id, request).await {
         Ok(output) => {
             // Mark input tokens as forwarded in the context
-            if let Some(ctx_id) = context_id {
-                if num_input_tokens > 0 {
-                    context::fill(
-                        model_id, ctx_id, num_input_tokens,
-                        fill_positions, fill_masks, adapter_id,
-                    )?;
-                }
+            if num_input_tokens > 0 {
+                context::fill(
+                    model_id, context_id, num_input_tokens,
+                    fill_positions, fill_masks, adapter_id,
+                )?;
             }
 
             let future_output = FutureOutput {

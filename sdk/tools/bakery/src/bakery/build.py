@@ -316,18 +316,27 @@ class _PollLoop(asyncio.AbstractEventLoop):
 
 
 class Run(exports.Run):
-    def run(self, args: list[str]) -> str:
+    def run(self, input: str) -> str:
         # Install PollLoop as the asyncio event loop (drives wasi:io/poll)
         loop = _PollLoop()
         asyncio.set_event_loop(loop)
 
-        # Call the user's main function, passing args
+        import json
+        # Parse JSON input into a dict for the user's main()
+        try:
+            input_data = json.loads(input) if input else {{}}
+        except json.JSONDecodeError:
+            input_data = {{"input": input}}
+
+        # Call the user's main function, passing parsed input
         if hasattr(_user_module, 'main'):
-            result = _user_module.main(args)
+            result = _user_module.main(input_data)
             # Support both sync and async main()
             if asyncio.iscoroutine(result):
                 result = loop.run_until_complete(result)
-            # Use the return value from main() if it returned a string
+            # Serialize structured output to JSON
+            if isinstance(result, dict):
+                return json.dumps(result)
             if isinstance(result, str):
                 return result
         else:
@@ -397,7 +406,7 @@ def generate_dynamic_wit(
 
 // Dynamic run interface for this inferlet
 interface run {{
-    run: func(args: list<string>) -> result<string, string>;
+    run: func(input: string) -> result<string, string>;
 }}
 
 // Exec world with imports and dynamic export

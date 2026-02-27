@@ -1,7 +1,7 @@
 //! Simple text completion inferlet.
 //!
-//! Demonstrates chat-style generation using the `InstructExt` +
-//! `EventStream` high-level API.
+//! Demonstrates chat-style generation using typed JSON input/output
+//! with the `InstructExt` + `EventStream` high-level API.
 
 use inferlet::{
     context::Context,
@@ -11,19 +11,43 @@ use inferlet::{
     ContextExt, Event, InstructExt,
     Result,
 };
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct Input {
+    /// The user prompt to complete.
+    prompt: String,
+
+    /// Maximum number of tokens to generate.
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+
+    /// System message for the assistant.
+    #[serde(default = "default_system")]
+    system: String,
+
+    /// Sampling temperature.
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+
+    /// Top-p (nucleus) sampling threshold.
+    #[serde(default = "default_top_p")]
+    top_p: f32,
+}
+
+fn default_max_tokens() -> usize { 256 }
+fn default_system() -> String { "You are a helpful, respectful and honest assistant.".into() }
+fn default_temperature() -> f32 { 0.6 }
+fn default_top_p() -> f32 { 0.95 }
+
+#[derive(Serialize)]
+struct Output {
+    /// The generated text.
+    text: String,
+}
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    let prompt: String = args.value_from_str(["-p", "--prompt"])
-        .map_err(|e| format!("--prompt: {e}"))?;
-    let max_tokens: usize = args.value_from_str(["-n", "--max-tokens"]).unwrap_or(256);
-    let system_message: String = args.value_from_str(["-s", "--system"])
-        .unwrap_or_else(|_| "You are a helpful, respectful and honest assistant.".to_string());
-    let temperature: f32 = args.value_from_str(["-t", "--temperature"]).unwrap_or(0.6);
-    let top_p: f32 = args.value_from_str("--top-p").unwrap_or(0.95);
-
+async fn main(input: Input) -> Result<Output> {
     // Load model
     let models = runtime::models();
     let model_name = models.first().ok_or("No models available")?;
@@ -31,14 +55,14 @@ async fn main(args: Vec<String>) -> Result<String> {
 
     // Create context and fill with instruct messages
     let ctx = Context::new(&model)?;
-    ctx.system(&system_message);
-    ctx.user(&prompt);
+    ctx.system(&input.system);
+    ctx.user(&input.prompt);
     ctx.cue();
 
     // Generate
     let mut events = ctx
-        .generate(Sampler::TopP((temperature, top_p)))
-        .with_max_tokens(max_tokens)
+        .generate(Sampler::TopP((input.temperature, input.top_p)))
+        .with_max_tokens(input.max_tokens)
         .decode()
         .with_reasoning();
 
@@ -62,5 +86,5 @@ async fn main(args: Vec<String>) -> Result<String> {
         }
     }
 
-    Ok(output)
+    Ok(Output { text: output })
 }

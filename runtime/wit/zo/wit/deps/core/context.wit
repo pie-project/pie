@@ -1,33 +1,33 @@
 interface context {
 
     use wasi:io/poll@0.2.4.{pollable};
-    use types.{error, future-bool};
+    use types.{error};
     use model.{model};
 
     type page-id = u32;
 
     resource context {
 
-        // Creates an anonymous context (auto-destroyed on process exit)
+        // Creates a fresh empty context
         create: static func(model: borrow<model>) -> result<context, error>;
 
-        // Opens a saved (named) context
-        open: static func(model: borrow<model>, name: string) -> option<context>;
+        // Opens a snapshot (implicit fork — snapshot stays immutable)
+        open: static func(model: borrow<model>, name: string) -> result<context, error>;
+
+        // Deletes a saved snapshot by name
+        delete: static func(model: borrow<model>, name: string) -> result<_, error>;
 
         // Forks into a new anonymous context
         fork: func() -> result<context, error>;
 
-        // Saves with a name (becomes persistent, survives process exit)
+        // Named save — snapshots committed chain + token metadata under a user-chosen name
         save: func(name: string) -> result<_, error>;
+
+        // Anonymous save — snapshots committed chain + token metadata, returns runtime-generated name
+        snapshot: func() -> result<string, error>;
 
         // Force-destroys immediately
         destroy: func();
-
-        // Acquires a lock on the context, returning a lock result
-        acquire-lock: func() -> future-bool;
-
-        // Releases the lock
-        release-lock: func() -> result<_, error>;
 
         // Number of tokens per page    
         tokens-per-page: func() -> u32;

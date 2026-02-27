@@ -48,6 +48,7 @@ class ModelConfig:
     max_num_adapters: int = 32
     max_adapter_rank: int = 8
     gpu_mem_utilization: float = 0.8
+    cpu_mem_budget_in_gb: int = 0
     use_cuda_graphs: bool = False
     random_seed: int = 42
     dummy_mode: bool = False
@@ -154,6 +155,9 @@ max_adapter_rank = 8
 # Memory management
 gpu_mem_utilization = 0.8
 
+# CPU memory budget for KV cache swap (GB), 0 = disabled
+cpu_mem_budget_in_gb = 0
+
 # CUDA graphs (experimental)
 use_cuda_graphs = false
 
@@ -233,6 +237,7 @@ def load_config(
             max_num_adapters=mc.get("max_num_adapters", 32),
             max_adapter_rank=mc.get("max_adapter_rank", 8),
             gpu_mem_utilization=mc.get("gpu_mem_utilization", 0.8),
+            cpu_mem_budget_in_gb=mc.get("cpu_mem_budget_in_gb", 0),
             use_cuda_graphs=mc.get("use_cuda_graphs", False),
             random_seed=mc.get("random_seed", 42),
             dummy_mode=dummy_mode or mc.get("dummy_mode", False),

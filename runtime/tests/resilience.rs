@@ -45,10 +45,10 @@ fn state() -> &'static TestState {
 const MODEL: usize = 0;
 const USER: &str = "test-user";
 
-fn make_request(tokens: Vec<u32>) -> ForwardPassRequest {
+fn make_request(ctx_id: u64, tokens: Vec<u32>) -> ForwardPassRequest {
     let n = tokens.len();
     ForwardPassRequest {
-        context_id: None,
+        context_id: ctx_id,
         tokens,
         positions: (0..n as u32).collect(),
         speculative_tokens: vec![],
@@ -72,12 +72,10 @@ fn device_timeout_returns_none() {
         let ctx_id = pie::context::create(MODEL)
             .await
             .unwrap();
-        let lock = pie::context::acquire_lock(MODEL, ctx_id);
-        pie::context::reserve_pages(MODEL, ctx_id, lock, 1).await.unwrap();
-        pie::context::release_lock(MODEL, ctx_id, lock).unwrap();
+        pie::context::reserve_pages(MODEL, ctx_id, 1).await.unwrap();
 
         let start = Instant::now();
-        let req = make_request(vec![10, 20]);
+        let req = make_request(ctx_id, vec![10, 20]);
         let output = pie::inference::forward_pass(MODEL, req).await.unwrap();
         let elapsed = start.elapsed();
 

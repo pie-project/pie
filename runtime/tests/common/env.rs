@@ -70,6 +70,7 @@ pub fn create_mock_env(
         .map(|name| DeviceConfig {
             hostname: name.clone(),
             total_pages: num_pages,
+            cpu_pages: 0,
             max_batch_size: 32,
             max_batch_tokens: 4096,
         })

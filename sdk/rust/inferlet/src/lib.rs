@@ -12,6 +12,10 @@ pub use wstd;
 // Re-export wit_bindgen so the macro-generated inline WIT can reference it
 pub use wit_bindgen;
 
+// Re-export serde and serde_json so the macro-generated JSON bridge can use them
+pub use serde;
+pub use serde_json;
+
 // Re-export the main attribute macro
 pub use inferlet_macros::main;
 
@@ -76,21 +80,6 @@ pub mod instruct {
 // =============================================================================
 
 use wstd::io::AsyncPollable;
-
-/// Extension trait for async adapter operations.
-pub trait AdapterExt {
-    /// Acquires a lock on the adapter asynchronously.
-    fn acquire_lock_async(&self) -> impl std::future::Future<Output = bool>;
-}
-
-impl AdapterExt for adapter::Adapter {
-    async fn acquire_lock_async(&self) -> bool {
-        let future = self.acquire_lock();
-        let pollable = future.pollable();
-        AsyncPollable::new(pollable).wait_for().await;
-        future.get().unwrap_or(false)
-    }
-}
 
 /// Extension trait for async forward pass operations.
 pub trait ForwardPassExt {
@@ -213,7 +202,6 @@ pub mod prelude {
     pub use crate::ContextExt;
     pub use crate::InstructExt;
     pub use crate::ModelExt;
-    pub use crate::AdapterExt;
     pub use crate::ForwardPassExt;
     pub use crate::SubscriptionExt;
     pub use crate::FutureStringExt;

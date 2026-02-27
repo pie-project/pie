@@ -37,7 +37,7 @@ impl pie::instruct::tool_use::Host for InstanceState {
         let ctx = self.ctx().table.get(&ctx)?;
         let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().equip(&tools);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
+        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
         Ok(Ok(()))
     }
 
@@ -50,7 +50,7 @@ impl pie::instruct::tool_use::Host for InstanceState {
         let ctx = self.ctx().table.get(&ctx)?;
         let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().answer(&name, &value);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
+        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
         Ok(())
     }
 

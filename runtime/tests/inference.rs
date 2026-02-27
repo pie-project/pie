@@ -34,10 +34,10 @@ const MODEL: usize = 0;
 const USER: &str = "test-user";
 
 /// Build a minimal forward pass request.
-fn make_request(tokens: Vec<u32>) -> ForwardPassRequest {
+fn make_request(ctx_id: u64, tokens: Vec<u32>) -> ForwardPassRequest {
     let n = tokens.len();
     ForwardPassRequest {
-        context_id: None,
+        context_id: ctx_id,
         tokens,
         positions: (0..n as u32).collect(),
         speculative_tokens: vec![],
@@ -61,12 +61,10 @@ fn single_forward_pass() {
         let ctx_id = pie::context::create(MODEL)
             .await
             .unwrap();
-        let lock = pie::context::acquire_lock(MODEL, ctx_id);
-        pie::context::reserve_pages(MODEL, ctx_id, lock, 1).await.unwrap();
-        pie::context::release_lock(MODEL, ctx_id, lock).unwrap();
+        pie::context::reserve_pages(MODEL, ctx_id, 1).await.unwrap();
 
         // Submit a forward pass
-        let req = make_request(vec![10, 20, 30]);
+        let req = make_request(ctx_id, vec![10, 20, 30]);
         let output = pie::inference::forward_pass(MODEL, req).await.unwrap();
 
         // EchoBehavior(42) should return token 42
@@ -97,11 +95,9 @@ fn multiple_forward_passes() {
             let ctx_id = pie::context::create(MODEL)
                 .await
                 .unwrap();
-            let lock = pie::context::acquire_lock(MODEL, ctx_id);
-            pie::context::reserve_pages(MODEL, ctx_id, lock, 1).await.unwrap();
-            pie::context::release_lock(MODEL, ctx_id, lock).unwrap();
+            pie::context::reserve_pages(MODEL, ctx_id, 1).await.unwrap();
 
-            let req = make_request(vec![100 + i]);
+            let req = make_request(ctx_id, vec![100 + i]);
             handles.push(tokio::spawn(async move {
                 pie::inference::forward_pass(MODEL, req).await
             }));

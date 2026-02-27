@@ -17,6 +17,7 @@ use crate::linker;
 use crate::program::ProgramName;
 use crate::server::{self, ClientId};
 use crate::service::{ServiceMap, ServiceHandler};
+use crate::workflow::WorkflowId;
 
 // =============================================================================
 // ProcessEvent
@@ -79,21 +80,16 @@ static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> =
 pub fn spawn(
     username: String,
     program_name: ProgramName,
-    arguments: Vec<String>,
+    input: String,
     client_id: Option<ClientId>,
-    parent_id: Option<ProcessId>,
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
+    workflow_id: Option<WorkflowId>,
 ) -> Result<ProcessId> {
-    let process = Process::new(username, program_name, arguments, client_id, parent_id, capture_outputs, result_tx);
+    let process = Process::new(username, program_name, input, client_id, capture_outputs, result_tx, workflow_id);
     let id = process.process_id;
 
     SERVICES.spawn(id, || process)?;
-
-    // Register as child of parent so it terminates with the parent
-    if let Some(parent_id) = parent_id {
-        add_child(parent_id, id);
-    }
 
     Ok(id)
 }
@@ -125,11 +121,7 @@ pub fn stderr(process_id: ProcessId, content: String) {
     let _ = SERVICES.send(&process_id, Message::Stderr { content });
 }
 
-/// Register a child process under a parent. The child will be terminated
-/// when the parent terminates or finishes.
-fn add_child(parent_id: ProcessId, child_id: ProcessId) {
-    let _ = SERVICES.send(&parent_id, Message::AddChild { child_id });
-}
+
 
 /// Get the username of a process.
 pub async fn get_username(process_id: ProcessId) -> Result<String> {
@@ -163,7 +155,7 @@ pub struct ProcessStats {
     pub id: String,
     pub username: String,
     pub program: String,
-    pub arguments: Vec<String>,
+    pub input: String,
     pub elapsed_secs: u64,
 }
 
@@ -184,10 +176,7 @@ enum Message {
     Terminate {
         result: Result<String, String>,
     },
-    /// Register a child process
-    AddChild {
-        child_id: ProcessId,
-    },
+
     /// Stdout output from the WASM instance
     Stdout {
         content: String,
@@ -220,16 +209,16 @@ const OUTPUT_BUFFER_CAP: usize = 4096;
 /// Actor managing a single WASM instance lifecycle.
 struct Process {
     process_id: ProcessId,
-    parent_id: Option<ProcessId>,
     username: String,
     program: ProgramName,
-    arguments: Vec<String>,
+    input: String,
     start_time: Instant,
     handle: JoinHandle<()>,
     client_id: Option<ClientId>,
-    children: Vec<ProcessId>,
     capture_outputs: bool,
     output_buffer: VecDeque<ProcessEvent>,
+    /// Optional link to the workflow that spawned this process.
+    workflow_id: Option<WorkflowId>,
 }
 
 impl Process {
@@ -237,11 +226,11 @@ impl Process {
     fn new(
         username: String,
         program: ProgramName,
-        arguments: Vec<String>,
+        input: String,
         client_id: Option<ClientId>,
-        parent_id: Option<ProcessId>,
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<Result<String, String>>>,
+        workflow_id: Option<WorkflowId>,
     ) -> Self {
         let process_id = Uuid::new_v4();
 
@@ -249,31 +238,35 @@ impl Process {
             process_id,
             username.clone(),
             program.clone(),
-            arguments.clone(),
+            input.clone(),
             capture_outputs,
             result_tx,
         ));
 
         Process {
             process_id,
-            parent_id,
             username,
             program,
-            arguments,
+            input,
             start_time: Instant::now(),
             handle,
             client_id,
-            children: Vec::new(),
             capture_outputs,
             output_buffer: VecDeque::new(),
+            workflow_id,
         }
     }
 
-    /// Deliver an event to the attached client, or buffer it if capturing.
+    /// Deliver an event to the attached client and/or the parent workflow.
     fn deliver_event(&mut self, event: ProcessEvent) {
+        // Forward to parent workflow (if any)
+        if let Some(wf_id) = self.workflow_id {
+            let _ = crate::workflow::forward_event(wf_id, self.process_id, event.clone());
+        }
+
+        // Deliver to attached client
         if let Some(client_id) = self.client_id {
             if server::send_event(client_id, self.process_id, &event).is_err() {
-                // Client gone — detach and fall back to buffering
                 self.client_id = None;
                 self.buffer_event(event);
             }
@@ -308,7 +301,7 @@ impl Process {
         process_id: ProcessId,
         username: String,
         program: ProgramName,
-        arguments: Vec<String>,
+        input: String,
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<Result<String, String>>>,
     ) {
@@ -329,10 +322,10 @@ impl Process {
                 .ok_or_else(|| "No 'run' function found".to_string())?;
 
             let run_func = instance
-                .get_typed_func::<(&[String],), (Result<String, String>,)>(&mut store, &run_func_export)
+                .get_typed_func::<(&str,), (Result<String, String>,)>(&mut store, &run_func_export)
                 .map_err(|e| format!("Failed to get 'run' function: {e}"))?;
 
-            match run_func.call_async(&mut store, (&arguments[..],)).await {
+            match run_func.call_async(&mut store, (&input,)).await {
                 Ok((Ok(output),)) => Ok(output),
                 Ok((Err(runtime_err),)) => Err(runtime_err),
                 Err(call_err) => Err(format!("Call error: {call_err}")),
@@ -351,18 +344,12 @@ impl Process {
         terminate(process_id, result);
     }
 
-    /// Abort the WASM execution task, notify any attached client, terminate
-    /// children, and unregister.
+    /// Abort the WASM execution task, notify any attached client, and unregister.
     fn terminate(&mut self, result: Result<String, String>) {
 
         self.handle.abort();
 
-        // Cascade: terminate all children
-        for child_id in self.children.drain(..) {
-            terminate(child_id, Err("parent terminated".into()));
-        }
-
-        // Notify attached client
+        // Notify attached client / workflow
         match result {
             Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
             Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),
@@ -395,10 +382,6 @@ impl ServiceHandler for Process {
                 self.terminate(result);
             }
 
-            Message::AddChild { child_id } => {
-                self.children.push(child_id);
-            }
-
             Message::Stdout { content } => self.deliver_event(ProcessEvent::Stdout(content)),
             Message::Stderr { content } => self.deliver_event(ProcessEvent::Stderr(content)),
 
@@ -415,7 +398,7 @@ impl ServiceHandler for Process {
                     id: self.process_id.to_string(),
                     username: self.username.clone(),
                     program: self.program.to_string(),
-                    arguments: self.arguments.clone(),
+                    input: self.input.clone(),
                     elapsed_secs: self.start_time.elapsed().as_secs(),
                 }));
             }

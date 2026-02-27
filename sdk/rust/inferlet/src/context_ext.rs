@@ -412,11 +412,6 @@ pub trait ContextExt {
     fn new(model: &Model) -> Result<Context> {
         Context::create(model)
     }    
-    // --- Async Operations ---
-    
-    /// Acquires a lock on the context asynchronously.
-    fn acquire_lock_async(&self) -> impl std::future::Future<Output = bool>;
-    
     // --- Fill Operations ---
     
     /// Fills the context with raw token IDs (appends to buffered tokens).
@@ -436,15 +431,6 @@ pub trait ContextExt {
 // =============================================================================
 
 impl ContextExt for Context {
-    // --- Async Operations ---
-    
-    async fn acquire_lock_async(&self) -> bool {
-        let future = self.acquire_lock();
-        let pollable = future.pollable();
-        AsyncPollable::new(pollable).wait_for().await;
-        future.get().unwrap_or(false)
-    }
-    
     // --- Fill Operations ---
     
     fn fill_tokens(&self, tokens: &[u32]) -> &Self {

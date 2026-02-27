@@ -17,6 +17,7 @@ path = "src/lib.rs"
 pie-client = { path = "../client/rust" }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 tokio = { version = "1.38", features = ["full"] }
+tokio-util = "0.7"
 anyhow = "1.0"
 futures-util = { version = "0.3", features = ["sink"] }
 serde = { version = "1.0", features = ["derive"] }

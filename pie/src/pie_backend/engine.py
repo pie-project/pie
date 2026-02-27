@@ -35,6 +35,10 @@ class Engine:
     model_config: object  # e.g., llama3.ModelConfig
     kv_cache_at_layer: list[torch.Tensor]
 
+    # CPU swap pool (pinned host memory, mirrors GPU KV cache layout)
+    kv_cache_at_layer_host: list[torch.Tensor]  # [pool_size, 2, page_size, kv_heads, dim_head] per layer
+    swap_pool_size: int  # total host slots (Rust manages allocation)
+
     # Adapter state
     adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]]
     adapters: dict
@@ -54,11 +58,15 @@ class Engine:
         arch_type: str,
         info: dict,
         snapshot_dir: str | None = None,
+        kv_cache_at_layer_host: list | None = None,
+        swap_pool_size: int = 0,
     ):
         self.config = config
         self.model_config = model_config
         self.forward_pass = forward_pass
         self.kv_cache_at_layer = kv_cache_at_layer
+        self.kv_cache_at_layer_host = kv_cache_at_layer_host or []
+        self.swap_pool_size = swap_pool_size
         self.adapter_at_layer = adapter_at_layer
         self.arch_type = arch_type
         self.info = info
@@ -136,6 +144,11 @@ class Engine:
         if hasattr(forward_pass, "compact_weights"):
             forward_pass.compact_weights()
 
+        # Allocate CPU swap pool (pinned host memory)
+        host_kv, pool_size = cls._create_host_kv_cache(
+            kv_cache_at_layer, config.swap_budget_bytes,
+        )
+
         return cls(
             config=config,
             model_config=model_config,
@@ -145,6 +158,8 @@ class Engine:
             arch_type=arch_type,
             info=info,
             snapshot_dir=snapshot_dir,
+            kv_cache_at_layer_host=host_kv,
+            swap_pool_size=pool_size,
         )
 
     @classmethod
@@ -185,6 +200,10 @@ class Engine:
 
         _log("Dummy mode initialization complete", "INFO")
 
+        host_kv, pool_size = cls._create_host_kv_cache(
+            kv_cache_at_layer, config.swap_budget_bytes,
+        )
+
         return cls(
             config=config,
             model_config=model_config,
@@ -194,7 +213,50 @@ class Engine:
             arch_type="dummy",
             info=info,
             snapshot_dir=snapshot_dir,
+            kv_cache_at_layer_host=host_kv,
+            swap_pool_size=pool_size,
         )
+
+    # ========================================================================
+    # CPU Swap Pool
+    # ========================================================================
+
+    @staticmethod
+    def _create_host_kv_cache(
+        gpu_kv: list[torch.Tensor],
+        swap_budget_bytes: int,
+    ) -> tuple[list[torch.Tensor], int]:
+        """Allocate pinned CPU tensors mirroring GPU KV cache layout.
+
+        Returns (host_tensors, pool_size). If budget is 0 or there are no
+        GPU KV layers, returns ([], 0).
+        """
+        if swap_budget_bytes <= 0 or not gpu_kv:
+            return [], 0
+
+        # gpu_kv[layer] shape: [max_pages+1, 2, page_size, kv_heads, dim_head]
+        num_layers = len(gpu_kv)
+        _, two, page_size, kv_heads, dim_head = gpu_kv[0].shape
+        dtype = gpu_kv[0].dtype
+        bytes_per_element = gpu_kv[0].element_size()
+
+        # Per-page bytes across ALL layers
+        per_page_bytes = num_layers * two * page_size * kv_heads * dim_head * bytes_per_element
+        pool_size = swap_budget_bytes // per_page_bytes
+
+        if pool_size == 0:
+            return [], 0
+
+        host_kv = [
+            torch.zeros(
+                (pool_size, two, page_size, kv_heads, dim_head),
+                dtype=dtype,
+                device="cpu",
+            ).pin_memory()
+            for _ in range(num_layers)
+        ]
+
+        return host_kv, pool_size
 
     # ========================================================================
     # Inference

@@ -6,6 +6,60 @@
 use bytes::Bytes;
 use pie_client::message::ServerMessage;
 
+/// Converts CLI-style `["--key", "value", ...]` arguments to a JSON object string.
+///
+/// Flags (`--key value`) become `{"key": "value"}`.
+/// Boolean flags (`--flag`) become `{"flag": true}`.
+/// Short flags (`-k value`) become `{"k": "value"}`.
+/// Remaining positional args go under `"_positional"`.
+///
+/// If the input is already a single JSON object string, it is returned as-is.
+fn args_to_json_input(arguments: &[String]) -> String {
+    // If there's exactly one argument that looks like JSON, pass through
+    if arguments.len() == 1 && arguments[0].starts_with('{') {
+        return arguments[0].clone();
+    }
+
+    // If empty, return empty object
+    if arguments.is_empty() {
+        return "{}".to_string();
+    }
+
+    let mut obj = serde_json::Map::new();
+    let mut positional = Vec::new();
+    let mut i = 0;
+
+    while i < arguments.len() {
+        if let Some(key) = arguments[i].strip_prefix("--") {
+            let key = key.replace('-', "_");
+            if i + 1 < arguments.len() && !arguments[i + 1].starts_with('-') {
+                obj.insert(key, serde_json::Value::String(arguments[i + 1].clone()));
+                i += 2;
+            } else {
+                obj.insert(key, serde_json::Value::Bool(true));
+                i += 1;
+            }
+        } else if arguments[i].starts_with('-') && arguments[i].len() == 2 {
+            let key = arguments[i][1..].to_string();
+            if i + 1 < arguments.len() {
+                obj.insert(key, serde_json::Value::String(arguments[i + 1].clone()));
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            positional.push(serde_json::Value::String(arguments[i].clone()));
+            i += 1;
+        }
+    }
+
+    if !positional.is_empty() {
+        obj.insert("_positional".to_string(), serde_json::Value::Array(positional));
+    }
+
+    serde_json::Value::Object(obj).to_string()
+}
+
 
 use crate::context;
 use crate::daemon;
@@ -14,6 +68,7 @@ use crate::messaging;
 use crate::model;
 use crate::process::{self, ProcessId};
 use crate::program::{self, Manifest, ProgramName};
+use crate::workflow::WorkflowId;
 
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
@@ -184,14 +239,16 @@ impl Session {
 
         // Launch the process
         let client_id = if capture_outputs { Some(self.id) } else { None };
+        // Convert arguments to JSON input string
+        let input = args_to_json_input(&arguments);
         match process::spawn(
             self.username.clone(),
             program_name,
-            arguments,
+            input,
             client_id,
-            None,
             capture_outputs,
             None,
+            None, // no workflow
         ) {
             Ok(process_id) => {
                 if capture_outputs {
@@ -233,7 +290,7 @@ impl Session {
             self.username.clone(),
             program_name,
             port as u16,
-            arguments,
+            args_to_json_input(&arguments),
         ) {
             Ok(_daemon_id) => {
                 self.send_response(corr_id, true, "server launched".to_string())
@@ -418,5 +475,91 @@ impl Session {
             })
             .await;
         }
+    }
+}
+
+// =============================================================================
+// Workflow Handlers
+// =============================================================================
+
+impl Session {
+    pub(super) async fn handle_submit_workflow(&mut self, corr_id: u32, json: String) {
+        match crate::workflow::submit(&self.username, &json, Some(self.id)).await {
+            Ok((workflow_id, result_rx)) => {
+                // Drop the result receiver — clients receive events via attach.
+                // The workflow actor stores the result internally.
+                drop(result_rx);
+                self.attached_workflows.push(workflow_id);
+                self.send_response(corr_id, true, workflow_id.to_string()).await;
+            }
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+            }
+        }
+    }
+
+    pub(super) async fn handle_cancel_workflow(&mut self, corr_id: u32, workflow_id: String) {
+        let wf_id = match workflow_id.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                self.send_response(corr_id, false, "Invalid workflow ID".to_string()).await;
+                return;
+            }
+        };
+        match crate::workflow::cancel(&wf_id) {
+            Ok(()) => {
+                self.send_response(corr_id, true, "Workflow cancelled".to_string()).await;
+            }
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+            }
+        }
+    }
+
+    pub(super) async fn handle_attach_workflow(&mut self, corr_id: u32, workflow_id: String) {
+        let wf_id: WorkflowId = match workflow_id.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                self.send_response(corr_id, false, "Invalid workflow ID".to_string()).await;
+                return;
+            }
+        };
+
+        // Authorization: only the same user can attach
+        match crate::workflow::get_username(&wf_id).await {
+            Ok(owner) if owner != self.username => {
+                self.send_response(corr_id, false, "Permission denied".to_string()).await;
+                return;
+            }
+            Err(_) => {
+                self.send_response(corr_id, false, "Workflow not found".to_string()).await;
+                return;
+            }
+            _ => {}
+        }
+
+        match crate::workflow::attach(&wf_id, self.id).await {
+            Ok(()) => {
+                self.attached_workflows.push(wf_id);
+                self.send_response(corr_id, true, "Workflow attached".to_string()).await;
+            }
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+            }
+        }
+    }
+
+    pub(super) async fn handle_detach_workflow(&mut self, corr_id: u32, workflow_id: String) {
+        let wf_id: WorkflowId = match workflow_id.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                self.send_response(corr_id, false, "Invalid workflow ID".to_string()).await;
+                return;
+            }
+        };
+
+        crate::workflow::detach(&wf_id);
+        self.attached_workflows.retain(|id| id != &wf_id);
+        self.send_response(corr_id, true, "Workflow detached".to_string()).await;
     }
 }

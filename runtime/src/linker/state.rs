@@ -45,7 +45,7 @@ impl Drop for InstanceState {
         // Auto-destroy all anonymous contexts owned by this instance
         for (model_idx, context_id) in self.owned_contexts.drain(..) {
             tokio::spawn(async move {
-                let _ = context::destroy(model_idx, context_id, 0, true).await;
+                let _ = context::destroy(model_idx, context_id, true).await;
             });
         }
     }

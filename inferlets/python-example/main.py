@@ -9,7 +9,7 @@ Demonstrates:
 from inferlet import Model, Context, Sampler, Event, runtime, session
 
 
-async def main(args: list[str]) -> str:
+async def main(input: dict) -> str:
     # Load model
     model = Model.load(runtime.models()[0])
 

@@ -257,6 +257,7 @@ def _bootstrap(
                 total_pages=meta.get("total_pages", 0),
                 max_batch_tokens=meta.get("max_batch_tokens", 10240),
                 max_batch_size=meta.get("max_batch_size", 128),
+                cpu_pages=meta.get("swap_pool_size", 0),
             )
         )
 

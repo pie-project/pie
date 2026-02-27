@@ -47,9 +47,9 @@ pub fn spawn(
     username: String,
     program: ProgramName,
     port: u16,
-    arguments: Vec<String>,
+    input: String,
 ) -> Result<DaemonId> {
-    let daemon = Daemon::new(username, program, port, arguments);
+    let daemon = Daemon::new(username, program, port, input);
     let id = daemon.daemon_id;
     SERVICES.spawn(id, || daemon)?;
     Ok(id)
@@ -115,7 +115,7 @@ impl Daemon {
         username: String,
         program: ProgramName,
         port: u16,
-        arguments: Vec<String>,
+        input: String,
     ) -> Self {
         let daemon_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -124,7 +124,7 @@ impl Daemon {
             addr,
             username.clone(),
             program.clone(),
-            arguments,
+            input,
         ));
 
         Daemon {
@@ -142,7 +142,7 @@ impl Daemon {
         addr: SocketAddr,
         username: String,
         program: ProgramName,
-        arguments: Vec<String>,
+        input: String,
     ) {
         let result: Result<()> = async {
             let socket = tokio::net::TcpSocket::new_v4()?;
@@ -156,7 +156,7 @@ impl Daemon {
                 let stream = TokioIo::new(stream);
                 let username = username.clone();
                 let program = program.clone();
-                let arguments = arguments.clone();
+                let input = input.clone();
 
                 tokio::task::spawn(async move {
                     if let Err(e) = http1::Builder::new()
@@ -167,7 +167,7 @@ impl Daemon {
                                 Self::handle_request(
                                     username.clone(),
                                     program.clone(),
-                                    arguments.clone(),
+                                    input.clone(),
                                     req,
                                 )
                             }),
@@ -196,7 +196,7 @@ impl Daemon {
     async fn handle_request(
         username: String,
         program: ProgramName,
-        _arguments: Vec<String>,
+        _input: String,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> Result<hyper::Response<HyperOutgoingBody>> {
         // Instantiate a fresh WASM component (store + instance) per request.

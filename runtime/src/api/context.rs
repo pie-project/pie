@@ -2,12 +2,10 @@
 
 use crate::api::model::Model;
 use crate::api::pie;
-use crate::api::types::FutureBool;
-use crate::context::{self, ContextId, LockId};
+use crate::context::{self, ContextId};
 use crate::linker::InstanceState;
 use crate::model::ModelId;
 use anyhow::Result;
-use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -18,8 +16,6 @@ pub struct Context {
     pub context_id: ContextId,
     /// The model ID (for routing to the correct ContextManager).
     pub model_id: ModelId,
-    /// Currently held lock ID (if any).
-    pub lock_id: Option<LockId>,
 }
 
 impl pie::core::context::Host for InstanceState {}
@@ -31,11 +27,12 @@ impl pie::core::context::HostContext for InstanceState {
     ) -> Result<Result<Resource<Context>, String>> {
         let model = self.ctx().table.get(&model)?;
         let model_id = model.model_id;
+        let process_id = self.id();
 
-        match context::create(model_id).await {
+        match context::create_owned(model_id, Some(process_id)).await {
             Ok(context_id) => {
                 self.track_context(model_id, context_id);
-                let ctx = Context { context_id, model_id, lock_id: None };
+                let ctx = Context { context_id, model_id };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -46,18 +43,34 @@ impl pie::core::context::HostContext for InstanceState {
         &mut self,
         model: Resource<Model>,
         name: String,
-    ) -> Result<Option<Resource<Context>>> {
+    ) -> Result<Result<Resource<Context>, String>> {
         let model = self.ctx().table.get(&model)?;
         let model_id = model.model_id;
         let username = self.get_username();
 
         match context::open(model_id, username, name).await {
-            Some(context_id) => {
-                // Opened contexts are NOT tracked for auto-cleanup (they're persistent)
-                let ctx = Context { context_id, model_id, lock_id: None };
-                Ok(Some(self.ctx().table.push(ctx)?))
+            Ok(context_id) => {
+                // Opened (forked-from-snapshot) contexts are tracked for auto-cleanup
+                self.track_context(model_id, context_id);
+                let ctx = Context { context_id, model_id };
+                Ok(Ok(self.ctx().table.push(ctx)?))
             }
-            None => Ok(None),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn delete(
+        &mut self,
+        model: Resource<Model>,
+        name: String,
+    ) -> Result<Result<(), String>> {
+        let model = self.ctx().table.get(&model)?;
+        let model_id = model.model_id;
+        let username = self.get_username();
+
+        match context::delete(model_id, username, name).await {
+            Ok(()) => Ok(Ok(())),
+            Err(e) => Ok(Err(e.to_string())),
         }
     }
 
@@ -72,7 +85,7 @@ impl pie::core::context::HostContext for InstanceState {
         match context::fork(model_id, context_id).await {
             Ok(new_context_id) => {
                 self.track_context(model_id, new_context_id);
-                let new_ctx = Context { context_id: new_context_id, model_id, lock_id: None };
+                let new_ctx = Context { context_id: new_context_id, model_id };
                 Ok(Ok(self.ctx().table.push(new_ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -90,11 +103,22 @@ impl pie::core::context::HostContext for InstanceState {
         let username = self.get_username();
 
         match context::save(model_id, context_id, username, name).await {
-            Ok(()) => {
-                // Context is now named/persistent — stop tracking for auto-cleanup
-                self.untrack_context(model_id, context_id);
-                Ok(Ok(()))
-            }
+            Ok(()) => Ok(Ok(())),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn snapshot(
+        &mut self,
+        this: Resource<Context>,
+    ) -> Result<Result<String, String>> {
+        let ctx = self.ctx().table.get(&this)?;
+        let context_id = ctx.context_id;
+        let model_id = ctx.model_id;
+        let username = self.get_username();
+
+        match context::snapshot(model_id, context_id, username).await {
+            Ok(name) => Ok(Ok(name)),
             Err(e) => Ok(Err(e.to_string())),
         }
     }
@@ -103,10 +127,9 @@ impl pie::core::context::HostContext for InstanceState {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
-        let lock_id = ctx.lock_id.unwrap_or(0);
 
         self.untrack_context(model_id, context_id);
-        let _ = context::destroy(model_id, context_id, lock_id, false).await;
+        let _ = context::destroy(model_id, context_id, false).await;
         self.ctx().table.delete(this)?;
         Ok(())
     }
@@ -118,42 +141,10 @@ impl pie::core::context::HostContext for InstanceState {
         // Only destroy anonymous contexts (ones still tracked).
         // Named/saved contexts survive handle drop.
         if self.untrack_context(model_id, context_id) {
-            let _ = context::destroy(model_id, context_id, 0, true).await;
+            let _ = context::destroy(model_id, context_id, true).await;
         }
         self.ctx().table.delete(this)?;
         Ok(())
-    }
-
-    async fn acquire_lock(&mut self, this: Resource<Context>) -> Result<Resource<FutureBool>> {
-        let ctx = self.ctx().table.get(&this)?;
-        let context_id = ctx.context_id;
-        let model_id = ctx.model_id;
-
-        // Acquire the lock synchronously so we can store the lock_id
-        let lock_id = context::acquire_lock(model_id, context_id);
-        let success = lock_id != 0;
-
-        if success {
-            let ctx = self.ctx().table.get_mut(&this)?;
-            ctx.lock_id = Some(lock_id);
-        }
-
-        // Return a pre-resolved future
-        let (bool_tx, bool_rx) = oneshot::channel();
-        let _ = bool_tx.send(success);
-
-        let future_bool = FutureBool::new(bool_rx);
-        Ok(self.ctx().table.push(future_bool)?)
-    }
-
-    async fn release_lock(&mut self, this: Resource<Context>) -> Result<Result<(), String>> {
-        let ctx = self.ctx().table.get_mut(&this)?;
-        let context_id = ctx.context_id;
-        let model_id = ctx.model_id;
-        let lock_id = ctx.lock_id.take().unwrap_or(0);
-
-        context::release_lock(model_id, context_id, lock_id)?;
-        Ok(Ok(()))
     }
 
     async fn tokens_per_page(&mut self, this: Resource<Context>) -> Result<u32> {
@@ -191,7 +182,7 @@ impl pie::core::context::HostContext for InstanceState {
         page_indices: Vec<u32>,
     ) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
-        match context::commit_pages(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), page_indices).await {
+        match context::commit_pages(ctx.model_id, ctx.context_id, page_indices).await {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
@@ -203,7 +194,7 @@ impl pie::core::context::HostContext for InstanceState {
         num_pages: u32,
     ) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
-        match context::reserve_pages(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), num_pages).await {
+        match context::reserve_pages(ctx.model_id, ctx.context_id, num_pages).await {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
@@ -211,7 +202,7 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn release_pages(&mut self, this: Resource<Context>, num_pages: u32) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
-        context::release_pages(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), num_pages)?;
+        context::release_pages(ctx.model_id, ctx.context_id, num_pages)?;
         Ok(())
     }
 
@@ -222,7 +213,7 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn set_cursor(&mut self, this: Resource<Context>, cursor: u32) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
-        context::set_cursor(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), cursor)?;
+        context::set_cursor(ctx.model_id, ctx.context_id, cursor)?;
         Ok(())
     }
 
@@ -233,13 +224,13 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn set_buffered_tokens(&mut self, this: Resource<Context>, tokens: Vec<u32>) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
-        context::set_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
+        context::set_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
         Ok(())
     }
 
     async fn append_buffered_tokens(&mut self, this: Resource<Context>, tokens: Vec<u32>) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
+        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
         Ok(())
     }
 

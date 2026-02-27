@@ -8,7 +8,7 @@ use inferlet::{
 };
 
 #[inferlet::main]
-async fn main(_args: Vec<String>) -> Result<String> {
+async fn main(_input: String) -> Result<String> {
     // Load the first available model
     let models = runtime::models();
     let model = Model::load(&models[0])?;

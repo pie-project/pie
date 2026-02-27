@@ -39,6 +39,7 @@ use tungstenite::Message as WsMessage;
 use crate::auth;
 use crate::service::{Service, ServiceHandler, ServiceMap};
 use crate::process::{self, ProcessId, ProcessEvent};
+use crate::workflow::{self, WorkflowId};
 
 /// Unique identifier for a connected client.
 pub type ClientId = u32;
@@ -263,6 +264,7 @@ struct Session {
     state: Arc<ServerState>,
     pub(super) inflight_uploads: DashMap<String, InFlightUpload>,
     pub(super) attached_processes: Vec<ProcessId>,
+    pub(super) attached_workflows: Vec<WorkflowId>,
     /// Per-process file delivery waiters (client → process).
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
     ws_msg_tx: mpsc::Sender<WsMessage>,
@@ -334,6 +336,7 @@ impl Session {
             state,
             inflight_uploads: DashMap::new(),
             attached_processes: Vec::new(),
+            attached_workflows: Vec::new(),
             file_waiters: HashMap::new(),
             ws_msg_tx,
             send_pump,
@@ -350,6 +353,9 @@ impl Session {
     fn cleanup(&mut self) {
         for process_id in self.attached_processes.drain(..) {
             process::detach(process_id);
+        }
+        for wf_id in self.attached_workflows.drain(..) {
+            workflow::detach(&wf_id);
         }
 
         self.recv_pump.abort();
@@ -700,6 +706,31 @@ impl Session {
                 } else {
                     tracing::warn!("MCP response for unknown corr_id {}", corr_id);
                 }
+            }
+
+            ClientMessage::SubmitWorkflow { corr_id, json } => {
+                self.handle_submit_workflow(corr_id, json).await;
+            }
+
+            ClientMessage::CancelWorkflow {
+                corr_id,
+                workflow_id,
+            } => {
+                self.handle_cancel_workflow(corr_id, workflow_id).await;
+            }
+
+            ClientMessage::AttachWorkflow {
+                corr_id,
+                workflow_id,
+            } => {
+                self.handle_attach_workflow(corr_id, workflow_id).await;
+            }
+
+            ClientMessage::DetachWorkflow {
+                corr_id,
+                workflow_id,
+            } => {
+                self.handle_detach_workflow(corr_id, workflow_id).await;
             }
         }
     }

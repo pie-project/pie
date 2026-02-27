@@ -29,7 +29,7 @@ impl pie::instruct::chat::Host for InstanceState {
         let ctx = self.ctx().table.get(&ctx)?;
         let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().system(&message);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
+        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
         Ok(())
     }
 
@@ -37,7 +37,7 @@ impl pie::instruct::chat::Host for InstanceState {
         let ctx = self.ctx().table.get(&ctx)?;
         let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().user(&message);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
+        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
         Ok(())
     }
 
@@ -45,7 +45,7 @@ impl pie::instruct::chat::Host for InstanceState {
         let ctx = self.ctx().table.get(&ctx)?;
         let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().assistant(&message);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
+        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
         Ok(())
     }
 
@@ -53,7 +53,7 @@ impl pie::instruct::chat::Host for InstanceState {
         let ctx = self.ctx().table.get(&ctx)?;
         let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().cue();
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
+        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
         Ok(())
     }
 
@@ -61,7 +61,7 @@ impl pie::instruct::chat::Host for InstanceState {
         let ctx = self.ctx().table.get(&ctx)?;
         let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().seal();
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
+        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
         Ok(())
     }
 

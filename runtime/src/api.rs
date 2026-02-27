@@ -26,9 +26,7 @@ wasmtime::component::bindgen!({
         "wasi:random/insecure": wasmtime_wasi::p2::bindings::random::insecure,
         "wasi:random/insecure-seed": wasmtime_wasi::p2::bindings::random::insecure_seed,
         // pie:core/types
-        "pie:core/types/future-bool": types::FutureBool,
         "pie:core/types/future-string": types::FutureString,
-        "pie:core/types/future-string-result": types::FutureStringResult,
         "pie:core/types/future-blob": types::FutureBlob,
         // pie:core/context
         "pie:core/context/context": context::Context,

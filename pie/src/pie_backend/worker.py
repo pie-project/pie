@@ -227,6 +227,7 @@ def worker_main(
                 "max_batch_size": getattr(config, "max_batch_size", 128),
                 "arch_name": engine.arch_type,
                 "snapshot_dir": str(engine.snapshot_dir) if engine.snapshot_dir else "",
+                "swap_pool_size": engine.swap_pool_size,
             }
 
             ready_queue.put((rank, server_name, metadata))
@@ -468,6 +469,28 @@ def _leader_loop(
 
         return {"results": results}
 
+    def _handle_swap_out_pages(**kwargs) -> None:
+        """D2H: copy GPU KV pages to pinned CPU buffers (vectorized per layer)."""
+        import torch
+        gpu_kv = engine.kv_cache_at_layer
+        host_kv = engine.kv_cache_at_layer_host
+        src = torch.tensor(kwargs["phys_ids"], dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(kwargs["slots"], dtype=torch.long)
+        for layer_idx in range(len(gpu_kv)):
+            host_kv[layer_idx][dst] = gpu_kv[layer_idx][src]
+        torch.cuda.synchronize()
+
+    def _handle_swap_in_pages(**kwargs) -> None:
+        """H2D: copy pinned CPU buffers back to GPU KV pages (vectorized per layer)."""
+        import torch
+        gpu_kv = engine.kv_cache_at_layer
+        host_kv = engine.kv_cache_at_layer_host
+        dst = torch.tensor(kwargs["phys_ids"], dtype=torch.long, device=gpu_kv[0].device)
+        src = torch.tensor(kwargs["slots"], dtype=torch.long)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx][dst] = host_kv[layer_idx][src]
+        torch.cuda.synchronize()
+
     # Method dispatch table
     methods = {
         "query": _handle_query,
@@ -477,6 +500,8 @@ def _leader_loop(
         "update_adapter": _handle_update_adapter,
         "load_adapter": _handle_load_adapter,
         "save_adapter": _handle_save_adapter,
+        "swap_out_pages": _handle_swap_out_pages,
+        "swap_in_pages": _handle_swap_in_pages,
     }
 
     try:

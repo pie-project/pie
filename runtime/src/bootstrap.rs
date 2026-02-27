@@ -49,6 +49,7 @@ pub struct ModelConfig {
 pub struct DeviceConfig {
     pub hostname: String,
     pub total_pages: usize,
+    pub cpu_pages: usize,
     pub max_batch_tokens: usize,
     pub max_batch_size: usize,
 }
@@ -113,9 +114,10 @@ pub async fn bootstrap(
             device::spawn(&d.hostname, d.total_pages, d.max_batch_size, d.max_batch_tokens)
         }).collect();
 
-        let num_kv_pages: Vec<usize> = cfg.devices.iter().map(|d| d.total_pages).collect();
+        let num_gpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.total_pages).collect();
+        let num_cpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.cpu_pages).collect();
 
-        context::spawn(cfg.kv_page_size, num_kv_pages);
+        context::spawn(cfg.kv_page_size, num_gpu_pages, num_cpu_pages);
         inference::spawn(
             &devices,
             cfg.scheduler.max_in_flight_batches,

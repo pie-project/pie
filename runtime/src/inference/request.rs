@@ -87,8 +87,8 @@ impl Sampler {
 /// Forward pass request for a single sequence.
 #[derive(Debug, Clone)]
 pub struct ForwardPassRequest {
-    /// Context ID for KV cache page resolution (resolved by inference service).
-    pub context_id: Option<ContextId>,
+    /// Context ID for KV cache page resolution.
+    pub context_id: ContextId,
     /// Input token IDs.
     pub tokens: Vec<u32>,
     /// Token positions.

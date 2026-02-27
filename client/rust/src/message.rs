@@ -109,6 +109,24 @@ pub enum ClientMessage {
         ok: bool,
         result: String,
     },
+
+    #[serde(rename = "submit_workflow")]
+    SubmitWorkflow {
+        corr_id: u32,
+        json: String,
+    },
+
+    #[serde(rename = "cancel_workflow")]
+    CancelWorkflow {
+        corr_id: u32,
+        workflow_id: String,
+    },
+
+    #[serde(rename = "attach_workflow")]
+    AttachWorkflow { corr_id: u32, workflow_id: String },
+
+    #[serde(rename = "detach_workflow")]
+    DetachWorkflow { corr_id: u32, workflow_id: String },
 }
 
 /// Messages from server -> client

@@ -1,503 +1,767 @@
-//! KV Cache - Content-Addressable Storage (CAS) for KV cache pages
+//! KV Cache — Content-Addressable Storage for KV cache pages.
 //!
-//! This module provides the PageStore for managing KV cache pages
-//! using content-addressable storage. Pages are identified by their content hash,
-//! enabling efficient deduplication and sharing across contexts.
+//! Pages are identified by a chained content hash (`PageHash`).
+//! Sharing across contexts is structural: two contexts with the same
+//! prefix automatically share physical pages.
 //!
-//! `PageStore` is exclusively owned by a `ContextManager` actor, so no
-//! interior mutability or locking is needed.
+//! Each model device gets its own `DevicePageCache` — no cross-device
+//! coordination for page identity. The cache is exclusively owned by
+//! a `ContextManager` actor, so no interior mutability or locking is needed.
 
-use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use rustc_hash::{FxHashMap, FxHasher};
+
 use anyhow::Result;
+use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::inference::brle::Brle;
 
-/// Hash key for content-addressable pages
+// =============================================================================
+// Types
+// =============================================================================
+
+/// Content hash of a KV cache page, chained to its predecessor.
 pub type PageHash = u64;
 
-pub type PageId = usize;
-
-/// Physical page index in GPU memory
+/// Physical page index in GPU or CPU memory.
 pub type PhysicalPageId = u32;
 
+/// Copy coordinates for GPU↔CPU swap, used by the RPC layer.
+#[derive(Debug, Clone)]
+pub struct SwapOp {
+    pub gpu_phys: PhysicalPageId,
+    pub cpu_slot: PhysicalPageId,
+}
 
+// =============================================================================
+// PhysicalPagePool
+// =============================================================================
 
-/// Load threshold for spillover (fraction of capacity)
-const LOAD_THRESHOLD: f64 = 0.8;
-
-
+/// Manages a pool of physical page slots (GPU or CPU) for a single device.
 #[derive(Debug)]
-pub enum Mapping {
-    Single(u8, PhysicalPageId),
-    Replicated(Vec<(u8, PhysicalPageId)>),
+struct PhysicalPagePool {
+    total: usize,
+    free: Vec<PhysicalPageId>,
 }
 
-#[derive(Debug)]
-pub struct Page {
-    pub mapping: Mapping,
-    pub hash: Option<PageHash>,  // None if mutable (not yet committed)
-    pub refcount: u16,
-    pub max_position: Option<u32>,  // Highest position ID in this page (None if uncommitted)
-}
-
-impl Page {
-    fn is_mutable(&self) -> bool {
-        self.hash.is_none()
-    }
-
-    fn device_id(&self) -> u8 {
-        match &self.mapping {
-            Mapping::Single(device_id, _) => *device_id,
-            Mapping::Replicated(mappings) => mappings[0].0,
+impl PhysicalPagePool {
+    fn new(total: usize) -> Self {
+        PhysicalPagePool {
+            total,
+            free: (0..total as PhysicalPageId).collect(),
         }
     }
 
-    /// Add mapping from another page, deduplicating by device.
-    /// Returns redundant physical pages that should be freed.
-    fn add_mapping(&mut self, other: Mapping) -> Vec<(u8, PhysicalPageId)> {
-        let new_entries = match other {
-            Mapping::Single(n, p) => vec![(n, p)],
-            Mapping::Replicated(v) => v,
-        };
+    fn alloc(&mut self) -> Option<PhysicalPageId> {
+        self.free.pop()
+    }
 
-        let mut all_entries = match &self.mapping {
-            Mapping::Single(n, p) => vec![(*n, *p)],
-            Mapping::Replicated(v) => v.clone(),
-        };
+    fn free(&mut self, id: PhysicalPageId) {
+        self.free.push(id);
+    }
 
-        let mut redundant = Vec::new();
+    fn used(&self) -> usize {
+        self.total - self.free.len()
+    }
 
-        // Deduplicate by device: keep first occurrence, mark rest as redundant
-        for (new_device, new_phys) in new_entries {
-            if all_entries.iter().any(|(n, _)| *n == new_device) {
-                redundant.push((new_device, new_phys));
-            } else {
-                all_entries.push((new_device, new_phys));
-            }
-        }
-
-        // Update mapping
-        self.mapping = if all_entries.len() == 1 {
-            Mapping::Single(all_entries[0].0, all_entries[0].1)
-        } else {
-            Mapping::Replicated(all_entries)
-        };
-
-        redundant
+    fn available(&self) -> usize {
+        self.free.len()
     }
 }
 
-// ============================================================================
-// PageStore: Centralized logical page storage
-// ============================================================================
+// =============================================================================
+// DevicePageCache
+// =============================================================================
 
-/// Per-device physical page storage
-#[derive(Debug)]
-struct PhysicalPageStore {
-    total_pages: usize,
-    free_pages: Vec<PhysicalPageId>,
-}
-
-impl PhysicalPageStore {
-    fn new(total_pages: usize) -> Self {
-        PhysicalPageStore {
-            total_pages,
-            free_pages: (0..total_pages as PhysicalPageId).collect(),
-        }
-    }
-
-    fn load_factor(&self) -> f64 {
-        if self.total_pages == 0 {
-            1.0
-        } else {
-            (self.total_pages - self.free_pages.len()) as f64 / self.total_pages as f64
-        }
-    }
-
-    #[allow(dead_code)]
-    fn is_overloaded(&self) -> bool {
-        self.load_factor() >= LOAD_THRESHOLD
-    }
-}
-
-/// Manages logical-to-physical KV cache page mappings.
+/// Per-device page cache. Manages the content-addressed KV cache for one GPU.
 ///
-/// Owned exclusively by a single `ContextManager` actor — no locking required.
+/// Data structures:
+/// - `pages`:       hash → GPU physical page (always present for GPU-resident pages)
+/// - `chain`:       hash → prev_hash (backward links for traversal)
+/// - `refcount`:    hash → number of contexts including this hash in their chain
+/// - `index_cache`: tip_hash → flattened `Vec<PhysicalPageId>` from root to tip
+///                  Sparse: only cached for active `committed_tip`s.
+///
+/// Committed pages that are evicted from GPU are simply discarded. They can be
+/// replayed from lineage when the context needs to be restored. CPU memory is
+/// used exclusively for working page swap (uncommitted pages during suspension).
 #[derive(Debug)]
-pub struct PageStore {
-    /// Tokens per page.
+pub struct DevicePageCache {
     page_size: usize,
-    /// Logical page metadata.
-    pages: Vec<Option<Page>>,
-    /// Hash → PageId index for content-addressable deduplication.
-    index: FxHashMap<PageHash, PageId>,
-    /// Recycled page ID slots.
-    free_page_ids: Vec<PageId>,
-    /// LRU queue for eviction (pages with refcount=0).
-    lru: VecDeque<PageId>,
-    /// Per-device physical page storage.
-    phys_page_tables: Vec<PhysicalPageStore>,
+
+    /// hash → GPU physical page ID. Present for every GPU-resident committed page.
+    pages: FxHashMap<PageHash, PhysicalPageId>,
+
+    /// hash → prev_hash for backward chain traversal. 0 = root (no predecessor).
+    chain: FxHashMap<PageHash, PageHash>,
+
+    /// hash → number of active contexts whose committed chain includes this hash.
+    refcount: FxHashMap<PageHash, usize>,
+
+    /// Traversal cache: tip_hash → ordered physical page IDs from root to tip.
+    /// Sparse: only maintained for hashes that are an active context's `committed_tip`.
+    index_cache: FxHashMap<PageHash, Vec<PhysicalPageId>>,
+
+    /// GPU physical page pool.
+    gpu: PhysicalPagePool,
+
+    /// CPU physical page pool (exclusively for working page swap).
+    cpu: PhysicalPagePool,
 }
 
-impl PageStore {
-    pub fn new(page_size: usize, num_kv_pages: &[usize]) -> Self {
-        let phys_page_tables = num_kv_pages.iter()
-            .map(|&n| PhysicalPageStore::new(n))
-            .collect();
-        PageStore {
+impl DevicePageCache {
+    pub fn new(page_size: usize, num_gpu_pages: usize, num_cpu_pages: usize) -> Self {
+        DevicePageCache {
             page_size,
-            pages: Vec::new(),
-            index: FxHashMap::default(),
-            free_page_ids: Vec::new(),
-            lru: VecDeque::new(),
-            phys_page_tables,
+            pages: FxHashMap::default(),
+            chain: FxHashMap::default(),
+            refcount: FxHashMap::default(),
+            index_cache: FxHashMap::default(),
+            gpu: PhysicalPagePool::new(num_gpu_pages),
+            cpu: PhysicalPagePool::new(num_cpu_pages),
         }
     }
 
-    /// Get the page size (number of tokens per page).
     pub fn page_size(&self) -> usize {
         self.page_size
     }
 
-    /// Returns (used_pages, total_pages) per device.
-    pub fn stats(&self) -> Vec<(usize, usize)> {
-        self.phys_page_tables.iter().map(|pt| {
-            (pt.total_pages - pt.free_pages.len(), pt.total_pages)
-        }).collect()
+    /// Returns (used_gpu_pages, total_gpu_pages).
+    pub fn stats(&self) -> (usize, usize) {
+        (self.gpu.used(), self.gpu.total)
     }
 
-    /// Compute hash chain from tokens.
-    fn compute_hashes(&self, tokens: &[u32]) -> Vec<PageHash> {
-        let mut hashes = Vec::new();
-        let mut prev_hash: PageHash = 0;
+    /// GPU memory pressure as a fraction [0.0, 1.0].
+    pub fn pressure(&self) -> f64 {
+        if self.gpu.total == 0 { 0.0 }
+        else { self.gpu.used() as f64 / self.gpu.total as f64 }
+    }
 
-        for chunk in tokens.chunks(self.page_size) {
+    /// Number of available GPU pages (free pool + evictable LRU pages).
+    pub fn available_gpu_pages(&self) -> usize {
+        self.gpu.available() + self.evictable_count()
+    }
+
+    // =========================================================================
+    // Hash computation
+    // =========================================================================
+
+    /// Compute chained hashes for a sequence of page-aligned token chunks.
+    /// Each hash depends on (tokens, positions, masks, prev_hash).
+    pub fn compute_page_hashes(
+        &self,
+        tokens: &[u32],
+        positions: &[u32],
+        masks: &[Brle],
+        prev_hash: PageHash,
+    ) -> Vec<PageHash> {
+        let mut hashes = Vec::new();
+        let mut running = prev_hash;
+
+        for (chunk_idx, chunk) in tokens.chunks(self.page_size).enumerate() {
+            let start = chunk_idx * self.page_size;
+            let end = start + chunk.len();
+            let chunk_pos = &positions[start..end];
+            let chunk_masks = &masks[start..end];
+
             let mut hasher = FxHasher::default();
             chunk.hash(&mut hasher);
+            for pos in chunk_pos { pos.hash(&mut hasher); }
+            for mask in chunk_masks { mask.hash(&mut hasher); }
             let content_hash = hasher.finish();
 
             let mut chain_hasher = FxHasher::default();
             content_hash.hash(&mut chain_hasher);
-            prev_hash.hash(&mut chain_hasher);
+            running.hash(&mut chain_hasher);
             let page_hash = chain_hasher.finish();
 
             hashes.push(page_hash);
-            prev_hash = page_hash;
+            running = page_hash;
         }
 
         hashes
     }
 
-    /// Lookup cached pages by token prefix (longest prefix match).
-    /// Automatically increments refcount for matched pages.
-    pub fn lookup(&mut self, tokens: &[u32]) -> Option<Vec<PageId>> {
-        if tokens.is_empty() {
-            return None;
-        }
+    // =========================================================================
+    // Commit
+    // =========================================================================
 
-        let hashes = self.compute_hashes(tokens);
-        let mut matched_pages = Vec::new();
-
-        for hash in &hashes {
-            if let Some(&page_id) = self.index.get(hash) {
-                // Remove from LRU if transitioning from refcount 0
-                let needs_lru_remove = self.pages[page_id]
-                    .as_ref()
-                    .map_or(false, |p| p.refcount == 0);
-                if needs_lru_remove {
-                    self.lru.retain(|&id| id != page_id);
-                }
-                if let Some(page) = self.pages[page_id].as_mut() {
-                    page.refcount += 1;
-                    matched_pages.push(page_id);
-                }
-            } else {
-                break;
-            }
-        }
-
-        if matched_pages.is_empty() {
-            None
-        } else {
-            Some(matched_pages)
-        }
-    }
-
-    /// Commit pages to the cache, making them immutable and shareable.
-    /// Hash chain includes tokens, positions, and masks.
-    /// Returns (final_page_ids, final_hash) for continued chaining.
-    pub fn commit(
+    /// Commit a single page to the cache.
+    ///
+    /// If the hash already exists (dedup hit), just increments refcount and
+    /// returns the existing physical page. Otherwise allocates a new GPU page.
+    ///
+    /// Does NOT update `index_cache` — call `update_index_cache` after committing
+    /// all pages for a context.
+    ///
+    /// Returns `(physical_page_id, is_new)`.
+    pub fn commit_page(
         &mut self,
-        page_ids: &[PageId],
-        tokens: &[u32],
-        positions: &[u32],
-        masks: &[Brle],
+        hash: PageHash,
         prev_hash: PageHash,
-    ) -> Result<(Vec<PageId>, PageHash)> {
-        if tokens.len() != positions.len() || tokens.len() != masks.len() {
-            anyhow::bail!(
-                "Length mismatch: {} tokens, {} positions, {} masks",
-                tokens.len(),
-                positions.len(),
-                masks.len()
-            );
+    ) -> Result<(PhysicalPageId, bool)> {
+        // Dedup: page already exists on GPU
+        if let Some(&phys) = self.pages.get(&hash) {
+            *self.refcount.entry(hash).or_insert(0) += 1;
+            return Ok((phys, false));
         }
 
-        // Compute hashes with position and mask info
+        // Allocate GPU page
+        let gpu_phys = self.gpu.alloc()
+            .ok_or_else(|| anyhow::anyhow!("No free GPU pages"))?;
+
+        self.pages.insert(hash, gpu_phys);
+        self.chain.insert(hash, prev_hash);
+        *self.refcount.entry(hash).or_insert(0) += 1;
+
+        Ok((gpu_phys, true))
+    }
+
+    /// Update the index_cache for a context's new committed_tip.
+    ///
+    /// Move semantics: if `old_tip` is provided and has an index_cache entry,
+    /// take it, append the new physical pages, and store under `new_tip`.
+    /// Otherwise rebuild from chain + pages.
+    pub fn update_index_cache(
+        &mut self,
+        new_tip: PageHash,
+        old_tip: Option<PageHash>,
+        new_phys_pages: &[PhysicalPageId],
+    ) {
+        // Try to reuse old tip's cached page table
+        let mut page_table = match old_tip {
+            Some(old) => self.index_cache.remove(&old).unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        // If empty (cache miss or first commit), rebuild from chain
+        if page_table.is_empty() && old_tip.is_some() {
+            page_table = self.rebuild_page_table(old_tip.unwrap());
+        }
+
+        page_table.extend_from_slice(new_phys_pages);
+        self.index_cache.insert(new_tip, page_table);
+    }
+
+    /// Remove an index_cache entry (e.g., when context is destroyed or suspended).
+    pub fn remove_index_cache(&mut self, tip: PageHash) {
+        self.index_cache.remove(&tip);
+    }
+
+    // =========================================================================
+    // Chain traversal & refcounting
+    // =========================================================================
+
+    /// Increment refcount for every page reachable from `tip`.
+    pub fn acquire_chain(&mut self, tip: PageHash) {
+        let mut h = tip;
+        loop {
+            *self.refcount.entry(h).or_insert(0) += 1;
+            match self.chain.get(&h) {
+                Some(&prev) if prev != 0 => h = prev,
+                _ => break,
+            }
+        }
+    }
+
+    /// Decrement refcount for every page reachable from `tip`.
+    /// Returns hashes that hit refcount=0 (candidates for eviction).
+    pub fn release_chain(&mut self, tip: PageHash) -> Vec<PageHash> {
+        let mut evictable = Vec::new();
+        let mut h = tip;
+        loop {
+            if let Some(rc) = self.refcount.get_mut(&h) {
+                *rc = rc.saturating_sub(1);
+                if *rc == 0 {
+                    evictable.push(h);
+                }
+            }
+            match self.chain.get(&h) {
+                Some(&prev) if prev != 0 => h = prev,
+                _ => break,
+            }
+        }
+        evictable
+    }
+
+    /// Walk the hash chain backward from `tip` to root, returning hashes in
+    /// root-to-tip order.
+    pub fn walk_chain(&self, tip: PageHash) -> Vec<PageHash> {
         let mut hashes = Vec::new();
-        let mut max_positions = Vec::new();
-        let mut running_hash = prev_hash;
-
-        for (chunk_idx, chunk) in tokens.chunks(self.page_size).enumerate() {
-            let start = chunk_idx * self.page_size;
-            let end = start + chunk.len();
-            let chunk_positions = &positions[start..end];
-            let chunk_masks = &masks[start..end];
-
-            let mut hasher = FxHasher::default();
-            chunk.hash(&mut hasher);
-            for pos in chunk_positions {
-                pos.hash(&mut hasher);
+        let mut h = tip;
+        loop {
+            hashes.push(h);
+            match self.chain.get(&h) {
+                Some(&prev) if prev != 0 => h = prev,
+                _ => break,
             }
-            for mask in chunk_masks {
-                mask.hash(&mut hasher);
-            }
-            let content_hash = hasher.finish();
-
-            let mut chain_hasher = FxHasher::default();
-            content_hash.hash(&mut chain_hasher);
-            running_hash.hash(&mut chain_hasher);
-            let page_hash = chain_hasher.finish();
-
-            hashes.push(page_hash);
-            running_hash = page_hash;
-
-            let max_pos = chunk_positions.iter().copied().max();
-            max_positions.push(max_pos);
         }
-
-        if page_ids.len() != hashes.len() {
-            anyhow::bail!(
-                "Page count mismatch: {} pages but {} hashes",
-                page_ids.len(),
-                hashes.len()
-            );
-        }
-
-        let mut final_page_ids = Vec::with_capacity(page_ids.len());
-
-        for (i, (&page_id, &hash)) in page_ids.iter().zip(hashes.iter()).enumerate() {
-            let max_pos = max_positions[i];
-
-            // Check for existing canonical page
-            if let Some(&canonical_id) = self.index.get(&hash) {
-                if canonical_id != page_id {
-                    // Deduplicate: merge current page into canonical
-                    if let Some(page) = self.pages[page_id].take() {
-                        // Check canonical page refcount before mutable borrow
-                        let needs_lru_remove = self.pages[canonical_id]
-                            .as_ref()
-                            .map_or(false, |p| p.refcount == 0);
-                        if needs_lru_remove {
-                            self.lru.retain(|&id| id != canonical_id);
-                        }
-                        if let Some(canonical_page) = self.pages[canonical_id].as_mut() {
-                            let redundant = canonical_page.add_mapping(page.mapping);
-                            for (device_id, phys_id) in redundant {
-                                self.phys_page_tables[device_id as usize]
-                                    .free_pages.push(phys_id);
-                            }
-                            canonical_page.refcount += 1;
-                        }
-                    }
-                    self.free_page_ids.push(page_id);
-                    final_page_ids.push(canonical_id);
-                    continue;
-                }
-            }
-
-            // Normal commit
-            let page = self.pages[page_id].as_mut().unwrap();
-            debug_assert!(page.is_mutable(), "Page {} is already committed", page_id);
-            page.hash = Some(hash);
-            page.max_position = max_pos;
-            self.index.insert(hash, page_id);
-            final_page_ids.push(page_id);
-        }
-
-        Ok((final_page_ids, running_hash))
+        hashes.reverse();
+        hashes
     }
 
-    /// Select the best device for allocation.
-    /// If affinity is specified, use that device. Otherwise, use the device with lowest load.
-    fn select_device(&self, affinity: Option<PageId>) -> Option<u8> {
-        if self.phys_page_tables.is_empty() {
-            return None;
-        }
-
-        if let Some(affinity_page_id) = affinity {
-            if let Some(page) = self.pages.get(affinity_page_id).and_then(|p| p.as_ref()) {
-                return Some(page.device_id());
-            }
-        }
-
-        // Select device with lowest load
-        let mut best: Option<(u8, f64)> = None;
-        for (idx, dev) in self.phys_page_tables.iter().enumerate() {
-            let load = dev.load_factor();
-            if best.is_none() || load < best.unwrap().1 {
-                best = Some((idx as u8, load));
-            }
-        }
-        best.map(|(id, _)| id)
+    /// Get the refcount for a specific hash.
+    pub fn refcount(&self, hash: PageHash) -> usize {
+        self.refcount.get(&hash).copied().unwrap_or(0)
     }
 
-    /// Try to evict one page from the LRU (must have refcount=0).
-    /// Returns true if a page was evicted.
-    fn evict_one(&mut self, target_device: u8) -> bool {
-        let mut evict_idx = None;
-        for (i, &page_id) in self.lru.iter().enumerate() {
-            if let Some(page) = self.pages[page_id].as_ref() {
-                if page.device_id() == target_device && page.refcount == 0 {
-                    evict_idx = Some(i);
-                    break;
-                }
-            }
-        }
+    // =========================================================================
+    // Physical page resolution
+    // =========================================================================
 
-        if let Some(idx) = evict_idx {
-            let page_id = self.lru.remove(idx).unwrap();
-            self.free_page(page_id);
-            true
-        } else {
-            false
+    /// Resolve the ordered list of GPU physical page IDs for a chain tip.
+    /// O(1) if the tip is in index_cache; otherwise rebuilds from chain + pages.
+    pub fn resolve_physical(&mut self, tip: PageHash) -> Vec<PhysicalPageId> {
+        if let Some(cached) = self.index_cache.get(&tip) {
+            return cached.clone();
         }
+        let table = self.rebuild_page_table(tip);
+        // Cache it for future lookups
+        self.index_cache.insert(tip, table.clone());
+        table
     }
 
-    /// Free a page, returning its physical page to the device.
-    fn free_page(&mut self, page_id: PageId) {
-        if let Some(page) = self.pages[page_id].take() {
-            // Remove from index if committed
-            if let Some(hash) = page.hash {
-                if let Some(&id) = self.index.get(&hash) {
-                    if id == page_id {
-                        self.index.remove(&hash);
-                    }
-                }
-            }
-
-            // Return physical page to device
-            match page.mapping {
-                Mapping::Single(device_id, phys_id) => {
-                    self.phys_page_tables[device_id as usize]
-                        .free_pages.push(phys_id);
-                }
-                Mapping::Replicated(mappings) => {
-                    for (device_id, phys_id) in mappings {
-                        self.phys_page_tables[device_id as usize]
-                            .free_pages.push(phys_id);
-                    }
-                }
-            }
-
-            // Recycle the page ID
-            self.free_page_ids.push(page_id);
-        }
+    /// Rebuild a page table from chain links + per-hash physical pages.
+    fn rebuild_page_table(&self, tip: PageHash) -> Vec<PhysicalPageId> {
+        let chain = self.walk_chain(tip);
+        chain.iter()
+            .filter_map(|h| self.pages.get(h).copied())
+            .collect()
     }
 
-    /// Allocate pages on a specific device.
-    pub fn allocate(&mut self, num_pages: usize, affinity: Option<PageId>) -> Result<Vec<PageId>> {
-        let device_id = self.select_device(affinity)
-            .ok_or_else(|| anyhow::anyhow!("No devices registered"))?;
+    /// Check if a specific hash has a GPU-resident physical page.
+    pub fn is_gpu_resident(&self, hash: PageHash) -> bool {
+        self.pages.contains_key(&hash)
+    }
 
-        let mut allocated = Vec::with_capacity(num_pages);
+    /// Count committed pages cached on this device (GPU-resident) in a chain.
+    pub fn chain_resident_count(&self, tip: PageHash) -> usize {
+        let chain = self.walk_chain(tip);
+        chain.iter().filter(|h| self.pages.contains_key(h)).count()
+    }
 
-        for _ in 0..num_pages {
-            let phys_id = loop {
-                if let Some(phys_id) = self.phys_page_tables[device_id as usize].free_pages.pop() {
-                    break phys_id;
+    // =========================================================================
+    // Working pages (uncommitted, mutable, exclusive to one context)
+    // =========================================================================
+
+    /// Allocate `n` mutable GPU pages. Returns physical page IDs.
+    /// Evicts unreferenced committed pages from LRU if needed.
+    pub fn allocate_working(&mut self, n: usize) -> Result<Vec<PhysicalPageId>> {
+        let mut allocated = Vec::with_capacity(n);
+
+        for _ in 0..n {
+            let phys = loop {
+                if let Some(p) = self.gpu.alloc() {
+                    break p;
                 }
-                if !self.evict_one(device_id) {
-                    for page_id in allocated {
-                        self.free_page(page_id);
+                // Evict one unreferenced committed page
+                if !self.evict_one() {
+                    // Rollback already allocated
+                    for p in allocated {
+                        self.gpu.free(p);
                     }
-                    anyhow::bail!("Out of memory on device {}", device_id);
+                    anyhow::bail!("No free GPU pages for working allocation");
                 }
             };
-
-            let page_id = if let Some(id) = self.free_page_ids.pop() {
-                id
-            } else {
-                let id = self.pages.len();
-                self.pages.push(None);
-                id
-            };
-
-            self.pages[page_id] = Some(Page {
-                mapping: Mapping::Single(device_id, phys_id),
-                hash: None,
-                refcount: 1,
-                max_position: None,
-            });
-
-            allocated.push(page_id);
+            allocated.push(phys);
         }
 
         Ok(allocated)
     }
 
-    /// Release pages (decrease refcount).
-    pub fn release(&mut self, page_ids: &[PageId]) {
-        for &page_id in page_ids {
-            let should_free = if let Some(page) = self.pages[page_id].as_mut() {
-                page.refcount = page.refcount.saturating_sub(1);
-                if page.refcount == 0 {
-                    if page.is_mutable() {
-                        true // will free below
-                    } else {
-                        self.lru.push_back(page_id);
-                        false
-                    }
-                } else {
-                    false
-                }
+    /// Free working pages back to the GPU pool.
+    pub fn free_working(&mut self, pages: &[PhysicalPageId]) {
+        for &p in pages {
+            self.gpu.free(p);
+        }
+    }
+
+    /// Free CPU slots back to the CPU pool (for suspended working pages).
+    pub fn free_cpu_slots(&mut self, slots: &[PhysicalPageId]) {
+        for &s in slots {
+            self.cpu.free(s);
+        }
+    }
+
+    /// Swap working pages from GPU to CPU.
+    /// Returns swap operations for the RPC layer.
+    pub fn swap_out_working(&mut self, gpu_pages: &[PhysicalPageId]) -> Result<Vec<SwapOp>> {
+        let mut ops = Vec::with_capacity(gpu_pages.len());
+
+        for &gpu_phys in gpu_pages {
+            let cpu_slot = self.cpu.alloc()
+                .ok_or_else(|| anyhow::anyhow!("No free CPU pages for working swap-out"))?;
+
+            ops.push(SwapOp { gpu_phys, cpu_slot });
+            self.gpu.free(gpu_phys);
+        }
+
+        Ok(ops)
+    }
+
+    /// Swap working pages from CPU back to GPU.
+    /// Returns swap operations for the RPC layer.
+    pub fn swap_in_working(&mut self, cpu_slots: &[PhysicalPageId]) -> Result<Vec<SwapOp>> {
+        let mut ops = Vec::with_capacity(cpu_slots.len());
+
+        for &cpu_slot in cpu_slots {
+            let gpu_phys = self.gpu.alloc()
+                .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working swap-in"))?;
+
+            ops.push(SwapOp { gpu_phys, cpu_slot });
+            self.cpu.free(cpu_slot);
+        }
+
+        Ok(ops)
+    }
+
+    // =========================================================================
+    // Eviction
+    // =========================================================================
+
+    /// Number of committed GPU pages with refcount=0 (evictable).
+    fn evictable_count(&self) -> usize {
+        self.pages.keys()
+            .filter(|h| self.refcount.get(h).copied().unwrap_or(0) == 0)
+            .count()
+    }
+
+    /// Evict one unreferenced committed page from GPU.
+    /// The page is discarded — it can be replayed from lineage.
+    /// Returns true if a page was evicted.
+    fn evict_one(&mut self) -> bool {
+        // Find an unreferenced GPU page
+        let victim = self.pages.iter()
+            .find(|(h, _)| self.refcount.get(h).copied().unwrap_or(0) == 0)
+            .map(|(&h, &p)| (h, p));
+
+        let (hash, gpu_phys) = match victim {
+            Some(v) => v,
+            None => return false,
+        };
+
+        // Remove from GPU and free the slot
+        self.pages.remove(&hash);
+        self.gpu.free(gpu_phys);
+
+        // Clean up refcount (keep chain links for future walk_chain)
+        self.refcount.remove(&hash);
+
+        true
+    }
+
+    /// Evict all unreferenced committed pages from GPU.
+    /// Returns the number of GPU pages freed.
+    pub fn evict_unreferenced(&mut self) -> usize {
+        let mut freed = 0;
+        while self.evict_one() {
+            freed += 1;
+        }
+        freed
+    }
+
+    // =========================================================================
+    // Residency check (for ensure_resident)
+    // =========================================================================
+
+    /// Classify pages in a committed chain by their GPU residency.
+    ///
+    /// Returns `(gpu_resident, discarded)` — each a Vec of PageHash
+    /// in root-to-tip order. Discarded pages must be replayed from lineage.
+    pub fn classify_chain(
+        &self,
+        tip: PageHash,
+    ) -> (Vec<PageHash>, Vec<PageHash>) {
+        let chain = self.walk_chain(tip);
+        let mut gpu = Vec::new();
+        let mut discarded = Vec::new();
+
+        for h in chain {
+            if self.pages.contains_key(&h) {
+                gpu.push(h);
             } else {
-                false
-            };
-            if should_free {
-                self.free_page(page_id);
+                discarded.push(h);
             }
         }
+
+        (gpu, discarded)
     }
 
-    /// Acquire pages (increase refcount).
-    /// Used when forking contexts to share committed pages.
-    pub fn acquire(&mut self, page_ids: &[PageId]) {
-        for &page_id in page_ids {
-            let needs_lru_remove = self.pages[page_id]
-                .as_ref()
-                .map_or(false, |p| p.refcount == 0);
-            if needs_lru_remove {
-                self.lru.retain(|&id| id != page_id);
-            }
-            if let Some(page) = self.pages[page_id].as_mut() {
-                page.refcount += 1;
+    // =========================================================================
+    // Prefix lookup (for restore from lineage)
+    // =========================================================================
+
+    /// Find the longest prefix of `hashes` that exists on GPU.
+    /// Increments refcount for matched pages.
+    /// Returns the number of matched pages (from the start).
+    pub fn longest_prefix_match(&mut self, hashes: &[PageHash]) -> usize {
+        let mut matched = 0;
+        for &h in hashes {
+            if self.pages.contains_key(&h) {
+                *self.refcount.entry(h).or_insert(0) += 1;
+                matched += 1;
+            } else {
+                break;
             }
         }
+        matched
+    }
+}
+
+// =============================================================================
+// Utility
+// =============================================================================
+
+/// Compute FlashInfer's `last_page_len` from total KV tokens and page geometry.
+///
+/// FlashInfer equation: `seq_len = (num_pages - 1) * page_size + last_page_len`
+pub fn compute_last_page_len(total_kv: u32, num_pages: u32, page_size: u32) -> u32 {
+    if num_pages == 0 {
+        0
+    } else {
+        let r = total_kv % page_size;
+        if r == 0 { page_size } else { r }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_brle(n: usize) -> Vec<Brle> {
+        (0..n).map(|_| Brle::new(0)).collect()
     }
 
-    /// Get physical page mappings for a logical page.
-    /// Returns the (device_id, PhysicalPageId) pairs for a page.
-    pub fn get_physical_mappings(&self, page_id: PageId) -> Vec<(u8, PhysicalPageId)> {
-        if let Some(Some(page)) = self.pages.get(page_id) {
-            match &page.mapping {
-                Mapping::Single(device_id, phys_id) => vec![(*device_id, *phys_id)],
-                Mapping::Replicated(mappings) => mappings.clone(),
-            }
-        } else {
-            Vec::new()
-        }
+    #[test]
+    fn test_commit_and_resolve() {
+        let mut cache = DevicePageCache::new(4, 100, 10);
+
+        // Compute hashes for 8 tokens (2 pages)
+        let tokens: Vec<u32> = (0..8).collect();
+        let positions: Vec<u32> = (0..8).collect();
+        let masks = make_brle(8);
+        let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
+        assert_eq!(hashes.len(), 2);
+
+        // Commit page 1
+        let (phys1, is_new1) = cache.commit_page(hashes[0], 0).unwrap();
+        assert!(is_new1);
+        assert!(cache.is_gpu_resident(hashes[0]));
+
+        // Commit page 2
+        let (phys2, is_new2) = cache.commit_page(hashes[1], hashes[0]).unwrap();
+        assert!(is_new2);
+
+        // Update index cache
+        cache.update_index_cache(hashes[1], None, &[phys1, phys2]);
+
+        // Resolve physical pages
+        let resolved = cache.resolve_physical(hashes[1]);
+        assert_eq!(resolved, vec![phys1, phys2]);
+    }
+
+    #[test]
+    fn test_dedup_on_commit() {
+        let mut cache = DevicePageCache::new(4, 100, 10);
+
+        let tokens: Vec<u32> = (0..4).collect();
+        let positions: Vec<u32> = (0..4).collect();
+        let masks = make_brle(4);
+        let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
+
+        // First commit
+        let (phys1, is_new1) = cache.commit_page(hashes[0], 0).unwrap();
+        assert!(is_new1);
+        assert_eq!(cache.refcount(hashes[0]), 1);
+
+        // Second commit of same hash (dedup)
+        let (phys2, is_new2) = cache.commit_page(hashes[0], 0).unwrap();
+        assert!(!is_new2);
+        assert_eq!(phys1, phys2); // Same physical page
+        assert_eq!(cache.refcount(hashes[0]), 2);
+    }
+
+    #[test]
+    fn test_acquire_release_chain() {
+        let mut cache = DevicePageCache::new(4, 100, 10);
+
+        let tokens: Vec<u32> = (0..8).collect();
+        let positions: Vec<u32> = (0..8).collect();
+        let masks = make_brle(8);
+        let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
+
+        cache.commit_page(hashes[0], 0).unwrap();
+        cache.commit_page(hashes[1], hashes[0]).unwrap();
+
+        // Initial refcount: 1 each (from commit)
+        assert_eq!(cache.refcount(hashes[0]), 1);
+        assert_eq!(cache.refcount(hashes[1]), 1);
+
+        // Acquire (simulating fork)
+        cache.acquire_chain(hashes[1]);
+        assert_eq!(cache.refcount(hashes[0]), 2);
+        assert_eq!(cache.refcount(hashes[1]), 2);
+
+        // Release (simulating destroy of fork)
+        let evictable = cache.release_chain(hashes[1]);
+        assert!(evictable.is_empty()); // Still held by original
+        assert_eq!(cache.refcount(hashes[0]), 1);
+        assert_eq!(cache.refcount(hashes[1]), 1);
+
+        // Release again (original destroyed)
+        let evictable = cache.release_chain(hashes[1]);
+        assert_eq!(evictable.len(), 2); // Both now evictable
+        assert_eq!(cache.refcount(hashes[0]), 0);
+        assert_eq!(cache.refcount(hashes[1]), 0);
+    }
+
+    #[test]
+    fn test_shared_pages_survive_eviction() {
+        let mut cache = DevicePageCache::new(4, 10, 5);
+
+        let tokens: Vec<u32> = (0..8).collect();
+        let positions: Vec<u32> = (0..8).collect();
+        let masks = make_brle(8);
+        let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
+
+        cache.commit_page(hashes[0], 0).unwrap();
+        cache.commit_page(hashes[1], hashes[0]).unwrap();
+
+        // Simulate fork: acquire chain
+        cache.acquire_chain(hashes[1]);
+        // refcount: h0=2, h1=2
+
+        // Release one context's chain
+        cache.release_chain(hashes[1]);
+        // refcount: h0=1, h1=1
+
+        // Try to evict — nothing should be evicted (refcount > 0)
+        let freed = cache.evict_unreferenced();
+        assert_eq!(freed, 0);
+        assert!(cache.is_gpu_resident(hashes[0]));
+        assert!(cache.is_gpu_resident(hashes[1]));
+    }
+
+    #[test]
+    fn test_evict_unreferenced() {
+        let mut cache = DevicePageCache::new(4, 10, 5);
+
+        let tokens: Vec<u32> = (0..4).collect();
+        let positions: Vec<u32> = (0..4).collect();
+        let masks = make_brle(4);
+        let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
+
+        cache.commit_page(hashes[0], 0).unwrap();
+
+        // Release chain → refcount=0
+        cache.release_chain(hashes[0]);
+
+        // Evict
+        let freed = cache.evict_unreferenced();
+        assert_eq!(freed, 1);
+        assert!(!cache.is_gpu_resident(hashes[0])); // Discarded entirely
+    }
+
+    #[test]
+    fn test_working_pages_alloc_free() {
+        let mut cache = DevicePageCache::new(4, 10, 5);
+
+        let pages = cache.allocate_working(3).unwrap();
+        assert_eq!(pages.len(), 3);
+        assert_eq!(cache.gpu.used(), 3);
+
+        cache.free_working(&pages);
+        assert_eq!(cache.gpu.used(), 0);
+    }
+
+    #[test]
+    fn test_working_pages_swap() {
+        let mut cache = DevicePageCache::new(4, 10, 5);
+
+        let pages = cache.allocate_working(2).unwrap();
+        let swap_ops = cache.swap_out_working(&pages).unwrap();
+        assert_eq!(swap_ops.len(), 2);
+        assert_eq!(cache.gpu.used(), 0); // GPU freed
+        assert_eq!(cache.cpu.used(), 2); // CPU used
+
+        let cpu_slots: Vec<_> = swap_ops.iter().map(|op| op.cpu_slot).collect();
+        let swap_in_ops = cache.swap_in_working(&cpu_slots).unwrap();
+        assert_eq!(swap_in_ops.len(), 2);
+        assert_eq!(cache.gpu.used(), 2); // GPU allocated
+        assert_eq!(cache.cpu.used(), 0); // CPU freed
+    }
+
+    #[test]
+    fn test_classify_chain() {
+        let mut cache = DevicePageCache::new(4, 10, 5);
+
+        let tokens: Vec<u32> = (0..8).collect();
+        let positions: Vec<u32> = (0..8).collect();
+        let masks = make_brle(8);
+        let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
+
+        cache.commit_page(hashes[0], 0).unwrap();
+        cache.commit_page(hashes[1], hashes[0]).unwrap();
+
+        // Both on GPU
+        let (gpu, disc) = cache.classify_chain(hashes[1]);
+        assert_eq!(gpu.len(), 2);
+        assert_eq!(disc.len(), 0);
+
+        // Release and evict page 0
+        cache.release_chain(hashes[0]); // Only decrements h0
+        cache.evict_unreferenced();
+
+        let (gpu, disc) = cache.classify_chain(hashes[1]);
+        assert_eq!(gpu.len(), 1); // Only h1 on GPU
+        assert_eq!(disc.len(), 1); // h0 discarded
+    }
+
+    #[test]
+    fn test_longest_prefix_match() {
+        let mut cache = DevicePageCache::new(4, 100, 10);
+
+        let tokens: Vec<u32> = (0..12).collect();
+        let positions: Vec<u32> = (0..12).collect();
+        let masks = make_brle(12);
+        let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
+        assert_eq!(hashes.len(), 3);
+
+        // Commit first 2 pages
+        cache.commit_page(hashes[0], 0).unwrap();
+        cache.commit_page(hashes[1], hashes[0]).unwrap();
+
+        // Lookup all 3 — should match first 2
+        let matched = cache.longest_prefix_match(&hashes);
+        assert_eq!(matched, 2);
+        // Refcount bumped for matched pages
+        assert_eq!(cache.refcount(hashes[0]), 2); // 1 from commit + 1 from match
+        assert_eq!(cache.refcount(hashes[1]), 2);
+    }
+
+    #[test]
+    fn test_index_cache_move_on_commit() {
+        let mut cache = DevicePageCache::new(4, 100, 10);
+
+        let tokens: Vec<u32> = (0..8).collect();
+        let positions: Vec<u32> = (0..8).collect();
+        let masks = make_brle(8);
+        let hashes = cache.compute_page_hashes(&tokens, &positions, &masks, 0);
+
+        let (phys1, _) = cache.commit_page(hashes[0], 0).unwrap();
+        cache.update_index_cache(hashes[0], None, &[phys1]);
+
+        // Now commit page 2 — index_cache should move from h0 to h1
+        let (phys2, _) = cache.commit_page(hashes[1], hashes[0]).unwrap();
+        cache.update_index_cache(hashes[1], Some(hashes[0]), &[phys2]);
+
+        // h0 entry should be gone
+        assert!(!cache.index_cache.contains_key(&hashes[0]));
+        // h1 entry should have both pages
+        let resolved = cache.resolve_physical(hashes[1]);
+        assert_eq!(resolved, vec![phys1, phys2]);
     }
 }

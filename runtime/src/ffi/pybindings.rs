@@ -146,6 +146,9 @@ pub struct DeviceConfig {
     /// Total KV cache pages available on this device group
     #[pyo3(get, set)]
     pub total_pages: usize,
+    /// Pre-allocated CPU swap pages for this device
+    #[pyo3(get, set)]
+    pub cpu_pages: usize,
     /// Maximum batch tokens this device can handle
     #[pyo3(get, set)]
     pub max_batch_tokens: usize,
@@ -157,10 +160,12 @@ pub struct DeviceConfig {
 #[pymethods]
 impl DeviceConfig {
     #[new]
-    fn new(hostname: String, total_pages: usize, max_batch_tokens: usize, max_batch_size: usize) -> Self {
+    #[pyo3(signature = (hostname, total_pages, max_batch_tokens, max_batch_size, cpu_pages = 0))]
+    fn new(hostname: String, total_pages: usize, max_batch_tokens: usize, max_batch_size: usize, cpu_pages: usize) -> Self {
         DeviceConfig {
             hostname,
             total_pages,
+            cpu_pages,
             max_batch_tokens,
             max_batch_size,
         }
@@ -351,6 +356,7 @@ impl From<Config> for BootstrapConfig {
                         .map(|d| BootstrapDeviceConfig {
                             hostname: d.hostname,
                             total_pages: d.total_pages,
+                            cpu_pages: d.cpu_pages,
                             max_batch_tokens: d.max_batch_tokens,
                             max_batch_size: d.max_batch_size,
                         })

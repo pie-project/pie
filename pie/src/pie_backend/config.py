@@ -86,6 +86,9 @@ class RuntimeConfig:
     # Dummy mode - skip GPU weight loading, return random tokens
     dummy_mode: bool = False
 
+    # CPU swap budget (bytes). 0 = disabled.
+    swap_budget_bytes: int = 0
+
     # =========================================================================
     # Convenience Properties (formerly in model.Config)
     # =========================================================================
@@ -171,6 +174,7 @@ class RuntimeConfig:
         use_cuda_graphs: bool = True,
         tensor_parallel_size: int = 1,
         dummy_mode: bool = False,
+        cpu_mem_budget_in_gb: int = 0,
     ) -> "RuntimeConfig":
         """
         Factory method to build a validated and resolved RuntimeConfig.
@@ -265,6 +269,7 @@ class RuntimeConfig:
             tensor_parallel_size=tensor_parallel_size,
             adapter_path=resolved_adapter_path,
             dummy_mode=dummy_mode,
+            swap_budget_bytes=cpu_mem_budget_in_gb * (1 << 30),
         )
 
     def print(self) -> None:

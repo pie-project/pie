@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 inferlet = { path = "../../sdk/rust/inferlet" }
+serde = { version = "1.0", features = ["derive"] }
 
 [profile.release]
 lto = true
