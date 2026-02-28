@@ -550,13 +550,19 @@ impl Context {
                 temperature: _temperature,
                 sampler,
             } => {
-                let dist = res.distributions.unwrap().into_iter().next().unwrap();
-                let sampled = sampler.sample(&dist.ids, &dist.probs);
-                sampled
+                let dist = res.distributions
+                    .expect("Forward pass failed: no distributions returned")
+                    .into_iter()
+                    .next()
+                    .expect("Forward pass returned empty distributions");
+                sampler.sample(&dist.ids, &dist.probs)
             }
             _ => {
-                let sampled = res.tokens.unwrap().into_iter().next().unwrap();
-                sampled
+                res.tokens
+                    .expect("Forward pass failed: no tokens returned")
+                    .into_iter()
+                    .next()
+                    .expect("Forward pass returned empty token list")
             }
         };
 
@@ -624,7 +630,11 @@ impl Context {
 
         let res = p.execute().await;
 
-        let dist = res.distributions.unwrap().into_iter().next().unwrap();
+        let dist = res.distributions
+            .expect("Forward pass failed: no distributions returned")
+            .into_iter()
+            .next()
+            .expect("Forward pass returned empty distributions");
 
         self.token_ids.extend(pending_token_ids);
         self.position_ids.extend(position_ids);
@@ -975,7 +985,8 @@ impl Context {
             p.attention_mask(&batch_masks);
             p.output_distributions(&out_range.map(|x| x as u32).collect::<Vec<_>>(), 0.0, None);
             let pass_result = p.execute().await;
-            let output_distributions = pass_result.distributions.unwrap();
+            let output_distributions = pass_result.distributions
+                .expect("Forward pass failed: no distributions returned (fire_batch RPC may have failed)");
 
             // The longest path in the draft Trie forest the passed the verification.
             let accepted_tokens = {

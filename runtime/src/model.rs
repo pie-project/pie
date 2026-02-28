@@ -680,15 +680,22 @@ impl Model {
             Ok(batch_resp) => {
                 let mut resp_iter = batch_resp.results.into_iter();
                 for (_, resp_tx) in requests {
+                    // Always advance iterator — Python returns one result per request
+                    let resp = resp_iter.next();
                     if let Some(tx) = resp_tx {
-                        if let Some(resp) = resp_iter.next() {
+                        if let Some(resp) = resp {
                             tx.send(resp).ok();
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[Error] fire_batch failed: {:?}", e);
+                tracing::error!(
+                    group_id = group_id,
+                    request_count = requests.len(),
+                    "fire_batch RPC failed: {:?} — response senders dropped, inferlets will see forward pass errors",
+                    e
+                );
             }
         }
     }
@@ -701,7 +708,7 @@ impl Model {
 
     pub fn submit(&self, _cmd_queue_id: CmdQueueId, _priority: u32, req: Request) {
         match req {
-            Request::ForwardPass(mut fp_req, resp_tx) => {
+            Request::ForwardPass(fp_req, resp_tx) => {
                 // Capture arrival time before queuing to avoid measurement distortion
                 // when requests pile up behind the in-flight limit.
                 
@@ -713,7 +720,7 @@ impl Model {
                 };
 
                 if self.forward_pass_tx.send((fp_req, resp_tx, group_id)).is_err() {
-                    eprintln!("[Error] Forward pass channel closed");
+                    tracing::error!("Forward pass channel closed — inference worker has exited");
                 }
             }
             Request::Query(query_req, resp_tx) => {
