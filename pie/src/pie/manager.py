@@ -49,7 +49,7 @@ class FfiWorkerHandle:
 def start_engine_and_backend(
     engine_config: dict,
     model_configs: list[dict],
-    timeout: float = 300.0,
+    timeout: float = 1200.0,
     console: Optional[Any] = None,
     on_status: Optional[callable] = None,
     on_message: Optional[callable] = None,
@@ -594,6 +594,40 @@ def _ipc_worker_process(
 
     rank = local_rank  # With nprocs=world_size, local_rank IS the actual rank
 
+    # Wrap entire worker body in try/finally for CUDA cleanup.
+    # On Jetson unified memory, CMA allocations leak if not explicitly freed
+    # before process exit — the driver does NOT reclaim on process death.
+    try:
+        _ipc_worker_body(
+            rank, world_size, devices, master_port, config_dict,
+            group_topology, ipc_server_names, ready_queue,
+            _pie, Runtime, RuntimeConfig, dist, torch,
+        )
+    except Exception:
+        import traceback, sys
+        traceback.print_exc()
+        raise
+    finally:
+        # Explicit CUDA cleanup — critical for Jetson unified memory (CMA).
+        # Without this, leaked CMA persists until host reboot.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Reset all CUDA state for this device
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+        import gc
+        gc.collect()
+
+
+def _ipc_worker_body(
+    rank, world_size, devices, master_port, config_dict,
+    group_topology, ipc_server_names, ready_queue,
+    _pie, Runtime, RuntimeConfig, dist, torch,
+):
+    """Inner body of _ipc_worker_process, separated for cleanup guarantee."""
+
     try:
         # Determine my group and TP rank within it
         my_group_id = 0
@@ -603,7 +637,7 @@ def _ipc_worker_process(
                 my_group_id = i
                 tp_rank = group.index(rank)  # My position within the TP group
                 break
-        
+
         tp_degree = len(group_topology[my_group_id])
     except Exception as e:
         with open("/tmp/worker_startup_error.log", "w") as f:
@@ -629,14 +663,12 @@ def _ipc_worker_process(
         else:
             pg_map = {}
             compute_pg_map = {}
-            
+
     except Exception as e:
         with open("/tmp/worker_startup_error.log", "w") as f:
             import traceback
             f.write(f"Worker startup failed during dist init: {e}\n{traceback.format_exc()}")
         raise
-
-
 
     # Create runtime config
     # For TP>1: each worker needs ALL devices in its TP group so devices[tp_rank] works
@@ -668,7 +700,7 @@ def _ipc_worker_process(
     # Sync all workers before connecting to server
     if dist.is_initialized():
         dist.barrier()
-    
+
     # Check if I'm a group leader (first rank in my TP group)
     is_group_leader = tp_rank == 0
 
