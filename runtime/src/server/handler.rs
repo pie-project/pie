@@ -6,60 +6,6 @@
 use bytes::Bytes;
 use pie_client::message::ServerMessage;
 
-/// Converts CLI-style `["--key", "value", ...]` arguments to a JSON object string.
-///
-/// Flags (`--key value`) become `{"key": "value"}`.
-/// Boolean flags (`--flag`) become `{"flag": true}`.
-/// Short flags (`-k value`) become `{"k": "value"}`.
-/// Remaining positional args go under `"_positional"`.
-///
-/// If the input is already a single JSON object string, it is returned as-is.
-fn args_to_json_input(arguments: &[String]) -> String {
-    // If there's exactly one argument that looks like JSON, pass through
-    if arguments.len() == 1 && arguments[0].starts_with('{') {
-        return arguments[0].clone();
-    }
-
-    // If empty, return empty object
-    if arguments.is_empty() {
-        return "{}".to_string();
-    }
-
-    let mut obj = serde_json::Map::new();
-    let mut positional = Vec::new();
-    let mut i = 0;
-
-    while i < arguments.len() {
-        if let Some(key) = arguments[i].strip_prefix("--") {
-            let key = key.replace('-', "_");
-            if i + 1 < arguments.len() && !arguments[i + 1].starts_with('-') {
-                obj.insert(key, serde_json::Value::String(arguments[i + 1].clone()));
-                i += 2;
-            } else {
-                obj.insert(key, serde_json::Value::Bool(true));
-                i += 1;
-            }
-        } else if arguments[i].starts_with('-') && arguments[i].len() == 2 {
-            let key = arguments[i][1..].to_string();
-            if i + 1 < arguments.len() {
-                obj.insert(key, serde_json::Value::String(arguments[i + 1].clone()));
-                i += 2;
-            } else {
-                i += 1;
-            }
-        } else {
-            positional.push(serde_json::Value::String(arguments[i].clone()));
-            i += 1;
-        }
-    }
-
-    if !positional.is_empty() {
-        obj.insert("_positional".to_string(), serde_json::Value::Array(positional));
-    }
-
-    serde_json::Value::Object(obj).to_string()
-}
-
 
 use crate::context;
 use crate::daemon;
@@ -220,7 +166,7 @@ impl Session {
         &mut self,
         corr_id: u32,
         inferlet: String,
-        arguments: Vec<String>,
+        input: String,
         capture_outputs: bool,
     ) {
         let program_name = match ProgramName::parse(&inferlet) {
@@ -239,8 +185,6 @@ impl Session {
 
         // Launch the process
         let client_id = if capture_outputs { Some(self.id) } else { None };
-        // Convert arguments to JSON input string
-        let input = args_to_json_input(&arguments);
         match process::spawn(
             self.username.clone(),
             program_name,
@@ -270,7 +214,7 @@ impl Session {
         corr_id: u32,
         port: u32,
         inferlet: String,
-        arguments: Vec<String>,
+        input: String,
     ) {
         let program_name = match ProgramName::parse(&inferlet) {
             Ok(p) => p,
@@ -290,7 +234,7 @@ impl Session {
             self.username.clone(),
             program_name,
             port as u16,
-            args_to_json_input(&arguments),
+            input,
         ) {
             Ok(_daemon_id) => {
                 self.send_response(corr_id, true, "server launched".to_string())

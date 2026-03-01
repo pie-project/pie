@@ -5,7 +5,7 @@ from conftest import run_inferlet, run_tests
 async def test_graph_of_thought(client, args):
     output = await run_inferlet(
         client, "graph-of-thought",
-        ["--proposal-tokens", "64,64,64,64"],
+        {"proposal_tokens": "64,64,64,64"},
         timeout=args.timeout,
     )
     assert "Aggregation complete" in output, "Missing 'Aggregation complete' message"

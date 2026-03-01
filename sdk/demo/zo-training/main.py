@@ -88,7 +88,7 @@ class TrainingConfig:
 async def launch_and_get_result(
     client: PieClient,
     inferlet_name: str,
-    arguments: List[str],
+    input_dict: dict,
     worker_id: Any = 0,
     verbose: bool = False,
 ) -> Optional[str]:
@@ -96,7 +96,7 @@ async def launch_and_get_result(
     if verbose:
         tqdm.write(f"🚀 Worker {worker_id}: Launching {inferlet_name}...")
     instance = await client.launch_process(
-        inferlet_name, arguments=arguments
+        inferlet_name, input=input_dict
     )
     final_payload = None
     while True:
@@ -228,26 +228,20 @@ class ESOrchestrator:
     async def _initialize_adapter(self):
         """Initializes the ES adapter on all clients."""
         tqdm.write("\n⚙️  Initializing ES Adapter on all clients...")
-        init_args = [
-            "--name",
-            self.config.ADAPTER_NAME,
-            "--rank",
-            str(self.config.LORA_RANK),
-            "--alpha",
-            str(self.config.LORA_ALPHA),
-            "--population-size",
-            str(self.config.POPULATION_SIZE),
-            "--mu-fraction",
-            str(self.config.MU_FRACTION),
-            "--initial-sigma",
-            str(self.config.INITIAL_SIGMA),
-        ]
-        init_args.extend(["--upload", ""])
+        init_input = {
+            "name": self.config.ADAPTER_NAME,
+            "rank": self.config.LORA_RANK,
+            "alpha": self.config.LORA_ALPHA,
+            "population_size": self.config.POPULATION_SIZE,
+            "mu_fraction": self.config.MU_FRACTION,
+            "initial_sigma": self.config.INITIAL_SIGMA,
+            "upload": "",
+        }
         init_tasks = [
             launch_and_get_result(
                 client,
                 self.config.INFERLET_NAMES["es-init"],
-                init_args,
+                init_input,
                 f"C{i}-Init",
                 verbose=True,  # Always log init
             )
@@ -426,25 +420,21 @@ class ESOrchestrator:
         tqdm.write("Phase: Update")
         seeds_str = ",".join(map(str, base_seeds))
         scores_str = ",".join(f"{s:.6f}" for s in aggregated_scores)
-        update_args = [
-            "--name",
-            self.config.ADAPTER_NAME,
-            "--seeds",
-            seeds_str,
-            "--scores",
-            scores_str,
-            "--max-sigma",
-            str(self.config.MAX_SIGMA),
-        ]
+        update_input = {
+            "name": self.config.ADAPTER_NAME,
+            "seeds": seeds_str,
+            "scores": scores_str,
+            "max_sigma": self.config.MAX_SIGMA,
+        }
         if step > 0 and step % self.config.CHECKPOINT_EVERY_N_STEPS == 0:
             checkpoint_name = f"{self.config.ADAPTER_NAME}-step-{step}"
             tqdm.write(f"💾 Saving checkpoint: {checkpoint_name}")
-            update_args.extend(["--download", checkpoint_name])
+            update_input["download"] = checkpoint_name
         update_tasks = [
             launch_and_get_result(
                 client,
                 self.config.INFERLET_NAMES["es-update"],
-                update_args,
+                update_input,
                 f"C{i}-Update",
                 self.config.VERBOSE_WORKER_LOGS,
             )
@@ -498,18 +488,14 @@ class ESOrchestrator:
             uid = hasher.hexdigest()
             rollouts.append({"uid": uid, "task": task_problem_str, "seed": int(seed)})
         rollouts_json = json.dumps(rollouts)
-        args = [
-            "--name",
-            self.config.ADAPTER_NAME,
-            "--rollouts",
-            rollouts_json,
-            "--max-num-outputs",
-            str(self.config.MAX_TOKENS_GEN),
-            "--system-prompt",
-            self.config.SYSTEM_PROMPT,
-        ]
+        input_dict = {
+            "name": self.config.ADAPTER_NAME,
+            "rollouts": rollouts_json,
+            "max_num_outputs": self.config.MAX_TOKENS_GEN,
+            "system_prompt": self.config.SYSTEM_PROMPT,
+        }
         res_json = await launch_and_get_result(
-            client, inferlet_name, args, who, self.config.VERBOSE_WORKER_LOGS
+            client, inferlet_name, input_dict, who, self.config.VERBOSE_WORKER_LOGS
         )
         if res_json:
             try:

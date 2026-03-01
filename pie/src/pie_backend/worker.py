@@ -477,7 +477,7 @@ def _leader_loop(
         src = torch.tensor(kwargs["phys_ids"], dtype=torch.long, device=gpu_kv[0].device)
         dst = torch.tensor(kwargs["slots"], dtype=torch.long)
         for layer_idx in range(len(gpu_kv)):
-            host_kv[layer_idx][dst] = gpu_kv[layer_idx][src]
+            host_kv[layer_idx][dst].copy_(gpu_kv[layer_idx][src], non_blocking=True)
         torch.cuda.synchronize()
 
     def _handle_swap_in_pages(**kwargs) -> None:
@@ -488,7 +488,7 @@ def _leader_loop(
         dst = torch.tensor(kwargs["phys_ids"], dtype=torch.long, device=gpu_kv[0].device)
         src = torch.tensor(kwargs["slots"], dtype=torch.long)
         for layer_idx in range(len(gpu_kv)):
-            gpu_kv[layer_idx][dst] = host_kv[layer_idx][src]
+            gpu_kv[layer_idx][dst].copy_(host_kv[layer_idx][src], non_blocking=True)
         torch.cuda.synchronize()
 
     # Method dispatch table

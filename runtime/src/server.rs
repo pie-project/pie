@@ -621,10 +621,10 @@ impl Session {
             ClientMessage::LaunchProcess {
                 corr_id,
                 inferlet,
-                arguments,
+                input,
                 capture_outputs,
             } => {
-                self.handle_launch_process(corr_id, inferlet, arguments, capture_outputs)
+                self.handle_launch_process(corr_id, inferlet, input, capture_outputs)
                     .await
             }
 
@@ -632,9 +632,9 @@ impl Session {
                 corr_id,
                 port,
                 inferlet,
-                arguments,
+                input,
             } => {
-                self.handle_launch_daemon(corr_id, port, inferlet, arguments)
+                self.handle_launch_daemon(corr_id, port, inferlet, input)
                     .await
             }
 

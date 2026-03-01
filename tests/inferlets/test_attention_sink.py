@@ -7,7 +7,7 @@ from conftest import run_inferlet, run_tests
 async def test_attention_sink(client, args):
     output = await run_inferlet(
         client, "attention-sink",
-        ["--max-tokens", "64"],
+        {"max_tokens": 64},
         timeout=args.timeout,
     )
     assert "Attention Sink" in output, "Missing header"

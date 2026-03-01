@@ -42,6 +42,8 @@ fn default_top_p() -> f32 { 0.95 }
 
 #[derive(Serialize)]
 struct Output {
+    /// The thinking/reasoning trace.
+    thinking: String,
     /// The generated text.
     text: String,
 }
@@ -66,12 +68,14 @@ async fn main(input: Input) -> Result<Output> {
         .decode()
         .with_reasoning();
 
+    let mut thinking = String::new();
     let mut output = String::new();
 
     while let Some(event) = events.next().await? {
         match event {
             Event::Thinking(s) => {
                 eprint!("{}", s);
+                thinking.push_str(&s);
             }
             Event::ThinkingDone(_) => {
                 eprintln!();
@@ -88,6 +92,6 @@ async fn main(input: Input) -> Result<Output> {
         }
     }
 
-    Ok(Output { text: output })
+    Ok(Output { thinking, text: output })
 }
 

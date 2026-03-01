@@ -10,7 +10,7 @@ Public API::
         client = await server.connect()
         process = await client.launch_process(
             "text-completion@0.2.11",
-            arguments=["--prompt", "Hello"],
+            input={"prompt": "Hello"},
         )
         event, value = await process.recv()
         print(value)

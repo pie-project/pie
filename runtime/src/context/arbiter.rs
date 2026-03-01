@@ -65,17 +65,21 @@ struct Node {
     weight: f64,
     /// Per-device page accounting.
     devices: HashMap<DeviceId, DevicePages>,
+    /// Birth timestamp — used as FCFS tiebreaker at equal invested importance.
+    created_at: Instant,
     /// Last access time.
     last_access: Instant,
 }
 
 impl Node {
     fn new() -> Self {
+        let now = Instant::now();
         Node {
             active_contexts: 0,
             weight: 1.0,
             devices: HashMap::new(),
-            last_access: Instant::now(),
+            created_at: now,
+            last_access: now,
         }
     }
 
@@ -218,6 +222,11 @@ impl Arbiter {
     /// Invested importance at an arbitrary page count on a device.
     pub fn priority_at(&self, pid: &ProcessId, device: DeviceId, pages: usize) -> f64 {
         self.nodes.get(pid).map(|n| n.priority_on_at(device, pages)).unwrap_or(0.0)
+    }
+
+    /// Birth timestamp of a process node (for FCFS tiebreaking).
+    pub fn node_created_at(&self, pid: &ProcessId) -> Option<Instant> {
+        self.nodes.get(pid).map(|n| n.created_at)
     }
 
     pub fn node_count(&self) -> usize {

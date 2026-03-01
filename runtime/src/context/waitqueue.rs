@@ -9,9 +9,9 @@ use anyhow::Result;
 use crate::process::ProcessId;
 use crate::device::DeviceId;
 
-use super::{ContextId, ReplayFill};
+use super::{CONTEXTS, ContextId, ContextState, ResidentResult};
 use super::manager::ContextManager;
-use super::kvcache::PhysicalPageId;
+use std::collections::HashMap;
 
 // =============================================================================
 // PageWaiter — unified wait queue entry
@@ -39,7 +39,7 @@ pub(crate) enum PageWaiter {
         requester: Option<ProcessId>,
         priority_floor: f64,
         enqueued_at: Instant,
-        response: oneshot::Sender<Result<Option<Vec<ReplayFill>>>>,
+        response: oneshot::Sender<Result<ResidentResult>>,
     },
 }
 
@@ -135,59 +135,89 @@ impl From<anyhow::Error> for WaitNeeded {
 // =============================================================================
 
 impl ContextManager {
-    /// Try to serve queued waiters on one or all devices.
+    /// Try to serve queued waiters on one or all devices using only
+    /// already-free pages (free pool + unreferenced committed pages).
+    ///
     /// `device`: `Some(d)` serves only device `d` (after a device-specific
     /// free event); `None` serves all devices (after a global weight change).
+    ///
+    /// **Never evicts active contexts.** This prevents thrashing where
+    /// waiters evict contexts that are about to complete their forward
+    /// passes and free pages naturally. Eviction only happens in the
+    /// direct `ReservePages` / `EnsureResident` message handlers.
     pub(crate) async fn try_serve_waiters(&mut self, device: Option<usize>) {
         let devs: Vec<usize> = match device {
             Some(d) => vec![d],
             None => (0..self.wait_queues.len()).collect(),
         };
         for dev in devs {
-            let queue = &mut self.wait_queues[dev];
-            let mut retry = Vec::new();
-            // Drain into a local vec so we can call &mut self methods.
-            let waiters: Vec<_> = std::iter::from_fn(|| queue.pop()).collect();
-            for waiter in waiters {
+            loop {
+                // Quick check: any free pages at all?
+                if self.devices[dev].available_gpu_pages() == 0 {
+                    break;
+                }
+
+                let waiter = match self.wait_queues[dev].pop() {
+                    Some(w) => w,
+                    None => break,
+                };
                 match waiter {
                     PageWaiter::Allocate { context_id, device, num_pages, requester, enqueued_at, response, .. } => {
-                        match self.reserve_pages(context_id, num_pages as u32).await {
-                            Ok(()) => {
+                        // Direct allocation: free pool + LRU eviction of
+                        // unreferenced committed pages. No context eviction.
+                        match self.devices[dev].allocate_working(num_pages) {
+                            Ok(new_pages) => {
+                                if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, context_id)) {
+                                    ctx.working_pages.extend(&new_pages);
+                                    ctx.device = Some(dev as DeviceId);
+                                }
+                                if let Some(pid) = requester {
+                                    self.arbiter.add_working(pid, dev, num_pages);
+                                }
                                 let _ = response.send(Ok(()));
+                                continue;
                             }
-                            Err(WaitNeeded::NeedPages) => {
+                            Err(_) => {
                                 let floor = self.requester_floor(requester, dev, num_pages);
-                                retry.push(PageWaiter::Allocate {
+                                self.wait_queues[dev].push(PageWaiter::Allocate {
                                     context_id, device, num_pages, requester,
                                     priority_floor: floor, enqueued_at, response,
                                 });
-                            }
-                            Err(WaitNeeded::Fatal(e)) => {
-                                let _ = response.send(Err(e));
+                                break;
                             }
                         }
                     }
                     PageWaiter::Restore { context_id, device, requester, enqueued_at, response, .. } => {
                         match self.ensure_resident(context_id).await {
-                            Ok(result) => {
-                                let _ = response.send(Ok(result));
+                            Ok(replay_chunks) => {
+                                // Fast path: atomically resolve pages + pin InFlight
+                                let pages = if replay_chunks.is_none() {
+                                    let pages = self.get_physical_page_ids(context_id).unwrap_or_default();
+                                    if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, context_id)) {
+                                        ctx.state = ContextState::InFlight;
+                                    }
+                                    pages
+                                } else {
+                                    HashMap::new()
+                                };
+                                let _ = response.send(Ok(ResidentResult { replay_chunks, pages }));
+                                continue;
                             }
                             Err(WaitNeeded::NeedPages) => {
                                 let floor = self.requester_floor(requester, dev, 1);
-                                retry.push(PageWaiter::Restore {
+                                self.wait_queues[dev].push(PageWaiter::Restore {
                                     context_id, device, requester,
                                     priority_floor: floor, enqueued_at, response,
                                 });
+                                break;
                             }
                             Err(WaitNeeded::Fatal(e)) => {
                                 let _ = response.send(Err(e));
+                                continue;
                             }
                         }
                     }
                 }
-            }
-            for w in retry {
-                self.wait_queues[dev].push(w);
             }
         }
     }

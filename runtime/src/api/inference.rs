@@ -313,6 +313,122 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
         let context_id = pass.context_id
             .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
+
+        // =====================================================================
+        // Context preparation — runs in THIS process's tokio task, not the
+        // inference actor. This is critical: blocking here only stalls this
+        // one process, not the entire inference pipeline.
+        //
+        // STATE MACHINE — a context is NEVER Active while a process holds its
+        // page IDs. All transitions to InFlight happen inside the actor:
+        //
+        //   Fast path:  Active → InFlight  (EnsureResident handler, atomically
+        //                                   resolves pages + pins InFlight)
+        //   Replay path: Restoring → InFlight  (finish_restore, fire-and-forget)
+        //
+        // The process calls clear_in_flight after inference::submit, which is
+        // the ONLY transition InFlight → Active. find_cheapest_victim only
+        // targets Active contexts, so pages can never be freed while a process
+        // holds them.
+        // =====================================================================
+
+        // Step 1: Ensure all pages are GPU-resident.
+        // Fast path returns pages + InFlight. Replay path returns chunks.
+        let resident = match context::ensure_resident(model_id, context_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("ensure_resident failed for ctx {context_id}: {e:#}");
+                return Ok(Err(e.to_string()));
+            }
+        };
+
+        // Step 2: Resolve pages — either from ensure_resident (fast) or
+        // finish_restore + get_physical_page_ids (replay).
+        let pages_by_device = if let Some(replay_chunks) = resident.replay_chunks {
+            // Replay path: context is Restoring (non-evictable)
+            for chunk in replay_chunks {
+                let commit_tokens = chunk.tokens.clone();
+                let commit_positions = chunk.positions.clone();
+                let commit_masks = chunk.masks.clone();
+                let commit_adapter = chunk.adapter;
+                let commit_num_pages = chunk.num_pages;
+
+                let replay_fwd = inference::request::ForwardPassRequest {
+                    context_id,
+                    tokens: chunk.tokens,
+                    positions: chunk.positions,
+                    masks: chunk.masks,
+                    speculative_tokens: vec![],
+                    speculative_positions: vec![],
+                    output_speculative_tokens: false,
+                    logit_mask: None,
+                    sampling_indices: vec![],
+                    samplers: vec![],
+                    adapter_id: chunk.adapter,
+                    adapter_seed: None,
+                    arrival_time: None,
+                };
+
+                let device_idx = chunk.device_id as usize;
+                if let Err(e) = inference::submit(
+                    model_id, replay_fwd, device_idx,
+                    chunk.physical_page_ids, chunk.last_page_len,
+                ).await {
+                    tracing::warn!("Replay forward pass failed for ctx {context_id}: {e:#}");
+                    return Ok(Err(e.to_string()));
+                }
+
+                if let Err(e) = context::commit_replay_chunk(
+                    model_id, context_id, commit_num_pages,
+                    commit_tokens, commit_positions, commit_masks, commit_adapter,
+                ).await {
+                    tracing::warn!("commit_replay_chunk failed for ctx {context_id}: {e:#}");
+                    return Ok(Err(e.to_string()));
+                }
+            }
+
+            // finish_restore: Restoring → InFlight (fire-and-forget, actor-side).
+            // The context is InFlight by the time get_physical_page_ids runs.
+            if let Err(e) = context::finish_restore(model_id, context_id) {
+                tracing::warn!("finish_restore failed for ctx {context_id}: {e:#}");
+                return Ok(Err(e.to_string()));
+            }
+
+            // Resolve pages — context is InFlight (set by finish_restore above),
+            // so it cannot be evicted between here and inference::submit.
+            match context::get_physical_page_ids(model_id, context_id).await {
+                Ok(pages) => pages,
+                Err(e) => {
+                    context::clear_in_flight(model_id, context_id);
+                    tracing::warn!("get_physical_page_ids failed for ctx {context_id}: {e:#}");
+                    return Ok(Err(e.to_string()));
+                }
+            }
+        } else {
+            // Fast path: pages already resolved and InFlight pinned by ensure_resident
+            resident.pages
+        };
+
+        if pages_by_device.len() > 1 {
+            context::clear_in_flight(model_id, context_id);
+            return Ok(Err(format!(
+                "Context pages span {} devices; context parallelism is not yet supported",
+                pages_by_device.len(),
+            )));
+        }
+
+        let (device_id, physical_page_ids) = pages_by_device
+            .into_iter()
+            .next()
+            .unwrap_or((0, vec![]));
+
+        // Step 3: Compute FlashInfer's last_page_len
+        let num_pages = physical_page_ids.len() as u32;
+        let kv_len = context::kv_len(model_id, context_id);
+        let page_size = context::tokens_per_page(model_id, context_id);
+        let total_kv = kv_len + num_input_tokens as u32;
+        let last_page_len = context::kvcache::compute_last_page_len(total_kv, num_pages, page_size);
+
         let request = ForwardPassRequest {
             context_id,
             tokens,
@@ -329,29 +445,36 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             arrival_time: Some(Instant::now()),
         };
 
+        // Step 5: Submit to inference service (inference actor just dispatches — never blocks)
+        let device_idx = device_id as usize;
+        match inference::submit(model_id, request, device_idx, physical_page_ids, last_page_len).await {
+            Ok(output) => {
+                // Unpin — forward pass completed, pages are safe.
+                context::clear_in_flight(model_id, context_id);
+                // Step 6: Mark input tokens as forwarded AFTER the forward pass completes
+                if num_input_tokens > 0 {
+                    if let Err(e) = context::fill(
+                        model_id, context_id, num_input_tokens,
+                        fill_positions, fill_masks, adapter_id,
+                    ) {
+                        tracing::warn!("context::fill failed for ctx {context_id}: {e:#}");
+                        return Ok(Err(e.to_string()));
+                    }
+                }
 
-        // Submit to inference service
-    match inference::forward_pass(model_id, request).await {
-        Ok(output) => {
-            // Mark input tokens as forwarded in the context
-            if num_input_tokens > 0 {
-                context::fill(
-                    model_id, context_id, num_input_tokens,
-                    fill_positions, fill_masks, adapter_id,
-                )?;
+                let future_output = FutureOutput {
+                    result: Some(convert_output(output)),
+                    rx: None,
+                    done: true,
+                };
+                Ok(Ok(self.ctx().table.push(future_output)?))
             }
-
-            let future_output = FutureOutput {
-                result: Some(convert_output(output)),
-                rx: None,
-                done: true,
-            };
-            Ok(Ok(self.ctx().table.push(future_output)?))
+            Err(e) => {
+                context::clear_in_flight(model_id, context_id);
+                tracing::warn!("inference::submit failed for ctx {context_id}: {e:#}");
+                return Ok(Err(e.to_string()));
+            },
         }
-        Err(e) => {
-            Ok(Err(e.to_string()))
-        },
-    }
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {

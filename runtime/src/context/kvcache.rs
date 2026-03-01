@@ -130,6 +130,12 @@ impl DevicePageCache {
         (self.gpu.used(), self.gpu.total)
     }
 
+    /// Whether the CPU swap pool can accommodate `n` working pages.
+    /// Returns false when cpu_mem_budget is 0 or the pool is full.
+    pub fn can_swap_working(&self, n: usize) -> bool {
+        self.cpu.available() >= n
+    }
+
     /// GPU memory pressure as a fraction [0.0, 1.0].
     pub fn pressure(&self) -> f64 {
         if self.gpu.total == 0 { 0.0 }
@@ -491,6 +497,12 @@ impl DevicePageCache {
     // =========================================================================
     // Prefix lookup (for restore from lineage)
     // =========================================================================
+
+    /// Count the longest prefix of `hashes` present on GPU (read-only).
+    /// Does NOT modify refcounts — use `acquire_prefix` after successful restore.
+    pub fn longest_prefix_length(&self, hashes: &[PageHash]) -> usize {
+        hashes.iter().take_while(|h| self.pages.contains_key(h)).count()
+    }
 
     /// Find the longest prefix of `hashes` that exists on GPU.
     /// Increments refcount for matched pages.

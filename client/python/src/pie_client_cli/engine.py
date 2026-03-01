@@ -354,7 +354,7 @@ def check_program(
 def launch_process(
     client: PieClient,
     inferlet: str,
-    arguments: list[str],
+    input: dict,
     capture_outputs: bool = True,
 ) -> Process:
     """Launch a process (sync wrapper).
@@ -362,7 +362,7 @@ def launch_process(
     The inferlet must be in name@version format (e.g., "text-completion@0.1.0").
     """
     return asyncio.get_event_loop().run_until_complete(
-        client.launch_process(inferlet, arguments, capture_outputs)
+        client.launch_process(inferlet, input, capture_outputs)
     )
 
 def close_client(client: PieClient) -> None:

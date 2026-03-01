@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Instant;
 use tokio::sync::oneshot;
-use anyhow::Result;
+use anyhow::{Result, Context as _};
 use serde::Serialize;
 
 use crate::service::{ServiceArray, ServiceHandler};
@@ -66,7 +66,7 @@ pub fn spawn(page_size: usize, num_gpu_pages: Vec<usize>, num_cpu_pages: Vec<usi
 pub async fn open(model_idx: usize, username: String, name: String) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Open { username, name, response: tx })?;
-    rx.await?
+    rx.await.context("context::open: actor dropped response")?
 }
 
 pub async fn create(model_idx: usize) -> Result<ContextId> {
@@ -76,49 +76,49 @@ pub async fn create(model_idx: usize) -> Result<ContextId> {
 pub async fn create_owned(model_idx: usize, owner: Option<ProcessId>) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Create { owner, response: tx })?;
-    rx.await?
+    rx.await.context("context::create_owned: actor dropped response")?
 }
 
 pub async fn save(model_idx: usize, id: ContextId, username: String, name: String) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Save { id, username, name, response: tx })?;
-    rx.await?
+    rx.await.context("context::save: actor dropped response")?
 }
 
 pub async fn snapshot(model_idx: usize, id: ContextId, username: String) -> Result<String> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Snapshot { id, username, response: tx })?;
-    rx.await?
+    rx.await.context("context::snapshot: actor dropped response")?
 }
 
 pub async fn delete(model_idx: usize, username: String, name: String) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Delete { username, name, response: tx })?;
-    rx.await?
+    rx.await.context("context::delete: actor dropped response")?
 }
 
 pub async fn destroy(model_idx: usize, id: ContextId, force: bool) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Destroy { id, force, response: tx })?;
-    rx.await?
+    rx.await.context("context::destroy: actor dropped response")?
 }
 
 pub async fn fork(model_idx: usize, id: ContextId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Fork { id, response: tx })?;
-    rx.await?
+    rx.await.context("context::fork: actor dropped response")?
 }
 
 pub async fn commit_pages(model_idx: usize, id: ContextId, page_indices: Vec<u32>) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::CommitPages { id, page_indices, response: tx })?;
-    rx.await?
+    rx.await.context("context::commit_pages: actor dropped response")?
 }
 
 pub async fn reserve_pages(model_idx: usize, id: ContextId, num_pages: u32) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::ReservePages { id, num_pages, response: tx })?;
-    rx.await?
+    rx.await.context("context::reserve_pages: actor dropped response")?
 }
 
 pub fn release_pages(model_idx: usize, id: ContextId, num_pages: u32) -> Result<()> {
@@ -128,19 +128,33 @@ pub fn release_pages(model_idx: usize, id: ContextId, num_pages: u32) -> Result<
 pub async fn get_physical_page_ids(model_idx: usize, id: ContextId) -> Result<HashMap<DeviceId, Vec<PhysicalPageId>>> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::GetPhysicalPageIds { id, response: tx })?;
-    rx.await?
+    rx.await.context("context::get_physical_page_ids: actor dropped response")?
 }
 
-pub async fn ensure_resident(model_idx: usize, id: ContextId) -> Result<Option<Vec<ReplayFill>>> {
+/// Result of ensure_resident: replay chunks (if any) + physical page IDs.
+/// On the fast path (no replay), pages are resolved atomically with InFlight.
+/// On the replay path, pages are empty — they come from finish_restore.
+#[derive(Debug)]
+pub struct ResidentResult {
+    pub replay_chunks: Option<Vec<ReplayFill>>,
+    pub pages: HashMap<DeviceId, Vec<PhysicalPageId>>,
+}
+
+pub async fn ensure_resident(model_idx: usize, id: ContextId) -> Result<ResidentResult> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::EnsureResident { id, response: tx })?;
-    rx.await?
+    rx.await.context("context::ensure_resident: actor dropped response")?
 }
 
-pub async fn commit_replay_chunk(model_idx: usize, id: ContextId, num_pages: u32) -> Result<()> {
+pub async fn commit_replay_chunk(
+    model_idx: usize, id: ContextId, num_pages: u32,
+    tokens: Vec<u32>, positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
+) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::CommitReplayFill { id, num_pages, response: tx })?;
-    rx.await?
+    SERVICES.send(model_idx, Message::CommitReplayFill {
+        id, num_pages, tokens, positions, masks, adapter, response: tx,
+    })?;
+    rx.await.context("context::commit_replay_chunk: actor dropped response")?
 }
 
 pub fn finish_restore(model_idx: usize, id: ContextId) -> Result<()> {
@@ -191,9 +205,27 @@ pub fn get_cursor(model_idx: usize, id: ContextId) -> u32 {
 }
 
 pub fn is_active(model_idx: usize, id: ContextId) -> bool {
-    CONTEXTS.get(&(model_idx, id)).map(|ctx| ctx.state == ContextState::Active).unwrap_or(false)
+    CONTEXTS.get(&(model_idx, id)).map(|ctx| matches!(ctx.state, ContextState::Active | ContextState::InFlight)).unwrap_or(false)
 }
 
+/// Try to pin context as InFlight (non-evictable). Returns true on success.
+/// Returns false if the context was evicted (Suspended) between page resolution
+/// and this call — meaning the resolved pages are stale.
+pub fn set_in_flight(model_idx: usize, id: ContextId) -> bool {
+    if let Some(mut ctx) = CONTEXTS.get_mut(&(model_idx, id)) {
+        if ctx.state == ContextState::Active {
+            ctx.state = ContextState::InFlight;
+            return true;
+        }
+    }
+    false
+}
+
+/// Clear in-flight state (fire-and-forget actor message).
+/// Transitions InFlight → Active and triggers waiter processing.
+pub fn clear_in_flight(model_idx: usize, id: ContextId) {
+    let _ = SERVICES.send(model_idx, Message::ClearInFlight { id });
+}
 pub fn set_cursor(model_idx: usize, id: ContextId, cursor: u32) -> Result<()> {
     let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
         .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
@@ -274,6 +306,9 @@ pub struct TokenInfo {
 enum ContextState {
     /// Active on GPU, ready for inference.
     Active,
+    /// Active on GPU, forward pass in progress — not evictable.
+    /// Prevents TOCTOU race between get_physical_page_ids and inference::submit.
+    InFlight,
     /// Committed chain refcounts released, working pages on CPU.
     Suspended,
     /// Being restored — replay in progress.
@@ -344,7 +379,8 @@ impl Context {
     fn num_uncommitted(&self) -> usize { self.working_pages.len() }
 
     fn has_gpu_pages(&self) -> bool {
-        self.state == ContextState::Active && (!self.working_pages.is_empty() || self.committed_tip.is_some())
+        matches!(self.state, ContextState::Active | ContextState::InFlight)
+            && (!self.working_pages.is_empty() || self.committed_tip.is_some())
     }
 
     fn fill(&mut self, n: usize, positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>) -> Result<()> {
@@ -383,9 +419,14 @@ pub(crate) enum Message {
     ReservePages { id: ContextId, num_pages: u32, response: oneshot::Sender<Result<()>> },
     ReleasePages { id: ContextId, num_pages: u32 },
     GetPhysicalPageIds { id: ContextId, response: oneshot::Sender<Result<HashMap<DeviceId, Vec<PhysicalPageId>>>> },
-    EnsureResident { id: ContextId, response: oneshot::Sender<Result<Option<Vec<ReplayFill>>>> },
-    CommitReplayFill { id: ContextId, num_pages: u32, response: oneshot::Sender<Result<()>> },
+    EnsureResident { id: ContextId, response: oneshot::Sender<Result<ResidentResult>> },
+    CommitReplayFill {
+        id: ContextId, num_pages: u32,
+        tokens: Vec<u32>, positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
+        response: oneshot::Sender<Result<()>>,
+    },
     FinishRestore { id: ContextId },
+    ClearInFlight { id: ContextId },
     GetStats { response: oneshot::Sender<Vec<(usize, usize)>> },
     SetDagWeights { weight: f64, pid_values: HashMap<ProcessId, f64> },
 }
@@ -394,6 +435,7 @@ impl ServiceHandler for ContextManager {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
+        self.msg_counter += 1;
         match msg {
             Message::Open { username, name, response } => {
                 let result = match self.name_to_id.get(&(username, name)) {
@@ -422,23 +464,40 @@ impl ServiceHandler for ContextManager {
             }
             Message::Fork { id, response } => { let _ = response.send(self.fork(id)); }
             Message::CommitPages { id, page_indices, response } => {
-                let dev = CONTEXTS.get(&(self.model_idx, id))
-                    .map(|c| c.device.unwrap_or(0) as usize);
-                let _ = response.send(self.commit_pages(id, page_indices));
-                if let Some(d) = dev {
-                    self.try_serve_waiters(Some(d)).await;
+                let ctx = CONTEXTS.get(&(self.model_idx, id));
+                let (dev_idx, state, owner) = match ctx.as_ref() {
+                    Some(c) => (c.device.unwrap_or(0) as usize, c.state, c.owner),
+                    None => {
+                        let _ = response.send(Err(anyhow::anyhow!("Context not found")));
+                        return;
+                    }
+                };
+                drop(ctx);
+
+                // If context was suspended (evicted), do a logical commit —
+                // update lineage and metadata without GPU page operations.
+                // Equivalent to restore → commit → suspend, but free.
+                if !matches!(state, ContextState::Active | ContextState::InFlight) {
+                    tracing::info!("CommitPages: ctx {id} suspended, performing logical commit");
+                    let _ = response.send(self.commit_pages_logical(id, page_indices));
+                    return;
                 }
+
+                let _ = response.send(self.commit_pages(id, page_indices));
+                self.try_serve_waiters(Some(dev_idx)).await;
             }
             Message::ReservePages { id, num_pages, response } => {
                 let ctx = CONTEXTS.get(&(self.model_idx, id));
-                let (dev, owner) = ctx.as_ref()
-                    .map(|c| (c.device.unwrap_or(0), c.owner))
-                    .unwrap_or((0, None));
+                let (dev, owner, has_committed) = ctx.as_ref()
+                    .map(|c| (c.device.unwrap_or(0), c.owner, c.committed_len > 0))
+                    .unwrap_or((0, None, false));
                 drop(ctx);
                 let dev_idx = dev as usize;
                 let floor = self.requester_floor(owner, dev_idx, num_pages as usize);
 
-                let should_queue = self.wait_queues[dev_idx].peek()
+                // Contexts with committed pages have invested GPU resources
+                // and must complete to free them — never delay behind waiters.
+                let should_queue = !has_committed && self.wait_queues[dev_idx].peek()
                     .is_some_and(|top| floor < top.effective_floor());
 
                 if should_queue {
@@ -476,14 +535,23 @@ impl ServiceHandler for ContextManager {
             }
             Message::EnsureResident { id, response } => {
                 let ctx = CONTEXTS.get(&(self.model_idx, id));
-                let (dev, owner) = ctx.as_ref()
-                    .map(|c| (c.device.unwrap_or(0), c.owner))
-                    .unwrap_or((0, None));
+                let (dev, owner, has_committed, is_suspended, has_cpu_working) = ctx.as_ref()
+                    .map(|c| (
+                        c.device.unwrap_or(0), c.owner, c.committed_len > 0,
+                        c.state == ContextState::Suspended,
+                        !c.working_cpu_slots.is_empty(),
+                    ))
+                    .unwrap_or((0, None, false, false, false));
                 drop(ctx);
                 let dev_idx = dev as usize;
                 let floor = self.requester_floor(owner, dev_idx, 1);
 
-                let should_queue = self.wait_queues[dev_idx].peek()
+                // Skip queueing when ensure_resident won't need pages:
+                //   - Committed contexts must complete (invested GPU resources)
+                //   - Non-suspended contexts without CPU working pages get the
+                //     fast path in ensure_resident (no pages needed at all)
+                let needs_pages = is_suspended || has_cpu_working;
+                let should_queue = !has_committed && needs_pages && self.wait_queues[dev_idx].peek()
                     .is_some_and(|top| floor < top.effective_floor());
 
                 if should_queue {
@@ -495,7 +563,23 @@ impl ServiceHandler for ContextManager {
                     });
                 } else {
                     match self.ensure_resident(id).await {
-                        Ok(result) => { let _ = response.send(Ok(result)); }
+                        Ok(replay_chunks) => {
+                            // Fast path: no replay needed — atomically resolve
+                            // pages + pin InFlight in this same actor message.
+                            // No eviction can happen between these operations.
+                            let pages = if replay_chunks.is_none() {
+                                let pages = self.get_physical_page_ids(id).unwrap_or_default();
+                                // Pin InFlight: context is never Active while a
+                                // process holds resolved page IDs.
+                                if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                                    ctx.state = ContextState::InFlight;
+                                }
+                                pages
+                            } else {
+                                HashMap::new()
+                            };
+                            let _ = response.send(Ok(ResidentResult { replay_chunks, pages }));
+                        }
                         Err(WaitNeeded::NeedPages) => {
                             tracing::info!("Enqueuing EnsureResident waiter for ctx {id} on dev {dev_idx} (floor={floor:.1})");
                             self.wait_queues[dev_idx].push(PageWaiter::Restore {
@@ -508,13 +592,27 @@ impl ServiceHandler for ContextManager {
                     }
                 }
             }
-            Message::CommitReplayFill { id, num_pages, response } => {
-                let _ = response.send(self.commit_replay_chunk(id, num_pages));
+            Message::CommitReplayFill { id, num_pages, tokens, positions, masks, adapter, response } => {
+                let _ = response.send(self.commit_replay_chunk(id, num_pages, tokens, positions, masks, adapter));
             }
             Message::FinishRestore { id } => {
                 let dev = CONTEXTS.get(&(self.model_idx, id))
                     .map(|c| c.device.unwrap_or(0) as usize);
+                // finish_restore sets InFlight (Restoring → InFlight)
                 self.finish_restore(id);
+                if let Some(d) = dev {
+                    self.try_serve_waiters(Some(d)).await;
+                }
+            }
+            Message::ClearInFlight { id } => {
+                let dev = CONTEXTS.get(&(self.model_idx, id))
+                    .map(|c| c.device.unwrap_or(0) as usize);
+                // InFlight → Active: forward pass completed, context is evictable again
+                if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                    if ctx.state == ContextState::InFlight {
+                        ctx.state = ContextState::Active;
+                    }
+                }
                 if let Some(d) = dev {
                     self.try_serve_waiters(Some(d)).await;
                 }

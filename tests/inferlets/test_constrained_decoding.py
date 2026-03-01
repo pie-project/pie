@@ -7,7 +7,7 @@ from conftest import run_inferlet, run_tests
 async def test_constrained_decoding(client, args):
     output = await run_inferlet(
         client, "constrained-decoding",
-        ["--num-tokens", "128"],
+        {"num_tokens": 128},
         timeout=args.timeout,
     )
     assert "Generated (constrained):" in output, "Missing constrained output header"

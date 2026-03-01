@@ -5,7 +5,7 @@ from conftest import run_inferlet, run_tests
 async def test_text_completion(client, args):
     output = await run_inferlet(
         client, "text-completion",
-        ["-p", "Hello, world!", "--max-tokens", "32"],
+        {"p": "Hello, world!", "max_tokens": 32},
         timeout=args.timeout,
     )
     assert len(output) > 0, "Output is empty"

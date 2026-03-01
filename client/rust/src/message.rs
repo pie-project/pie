@@ -50,7 +50,7 @@ pub enum ClientMessage {
     LaunchProcess {
         corr_id: u32,
         inferlet: String,
-        arguments: Vec<String>,
+        input: String,
         capture_outputs: bool,
     },
 
@@ -59,7 +59,7 @@ pub enum ClientMessage {
         corr_id: u32,
         port: u32,
         inferlet: String,
-        arguments: Vec<String>,
+        input: String,
     },
 
     #[serde(rename = "attach_process")]

@@ -57,7 +57,7 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
 async def run_inferlet(
     client,
     name: str,
-    extra_args: list[str] | None = None,
+    extra_args: dict | None = None,
     *,
     timeout: int = 120,
 ) -> str:
@@ -67,7 +67,7 @@ async def run_inferlet(
     Raises ``RuntimeError`` on error or timeout, ``FileNotFoundError`` if the
     WASM binary or manifest is missing.
     """
-    extra_args = extra_args or []
+    extra_args = extra_args or {}
     wasm_name = name.replace("-", "_")
     wasm_path = INFERLETS_DIR / name / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm"
     manifest_path = INFERLETS_DIR / name / "Pie.toml"
@@ -83,7 +83,7 @@ async def run_inferlet(
     inferlet_id = f"{pkg_name}@{version}"
 
     await client.install_program(wasm_path, manifest_path)
-    process = await client.launch_process(inferlet_id, arguments=extra_args)
+    process = await client.launch_process(inferlet_id, input=extra_args)
 
     output_parts: list[str] = []
     start = time.time()

@@ -19,8 +19,8 @@ mod adaptive_policy;
 
 use tokio::sync::oneshot;
 
-use crate::context;
 use crate::service::{ServiceArray, ServiceHandler};
+use crate::context::kvcache::PhysicalPageId;
 use crate::device::DeviceId;
 use anyhow::Result;
 use request::{ForwardPassOutput, ForwardPassRequest};
@@ -77,11 +77,25 @@ pub async fn spawn(
     )).expect("Failed to spawn inference service")
 }
 
-/// Executes a forward pass and returns the output.
-pub async fn forward_pass(model_idx: usize, request: ForwardPassRequest) -> Result<ForwardPassOutput> {
+/// Submits a pre-resolved forward pass to the appropriate device scheduler.
+///
+/// All context operations (ensure_resident, page resolution) must be done
+/// by the caller BEFORE calling this. The inference actor just dispatches
+/// to the batch scheduler — it never blocks on context operations.
+pub async fn submit(
+    model_idx: usize,
+    request: ForwardPassRequest,
+    device_idx: usize,
+    physical_page_ids: Vec<PhysicalPageId>,
+    last_page_len: u32,
+) -> Result<ForwardPassOutput> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::ForwardPass { request, response: tx })?;
-    Ok(rx.await?)
+    SERVICES.send(model_idx, Message::Submit {
+        request, device_idx, physical_page_ids, last_page_len, response: tx,
+    })?;
+    Ok(rx.await.map_err(|_| anyhow::anyhow!(
+        "inference submit: scheduler dropped response channel"
+    ))?)
 }
 
 /// Returns aggregated inference stats for a model (lock-free, non-blocking).
@@ -179,80 +193,6 @@ impl InferenceService {
         }
     }
 
-    /// Resolves physical pages from context and queues the forward pass.
-    /// Transparently handles swap-in and replay via the unified replay path.
-    async fn forward_pass(&self, request: ForwardPassRequest, response_tx: oneshot::Sender<ForwardPassOutput>) -> Result<()> {
-        let ctx_id = request.context_id;
-
-        // Step 1: Ensure all pages are GPU-resident (swap-in from CPU, replay discarded)
-        let replay_plan = context::ensure_resident(self.model_idx, ctx_id).await?;
-
-        // Execute replay plan if pages were discarded and need rebuilding
-        if let Some(replay_chunks) = replay_plan {
-            for chunk in replay_chunks {
-                let device_idx = (chunk.device_id as usize)
-                    .min(self.num_devices.saturating_sub(1));
-
-                let replay_fwd = request::ForwardPassRequest {
-                    context_id: ctx_id,
-                    tokens: chunk.tokens,
-                    positions: chunk.positions,
-                    masks: chunk.masks,
-                    speculative_tokens: vec![],
-                    speculative_positions: vec![],
-                    output_speculative_tokens: false,
-                    logit_mask: None,
-                    sampling_indices: vec![],
-                    samplers: vec![],
-                    adapter_id: chunk.adapter,
-                    adapter_seed: None,
-                    arrival_time: None,
-                };
-
-                let (replay_tx, replay_rx) = oneshot::channel();
-                self.schedulers[device_idx].submit(
-                    replay_fwd, replay_tx,
-                    chunk.physical_page_ids, chunk.last_page_len,
-                )?;
-                let _ = replay_rx.await;
-
-                context::commit_replay_chunk(
-                    self.model_idx, ctx_id, chunk.num_pages,
-                ).await?;
-            }
-
-            context::finish_restore(self.model_idx, ctx_id)?;
-        }
-
-        // Step 2: Resolve physical page IDs (pure lookup — all pages must be GPU-resident)
-        let pages_by_device = context::get_physical_page_ids(self.model_idx, ctx_id).await?;
-
-        // Context parallelism not yet supported — pages must reside on a single device
-        if pages_by_device.len() > 1 {
-            anyhow::bail!(
-                "Context pages span {} devices; context parallelism is not yet supported",
-                pages_by_device.len()
-            );
-        }
-
-        // Extract the single device entry, or default to device 0
-        let (device_id, physical_page_ids) = pages_by_device
-            .into_iter()
-            .next()
-            .unwrap_or((0, vec![]));
-
-        // Compute FlashInfer's last_page_len
-        let num_pages = physical_page_ids.len() as u32;
-        let num_input_tokens = request.tokens.len() as u32;
-        let kv_len = context::kv_len(self.model_idx, ctx_id);
-        let page_size = context::tokens_per_page(self.model_idx, ctx_id);
-        let total_kv = kv_len + num_input_tokens;
-        let last_page_len = context::kvcache::compute_last_page_len(total_kv, num_pages, page_size);
-
-        // Route to the appropriate BatchScheduler
-        let device_idx = device_id.min(self.num_devices.saturating_sub(1));
-        self.schedulers[device_idx].submit(request, response_tx, physical_page_ids, last_page_len)
-    }
 }
 
 // =============================================================================
@@ -262,7 +202,15 @@ impl InferenceService {
 /// Messages handled by InferenceService.
 #[derive(Debug)]
 enum Message {
-    ForwardPass { request: ForwardPassRequest, response: oneshot::Sender<ForwardPassOutput> },
+    /// Submit a pre-resolved forward pass to the scheduler.
+    /// All context operations must be done by the caller before sending this.
+    Submit {
+        request: ForwardPassRequest,
+        device_idx: usize,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+        response: oneshot::Sender<ForwardPassOutput>,
+    },
     GetStats { response: oneshot::Sender<InferenceStats> },
 }
 
@@ -272,9 +220,12 @@ impl ServiceHandler for InferenceService {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::ForwardPass { request, response } => {
-                if let Err(e) = self.forward_pass(request, response).await {
-                    tracing::error!("Failed to queue forward pass: {}", e);
+            Message::Submit { request, device_idx, physical_page_ids, last_page_len, response } => {
+                let idx = device_idx.min(self.num_devices.saturating_sub(1));
+                if let Err(e) = self.schedulers[idx].submit(
+                    request, response, physical_page_ids, last_page_len,
+                ) {
+                    tracing::error!("Failed to submit to scheduler: {}", e);
                 }
             }
             Message::GetStats { response } => {

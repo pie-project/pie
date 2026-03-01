@@ -5,7 +5,7 @@ from conftest import run_inferlet, run_tests
 async def test_agent_react(client, args):
     output = await run_inferlet(
         client, "agent-react",
-        ["--num-function-calls", "5", "--tokens-between-calls", "256"],
+        {"num_function_calls": 5, "tokens_between_calls": 256},
         timeout=args.timeout,
     )
     # The agent should either find a final answer or report none

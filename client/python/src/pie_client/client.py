@@ -434,20 +434,20 @@ class PieClient:
     async def launch_process(
         self,
         inferlet: str,
-        arguments: list[str] | None = None,
+        input: dict | None = None,
         capture_outputs: bool = True,
     ) -> Process:
         """Launch a process. Returns a Process object for interaction.
 
         :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
-        :param arguments: Command-line arguments to pass to the inferlet.
+        :param input: A dict of input parameters, serialized to JSON.
         :param capture_outputs: If True, process outputs are streamed to the client.
         :return: A Process object for the launched inferlet.
         """
         msg = {
             "type": "launch_process",
             "inferlet": inferlet,
-            "arguments": arguments or [],
+            "input": json.dumps(input or {}),
             "capture_outputs": capture_outputs,
         }
         ok, result = await self._send_msg_and_wait(msg)
@@ -526,14 +526,14 @@ class PieClient:
         self,
         inferlet: str,
         port: int,
-        arguments: list[str] | None = None,
+        input: dict | None = None,
     ) -> None:
         """Launch a daemon inferlet that listens on a specific port."""
         msg = {
             "type": "launch_daemon",
             "port": port,
             "inferlet": inferlet,
-            "arguments": arguments or [],
+            "input": json.dumps(input or {}),
         }
         ok, result = await self._send_msg_and_wait(msg)
         if not ok:

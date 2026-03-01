@@ -52,6 +52,7 @@ pub(crate) struct ContextManager {
     /// Per-device wait queues. Waiters only compete against others on the
     /// same device, so free events on device `d` only wake device-`d` waiters.
     pub(crate) wait_queues: Vec<BinaryHeap<PageWaiter>>,
+    pub(crate) msg_counter: u64,
 }
 
 impl ContextManager {
@@ -65,6 +66,7 @@ impl ContextManager {
             devices, page_size, model_idx,
             name_to_id: HashMap::new(), next_id: 1, arbiter,
             wait_queues: (0..num_devices).map(|_| BinaryHeap::new()).collect(),
+            msg_counter: 0,
         }
     }
 
@@ -295,7 +297,7 @@ impl ContextManager {
 
         loop {
             let requester_floor = self.requester_floor(requester, dev_idx, num_pages);
-            match self.find_cheapest_victim(dev_idx, requester_floor) {
+            match self.find_cheapest_victim(dev_idx, requester_floor, requester) {
                 Some(vid) => {
                     self.suspend_context(vid).await;
                     if let Ok(pages) = self.devices[dev_idx].allocate_working(num_pages) {
@@ -396,7 +398,8 @@ impl ContextManager {
             running_prev = hash;
         }
 
-        let new_tip = *hashes.last().unwrap();
+        let new_tip = *hashes.last()
+            .ok_or_else(|| anyhow::anyhow!("No page hashes computed during commit"))?;
         dev.update_index_cache(new_tip, old_tip, &new_phys);
 
         let owner = {
@@ -419,6 +422,95 @@ impl ContextManager {
             ctx.max_committed_position = all_positions_for_validation.iter().copied().max()
                 .or(ctx.max_committed_position);
 
+            if let Some(Record::Fill { tokens: t, positions: p, mask: m, adapter: a }) = ctx.lineage.last_mut() {
+                if *a == lineage_adapter {
+                    t.extend_from_slice(&tokens);
+                    p.extend_from_slice(&positions);
+                    m.extend_from_slice(&masks);
+                } else {
+                    ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter });
+                }
+            } else {
+                ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter });
+            }
+
+            ctx.owner
+        };
+
+        if let Some(pid) = owner {
+            self.arbiter.commit(pid, dev_idx, indices.len());
+        }
+
+        Ok(())
+    }
+
+    /// Logical commit for suspended contexts — updates lineage and metadata
+    /// without touching GPU pages. Equivalent to restore → commit → suspend
+    /// but without any GPU round-trips.
+    pub(crate) fn commit_pages_logical(&mut self, id: ContextId, indices: Vec<u32>) -> Result<()> {
+        let page_size = self.page_size;
+        let ctx = self.ctx(id)?;
+
+        // Collect token data from tokens_filled (same validation as normal commit)
+        let mut tokens = Vec::new();
+        let mut positions = Vec::new();
+        let mut masks = Vec::new();
+
+        for &idx in &indices {
+            let start = idx as usize * page_size;
+            let end = start + page_size;
+            if end > ctx.tokens_filled.len() {
+                anyhow::bail!("Page {} not fully filled: need {} tokens but only have {}", idx, end, ctx.tokens_filled.len());
+            }
+            for i in start..end {
+                let info = &ctx.tokens_filled[i];
+                tokens.push(info.token);
+                positions.push(info.position);
+                masks.push(info.mask.clone());
+            }
+        }
+
+        if let Some(max_committed) = ctx.max_committed_position {
+            for &pos in &positions {
+                if pos <= max_committed {
+                    anyhow::bail!("Position {} must be > max committed position {}", pos, max_committed);
+                }
+            }
+        }
+
+        // Compute hash chain (pure math — no GPU pages needed)
+        let prev_hash = ctx.committed_tip.unwrap_or(0);
+        let dev_idx = ctx.device.unwrap_or(0) as usize;
+        let lineage_adapter = ctx.tokens_filled.first().and_then(|t| t.adapter);
+        drop(ctx);
+
+        let hashes = self.devices[dev_idx].compute_page_hashes(&tokens, &positions, &masks, prev_hash);
+        let new_tip = *hashes.last()
+            .ok_or_else(|| anyhow::anyhow!("No page hashes computed during logical commit"))?;
+
+        // Update metadata only — no physical page operations
+        let owner = {
+            let mut ctx = self.ctx_mut(id)
+                .map_err(|_| anyhow::anyhow!("Context lost during logical commit"))?;
+
+            // Drain tokens_filled for the committed pages
+            let mut sorted_indices: Vec<usize> = indices.iter().map(|&i| i as usize).collect();
+            sorted_indices.sort_unstable();
+            for &idx in sorted_indices.iter().rev() {
+                let start = idx * page_size;
+                let end = ((idx + 1) * page_size).min(ctx.tokens_filled.len());
+                ctx.tokens_filled.drain(start..end);
+            }
+
+            // NOTE: working_pages is already empty for suspended contexts
+            // (cleared by suspend_context), so no removal needed.
+
+            ctx.committed_tip = Some(new_tip);
+            ctx.committed_len += indices.len();
+            ctx.max_committed_position = positions.iter().copied().max()
+                .or(ctx.max_committed_position);
+
+            // Append to lineage
             if let Some(Record::Fill { tokens: t, positions: p, mask: m, adapter: a }) = ctx.lineage.last_mut() {
                 if *a == lineage_adapter {
                     t.extend_from_slice(&tokens);

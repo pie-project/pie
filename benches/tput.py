@@ -64,32 +64,36 @@ async def run_benchmark(args):
     print(f"Requests:    {args.num_requests}")
     print(f"Concurrency: {args.concurrency}")
     print(f"Max Tokens:  {args.max_tokens}")
+    print(f"GPU Mem:     {args.gpu_mem_util}")
     print(f"Prompt:      {args.prompt!r}")
     print()
 
     cfg = Config(
         port=0,
         auth=AuthConfig(enabled=False),
-        models=[ModelConfig(hf_repo=args.model, device=device, dummy_mode=args.dummy)],
+        models=[ModelConfig(
+            hf_repo=args.model, device=device,
+            dummy_mode=args.dummy,
+            gpu_mem_utilization=args.gpu_mem_util,
+            cpu_mem_budget_in_gb=args.cpu_mem_budget,
+        )],
     )
     async with Server(cfg) as server:
         client = await server.connect()
         # -- Install program --------------------------------------------------
 
-        if not await client.check_program(inferlet_name, wasm_path, manifest_path):
-            print("Installing program...")
-            await client.install_program(wasm_path, manifest_path)
-        else:
-            print("Program already installed.")
+        # Always install to pick up latest build
+        print("Installing program...")
+        await client.install_program(wasm_path, manifest_path, force_overwrite=True)
 
         # -- Build workload ---------------------------------------------------
 
-        inferlet_args = [
-            "--prompt", args.prompt,
-            "--max-tokens", str(args.max_tokens),
-            "--temperature", str(args.temperature),
-            "--system", "You are a helpful benchmarking assistant.",
-        ]
+        inferlet_input = {
+            "prompt": args.prompt,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "system": "You are a helpful benchmarking assistant.",
+        }
 
         queue = asyncio.Queue()
         for i in range(args.num_requests):
@@ -111,12 +115,14 @@ async def run_benchmark(args):
 
                 try:
                     process = await client.launch_process(
-                        inferlet_name, arguments=inferlet_args,
+                        inferlet_name, input=inferlet_input,
                     )
                     req_chars = 0
                     while True:
                         event, msg = await process.recv()
                         if event == Event.Stdout:
+                            req_chars += len(msg)
+                        elif event == Event.Stderr:
                             req_chars += len(msg)
                         elif event == Event.Return:
                             req_chars += len(msg)
@@ -165,6 +171,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens per request")
     parser.add_argument("--temperature", type=float, default=0.6, help="Temperature")
     parser.add_argument("--dummy", action="store_true", help="Use dummy mode (no GPU)")
+    parser.add_argument("--gpu-mem-util", type=float, default=0.8, help="GPU memory utilization for KV cache (lower = fewer pages = more contention)")
+    parser.add_argument("--cpu-mem-budget", type=int, default=0, help="CPU memory budget in GB for working page swap (0 = disabled)")
 
     args = parser.parse_args()
 

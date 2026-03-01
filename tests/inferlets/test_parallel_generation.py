@@ -5,7 +5,7 @@ from conftest import run_inferlet, run_tests
 async def test_parallel_generation(client, args):
     output = await run_inferlet(
         client, "parallel-generation",
-        ["--max-tokens", "32"],
+        {"max_tokens": 32},
         timeout=args.timeout,
     )
     assert "Output 1:" in output, "Missing Output 1"

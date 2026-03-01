@@ -7,7 +7,7 @@ from conftest import run_inferlet, run_tests
 async def test_jacobi_decoding(client, args):
     output = await run_inferlet(
         client, "jacobi-decoding",
-        ["--max-tokens", "32"],
+        {"max_tokens": 32},
         timeout=args.timeout,
     )
     assert "Jacobi Decoding" in output, "Missing header"

@@ -20,6 +20,64 @@ from pie.server import Server
 console = Console()
 
 
+def _cli_args_to_dict(arguments: list[str]) -> dict:
+    """Convert CLI-style ['--key', 'value', ...] arguments to a dict.
+
+    Flags (--key value) become {"key": value} with automatic type inference.
+    Boolean flags (--flag) become {"flag": true}.
+    Short flags (-k value) become {"k": value}.
+    Remaining positional args go under "_positional".
+    """
+    if not arguments:
+        return {}
+
+    obj = {}
+    positional = []
+    i = 0
+
+    while i < len(arguments):
+        if arguments[i].startswith("--"):
+            key = arguments[i][2:].replace("-", "_")
+            if i + 1 < len(arguments) and not arguments[i + 1].startswith("-"):
+                obj[key] = _parse_cli_value(arguments[i + 1])
+                i += 2
+            else:
+                obj[key] = True
+                i += 1
+        elif arguments[i].startswith("-") and len(arguments[i]) == 2:
+            key = arguments[i][1:]
+            if i + 1 < len(arguments):
+                obj[key] = _parse_cli_value(arguments[i + 1])
+                i += 2
+            else:
+                i += 1
+        else:
+            positional.append(_parse_cli_value(arguments[i]))
+            i += 1
+
+    if positional:
+        obj["_positional"] = positional
+
+    return obj
+
+
+def _parse_cli_value(s: str):
+    """Infer the type of a CLI string value (int → float → bool → str)."""
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    return s
+
+
 def run(
     inferlet: str | None = typer.Argument(
         None, help="Inferlet name from registry (e.g., 'text-completion@0.1.0')"
@@ -112,9 +170,13 @@ def run(
 
             # Launch and stream
             print(f"Launching {resolved}...")
+
+            # Convert CLI arguments to input dict
+            input_dict = _cli_args_to_dict(arguments or [])
+
             process = await client.launch_process(
                 resolved,
-                arguments=arguments or [],
+                input=input_dict,
                 capture_outputs=True,
             )
             print(f"Process started: {process.process_id}")

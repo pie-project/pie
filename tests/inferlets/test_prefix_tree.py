@@ -7,7 +7,7 @@ from conftest import run_inferlet, run_tests
 async def test_prefix_tree(client, args):
     output = await run_inferlet(
         client, "prefix-tree",
-        ["--num-tokens", "32"],
+        {"num_tokens": 32},
         timeout=args.timeout,
     )
     found = {int(m.group(1)) for m in re.finditer(r"Prompt #(\d+)", output)}

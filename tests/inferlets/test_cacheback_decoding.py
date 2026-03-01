@@ -7,7 +7,7 @@ from conftest import run_inferlet, run_tests
 async def test_cacheback_decoding(client, args):
     output = await run_inferlet(
         client, "cacheback-decoding",
-        ["--max-tokens", "64"],
+        {"max_tokens": 64},
         timeout=args.timeout,
     )
     assert "Generated in" in output, "Missing timing line"
