@@ -189,7 +189,7 @@ jobs:
     if: needs.setup.outputs.is_maturin == 'true' && inputs.dry_run == false
     environment: pypi
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           merge-multiple: true
@@ -206,7 +206,7 @@ jobs:
     if: needs.setup.outputs.is_maturin == 'false' && inputs.dry_run == false
     environment: pypi
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: wheels-python
           path: dist
