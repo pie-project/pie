@@ -341,9 +341,14 @@ def run_componentize_py(
         "-w",
         "exec",
         "componentize",
-        module_name,
+        "--no-snapshot",
+        "--shared-modules",
+        "auto",
+        "-e",
+        str(work_dir),
         "-o",
         str(output_wasm_abs),
+        module_name,
     ]
 
     result = subprocess.run(

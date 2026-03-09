@@ -12,6 +12,7 @@ pub mod instance;
 pub mod kvs;
 pub mod messaging;
 pub mod model;
+pub mod path;
 pub mod runtime;
 pub mod server;
 pub mod service;

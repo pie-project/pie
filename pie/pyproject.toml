@@ -69,15 +69,6 @@ cu128 = [
     "flashinfer-jit-cache>=0.6.1",
 ]
 
-# for uv only
-cu130 = [
-    "torch>=2.7.1",
-    "torchao>=0.14.1",
-    "flashinfer-python>=0.6.1",
-    "flashinfer-cubin>=0.6.1",
-    "flashinfer-jit-cache>=0.6.1",
-]
-
 
 # --- Metal (macOS) ---
 metal = [
@@ -101,20 +92,8 @@ explicit = true
 
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/nightly/cu130"
-explicit = true
-
-
-[[tool.uv.index]]
 name = "flashinfer-cu128"
 url = "https://flashinfer.ai/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "flashinfer-cu130"
-url = "https://flashinfer.ai/whl/cu130"
-explicit = true
 
 # 2. Source Pinning
 [tool.uv.sources]
@@ -125,13 +104,11 @@ pie-client = { path = "../client/python", editable = true }
 # --- Torch Sources ---
 torch = [
     { index = "pytorch-cu126", extra = "cu126" },
-    { index = "pytorch-cu130", extra = "cu130" },
 ]
 
 # --- FlashInfer JIT Cache Sources (only this package uses custom indexes) ---
 flashinfer-jit-cache = [
     { index = "flashinfer-cu128", extra = "cu128" },
-    { index = "flashinfer-cu130", extra = "cu130" },
 ]
 
 [tool.maturin]
@@ -149,7 +126,6 @@ conflicts = [
     [
         { extra = "cu126" },
         { extra = "cu128" },
-        { extra = "cu130" },
         { extra = "metal" },
     ],
 ]

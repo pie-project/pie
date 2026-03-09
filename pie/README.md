@@ -18,7 +18,7 @@ pip install pie-server
 ### From Source
 
 ```bash
-uv sync --extra cu128 # cu126, cu128, cu130 supported
+uv sync --extra cu128 # cu126, cu128 supported
 ```
 
 ### Verify Installation

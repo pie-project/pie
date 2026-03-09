@@ -7,6 +7,7 @@ use bytes::Bytes;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,7 @@ use wasmtime_wasi::async_trait;
 use wasmtime_wasi::cli::IsTerminal;
 use wasmtime_wasi::cli::StdoutStream;
 use wasmtime_wasi::p2::{OutputStream, Pollable, StreamResult};
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 pub type InstanceId = Uuid;
@@ -154,6 +155,7 @@ impl InstanceState {
         id: InstanceId,
         username: String,
         arguments: Vec<String>,
+        py_runtime_dir: Option<&Path>,
     ) -> (Self, OutputDeliveryCtrl) {
         let mut builder = WasiCtx::builder();
         builder.inherit_network(); // TODO: Replace with socket_addr_check later.
@@ -165,6 +167,42 @@ impl InstanceState {
         // Clone the streams for the WASI context (LogStream is cheap to clone due to Arc)
         builder.stdout(stdout_stream.clone());
         builder.stderr(stderr_stream.clone());
+
+        // Set up Python runtime environment if py-runtime directory is available.
+        // Layout: py-runtime/runtime/{python,bundled}, py-runtime/site-packages
+        if let Some(dir) = py_runtime_dir {
+            let runtime_dir = dir.join("runtime");
+            let site_packages_dir = dir.join("site-packages");
+
+            const PYTHON_PATH: &str = "/python:/0:/bundled";
+
+            builder
+                .env("PYTHONHOME", "/python")
+                .env("PYTHONPATH", PYTHON_PATH)
+                .env("PYTHONUNBUFFERED", "1");
+
+            builder
+                .preopened_dir(
+                    runtime_dir.join("python"),
+                    "python",
+                    DirPerms::READ,
+                    FilePerms::READ,
+                )
+                .expect("failed to preopen python dir");
+
+            builder
+                .preopened_dir(
+                    runtime_dir.join("bundled"),
+                    "bundled",
+                    DirPerms::READ,
+                    FilePerms::READ,
+                )
+                .expect("failed to preopen bundled dir");
+
+            builder
+                .preopened_dir(site_packages_dir, "0", DirPerms::READ, FilePerms::READ)
+                .expect("failed to preopen site-packages dir");
+        }
 
         let streaming_ctrl = OutputDeliveryCtrl {
             stdout_stream,

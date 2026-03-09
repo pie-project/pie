@@ -3,13 +3,24 @@
 Implements: pie config init|update|show
 """
 
+import lzma
+import tarfile
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import toml
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TextColumn,
+    TransferSpeedColumn,
+)
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -20,6 +31,40 @@ from huggingface_hub import scan_cache_dir
 console = Console()
 app = typer.Typer(help="Manage configuration")
 
+PYTHON_RUNTIME_URL = (
+    "https://registry.pie-project.org/api/v1/runtimes/python3.14/0.1.0/download"
+)
+
+
+def _download_python_runtime(dest_dir: Path) -> None:
+    """Download and extract the Python 3.14 runtime into dest_dir."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    with httpx.stream("GET", PYTHON_RUNTIME_URL, follow_redirects=True) as resp:
+        resp.raise_for_status()
+        total = int(resp.headers.get("content-length", 0))
+
+        progress = Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+        )
+        with progress:
+            task = progress.add_task(
+                "Downloading Python 3.14 runtime for Python inferlets",
+                total=total if total else None,
+            )
+            chunks = bytearray()
+            for chunk in resp.iter_bytes():
+                chunks.extend(chunk)
+                progress.update(task, advance=len(chunk))
+
+    console.print("[dim]Extracting runtime…[/dim]")
+    decompressed = lzma.decompress(bytes(chunks))
+    with tarfile.open(fileobj=BytesIO(decompressed), mode="r:") as tar:
+        tar.extractall(path=dest_dir)
+
 
 @app.command("init")
 def config_init(
@@ -27,6 +72,7 @@ def config_init(
 ) -> None:
     """Create a default config file."""
     config_path = Path(path) if path else pie_path.get_default_config_path()
+    pie_home = pie_path.get_pie_home()
 
     # Create parent directory if needed
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,6 +82,16 @@ def config_init(
 
     config_path.write_text(content)
     console.print(f"[green]✓[/green] Configuration file created at {config_path}")
+
+    # Download and install the Python 3.14 runtime
+    try:
+        _download_python_runtime(pie_home)
+        console.print("[green]✓[/green] Python 3.14 runtime installed")
+    except Exception as exc:
+        console.print(
+            f"[red]✗[/red] Failed to download Python runtime: {exc}\n"
+            "  You can retry with [bold]pie config init[/bold]."
+        )
 
     # Check if default model exists
     try:
