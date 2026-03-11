@@ -11,6 +11,7 @@ only called when ``_is_sm110_fallback()`` returns True.
 
 from __future__ import annotations
 
+import os
 import torch
 import flashinfer as ops  # type: ignore[import]
 
@@ -18,6 +19,21 @@ from .gpt_oss_utils import (
     TUNE_MAX_NUM_TOKENS,
     dequant_mxfp4_to_bf16,
 )
+
+
+def _drop_page_cache() -> None:
+    """Drop OS page cache to reclaim unified memory on Jetson.
+
+    On Jetson's unified memory architecture, mmap'd safetensors pages
+    accumulate as page cache during weight loading and persist across
+    inference. CUDA cannot reclaim this memory, so we must explicitly
+    drop caches before large allocations (FP4→BF16 dequantization)
+    to prevent OOM during sampling.
+    """
+    os.system(
+        "sync; (echo 3 > /host_drop_caches "
+        "|| echo 3 > /proc/sys/vm/drop_caches) 2>/dev/null; true"
+    )
 
 
 def init_dequant_buffers(
@@ -195,6 +211,11 @@ def moe_forward(
         router_logits.float(), k=experts_per_token, dim=-1
     )
     topk_weights = torch.softmax(topk_weights, dim=-1)
+
+    # Drop page cache before dequant to reclaim unified memory (Jetson only).
+    # Without this, mmap'd safetensors pages consume unified memory that CUDA
+    # needs for the BF16 dequant buffers and downstream sampling allocations.
+    _drop_page_cache()
 
     # Only dequant the experts actually selected by routing
     _selected = topk_ids.view(-1).unique()
