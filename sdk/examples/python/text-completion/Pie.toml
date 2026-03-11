@@ -7,6 +7,7 @@ authors = ["Pie Team"]
 [runtime]
 core = "^0.2.0"
 mcp = "^0.2.0"
+python-runtime = "^0.2.0"
 
 [parameters]
 prompt = {type = "string", optional = true, description = "The user message to complete (default: 'Hello, world!')"}

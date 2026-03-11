@@ -32,7 +32,7 @@ console = Console()
 app = typer.Typer(help="Manage configuration")
 
 PYTHON_RUNTIME_URL = (
-    "https://registry.pie-project.org/api/v1/runtimes/python3.14/0.1.0/download"
+    "https://registry.pie-project.org/api/v1/runtimes/python3.14/0.2.0/download"
 )
 
 

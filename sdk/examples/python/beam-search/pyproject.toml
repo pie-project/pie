@@ -3,3 +3,8 @@ name = "beam-search"
 version = "0.1.0"
 description = "Beam search decoding example using inferlet"
 requires-python = ">=3.10"
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+python-runtime = "^0.2.0"

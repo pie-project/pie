@@ -158,6 +158,8 @@ struct ProgramMetadata {
     manifest_hash: String,
     /// Dependencies of this inferlet
     dependencies: Vec<ProgramName>,
+    /// Optional python runtime version requirement (from `[runtime] python-runtime`)
+    python_runtime: Option<String>,
 }
 
 struct ServerState {
@@ -980,9 +982,18 @@ impl Session {
                 return;
             }
 
-            // Parse the manifest to extract name, version, and dependencies
+            // Parse the manifest to extract name, version, dependencies, etc.
             let manifest_content = mem::take(&mut inflight.manifest);
-            let program_name = match parse_program_name_from_manifest(&manifest_content) {
+            let manifest_table = match parse_manifest(&manifest_content) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.send_response(corr_id, false, format!("Failed to parse manifest: {}", e))
+                        .await;
+                    self.inflight_program_upload = None;
+                    return;
+                }
+            };
+            let program_name = match manifest_program_name(&manifest_table) {
                 Ok(result) => result,
                 Err(e) => {
                     self.send_response(corr_id, false, format!("Failed to parse manifest: {}", e))
@@ -991,7 +1002,8 @@ impl Session {
                     return;
                 }
             };
-            let dependencies = parse_program_dependencies_from_manifest(&manifest_content);
+            let dependencies = get_manifest_dependencies(&manifest_table);
+            let python_runtime = get_manifest_python_runtime(&manifest_table);
 
             // Write to disk: {cache_dir}/programs/{name}/{version}.{wasm,toml,hash}
             let dir_path = self
@@ -1066,6 +1078,7 @@ impl Session {
                     wasm_hash: final_hash.clone(),
                     manifest_hash,
                     dependencies,
+                    python_runtime,
                 },
             );
 
@@ -1658,14 +1671,17 @@ fn load_programs_from_dir(dir: &Path, programs_in_disk: &DashMap<ProgramName, Pr
                     Err(_) => continue, // Skip programs without a manifest hash file
                 };
 
-                // Read and parse the manifest to extract dependencies
+                // Read and parse the manifest to extract dependencies and python runtime
                 let manifest_path = file_path.with_extension("toml");
-                let dependencies = match std::fs::read_to_string(&manifest_path) {
-                    Ok(manifest_content) => {
-                        parse_program_dependencies_from_manifest(&manifest_content)
-                    }
-                    Err(_) => continue, // Skip programs without a manifest file
+                let manifest_table = match std::fs::read_to_string(&manifest_path)
+                    .map_err(|e| anyhow!(e))
+                    .and_then(|s| parse_manifest(&s))
+                {
+                    Ok(t) => t,
+                    Err(_) => continue, // Skip programs without a valid manifest file
                 };
+                let dependencies = get_manifest_dependencies(&manifest_table);
+                let python_runtime = get_manifest_python_runtime(&manifest_table);
 
                 let program_name = ProgramName {
                     name: name.clone(),
@@ -1678,6 +1694,7 @@ fn load_programs_from_dir(dir: &Path, programs_in_disk: &DashMap<ProgramName, Pr
                         wasm_hash,
                         manifest_hash,
                         dependencies,
+                        python_runtime,
                     },
                 );
             }
@@ -1685,13 +1702,15 @@ fn load_programs_from_dir(dir: &Path, programs_in_disk: &DashMap<ProgramName, Pr
     }
 }
 
-/// Parses a manifest TOML string to extract the program name (name, version).
+/// Parses a manifest TOML string into a table.
+fn parse_manifest(manifest: &str) -> Result<toml::Table> {
+    toml::from_str(manifest).map_err(|e| anyhow!("Failed to parse manifest TOML: {}", e))
+}
+
+/// Extracts the program name (name, version) from a parsed manifest.
 ///
 /// The manifest must have a [package] section with "name" and "version" fields.
-fn parse_program_name_from_manifest(manifest: &str) -> Result<ProgramName> {
-    let table: toml::Table =
-        toml::from_str(manifest).map_err(|e| anyhow!("Failed to parse manifest TOML: {}", e))?;
-
+fn manifest_program_name(table: &toml::Table) -> Result<ProgramName> {
     let package = table
         .get("package")
         .and_then(|p| p.as_table())
@@ -1713,24 +1732,15 @@ fn parse_program_name_from_manifest(manifest: &str) -> Result<ProgramName> {
     })
 }
 
-/// Parses a manifest TOML string to extract the dependencies.
+/// Extracts the dependencies from a parsed manifest.
 ///
 /// The optional "dependencies" field in the [package] section is an array of strings
-/// in the format "name@version". Returns an empty vector if parsing fails
-/// or no dependencies are specified.
-fn parse_program_dependencies_from_manifest(manifest: &str) -> Vec<ProgramName> {
-    let table: toml::Table = match toml::from_str(manifest) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
-    };
-
-    let package = match table.get("package").and_then(|p| p.as_table()) {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
-
-    package
-        .get("dependencies")
+/// in the format "name@version". Returns an empty vector if no dependencies are specified.
+fn get_manifest_dependencies(table: &toml::Table) -> Vec<ProgramName> {
+    table
+        .get("package")
+        .and_then(|p| p.as_table())
+        .and_then(|p| p.get("dependencies"))
         .and_then(|d| d.as_array())
         .map(|arr| {
             arr.iter()
@@ -1738,6 +1748,18 @@ fn parse_program_dependencies_from_manifest(manifest: &str) -> Vec<ProgramName> 
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Extracts the optional `python-runtime` version from a parsed manifest.
+///
+/// Looks for `[runtime] python-runtime = "..."` and returns the value if present.
+fn get_manifest_python_runtime(table: &toml::Table) -> Option<String> {
+    table
+        .get("runtime")
+        .and_then(|r| r.as_table())
+        .and_then(|r| r.get("python-runtime"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Compiles WASM bytes to a Component in a blocking thread.
@@ -1883,6 +1905,12 @@ async fn ensure_program_loaded_with_dependencies(
                 )
             })?;
 
+        let wasm_bytes_for_snapshot = if program_metadata.python_runtime.is_some() {
+            Some(raw_bytes.clone())
+        } else {
+            None
+        };
+
         let component = compile_wasm_component(wasm_engine, raw_bytes)
             .await
             .map_err(|e| e.to_string())?;
@@ -1911,6 +1939,8 @@ async fn ensure_program_loaded_with_dependencies(
             ),
             component,
             dependencies,
+            python_runtime: program_metadata.python_runtime.clone(),
+            wasm_bytes: wasm_bytes_for_snapshot,
             event: load_tx,
         }
         .dispatch();
@@ -2070,13 +2100,16 @@ async fn try_download_inferlet_from_registry(
         wasm_hash
     );
 
-    // Parse dependencies and create metadata
-    let dependencies = parse_program_dependencies_from_manifest(&manifest_data);
+    // Parse manifest once, then extract dependencies and python runtime
+    let manifest_table = parse_manifest(&manifest_data)?;
+    let dependencies = get_manifest_dependencies(&manifest_table);
+    let python_runtime = get_manifest_python_runtime(&manifest_table);
     let metadata = ProgramMetadata {
         wasm_path,
         wasm_hash,
         manifest_hash,
         dependencies,
+        python_runtime,
     };
     registry_programs_in_disk.insert(program_name.clone(), metadata.clone());
     Ok(metadata)
