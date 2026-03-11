@@ -47,13 +47,46 @@ async fn plan_and_generate_parallel(
         .await;
 
     // 2. Robustly parse points from the output.
-    let points: Vec<String> = output
+    let mut points: Vec<String> = output
         .split("<point>")
         .skip(1)
         .filter_map(|s| s.split("</point>").next())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+
+    // Fallback: try numbered lists (1. ..., 2. ...) or bullet points (- ..., * ...)
+    if points.is_empty() {
+        points = output
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                // Match "- text" or "* text"
+                if let Some(rest) =
+                    trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* "))
+                {
+                    Some(rest.trim().to_string())
+                } else if trimmed.len() > 2 && trimmed.as_bytes()[0].is_ascii_digit() {
+                    // Match "1. text" or "1) text"
+                    let after_digit =
+                        trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
+                    if let Some(rest) =
+                        after_digit.strip_prefix(". ").or_else(|| after_digit.strip_prefix(") "))
+                    {
+                        Some(rest.trim().to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+
+    // Limit to requested number of points
+    points.truncate(max_points);
 
     if points.is_empty() {
         return Vec::new();

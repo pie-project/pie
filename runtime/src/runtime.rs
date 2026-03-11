@@ -8,13 +8,15 @@ use dashmap::DashMap;
 use hyper::server::conn::http1;
 use pie_client::message;
 use std::collections::HashSet;
+use std::fs;
 use std::net::SocketAddr;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 use wasmtime::component::Resource;
-use wasmtime::{Engine, Store, component::Component, component::Linker};
+use wasmtime::{Engine, Module, Store, component::Component, component::Linker};
 use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::bindings::exports::wasi::http::incoming_handler::{
     IncomingRequest, ResponseOutparam,
@@ -184,6 +186,12 @@ struct Runtime {
 
     /// Running server instances
     running_server_instances: DashMap<InstanceId, InstanceHandle>,
+
+    /// Shared core modules (e.g. CPython interpreter) loaded from py-runtime/shared/
+    shared_modules: Arc<Vec<(String, Module)>>,
+
+    /// Path to the py-runtime directory (~/.pie/py-runtime), if it exists
+    py_runtime_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -426,8 +434,46 @@ impl Service for Runtime {
     }
 }
 
+/// Loads shared core modules (.wasm files) from a directory.
+fn load_shared_modules(engine: &Engine, shared_dir: &Path) -> Vec<(String, Module)> {
+    let mut modules = Vec::new();
+    let entries = match fs::read_dir(shared_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to read shared modules dir {}: {e}",
+                shared_dir.display()
+            );
+            return modules;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Failed to read shared module entry: {e}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "wasm") {
+            let import_name = path.file_stem().unwrap().to_str().unwrap().to_string();
+            tracing::info!(
+                "Loading shared module: {} -> {}",
+                path.display(),
+                import_name
+            );
+            match Module::from_file(engine, &path) {
+                Ok(module) => modules.push((import_name, module)),
+                Err(e) => tracing::error!("Failed to load shared module {}: {e}", path.display()),
+            }
+        }
+    }
+    modules
+}
+
 /// Creates a new linker with WASI and API bindings configured.
-fn create_linker(engine: &Engine) -> Linker<InstanceState> {
+fn create_linker(engine: &Engine, shared_modules: &[(String, Module)]) -> Linker<InstanceState> {
     let mut linker = Linker::<InstanceState>::new(engine);
 
     // Add WASI and HTTP bindings
@@ -441,17 +487,53 @@ fn create_linker(engine: &Engine) -> Linker<InstanceState> {
     // Add custom API bindings
     api::add_to_linker(&mut linker).unwrap();
 
+    // Register shared core modules (e.g. CPython interpreter)
+    for (name, module) in shared_modules {
+        linker
+            .root()
+            .module(name, module)
+            .unwrap_or_else(|e| panic!("Failed to register shared module '{name}': {e}"));
+    }
+
     linker
 }
 
 impl Runtime {
     fn new(engine: Engine) -> Self {
+        let py_runtime_dir = {
+            let dir = crate::path::get_py_runtime_dir();
+            if dir.is_dir() {
+                tracing::info!("Python runtime directory: {}", dir.display());
+                Some(dir)
+            } else {
+                tracing::info!("No Python runtime directory found at {}", dir.display());
+                None
+            }
+        };
+
+        let shared_modules = if let Some(ref dir) = py_runtime_dir {
+            let shared_dir = dir.join("shared");
+            if shared_dir.is_dir() {
+                load_shared_modules(&engine, &shared_dir)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        if !shared_modules.is_empty() {
+            tracing::info!("Loaded {} shared core module(s)", shared_modules.len());
+        }
+
         Self {
             engine,
             compiled_programs: DashMap::new(),
             running_instances: DashMap::new(),
             finished_instances: DashMap::new(),
             running_server_instances: DashMap::new(),
+            shared_modules: Arc::new(shared_modules),
+            py_runtime_dir,
         }
     }
 
@@ -541,6 +623,8 @@ impl Runtime {
             arguments.clone(),
             detached,
             engine,
+            self.shared_modules.clone(),
+            self.py_runtime_dir.clone(),
             start_rx,
             output_delivery_ctrl_tx,
         ));
@@ -645,12 +729,14 @@ impl Runtime {
             dependency_components,
             arguments.clone(),
             engine,
+            self.shared_modules.clone(),
+            self.py_runtime_dir.clone(),
             start_rx,
         ));
 
         // Create a dummy output delivery controller for server instances (not used since each request gets its own instance)
         let (dummy_state, output_delivery_ctrl) =
-            InstanceState::new(Uuid::new_v4(), username.clone(), vec![]).await;
+            InstanceState::new(Uuid::new_v4(), username.clone(), vec![], None).await;
         drop(dummy_state); // We don't actually use this
 
         // Record in the "running_instances" so we can manage it later
@@ -754,11 +840,13 @@ impl Runtime {
         component: Component,
         dependency_components: Vec<Component>,
         arguments: Vec<String>,
+        shared_modules: Arc<Vec<(String, Module)>>,
+        py_runtime_dir: Option<PathBuf>,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
         let inst_id = Uuid::new_v4();
         let (inst_state, _output_delivery_ctrl) =
-            InstanceState::new(inst_id, username, arguments).await;
+            InstanceState::new(inst_id, username, arguments, py_runtime_dir.as_deref()).await;
 
         let mut store = Store::new(&engine, inst_state);
         let (sender, receiver) = oneshot::channel();
@@ -766,7 +854,7 @@ impl Runtime {
         let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
         let out = store.data_mut().new_response_outparam(sender)?;
 
-        let mut linker = create_linker(&engine);
+        let mut linker = create_linker(&engine, &shared_modules);
 
         // Instantiate dependencies and register their exports in the linker
         dynamic_linking::instantiate_libraries(
@@ -828,6 +916,8 @@ impl Runtime {
         dependency_components: Vec<Component>,
         arguments: Vec<String>,
         engine: Engine,
+        shared_modules: Arc<Vec<(String, Module)>>,
+        py_runtime_dir: Option<PathBuf>,
         start_rx: oneshot::Receiver<()>,
     ) {
         // Wait for the signal to start
@@ -848,6 +938,8 @@ impl Runtime {
                     let dependency_components_ = dependency_components.clone();
                     let arguments_ = arguments.clone();
                     let username_ = username.clone();
+                    let shared_modules_ = shared_modules.clone();
+                    let py_runtime_dir_ = py_runtime_dir.clone();
                     tokio::task::spawn(async move {
                         if let Err(e) = http1::Builder::new()
                             .keep_alive(true)
@@ -860,6 +952,8 @@ impl Runtime {
                                         component_.clone(),
                                         dependency_components_.clone(),
                                         arguments_.clone(),
+                                        shared_modules_.clone(),
+                                        py_runtime_dir_.clone(),
                                         req,
                                     )
                                 }),
@@ -887,12 +981,14 @@ impl Runtime {
         arguments: Vec<String>,
         detached: bool,
         engine: Engine,
+        shared_modules: Arc<Vec<(String, Module)>>,
+        py_runtime_dir: Option<PathBuf>,
         start_rx: oneshot::Receiver<()>,
         output_delivery_ctrl_tx: oneshot::Sender<OutputDeliveryCtrl>,
     ) {
         // Create the instance state and output delivery controller
         let (inst_state, output_delivery_ctrl) =
-            InstanceState::new(instance_id, username, arguments).await;
+            InstanceState::new(instance_id, username, arguments, py_runtime_dir.as_deref()).await;
 
         let output_delivery = if detached {
             OutputDelivery::Buffered
@@ -917,7 +1013,7 @@ impl Runtime {
         let result = async {
             let mut store = Store::new(&engine, inst_state);
 
-            let mut linker = create_linker(&engine);
+            let mut linker = create_linker(&engine, &shared_modules);
 
             // Instantiate dependencies and register their exports in the linker
             dynamic_linking::instantiate_libraries(

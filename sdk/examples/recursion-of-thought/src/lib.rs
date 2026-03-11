@@ -61,11 +61,17 @@ fn parse_response(response: &str) -> Result<(Option<String>, Option<(String, Str
         }
     }
 
-    let branches: Vec<String> = response
-        .match_indices("<branch>")
-        .zip(response.match_indices("</branch>"))
-        .map(|((start, _), (end, _))| response[start + 8..end].trim().to_string())
-        .collect();
+    let mut branches: Vec<String> = Vec::new();
+    let mut search_from = 0;
+    while let Some(start) = response[search_from..].find("<branch>") {
+        let abs_start = search_from + start + 8; // past "<branch>"
+        if let Some(end) = response[abs_start..].find("</branch>") {
+            branches.push(response[abs_start..abs_start + end].trim().to_string());
+            search_from = abs_start + end + 9; // past "</branch>"
+        } else {
+            break; // unclosed tag — truncated output
+        }
+    }
 
     if branches.len() == 2 {
         Ok((None, Some((branches[0].clone(), branches[1].clone()))))

@@ -1,9 +1,9 @@
 pub mod core;
 pub mod image;
 
+pub mod actor;
 pub mod adapter;
 pub mod zo;
-pub mod actor;
 
 use wasmtime::component::HasSelf;
 
@@ -12,20 +12,20 @@ wasmtime::component::bindgen!({
     world: "imports",
     with: {
         "wasi:io/poll": wasmtime_wasi::p2::bindings::io::poll,
-        "inferlet:core/common/blob-result": core::BlobResult,
-        "inferlet:core/common/model": core::Model,
-        "inferlet:core/common/queue": core::Queue,
-        "inferlet:core/common/blob": core::Blob,
-        "inferlet:core/common/debug-query-result": core::DebugQueryResult,
-        "inferlet:core/common/synchronization-result": core::SynchronizationResult,
-        "inferlet:core/message/subscription": core::message::Subscription,
-        "inferlet:core/message/receive-result": core::message::ReceiveResult,
-        "inferlet:core/forward/forward-pass": core::forward::ForwardPass,
-        "inferlet:core/forward/forward-pass-result": core::forward::ForwardPassResult,
-        "inferlet:core/tokenize/tokenizer": core::tokenize::Tokenizer,
-        "inferlet:actor/common/global-context": actor::GlobalContext,
-        "inferlet:actor/common/adapter": actor::Adapter,
-        "inferlet:actor/common/optimizer": actor::Optimizer,
+        "inferlet:core/common.blob-result": core::BlobResult,
+        "inferlet:core/common.model": core::Model,
+        "inferlet:core/common.queue": core::Queue,
+        "inferlet:core/common.blob": core::Blob,
+        "inferlet:core/common.debug-query-result": core::DebugQueryResult,
+        "inferlet:core/common.synchronization-result": core::SynchronizationResult,
+        "inferlet:core/message.subscription": core::message::Subscription,
+        "inferlet:core/message.receive-result": core::message::ReceiveResult,
+        "inferlet:core/forward.forward-pass": core::forward::ForwardPass,
+        "inferlet:core/forward.forward-pass-result": core::forward::ForwardPassResult,
+        "inferlet:core/tokenize.tokenizer": core::tokenize::Tokenizer,
+        "inferlet:actor/common.global-context": actor::GlobalContext,
+        "inferlet:actor/common.adapter": actor::Adapter,
+        "inferlet:actor/common.optimizer": actor::Optimizer,
     },
     imports: { default: async | trappable },
     exports: { default: async },

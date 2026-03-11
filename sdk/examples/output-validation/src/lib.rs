@@ -3,7 +3,7 @@
 //! This example shows how to evaluate the likelihood of different candidate outputs
 //! given a context.
 
-use inferlet::{Args, Context, Result, anyhow};
+use inferlet::{Args, Context, Result};
 use std::time::Instant;
 
 const HELP: &str = "\
@@ -101,26 +101,13 @@ async fn main(mut args: Args) -> Result<()> {
     let model = inferlet::get_auto_model();
     let mut ctx = model.create_context();
 
-    if !model.get_name().starts_with("llama-3") {
-        return Err(anyhow!(
-            "Output validation example is only implemented for Llama 3 models. Got: {}",
-            model.get_name()
-        ));
-    }
-
-    // 1. Set up the initial context (the "prompt")
+    // 1. Set up the initial context using model-agnostic chat formatting
     let prompt = "The name of the person in the report is ";
-    ctx.fill("<|begin_of_text|>");
-    ctx.fill(
-        "<|start_header_id|>system<|end_header_id|>\n\n\
-        You are an expert at information extraction.<|eot_id|>",
+    ctx.fill_system("You are an expert at information extraction.");
+    ctx.fill_user(
+        "From the sentence \"The financial report was prepared by David Chen.\", \
+        extract the person's name.",
     );
-    ctx.fill(&format!(
-        "<|start_header_id|>user<|end_header_id|>\n\n\
-        From the sentence \"The financial report was prepared by David Chen.\", \
-        extract the person's name.<|eot_id|>"
-    ));
-    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
     ctx.fill(prompt);
     ctx.flush().await;
 

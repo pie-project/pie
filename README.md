@@ -34,7 +34,7 @@ pip install "pie-server[metal]"  # macOS
 ```bash
 git clone https://github.com/pie-project/pie.git && cd pie/pie
 
-# Recommended: use uv to sync (options: cu126, cu128, cu130, metal)
+# Recommended: use uv to sync (options: cu126, cu128, metal)
 uv sync --extra cu128
 ```
 

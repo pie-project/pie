@@ -128,7 +128,7 @@ install_bakery() {
 
 install_componentize_py() {
     log "Installing componentize-py ..."
-    uv tool install "componentize-py>=0.19" --quiet
+    uv tool install "factored-componentize-py>=0.20.3" --quiet
     if command -v componentize-py &>/dev/null; then
         log "componentize-py: installed"
     else
