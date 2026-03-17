@@ -1734,17 +1734,21 @@ fn manifest_program_name(table: &toml::Table) -> Result<ProgramName> {
 
 /// Extracts the dependencies from a parsed manifest.
 ///
-/// The optional "dependencies" field in the [package] section is an array of strings
-/// in the format "name@version". Returns an empty vector if no dependencies are specified.
+/// The optional [dependencies] section is a table of key-value pairs where each key is
+/// the dependency name and the value is its version string. Returns an empty vector if
+/// no dependencies are specified.
 fn get_manifest_dependencies(table: &toml::Table) -> Vec<ProgramName> {
     table
-        .get("package")
-        .and_then(|p| p.as_table())
-        .and_then(|p| p.get("dependencies"))
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(ProgramName::parse))
+        .get("dependencies")
+        .and_then(|d| d.as_table())
+        .map(|deps| {
+            deps.iter()
+                .filter_map(|(name, version)| {
+                    version.as_str().map(|v| ProgramName {
+                        name: name.clone(),
+                        version: v.to_string(),
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default()
