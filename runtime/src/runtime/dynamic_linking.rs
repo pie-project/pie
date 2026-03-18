@@ -977,6 +977,49 @@ fn register_component_exports(
 ) -> Result<(), wasmtime::Error> {
     let component_type = linker.substituted_component_type(library_component)?;
 
+    // First pass: collect ALL defined resource types across all interfaces of this component.
+    // A resource is "defined" in an interface if it has constructors, methods, or static methods
+    // there. Resources that appear via `use other-interface.{type}` are NOT defined — they are
+    // re-exported aliases and must reuse the proxy registered in their defining interface.
+    let mut component_defined_resource_types: Vec<ResourceType> = Vec::new();
+
+    for (_, export_item) in component_type.exports(engine) {
+        if let ComponentItem::ComponentInstance(instance_type) = export_item {
+            let mut resource_types_by_name: HashMap<String, ResourceType> = HashMap::new();
+            let mut defined_names: HashSet<String> = HashSet::new();
+
+            for (name, item) in instance_type.exports(engine) {
+                match item {
+                    ComponentItem::Resource(rt) => {
+                        resource_types_by_name.insert(name.to_string(), rt);
+                    }
+                    ComponentItem::ComponentFunc(_) => {
+                        match FuncCategory::from_name(&name) {
+                            FuncCategory::Constructor { resource_name }
+                            | FuncCategory::Method { resource_name }
+                            | FuncCategory::StaticMethod { resource_name } => {
+                                defined_names.insert(resource_name);
+                            }
+                            FuncCategory::FreeFunction => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            for name in &defined_names {
+                if let Some(rt) = resource_types_by_name.get(name) {
+                    if !component_defined_resource_types.contains(rt) {
+                        component_defined_resource_types.push(*rt);
+                    }
+                }
+            }
+        }
+    }
+
+    let component_defined_resource_types = Arc::new(component_defined_resource_types);
+
+    // Second pass: register exports for each interface, passing the component-wide set.
     for (interface_name, export_item) in component_type.exports(engine) {
         if let ComponentItem::ComponentInstance(instance_type) = export_item {
             register_interface_exports(
@@ -986,6 +1029,7 @@ fn register_component_exports(
                 &interface_name,
                 &instance_type,
                 library_instance,
+                &component_defined_resource_types,
             )?;
         }
     }
@@ -1001,6 +1045,7 @@ fn register_interface_exports(
     interface_name: &str,
     instance_type: &ComponentInstanceType,
     library_instance: Instance,
+    component_defined_resource_types: &Arc<Vec<ResourceType>>,
 ) -> Result<(), wasmtime::Error> {
     let (_, interface_idx) = library_instance
         .get_export(&mut *store, None, interface_name)
@@ -1019,42 +1064,14 @@ fn register_interface_exports(
         ))
     })?;
 
+    // First, collect all resources and functions without registering anything.
     let mut resource_type_by_name: HashMap<String, ResourceType> = HashMap::new();
     let mut functions = Vec::new();
 
-    // Loop through the interface's exports. For each exported resource, create a host-defined
-    // proxy resource and register it with the linker. For each exported function, collect
-    // them to register them later.
     for (export_name, export_item) in instance_type.exports(engine) {
         match export_item {
             ComponentItem::Resource(resource_type) => {
-                let resource_name = export_name.to_string();
-                resource_type_by_name.insert(resource_name, resource_type);
-
-                // Register a host-defined proxy resource with the same name as the exported
-                // resource. The destructor of the proxy resource will forward the call to the
-                // library instance.
-                inst.resource_async(
-                    export_name,
-                    ResourceType::host::<ProxyResource>(),
-                    move |mut store, rep| {
-                        Box::new(async move {
-                            // Look up and remove the guest resource from the resource map
-                            let guest_resource = store
-                                .data_mut()
-                                .remove_dynamic_resource_mapping(rep)
-                                .ok_or_else(|| {
-                                    wasmtime::Error::msg(format!(
-                                        "Guest resource not found for rep={}",
-                                        rep
-                                    ))
-                                })?;
-
-                            // Call the destructor of the guest resource
-                            guest_resource.resource_drop_async(&mut store).await
-                        })
-                    },
-                )?;
+                resource_type_by_name.insert(export_name.to_string(), resource_type);
             }
             ComponentItem::ComponentFunc(func_type) => {
                 functions.push((export_name.to_string(), func_type));
@@ -1064,7 +1081,7 @@ fn register_interface_exports(
     }
 
     // Identify resources that this interface defines.
-    // Imported resources will not appear in constructor/method/static patterns.
+    // Resources imported via `use` will not have constructor/method/static patterns here.
     let mut defined_resource_names: HashSet<String> = HashSet::new();
     for (func_name, _func_type) in functions.iter() {
         match FuncCategory::from_name(func_name) {
@@ -1077,18 +1094,42 @@ fn register_interface_exports(
         }
     }
 
-    // Convert defined resource names to `ResourceType` handles
-    let mut defined_resource_types: Vec<ResourceType> = Vec::new();
-    for resource_name in &defined_resource_names {
-        if let Some(resource_type) = resource_type_by_name.get(resource_name) {
-            defined_resource_types.push(*resource_type);
+    // Only register proxy resources for resources DEFINED in this interface.
+    // Resources that appear via `use other-interface.{type}` must NOT get a new proxy
+    // definition — they reuse the proxy already registered in their defining interface.
+    // Registering a second proxy would create an incompatible resource type, causing
+    // handle type mismatches when the caller passes a handle obtained from the original
+    // interface.
+    for (resource_name, _resource_type) in &resource_type_by_name {
+        if !defined_resource_names.contains(resource_name) {
+            continue;
         }
+
+        inst.resource_async(
+            resource_name,
+            ResourceType::host::<ProxyResource>(),
+            move |mut store, rep| {
+                Box::new(async move {
+                    let guest_resource = store
+                        .data_mut()
+                        .remove_dynamic_resource_mapping(rep)
+                        .ok_or_else(|| {
+                            wasmtime::Error::msg(format!(
+                                "Guest resource not found for rep={}",
+                                rep
+                            ))
+                        })?;
+
+                    guest_resource.resource_drop_async(&mut store).await
+                })
+            },
+        )?;
     }
-    let defined_resource_types = Arc::new(defined_resource_types);
 
     // Register forwarding implementations for each function.
+    // Use the component-wide defined resource types so that resources defined in ANY
+    // interface of this component are correctly translated between proxy and guest handles.
     for (func_name, func_type) in functions {
-        // Look up the function.
         let (_, func_idx) = library_instance
             .get_export(&mut *store, Some(&interface_idx), &func_name)
             .ok_or_else(|| {
@@ -1106,7 +1147,6 @@ fn register_interface_exports(
                 ))
             })?;
 
-        // Collect argument and return types.
         let arg_types: Arc<Vec<Type>> = Arc::new(func_type.params().map(|(_, ty)| ty).collect());
         let return_types: Arc<Vec<Type>> = Arc::new(func_type.results().collect());
 
@@ -1116,7 +1156,7 @@ fn register_interface_exports(
             func,
             arg_types,
             return_types,
-            defined_resource_types.clone(),
+            component_defined_resource_types.clone(),
         )?;
     }
 
