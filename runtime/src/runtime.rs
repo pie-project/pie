@@ -1015,6 +1015,21 @@ impl Runtime {
         py_runtime_dir: Option<PathBuf>,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
+        // Collect the full request body before passing to the WASM handler.
+        // hyper's Incoming body uses a zero-capacity channel that requires
+        // sender and receiver to poll in the same task. Since the WASM handler
+        // runs in a spawned task, we must buffer the body here to avoid a
+        // cross-task deadlock for requests larger than ~16KB.
+        let (parts, body) = req.into_parts();
+        let collected = http_body_util::BodyExt::collect(body)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read request body: {e}"))?;
+        let buffered_body = http_body_util::BodyExt::map_err(
+            http_body_util::Full::new(collected.to_bytes()),
+            |never: std::convert::Infallible| -> hyper::Error { match never {} },
+        );
+        let req = hyper::Request::from_parts(parts, buffered_body);
+
         let inst_id = Uuid::new_v4();
         let (inst_state, _output_delivery_ctrl) =
             InstanceState::new(inst_id, username, arguments, py_runtime_dir.as_deref()).await;
