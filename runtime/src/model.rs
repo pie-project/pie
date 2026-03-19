@@ -680,9 +680,16 @@ impl Model {
             Ok(batch_resp) => {
                 let mut resp_iter = batch_resp.results.into_iter();
                 for (_, resp_tx) in requests {
+                    // Always advance the iterator to stay aligned with the
+                    // Python-side response array, which contains one entry per
+                    // request regardless of whether the request expects output.
+                    // Flush requests (resp_tx = None) still produce a response
+                    // in the batch; skipping them here would shift all
+                    // subsequent responses by one.
+                    let resp = resp_iter.next();
                     if let Some(tx) = resp_tx {
-                        if let Some(resp) = resp_iter.next() {
-                            tx.send(resp).ok();
+                        if let Some(r) = resp {
+                            tx.send(r).ok();
                         }
                     }
                 }

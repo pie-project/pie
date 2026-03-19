@@ -386,28 +386,29 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
             (request, svc_id, queue_id, priority)
         };
 
-        if returns_output {
-            let (tx, rx) = oneshot::channel();
+        // Always create a response channel so every request participates in
+        // the batch response protocol.  Without this, flush (no output) and
+        // decode (with output) in the same batch cause response misalignment:
+        // Python returns N responses for N requests, but the old code only
+        // advanced the response iterator for requests with a sender, shifting
+        // all subsequent responses by one.
+        //
+        // For flush requests (returns_output=false), the SDK still gets a
+        // pollable ForwardPassResult.  The inferlet awaits it, which ensures
+        // the batch's GPU forward pass completes before fork() proceeds —
+        // preventing KV write races with forked contexts.
+        let (tx, rx) = oneshot::channel();
+        let req = Request::ForwardPass(request, Some(tx));
+        submit_request(svc_id, queue_id, priority, req)?;
 
-            let req = Request::ForwardPass(request, Some(tx));
+        let res = ForwardPassResult {
+            receiver: rx,
+            distributions: vec![],
+            tokens: vec![],
+            done: false,
+        };
 
-            submit_request(svc_id, queue_id, priority, req)?;
-
-            let res = ForwardPassResult {
-                receiver: rx,
-                distributions: vec![],
-                tokens: vec![],
-                done: false,
-            };
-
-            Ok(Some(self.ctx().table.push(res)?))
-        } else {
-            let req = Request::ForwardPass(request, None);
-
-            submit_request(svc_id, queue_id, priority, req)?;
-
-            Ok(None)
-        }
+        Ok(Some(self.ctx().table.push(res)?))
     }
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {
         self.ctx().table.delete(this)?;
