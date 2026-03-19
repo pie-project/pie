@@ -140,10 +140,10 @@ impl Context {
     /// Creates a safe, copy-on-write fork of the context.
     ///
     /// This method creates a new context that shares the immutable history of the current
-    /// one. If the last KV-cache page is not full, its tokens are moved to the
-    /// `token_ids_pending` buffer of the new context to be recomputed, ensuring state isolation.
-    ///
-    /// This function will flush any pending tokens in the current context before forking.
+    /// one. If the last KV-cache page is not full (or full but with no pending tokens),
+    /// recomputed, ensuring state isolation. If the source context has at least one
+    /// committed or pending token, the forked context will have at least one pending
+    /// seed token for subsequent generation.
     pub fn fork(&self) -> Self {
         let (
             new_tokens,
@@ -152,8 +152,13 @@ impl Context {
             new_kv_page_last_len,
             new_pos_ids,
             new_mask_pending,
-        ) = if self.kv_page_last_len == self.kv_page_size {
-            // Easy case: the last page is full, we can share everything.
+        ) = if self.kv_page_last_len == self.kv_page_size
+            && !self.token_ids_pending.is_empty()
+        {
+            // Easy case: the last page is full and there are pending tokens,
+            // so we can share everything. When pending is empty we must fall
+            // through to the hard case, which moves the last page's tokens
+            // back into pending so that decode_step() can see seed tokens.
             (
                 self.token_ids.clone(),
                 self.token_ids_pending.clone(),
