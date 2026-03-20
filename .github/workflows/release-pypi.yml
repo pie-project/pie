@@ -72,7 +72,7 @@ jobs:
           manylinux: auto
           before-script-linux: |
             if command -v yum &> /dev/null; then yum install -y openssl-devel pkgconfig perl-IPC-Cmd; else apt-get update && apt-get install -y libssl-dev pkg-config; fi
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-x86_64
           path: ${{ needs.setup.outputs.package_path }}/dist
@@ -95,7 +95,7 @@ jobs:
           manylinux: auto
           before-script-linux: |
             if command -v yum &> /dev/null; then yum install -y openssl-devel pkgconfig perl-IPC-Cmd; else apt-get update && apt-get install -y libssl-dev pkg-config; fi
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-aarch64
           path: ${{ needs.setup.outputs.package_path }}/dist
@@ -115,7 +115,7 @@ jobs:
           target: aarch64-apple-darwin
           args: --release --out dist
           working-directory: ${{ needs.setup.outputs.package_path }}
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-macos-aarch64
           path: ${{ needs.setup.outputs.package_path }}/dist
@@ -134,7 +134,7 @@ jobs:
         with:
           args: --release --out dist
           working-directory: ${{ needs.setup.outputs.package_path }}
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-windows
           path: ${{ needs.setup.outputs.package_path }}/dist
@@ -151,7 +151,7 @@ jobs:
           command: sdist
           args: --out dist
           working-directory: ${{ needs.setup.outputs.package_path }}
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
           path: ${{ needs.setup.outputs.package_path }}/dist
@@ -173,7 +173,7 @@ jobs:
         run: pip install build
       - name: Build package
         run: python -m build ${{ needs.setup.outputs.package_path }}
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-python
           path: ${{ needs.setup.outputs.package_path }}/dist
