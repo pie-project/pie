@@ -75,6 +75,9 @@ def load_config(
         ),
         # Include telemetry configuration from [telemetry] section
         "telemetry": config.get("telemetry", {}),
+        "python_snapshot": engine_section.get(
+            "python_snapshot", config.get("python_snapshot", True)
+        ),
     }
 
     model_configs = config.get("model", [])

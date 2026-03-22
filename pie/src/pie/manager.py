@@ -120,6 +120,7 @@ def start_engine_and_backend(
         telemetry_enabled=telemetry_config.get("enabled", False),
         telemetry_endpoint=telemetry_config.get("endpoint", "http://localhost:4317"),
         telemetry_service_name=telemetry_config.get("service_name", "pie-runtime"),
+        python_snapshot=engine_config.get("python_snapshot", True),
     )
 
     # FFI MODE: Queue-based communication for high throughput

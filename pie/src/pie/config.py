@@ -29,6 +29,9 @@ port = 8080
 # Authentication
 enable_auth = false
 
+# Runtime snapshot optimization
+python_snapshot = true
+
 # Model configuration (can have multiple [[model]] sections)
 [[model]]
 # HuggingFace model repository

@@ -1278,8 +1278,8 @@ impl<T: Send + 'static> Invoker for HostInvoker<T> {
 pub(super) async fn snapshot_component<T: Send + 'static>(
     engine: &Engine,
     original_bytes: &[u8],
-    linker: &Linker<T>,
-    make_store: &(dyn Fn(&Engine) -> Result<Store<T>> + Send + Sync),
+    linker: Linker<T>,
+    mut store: Store<T>,
 ) -> Result<Vec<u8>> {
     let (instrumented_bytes, instrumentation) = instrument(original_bytes)?;
 
@@ -1289,8 +1289,6 @@ pub(super) async fn snapshot_component<T: Send + 'static>(
 
     let instrumented_component =
         Component::new(engine, &instrumented_bytes).context("compiling instrumented component")?;
-
-    let mut store = make_store(engine)?;
 
     let instance = linker
         .instantiate_async(&mut store, &instrumented_component)

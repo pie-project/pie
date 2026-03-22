@@ -36,8 +36,8 @@ static COMMAND_DISPATCHER: OnceLock<CommandDispatcher<Command>> = OnceLock::new(
 
 /// Starts the runtime service. A daemon task will be spawned to handle the
 /// commands dispatched from other services.
-pub fn start_service(engine: Engine) {
-    let runtime = Runtime::new(engine);
+pub fn start_service(engine: Engine, python_snapshot: bool) {
+    let runtime = Runtime::new(engine, python_snapshot);
     runtime.start(&COMMAND_DISPATCHER);
 }
 
@@ -172,6 +172,8 @@ struct CompiledProgram {
     dependencies: Vec<ProgramHash>,
     /// Optional python runtime version requirement (from manifest `[runtime] python-runtime`)
     python_runtime: Option<String>,
+    /// Whether this component was successfully snapshotted (and thus needs stripped shared modules)
+    snapshotted: bool,
 }
 
 /// Holds the “global” or “runtime” data that the controller needs to manage
@@ -200,6 +202,9 @@ struct Runtime {
 
     /// Path to the py-runtime directory (~/.pie/py-runtime), if it exists
     py_runtime_dir: Option<PathBuf>,
+
+    /// Whether to apply snapshot optimization for Python components
+    python_snapshot: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -539,7 +544,7 @@ fn create_linker(engine: &Engine, shared_modules: &[(String, Module)]) -> Linker
 }
 
 impl Runtime {
-    fn new(engine: Engine) -> Self {
+    fn new(engine: Engine, python_snapshot: bool) -> Self {
         let py_runtime_dir = {
             let dir = crate::path::get_py_runtime_dir();
             if dir.is_dir() {
@@ -575,6 +580,7 @@ impl Runtime {
             shared_modules: Arc::new(shared_modules),
             stripped_shared_modules: Arc::new(stripped_shared_modules),
             py_runtime_dir,
+            python_snapshot,
         }
     }
 
@@ -589,6 +595,13 @@ impl Runtime {
         }
     }
 
+    fn is_program_snapshotted(&self, program_hash: &ProgramHash) -> bool {
+        self.compiled_programs
+            .get(program_hash)
+            .map(|entry| entry.value().snapshotted)
+            .unwrap_or(false)
+    }
+
     async fn load_program(
         &self,
         program_hash: ProgramHash,
@@ -597,29 +610,33 @@ impl Runtime {
         python_runtime: Option<String>,
         wasm_bytes: Option<Vec<u8>>,
     ) {
-        // Perform snapshot optimization if the program requires a Python runtime,
-        // otherwise use the original component.
-        let final_component = if python_runtime.is_some() {
+        // Perform snapshot optimization if the program requires a Python runtime
+        // and python_snapshot is enabled, otherwise use the original component.
+        let (final_component, snapshotted) = if python_runtime.is_some() && self.python_snapshot {
             if let Some(original_bytes) = wasm_bytes {
-                match self.snapshot_python_component(&original_bytes).await {
-                    Ok(snapshotted) => snapshotted,
+                match self
+                    .snapshot_python_component(&original_bytes, &dependencies)
+                    .await
+                {
+                    Ok(snapshotted) => (snapshotted, true),
                     Err(e) => {
                         tracing::error!("Snapshot failed, falling back to original component: {e}");
-                        component
+                        (component, false)
                     }
                 }
             } else {
                 tracing::warn!("Python component missing wasm_bytes for snapshot, using original");
-                component
+                (component, false)
             }
         } else {
-            component
+            (component, false)
         };
 
         let compiled_program = CompiledProgram {
             component: final_component,
             dependencies,
             python_runtime,
+            snapshotted,
         };
         self.compiled_programs
             .insert(program_hash, compiled_program);
@@ -630,29 +647,48 @@ impl Runtime {
     async fn snapshot_python_component(
         &self,
         original_bytes: &[u8],
+        dependencies: &[ProgramHash],
     ) -> Result<Component, RuntimeError> {
         let engine = self.engine.clone();
-        let shared_modules = self.shared_modules.clone();
         let py_runtime_dir = self.py_runtime_dir.clone();
 
-        let linker = create_linker(&engine, &shared_modules);
+        let mut linker = create_linker(&engine, &self.shared_modules);
 
-        let make_store = move |engine: &Engine| -> anyhow::Result<Store<InstanceState>> {
-            let (inst_state, _output_delivery_ctrl) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(InstanceState::new(
-                    Uuid::new_v4(),
-                    "snapshot".to_string(),
-                    vec![],
-                    py_runtime_dir.as_deref(),
-                ))
-            });
-            Ok(Store::new(engine, inst_state))
-        };
+        let dependency_components: Vec<Component> = dependencies
+            .iter()
+            .filter_map(|dep_hash| {
+                self.compiled_programs
+                    .get(dep_hash)
+                    .map(|entry| entry.component.clone())
+            })
+            .collect();
+
+        let (inst_state, _output_delivery_ctrl) = InstanceState::new(
+            Uuid::new_v4(),
+            "snapshot".to_string(),
+            vec![],
+            py_runtime_dir.as_deref(),
+        )
+        .await;
+        let mut store = Store::new(&engine, inst_state);
+
+        dynamic_linking::instantiate_libraries(
+            &engine,
+            &mut linker,
+            &mut store,
+            dependency_components,
+        )
+        .await
+        .map_err(|e| {
+            RuntimeError::Other(format!(
+                "Failed to instantiate dependencies for snapshot: {e}"
+            ))
+        })?;
 
         let snapshotted_bytes =
-            snapshot::snapshot_component(&engine, original_bytes, &linker, &make_store)
+            snapshot::snapshot_component(&engine, original_bytes, linker, store)
                 .await
-                .map_err(|e| RuntimeError::Other(format!("Snapshot failed: {e}")))?;
+                .map_err(|e| RuntimeError::Other(format!("Snapshot failed: {e:#}")))?;
 
         Component::new(&engine, &snapshotted_bytes).map_err(|e| {
             RuntimeError::Other(format!("Failed to compile snapshotted component: {e}"))
@@ -758,11 +794,17 @@ impl Runtime {
         let (dependency_components, python_runtime) =
             self.collect_dependencies_topo_order(&program_hash)?;
 
+        // Use stripped shared modules only if the program was actually snapshotted.
+        // If snapshot failed and we fell back to the original component, we need
+        // full shared modules (with data segments and start sections).
+        let snapshotted = self.is_program_snapshotted(&program_hash);
         let (shared_modules, py_runtime_dir) = if python_runtime.is_some() {
-            (
-                self.stripped_shared_modules.clone(),
-                self.py_runtime_dir.clone(),
-            )
+            let modules = if snapshotted {
+                self.stripped_shared_modules.clone()
+            } else {
+                self.shared_modules.clone()
+            };
+            (modules, self.py_runtime_dir.clone())
         } else {
             (Arc::new(Vec::new()), None)
         };
@@ -877,11 +919,14 @@ impl Runtime {
         let (dependency_components, python_runtime) =
             self.collect_dependencies_topo_order(&program_hash)?;
 
+        let snapshotted = self.is_program_snapshotted(&program_hash);
         let (shared_modules, py_runtime_dir) = if python_runtime.is_some() {
-            (
-                self.stripped_shared_modules.clone(),
-                self.py_runtime_dir.clone(),
-            )
+            let modules = if snapshotted {
+                self.stripped_shared_modules.clone()
+            } else {
+                self.shared_modules.clone()
+            };
+            (modules, self.py_runtime_dir.clone())
         } else {
             (Arc::new(Vec::new()), None)
         };
