@@ -12,7 +12,7 @@ Get from zero to generating text in under 5 minutes.
 
 Make sure you have:
 - Pie installed ([Installation Guide](../installation/index.mdx))
-- A model downloaded (`pie model download meta-llama/Llama-3.2-1B-Instruct`)
+- A model downloaded (`pie model download Qwen/Qwen3-0.6B`)
 - Configuration initialized (`pie config init`)
 
 ## Run Your First Prompt
@@ -28,7 +28,7 @@ You should see output like:
 ```
 ╭─ Pie Run ─────────────────────────────────────╮
 │ Inferlet       text-completion                │
-│ Model          meta-llama/Llama-3.2-1B-Instruct │
+│ Model          Qwen/Qwen3-0.6B                  │
 │ Device         cuda:0                         │
 ╰───────────────────────────────────────────────╯
 
@@ -67,7 +67,7 @@ port = 8080             # Server port
 enable_auth = true      # Require authentication
 
 [[model]]
-hf_repo = "meta-llama/Llama-3.2-1B-Instruct"
+hf_repo = "Qwen/Qwen3-0.6B"
 device = ["cuda:0"]     # GPU(s) to use
 ```
 

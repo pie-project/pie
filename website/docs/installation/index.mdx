@@ -48,16 +48,16 @@ This creates `~/.pie/config.toml` with default settings.
 
 ## Download a Model
 
-Download a model from HuggingFace:
+Download the default model from HuggingFace:
 
 ```bash
-pie model download meta-llama/Llama-3.2-1B-Instruct
+pie model download Qwen/Qwen3-0.6B
 ```
 
 Or use any compatible model:
 
 ```bash
-pie model download Qwen/Qwen2.5-0.5B-Instruct
+pie model download meta-llama/Llama-3.2-1B-Instruct
 ```
 
 ## Verify Installation
@@ -83,7 +83,7 @@ port = 8080
 enable_auth = true
 
 [[model]]
-hf_repo = "meta-llama/Llama-3.2-1B-Instruct"
+hf_repo = "Qwen/Qwen3-0.6B"
 device = ["cuda:0"]
 ```
 
