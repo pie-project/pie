@@ -45,7 +45,38 @@ use pyo3::types::PyBytes;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::oneshot;
+
+/// Check if IPC timing instrumentation is enabled (cached after first check).
+/// Always returns false when the `ipc-profiling` feature is not enabled.
+#[inline]
+pub fn ipc_timing_enabled() -> bool {
+    #[cfg(not(feature = "ipc-profiling"))]
+    { false }
+    #[cfg(feature = "ipc-profiling")]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("PIE_IPC_TIMING").is_ok())
+    }
+}
+
+/// Get current wall-clock time in nanoseconds since UNIX epoch.
+/// Returns 0 when the `ipc-profiling` feature is not enabled.
+#[inline]
+pub fn wall_clock_nanos() -> u64 {
+    #[cfg(not(feature = "ipc-profiling"))]
+    { 0 }
+    #[cfg(feature = "ipc-profiling")]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+    }
+}
 
 /// Request message sent from Rust to Python
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +91,9 @@ pub struct IpcRequest {
 pub struct IpcResponse {
     pub request_id: u64,
     pub payload: Vec<u8>,
+    /// Wall-clock nanos when respond() called tx.send() (for IPC transit timing)
+    #[serde(default)]
+    pub send_wall_nanos: u64,
 }
 
 /// Channel endpoints sent from Rust to Python during connection setup
@@ -77,7 +111,7 @@ pub struct IpcChannels {
 pub struct FfiIpcBackend {
     /// Sender for Rust → Python requests (wrapped in Mutex for Sync safety)
     request_tx: Mutex<IpcSender<IpcRequest>>,
-    /// Receiver for Python → Rust responses  
+    /// Receiver for Python → Rust responses
     response_rx: Arc<Mutex<IpcReceiver<IpcResponse>>>,
     /// Pending response channels
     pending: Arc<dashmap::DashMap<u64, oneshot::Sender<Vec<u8>>>>,
@@ -89,6 +123,9 @@ pub struct FfiIpcBackend {
     group_id: usize,
     /// Whether connection is established
     connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Wall-clock nanos when handler thread completes oneshot send — shared with call()
+    /// for tokio wakeup delay measurement
+    handler_done_nanos: Arc<AtomicU64>,
 }
 
 impl FfiIpcBackend {
@@ -172,14 +209,9 @@ impl FfiIpcBackend {
             server_name: server_name.clone(),
             group_id,
             connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handler_done_nanos: Arc::new(AtomicU64::new(0)),
         };
-        
-        // We need a way to send `channels` to Python. Let's use a second channel.
-        // Actually we can store it and let Python fetch via a different mechanism.
-        //
-        // For now, let me just serialize the channels to a file that Python can read.
-        // This is a hacky but simple approach.
-        
+
         Ok((backend, server_name))
     }
     
@@ -210,7 +242,11 @@ impl FfiIpcBackend {
         let response_rx_clone = Arc::clone(&response_rx_for_handler);
         let pending: Arc<dashmap::DashMap<u64, oneshot::Sender<Vec<u8>>>> = Arc::new(dashmap::DashMap::new());
         let pending_clone = Arc::clone(&pending);
-        
+
+        // Shared timestamp for cross-thread timing (handler → call() tokio wakeup)
+        let handler_done_nanos = Arc::new(AtomicU64::new(0));
+        let handler_done_nanos_clone = Arc::clone(&handler_done_nanos);
+
         // Spawn thread to handle connection AND start response handler
         std::thread::spawn(move || {
             // Wait for Python to connect and send us a sender
@@ -218,15 +254,39 @@ impl FfiIpcBackend {
                 // Python sent us a sender, use it to send the channels
                 if channels_tx.send(channels).is_ok() {
                     connected_clone.store(true, Ordering::SeqCst);
-                    
+
                     // Start response handler in this thread (blocking receive loop)
                     loop {
                         let rx = response_rx_clone.lock().unwrap();
                         match rx.recv() {
                             Ok(response) => {
+                                let t_recv = Instant::now();
+                                let recv_wall_nanos = wall_clock_nanos();
                                 drop(rx); // Release lock before processing
+
+                                // Compute IPC transit time using timestamp embedded in the response
+                                let ipc_transit_us = if response.send_wall_nanos > 0 {
+                                    recv_wall_nanos.saturating_sub(response.send_wall_nanos) as f64 / 1000.0
+                                } else {
+                                    f64::NAN
+                                };
+
                                 if let Some((_, tx)) = pending_clone.remove(&response.request_id) {
+                                    let t_lookup = Instant::now();
                                     let _ = tx.send(response.payload);
+                                    let t_sent = Instant::now();
+
+                                    // Store wall-clock time after oneshot send for tokio wakeup measurement
+                                    handler_done_nanos_clone.store(wall_clock_nanos(), Ordering::Release);
+
+                                    if ipc_timing_enabled() {
+                                        eprintln!(
+                                            "[RESP-HANDLER] ipc_transit={:.3}ms lookup={:.3}ms oneshot_send={:.3}ms",
+                                            ipc_transit_us / 1000.0,
+                                            t_lookup.duration_since(t_recv).as_micros() as f64 / 1000.0,
+                                            t_sent.duration_since(t_lookup).as_micros() as f64 / 1000.0,
+                                        );
+                                    }
                                 }
                             }
                             Err(_) => break, // Channel closed
@@ -235,7 +295,7 @@ impl FfiIpcBackend {
                 }
             }
         });
-        
+
         let backend = Self {
             request_tx: Mutex::new(request_tx),
             response_rx: response_rx_for_handler,
@@ -244,6 +304,7 @@ impl FfiIpcBackend {
             server_name: server_name.clone(),
             group_id,
             connected,
+            handler_done_nanos,
         };
         
         Ok((backend, server_name))
@@ -273,15 +334,38 @@ impl FfiIpcBackend {
     fn spawn_response_handler(&self) {
         let response_rx = Arc::clone(&self.response_rx);
         let pending = Arc::clone(&self.pending);
-        
+        let handler_done_nanos = Arc::clone(&self.handler_done_nanos);
+
         std::thread::spawn(move || {
             loop {
                 let rx = response_rx.lock().unwrap();
                 match rx.recv() {
                     Ok(response) => {
+                        let t_recv = Instant::now();
+                        let recv_wall_nanos = wall_clock_nanos();
                         drop(rx); // Release lock before processing
+
+                        let ipc_transit_us = if response.send_wall_nanos > 0 {
+                            recv_wall_nanos.saturating_sub(response.send_wall_nanos) as f64 / 1000.0
+                        } else {
+                            f64::NAN
+                        };
+
                         if let Some((_, tx)) = pending.remove(&response.request_id) {
+                            let t_lookup = Instant::now();
                             let _ = tx.send(response.payload);
+                            let t_sent = Instant::now();
+
+                            handler_done_nanos.store(wall_clock_nanos(), Ordering::Release);
+
+                            if ipc_timing_enabled() {
+                                eprintln!(
+                                    "[RESP-HANDLER] ipc_transit={:.3}ms lookup={:.3}ms oneshot_send={:.3}ms",
+                                    ipc_transit_us / 1000.0,
+                                    t_lookup.duration_since(t_recv).as_micros() as f64 / 1000.0,
+                                    t_sent.duration_since(t_lookup).as_micros() as f64 / 1000.0,
+                                );
+                            }
                         }
                     }
                     Err(_) => break, // Channel closed
@@ -293,25 +377,49 @@ impl FfiIpcBackend {
     /// Send a request to Python and await response (async)
     pub async fn call(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        
+
         let request = IpcRequest {
             request_id,
             method: method.to_string(),
             payload,
         };
-        
+
         // Create response channel
         let (response_tx, response_rx) = oneshot::channel();
         self.pending.insert(request_id, response_tx);
-        
+
         // Send request (scope ensures lock is dropped before await)
         {
             let tx = self.request_tx.lock().unwrap();
             tx.send(request)?;
         }
-        
-        // Await response
-        response_rx.await.map_err(|_| anyhow::anyhow!("Response channel closed"))
+
+        // Await response with tokio wakeup timing
+        let t_before_await = Instant::now();
+        let result = response_rx.await.map_err(|_| anyhow::anyhow!("Response channel closed"))?;
+        let t_after_await = Instant::now();
+
+        if ipc_timing_enabled() {
+            let await_ms = t_after_await.duration_since(t_before_await).as_micros() as f64 / 1000.0;
+
+            // Compute tokio wakeup delay: time between handler's oneshot send and our await returning
+            let handler_done = self.handler_done_nanos.load(Ordering::Acquire);
+            let after_await_wall = wall_clock_nanos();
+            let tokio_wakeup_us = if handler_done > 0 {
+                after_await_wall.saturating_sub(handler_done) as f64 / 1000.0
+            } else {
+                f64::NAN
+            };
+
+            eprintln!(
+                "[CALL-TIMING] req={} await={:.3}ms tokio_wakeup={:.3}ms",
+                request_id,
+                await_ms,
+                tokio_wakeup_us / 1000.0,
+            );
+        }
+
+        Ok(result)
     }
     
     /// Get server name for Python to connect
@@ -453,12 +561,28 @@ impl FfiIpcQueue {
     
     /// Send a response back to Rust for the given request ID.
     fn respond(&self, request_id: u64, response: &[u8]) -> PyResult<bool> {
+        let t0 = Instant::now();
         let tx = self.response_tx.lock().unwrap();
+        let t_lock = Instant::now();
+        let send_wall_nanos = wall_clock_nanos();
         tx.send(IpcResponse {
             request_id,
             payload: response.to_vec(),
+            send_wall_nanos,
         })
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{:?}", e)))?;
+        let t_sent = Instant::now();
+
+        if ipc_timing_enabled() {
+            eprintln!(
+                "[RESPOND] lock={:.3}ms send={:.3}ms total={:.3}ms bytes={}",
+                t_lock.duration_since(t0).as_micros() as f64 / 1000.0,
+                t_sent.duration_since(t_lock).as_micros() as f64 / 1000.0,
+                t_sent.duration_since(t0).as_micros() as f64 / 1000.0,
+                response.len(),
+            );
+        }
+
         Ok(true)
     }
     

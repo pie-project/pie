@@ -56,9 +56,39 @@ impl Pollable for ForwardPassResult {
             return;
         }
 
+        #[cfg(feature = "ipc-profiling")]
+        let t_wait_start = std::time::Instant::now();
+        #[cfg(feature = "ipc-profiling")]
+        let poll_start_nanos = crate::model::ffi_ipc::wall_clock_nanos();
+
         if let Ok(res) = (&mut self.receiver).await {
             self.distributions = res.dists;
             self.tokens = res.tokens;
+
+            #[cfg(feature = "ipc-profiling")]
+            if crate::model::ffi_ipc::ipc_timing_enabled() {
+                let t_received = std::time::Instant::now();
+                let recv_wall_nanos = crate::model::ffi_ipc::wall_clock_nanos();
+
+                let dispatch_nanos = crate::model::BATCH_DISPATCH_NANOS
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let sched_us = if dispatch_nanos > 0 {
+                    recv_wall_nanos.saturating_sub(dispatch_nanos) as f64 / 1000.0
+                } else { f64::NAN };
+
+                let submit_nanos = crate::model::SUBMIT_REQUEST_NANOS
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let wasm_code_us = if submit_nanos > 0 && submit_nanos > poll_start_nanos {
+                    (submit_nanos - poll_start_nanos) as f64 / 1000.0
+                } else { f64::NAN };
+
+                eprintln!(
+                    "[POLL-TIMING] wait={:.2}ms sched={:.3}ms wasm_code={:.3}ms",
+                    t_received.duration_since(t_wait_start).as_micros() as f64 / 1000.0,
+                    sched_us / 1000.0,
+                    wasm_code_us / 1000.0,
+                );
+            }
         }
 
         self.done = true;
