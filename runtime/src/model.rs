@@ -27,6 +27,15 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{self, JoinHandle};
 
+// Profiling: wall-clock timestamps shared between tasks for scheduling measurement.
+// Only written/read when cfg!(feature = "ipc-profiling") gates are active.
+#[doc(hidden)]
+pub static BATCH_DISPATCH_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[doc(hidden)]
+pub static SUBMIT_REQUEST_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 // Re-export SchedulerConfig for public API
 pub use batching::SchedulerConfig;
 
@@ -510,6 +519,20 @@ impl Model {
                 }
             }
 
+            // Process completions that arrived while we were blocked on req_rx.recv().
+            // Without this, in_flight_counts can be stale (previous batch completed but
+            // not yet accounted for), causing should_fire() to delay firing by one
+            // scheduler poll interval (~2ms due to tokio timer granularity).
+            while let Ok((batch_size, tokens_in_batch, latency, group_id)) = completion_rx.try_recv() {
+                if group_id < num_groups {
+                    if in_flight_counts[group_id] > 0 {
+                        in_flight_counts[group_id] -= 1;
+                    }
+                    let mut sched = scheduler.lock().unwrap();
+                    sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
+                }
+            }
+
             // Check all groups for firing
             let mut fired_any = false;
             for group_id in 0..num_groups {
@@ -544,7 +567,7 @@ impl Model {
                     let completion_tx_clone = completion_tx.clone();
                     let batch_size = batch_len;
                     let tokens_in_batch = total_tok;
-                    
+
                     tokio::spawn(async move {
                          let start_time = Instant::now();
                          Self::execute_forward_pass_batch(&backend_clone, batch_to_fire, group_id, REQUEST_TIMEOUT).await;
@@ -672,26 +695,49 @@ impl Model {
             batch_req.set_trace_context(traceparent);
         }
 
+        #[cfg(feature = "ipc-profiling")]
+        let t_before_call = Instant::now();
         let result: Result<BatchedForwardPassResponse, _> = backend
             .call_with_timeout("fire_batch", &batch_req, timeout)
             .await;
+        #[cfg(feature = "ipc-profiling")]
+        let t_after_call = Instant::now();
 
         match result {
             Ok(batch_resp) => {
+                #[cfg(feature = "ipc-profiling")]
+                let t_before_dispatch = Instant::now();
                 let mut resp_iter = batch_resp.results.into_iter();
                 for (_, resp_tx) in requests {
-                    // Always advance the iterator to stay aligned with the
-                    // Python-side response array, which contains one entry per
-                    // request regardless of whether the request expects output.
-                    // Flush requests (resp_tx = None) still produce a response
-                    // in the batch; skipping them here would shift all
-                    // subsequent responses by one.
                     let resp = resp_iter.next();
                     if let Some(tx) = resp_tx {
                         if let Some(r) = resp {
                             tx.send(r).ok();
                         }
                     }
+                }
+                #[cfg(feature = "ipc-profiling")]
+                let t_dispatched = Instant::now();
+
+                #[cfg(feature = "ipc-profiling")]
+                BATCH_DISPATCH_NANOS.store(
+                    ffi_ipc::wall_clock_nanos(),
+                    std::sync::atomic::Ordering::Release,
+                );
+
+                #[cfg(feature = "ipc-profiling")]
+                if ffi_ipc::ipc_timing_enabled() {
+                    let submit_nanos = SUBMIT_REQUEST_NANOS.load(std::sync::atomic::Ordering::Acquire);
+                    let submit_to_fire_ms = if submit_nanos > 0 {
+                        ffi_ipc::wall_clock_nanos().saturating_sub(submit_nanos) as f64 / 1_000_000.0
+                    } else { f64::NAN };
+
+                    eprintln!(
+                        "[STEP-PROFILE] {{\"call_ms\":{:.3},\"dispatch_ms\":{:.3},\"submit_to_fire_ms\":{:.3}}}",
+                        t_after_call.duration_since(t_before_call).as_micros() as f64 / 1000.0,
+                        t_dispatched.duration_since(t_before_dispatch).as_micros() as f64 / 1000.0,
+                        submit_to_fire_ms,
+                    );
                 }
             }
             Err(e) => {
@@ -718,6 +764,12 @@ impl Model {
                 } else {
                     0
                 };
+
+                #[cfg(feature = "ipc-profiling")]
+                SUBMIT_REQUEST_NANOS.store(
+                    ffi_ipc::wall_clock_nanos(),
+                    std::sync::atomic::Ordering::Release,
+                );
 
                 if self.forward_pass_tx.send((fp_req, resp_tx, group_id)).is_err() {
                     eprintln!("[Error] Forward pass channel closed");
