@@ -48,7 +48,7 @@ curl http://localhost:8080/
 curl http://localhost:8080/wait
 
 # Echo back POST body
-curl -X POST -d "Hello, World!" http://localhost:8080/echo
+curl -X POST -d "Hello, world" http://localhost:8080/echo
 
 # Echo headers
 curl -v http://localhost:8080/echo-headers

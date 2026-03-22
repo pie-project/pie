@@ -37,6 +37,6 @@ pie-cli submit text-completion.wasm -- --prompt "What is Python?"
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `prompt` | "Hello, world!" | User prompt |
+| `prompt` | "What is the capital of France?" | User prompt |
 | `max_tokens` | 256 | Maximum tokens to generate |
 | `system` | "You are a helpful assistant." | System prompt |

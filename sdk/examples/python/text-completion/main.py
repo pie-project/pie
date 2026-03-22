@@ -16,7 +16,7 @@ from inferlet import Context, get_auto_model, get_arguments, set_return
 def main() -> None:
     # Parse arguments
     args = get_arguments()
-    prompt = args.get("prompt", "Hello, world!")
+    prompt = args.get("prompt", "What is the capital of France?")
     max_tokens = int(args.get("max_tokens", 256))
     system_prompt = args.get("system", "You are a helpful assistant.")
 

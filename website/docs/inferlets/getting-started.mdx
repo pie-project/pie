@@ -167,7 +167,7 @@ The code below creates a simple text-completion inferlet. It reads a prompt from
       // Parse command-line arguments with defaults
       let prompt: String = args
           .value_from_str(["-p", "--prompt"])
-          .unwrap_or("Hello, world!".to_string());
+          .unwrap_or("What is the capital of France?".to_string());
       let max_tokens: usize = args.value_from_str(["-n", "--max-tokens"]).unwrap_or(256);
 
       // Load the model and create a generation context
@@ -198,7 +198,7 @@ The code below creates a simple text-completion inferlet. It reads a prompt from
   def main() -> None:
       # Parse arguments passed via `pie run ... -- --prompt "..."`
       args = get_arguments()
-      prompt = args.get("prompt", "Hello, world!")
+      prompt = args.get("prompt", "What is the capital of France?")
       max_tokens = int(args.get("max_tokens", 256))
 
       # Load the model configured on the server
@@ -226,7 +226,7 @@ The code below creates a simple text-completion inferlet. It reads a prompt from
 
   // Parse arguments passed via `pie run ... -- --prompt "..."`
   const args = getArguments();
-  const prompt = (args.prompt as string) ?? 'Hello, world!';
+  const prompt = (args.prompt as string) ?? 'What is the capital of France?';
   const maxTokens = Number(args.maxTokens ?? 256);
 
   // Load model and create a generation context

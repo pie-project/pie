@@ -63,7 +63,7 @@ Inferlets use **top-level await**. Import the APIs you need from `'inferlet'`:
 import { Context, getAutoModel, getArguments, send } from 'inferlet';
 
 const args = getArguments();
-const prompt = (args.prompt as string) ?? 'Hello, world!';
+const prompt = (args.prompt as string) ?? 'What is the capital of France?';
 
 const model = getAutoModel();
 const ctx = new Context(model);

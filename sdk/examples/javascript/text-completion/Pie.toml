@@ -9,6 +9,6 @@ core = "^0.2.0"
 mcp = "^0.2.0"
 
 [parameters]
-prompt = {type = "string", optional = true, description = "The user message to complete (default: 'Hello, world!')"}
+prompt = {type = "string", optional = true, description = "The user message to complete (default: 'What is the capital of France?')"}
 max_tokens = {type = "int", optional = true, description = "Maximum number of tokens to generate (default: 256)"}
 system = {type = "string", optional = true, description = "System prompt to set assistant behavior"}

@@ -5,7 +5,7 @@ import { Context, getAutoModel, getArguments, send } from 'inferlet';
 
 // Get parsed arguments
 const args = getArguments();
-const prompt = (args.prompt as string) ?? 'Hello, world!';
+const prompt = (args.prompt as string) ?? 'What is the capital of France?';
 const maxTokens = Number(args.maxTokens ?? 256);
 const system = (args.system as string) ?? 'You are a helpful, respectful and honest assistant.';
 

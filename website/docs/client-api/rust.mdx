@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     // Launch an inferlet from registry
     let mut instance = client.launch_instance_from_registry(
         "text-completion".to_string(),
-        vec!["--prompt".to_string(), "Hello, world!".to_string()],
+        vec!["--prompt".to_string(), "What is the capital of France?".to_string()],
         false,  // not detached
     ).await?;
     
