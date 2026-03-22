@@ -12,6 +12,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -1015,24 +1016,26 @@ impl Runtime {
         py_runtime_dir: Option<PathBuf>,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
+        let t_start = Instant::now();
+
         // Collect the full request body before passing to the WASM handler.
-        // hyper's Incoming body uses a zero-capacity channel that requires
-        // sender and receiver to poll in the same task. Since the WASM handler
-        // runs in a spawned task, we must buffer the body here to avoid a
-        // cross-task deadlock for requests larger than ~16KB.
         let (parts, body) = req.into_parts();
         let collected = http_body_util::BodyExt::collect(body)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read request body: {e}"))?;
+        let collected_bytes = collected.to_bytes();
+        let body_len = collected_bytes.len();
         let buffered_body = http_body_util::BodyExt::map_err(
-            http_body_util::Full::new(collected.to_bytes()),
+            http_body_util::Full::new(collected_bytes),
             |never: std::convert::Infallible| -> hyper::Error { match never {} },
         );
         let req = hyper::Request::from_parts(parts, buffered_body);
+        let t_body = Instant::now();
 
         let inst_id = Uuid::new_v4();
         let (inst_state, _output_delivery_ctrl) =
             InstanceState::new(inst_id, username, arguments, py_runtime_dir.as_deref()).await;
+        let t_instance = Instant::now();
 
         let mut store = Store::new(&engine, inst_state);
         let (sender, receiver) = oneshot::channel();
@@ -1051,11 +1054,13 @@ impl Runtime {
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to instantiate dependencies: {e}"))?;
+        let t_deps = Instant::now();
 
         let instance = linker
             .instantiate_async(&mut store, &component)
             .await
             .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
+        let t_instantiate = Instant::now();
 
         let (_, serve_export) = instance
             .get_export(&mut store, None, "wasi:http/incoming-handler@0.2.4")
@@ -1071,6 +1076,19 @@ impl Runtime {
                 &handle_func_export,
             )
             .map_err(|e| RuntimeError::Other(format!("Failed to get 'handle' function: {e}")))?;
+
+        #[cfg(feature = "ipc-profiling")]
+        if crate::model::ffi_ipc::ipc_timing_enabled() {
+            eprintln!(
+                "[REQ-PROFILE] {{\"phase\":\"runtime\",\"body_ms\":{:.1},\"instance_ms\":{:.1},\"deps_ms\":{:.1},\"instantiate_ms\":{:.1},\"total_setup_ms\":{:.1},\"body_bytes\":{}}}",
+                t_body.duration_since(t_start).as_micros() as f64 / 1000.0,
+                t_instance.duration_since(t_body).as_micros() as f64 / 1000.0,
+                t_deps.duration_since(t_instance).as_micros() as f64 / 1000.0,
+                t_instantiate.duration_since(t_deps).as_micros() as f64 / 1000.0,
+                t_instantiate.duration_since(t_start).as_micros() as f64 / 1000.0,
+                body_len,
+            );
+        }
 
         let task = tokio::task::spawn(async move {
             if let Err(e) = handle_func.call_async(&mut store, (req, out)).await {
