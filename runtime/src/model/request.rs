@@ -15,6 +15,7 @@ pub static INITIALIZE_ADAPTER_ID: u32 = 5;
 pub static UPDATE_ADAPTER_ID: u32 = 6;
 pub static UPLOAD_ADAPTER_ID: u32 = 7;
 pub static DOWNLOAD_ADAPTER_ID: u32 = 8;
+pub static FORMAT_CHAT_ID: u32 = 9;
 
 #[derive(Debug)]
 pub enum Request {
@@ -31,6 +32,7 @@ pub enum Request {
     UpdateAdapter(UpdateAdapterRequest),
     UploadAdapter(UploadAdapterRequest),
     DownloadAdapter(DownloadAdapterRequest),
+    FormatChat(FormatChatRequest, oneshot::Sender<FormatChatResponse>),
 }
 
 impl Request {
@@ -53,6 +55,7 @@ impl Request {
             Request::Handshake(_, _) => true,
             Request::Query(_, _) => true,
             Request::ForwardPass(_, r) => r.is_some(),
+            Request::FormatChat(_, _) => true,
             _ => false,
         }
     }
@@ -69,6 +72,7 @@ impl Request {
             Request::UpdateAdapter(_) => UPDATE_ADAPTER_ID,
             Request::UploadAdapter(_) => UPLOAD_ADAPTER_ID,
             Request::DownloadAdapter(_) => DOWNLOAD_ADAPTER_ID,
+            Request::FormatChat(_, _) => FORMAT_CHAT_ID,
         }
     }
 
@@ -83,6 +87,7 @@ impl Request {
             Request::UpdateAdapter(req) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::UploadAdapter(req) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::DownloadAdapter(req) => Bytes::from(rmp_serde::to_vec_named(&req)?),
+            Request::FormatChat(req, _) => Bytes::from(rmp_serde::to_vec_named(&req)?),
         };
         Ok(b)
     }
@@ -102,6 +107,10 @@ impl Request {
                 if let Some(tx) = resp {
                     tx.send(r).ok();
                 }
+            }
+            Request::FormatChat(_, resp) => {
+                let r: FormatChatResponse = rmp_serde::from_slice(&b)?;
+                resp.send(r).ok();
             }
             _ => {
                 bail!("cannot deserialize response for request {:?}", self);
@@ -210,6 +219,19 @@ pub struct UploadAdapterRequest {
 pub struct DownloadAdapterRequest {
     pub adapter_ptr: u32,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormatChatRequest {
+    pub messages_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_json: Option<String>,
+    pub add_generation_prompt: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FormatChatResponse {
+    pub token_ids: Vec<u32>,
 }
 
 /// Wrapper for Vec<u32> that serializes as raw bytes for zero-copy Python deserialization.
