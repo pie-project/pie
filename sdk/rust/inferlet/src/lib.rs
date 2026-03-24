@@ -290,6 +290,24 @@ impl Queue {
         future.get().unwrap()
     }
 
+    /// Format chat messages using the server-side HF tokenizer template.
+    /// Returns token IDs. Supports tools for model-agnostic tool calling.
+    pub async fn format_chat(
+        &self,
+        messages_json: &str,
+        tools_json: Option<&str>,
+        add_generation_prompt: bool,
+    ) -> Vec<u32> {
+        let future = self.inner.format_chat(
+            messages_json,
+            tools_json,
+            add_generation_prompt,
+        );
+        let pollable = future.pollable();
+        AsyncPollable::new(pollable).wait_for().await;
+        future.get().unwrap()
+    }
+
     pub fn allocate_resources(&self, resource: Resource, count: u32) -> Vec<u32> {
         api::allocate_resources(&self.inner, resource as u32, count)
     }
