@@ -74,5 +74,5 @@ bytemuck = { version = "1.21", features = ["derive"] }
 ipc-channel = "0.19"
 
 [features]
-default = []
+default = ["ipc-profiling"]
 ipc-profiling = []  # Enable detailed per-step IPC/scheduler profiling output
