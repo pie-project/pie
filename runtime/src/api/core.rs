@@ -8,7 +8,7 @@ use crate::api::inferlet;
 use crate::api::inferlet::core::common::Priority;
 use crate::instance::InstanceState;
 use crate::model;
-use crate::model::request::{QueryRequest, QueryResponse, Request};
+use crate::model::request::{FormatChatRequest, FormatChatResponse, QueryRequest, QueryResponse, Request};
 use crate::model::resource::{ResourceId, ResourceTypeId};
 use crate::model::{ModelInfo, submit_request};
 use anyhow::Result;
@@ -51,6 +51,13 @@ pub struct DebugQueryResult {
 }
 
 #[derive(Debug)]
+pub struct FormatChatResult {
+    receiver: oneshot::Receiver<FormatChatResponse>,
+    result: Option<Vec<u32>>,
+    done: bool,
+}
+
+#[derive(Debug)]
 pub struct SynchronizationResult {
     receiver: oneshot::Receiver<()>,
     done: bool,
@@ -72,6 +79,18 @@ impl Pollable for DebugQueryResult {
         let res = (&mut self.receiver).await.unwrap();
         let res_string = res.value;
         self.result = Some(res_string);
+        self.done = true;
+    }
+}
+
+#[async_trait]
+impl Pollable for FormatChatResult {
+    async fn ready(&mut self) {
+        if self.done {
+            return;
+        }
+        let res = (&mut self.receiver).await.unwrap();
+        self.result = Some(res.token_ids);
         self.done = true;
     }
 }
@@ -342,6 +361,29 @@ impl inferlet::core::common::HostQueue for InstanceState {
         Ok(self.ctx().table.push(res)?)
     }
 
+    async fn format_chat(
+        &mut self,
+        this: Resource<Queue>,
+        messages_json: String,
+        tools_json: Option<String>,
+        add_generation_prompt: bool,
+    ) -> Result<Resource<FormatChatResult>> {
+        let (svc_id, queue_id, priority) = self.read_queue(&this)?;
+        let (tx, rx) = oneshot::channel();
+        let req = Request::FormatChat(
+            FormatChatRequest { messages_json, tools_json, add_generation_prompt },
+            tx,
+        );
+        submit_request(svc_id, queue_id, priority, req)?;
+
+        let res = FormatChatResult {
+            receiver: rx,
+            result: None,
+            done: false,
+        };
+        Ok(self.ctx().table.push(res)?)
+    }
+
     async fn drop(&mut self, this: Resource<Queue>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
@@ -366,6 +408,29 @@ impl inferlet::core::common::HostDebugQueryResult for InstanceState {
     }
 
     async fn drop(&mut self, this: Resource<DebugQueryResult>) -> Result<()> {
+        self.ctx().table.delete(this)?;
+        Ok(())
+    }
+}
+
+impl inferlet::core::common::HostFormatChatResult for InstanceState {
+    async fn pollable(
+        &mut self,
+        this: Resource<FormatChatResult>,
+    ) -> Result<Resource<DynPollable>> {
+        subscribe(self.ctx().table, this)
+    }
+
+    async fn get(&mut self, this: Resource<FormatChatResult>) -> Result<Option<Vec<u32>>> {
+        let result = self.ctx().table.get_mut(&this)?;
+        if result.done {
+            Ok(result.result.clone())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn drop(&mut self, this: Resource<FormatChatResult>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
     }

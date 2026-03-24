@@ -17,6 +17,7 @@ wasmtime::component::bindgen!({
         "inferlet:core/common.queue": core::Queue,
         "inferlet:core/common.blob": core::Blob,
         "inferlet:core/common.debug-query-result": core::DebugQueryResult,
+        "inferlet:core/common.format-chat-result": core::FormatChatResult,
         "inferlet:core/common.synchronization-result": core::SynchronizationResult,
         "inferlet:core/message.subscription": core::message::Subscription,
         "inferlet:core/message.receive-result": core::message::ReceiveResult,

@@ -8,8 +8,9 @@ pub mod tokenizer;
 
 use super::model::batching::SharedScheduler;
 use super::model::request::{
-    BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassRequest, ForwardPassResponse,
-    HandshakeRequest, HandshakeResponse, QueryRequest, QueryResponse, Request,
+    BatchedForwardPassRequest, BatchedForwardPassResponse, FormatChatRequest, FormatChatResponse,
+    ForwardPassRequest, ForwardPassResponse, HandshakeRequest, HandshakeResponse, QueryRequest,
+    QueryResponse, Request,
 };
 use super::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
 use super::model::tokenizer::BytePairEncoder;
@@ -699,6 +700,11 @@ impl Model {
         backend.call_with_timeout("query", &req, TIMEOUT).await.ok()
     }
 
+    async fn execute_format_chat(backend: &RpcBackend, req: FormatChatRequest) -> Option<FormatChatResponse> {
+        const TIMEOUT: Duration = Duration::from_secs(30);
+        backend.call_with_timeout("format_chat", &req, TIMEOUT).await.ok()
+    }
+
     pub fn submit(&self, _cmd_queue_id: CmdQueueId, _priority: u32, req: Request) {
         match req {
             Request::ForwardPass(mut fp_req, resp_tx) => {
@@ -766,6 +772,14 @@ impl Model {
             }
             Request::Handshake(_, _) => {
                 eprintln!("[Warn] Unexpected handshake request in submit");
+            }
+            Request::FormatChat(fc_req, resp_tx) => {
+                let backend_clone = self.primary_backend.clone();
+                tokio::spawn(async move {
+                    if let Some(resp) = Self::execute_format_chat(&backend_clone, fc_req).await {
+                        resp_tx.send(resp).ok();
+                    }
+                });
             }
             Request::Synchronize(tx) => {
                 tx.send(()).ok();
