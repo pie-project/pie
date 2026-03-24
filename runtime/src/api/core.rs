@@ -424,7 +424,7 @@ impl inferlet::core::common::HostFormatChatResult for InstanceState {
     async fn get(&mut self, this: Resource<FormatChatResult>) -> Result<Option<Vec<u32>>> {
         let result = self.ctx().table.get_mut(&this)?;
         if result.done {
-            Ok(result.result.clone())
+            Ok(result.result.take())
         } else {
             Ok(None)
         }
