@@ -5,6 +5,7 @@ Mirrors the Rust ChatFormatter from inferlet/src/chat.rs
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -62,7 +63,8 @@ class ChatFormatter:
             env.globals["raise_exception"] = self._raise_exception
             try:
                 self._template = env.from_string(self._template_str)
-            except Exception:
+            except Exception as e:
+                print(f"[ChatFormatter] Jinja2 template parse failed: {e}", file=sys.stderr)
                 self._template = None
 
     @staticmethod
@@ -170,7 +172,8 @@ class ChatFormatter:
                 env = Environment(loader=BaseLoader())
                 env.globals["raise_exception"] = self._raise_exception
                 active_template = env.from_string(template)
-            except Exception:
+            except Exception as e:
+                print(f"[ChatFormatter] Jinja2 override template parse failed: {e}", file=sys.stderr)
                 active_template = None
 
         # Convert messages to dict format for template
@@ -185,8 +188,8 @@ class ChatFormatter:
                     bos_token="",
                     eos_token="",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ChatFormatter] Jinja2 render failed, using fallback: {e}", file=sys.stderr)
 
         # Fallback formatting
         return self._format_fallback(messages_dict, add_generation_prompt)
@@ -340,8 +343,8 @@ class ChatFormatter:
                     bos_token="",
                     eos_token="",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ChatFormatter] Jinja2 render failed, using fallback: {e}", file=sys.stderr)
 
         # Fallback formatting
         return self._format_fallback(messages, add_generation_prompt)

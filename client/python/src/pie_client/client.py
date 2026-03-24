@@ -662,7 +662,7 @@ class PieClient:
         msg = {
             "type": "launch_server_instance",
             "port": port,
-            "program_hash": program_hash,
+            "inferlet": program_hash,
             "arguments": arguments or [],
         }
         successful, result = await self._send_msg_and_wait(msg)
