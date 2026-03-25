@@ -30,6 +30,9 @@ pub struct ForwardPass {
     output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     output_embed_ptrs: Vec<u32>,
     output_embed_indices: Vec<u32>,
+    /// Timestamp when this ForwardPass was created (for WIT boundary timing)
+    #[cfg(feature = "ipc-profiling")]
+    created_at: std::time::Instant,
 }
 
 #[derive(Debug)]
@@ -117,6 +120,8 @@ impl inferlet::core::forward::Host for InstanceState {
             output_token_samplers: vec![],
             output_embed_ptrs: vec![],
             output_embed_indices: vec![],
+            #[cfg(feature = "ipc-profiling")]
+            created_at: std::time::Instant::now(),
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -387,6 +392,11 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
             !pass.output_token_indices.is_empty()
         };
 
+        // Capture timing before mutable borrow
+        #[cfg(feature = "ipc-profiling")]
+        let _wit_created_at = self.ctx().table.get(&this).ok()
+            .map(|p| p.created_at);
+
         // 2) Build the request by MOVING data out of the pass (mutable borrow)
         let (request, svc_id, queue_id, priority) = {
             let pass = self.ctx().table.get_mut(&this)?;
@@ -427,6 +437,17 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
         // pollable ForwardPassResult.  The inferlet awaits it, which ensures
         // the batch's GPU forward pass completes before fork() proceeds —
         // preventing KV write races with forked contexts.
+        #[cfg(feature = "ipc-profiling")]
+        if crate::model::ffi_ipc::ipc_timing_enabled() {
+            if let Some(created) = _wit_created_at {
+                let build_ms = created.elapsed().as_micros() as f64 / 1000.0;
+                eprintln!(
+                    "[WIT-BUILD] build={:.3}ms kv_pages={} tokens={}",
+                    build_ms, request.kv_page_ptrs.len(), request.input_tokens.len(),
+                );
+            }
+        }
+
         let (tx, rx) = oneshot::channel();
         let req = Request::ForwardPass(request, Some(tx));
         submit_request(svc_id, queue_id, priority, req)?;
