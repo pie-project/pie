@@ -139,18 +139,13 @@ impl inferlet::core::forward::Host for InstanceState {
     async fn kv_cache(
         &mut self,
         pass: Resource<ForwardPass>,
-        mut kv_page_ptrs: Vec<ResourceId>,
+        kv_page_ptrs: Vec<ResourceId>,
         kv_page_last_len: u32,
     ) -> Result<()> {
         let svc_id = self.ctx().table.get(&pass)?.queue.service_id;
-
-        kv_page_ptrs.iter_mut().try_for_each(|kv_page_ptr| {
-            *kv_page_ptr = self.translate_resource_ptr(svc_id, KV_PAGE_TYPE_ID, *kv_page_ptr)?;
-            Ok::<_, anyhow::Error>(())
-        })?;
-
+        let translated = self.translate_kv_pages_cached(svc_id, &kv_page_ptrs)?;
         let pass = self.ctx().table.get_mut(&pass)?;
-        pass.kv_page_ptrs = kv_page_ptrs;
+        pass.kv_page_ptrs = translated;
         pass.kv_page_last_len = kv_page_last_len;
         Ok(())
     }

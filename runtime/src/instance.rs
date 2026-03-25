@@ -1,6 +1,6 @@
 use super::api::core::Queue;
 use super::utils;
-use crate::model::resource::{ResourceId, ResourceTypeId};
+use crate::model::resource::{KV_PAGE_TYPE_ID, ResourceId, ResourceTypeId};
 use crate::server::InstanceEvent;
 use anyhow::{Result, format_err};
 use bytes::Bytes;
@@ -122,6 +122,10 @@ pub struct InstanceState {
     // virtual resources
     resources: HashMap<(usize, ResourceTypeId), ResourceIdMapper>,
 
+    // Cache of translated KV page IDs to avoid redundant HashMap lookups per decode step.
+    // Keyed by service_id. Value is (virtual_ids, physical_ids) from last kv_cache() call.
+    kv_translation_cache: HashMap<usize, (Vec<ResourceId>, Vec<ResourceId>)>,
+
     // Dynamic linking state: maps host rep -> guest's ResourceAny
     dynamic_resource_map: HashMap<u32, ResourceAny>,
     // Reverse map: guest ResourceAny -> host rep (for identity preservation)
@@ -218,6 +222,7 @@ impl InstanceState {
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
             resources: HashMap::new(),
+            kv_translation_cache: HashMap::new(),
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
@@ -326,6 +331,59 @@ impl InstanceState {
             m.virtual_to_physical
         ))?;
         Ok(phys_id)
+    }
+
+    /// Translate KV page virtual IDs to physical IDs, caching translations across calls.
+    /// Only translates pages beyond the matching prefix from the previous call.
+    pub fn translate_kv_pages_cached(
+        &mut self,
+        service_id: usize,
+        kv_page_ptrs: &[ResourceId],
+    ) -> Result<Vec<ResourceId>> {
+        let mapper = self.resources
+            .get(&(service_id, KV_PAGE_TYPE_ID))
+            .ok_or_else(|| format_err!(
+                "Failed to find resource mapper for service_id: {:?}, resource_type: {:?}",
+                service_id, KV_PAGE_TYPE_ID
+            ))?;
+
+        let (cached_virt, cached_phys) = self.kv_translation_cache
+            .entry(service_id)
+            .or_insert_with(|| (Vec::new(), Vec::new()));
+
+        // Find how many leading pages match the cache
+        let prefix_len = cached_virt.len().min(kv_page_ptrs.len());
+        let mut match_len = 0;
+        for i in 0..prefix_len {
+            if kv_page_ptrs[i] == cached_virt[i] {
+                match_len = i + 1;
+            } else {
+                break;
+            }
+        }
+
+        // Build translated list: cached prefix + fresh translations for new tail
+        let mut translated = Vec::with_capacity(kv_page_ptrs.len());
+        translated.extend_from_slice(&cached_phys[..match_len]);
+        for &virt_id in &kv_page_ptrs[match_len..] {
+            translated.push(mapper.translate(virt_id).ok_or_else(|| {
+                format_err!("Failed to translate KV page ptr: {}", virt_id)
+            })?);
+        }
+
+        #[cfg(feature = "ipc-profiling")]
+        if crate::model::ffi_ipc::ipc_timing_enabled() {
+            let total = kv_page_ptrs.len();
+            let fresh = total - match_len;
+            eprintln!("[KV-CACHE] total={} cached={} fresh={}", total, match_len, fresh);
+        }
+
+        // Update cache
+        cached_virt.clear();
+        cached_virt.extend_from_slice(kv_page_ptrs);
+        *cached_phys = translated.clone();
+
+        Ok(translated)
     }
 }
 
