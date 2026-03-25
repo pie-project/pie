@@ -5,7 +5,7 @@ use crate::server::InstanceEvent;
 use anyhow::{Result, format_err};
 use bytes::Bytes;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
@@ -63,9 +63,11 @@ struct ResourceIdMapper {
     virtual_id_pool: utils::IdPool<u32>,
     /// The map from a virtual ID to its corresponding physical ID.
     virtual_to_physical: HashMap<ResourceId, ResourceId>,
-    /// Monotonically increasing counter, bumped on every map/unmap operation.
-    /// Used to invalidate translation caches when mappings change.
-    generation: u64,
+    /// Virtual IDs that were unmapped and may be recycled with different
+    /// physical mappings. Only `unmap_resources` populates this set;
+    /// `map_resources` does not (new allocations cannot collide with
+    /// existing cached translations). Consumed by the TLB on next lookup.
+    invalidated_ids: HashSet<ResourceId>,
 }
 
 impl Default for ResourceIdMapper {
@@ -73,7 +75,7 @@ impl Default for ResourceIdMapper {
         ResourceIdMapper {
             virtual_id_pool: utils::IdPool::new(u32::MAX),
             virtual_to_physical: HashMap::new(),
-            generation: 0,
+            invalidated_ids: HashSet::new(),
         }
     }
 }
@@ -95,7 +97,6 @@ impl ResourceIdMapper {
             self.virtual_to_physical.insert(virtual_id, physical_id);
         }
 
-        self.generation += 1;
         virtual_ids
     }
 
@@ -105,7 +106,7 @@ impl ResourceIdMapper {
             self.virtual_to_physical.remove(&virtual_id);
         }
         self.virtual_id_pool.release_many(virtual_ids).unwrap();
-        self.generation += 1;
+        self.invalidated_ids.extend(virtual_ids);
     }
 
     /// Translates a single virtual ID to its corresponding physical ID.
@@ -128,10 +129,9 @@ pub struct InstanceState {
     // virtual resources
     resources: HashMap<(usize, ResourceTypeId), ResourceIdMapper>,
 
-    // Cache of translated KV page IDs to avoid redundant HashMap lookups per decode step.
-    // Keyed by service_id. Value is (mapper_generation, virtual_ids, physical_ids).
-    // Cache is invalidated when mapper generation changes (any map/unmap operation).
-    kv_translation_cache: HashMap<usize, (u64, Vec<ResourceId>, Vec<ResourceId>)>,
+    // TLB: caches virtual→physical KV page translations across decode steps.
+    // Keyed by service_id. Per-page invalidation via ResourceIdMapper.invalidated_ids.
+    kv_translation_cache: HashMap<usize, (Vec<ResourceId>, Vec<ResourceId>)>,
 
     // Dynamic linking state: maps host rep -> guest's ResourceAny
     dynamic_resource_map: HashMap<u32, ResourceAny>,
@@ -340,32 +340,46 @@ impl InstanceState {
         Ok(phys_id)
     }
 
-    /// Translate KV page virtual IDs to physical IDs, caching translations across calls.
-    /// Only translates pages beyond the matching prefix from the previous call.
+    /// TLB for KV page virtual→physical translation.
+    ///
+    /// Caches translations across decode steps. Per-page invalidation:
+    /// only pages unmapped via `unmap_resources` (which may be recycled
+    /// with different physical mappings) trigger re-translation. New
+    /// allocations via `map_resources` are safe and don't invalidate.
     pub fn translate_kv_pages_cached(
         &mut self,
         service_id: usize,
         kv_page_ptrs: &[ResourceId],
     ) -> Result<Vec<ResourceId>> {
-        let mapper = self.resources
-            .get(&(service_id, KV_PAGE_TYPE_ID))
-            .ok_or_else(|| format_err!(
-                "Failed to find resource mapper for service_id: {:?}, resource_type: {:?}",
-                service_id, KV_PAGE_TYPE_ID
-            ))?;
-        let current_gen = mapper.generation;
+        // Check for per-page invalidations (from unmap_resources).
+        // Drain the set unconditionally to prevent unbounded growth.
+        let needs_full_retranslate = {
+            let mapper = self.resources
+                .get_mut(&(service_id, KV_PAGE_TYPE_ID))
+                .ok_or_else(|| format_err!(
+                    "Failed to find resource mapper for service_id: {:?}, resource_type: {:?}",
+                    service_id, KV_PAGE_TYPE_ID
+                ))?;
+            if mapper.invalidated_ids.is_empty() {
+                false
+            } else {
+                let (cached_virt, _) = self.kv_translation_cache
+                    .get(&service_id)
+                    .map(|(v, p)| (v.as_slice(), p.as_slice()))
+                    .unwrap_or((&[], &[]));
+                let hit = mapper.invalidated_ids.iter().any(|id| cached_virt.contains(id));
+                mapper.invalidated_ids.clear();
+                hit
+            }
+        };
 
-        let (cached_gen, cached_virt, cached_phys) = self.kv_translation_cache
+        let (cached_virt, cached_phys) = self.kv_translation_cache
             .entry(service_id)
-            .or_insert_with(|| (0, Vec::new(), Vec::new()));
+            .or_insert_with(|| (Vec::new(), Vec::new()));
 
-        // If any mappings changed (map/unmap), invalidate the entire cache.
-        // This handles page replacement, masking, and virtual ID recycling.
-        let gen_valid = *cached_gen == current_gen;
-
-        // Find how many leading pages match the cache (0 if generation changed)
+        // Prefix match: reuse cached translations for unchanged leading pages.
         let mut match_len = 0;
-        if gen_valid {
+        if !needs_full_retranslate {
             let prefix_len = cached_virt.len().min(kv_page_ptrs.len());
             for i in 0..prefix_len {
                 if kv_page_ptrs[i] == cached_virt[i] {
@@ -376,7 +390,12 @@ impl InstanceState {
             }
         }
 
-        // Build translated list: cached prefix + fresh translations for new tail
+        // Re-fetch mapper (immutable — split borrow released above)
+        let mapper = self.resources
+            .get(&(service_id, KV_PAGE_TYPE_ID))
+            .unwrap();
+
+        // Build translated list: cached prefix + fresh lookups for tail
         let mut translated = Vec::with_capacity(kv_page_ptrs.len());
         translated.extend_from_slice(&cached_phys[..match_len]);
         for &virt_id in &kv_page_ptrs[match_len..] {
@@ -389,12 +408,14 @@ impl InstanceState {
         if crate::model::ffi_ipc::ipc_timing_enabled() {
             let total = kv_page_ptrs.len();
             let fresh = total - match_len;
-            eprintln!("[KV-CACHE] total={} cached={} fresh={} gen_hit={}",
-                total, match_len, fresh, gen_valid);
+            eprintln!("[KV-CACHE] total={} cached={} fresh={} invalidated={}",
+                total, match_len, fresh, needs_full_retranslate);
         }
 
         // Update cache
-        *cached_gen = current_gen;
+        let (cached_virt, cached_phys) = self.kv_translation_cache
+            .get_mut(&service_id)
+            .unwrap();
         cached_virt.clear();
         cached_virt.extend_from_slice(kv_page_ptrs);
         *cached_phys = translated.clone();
