@@ -63,6 +63,9 @@ struct ResourceIdMapper {
     virtual_id_pool: utils::IdPool<u32>,
     /// The map from a virtual ID to its corresponding physical ID.
     virtual_to_physical: HashMap<ResourceId, ResourceId>,
+    /// Monotonically increasing counter, bumped on every map/unmap operation.
+    /// Used to invalidate translation caches when mappings change.
+    generation: u64,
 }
 
 impl Default for ResourceIdMapper {
@@ -70,6 +73,7 @@ impl Default for ResourceIdMapper {
         ResourceIdMapper {
             virtual_id_pool: utils::IdPool::new(u32::MAX),
             virtual_to_physical: HashMap::new(),
+            generation: 0,
         }
     }
 }
@@ -91,6 +95,7 @@ impl ResourceIdMapper {
             self.virtual_to_physical.insert(virtual_id, physical_id);
         }
 
+        self.generation += 1;
         virtual_ids
     }
 
@@ -100,6 +105,7 @@ impl ResourceIdMapper {
             self.virtual_to_physical.remove(&virtual_id);
         }
         self.virtual_id_pool.release_many(virtual_ids).unwrap();
+        self.generation += 1;
     }
 
     /// Translates a single virtual ID to its corresponding physical ID.
@@ -123,8 +129,9 @@ pub struct InstanceState {
     resources: HashMap<(usize, ResourceTypeId), ResourceIdMapper>,
 
     // Cache of translated KV page IDs to avoid redundant HashMap lookups per decode step.
-    // Keyed by service_id. Value is (virtual_ids, physical_ids) from last kv_cache() call.
-    kv_translation_cache: HashMap<usize, (Vec<ResourceId>, Vec<ResourceId>)>,
+    // Keyed by service_id. Value is (mapper_generation, virtual_ids, physical_ids).
+    // Cache is invalidated when mapper generation changes (any map/unmap operation).
+    kv_translation_cache: HashMap<usize, (u64, Vec<ResourceId>, Vec<ResourceId>)>,
 
     // Dynamic linking state: maps host rep -> guest's ResourceAny
     dynamic_resource_map: HashMap<u32, ResourceAny>,
@@ -346,19 +353,26 @@ impl InstanceState {
                 "Failed to find resource mapper for service_id: {:?}, resource_type: {:?}",
                 service_id, KV_PAGE_TYPE_ID
             ))?;
+        let current_gen = mapper.generation;
 
-        let (cached_virt, cached_phys) = self.kv_translation_cache
+        let (cached_gen, cached_virt, cached_phys) = self.kv_translation_cache
             .entry(service_id)
-            .or_insert_with(|| (Vec::new(), Vec::new()));
+            .or_insert_with(|| (0, Vec::new(), Vec::new()));
 
-        // Find how many leading pages match the cache
-        let prefix_len = cached_virt.len().min(kv_page_ptrs.len());
+        // If any mappings changed (map/unmap), invalidate the entire cache.
+        // This handles page replacement, masking, and virtual ID recycling.
+        let gen_valid = *cached_gen == current_gen;
+
+        // Find how many leading pages match the cache (0 if generation changed)
         let mut match_len = 0;
-        for i in 0..prefix_len {
-            if kv_page_ptrs[i] == cached_virt[i] {
-                match_len = i + 1;
-            } else {
-                break;
+        if gen_valid {
+            let prefix_len = cached_virt.len().min(kv_page_ptrs.len());
+            for i in 0..prefix_len {
+                if kv_page_ptrs[i] == cached_virt[i] {
+                    match_len = i + 1;
+                } else {
+                    break;
+                }
             }
         }
 
@@ -375,10 +389,12 @@ impl InstanceState {
         if crate::model::ffi_ipc::ipc_timing_enabled() {
             let total = kv_page_ptrs.len();
             let fresh = total - match_len;
-            eprintln!("[KV-CACHE] total={} cached={} fresh={}", total, match_len, fresh);
+            eprintln!("[KV-CACHE] total={} cached={} fresh={} gen_hit={}",
+                total, match_len, fresh, gen_valid);
         }
 
         // Update cache
+        *cached_gen = current_gen;
         cached_virt.clear();
         cached_virt.extend_from_slice(kv_page_ptrs);
         *cached_phys = translated.clone();
