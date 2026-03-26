@@ -170,7 +170,6 @@ def _launch_server_inferlet(
 ) -> None:
     """Upload and launch a server inferlet from a local path."""
     import asyncio
-    import blake3
     import tomllib
     from pie_client import PieClient
 
@@ -197,12 +196,8 @@ def _launch_server_inferlet(
         async with PieClient(uri) as client:
             await client.internal_authenticate(client_config["internal_auth_token"])
 
-            # Read and hash the program
-            program_bytes = path.read_bytes()
-            program_hash = blake3.blake3(program_bytes).hexdigest()
-
             # Install if needed
-            if not await client.program_exists(program_hash):
+            if not await client.program_exists(inferlet_id, wasm_path=path, manifest_path=manifest_path):
                 console.print(f"[dim]Installing {path.name} as {inferlet_id}...[/dim]")
                 await client.install_program(str(path), str(manifest_path))
 
