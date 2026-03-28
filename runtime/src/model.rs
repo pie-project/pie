@@ -487,10 +487,49 @@ impl Model {
                 prof_requests_received[group_id] += 1;
             }
 
-            // Try to accumulate more requests (non-blocking)
-            loop {
-                match req_rx.try_recv() {
-                    Ok((req, tx, group_id)) => {
+            // Drain channel into batches, with optional coalesce window.
+            //
+            // Coalesce: when a group's pipeline is empty and batch is incomplete,
+            // wait up to 2ms for more requests before firing. This prevents batch
+            // fragmentation when WASM inferlets resume with slight stagger after
+            // a batch completes.
+            //
+            // Without coalesce, the scheduler fires the first arrival immediately,
+            // producing single-request batches instead of full batches.
+            {
+                const COALESCE_WINDOW: Duration = Duration::from_millis(2);
+
+                // Compute coalesce deadline if any group needs it.
+                // Groups at capacity or with in-flight batches don't participate.
+                let deadline = (0..num_groups)
+                    .filter(|&gid| {
+                        batches[gid].len() > 0
+                            && in_flight_counts[gid] == 0
+                            && batches[gid].len() < max_batch_size
+                            && group_tokens[gid] < max_batch_tokens
+                    })
+                    .next()
+                    .map(|_| Instant::now() + COALESCE_WINDOW);
+
+                loop {
+                    let maybe_req = if let Some(dl) = deadline {
+                        let remaining = dl.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match tokio::time::timeout(remaining, req_rx.recv()).await {
+                            Ok(Some(req)) => Some(req),
+                            _ => break, // timeout or channel closed
+                        }
+                    } else {
+                        // No coalesce needed — just drain what's immediately available
+                        match req_rx.try_recv() {
+                            Ok(req) => Some(req),
+                            Err(_) => break,
+                        }
+                    };
+
+                    if let Some((req, tx, group_id)) = maybe_req {
                         let group_id = std::cmp::min(group_id, num_groups - 1);
                         {
                             let mut sched = scheduler.lock().unwrap();
@@ -501,12 +540,13 @@ impl Model {
                         batches[group_id].push((req, tx));
                         prof_requests_received[group_id] += 1;
 
-                        // Stop accumulating if THIS group hit capacity to avoid latency spikes
-                        if batches[group_id].len() >= max_batch_size || group_tokens[group_id] >= max_batch_tokens {
+                        // If this group hit capacity, stop draining
+                        if batches[group_id].len() >= max_batch_size
+                            || group_tokens[group_id] >= max_batch_tokens
+                        {
                             break;
                         }
                     }
-                    Err(_) => break,
                 }
             }
 
