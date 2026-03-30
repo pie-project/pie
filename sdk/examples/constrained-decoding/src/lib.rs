@@ -2,12 +2,11 @@
 //!
 //! This example uses the `llguidance` library to constrain model outputs to
 //! valid structured formats (e.g., JSON) by masking invalid tokens during
-//! sampling.
+//! sampling. It uses `Context::decode_step_dist` to obtain per-step token
+//! distributions, then applies the grammar mask to pick the best valid token.
 
 mod sampler;
 
-use inferlet::sampler::Sampler;
-use inferlet::stop_condition::{self, StopCondition};
 use inferlet::{Args, Result, anyhow};
 use sampler::ConstrainedSampler;
 use std::time::Instant;
@@ -34,7 +33,7 @@ const JSON_GRAMMAR: &str = r##"
 ?value: object
         | array
         | string
-        | SIGNED_NUMBER      -> number
+        | NUMBER             -> number
         | "true"             -> true
         | "false"            -> false
         | "null"             -> null
@@ -42,8 +41,8 @@ array  : "[" [value ("," value)*] "]"
 object : "{" [pair ("," pair)*] "}"
 pair   : string ":" value
 string : ESCAPED_STRING
+NUMBER : /-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?/
 %import common.ESCAPED_STRING
-%import common.SIGNED_NUMBER
 %import common.WS
 %ignore WS
 "##;
@@ -84,7 +83,7 @@ async fn main(mut args: Args) -> Result<()> {
     // directly. See the `ctx.fill` calls below for more details.
     let model_name = model.get_name();
     if !(model_name.starts_with("llama-3")
-        || model_name.starts_with("qwen-3")
+        || model_name.starts_with("Qwen/Qwen3")
         || model_name.starts_with("deepseek-r1-distill-qwen-2"))
     {
         return Err(anyhow!(
@@ -96,8 +95,8 @@ async fn main(mut args: Args) -> Result<()> {
     // Determine if we need to escape non-printable characters.
     // For example, Qwen 3 and DeepSeek R1 Distill Qwen 2 models will output "Ġ" for space, while
     // Llama 3 models will output " " for space.
-    let escape_non_printable =
-        model_name.starts_with("qwen-3") || model_name.starts_with("deepseek-r1-distill-qwen-2");
+    let escape_non_printable = model_name.starts_with("Qwen/Qwen3")
+        || model_name.starts_with("deepseek-r1-distill-qwen-2");
 
     // Find the EOS token ID for the model. This is used as a fallback when the grammar constraint
     // is not met. We need to find a single EOS token ID because the sampler outputs a single token
@@ -115,19 +114,14 @@ async fn main(mut args: Args) -> Result<()> {
     let tokenizer = model.get_tokenizer();
     let mut ctx = model.create_context();
 
-    let sampler = Box::new(ConstrainedSampler::new(
+    let constrained_sampler = ConstrainedSampler::new(
         tokenizer.get_vocabs(),
         tokenizer.get_special_tokens(),
         tokenizer.get_split_regex(),
         grammar,
         eot_token_id,
         escape_non_printable,
-    ));
-
-    let sampler = Sampler::Custom {
-        temperature: 0.0,
-        sampler,
-    };
+    );
 
     ctx.fill_system("You are a helpful, respectful and honest assistant.");
     ctx.fill_user(&prompt);
@@ -138,7 +132,7 @@ async fn main(mut args: Args) -> Result<()> {
         ctx.fill("\n\n");
     // Qwen 3 models are thinking models. We put the <think> and </think> tags here so that
     // the model can output the JSON directly.
-    } else if model_name.starts_with("qwen-3") {
+    } else if model_name.starts_with("Qwen/Qwen3") {
         ctx.fill("\n\n<think></think>\n\n");
     // DeepSeek R1 Distill Qwen 2 models are thinking models. We put the </think> tag here so that
     // the model can output the JSON directly.
@@ -146,19 +140,38 @@ async fn main(mut args: Args) -> Result<()> {
         ctx.fill("\n</think>\n\n");
     }
 
-    let stop_cond =
-        stop_condition::max_len(max_tokens).or(stop_condition::ends_with_any(model.eos_tokens()));
+    let eos_sequences = model.eos_tokens();
 
-    let output = ctx.generate(sampler, stop_cond).await;
-    let output_token_ids = tokenizer.tokenize(&output);
+    // Manual decode loop: get the full next-token distribution each step,
+    // apply the grammar mask via the ConstrainedSampler, and feed the
+    // chosen token back into the context.
+    let mut generated_token_ids = Vec::new();
+    loop {
+        let dist = ctx.decode_step_dist().await;
+        let token = constrained_sampler.sample(&dist.ids, &dist.probs);
+        ctx.fill_token(token);
+        generated_token_ids.push(token);
+
+        if generated_token_ids.len() >= max_tokens {
+            break;
+        }
+        if let Some(seq) = eos_sequences
+            .iter()
+            .find(|seq| generated_token_ids.ends_with(seq))
+        {
+            generated_token_ids.truncate(generated_token_ids.len() - seq.len());
+            break;
+        }
+    }
+    let output = tokenizer.detokenize(&generated_token_ids);
 
     println!("Output: {} (total elapsed: {:?})", output, start.elapsed());
 
     // Compute per-token latency, avoiding division by zero.
-    if !output_token_ids.is_empty() {
+    if !generated_token_ids.is_empty() {
         println!(
             "Per token latency: {:?}",
-            start.elapsed() / (output_token_ids.len() as u32)
+            start.elapsed() / (generated_token_ids.len() as u32)
         );
     }
 

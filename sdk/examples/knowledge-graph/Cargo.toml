@@ -1,0 +1,14 @@
+[package]
+name = "knowledge-graph"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet.workspace = true
+inferlet-macros.workspace = true
+serde_json.workspace = true
+petgraph = { version = "0.8", default-features = false, features = ["graphmap", "stable_graph"] }
+futures.workspace = true
