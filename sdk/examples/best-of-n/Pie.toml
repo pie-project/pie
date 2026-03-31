@@ -1,0 +1,14 @@
+[package]
+name = "best-of-n"
+version = "0.1.0"
+description = "Best-of-N generation with diversity ranking using strsim"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+question = {type = "string", optional = true, description = "The question to answer (default: a math/reasoning question)"}
+num_candidates = {type = "int", optional = true, description = "Number of candidate responses to generate in parallel (default: 5)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens per candidate generation (default: 1024)"}
