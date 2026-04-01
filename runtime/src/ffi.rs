@@ -273,16 +273,16 @@ impl PartialServerHandle {
                     PyRuntimeError::new_err("complete() already called")
                 })?
             };
-            
+
             let scheduler_config = self.scheduler_config.clone();
-            
-            self.runtime.block_on(async {
+
+            let result = self.runtime.block_on(async {
                 // Now Python workers are connected, handshake will succeed
                 let model = Model::new_with_backends(backends, scheduler_config).await
                     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create model: {}", e)))?;
-                
+
                 let model_name = model.name().to_string();
-                
+
                 // Register the model with the engine
                 let model_id = model::install_model(model_name.clone(), model);
                 if model_id.is_none() {
@@ -290,10 +290,24 @@ impl PartialServerHandle {
                         "Failed to register model '{}': already exists", model_name
                     )));
                 }
-                
+
+                // Signal that the server is ready to accept client connections
+                crate::server::mark_ready();
+
                 Ok::<(), PyErr>(())
-            })?;
-            
+            });
+
+            if result.is_err() {
+                // Shut down the server so the listener task (blocked on the
+                // readiness gate) doesn't hang forever.
+                if let Ok(mut guard) = self.shutdown_tx.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            result?;
+
             Ok(ServerHandle {
                 internal_token: self.internal_token.clone(),
                 shutdown_tx: Arc::clone(&self.shutdown_tx),
