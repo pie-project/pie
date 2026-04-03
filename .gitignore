@@ -244,4 +244,4 @@ website/.cache-loader/
 website/src/data/models.json
 
 *.pt
-*.zt
+*.zt.worktrees/
