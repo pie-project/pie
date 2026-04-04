@@ -1245,11 +1245,21 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
 
             pending = side_channel.drain_requests()
 
-            if _trace:
-                _ts_drain_done = _mono(_mono_clock)
-
             if not pending:
                 continue
+
+            # Coalesce window: after receiving the first request(s), wait
+            # briefly for more WASM instances to submit their next decode_step.
+            # Without this, max_in_flight=MAX causes Rust to fire each request
+            # individually, and Python processes reqs=1 batches serially.
+            # 0.5-1ms is enough for WASM token processing + Rust dispatch.
+            _time.sleep(0.001)  # 1ms coalesce window
+            more = side_channel.drain_requests()
+            if more:
+                pending.extend(more)
+
+            if _trace:
+                _ts_drain_done = _mono(_mono_clock)
 
             # Emit deferred timestamps (only for non-idle steps)
             if _trace:
