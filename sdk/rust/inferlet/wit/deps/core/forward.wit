@@ -97,4 +97,11 @@ interface forward {
         top-p: f32
     );
 
+    /// Budget hint: engine may run up to max-steps sequential decode steps
+    /// before returning to WASM. WASM receives all tokens at once.
+    set-max-decode-steps: func(
+        pass: borrow<forward-pass>,
+        max-steps: u32,
+    );
+
 }

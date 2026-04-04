@@ -3,8 +3,10 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
+
+fn default_one() -> u32 { 1 }
 
 pub static HANDSHAKE_ID: u32 = 0;
 
@@ -186,6 +188,14 @@ pub struct ForwardPassRequest {
     /// Arrival time for scheduler estimation (not serialized).
     #[serde(skip)]
     pub arrival_time: Option<Instant>,
+    #[serde(default = "default_one")]
+    pub max_decode_steps: u32,
+    #[serde(skip)]
+    pub multi_step_tokens: Vec<u32>,
+    #[serde(skip)]
+    pub kv_page_size: u32,
+    #[serde(skip)]
+    pub token_stream_tx: Option<mpsc::UnboundedSender<u32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +347,10 @@ pub struct BatchedForwardPassRequest {
     // Sent from Rust ResourceManager on deallocate/cleanup.
     #[serde(default, skip_serializing_if = "ByteVec::is_empty")]
     pub freed_block_ids: ByteVec,
+
+    // Budget continuation: max decode steps for the batch (max across requests).
+    #[serde(default = "default_one")]
+    pub max_decode_steps: u32,
 }
 
 impl BatchedForwardPassRequest {
@@ -368,6 +382,7 @@ impl BatchedForwardPassRequest {
             trace_context: None,
             group_id: None,
             freed_block_ids: ByteVec(Vec::new()),
+            max_decode_steps: 1,
         }
     }
 
@@ -448,6 +463,11 @@ impl BatchedForwardPassRequest {
         // Update inference mode hint
         if req.input_tokens.len() > 1 {
             self.single_token_mode = false;
+        }
+
+        // Propagate max_decode_steps (take batch-wide max)
+        if req.max_decode_steps > self.max_decode_steps {
+            self.max_decode_steps = req.max_decode_steps;
         }
 
     }

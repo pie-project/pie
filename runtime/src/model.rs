@@ -481,6 +481,11 @@ impl Model {
         // Channel for batch completions (batch_size, tokens, latency, group_id)
         let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<(usize, usize, Duration, usize)>();
 
+        // Channel for budget continuations: requests with max_decode_steps > 1
+        // are re-fired automatically without dispatching back to WASM.
+        let (continuation_tx, mut continuation_rx) =
+            mpsc::unbounded_channel::<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>();
+
         // PROFILING: Track request rates and batch firing
         let mut prof_requests_received: Vec<usize> = vec![0; num_groups];
         let mut prof_batches_fired: Vec<usize> = vec![0; num_groups];
@@ -515,6 +520,13 @@ impl Model {
                 }
             }
 
+            // Drain budget continuations into batch queues (bypasses WASM).
+            while let Ok((req, tx, group_id)) = continuation_rx.try_recv() {
+                let group_id = std::cmp::min(group_id, num_groups - 1);
+                group_tokens[group_id] += req.input_tokens.len();
+                batches[group_id].push((req, tx));
+            }
+
             let all_batches_empty = batches.iter().all(|b| b.is_empty());
 
             if all_batches_empty {
@@ -540,6 +552,13 @@ impl Model {
                             Self::trace("rs.select_wake", prof_batches_fired[0], "src=completion");
                         }
                         continue;
+                    }
+                    maybe_cont = continuation_rx.recv() => {
+                        if let Some((req, tx, group_id)) = maybe_cont {
+                            let group_id = std::cmp::min(group_id, num_groups - 1);
+                            group_tokens[group_id] += req.input_tokens.len();
+                            batches[group_id].push((req, tx));
+                        }
                     }
                     maybe_req = req_rx.recv() => {
                         match maybe_req {
@@ -645,12 +664,14 @@ impl Model {
                         );
                     }
 
+                    let continuation_tx_clone = continuation_tx.clone();
                     tokio::spawn(async move {
                          let start_time = Instant::now();
                          Self::execute_forward_pass_batch(
                              &backend_clone, batch_to_fire, group_id,
                              REQUEST_TIMEOUT,
                              trace_batch_id, batch_freed,
+                             &continuation_tx_clone,
                          ).await;
                          if Self::trace_enabled() {
                              Self::trace("rs.pre_completion", trace_batch_id,
@@ -710,6 +731,13 @@ impl Model {
                             }
                         }
                     }
+                    maybe_cont = continuation_rx.recv() => {
+                        if let Some((req, tx, group_id)) = maybe_cont {
+                            let group_id = std::cmp::min(group_id, num_groups - 1);
+                            group_tokens[group_id] += req.input_tokens.len();
+                            batches[group_id].push((req, tx));
+                        }
+                    }
                     maybe_req = req_rx.recv() => {
                         match maybe_req {
                             Some((req, tx, group_id)) => {
@@ -733,7 +761,7 @@ impl Model {
         for group_id in 0..num_groups {
             if !batches[group_id].is_empty() {
                 let batch = std::mem::take(&mut batches[group_id]);
-                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, 0, Vec::new()).await;
+                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, 0, Vec::new(), &continuation_tx).await;
             }
         }
 
@@ -772,7 +800,7 @@ impl Model {
 
     #[tracing::instrument(
         name = "rust.fire_batch",
-        skip(backend, requests, freed_block_ids),
+        skip(backend, requests, freed_block_ids, continuation_tx),
         fields(batch_size = requests.len())
     )]
     async fn execute_forward_pass_batch(
@@ -782,6 +810,7 @@ impl Model {
         timeout: Duration,
         trace_batch_id: usize,
         freed_block_ids: Vec<u32>,
+        continuation_tx: &mpsc::UnboundedSender<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>,
     ) {
         let _t_entry = if Self::sched_tracing_enabled() { Some(Self::mono_ns()) } else { None };
 
@@ -828,13 +857,67 @@ impl Model {
         match result {
             Ok(batch_resp) => {
                 let mut resp_iter = batch_resp.results.into_iter();
-                for (_fp_req, resp_tx) in requests {
+                let mut pending_continuations: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)> = Vec::new();
+
+                for (mut fp_req, resp_tx) in requests {
                     let resp = resp_iter.next();
-                    if let Some(tx) = resp_tx {
-                        if let Some(r) = resp {
-                            tx.send(r).ok();
+
+                    if fp_req.max_decode_steps > 1 {
+                        // Budget continuation: accumulate token, re-enqueue.
+                        if let Some(ref r) = resp {
+                            if let Some(&token) = r.tokens.first() {
+                                // Stream token to WASM immediately
+                                let cancelled = if let Some(ref tx) = fp_req.token_stream_tx {
+                                    tx.send(token).is_err()
+                                } else {
+                                    false
+                                };
+
+                                fp_req.multi_step_tokens.push(token);
+                                fp_req.max_decode_steps -= 1;
+
+                                if !cancelled && fp_req.max_decode_steps > 0 {
+                                    // Build continuation: single-token decode
+                                    fp_req.kv_page_last_len += 1;
+                                    if fp_req.kv_page_size > 0
+                                        && fp_req.kv_page_last_len > fp_req.kv_page_size
+                                    {
+                                        fp_req.kv_page_last_len = 1;
+                                    }
+                                    let next_pos = fp_req.input_token_positions.last()
+                                        .map(|&p| p + 1).unwrap_or(0);
+                                    let ctx_len: u32 = fp_req.mask.last()
+                                        .map(|m| m.iter().copied().sum()).unwrap_or(0);
+                                    fp_req.input_tokens = vec![token];
+                                    fp_req.input_token_positions = vec![next_pos];
+                                    fp_req.mask = vec![vec![ctx_len + 1]];
+                                    fp_req.output_token_indices = vec![0];
+                                    pending_continuations.push((fp_req, resp_tx, group_id));
+                                    continue;
+                                }
+                            }
+                        }
+                        // Budget exhausted or cancelled: deliver all tokens to WASM
+                        drop(fp_req.token_stream_tx.take());
+                        if let Some(tx) = resp_tx {
+                            tx.send(ForwardPassResponse {
+                                tokens: fp_req.multi_step_tokens,
+                                dists: resp.map(|r| r.dists).unwrap_or_default(),
+                            }).ok();
+                        }
+                    } else {
+                        // No budget: dispatch directly (single-step)
+                        if let Some(tx) = resp_tx {
+                            if let Some(r) = resp {
+                                tx.send(r).ok();
+                            }
                         }
                     }
+                }
+
+                // Send continuations in bulk
+                for cont in pending_continuations {
+                    continuation_tx.send(cont).ok();
                 }
 
                 if Self::trace_enabled() {

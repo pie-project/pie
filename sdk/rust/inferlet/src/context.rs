@@ -503,6 +503,55 @@ impl Context {
         sampled
     }
 
+    /// Decode up to N tokens with one WASM yield. The engine runs N single-step
+    /// GPU passes server-side, delivering all tokens at once.
+    ///
+    /// Returns 1..=max_steps tokens. The last token is NOT committed — caller
+    /// must call `fill_token(last_token)`, same contract as `decode_step`.
+    ///
+    /// No KV page pre-allocation — engine allocates one-at-a-time during continuation.
+    /// Requires engine-side sampling (not Custom sampler).
+    pub async fn decode_n(&mut self, sampler: &Sampler, max_steps: u32) -> Vec<u32> {
+        if max_steps <= 1 {
+            let token = self.decode_step(sampler).await;
+            return vec![token];
+        }
+
+        if let Sampler::Custom { .. } = sampler {
+            panic!(
+                "decode_n with max_steps > 1 requires engine-side sampling, \
+                 not Custom sampler. Use decode_step for Custom sampling."
+            );
+        }
+
+        let (p, pending_token_ids, position_ids) = self.prepare_forward_pass(sampler);
+        p.set_max_decode_steps(max_steps);
+
+        let res = p.execute().await;
+        let tokens = res.tokens.unwrap_or_default();
+
+        let last_pos_id = position_ids.first().copied().unwrap_or(0);
+
+        // Commit pending tokens to context (same as decode_step)
+        self.token_ids.extend(&pending_token_ids);
+        self.position_ids.extend(&position_ids);
+
+        // Commit all generated tokens EXCEPT the last one.
+        let commit_count = tokens.len().saturating_sub(1);
+        for (i, &token) in tokens[..commit_count].iter().enumerate() {
+            self.token_ids.push(token);
+            self.position_ids
+                .push(last_pos_id + pending_token_ids.len() as u32 + i as u32);
+        }
+
+        // Update mask for committed tokens
+        for _ in 0..(pending_token_ids.len() + commit_count) {
+            self.token_mask_current.append(false);
+        }
+
+        tokens
+    }
+
     /// Shared forward-pass setup for decode_step.
     /// Consumes pending tokens, grows KV pages, builds mask, configures
     /// adapter and sampler on the forward pass.

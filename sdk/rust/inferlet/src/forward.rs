@@ -194,6 +194,47 @@ impl Forward for Queue {
 }
 
 impl ForwardPass {
+    pub fn set_max_decode_steps(&self, max_steps: u32) {
+        api::forward::set_max_decode_steps(&self.inner, max_steps);
+    }
+
+    /// Execute and stream tokens one at a time via callback.
+    /// Returns false from callback to cancel early.
+    pub async fn execute_stream<F: FnMut(u32) -> bool>(&self, mut on_token: F) -> ForwardPassResult {
+        if let Some(future) = self.inner.execute() {
+            loop {
+                let pollable = future.pollable();
+                AsyncPollable::new(pollable).wait_for().await;
+
+                match future.get_tokens() {
+                    Some(tokens) if !tokens.is_empty() => {
+                        for &t in &tokens {
+                            if !on_token(t) {
+                                return ForwardPassResult {
+                                    distributions: None,
+                                    tokens: Some(tokens),
+                                };
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        let mut dists = Vec::new();
+                        if let Some(distributions) = future.get_distributions() {
+                            for (ids, probs) in distributions {
+                                dists.push(Distribution { ids, probs });
+                            }
+                        }
+                        let distributions = if dists.is_empty() { None } else { Some(dists) };
+                        return ForwardPassResult { distributions, tokens: None };
+                    }
+                }
+            }
+        } else {
+            ForwardPassResult { distributions: None, tokens: None }
+        }
+    }
+
     pub async fn execute(&self) -> ForwardPassResult {
         if let Some(future) = self.inner.execute() {
             // Single iteration: get tokens, then done.
