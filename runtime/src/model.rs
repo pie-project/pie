@@ -481,21 +481,10 @@ impl Model {
         // Channel for batch completions (batch_size, tokens, latency, group_id)
         let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<(usize, usize, Duration, usize)>();
 
-        // Channel for multi-step continuations: re-enqueued requests bypass
-        // WASM and coalesce, going directly back into the batch queue.
-        let (continuation_tx, mut continuation_rx) =
-            mpsc::unbounded_channel::<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>();
-
-
         // PROFILING: Track request rates and batch firing
         let mut prof_requests_received: Vec<usize> = vec![0; num_groups];
         let mut prof_batches_fired: Vec<usize> = vec![0; num_groups];
         let mut prof_last_report = Instant::now();
-
-        // Track whether each group's pending batch contains new (non-continuation) requests.
-        // When a batch has ONLY continuations, skip the coalesce window since there's
-        // no benefit in waiting for more arrivals — the continuations are already ready.
-        let mut group_has_new_requests: Vec<bool> = vec![false; num_groups];
 
         loop {
             if Self::trace_enabled() {
@@ -526,26 +515,6 @@ impl Model {
                 }
             }
 
-            // Drain multi-step continuations into batch queues (bypasses WASM).
-            {
-                let mut cont_count = 0u32;
-                while let Ok((req, tx, group_id)) = continuation_rx.try_recv() {
-                    let group_id = std::cmp::min(group_id, num_groups - 1);
-                    group_tokens[group_id] += req.input_tokens.len();
-                    batches[group_id].push((req, tx));
-                    cont_count += 1;
-                }
-                if cont_count > 0 {
-                    if Self::trace_enabled() {
-                        Self::trace("rs.cont_drain_done", prof_batches_fired[0],
-                            &format!("n={}", cont_count));
-                    }
-                    if Self::sched_tracing_enabled() {
-                        eprintln!("[SCHED-CONT-DRAIN] t={} drained={}", Self::mono_ns(), cont_count);
-                    }
-                }
-            }
-
             let all_batches_empty = batches.iter().all(|b| b.is_empty());
 
             if all_batches_empty {
@@ -570,18 +539,7 @@ impl Model {
                         if Self::trace_enabled() {
                             Self::trace("rs.select_wake", prof_batches_fired[0], "src=completion");
                         }
-                        continue; // re-check — continuation drain at top of loop
-                    }
-                    maybe_cont = continuation_rx.recv() => {
-                        if let Some((req, tx, group_id)) = maybe_cont {
-                            let group_id = std::cmp::min(group_id, num_groups - 1);
-                            group_tokens[group_id] += req.input_tokens.len();
-                            batches[group_id].push((req, tx));
-                        }
-                        if Self::trace_enabled() {
-                            Self::trace("rs.select_wake", prof_batches_fired[0], "src=continuation");
-                        }
-                        continue; // skip the req_rx add below
+                        continue;
                     }
                     maybe_req = req_rx.recv() => {
                         match maybe_req {
@@ -594,7 +552,7 @@ impl Model {
                                 }
                                 group_tokens[group_id] += req.input_tokens.len();
                                 batches[group_id].push((req, tx));
-                                group_has_new_requests[group_id] = true;
+
                                 prof_requests_received[group_id] += 1;
                             }
                             None => break,
@@ -616,7 +574,6 @@ impl Model {
                     }
                     group_tokens[group_id] += req.input_tokens.len();
                     batches[group_id].push((req, tx));
-                    group_has_new_requests[group_id] = true;
                     prof_requests_received[group_id] += 1;
                 }
             }
@@ -654,7 +611,7 @@ impl Model {
                     // Fire!
                     let batch_to_fire = std::mem::take(&mut batches[group_id]);
                     group_tokens[group_id] = 0;
-                    group_has_new_requests[group_id] = false;
+
                     in_flight_counts[group_id] += 1;
                     fired_any = true;
                     prof_batches_fired[group_id] += 1;
@@ -672,7 +629,6 @@ impl Model {
                     // Spawn batch execution using group-specific backend
                     let backend_clone = backends[group_id].clone();
                     let completion_tx_clone = completion_tx.clone();
-                    let continuation_tx_clone = continuation_tx.clone();
                     let batch_size = batch_len;
                     let tokens_in_batch = total_tok;
                     // Python's _batch_counter is 0-based; prof_batches_fired is post-increment
@@ -693,7 +649,7 @@ impl Model {
                          let start_time = Instant::now();
                          Self::execute_forward_pass_batch(
                              &backend_clone, batch_to_fire, group_id,
-                             REQUEST_TIMEOUT, &continuation_tx_clone,
+                             REQUEST_TIMEOUT,
                              trace_batch_id, batch_freed,
                          ).await;
                          if Self::trace_enabled() {
@@ -754,13 +710,6 @@ impl Model {
                             }
                         }
                     }
-                    maybe_cont = continuation_rx.recv() => {
-                        if let Some((req, tx, group_id)) = maybe_cont {
-                            let group_id = std::cmp::min(group_id, num_groups - 1);
-                            group_tokens[group_id] += req.input_tokens.len();
-                            batches[group_id].push((req, tx));
-                        }
-                    }
                     maybe_req = req_rx.recv() => {
                         match maybe_req {
                             Some((req, tx, group_id)) => {
@@ -784,7 +733,7 @@ impl Model {
         for group_id in 0..num_groups {
             if !batches[group_id].is_empty() {
                 let batch = std::mem::take(&mut batches[group_id]);
-                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, &continuation_tx, 0, Vec::new()).await;
+                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, 0, Vec::new()).await;
             }
         }
 
@@ -823,7 +772,7 @@ impl Model {
 
     #[tracing::instrument(
         name = "rust.fire_batch",
-        skip(backend, requests, continuation_tx, freed_block_ids),
+        skip(backend, requests, freed_block_ids),
         fields(batch_size = requests.len())
     )]
     async fn execute_forward_pass_batch(
@@ -831,7 +780,6 @@ impl Model {
         requests: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>,
         group_id: usize,
         timeout: Duration,
-        continuation_tx: &mpsc::UnboundedSender<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>,
         trace_batch_id: usize,
         freed_block_ids: Vec<u32>,
     ) {
@@ -879,92 +827,18 @@ impl Model {
 
         match result {
             Ok(batch_resp) => {
-                // Collect all continuations FIRST, then send them in bulk.
-                // This prevents tokio from interleaving the scheduler loop
-                // between individual sends, which causes batch fragmentation
-                // (scheduler fires reqs=1 before all continuations arrive).
-                let mut pending_continuations: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)> = Vec::new();
-
                 let mut resp_iter = batch_resp.results.into_iter();
-                for (mut fp_req, resp_tx) in requests {
+                for (_fp_req, resp_tx) in requests {
                     let resp = resp_iter.next();
-
-                    if fp_req.max_decode_steps > 1 || !fp_req.multi_step_tokens.is_empty() {
-                        // Multi-step: accumulate token(s), re-enqueue or finish.
-                        if let Some(ref r) = resp {
-                            if r.tokens.len() > 1 {
-                                // Stream all tokens at once if Python returned multiple
-                                if let Some(ref tx) = fp_req.token_stream_tx {
-                                    for &t in &r.tokens {
-                                        if tx.send(t).is_err() { break; }
-                                    }
-                                }
-                                fp_req.multi_step_tokens.extend(&r.tokens);
-                                fp_req.max_decode_steps = 0;
-                            } else if let Some(&token) = r.tokens.first() {
-                                // Stream this token immediately to WASM
-                                let cancelled = if let Some(ref tx) = fp_req.token_stream_tx {
-                                    tx.send(token).is_err() // WASM dropped receiver = cancel
-                                } else {
-                                    false
-                                };
-
-                                fp_req.multi_step_tokens.push(token);
-                                fp_req.max_decode_steps -= 1;
-
-                                if !cancelled && fp_req.max_decode_steps > 0 {
-                                    fp_req.kv_page_last_len += 1;
-                                    if fp_req.kv_page_size > 0
-                                        && fp_req.kv_page_last_len > fp_req.kv_page_size
-                                    {
-                                        fp_req.kv_page_last_len = 1;
-                                    }
-                                    let next_pos = fp_req.input_token_positions.last()
-                                        .map(|&p| p + 1).unwrap_or(0);
-                                    let ctx_len: u32 = fp_req.mask.last()
-                                        .map(|m| m.iter().copied().sum()).unwrap_or(0);
-                                    fp_req.input_tokens = vec![token];
-                                    fp_req.input_token_positions = vec![next_pos];
-                                    fp_req.mask = vec![vec![ctx_len + 1]];
-                                    fp_req.output_token_indices = vec![0];
-                                    if Self::sched_tracing_enabled() {
-                                        eprintln!("[MS-REQUEUE] t={} step={} remaining={} token={}",
-                                            Self::mono_ns(), fp_req.multi_step_tokens.len(),
-                                            fp_req.max_decode_steps, token);
-                                    }
-                                    pending_continuations.push((fp_req, resp_tx, group_id));
-                                    continue;
-                                }
-                            }
-                        }
-                        // Drop the streaming sender before sending final oneshot.
-                        // This closes the mpsc channel, signaling WASM that streaming is done.
-                        drop(fp_req.token_stream_tx.take());
-                        if let Some(tx) = resp_tx {
-                            tx.send(ForwardPassResponse {
-                                tokens: fp_req.multi_step_tokens,
-                                dists: resp.map(|r| r.dists).unwrap_or_default(),
-                            }).ok();
-                        }
-                    } else {
-                        if let Some(tx) = resp_tx {
-                            if let Some(r) = resp {
-                                tx.send(r).ok();
-                            }
+                    if let Some(tx) = resp_tx {
+                        if let Some(r) = resp {
+                            tx.send(r).ok();
                         }
                     }
                 }
 
                 if Self::trace_enabled() {
-                    Self::trace("rs.dispatch_done", trace_batch_id, &format!("reqs={} conts={}", batch_size, pending_continuations.len()));
-                }
-
-                // Send all continuations in bulk — no tokio yield points between sends.
-                for cont in pending_continuations {
-                    continuation_tx.send(cont).ok();
-                }
-                if Self::trace_enabled() {
-                    Self::trace("rs.conts_sent", trace_batch_id, &format!("reqs={}", batch_size));
+                    Self::trace("rs.dispatch_done", trace_batch_id, &format!("reqs={}", batch_size));
                 }
             }
             Err(e) => {

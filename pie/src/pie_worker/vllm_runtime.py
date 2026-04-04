@@ -936,30 +936,8 @@ class PieVllmRuntime:
         return tokens
 
     @torch.inference_mode()
-    def fire_batch(self, _drain_fn=None, _merge_fn=None, _counts_fn=None,
-                   **kwargs: Any) -> dict:
+    def fire_batch(self, **kwargs: Any) -> dict:
         """Execute a batched forward pass via vLLM's Worker.
-
-        When max_decode_steps > 1, loops internally for multi-step decode.
-        Between steps, calls _drain_fn to get new requests from the
-        side-channel, merges them via _merge_fn, and processes the combined
-        batch. This enables continuous batching at the Python level.
-
-        Args:
-            _drain_fn: Callable returning list[(req_id, msgpack_bytes)] of
-                new fire_batch requests from the side-channel. None to disable.
-            _merge_fn: merge_fire_batch_kwargs from batch_merger.
-            _counts_fn: compute_batch_generate_counts from batch_merger.
-            **kwargs: Batch fields from Rust IPC (msgpack-decoded).
-
-        This is the critical path:
-          1. Decode batch arrays from msgpack bytes
-          2. Build per-request data
-          3. Construct SchedulerOutput
-          4. Call worker.execute_model()
-          5. Handle two-phase: if None, call worker.sample_tokens(None)
-          6. Package response
-          7. Track request IDs for next call's finished_req_ids
 
         Args:
             **kwargs: Batch fields from Rust IPC (msgpack-decoded).
@@ -974,6 +952,8 @@ class PieVllmRuntime:
         if freed_raw is not None and len(freed_raw) > 0:
             freed_ids = set(np.frombuffer(freed_raw, dtype=np.uint32).tolist())
             self._seq_tracker.finish_by_block_ids(freed_ids)
+
+        kwargs.pop("max_decode_steps", None)
 
         # --- 1. Decode batch metadata ---
         arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
@@ -1046,161 +1026,6 @@ class PieVllmRuntime:
         self._captured_sample_hidden_states = None
         self._captured_full_hidden_states = None
 
-        # --- Multi-step decode loop ---
-        max_steps = kwargs.get("max_decode_steps", 1)
-        if os.environ.get("PIE_TRACE") and max_steps > 1:
-            print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.fb_multistep {self._batch_counter} max_decode_steps={max_steps}",
-                  file=sys.stderr, flush=True)
-        if max_steps > 1:
-            all_step_results = [results]  # results from step 0
-            _orig_num_reqs = len(results)  # track original request count
-            _all_merged_req_ids = []  # (req_id, split_result) for merged requests
-            _all_merged_counts = []
-            for step_i in range(1, max_steps):
-                # Extract sampled tokens from previous step
-                prev_tokens = []
-                for r in results:
-                    toks = r.get("tokens", [])
-                    if len(toks) > 0:
-                        prev_tokens.append(toks[0])
-                if not prev_tokens:
-                    break  # no tokens (all flush or EOS)
-
-                # Build continuation by updating kwargs and re-decoding.
-                # This uses the SAME path as a fresh fire_batch, ensuring
-                # arrays are built identically to what Rust would provide.
-                new_kv_lens = arrays.kv_last_page_lens.copy()
-                new_kv_lens += 1
-                # Handle page boundary: wrap kv_last_page_lens when crossing.
-                # Pages are pre-allocated by the SDK (extra_kv_tokens), so the
-                # next page exists. If no pre-allocation, stop instead.
-                if self.kv_page_size > 0:
-                    _crossing = new_kv_lens > self.kv_page_size
-                    if np.any(_crossing):
-                        # Check if the next page exists for each crossing request
-                        _can_cross = True
-                        for _ri in range(len(new_kv_lens)):
-                            if _crossing[_ri]:
-                                _pages_needed = int(arrays.kv_page_indptr[_ri + 1] - arrays.kv_page_indptr[_ri])
-                                _pages_used = (int(arrays.seq_lens[_ri]) + self.kv_page_size - 1) // self.kv_page_size
-                                if _pages_used >= _pages_needed:
-                                    _can_cross = False  # no more pages
-                                    break
-                        if not _can_cross:
-                            break
-                        new_kv_lens[_crossing] = 1  # wrap to start of next page
-                kwargs["token_ids"] = np.array(prev_tokens, dtype=np.uint32).tobytes()
-                kwargs["qo_indptr"] = np.arange(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
-                kwargs["kv_last_page_lens"] = new_kv_lens.astype(np.uint32).tobytes()
-                kwargs["single_token_mode"] = True
-                kwargs["flattened_masks"] = b""
-                kwargs["mask_indptr"] = np.zeros(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
-                kwargs["output_token_indptr"] = np.arange(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
-                # Re-decode kwargs through the standard path
-                arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
-                num_requests = arrays.num_requests
-
-                # Between steps: drain side-channel for new requests and merge
-                # into the current batch. This enables continuous batching —
-                # new requests are processed in parallel with ongoing decode.
-                if _drain_fn and _merge_fn:
-                    _new_pending = _drain_fn()
-                    if os.environ.get("PIE_TRACE"):
-                        print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_drain {self._batch_counter} step={step_i} found={len(_new_pending) if _new_pending else 0}",
-                              file=sys.stderr, flush=True)
-                    if _new_pending:
-                        try:
-                            import msgpack as _msgpack
-                            _new_items = [(_rid, _msgpack.unpackb(_raw))
-                                          for _rid, _raw in _new_pending]
-                            _new_batches = [_kw for _, _kw in _new_items]
-                            _new_rids = [_rid for _rid, _ in _new_items]
-                            _new_counts = _counts_fn(_new_batches) if _counts_fn else [1] * len(_new_batches)
-                            _all_merged_req_ids.extend(_new_rids)
-                            _all_merged_counts.extend(_new_counts)
-                            _all_batches = [kwargs] + _new_batches
-                            kwargs = _merge_fn(_all_batches)
-                            arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
-                            num_requests = arrays.num_requests
-                            if os.environ.get("PIE_TRACE"):
-                                print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_merge {self._batch_counter} step={step_i} new_reqs={len(_new_pending)} total_reqs={num_requests}",
-                                      file=sys.stderr, flush=True)
-                        except Exception as _merge_err:
-                            # Merge failed — log error, skip merge, process new
-                            # requests after the loop instead
-                            import traceback
-                            print(f"[MS-MERGE-ERROR] step {step_i}: {_merge_err}\n{traceback.format_exc()}",
-                                  file=sys.stderr, flush=True)
-                            # Put back as raw tuples for manager.py to process later
-                            _all_merged_req_ids.extend(_new_pending)
-
-                if os.environ.get("PIE_TRACE"):
-                    print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_step {self._batch_counter} step={step_i} reqs={arrays.num_requests}",
-                          file=sys.stderr, flush=True)
-
-                try:
-                    scheduler_output = self.prepare_step(arrays, kwargs)
-                    # Dump SchedulerOutput details for debugging
-                    if os.environ.get("PIE_MS_DEBUG"):
-                        _so = scheduler_output
-                        _nr = _so.scheduled_new_reqs
-                        _cr = _so.scheduled_cached_reqs
-                        _fi = _so.finished_req_ids
-                        _ns = _so.num_scheduled_tokens
-                        print(f"[MS-DEBUG] step={step_i} new_reqs={len(_nr)} "
-                              f"cached_req_ids={getattr(_cr, 'req_ids', [])} "
-                              f"finished={_fi} num_sched_tokens={_ns}",
-                              file=sys.stderr, flush=True)
-                        if _nr:
-                            for _nri, _nrd in enumerate(_nr):
-                                print(f"  NEW[{_nri}] req_id={_nrd.req_id} "
-                                      f"prompt_len={len(_nrd.prompt_token_ids)} "
-                                      f"num_computed={_nrd.num_computed_tokens} "
-                                      f"blocks={[b[:3] for b in _nrd.block_ids]}...",
-                                      file=sys.stderr, flush=True)
-                        if hasattr(_cr, 'req_ids') and _cr.req_ids:
-                            print(f"  CACHED req_ids={_cr.req_ids} "
-                                  f"num_computed={_cr.num_computed_tokens} "
-                                  f"num_output={_cr.num_output_tokens}",
-                                  file=sys.stderr, flush=True)
-                    result = self.execute_step(scheduler_output)
-                    logits_expanded = self._expand_logits_for_multi_position(
-                        kwargs, arrays.qo_indptr, arrays.num_requests
-                    )
-                    results = self._package_response(
-                        result, kwargs, arrays.num_requests,
-                        logits_expanded=logits_expanded,
-                    )
-                    if os.environ.get("PIE_MS_DEBUG"):
-                        print(f"[MS-DEBUG] step={step_i} results={[{k: v for k, v in r.items() if k == 'tokens'} for r in results]}",
-                              file=sys.stderr, flush=True)
-                except Exception as e:
-                    print(f"[MS-ERROR] step {step_i}: {e}", file=sys.stderr, flush=True)
-                    import traceback; traceback.print_exc(file=sys.stderr)
-                    break
-
-                self._captured_sample_hidden_states = None
-                self._captured_full_hidden_states = None
-                all_step_results.append(results)
-
-            # Combine all steps: accumulate tokens for ORIGINAL requests only.
-            # Merged (new) requests get their tokens from the steps they joined.
-            if len(all_step_results) > 1:
-                # Original requests: always at indices 0.._orig_num_reqs-1
-                combined = []
-                for req_idx in range(_orig_num_reqs):
-                    all_tokens, all_dists = [], []
-                    for sr in all_step_results:
-                        if req_idx < len(sr):
-                            all_tokens.extend(sr[req_idx].get("tokens", []))
-                            all_dists.extend(sr[req_idx].get("dists", []))
-                    combined.append({"tokens": all_tokens, "dists": all_dists})
-                results = combined
-
-                if os.environ.get("PIE_TRACE"):
-                    print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_done {self._batch_counter} steps={len(all_step_results)} merged={len(_all_merged_req_ids)}",
-                          file=sys.stderr, flush=True)
-
         t_end = time.perf_counter()
 
         metrics = {
@@ -1237,44 +1062,6 @@ class PieVllmRuntime:
                   file=sys.stderr, flush=True)
 
         ret = {"results": results, "metrics": metrics}
-        # If requests were merged during multi-step, split their responses.
-        # If merge failed, return raw tuples for manager.py to re-process.
-        if max_steps > 1 and '_all_merged_req_ids' in dir() and _all_merged_req_ids:
-            # Check if items are merged (int req_ids from side-channel) or
-            # raw (tuple from failed merge).  Side-channel request IDs are
-            # integers (int.from_bytes), NOT strings.
-            _merged_resps = []
-            _queued_raw = []
-            for item in _all_merged_req_ids:
-                if isinstance(item, int):
-                    _merged_resps.append(item)
-                else:
-                    _queued_raw.append(item)
-            # For successfully merged requests: their results are in the
-            # combined results at indices >= _orig_num_reqs
-            if _merged_resps:
-                _split_results = []
-                _offset = _orig_num_reqs
-                for _mr_idx, _rid in enumerate(_merged_resps):
-                    _cnt = _all_merged_counts[_mr_idx] if _mr_idx < len(_all_merged_counts) else 1
-                    # Build per-request result entries (Rust expects one per
-                    # generate request in the batch).
-                    _mr_results = []
-                    for _ri in range(_offset, _offset + _cnt):
-                        _ri_tokens, _ri_dists = [], []
-                        for sr in all_step_results:
-                            if _ri < len(sr):
-                                _ri_tokens.extend(sr[_ri].get("tokens", []))
-                                _ri_dists.extend(sr[_ri].get("dists", []))
-                        _mr_results.append({"tokens": _ri_tokens, "dists": _ri_dists})
-                    _split_results.append({
-                        "req_id": _rid,
-                        "result": {"results": _mr_results, "metrics": {}},
-                    })
-                    _offset += _cnt
-                ret["_merged_responses"] = _split_results
-            if _queued_raw:
-                ret["_queued_requests"] = _queued_raw
         return ret
 
     def _store_output_embeddings(

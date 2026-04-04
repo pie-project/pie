@@ -66,8 +66,6 @@ def merge_fire_batch_kwargs(kwargs_list: list[dict]) -> dict:
     all_output_embed_indices = []
 
     single_token_mode = True
-    max_decode_steps = 1
-
     for kw in kwargs_list:
         # Decode flat arrays
         tids = decode(kw["token_ids"], np.uint32)
@@ -122,7 +120,6 @@ def merge_fire_batch_kwargs(kwargs_list: list[dict]) -> dict:
         all_output_embed_indices.extend(kw.get("output_embed_indices", [[] for _ in range(num_req)]))
 
         single_token_mode = single_token_mode and kw.get("single_token_mode", True)
-        max_decode_steps = max(max_decode_steps, kw.get("max_decode_steps", 1))
 
     # Build merged arrays
     def _concat_and_encode(parts: list[np.ndarray]) -> bytes:
@@ -162,7 +159,6 @@ def merge_fire_batch_kwargs(kwargs_list: list[dict]) -> dict:
         "output_embed_ptrs": all_output_embed_ptrs,
         "output_embed_indices": all_output_embed_indices,
         "single_token_mode": single_token_mode,
-        "max_decode_steps": max_decode_steps,
     }
 
     # Copy optional scalar fields from first batch

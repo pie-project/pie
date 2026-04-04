@@ -3,7 +3,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 pub static HANDSHAKE_ID: u32 = 0;
@@ -179,36 +179,13 @@ pub struct ForwardPassRequest {
     pub output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     pub output_embed_ptrs: Vec<u32>,
     pub output_embed_indices: Vec<u32>,
-    /// Maximum number of sequential decode steps to run before returning.
-    /// Default 1 (current behavior). When >1, the host runs N autoregressive
-    /// steps internally, feeding each sampled token back as input for the next.
-    /// Requires engine-side sampling (output_tokens variants). Incompatible
-    /// with output_distributions (Custom sampler).
-    #[serde(default = "default_one")]
-    pub max_decode_steps: u32,
     /// When true, capture and return probability distributions alongside
     /// sampled tokens for each step. Only valid with output_tokens variants.
     #[serde(default)]
     pub return_distributions: bool,
-    /// Accumulated tokens across multi-step re-enqueue cycles (scheduler-only).
-    #[serde(skip)]
-    pub multi_step_tokens: Vec<u32>,
-    /// KV page size for multi-step KV state tracking (scheduler-only).
-    #[serde(skip)]
-    pub kv_page_size: u32,
     /// Arrival time for scheduler estimation (not serialized).
     #[serde(skip)]
     pub arrival_time: Option<Instant>,
-    /// Per-token streaming channel (scheduler-only, not serialized).
-    /// When set, each multi-step continuation sends its token immediately
-    /// instead of only accumulating in multi_step_tokens. Enables the
-    /// WASM inferlet to process tokens while the next GPU step runs.
-    #[serde(skip)]
-    pub token_stream_tx: Option<mpsc::UnboundedSender<u32>>,
-}
-
-fn default_one() -> u32 {
-    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,11 +333,6 @@ pub struct BatchedForwardPassRequest {
     // Target group ID for Data Parallelism routing
     pub group_id: Option<usize>,
 
-    // Maximum sequential decode steps for multi-step decode.
-    // When >1, the Python backend loops internally.
-    #[serde(default = "default_one")]
-    pub max_decode_steps: u32,
-
     // KV page IDs freed since last batch (explicit finish signal for SequenceTracker).
     // Sent from Rust ResourceManager on deallocate/cleanup.
     #[serde(default, skip_serializing_if = "ByteVec::is_empty")]
@@ -395,7 +367,6 @@ impl BatchedForwardPassRequest {
             single_token_mode: true,
             trace_context: None,
             group_id: None,
-            max_decode_steps: 1,
             freed_block_ids: ByteVec(Vec::new()),
         }
     }
@@ -479,10 +450,6 @@ impl BatchedForwardPassRequest {
             self.single_token_mode = false;
         }
 
-        // Propagate max_decode_steps (use max across batch)
-        if req.max_decode_steps > self.max_decode_steps {
-            self.max_decode_steps = req.max_decode_steps;
-        }
     }
 
     /// Get the number of requests in this batch.

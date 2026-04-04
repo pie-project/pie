@@ -71,8 +71,6 @@ pub struct ForwardPass {
     output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     output_embed_ptrs: Vec<u32>,
     output_embed_indices: Vec<u32>,
-    /// Max sequential decode steps per execute() call (default 1).
-    max_decode_steps: u32,
     /// Return distributions alongside tokens for each step.
     return_distributions: bool,
 }
@@ -80,9 +78,6 @@ pub struct ForwardPass {
 #[derive(Debug)]
 pub struct ForwardPassResult {
     pub receiver: oneshot::Receiver<ForwardPassResponse>,
-    /// Per-token streaming channel. Present when max_decode_steps > 1.
-    /// Each continuation step sends its token here immediately.
-    pub token_rx: Option<tokio::sync::mpsc::UnboundedReceiver<u32>>,
     pub distributions: Vec<(Vec<u32>, Vec<f32>)>,
     pub tokens: Vec<u32>,
     pub done: bool,
@@ -106,41 +101,12 @@ impl Pollable for ForwardPassResult {
 
         let t0 = if wit_timing_enabled() { Some(mono_ns()) } else { None };
 
-        if let Some(ref mut token_rx) = self.token_rx {
-            // Streaming mode: wait for next token OR oneshot completion.
-            tokio::select! {
-                biased;
-                token = token_rx.recv() => {
-                    match token {
-                        Some(t) => self.tokens.push(t),
-                        None => {
-                            // Token channel closed — all tokens streamed.
-                            // Wait for oneshot to get distributions and signal done.
-                            if let Ok(res) = (&mut self.receiver).await {
-                                self.distributions = res.dists;
-                                self.tokens.extend(res.tokens);
-                            }
-                            self.done = true;
-                        }
-                    }
-                }
-                res = &mut self.receiver => {
-                    // Oneshot fired (final response with distributions).
-                    if let Ok(r) = res {
-                        self.distributions = r.dists;
-                        self.tokens.extend(r.tokens);
-                    }
-                    self.done = true;
-                }
-            }
-        } else {
-            // Non-streaming (single-step): wait for oneshot as before.
-            if let Ok(res) = (&mut self.receiver).await {
-                self.distributions = res.dists;
-                self.tokens = res.tokens;
-            }
-            self.done = true;
+        // Wait for oneshot response.
+        if let Ok(res) = (&mut self.receiver).await {
+            self.distributions = res.dists;
+            self.tokens = res.tokens;
         }
+        self.done = true;
 
         if let Some(t0) = t0 {
             WIT_READY_SUM_NS.fetch_add(mono_ns() - t0, AtomicOrdering::Relaxed);
@@ -170,7 +136,6 @@ impl inferlet::core::forward::Host for InstanceState {
             output_token_samplers: vec![],
             output_embed_ptrs: vec![],
             output_embed_indices: vec![],
-            max_decode_steps: 1,
             return_distributions: false,
         };
         Ok(self.ctx().table.push(pass)?)
@@ -425,16 +390,6 @@ impl inferlet::core::forward::Host for InstanceState {
         Ok(())
     }
 
-    async fn set_max_decode_steps(
-        &mut self,
-        pass: Resource<ForwardPass>,
-        max_steps: u32,
-    ) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&pass)?;
-        pass.max_decode_steps = max_steps.max(1);
-        Ok(())
-    }
-
 }
 
 impl inferlet::core::forward::HostForwardPass for InstanceState {
@@ -472,23 +427,13 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
                 output_token_samplers: take(&mut pass.output_token_samplers),
                 output_embed_ptrs: take(&mut pass.output_embed_ptrs),
                 output_embed_indices: take(&mut pass.output_embed_indices),
-                max_decode_steps: pass.max_decode_steps,
                 return_distributions: pass.return_distributions,
-                multi_step_tokens: Vec::new(),
-                kv_page_size: pass.queue.info.kv_page_size,
                 arrival_time: None, // Set in Model::submit() before queuing
                 inst_id: Some(self.id()),
-                token_stream_tx: None, // set below for multi-step
             };
 
             (request, svc_id, queue_id, priority)
         };
-
-        // Per-token streaming channel is disabled by default. When Python
-        // handles multi-step internally (returns all tokens in one response),
-        // the mpsc channel is not needed — all tokens arrive via the oneshot.
-        // Enable with PIE_TOKEN_STREAM=1 for per-token SSE delivery.
-        let token_rx: Option<tokio::sync::mpsc::UnboundedReceiver<u32>> = None;
 
         // Always create a response channel so every request participates in
         // the batch response protocol.
@@ -502,7 +447,6 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
 
         let res = ForwardPassResult {
             receiver: rx,
-            token_rx,
             distributions: vec![],
             tokens: vec![],
             done: false,

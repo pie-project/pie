@@ -97,12 +97,4 @@ interface forward {
         top-p: f32
     );
 
-    /// Set maximum number of sequential decode steps per execute() call.
-    /// Default 1 (single step). When >1, the host runs N autoregressive
-    /// steps internally before returning, amortizing async overhead.
-    set-max-decode-steps: func(
-        pass: borrow<forward-pass>,
-        max-steps: u32,
-    );
-
 }

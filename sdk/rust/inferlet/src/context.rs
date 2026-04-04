@@ -482,7 +482,7 @@ impl Context {
     /// A `Result` containing the `Distribution` over the next possible tokens,
     /// or an error if the generation step could not be performed.
     pub async fn decode_step(&mut self, sampler: &Sampler) -> u32 {
-        let (p, pending_token_ids, position_ids) = self.prepare_forward_pass(sampler, 0);
+        let (p, pending_token_ids, position_ids) = self.prepare_forward_pass(sampler);
 
         let res = p.execute().await;
 
@@ -503,145 +503,12 @@ impl Context {
         sampled
     }
 
-    /// Decode up to N tokens in one async yield, amortizing wasmtime async
-    /// overhead (~5.4ms) over N tokens instead of paying it per-token.
-    ///
-    /// Returns 1..=max_steps sampled tokens. The last token is NOT committed
-    /// to context state — the caller must call `fill_token(last_token)` to
-    /// set it up as the seed for the next decode call. This preserves the
-    /// same contract as `decode_step` + `fill_token`.
-    ///
-    /// Requires engine-side sampling (not Custom sampler). Panics if
-    /// max_steps > 1 with a Custom sampler.
-    pub async fn decode_n(&mut self, sampler: &Sampler, max_steps: u32) -> Vec<u32> {
-        // Fallback: if max_steps <= 1, just do a normal decode_step
-        if max_steps <= 1 {
-            let token = self.decode_step(sampler).await;
-            return vec![token];
-        }
-
-        // Validate: Custom sampler incompatible with multi-step
-        if let Sampler::Custom { .. } = sampler {
-            panic!(
-                "decode_n with max_steps > 1 requires engine-side sampling, \
-                 not Custom sampler. Use decode_step for Custom sampling."
-            );
-        }
-
-        let (p, pending_token_ids, position_ids) =
-            self.prepare_forward_pass(sampler, max_steps as usize - 1);
-
-        p.set_max_decode_steps(max_steps);
-
-        let res = p.execute().await; // ONE async yield for up to N tokens
-        let tokens = res.tokens.unwrap_or_default();
-
-        let last_pos_id = position_ids.first().copied().unwrap_or(0);
-
-        // Commit pending tokens to context (same as decode_step)
-        self.token_ids.extend(&pending_token_ids);
-        self.position_ids.extend(&position_ids);
-
-        // Commit all generated tokens EXCEPT the last one.
-        // The last token is left for the caller to fill_token(), preserving
-        // the same contract as decode_step: caller seeds the next step.
-        let commit_count = tokens.len().saturating_sub(1);
-        for (i, &token) in tokens[..commit_count].iter().enumerate() {
-            self.token_ids.push(token);
-            self.position_ids
-                .push(last_pos_id + pending_token_ids.len() as u32 + i as u32);
-        }
-
-        // Update mask for committed tokens (pending + intermediates).
-        // The last generated token is NOT included — fill_token handles it.
-        // This mirrors what fill_tokens + fill_token would do for these tokens.
-        for _ in 0..(pending_token_ids.len() + commit_count) {
-            self.token_mask_current.append(false);
-        }
-
-        // Shrink over-allocated KV pages.
-        // We pre-allocated for (pending + max_steps-1) tokens.
-        // Actually used: pending + commit_count (excluding the last token
-        // which will be committed when the caller calls fill_token → next
-        // decode → grow_kv_pages(1)).
-        let over_allocated = (max_steps as usize - 1).saturating_sub(commit_count);
-        if over_allocated > 0 {
-            self.shrink_kv_pages(over_allocated);
-        }
-
-        tokens
-    }
-
-    /// Decode tokens with per-token streaming. Each token is delivered to the
-    /// callback as soon as the GPU produces it, while the next step is already
-    /// in flight. Eliminates the yield-boundary stall of decode_n.
-    ///
-    /// The callback receives each token and returns `true` to continue or
-    /// `false` to cancel generation (e.g., on stop token / EOS).
-    ///
-    /// Returns all generated tokens. The last token is NOT committed to context
-    /// — the caller must call `fill_token(last_token)`, same as decode_n.
-    pub async fn decode_stream<F: FnMut(u32) -> bool>(
-        &mut self,
-        sampler: &Sampler,
-        max_steps: u32,
-        mut on_token: F,
-    ) -> Vec<u32> {
-        if max_steps <= 1 {
-            let token = self.decode_step(sampler).await;
-            on_token(token);
-            return vec![token];
-        }
-
-        if let Sampler::Custom { .. } = sampler {
-            panic!("decode_stream requires engine-side sampling, not Custom sampler.");
-        }
-
-        let (p, pending_token_ids, position_ids) =
-            self.prepare_forward_pass(sampler, max_steps as usize - 1);
-        p.set_max_decode_steps(max_steps);
-
-        let mut all_tokens = Vec::new();
-        p.execute_stream(|token| {
-            all_tokens.push(token);
-            on_token(token)
-        })
-        .await;
-
-        // Commit to context state (same as decode_n)
-        let last_pos_id = position_ids.first().copied().unwrap_or(0);
-        self.token_ids.extend(&pending_token_ids);
-        self.position_ids.extend(&position_ids);
-
-        let commit_count = all_tokens.len().saturating_sub(1);
-        for (i, &token) in all_tokens[..commit_count].iter().enumerate() {
-            self.token_ids.push(token);
-            self.position_ids
-                .push(last_pos_id + pending_token_ids.len() as u32 + i as u32);
-        }
-
-        for _ in 0..(pending_token_ids.len() + commit_count) {
-            self.token_mask_current.append(false);
-        }
-
-        let over_allocated = (max_steps as usize - 1).saturating_sub(commit_count);
-        if over_allocated > 0 {
-            self.shrink_kv_pages(over_allocated);
-        }
-
-        all_tokens
-    }
-
-    /// Shared forward-pass setup for decode_step and decode_n.
+    /// Shared forward-pass setup for decode_step.
     /// Consumes pending tokens, grows KV pages, builds mask, configures
     /// adapter and sampler on the forward pass.
-    ///
-    /// `extra_kv_tokens`: additional KV pages to pre-allocate beyond pending
-    /// (used by decode_n for multi-step).
     fn prepare_forward_pass(
         &mut self,
         sampler: &Sampler,
-        extra_kv_tokens: usize,
     ) -> (ForwardPass, Vec<u32>, Vec<u32>) {
         assert!(
             !self.token_ids_pending.is_empty(),
@@ -653,23 +520,7 @@ impl Context {
         let position_ids =
             (last_pos_id..(last_pos_id + pending_token_ids.len() as u32)).collect::<Vec<u32>>();
 
-        // Pre-allocate pages for extra_kv_tokens but only pass ACTUAL
-        // pages to the ForwardPass. The extra pages stay in self.kv_pages
-        // for the Rust continuation loop to use later.
-        let actual_total_before = if self.kv_pages.is_empty() {
-            0
-        } else {
-            (self.kv_pages.len() - 1) * self.kv_page_size + self.kv_page_last_len
-        };
-        self.grow_kv_pages(pending_token_ids.len() + extra_kv_tokens);
-        let actual_total = actual_total_before + pending_token_ids.len();
-        let actual_pages = actual_total.div_ceil(self.kv_page_size);
-        let actual_last_len = actual_total % self.kv_page_size;
-        let actual_last_len = if actual_last_len == 0 && actual_total > 0 {
-            self.kv_page_size
-        } else {
-            actual_last_len
-        };
+        self.grow_kv_pages(pending_token_ids.len());
 
         let mask = mem::take(&mut self.token_mask_pending)
             .into_iter()
@@ -686,9 +537,7 @@ impl Context {
         }
 
         p.input_tokens(&pending_token_ids, &position_ids);
-        // Pass only actual pages (not pre-allocated extras) to avoid
-        // vLLM attending to uninitialized KV positions.
-        p.kv_cache(&self.kv_pages[..actual_pages], actual_last_len);
+        p.kv_cache(&self.kv_pages, self.kv_page_last_len);
         p.attention_mask(&mask);
 
         let output_idx = pending_token_ids.len() as u32 - 1;
