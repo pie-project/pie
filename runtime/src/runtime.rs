@@ -705,7 +705,7 @@ impl Runtime {
 
         let mut visited = HashSet::new();
         let mut dependency_components = Vec::new();
-        let mut dep_python_runtime: Option<String> = None;
+        let mut dep_python_runtime = None;
         let mut any_dep_snapshotted = false;
         let mut any_dep_not_snapshotted = false;
 
@@ -721,30 +721,17 @@ impl Runtime {
             )?;
         }
 
-        if any_dep_snapshotted && any_dep_not_snapshotted {
-            return Err(RuntimeError::Other(
-                "Inconsistent snapshot status among dependencies: some Python components \
-                 are snapshotted while others are not."
-                    .to_string(),
-            ));
-        }
-
-        if any_dep_not_snapshotted {
-            return Err(RuntimeError::Other(
-                "Cannot snapshot: Python dependencies are not snapshotted. \
-                 All Python components in a dependency tree must share the same \
-                 snapshot status."
-                    .to_string(),
-            ));
-        }
-
-        let shared_modules = if any_dep_snapshotted {
-            &self.stripped_shared_modules
-        } else {
-            &self.shared_modules
-        };
-
-        let mut linker = create_linker(&engine, shared_modules);
+        // Always use full (non-stripped) shared modules for snapshotting.
+        // The snapshot process must initialize CPython from scratch to load
+        // the component's Python code; stripped modules lack the data segments
+        // and start functions required for this.  Each component gets its own
+        // instances of the shared modules, so snapshotted dependencies are
+        // unaffected — their snapshot state may be partially overwritten in
+        // their own instance, but the snapshot process only needs their WIT
+        // exports for import resolution, not their full Python runtime state.
+        // Stripped modules are only needed at *runtime* (in launch_instance)
+        // to prevent shared-module data segments from clobbering the snapshot.
+        let mut linker = create_linker(&engine, &self.shared_modules);
 
         let (inst_state, _output_delivery_ctrl) = InstanceState::new(
             Uuid::new_v4(),
