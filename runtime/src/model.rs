@@ -477,6 +477,9 @@ impl Model {
             (0..num_groups).map(|_| Vec::new()).collect();
         let mut group_tokens: Vec<usize> = vec![0; num_groups];
         let mut in_flight_counts: Vec<usize> = vec![0; num_groups];
+        // Adaptive coalesce: track how many requests were in the last completed batch.
+        // When GPU is idle and requests arrive, wait for this many before firing.
+        let mut expected_arrivals: usize = 0;
 
         // Channel for batch completions (batch_size, tokens, latency, group_id)
         let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<(usize, usize, Duration, usize)>();
@@ -517,6 +520,8 @@ impl Model {
                     }
                     let mut sched = scheduler.lock().unwrap();
                     sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
+                                expected_arrivals = batch_size;
+                    expected_arrivals = batch_size;
                 }
             }
 
@@ -546,6 +551,7 @@ impl Model {
                                 }
                                 let mut sched = scheduler.lock().unwrap();
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
+                                expected_arrivals = batch_size;
                             }
                         }
                         if Self::trace_enabled() {
@@ -603,33 +609,47 @@ impl Model {
                 freed_block_ids.extend(ids);
             }
 
-            // With max_in_flight=1, requests accumulate while GPU is busy.
-            // When GPU is idle (in_flight=0) and requests arrive, coalesce
-            // briefly to catch staggered WASM re-submissions at budget-cycle
-            // boundaries. Skip coalesce when GPU is busy (natural accumulation).
+            // Adaptive coalesce: when GPU is idle and requests arrive, wait
+            // for expected_arrivals (last batch size) before firing. This catches
+            // all WASM re-submissions between budget cycles without fixed timeouts.
+            // When GPU is busy (in_flight>0), requests accumulate naturally.
             let any_idle = in_flight_counts.iter().any(|&c| c == 0);
-            let any_pending = batches.iter().any(|b| !b.is_empty());
-            if any_idle && any_pending {
-                tokio::time::sleep(std::time::Duration::from_micros(500)).await;
-                // Drain arrivals during coalesce window
-                while let Ok((req, tx, group_id)) = continuation_rx.try_recv() {
-                    let group_id = std::cmp::min(group_id, num_groups - 1);
-                    group_tokens[group_id] += req.input_tokens.len();
-                    batches[group_id].push((req, tx));
-                }
-                while let Ok((req, tx, group_id)) = req_rx.try_recv() {
-                    let group_id = std::cmp::min(group_id, num_groups - 1);
-                    {
-                        let mut sched = scheduler.lock().unwrap();
-                        let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
-                        sched.on_request_arrival(group_id, arrival_time);
+            let pending_count: usize = batches.iter().map(|b| b.len()).sum();
+            if any_idle && pending_count > 0 && expected_arrivals > 1 && pending_count < expected_arrivals {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(3);
+                loop {
+                    let current: usize = batches.iter().map(|b| b.len()).sum();
+                    if current >= expected_arrivals {
+                        break; // Got all expected requests
                     }
-                    group_tokens[group_id] += req.input_tokens.len();
-                    batches[group_id].push((req, tx));
-                    prof_requests_received[group_id] += 1;
+                    if tokio::time::Instant::now() >= deadline {
+                        break; // Timeout
+                    }
+                    // Short sleep + drain
+                    tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    while let Ok((req, tx, group_id)) = continuation_rx.try_recv() {
+                        let group_id = std::cmp::min(group_id, num_groups - 1);
+                        group_tokens[group_id] += req.input_tokens.len();
+                        batches[group_id].push((req, tx));
+                    }
+                    while let Ok((req, tx, group_id)) = req_rx.try_recv() {
+                        let group_id = std::cmp::min(group_id, num_groups - 1);
+                        {
+                            let mut sched = scheduler.lock().unwrap();
+                            let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
+                            sched.on_request_arrival(group_id, arrival_time);
+                        }
+                        group_tokens[group_id] += req.input_tokens.len();
+                        batches[group_id].push((req, tx));
+                        prof_requests_received[group_id] += 1;
+                    }
+                }
+                if Self::trace_enabled() {
+                    let final_count: usize = batches.iter().map(|b| b.len()).sum();
+                    Self::trace("rs.adaptive_coalesce", prof_batches_fired[0],
+                        &format!("expected={} got={}", expected_arrivals, final_count));
                 }
             }
-
             let mut fired_any = false;
             for group_id in 0..num_groups {
                 let batch_len = batches[group_id].len();
@@ -750,6 +770,7 @@ impl Model {
                                 }
                                 let mut sched = scheduler.lock().unwrap();
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
+                                expected_arrivals = batch_size;
                             }
                         }
                     }
