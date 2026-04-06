@@ -899,6 +899,7 @@ impl Model {
 
         match result {
             Ok(batch_resp) => {
+                let _t_resp = Self::mono_ns();
                 let mut resp_iter = batch_resp.results.into_iter();
                 let mut pending_continuations: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)> = Vec::new();
 
@@ -959,12 +960,19 @@ impl Model {
                 }
 
                 // Send continuations in bulk
+                let _t_cont_built = Self::mono_ns();
+                let n_conts = pending_continuations.len();
                 for cont in pending_continuations {
                     continuation_tx.send(cont).ok();
                 }
+                let _t_cont_sent = Self::mono_ns();
 
                 if Self::trace_enabled() {
-                    Self::trace("rs.dispatch_done", trace_batch_id, &format!("reqs={}", batch_size));
+                    Self::trace("rs.dispatch_done", trace_batch_id,
+                        &format!("reqs={} conts={} resp_proc={:.2}ms cont_send={:.2}ms",
+                            batch_size, n_conts,
+                            (_t_cont_built - _t_resp) as f64 / 1e6,
+                            (_t_cont_sent - _t_cont_built) as f64 / 1e6));
                 }
             }
             Err(e) => {

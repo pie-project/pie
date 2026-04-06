@@ -882,8 +882,16 @@ class PieVllmRuntime:
             capture_scheduler_output(scheduler_output, f"batch-{self._batch_counter-1}", _cap)
 
         try:
+            _fine = os.environ.get("PIE_FINE_TIMING")
+            _t_ctx0 = time.perf_counter()
             with set_current_vllm_config(self.vllm_config):
+                _t_ctx1 = time.perf_counter()
+                if _fine:
+                    import torch
+                    torch.cuda.synchronize()
+                _t_exec0 = time.perf_counter()
                 result = self.vllm_worker.execute_model(scheduler_output)
+                _t_exec1 = time.perf_counter()
 
                 from vllm.v1.outputs import AsyncModelRunnerOutput
                 if isinstance(result, AsyncModelRunnerOutput):
@@ -892,6 +900,19 @@ class PieVllmRuntime:
                     result = self.vllm_worker.sample_tokens(None)
                 if hasattr(result, 'get_output'):
                     result = result.get_output()
+                _t_exec2 = time.perf_counter()
+                if _fine:
+                    torch.cuda.synchronize()
+                _t_exec3 = time.perf_counter()
+
+                if os.environ.get("PIE_VLLM_TIMING"):
+                    print(f"[EXEC-SPLIT] ctx_enter={(_t_ctx1-_t_ctx0)*1000:.2f}ms "
+                          f"cuda_pre_sync={(_t_exec0-_t_ctx1)*1000:.2f}ms "
+                          f"execute_model={(_t_exec1-_t_exec0)*1000:.2f}ms "
+                          f"get_output={(_t_exec2-_t_exec1)*1000:.2f}ms "
+                          f"cuda_sync={(_t_exec3-_t_exec2)*1000:.2f}ms "
+                          f"total={(_t_exec3-_t_ctx0)*1000:.2f}ms",
+                          file=sys.stderr, flush=True)
 
                 if _cap:
                     from pie_worker.vllm_capture import capture_model_output
@@ -963,6 +984,7 @@ class PieVllmRuntime:
         num_requests = arrays.num_requests
 
         # --- 2-3. Build SchedulerOutput + configure model runner ---
+        t_prepare_start = time.perf_counter()
         try:
             scheduler_output = self.prepare_step(arrays, kwargs)
             if os.environ.get("PIE_MS_DEBUG"):
@@ -986,6 +1008,8 @@ class PieVllmRuntime:
                   file=sys.stderr, flush=True)
             traceback.print_exc(file=sys.stderr)
             raise
+
+        t_prepare_end = time.perf_counter()
 
         # --- 4. Execute model ---
         t_model_start = time.perf_counter()
@@ -1052,11 +1076,13 @@ class PieVllmRuntime:
             # Use CLOCK_MONOTONIC for cross-process correlation with Rust IPC timing
             wall_end_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
             wall_start_ns = int(t_start * 1e9)
+            _prepare_ms = (t_prepare_end - t_prepare_start) * 1000
             print(f"[TIMING] batch#{self._batch_counter - 1}: "
                   f"total={metrics['total_ms']:.1f}ms "
                   f"model={metrics['model_forward_ms']:.1f}ms "
                   f"xlate={metrics['translation_overhead_ms']:.2f}ms "
-                  f"pkg={metrics['total_ms'] - metrics['model_forward_ms'] - metrics['translation_overhead_ms']:.2f}ms "
+                  f"prepare={_prepare_ms:.2f}ms "
+                  f"pkg={metrics['total_ms'] - metrics['model_forward_ms'] - metrics['translation_overhead_ms'] - _prepare_ms:.2f}ms "
                   f"reqs={num_requests} toks={metrics['batch_tokens']} "
                   f"ws={wall_start_ns} we={wall_end_ns}",
                   file=sys.stderr, flush=True)

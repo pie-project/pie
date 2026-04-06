@@ -26,16 +26,38 @@ impl AsyncIpcClient {
         T: Serialize,
         R: DeserializeOwned,
     {
+        static FINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fine = *FINE.get_or_init(|| std::env::var("PIE_FINE_TIMING").is_ok());
+        let t0 = std::time::Instant::now();
+
         // Serialize arguments
         let payload = rmp_serde::to_vec_named(args)
             .map_err(|e| anyhow::anyhow!("Failed to serialize args: {}", e))?;
-        
+        let t1 = std::time::Instant::now();
+        let payload_len = payload.len();
+
         // Send via IPC
         let response = self.backend.call(method, payload).await?;
-        
+        let t2 = std::time::Instant::now();
+        let resp_len = response.len();
+
         // Deserialize response
-        rmp_serde::from_slice(&response)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize response: {}", e))
+        let result = rmp_serde::from_slice(&response)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize response: {}", e))?;
+        let t3 = std::time::Instant::now();
+
+        if fine && method == "fire_batch" {
+            eprintln!(
+                "[IPC-DETAIL] serialize={:.2}ms ipc={:.2}ms deserialize={:.2}ms total={:.2}ms payload={}B resp={}B",
+                t1.duration_since(t0).as_secs_f64() * 1000.0,
+                t2.duration_since(t1).as_secs_f64() * 1000.0,
+                t3.duration_since(t2).as_secs_f64() * 1000.0,
+                t3.duration_since(t0).as_secs_f64() * 1000.0,
+                payload_len, resp_len,
+            );
+        }
+
+        Ok(result)
     }
     
     /// Fire-and-forget notification.
