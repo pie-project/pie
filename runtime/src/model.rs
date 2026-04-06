@@ -477,8 +477,11 @@ impl Model {
             (0..num_groups).map(|_| Vec::new()).collect();
         let mut group_tokens: Vec<usize> = vec![0; num_groups];
         let mut in_flight_counts: Vec<usize> = vec![0; num_groups];
-        // Adaptive coalesce: track how many requests were in the last completed batch.
-        // When GPU is idle and requests arrive, wait for this many before firing.
+        // Adaptive coalesce: windowed max of recent batch sizes.
+        // When GPU is idle and requests arrive, wait for expected_arrivals before firing.
+        // Using a ring buffer of last 4 batch sizes to adapt to concurrency changes.
+        let mut recent_batch_sizes: [usize; 4] = [0; 4];
+        let mut ring_idx: usize = 0;
         let mut expected_arrivals: usize = 0;
 
         // Channel for batch completions (batch_size, tokens, latency, group_id)
@@ -520,8 +523,9 @@ impl Model {
                     }
                     let mut sched = scheduler.lock().unwrap();
                     sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
-                                expected_arrivals = batch_size;
-                    expected_arrivals = batch_size;
+                    recent_batch_sizes[ring_idx % 4] = batch_size;
+                    ring_idx += 1;
+                    expected_arrivals = *recent_batch_sizes.iter().max().unwrap_or(&0);
                 }
             }
 
@@ -551,7 +555,9 @@ impl Model {
                                 }
                                 let mut sched = scheduler.lock().unwrap();
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
-                                expected_arrivals = batch_size;
+                                recent_batch_sizes[ring_idx % 4] = batch_size;
+                                ring_idx += 1;
+                                expected_arrivals = *recent_batch_sizes.iter().max().unwrap_or(&0);
                             }
                         }
                         if Self::trace_enabled() {
@@ -770,7 +776,9 @@ impl Model {
                                 }
                                 let mut sched = scheduler.lock().unwrap();
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
-                                expected_arrivals = batch_size;
+                                recent_batch_sizes[ring_idx % 4] = batch_size;
+                                ring_idx += 1;
+                                expected_arrivals = *recent_batch_sizes.iter().max().unwrap_or(&0);
                             }
                         }
                     }
