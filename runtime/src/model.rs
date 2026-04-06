@@ -603,10 +603,33 @@ impl Model {
                 freed_block_ids.extend(ids);
             }
 
-            // With max_in_flight=1, all requests (continuations + new WASM
-            // submissions) accumulate in batches[] while the GPU step runs.
-            // When the step completes, we fire everything together.
-            // No explicit coalesce needed — the GPU step IS the coalesce window.
+            // With max_in_flight=1, requests accumulate while GPU is busy.
+            // When GPU is idle (in_flight=0) and requests arrive, coalesce
+            // briefly to catch staggered WASM re-submissions at budget-cycle
+            // boundaries. Skip coalesce when GPU is busy (natural accumulation).
+            let any_idle = in_flight_counts.iter().any(|&c| c == 0);
+            let any_pending = batches.iter().any(|b| !b.is_empty());
+            if any_idle && any_pending {
+                tokio::time::sleep(std::time::Duration::from_micros(500)).await;
+                // Drain arrivals during coalesce window
+                while let Ok((req, tx, group_id)) = continuation_rx.try_recv() {
+                    let group_id = std::cmp::min(group_id, num_groups - 1);
+                    group_tokens[group_id] += req.input_tokens.len();
+                    batches[group_id].push((req, tx));
+                }
+                while let Ok((req, tx, group_id)) = req_rx.try_recv() {
+                    let group_id = std::cmp::min(group_id, num_groups - 1);
+                    {
+                        let mut sched = scheduler.lock().unwrap();
+                        let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
+                        sched.on_request_arrival(group_id, arrival_time);
+                    }
+                    group_tokens[group_id] += req.input_tokens.len();
+                    batches[group_id].push((req, tx));
+                    prof_requests_received[group_id] += 1;
+                }
+            }
+
             let mut fired_any = false;
             for group_id in 0..num_groups {
                 let batch_len = batches[group_id].len();
