@@ -603,31 +603,10 @@ impl Model {
                 freed_block_ids.extend(ids);
             }
 
-            // Coalesce window: after requests arrive, wait briefly for more
-            // to accumulate before firing. This prevents single-request batches
-            // when WASM instances submit decode_step at slightly different times
-            // (e.g., between budget continuation cycles).
-            if batches.iter().any(|b| !b.is_empty()) {
-                tokio::time::sleep(std::time::Duration::from_micros(500)).await;
-                // Drain any additional requests that arrived during the wait
-                while let Ok((req, tx, group_id)) = continuation_rx.try_recv() {
-                    let group_id = std::cmp::min(group_id, num_groups - 1);
-                    group_tokens[group_id] += req.input_tokens.len();
-                    batches[group_id].push((req, tx));
-                }
-                while let Ok((req, tx, group_id)) = req_rx.try_recv() {
-                    let group_id = std::cmp::min(group_id, num_groups - 1);
-                    {
-                        let mut sched = scheduler.lock().unwrap();
-                        let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
-                        sched.on_request_arrival(group_id, arrival_time);
-                    }
-                    group_tokens[group_id] += req.input_tokens.len();
-                    batches[group_id].push((req, tx));
-                    prof_requests_received[group_id] += 1;
-                }
-            }
-
+            // With max_in_flight=1, all requests (continuations + new WASM
+            // submissions) accumulate in batches[] while the GPU step runs.
+            // When the step completes, we fire everything together.
+            // No explicit coalesce needed — the GPU step IS the coalesce window.
             let mut fired_any = false;
             for group_id in 0..num_groups {
                 let batch_len = batches[group_id].len();

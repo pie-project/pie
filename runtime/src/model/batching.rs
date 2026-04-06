@@ -34,7 +34,7 @@ impl Default for SchedulerConfig {
             latency_ema_alpha: 0.2,
             min_batch_for_optimization: 8,
             max_wait_time: Duration::from_millis(50),
-            max_in_flight_batches: usize::MAX,
+            max_in_flight_batches: 1,
         }
     }
 }
