@@ -163,12 +163,28 @@ def _launch_server_inferlet(
     """Upload and launch a server inferlet from a local path."""
     import asyncio
     import blake3
+    import tomllib
     from pie_client import PieClient
 
     async def _launch():
         host = client_config["host"]
         engine_port = client_config["port"]
         uri = f"ws://{host}:{engine_port}"
+
+        # Resolve manifest (Pie.toml) next to the WASM file
+        manifest_path = path.parent / "Pie.toml"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Manifest not found: {manifest_path} "
+                f"(expected Pie.toml next to {path.name})"
+            )
+
+        # Parse program name@version from manifest for launch
+        manifest = tomllib.loads(manifest_path.read_text())
+        pkg = manifest.get("package", {})
+        program_name = pkg.get("name", path.stem)
+        program_version = pkg.get("version", "0.1.0")
+        inferlet_id = f"{program_name}@{program_version}"
 
         async with PieClient(uri) as client:
             await client.internal_authenticate(client_config["internal_auth_token"])
@@ -179,11 +195,11 @@ def _launch_server_inferlet(
 
             # Install if needed
             if not await client.program_exists(program_hash):
-                console.print(f"[dim]Installing {path.name}...[/dim]")
-                await client.install_program(program_bytes)
+                console.print(f"[dim]Installing {path.name} as {inferlet_id}...[/dim]")
+                await client.install_program(str(path), str(manifest_path))
 
-            # Launch as server instance
-            console.print(f"[dim]Starting server on port {port}...[/dim]")
-            await client.launch_server_instance(program_hash, port, arguments)
+            # Launch as server instance using program name (not hash)
+            console.print(f"[dim]Starting {inferlet_id} on port {port}...[/dim]")
+            await client.launch_server_instance(inferlet_id, port, arguments)
 
     asyncio.run(_launch())
