@@ -35,6 +35,16 @@ type ClientId = u32;
 /// handler task.
 static COMMAND_DISPATCHER: OnceLock<CommandDispatcher<ServerEvent>> = OnceLock::new();
 
+/// Readiness gate: the listener loop waits on this before accepting connections.
+/// Signaled by `mark_ready()` after the model is registered.
+static ACCEPT_READY: Notify = Notify::const_new();
+
+/// Signal that the server is ready to accept client connections.
+/// Call this after model registration is complete.
+pub fn mark_ready() {
+    ACCEPT_READY.notify_one();
+}
+
 /// Starts the server service. A daemon task will be spawned to handle the
 /// commands dispatched from other services.
 pub fn start_service(
@@ -290,6 +300,8 @@ impl Server {
 
     async fn listener_loop(ip_port: String, state: Arc<ServerState>) {
         let listener = TcpListener::bind(ip_port).await.unwrap();
+        // Wait until the engine signals that models are loaded
+        ACCEPT_READY.notified().await;
         while let Ok((stream, _addr)) = listener.accept().await {
             let id = {
                 let mut id_pool = state.client_id_pool.lock().await;
