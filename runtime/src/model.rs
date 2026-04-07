@@ -484,6 +484,9 @@ impl Model {
         let mut ring_idx: usize = 0;
         let mut expected_arrivals: usize = 0;
 
+        // Accumulator for freed KV page IDs received via select! (before batch drain).
+        let mut early_freed_kv: Vec<u32> = Vec::new();
+
         // Channel for batch completions (batch_size, tokens, latency, group_id)
         let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<(usize, usize, Duration, usize)>();
 
@@ -543,7 +546,9 @@ impl Model {
                     Self::trace("rs.select_enter", prof_batches_fired[0],
                         &format!("inf={}", in_flight_counts.iter().sum::<usize>()));
                 }
-                // Wait for any event: new request, completion, or continuation.
+                // Wait for any event: new request, completion, continuation, or freed KV.
+                // freed_kv_rx is checked with HIGH priority (before req_rx) to ensure
+                // stale sequences are cleaned up before new requests that reuse their pages.
                 tokio::select! {
                     biased;
                     _ = shutdown_rx.recv() => break,
@@ -571,6 +576,14 @@ impl Model {
                             group_tokens[group_id] += req.input_tokens.len();
                             batches[group_id].push((req, tx));
                         }
+                    }
+                    maybe_freed = freed_kv_rx.recv() => {
+                        // Eagerly accumulate freed KV page IDs so they're available
+                        // when the next batch fires. Processed in the drain below.
+                        if let Some(ids) = maybe_freed {
+                            early_freed_kv.extend(ids);
+                        }
+                        continue; // Re-enter select to also pick up any request
                     }
                     maybe_req = req_rx.recv() => {
                         match maybe_req {
@@ -609,8 +622,9 @@ impl Model {
                 }
             }
 
-            // Drain freed KV page IDs (non-blocking) for Python SequenceTracker cleanup
-            let mut freed_block_ids: Vec<u32> = Vec::new();
+            // Drain freed KV page IDs (non-blocking) for Python SequenceTracker cleanup.
+            // Includes any IDs collected eagerly via the select! branch above.
+            let mut freed_block_ids: Vec<u32> = std::mem::take(&mut early_freed_kv);
             while let Ok(ids) = freed_kv_rx.try_recv() {
                 freed_block_ids.extend(ids);
             }
