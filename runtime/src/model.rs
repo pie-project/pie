@@ -326,8 +326,12 @@ pub struct Model {
     scheduler_config: SchedulerConfig,
     /// Shared scheduler for metrics tracking
     scheduler: SharedScheduler,
-    /// Channel to send freed KV page IDs to inference_worker for Python signaling
-    freed_kv_tx: mpsc::UnboundedSender<Vec<ResourceId>>,
+    /// Shared accumulator for freed KV page IDs. Written by the command
+    /// processor (on Deallocate/Cleanup), read by the scheduler before
+    /// firing each batch. Using a Mutex instead of a channel eliminates
+    /// the race where freed IDs arrive after the scheduler has already
+    /// polled the channel.
+    freed_kv_ids: Arc<std::sync::Mutex<Vec<ResourceId>>>,
 }
 
 impl Model {
@@ -358,8 +362,9 @@ impl Model {
             num_groups,
         )));
 
-        // Channel for freed KV page IDs: Model command loop → inference_worker → Python
-        let (freed_kv_tx, freed_kv_rx) = mpsc::unbounded_channel::<Vec<ResourceId>>();
+        // Shared freed KV page ID accumulator: command processor writes, scheduler reads.
+        let freed_kv_ids: Arc<std::sync::Mutex<Vec<ResourceId>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let worker_handle = tokio::spawn(Self::inference_worker(
             backends.clone(),
@@ -370,7 +375,7 @@ impl Model {
             Arc::clone(&scheduler),
             scheduler_config.max_in_flight_batches,
             num_groups,
-            freed_kv_rx,
+            Arc::clone(&freed_kv_ids),
         ));
 
         let tokenizer = Arc::new(BytePairEncoder::new(
@@ -430,7 +435,7 @@ impl Model {
             worker_handle: Some(worker_handle),
             scheduler_config,
             scheduler,
-            freed_kv_tx,
+            freed_kv_ids,
         })
     }
 
@@ -468,7 +473,7 @@ impl Model {
         scheduler: SharedScheduler,
         max_in_flight_batches: usize,
         num_groups: usize,
-        mut freed_kv_rx: mpsc::UnboundedReceiver<Vec<ResourceId>>,
+        freed_kv_ids: Arc<std::sync::Mutex<Vec<ResourceId>>>,
     ) {
         const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -483,9 +488,6 @@ impl Model {
         let mut recent_batch_sizes: [usize; 4] = [0; 4];
         let mut ring_idx: usize = 0;
         let mut expected_arrivals: usize = 0;
-
-        // Accumulator for freed KV page IDs received via select! (before batch drain).
-        let mut early_freed_kv: Vec<u32> = Vec::new();
 
         // Channel for batch completions (batch_size, tokens, latency, group_id)
         let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<(usize, usize, Duration, usize)>();
@@ -546,9 +548,7 @@ impl Model {
                     Self::trace("rs.select_enter", prof_batches_fired[0],
                         &format!("inf={}", in_flight_counts.iter().sum::<usize>()));
                 }
-                // Wait for any event: new request, completion, continuation, or freed KV.
-                // freed_kv_rx is checked with HIGH priority (before req_rx) to ensure
-                // stale sequences are cleaned up before new requests that reuse their pages.
+                // Wait for any event: new request, completion, or continuation.
                 tokio::select! {
                     biased;
                     _ = shutdown_rx.recv() => break,
@@ -576,14 +576,6 @@ impl Model {
                             group_tokens[group_id] += req.input_tokens.len();
                             batches[group_id].push((req, tx));
                         }
-                    }
-                    maybe_freed = freed_kv_rx.recv() => {
-                        // Eagerly accumulate freed KV page IDs so they're available
-                        // when the next batch fires. Processed in the drain below.
-                        if let Some(ids) = maybe_freed {
-                            early_freed_kv.extend(ids);
-                        }
-                        continue; // Re-enter select to also pick up any request
                     }
                     maybe_req = req_rx.recv() => {
                         match maybe_req {
@@ -622,12 +614,14 @@ impl Model {
                 }
             }
 
-            // Drain freed KV page IDs (non-blocking) for Python SequenceTracker cleanup.
-            // Includes any IDs collected eagerly via the select! branch above.
-            let mut freed_block_ids: Vec<u32> = std::mem::take(&mut early_freed_kv);
-            while let Ok(ids) = freed_kv_rx.try_recv() {
-                freed_block_ids.extend(ids);
-            }
+            // Drain freed KV page IDs (atomic) for Python SequenceTracker cleanup.
+            // Uses a shared mutex instead of a channel to guarantee the scheduler
+            // sees ALL freed IDs accumulated by the command processor up to this point,
+            // eliminating the race where channel buffering delays freed signals.
+            let mut freed_block_ids: Vec<u32> = {
+                let mut guard = freed_kv_ids.lock().unwrap();
+                std::mem::take(&mut *guard)
+            };
 
             // Adaptive coalesce: when GPU is idle and requests arrive, wait
             // for expected_arrivals (last batch size) before firing. This catches
@@ -1245,14 +1239,14 @@ impl Model {
                 if let Err(e) = self.resource_manager.deallocate(inst_id, type_id, ptrs) {
                     terminate_instance_with_exception(inst_id, e);
                 } else if let Some(ids) = freed_kv {
-                    let _ = self.freed_kv_tx.send(ids);
+                    self.freed_kv_ids.lock().unwrap().extend(ids);
                 }
             }
             Command::Cleanup { inst_id } => {
                 match self.resource_manager.cleanup_with_freed_kv(inst_id) {
                     Ok(freed_kv_ids) => {
                         if !freed_kv_ids.is_empty() {
-                            let _ = self.freed_kv_tx.send(freed_kv_ids);
+                            self.freed_kv_ids.lock().unwrap().extend(freed_kv_ids);
                         }
                     }
                     Err(e) => terminate_instance_with_exception(inst_id, e),
