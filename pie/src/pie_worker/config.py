@@ -65,10 +65,6 @@ class RuntimeConfig:
         str  # "auto", "float32", "float16", "bfloat16", "int4", "int8", "float8"
     )
 
-    # Remote code trust (required by vllm_config_bridge on some images)
-    trust_remote_code: bool = False
-    max_model_len: int | None = None
-
     # Dummy mode - skip GPU weight loading, return random tokens
     dummy_mode: bool = False
 
