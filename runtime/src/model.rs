@@ -905,14 +905,32 @@ impl Model {
             Self::trace("rs.rpc_done", trace_batch_id, &format!("reqs={}", batch_size));
         }
 
+        // Enable detailed token delivery tracing with PIE_TOKEN_TRACE=1
+        let token_trace = {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| std::env::var("PIE_TOKEN_TRACE").is_ok())
+        };
+
         match result {
             Ok(batch_resp) => {
                 let _t_resp = Self::mono_ns();
+                let n_results = batch_resp.results.len();
+                if token_trace {
+                    eprintln!("[TOKEN-TRACE] batch={} n_results={} n_requests={}",
+                        trace_batch_id, n_results, batch_size);
+                }
                 let mut resp_iter = batch_resp.results.into_iter();
                 let mut pending_continuations: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)> = Vec::new();
 
-                for (mut fp_req, resp_tx) in requests {
+                for (idx, (mut fp_req, resp_tx)) in requests.into_iter().enumerate() {
                     let resp = resp_iter.next();
+
+                    if token_trace {
+                        let resp_tokens = resp.as_ref().map(|r| r.tokens.len()).unwrap_or(0);
+                        eprintln!("[TOKEN-TRACE] batch={} req={} resp={} resp_tokens={} max_steps={} accum={}",
+                            trace_batch_id, idx, if resp.is_some() { "Some" } else { "None" },
+                            resp_tokens, fp_req.max_decode_steps, fp_req.multi_step_tokens.len());
+                    }
 
                     if fp_req.max_decode_steps > 1 {
                         // Budget continuation: accumulate token, re-enqueue.
@@ -955,6 +973,10 @@ impl Model {
                         }
                         // Budget exhausted or cancelled: deliver all tokens to WASM
                         drop(fp_req.token_stream_tx.take());
+                        if token_trace {
+                            eprintln!("[TOKEN-TRACE] batch={} req={} ONESHOT tokens={} has_tx={}",
+                                trace_batch_id, idx, fp_req.multi_step_tokens.len(), resp_tx.is_some());
+                        }
                         if let Some(tx) = resp_tx {
                             tx.send(ForwardPassResponse {
                                 tokens: fp_req.multi_step_tokens,
@@ -965,7 +987,14 @@ impl Model {
                         // No budget: dispatch directly (single-step)
                         if let Some(tx) = resp_tx {
                             if let Some(r) = resp {
+                                if token_trace {
+                                    eprintln!("[TOKEN-TRACE] batch={} req={} DIRECT tokens={}",
+                                        trace_batch_id, idx, r.tokens.len());
+                                }
                                 tx.send(r).ok();
+                            } else if token_trace {
+                                eprintln!("[TOKEN-TRACE] batch={} req={} DIRECT resp=None — ONESHOT DROPPED!",
+                                    trace_batch_id, idx);
                             }
                         }
                     }
@@ -988,7 +1017,7 @@ impl Model {
                 }
             }
             Err(e) => {
-                eprintln!("[Error] fire_batch failed: {:?}", e);
+                eprintln!("[Error] fire_batch failed: {:?} — {} request oneshots will be DROPPED!", e, batch_size);
             }
         }
 

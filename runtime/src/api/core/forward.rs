@@ -126,9 +126,18 @@ impl Pollable for ForwardPassResult {
                 }
             }
         } else {
-            if let Ok(res) = (&mut self.receiver).await {
-                self.distributions = res.dists;
-                self.tokens = res.tokens;
+            // Non-streaming (single-step): wait for oneshot as before.
+            match (&mut self.receiver).await {
+                Ok(res) => {
+                    if res.tokens.is_empty() {
+                        eprintln!("[FP-READY] oneshot received EMPTY tokens (zero-content!)");
+                    }
+                    self.tokens = res.tokens;
+                    self.distributions = res.dists;
+                }
+                Err(_) => {
+                    eprintln!("[FP-READY] oneshot DROPPED (sender never sent — fire_batch failed?)");
+                }
             }
             self.done = true;
         }
