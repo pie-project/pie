@@ -48,6 +48,11 @@ impl KvPage {
 
 impl Drop for KvPage {
     fn drop(&mut self) {
+        // NOTE: This Drop impl calls a WIT host function (deallocate_resources)
+        // which is async. In wasmtime, calling async host functions from
+        // synchronous Drop deadlocks because Drop can't yield to the async runtime.
+        // Callers should explicitly call deallocate_kv_page_ptrs() before dropping
+        // the Context, then clear kv_pages to prevent this path from firing.
         if Rc::strong_count(&self.rc) == 1 {
             self.queue.deallocate_kv_page_ptr(self.ptr);
         }
