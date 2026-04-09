@@ -1190,7 +1190,11 @@ impl Model {
                 };
                 if let Err(e) = self.resource_manager.deallocate(inst_id, type_id, ptrs) {
                     terminate_instance_with_exception(inst_id, e);
-                } else if let Some(ids) = freed_kv {
+                }
+                // Always signal freed KV pages to Python, regardless of dealloc result.
+                // OOM-kill races can cause dealloc to fail (instance already cleaned up),
+                // but Python still needs to know these blocks are no longer in use.
+                if let Some(ids) = freed_kv {
                     let _ = self.freed_kv_tx.send(ids);
                 }
             }
