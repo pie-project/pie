@@ -3,9 +3,6 @@
 These tests verify that build_scheduler_output correctly classifies
 requests as NEW vs CACHED when given explicit request_ids and is_new
 parameters, preventing block-reuse collisions.
-
-TDD: These tests are written BEFORE the implementation changes.
-They will fail until build_scheduler_output accepts request_ids/is_new.
 """
 from __future__ import annotations
 
@@ -111,8 +108,8 @@ def _make_batch(
     tokens_per_req: list[int],
     blocks_per_req: list[list[int]],
     seq_lens: list[int],
-    request_ids: list[str] | None = None,
-    is_new: list[bool] | None = None,
+    request_ids: list[str],
+    is_new: list[bool],
     batch_id: int = 0,
 ):
     """Helper to build kwargs for build_scheduler_output."""
@@ -120,7 +117,7 @@ def _make_batch(
     cumsum = np.cumsum([0] + tokens_per_req).astype(np.int32)
     sls = np.array(seq_lens, dtype=np.int32)
     sp = [{"temperature": 1.0, "top_k": 0, "top_p": 1.0, "min_p": 0.0}] * len(tokens_per_req)
-    kwargs = dict(
+    return dict(
         batch_id=batch_id,
         token_ids=flat,
         qo_indptr=cumsum,
@@ -128,12 +125,9 @@ def _make_batch(
         blocks_per_req=blocks_per_req,
         seq_lens=sls,
         sampling_params_list=sp,
+        request_ids=request_ids,
+        is_new=is_new,
     )
-    if request_ids is not None:
-        kwargs["request_ids"] = request_ids
-    if is_new is not None:
-        kwargs["is_new"] = is_new
-    return kwargs
 
 
 def _count_new_reqs(output) -> int:
@@ -393,84 +387,3 @@ class TestIsNewFlag:
         assert "pie-0-0" in _cached_req_ids(out)
 
 
-# ---------------------------------------------------------------------------
-# Test 4: Backward compatibility — no request_ids/is_new
-# ---------------------------------------------------------------------------
-
-class TestBackwardCompat:
-    """When request_ids and is_new are absent, the tracker must fall
-    back to block-ID inference (the existing behavior)."""
-
-    def test_new_block_creates_new_request(self):
-        """A block not seen before -> NewRequestData (existing behavior)."""
-        tracker = SequenceTracker()
-
-        out = tracker.build_scheduler_output(**_make_batch(
-            token_ids=[10, 11, 12],
-            tokens_per_req=[3],
-            blocks_per_req=[[5]],
-            seq_lens=[3],
-            batch_id=0,
-        ))
-        assert _count_new_reqs(out) == 1
-
-    def test_same_block_continues_as_cached(self):
-        """Same block in next batch -> CachedRequestData (existing behavior)."""
-        tracker = SequenceTracker()
-
-        tracker.build_scheduler_output(**_make_batch(
-            token_ids=[10, 11, 12],
-            tokens_per_req=[3],
-            blocks_per_req=[[5]],
-            seq_lens=[3],
-            batch_id=0,
-        ))
-
-        out2 = tracker.build_scheduler_output(**_make_batch(
-            token_ids=[13],
-            tokens_per_req=[1],
-            blocks_per_req=[[5]],
-            seq_lens=[4],
-            batch_id=1,
-        ))
-        assert _count_new_reqs(out2) == 0
-        assert len(_cached_req_ids(out2)) == 1
-
-    def test_disappeared_block_finishes_request(self):
-        """Block disappearing from batch -> finished_req_ids (existing behavior)."""
-        tracker = SequenceTracker()
-
-        out1 = tracker.build_scheduler_output(**_make_batch(
-            token_ids=[10, 11, 12],
-            tokens_per_req=[3],
-            blocks_per_req=[[5]],
-            seq_lens=[3],
-            batch_id=0,
-        ))
-        req_id_a = _new_req_ids(out1)[0]
-
-        # Next batch has a different block (block 5 is gone)
-        out2 = tracker.build_scheduler_output(**_make_batch(
-            token_ids=[20, 21],
-            tokens_per_req=[2],
-            blocks_per_req=[[9]],
-            seq_lens=[2],
-            batch_id=1,
-        ))
-        assert req_id_a in out2.finished_req_ids
-
-    def test_no_request_ids_ignores_is_new(self):
-        """Without request_ids, the tracker uses pure block-ID inference
-        regardless of whether is_new is accidentally passed."""
-        tracker = SequenceTracker()
-
-        # Even without request_ids, the method should work identically
-        # to the current behavior.
-        out = tracker.build_scheduler_output(**_make_batch(
-            token_ids=[1, 2, 3],
-            tokens_per_req=[3],
-            blocks_per_req=[[10]],
-            seq_lens=[3],
-            batch_id=0,
-        ))
-        assert _count_new_reqs(out) == 1

@@ -447,6 +447,8 @@ class PieVllmRuntime:
         is_new: list[bool] | None = None,
     ):
         """Delegate to SequenceTracker.build_scheduler_output()."""
+        assert request_ids is not None, "request_ids is required"
+        assert is_new is not None, "is_new is required"
         return self._seq_tracker.build_scheduler_output(
             batch_id=batch_id,
             token_ids=token_ids,
