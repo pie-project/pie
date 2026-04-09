@@ -349,16 +349,14 @@ impl ResourceManager {
             }
         }
 
-        // Prune empty entries to prevent unbounded HashMap growth
+        // Prune empty res_allocated entries to prevent unbounded HashMap growth
         // from per-request WASM instances that allocate then free all pages.
+        // NOTE: Do NOT remove instance_groups here — the double-dealloc pattern
+        // (explicit dealloc + KvPage::drop) means a second Deallocate command
+        // arrives after this cleanup. If instance_groups is already removed,
+        // the second dealloc fails with InstanceGroupNotFound → instance terminated.
         if allocated.is_empty() {
             self.res_allocated.remove(&(type_id, inst_id));
-            // If this instance has no more allocations of any type, clean up tracking
-            let has_any = self.res_allocated.keys().any(|(_, id)| *id == inst_id);
-            if !has_any {
-                self.instance_groups.remove(&inst_id);
-                self.inst_start_time.remove(&inst_id);
-            }
         }
 
         Ok(())
