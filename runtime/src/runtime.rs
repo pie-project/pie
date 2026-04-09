@@ -1215,6 +1215,13 @@ impl Runtime {
                         (t_response - t_spawn).as_secs_f64() * 1000.0,
                     );
                 }
+                // Await the WASM task to completion in the background, then clean up.
+                // The response is already being streamed to the client, but the Store
+                // (and its KvPages) must be dropped and cleanup_instance called.
+                tokio::task::spawn(async move {
+                    let _ = task.await;
+                    model::cleanup_instance(inst_id);
+                });
                 Ok(resp)
             }
             Ok(Err(e)) => Err(e.into()),
@@ -1225,6 +1232,7 @@ impl Runtime {
                     }
                     Err(e) => e.into(),
                 };
+                model::cleanup_instance(inst_id);
                 Err(e.context("guest never invoked `response-outparam::set` method"))
             }
         }
