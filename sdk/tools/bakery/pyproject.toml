@@ -24,7 +24,7 @@ bakery = "bakery.main:app"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
+    "pytest>=9.0.3",
 ]
 
 [tool.setuptools.packages.find]
