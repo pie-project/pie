@@ -15,7 +15,7 @@ dependencies = [
     "toml>=0.10.0",
     "httpx>=0.27.0",
     "esprima>=4.0.0",
-    "rich>=13.0.0",
+    "rich>=15.0.0",
     "factored-componentize-py>=0.20.4",
 ]
 
