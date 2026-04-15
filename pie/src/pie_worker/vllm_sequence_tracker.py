@@ -695,6 +695,25 @@ class SequenceTracker:
             )
             from vllm.config import set_current_vllm_config
 
+            # Reset the BatchUpdateBuilder before issuing the cleanup
+            # SchedulerOutput. The failed execute_model call may have already
+            # triggered `_ensure_removed_sorted` (via pop_removed in
+            # add_request), which sets _is_removed_sorted=True. Subsequent
+            # removed_append calls from our cleanup's remove_request path
+            # would raise: "Cannot register new removed request after
+            # self.removed has been read." Resetting here restores the
+            # builder to a clean state so cleanup removals succeed.
+            try:
+                model_runner = getattr(vllm_worker, "model_runner", None)
+                input_batch = getattr(model_runner, "input_batch", None) if model_runner is not None else None
+                builder = getattr(input_batch, "batch_update_builder", None) if input_batch is not None else None
+                if builder is not None:
+                    builder.reset()
+            except Exception:
+                # Reset is best-effort. If it fails, fall through and let
+                # the cleanup attempt either succeed or hit the outer except.
+                pass
+
             cleanup_output = SchedulerOutput(
                 scheduled_new_reqs=[],
                 scheduled_cached_reqs=CachedRequestData.make_empty(),
