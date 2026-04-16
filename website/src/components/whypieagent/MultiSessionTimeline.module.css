@@ -1,0 +1,382 @@
+/* Case 3: Vertical progress + memory view */
+
+.wrapper {
+  max-width: 880px;
+  margin: 0 auto;
+}
+
+/* Memory row: two memory views side by side */
+.memRow {
+  display: flex;
+  gap: 0;
+  justify-content: center;
+}
+
+.memCol {
+  flex: 1;
+  max-width: 400px;
+}
+
+.memColSpacer {
+  width: 40px;
+  flex-shrink: 0;
+}
+
+.systemTitle {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: #9898b0;
+  text-align: center;
+  margin: 0 0 1rem;
+  letter-spacing: 0.02em;
+}
+
+/* Progress row: two timelines with time arrow between, top-aligned */
+.progressRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  margin-top: 1rem;
+}
+
+.progressCol {
+  flex: 1;
+  max-width: 400px;
+}
+
+.timeArrowCol {
+  width: 40px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  align-self: stretch;
+}
+
+/* ─── Memory view ─── */
+
+.memoryView {
+  width: 100%;
+}
+
+.memTitle {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.65rem;
+  color: #606078;
+  text-align: center;
+  margin-bottom: 0.5rem;
+  letter-spacing: 0.03em;
+}
+
+.memSlots {
+  display: flex;
+  gap: 6px;
+}
+
+.memSlot {
+  flex: 1;
+  display: flex;
+  gap: 3px;
+}
+
+.memSlotLabel {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.6rem;
+  font-weight: 600;
+  writing-mode: horizontal-tb;
+  display: flex;
+  align-items: center;
+  padding-right: 4px;
+  flex-shrink: 0;
+}
+
+/* Session color themes for slot labels */
+.memSlotS1 .memSlotLabel { color: #8aaad0; }
+.memSlotS2 .memSlotLabel { color: #c0a080; }
+
+.memBlock {
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.55rem;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.12);
+  border: 1px dashed #22222e;
+  z-index: 0;
+  overflow: hidden;
+  position: relative;
+  background: #0e0e16;
+  transition: color 0.3s ease, border-color 0.3s ease;
+}
+
+.memBlockLabel {
+  position: relative;
+  z-index: 1;
+}
+
+/* Inner fill driven by --mem-fill and --mem-evict custom properties.
+   --mem-fill: 0-100% how much is filled (grows from left)
+   --mem-evict: 0-100% how much is evicted (clips from left) */
+.memBlock::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 100%;
+  border-radius: 2px;
+  z-index: 0;
+  clip-path: inset(0 calc(100% - var(--mem-fill, 0%)) 0 var(--mem-evict, 0%));
+}
+
+.memBlockSys {
+  height: 36px;
+  flex: 1;
+}
+
+.memBlockConv {
+  height: 36px;
+  flex: 2.5;
+}
+
+.memBlock.memFilled {
+  border-style: solid;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+/* Session 1 memory colors (blue tones) */
+.memS1Sys.memFilled { border-color: #2a3a60; }
+.memS1Sys::after { background: #1a2848; }
+
+.memS1Conv.memFilled { border-color: #263050; }
+.memS1Conv::after { background: #162040; }
+
+/* Session 2 memory colors (warm tones) */
+.memS2Sys.memFilled { border-color: #3a3228; }
+.memS2Sys::after { background: #2a2218; }
+
+.memS2Conv.memFilled { border-color: #322e26; }
+.memS2Conv::after { background: #221e16; }
+
+/* Section sub-header between memory and timeline */
+.sectionTitle {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.62rem;
+  color: #606078;
+  letter-spacing: 0.03em;
+  margin-top: 0.25rem;
+}
+
+/* ─── Vertical timeline ─── */
+
+.timeline {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border-radius: 6px;
+  overflow: hidden;
+  position: relative;
+}
+
+.phase {
+  position: relative;
+  overflow: hidden;
+}
+
+.phaseBg {
+  position: absolute;
+  inset: 0;
+  background: #10101a;
+}
+
+.phaseFill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+}
+
+.phaseLabel {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 0.6rem;
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.68rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.2;
+  transition: opacity 0.3s ease;
+}
+
+.phaseLabelVisible {
+  opacity: 1;
+}
+
+/* Session label colors */
+.phaseS1 .phaseLabel { color: rgba(138, 170, 208, 0.8); }
+.phaseS2 .phaseLabel { color: rgba(192, 160, 128, 0.8); }
+
+.importedTag {
+  color: #7ec9a0;
+  font-weight: 600;
+}
+
+.cacheHit {
+  position: absolute;
+  right: 0.6rem;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 1;
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: #7ec9a0;
+}
+
+/* Phase fill colors — session-themed */
+.phaseSysS1 { background: #1a2848; }
+.phaseConvS1 { background: #162040; }
+.phaseReprefillS1 {
+  background: repeating-linear-gradient(
+    -45deg,
+    #1a2848,
+    #1a2848 4px,
+    #0e1830 4px,
+    #0e1830 8px
+  );
+}
+.phaseImportS1 { background: #1a3a28; }
+
+.phaseSysS2 { background: #2a2218; }
+.phaseConvS2 { background: #221e16; }
+.phaseReprefillS2 { background: #3a2018; }
+.phaseImportS2 { background: #1a3a28; }
+
+.doneLabel {
+  position: absolute;
+  bottom: 10px;
+  right: 10px;
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #7ec9a0;
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ─── Time direction arrow ─── */
+
+.timeArrow {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+  margin-top: 0.75rem;
+  color: #404058;
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.04em;
+}
+
+.timeArrowLine {
+  width: 1px;
+  height: 24px;
+  background: #404058;
+  position: relative;
+}
+
+.timeArrowLine::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  left: -3px;
+  width: 0;
+  height: 0;
+  border-top: 5px solid #404058;
+  border-left: 3.5px solid transparent;
+  border-right: 3.5px solid transparent;
+}
+
+/* ─── Legend ─── */
+
+.legend {
+  display: flex;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.legendItem {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.68rem;
+  color: #787890;
+}
+
+.legendDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.dotSys { background: #1a2848; border: 1px solid #2a3a60; }
+.dotConv { background: #162040; border: 1px solid #263050; }
+.dotReprefill {
+  background: repeating-linear-gradient(
+    -45deg,
+    #1a2848,
+    #1a2848 2px,
+    #0e1830 2px,
+    #0e1830 4px
+  );
+  border: 1px solid #2a3a60;
+}
+.dotImport { background: #1a3a28; border: 1px solid #2a5a38; }
+
+/* ─── Replay ─── */
+
+.replayRow {
+  margin-top: 0.75rem;
+  text-align: center;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  pointer-events: none;
+}
+
+.replayRow.replayVisible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.replayBtn {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.92rem;
+  font-weight: 600;
+  padding: 0;
+  border: none;
+  background: none;
+  color: #505068;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.replayBtn:hover {
+  color: #8090b0;
+}

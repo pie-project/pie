@@ -1,0 +1,94 @@
+/* Fair Notes — dark theme */
+
+.wrapper {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+.title {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: clamp(1.5rem, 2.5vw, 2rem);
+  font-weight: 700;
+  text-align: center;
+  margin: 0 0 2rem;
+  color: #f0f0f8;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1rem;
+}
+
+.card {
+  border: 1px solid #2a2a3a;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #12121a;
+}
+
+.cardHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem 1.25rem;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+  transition: background 0.15s ease;
+}
+
+.cardHeader:hover {
+  background: rgba(59, 130, 246, 0.05);
+}
+
+.chevron {
+  font-size: 0.85rem;
+  color: #4a4a60;
+  transition: transform 0.2s ease;
+  flex-shrink: 0;
+}
+
+.chevronOpen {
+  transform: rotate(90deg);
+}
+
+.cardTitle {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0;
+  color: #e0e0e8;
+}
+
+.cardBody {
+  padding: 0 1.25rem 1.25rem;
+  color: #9090a8;
+  font-size: 0.92rem;
+  line-height: 1.65;
+}
+
+.cardBody ul {
+  margin: 0.5rem 0 0;
+  padding-left: 1.25rem;
+}
+
+.cardBody li {
+  margin-bottom: 0.4rem;
+}
+
+.cardBody li:last-child {
+  margin-bottom: 0;
+}
+
+.cardBody strong {
+  color: #c0c0d0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chevron { transition: none; }
+}

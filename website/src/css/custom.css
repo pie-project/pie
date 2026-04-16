@@ -33,3 +33,44 @@
 }
 
 /* src/css/custom.css */
+
+/* === /whypieagent dark theme: re-skin navbar + footer to match page ===
+   Scoped to body.whypieagent-dark because Docusaurus actively manages the
+   <html> className on route changes and clobbers any class added there. */
+body.whypieagent-dark,
+body.whypieagent-dark html {
+  background: #0a0a0f;
+}
+body.whypieagent-dark .navbar {
+  background: #0a0a0f;
+  border-bottom: 1px solid #2a2a3a;
+  box-shadow: none;
+}
+body.whypieagent-dark .navbar__title,
+body.whypieagent-dark .navbar__link,
+body.whypieagent-dark .navbar__brand,
+body.whypieagent-dark .navbar__toggle {
+  color: #e0e0e8;
+}
+body.whypieagent-dark .navbar__link:hover,
+body.whypieagent-dark .navbar__link--active {
+  color: #f48b69;
+}
+body.whypieagent-dark .navbar-sidebar,
+body.whypieagent-dark .navbar-sidebar__brand {
+  background: #0a0a0f;
+  color: #e0e0e8;
+}
+body.whypieagent-dark .footer {
+  background: #0a0a0f;
+  color: #a8a8b3;
+  border-top: 1px solid #2a2a3a;
+}
+body.whypieagent-dark .footer a,
+body.whypieagent-dark .footer__link-item,
+body.whypieagent-dark .footer__title {
+  color: #e0e0e8;
+}
+body.whypieagent-dark .footer__copyright {
+  color: #808090;
+}

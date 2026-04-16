@@ -1,0 +1,214 @@
+/* Case 2: Channel Switch — side-by-side, pastel dark theme */
+
+.wrapper {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+
+/* Side by side layout */
+.sideBySide {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+}
+
+@media (max-width: 760px) {
+  .sideBySide {
+    grid-template-columns: 1fr;
+  }
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+}
+
+.columnTitle {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #9898b0;
+  margin: 0 0 0.75rem;
+  text-align: center;
+  letter-spacing: 0.02em;
+}
+
+.blockStack {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #22222e;
+}
+
+
+.blockLabel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  position: relative;
+  z-index: 1;
+}
+
+.blockTokens {
+  font-size: 0.6rem;
+  opacity: 0.5;
+  margin-left: 0.5rem;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+}
+
+/* Block base — always the default gray, overlay wipes color in */
+.block {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0.6rem;
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.68rem;
+  overflow: hidden;
+  white-space: nowrap;
+  min-height: 18px;
+  background-color: #282840;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+/* Color overlay — wipes in from left */
+.blockOverlay {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  clip-path: inset(0 100% 0 0);
+}
+
+.blockOverlay.blockWiped {
+  clip-path: inset(0 0 0 0);
+  transition: clip-path 0.3s ease;
+}
+
+.overlayCached {
+  background-color: #1a3a2e;
+}
+
+.overlayInvalidated {
+  background-color: #3a2e1a;
+}
+
+.overlayChanged {
+  background-color: #3a1a22;
+}
+
+/* Stats below each column */
+.stats {
+  display: flex;
+  justify-content: center;
+  gap: 1.25rem;
+  margin-top: 0.75rem;
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.75rem;
+}
+
+.statCached {
+  color: #7ec9a0;
+}
+
+.statReprefill {
+  color: #d4a06a;
+}
+
+/* Summary bar */
+.summaryBar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 1.5rem;
+  padding: 0.75rem 1.5rem;
+  background: rgba(107, 138, 219, 0.08);
+  border: 1px solid rgba(107, 138, 219, 0.2);
+  border-radius: 8px;
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  flex-wrap: wrap;
+}
+
+.summaryLabel {
+  font-size: 0.78rem;
+  color: #7080a0;
+}
+
+.summaryValue {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #a0c0e8;
+}
+
+.summaryDetail {
+  font-size: 0.72rem;
+  color: #606880;
+}
+
+/* Legend */
+.legend {
+  display: flex;
+  justify-content: center;
+  gap: 1.25rem;
+  margin-top: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.legendItem {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.78rem;
+  color: #787890;
+}
+
+.legendDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.dotCached { background: #1a3a2e; border: 1px solid #2a5040; }
+.dotChanged { background: #3a1a22; border: 1px solid #5a2a35; }
+.dotInvalidated { background: #3a2e1a; border: 1px solid #5a4a2a; }
+
+.legend {
+  margin-top: 1.5rem;
+}
+
+.replayRow {
+  margin-top: 0.75rem;
+  text-align: center;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  pointer-events: none;
+}
+
+.replayRow.replayVisible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.replayBtn {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.92rem;
+  font-weight: 600;
+  padding: 0;
+  border: none;
+  background: none;
+  color: #505068;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.replayBtn:hover {
+  color: #8090b0;
+}
+

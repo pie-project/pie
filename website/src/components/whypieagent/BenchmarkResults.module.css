@@ -1,0 +1,134 @@
+/* Benchmark Results — dark theme */
+
+.wrapper {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 0 1rem 2rem;
+}
+
+.title {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: clamp(1.3rem, 2.2vw, 1.6rem);
+  font-weight: 700;
+  text-align: center;
+  margin: 0 0 1.5rem;
+  color: #f0f0f8;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  table-layout: fixed;
+}
+
+.table th,
+.table td {
+  padding: 0.75rem 1rem;
+  text-align: left;
+  border-bottom: 1px solid #2a2a3a;
+  vertical-align: top !important;
+  word-wrap: break-word;
+}
+
+.table th:nth-child(1),
+.table td:nth-child(1) {
+  width: 38%;
+}
+
+.table th:nth-child(2),
+.table td:nth-child(2) {
+  width: 25%;
+}
+
+.table th:nth-child(3),
+.table td:nth-child(3) {
+  width: 22%;
+}
+
+.table th:nth-child(4),
+.table td:nth-child(4) {
+  width: 15%;
+  min-width: 110px;
+  white-space: nowrap;
+}
+
+.table th {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #6b6b88;
+  background: #12121a;
+}
+
+.table td {
+  color: #c0c0d0;
+}
+
+.table tbody tr:hover {
+  background: rgba(59, 130, 246, 0.04);
+}
+
+.monoCell {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-weight: 400;
+}
+
+.metricPrimary {
+  display: block;
+  color: #e0e0f0;
+}
+
+.metricSecondary {
+  display: block;
+  color: #7a7a95;
+  font-size: 0.85em;
+  margin-top: 0.2rem;
+}
+
+.scenarioDesc {
+  display: block;
+  font-size: 0.85em;
+  font-weight: 400;
+  color: #8a8aa0;
+  margin-top: 0.2rem;
+}
+
+.badge {
+  display: inline-block;
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  vertical-align: middle;
+}
+
+.badgeEstimated {
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+}
+
+.badgeMeasured {
+  background: rgba(34, 197, 94, 0.15);
+  color: #22c55e;
+}
+
+.tableNote {
+  text-align: center;
+  margin-top: 1rem;
+  font-size: 0.85rem;
+  color: #6b6b88;
+  line-height: 1.5;
+}
+
+@media (max-width: 640px) {
+  .table th,
+  .table td {
+    padding: 0.5rem 0.6rem;
+    font-size: 0.82rem;
+  }
+}
