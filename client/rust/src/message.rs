@@ -108,6 +108,10 @@ pub enum ClientMessage {
         port: u32,
         inferlet: String,
         arguments: Vec<String>,
+        /// IP to bind the server inferlet on.  Omitted by older clients → defaults to
+        /// `127.0.0.1` runtime-side (see `server::handle_launch_server_instance`).
+        #[serde(default)]
+        host: Option<String>,
     },
 
     #[serde(rename = "signal_instance")]
