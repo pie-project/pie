@@ -76,8 +76,7 @@ export default function BenchmarkResults({ case1, case2, benchmarks }: Props) {
       </table>
 
       <p className={styles.tableNote}>
-        Percentages reflect token reduction (prefill for rows 1-3; input per turn for row 4).
-        End-to-end latency improvement varies with response length since decode throughput is similar between systems.
+        Percentages reflect token reduction (prefill for scenarios 1-3; input per turn for scenario 4).
         {benchmarks?.platform && <>{' '}Measured on {benchmarks.platform}.</>}
       </p>
     </div>
