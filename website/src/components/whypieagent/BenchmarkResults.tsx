@@ -77,7 +77,7 @@ export default function BenchmarkResults({ case1, case2, benchmarks }: Props) {
 
       <p className={styles.tableNote}>
         Percentages reflect token reduction (prefill for scenarios 1-3; input per turn for scenario 4).
-        {benchmarks?.platform && <>{' '}Measured on {benchmarks.platform}.</>}
+        {benchmarks?.platform && <><br />Measured on {benchmarks.platform}.</>}
       </p>
     </div>
   );
