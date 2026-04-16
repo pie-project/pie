@@ -33,3 +33,44 @@
 }
 
 /* src/css/custom.css */
+
+/* === /whypieagent dark theme: re-skin navbar + footer to match page === */
+html.whypieagent-dark {
+  background: #0a0a0f;
+}
+html.whypieagent-dark body {
+  background: #0a0a0f;
+}
+html.whypieagent-dark .navbar {
+  background: #0a0a0f;
+  border-bottom: 1px solid #2a2a3a;
+  box-shadow: none;
+}
+html.whypieagent-dark .navbar__title,
+html.whypieagent-dark .navbar__link,
+html.whypieagent-dark .navbar__brand,
+html.whypieagent-dark .navbar__toggle {
+  color: #e0e0e8;
+}
+html.whypieagent-dark .navbar__link:hover,
+html.whypieagent-dark .navbar__link--active {
+  color: #f48b69;
+}
+html.whypieagent-dark .navbar-sidebar,
+html.whypieagent-dark .navbar-sidebar__brand {
+  background: #0a0a0f;
+  color: #e0e0e8;
+}
+html.whypieagent-dark .footer {
+  background: #0a0a0f;
+  color: #a8a8b3;
+  border-top: 1px solid #2a2a3a;
+}
+html.whypieagent-dark .footer a,
+html.whypieagent-dark .footer__link-item,
+html.whypieagent-dark .footer__title {
+  color: #e0e0e8;
+}
+html.whypieagent-dark .footer__copyright {
+  color: #808090;
+}

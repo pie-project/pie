@@ -48,6 +48,13 @@ function WhyPieAgentContent() {
   const [data, setData] = useState<DemoData | null>(null);
 
   useEffect(() => {
+    document.documentElement.classList.add('whypieagent-dark');
+    return () => {
+      document.documentElement.classList.remove('whypieagent-dark');
+    };
+  }, []);
+
+  useEffect(() => {
     fetch(dataUrl)
       .then((r) => r.json())
       .then(setData)
@@ -155,9 +162,8 @@ function WhyPieAgentContent() {
               approaches. They do not represent exact measurements or benchmarks.
               Actual performance varies by model, hardware, workload, and
               configuration. Token counts are derived from prompt structure
-              analysis of a real agentic system prompt. Timing proportions in
-              Case 3 are schematic. Measured benchmarks will be published
-              separately.
+              analysis of a real agentic system prompt. Timing proportions
+              are schematic.
             </p>
           </div>
         </section>
