@@ -48,9 +48,18 @@ function WhyPieAgentContent() {
   const [data, setData] = useState<DemoData | null>(null);
 
   useEffect(() => {
-    document.documentElement.classList.add('whypieagent-dark');
+    const CLS = 'whypieagent-dark';
+    const ensure = () => {
+      if (!document.body.classList.contains(CLS)) {
+        document.body.classList.add(CLS);
+      }
+    };
+    ensure();
+    const obs = new MutationObserver(ensure);
+    obs.observe(document.body, { attributes: true, attributeFilter: ['class'] });
     return () => {
-      document.documentElement.classList.remove('whypieagent-dark');
+      obs.disconnect();
+      document.body.classList.remove(CLS);
     };
   }, []);
 
