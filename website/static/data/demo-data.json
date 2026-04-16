@@ -1,0 +1,210 @@
+{
+  "total_tokens": 7059,
+  "total_chars": 28236,
+  "sections": [
+    {
+      "name": "## Tooling",
+      "token_start": 13,
+      "token_end": 1049,
+      "tokens": 1035,
+      "stability": "static"
+    },
+    {
+      "name": "## Tool Call Style",
+      "token_start": 1049,
+      "token_end": 1312,
+      "tokens": 263,
+      "stability": "static"
+    },
+    {
+      "name": "## Safety",
+      "token_start": 1312,
+      "token_end": 1452,
+      "tokens": 140,
+      "stability": "static"
+    },
+    {
+      "name": "## OpenClaw CLI Quick Reference",
+      "token_start": 1452,
+      "token_end": 1542,
+      "tokens": 89,
+      "stability": "static"
+    },
+    {
+      "name": "## Skills (mandatory)",
+      "token_start": 1542,
+      "token_end": 2297,
+      "tokens": 755,
+      "stability": "static"
+    },
+    {
+      "name": "## Memory Recall",
+      "token_start": 2297,
+      "token_end": 2383,
+      "tokens": 85,
+      "stability": "static"
+    },
+    {
+      "name": "## OpenClaw Self-Update + ## Workspace",
+      "token_start": 2383,
+      "token_end": 2643,
+      "tokens": 260,
+      "stability": "static"
+    },
+    {
+      "name": "## Documentation + ## Current Date & Time + ## Workspace Files (injected)",
+      "token_start": 2643,
+      "token_end": 2784,
+      "tokens": 141,
+      "stability": "static"
+    },
+    {
+      "name": "## Reply Tags",
+      "token_start": 2784,
+      "token_end": 2927,
+      "tokens": 142,
+      "stability": "static"
+    },
+    {
+      "name": "## Messaging",
+      "token_start": 2927,
+      "token_end": 3057,
+      "tokens": 130,
+      "stability": "static"
+    },
+    {
+      "name": "## Inbound Context (trusted metadata) + ## Reactions",
+      "token_start": 3194,
+      "token_end": 3348,
+      "tokens": 154,
+      "stability": "dynamic"
+    },
+    {
+      "name": "# Project Context + ## /home/node/.openclaw/workspace/AGENTS.md + ## First Run",
+      "token_start": 3348,
+      "token_end": 3470,
+      "tokens": 122,
+      "stability": "static"
+    },
+    {
+      "name": "## Session Startup",
+      "token_start": 3470,
+      "token_end": 3550,
+      "tokens": 80,
+      "stability": "static"
+    },
+    {
+      "name": "## Memory + ## Red Lines + ## External vs Internal + ## Group Chats",
+      "token_start": 3550,
+      "token_end": 4057,
+      "tokens": 507,
+      "stability": "static"
+    },
+    {
+      "name": "## Tools",
+      "token_start": 4460,
+      "token_end": 4613,
+      "tokens": 153,
+      "stability": "static"
+    },
+    {
+      "name": "## \ud83d\udc93 Heartbeats - Be Proactive! + ## Make It Yours + ## /home/node/.openclaw/workspace/SOUL.md",
+      "token_start": 4613,
+      "token_end": 5374,
+      "tokens": 761,
+      "stability": "static"
+    },
+    {
+      "name": "## Core Truths + ## Boundaries + ## Vibe + ## Continuity + ## /home/node/.openclaw/workspace/TOOLS.md + ## What Goes Here + ## Examples + ## Why Separate? + ## /home/node/.openclaw/workspace/IDENTITY.md + ## /home/node/.openclaw/workspace/USER.md + ## Context + ## /home/node/.openclaw/workspace/HEARTBEAT.md + ## /home/node/.openclaw/workspace/BOOTSTRAP.md",
+      "token_start": 5393,
+      "token_end": 6378,
+      "tokens": 985,
+      "stability": "static"
+    },
+    {
+      "name": "## The Conversation",
+      "token_start": 6429,
+      "token_end": 6557,
+      "tokens": 127,
+      "stability": "static"
+    },
+    {
+      "name": "## After You Know Who You Are + ## Connect (Optional) + ## When You're Done",
+      "token_start": 6557,
+      "token_end": 6741,
+      "tokens": 184,
+      "stability": "static"
+    },
+    {
+      "name": "## Silent Replies",
+      "token_start": 6741,
+      "token_end": 6824,
+      "tokens": 83,
+      "stability": "static"
+    },
+    {
+      "name": "## Heartbeats",
+      "token_start": 6824,
+      "token_end": 6961,
+      "tokens": 136,
+      "stability": "static"
+    },
+    {
+      "name": "## Runtime",
+      "token_start": 6961,
+      "token_end": 7059,
+      "tokens": 97,
+      "stability": "dynamic"
+    }
+  ],
+  "divergence_original": 3234,
+  "divergence_reordered": 6833,
+  "common_prefix_pct_original": 45.8,
+  "common_prefix_pct_reordered": 96.8,
+  "case1": {
+    "vllm_prefill_tokens": 6758,
+    "pie_prefill_tokens": 124,
+    "description": "First request to fresh engine (Pie has prewarmed stable prefix)"
+  },
+  "case2": {
+    "vllm_reprefill_tokens": 3825,
+    "pie_reprefill_tokens": 30,
+    "reduction_pct": 99.2,
+    "description": "Channel switch Telegram -> Discord (section reordering keeps stable prefix intact)"
+  },
+  "case3": {
+    "sessions": 4,
+    "context_tokens": 7059,
+    "description": "Session pinning under memory pressure (illustrative \u2014 pinning at scale is future work)"
+  },
+  "benchmarks": {
+    "platform": "A100 SXM4 80GB \u00b7 Qwen3-8B \u00b7 max_model_len=16384",
+    "date": "2026-04-13",
+    "rows": [
+      {
+        "scenario": "Cold start: fresh agent session",
+        "standard": "6,758 tok\n1,023 ms",
+        "pie": "124 tok\n292 ms",
+        "improvement": "98%"
+      },
+      {
+        "scenario": "Multi-tenant fleet: per user, 8 diverse workspaces",
+        "standard": "991 tok\n306 ms",
+        "pie": "130 tok\n223 ms",
+        "improvement": "87%"
+      },
+      {
+        "scenario": "Channel switch: Telegram \u2192 Discord",
+        "standard": "3,825 tok\n461 ms",
+        "pie": "30 tok\n218 ms",
+        "improvement": "99%"
+      },
+      {
+        "scenario": "Removing redundant information: API tools already in system prompt",
+        "standard": "16,375 tok\n\u2014",
+        "pie": "6,727 tok\n\u2014",
+        "improvement": "59%"
+      }
+    ]
+  }
+}

@@ -1,0 +1,162 @@
+/* Case 1: Cold Start Race — dark theme */
+
+.container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2rem;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+@media (max-width: 640px) {
+  .container {
+    grid-template-columns: 1fr;
+  }
+}
+
+.panel {
+  background: #14141e;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid #22222e;
+}
+
+.panelHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  background: #10101a;
+  border-bottom: 1px solid #22222e;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.dotRed { background: #ff5f56; }
+.dotYellow { background: #ffbd2e; }
+.dotGreen { background: #27c93f; }
+
+.panelTitle {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.82rem;
+  color: #8080a0;
+  margin: 0;
+  margin-left: 0.5rem;
+}
+
+.panelBody {
+  padding: 1.25rem;
+  min-height: 140px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1rem;
+}
+
+.progressTrack {
+  height: 28px;
+  background: #12121e;
+  border-radius: 6px;
+  overflow: hidden;
+  position: relative;
+}
+
+.progressFill {
+  height: 100%;
+  border-radius: 6px;
+}
+
+.fillStd {
+  background: linear-gradient(90deg, #3a2e50 0%, #4a3a60 100%);
+}
+
+.fillPie {
+  background: linear-gradient(90deg, #1e3a50 0%, #2a4a60 100%);
+}
+
+.label {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.8rem;
+  color: #6b6b88;
+}
+
+.tokens {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.9rem;
+  color: #d0d0e0;
+  font-weight: 600;
+}
+
+.tokenLabel {
+  color: #6b6b88;
+  font-weight: 400;
+}
+
+.tokenSlash {
+  color: #4a4a60;
+  font-weight: 400;
+}
+
+.stats {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.done {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.8rem;
+  color: #7ec9a0;
+  opacity: 0;
+}
+
+.done.show {
+  animation: fadeIn 0.3s ease-out forwards;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.outer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.replayRow {
+  margin-top: 1.25rem;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  pointer-events: none;
+}
+
+.replayRow.replayVisible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.replayBtn {
+  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 0.92rem;
+  font-weight: 600;
+  padding: 0;
+  border: none;
+  background: none;
+  color: #505068;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.replayBtn:hover {
+  color: #8090b0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .done.show { animation: none; opacity: 1; }
+}
