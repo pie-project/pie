@@ -676,8 +676,9 @@ impl Session {
                     port,
                     inferlet,
                     arguments,
+                    host,
                 } => {
-                    self.handle_launch_server_instance(corr_id, port, inferlet, arguments)
+                    self.handle_launch_server_instance(corr_id, port, inferlet, arguments, host)
                         .await
                 }
                 ClientMessage::SignalInstance {
@@ -1344,6 +1345,7 @@ impl Session {
         port: u32,
         inferlet: String,
         arguments: Vec<String>,
+        host: Option<String>,
     ) {
         let program_name = ProgramName::parse(&inferlet);
 
@@ -1385,6 +1387,7 @@ impl Session {
                     program_metadata.manifest_hash,
                 ),
                 port,
+                host,
                 arguments,
                 event: evt_tx,
             }

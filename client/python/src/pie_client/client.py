@@ -646,6 +646,7 @@ class PieClient:
         program_hash: str,
         port: int,
         arguments: list[str] | None = None,
+        host: str | None = None,
     ) -> None:
         """
         Launch a server inferlet that listens on a specific port.
@@ -657,14 +658,18 @@ class PieClient:
         :param program_hash: The hash of the uploaded program.
         :param port: The TCP port to listen on.
         :param arguments: Command-line arguments to pass to the inferlet.
+        :param host: IP to bind on (e.g. ``"0.0.0.0"``). ``None`` keeps the
+            engine's historical default of ``127.0.0.1``.
         :raises Exception: If launch fails.
         """
-        msg = {
+        msg: dict = {
             "type": "launch_server_instance",
             "port": port,
             "inferlet": program_hash,
             "arguments": arguments or [],
         }
+        if host is not None:
+            msg["host"] = host
         successful, result = await self._send_msg_and_wait(msg)
         if not successful:
             raise Exception(f"Failed to launch server instance: {result}")
