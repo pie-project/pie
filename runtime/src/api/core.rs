@@ -232,6 +232,34 @@ impl inferlet::core::common::Host for InstanceState {
         Ok(())
     }
 
+    async fn export_resources_sync(
+        &mut self,
+        queue: Resource<Queue>,
+        resource_type: ResourceTypeId,
+        mut ptrs: Vec<ResourceId>,
+        name: String,
+    ) -> Result<Result<(), String>> {
+        let inst_id = self.id();
+        let svc_id = self.ctx().table.get(&queue)?.service_id;
+
+        ptrs.iter_mut().try_for_each(|ptr| {
+            *ptr = self.translate_resource_ptr(svc_id, resource_type, *ptr)?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+
+        let (tx, rx) = oneshot::channel();
+        model::Command::ExportSync {
+            inst_id,
+            type_id: resource_type,
+            ptrs,
+            name,
+            response: tx,
+        }
+        .dispatch(svc_id)?;
+
+        Ok(rx.await?)
+    }
+
     async fn import_resources(
         &mut self,
         queue: Resource<Queue>,

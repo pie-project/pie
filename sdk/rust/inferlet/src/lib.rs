@@ -320,6 +320,10 @@ impl Queue {
         api::export_resources(&self.inner, resource as u32, ptrs, name)
     }
 
+    pub fn export_resource_sync(&self, resource: Resource, ptrs: &[u32], name: &str) -> Result<(), String> {
+        api::export_resources_sync(&self.inner, resource as u32, ptrs, name)
+    }
+
     pub fn import_resource(&self, resource: Resource, name: &str) -> Vec<u32> {
         api::import_resources(&self.inner, resource as u32, name)
     }

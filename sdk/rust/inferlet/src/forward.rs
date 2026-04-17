@@ -99,6 +99,8 @@ pub trait Forward {
     fn new_kv_pages(&self, count: usize) -> Vec<KvPage>;
 
     fn export_kv_pages(&self, ptrs: &[KvPage], name: &str);
+    fn export_kv_pages_sync(&self, ptrs: &[KvPage], name: &str) -> Result<(), String>;
+    fn export_kv_page_ptrs_sync(&self, ptrs: &[u32], name: &str) -> Result<(), String>;
     fn import_kv_pages(&self, name: &str) -> Vec<KvPage>;
     fn allocate_kv_page_ptr(&self) -> u32;
     fn allocate_kv_page_ptrs(&self, count: usize) -> Vec<u32>;
@@ -138,6 +140,15 @@ impl Forward for Queue {
     fn export_kv_pages(&self, kv_pages: &[KvPage], name: &str) {
         let ptrs = kv_pages.iter().map(|kv| kv.ptr()).collect::<Vec<_>>();
         self.export_resource(Resource::KvPage, &ptrs, name)
+    }
+
+    fn export_kv_pages_sync(&self, kv_pages: &[KvPage], name: &str) -> Result<(), String> {
+        let ptrs = kv_pages.iter().map(|kv| kv.ptr()).collect::<Vec<_>>();
+        self.export_resource_sync(Resource::KvPage, &ptrs, name)
+    }
+
+    fn export_kv_page_ptrs_sync(&self, ptrs: &[u32], name: &str) -> Result<(), String> {
+        self.export_resource_sync(Resource::KvPage, ptrs, name)
     }
 
     fn import_kv_pages(&self, name: &str) -> Vec<KvPage> {

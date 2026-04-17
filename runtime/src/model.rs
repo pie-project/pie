@@ -259,6 +259,13 @@ pub enum Command {
         ptrs: Vec<ResourceId>,
         name: String,
     },
+    ExportSync {
+        inst_id: InstanceId,
+        type_id: ResourceTypeId,
+        ptrs: Vec<ResourceId>,
+        name: String,
+        response: oneshot::Sender<Result<(), String>>,
+    },
     Import {
         inst_id: InstanceId,
         type_id: ResourceTypeId,
@@ -1262,6 +1269,24 @@ impl Model {
                 if let Err(e) = self.resource_manager.export(inst_id, type_id, ptrs, name) {
                     eprintln!("[RESOURCE-DEBUG] Export FAILED: {:?}", e);
                     terminate_instance_with_exception(inst_id, e);
+                }
+            }
+            Command::ExportSync { inst_id, type_id, ptrs, name, response } => {
+                // Synchronous variant: instead of terminating on failure, the
+                // error is returned to the guest through the oneshot so the
+                // inferlet can decide (e.g. skip session state save and fall
+                // back to prefix checkpoint next turn). Used by the session-KV
+                // export path in openai-compat-v2 to avoid poisoning the
+                // inferlet's on-disk session_state when the engine-side
+                // export rejects the ptrs list.
+                match self.resource_manager.export(inst_id, type_id, ptrs, name) {
+                    Ok(()) => {
+                        response.send(Ok(())).ok();
+                    }
+                    Err(e) => {
+                        eprintln!("[RESOURCE-DEBUG] ExportSync FAILED: {:?}", e);
+                        response.send(Err(format!("{:?}", e))).ok();
+                    }
                 }
             }
             Command::Import { inst_id, type_id, name, response } => {

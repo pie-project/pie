@@ -4,6 +4,7 @@ pub use crate::api::inferlet::core::common::{
     allocate_resources,
     deallocate_resources,
     export_resources,
+    export_resources_sync,
     import_resources,
     get_all_exported_resources,
     release_exported_resources
