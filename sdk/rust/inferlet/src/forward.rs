@@ -48,9 +48,38 @@ impl KvPage {
 
 impl Drop for KvPage {
     fn drop(&mut self) {
-        if Rc::strong_count(&self.rc) == 1 {
-            self.queue.deallocate_kv_page_ptr(self.ptr);
-        }
+        // Intentionally a no-op.
+        //
+        // Previously this decremented the pool ref_count via
+        // `deallocate_kv_page_ptr` on the last Rc clone. That pattern had a
+        // correctness hazard: `KvPage::new` mints a fresh `Rc<()>` per call,
+        // so multiple `KvPage` values for the same ptr within one WASM
+        // instance can coexist (e.g. `import_kv_pages().into_iter().take(n)
+        // .collect()` drops the tail while the kept prefix still references
+        // the same ptrs through a separate Rc chain). Each chain's Drop would
+        // fire independently and the engine-side `deallocate` would remove
+        // the ptr from `instance.res_allocated` that a later export still
+        // needs — producing `PointerNotAllocated` at export time.
+        //
+        // The correct accounting invariant is
+        //     pool.ref_count[ptr] =
+        //         (# instances with ptr in res_allocated)
+        //       + (# exports containing ptr in ptrs)
+        // and the only state transitions that touch it are:
+        //     - allocate / register_imported        (inc by 1)
+        //     - explicit `deallocate_kv_page_ptr`   (dec by 1)
+        //     - `release_exported`                  (dec by 1)
+        //     - instance cleanup via `cleanup_with_freed_kv`
+        //                                           (dec by 1 per ptr held)
+        //     - export itself shifts ownership      (net 0)
+        // A per-wrapper `Drop` cannot safely belong to this set because it
+        // has no way to know whether the instance is truly done with the ptr
+        // — it only knows its own Rc chain.
+        //
+        // With this no-op Drop the invariant holds exactly: cleanup runs at
+        // instance termination, exports keep pages alive for importing
+        // instances, and explicit mid-life release remains available via
+        // `Queue::deallocate_kv_page_ptr(s)`.
     }
 }
 
