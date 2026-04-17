@@ -1274,7 +1274,19 @@ impl Model {
                         self.resource_manager.register_imported(inst_id, type_id, group_id, &ptrs);
                         response.send(ptrs).ok();
                     }
-                    Err(e) => terminate_instance_with_exception(inst_id, e),
+                    Err(e) => {
+                        // Graceful fallback: send an empty ptrs list instead of
+                        // terminating the instance. The guest SDK treats an
+                        // empty return as "export not found", which inferlets
+                        // can branch on (e.g. skip session KV reuse and fall
+                        // back to prefix checkpoint or full prefill). Previous
+                        // behavior (terminate_instance_with_exception) dropped
+                        // the oneshot response and the guest's wasi async
+                        // future saw "channel closed", crashing the HTTP
+                        // handler before it could return a response body.
+                        eprintln!("[RESOURCE-DEBUG] Import failed: err={:?}", e);
+                        response.send(Vec::new()).ok();
+                    }
                 }
             }
             Command::ReleaseExported { inst_id, type_id, name } => {
