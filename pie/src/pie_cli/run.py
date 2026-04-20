@@ -154,9 +154,9 @@ def run(
 
         if isinstance(e, manager.EngineError):
             console.print(f"[red]✗[/red] {e}")
-            manager.terminate_engine_and_backend(server_handle, backend_processes)
-            raise typer.Exit(1)
-    except Exception as e:
-        console.print(f"[red]✗[/red] Error: {e}")
+        else:
+            console.print(f"[red]✗[/red] Error: {e}")
+            import traceback
+            traceback.print_exc()
         manager.terminate_engine_and_backend(server_handle, backend_processes)
         raise typer.Exit(1)
