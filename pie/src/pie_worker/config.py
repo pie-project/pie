@@ -68,6 +68,15 @@ class RuntimeConfig:
     # Dummy mode - skip GPU weight loading, return random tokens
     dummy_mode: bool = False
 
+    # Engine backend selection (None = native PIE, "vllm" = vLLM backend)
+    backend: str | None = None
+
+    # Maximum model sequence length (caps KV cache allocation)
+    max_model_len: int | None = None
+
+    # Trust remote code when loading HuggingFace models (needed by vLLM)
+    trust_remote_code: bool = False
+
     # =========================================================================
     # Convenience Properties (formerly in model.Config)
     # =========================================================================
@@ -158,6 +167,9 @@ class RuntimeConfig:
         tensor_parallel_size: int = 1,
         adapter_path: str | None = None,
         dummy_mode: bool = False,
+        backend: str | None = None,
+        max_model_len: int | None = None,
+        trust_remote_code: bool = False,
     ) -> "RuntimeConfig":
         """
         Factory method to build a validated and resolved RuntimeConfig.
@@ -252,6 +264,9 @@ class RuntimeConfig:
             tensor_parallel_size=tensor_parallel_size,
             adapter_path=resolved_adapter_path,
             dummy_mode=dummy_mode,
+            backend=backend,
+            max_model_len=max_model_len,
+            trust_remote_code=trust_remote_code,
         )
 
     def print(self) -> None:
