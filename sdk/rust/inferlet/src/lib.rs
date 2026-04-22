@@ -265,6 +265,14 @@ impl Model {
         }
     }
 
+    /// Construct a ready-to-use `Sampler` by merging client-supplied
+    /// `SamplingOverrides` with this model's `generation_defaults()`.
+    ///
+    /// See `Sampler::merge` for precedence rules.
+    pub fn build_sampler(&self, overrides: SamplingOverrides) -> Sampler {
+        Sampler::merge(overrides, self.generation_defaults())
+    }
+
     /// Create a new command queue for this model.
     pub fn create_queue(&self) -> Queue {
         Queue {

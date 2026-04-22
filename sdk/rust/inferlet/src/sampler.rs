@@ -1,3 +1,10 @@
+/// Model-authored sampling defaults sourced from the engine's `generation_config.json`.
+///
+/// Only includes knobs a model publishes in its gen_config: the four filter-style
+/// fields (`temperature`, `top_p`, `top_k`, `min_p`) plus `repetition_penalty`.
+/// `frequency_penalty` and `presence_penalty` are intentionally absent — HF
+/// `generation_config.json` never carries them; they are client-intent only and
+/// live exclusively on `SamplingOverrides`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GenerationDefaults {
     pub temperature:        Option<f32>,
@@ -73,6 +80,36 @@ impl Sampler {
     pub fn reasoning() -> Self {
         Self::top_k_top_p(0.6, 20, 0.95)
     }
+
+    /// Merge client-supplied `SamplingOverrides` with model-authored
+    /// `GenerationDefaults` into a ready-to-use `Sampler` variant.
+    ///
+    /// Precedence: `overrides.field.or(defaults.field).unwrap_or(neutral)`.
+    /// Client-set fields win; the model's generation_config fills in; neutrals
+    /// (temperature=1.0, top_p=1.0 disabled, top_k=0 disabled, min_p=0.0
+    /// disabled) are the last resort.
+    ///
+    /// Only the four filter-style fields (temperature, top_p, top_k, min_p) are
+    /// considered here. `repetition_penalty` / `frequency_penalty` /
+    /// `presence_penalty` will be folded in by Task B1 when `Sampler` variants
+    /// grow a `Penalties` field.
+    pub fn merge(overrides: SamplingOverrides, defaults: GenerationDefaults) -> Self {
+        let temperature = overrides.temperature.or(defaults.temperature).unwrap_or(1.0);
+        let top_p = overrides.top_p.or(defaults.top_p);
+        let top_k = overrides.top_k.or(defaults.top_k);
+        let min_p = overrides.min_p.or(defaults.min_p);
+        // top_p == 1.0 or top_k == 0 means "disabled"; treat as None.
+        let top_p_active = top_p.filter(|v| *v < 1.0 && *v > 0.0);
+        let top_k_active = top_k.filter(|v| *v > 0);
+        let min_p_active = min_p.filter(|v| *v > 0.0);
+        match (top_k_active, top_p_active, min_p_active) {
+            (Some(k), Some(p), _) => Sampler::TopKTopP { temperature, top_k: k, top_p: p },
+            (Some(k), None, _)    => Sampler::TopK { temperature, top_k: k },
+            (None, Some(p), _)    => Sampler::TopP { temperature, top_p: p },
+            (None, None, Some(m)) => Sampler::MinP { temperature, min_p: m },
+            (None, None, None)    => Sampler::Multinomial { temperature },
+        }
+    }
 }
 
 pub trait Sample {
@@ -99,5 +136,38 @@ mod tests {
     fn defaults_empty_is_all_none() {
         let d = GenerationDefaults::default();
         assert!(d.repetition_penalty.is_none());
+    }
+
+    fn qwen25_defaults() -> GenerationDefaults {
+        GenerationDefaults {
+            temperature:        Some(0.7),
+            top_p:              Some(0.8),
+            top_k:              Some(20),
+            min_p:              None,
+            repetition_penalty: Some(1.05),
+        }
+    }
+
+    #[test]
+    fn client_overrides_win() {
+        let o = SamplingOverrides { temperature: Some(0.5), ..Default::default() };
+        let s = Sampler::merge(o, qwen25_defaults());
+        // Expect TopKTopP { temperature=0.5, top_p=0.8, top_k=20 }
+        assert!(matches!(s, Sampler::TopKTopP { temperature: t, top_p: 0.8, top_k: 20 } if (t - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn defaults_fill_missing() {
+        let o = SamplingOverrides::default();
+        let s = Sampler::merge(o, qwen25_defaults());
+        assert!(matches!(s, Sampler::TopKTopP { top_p: 0.8, top_k: 20, .. }));
+    }
+
+    #[test]
+    fn neutral_fallback_when_both_empty() {
+        let o = SamplingOverrides::default();
+        let s = Sampler::merge(o, GenerationDefaults::default());
+        // No filters set → Multinomial at temperature 1.0
+        assert!(matches!(s, Sampler::Multinomial { temperature: t } if (t - 1.0).abs() < 1e-6));
     }
 }
