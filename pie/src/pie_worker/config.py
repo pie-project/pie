@@ -77,6 +77,10 @@ class RuntimeConfig:
     # Trust remote code when loading HuggingFace models (needed by vLLM)
     trust_remote_code: bool = False
 
+    # Port for torch.distributed rendezvous (TP workers use this to find
+    # each other for NCCL init). 0 means single-GPU / not applicable.
+    master_port: int = 0
+
     # =========================================================================
     # Convenience Properties (formerly in model.Config)
     # =========================================================================
@@ -170,6 +174,7 @@ class RuntimeConfig:
         backend: str | None = None,
         max_model_len: int | None = None,
         trust_remote_code: bool = False,
+        master_port: int = 0,
     ) -> "RuntimeConfig":
         """
         Factory method to build a validated and resolved RuntimeConfig.
@@ -267,6 +272,7 @@ class RuntimeConfig:
             backend=backend,
             max_model_len=max_model_len,
             trust_remote_code=trust_remote_code,
+            master_port=master_port,
         )
 
     def print(self) -> None:
