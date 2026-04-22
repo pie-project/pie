@@ -312,17 +312,20 @@ impl inferlet::core::common::HostModel for InstanceState {
 
     async fn get_generation_defaults(
         &mut self,
-        _this: Resource<Model>,
+        this: Resource<Model>,
     ) -> Result<inferlet::core::common::GenerationDefaults> {
-        // Stub: real values are plumbed in from pie-vllm in task A5-A6.
-        // Until then, every field is None — inferlets must fall back to their
-        // own neutral defaults.
+        // Sourced from HF `generation_config.json` via the Python worker's
+        // handshake response (A5 `extract_generation_defaults`, A6 plumbing).
+        // All-None is still a valid outcome for models that ship no
+        // generation_config (Mistral, Gemma, Yi, ...); inferlets must
+        // fall back to their own neutral defaults.
+        let defaults = &self.ctx().table.get(&this)?.info.generation_defaults;
         Ok(inferlet::core::common::GenerationDefaults {
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            min_p: None,
-            repetition_penalty: None,
+            temperature: defaults.temperature,
+            top_p: defaults.top_p,
+            top_k: defaults.top_k,
+            min_p: defaults.min_p,
+            repetition_penalty: defaults.repetition_penalty,
         })
     }
 

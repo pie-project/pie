@@ -309,6 +309,55 @@ impl Command {
 /// Number of format_chat requests to validate (both paths) before trusting the fast path.
 pub const FORMAT_CHAT_VALIDATION_COUNT: u32 = 1;
 
+/// Per-model sampling defaults sourced from HF `generation_config.json`.
+///
+/// Mirrors the `generation-defaults` WIT record in
+/// `sdk/interfaces/core/wit/common.wit`. All fields are optional: absent
+/// means the engine / model has no opinion and inferlets should fall back
+/// to their own neutral defaults.
+///
+/// Populated during handshake from the Python worker's
+/// `extract_generation_defaults(model_config)` output. An absent key (or
+/// a value that fails to coerce to the expected numeric type) leaves the
+/// corresponding field as `None`.
+#[derive(Debug, Clone, Default)]
+pub struct GenerationDefaults {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+}
+
+impl GenerationDefaults {
+    /// Parse a wire-format dict (from `HandshakeResponse.generation_defaults`)
+    /// into a typed struct. Unknown keys are silently ignored; values that
+    /// fail to coerce to the target numeric type leave the field `None`.
+    pub fn from_wire(dict: &HashMap<String, serde_json::Value>) -> Self {
+        fn as_f32(v: &serde_json::Value) -> Option<f32> {
+            v.as_f64().map(|x| x as f32)
+        }
+        fn as_u32(v: &serde_json::Value) -> Option<u32> {
+            // Accept integers and floats that are whole numbers.
+            v.as_u64()
+                .map(|x| x as u32)
+                .or_else(|| v.as_i64().filter(|x| *x >= 0).map(|x| x as u32))
+                .or_else(|| {
+                    v.as_f64()
+                        .filter(|x| *x >= 0.0 && x.fract() == 0.0)
+                        .map(|x| x as u32)
+                })
+        }
+        Self {
+            temperature: dict.get("temperature").and_then(as_f32),
+            top_p: dict.get("top_p").and_then(as_f32),
+            top_k: dict.get("top_k").and_then(as_u32),
+            min_p: dict.get("min_p").and_then(as_f32),
+            repetition_penalty: dict.get("repetition_penalty").and_then(as_f32),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub name: String,
@@ -326,6 +375,10 @@ pub struct ModelInfo {
     /// Decided once at startup by rendering a synthetic message through both
     /// minijinja and Python RPC and comparing token IDs.
     pub use_minijinja_fast_path: bool,
+    /// Sampling defaults from HF `generation_config.json` (e.g. Qwen2.5
+    /// ships `temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05`).
+    /// Default (all-None) for models that ship no generation_config.
+    pub generation_defaults: GenerationDefaults,
 }
 
 /// Model service for communication with Python backend via FFI.
@@ -430,6 +483,9 @@ impl Model {
             eprintln!("[INFO] Chat template minijinja fast path DISABLED; using Python RPC");
         }
 
+        let generation_defaults =
+            GenerationDefaults::from_wire(&handshake_info.generation_defaults);
+
         let info = ModelInfo {
             name: handshake_info.model_name,
             traits: handshake_info.model_traits,
@@ -442,6 +498,7 @@ impl Model {
             max_batch_tokens: handshake_info.max_batch_tokens,
             chat_template,
             use_minijinja_fast_path,
+            generation_defaults,
         };
 
         let resource_manager = ResourceManager::new(handshake_info.resources, num_groups);
@@ -1342,5 +1399,76 @@ impl Model {
                 response.send(vec![]).ok();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod generation_defaults_tests {
+    use super::GenerationDefaults;
+    use std::collections::HashMap;
+
+    /// Qwen2.5's `generation_config.json` ships these exact values; a full
+    /// round-trip through `from_wire` must preserve each one with the
+    /// correct numeric type.
+    #[test]
+    fn qwen25_values_round_trip() {
+        let mut dict = HashMap::new();
+        dict.insert("temperature".to_string(), serde_json::json!(0.7));
+        dict.insert("top_p".to_string(), serde_json::json!(0.8));
+        dict.insert("top_k".to_string(), serde_json::json!(20));
+        dict.insert("repetition_penalty".to_string(), serde_json::json!(1.05));
+
+        let d = GenerationDefaults::from_wire(&dict);
+        assert_eq!(d.temperature, Some(0.7_f32));
+        assert_eq!(d.top_p, Some(0.8_f32));
+        assert_eq!(d.top_k, Some(20_u32));
+        assert_eq!(d.min_p, None);
+        assert!((d.repetition_penalty.unwrap() - 1.05_f32).abs() < 1e-6);
+    }
+
+    /// Empty dict is the normal case for models that ship no
+    /// generation_config (Mistral, Gemma, Yi, ...). Fallback: all-None.
+    #[test]
+    fn empty_dict_yields_all_none() {
+        let dict: HashMap<String, serde_json::Value> = HashMap::new();
+        let d = GenerationDefaults::from_wire(&dict);
+        assert_eq!(d.temperature, None);
+        assert_eq!(d.top_p, None);
+        assert_eq!(d.top_k, None);
+        assert_eq!(d.min_p, None);
+        assert_eq!(d.repetition_penalty, None);
+    }
+
+    /// Unknown keys (e.g. `max_tokens`, `stop_token_ids`) must be silently
+    /// ignored — the Python side filters to sampling keys, but the Rust
+    /// side must not blow up if an extra key slips through.
+    #[test]
+    fn unknown_keys_ignored() {
+        let mut dict = HashMap::new();
+        dict.insert("temperature".to_string(), serde_json::json!(0.5));
+        dict.insert("max_tokens".to_string(), serde_json::json!(4096));
+        dict.insert("stop_token_ids".to_string(), serde_json::json!([151645]));
+
+        let d = GenerationDefaults::from_wire(&dict);
+        assert_eq!(d.temperature, Some(0.5_f32));
+        assert_eq!(d.top_p, None);
+    }
+
+    /// `top_k` in generation_config.json may be serialized as an int or
+    /// a whole-number float; both must coerce to `u32`. Non-whole floats
+    /// are rejected (no silent truncation).
+    #[test]
+    fn top_k_accepts_int_and_whole_float() {
+        let mut dict = HashMap::new();
+        dict.insert("top_k".to_string(), serde_json::json!(20));
+        assert_eq!(GenerationDefaults::from_wire(&dict).top_k, Some(20));
+
+        dict.clear();
+        dict.insert("top_k".to_string(), serde_json::json!(20.0));
+        assert_eq!(GenerationDefaults::from_wire(&dict).top_k, Some(20));
+
+        dict.clear();
+        dict.insert("top_k".to_string(), serde_json::json!(20.5));
+        assert_eq!(GenerationDefaults::from_wire(&dict).top_k, None);
     }
 }

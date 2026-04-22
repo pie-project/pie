@@ -150,6 +150,14 @@ pub struct HandshakeResponse {
     /// Whether the chat template is minijinja-compatible (no Python-only Jinja2 features).
     #[serde(default)]
     pub template_minijinja_compatible: bool,
+    /// Sampling defaults sourced from HF `generation_config.json` on the
+    /// Python side. Optional — absent or empty means the model ships no
+    /// sampling defaults and inferlets should fall back to their own.
+    /// Keys are a subset of `{temperature, top_p, top_k, min_p,
+    /// repetition_penalty}`; values are JSON scalars (int/float).
+    /// Unknown keys are ignored by the runtime.
+    #[serde(default)]
+    pub generation_defaults: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
