@@ -1,3 +1,9 @@
+pub mod primitives;
+
+pub use primitives::{
+    EmittedHistory, apply_repetition_penalty, apply_top_k, apply_top_p, weighted_sample,
+};
+
 /// Model-authored sampling defaults sourced from the engine's `generation_config.json`.
 ///
 /// Only includes knobs a model publishes in its gen_config: the four filter-style
