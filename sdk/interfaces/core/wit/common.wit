@@ -56,6 +56,7 @@ interface common {
         synchronize: func() -> synchronization-result; // Begin synchronization process
         set-priority: func(priority: priority);     // Change the queue's priority
         debug-query: func(query: string) -> debug-query-result;  // Sends a message to the model and returns the response
+        format-chat: func(messages-json: string, tools-json: option<string>, add-generation-prompt: bool) -> format-chat-result;
     }
 
     // Result of a synchronization attempt
@@ -68,6 +69,12 @@ interface common {
     resource debug-query-result {
         pollable: func() -> pollable;
         get: func() -> option<string>;
+    }
+
+    // Result of a format-chat operation (returns token IDs from server-side HF template)
+    resource format-chat-result {
+        pollable: func() -> pollable;
+        get: func() -> option<list<u32>>;
     }
 
     // resources
