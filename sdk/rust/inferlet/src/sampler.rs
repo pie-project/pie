@@ -170,4 +170,49 @@ mod tests {
         // No filters set → Multinomial at temperature 1.0
         assert!(matches!(s, Sampler::Multinomial { temperature: t } if (t - 1.0).abs() < 1e-6));
     }
+
+    #[test]
+    fn empty_gen_config_client_only_params() {
+        // Mistral/Gemma/Yi case: model ships empty gen_config.
+        let o = SamplingOverrides { temperature: Some(0.9), top_p: Some(0.95), ..Default::default() };
+        let s = Sampler::merge(o, GenerationDefaults::default());
+        assert!(matches!(s, Sampler::TopP { top_p: p, .. } if (p - 0.95).abs() < 1e-6));
+    }
+
+    #[test]
+    fn disabled_top_p_equals_one_falls_through() {
+        let o = SamplingOverrides { temperature: Some(0.9), top_p: Some(1.0), ..Default::default() };
+        let s = Sampler::merge(o, GenerationDefaults::default());
+        assert!(matches!(s, Sampler::Multinomial { .. }));
+    }
+
+    #[test]
+    fn defaults_only_top_k_yields_topk() {
+        // Model gen_config sets only top_k; client sends nothing → Sampler::TopK.
+        let d = GenerationDefaults { top_k: Some(50), temperature: Some(0.7), ..Default::default() };
+        let s = Sampler::merge(SamplingOverrides::default(), d);
+        assert!(matches!(s, Sampler::TopK { top_k: 50, temperature: t } if (t - 0.7).abs() < 1e-6));
+    }
+
+    #[test]
+    fn client_only_min_p_yields_minp() {
+        // Empty gen_config; client sets min_p only → Sampler::MinP.
+        let o = SamplingOverrides { min_p: Some(0.1), ..Default::default() };
+        let s = Sampler::merge(o, GenerationDefaults::default());
+        assert!(matches!(s, Sampler::MinP { min_p: m, .. } if (m - 0.1).abs() < 1e-6));
+    }
+
+    #[test]
+    fn override_disables_default_top_p() {
+        // Qwen2.5 defaults have top_p=0.8. Client explicitly sends top_p=1.0 ("disable").
+        // Must fall through past TopP/TopKTopP — client wins even when client chooses "disabled".
+        let d = GenerationDefaults {
+            temperature: Some(0.7), top_p: Some(0.8), top_k: Some(20),
+            ..Default::default()
+        };
+        let o = SamplingOverrides { top_p: Some(1.0), ..Default::default() };
+        let s = Sampler::merge(o, d);
+        // With top_p disabled by client but top_k=20 still active from defaults → TopK only
+        assert!(matches!(s, Sampler::TopK { top_k: 20, .. }));
+    }
 }
