@@ -366,6 +366,13 @@ def decode_brle_batch(
         global_bit_start = token_acc_seq_lens[k]
         valid_len = position_ids[k] + 1
 
+        if rle_start == rle_end:
+            # No BRLE data for this token (e.g. decode token merged with
+            # prefill tokens).  Default to causal: attend to positions
+            # 0..position_id (all True up to valid_len).
+            result[global_bit_start : global_bit_start + valid_len] = True
+            continue
+
         curr_bit_pos = global_bit_start
         bits_consumed = 0
         is_true_run = True

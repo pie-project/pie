@@ -67,6 +67,9 @@ pub struct ForwardPass {
     mask: Vec<Vec<u32>>,
     kv_page_ptrs: Vec<u32>,
     kv_page_last_len: u32,
+    /// Number of active (data-containing) KV pages. Pages beyond this
+    /// in kv_page_ptrs are pre-allocated reserves for page crossings.
+    kv_actual_pages: u32,
     output_token_indices: Vec<u32>,
     output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     output_embed_ptrs: Vec<u32>,
@@ -75,8 +78,6 @@ pub struct ForwardPass {
     max_decode_steps: u32,
     /// Return distributions alongside tokens for each step.
     return_distributions: bool,
-    /// Number of active (non-pre-allocated) KV pages.  Default 0 = use all.
-    kv_actual_pages: u32,
 }
 
 #[derive(Debug)]
@@ -168,13 +169,13 @@ impl inferlet::core::forward::Host for InstanceState {
             mask: vec![],
             kv_page_ptrs: vec![],
             kv_page_last_len: 0,
+            kv_actual_pages: 0,
             output_token_indices: vec![],
             output_token_samplers: vec![],
             output_embed_ptrs: vec![],
             output_embed_indices: vec![],
             max_decode_steps: 1,
             return_distributions: false,
-            kv_actual_pages: 0, // 0 = use all pages
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -194,12 +195,14 @@ impl inferlet::core::forward::Host for InstanceState {
         pass: Resource<ForwardPass>,
         kv_page_ptrs: Vec<ResourceId>,
         kv_page_last_len: u32,
+        actual_pages: u32,
     ) -> Result<()> {
         let svc_id = self.ctx().table.get(&pass)?.queue.service_id;
         let translated = self.translate_kv_pages_cached(svc_id, &kv_page_ptrs)?;
         let pass = self.ctx().table.get_mut(&pass)?;
         pass.kv_page_ptrs = translated;
         pass.kv_page_last_len = kv_page_last_len;
+        pass.kv_actual_pages = actual_pages;
         Ok(())
     }
 
@@ -435,16 +438,6 @@ impl inferlet::core::forward::Host for InstanceState {
     ) -> Result<()> {
         let pass = self.ctx().table.get_mut(&pass)?;
         pass.max_decode_steps = max_steps.max(1);
-        Ok(())
-    }
-
-    async fn set_kv_actual_pages(
-        &mut self,
-        pass: Resource<ForwardPass>,
-        actual_pages: u32,
-    ) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&pass)?;
-        pass.kv_actual_pages = actual_pages;
         Ok(())
     }
 

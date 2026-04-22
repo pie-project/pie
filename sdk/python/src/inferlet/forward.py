@@ -54,15 +54,25 @@ class ForwardPass:
         """
         _forward.input_embeddings(self._inner, emb_ptrs, positions)
 
-    def kv_cache(self, kv_page_ptrs: list[int], last_kv_page_len: int) -> None:
+    def kv_cache(
+        self,
+        kv_page_ptrs: list[int],
+        last_kv_page_len: int,
+        actual_pages: int | None = None,
+    ) -> None:
         """
         Set the KV cache pages for the forward pass.
 
         Args:
             kv_page_ptrs: Pointers to KV cache pages
             last_kv_page_len: Length of the last KV page
+            actual_pages: Number of pages that currently contain data. Defaults
+                to len(kv_page_ptrs). Supply a smaller value when pre-allocating
+                trailing pages (see Rust SDK Context::flush).
         """
-        _forward.kv_cache(self._inner, kv_page_ptrs, last_kv_page_len)
+        if actual_pages is None:
+            actual_pages = len(kv_page_ptrs)
+        _forward.kv_cache(self._inner, kv_page_ptrs, last_kv_page_len, actual_pages)
 
     def attention_mask(self, mask: list[list[int]]) -> None:
         """

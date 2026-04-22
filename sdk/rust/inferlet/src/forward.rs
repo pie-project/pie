@@ -48,9 +48,38 @@ impl KvPage {
 
 impl Drop for KvPage {
     fn drop(&mut self) {
-        if Rc::strong_count(&self.rc) == 1 {
-            self.queue.deallocate_kv_page_ptr(self.ptr);
-        }
+        // Intentionally a no-op.
+        //
+        // Previously this decremented the pool ref_count via
+        // `deallocate_kv_page_ptr` on the last Rc clone. That pattern had a
+        // correctness hazard: `KvPage::new` mints a fresh `Rc<()>` per call,
+        // so multiple `KvPage` values for the same ptr within one WASM
+        // instance can coexist (e.g. `import_kv_pages().into_iter().take(n)
+        // .collect()` drops the tail while the kept prefix still references
+        // the same ptrs through a separate Rc chain). Each chain's Drop would
+        // fire independently and the engine-side `deallocate` would remove
+        // the ptr from `instance.res_allocated` that a later export still
+        // needs — producing `PointerNotAllocated` at export time.
+        //
+        // The correct accounting invariant is
+        //     pool.ref_count[ptr] =
+        //         (# instances with ptr in res_allocated)
+        //       + (# exports containing ptr in ptrs)
+        // and the only state transitions that touch it are:
+        //     - allocate / register_imported        (inc by 1)
+        //     - explicit `deallocate_kv_page_ptr`   (dec by 1)
+        //     - `release_exported`                  (dec by 1)
+        //     - instance cleanup via `cleanup_with_freed_kv`
+        //                                           (dec by 1 per ptr held)
+        //     - export itself shifts ownership      (net 0)
+        // A per-wrapper `Drop` cannot safely belong to this set because it
+        // has no way to know whether the instance is truly done with the ptr
+        // — it only knows its own Rc chain.
+        //
+        // With this no-op Drop the invariant holds exactly: cleanup runs at
+        // instance termination, exports keep pages alive for importing
+        // instances, and explicit mid-life release remains available via
+        // `Queue::deallocate_kv_page_ptr(s)`.
     }
 }
 
@@ -70,6 +99,8 @@ pub trait Forward {
     fn new_kv_pages(&self, count: usize) -> Vec<KvPage>;
 
     fn export_kv_pages(&self, ptrs: &[KvPage], name: &str);
+    fn export_kv_pages_sync(&self, ptrs: &[KvPage], name: &str) -> Result<(), String>;
+    fn export_kv_page_ptrs_sync(&self, ptrs: &[u32], name: &str) -> Result<(), String>;
     fn import_kv_pages(&self, name: &str) -> Vec<KvPage>;
     fn allocate_kv_page_ptr(&self) -> u32;
     fn allocate_kv_page_ptrs(&self, count: usize) -> Vec<u32>;
@@ -109,6 +140,15 @@ impl Forward for Queue {
     fn export_kv_pages(&self, kv_pages: &[KvPage], name: &str) {
         let ptrs = kv_pages.iter().map(|kv| kv.ptr()).collect::<Vec<_>>();
         self.export_resource(Resource::KvPage, &ptrs, name)
+    }
+
+    fn export_kv_pages_sync(&self, kv_pages: &[KvPage], name: &str) -> Result<(), String> {
+        let ptrs = kv_pages.iter().map(|kv| kv.ptr()).collect::<Vec<_>>();
+        self.export_resource_sync(Resource::KvPage, &ptrs, name)
+    }
+
+    fn export_kv_page_ptrs_sync(&self, ptrs: &[u32], name: &str) -> Result<(), String> {
+        self.export_resource_sync(Resource::KvPage, ptrs, name)
     }
 
     fn import_kv_pages(&self, name: &str) -> Vec<KvPage> {
@@ -322,13 +362,13 @@ impl ForwardPass {
         api::forward::attention_mask(&self.inner, mask);
     }
 
-    pub fn kv_cache(&self, kv_pages: &[KvPage], last_kv_page_len: usize) {
+    pub fn kv_cache(&self, kv_pages: &[KvPage], last_kv_page_len: usize, actual_pages: u32) {
         let ptrs = kv_pages.iter().map(|kv| kv.ptr()).collect::<Vec<_>>();
-        api::forward::kv_cache(&self.inner, &ptrs, last_kv_page_len as u32);
+        api::forward::kv_cache(&self.inner, &ptrs, last_kv_page_len as u32, actual_pages);
     }
 
-    pub fn kv_cache_ptrs(&self, kv_page_ptrs: &[u32], last_kv_page_len: usize) {
-        api::forward::kv_cache(&self.inner, kv_page_ptrs, last_kv_page_len as u32);
+    pub fn kv_cache_ptrs(&self, kv_page_ptrs: &[u32], last_kv_page_len: usize, actual_pages: u32) {
+        api::forward::kv_cache(&self.inner, kv_page_ptrs, last_kv_page_len as u32, actual_pages);
     }
 
     /// Set maximum number of sequential decode steps per execute() call.
@@ -336,13 +376,6 @@ impl ForwardPass {
     /// N autoregressive steps before returning, amortizing async overhead.
     pub fn set_max_decode_steps(&self, max_steps: u32) {
         api::forward::set_max_decode_steps(&self.inner, max_steps);
-    }
-
-    /// Set the number of active (non-pre-allocated) KV pages.
-    /// The runtime uses this for kv_page_indptr serialization and
-    /// extends it on page-boundary crossings during multi-step continuation.
-    pub fn set_kv_actual_pages(&self, actual_pages: u32) {
-        api::forward::set_kv_actual_pages(&self.inner, actual_pages);
     }
 
 }

@@ -540,13 +540,18 @@ class SequenceTracker:
         vllm_worker: Any = None,
         vllm_config: Any = None,
     ) -> None:
-        """Clean up vLLM state after a failed execute_model call.
+        """Clean up tracker AND vLLM state after a failed execute_model call.
 
-        When execute_model raises (e.g. shape mismatch during multi-fork),
-        vLLM's input_batch may contain partially-added requests.  We send
-        a no-op SchedulerOutput that finishes ALL requests from the failed
-        batch, preventing stale entries from causing KeyError on the next
-        fire_batch call.
+        When execute_model raises (e.g. shape mismatch during page-crossing
+        in multi-step decode), vLLM's input_batch may contain partially-added
+        requests.  We must:
+          1. Remove failed req_ids from tracker state (pure Python, always safe)
+          2. Send a no-op SchedulerOutput to vLLM to finish them there too
+
+        Step 1 is critical: without it, the next fire_batch call sees the
+        failed requests in _active_requests and classifies them as CONTINUING
+        (CachedRequestData), but vLLM has already removed them — causing
+        KeyError in _update_states.
 
         Args:
             scheduler_output: The SchedulerOutput that failed.
@@ -554,6 +559,28 @@ class SequenceTracker:
             vllm_worker: The vLLM GPU worker instance.
             vllm_config: The vLLM configuration object.
         """
+        # --- Step 1: Clean up tracker state (always runs, no dependencies) ---
+        all_req_ids = set(scheduler_output.num_scheduled_tokens.keys())
+        for nr in scheduler_output.scheduled_new_reqs:
+            all_req_ids.add(nr.req_id)
+
+        if not all_req_ids:
+            return
+
+        # Remove from _active_requests (keyed by seq_key, not req_id)
+        to_remove = [
+            seq_key for seq_key, ar in self._active_requests.items()
+            if ar.req_id in all_req_ids
+        ]
+        for seq_key in to_remove:
+            del self._active_requests[seq_key]
+            self._token_history.pop(seq_key, None)
+
+        # Remove from _all_issued_req_ids so the stale safety net
+        # doesn't try to finish them again on the next batch
+        self._all_issued_req_ids -= all_req_ids
+
+        # --- Step 2: Clean up vLLM state (may fail if vLLM unavailable) ---
         try:
             from vllm.v1.core.sched.output import (
                 SchedulerOutput,
@@ -561,16 +588,25 @@ class SequenceTracker:
             )
             from vllm.config import set_current_vllm_config
 
-            # Collect all req_ids that were in the failed batch
-            all_req_ids = set(scheduler_output.num_scheduled_tokens.keys())
-            # Also include any new request IDs
-            for nr in scheduler_output.scheduled_new_reqs:
-                all_req_ids.add(nr.req_id)
+            # Reset the BatchUpdateBuilder before issuing the cleanup
+            # SchedulerOutput. The failed execute_model call may have already
+            # triggered `_ensure_removed_sorted` (via pop_removed in
+            # add_request), which sets _is_removed_sorted=True. Subsequent
+            # removed_append calls from our cleanup's remove_request path
+            # would raise: "Cannot register new removed request after
+            # self.removed has been read." Resetting here restores the
+            # builder to a clean state so cleanup removals succeed.
+            try:
+                model_runner = getattr(vllm_worker, "model_runner", None)
+                input_batch = getattr(model_runner, "input_batch", None) if model_runner is not None else None
+                builder = getattr(input_batch, "batch_update_builder", None) if input_batch is not None else None
+                if builder is not None:
+                    builder.reset()
+            except Exception:
+                # Reset is best-effort. If it fails, fall through and let
+                # the cleanup attempt either succeed or hit the outer except.
+                pass
 
-            if not all_req_ids:
-                return
-
-            # Send a no-op batch that finishes everything
             cleanup_output = SchedulerOutput(
                 scheduled_new_reqs=[],
                 scheduled_cached_reqs=CachedRequestData.make_empty(),
@@ -582,15 +618,17 @@ class SequenceTracker:
                 finished_req_ids=all_req_ids,
                 free_encoder_mm_hashes=[],
             )
-            # For TP>1, send cleanup to non-leaders so they participate
             if tp_queue is not None:
                 tp_queue.put(cleanup_output)
             with set_current_vllm_config(vllm_config):
                 vllm_worker.execute_model(cleanup_output)
         except Exception:
-            # Recovery itself failed -- log and continue.
-            # The next fire_batch may still fail, but we've done our best.
+            # vLLM cleanup failed — tracker is already clean (step 1).
+            # The next fire_batch will re-add requests as NEW, which
+            # also implicitly finishes any stale vLLM entries via
+            # the stale safety net in build_scheduler_output.
             import traceback
-            print("[WARN] recover_from_failed_batch failed:",
+            print("[WARN] recover_from_failed_batch: vLLM cleanup failed "
+                  "(tracker state already cleaned):",
                   file=sys.stderr, flush=True)
             traceback.print_exc(file=sys.stderr)

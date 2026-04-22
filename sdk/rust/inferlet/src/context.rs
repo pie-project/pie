@@ -79,19 +79,121 @@ impl Context {
         prefix_tokens: Vec<u32>,
         kv_page_last_len: usize,
     ) -> Self {
+        let num_tokens = prefix_tokens.len();
+        let position_ids = (0..num_tokens as u32).collect();
+        Self::from_imported_state_with_positions(
+            model,
+            kv_pages,
+            prefix_tokens,
+            position_ids,
+            kv_page_last_len,
+        )
+    }
+
+    /// Overrides the position the next `fill_*` / `decode_*` call will
+    /// assign to the first new token.
+    ///
+    /// Normally `prepare_forward_pass` computes the next Q position as
+    /// `self.position_ids.last() + 1`. For sparse imports that omit a
+    /// trailing segment — e.g. keeping `sys + ex0 + ex2` but dropping
+    /// `ex3` whose original position range was `1280..1616` — the default
+    /// would start Q at 1280 (right where ex3 used to begin), which
+    /// lands the dyn_text prompt mid-range of a never-seen example and
+    /// can push the model into OOD positional territory.
+    ///
+    /// Calling `set_next_position(1616)` before `fill_user(&dyn)` biases
+    /// new-token positions to `[1616, 1617, ...]` instead, giving the
+    /// kept K the same relative positions they would have in a dense
+    /// original context. Q rotation is then computed for the overridden
+    /// position, and subsequent forward passes see a clean "end of
+    /// sequence" Q without dependence on which segments were kept.
+    ///
+    /// Caveat: this only affects the NEXT prepare_forward_pass. After
+    /// that call, new tokens' positions are appended to
+    /// `self.position_ids`, and the next Q position comes from the usual
+    /// `last() + 1` rule. Typically you only need to call this once,
+    /// right after `from_imported_state_with_positions`.
+    ///
+    /// Implemented by rewriting `self.position_ids.last()` to `pos - 1`.
+    /// This does NOT re-rotate any stored K: the imported K tensors are
+    /// already baked at their write-time positions and flashinfer does
+    /// not re-apply RoPE (`pos_encoding_mode="NONE"`). The rewritten
+    /// value is only ever read by `prepare_forward_pass` to derive
+    /// `last_pos_id + 1` for the new tokens.
+    pub fn set_next_position(&mut self, pos: u32) {
+        assert!(
+            !self.position_ids.is_empty(),
+            "set_next_position called on empty context — use fill_token/fill_user directly",
+        );
+        assert!(
+            pos > 0,
+            "set_next_position(0) would produce last_pos=-1; use fill on a fresh context instead",
+        );
+        let last_idx = self.position_ids.len() - 1;
+        self.position_ids[last_idx] = pos - 1;
+    }
+
+    /// Like `from_imported_state`, but lets the caller provide the original
+    /// absolute `position_ids` of the imported tokens.
+    ///
+    /// Use this when the imported KV pages were exported from a context where
+    /// their logical positions were not `0..num_tokens`. Examples:
+    ///
+    /// - **Selective import**: exporting sys + ex0 + ex1 + ex2 + ex3 from one
+    ///   context and then importing only `[sys, ex0, ex2]` into a query
+    ///   context. The surviving tokens' RoPE rotations were baked for their
+    ///   *original* positions (e.g. ex2's K is rotated for positions
+    ///   `944..1270`, not `272..598`), so `position_ids` for the query
+    ///   context must reflect those original values and may have gaps.
+    ///
+    /// - **Page-level eviction across sessions** (like attention-sink, but
+    ///   serialized across invocations): keep the sink + window pages, drop
+    ///   the middle, preserving the sink's `[0..K)` positions and the
+    ///   window's `[N-W..N)` positions.
+    ///
+    /// The caller is responsible for ensuring:
+    /// - `prefix_tokens.len() == position_ids.len()` (each imported token
+    ///   has exactly one position).
+    /// - `prefix_tokens.len() == (kv_pages.len() - 1) * kv_page_size
+    ///   + kv_page_last_len` (the page count matches the token count).
+    /// - Each contiguous page's tokens have contiguous positions internally
+    ///   (K within a single page was rotated as a contiguous `page_size`
+    ///   run when it was written — you can skip whole pages but not
+    ///   fragment tokens inside a page).
+    ///
+    /// After construction, `ctx.position_ids.last() + 1` will be used as
+    /// the starting position for any new tokens filled via `fill_*` and
+    /// emitted as Q positions by subsequent forward passes. This means new
+    /// tokens will correctly slot in after the highest imported position,
+    /// which is what you want for "resume generation after a sparse
+    /// historical prefix".
+    pub fn from_imported_state_with_positions(
+        model: &Model,
+        kv_pages: Vec<KvPage>,
+        prefix_tokens: Vec<u32>,
+        position_ids: Vec<u32>,
+        kv_page_last_len: usize,
+    ) -> Self {
         let queue = model.create_queue();
         let kv_page_size = model.get_kv_page_size() as usize;
         let tokenizer = model.get_tokenizer();
 
+        let num_tokens = prefix_tokens.len();
+
         assert_eq!(
-            prefix_tokens.len(),
+            num_tokens,
             (kv_pages.len() - 1) * kv_page_size + kv_page_last_len,
+            "token count must match page count (pages {} × page_size {} + last_page_len {})",
+            kv_pages.len() - 1,
+            kv_page_size,
+            kv_page_last_len,
+        );
+        assert_eq!(
+            num_tokens,
+            position_ids.len(),
+            "position_ids must have one entry per imported token",
         );
 
-        let num_tokens = prefix_tokens.len();
-        // The new context takes ownership of the imported pages.
-        // It's assumed the state in these pages corresponds exactly
-        // to the provided prefix_tokens and kv_page_last_len.
         Context {
             queue,
             model: model.clone(),
@@ -101,7 +203,7 @@ impl Context {
             token_ids_pending: Vec::new(),
             token_mask_pending: Vec::new(),
             token_mask_current: Brle::new(num_tokens),
-            position_ids: (0..num_tokens as u32).collect(),
+            position_ids,
             kv_pages,
             kv_page_last_len,
             kv_page_size,
@@ -274,6 +376,27 @@ impl Context {
     pub fn fill_assistant(&mut self, text: &str) {
         self.formatter.assistant(text);
         self.flush_chat_messages2(false);
+    }
+
+    /// Returns `true` if the context has any user-set masked positions in
+    /// `token_mask_current` (via `mask_token`, `mask_tokens`, or
+    /// `mask_token_range` with `mask=true`).
+    ///
+    /// A pristine (causal-only) context has `token_mask_current` = `Brle::new(N)`
+    /// which is a single all-`false` run, meaning every position is visible.
+    /// Any masked positions introduce `true` runs into the BRLE.
+    ///
+    /// Used by multi-step decode paths (`decode_n`, `decode_stream`) to detect
+    /// the unsafe "user mask + multi-step continuation" combination: the engine
+    /// only applies the attention mask at the first internal step of a
+    /// multi-step decode, so subsequent steps silently fall back to default
+    /// causal attention and re-admit the masked positions into attention.
+    fn has_user_attention_mask(&self) -> bool {
+        let total = self.token_mask_current.total_size;
+        if total == 0 {
+            return false;
+        }
+        !self.token_mask_current.is_range_all_value(0, total, false)
     }
 
     pub fn mask_tokens(&mut self, indices: &[usize], mask: bool) {
@@ -457,7 +580,7 @@ impl Context {
 
         let p = self.queue.create_forward_pass();
         p.input_tokens(&pending_token_ids, &position_ids);
-        p.kv_cache(&self.kv_pages, self.kv_page_last_len);
+        p.kv_cache(&self.kv_pages, self.kv_page_last_len, self.kv_pages.len() as u32);
         p.attention_mask(&mask);
 
         let _ = p.execute().await;
@@ -528,6 +651,34 @@ impl Context {
             );
         }
 
+        // Validate: user-set attention masks are not honored across the
+        // engine's multi-step decode continuation. The engine only applies
+        // the per-token BRLE mask for the FIRST internal step; steps 2..N
+        // fall back to default causal attention, silently re-admitting the
+        // masked positions. This produces output that looks like the mask
+        // was never set.
+        //
+        // Callers that need attention masks during generation must use
+        // `decode_step` (or `decode_n` with `max_steps=1`) per token so the
+        // mask snapshot is refreshed and sent on every forward pass. If you
+        // want to eliminate masked positions entirely, use
+        // `drop_masked_kv_pages()` first to physically remove fully-masked
+        // pages from the block table — then `decode_n` is safe because the
+        // remaining pages need no mask.
+        if self.has_user_attention_mask() {
+            panic!(
+                "decode_n(max_steps={}) called on a Context with user-set \
+                 attention masks (via mask_token / mask_tokens / \
+                 mask_token_range). Multi-step decode continuation does not \
+                 re-apply the mask for internal steps 2..N, so masked \
+                 positions leak back into attention and generation ignores \
+                 the mask. Use decode_step per token, or call \
+                 drop_masked_kv_pages() first to physically remove \
+                 fully-masked pages from the block table.",
+                max_steps
+            );
+        }
+
         let (p, pending_token_ids, position_ids) =
             self.prepare_forward_pass(sampler, max_steps as usize - 1);
 
@@ -595,6 +746,22 @@ impl Context {
 
         if let Sampler::Custom { .. } = sampler {
             panic!("decode_stream requires engine-side sampling, not Custom sampler.");
+        }
+
+        // Same multi-step mask-safety check as decode_n — see the comment
+        // there for the full rationale.
+        if self.has_user_attention_mask() {
+            panic!(
+                "decode_stream(max_steps={}) called on a Context with user-set \
+                 attention masks (via mask_token / mask_tokens / \
+                 mask_token_range). Multi-step decode continuation does not \
+                 re-apply the mask for internal steps 2..N, so masked \
+                 positions leak back into attention and generation ignores \
+                 the mask. Use decode_step per token, or call \
+                 drop_masked_kv_pages() first to physically remove \
+                 fully-masked pages from the block table.",
+                max_steps
+            );
         }
 
         let (p, pending_token_ids, position_ids) =
@@ -687,12 +854,10 @@ impl Context {
 
         p.input_tokens(&pending_token_ids, &position_ids);
         // Send ALL pages (including pre-allocated extras from decode_n)
-        // so the scheduler can extend into them on page-boundary crossings.
-        // set_kv_actual_pages tells the runtime how many are currently active.
-        p.kv_cache(&self.kv_pages, actual_last_len);
-        if actual_pages < self.kv_pages.len() {
-            p.set_kv_actual_pages(actual_pages as u32);
-        }
+        // so the scheduler and Python multi-step loop can cross page
+        // boundaries without round-tripping. actual_pages tells the
+        // runtime how many pages currently have data.
+        p.kv_cache(&self.kv_pages, actual_last_len, actual_pages as u32);
         p.attention_mask(&mask);
 
         let output_idx = pending_token_ids.len() as u32 - 1;
@@ -777,7 +942,7 @@ impl Context {
         }
 
         p.input_tokens(&pending_token_ids, &position_ids);
-        p.kv_cache(&self.kv_pages, self.kv_page_last_len);
+        p.kv_cache(&self.kv_pages, self.kv_page_last_len, self.kv_pages.len() as u32);
         p.attention_mask(&mask);
 
         let output_idx = pending_token_ids.len() as u32 - 1;
@@ -817,18 +982,51 @@ impl Context {
     ) -> String {
         let mut generated_token_ids = Vec::new();
 
-        // The autoregressive generation loop
-        loop {
-            // start time
-            //let start_time = Instant::now();
-            let next_token_id = self.decode_step(&sampler).await;
+        // Multi-step decode: decode_n(N) yields N tokens per WASM async
+        // boundary, amortizing the ~5 ms wasmtime poll/wake overhead and
+        // letting Rust's continuation loop pipeline N forward passes
+        // without round-tripping through WASM. Stop condition is checked
+        // per-token within the chunk to avoid wasted forward passes if
+        // stop hits mid-chunk.
+        //
+        // Custom samplers fall back to single-step (decode_n internally
+        // panics on Custom + max_steps>1, so we use decode_step there).
+        const CHUNK_SIZE: u32 = 8;
+        let use_chunks = !matches!(sampler, Sampler::Custom { .. });
 
-            self.fill_token(next_token_id);
+        'outer: loop {
+            if !use_chunks {
+                let next = self.decode_step(&sampler).await;
+                self.fill_token(next);
+                generated_token_ids.push(next);
+                if stop_condition.check(&generated_token_ids) {
+                    break;
+                }
+                continue;
+            }
 
-            generated_token_ids.push(next_token_id);
-
-            if stop_condition.check(&generated_token_ids) {
+            let tokens = self.decode_n(&sampler, CHUNK_SIZE).await;
+            let num_tokens = tokens.len();
+            if num_tokens == 0 {
+                // Engine returned no tokens — final exit (e.g. all-flush
+                // or hard EOS). NOTE: getting fewer tokens than requested
+                // is NOT terminal — the engine may break early for a
+                // page boundary or other recoverable reason. We always
+                // continue the outer loop until num_tokens == 0 OR
+                // stop_condition fires.
                 break;
+            }
+
+            // decode_n's contract: all but the last token are committed
+            // to context state. The caller must fill_token() the last.
+            for (ti, &token_id) in tokens.iter().enumerate() {
+                if ti == num_tokens - 1 {
+                    self.fill_token(token_id);
+                }
+                generated_token_ids.push(token_id);
+                if stop_condition.check(&generated_token_ids) {
+                    break 'outer;
+                }
             }
         }
 
@@ -1132,7 +1330,7 @@ impl Context {
 
             // Run the forward pass.
             p.input_tokens(&batch_tokens, &batch_positions);
-            p.kv_cache(&self.kv_pages, self.kv_page_last_len);
+            p.kv_cache(&self.kv_pages, self.kv_page_last_len, self.kv_pages.len() as u32);
             p.attention_mask(&batch_masks);
             p.output_distributions(&out_range.map(|x| x as u32).collect::<Vec<_>>(), 0.0, None);
             let pass_result = p.execute().await;

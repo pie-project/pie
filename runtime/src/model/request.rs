@@ -383,6 +383,20 @@ pub struct BatchedForwardPassRequest {
     // Per-request first-fire flag. true = first time this request is sent to Python.
     #[serde(default)]
     pub is_new: Vec<bool>,
+
+    // Per-request active KV page count. kv_page_indices contains ALL pages
+    // (active + pre-allocated extras for decode_n headroom). This array tells
+    // Python how many of each request's pages have actual KV data. Used by:
+    //   - compute_seq_lens (derive sequence length from active pages only)
+    //   - multi-step page crossing (extra pages available = can cross without Rust round-trip)
+    #[serde(default, skip_serializing_if = "ByteVec::is_empty")]
+    pub kv_actual_page_counts: ByteVec,
+
+    // Instance UUIDs that have finished (from cleanup_instance).
+    // Sent alongside freed_block_ids but carries the authoritative identity
+    // so Python can finish requests directly by key without block-ID reverse map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finished_request_ids: Vec<String>,
 }
 
 impl BatchedForwardPassRequest {
@@ -417,6 +431,8 @@ impl BatchedForwardPassRequest {
             freed_block_ids: ByteVec(Vec::new()),
             request_ids: Vec::new(),
             is_new: Vec::new(),
+            kv_actual_page_counts: ByteVec(Vec::new()),
+            finished_request_ids: Vec::new(),
         }
     }
 
@@ -426,16 +442,20 @@ impl BatchedForwardPassRequest {
         self.token_ids.0.extend(&req.input_tokens);
         self.position_ids.0.extend(&req.input_token_positions);
 
-        // KV cache layout — use actual_kv_pages to exclude pre-allocated
-        // extras from kv_page_indptr so Python's seq_lens is correct.
+        // KV cache layout — send ALL pages (active + pre-allocated extras).
+        // Python's multi-step loop needs the extras to cross page boundaries
+        // without a Rust round-trip. The active count is sent separately in
+        // kv_actual_page_counts so Python can compute seq_lens correctly.
+        let total_pages = req.kv_page_ptrs.len();
         let active_pages = if req.actual_kv_pages > 0 {
-            (req.actual_kv_pages as usize).min(req.kv_page_ptrs.len())
+            (req.actual_kv_pages as usize).min(total_pages)
         } else {
-            req.kv_page_ptrs.len()
+            total_pages
         };
-        self.kv_page_indices.0.extend(&req.kv_page_ptrs[..active_pages]);
+        self.kv_page_indices.0.extend(&req.kv_page_ptrs);
         self.kv_page_indptr.0.push(self.kv_page_indices.0.len() as u32);
         self.kv_last_page_lens.0.push(req.kv_page_last_len);
+        self.kv_actual_page_counts.0.push(active_pages as u32);
 
         // Query/output indirection
         let total_tokens = self.token_ids.0.len() as u32;

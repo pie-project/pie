@@ -27,6 +27,13 @@ def http(
     port: int = typer.Option(
         ..., "--port", help="TCP port for the server to listen on"
     ),
+    host: str = typer.Option(
+        "127.0.0.1",
+        "--host",
+        help="IP to bind the server inferlet on. Use 0.0.0.0 to accept "
+             "connections from outside the current network namespace (e.g. "
+             "when running under Docker bridge networking with -p).",
+    ),
     config: Optional[Path] = typer.Option(
         None, "--config", "-c", help="Path to TOML configuration file"
     ),
@@ -83,8 +90,8 @@ def http(
     lines = Text()
     lines.append(f"{'Inferlet':<15}", style="white")
     lines.append(f"{inferlet_display}\n", style="dim")
-    lines.append(f"{'Port':<15}", style="white")
-    lines.append(f"{port}\n", style="cyan bold")
+    lines.append(f"{'Bind':<15}", style="white")
+    lines.append(f"{host}:{port}\n", style="cyan bold")
     lines.append(f"{'Model':<15}", style="white")
     lines.append(f"{model_configs[0].get('hf_repo', 'unknown')}\n", style="dim")
     lines.append(f"{'Device':<15}", style="white")
@@ -119,14 +126,14 @@ def http(
 
         if path is not None:
             _launch_server_inferlet(
-                client_config, path, port, arguments or []
+                client_config, path, port, arguments or [], host=host
             )
         else:
             # TODO: Support launching from registry
             console.print("[red]✗[/red] Registry mode not yet supported for server inferlets")
             raise typer.Exit(1)
 
-        console.print(f"[green]✓[/green] Server inferlet listening on [cyan]http://127.0.0.1:{port}/[/cyan]")
+        console.print(f"[green]✓[/green] Server inferlet listening on [cyan]http://{host}:{port}/[/cyan]")
         console.print("[dim]Press Ctrl+C to stop[/dim]")
         console.print()
 
@@ -159,10 +166,10 @@ def _launch_server_inferlet(
     path: Path,
     port: int,
     arguments: list[str],
+    host: str = "127.0.0.1",
 ) -> None:
     """Upload and launch a server inferlet from a local path."""
     import asyncio
-    import blake3
     import tomllib
     from pie_client import PieClient
 
@@ -189,17 +196,20 @@ def _launch_server_inferlet(
         async with PieClient(uri) as client:
             await client.internal_authenticate(client_config["internal_auth_token"])
 
-            # Read and hash the program
-            program_bytes = path.read_bytes()
-            program_hash = blake3.blake3(program_bytes).hexdigest()
-
             # Install if needed
-            if not await client.program_exists(program_hash):
+            if not await client.program_exists(inferlet_id, wasm_path=path, manifest_path=manifest_path):
                 console.print(f"[dim]Installing {path.name} as {inferlet_id}...[/dim]")
                 await client.install_program(str(path), str(manifest_path))
 
-            # Launch as server instance using program name (not hash)
-            console.print(f"[dim]Starting {inferlet_id} on port {port}...[/dim]")
-            await client.launch_server_instance(inferlet_id, port, arguments)
+            # Launch as server instance using program name (not hash).
+            # Omit the host kwarg when the caller wants the historical
+            # default so we stay wire-compatible with older runtimes.
+            console.print(f"[dim]Starting {inferlet_id} on {host}:{port}...[/dim]")
+            if host == "127.0.0.1":
+                await client.launch_server_instance(inferlet_id, port, arguments)
+            else:
+                await client.launch_server_instance(
+                    inferlet_id, port, arguments, host=host
+                )
 
     asyncio.run(_launch())

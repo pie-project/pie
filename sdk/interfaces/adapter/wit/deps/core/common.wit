@@ -89,6 +89,12 @@ interface common {
         ptrs: list<pointer>,
         name: string
     );
+    export-resources-sync: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        ptrs: list<pointer>,
+        name: string
+    ) -> result<_, string>;
 
     import-resources: func(
         queue: borrow<queue>,

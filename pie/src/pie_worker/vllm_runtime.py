@@ -1097,22 +1097,30 @@ class PieVllmRuntime:
                 new_kv_lens = arrays.kv_last_page_lens.copy()
                 new_kv_lens += 1
                 # Handle page boundary: wrap kv_last_page_lens when crossing.
-                # Pages are pre-allocated by the SDK (extra_kv_tokens), so the
-                # next page exists. If no pre-allocation, stop instead.
+                # The SDK sends pre-allocated reserve pages beyond kv_page_indptr.
+                # On crossing, extend kv_page_indptr to include the next reserve.
                 if self.kv_page_size > 0:
                     _crossing = new_kv_lens > self.kv_page_size
                     if np.any(_crossing):
-                        # Check if the next page exists for each crossing request
+                        _kv_indices = np.frombuffer(
+                            kwargs["kv_page_indices"], dtype=np.uint32
+                        )
+                        _total_pages = len(_kv_indices)
+                        _kv_indptr = np.frombuffer(
+                            kwargs["kv_page_indptr"], dtype=np.uint32
+                        ).copy()
                         _can_cross = True
                         for _ri in range(len(new_kv_lens)):
                             if _crossing[_ri]:
-                                _pages_needed = int(arrays.kv_page_indptr[_ri + 1] - arrays.kv_page_indptr[_ri])
-                                _pages_used = (int(arrays.seq_lens[_ri]) + self.kv_page_size - 1) // self.kv_page_size
-                                if _pages_used >= _pages_needed:
-                                    _can_cross = False  # no more pages
+                                _cur_end = int(_kv_indptr[_ri + 1])
+                                if _cur_end >= _total_pages:
+                                    _can_cross = False  # no reserve pages
                                     break
+                                # Extend this request's page range by 1
+                                _kv_indptr[_ri + 1:] += 1
                         if not _can_cross:
                             break
+                        kwargs["kv_page_indptr"] = _kv_indptr.tobytes()
                         new_kv_lens[_crossing] = 1  # wrap to start of next page
                 kwargs["token_ids"] = np.array(prev_tokens, dtype=np.uint32).tobytes()
                 kwargs["qo_indptr"] = np.arange(len(prev_tokens) + 1, dtype=np.uint32).tobytes()

@@ -113,6 +113,9 @@ pub enum Command {
         username: String,
         program_hash: ProgramHash,
         port: u32,
+        /// IP to bind the server on. `None` → `127.0.0.1` (preserves
+        /// historical behaviour for callers that don't opt in).
+        host: Option<String>,
         arguments: Vec<String>,
         event: oneshot::Sender<Result<(), RuntimeError>>,
     },
@@ -342,11 +345,12 @@ impl Service for Runtime {
                 username,
                 program_hash,
                 port,
+                host,
                 arguments,
                 event,
             } => {
                 let res = self
-                    .launch_server_instance(username, program_hash, port, arguments)
+                    .launch_server_instance(username, program_hash, port, host, arguments)
                     .await;
                 event.send(res.map(|_| ())).unwrap();
             }
@@ -963,6 +967,7 @@ impl Runtime {
         username: String,
         program_hash: ProgramHash,
         port: u32,
+        host: Option<String>,
         arguments: Vec<String>,
     ) -> Result<InstanceId, RuntimeError> {
         let instance_id = Uuid::new_v4();
@@ -985,7 +990,17 @@ impl Runtime {
 
         // Instantiate and run in a task
         let engine = self.engine.clone();
-        let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
+        // Default to 127.0.0.1 so clients that don't opt in keep the old
+        // loopback-only semantics. Setting host = Some("0.0.0.0") makes the
+        // server reachable from other netns / outside the container, which
+        // is what the pieclaw inferlet-runner image needs.
+        let bind_host = host.as_deref().unwrap_or("127.0.0.1");
+        let bind_ip: std::net::IpAddr = bind_host.parse().map_err(|e| {
+            RuntimeError::Other(format!(
+                "launch_server_instance: invalid host {bind_host:?}: {e}"
+            ))
+        })?;
+        let addr = SocketAddr::from((bind_ip, port as u16));
 
         // Create a oneshot channel to signal when the task can start
         let (start_tx, start_rx) = oneshot::channel();
@@ -1215,16 +1230,22 @@ impl Runtime {
                         (t_response - t_spawn).as_secs_f64() * 1000.0,
                     );
                 }
-                // Await the WASM task to completion in the background, then clean up.
-                // The response is already being streamed to the client, but the Store
-                // (and its KvPages) must be dropped and cleanup_instance called.
-                tokio::task::spawn(async move {
+                // Spawn cleanup: wait for WASM task to finish (streaming body),
+                // then call cleanup_instance to free resource manager metadata
+                // (inst_start_time, instance_groups). KV pages are freed by
+                // KvPage::drop when the store drops, but the metadata entries
+                // must be explicitly cleaned up to prevent unbounded growth.
+                tokio::spawn(async move {
                     let _ = task.await;
                     model::cleanup_instance(inst_id);
                 });
                 Ok(resp)
             }
-            Ok(Err(e)) => Err(e.into()),
+            Ok(Err(e)) => {
+                // WASM set an error response — task may still be running
+                model::cleanup_instance(inst_id);
+                Err(e.into())
+            }
             Err(_) => {
                 let e = match task.await {
                     Ok(r) => {

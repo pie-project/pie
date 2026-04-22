@@ -641,6 +641,13 @@ def _ipc_worker_process(
         ipc_server_names: IPC server names for each group
         ready_queue: Queue to signal when ready
     """
+    import os
+    import faulthandler as _fh
+
+    _pid = os.getpid()
+    _fault_log = open(f"/tmp/pie-worker-{_pid}.fault.log", "w")
+    _fh.enable(file=_fault_log, all_threads=True)
+
     from pie import _pie
     from pie_worker.runtime import Runtime
     from pie_worker.config import RuntimeConfig
@@ -941,6 +948,17 @@ def _vllm_worker_process(
         ready_queue: Queue to signal when ready
         tp_queues: Per-group queues for TP leader→follower signaling
     """
+    import os
+    import faulthandler as _fh
+
+    # Redirect stderr + install faulthandler so CUDA crashes leave a trace.
+    # Python can't catch SIGSEGV/SIGABRT, but faulthandler dumps a traceback
+    # to the fault log before the process dies.
+    _pid = os.getpid()
+    _stderr_log = open(f"/tmp/pie-worker-{_pid}.stderr.log", "w")
+    _fault_log = open(f"/tmp/pie-worker-{_pid}.fault.log", "w")
+    _fh.enable(file=_fault_log, all_threads=True)
+
     from pie import _pie
     from pie_worker.vllm_runtime import PieVllmRuntime
     from pie_worker.config import RuntimeConfig
@@ -1178,6 +1196,12 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
     parent_pid = os.getppid()
     check_parent_every = 100 if side_channel else 10
     poll_count = 0
+    # Adaptive coalesce: windowed max of last 4 batch sizes.
+    # When GPU finishes a batch and requests re-submit from WASM, wait
+    # for the expected count before firing (avoids batch-of-1 waste).
+    _recent_batches = [0, 0, 0, 0]
+    _recent_idx = 0
+    _expected_arrivals = 0
 
     # Batch merger imports (only when side-channel is active)
     merge_fn = None
@@ -1288,6 +1312,21 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
             if not pending:
                 continue
 
+            # Adaptive coalesce: when the batch is small relative to the
+            # expected concurrency, wait briefly for more WASM re-submissions.
+            # Uses windowed max of last 4 batch sizes to track expected count.
+            # Fires instantly at c=1 (no coalesce penalty for single requests).
+            if _expected_arrivals > 1 and len(pending) < _expected_arrivals:
+                import time as _time
+                _coalesce_deadline = _time.monotonic() + 0.002  # 2ms max
+                while _time.monotonic() < _coalesce_deadline:
+                    _more = side_channel.drain_requests()
+                    if _more:
+                        pending.extend(_more)
+                    if len(pending) >= _expected_arrivals:
+                        break
+                    _time.sleep(0.0001)  # 0.1ms poll
+
             # Emit deferred timestamps (only for non-idle steps)
             if _trace:
                 _tfd = _trace_fd
@@ -1326,6 +1365,10 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
             _n_reqs = len(np.frombuffer(
                 fire_kwargs.get("qo_indptr", b"\x00\x00\x00\x00"), dtype=np.uint32
             )) - 1
+            # Update windowed max for adaptive coalesce
+            _recent_batches[_recent_idx % 4] = _n_reqs
+            _recent_idx += 1
+            _expected_arrivals = max(_recent_batches)
 
             if _trace:
                 _t("py.unpack_done", _bid, reqs=_n_reqs, drained=len(batch_items))
@@ -1495,25 +1538,56 @@ def check_backend_processes(
                 return_code = process.returncode
                 stderr = process.stderr.read().decode() if process.stderr else ""
         else:
-            # Assume multiprocessing.Process
-            if not process.is_alive():
+            # SpawnContext (from mp.spawn): check individual worker processes
+            if hasattr(process, "processes"):
+                for p in process.processes:
+                    if not p.is_alive():
+                        is_dead = True
+                        return_code = p.exitcode
+                        signal_name = ""
+                        if return_code is not None and return_code < 0:
+                            import signal as _sig
+                            try:
+                                signal_name = _sig.Signals(-return_code).name
+                            except (ValueError, AttributeError):
+                                signal_name = f"signal {-return_code}"
+                        error_msg = (
+                            f"Worker PID {p.pid} died: "
+                            f"exit_code={return_code} ({signal_name})"
+                        )
+                        # Check for fault/stderr logs from the worker
+                        for log_path in [
+                            f"/tmp/pie-worker-{p.pid}.fault.log",
+                            f"/tmp/pie-worker-{p.pid}.stderr.log",
+                        ]:
+                            try:
+                                with open(log_path) as f:
+                                    content = f.read().strip()
+                                if content:
+                                    error_msg += f"\n  {log_path}:\n  {content[:500]}"
+                            except FileNotFoundError:
+                                pass
+                        if on_error:
+                            on_error(error_msg)
+                        else:
+                            print(f"❌ {error_msg}", file=sys.stderr, flush=True)
+                        break
+            elif not process.is_alive():
                 is_dead = True
                 return_code = process.exitcode
-                # Check for SpawnContext
-                if hasattr(process, "processes"):
-                    # For SpawnContext, is_alive checks if any process is alive
-                    # Context is "dead" if all processes are dead
-                    pass
 
         if is_dead:
             all_alive = False
-            error_msg = f"Backend process exited unexpectedly (exit code {return_code})"
-            if stderr:
-                error_msg += f" stderr: {stderr[:500]}"
-            if on_error:
-                on_error(error_msg)
-            else:
-                print(f"❌ {error_msg}", file=sys.stderr)
+            if not hasattr(process, "processes"):
+                # Only print generic message for non-SpawnContext
+                # (SpawnContext already printed per-worker details above)
+                error_msg = f"Backend process exited unexpectedly (exit code {return_code})"
+                if stderr:
+                    error_msg += f" stderr: {stderr[:500]}"
+                if on_error:
+                    on_error(error_msg)
+                else:
+                    print(f"❌ {error_msg}", file=sys.stderr, flush=True)
 
     return all_alive
 
