@@ -613,6 +613,7 @@ impl Context {
             Sampler::Custom {
                 temperature: _temperature,
                 sampler,
+                ..
             } => {
                 let dist = res.distributions.unwrap().into_iter().next().unwrap();
                 sampler.sample(&dist.ids, &dist.probs)
@@ -861,31 +862,43 @@ impl Context {
         p.attention_mask(&mask);
 
         let output_idx = pending_token_ids.len() as u32 - 1;
+        // `penalties` ride the msgpack forward batch on every non-Custom variant
+        // (Task B2). The Custom path uses `output_distributions` and applies
+        // penalties client-side via SDK primitives, so its arm keeps dropping
+        // the penalty field.
         match sampler {
             Sampler::Custom {
                 temperature,
                 sampler: _sampler,
+                penalties: _,
             } => {
                 p.output_distributions(&[output_idx], *temperature, None);
             }
-            Sampler::Multinomial { temperature } => {
-                p.output_tokens(&[output_idx], *temperature);
+            Sampler::Multinomial { temperature, penalties } => {
+                p.output_tokens(&[output_idx], *temperature, *penalties);
             }
-            Sampler::TopP { temperature, top_p } => {
-                p.output_tokens_top_p(&[output_idx], *temperature, *top_p);
+            Sampler::TopP { temperature, top_p, penalties } => {
+                p.output_tokens_top_p(&[output_idx], *temperature, *top_p, *penalties);
             }
-            Sampler::TopK { temperature, top_k } => {
-                p.output_tokens_top_k(&[output_idx], *temperature, *top_k);
+            Sampler::TopK { temperature, top_k, penalties } => {
+                p.output_tokens_top_k(&[output_idx], *temperature, *top_k, *penalties);
             }
-            Sampler::MinP { temperature, min_p } => {
-                p.output_tokens_min_p(&[output_idx], *temperature, *min_p);
+            Sampler::MinP { temperature, min_p, penalties } => {
+                p.output_tokens_min_p(&[output_idx], *temperature, *min_p, *penalties);
             }
             Sampler::TopKTopP {
                 temperature,
                 top_k,
                 top_p,
+                penalties,
             } => {
-                p.output_tokens_top_k_top_p(&[output_idx], *temperature, *top_k, *top_p);
+                p.output_tokens_top_k_top_p(
+                    &[output_idx],
+                    *temperature,
+                    *top_k,
+                    *top_p,
+                    *penalties,
+                );
             }
         }
 

@@ -310,6 +310,25 @@ impl inferlet::core::common::HostModel for InstanceState {
         Ok(stop_tokens)
     }
 
+    async fn get_generation_defaults(
+        &mut self,
+        this: Resource<Model>,
+    ) -> Result<inferlet::core::common::GenerationDefaults> {
+        // Sourced from HF `generation_config.json` via the Python worker's
+        // handshake response (A5 `extract_generation_defaults`, A6 plumbing).
+        // All-None is still a valid outcome for models that ship no
+        // generation_config (Mistral, Gemma, Yi, ...); inferlets must
+        // fall back to their own neutral defaults.
+        let defaults = &self.ctx().table.get(&this)?.info.generation_defaults;
+        Ok(inferlet::core::common::GenerationDefaults {
+            temperature: defaults.temperature,
+            top_p: defaults.top_p,
+            top_k: defaults.top_k,
+            min_p: defaults.min_p,
+            repetition_penalty: defaults.repetition_penalty,
+        })
+    }
+
     async fn get_service_id(&mut self, this: Resource<Model>) -> Result<u32> {
         Ok(self.ctx().table.get(&this)?.service_id as u32)
     }

@@ -150,6 +150,14 @@ pub struct HandshakeResponse {
     /// Whether the chat template is minijinja-compatible (no Python-only Jinja2 features).
     #[serde(default)]
     pub template_minijinja_compatible: bool,
+    /// Sampling defaults sourced from HF `generation_config.json` on the
+    /// Python side. Optional — absent or empty means the model ships no
+    /// sampling defaults and inferlets should fall back to their own.
+    /// Keys are a subset of `{temperature, top_p, top_k, min_p,
+    /// repetition_penalty}`; values are JSON scalars (int/float).
+    /// Unknown keys are ignored by the runtime.
+    #[serde(default)]
+    pub generation_defaults: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +352,9 @@ pub struct BatchedForwardPassRequest {
     pub sampler_top_k: ByteVec,           // u32 array (will cast to i32 in Python)
     pub sampler_top_p: ByteVecF32,        // f32 array
     pub sampler_min_p: ByteVecF32,        // f32 array
+    pub sampler_repetition_penalty: ByteVecF32, // f32 array, 1.0 = neutral
+    pub sampler_frequency_penalty: ByteVecF32,  // f32 array, 0.0 = neutral
+    pub sampler_presence_penalty: ByteVecF32,   // f32 array, 0.0 = neutral
     pub sampler_types: ByteVec,           // u32 array (0=dist, 1/2/3=sampler types)
     pub request_num_samplers: ByteVec,    // u32 array, num samplers per request
 
@@ -418,6 +429,9 @@ impl BatchedForwardPassRequest {
             sampler_top_k: ByteVec(Vec::new()),
             sampler_top_p: ByteVecF32(Vec::new()),
             sampler_min_p: ByteVecF32(Vec::new()),
+            sampler_repetition_penalty: ByteVecF32(Vec::new()),
+            sampler_frequency_penalty: ByteVecF32(Vec::new()),
+            sampler_presence_penalty: ByteVecF32(Vec::new()),
             sampler_types: ByteVec(Vec::new()),
             request_num_samplers: ByteVec(Vec::new()),
             flat_output_token_indices: ByteVec(Vec::new()),
@@ -514,6 +528,26 @@ impl BatchedForwardPassRequest {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0) as f32;
             self.sampler_min_p.0.push(min_p);
+
+            // Extract penalties. Defaults are neutral so pre-B1 Sampler variants
+            // (which do not set these keys) don't accidentally penalize tokens.
+            let repetition_penalty = sampler_cfg
+                .get("repetition_penalty")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32;
+            self.sampler_repetition_penalty.0.push(repetition_penalty);
+
+            let frequency_penalty = sampler_cfg
+                .get("frequency_penalty")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32;
+            self.sampler_frequency_penalty.0.push(frequency_penalty);
+
+            let presence_penalty = sampler_cfg
+                .get("presence_penalty")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32;
+            self.sampler_presence_penalty.0.push(presence_penalty);
         }
 
         // Embed outputs
@@ -565,4 +599,136 @@ impl Default for BatchedForwardPassRequest {
 pub struct BatchedForwardPassResponse {
     /// Results indexed by request order in the batch.
     pub results: Vec<ForwardPassResponse>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_request() -> ForwardPassRequest {
+        ForwardPassRequest {
+            input_tokens: Vec::new(),
+            input_token_positions: Vec::new(),
+            input_embed_ptrs: Vec::new(),
+            input_embed_positions: Vec::new(),
+            inst_id: None,
+            adapter: None,
+            adapter_seed: None,
+            mask: Vec::new(),
+            kv_page_ptrs: Vec::new(),
+            kv_page_last_len: 0,
+            output_token_indices: Vec::new(),
+            output_token_samplers: Vec::new(),
+            output_embed_ptrs: Vec::new(),
+            output_embed_indices: Vec::new(),
+            max_decode_steps: 1,
+            return_distributions: false,
+            multi_step_tokens: Vec::new(),
+            kv_page_size: 0,
+            actual_kv_pages: 0,
+            arrival_time: None,
+            token_stream_tx: None,
+            has_been_fired: false,
+        }
+    }
+
+    fn sampler_with_all_fields() -> HashMap<String, rmpv::Value> {
+        let mut s = HashMap::new();
+        s.insert("sampler".to_string(), rmpv::Value::from(1u32));
+        s.insert("temperature".to_string(), rmpv::Value::from(0.8f32));
+        s.insert("top_k".to_string(), rmpv::Value::from(20u32));
+        s.insert("top_p".to_string(), rmpv::Value::from(0.9f32));
+        s.insert("min_p".to_string(), rmpv::Value::from(0.05f32));
+        s.insert("repetition_penalty".to_string(), rmpv::Value::from(1.05f32));
+        s.insert("frequency_penalty".to_string(), rmpv::Value::from(0.1f32));
+        s.insert("presence_penalty".to_string(), rmpv::Value::from(0.2f32));
+        s
+    }
+
+    /// Verify add_request extracts penalty fields from the per-sampler hashmap
+    /// into the batch-level SoA ByteVecF32 arrays.
+    #[test]
+    fn add_request_aggregates_penalties_into_soa_arrays() {
+        let mut batch = BatchedForwardPassRequest::new();
+        let mut req = empty_request();
+        req.output_token_samplers.push(sampler_with_all_fields());
+        batch.add_request(&req);
+
+        assert_eq!(batch.sampler_repetition_penalty.0, vec![1.05f32]);
+        assert_eq!(batch.sampler_frequency_penalty.0, vec![0.1f32]);
+        assert_eq!(batch.sampler_presence_penalty.0, vec![0.2f32]);
+        // Sanity: existing fields still aggregated.
+        assert_eq!(batch.sampler_temperatures.0, vec![0.8f32]);
+        assert_eq!(batch.sampler_top_p.0, vec![0.9f32]);
+    }
+
+    /// Pre-B1 Sampler variants don't set penalty keys. add_request must default
+    /// them to neutral (1.0 / 0.0 / 0.0) so old call sites don't silently
+    /// penalize tokens.
+    #[test]
+    fn add_request_defaults_missing_penalties_to_neutral() {
+        let mut batch = BatchedForwardPassRequest::new();
+        let mut req = empty_request();
+        let mut s = HashMap::new();
+        s.insert("sampler".to_string(), rmpv::Value::from(1u32));
+        s.insert("temperature".to_string(), rmpv::Value::from(1.0f32));
+        req.output_token_samplers.push(s);
+        batch.add_request(&req);
+
+        assert_eq!(batch.sampler_repetition_penalty.0, vec![1.0f32]);
+        assert_eq!(batch.sampler_frequency_penalty.0, vec![0.0f32]);
+        assert_eq!(batch.sampler_presence_penalty.0, vec![0.0f32]);
+    }
+
+    /// Serialized batch msgpack must carry the exact plural keys pie-vllm's
+    /// batch_merger reads: `sampler_repetition_penalty`,
+    /// `sampler_frequency_penalty`, `sampler_presence_penalty`.
+    #[test]
+    fn serialized_batch_exposes_plural_penalty_keys() {
+        let mut batch = BatchedForwardPassRequest::new();
+        let mut req = empty_request();
+        req.output_token_samplers.push(sampler_with_all_fields());
+        batch.add_request(&req);
+
+        let bytes = rmp_serde::to_vec_named(&batch).expect("msgpack encode");
+        let value: rmpv::Value = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        let map = value.as_map().expect("top-level msgpack map");
+
+        let has = |key: &str| {
+            map.iter()
+                .any(|(k, _)| k.as_str().map(|s| s == key).unwrap_or(false))
+        };
+
+        assert!(has("sampler_repetition_penalty"));
+        assert!(has("sampler_frequency_penalty"));
+        assert!(has("sampler_presence_penalty"));
+    }
+
+    /// Multi-sampler aggregation: two samplers in one request must flatten
+    /// into length-2 arrays in the correct order.
+    #[test]
+    fn add_request_flattens_multiple_samplers_in_order() {
+        let mut batch = BatchedForwardPassRequest::new();
+        let mut req = empty_request();
+
+        let mut s1 = HashMap::new();
+        s1.insert("sampler".to_string(), rmpv::Value::from(1u32));
+        s1.insert("repetition_penalty".to_string(), rmpv::Value::from(1.1f32));
+        s1.insert("frequency_penalty".to_string(), rmpv::Value::from(0.3f32));
+        s1.insert("presence_penalty".to_string(), rmpv::Value::from(0.4f32));
+
+        let mut s2 = HashMap::new();
+        s2.insert("sampler".to_string(), rmpv::Value::from(1u32));
+        s2.insert("repetition_penalty".to_string(), rmpv::Value::from(1.2f32));
+        s2.insert("frequency_penalty".to_string(), rmpv::Value::from(0.5f32));
+        s2.insert("presence_penalty".to_string(), rmpv::Value::from(0.6f32));
+
+        req.output_token_samplers.push(s1);
+        req.output_token_samplers.push(s2);
+        batch.add_request(&req);
+
+        assert_eq!(batch.sampler_repetition_penalty.0, vec![1.1f32, 1.2f32]);
+        assert_eq!(batch.sampler_frequency_penalty.0, vec![0.3f32, 0.5f32]);
+        assert_eq!(batch.sampler_presence_penalty.0, vec![0.4f32, 0.6f32]);
+    }
 }

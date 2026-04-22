@@ -1,8 +1,21 @@
 use crate::api;
 use crate::brle::Brle;
+use crate::sampler::Penalties;
 use crate::{Queue, Resource};
 use std::rc::Rc;
 use wstd::io::AsyncPollable;
+
+/// Convert the SDK's `Penalties` struct into the WIT-generated binding type
+/// that crosses the WASM boundary. Field-for-field copy; both types carry the
+/// same three `f32`s.
+#[inline]
+fn wit_penalties(p: Penalties) -> api::forward::Penalties {
+    api::forward::Penalties {
+        repetition: p.repetition,
+        frequency: p.frequency,
+        presence: p.presence,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ForwardPass {
@@ -332,20 +345,56 @@ impl ForwardPass {
         api::forward::output_distributions(&self.inner, indices, temperature, top_k);
     }
 
-    pub fn output_tokens(&self, indices: &[u32], temperature: f32) {
-        api::forward::output_tokens(&self.inner, indices, temperature);
+    pub fn output_tokens(&self, indices: &[u32], temperature: f32, penalties: Penalties) {
+        api::forward::output_tokens(&self.inner, indices, temperature, wit_penalties(penalties));
     }
 
-    pub fn output_tokens_top_p(&self, indices: &[u32], temperature: f32, top_p: f32) {
-        api::forward::output_tokens_top_p(&self.inner, indices, temperature, top_p);
+    pub fn output_tokens_top_p(
+        &self,
+        indices: &[u32],
+        temperature: f32,
+        top_p: f32,
+        penalties: Penalties,
+    ) {
+        api::forward::output_tokens_top_p(
+            &self.inner,
+            indices,
+            temperature,
+            top_p,
+            wit_penalties(penalties),
+        );
     }
 
-    pub fn output_tokens_top_k(&self, indices: &[u32], temperature: f32, top_k: u32) {
-        api::forward::output_tokens_top_k(&self.inner, indices, temperature, top_k);
+    pub fn output_tokens_top_k(
+        &self,
+        indices: &[u32],
+        temperature: f32,
+        top_k: u32,
+        penalties: Penalties,
+    ) {
+        api::forward::output_tokens_top_k(
+            &self.inner,
+            indices,
+            temperature,
+            top_k,
+            wit_penalties(penalties),
+        );
     }
 
-    pub fn output_tokens_min_p(&self, indices: &[u32], temperature: f32, min_p: f32) {
-        api::forward::output_tokens_min_p(&self.inner, indices, temperature, min_p);
+    pub fn output_tokens_min_p(
+        &self,
+        indices: &[u32],
+        temperature: f32,
+        min_p: f32,
+        penalties: Penalties,
+    ) {
+        api::forward::output_tokens_min_p(
+            &self.inner,
+            indices,
+            temperature,
+            min_p,
+            wit_penalties(penalties),
+        );
     }
 
     pub fn output_tokens_top_k_top_p(
@@ -354,8 +403,16 @@ impl ForwardPass {
         temperature: f32,
         top_k: u32,
         top_p: f32,
+        penalties: Penalties,
     ) {
-        api::forward::output_tokens_top_k_top_p(&self.inner, indices, temperature, top_k, top_p);
+        api::forward::output_tokens_top_k_top_p(
+            &self.inner,
+            indices,
+            temperature,
+            top_k,
+            top_p,
+            wit_penalties(penalties),
+        );
     }
 
     pub fn attention_mask(&self, mask: &[Vec<u32>]) {

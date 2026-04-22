@@ -1,6 +1,6 @@
 pub use crate::chat::ChatFormatter;
 pub use crate::context::Context;
-pub use crate::sampler::Sampler;
+pub use crate::sampler::{GenerationDefaults, Sampler, SamplingOverrides};
 use crate::stop_condition::StopCondition;
 use crate::wstd::runtime::AsyncPollable;
 pub use anyhow::{Context as AnyhowContext, Error, Result, anyhow, bail, ensure, format_err};
@@ -249,6 +249,28 @@ impl Model {
 
     pub fn get_kv_page_size(&self) -> u32 {
         self.inner.get_kv_page_size()
+    }
+
+    /// Returns the per-model sampling defaults sourced from the engine's
+    /// generation_config. Fields that are `None` indicate the engine/model
+    /// has no opinion; the inferlet should fall back to a neutral default.
+    pub fn generation_defaults(&self) -> GenerationDefaults {
+        let wit = self.inner.get_generation_defaults();
+        GenerationDefaults {
+            temperature:        wit.temperature,
+            top_p:              wit.top_p,
+            top_k:              wit.top_k,
+            min_p:              wit.min_p,
+            repetition_penalty: wit.repetition_penalty,
+        }
+    }
+
+    /// Construct a ready-to-use `Sampler` by merging client-supplied
+    /// `SamplingOverrides` with this model's `generation_defaults()`.
+    ///
+    /// See `Sampler::merge` for precedence rules.
+    pub fn build_sampler(&self, overrides: SamplingOverrides) -> Sampler {
+        Sampler::merge(overrides, self.generation_defaults())
     }
 
     /// Create a new command queue for this model.
