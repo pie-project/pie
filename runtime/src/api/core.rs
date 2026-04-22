@@ -310,6 +310,22 @@ impl inferlet::core::common::HostModel for InstanceState {
         Ok(stop_tokens)
     }
 
+    async fn get_generation_defaults(
+        &mut self,
+        _this: Resource<Model>,
+    ) -> Result<inferlet::core::common::GenerationDefaults> {
+        // Stub: real values are plumbed in from pie-vllm in task A5-A6.
+        // Until then, every field is None — inferlets must fall back to their
+        // own neutral defaults.
+        Ok(inferlet::core::common::GenerationDefaults {
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repetition_penalty: None,
+        })
+    }
+
     async fn get_service_id(&mut self, this: Resource<Model>) -> Result<u32> {
         Ok(self.ctx().table.get(&this)?.service_id as u32)
     }

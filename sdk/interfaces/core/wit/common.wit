@@ -11,6 +11,17 @@ interface common {
         high,       // Highest priority
     }
 
+    // Per-model sampling defaults sourced from the engine's generation_config.
+    // All fields are optional: absent means the engine/model has no opinion
+    // and the inferlet should fall back to its own neutral default.
+    record generation-defaults {
+        temperature:        option<f32>,
+        top-p:              option<f32>,
+        top-k:              option<u32>,
+        min-p:              option<f32>,
+        repetition-penalty: option<f32>,
+    }
+
     resource blob {
         constructor(init: list<u8>);
         read: func(offset: u64, n: u64) -> list<u8>;
@@ -33,6 +44,7 @@ interface common {
         get-description: func() -> string;           // Human-readable description of the model
         get-prompt-template: func() -> string;       // Returns the prompt formatting template in Tera
         get-stop-tokens: func() -> list<string>;
+        get-generation-defaults: func() -> generation-defaults;
         get-service-id: func() -> u32;
         get-kv-page-size: func() -> u32; // Get the size of a KV page
         create-queue: func() -> queue;               // Create a new command queue
