@@ -613,6 +613,7 @@ impl Context {
             Sampler::Custom {
                 temperature: _temperature,
                 sampler,
+                ..
             } => {
                 let dist = res.distributions.unwrap().into_iter().next().unwrap();
                 sampler.sample(&dist.ids, &dist.probs)
@@ -861,29 +862,34 @@ impl Context {
         p.attention_mask(&mask);
 
         let output_idx = pending_token_ids.len() as u32 - 1;
+        // NOTE: penalties are carried on every variant but not yet wired into the
+        // forward-pass msgpack. Task B2 plumbs them through the runtime; here we
+        // ignore them via `..` so builds stay green.
         match sampler {
             Sampler::Custom {
                 temperature,
                 sampler: _sampler,
+                ..
             } => {
                 p.output_distributions(&[output_idx], *temperature, None);
             }
-            Sampler::Multinomial { temperature } => {
+            Sampler::Multinomial { temperature, .. } => {
                 p.output_tokens(&[output_idx], *temperature);
             }
-            Sampler::TopP { temperature, top_p } => {
+            Sampler::TopP { temperature, top_p, .. } => {
                 p.output_tokens_top_p(&[output_idx], *temperature, *top_p);
             }
-            Sampler::TopK { temperature, top_k } => {
+            Sampler::TopK { temperature, top_k, .. } => {
                 p.output_tokens_top_k(&[output_idx], *temperature, *top_k);
             }
-            Sampler::MinP { temperature, min_p } => {
+            Sampler::MinP { temperature, min_p, .. } => {
                 p.output_tokens_min_p(&[output_idx], *temperature, *min_p);
             }
             Sampler::TopKTopP {
                 temperature,
                 top_k,
                 top_p,
+                ..
             } => {
                 p.output_tokens_top_k_top_p(&[output_idx], *temperature, *top_k, *top_p);
             }

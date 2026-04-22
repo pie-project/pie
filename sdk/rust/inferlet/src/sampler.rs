@@ -25,48 +25,75 @@ pub struct SamplingOverrides {
     pub presence_penalty:   Option<f32>,  // F3 (client-only, not in gen_config)
 }
 
+/// Token-penalty parameters attached to every `Sampler` variant.
+///
+/// Neutral defaults (`repetition=1.0, frequency=0.0, presence=0.0`) match
+/// vLLM's `SamplingParams` defaults — multiplying by 1.0 or adding 0.0 is a
+/// mathematical no-op, so code paths that unconditionally apply penalties stay
+/// correct when the client hasn't set them.
+///
+/// `frequency` and `presence` have no source in HF `generation_config.json`
+/// (confirmed via survey of 9 models); they are client-only and only `repetition`
+/// can be filled from `GenerationDefaults`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Penalties {
+    pub repetition: f32,  // 1.0 = neutral
+    pub frequency:  f32,  // 0.0 = neutral
+    pub presence:   f32,  // 0.0 = neutral
+}
+
+impl Default for Penalties {
+    fn default() -> Self { Self { repetition: 1.0, frequency: 0.0, presence: 0.0 } }
+}
+
 pub enum Sampler {
     Custom {
         temperature: f32,
         sampler: Box<dyn Sample>,
+        penalties: Penalties,
     },
     Multinomial {
         temperature: f32,
+        penalties: Penalties,
     },
     TopP {
         temperature: f32,
         top_p: f32,
+        penalties: Penalties,
     },
     TopK {
         temperature: f32,
         top_k: u32,
+        penalties: Penalties,
     },
     MinP {
         temperature: f32,
         min_p: f32,
+        penalties: Penalties,
     },
     TopKTopP {
         temperature: f32,
         top_k: u32,
         top_p: f32,
+        penalties: Penalties,
     },
 }
 
 impl Sampler {
     pub fn greedy() -> Self {
-        Sampler::Multinomial { temperature: 0.0 }
+        Sampler::Multinomial { temperature: 0.0, penalties: Penalties::default() }
     }
 
     pub fn top_p(temperature: f32, top_p: f32) -> Self {
-        Sampler::TopP { temperature, top_p }
+        Sampler::TopP { temperature, top_p, penalties: Penalties::default() }
     }
 
     pub fn top_k(temperature: f32, top_k: u32) -> Self {
-        Sampler::TopK { temperature, top_k }
+        Sampler::TopK { temperature, top_k, penalties: Penalties::default() }
     }
 
     pub fn min_p(temperature: f32, min_p: f32) -> Self {
-        Sampler::MinP { temperature, min_p }
+        Sampler::MinP { temperature, min_p, penalties: Penalties::default() }
     }
 
     pub fn top_k_top_p(temperature: f32, top_k: u32, top_p: f32) -> Self {
@@ -74,6 +101,7 @@ impl Sampler {
             temperature,
             top_k,
             top_p,
+            penalties: Penalties::default(),
         }
     }
 
@@ -89,10 +117,11 @@ impl Sampler {
     /// (temperature=1.0, top_p=1.0 disabled, top_k=0 disabled, min_p=0.0
     /// disabled) are the last resort.
     ///
-    /// Only the four filter-style fields (temperature, top_p, top_k, min_p) are
-    /// considered here. `repetition_penalty` / `frequency_penalty` /
-    /// `presence_penalty` will be folded in by Task B1 when `Sampler` variants
-    /// grow a `Penalties` field.
+    /// Filter selection (temperature, top_p, top_k, min_p) and penalty
+    /// parameters (repetition, frequency, presence) are resolved independently.
+    /// Penalty fields flow into every variant via the `Penalties` struct;
+    /// `frequency_penalty` and `presence_penalty` are client-only (no defaults
+    /// source) while `repetition_penalty` can come from `GenerationDefaults`.
     pub fn merge(overrides: SamplingOverrides, defaults: GenerationDefaults) -> Self {
         let temperature = overrides.temperature.or(defaults.temperature).unwrap_or(1.0);
         let top_p = overrides.top_p.or(defaults.top_p);
@@ -102,12 +131,17 @@ impl Sampler {
         let top_p_active = top_p.filter(|v| *v < 1.0 && *v > 0.0);
         let top_k_active = top_k.filter(|v| *v > 0);
         let min_p_active = min_p.filter(|v| *v > 0.0);
+        let penalties = Penalties {
+            repetition: overrides.repetition_penalty.or(defaults.repetition_penalty).unwrap_or(1.0),
+            frequency:  overrides.frequency_penalty.unwrap_or(0.0),   // no defaults source
+            presence:   overrides.presence_penalty.unwrap_or(0.0),    // no defaults source
+        };
         match (top_k_active, top_p_active, min_p_active) {
-            (Some(k), Some(p), _) => Sampler::TopKTopP { temperature, top_k: k, top_p: p },
-            (Some(k), None, _)    => Sampler::TopK { temperature, top_k: k },
-            (None, Some(p), _)    => Sampler::TopP { temperature, top_p: p },
-            (None, None, Some(m)) => Sampler::MinP { temperature, min_p: m },
-            (None, None, None)    => Sampler::Multinomial { temperature },
+            (Some(k), Some(p), _) => Sampler::TopKTopP { temperature, top_k: k, top_p: p, penalties },
+            (Some(k), None, _)    => Sampler::TopK { temperature, top_k: k, penalties },
+            (None, Some(p), _)    => Sampler::TopP { temperature, top_p: p, penalties },
+            (None, None, Some(m)) => Sampler::MinP { temperature, min_p: m, penalties },
+            (None, None, None)    => Sampler::Multinomial { temperature, penalties },
         }
     }
 }
@@ -153,7 +187,7 @@ mod tests {
         let o = SamplingOverrides { temperature: Some(0.5), ..Default::default() };
         let s = Sampler::merge(o, qwen25_defaults());
         // Expect TopKTopP { temperature=0.5, top_p=0.8, top_k=20 }
-        assert!(matches!(s, Sampler::TopKTopP { temperature: t, top_p: 0.8, top_k: 20 } if (t - 0.5).abs() < 1e-6));
+        assert!(matches!(s, Sampler::TopKTopP { temperature: t, top_p: 0.8, top_k: 20, .. } if (t - 0.5).abs() < 1e-6));
     }
 
     #[test]
@@ -168,7 +202,7 @@ mod tests {
         let o = SamplingOverrides::default();
         let s = Sampler::merge(o, GenerationDefaults::default());
         // No filters set → Multinomial at temperature 1.0
-        assert!(matches!(s, Sampler::Multinomial { temperature: t } if (t - 1.0).abs() < 1e-6));
+        assert!(matches!(s, Sampler::Multinomial { temperature: t, .. } if (t - 1.0).abs() < 1e-6));
     }
 
     #[test]
@@ -191,7 +225,7 @@ mod tests {
         // Model gen_config sets only top_k; client sends nothing → Sampler::TopK.
         let d = GenerationDefaults { top_k: Some(50), temperature: Some(0.7), ..Default::default() };
         let s = Sampler::merge(SamplingOverrides::default(), d);
-        assert!(matches!(s, Sampler::TopK { top_k: 50, temperature: t } if (t - 0.7).abs() < 1e-6));
+        assert!(matches!(s, Sampler::TopK { top_k: 50, temperature: t, .. } if (t - 0.7).abs() < 1e-6));
     }
 
     #[test]
@@ -214,5 +248,32 @@ mod tests {
         let s = Sampler::merge(o, d);
         // With top_p disabled by client but top_k=20 still active from defaults → TopK only
         assert!(matches!(s, Sampler::TopK { top_k: 20, .. }));
+    }
+
+    #[test]
+    fn penalties_neutral_is_no_op() {
+        let p = Penalties::default();
+        assert_eq!(p.repetition, 1.0);
+        assert_eq!(p.frequency, 0.0);
+        assert_eq!(p.presence, 0.0);
+    }
+
+    #[test]
+    fn sampler_carries_penalties_from_merge() {
+        let o = SamplingOverrides {
+            temperature: Some(0.5),
+            repetition_penalty: Some(1.1),
+            frequency_penalty: Some(0.2),
+            ..Default::default()
+        };
+        let s = Sampler::merge(o, GenerationDefaults::default());
+        // With no filter active and no defaults, result is Multinomial
+        if let Sampler::Multinomial { penalties, .. } = s {
+            assert_eq!(penalties.repetition, 1.1);
+            assert_eq!(penalties.frequency, 0.2);
+            assert_eq!(penalties.presence, 0.0);  // neutral fallback
+        } else {
+            panic!("expected Multinomial variant");
+        }
     }
 }
