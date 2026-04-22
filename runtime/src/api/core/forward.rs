@@ -100,6 +100,26 @@ enum Sampler {
     TopKTopP = 5,
 }
 
+/// Serialize `Penalties` into the per-token sampler msgpack map under the
+/// `*_penalty` keys consumed by pie-vllm's `SamplingParams` builder.
+fn insert_penalties(
+    sampler: &mut HashMap<String, rmpv::Value>,
+    penalties: &inferlet::core::forward::Penalties,
+) {
+    sampler.insert(
+        "repetition_penalty".to_string(),
+        rmpv::Value::from(penalties.repetition),
+    );
+    sampler.insert(
+        "frequency_penalty".to_string(),
+        rmpv::Value::from(penalties.frequency),
+    );
+    sampler.insert(
+        "presence_penalty".to_string(),
+        rmpv::Value::from(penalties.presence),
+    );
+}
+
 #[async_trait]
 impl Pollable for ForwardPassResult {
     async fn ready(&mut self) {
@@ -314,6 +334,7 @@ impl inferlet::core::forward::Host for InstanceState {
         pass: Resource<ForwardPass>,
         indices: Vec<u32>,
         temperature: f32,
+        penalties: inferlet::core::forward::Penalties,
     ) -> Result<()> {
         let mut sampler = HashMap::new();
 
@@ -322,6 +343,7 @@ impl inferlet::core::forward::Host for InstanceState {
             rmpv::Value::from(Sampler::Multinomial as u32),
         );
         sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
+        insert_penalties(&mut sampler, &penalties);
 
         let samplers = iter::repeat(sampler.clone())
             .take(indices.len())
@@ -339,6 +361,7 @@ impl inferlet::core::forward::Host for InstanceState {
         indices: Vec<u32>,
         temperature: f32,
         top_k: u32,
+        penalties: inferlet::core::forward::Penalties,
     ) -> Result<()> {
         let mut sampler = HashMap::new();
 
@@ -348,6 +371,7 @@ impl inferlet::core::forward::Host for InstanceState {
         );
         sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
         sampler.insert("top_k".to_string(), rmpv::Value::from(top_k));
+        insert_penalties(&mut sampler, &penalties);
 
         let pass = self.ctx().table.get_mut(&pass)?;
         pass.output_token_samplers
@@ -363,6 +387,7 @@ impl inferlet::core::forward::Host for InstanceState {
         indices: Vec<u32>,
         temperature: f32,
         top_p: f32,
+        penalties: inferlet::core::forward::Penalties,
     ) -> Result<()> {
         let mut sampler = HashMap::new();
 
@@ -372,6 +397,7 @@ impl inferlet::core::forward::Host for InstanceState {
         );
         sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
         sampler.insert("top_p".to_string(), rmpv::Value::from(top_p));
+        insert_penalties(&mut sampler, &penalties);
 
         let pass = self.ctx().table.get_mut(&pass)?;
         pass.output_token_samplers
@@ -387,6 +413,7 @@ impl inferlet::core::forward::Host for InstanceState {
         indices: Vec<u32>,
         temperature: f32,
         min_p: f32,
+        penalties: inferlet::core::forward::Penalties,
     ) -> Result<()> {
         let mut sampler = HashMap::new();
 
@@ -396,6 +423,7 @@ impl inferlet::core::forward::Host for InstanceState {
         );
         sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
         sampler.insert("min_p".to_string(), rmpv::Value::from(min_p));
+        insert_penalties(&mut sampler, &penalties);
 
         let pass = self.ctx().table.get_mut(&pass)?;
         pass.output_token_samplers
@@ -412,6 +440,7 @@ impl inferlet::core::forward::Host for InstanceState {
         temperature: f32,
         top_k: u32,
         top_p: f32,
+        penalties: inferlet::core::forward::Penalties,
     ) -> Result<()> {
         let mut sampler = HashMap::new();
 
@@ -422,6 +451,7 @@ impl inferlet::core::forward::Host for InstanceState {
         sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
         sampler.insert("top_k".to_string(), rmpv::Value::from(top_k));
         sampler.insert("top_p".to_string(), rmpv::Value::from(top_p));
+        insert_penalties(&mut sampler, &penalties);
 
         let pass = self.ctx().table.get_mut(&pass)?;
         pass.output_token_samplers

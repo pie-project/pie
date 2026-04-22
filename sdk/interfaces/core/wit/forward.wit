@@ -55,6 +55,15 @@ interface forward {
         indices: list<u32>,
     );
 
+    /// Token-penalty parameters passed alongside every token-sampling call.
+    /// Neutral values (repetition=1.0, frequency=0.0, presence=0.0) are a
+    /// mathematical no-op so handlers can apply them unconditionally.
+    record penalties {
+        repetition: f32,
+        frequency:  f32,
+        presence:   f32,
+    }
+
     output-distributions: func(
         pass: borrow<forward-pass>,
         indices: list<u32>,
@@ -66,13 +75,15 @@ interface forward {
         pass: borrow<forward-pass>,
         indices: list<u32>,
         temperature: f32,
+        penalties: penalties,
     );
 
     output-tokens-top-k: func(
         pass: borrow<forward-pass>,
         indices: list<u32>,
         temperature: f32,
-        top-k: u32
+        top-k: u32,
+        penalties: penalties,
     );
 
     output-tokens-top-p: func(
@@ -80,6 +91,7 @@ interface forward {
         indices: list<u32>,
         temperature: f32,
         top-p: f32,
+        penalties: penalties,
     );
 
     output-tokens-min-p: func(
@@ -87,6 +99,7 @@ interface forward {
         indices: list<u32>,
         temperature: f32,
         min-p: f32,
+        penalties: penalties,
     );
 
     output-tokens-top-k-top-p: func(
@@ -94,7 +107,8 @@ interface forward {
         indices: list<u32>,
         temperature: f32,
         top-k: u32,
-        top-p: f32
+        top-p: f32,
+        penalties: penalties,
     );
 
     /// Set maximum number of sequential decode steps per execute() call.
