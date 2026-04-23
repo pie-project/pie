@@ -49,8 +49,7 @@ async fn main(mut args: Args) -> Result<String> {
             let mut generated_token_ids = Vec::new();
 
             loop {
-                let next_token_id = ctx.decode_step(&sampler).await;
-                ctx.fill_token(next_token_id);
+                let next_token_id = ctx.decode_step_and_fill(&sampler).await;
                 generated_token_ids.push(next_token_id);
                 if stop_cond_.check(&generated_token_ids) {
                     break;

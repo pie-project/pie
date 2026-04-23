@@ -602,8 +602,35 @@ impl Context {
     ///
     /// # Returns
     ///
-    /// A `Result` containing the `Distribution` over the next possible tokens,
-    /// or an error if the generation step could not be performed.
+    /// The sampled next-token id. The sampled token is **not** committed to
+    /// pending — callers must seed the next step themselves.
+    ///
+    /// # Contract — per-token loops REQUIRE `fill_token` between calls
+    ///
+    /// The returned token is the seed for the next step but is *not* placed
+    /// in `token_ids_pending` automatically. Calling `decode_step` again
+    /// without an intervening `fill_token(returned)` leaves pending empty
+    /// and trips the `!token_ids_pending.is_empty()` assertion inside
+    /// `prepare_forward_pass`.
+    ///
+    /// Under the pie HTTP runtime that assertion's panic manifests as a
+    /// **silent stream stall**: the WASM handler's future never resolves,
+    /// the SSE response body is left half-open, and the client only
+    /// recovers when its own read timeout fires. The canonical per-token
+    /// loop is:
+    ///
+    /// ```ignore
+    /// loop {
+    ///     let next = ctx.decode_step(&sampler).await;
+    ///     ctx.fill_token(next);           // ← MUST be here
+    ///     generated.push(next);
+    ///     if stop_cond.check(&generated) { break; }
+    /// }
+    /// ```
+    ///
+    /// For per-token loops, prefer [`Context::decode_step_and_fill`], which
+    /// performs the `fill_token` automatically and is impossible to misuse
+    /// in this way.
     pub async fn decode_step(&mut self, sampler: &Sampler) -> u32 {
         let (p, pending_token_ids, position_ids) = self.prepare_forward_pass(sampler, 0);
 
@@ -624,6 +651,27 @@ impl Context {
         self.token_ids.extend(pending_token_ids);
         self.position_ids.extend(position_ids);
 
+        sampled
+    }
+
+    /// Single-step decode that also seeds the next step.
+    ///
+    /// Equivalent to `decode_step` followed by `fill_token(returned)`.
+    /// Prefer this helper for per-token decode loops — it makes the
+    /// `decode_step` → `fill_token` contract un-skippable by construction,
+    /// eliminating the silent-stream-stall failure mode described in
+    /// [`Context::decode_step`]'s documentation.
+    ///
+    /// ```ignore
+    /// loop {
+    ///     let next = ctx.decode_step_and_fill(&sampler).await;
+    ///     generated.push(next);
+    ///     if stop_cond.check(&generated) { break; }
+    /// }
+    /// ```
+    pub async fn decode_step_and_fill(&mut self, sampler: &Sampler) -> u32 {
+        let sampled = self.decode_step(sampler).await;
+        self.fill_token(sampled);
         sampled
     }
 
@@ -813,7 +861,14 @@ impl Context {
     ) -> (ForwardPass, Vec<u32>, Vec<u32>) {
         assert!(
             !self.token_ids_pending.is_empty(),
-            "Must have at least one seed token"
+            "prepare_forward_pass: token_ids_pending is empty. A decode call \
+             (decode_step / decode_n / decode_stream) was made with no seed \
+             token. This is usually caused by a per-token decode_step loop \
+             that forgot to call fill_token(returned) between iterations — \
+             see Context::decode_step docs and prefer decode_step_and_fill. \
+             Under the pie HTTP runtime this panic manifests as a silent \
+             stream stall; the client only recovers via its own read \
+             timeout."
         );
 
         let pending_token_ids = mem::take(&mut self.token_ids_pending);
