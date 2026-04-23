@@ -19,9 +19,8 @@ pub async fn generate_with_sliding_window<C: StopCondition>(
 
     // The autoregressive generation loop
     loop {
-        // 1. Decode the next token, sample, and add it to the pending buffer.
-        let next_token_id = ctx.decode_step(&sampler).await;
-        ctx.fill_token(next_token_id);
+        // 1. Decode the next token and seed the next step.
+        let next_token_id = ctx.decode_step_and_fill(&sampler).await;
         generated_token_ids.push(next_token_id);
 
         // 2. Check for the stop condition.

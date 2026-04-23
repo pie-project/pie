@@ -38,9 +38,8 @@ pub async fn generate_with_attention_sink<C: StopCondition>(
     let max_cache_size = attention_sink_initial_size + attention_sink_window_size;
 
     loop {
-        // 1. Decode the next token
-        let next_token_id = ctx.decode_step(sampler).await;
-        ctx.fill_token(next_token_id);
+        // 1. Decode the next token and seed the next step.
+        let next_token_id = ctx.decode_step_and_fill(sampler).await;
         generated_token_ids.push(next_token_id);
 
         // 2. Check if the stop condition is met

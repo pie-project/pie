@@ -183,8 +183,7 @@ async fn handle_streaming_response(
 
     // Token-by-token generation loop with TRUE streaming
     loop {
-        let next_token_id = ctx.decode_step(&sampler).await;
-        ctx.fill_token(next_token_id);
+        let next_token_id = ctx.decode_step_and_fill(&sampler).await;
         generated_token_ids.push(next_token_id);
 
         // Decode just this token to get the delta text
