@@ -27,10 +27,24 @@ fn wit_timing_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("PIE_WIT_TIMING").is_ok())
 }
 
-fn mono_ns() -> u64 {
+/// Task #40 fine-grained profiling of WASM↔Rust boundary.
+/// Emits [WASM-ENQUEUE] / [WASM-RESUME] timestamps, pairable via `inst=`.
+pub(crate) fn wasm_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PIE_WASM_TIMING").is_ok())
+}
+
+pub(crate) fn mono_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+/// Short form of a UUID for log brevity (first 8 hex chars, 32 bits entropy —
+/// plenty to disambiguate in-flight instances within a single run).
+pub(crate) fn short_inst(id: &uuid::Uuid) -> String {
+    let s = id.simple().to_string();
+    s.chars().take(8).collect()
 }
 
 /// Print and reset WIT timing accumulators every N steps.
@@ -89,6 +103,9 @@ pub struct ForwardPassResult {
     pub distributions: Vec<(Vec<u32>, Vec<f32>)>,
     pub tokens: Vec<u32>,
     pub done: bool,
+    /// Task #40: enqueue timestamp + short instance id for [WASM-RESUME]
+    /// pairing. None when PIE_WASM_TIMING is not set.
+    pub wasm_trace: Option<(u64, String)>,
 }
 
 enum Sampler {
@@ -167,6 +184,16 @@ impl Pollable for ForwardPassResult {
 
         if let Some(t0) = t0 {
             WIT_READY_SUM_NS.fetch_add(mono_ns() - t0, AtomicOrdering::Relaxed);
+        }
+
+        if let Some((t_enqueue, ref inst_short)) = self.wasm_trace {
+            let t_resume = mono_ns();
+            eprintln!(
+                "[WASM-RESUME] t={} inst={} wait_us={}",
+                t_resume,
+                inst_short,
+                (t_resume - t_enqueue) / 1_000,
+            );
         }
     }
 }
@@ -531,6 +558,24 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
         // Always create a response channel so every request participates in
         // the batch response protocol.
         let (tx, rx) = oneshot::channel();
+
+        // Task #40: WASM↔Rust boundary probe. Emit BEFORE submit_request so
+        // the timestamp captures the moment the request leaves WASM, not
+        // after potentially-blocking channel submission.
+        let wasm_trace = if wasm_timing_enabled() {
+            let t_enqueue = mono_ns();
+            let inst_short = short_inst(&self.id());
+            let toks = request.input_tokens.len();
+            let msteps = request.max_decode_steps;
+            eprintln!(
+                "[WASM-ENQUEUE] t={} inst={} toks={} max_steps={}",
+                t_enqueue, inst_short, toks, msteps,
+            );
+            Some((t_enqueue, inst_short))
+        } else {
+            None
+        };
+
         let req = Request::ForwardPass(request, Some(tx));
         submit_request(svc_id, queue_id, priority, req)?;
 
@@ -544,6 +589,7 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
             distributions: vec![],
             tokens: vec![],
             done: false,
+            wasm_trace,
         };
 
         Ok(Some(self.ctx().table.push(res)?))

@@ -907,6 +907,18 @@ impl Model {
         *ENABLED.get_or_init(|| std::env::var("PIE_SCHED_TIMING").is_ok())
     }
 
+    /// Task #40: per-request WASM↔Rust boundary probes (pair with
+    /// [WASM-ENQUEUE] / [WASM-RESUME] emitted from api::core::forward).
+    fn wasm_timing_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("PIE_WASM_TIMING").is_ok())
+    }
+
+    fn short_inst(id: &uuid::Uuid) -> String {
+        let s = id.simple().to_string();
+        s.chars().take(8).collect()
+    }
+
     fn trace_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("PIE_TRACE").is_ok())
@@ -1061,11 +1073,23 @@ impl Model {
                                 tokens: fp_req.multi_step_tokens,
                                 dists: resp.map(|r| r.dists).unwrap_or_default(),
                             }).ok();
+                            if Self::wasm_timing_enabled() {
+                                if let Some(ref id) = fp_req.inst_id {
+                                    eprintln!("[WASM-RESUME-SEND] t={} inst={} ms=1",
+                                        Self::mono_ns(), Self::short_inst(id));
+                                }
+                            }
                         }
                     } else {
                         if let Some(tx) = resp_tx {
                             if let Some(r) = resp {
                                 tx.send(r).ok();
+                            }
+                            if Self::wasm_timing_enabled() {
+                                if let Some(ref id) = fp_req.inst_id {
+                                    eprintln!("[WASM-RESUME-SEND] t={} inst={} ms=0",
+                                        Self::mono_ns(), Self::short_inst(id));
+                                }
                             }
                         }
                     }
