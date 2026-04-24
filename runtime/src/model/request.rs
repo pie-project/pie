@@ -595,10 +595,21 @@ impl Default for BatchedForwardPassRequest {
 }
 
 /// Batched forward pass response from Python via pycrust.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `error` is populated by the Python fire_batch wrapper when the batch
+/// raised an exception (see pie/src/pie/manager.py). Prior to its addition,
+/// rmp_serde silently discarded the error string because the Rust struct
+/// only had `results`; failed batches manifested on the client as HTTP 200
+/// with completion_tokens=0 (task #48). Callers MUST check `error` before
+/// treating an empty `results` as successful completion.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BatchedForwardPassResponse {
-    /// Results indexed by request order in the batch.
+    /// Results indexed by request order in the batch. Empty when `error` is set.
+    #[serde(default)]
     pub results: Vec<ForwardPassResponse>,
+    /// Python-side exception string from fire_batch (None on success).
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]
@@ -730,5 +741,34 @@ mod tests {
         assert_eq!(batch.sampler_repetition_penalty.0, vec![1.1f32, 1.2f32]);
         assert_eq!(batch.sampler_frequency_penalty.0, vec![0.3f32, 0.5f32]);
         assert_eq!(batch.sampler_presence_penalty.0, vec![0.4f32, 0.6f32]);
+    }
+
+    /// Wire-compat with the Python fire_batch error path
+    /// (pie/src/pie/manager.py: `msgpack.packb({"error": str(e), "results": []})`).
+    /// Prior to adding the `error` field this deserialized with a silently
+    /// ignored key and manifested as HTTP 200 + completion_tokens=0 (task #48).
+    #[test]
+    fn batched_response_deserializes_error_from_python() {
+        let err_payload = rmpv::Value::Map(vec![
+            (rmpv::Value::from("error"),
+             rmpv::Value::from("AssertionError at execute_step")),
+            (rmpv::Value::from("results"), rmpv::Value::Array(vec![])),
+        ]);
+        let bytes = rmp_serde::to_vec_named(&err_payload).unwrap();
+        let parsed: BatchedForwardPassResponse = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(parsed.results.is_empty());
+        assert_eq!(parsed.error.as_deref(), Some("AssertionError at execute_step"));
+    }
+
+    /// The success path (no `error` key present) must still deserialize.
+    #[test]
+    fn batched_response_deserializes_ok_without_error_key() {
+        let ok_payload = rmpv::Value::Map(vec![
+            (rmpv::Value::from("results"), rmpv::Value::Array(vec![])),
+        ]);
+        let bytes = rmp_serde::to_vec_named(&ok_payload).unwrap();
+        let parsed: BatchedForwardPassResponse = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(parsed.results.is_empty());
+        assert!(parsed.error.is_none());
     }
 }

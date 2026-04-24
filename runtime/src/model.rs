@@ -986,6 +986,30 @@ impl Model {
 
         match result {
             Ok(batch_resp) => {
+                // Python raised inside fire_batch: propagate as per-request
+                // instance termination rather than silently dropping into the
+                // "no response → empty tokens" path that used to mask errors
+                // as HTTP 200 + completion_tokens=0 (task #48).
+                if let Some(err_msg) = batch_resp.error.as_ref() {
+                    eprintln!(
+                        "[Error] fire_batch returned error for batch={} reqs={}: {}",
+                        trace_batch_id, batch_size, err_msg
+                    );
+                    for (fp_req, resp_tx) in requests {
+                        // Drop streaming sender so WASM sees the stream end
+                        // before the termination notification arrives.
+                        drop(fp_req.token_stream_tx);
+                        drop(resp_tx);
+                        if let Some(inst_id) = fp_req.inst_id {
+                            terminate_instance_with_exception(
+                                inst_id,
+                                format!("fire_batch failed: {}", err_msg),
+                            );
+                        }
+                    }
+                    return;
+                }
+
                 // Collect all continuations FIRST, then send them in bulk.
                 // This prevents tokio from interleaving the scheduler loop
                 // between individual sends, which causes batch fragmentation
