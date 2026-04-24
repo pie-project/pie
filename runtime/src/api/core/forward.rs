@@ -89,6 +89,11 @@ pub struct ForwardPassResult {
     pub distributions: Vec<(Vec<u32>, Vec<f32>)>,
     pub tokens: Vec<u32>,
     pub done: bool,
+    /// Set when the batch failed upstream (fire_batch error, instance
+    /// termination). Surfaced to the WASM guest via `get_tokens` returning
+    /// a WIT trap so the HTTP handler produces a 5xx instead of the old
+    /// silent empty-completion HTTP 200 (task #48 Phase 2).
+    pub error: Option<String>,
 }
 
 enum Sampler {
@@ -139,9 +144,23 @@ impl Pollable for ForwardPassResult {
                         None => {
                             // Token channel closed — all tokens streamed.
                             // Wait for oneshot to get distributions and signal done.
-                            if let Ok(res) = (&mut self.receiver).await {
-                                self.distributions = res.dists;
-                                self.tokens.extend(res.tokens);
+                            match (&mut self.receiver).await {
+                                Ok(res) => {
+                                    self.distributions = res.dists;
+                                    self.tokens.extend(res.tokens);
+                                }
+                                Err(_) if self.tokens.is_empty() => {
+                                    // Canceled before any token arrived — upstream
+                                    // batch failure. Mark error so get_tokens traps
+                                    // the guest instead of silently exiting clean.
+                                    self.error = Some(
+                                        "forward pass canceled before any token (upstream batch error)".to_string(),
+                                    );
+                                }
+                                Err(_) => {
+                                    // Some tokens already streamed; treat the
+                                    // late cancel as end-of-stream, keep tokens.
+                                }
                             }
                             self.done = true;
                         }
@@ -149,18 +168,35 @@ impl Pollable for ForwardPassResult {
                 }
                 res = &mut self.receiver => {
                     // Oneshot fired (final response with distributions).
-                    if let Ok(r) = res {
-                        self.distributions = r.dists;
-                        self.tokens.extend(r.tokens);
+                    match res {
+                        Ok(r) => {
+                            self.distributions = r.dists;
+                            self.tokens.extend(r.tokens);
+                        }
+                        Err(_) if self.tokens.is_empty() => {
+                            self.error = Some(
+                                "forward pass canceled before any token (upstream batch error)".to_string(),
+                            );
+                        }
+                        Err(_) => {}
                     }
                     self.done = true;
                 }
             }
         } else {
             // Non-streaming (single-step): wait for oneshot as before.
-            if let Ok(res) = (&mut self.receiver).await {
-                self.distributions = res.dists;
-                self.tokens = res.tokens;
+            match (&mut self.receiver).await {
+                Ok(res) => {
+                    self.distributions = res.dists;
+                    self.tokens = res.tokens;
+                }
+                Err(_) => {
+                    // Canceled. In non-streaming mode there's no partial
+                    // progress — treat as error unconditionally.
+                    self.error = Some(
+                        "forward pass canceled (upstream batch error)".to_string(),
+                    );
+                }
             }
             self.done = true;
         }
@@ -544,6 +580,7 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
             distributions: vec![],
             tokens: vec![],
             done: false,
+            error: None,
         };
 
         Ok(Some(self.ctx().table.push(res)?))
@@ -578,6 +615,13 @@ impl inferlet::core::forward::HostForwardPassResult for InstanceState {
     async fn get_tokens(&mut self, this: Resource<ForwardPassResult>) -> Result<Option<Vec<u32>>> {
         let t0 = if wit_timing_enabled() { Some(mono_ns()) } else { None };
         let result = self.ctx().table.get_mut(&this)?;
+
+        // Upstream batch error — trap the guest so the HTTP handler
+        // raises a 5xx instead of building an empty-content HTTP 200.
+        // See task #48 for the prior silent-failure behavior.
+        if let Some(err) = result.error.take() {
+            return Err(anyhow::anyhow!(err));
+        }
 
         let ret = if !result.tokens.is_empty() {
             // Streaming or final: return buffered tokens, clear buffer.
