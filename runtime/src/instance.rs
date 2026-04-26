@@ -1,11 +1,11 @@
 use super::api::core::Queue;
 use super::utils;
-use crate::model::resource::{ResourceId, ResourceTypeId};
+use crate::model::resource::{KV_PAGE_TYPE_ID, ResourceId, ResourceTypeId};
 use crate::server::InstanceEvent;
 use anyhow::{Result, format_err};
 use bytes::Bytes;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
@@ -63,6 +63,11 @@ struct ResourceIdMapper {
     virtual_id_pool: utils::IdPool<u32>,
     /// The map from a virtual ID to its corresponding physical ID.
     virtual_to_physical: HashMap<ResourceId, ResourceId>,
+    /// Virtual IDs that were unmapped and may be recycled with different
+    /// physical mappings. Only `unmap_resources` populates this set;
+    /// `map_resources` does not (new allocations cannot collide with
+    /// existing cached translations). Consumed by the TLB on next lookup.
+    invalidated_ids: HashSet<ResourceId>,
 }
 
 impl Default for ResourceIdMapper {
@@ -70,6 +75,7 @@ impl Default for ResourceIdMapper {
         ResourceIdMapper {
             virtual_id_pool: utils::IdPool::new(u32::MAX),
             virtual_to_physical: HashMap::new(),
+            invalidated_ids: HashSet::new(),
         }
     }
 }
@@ -100,6 +106,7 @@ impl ResourceIdMapper {
             self.virtual_to_physical.remove(&virtual_id);
         }
         self.virtual_id_pool.release_many(virtual_ids).unwrap();
+        self.invalidated_ids.extend(virtual_ids);
     }
 
     /// Translates a single virtual ID to its corresponding physical ID.
@@ -121,6 +128,10 @@ pub struct InstanceState {
     http_ctx: WasiHttpCtx,
     // virtual resources
     resources: HashMap<(usize, ResourceTypeId), ResourceIdMapper>,
+
+    // TLB: caches virtual→physical KV page translations across decode steps.
+    // Keyed by service_id. Per-page invalidation via ResourceIdMapper.invalidated_ids.
+    kv_translation_cache: HashMap<usize, (Vec<ResourceId>, Vec<ResourceId>)>,
 
     // Dynamic linking state: maps host rep -> guest's ResourceAny
     dynamic_resource_map: HashMap<u32, ResourceAny>,
@@ -218,6 +229,7 @@ impl InstanceState {
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
             resources: HashMap::new(),
+            kv_translation_cache: HashMap::new(),
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
@@ -326,6 +338,89 @@ impl InstanceState {
             m.virtual_to_physical
         ))?;
         Ok(phys_id)
+    }
+
+    /// TLB for KV page virtual→physical translation.
+    ///
+    /// Caches translations across decode steps. Per-page invalidation:
+    /// only pages unmapped via `unmap_resources` (which may be recycled
+    /// with different physical mappings) trigger re-translation. New
+    /// allocations via `map_resources` are safe and don't invalidate.
+    pub fn translate_kv_pages_cached(
+        &mut self,
+        service_id: usize,
+        kv_page_ptrs: &[ResourceId],
+    ) -> Result<Vec<ResourceId>> {
+        // Check for per-page invalidations (from unmap_resources).
+        // Drain the set unconditionally to prevent unbounded growth.
+        let needs_full_retranslate = {
+            let mapper = self.resources
+                .get_mut(&(service_id, KV_PAGE_TYPE_ID))
+                .ok_or_else(|| format_err!(
+                    "Failed to find resource mapper for service_id: {:?}, resource_type: {:?}",
+                    service_id, KV_PAGE_TYPE_ID
+                ))?;
+            if mapper.invalidated_ids.is_empty() {
+                false
+            } else {
+                let (cached_virt, _) = self.kv_translation_cache
+                    .get(&service_id)
+                    .map(|(v, p)| (v.as_slice(), p.as_slice()))
+                    .unwrap_or((&[], &[]));
+                let hit = mapper.invalidated_ids.iter().any(|id| cached_virt.contains(id));
+                mapper.invalidated_ids.clear();
+                hit
+            }
+        };
+
+        let (cached_virt, cached_phys) = self.kv_translation_cache
+            .entry(service_id)
+            .or_insert_with(|| (Vec::new(), Vec::new()));
+
+        // Prefix match: reuse cached translations for unchanged leading pages.
+        let mut match_len = 0;
+        if !needs_full_retranslate {
+            let prefix_len = cached_virt.len().min(kv_page_ptrs.len());
+            for i in 0..prefix_len {
+                if kv_page_ptrs[i] == cached_virt[i] {
+                    match_len = i + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Re-fetch mapper (immutable — split borrow released above)
+        let mapper = self.resources
+            .get(&(service_id, KV_PAGE_TYPE_ID))
+            .unwrap();
+
+        // Build translated list: cached prefix + fresh lookups for tail
+        let mut translated = Vec::with_capacity(kv_page_ptrs.len());
+        translated.extend_from_slice(&cached_phys[..match_len]);
+        for &virt_id in &kv_page_ptrs[match_len..] {
+            translated.push(mapper.translate(virt_id).ok_or_else(|| {
+                format_err!("Failed to translate KV page ptr: {}", virt_id)
+            })?);
+        }
+
+        #[cfg(feature = "ipc-profiling")]
+        if crate::model::ffi_ipc::ipc_timing_enabled() {
+            let total = kv_page_ptrs.len();
+            let fresh = total - match_len;
+            eprintln!("[KV-CACHE] total={} cached={} fresh={} invalidated={}",
+                total, match_len, fresh, needs_full_retranslate);
+        }
+
+        // Update cache
+        let (cached_virt, cached_phys) = self.kv_translation_cache
+            .get_mut(&service_id)
+            .unwrap();
+        cached_virt.clear();
+        cached_virt.extend_from_slice(kv_page_ptrs);
+        *cached_phys = translated.clone();
+
+        Ok(translated)
     }
 }
 
