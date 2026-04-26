@@ -586,6 +586,15 @@ impl Context {
     /// A `Result` containing the `Distribution` over the next possible tokens,
     /// or an error if the generation step could not be performed.
     pub async fn decode_step_dist(&mut self) -> Distribution {
+        self.decode_step_dist_top_k(None).await
+    }
+
+    /// Like `decode_step_dist`, but with an explicit `top_k` parameter
+    /// controlling how many tokens are returned in the distribution.
+    ///
+    /// Use a large value (e.g. 131072) for loglikelihood scoring where you
+    /// need to find arbitrary tokens in the distribution.
+    pub async fn decode_step_dist_top_k(&mut self, top_k: Option<u32>) -> Distribution {
         assert!(
             !self.token_ids_pending.is_empty(),
             "Must have at least one seed token"
@@ -597,13 +606,6 @@ impl Context {
             (last_pos_id..(last_pos_id + pending_token_ids.len() as u32)).collect::<Vec<u32>>();
 
         self.grow_kv_pages(pending_token_ids.len());
-
-        // println!("next token id: {}", next_token_id);
-        // println!("next pos id: {}", next_pos_id);
-        // println!("kv page last len: {}", self.kv_page_last_len);
-        // println!("kv page ids: {:?}", &self.kv_page_ids);
-        // println!("token ids: {:?}", &self.token_ids);
-        // println!("token ids pending: {:?}", &self.token_ids_pending);
 
         let mask = mem::take(&mut self.token_mask_pending)
             .into_iter()
@@ -625,7 +627,7 @@ impl Context {
         p.attention_mask(&mask);
 
         let output_idx = pending_token_ids.len() as u32 - 1;
-        p.output_distributions(&[output_idx], 1.0, None);
+        p.output_distributions(&[output_idx], 1.0, top_k);
 
         let res = p.execute().await;
 
