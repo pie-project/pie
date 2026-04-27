@@ -1410,8 +1410,12 @@ impl Runtime {
                     Err(RuntimeError::Other(runtime_err))
                 }
                 Err(call_err) => {
-                    //eprintln!("Instance {instance_id} call error: {call_err}");
-                    Err(RuntimeError::Other(format!("Call error: {call_err}")))
+                    // Print the full error chain (anyhow's alternate Display)
+                    // so host-function `bail!` messages — e.g. "max batch
+                    // tokens exceeded, input tokens: N, max tokens: M" — reach
+                    // the inferlet status string instead of being collapsed
+                    // into the top-level "error while executing" trap text.
+                    Err(RuntimeError::Other(format!("Call error: {call_err:#}")))
                 }
             };
         }
