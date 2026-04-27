@@ -213,11 +213,14 @@ pub fn submit_request(
 
 fn terminate_instance_with_exception<T>(inst_id: InstanceId, exception: T)
 where
-    T: ToString,
+    T: std::fmt::Display,
 {
+    // Use anyhow's alternate Display so `anyhow::Error` callers (most of them)
+    // pass through their full error chain instead of just the top-level
+    // message. For `String` callers this is identical to `{}`.
     runtime::Command::TerminateInstance {
         inst_id,
-        notification_to_client: Some(TerminationCause::Exception(exception.to_string())),
+        notification_to_client: Some(TerminationCause::Exception(format!("{exception:#}"))),
     }
     .dispatch();
 }
