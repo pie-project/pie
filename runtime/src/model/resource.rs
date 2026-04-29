@@ -292,6 +292,66 @@ impl ResourceManager {
         Ok(result)
     }
 
+    /// Like `allocate_with_oom` but never triggers the OOM killer.
+    /// Returns `Ok(Some(pages))` when enough capacity is currently free,
+    /// `Ok(None)` when the request is still unsatisfiable (caller should
+    /// keep waiting), or `Err(...)` for unrecoverable conditions like
+    /// requesting more pages than the pool can ever hold.
+    ///
+    /// Used to drain the admission-control wait queue (see ticket #61
+    /// Fix B): when an instance was queued because OOM was unrecoverable
+    /// at submission time, every subsequent page release calls back into
+    /// this method to attempt satisfaction without disturbing the running
+    /// fleet.
+    pub fn try_allocate(
+        &mut self,
+        inst_id: InstanceId,
+        type_id: ResourceTypeId,
+        count: usize,
+    ) -> Result<Option<Vec<ResourceId>>, ResourceError> {
+        let group_id = *self
+            .instance_groups
+            .entry(inst_id)
+            .or_insert_with(|| {
+                let group = self.next_group_rr.get();
+                self.next_group_rr.set((group + 1) % self.num_groups);
+                group
+            });
+        self.inst_start_time
+            .entry(inst_id)
+            .or_insert_with(Instant::now);
+
+        let pool = self
+            .res_pool
+            .get(&(group_id, type_id))
+            .ok_or(ResourceError::PoolNotFound { type_id, group_id })?;
+        if (count as u32) > pool.capacity() {
+            // Pool can never satisfy this request even after every other
+            // instance frees its pages; fail fast rather than queueing
+            // forever.
+            return Err(ResourceError::OomUnrecoverable(format!(
+                "requested count={} exceeds pool capacity={} (type={}, group={})",
+                count, pool.capacity(), type_id, group_id,
+            )));
+        }
+        if pool.available() < count {
+            return Ok(None);
+        }
+        let result = self.allocate(inst_id, type_id, count)?;
+
+        if type_id == KV_PAGE_TYPE_ID {
+            if let Some(m) = telemetry::metrics() {
+                if let Some(pool) = self.res_pool.get(&(group_id, type_id)) {
+                    let capacity = pool.capacity() as usize;
+                    let available = pool.available();
+                    m.kv_pages_allocated.record((capacity - available) as u64, &[]);
+                    m.kv_pages_available.record(available as u64, &[]);
+                }
+            }
+        }
+        Ok(Some(result))
+    }
+
     fn available(&self, group_id: GroupId, type_id: ResourceTypeId) -> Result<usize, ResourceError> {
         let pool = self
             .res_pool

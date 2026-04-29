@@ -13,7 +13,7 @@ use super::model::request::{
     ForwardPassRequest, ForwardPassResponse, HandshakeRequest, HandshakeResponse, QueryRequest,
     QueryResponse, Request,
 };
-use super::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
+use super::model::resource::{ResourceError, ResourceId, ResourceManager, ResourceTypeId};
 use super::model::tokenizer::BytePairEncoder;
 use super::runtime::{self, TerminationCause};
 use super::service::ServiceCommand;
@@ -22,7 +22,7 @@ use anyhow::Result;
 
 use futures::future;
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -408,6 +408,23 @@ pub struct Model {
     /// Channel to send finished instance IDs (UUIDs) to inference_worker.
     /// Decouples request lifecycle from resource lifecycle for SequenceTracker.
     finished_requests_tx: mpsc::UnboundedSender<String>,
+    /// FIFO admission-control wait queue for resource allocations that
+    /// could not be satisfied even after the OOM killer ran (typical at
+    /// fan-in: several inferlets arrive within ms of each other and the
+    /// OOM killer cannot evict older instances). Drained whenever pages
+    /// are released via Deallocate / Cleanup. See ticket #61 Fix B.
+    pending_allocs: VecDeque<PendingAlloc>,
+}
+
+/// One queued admission-control waiter — an inferlet whose
+/// `Command::Allocate` call could not be satisfied immediately and is
+/// parked until enough pages free up.
+struct PendingAlloc {
+    inst_id: InstanceId,
+    type_id: ResourceTypeId,
+    count: usize,
+    response: oneshot::Sender<Vec<ResourceId>>,
+    queued_at: Instant,
 }
 
 impl Model {
@@ -520,6 +537,7 @@ impl Model {
             scheduler,
             freed_kv_tx,
             finished_requests_tx,
+            pending_allocs: VecDeque::new(),
         })
     }
 
@@ -1295,7 +1313,75 @@ impl Model {
             stats.insert("model.throughput.tokens_per_second".to_string(), format!("{:.1}", tps));
             stats.insert("model.latency.avg_ms".to_string(), format!("{:.1}", avg_lat));
         }
+        stats.insert(
+            "model.admit.pending_alloc_depth".to_string(),
+            self.pending_allocs.len().to_string(),
+        );
         stats
+    }
+
+    /// Drain head-of-queue waiters that can now be satisfied.
+    ///
+    /// Called after every page release (Deallocate / Cleanup). FIFO: if
+    /// the head can't be satisfied with currently-free pages, stop —
+    /// later waiters don't jump the line.
+    ///
+    /// Cancelled waiters (response receiver dropped, e.g. client closed
+    /// the HTTP connection mid-wait) are popped silently.
+    fn drain_pending_allocs(&mut self) {
+        loop {
+            // Skip cancelled waiters (HTTP client closed → oneshot
+            // receiver dropped). They don't count against head-of-line.
+            while self
+                .pending_allocs
+                .front()
+                .map(|w| w.response.is_closed())
+                .unwrap_or(false)
+            {
+                let cancelled = self.pending_allocs.pop_front().unwrap();
+                let waited_ms = cancelled.queued_at.elapsed().as_millis();
+                eprintln!(
+                    "[ADMIT-CANCEL] inst={} type={} count={} waited_ms={} (caller dropped)",
+                    cancelled.inst_id, cancelled.type_id, cancelled.count, waited_ms,
+                );
+            }
+
+            let head = match self.pending_allocs.front() {
+                Some(h) => (h.inst_id, h.type_id, h.count),
+                None => return,
+            };
+
+            match self
+                .resource_manager
+                .try_allocate(head.0, head.1, head.2)
+            {
+                Ok(Some(allocated)) => {
+                    let waiter = self.pending_allocs.pop_front().unwrap();
+                    let waited_ms = waiter.queued_at.elapsed().as_millis();
+                    eprintln!(
+                        "[ADMIT-WAKE] inst={} type={} count={} waited_ms={} queue_depth={}",
+                        waiter.inst_id,
+                        waiter.type_id,
+                        waiter.count,
+                        waited_ms,
+                        self.pending_allocs.len(),
+                    );
+                    let _ = waiter.response.send(allocated);
+                }
+                Ok(None) => {
+                    // Head still can't be satisfied — leave it queued.
+                    return;
+                }
+                Err(e) => {
+                    let waiter = self.pending_allocs.pop_front().unwrap();
+                    eprintln!(
+                        "[ADMIT-FAIL] inst={} type={} count={} err={:?}",
+                        waiter.inst_id, waiter.type_id, waiter.count, e,
+                    );
+                    terminate_instance_with_exception(waiter.inst_id, e);
+                }
+            }
+        }
     }
 
     async fn handle(&mut self, cmd: Command) {
@@ -1312,6 +1398,24 @@ impl Model {
             Command::Allocate { inst_id, type_id, count, response } => {
                 match self.resource_manager.allocate_with_oom(inst_id, type_id, count) {
                     Ok(allocated_ids) => { response.send(allocated_ids).ok(); }
+                    Err(ResourceError::OomUnrecoverable(reason)) => {
+                        // Park the request rather than terminating the
+                        // instance. Pages will free up as other instances
+                        // finish (Deallocate / Cleanup) and we'll drain
+                        // the queue then. See ticket #61 Fix B for the
+                        // full design rationale (await-on-scarcity, FIFO,
+                        // bounded by client-side timeout).
+                        eprintln!("[ADMIT-WAIT] inst={} type={} count={} reason={} queue_depth={}",
+                                  inst_id, type_id, count, reason,
+                                  self.pending_allocs.len() + 1);
+                        self.pending_allocs.push_back(PendingAlloc {
+                            inst_id,
+                            type_id,
+                            count,
+                            response,
+                            queued_at: Instant::now(),
+                        });
+                    }
                     Err(e) => {
                         eprintln!("[ALLOC-FAIL] inst={} type={} count={} err={:?}",
                                   inst_id, type_id, count, e);
@@ -1335,11 +1439,26 @@ impl Model {
                 if let Some(ids) = freed_kv {
                     let _ = self.freed_kv_tx.send(ids);
                 }
+                // Pages just freed — wake any pending admission waiters
+                // that can now be satisfied. FIFO so head-of-line still
+                // gets first crack at the freed capacity.
+                self.drain_pending_allocs();
             }
             Command::Cleanup { inst_id } => {
                 // Send finished instance ID for direct identity-based cleanup.
                 // This decouples request lifecycle from resource lifecycle.
                 let _ = self.finished_requests_tx.send(inst_id.to_string());
+                // Cancel any pending admission waiter for this instance.
+                // Reaching Cleanup means the instance is gone (e.g.,
+                // dropped by wasmtime or finished and cleaned up); we
+                // mustn't satisfy a waiter on a dead inst_id.
+                let before = self.pending_allocs.len();
+                self.pending_allocs.retain(|w| w.inst_id != inst_id);
+                let removed = before - self.pending_allocs.len();
+                if removed > 0 {
+                    eprintln!("[ADMIT-CANCEL] inst={} dropped {} pending alloc(s) on cleanup",
+                              inst_id, removed);
+                }
                 match self.resource_manager.cleanup_with_freed_kv(inst_id) {
                     Ok(freed_kv_ids) => {
                         if !freed_kv_ids.is_empty() {
@@ -1348,6 +1467,9 @@ impl Model {
                     }
                     Err(e) => terminate_instance_with_exception(inst_id, e),
                 }
+                // Cleanup typically frees the instance's pages — drain
+                // the wait queue.
+                self.drain_pending_allocs();
             }
             Command::GetAllExported { type_id, response } => {
                 response.send(self.resource_manager.get_all_exported(type_id)).ok();
