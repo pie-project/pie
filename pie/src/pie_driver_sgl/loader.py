@@ -63,7 +63,7 @@ class LoadedModel:
 
     runner: Any                # sglang.srt.model_executor.model_runner.ModelRunner
     sglang_model_config: Any   # sglang.srt.configs.model_config.ModelConfig
-    arch_type: str             # HF architecture string, e.g. "Qwen3ForCausalLM"
+    arch_type: str             # pie internal arch name (e.g. "qwen3"); resolved via pie_driver.model.resolve()
     snapshot_dir: str | None
     # If True, the loader skipped `runner.init_device_graphs()` and the
     # engine must call it after installing pie's hooks (see engine.py).
@@ -206,8 +206,11 @@ def load_sglang_model(
         )
     _log("Model loaded via SGLang", "INFO")
 
-    arches = list(sglang_model_config.hf_config.architectures)
-    arch_type = arches[0] if arches else "Unknown"
+    # Resolve HF identity to pie's internal arch name (the dispatch key
+    # the Rust runtime expects). See pie_driver/model/__init__.py for why
+    # this lives in Python.
+    from pie_driver.model import resolve as resolve_pie_arch
+    arch_type = resolve_pie_arch(sglang_model_config.hf_config)
 
     snapshot_dir = _resolve_hf_snapshot_dir(config.hf_repo)
     if snapshot_dir is None:

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from huggingface_hub.constants import HF_HUB_CACHE
 
-from .model import HF_TO_PIE_ARCH
+from .model import HF_TO_PIE_ARCH, resolve, UnknownArchitectureError
 
 
 
@@ -118,10 +118,8 @@ def check_pie_compatibility(config: dict | None) -> tuple[bool, str]:
     """
     if config is None:
         return False, "no config"
-
-    model_type = config.get("model_type", "")
-    if model_type in HF_TO_PIE_ARCH:
-        return True, HF_TO_PIE_ARCH[model_type]
-
-    return False, f"unsupported type: {model_type}"
+    try:
+        return True, resolve(config)
+    except UnknownArchitectureError:
+        return False, f"unsupported type: {config.get('model_type', '')}"
 
