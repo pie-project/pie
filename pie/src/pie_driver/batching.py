@@ -59,22 +59,19 @@ class Batch:
         self._kv_page_size = int(kv_page_size)
         self._spec_plan: list[dict | None] | None = None
 
-        # Helper to decode bytes as u32 array or pass through lists
+        # Helper to decode bytes as u32 array or pass through lists.
+        # Accepts bytes (msgpack), memoryview (shmem zero-copy schema), or list.
         def _decode_u32(data):
-            if isinstance(data, bytes):
+            if isinstance(data, (bytes, bytearray, memoryview)):
                 return np.frombuffer(data, dtype=np.uint32)
-
-            print("Decoding u32 from list")
             return np.array(data, dtype=np.uint32)
 
         # Helper to decode bytes as i64 array
         def _decode_i64(data):
-            if isinstance(data, bytes):
-                # Assume input is u32/i32 for now as input is from msgpack
-                # but we need i64 for token_ids in torch
+            if isinstance(data, (bytes, bytearray, memoryview)):
+                # Wire format stores token_ids as u32 in both msgpack and shmem;
+                # widen to i64 for torch.
                 return np.frombuffer(data, dtype=np.uint32).astype(np.int64)
-
-            print("Decoding i64 from list")
             return np.array(data, dtype=np.int64)
 
         # Direct assignments - decode bytes as u32 arrays
@@ -144,11 +141,11 @@ class Batch:
         )
         self.timing["brle_decode"] = time.perf_counter() - t_brle
 
-        # Helper to decode bytes as f32 array
+        # Helper to decode bytes as f32 array.
+        # Accepts bytes (msgpack), memoryview (shmem zero-copy schema), or list.
         def _decode_f32(data):
-            if isinstance(data, bytes):
+            if isinstance(data, (bytes, bytearray, memoryview)):
                 return np.frombuffer(data, dtype=np.float32)
-            print("Decoding f32 from list")
             return np.array(data, dtype=np.float32)
 
         # ===== ZERO-COPY SAMPLER PARAMETER LOADING (SoA from Rust) =====
@@ -294,7 +291,29 @@ class Batch:
             Dictionary containing input tensors for the model engine.
         """
         # self.adapter_subpass_needed = False  # disable ZO for testing
+
+        # Pre-compute CPU-side bounds for engine.fire_batch's validation —
+        # avoids 6 CUDA `.item()` syncs per forward pass.
+        if len(self.kv_page_indices) > 0:
+            _kv_idx_max = int(self.kv_page_indices.max())
+            _kv_idx_min = int(self.kv_page_indices.min())
+        else:
+            _kv_idx_max = 0
+            _kv_idx_min = 0
+        _kv_indptr_last = int(self.kv_page_indptr[-1]) if len(self.kv_page_indptr) > 0 else 0
+        if len(self.kv_last_page_lens) > 0:
+            _kv_last_max = int(self.kv_last_page_lens.max())
+            _kv_last_min = int(self.kv_last_page_lens.min())
+        else:
+            _kv_last_max = 0
+            _kv_last_min = 1
+
         return {
+            "kv_page_indices_max": _kv_idx_max,
+            "kv_page_indices_min": _kv_idx_min,
+            "kv_page_indptr_last": _kv_indptr_last,
+            "kv_last_page_lens_max": _kv_last_max,
+            "kv_last_page_lens_min": _kv_last_min,
             "token_ids": torch.as_tensor(
                 self.token_ids, device=device, dtype=torch.long
             ),
@@ -898,9 +917,19 @@ class Batch:
 
         responses = []
         cursor = 0
+        # Hoist per-iter conversions out of the loop.
+        counts_list = self.request_output_counts.tolist() if hasattr(
+            self.request_output_counts, "tolist"
+        ) else list(self.request_output_counts)
+        sampler_types = self.sampler_types  # already a Python list
+        output_spec_flags = self.output_spec_flags
+        # Bound logits/logprobs/entropies len checks once.
+        _len_logits = len(final_logits)
+        _len_logprobs = len(final_logprobs)
+        _len_entropies = len(final_entropies)
 
         for req_idx in range(num_requests):
-            num_outputs = int(self.request_output_counts[req_idx])
+            num_outputs = counts_list[req_idx]
             request_dists = []
             request_tokens = []
             request_logits: list[bytes] = []
@@ -917,22 +946,41 @@ class Batch:
                 # sampler — see get_spec_expanded_sampling_metadata).
                 request_tokens = list(spec_accepted)
             else:
-                for i in range(cursor, cursor + num_outputs):
-                    stype = self.sampler_types[i]
+                end = cursor + num_outputs
+                # Hot path: 1 token output per request (most common).
+                if num_outputs == 1:
+                    stype = sampler_types[cursor]
                     if stype == 0:
-                        if final_dists[i] is not None:
-                            request_dists.append(final_dists[i])
+                        if final_dists[cursor] is not None:
+                            request_dists.append(final_dists[cursor])
                     elif stype == 7:
-                        if i < len(final_logits) and final_logits[i] is not None:
-                            request_logits.append(final_logits[i])
+                        if cursor < _len_logits and final_logits[cursor] is not None:
+                            request_logits.append(final_logits[cursor])
                     elif stype in (8, 9):
-                        if i < len(final_logprobs) and final_logprobs[i] is not None:
-                            request_logprobs.append(final_logprobs[i])
+                        if cursor < _len_logprobs and final_logprobs[cursor] is not None:
+                            request_logprobs.append(final_logprobs[cursor])
                     elif stype == 10:
-                        if i < len(final_entropies) and final_entropies[i] is not None:
-                            request_entropies.append(final_entropies[i])
+                        if cursor < _len_entropies and final_entropies[cursor] is not None:
+                            request_entropies.append(final_entropies[cursor])
                     else:
-                        request_tokens.append(final_tokens_list[i])
+                        request_tokens.append(final_tokens_list[cursor])
+                else:
+                    for i in range(cursor, end):
+                        stype = sampler_types[i]
+                        if stype == 0:
+                            if final_dists[i] is not None:
+                                request_dists.append(final_dists[i])
+                        elif stype == 7:
+                            if i < _len_logits and final_logits[i] is not None:
+                                request_logits.append(final_logits[i])
+                        elif stype in (8, 9):
+                            if i < _len_logprobs and final_logprobs[i] is not None:
+                                request_logprobs.append(final_logprobs[i])
+                        elif stype == 10:
+                            if i < _len_entropies and final_entropies[i] is not None:
+                                request_entropies.append(final_entropies[i])
+                        else:
+                            request_tokens.append(final_tokens_list[i])
 
             # Build response with optional speculation
             resp = message.ForwardPassResponse(
@@ -944,7 +992,7 @@ class Batch:
             )
             if (
                 spec_tokens_all is not None
-                and self.output_spec_flags[req_idx]
+                and output_spec_flags[req_idx]
                 and spec_tokens_all[req_idx] is not None
             ):
                 resp.spec_tokens = spec_tokens_all[req_idx]

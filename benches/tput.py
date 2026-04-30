@@ -115,6 +115,8 @@ async def run_benchmark(args):
                 name="default",
                 hf_repo=args.model,
                 default_token_budget=args.default_token_budget,
+                default_endowment_pages=args.default_endowment_pages,
+                oversubscription_factor=args.oversubscription_factor,
                 driver=DriverConfig(
                     type=args.driver,
                     device=device,
@@ -141,8 +143,8 @@ async def run_benchmark(args):
         }
 
         queue = asyncio.Queue()
-        for i in range(args.num_requests):
-            queue.put_nowait(i)
+        # Items are pushed inside the warmup / timed-run blocks below so the
+        # warmup and timed phases don't share queue items.
 
         completed = 0
         total_chars = 0
@@ -195,7 +197,27 @@ async def run_benchmark(args):
                 finally:
                     queue.task_done()
 
+        # -- Warmup -----------------------------------------------------------
+
+        if args.warmup_requests > 0:
+            print(f"Warmup ({args.warmup_requests} reqs)", end="", flush=True)
+            for i in range(args.warmup_requests):
+                queue.put_nowait(args.num_requests + i)
+            warmup_workers = [
+                asyncio.create_task(worker(-1 - i)) for i in range(args.warmup_requests)
+            ]
+            await asyncio.wait(warmup_workers)
+            # Reset counters so warmup doesn't pollute the timed measurement.
+            completed = 0
+            total_chars = 0
+            total_tokens_est = 0
+            output_samples.clear()
+            print(" done")
+
         # -- Run --------------------------------------------------------------
+
+        for i in range(args.num_requests):
+            queue.put_nowait(i)
 
         print("Running", end="", flush=True)
         start = time.time()
@@ -253,6 +275,12 @@ def main():
                         help="SGLang attention backend (triton / flashinfer / flex_attention / fa3). Only used when --driver=sglang")
     parser.add_argument("--use-cuda-graphs", action="store_true",
                         help="Enable CUDA graphs (vllm: piecewise compile + graph capture; native: FlashInfer planning)")
+    parser.add_argument("--default-endowment-pages", type=int, default=64,
+                        help="Per-process KV-page endowment used by the admission gate (lower = more concurrent processes admitted)")
+    parser.add_argument("--oversubscription-factor", type=float, default=4.0,
+                        help="Admission overbook factor (Σ endowment ≤ capacity × factor); set very high to disable")
+    parser.add_argument("--warmup-requests", type=int, default=0,
+                        help="Number of warmup requests to run (and discard) before timing")
 
     args = parser.parse_args()
 

@@ -717,6 +717,7 @@ def _leader_loop(
 
     # Method dispatch table
     methods = {
+        "ping": lambda **kw: {"ok": True},
         "query": _handle_query,
         "fire_batch": _handle_fire_batch,
         "embed_image": _handle_embed_image,
@@ -732,25 +733,93 @@ def _leader_loop(
         "copy_h2h": _handle_copy_h2h,
     }
 
-    try:
-        while not stop_event.is_set():
-            # Poll the RPC server (releases GIL while waiting)
-            request = server.poll_blocking(poll_timeout_ms)
-            if request is None:
-                continue  # Timeout, try again
+    import os as _os, sys as _sys, time as _time
 
-            request_id, method, payload = request
+    # ---- Shmem fast-path setup -----------------------------------------------
+    # `fire_batch` always runs over shared memory with the zero-copy schema;
+    # all other RPCs (adapter ops, page copies, query/ping) use the legacy
+    # ipc-channel transport on `server`.
+    SHMEM_NAME = "/pie_shmem"
+    SHMEM_SLOTS = 8
+    SHMEM_REQ_BUF = 4 * 1024 * 1024
+    SHMEM_RESP_BUF = 1 * 1024 * 1024
+    SHMEM_BUSY_US = 10_000
+
+    from pie_driver import shmem_ipc as _shm
+    from pie_driver import shmem_schema as _shm_schema
+    import threading as _threading
+    _shmem_server = _shm.ShmemServer(
+        SHMEM_NAME, num_slots=SHMEM_SLOTS,
+        req_buf=SHMEM_REQ_BUF, resp_buf=SHMEM_RESP_BUF,
+    )
+    print(f"[shmem] Worker created shmem region '{SHMEM_NAME}' "
+          f"({SHMEM_SLOTS} slots) — fast path enabled.")
+
+    # Best-effort cleanup on signal-induced exit (mp.spawn daemon=True sends
+    # SIGTERM on parent exit, which bypasses atexit).
+    import signal as _signal
+    def _shmem_signal_cleanup(signum, frame):
+        try:
+            _shmem_server.close()
+        except Exception:
+            pass
+        _os._exit(0)
+    for _sig in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            _signal.signal(_sig, _shmem_signal_cleanup)
+        except Exception:
+            pass
+
+    def _shmem_loop():
+        while not stop_event.is_set():
+            req = _shmem_server.busy_poll_any_slot(SHMEM_BUSY_US)
+            if req is None:
+                continue
+            req_id, method_tag, payload_len, slot, send_walltime_us = req
+
+            # Zero-copy view of the request payload bytes (flat schema).
+            view = _shmem_server.request_payload_view(slot, payload_len)
+            args = _shm_schema.parse_request(memoryview(view))
+
+            fn = methods["fire_batch"]
+            try:
+                result = fn(**args) if isinstance(args, dict) else fn(args)
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[Shmem Worker Error] fire_batch: {e}\n{tb}")
+                response = msgpack.packb(str(e))
+                _shmem_server.respond(slot, response, 0)
+                continue
+
+            # Zero-copy: write the response straight into the shmem response
+            # buffer (flat schema for token-only common case; msgpack-fallback
+            # embedded for the advanced path).
+            resp_view = _shmem_server.respond_view(slot)
+            resp_len = _shm_schema.write_response(result, resp_view, msgpack)
+            _shmem_server.commit_respond(slot, resp_len, 0)
+
+    _shmem_thread = _threading.Thread(target=_shmem_loop, name="shmem-fire-batch", daemon=True)
+    _shmem_thread.start()
+
+    try:
+        # Cold-path RPC loop: adapter ops, page copies, query/ping. Busy-spin
+        # for 10 ms before blocking — these calls are infrequent, so the
+        # busy window is mostly there to keep latency low when they do fire.
+        while not stop_event.is_set():
+            req = server.poll_busy(SHMEM_BUSY_US, poll_timeout_ms)
+            if req is None:
+                continue
+            request_id, method, payload, send_walltime_us = req
 
             try:
                 args = msgpack.unpackb(payload)
-
                 fn = methods.get(method)
                 if fn is None:
                     response = msgpack.packb(f"Method not found: {method}")
-                    server.respond(request_id, response)
+                    server.respond(request_id, response, 0)
                     continue
 
-                # Call handler
                 if isinstance(args, dict):
                     result = fn(**args)
                 elif isinstance(args, (list, tuple)):
@@ -759,7 +828,7 @@ def _leader_loop(
                     result = fn(args)
 
                 response = msgpack.packb(result)
-                server.respond(request_id, response)
+                server.respond(request_id, response, 0)
 
             except Exception as e:
                 import traceback
@@ -768,7 +837,15 @@ def _leader_loop(
                 response = msgpack.packb(str(e))
                 server.respond(request_id, response)
     finally:
-        # Shutdown: broadcast STOP to followers
+        # Shutdown: stop shmem thread and broadcast STOP to followers
+        try:
+            _shmem_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            _shmem_server.close()
+        except Exception:
+            pass
         print("[RPC Worker] Shutting down...")
         if config.world_size > 1 and config.rank == 0 and compute_pg is not None:
             try:
