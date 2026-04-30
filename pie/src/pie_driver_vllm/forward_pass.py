@@ -183,7 +183,6 @@ class VllmForwardPass:
         kv_last_page_lens: torch.Tensor,
         custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
-        total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         """Run the model's transformer trunk inside `set_forward_context`."""
         from ._vllm_compat import set_forward_context

@@ -58,7 +58,6 @@ def build_driver_config(args, device: list[str]) -> dict:
         opts = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "max_batch_size": args.max_batch_size,
-            "use_cuda_graphs": args.use_cuda_graphs,
         }
     elif args.driver == "sglang":
         opts = {

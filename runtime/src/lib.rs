@@ -19,4 +19,6 @@ pub mod process;
 pub mod daemon;
 pub mod telemetry;
 pub mod ffi;
+pub mod shmem_ipc;
+pub mod shmem_schema;
 pub mod workflow;

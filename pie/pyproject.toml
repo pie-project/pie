@@ -76,31 +76,6 @@ metal = [
     "pyobjc-framework-Cocoa>=10.0,<11.0",
 ]
 
-# --- vLLM backend (CUDA / ROCm / XPU / TPU) ---
-# Pinned tight to the version we test against; bumped weekly via automation.
-# Sourced from the sibling `vllm/` checkout so we track upstream tip, not
-# the stale `vllm` PyPI metadata (the cu128 mirror lags far behind upstream).
-vllm = [
-    "vllm",
-]
-
-# --- SGLang backend (CUDA / ROCm / XPU / NPU) ---
-# Sourced from the sibling `sglang/` checkout so we track upstream tip.
-# SGLang's pyproject pins exact torch/torchao/torchaudio + flashinfer
-# patch versions; mirror those here so uv resolves them through the
-# torch-cu130 index (otherwise it tries cu13x and the wheels are missing).
-# Bumped in lockstep with `git -C ../../sglang pull`.
-sglang = [
-    "torch==2.9.1",
-    "torchao==0.17.0",
-    "torchaudio==2.9.1",
-    "torchvision",
-    "flashinfer-python==0.6.8.post1",
-    "flashinfer-cubin==0.6.8.post1",
-    "flashinfer-jit-cache==0.6.8.post1",
-    "sglang",
-]
-
 [project.scripts]
 pie = "pie_cli.cli:app"
 
@@ -116,15 +91,6 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
-# cu130 channel — used by the sglang extra. Upstream sglang's pyproject
-# pins torch/torchvision/torchaudio through its own `torch-cu130` index
-# (see ../../sglang/python/pyproject.toml [tool.uv.sources]); we mirror that
-# choice here so uv sees a single source for these packages.
-[[tool.uv.index]]
-name = "torch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
 [[tool.uv.index]]
 name = "flashinfer-cu128"
 url = "https://flashinfer.ai/whl/cu128"
@@ -136,38 +102,16 @@ explicit = true
 pie-client = { path = "../client/python", editable = true }
 pie-bakery = { path = "../sdk/tools/bakery", editable = true }
 
-# Track upstream vllm via the sibling checkout. Pin behavior is "whatever is
-# checked out" — bump via `git -C ../../vllm pull` then re-sync.
-# vllm = { path = "../../vllm", editable = true }
-
-# Track upstream sglang via the sibling checkout. Same convention as vllm.
-# The sglang Python package lives at ../../sglang/python.
-# sglang = { path = "../../sglang/python", editable = true }
-
-# Torch: cu126 from cu126 index, sglang's pinned 2.9.1 from the cu130 index
-# (sglang upstream pins it that way). The vllm path's loose `torch>=2.7.1`
-# (in the cu128 base extra) keeps using PyPI's default channel as before.
 torch = [
     { index = "pytorch-cu126", extra = "cu126" },
     { index = "pytorch-cu128", extra = "cu128" },
-    { index = "torch-cu130", extra = "sglang" },
 ]
 torchao = [
     { index = "pytorch-cu128", extra = "cu128" },
-    { index = "torch-cu130", extra = "sglang" },
-]
-torchaudio = [
-    { index = "torch-cu130", extra = "sglang" },
-]
-torchvision = [
-    { index = "torch-cu130", extra = "sglang" },
 ]
 
-# FlashInfer JIT Cache: custom index for cu128 base extra and the sglang extra
-# (both pin 0.6.8.post1).
 flashinfer-jit-cache = [
     { index = "flashinfer-cu128", extra = "cu128" },
-    { index = "flashinfer-cu128", extra = "sglang" },
 ]
 
 [tool.maturin]
@@ -185,14 +129,5 @@ conflicts = [
         { extra = "cu126" },
         { extra = "cu128" },
         { extra = "metal" },
-        # sglang's torch==2.9.1 / torchao==0.17.0 conflict with the looser
-        # cu128 pin and with cu126's index. Treat sglang as its own platform
-        # bundle: it pins the full torch trio + flashinfer set.
-        { extra = "sglang" },
-    ],
-    # sglang and vllm pull conflicting flashinfer / torch pins; pick one.
-    [
-        { extra = "vllm" },
-        { extra = "sglang" },
     ],
 ]

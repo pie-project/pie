@@ -463,7 +463,6 @@ class ConfigPanel(ScrollableContainer):
         add_item("kv_page", str(self._config.get("kv_page_size", 16)))
         add_item("batch", str(self._config.get("max_batch_tokens", 10240)))
         add_item("mem", f"{self._config.get('gpu_mem_utilization', 0.8):.0%}")
-        add_bool_item("cuda_graphs", self._config.get("use_cuda_graphs", False))
 
         static = self.query_one("#config-content", Static)
         static.update(text)

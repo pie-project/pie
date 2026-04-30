@@ -109,8 +109,9 @@ class DummyForwardPass:
         """
         token_ids = batch_metadata["token_ids"]
         num_tokens = len(token_ids)
-        return torch.randn(
-            num_tokens, self.dim_hidden, device=self.device, dtype=self.dtype
+        # CPU-only to avoid kernel-launch + sync overhead in dummy mode.
+        return torch.empty(
+            num_tokens, self.dim_hidden, device="cpu", dtype=self.dtype
         )
 
     def transform(
@@ -125,7 +126,6 @@ class DummyForwardPass:
         custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
         adapter_subpass=None,
-        total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         """
         No-op transform that passes through the input embeddings.
@@ -176,18 +176,22 @@ class DummyForwardPass:
         # [num_samples, vocab_size]; True means the token is allowed.
         sampling_masks = sampling_metadata.get("sampling_masks")
 
-        random_tokens: list[int] = []
-        for i in range(num_samples):
-            if sampling_masks is not None:
+        # Batched CPU random sampling: one numpy call instead of N Python calls.
+        if sampling_masks is None:
+            import numpy as _np
+            random_tokens = _np.random.randint(
+                0, self.vocab_size, num_samples, dtype=_np.int64
+            ).tolist()
+        else:
+            random_tokens: list[int] = []
+            import random as _random
+            for i in range(num_samples):
                 allowed = torch.nonzero(sampling_masks[i], as_tuple=True)[0]
                 if allowed.numel() > 0:
-                    pick = torch.randint(0, allowed.numel(), (1,), device=self.device).item()
-                    picked_tok = int(allowed[pick].item())
-                    random_tokens.append(picked_tok)
+                    pick = _random.randrange(allowed.numel())
+                    random_tokens.append(int(allowed[pick].item()))
                     continue
-            random_tokens.append(
-                int(torch.randint(0, self.vocab_size, (1,), device=self.device).item())
-            )
+                random_tokens.append(_random.randrange(self.vocab_size))
 
         # Build distributions: None for token-sampling, (ids, probs) for dist requests
         dists: list[tuple[list[int], list[float]] | None] = [None] * num_samples
@@ -226,14 +230,6 @@ class DummyForwardPass:
             "dists": dists,
             "nan_indices": [],
         }
-
-    def warmup_cuda_graphs(self, kv_cache_at_layer: list[torch.Tensor]) -> None:
-        """
-        No-op warmup for CUDA graphs.
-
-        Dummy mode doesn't use CUDA graphs.
-        """
-        pass
 
 
 class _DummyWeightStore:

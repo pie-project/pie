@@ -19,6 +19,14 @@ from pie_kernels.sampling import (  # noqa: F401
     min_p_sampling_from_probs,
     top_k_top_p_sampling_from_probs,
 )
+# NOTE: We intentionally route token sampling through the `*_from_probs`
+# kernels rather than flashinfer's fused `*_from_logits` variants. Mapping
+# pie's most common sampler (TopP, type 3) onto
+# `top_k_top_p_sampling_from_logits` with `top_k=vocab_size` (no-op filter)
+# was measured slower than the explicit `scaled_softmax` +
+# `top_p_sampling_from_probs` pair on Qwen3-0.6B / A40 — the kernel still
+# pays for the unused top-k step. Revisit if a future flashinfer release
+# short-circuits or if sampler 1 (Multinomial) becomes the dominant type.
 
 if torch.cuda.is_available():
     NUM_SM = torch.cuda.get_device_properties(
@@ -47,157 +55,23 @@ LOGPROB_TYPES = frozenset({8, 9, 10})
 NEEDS_PROBS_TYPES = TOKEN_SAMPLING_TYPES | DIST_TYPES  # need temperature-scaled softmax
 
 
-def _safe_scaled_softmax_impl_torch(logits, temperatures, greedy_threshold=1e-5):
+def scaled_softmax(logits, temperatures, greedy_threshold=1e-5):
+    """Temperature-scaled softmax with safe handling of T≈0 (greedy).
+
+    Clamps temperature to `greedy_threshold` before dividing. PyTorch's
+    softmax is numerically stable (subtracts max), so `softmax(logits / 1e-5)`
+    yields a near-one-hot distribution at the argmax — functionally
+    indistinguishable from a true one-hot for downstream sampling.
+
+    This is much cheaper than the previous "safe" impl which allocated a
+    `(batch × vocab)` one-hot tensor and ran a `torch.where` over the full
+    probs tensor for every step.
     """
-    Optimized Approach: Branchless safe_scaled_softmax (PyTorch Fallback)
-    """
-    # Ensure temperatures broadcasts correctly for where
     if temperatures.ndim == 1:
         temperatures = temperatures.unsqueeze(1)
-
-    greedy_mask = temperatures < greedy_threshold
-
-    # Branchless logic
-    safe_temps = torch.where(greedy_mask, 1.0, temperatures)
-    scaled_logits = logits / safe_temps
-    probs_sampling = torch.softmax(scaled_logits, dim=-1)
-
-    greedy_indices = logits.argmax(dim=-1)
-    probs_greedy = torch.nn.functional.one_hot(
-        greedy_indices, num_classes=logits.shape[-1]
+    return torch.softmax(
+        logits / temperatures.clamp(min=greedy_threshold), dim=-1
     )
-    probs_greedy = probs_greedy.to(dtype=logits.dtype)
-
-    return torch.where(greedy_mask, probs_greedy, probs_sampling)
-
-
-if torch.backends.mps.is_available():
-    safe_scaled_softmax = _safe_scaled_softmax_impl_torch
-else:
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def _safe_softmax_kernel(
-        output_ptr,
-        logits_ptr,
-        temps_ptr,
-        stride_logits_row,
-        stride_logits_col,
-        stride_temps_row,
-        stride_out_row,
-        stride_out_col,
-        n_cols,
-        greedy_threshold,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        # Row index this program instance is processing
-        row_idx = tl.program_id(0)
-
-        # Calculate pointers for the specific row
-        logits_row_ptr = logits_ptr + row_idx * stride_logits_row
-        temps_ptr_loc = temps_ptr + row_idx * stride_temps_row
-        out_row_ptr = output_ptr + row_idx * stride_out_row
-
-        # Load temperature for this row
-        # We assume temps is shape (Batch, 1) or (Batch,)
-        T = tl.load(temps_ptr_loc)
-
-        # Create offsets for column loading
-        col_offsets = tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < n_cols
-
-        # Load logits with -inf padding for safety in max/argmax operations
-        row_logits = tl.load(
-            logits_row_ptr + col_offsets * stride_logits_col,
-            mask=mask,
-            other=-float("inf"),
-        )
-
-        # -----------------------------------------------------------
-        # Optimization: Uniform Control Flow
-        # Since T is constant for the whole row, all threads in the
-        # warp/block take the same branch.
-        # -----------------------------------------------------------
-        if T < greedy_threshold:
-            # --- GREEDY PATH (Argmax) ---
-            # 1. Find the index of the max value
-            max_idx = tl.argmax(row_logits, axis=0)
-
-            # 2. Create One-Hot encoding
-            # Compare every offset to the max_idx
-            result = tl.where(col_offsets == max_idx, 1.0, 0.0)
-
-        else:
-            # --- SAMPLING PATH (Softmax) ---
-            # --- SAMPLING PATH (Softmax) ---
-            # 1. Apply temperature scaling
-            scaled_logits = row_logits / T
-
-            # 2. Subtract max for numerical stability (standard softmax trick)
-            max_val = tl.max(scaled_logits, axis=0)
-            logits_minus_max = scaled_logits - max_val
-
-            # 3. Exponentiate
-            numerator = tl.exp(logits_minus_max)
-
-            # 4. Sum (normalization factor)
-            denominator = tl.sum(numerator, axis=0)
-
-            # 5. Divide
-            result = numerator / denominator
-
-        # Store result
-        tl.store(out_row_ptr + col_offsets * stride_out_col, result, mask=mask)
-
-    def safe_scaled_softmax_triton(logits, temperatures, greedy_threshold=1e-5):
-        """
-        Triton wrapper for safe scaled softmax.
-        """
-        # Input handling
-        n_rows, n_cols = logits.shape
-
-        # Ensure temperatures broadcasts correctly.
-        # If 1D (Batch,), reshape to (Batch, 1) for consistent striding logic
-        if temperatures.ndim == 1:
-            temperatures = temperatures.unsqueeze(1)
-
-        # Output allocation
-        output = torch.empty_like(logits)
-
-        # Heuristics for Block Size and Warps
-        # Next power of 2 to fit the row in SRAM
-        BLOCK_SIZE = triton.next_power_of_2(n_cols)
-
-        # Manage maximum block size (hardware limit is usually 128KB, so ~32k float32s)
-        # If n_cols is massive, we would need a tiled implementation, but this covers most cases.
-        num_warps = 4
-        if BLOCK_SIZE >= 2048:
-            num_warps = 8
-        if BLOCK_SIZE >= 4096:
-            num_warps = 16
-
-        # Launch Kernel
-        grid = (n_rows,)
-
-        _safe_softmax_kernel[grid](
-            output,
-            logits,
-            temperatures,
-            logits.stride(0),
-            logits.stride(1),
-            temperatures.stride(0),
-            output.stride(0),
-            output.stride(1),
-            n_cols,
-            greedy_threshold,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=num_warps,
-        )
-
-        return output
-
-    safe_scaled_softmax = safe_scaled_softmax_triton
 
 
 def sample_common(
@@ -227,19 +101,13 @@ def sample_common(
 
     indices_for_logits = sampling_metadata["indices_for_logits"]
 
-    # Stage 1: Compute logits via LM head
+    # Stage 1: Compute logits via LM head.
+    # We deliberately skip an explicit `torch.isnan(...).any()` check here:
+    # the reduction forced a CPU↔GPU sync on every fire_batch, and pre-trained
+    # weights don't produce NaNs in normal inference. `torch.nan_to_num` below
+    # still scrubs any stray NaN as a defense-in-depth.
     logits_input = hidden_states[indices_for_logits]
-
-    # TODO: NaN check.
-    # TODO: NaN check.
-    # TODO: NaN check.
-    nan_indices = []
-    if torch.isnan(logits_input).any():
-        nan_mask = torch.isnan(logits_input).any(dim=-1)
-        nan_local_indices = torch.nonzero(nan_mask, as_tuple=True)[0]
-        nan_indices = [indices_for_logits[i] for i in nan_local_indices.tolist()]
-        print(f"Warning: NaNs detected in logits_input for indices: {nan_indices}")
-
+    nan_indices: list[int] = []
     logits_input = torch.nan_to_num(logits_input)
 
     # Apply lm_head_fn
@@ -256,8 +124,7 @@ def sample_common(
     needs_log_probs = any(idx in LOGPROB_TYPES for idx in sampler_groups)
 
     if needs_probs:
-        temperatures = sampling_metadata["temperatures"]
-        probs = safe_scaled_softmax(logits, temperatures)
+        probs = scaled_softmax(logits, sampling_metadata["temperatures"])
     else:
         probs = None
 
@@ -367,7 +234,8 @@ def sample_common(
 
             final_tokens_tensor.scatter_(0, indices_tensor, sampled)
 
-    # Stage 5: Combine results
+    # Stage 5: Combine results — `.tolist()` forces a CPU sync so we can
+    # ship plain Python ints back to the worker.
     final_tokens_list = final_tokens_tensor.tolist()
 
     return {
@@ -610,7 +478,7 @@ def estimate_flashinfer_workspace_size(
             padded_batch_size = batch_size
         else:
             split_kv = True
-            # In worst case (or CUDA graph), it pads to max capacity
+            # Worst-case: pad to max grid capacity.
             padded_batch_size = max_grid_size // max(1, gqa_group_size)
 
         # -- Int Buffer Allocations --

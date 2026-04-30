@@ -26,6 +26,7 @@ from ..schema import Schema, Source, WeightStore
 import pie_kernels as ops
 
 from . import common
+from ._base import DenseForwardPass
 
 
 # =============================================================================
@@ -120,7 +121,14 @@ class ModelConfig(ModelConfigBase):
 # =============================================================================
 
 
-class ForwardPass:
+class ForwardPass(DenseForwardPass):
+    """Phi3 forward pass implementation.
+
+    No adapter integration; ``embed_tokens`` / ``embed_inputs`` /
+    ``sample`` use the base defaults. ``__init__`` rejects TP > 1
+    (fused qkv_proj sharding isn't wired for phi3 yet).
+    """
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -132,33 +140,10 @@ class ForwardPass:
             # The pre-fused qkv_proj weight needs an interleaved-by-head
             # column shard to keep Q heads aligned with their matching K/V
             # groups across ranks; the loader has no path for that yet.
-            raise NotImplementedError("phi3: TP>1 not supported (fused qkv_proj sharding not wired)")
-
-        self.model_config = model_config
-        self.runtime_config = runtime_config
-        self.weights = weights
-
-        self.workspace_buffer = torch.zeros(
-            128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
-        )
-        self.wrapper_decode = ops.BatchDecodeWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
-        self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
-
-    def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return fun.embedding(token_ids, self.weights.get("embed_token"))
-
-    def embed_inputs(self, batch_metadata: dict[str, Any]) -> torch.Tensor:
-        ids = torch.as_tensor(batch_metadata["token_ids"], device=self.runtime_config.device, dtype=torch.int32)
-        return self.embed_tokens(ids)
-
-    def sample(self, hidden_states: torch.Tensor, sampling_metadata: dict[str, Any]) -> dict[str, Any]:
-        return common.sample_common(
-            hidden_states=hidden_states,
-            sampling_metadata=sampling_metadata,
-            lm_head_fn=lambda x: self.lm_head(x),
-            device=self.runtime_config.device,
-            dtype=self.runtime_config.activation_dtype,
-        )
+            raise NotImplementedError(
+                "phi3: TP>1 not supported (fused qkv_proj sharding not wired)"
+            )
+        super().__init__(model_config, runtime_config, weights, compute_process_group)
 
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         normed = fun.rms_norm(
@@ -239,6 +224,42 @@ class ForwardPass:
         attn_proj = fun.linear(attn_out, self.weights.get(f"layers.{layer_idx}.proj_o"))
         return residual + attn_proj
 
+    def _run_layers(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache_at_layer: list[torch.Tensor],
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
+        adapter_subpass: Optional[AdapterSubpass],
+        wrapper: Any,
+    ) -> torch.Tensor:
+        """Execute all transformer layers sequentially.
+
+        Phi3 has no adapter integration, so ``adapter_subpass`` is
+        ignored (kept in the signature to satisfy the
+        :class:`DenseForwardPass` contract).
+        """
+        del adapter_subpass
+        for layer_idx in range(self.model_config.num_layers):
+            hidden_states = self.attention(
+                hidden_states=hidden_states,
+                layer_idx=layer_idx,
+                position_ids=position_ids,
+                kv_cache_layer=kv_cache_at_layer[layer_idx],
+                kv_page_indices=kv_page_indices,
+                kv_page_indptr=kv_page_indptr,
+                kv_last_page_lens=kv_last_page_lens,
+                batch_indices=batch_indices,
+                batch_positions=batch_positions,
+                wrapper=wrapper,
+            )
+            hidden_states = self.mlp(hidden_states, layer_idx)
+        return hidden_states
+
     def transform(
         self,
         input_embeds: torch.Tensor,
@@ -251,7 +272,6 @@ class ForwardPass:
         custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
         adapter_subpass: Optional[AdapterSubpass],
-        total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         if self.runtime_config.device.type == "cuda":
             torch.cuda.set_device(self.runtime_config.device)
@@ -300,20 +320,18 @@ class ForwardPass:
                 q_data_type=input_embeds.dtype,
             )
 
-        h = input_embeds
-        for layer_idx in range(cfg.num_layers):
-            h = self.attention(
-                h, layer_idx, position_ids,
-                kv_cache_layer=kv_cache_at_layer[layer_idx],
-                kv_page_indices=kv_page_indices,
-                kv_page_indptr=kv_page_indptr,
-                kv_last_page_lens=kv_last_page_lens,
-                batch_indices=batch_indices,
-                batch_positions=batch_positions,
-                wrapper=wrapper,
-            )
-            h = self.mlp(h, layer_idx)
-        return h
+        return self._run_layers(
+            hidden_states=input_embeds,
+            position_ids=position_ids,
+            kv_cache_at_layer=kv_cache_at_layer,
+            kv_page_indices=kv_page_indices,
+            kv_page_indptr=kv_page_indptr,
+            kv_last_page_lens=kv_last_page_lens,
+            batch_indices=batch_indices,
+            batch_positions=batch_positions,
+            adapter_subpass=adapter_subpass,
+            wrapper=wrapper,
+        )
 
 
 def create_kv_cache(model_config: ModelConfig, runtime_config: RuntimeConfig) -> list[torch.Tensor]:

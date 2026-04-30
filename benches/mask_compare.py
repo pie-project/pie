@@ -170,7 +170,6 @@ def load_native_engine(model_repo: str, device: str = "cuda:0"):
         max_num_embeds=8,
         max_num_adapters=0,
         max_adapter_rank=0,
-        use_cuda_graphs=False,
         weight_dtype="auto",
         dummy_mode=False,
     )

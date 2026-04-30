@@ -214,9 +214,6 @@ class NativeRuntimeConfig(RuntimeConfig):
     max_num_adapters: int = 32
     max_adapter_rank: int = 8
 
-    # CUDA graph capture for the FlashInfer wrapper path
-    use_cuda_graphs: bool = False
-
     # Weight dtype + quantization stack
     weight_dtype: str = "auto"
 
@@ -273,7 +270,6 @@ class NativeRuntimeConfig(RuntimeConfig):
         max_num_embeds: int = 128,
         max_num_adapters: int = 32,
         max_adapter_rank: int = 8,
-        use_cuda_graphs: bool = False,
         weight_dtype: str = "auto",
         dummy_mode: bool = False,
         **_unknown,
@@ -303,7 +299,6 @@ class NativeRuntimeConfig(RuntimeConfig):
             max_num_embeds=max_num_embeds,
             max_num_adapters=max_num_adapters,
             max_adapter_rank=max_adapter_rank,
-            use_cuda_graphs=use_cuda_graphs,
             weight_dtype=weight_dtype,
             dummy_mode=dummy_mode,
         )
@@ -328,6 +323,5 @@ class NativeDriverConfig:
     max_num_adapters: int = 32
     max_adapter_rank: int = 8
     kv_page_size: int = 16
-    use_cuda_graphs: bool = False
     weight_dtype: str = "auto"
     cpu_mem_budget_in_gb: int = 0

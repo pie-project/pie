@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import os
 import queue
 import socket
 import time
@@ -452,3 +453,14 @@ def _terminate(
             ctx.join(timeout=1)
         except Exception:
             pass
+
+    # Best-effort cleanup of the shmem region. The worker normally unlinks on
+    # its own SIGTERM handler, but SIGKILL fallback skips it; the parent has
+    # the same name available.
+    import ctypes as _ctypes
+    try:
+        _librt = _ctypes.CDLL("librt.so.1")
+        _librt.shm_unlink.argtypes = [_ctypes.c_char_p]
+        _librt.shm_unlink(b"/pie_shmem")
+    except Exception:
+        pass
