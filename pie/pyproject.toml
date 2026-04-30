@@ -66,6 +66,11 @@ cu128 = [
     "flashinfer-jit-cache==0.6.8.post1",
 ]
 
+cu129 = [
+    "torch>=2.11.0",
+    "torchao>=0.14.1",
+]
+
 # --- Metal (macOS) ---
 metal = [
     "torch>=2.7.1",
@@ -77,12 +82,13 @@ metal = [
 ]
 
 # --- vLLM backend (CUDA / ROCm / XPU / TPU) ---
-# Pinned tight to the version we test against; bumped weekly via automation.
-# Sourced from the sibling `vllm/` checkout so we track upstream tip, not
-# the stale `vllm` PyPI metadata (the cu128 mirror lags far behind upstream).
-vllm = [
-    "vllm",
-]
+# Headless: pie does NOT pin vllm. Users install vllm themselves per
+# https://docs.vllm.ai/en/stable/getting_started/installation/gpu/, picking
+# the wheel that matches their CUDA generation (e.g. +cu129 release asset
+# for a CUDA 12.9 host, the default PyPI wheel for cu130 hosts). pie's
+# pie_driver_vllm raises a clear error at import time if vllm is missing.
+# Supported range: vllm>=0.20,<0.21 as of this writing.
+vllm = []
 
 # --- SGLang backend (CUDA / ROCm / XPU / NPU) ---
 # Sourced from the sibling `sglang/` checkout so we track upstream tip.
@@ -114,6 +120,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 # cu130 channel — used by the sglang extra. Upstream sglang's pyproject
@@ -150,10 +161,12 @@ pie-bakery = { path = "../sdk/tools/bakery", editable = true }
 torch = [
     { index = "pytorch-cu126", extra = "cu126" },
     { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu129", extra = "cu129" },
     { index = "torch-cu130", extra = "sglang" },
 ]
 torchao = [
     { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu129", extra = "cu129" },
     { index = "torch-cu130", extra = "sglang" },
 ]
 torchaudio = [
@@ -184,6 +197,7 @@ conflicts = [
     [
         { extra = "cu126" },
         { extra = "cu128" },
+        { extra = "cu129" },
         { extra = "metal" },
         # sglang's torch==2.9.1 / torchao==0.17.0 conflict with the looser
         # cu128 pin and with cu126's index. Treat sglang as its own platform
