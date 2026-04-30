@@ -364,6 +364,352 @@ inline ArchSpec arch_spec_for(PieArch a, const Hparams& h) {
     return s;
 }
 
+// -----------------------------------------------------------------------------
+// Plan helpers
+//
+// These split `ForwardEngine::plan_` into composable phases:
+//   1. extract_plan_arrays:   pull all 23+ typed views from the BPIQ wire blob
+//   2. validate_plan_top_level: check the top-level invariants (batch shape)
+//   3. resolve_active_adapter_id: enforce single-adapter-per-batch (v1)
+//   4. plan_single_request:   build one ReqPlan + per-token positions/kv idxs
+//   5. build_pure_decode_packing: M11 fast-path packing for the all-decode case
+// -----------------------------------------------------------------------------
+
+struct PlanArrays {
+    std::span<const std::uint64_t> context_ids;
+    std::span<const std::uint32_t> token_ids;
+    std::span<const std::uint32_t> position_ids;
+    std::span<const std::uint32_t> qo_indptr;
+    std::span<const std::uint32_t> sampling_idx;
+    std::span<const std::uint32_t> sampling_indptr;
+    std::span<const std::uint32_t> request_num_samplers;
+    std::span<const std::uint32_t> kv_page_indices;
+    std::span<const std::uint32_t> kv_page_indptr;
+    std::span<const std::uint32_t> kv_last_lens;
+    std::span<const std::uint32_t> sampler_types;
+    std::span<const float>         sampler_temps;
+    std::span<const std::uint32_t> sampler_top_k;
+    std::span<const float>         sampler_top_p;
+    std::span<const float>         sampler_min_p;
+    std::span<const std::uint32_t> sampler_seeds;
+    std::span<const std::uint32_t> sampler_label_ids;
+    std::span<const std::uint32_t> sampler_label_indptr;
+    std::span<const std::uint32_t> logit_masks;
+    std::span<const std::uint32_t> logit_mask_indptr;
+    std::span<const std::uint32_t> flat_attn_masks;
+    std::span<const std::uint32_t> attn_mask_indptr;
+    std::span<const std::int64_t>  adapter_indices;
+    std::span<const std::uint32_t> spec_token_ids;
+    std::span<const std::uint32_t> spec_position_ids;
+    std::span<const std::uint32_t> spec_indptr;
+
+    std::int32_t n_request = 0;
+    std::int32_t total_n_tokens = 0;
+    bool         batch_has_drafts = false;
+    bool         batch_has_attn_masks = false;
+};
+
+PlanArrays extract_plan_arrays(const schema::DecodedRequest& req) {
+    PlanArrays a;
+    a.context_ids          = req.as<std::uint64_t>(schema::A_CONTEXT_IDS);
+    a.token_ids            = req.as<std::uint32_t>(schema::A_TOKEN_IDS);
+    a.position_ids         = req.as<std::uint32_t>(schema::A_POSITION_IDS);
+    a.qo_indptr            = req.as<std::uint32_t>(schema::A_QO_INDPTR);
+    a.sampling_idx         = req.as<std::uint32_t>(schema::A_SAMPLING_INDICES);
+    a.sampling_indptr      = req.as<std::uint32_t>(schema::A_SAMPLING_INDPTR);
+    a.request_num_samplers = req.as<std::uint32_t>(schema::A_REQUEST_NUM_SAMPLERS);
+    a.kv_page_indices      = req.as<std::uint32_t>(schema::A_KV_PAGE_INDICES);
+    a.kv_page_indptr       = req.as<std::uint32_t>(schema::A_KV_PAGE_INDPTR);
+    a.kv_last_lens         = req.as<std::uint32_t>(schema::A_KV_LAST_PAGE_LENS);
+    a.sampler_types        = req.as<std::uint32_t>(schema::A_SAMPLER_TYPES);
+    a.sampler_temps        = req.as<float>(schema::A_SAMPLER_TEMPERATURES);
+    a.sampler_top_k        = req.as<std::uint32_t>(schema::A_SAMPLER_TOP_K);
+    a.sampler_top_p        = req.as<float>(schema::A_SAMPLER_TOP_P);
+    a.sampler_min_p        = req.as<float>(schema::A_SAMPLER_MIN_P);
+    a.sampler_seeds        = req.as<std::uint32_t>(schema::A_SAMPLER_SEEDS);
+    a.sampler_label_ids    = req.as<std::uint32_t>(schema::A_SAMPLER_LABEL_IDS);
+    a.sampler_label_indptr = req.as<std::uint32_t>(schema::A_SAMPLER_LABEL_INDPTR);
+    a.logit_masks          = req.as<std::uint32_t>(schema::A_LOGIT_MASKS);
+    a.logit_mask_indptr    = req.as<std::uint32_t>(schema::A_LOGIT_MASK_INDPTR);
+    a.flat_attn_masks      = req.as<std::uint32_t>(schema::A_FLATTENED_MASKS);
+    a.attn_mask_indptr     = req.as<std::uint32_t>(schema::A_MASK_INDPTR);
+    a.adapter_indices      = req.as<std::int64_t>(schema::A_ADAPTER_INDICES);
+    a.spec_token_ids       = req.as<std::uint32_t>(schema::A_SPEC_TOKEN_IDS);
+    a.spec_position_ids    = req.as<std::uint32_t>(schema::A_SPEC_POSITION_IDS);
+    a.spec_indptr          = req.as<std::uint32_t>(schema::A_SPEC_INDPTR);
+
+    a.n_request      = static_cast<std::int32_t>(a.context_ids.size());
+    a.total_n_tokens = static_cast<std::int32_t>(a.token_ids.size());
+    a.batch_has_drafts =
+        a.spec_indptr.size() == static_cast<std::size_t>(a.n_request) + 1;
+    // Custom (non-causal) masks are present iff the indptr fully covers
+    // every token's row. Otherwise the M11 packed-decode fast path is safe.
+    a.batch_has_attn_masks =
+        !a.flat_attn_masks.empty() &&
+        a.attn_mask_indptr.size() ==
+            static_cast<std::size_t>(a.total_n_tokens) + 1;
+    return a;
+}
+
+void validate_plan_top_level(const PlanArrays& a) {
+    if (a.n_request == 0) {
+        throw std::runtime_error("plan: no requests in batch");
+    }
+    if (a.token_ids.size() != a.position_ids.size()) {
+        throw std::runtime_error("plan: token_ids/position_ids size mismatch");
+    }
+    const auto n_plus_1 = static_cast<std::size_t>(a.n_request) + 1;
+    if (a.qo_indptr.size() != n_plus_1) {
+        throw std::runtime_error("plan: qo_indptr length must be num_requests+1");
+    }
+    if (a.kv_page_indptr.size() != n_plus_1) {
+        throw std::runtime_error("plan: kv_page_indptr length must be num_requests+1");
+    }
+    if (a.kv_last_lens.size() != static_cast<std::size_t>(a.n_request)) {
+        throw std::runtime_error("plan: kv_last_page_lens length must equal num_requests");
+    }
+    if (a.request_num_samplers.size() != static_cast<std::size_t>(a.n_request)) {
+        throw std::runtime_error("plan: request_num_samplers length mismatch");
+    }
+    if (a.sampling_indptr.size() != n_plus_1) {
+        throw std::runtime_error("plan: sampling_indptr length must be num_requests+1");
+    }
+}
+
+// Returns the active adapter id (-1 if no request set one). Throws if
+// requests in the same batch ask for different adapters — v1 enforces
+// a single LoRA per fire_batch.
+std::int64_t resolve_active_adapter_id(const PlanArrays& a) {
+    std::int64_t active = -1;
+    bool any = false;
+    for (auto x : a.adapter_indices) {
+        if (x < 0) continue;
+        if (!any) { active = x; any = true; }
+        else if (x != active) {
+            throw std::runtime_error(
+                "plan: mixed adapters in one batch — v1 supports a single "
+                "adapter per fire_batch (got " + std::to_string(active) +
+                " and " + std::to_string(x) + ")");
+        }
+    }
+    return active;
+}
+
+void plan_single_request(const PlanArrays& a,
+                         std::int32_t r,
+                         std::int32_t page_size,
+                         std::int32_t total_pages,
+                         const ArchSpec& spec,
+                         ForwardEngine::BatchPlan& plan) {
+    // M8 spec decode allows multi-slot per request. v1 expects ≥1 slot.
+    if (a.request_num_samplers[r] < 1) {
+        throw std::runtime_error(
+            "plan: request " + std::to_string(r) + " has 0 sampler slots");
+    }
+    const std::int32_t qo_start = static_cast<std::int32_t>(a.qo_indptr[r]);
+    const std::int32_t qo_end   = static_cast<std::int32_t>(a.qo_indptr[r + 1]);
+    const std::int32_t n_tok    = qo_end - qo_start;
+    if (n_tok <= 0) {
+        throw std::runtime_error(
+            "plan: request " + std::to_string(r) + " has zero tokens");
+    }
+
+    const std::int32_t pages_off   = static_cast<std::int32_t>(a.kv_page_indptr[r]);
+    const std::int32_t num_pages_r =
+        static_cast<std::int32_t>(a.kv_page_indptr[r + 1]) - pages_off;
+    const std::int32_t last_len    = static_cast<std::int32_t>(a.kv_last_lens[r]);
+    const std::int32_t seq_len     = num_pages_r > 0
+        ? (num_pages_r - 1) * page_size + last_len
+        : last_len;
+    if (seq_len <= 0) {
+        throw std::runtime_error(
+            "plan: request " + std::to_string(r) + " has empty KV state");
+    }
+
+    // Sanity-check that page IDs are in-bounds for the configured pool.
+    for (std::int32_t pi = 0; pi < num_pages_r; ++pi) {
+        const auto p = a.kv_page_indices[pages_off + pi];
+        if (p >= static_cast<std::uint32_t>(total_pages)) {
+            throw std::runtime_error(
+                "plan: page id " + std::to_string(p) +
+                " out of bounds (total_pages=" +
+                std::to_string(total_pages) + ")");
+        }
+    }
+
+    // BPIQ provides 1 slot per request (the last-pending position that
+    // predicts the first draft / next token). Spec decode grows this to
+    // 1 + n_drafts.
+    const std::int32_t s_start = static_cast<std::int32_t>(a.sampling_indptr[r]);
+    const std::int32_t s_end   = static_cast<std::int32_t>(a.sampling_indptr[r + 1]);
+    const std::int32_t n_bpiq_slots = s_end - s_start;
+    if (n_bpiq_slots < 1) {
+        throw std::runtime_error(
+            "plan: request " + std::to_string(r) +
+            " has 0 BPIQ sampling indices; expected ≥1");
+    }
+    const std::int32_t primary_idx =
+        static_cast<std::int32_t>(a.sampling_idx[s_start]);
+    if (primary_idx < qo_start || primary_idx >= qo_end) {
+        throw std::runtime_error(
+            "plan: request " + std::to_string(r) +
+            " sampling_index " + std::to_string(primary_idx) +
+            " out of [" + std::to_string(qo_start) + "," +
+            std::to_string(qo_end) + ")");
+    }
+
+    // Per-token: tokens, positions, and write idxs.
+    for (std::int32_t i = qo_start; i < qo_end; ++i) {
+        const std::int32_t pos_i = static_cast<std::int32_t>(a.position_ids[i]);
+        if (pos_i >= seq_len) {
+            throw std::runtime_error(
+                "plan: request " + std::to_string(r) +
+                " token at position " + std::to_string(pos_i) +
+                " exceeds seq_len " + std::to_string(seq_len));
+        }
+        plan.tokens_i32[i]    = static_cast<std::int32_t>(a.token_ids[i]);
+        plan.positions_i32[i] = pos_i;
+        plan.kv_idxs_i64[i] = physical_idx(a.kv_page_indices.data(),
+                                           pages_off, page_size, pos_i);
+    }
+
+    ForwardEngine::ReqPlan rp;
+    rp.qo_start     = qo_start;
+    rp.n_tokens     = n_tok;
+    rp.n_tokens_pad = ((n_tok + MASK_PAD - 1) / MASK_PAD) * MASK_PAD;
+    rp.n_kv         = seq_len;
+    rp.sampling_pos = primary_idx;
+
+    // Sampling slots: primary first, then one per draft.
+    rp.sampling_positions.push_back(primary_idx);
+    plan.sampling_pos_i32.push_back(primary_idx);
+
+    if (a.batch_has_drafts) {
+        const std::int32_t d_start = static_cast<std::int32_t>(a.spec_indptr[r]);
+        const std::int32_t d_end   = static_cast<std::int32_t>(a.spec_indptr[r + 1]);
+        const std::int32_t n_drafts = d_end - d_start;
+        if (n_drafts > 0) {
+            rp.draft_tokens.assign(a.spec_token_ids.data() + d_start,
+                                   a.spec_token_ids.data() + d_end);
+            // Each draft sits at the unique batch index i where
+            // positions_i32[i] == draft_pos.
+            for (std::int32_t k = 0; k < n_drafts; ++k) {
+                const std::int32_t draft_pos =
+                    static_cast<std::int32_t>(a.spec_position_ids[d_start + k]);
+                std::int32_t idx = -1;
+                for (std::int32_t i = qo_start; i < qo_end; ++i) {
+                    if (static_cast<std::int32_t>(a.position_ids[i]) == draft_pos) {
+                        idx = i; break;
+                    }
+                }
+                if (idx < 0) {
+                    throw std::runtime_error(
+                        "plan: spec draft at position " + std::to_string(draft_pos) +
+                        " not found in request " + std::to_string(r) + "'s qo range");
+                }
+                rp.sampling_positions.push_back(idx);
+                plan.sampling_pos_i32.push_back(idx);
+            }
+        }
+    }
+
+    rp.gather_idxs.resize(seq_len);
+    for (std::int32_t k = 0; k < seq_len; ++k) {
+        rp.gather_idxs[k] = static_cast<std::int32_t>(
+            physical_idx(a.kv_page_indices.data(), pages_off, page_size, k));
+    }
+
+    // Custom per-token attention masks (M6) — optional.
+    std::vector<PerTokenMaskRuns> per_token_runs;
+    if (a.batch_has_attn_masks) {
+        per_token_runs.resize(n_tok);
+        for (std::int32_t i = 0; i < n_tok; ++i) {
+            const std::int32_t global_i = qo_start + i;
+            const std::int32_t lo = static_cast<std::int32_t>(a.attn_mask_indptr[global_i]);
+            const std::int32_t hi = static_cast<std::int32_t>(a.attn_mask_indptr[global_i + 1]);
+            per_token_runs[i].runs   = a.flat_attn_masks.data() + lo;
+            per_token_runs[i].n_runs = static_cast<std::size_t>(hi - lo);
+        }
+    }
+    build_attn_mask_f16(rp.mask_f16, seq_len, n_tok, rp.n_tokens_pad,
+                        plan.positions_i32.data() + qo_start,
+                        a.batch_has_attn_masks ? per_token_runs.data() : nullptr,
+                        spec.sliding_window);
+
+    // Sampler params (slot index = s_start in v1, where each request has 1 slot).
+    if (s_start >= static_cast<std::int32_t>(a.sampler_types.size())) {
+        throw std::runtime_error(
+            "plan: sampler_types too short for request " + std::to_string(r));
+    }
+    rp.sampler.type = static_cast<SamplerType>(a.sampler_types[s_start]);
+    auto opt_at = [&](auto span, auto fallback) {
+        return s_start < static_cast<std::int32_t>(span.size())
+            ? span[s_start] : fallback;
+    };
+    rp.sampler.temperature = opt_at(a.sampler_temps, 1.0f);
+    rp.sampler.top_k       = opt_at(a.sampler_top_k, 0u);
+    rp.sampler.top_p       = opt_at(a.sampler_top_p, 1.0f);
+    rp.sampler.min_p       = opt_at(a.sampler_min_p, 0.0f);
+    rp.sampler.seed        = opt_at(a.sampler_seeds, 0u);
+
+    // Per-slot Logprob/Logprobs labels (sampler-slot-keyed indptr).
+    if (a.sampler_label_indptr.size() > static_cast<std::size_t>(s_start) + 1) {
+        const std::int32_t la = static_cast<std::int32_t>(a.sampler_label_indptr[s_start]);
+        const std::int32_t lb = static_cast<std::int32_t>(a.sampler_label_indptr[s_start + 1]);
+        if (lb > la) {
+            rp.sampler.labels.assign(
+                a.sampler_label_ids.data() + la,
+                a.sampler_label_ids.data() + lb);
+        }
+    }
+
+    // Per-request BRLE logit mask. Optional — empty = no constraint.
+    if (a.logit_mask_indptr.size() == static_cast<std::size_t>(a.n_request) + 1) {
+        const std::int32_t lm_start = static_cast<std::int32_t>(a.logit_mask_indptr[r]);
+        const std::int32_t lm_end   = static_cast<std::int32_t>(a.logit_mask_indptr[r + 1]);
+        if (lm_end > lm_start) {
+            rp.logit_mask_runs.assign(
+                a.logit_masks.data() + lm_start,
+                a.logit_masks.data() + lm_end);
+        }
+    }
+
+    plan.reqs.push_back(std::move(rp));
+}
+
+// M11 packed-decode fast path. Caller has already verified every request
+// has n_tokens == 1 and there are no custom attention masks, so the whole
+// batch can be expressed as a single ne33-broadcast attention call per
+// layer. Builds packed gather idxs + a single mask tensor of shape
+// [max_n_kv, 64, 1, n_request].
+void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
+                               std::int32_t n_request,
+                               const ArchSpec& spec) {
+    const std::int32_t M = plan.max_n_kv;
+    const std::int32_t N = n_request;
+    plan.packed_gather_idxs.assign(static_cast<std::size_t>(M) * N, 0);
+    plan.packed_mask_f16.assign(
+        static_cast<std::size_t>(M) * MASK_PAD * N,
+        ggml_fp32_to_fp16(-INFINITY));
+    const auto zero = ggml_fp32_to_fp16(0.0f);
+    const std::int32_t W = spec.sliding_window;
+    for (std::int32_t r = 0; r < N; ++r) {
+        const auto& rp = plan.reqs[r];
+        for (std::int32_t k = 0; k < rp.n_kv; ++k) {
+            plan.packed_gather_idxs[
+                static_cast<std::size_t>(r) * M + k] = rp.gather_idxs[k];
+        }
+        // For stream r, row b=0 (the single query at pos = n_kv_r-1)
+        // attends [max(0, n_kv_r - W), n_kv_r) when SWA; else full range.
+        std::uint16_t* row = plan.packed_mask_f16.data()
+            + static_cast<std::size_t>(r) * M * MASK_PAD;
+        const std::int32_t lo = (W > 0) ? std::max(0, rp.n_kv - W) : 0;
+        for (std::int32_t k = lo; k < rp.n_kv; ++k) {
+            row[k] = zero;
+        }
+    }
+}
+
 struct GraphInputs {
     ggml_tensor*              tok_input;   // I32 [total_n_tokens]
     ggml_tensor*              pos_input;   // I32 [total_n_tokens]
@@ -891,340 +1237,44 @@ ForwardEngine::~ForwardEngine() {
 ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req) {
     const auto& hpar = model_.hparams();
     const ArchSpec spec = arch_spec_for(hpar.arch, hpar);
-    const auto context_ids   = req.as<std::uint64_t>(schema::A_CONTEXT_IDS);
-    const auto token_ids     = req.as<std::uint32_t>(schema::A_TOKEN_IDS);
-    const auto position_ids  = req.as<std::uint32_t>(schema::A_POSITION_IDS);
-    const auto qo_indptr     = req.as<std::uint32_t>(schema::A_QO_INDPTR);
-    const auto sampling_idx  = req.as<std::uint32_t>(schema::A_SAMPLING_INDICES);
-    const auto sampling_indptr = req.as<std::uint32_t>(schema::A_SAMPLING_INDPTR);
-    const auto request_num_samplers =
-        req.as<std::uint32_t>(schema::A_REQUEST_NUM_SAMPLERS);
-    const auto kv_page_indices = req.as<std::uint32_t>(schema::A_KV_PAGE_INDICES);
-    const auto kv_page_indptr  = req.as<std::uint32_t>(schema::A_KV_PAGE_INDPTR);
-    const auto kv_last_lens    = req.as<std::uint32_t>(schema::A_KV_LAST_PAGE_LENS);
-    const auto sampler_types   = req.as<std::uint32_t>(schema::A_SAMPLER_TYPES);
-    const auto sampler_temps   = req.as<float>(schema::A_SAMPLER_TEMPERATURES);
-    const auto sampler_top_k   = req.as<std::uint32_t>(schema::A_SAMPLER_TOP_K);
-    const auto sampler_top_p   = req.as<float>(schema::A_SAMPLER_TOP_P);
-    const auto sampler_min_p   = req.as<float>(schema::A_SAMPLER_MIN_P);
-    const auto sampler_seeds   = req.as<std::uint32_t>(schema::A_SAMPLER_SEEDS);
-    const auto sampler_label_ids   = req.as<std::uint32_t>(schema::A_SAMPLER_LABEL_IDS);
-    const auto sampler_label_indptr =
-        req.as<std::uint32_t>(schema::A_SAMPLER_LABEL_INDPTR);
-    const auto logit_masks     = req.as<std::uint32_t>(schema::A_LOGIT_MASKS);
-    const auto logit_mask_indptr =
-        req.as<std::uint32_t>(schema::A_LOGIT_MASK_INDPTR);
-    const auto flat_attn_masks   = req.as<std::uint32_t>(schema::A_FLATTENED_MASKS);
-    const auto attn_mask_indptr  = req.as<std::uint32_t>(schema::A_MASK_INDPTR);
 
-    const std::int32_t n_request = static_cast<std::int32_t>(context_ids.size());
-    if (n_request == 0) {
-        throw std::runtime_error("plan: no requests in batch");
-    }
-    if (token_ids.size() != position_ids.size()) {
-        throw std::runtime_error("plan: token_ids/position_ids size mismatch");
-    }
-    if (qo_indptr.size() != static_cast<std::size_t>(n_request) + 1) {
-        throw std::runtime_error("plan: qo_indptr length must be num_requests+1");
-    }
-    if (kv_page_indptr.size() != static_cast<std::size_t>(n_request) + 1) {
-        throw std::runtime_error("plan: kv_page_indptr length must be num_requests+1");
-    }
-    if (kv_last_lens.size() != static_cast<std::size_t>(n_request)) {
-        throw std::runtime_error("plan: kv_last_page_lens length must equal num_requests");
-    }
-    if (request_num_samplers.size() != static_cast<std::size_t>(n_request)) {
-        throw std::runtime_error("plan: request_num_samplers length mismatch");
-    }
-    if (sampling_indptr.size() != static_cast<std::size_t>(n_request) + 1) {
-        throw std::runtime_error("plan: sampling_indptr length must be num_requests+1");
-    }
-
-    const std::int32_t page_size   = kv_.page_size();
-    const std::int32_t total_pages = kv_.total_pages();
+    const PlanArrays arrays = extract_plan_arrays(req);
+    validate_plan_top_level(arrays);
 
     BatchPlan plan;
-    plan.total_n_tokens = static_cast<std::int32_t>(token_ids.size());
+    plan.total_n_tokens = arrays.total_n_tokens;
     plan.tokens_i32.resize(plan.total_n_tokens);
     plan.positions_i32.resize(plan.total_n_tokens);
     plan.kv_idxs_i64.resize(plan.total_n_tokens);
-    // sampling_pos_i32 is FLAT across all requests' slots; we'll grow it
-    // as we walk the request list. Reserve a generous upper bound now.
-    plan.sampling_pos_i32.reserve(n_request * 4);
-    plan.reqs.reserve(n_request);
+    // sampling_pos_i32 is FLAT across all requests' slots; reserve a
+    // generous upper bound (handles spec decode's 1 + n_drafts case).
+    plan.sampling_pos_i32.reserve(arrays.n_request * 4);
+    plan.reqs.reserve(arrays.n_request);
 
-    // M9 LoRA: per-request adapter id (i64; -1 = no adapter). Single-
-    // adapter-per-batch v1: all non-(-1) entries must match.
-    const auto adapter_indices = req.as<std::int64_t>(schema::A_ADAPTER_INDICES);
-    std::int64_t active_adapter_id = -1;
-    bool any_adapter = false;
-    for (auto a : adapter_indices) {
-        if (a < 0) continue;
-        if (!any_adapter) { active_adapter_id = a; any_adapter = true; }
-        else if (a != active_adapter_id) {
-            throw std::runtime_error(
-                "plan: mixed adapters in one batch — v1 supports a single "
-                "adapter per fire_batch (got " +
-                std::to_string(active_adapter_id) + " and " +
-                std::to_string(a) + ")");
-        }
+    // M9 LoRA: at most one adapter per fire_batch in v1.
+    const std::int64_t active_adapter_id = resolve_active_adapter_id(arrays);
+
+    const std::int32_t page_size   = kv_.page_size();
+    const std::int32_t total_pages = kv_.total_pages();
+    for (std::int32_t r = 0; r < arrays.n_request; ++r) {
+        plan_single_request(arrays, r, page_size, total_pages, spec, plan);
     }
 
-    // Spec decode arrays — optional. Even when present they may be all-zero
-    // for a batch where the runtime's drafter found nothing to propose.
-    const auto spec_token_ids   = req.as<std::uint32_t>(schema::A_SPEC_TOKEN_IDS);
-    const auto spec_position_ids = req.as<std::uint32_t>(schema::A_SPEC_POSITION_IDS);
-    const auto spec_indptr      = req.as<std::uint32_t>(schema::A_SPEC_INDPTR);
-    const bool batch_has_drafts =
-        spec_indptr.size() == static_cast<std::size_t>(n_request) + 1;
-
-    // Whether ANY token in this batch has a custom (non-causal) attention
-    // mask. If so, the M11 packed-decode fast path is not safe (it folds
-    // every request's mask into a single ne33 tensor with stride-uniform
-    // structure; mixing custom masks would need a different layout).
-    const bool batch_has_attn_masks = !flat_attn_masks.empty()
-        && attn_mask_indptr.size() ==
-           static_cast<std::size_t>(plan.total_n_tokens) + 1;
-
-    for (std::int32_t r = 0; r < n_request; ++r) {
-        // M8 spec decode allows multi-slot per request. v1 expects 1 slot
-        // for plain sampling; spec inflates this to 1 + n_drafts.
-        if (request_num_samplers[r] < 1) {
-            throw std::runtime_error(
-                "plan: request " + std::to_string(r) +
-                " has 0 sampler slots");
-        }
-        const std::int32_t qo_start = static_cast<std::int32_t>(qo_indptr[r]);
-        const std::int32_t qo_end   = static_cast<std::int32_t>(qo_indptr[r + 1]);
-        const std::int32_t n_tok    = qo_end - qo_start;
-        if (n_tok <= 0) {
-            throw std::runtime_error(
-                "plan: request " + std::to_string(r) + " has zero tokens");
-        }
-
-        const std::int32_t pages_off = static_cast<std::int32_t>(kv_page_indptr[r]);
-        const std::int32_t num_pages_r =
-            static_cast<std::int32_t>(kv_page_indptr[r + 1]) - pages_off;
-        const std::int32_t last_len = static_cast<std::int32_t>(kv_last_lens[r]);
-        const std::int32_t seq_len = num_pages_r > 0
-            ? (num_pages_r - 1) * page_size + last_len
-            : last_len;
-        if (seq_len <= 0) {
-            throw std::runtime_error(
-                "plan: request " + std::to_string(r) + " has empty KV state");
-        }
-
-        // Sanity-check that page IDs are in-bounds for the configured pool.
-        for (std::int32_t pi = 0; pi < num_pages_r; ++pi) {
-            const auto p = kv_page_indices[pages_off + pi];
-            if (p >= static_cast<std::uint32_t>(total_pages)) {
-                throw std::runtime_error(
-                    "plan: page id " + std::to_string(p) +
-                    " out of bounds (total_pages=" +
-                    std::to_string(total_pages) + ")");
-            }
-        }
-
-        // Sampling positions: BPIQ provides 1 slot per request (the
-        // last-pending position that predicts the first draft / next token).
-        // For spec decode we grow this to 1 + n_drafts: the extra slots
-        // sample at each draft position to predict its successor.
-        const std::int32_t s_start = static_cast<std::int32_t>(sampling_indptr[r]);
-        const std::int32_t s_end   = static_cast<std::int32_t>(sampling_indptr[r + 1]);
-        const std::int32_t n_bpiq_slots = s_end - s_start;
-        if (n_bpiq_slots < 1) {
-            throw std::runtime_error(
-                "plan: request " + std::to_string(r) +
-                " has 0 BPIQ sampling indices; expected ≥1");
-        }
-
-        // First slot: BPIQ's primary sampling position.
-        const std::int32_t primary_idx =
-            static_cast<std::int32_t>(sampling_idx[s_start]);
-        if (primary_idx < qo_start || primary_idx >= qo_end) {
-            throw std::runtime_error(
-                "plan: request " + std::to_string(r) +
-                " sampling_index " + std::to_string(primary_idx) +
-                " out of [" + std::to_string(qo_start) + "," +
-                std::to_string(qo_end) + ")");
-        }
-
-        // Per-token: tokens, positions, and write idxs.
-        for (std::int32_t i = qo_start; i < qo_end; ++i) {
-            const std::int32_t pos_i = static_cast<std::int32_t>(position_ids[i]);
-            if (pos_i >= seq_len) {
-                throw std::runtime_error(
-                    "plan: request " + std::to_string(r) +
-                    " token at position " + std::to_string(pos_i) +
-                    " exceeds seq_len " + std::to_string(seq_len));
-            }
-            plan.tokens_i32[i]    = static_cast<std::int32_t>(token_ids[i]);
-            plan.positions_i32[i] = pos_i;
-            plan.kv_idxs_i64[i] = physical_idx(kv_page_indices.data(),
-                                               pages_off, page_size, pos_i);
-        }
-
-        // Per-request: gather idxs (all positions [0, seq_len)) + mask.
-        ReqPlan rp;
-        rp.qo_start     = qo_start;
-        rp.n_tokens     = n_tok;
-        rp.n_tokens_pad = ((n_tok + MASK_PAD - 1) / MASK_PAD) * MASK_PAD;
-        rp.n_kv         = seq_len;
-        rp.sampling_pos = primary_idx;
-
-        // Build per-slot sampling positions. Always start with the
-        // primary slot. If drafts exist, also sample at each draft
-        // token's position to verify it.
-        rp.sampling_positions.push_back(primary_idx);
-        plan.sampling_pos_i32.push_back(primary_idx);
-
-        if (batch_has_drafts) {
-            const std::int32_t d_start = static_cast<std::int32_t>(spec_indptr[r]);
-            const std::int32_t d_end   = static_cast<std::int32_t>(spec_indptr[r + 1]);
-            const std::int32_t n_drafts = d_end - d_start;
-            if (n_drafts > 0) {
-                rp.draft_tokens.assign(spec_token_ids.data() + d_start,
-                                       spec_token_ids.data() + d_end);
-                // Each draft sits in this batch's tokens at some index in
-                // [qo_start, qo_end). Match by position_id: a draft with
-                // sequence-position p_d lives at the unique batch index i
-                // where positions_i32[i] == p_d.
-                for (std::int32_t k = 0; k < n_drafts; ++k) {
-                    const std::int32_t draft_pos =
-                        static_cast<std::int32_t>(spec_position_ids[d_start + k]);
-                    std::int32_t idx = -1;
-                    for (std::int32_t i = qo_start; i < qo_end; ++i) {
-                        if (static_cast<std::int32_t>(position_ids[i]) == draft_pos) {
-                            idx = i; break;
-                        }
-                    }
-                    if (idx < 0) {
-                        throw std::runtime_error(
-                            "plan: spec draft at position " +
-                            std::to_string(draft_pos) +
-                            " not found in request " + std::to_string(r) +
-                            "'s qo range");
-                    }
-                    rp.sampling_positions.push_back(idx);
-                    plan.sampling_pos_i32.push_back(idx);
-                }
-            }
-        }
-        rp.gather_idxs.resize(seq_len);
-        for (std::int32_t k = 0; k < seq_len; ++k) {
-            rp.gather_idxs[k] = static_cast<std::int32_t>(
-                physical_idx(kv_page_indices.data(), pages_off, page_size, k));
-        }
-        // Custom per-token attention masks (M6) — optional.
-        std::vector<PerTokenMaskRuns> per_token_runs;
-        if (batch_has_attn_masks) {
-            per_token_runs.resize(n_tok);
-            for (std::int32_t i = 0; i < n_tok; ++i) {
-                const std::int32_t global_i = qo_start + i;
-                const std::int32_t a = static_cast<std::int32_t>(attn_mask_indptr[global_i]);
-                const std::int32_t b = static_cast<std::int32_t>(attn_mask_indptr[global_i + 1]);
-                per_token_runs[i].runs   = flat_attn_masks.data() + a;
-                per_token_runs[i].n_runs = static_cast<std::size_t>(b - a);
-            }
-        }
-        build_attn_mask_f16(rp.mask_f16, seq_len, n_tok, rp.n_tokens_pad,
-                            plan.positions_i32.data() + qo_start,
-                            batch_has_attn_masks ? per_token_runs.data() : nullptr,
-                            spec.sliding_window);
-
-        // Sampler params for this request's single sampler slot. Slot index
-        // equals request index r in v1 (request_num_samplers[r] == 1).
-        if (s_start >= static_cast<std::int32_t>(sampler_types.size())) {
-            throw std::runtime_error(
-                "plan: sampler_types too short for request " + std::to_string(r));
-        }
-        rp.sampler.type = static_cast<SamplerType>(sampler_types[s_start]);
-        rp.sampler.temperature =
-            s_start < static_cast<std::int32_t>(sampler_temps.size())
-                ? sampler_temps[s_start] : 1.0f;
-        rp.sampler.top_k =
-            s_start < static_cast<std::int32_t>(sampler_top_k.size())
-                ? sampler_top_k[s_start] : 0u;
-        rp.sampler.top_p =
-            s_start < static_cast<std::int32_t>(sampler_top_p.size())
-                ? sampler_top_p[s_start] : 1.0f;
-        rp.sampler.min_p =
-            s_start < static_cast<std::int32_t>(sampler_min_p.size())
-                ? sampler_min_p[s_start] : 0.0f;
-        rp.sampler.seed =
-            s_start < static_cast<std::int32_t>(sampler_seeds.size())
-                ? sampler_seeds[s_start] : 0u;
-
-        // Per-slot Logprob/Logprobs labels. label_indptr is keyed by
-        // sampler-slot index (s_start in our v1 = request index r).
-        if (sampler_label_indptr.size() >
-            static_cast<std::size_t>(s_start) + 1) {
-            const std::int32_t a = static_cast<std::int32_t>(sampler_label_indptr[s_start]);
-            const std::int32_t b = static_cast<std::int32_t>(sampler_label_indptr[s_start + 1]);
-            if (b > a) {
-                rp.sampler.labels.assign(
-                    sampler_label_ids.data() + a,
-                    sampler_label_ids.data() + b);
-            }
-        }
-
-        // Logit mask (BRLE per request). Optional — empty = no constraint.
-        if (logit_mask_indptr.size() == static_cast<std::size_t>(n_request) + 1) {
-            const std::int32_t lm_start = static_cast<std::int32_t>(logit_mask_indptr[r]);
-            const std::int32_t lm_end   = static_cast<std::int32_t>(logit_mask_indptr[r + 1]);
-            if (lm_end > lm_start) {
-                rp.logit_mask_runs.assign(
-                    logit_masks.data() + lm_start,
-                    logit_masks.data() + lm_end);
-            }
-        }
-
-        plan.reqs.push_back(std::move(rp));
-    }
-
-    // ---- M11 fast path: detect pure-decode ---------------------------------
-    // All requests have n_tokens=1 and no custom attention masks → packed
-    // ne3-broadcast attention path (single flash_attn_ext per layer).
-    plan.pure_decode = !plan.reqs.empty() && !batch_has_attn_masks;
+    // M11 packed-decode fast path: all-decode (n_tokens == 1) batches with
+    // no custom masks fuse into one attn call per layer.
+    plan.pure_decode = !plan.reqs.empty() && !arrays.batch_has_attn_masks;
     plan.max_n_kv = 0;
-    for (const auto& r : plan.reqs) {
-        plan.max_n_kv = std::max(plan.max_n_kv, r.n_kv);
-        if (r.n_tokens != 1) {
-            plan.pure_decode = false;
-            break;
-        }
+    for (const auto& rp : plan.reqs) {
+        plan.max_n_kv = std::max(plan.max_n_kv, rp.n_kv);
+        if (rp.n_tokens != 1) plan.pure_decode = false;
     }
     if (plan.pure_decode) {
-        const std::int32_t M = plan.max_n_kv;
-        const std::int32_t N = n_request;
-        plan.packed_gather_idxs.assign(static_cast<std::size_t>(M) * N, 0);
-        plan.packed_mask_f16.assign(
-            static_cast<std::size_t>(M) * MASK_PAD * N,
-            ggml_fp32_to_fp16(-INFINITY));
-        const auto zero = ggml_fp32_to_fp16(0.0f);
-        const std::int32_t W = spec.sliding_window;
-        for (std::int32_t r = 0; r < N; ++r) {
-            const auto& rp = plan.reqs[r];
-            for (std::int32_t k = 0; k < rp.n_kv; ++k) {
-                plan.packed_gather_idxs[
-                    static_cast<std::size_t>(r) * M + k] = rp.gather_idxs[k];
-            }
-            // mask ne layout [M, 64, 1, N] (ne[0] innermost). For stream r,
-            // row b=0 (the single query at pos = n_kv_r-1) attends
-            // [max(0, n_kv_r - W), n_kv_r) when SWA; else full [0, n_kv_r).
-            std::uint16_t* row = plan.packed_mask_f16.data()
-                + static_cast<std::size_t>(r) * M * MASK_PAD;
-            const std::int32_t lo = (W > 0) ? std::max(0, rp.n_kv - W) : 0;
-            for (std::int32_t k = lo; k < rp.n_kv; ++k) {
-                row[k] = zero;
-            }
-        }
+        build_pure_decode_packing(plan, arrays.n_request, spec);
     }
 
     // Resolve the active adapter via the pool. If lookup fails, the
-    // adapter wasn't registered yet — fall through to base-model
-    // behavior (degraded but not fatal).
-    if (any_adapter && adapters_) {
+    // adapter wasn't registered yet — fall through to base-model behavior.
+    if (active_adapter_id >= 0 && adapters_) {
         plan.active_adapter = adapters_->get(
             static_cast<std::uint64_t>(active_adapter_id));
         if (!plan.active_adapter) {
@@ -1232,9 +1282,9 @@ ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req)
                       << " not in pool — running without adapter\n";
         }
     }
-
     return plan;
 }
+
 
 // -----------------------------------------------------------------------------
 // Test harness plan: simulate Pie's page allocator with contiguous pages
