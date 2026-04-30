@@ -53,14 +53,19 @@ else:
         key = (rng_method, rounds)
         if key in _ext_cache:
             return _ext_cache[key]
+        # SM tag is in the name + gencode so a single source tree builds
+        # for whichever GPU is present (A100 sm_80, RTX-30 sm_86, L40 sm_89,
+        # H100 sm_90).
+        cc_major, cc_minor = torch.cuda.get_device_capability()
+        sm_tag = f"{cc_major}{cc_minor}"
         ext = load(
-            name=f"rand_mv_cuda_v13_m{rng_method}_r{rounds}",
+            name=f"rand_mv_cuda_v13_sm{sm_tag}_m{rng_method}_r{rounds}",
             sources=[os.path.join(_HERE, "cuda_kernels.cu")],
             extra_cuda_cflags=[
                 "-O3",
                 "--use_fast_math",
                 "-lineinfo",
-                "-gencode=arch=compute_86,code=sm_86",
+                f"-gencode=arch=compute_{sm_tag},code=sm_{sm_tag}",
                 "-std=c++17",
                 f"-DRNG_METHOD={rng_method}",
                 f"-DPHILOX_ROUNDS={rounds}",
@@ -216,14 +221,14 @@ else:
             # the bound namespace).
             return getattr(self._resolve(), name)
 
-    BM7    = _bind(_get_ext(0,  7))
+    # All four variants are lazy: _get_ext() runs torch.utils.cpp_extension.load
+    # which creates a CUDA primary context as a side effect; doing that at module
+    # import (before the caller's torch.cuda.set_device) breaks the device handle
+    # on some archs.
+    BM7    = _LazyVariant(0,  7)
     BM     = _LazyVariant(0, 10)
     PROBIT = _LazyVariant(1, 10)
     ZIG    = _LazyVariant(2, 10)
-    # BM is the default n_rounds=10 variant — every hot-path top-level call
-    # routes to it. Resolve eagerly so dispatch doesn't pay the __getattr__
-    # tax on the first batch of every fresh run.
-    BM._resolve()
 
     # Public top-level API.
     #
