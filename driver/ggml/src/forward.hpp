@@ -69,7 +69,6 @@ public:
         std::int32_t  n_tokens;       // pending + drafts (after spec splice)
         std::int32_t  n_tokens_pad;   // GGML_PAD(n_tokens, 64)
         std::int32_t  n_kv;           // total KV positions to attend (= seq_len)
-        std::int32_t  sampling_pos;   // legacy single-slot index (== sampling_positions[0])
         std::vector<std::uint16_t> mask_f16;     // [n_kv, n_tokens_pad] F16
         std::vector<std::int32_t>  gather_idxs;  // [n_kv] physical KV row indices
         SamplerParams sampler;        // per-request sampler config (shared across slots)

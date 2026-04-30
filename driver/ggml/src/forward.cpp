@@ -22,8 +22,13 @@ namespace pie_ggml_driver {
 
 namespace {
 
-constexpr std::int32_t MASK_PAD = 64;  // GGML_KQ_MASK_PAD
-constexpr std::int64_t MASK_PAD_INT = 64;
+// ggml_flash_attn_ext requires the mask's row count to be a multiple of
+// GGML_KQ_MASK_PAD (= 64). Pad accordingly when building per-request and
+// packed-decode masks.
+constexpr std::int32_t MASK_PAD = 64;
+// Per-call ggml graph node budget. Sized to comfortably fit MoE + spec
+// decode batches (every layer's MoE op count is ~10-20 nodes).
+constexpr std::size_t GRAPH_MAX_NODES = 1ull << 19;
 
 // (legacy mul_with_cast removed; norm_scale is the single entry point now)
 
@@ -578,7 +583,6 @@ void plan_single_request(const PlanArrays& a,
     rp.n_tokens     = n_tok;
     rp.n_tokens_pad = ((n_tok + MASK_PAD - 1) / MASK_PAD) * MASK_PAD;
     rp.n_kv         = seq_len;
-    rp.sampling_pos = primary_idx;
 
     // Sampling slots: primary first, then one per draft.
     rp.sampling_positions.push_back(primary_idx);
@@ -746,7 +750,7 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
     // Graph node budget: each layer adds ~10 ops per request (mostly attention
     // + concat) plus ~10 shared ops (norm, projections, FFN). 512 requests
     // over 28 layers needs ~150k nodes; budget 4× that to leave headroom.
-    const int graph_size = 1 << 19;  // 524288 nodes
+    const int graph_size = static_cast<int>(GRAPH_MAX_NODES);
     auto* gf = ggml_new_graph_custom(ctx, graph_size, /*grads=*/ false);
 
     GraphInputs in{};
@@ -777,7 +781,8 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         ggml_set_input(in.packed_gather);
 
         in.packed_mask = ggml_new_tensor_4d(
-            ctx, GGML_TYPE_F16, plan.max_n_kv, MASK_PAD_INT, 1, n_req);
+            ctx, GGML_TYPE_F16, plan.max_n_kv,
+            static_cast<std::int64_t>(MASK_PAD), 1, n_req);
         ggml_set_name(in.packed_mask, "kq_mask.packed");
         ggml_set_input(in.packed_mask);
     } else {
@@ -1471,7 +1476,6 @@ ForwardEngine::BatchPlan ForwardEngine::plan_test_simple_(
     rp.n_tokens     = n_tok;
     rp.n_tokens_pad = ((n_tok + MASK_PAD - 1) / MASK_PAD) * MASK_PAD;
     rp.n_kv         = seq_len;
-    rp.sampling_pos = sampling_pos;
     rp.sampling_positions.push_back(sampling_pos);
     rp.gather_idxs.resize(seq_len);
     for (std::int32_t k = 0; k < seq_len; ++k) {
@@ -1504,11 +1508,11 @@ ForwardEngine::BatchPlan ForwardEngine::plan_test_simple_(
 // -----------------------------------------------------------------------------
 
 std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
-    // Tensor metadata + graph node arrays. Sized to match the 512k graph
-    // node budget in `build_qwen3_graph`.
+    // Tensor metadata + graph node arrays. Sized to match GRAPH_MAX_NODES
+    // (the same budget the graph builder uses).
     const std::size_t mem_size =
         ggml_tensor_overhead() * (1ull << 20) +
-        ggml_graph_overhead_custom(1ull << 19, false);
+        ggml_graph_overhead_custom(GRAPH_MAX_NODES, false);
     ggml_init_params ip{
         /*.mem_size   =*/ mem_size,
         /*.mem_buffer =*/ nullptr,
@@ -1703,7 +1707,6 @@ std::vector<std::vector<std::uint32_t>> ForwardEngine::generate_multi(
             rp.n_tokens     = 1;
             rp.n_tokens_pad = MASK_PAD;
             rp.n_kv         = seq_len;
-            rp.sampling_pos = qo_start;
             rp.sampling_positions.push_back(qo_start);
             rp.gather_idxs.resize(seq_len);
             for (std::int32_t k = 0; k < seq_len; ++k) {
