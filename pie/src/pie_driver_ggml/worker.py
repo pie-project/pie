@@ -18,10 +18,15 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import threading
+import time
+import traceback
 from pathlib import Path
 
 import msgpack
@@ -154,17 +159,12 @@ def _write_startup_toml(
 #     u64 req_id
 
 
-import socket as _socket
-import struct as _struct
-import threading as _threading
-
-
 _AUX_MAGIC      = 0x41454950
 _AUX_ACK_MAGIC  = 0x4B414950
-_AUX_HDR        = _struct.Struct("<IIIIQ")    # 24 bytes (magic, method, n_pages, reserved, req_id)
-_AUX_PAIR       = _struct.Struct("<II")       # 8 bytes
-_AUX_ACK        = _struct.Struct("<IIQ")      # 16 bytes (magic, status, req_id)
-_AUX_LOAD_HDR   = _struct.Struct("<QII")      # 16 bytes (adapter_id, path_len, reserved)
+_AUX_HDR        = struct.Struct("<IIIIQ")    # 24 bytes (magic, method, n_pages, reserved, req_id)
+_AUX_PAIR       = struct.Struct("<II")       # 8 bytes
+_AUX_ACK        = struct.Struct("<IIQ")      # 16 bytes (magic, status, req_id)
+_AUX_LOAD_HDR   = struct.Struct("<QII")      # 16 bytes (adapter_id, path_len, reserved)
 _METHOD_LOAD_ADAPTER = 5
 
 
@@ -176,25 +176,60 @@ class _AuxClient:
     def __init__(self, socket_path: str):
         self._path = socket_path
         self._sock = None
-        self._lock = _threading.Lock()
+        self._lock = threading.Lock()
         self._next_req = 1
+
+    def call(self, method: int, pairs: list[tuple[int, int]]) -> None:
+        payload = b"".join(_AUX_PAIR.pack(s, d) for (s, d) in pairs)
+        self._send_command(method, payload, n_pages=len(pairs))
+
+    def load_adapter(self, adapter_id: int, file_path: str) -> None:
+        """Send a LoadAdapter command pointing at an on-disk safetensors
+        file. The binary reads + parses the file and registers the
+        adapter under `adapter_id`."""
+        path_bytes = file_path.encode("utf-8")
+        sub = _AUX_LOAD_HDR.pack(adapter_id, len(path_bytes), 0)
+        self._send_command(_METHOD_LOAD_ADAPTER, sub + path_bytes, n_pages=0)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+
+    # -------------------------------------------------------------------------
+    # Internals
+    # -------------------------------------------------------------------------
+
+    def _send_command(self, method: int, payload: bytes, n_pages: int) -> None:
+        """Send one aux command and read its ack. Holds `self._lock` for the
+        full round-trip so concurrent callers serialize cleanly."""
+        with self._lock:
+            self._connect()
+            req_id = self._next_req
+            self._next_req += 1
+            hdr = _AUX_HDR.pack(_AUX_MAGIC, method, n_pages, 0, req_id)
+            self._sock.sendall(hdr + payload)
+            self._read_ack(req_id)
 
     def _connect(self) -> None:
         if self._sock is not None:
             return
-        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         # Retry briefly: the binary's listener may take a few ms to bind.
-        import time as _time
-        deadline = _time.monotonic() + 5.0
+        deadline = time.monotonic() + 5.0
         last_err = None
-        while _time.monotonic() < deadline:
+        while time.monotonic() < deadline:
             try:
                 s.connect(self._path)
                 self._sock = s
                 return
             except (FileNotFoundError, ConnectionRefusedError) as e:
                 last_err = e
-                _time.sleep(0.05)
+                time.sleep(0.05)
         raise RuntimeError(f"aux IPC connect failed: {last_err}")
 
     def _recv_full(self, n: int) -> bytes:
@@ -206,30 +241,6 @@ class _AuxClient:
             buf.extend(chunk)
         return bytes(buf)
 
-    def call(self, method: int, pairs: list[tuple[int, int]]) -> None:
-        with self._lock:
-            self._connect()
-            req_id = self._next_req
-            self._next_req += 1
-            hdr = _AUX_HDR.pack(_AUX_MAGIC, method, len(pairs), 0, req_id)
-            payload = b"".join(_AUX_PAIR.pack(s, d) for (s, d) in pairs)
-            self._sock.sendall(hdr + payload)
-            self._read_ack(req_id)
-
-    def load_adapter(self, adapter_id: int, file_path: str) -> None:
-        """Send a LoadAdapter command pointing at an on-disk safetensors
-        file. The binary reads + parses the file and registers the
-        adapter under `adapter_id`."""
-        with self._lock:
-            self._connect()
-            req_id = self._next_req
-            self._next_req += 1
-            path_bytes = file_path.encode("utf-8")
-            hdr = _AUX_HDR.pack(_AUX_MAGIC, _METHOD_LOAD_ADAPTER, 0, 0, req_id)
-            sub = _AUX_LOAD_HDR.pack(adapter_id, len(path_bytes), 0)
-            self._sock.sendall(hdr + sub + path_bytes)
-            self._read_ack(req_id)
-
     def _read_ack(self, req_id: int) -> None:
         ack = self._recv_full(_AUX_ACK.size)
         magic, status, ack_req = _AUX_ACK.unpack(ack)
@@ -240,15 +251,6 @@ class _AuxClient:
                 f"aux IPC: ack req_id mismatch ({ack_req} != {req_id})")
         if status != 0:
             raise RuntimeError(f"aux IPC: command failed (status={status})")
-
-    def close(self) -> None:
-        with self._lock:
-            if self._sock is not None:
-                try:
-                    self._sock.close()
-                except Exception:
-                    pass
-                self._sock = None
 
 
 # =============================================================================
@@ -264,9 +266,6 @@ def _wait_for_ready(proc: subprocess.Popen, timeout_s: float) -> dict:
     """Read lines from `proc.stdout` until a `READY {json}` arrives. Anything
     else is forwarded to stderr so the user sees binary log output during
     startup. Raises if the binary exits, times out, or emits malformed JSON."""
-    import selectors
-    import time
-
     if proc.stdout is None:
         raise RuntimeError("subprocess has no stdout pipe")
 
@@ -443,7 +442,6 @@ def _run_rpc_loop(
             response = msgpack.packb(result)
             server.respond(request_id, response, 0)
         except Exception as e:
-            import traceback
             print(f"[ggml RPC Error] {method}: {e}\n{traceback.format_exc()}")
             response = msgpack.packb(str(e))
             server.respond(request_id, response, 0)
