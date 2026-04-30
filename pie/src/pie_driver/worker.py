@@ -748,7 +748,11 @@ def _leader_loop(
     SHMEM_NAME = "/pie_shmem"
     SHMEM_SLOTS = 8
     SHMEM_REQ_BUF = 4 * 1024 * 1024
-    SHMEM_RESP_BUF = 1 * 1024 * 1024
+    # Sized to hold a full-vocab `Distribution` probe (vocab × 8 bytes)
+    # plus per-request overhead and the spec-mode multi-slot tail; 1 MiB
+    # is too small for models with ~150K vocab once a distribution probe
+    # is active. Must match SHMEM_RESP_BUF in runtime/src/device.rs.
+    SHMEM_RESP_BUF = 8 * 1024 * 1024
     SHMEM_BUSY_US = 10_000
 
     from pie_driver import shmem_ipc as _shm

@@ -28,8 +28,11 @@ const SHMEM_NAME: &str = "/pie_shmem";
 const SHMEM_SLOTS: usize = 8;
 /// Per-slot request payload buffer size.
 const SHMEM_REQ_BUF: usize = 4 * 1024 * 1024;
-/// Per-slot response payload buffer size.
-const SHMEM_RESP_BUF: usize = 1 * 1024 * 1024;
+/// Per-slot response payload buffer size. Sized to hold a full-vocab
+/// `Distribution` probe (vocab × 8 bytes) plus per-request overhead and
+/// the spec-mode multi-slot tail; 1 MiB is too small for models with
+/// ~150K vocab once a distribution probe is active.
+const SHMEM_RESP_BUF: usize = 8 * 1024 * 1024;
 /// Busy-spin window (µs) before yielding while waiting on resp_seq.
 const SHMEM_SPIN_US: u64 = 10_000;
 
