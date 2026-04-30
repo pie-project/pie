@@ -2,7 +2,8 @@
 
 # Shmem IPC channel — must match the runtime's `[model.<name>.driver]` config.
 [shmem]
-name = "/pie-fwd-0"
+# Hardcoded across the stack (runtime/src/device.rs, pie_driver/worker.py).
+name = "/pie_shmem"
 num_slots = 8
 req_buf = 4194304   # 4 MiB
 resp_buf = 1048576  # 1 MiB

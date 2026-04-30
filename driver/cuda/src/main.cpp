@@ -15,6 +15,7 @@
 #include <string>
 
 #include <CLI/CLI.hpp>
+#include <nlohmann/json.hpp>
 
 #include "config.hpp"
 #include "shmem_ipc.hpp"
@@ -39,7 +40,9 @@ int main(int argc, char** argv) {
 
     const auto cfg = pie_cuda_driver::load_config(config_path);
 
-    std::cout << "[pie-driver-cuda] config loaded\n"
+    // Informational logs go to stderr — stdout is reserved for the READY
+    // handshake line consumed by the Python wrapper.
+    std::cerr << "[pie-driver-cuda] config loaded\n"
               << "  shmem.name      = " << cfg.shmem.name << "\n"
               << "  shmem.num_slots = " << cfg.shmem.num_slots << "\n"
               << "  model.hf_repo   = " << cfg.model.hf_repo << "\n"
@@ -57,7 +60,25 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    std::cout << "[pie-driver-cuda] serving on shmem " << server.name()
+    // M1.1 stub: model isn't loaded yet, so capabilities reflect config-only
+    // budgets. Real values land in M1.2 when the loader is wired in.
+    nlohmann::json caps = {
+        {"total_pages",      0},
+        {"kv_page_size",     cfg.batching.kv_page_size},
+        {"swap_pool_size",   0},
+        {"max_batch_tokens", cfg.batching.max_batch_tokens},
+        {"max_batch_size",   cfg.batching.max_batch_size},
+        {"arch_name",        ""},
+        {"vocab_size",       0},
+        {"max_model_len",    0},
+        {"activation_dtype", cfg.model.dtype},
+        {"snapshot_dir",     ""},
+        {"shmem_name",       cfg.shmem.name},
+    };
+    // The wrapper greps stdout for `^READY ` to complete the handshake.
+    std::cout << "READY " << caps.dump() << std::endl;
+
+    std::cerr << "[pie-driver-cuda] serving on shmem " << server.name()
               << " (" << server.num_slots() << " slots, "
               << "req_buf=" << server.req_buf_size() << ", "
               << "resp_buf=" << server.resp_buf_size() << ")\n";
@@ -81,7 +102,7 @@ int main(int argc, char** argv) {
                 decoded.as<std::uint64_t>(pie_cuda_driver::schema::A_CONTEXT_IDS);
 
             if (handled <= 4 || handled % 100 == 0) {
-                std::cout << "[pie-driver-cuda] req_id=" << req.req_id
+                std::cerr << "[pie-driver-cuda] req_id=" << req.req_id
                           << " device=" << decoded.device_id
                           << " single_token=" << decoded.single_token_mode
                           << " tokens=" << tokens.size()
@@ -93,13 +114,13 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        // TODO(pie-cpp): run actual forward pass; emit sampled tokens.
+        // TODO(M1.2): run actual forward pass; emit sampled tokens.
         (void)response;
         return 0;
     });
 
     g_server.store(nullptr);
-    std::cout << "[pie-driver-cuda] shutting down (handled " << handled
+    std::cerr << "[pie-driver-cuda] shutting down (handled " << handled
               << " requests)\n";
     return 0;
 }

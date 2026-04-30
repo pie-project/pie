@@ -23,21 +23,23 @@ find_package(CUDAToolkit REQUIRED)
 
 include(cmake/CPM.cmake)
 
+# NOTE: flashinfer dropped its top-level CMakeLists.txt after v0.2.7. From
+# v0.3.0+ the build is Python-driven (per-arch JIT cubins via build_backend.py).
+# We still fetch the source tree for headers and `csrc/`. Kernel integration
+# at M1.2 will either (a) compile the csrc TUs we need into our binary
+# directly, or (b) consume the precompiled `flashinfer-cubin` artifacts via
+# the cuModule API.
 cpmaddpackage(
-  URI "gh:flashinfer-ai/flashinfer@0.2.7"
-  OPTIONS
-    "FLASHINFER_ENABLE_FP8 OFF"
-    "FLASHINFER_ENABLE_FP8_E4M3 OFF"
-    "FLASHINFER_ENABLE_FP8_E5M2 OFF"
-    "FLASHINFER_GEN_POS_ENCODING_MODES 0")
+  NAME flashinfer
+  GITHUB_REPOSITORY flashinfer-ai/flashinfer
+  GIT_TAG v0.6.9
+  DOWNLOAD_ONLY YES)
 
 cpmaddpackage(URI "gh:marzer/tomlplusplus@3.4.0")
 cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 
-file(GLOB_RECURSE FLASHINFER_GENERATED_SOURCES
-     "${flashinfer_SOURCE_DIR}/src/generated/*.cu")
 
 # pie_driver_cuda — native CUDA backend, sibling to ../../runtime (Rust) and
 # ../../pie (Python driver). Talks to the runtime via the shmem fast path;
@@ -62,8 +64,7 @@ target_compile_options(pie_driver_cuda PRIVATE
 target_include_directories(pie_driver_cuda
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${flashinfer_SOURCE_DIR}/include
-    ${flashinfer_SOURCE_DIR}/src/generated)
+    ${flashinfer_SOURCE_DIR}/include)
 
 target_link_libraries(pie_driver_cuda PRIVATE
   CLI11::CLI11
