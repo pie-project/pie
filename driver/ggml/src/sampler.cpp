@@ -87,7 +87,7 @@ void softmax_with_temperature(float* probs, std::int32_t vocab_size,
     }
 }
 
-// Categorical sample by inverse-CDF.
+// Categorical sample by inverse-CDF over a sorted (prob, id) list.
 std::uint32_t categorical_sample(const std::vector<std::pair<float, std::uint32_t>>& sorted,
                                  float total, Pcg32& rng) {
     const float u = rng.next_uniform() * total;
@@ -97,6 +97,71 @@ std::uint32_t categorical_sample(const std::vector<std::pair<float, std::uint32_
         if (u < acc) return id;
     }
     return sorted.back().second;  // numerical safety
+}
+
+// Categorical sample directly over the unsorted full distribution.
+// Used by Multinomial when no filtering is requested.
+std::uint32_t multinomial_sample(const float* probs,
+                                 std::int32_t vocab_size,
+                                 Pcg32& rng) {
+    const float u = rng.next_uniform();
+    float acc = 0.0f;
+    for (std::int32_t v = 0; v < vocab_size; ++v) {
+        acc += probs[v];
+        if (u < acc) return static_cast<std::uint32_t>(v);
+    }
+    return argmax(probs, vocab_size);  // numerical safety
+}
+
+// Filter helpers: each takes the descending-prob `sorted` list and a
+// running `keep` count, and returns the new (smaller) keep count.
+
+inline bool desc_by_prob(const std::pair<float, std::uint32_t>& a,
+                         const std::pair<float, std::uint32_t>& b) {
+    return a.first > b.first;
+}
+
+// Top-K: keep the K largest. Always sorts the prefix; returns min(K, keep).
+std::size_t apply_top_k(std::vector<std::pair<float, std::uint32_t>>& sorted,
+                        std::uint32_t k,
+                        std::size_t keep) {
+    if (k == 0 || k >= keep) {
+        std::sort(sorted.begin(), sorted.begin() + keep, desc_by_prob);
+        return keep;
+    }
+    std::partial_sort(sorted.begin(), sorted.begin() + k,
+                      sorted.begin() + keep, desc_by_prob);
+    return k;
+}
+
+// Top-P (nucleus): keep the smallest prefix whose cumulative prob ≥ p.
+// Caller must have already sorted the [0, keep) range descending.
+std::size_t apply_top_p(const std::vector<std::pair<float, std::uint32_t>>& sorted,
+                        float p,
+                        std::size_t keep) {
+    const float threshold = std::clamp(p, 0.0f, 1.0f);
+    if (threshold >= 1.0f) return keep;
+    float cum = 0.0f;
+    for (std::size_t i = 0; i < keep; ++i) {
+        cum += sorted[i].first;
+        if (cum >= threshold) return i + 1;
+    }
+    return keep;
+}
+
+// Min-P: keep entries with prob ≥ min_p × top_prob. Caller must have
+// already sorted descending. If nothing passes the threshold (which can
+// only happen for invalid min_p > 1), leave `keep` unchanged.
+std::size_t apply_min_p(const std::vector<std::pair<float, std::uint32_t>>& sorted,
+                        float min_p,
+                        std::size_t keep) {
+    if (keep == 0) return 0;
+    const float thr = min_p * sorted[0].first;
+    std::size_t cut = 0;
+    for (; cut < keep; ++cut) {
+        if (sorted[cut].first < thr) break;
+    }
+    return cut > 0 ? cut : keep;
 }
 
 }  // namespace
@@ -288,7 +353,7 @@ std::uint32_t sample_token(const float* logits,
             throw std::runtime_error(
                 "sampler: type " +
                 std::to_string(static_cast<int>(params.type)) +
-                " is a special sampler — call sample() and use msgpack mode");
+                " is a special sampler — call sample_slot() and use msgpack mode");
     }
 
     // Greedy fast path — no need to softmax / sort.
@@ -296,29 +361,20 @@ std::uint32_t sample_token(const float* logits,
         return argmax(logits, vocab_size);
     }
 
-    // Stage 1: temperature + softmax.
+    // Temperature + softmax.
     std::vector<float> probs(logits, logits + vocab_size);
     softmax_with_temperature(probs.data(), vocab_size, params.temperature);
 
-    const std::uint64_t seed_u64 = params.seed != 0
-        ? static_cast<std::uint64_t>(params.seed)
-        : default_rng_seed();
-    Pcg32 rng(seed_u64);
+    Pcg32 rng(params.seed != 0
+                  ? static_cast<std::uint64_t>(params.seed)
+                  : default_rng_seed());
 
+    // Multinomial: no filtering, sample directly over the full distribution.
     if (params.type == T::Multinomial) {
-        // Full categorical without filtering — sample directly.
-        const float u = rng.next_uniform();
-        float acc = 0.0f;
-        for (std::int32_t v = 0; v < vocab_size; ++v) {
-            acc += probs[v];
-            if (u < acc) return static_cast<std::uint32_t>(v);
-        }
-        return argmax(probs.data(), vocab_size);
+        return multinomial_sample(probs.data(), vocab_size, rng);
     }
 
-    // Stage 2: build (prob, id) pairs sorted by descending prob. For top-k
-    // alone we partial-sort; for top-p / min-p we need full sort because
-    // the threshold may fall anywhere.
+    // Build (prob, id) pairs over non-zero entries.
     std::vector<std::pair<float, std::uint32_t>> sorted;
     sorted.reserve(vocab_size);
     for (std::int32_t v = 0; v < vocab_size; ++v) {
@@ -327,60 +383,29 @@ std::uint32_t sample_token(const float* logits,
         }
     }
     if (sorted.empty()) return 0;
-
-    auto desc_by_prob = [](const auto& a, const auto& b) {
-        return a.first > b.first;
-    };
-
-    // Stage 3: filter.
     std::size_t keep = sorted.size();
 
-    if (params.type == T::TopK || params.type == T::TopKTopP) {
-        if (params.top_k != 0 && params.top_k < keep) {
-            // Partial sort — top-k keeps the K largest.
-            std::partial_sort(sorted.begin(),
-                              sorted.begin() + params.top_k,
-                              sorted.end(), desc_by_prob);
-            keep = params.top_k;
-        } else {
-            std::sort(sorted.begin(), sorted.end(), desc_by_prob);
-        }
+    // Filter pipeline — each helper sorts the [0, keep) range as needed
+    // and returns the new keep count.
+    const bool wants_top_k = params.type == T::TopK || params.type == T::TopKTopP;
+    const bool wants_top_p = params.type == T::TopP || params.type == T::TopKTopP;
+    const bool wants_min_p = params.type == T::MinP;
+
+    if (wants_top_k) {
+        keep = apply_top_k(sorted, params.top_k, keep);
     } else {
+        // Top-p / min-p both require a full sort so the cutoff lookup works.
         std::sort(sorted.begin(), sorted.end(), desc_by_prob);
     }
-
-    if (params.type == T::TopP || params.type == T::TopKTopP) {
-        const float threshold = std::clamp(params.top_p, 0.0f, 1.0f);
-        if (threshold < 1.0f) {
-            float cum = 0.0f;
-            std::size_t cut = 0;
-            for (std::size_t i = 0; i < keep; ++i) {
-                cum += sorted[i].first;
-                if (cum >= threshold) {
-                    cut = i + 1;
-                    break;
-                }
-            }
-            if (cut > 0 && cut < keep) keep = cut;
-        }
-    }
-
-    if (params.type == T::MinP) {
-        const float thr = params.min_p * sorted[0].first;  // top is sorted[0]
-        std::size_t cut = 0;
-        for (; cut < keep; ++cut) {
-            if (sorted[cut].first < thr) break;
-        }
-        if (cut > 0) keep = cut;
-    }
+    if (wants_top_p) keep = apply_top_p(sorted, params.top_p, keep);
+    if (wants_min_p) keep = apply_min_p(sorted, params.min_p, keep);
 
     sorted.resize(keep);
 
-    // Stage 4: renormalize and sample.
+    // Renormalize + categorical sample.
     double total = 0.0;
     for (const auto& [p, _] : sorted) total += p;
     if (total <= 0.0) return sorted[0].second;
-
     return categorical_sample(sorted, static_cast<float>(total), rng);
 }
 
