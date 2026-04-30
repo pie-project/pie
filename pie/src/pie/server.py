@@ -399,6 +399,9 @@ def _bootstrap(
         telemetry_enabled=config.telemetry.enabled,
         telemetry_endpoint=config.telemetry.endpoint,
         telemetry_service_name=config.telemetry.service_name,
+        runtime=pie_runtime.RuntimeConfig(
+            worker_threads=config.runtime.worker_threads,
+        ),
         models=[py_model],
         allow_filesystem=config.server.allow_filesystem,
         max_concurrent_processes=config.server.max_concurrent_processes,

@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use crate::bootstrap::{
     AuthConfig, Config as BootstrapConfig, DeviceConfig as BootstrapDeviceConfig,
-    ModelConfig as BootstrapModelConfig, SchedulerConfig as BootstrapSchedulerConfig,
-    TelemetryConfig,
+    ModelConfig as BootstrapModelConfig, RuntimeConfig as BootstrapRuntimeConfig,
+    SchedulerConfig as BootstrapSchedulerConfig, TelemetryConfig,
 };
 use crate::device::RpcServer as InternalRpcServer;
 
@@ -176,6 +176,30 @@ impl RpcServer {
 // Configuration Types
 // =============================================================================
 
+/// Tokio runtime tuning. All fields opt-in — empty `RuntimeConfig`
+/// reproduces the stock `tokio::runtime::Runtime::new()` defaults.
+#[pyclass(name = "RuntimeConfig")]
+#[derive(Clone, Default)]
+pub struct RuntimeConfig {
+    /// Number of tokio worker threads. `None` = let tokio default to
+    /// `num_cpus`.
+    #[pyo3(get, set)]
+    pub worker_threads: Option<usize>,
+}
+
+#[pymethods]
+impl RuntimeConfig {
+    #[new]
+    #[pyo3(signature = (worker_threads = None))]
+    fn new(worker_threads: Option<usize>) -> Self {
+        RuntimeConfig { worker_threads }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("RuntimeConfig(worker_threads={:?})", self.worker_threads)
+    }
+}
+
 /// Scheduler configuration for a model.
 #[pyclass(name = "SchedulerConfig")]
 #[derive(Clone)]
@@ -328,6 +352,9 @@ pub struct Config {
     pub telemetry_endpoint: String,
     #[pyo3(get, set)]
     pub telemetry_service_name: String,
+    // Runtime tuning (tokio)
+    #[pyo3(get, set)]
+    pub runtime: RuntimeConfig,
     // Models
     #[pyo3(get, set)]
     pub models: Vec<ModelConfig>,
@@ -357,6 +384,7 @@ impl Config {
         telemetry_enabled = false,
         telemetry_endpoint = "http://localhost:4317".to_string(),
         telemetry_service_name = "pie".to_string(),
+        runtime = None,
         models = vec![],
         allow_filesystem = false,
         max_concurrent_processes = None,
@@ -375,6 +403,7 @@ impl Config {
         telemetry_enabled: bool,
         telemetry_endpoint: String,
         telemetry_service_name: String,
+        runtime: Option<RuntimeConfig>,
         models: Vec<ModelConfig>,
         allow_filesystem: bool,
         max_concurrent_processes: Option<usize>,
@@ -392,6 +421,7 @@ impl Config {
             telemetry_enabled,
             telemetry_endpoint,
             telemetry_service_name,
+            runtime: runtime.unwrap_or_default(),
             models,
             allow_filesystem,
             max_concurrent_processes,
@@ -431,6 +461,9 @@ impl From<Config> for BootstrapConfig {
                 enabled: cfg.telemetry_enabled,
                 endpoint: cfg.telemetry_endpoint,
                 service_name: cfg.telemetry_service_name,
+            },
+            runtime: BootstrapRuntimeConfig {
+                worker_threads: cfg.runtime.worker_threads,
             },
             models: cfg
                 .models
@@ -529,12 +562,24 @@ impl RuntimeHandle {
 #[pyo3(name = "bootstrap")]
 fn py_bootstrap(py: Python<'_>, config: Config) -> PyResult<RuntimeHandle> {
     py.allow_threads(|| {
+        let bootstrap_config: BootstrapConfig = config.into();
+
+        // Honor the worker-thread override if provided. `worker_threads(0)`
+        // would panic in tokio, so treat any non-positive value as "use
+        // default" — matches the contract that `None` and `Some(0)` are
+        // equivalent no-ops.
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        if let Some(n) = bootstrap_config.runtime.worker_threads {
+            if n > 0 {
+                builder.worker_threads(n);
+            }
+        }
         let rt = Arc::new(
-            tokio::runtime::Runtime::new()
+            builder
+                .build()
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?,
         );
-
-        let bootstrap_config: BootstrapConfig = config.into();
 
         let internal_token = rt.block_on(async {
             crate::bootstrap::bootstrap(bootstrap_config)
@@ -560,6 +605,7 @@ pub fn _runtime(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ModelConfig>()?;
     m.add_class::<DeviceConfig>()?;
     m.add_class::<SchedulerConfig>()?;
+    m.add_class::<RuntimeConfig>()?;
     m.add_class::<RuntimeHandle>()?;
     m.add_class::<RpcServer>()?;
     m.add_function(wrap_pyfunction!(py_bootstrap, m)?)?;

@@ -29,6 +29,7 @@ pub struct Config {
     pub log_dir: Option<PathBuf>,
     pub registry_url: String,
     pub telemetry: TelemetryConfig,
+    pub runtime: RuntimeConfig,
     pub models: Vec<ModelConfig>,
     /// Allow inferlets to access a sandboxed scratch filesystem.
     pub allow_filesystem: bool,
@@ -41,6 +42,18 @@ pub struct Config {
     /// Disable via `python_snapshot = false` in the engine config or the
     /// `--no-snapshot` CLI flag.
     pub python_snapshot: bool,
+}
+
+/// Tokio runtime tuning. All fields are opt-in — leaving them at their
+/// defaults yields the stock `tokio::runtime::Runtime::new()` behavior.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeConfig {
+    /// Number of tokio worker threads. `None` = let tokio default to
+    /// `num_cpus`. On boxes with high logical-core counts and many
+    /// in-flight tasks, lowering this (e.g. to 8) cuts migration /
+    /// context-switch overhead and can give a substantial throughput
+    /// win — see comments in `RuntimeConfig` on the Python side.
+    pub worker_threads: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

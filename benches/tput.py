@@ -22,7 +22,7 @@ from pie_client import Event
 
 async def run_benchmark(args):
     from pie.server import Server
-    from pie.config import Config, ModelConfig, AuthConfig
+    from pie.config import Config, ModelConfig, AuthConfig, RuntimeConfig
 
     if args.driver == "native" and args.use_cuda_graphs:
         print("ERROR: --use-cuda-graphs is not supported on the native driver.",
@@ -114,6 +114,7 @@ async def run_benchmark(args):
         ),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
+        runtime=RuntimeConfig(worker_threads=args.worker_threads),
         models={
             "default": ModelConfig(
                 name="default",
@@ -288,6 +289,10 @@ def main():
                              "Default 1000.0 effectively disables the gate; lower it to study admission behavior.")
     parser.add_argument("--warmup-requests", type=int, default=0,
                         help="Number of warmup requests to run (and discard) before timing")
+    parser.add_argument("--worker-threads", type=int, default=None,
+                        help="Tokio runtime worker-thread count override "
+                             "(default: tokio's num_cpus). Lowering this on "
+                             "many-core boxes can cut migration overhead.")
 
     args = parser.parse_args()
 

@@ -80,6 +80,33 @@ class TelemetryConfig:
 
 
 @dataclass
+class RuntimeConfig:
+    """Tokio runtime tuning (the `[runtime]` block).
+
+    All fields are opt-in — leaving the section out yields the stock
+    `tokio::runtime::Runtime::new()` defaults.
+
+    `worker_threads`: number of tokio worker threads. `None` (default)
+    lets tokio pick `num_cpus`. On boxes with high logical-core counts
+    and many in-flight tasks (e.g. 96 cores at high request
+    concurrency), the default can cause heavy migration / context-switch
+    overhead; lowering this (commonly to 8) substantially improves
+    throughput. For real GPU backends where Python compute dominates,
+    the default is fine — leave this unset unless a profile shows
+    benefit.
+    """
+
+    worker_threads: int | None = None
+
+    def __post_init__(self):
+        if self.worker_threads is not None and self.worker_threads <= 0:
+            raise ValueError(
+                f"runtime.worker_threads must be > 0 if set "
+                f"(got {self.worker_threads!r})"
+            )
+
+
+@dataclass
 class SchedulerConfig:
     """The `[model.X.scheduler]` block.
 
@@ -166,6 +193,7 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     models: dict[str, ModelConfig] = field(default_factory=dict)
 
     @property
@@ -220,6 +248,12 @@ enabled = false
 enabled = false
 endpoint = "http://localhost:4317"
 service_name = "pie"
+
+# [runtime]
+# Tokio runtime tuning. Leave the section out for stock defaults.
+# Lower `worker_threads` on boxes with many logical cores when you see
+# high context-switch / migration overhead under concurrency.
+# worker_threads = 8
 
 [model.default]
 hf_repo = "{DEFAULT_MODEL}"
@@ -359,6 +393,7 @@ def load_config(
     server_raw = raw.get("server", {})
     auth_raw = raw.get("auth", {})
     telemetry_raw = raw.get("telemetry", {})
+    runtime_raw = raw.get("runtime", {})
     model_raw = raw.get("model", {})
 
     if not isinstance(model_raw, dict) or not model_raw:
@@ -384,6 +419,15 @@ def load_config(
 
     auth_enabled = (not no_auth) and bool(auth_raw.get("enabled", True))
 
+    if not isinstance(runtime_raw, dict):
+        raise ValueError(
+            f"[runtime] must be a TOML table, got {type(runtime_raw).__name__}."
+        )
+    worker_threads = runtime_raw.get("worker_threads")
+    runtime_cfg = RuntimeConfig(
+        worker_threads=int(worker_threads) if worker_threads is not None else None,
+    )
+
     return Config(
         server=server,
         auth=AuthConfig(enabled=auth_enabled),
@@ -392,5 +436,6 @@ def load_config(
             endpoint=str(telemetry_raw.get("endpoint", "http://localhost:4317")),
             service_name=str(telemetry_raw.get("service_name", "pie")),
         ),
+        runtime=runtime_cfg,
         models=models,
     )
