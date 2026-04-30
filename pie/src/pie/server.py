@@ -97,6 +97,29 @@ class Server:
     async def __aenter__(self) -> Server:
         console = Console(quiet=True)
 
+        # Pre-warm CUDA in the main thread so torch.cuda.device_count()
+        # populates `_cached_device_count`. Without this, the first call
+        # happens inside `_bootstrap`'s asyncio.to_thread worker, where
+        # both torch's NVML path and the CUDA-driver fallback can return 0
+        # — yielding a spurious "0 GPU(s) visible" RuntimeError even when
+        # GPUs are present.
+        #
+        # Note: torch's `device_count()` only stores the cache when
+        # `torch.cuda._initialized` is True, so we trigger lazy init first
+        # via `torch.cuda.init()`. Both calls are best-effort: if a GPU is
+        # genuinely missing they are no-ops/raise and the bootstrap thread
+        # surfaces the real error downstream.
+        #
+        # See: https://docs.pytorch.org/docs/stable/generated/torch.cuda.device_count.html
+        # ("This API will NOT poison fork if NVML discovery succeeds") and
+        # pytorch/pytorch#83973 for design context on the NVML path.
+        import torch
+        try:
+            torch.cuda.init()
+        except Exception:
+            pass
+        _ = torch.cuda.device_count()
+
         # Make sure the Python WASM runtime is on disk before the engine
         # spins up. The runtime tarball provides the `componentize-py-runtime`
         # core module that Python inferlets link against; without it,
