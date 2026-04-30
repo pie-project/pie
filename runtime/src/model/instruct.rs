@@ -102,7 +102,14 @@ pub trait Instruct: Send + Sync {
     }
 }
 
-/// Create the appropriate instruct implementation for the given architecture.
+/// Dispatch on the pie internal arch name resolved by the Python driver.
+///
+/// HF identity (`architectures[0]` class name, `model_type`, and any
+/// disambiguating config fields like `rope_scaling`) never crosses the FFI
+/// boundary — Python's `pie_driver.model.resolve()` is the single owner
+/// of that translation. See pie-project/pie#328: the regression there
+/// came from the vllm/sgl drivers forwarding a raw HF class name and
+/// Rust silently hitting the fallback arm below.
 pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
     use self::qwen3::{QwenInstruct, ChatMLConfig};
 
@@ -120,10 +127,66 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         "gemma2" | "gemma3" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
         "mistral3" | "ministral3" => Arc::new(self::mistral3::MistralInstruct::new(tokenizer)),
         "olmo3" => Arc::new(self::olmo3::OlmoInstruct::new(tokenizer)),
+        // Silent fallback returns Qwen ChatML — wrong template for non-Qwen
+        // models. Any unrecognised name here means the Python driver skipped
+        // pie_driver.model.resolve() or sent an HF class name; that's the
+        // bug, not a missing arm here.
         _ => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
             has_thinking: false,
             has_tools: false,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::tokenizer::Tokenizer;
+
+    fn make_tok() -> Arc<Tokenizer> {
+        let v: Vec<String> = vec![
+            "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+            "system", "\n", "user", "assistant",
+            "<think>", "</think>",
+        ].into_iter().map(String::from).collect();
+        Arc::new(Tokenizer::from_vocab(&v))
+    }
+
+    /// Resolved pie internal name -> reasoning enabled. The Python driver
+    /// (pie_driver.model.resolve) is responsible for sending this exact form.
+    #[test]
+    fn qwen3_pie_name_enables_thinking() {
+        let tok = make_tok();
+        let inst = create("qwen3", tok.clone());
+        let mut dec = inst.reasoning_decoder();
+        let think_id = tok.encode("<think>");
+        match dec.feed(&think_id) {
+            ReasoningEvent::Start => {}
+            other => panic!(
+                "create(\"qwen3\") gave a no-op reasoning decoder: {other:?}"
+            ),
+        }
+    }
+
+    /// Raw HF class name MUST hit the fallback arm. Pie runtime is not in the
+    /// business of recognising HF strings — that translation is the Python
+    /// driver's job (#328). If this test starts failing, someone added an
+    /// HF alias to `create()`; remove it and fix the driver instead.
+    #[test]
+    fn hf_class_name_hits_fallback() {
+        let tok = make_tok();
+        let inst = create("Qwen3ForCausalLM", tok.clone());
+        let mut dec = inst.reasoning_decoder();
+        let think_id = tok.encode("<think>");
+        match dec.feed(&think_id) {
+            ReasoningEvent::Delta(s) if s.is_empty() => {}
+            other => panic!(
+                "create(\"Qwen3ForCausalLM\") was supposed to hit the no-op \
+                 fallback (NoopReasoningDecoder always returns Delta(\"\")), \
+                 got {other:?}. Did someone alias an HF class name in \
+                 create()? See #328 — keep HF resolution in pie_driver.model.resolve()."
+            ),
+        }
     }
 }

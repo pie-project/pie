@@ -60,8 +60,11 @@ class DriverCapabilities:
     max_batch_size: int
 
     # ── Model-architecture facts ───────────────────────────────────────
-    # First architecture string from the HF config (e.g. "LlamaForCausalLM",
-    # "Qwen3ForCausalLM"). Forwarded to Rust as ModelConfig.arch_name.
+    # Pie internal arch name (lowercase: "qwen3", "llama3", …) — the
+    # dispatch key the Rust runtime expects. Drivers MUST resolve this
+    # via `pie_driver.model.resolve()` from the HF config; raw HF class
+    # names like "Qwen3ForCausalLM" are NOT accepted on the Rust side.
+    # See pie_driver/model/__init__.py and pie-project/pie#328.
     arch_name: str
 
     # Vocabulary size and max context length. Currently Python-only —

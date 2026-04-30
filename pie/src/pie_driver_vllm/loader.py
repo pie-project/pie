@@ -60,7 +60,7 @@ class LoadedModel:
     vllm_config: Any           # vllm.config.VllmConfig
     attn_backend: Any          # resolved AttentionBackend class (or None — resolved lazily)
     model_config: Any          # vllm's ModelConfig — exposes vocab_size, num_layers, etc.
-    arch_type: str             # HF architecture string, e.g. "LlamaForCausalLM"
+    arch_type: str             # pie internal arch name (e.g. "llama3"); resolved via pie_driver.model.resolve()
     info: dict
     snapshot_dir: str | None
 
@@ -204,20 +204,19 @@ def load_vllm_model(
         )
         _log("Model weights loaded", "INFO")
 
-    # Architecture string (first arch in the HF config). Used for telemetry
-    # and as the `arch_type` reported back through pie's ready handshake.
-    # Multimodal HF configs (e.g. Qwen3.5) carry `architectures` only on the
-    # top-level config; the inner `text_config` is None there. Fall back to
-    # the outer `hf_config` so multimodal text-only loads still report a name.
+    # Resolve HF identity to pie's internal arch name (the dispatch key
+    # the Rust runtime expects). Multimodal HF configs (e.g. Qwen3.5)
+    # carry `model_type` only on the inner `hf_text_config`; fall through
+    # to the outer `hf_config` so text-only loads still resolve.
+    from pie_driver.model import resolve as resolve_pie_arch
+    try:
+        arch_type = resolve_pie_arch(vllm_config.model_config.hf_text_config)
+    except Exception:
+        arch_type = resolve_pie_arch(vllm_config.model_config.hf_config)
+
     text_arches = vllm_config.model_config.hf_text_config.architectures
     outer_arches = getattr(vllm_config.model_config.hf_config, "architectures", None)
     arches = list(text_arches or outer_arches or [])
-    if not arches:
-        raise RuntimeError(
-            f"vllm's HF config for {config.hf_repo} has no `architectures` field. "
-            "Pie needs at least one HF architecture string."
-        )
-    arch_type = arches[0]
 
     info = {
         "architecture": {"type": arch_type, "all": arches},
@@ -231,9 +230,7 @@ def load_vllm_model(
     # Snapshot dir: pie's Rust runtime needs a local filesystem path that
     # contains tokenizer.json (and the HF config). vllm's `model_config.model`
     # is just the HF repo name like "Qwen/Qwen3-0.6B", so we resolve it to
-    # the cached snapshot via huggingface_hub. (We avoid `pie_driver.hf_utils`
-    # because it transitively imports `pie_kernels` which JIT-compiles CUDA
-    # extensions; that's heavy and irrelevant on the vllm path.)
+    # the cached snapshot via huggingface_hub.
     snapshot_dir = _resolve_hf_snapshot_dir(config.hf_repo)
     if snapshot_dir is None:
         raise RuntimeError(

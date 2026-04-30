@@ -62,22 +62,20 @@ class ModelLoader:
         # Load config from HuggingFace config.json
         hf_config = hf_utils.load_hf_config(self.snapshot_dir)
 
-        # Derive architecture from HF model_type
-        hf_model_type = hf_config.get("model_type", "")
-        # Handle case where model_type might be mapped (e.g. llama -> llama3)
-        # We need hf_utils.HF_TO_PIE_ARCH to map it.
-        # If it's not in the map, check if it's already a valid PIE type (less likely but possible)
-        arch_type = hf_utils.HF_TO_PIE_ARCH.get(hf_model_type)
-
-        if arch_type is None:
-            # Basic fallback or error
-            if hf_model_type in hf_utils.HF_TO_PIE_ARCH.values():
+        # Derive pie internal arch name from HF identity. Single source of
+        # truth: pie_driver.model.resolve().
+        from .model import resolve as resolve_pie_arch, UnknownArchitectureError, HF_TO_PIE_ARCH
+        try:
+            arch_type = resolve_pie_arch(hf_config)
+        except UnknownArchitectureError as e:
+            # Soft fallback for callers that already pass a pie internal name
+            # via `model_type` (legacy behavior — kept until external callers
+            # migrate). Strict path is `resolve()`.
+            hf_model_type = hf_config.get("model_type", "")
+            if hf_model_type in HF_TO_PIE_ARCH.values():
                 arch_type = hf_model_type
             else:
-                raise ValueError(
-                    f"Unsupported HuggingFace model_type: '{hf_model_type}'. "
-                    f"Supported types: {list(hf_utils.HF_TO_PIE_ARCH.keys())}"
-                )
+                raise ValueError(str(e)) from e
 
         # Inject PIE type into config for runtime to use
         hf_config["type"] = arch_type
