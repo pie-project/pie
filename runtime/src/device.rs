@@ -93,12 +93,18 @@ pub fn notify<T: Serialize>(device_idx: usize, method: &str, args: &T) -> Result
 // Convenience Wrappers
 // =============================================================================
 
-/// Fires a batched forward pass on the given device (30 s timeout).
+/// Fires a batched forward pass on the given device (300 s timeout).
+///
+/// The first forward of any vllm/sglang backend triggers flashinfer JIT
+/// compilation + (when not in eager mode) torch.compile, which together
+/// can take 30–60 s on a fresh container. The original 30 s budget was
+/// for steady-state decode batches; reusing it for first-call warmup
+/// times out the inferlet before any token comes back.
 pub async fn fire_batch(
     device_idx: usize,
     batch: &crate::inference::request::BatchedForwardPassRequest,
 ) -> Result<crate::inference::request::BatchedForwardPassResponse> {
-    call_with_timeout(device_idx, "fire_batch", batch, Duration::from_secs(30)).await
+    call_with_timeout(device_idx, "fire_batch", batch, Duration::from_secs(300)).await
 }
 
 /// GPU → CPU page copy (fire-and-forget).
