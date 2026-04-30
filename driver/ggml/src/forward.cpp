@@ -1091,26 +1091,38 @@ inline bool needs_msgpack_mode(const std::vector<SamplerOutput>& outs) {
     return false;
 }
 
+// Shared 16-byte BPIS response header. Both flat and msgpack responses
+// start with this; only the `mode` field and the meaning of `total_tokens`
+// differ. Returns the header size for chaining.
+constexpr std::size_t BPIS_HEADER_SIZE = 16;
+
+inline void write_bpis_header(std::span<std::uint8_t> dst,
+                              std::uint32_t mode,
+                              std::uint32_t n_req,
+                              std::uint32_t total_tokens) {
+    if (dst.size() < BPIS_HEADER_SIZE) {
+        throw std::runtime_error("response: dst too small for BPIS header");
+    }
+    auto write_u32 = [](std::uint8_t* p, std::uint32_t v) {
+        std::memcpy(p, &v, 4);
+    };
+    write_u32(dst.data() + 0,  RESP_MAGIC);
+    write_u32(dst.data() + 4,  mode);
+    write_u32(dst.data() + 8,  n_req);
+    write_u32(dst.data() + 12, total_tokens);
+}
+
 // Emit a `BPIS` msgpack-mode response with one ForwardPassResponse per
 // request. Field shapes mirror `runtime/src/inference/request.rs` and
 // Pie's Python `write_response` (rmp_serde + serde derive accepts maps
 // with field-name keys).
 std::size_t write_msgpack_response(std::span<std::uint8_t> dst,
                                    const std::vector<SamplerOutput>& outs) {
-    constexpr std::size_t HEADER = 16;
-    if (dst.size() < HEADER) {
-        throw std::runtime_error("response: dst too small for msgpack header");
-    }
+    write_bpis_header(dst, RESP_MODE_MSGPACK,
+                      static_cast<std::uint32_t>(outs.size()),
+                      /*total_tokens=*/ 0);  // unused in msgpack mode
 
-    auto write_u32 = [](std::uint8_t* p, std::uint32_t v) {
-        std::memcpy(p, &v, 4);
-    };
-    write_u32(dst.data() + 0, RESP_MAGIC);
-    write_u32(dst.data() + 4, RESP_MODE_MSGPACK);
-    write_u32(dst.data() + 8, static_cast<std::uint32_t>(outs.size()));
-    write_u32(dst.data() + 12, 0);  // total_tokens unused in msgpack mode
-
-    MsgpackWriter w(dst.subspan(HEADER));
+    MsgpackWriter w(dst.subspan(BPIS_HEADER_SIZE));
     // {"results": [ ... ]}
     w.map_header(1);
     w.str("results");
@@ -1170,16 +1182,15 @@ std::size_t write_msgpack_response(std::span<std::uint8_t> dst,
         w.str("spec_positions");
         w.array_header(0);
     }
-    return HEADER + w.size();
+    return BPIS_HEADER_SIZE + w.size();
 }
 
 std::size_t write_flat_response(std::span<std::uint8_t> dst,
                                 std::span<const std::uint32_t> tokens_per_req,
                                 std::span<const std::uint32_t> all_tokens) {
-    const std::size_t n_req       = tokens_per_req.size();
+    const std::size_t n_req        = tokens_per_req.size();
     const std::size_t total_tokens = all_tokens.size();
-    const std::size_t header_size = 16;
-    const std::size_t need = header_size + n_req * 4 + total_tokens * 4;
+    const std::size_t need = BPIS_HEADER_SIZE + n_req * 4 + total_tokens * 4;
 
     if (dst.size() < need) {
         throw std::runtime_error(
@@ -1187,19 +1198,139 @@ std::size_t write_flat_response(std::span<std::uint8_t> dst,
             ", need " + std::to_string(need) + ")");
     }
 
-    auto write_u32 = [](std::uint8_t* p, std::uint32_t v) {
-        std::memcpy(p, &v, 4);
-    };
-    write_u32(dst.data() + 0, RESP_MAGIC);
-    write_u32(dst.data() + 4, RESP_MODE_FLAT);
-    write_u32(dst.data() + 8, static_cast<std::uint32_t>(n_req));
-    write_u32(dst.data() + 12, static_cast<std::uint32_t>(total_tokens));
-
-    std::memcpy(dst.data() + header_size,
+    write_bpis_header(dst, RESP_MODE_FLAT,
+                      static_cast<std::uint32_t>(n_req),
+                      static_cast<std::uint32_t>(total_tokens));
+    std::memcpy(dst.data() + BPIS_HEADER_SIZE,
                 tokens_per_req.data(), n_req * 4);
-    std::memcpy(dst.data() + header_size + n_req * 4,
+    std::memcpy(dst.data() + BPIS_HEADER_SIZE + n_req * 4,
                 all_tokens.data(), total_tokens * 4);
     return need;
+}
+
+// -----------------------------------------------------------------------------
+// Compute helpers
+// -----------------------------------------------------------------------------
+
+// Stage all per-batch host arrays into the graph's input tensors. Picks
+// between the slow (per-request) path and the M11 packed-decode fast path
+// based on `plan.pure_decode`.
+void upload_graph_inputs(const GraphResult& g,
+                         const ForwardEngine::BatchPlan& plan) {
+    ggml_backend_tensor_set(g.in.tok_input, plan.tokens_i32.data(), 0,
+                            plan.tokens_i32.size() * sizeof(std::int32_t));
+    ggml_backend_tensor_set(g.in.pos_input, plan.positions_i32.data(), 0,
+                            plan.positions_i32.size() * sizeof(std::int32_t));
+    ggml_backend_tensor_set(g.in.kv_idxs, plan.kv_idxs_i64.data(), 0,
+                            plan.kv_idxs_i64.size() * sizeof(std::int64_t));
+    ggml_backend_tensor_set(g.in.out_idx, plan.sampling_pos_i32.data(), 0,
+                            plan.sampling_pos_i32.size() * sizeof(std::int32_t));
+    if (plan.pure_decode) {
+        ggml_backend_tensor_set(g.in.packed_gather,
+                                plan.packed_gather_idxs.data(), 0,
+                                plan.packed_gather_idxs.size() * sizeof(std::int32_t));
+        ggml_backend_tensor_set(g.in.packed_mask,
+                                plan.packed_mask_f16.data(), 0,
+                                plan.packed_mask_f16.size() * sizeof(std::uint16_t));
+    } else {
+        for (std::size_t r = 0; r < plan.reqs.size(); ++r) {
+            const auto& mask = plan.reqs[r].mask_f16;
+            const auto& gat  = plan.reqs[r].gather_idxs;
+            ggml_backend_tensor_set(g.in.masks[r], mask.data(), 0,
+                                    mask.size() * sizeof(std::uint16_t));
+            ggml_backend_tensor_set(g.in.gather_idxs[r], gat.data(), 0,
+                                    gat.size() * sizeof(std::int32_t));
+        }
+    }
+}
+
+// Returns true if any slot produced a special-sampler payload
+// (Distribution / RawLogits / Logprob / Logprobs / Entropy).
+inline bool any_slot_special(const std::vector<SlotOutput>& slots) {
+    for (const auto& s : slots) {
+        if (s.has_dist || !s.raw_logits.empty()
+            || !s.logprobs.empty() || s.has_entropy) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Sample every slot for one request (after BRLE logit-mask application).
+std::vector<SlotOutput> sample_request_slots(const ForwardEngine::ReqPlan& rp,
+                                             float* slots_logits_base,
+                                             std::int32_t n_slots,
+                                             std::int32_t vocab_size) {
+    std::vector<SlotOutput> out(n_slots);
+    for (std::int32_t s = 0; s < n_slots; ++s) {
+        float* row = slots_logits_base + static_cast<std::size_t>(s) * vocab_size;
+        if (!rp.logit_mask_runs.empty()) {
+            apply_brle_logit_mask(row, vocab_size,
+                                  rp.logit_mask_runs.data(),
+                                  rp.logit_mask_runs.size());
+        }
+        sample_slot(row, vocab_size, rp.sampler, out[s]);
+    }
+    return out;
+}
+
+// Resolve per-request sampled slots into a final SamplerOutput. Three
+// modes:
+//   - special: hand through per-slot special payloads
+//   - spec decode: walk drafts vs predictions, accept matching prefix +
+//     1 bonus token
+//   - plain: emit the single sampled token
+void resolve_request_output(const ForwardEngine::ReqPlan& rp,
+                            std::vector<SlotOutput>&& slot_out,
+                            SamplerOutput& dst) {
+    if (any_slot_special(slot_out)) {
+        dst.special_slots = std::move(slot_out);
+        return;
+    }
+    const std::int32_t n_drafts =
+        static_cast<std::int32_t>(rp.draft_tokens.size());
+    if (n_drafts == 0) {
+        dst.tokens.push_back(slot_out[0].token);
+        return;
+    }
+    // Spec verifier walk. Slot k predicts the token that should follow
+    // draft k (slot 0 predicts the first draft itself). Accept the
+    // matching prefix + 1 bonus.
+    dst.tokens.reserve(n_drafts + 1);
+    bool all_match = true;
+    for (std::int32_t k = 0; k < n_drafts; ++k) {
+        if (slot_out[k].token == rp.draft_tokens[k]) {
+            dst.tokens.push_back(rp.draft_tokens[k]);
+        } else {
+            dst.tokens.push_back(slot_out[k].token);  // bonus replacing rejected
+            all_match = false;
+            break;
+        }
+    }
+    if (all_match) {
+        // Every draft accepted — append the bonus from the last slot.
+        dst.tokens.push_back(slot_out[n_drafts].token);
+    }
+}
+
+// Top-level batch sampler: walk the per-request slot output starting at
+// `all_logits` (laid out flat as [n_slots, vocab_size]).
+std::vector<SamplerOutput> sample_batch(const ForwardEngine::BatchPlan& plan,
+                                        float* all_logits,
+                                        std::int32_t vocab_size) {
+    const std::int32_t n_req = static_cast<std::int32_t>(plan.reqs.size());
+    std::vector<SamplerOutput> sampled(n_req);
+    std::int32_t slot_off = 0;
+    for (std::int32_t r = 0; r < n_req; ++r) {
+        const auto& rp = plan.reqs[r];
+        const std::int32_t n_slots =
+            static_cast<std::int32_t>(rp.sampling_positions.size());
+        float* base = all_logits + static_cast<std::size_t>(slot_off) * vocab_size;
+        auto slot_out = sample_request_slots(rp, base, n_slots, vocab_size);
+        resolve_request_output(rp, std::move(slot_out), sampled[r]);
+        slot_off += n_slots;
+    }
+    return sampled;
 }
 
 }  // namespace
@@ -1386,54 +1517,25 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
     ggml_context* ctx = ggml_init(ip);
     if (!ctx) throw std::runtime_error("compute: ggml_init failed");
 
-    GraphResult g;
-    try {
-        g = build_qwen3_graph(ctx, model_, kv_, plan);
-    } catch (...) {
-        ggml_free(ctx);
-        throw;
-    }
+    // RAII for the context; ensures ggml_free() runs on every exit path.
+    auto ctx_guard = std::unique_ptr<ggml_context, decltype(&ggml_free)>(
+        ctx, &ggml_free);
+
+    const GraphResult g = build_qwen3_graph(ctx, model_, kv_, plan);
 
     if (!ggml_gallocr_alloc_graph(galloc_, g.gf)) {
-        ggml_free(ctx);
         throw std::runtime_error("compute: gallocr_alloc_graph failed");
     }
 
-    ggml_backend_tensor_set(g.in.tok_input, plan.tokens_i32.data(), 0,
-                            plan.tokens_i32.size() * sizeof(std::int32_t));
-    ggml_backend_tensor_set(g.in.pos_input, plan.positions_i32.data(), 0,
-                            plan.positions_i32.size() * sizeof(std::int32_t));
-    ggml_backend_tensor_set(g.in.kv_idxs, plan.kv_idxs_i64.data(), 0,
-                            plan.kv_idxs_i64.size() * sizeof(std::int64_t));
-    ggml_backend_tensor_set(g.in.out_idx, plan.sampling_pos_i32.data(), 0,
-                            plan.sampling_pos_i32.size() * sizeof(std::int32_t));
-    if (plan.pure_decode) {
-        ggml_backend_tensor_set(g.in.packed_gather,
-                                plan.packed_gather_idxs.data(), 0,
-                                plan.packed_gather_idxs.size() * sizeof(std::int32_t));
-        ggml_backend_tensor_set(g.in.packed_mask,
-                                plan.packed_mask_f16.data(), 0,
-                                plan.packed_mask_f16.size() * sizeof(std::uint16_t));
-    } else {
-        for (std::size_t r = 0; r < plan.reqs.size(); ++r) {
-            const auto& mask = plan.reqs[r].mask_f16;
-            const auto& gat  = plan.reqs[r].gather_idxs;
-            ggml_backend_tensor_set(g.in.masks[r], mask.data(), 0,
-                                    mask.size() * sizeof(std::uint16_t));
-            ggml_backend_tensor_set(g.in.gather_idxs[r], gat.data(), 0,
-                                    gat.size() * sizeof(std::int32_t));
-        }
-    }
+    upload_graph_inputs(g, plan);
 
     const auto status = ggml_backend_graph_compute(model_.backend(), g.gf);
     if (status != GGML_STATUS_SUCCESS) {
-        ggml_free(ctx);
         throw std::runtime_error("compute: graph_compute status=" +
                                  std::to_string(static_cast<int>(status)));
     }
 
     const std::int32_t vocab_size = model_.hparams().vocab_size;
-    const std::int32_t n_req = static_cast<std::int32_t>(plan.reqs.size());
     const std::int32_t n_slots =
         static_cast<std::int32_t>(plan.sampling_pos_i32.size());
     std::vector<float> all_logits(
@@ -1441,79 +1543,7 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
     ggml_backend_tensor_get(g.logits, all_logits.data(), 0,
                             all_logits.size() * sizeof(float));
 
-    std::vector<SamplerOutput> sampled(n_req);
-    std::int32_t slot_off = 0;
-    for (std::int32_t r = 0; r < n_req; ++r) {
-        const auto& rp = plan.reqs[r];
-        const std::int32_t n_req_slots =
-            static_cast<std::int32_t>(rp.sampling_positions.size());
-
-        // Sample each slot independently. For spec-decode this gives one
-        // model prediction per (last_pending + draft) position.
-        std::vector<SlotOutput> slot_out(n_req_slots);
-        for (std::int32_t s = 0; s < n_req_slots; ++s) {
-            float* row = all_logits.data() +
-                         (slot_off + s) * vocab_size;
-            // Logit mask applies to every slot for this request.
-            const auto& runs = rp.logit_mask_runs;
-            if (!runs.empty()) {
-                apply_brle_logit_mask(row, vocab_size,
-                                      runs.data(), runs.size());
-            }
-            sample_slot(row, vocab_size, rp.sampler, slot_out[s]);
-        }
-
-        // Walk samples vs drafts. For non-spec (n_req_slots == 1), this
-        // just emits the single sampled token.
-        const std::int32_t n_drafts =
-            static_cast<std::int32_t>(rp.draft_tokens.size());
-
-        // Are any slots special-output (Distribution / RawLogits / etc.)?
-        bool any_special = false;
-        for (const auto& s : slot_out) {
-            if (s.has_dist || !s.raw_logits.empty()
-                || !s.logprobs.empty() || s.has_entropy) {
-                any_special = true; break;
-            }
-        }
-
-        if (any_special) {
-            // Special-sampler path: don't run the spec walk; just hand
-            // through the per-slot outputs (mostly applicable to slot 0;
-            // spec + special is unusual and treated structurally only).
-            sampled[r].special_slots = std::move(slot_out);
-        } else if (n_drafts > 0) {
-            // Spec-decode verifier walk. Slot s predicts the token at
-            // position p_{s} where:
-            //   slot 0 → first draft pos     (= rp.sampling_positions[1] in batch)
-            //   slot k → draft k's successor
-            // Compare prediction against the corresponding draft token;
-            // accept matching prefix + 1 bonus.
-            sampled[r].tokens.reserve(n_drafts + 1);
-            bool all_match = true;
-            for (std::int32_t k = 0; k < n_drafts; ++k) {
-                if (slot_out[k].token == rp.draft_tokens[k]) {
-                    sampled[r].tokens.push_back(rp.draft_tokens[k]);
-                } else {
-                    sampled[r].tokens.push_back(slot_out[k].token);  // bonus replacing rejected
-                    all_match = false;
-                    break;
-                }
-            }
-            if (all_match) {
-                // All drafts accepted — append the bonus from the last slot.
-                sampled[r].tokens.push_back(slot_out[n_drafts].token);
-            }
-        } else {
-            // Plain path.
-            sampled[r].tokens.push_back(slot_out[0].token);
-        }
-
-        slot_off += n_req_slots;
-    }
-
-    ggml_free(ctx);
-    return sampled;
+    return sample_batch(plan, all_logits.data(), vocab_size);
 }
 
 // -----------------------------------------------------------------------------
