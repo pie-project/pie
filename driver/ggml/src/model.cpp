@@ -26,6 +26,10 @@ ggml_type st_to_ggml_dtype(StDtype dt, const std::string& tensor_name) {
     }
 }
 
+std::string layer_path(std::int32_t i) {
+    return "model.layers." + std::to_string(i) + ".";
+}
+
 // HF/PyTorch shape `[d_n, ..., d_0]` → ggml ne `[d_0, d_1, ..., d_n]`.
 // Memory layout is row-major in both, so reversing the dimension list
 // produces the correct ggml tensor without touching bytes.
@@ -296,39 +300,137 @@ std::string Model::activation_dtype_str() const {
 
 // -----------------------------------------------------------------------------
 // Per-arch builders
+//
+// All dense (non-MoE) archs share a common skeleton; the variations are
+// captured by `LoaderSpec`. MoE archs add stacked-expert tensors driven by
+// `LoaderSpec::moe`. Phi3 keeps its own per-layer loop because its fused
+// QKV / gate_up tensors require offset-based slicing.
 // -----------------------------------------------------------------------------
 
-void Model::build_qwen3_() {
+void Model::load_top_level_() {
     const auto& h = hparams_;
-
     weights_.tok_embd    = declare_("model.embed_tokens.weight");
     weights_.output_norm = declare_("model.norm.weight");
     if (!h.tie_word_embeddings) {
         weights_.output_head = declare_("lm_head.weight");
     }
-
     weights_.layers.resize(h.num_hidden_layers);
-    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
-        auto& L = weights_.layers[i];
+}
 
-        L.attn_norm = declare_(p + "input_layernorm.weight");
-        L.ffn_norm  = declare_(p + "post_attention_layernorm.weight");
+void Model::load_layer_(std::int32_t i, const LoaderSpec& spec) {
+    const std::string p = layer_path(i);
+    auto& L = weights_.layers[i];
 
-        L.q_proj = declare_(p + "self_attn.q_proj.weight");
-        L.k_proj = declare_(p + "self_attn.k_proj.weight");
-        L.v_proj = declare_(p + "self_attn.v_proj.weight");
-        L.o_proj = declare_(p + "self_attn.o_proj.weight");
+    L.attn_norm = declare_(p + "input_layernorm.weight");
+    L.ffn_norm  = declare_(p + spec.ffn_norm_name + ".weight");
+    if (spec.has_post_attn_norm) {
+        L.post_attn_norm = declare_(p + "post_attention_layernorm.weight");
+    }
+    if (spec.has_post_ffn_norm) {
+        L.post_ffn_norm  = declare_(p + "post_feedforward_layernorm.weight");
+    }
 
-        // Qwen3-specific QK norm.
+    L.q_proj = declare_(p + "self_attn.q_proj.weight");
+    L.k_proj = declare_(p + "self_attn.k_proj.weight");
+    L.v_proj = declare_(p + "self_attn.v_proj.weight");
+    L.o_proj = declare_(p + "self_attn.o_proj.weight");
+
+    if (spec.has_qkv_bias) {
+        L.q_proj_b = declare_(p + "self_attn.q_proj.bias");
+        L.k_proj_b = declare_(p + "self_attn.k_proj.bias");
+        L.v_proj_b = declare_(p + "self_attn.v_proj.bias");
+    }
+    if (spec.has_qk_norm) {
         L.q_norm = declare_(p + "self_attn.q_norm.weight");
         L.k_norm = declare_(p + "self_attn.k_norm.weight");
+    }
 
+    if (spec.moe == LoaderSpec::MoeNaming::None) {
         L.gate_proj = declare_(p + "mlp.gate_proj.weight");
         L.up_proj   = declare_(p + "mlp.up_proj.weight");
         L.down_proj = declare_(p + "mlp.down_proj.weight");
+    } else {
+        load_moe_layer_(i, p, spec.moe);
     }
 }
+
+void Model::load_moe_layer_(std::int32_t i,
+                            const std::string& p,
+                            LoaderSpec::MoeNaming kind) {
+    const auto& h = hparams_;
+    auto& L = weights_.layers[i];
+
+    const std::int32_t n_exp  = h.num_experts;
+    const std::int64_t hidden = h.hidden_size;
+    const std::int64_t ff     = h.moe_intermediate_size > 0
+        ? h.moe_intermediate_size : h.intermediate_size;
+
+    std::vector<std::string> gate_names, up_names, down_names;
+    gate_names.reserve(n_exp);
+    up_names.reserve(n_exp);
+    down_names.reserve(n_exp);
+
+    if (kind == LoaderSpec::MoeNaming::MlpExperts) {
+        // Qwen-MoE / GPT-OSS layout.
+        L.moe_router = declare_(p + "mlp.gate.weight");
+        for (std::int32_t e = 0; e < n_exp; ++e) {
+            const std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+            gate_names.push_back(ep + "gate_proj.weight");
+            up_names  .push_back(ep + "up_proj.weight");
+            down_names.push_back(ep + "down_proj.weight");
+        }
+    } else {
+        // Mixtral layout: w1=gate, w2=down, w3=up, router under
+        // block_sparse_moe.gate.
+        L.moe_router = declare_(p + "block_sparse_moe.gate.weight");
+        for (std::int32_t e = 0; e < n_exp; ++e) {
+            const std::string ep = p + "block_sparse_moe.experts." + std::to_string(e) + ".";
+            gate_names.push_back(ep + "w1.weight");
+            up_names  .push_back(ep + "w3.weight");
+            down_names.push_back(ep + "w2.weight");
+        }
+    }
+
+    const ggml_type w_dtype =
+        st_to_ggml_dtype(archive_->at(gate_names[0]).dtype, gate_names[0]);
+    L.moe_gate_exps = declare_stacked_experts_(
+        p + "moe_gate", hidden, ff, n_exp, gate_names, w_dtype);
+    L.moe_up_exps   = declare_stacked_experts_(
+        p + "moe_up",   hidden, ff, n_exp, up_names,   w_dtype);
+    L.moe_down_exps = declare_stacked_experts_(
+        p + "moe_down", ff, hidden, n_exp, down_names, w_dtype);
+}
+
+void Model::build_qwen3_() {
+    LoaderSpec s;
+    s.has_qk_norm = true;
+    load_top_level_();
+    for (std::int32_t i = 0; i < hparams_.num_hidden_layers; ++i) {
+        load_layer_(i, s);
+    }
+}
+
+void Model::build_qwen2_() {
+    LoaderSpec s;
+    s.has_qkv_bias = true;
+    load_top_level_();
+    for (std::int32_t i = 0; i < hparams_.num_hidden_layers; ++i) {
+        load_layer_(i, s);
+    }
+}
+
+void Model::build_mistral3_() {
+    // Mistral / Mistral3: same tensor layout as Llama3 (no biases, no
+    // QK-norm, no rope_scaling.llama3). All sliding-window attention is
+    // encoded in the graph mask, not the weight set.
+    LoaderSpec s;
+    load_top_level_();
+    for (std::int32_t i = 0; i < hparams_.num_hidden_layers; ++i) {
+        load_layer_(i, s);
+    }
+}
+
+namespace {
 
 // Compute LLaMA-3.1 NTK-by-parts RoPE frequency factors. Mirrors
 // transformers' `_compute_llama3_parameters`. Returns a [head_dim/2] F32
@@ -342,7 +444,7 @@ void Model::build_qwen3_() {
 //
 // In ggml's `c` (freq_factors) tensor convention, c[i] divides the base
 // frequency, so c[i] = inv_freq_default / inv_freq_llama3.
-static std::vector<float> compute_llama3_freq_factors(
+std::vector<float> compute_llama3_freq_factors(
         std::int32_t head_dim,
         float rope_theta,
         float factor,
@@ -378,85 +480,39 @@ static std::vector<float> compute_llama3_freq_factors(
     return c;
 }
 
-void Model::build_llama3_() {
+}  // namespace
+
+// LLaMA-3.1+: NTK-by-parts scaling synthesizes a freq_factors tensor.
+// Llama 3.0 has no rope_scaling; this is a no-op there. Other archs
+// don't call this.
+void Model::synth_llama3_freq_factors_() {
     const auto& h = hparams_;
+    if (!h.has_rope_scaling || h.rope_scaling_type != "llama3") return;
 
-    weights_.tok_embd    = declare_("model.embed_tokens.weight");
-    weights_.output_norm = declare_("model.norm.weight");
-    if (!h.tie_word_embeddings) {
-        weights_.output_head = declare_("lm_head.weight");
-    }
-
-    weights_.layers.resize(h.num_hidden_layers);
-    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
-        auto& L = weights_.layers[i];
-
-        L.attn_norm = declare_(p + "input_layernorm.weight");
-        L.ffn_norm  = declare_(p + "post_attention_layernorm.weight");
-
-        L.q_proj = declare_(p + "self_attn.q_proj.weight");
-        L.k_proj = declare_(p + "self_attn.k_proj.weight");
-        L.v_proj = declare_(p + "self_attn.v_proj.weight");
-        L.o_proj = declare_(p + "self_attn.o_proj.weight");
-
-        // No QKV bias, no QK-norm in Llama3.
-
-        L.gate_proj = declare_(p + "mlp.gate_proj.weight");
-        L.up_proj   = declare_(p + "mlp.up_proj.weight");
-        L.down_proj = declare_(p + "mlp.down_proj.weight");
-    }
-
-    // LLaMA-3.1+ NTK-by-parts scaling: synthesize a freq_factors tensor.
-    // Llama 3.0 has no rope_scaling — fall through to plain NEOX RoPE.
-    if (h.has_rope_scaling && h.rope_scaling_type == "llama3") {
-        const auto factors = compute_llama3_freq_factors(
-            h.head_dim,
-            h.rope_theta,
-            h.rope_scaling_factor,
-            h.rope_scaling_low_freq_factor,
-            h.rope_scaling_high_freq_factor,
-            h.rope_scaling_original_max_position);
-        weights_.freq_factors =
-            ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, h.head_dim / 2);
-        ggml_set_name(weights_.freq_factors, "rope_freq_factors");
-        SynthTensor s;
-        s.tensor = weights_.freq_factors;
-        s.data.resize(factors.size() * sizeof(float));
-        std::memcpy(s.data.data(), factors.data(), s.data.size());
-        synth_.push_back(std::move(s));
-    }
+    const auto factors = compute_llama3_freq_factors(
+        h.head_dim,
+        h.rope_theta,
+        h.rope_scaling_factor,
+        h.rope_scaling_low_freq_factor,
+        h.rope_scaling_high_freq_factor,
+        h.rope_scaling_original_max_position);
+    weights_.freq_factors =
+        ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, h.head_dim / 2);
+    ggml_set_name(weights_.freq_factors, "rope_freq_factors");
+    SynthTensor s;
+    s.tensor = weights_.freq_factors;
+    s.data.resize(factors.size() * sizeof(float));
+    std::memcpy(s.data.data(), factors.data(), s.data.size());
+    synth_.push_back(std::move(s));
 }
 
-// Mistral / Mistral3: same tensor layout as Llama3 (no biases, no QK-norm,
-// no rope_scaling.llama3). All sliding-window attention is encoded in the
-// graph mask, not the weight set.
-void Model::build_mistral3_() {
-    const auto& h = hparams_;
-
-    weights_.tok_embd    = declare_("model.embed_tokens.weight");
-    weights_.output_norm = declare_("model.norm.weight");
-    if (!h.tie_word_embeddings) {
-        weights_.output_head = declare_("lm_head.weight");
+void Model::build_llama3_() {
+    LoaderSpec s;
+    load_top_level_();
+    for (std::int32_t i = 0; i < hparams_.num_hidden_layers; ++i) {
+        load_layer_(i, s);
     }
-
-    weights_.layers.resize(h.num_hidden_layers);
-    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
-        auto& L = weights_.layers[i];
-
-        L.attn_norm = declare_(p + "input_layernorm.weight");
-        L.ffn_norm  = declare_(p + "post_attention_layernorm.weight");
-
-        L.q_proj = declare_(p + "self_attn.q_proj.weight");
-        L.k_proj = declare_(p + "self_attn.k_proj.weight");
-        L.v_proj = declare_(p + "self_attn.v_proj.weight");
-        L.o_proj = declare_(p + "self_attn.o_proj.weight");
-
-        L.gate_proj = declare_(p + "mlp.gate_proj.weight");
-        L.up_proj   = declare_(p + "mlp.up_proj.weight");
-        L.down_proj = declare_(p + "mlp.down_proj.weight");
-    }
+    synth_llama3_freq_factors_();
 }
 
 // Phi3: HF stores fused QKV as `qkv_proj.weight` of shape
@@ -468,38 +524,20 @@ void Model::build_mistral3_() {
 // projection occupies a contiguous byte range of the fused tensor.
 void Model::build_phi3_() {
     const auto& h = hparams_;
-
-    weights_.tok_embd    = declare_("model.embed_tokens.weight");
-    weights_.output_norm = declare_("model.norm.weight");
-    if (!h.tie_word_embeddings) {
-        weights_.output_head = declare_("lm_head.weight");
-    }
-
-    weights_.layers.resize(h.num_hidden_layers);
-
-    // We need the fused tensor's dtype to compute byte offsets.
-    auto fused_dtype = [&](const std::string& name) -> std::pair<ggml_type, std::size_t> {
-        const auto& t = archive_->at(name);
-        ggml_type type;
-        switch (t.dtype) {
-            case StDtype::F32:  type = GGML_TYPE_F32;  break;
-            case StDtype::F16:  type = GGML_TYPE_F16;  break;
-            case StDtype::BF16: type = GGML_TYPE_BF16; break;
-            default:
-                throw std::runtime_error(
-                    "model phi3: unsupported fused-tensor dtype for '" + name +
-                    "': " + std::string(st_dtype_name(t.dtype)));
-        }
-        return {type, st_dtype_size(t.dtype)};
-    };
+    load_top_level_();
 
     const std::int64_t hidden = h.hidden_size;
     const std::int64_t n_q    = static_cast<std::int64_t>(h.num_attention_heads) * h.head_dim;
     const std::int64_t n_kv   = static_cast<std::int64_t>(h.num_key_value_heads) * h.head_dim;
     const std::int64_t n_ff   = h.intermediate_size;
 
+    auto fused_dtype = [&](const std::string& name) {
+        const auto& t = archive_->at(name);
+        return std::pair{st_to_ggml_dtype(t.dtype, name), st_dtype_size(t.dtype)};
+    };
+
     for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
+        const std::string p = layer_path(i);
         auto& L = weights_.layers[i];
 
         L.attn_norm = declare_(p + "input_layernorm.weight");
@@ -535,70 +573,26 @@ void Model::build_phi3_() {
 // Gemma2: extra norms (post_attention_layernorm + pre_feedforward_layernorm
 // + post_feedforward_layernorm), softcaps, alternating SWA layers.
 void Model::build_gemma2_() {
-    const auto& h = hparams_;
-
-    weights_.tok_embd    = declare_("model.embed_tokens.weight");
-    weights_.output_norm = declare_("model.norm.weight");
-    if (!h.tie_word_embeddings) {
-        weights_.output_head = declare_("lm_head.weight");
-    }
-
-    weights_.layers.resize(h.num_hidden_layers);
-    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
-        auto& L = weights_.layers[i];
-
-        L.attn_norm      = declare_(p + "input_layernorm.weight");
-        L.post_attn_norm = declare_(p + "post_attention_layernorm.weight");
-        L.ffn_norm       = declare_(p + "pre_feedforward_layernorm.weight");
-        L.post_ffn_norm  = declare_(p + "post_feedforward_layernorm.weight");
-
-        L.q_proj = declare_(p + "self_attn.q_proj.weight");
-        L.k_proj = declare_(p + "self_attn.k_proj.weight");
-        L.v_proj = declare_(p + "self_attn.v_proj.weight");
-        L.o_proj = declare_(p + "self_attn.o_proj.weight");
-
-        L.gate_proj = declare_(p + "mlp.gate_proj.weight");
-        L.up_proj   = declare_(p + "mlp.up_proj.weight");
-        L.down_proj = declare_(p + "mlp.down_proj.weight");
+    LoaderSpec s;
+    s.ffn_norm_name      = "pre_feedforward_layernorm";
+    s.has_post_attn_norm = true;
+    s.has_post_ffn_norm  = true;
+    load_top_level_();
+    for (std::int32_t i = 0; i < hparams_.num_hidden_layers; ++i) {
+        load_layer_(i, s);
     }
 }
 
-// Gemma3: like Gemma2 but adds QK-norm and dual RoPE base (one for
-// global layers, one for sliding). v1 honors the per-layer SWA pattern
-// in the mask; per-layer RoPE base support is approximate (single
-// `rope_theta` for all layers — the global rope_theta).
+// Gemma3: like Gemma2 but adds QK-norm.
 void Model::build_gemma3_() {
-    const auto& h = hparams_;
-
-    weights_.tok_embd    = declare_("model.embed_tokens.weight");
-    weights_.output_norm = declare_("model.norm.weight");
-    if (!h.tie_word_embeddings) {
-        weights_.output_head = declare_("lm_head.weight");
-    }
-
-    weights_.layers.resize(h.num_hidden_layers);
-    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
-        auto& L = weights_.layers[i];
-
-        L.attn_norm      = declare_(p + "input_layernorm.weight");
-        L.post_attn_norm = declare_(p + "post_attention_layernorm.weight");
-        L.ffn_norm       = declare_(p + "pre_feedforward_layernorm.weight");
-        L.post_ffn_norm  = declare_(p + "post_feedforward_layernorm.weight");
-
-        L.q_proj = declare_(p + "self_attn.q_proj.weight");
-        L.k_proj = declare_(p + "self_attn.k_proj.weight");
-        L.v_proj = declare_(p + "self_attn.v_proj.weight");
-        L.o_proj = declare_(p + "self_attn.o_proj.weight");
-
-        // Gemma3 has Q/K-norm (per-head RMSNorm before RoPE), like Qwen3.
-        L.q_norm = declare_(p + "self_attn.q_norm.weight");
-        L.k_norm = declare_(p + "self_attn.k_norm.weight");
-
-        L.gate_proj = declare_(p + "mlp.gate_proj.weight");
-        L.up_proj   = declare_(p + "mlp.up_proj.weight");
-        L.down_proj = declare_(p + "mlp.down_proj.weight");
+    LoaderSpec s;
+    s.ffn_norm_name      = "pre_feedforward_layernorm";
+    s.has_post_attn_norm = true;
+    s.has_post_ffn_norm  = true;
+    s.has_qk_norm        = true;
+    load_top_level_();
+    for (std::int32_t i = 0; i < hparams_.num_hidden_layers; ++i) {
+        load_layer_(i, s);
     }
 }
 
@@ -612,109 +606,24 @@ void Model::build_gemma4_() {
         "in place; full implementation is post-v1.");
 }
 
-// MoE family stubs. The graph machinery for `ggml_mul_mat_id`-based expert
-// routing + stacked expert weight loading is not yet wired. Each arch
-// here acknowledges its presence (so PieArch dispatch is exhaustive) and
-// raises a clear, actionable error pointing at the missing infrastructure.
-//
-// Implementation outline for follow-up:
-//   1. Hparams: parse num_experts, num_experts_per_tok, gating type
-//      (softmax / sigmoid), router-bias support (DeepSeek-style)
-//   2. Loader: a `declare_stacked_experts_(layer_id, kind)` helper that
-//      allocates one [in_dim, out_dim, n_experts] tensor and stitches
-//      `model.layers.N.experts.E.{gate,up,down}_proj.weight` from each
-//      expert into the right slot
-//   3. Graph: a `build_moe_ffn` helper modeled on
-//      `src/llama-graph.cpp::llm_graph_context::build_moe_ffn`:
-//        router_logits = mul_mat(gate_inp, cur)
-//        probs         = softmax / sigmoid (per arch)
-//        selected      = top_k(probs, n_used)
-//        weights       = get_rows(probs, selected)        (renormalize per arch)
-//        gate          = mul_mat_id(gate_exps, cur, selected)
-//        up            = mul_mat_id(up_exps,   cur, selected)
-//        down          = mul_mat_id(down_exps, silu/gelu(gate)*up, selected)
-//        result        = sum_along_n_used(down * weights)
-//   4. Per-arch wrinkles: gpt_oss has attention sinks (already supported);
-//      mixtral uses softmax gating + normalization; qwen3moe uses softmax
-//      without renorm; deepseek-v3 uses sigmoid + per-expert bias.
-
-// Helper to derive ggml_type from a safetensor's dtype.
-static ggml_type st_to_ggml(StDtype dt, const std::string& dbg) {
-    switch (dt) {
-        case StDtype::F32:  return GGML_TYPE_F32;
-        case StDtype::F16:  return GGML_TYPE_F16;
-        case StDtype::BF16: return GGML_TYPE_BF16;
-        default:
-            throw std::runtime_error(
-                "model: unsupported MoE expert dtype for '" + dbg +
-                "': " + std::string(st_dtype_name(dt)));
-    }
-}
-
-// Mixtral / Qwen2-3 MoE / GPT-OSS share the same overall layout. The
-// differences are tensor naming (Mixtral uses `block_sparse_moe.experts.E.w1/w2/w3`
-// where w1=gate, w2=down, w3=up; Qwen-MoE/GPT-OSS use `mlp.experts.E.{gate,up,down}_proj`)
-// and minor extras (Mixtral's router lives at `block_sparse_moe.gate.weight`,
-// Qwen-MoE's at `mlp.gate.weight`).
-//
-// Each helper declares the per-layer attention + 3 stacked-expert tensors
-// + 1 router weight. The graph builder later picks `is_moe` and routes to
-// `build_moe_ffn` instead of the dense SwiGLU path.
+// MoE family. Mixtral / Qwen2-3 MoE / GPT-OSS share the same overall
+// structure (attention + 3 stacked-expert tensors + 1 router weight per
+// layer). Tensor naming differs and is captured by `LoaderSpec::moe`:
+//   - MlpExperts:    qwen-moe / gpt-oss layout
+//   - BlockSparseMoe: mixtral layout (w1=gate, w2=down, w3=up)
+// The graph builder picks `is_moe` and routes to `build_moe_ffn` instead
+// of the dense SwiGLU path.
 void Model::build_qwen3_5_() {
     const auto& h = hparams_;
     if (h.num_experts <= 0 || h.num_experts_per_tok <= 0) {
         throw std::runtime_error(
             "model qwen3_5: missing num_experts / num_experts_per_tok in config");
     }
-
-    weights_.tok_embd    = declare_("model.embed_tokens.weight");
-    weights_.output_norm = declare_("model.norm.weight");
-    if (!h.tie_word_embeddings) {
-        weights_.output_head = declare_("lm_head.weight");
-    }
-    weights_.layers.resize(h.num_hidden_layers);
-
-    const std::int32_t n_exp = h.num_experts;
-    const std::int64_t hidden = h.hidden_size;
-    const std::int64_t ff = h.moe_intermediate_size > 0
-        ? h.moe_intermediate_size : h.intermediate_size;
-
-    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
-        auto& L = weights_.layers[i];
-
-        L.attn_norm = declare_(p + "input_layernorm.weight");
-        L.ffn_norm  = declare_(p + "post_attention_layernorm.weight");
-
-        L.q_proj = declare_(p + "self_attn.q_proj.weight");
-        L.k_proj = declare_(p + "self_attn.k_proj.weight");
-        L.v_proj = declare_(p + "self_attn.v_proj.weight");
-        L.o_proj = declare_(p + "self_attn.o_proj.weight");
-
-        // Router — Qwen-MoE places it at `mlp.gate.weight`.
-        L.moe_router = declare_(p + "mlp.gate.weight");
-
-        // Stacked expert tensors. Pick dtype from expert 0; all experts
-        // share dtype (HF convention).
-        auto pick_dtype = [&](const std::string& sample) {
-            return st_to_ggml(archive_->at(sample).dtype, sample);
-        };
-        std::vector<std::string> gate_names, up_names, down_names;
-        gate_names.reserve(n_exp);
-        up_names.reserve(n_exp);
-        down_names.reserve(n_exp);
-        for (std::int32_t e = 0; e < n_exp; ++e) {
-            gate_names.push_back(p + "mlp.experts." + std::to_string(e) + ".gate_proj.weight");
-            up_names  .push_back(p + "mlp.experts." + std::to_string(e) + ".up_proj.weight");
-            down_names.push_back(p + "mlp.experts." + std::to_string(e) + ".down_proj.weight");
-        }
-        const ggml_type w_dtype = pick_dtype(gate_names[0]);
-        L.moe_gate_exps = declare_stacked_experts_(
-            p + "moe_gate", hidden, ff, n_exp, gate_names, w_dtype);
-        L.moe_up_exps   = declare_stacked_experts_(
-            p + "moe_up",   hidden, ff, n_exp, up_names,   w_dtype);
-        L.moe_down_exps = declare_stacked_experts_(
-            p + "moe_down", ff, hidden, n_exp, down_names, w_dtype);
+    LoaderSpec s;
+    s.moe = LoaderSpec::MoeNaming::MlpExperts;
+    load_top_level_();
+    for (std::int32_t i = 0; i < hparams_.num_hidden_layers; ++i) {
+        load_layer_(i, s);
     }
 }
 
@@ -724,52 +633,11 @@ void Model::build_mixtral_() {
         throw std::runtime_error(
             "model mixtral: missing num_experts / num_experts_per_tok");
     }
-
-    weights_.tok_embd    = declare_("model.embed_tokens.weight");
-    weights_.output_norm = declare_("model.norm.weight");
-    if (!h.tie_word_embeddings) {
-        weights_.output_head = declare_("lm_head.weight");
-    }
-    weights_.layers.resize(h.num_hidden_layers);
-
-    const std::int32_t n_exp = h.num_experts;
-    const std::int64_t hidden = h.hidden_size;
-    const std::int64_t ff = h.moe_intermediate_size > 0
-        ? h.moe_intermediate_size : h.intermediate_size;
-
-    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
-        auto& L = weights_.layers[i];
-
-        L.attn_norm = declare_(p + "input_layernorm.weight");
-        L.ffn_norm  = declare_(p + "post_attention_layernorm.weight");
-
-        L.q_proj = declare_(p + "self_attn.q_proj.weight");
-        L.k_proj = declare_(p + "self_attn.k_proj.weight");
-        L.v_proj = declare_(p + "self_attn.v_proj.weight");
-        L.o_proj = declare_(p + "self_attn.o_proj.weight");
-
-        // Mixtral router lives under `block_sparse_moe.gate.weight`.
-        L.moe_router = declare_(p + "block_sparse_moe.gate.weight");
-
-        // Mixtral expert naming: w1=gate, w2=down, w3=up.
-        std::vector<std::string> w1_names, w2_names, w3_names;
-        w1_names.reserve(n_exp);
-        w2_names.reserve(n_exp);
-        w3_names.reserve(n_exp);
-        for (std::int32_t e = 0; e < n_exp; ++e) {
-            const std::string ep = p + "block_sparse_moe.experts." + std::to_string(e) + ".";
-            w1_names.push_back(ep + "w1.weight");  // gate
-            w2_names.push_back(ep + "w2.weight");  // down
-            w3_names.push_back(ep + "w3.weight");  // up
-        }
-        const ggml_type w_dtype = st_to_ggml(archive_->at(w1_names[0]).dtype, w1_names[0]);
-        L.moe_gate_exps = declare_stacked_experts_(
-            p + "moe_gate", hidden, ff, n_exp, w1_names, w_dtype);
-        L.moe_up_exps   = declare_stacked_experts_(
-            p + "moe_up",   hidden, ff, n_exp, w3_names, w_dtype);
-        L.moe_down_exps = declare_stacked_experts_(
-            p + "moe_down", ff, hidden, n_exp, w2_names, w_dtype);
+    LoaderSpec s;
+    s.moe = LoaderSpec::MoeNaming::BlockSparseMoe;
+    load_top_level_();
+    for (std::int32_t i = 0; i < hparams_.num_hidden_layers; ++i) {
+        load_layer_(i, s);
     }
 }
 
@@ -777,44 +645,8 @@ void Model::build_gpt_oss_() {
     // GPT-OSS uses the same layout as Qwen3-MoE for routing + expert
     // tensor naming. The arch-specific differences (attention sinks,
     // YARN-extended RoPE) are handled at the graph layer via ArchSpec
-    // and the existing flash_attn_ext sink support. For the loader we
-    // can reuse the qwen3_5 path.
+    // and the existing flash_attn_ext sink support.
     build_qwen3_5_();
-}
-
-void Model::build_qwen2_() {
-    const auto& h = hparams_;
-
-    weights_.tok_embd    = declare_("model.embed_tokens.weight");
-    weights_.output_norm = declare_("model.norm.weight");
-    if (!h.tie_word_embeddings) {
-        weights_.output_head = declare_("lm_head.weight");
-    }
-
-    weights_.layers.resize(h.num_hidden_layers);
-    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
-        auto& L = weights_.layers[i];
-
-        L.attn_norm = declare_(p + "input_layernorm.weight");
-        L.ffn_norm  = declare_(p + "post_attention_layernorm.weight");
-
-        L.q_proj = declare_(p + "self_attn.q_proj.weight");
-        L.k_proj = declare_(p + "self_attn.k_proj.weight");
-        L.v_proj = declare_(p + "self_attn.v_proj.weight");
-        L.o_proj = declare_(p + "self_attn.o_proj.weight");
-
-        // Qwen2 has QKV biases (Qwen3 dropped them).
-        L.q_proj_b = declare_(p + "self_attn.q_proj.bias");
-        L.k_proj_b = declare_(p + "self_attn.k_proj.bias");
-        L.v_proj_b = declare_(p + "self_attn.v_proj.bias");
-
-        // No QK-norm in Qwen2.
-
-        L.gate_proj = declare_(p + "mlp.gate_proj.weight");
-        L.up_proj   = declare_(p + "mlp.up_proj.weight");
-        L.down_proj = declare_(p + "mlp.down_proj.weight");
-    }
 }
 
 }  // namespace pie_ggml_driver

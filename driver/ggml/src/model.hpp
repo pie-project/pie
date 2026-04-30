@@ -106,6 +106,34 @@ public:
     std::string activation_dtype_str() const;
 
 private:
+    // Per-arch loader description. Captures the structural variations across
+    // archs (extra norms, fused/biased QKV, MoE naming) so a single set of
+    // loader helpers can drive all of them. Specialized cases that don't fit
+    // (phi3's fused QKV, llama3's rope freq factors) are layered on top.
+    struct LoaderSpec {
+        // Suffix of the per-layer norm sitting on the FFN side. Most archs
+        // reuse "post_attention_layernorm"; the gemma family puts a
+        // pre-FFN norm at "pre_feedforward_layernorm" and adds extras.
+        std::string ffn_norm_name = "post_attention_layernorm";
+
+        // Gemma family: extra norms on the post-attention and post-FFN
+        // residual paths.
+        bool has_post_attn_norm = false;
+        bool has_post_ffn_norm  = false;
+
+        // QKV biases (qwen2 only) and per-head Q/K RMSNorm (qwen3, gemma3).
+        bool has_qkv_bias = false;
+        bool has_qk_norm  = false;
+
+        // MoE naming family. None = dense MLP path. The two MoE flavors
+        // differ in tensor naming only:
+        //   MlpExperts:    mlp.gate.weight, mlp.experts.E.{gate,up,down}_proj
+        //   BlockSparseMoe: block_sparse_moe.gate.weight,
+        //                   block_sparse_moe.experts.E.{w1,w2,w3}
+        enum class MoeNaming { None, MlpExperts, BlockSparseMoe };
+        MoeNaming moe = MoeNaming::None;
+    };
+
     void build_qwen3_();
     void build_qwen2_();
     void build_llama3_();
@@ -117,6 +145,19 @@ private:
     void build_gpt_oss_();
     void build_qwen3_5_();   // qwen3-moe family
     void build_mixtral_();
+
+    // Load tok_embd / output_norm / (optional) output_head and resize the
+    // per-layer vector. Common to all archs.
+    void load_top_level_();
+    // Per-layer dense or MoE weight loader, driven by `spec`.
+    void load_layer_(std::int32_t i, const LoaderSpec& spec);
+    // Per-layer MoE branch (router + 3 stacked-expert tensors).
+    void load_moe_layer_(std::int32_t i,
+                         const std::string& path_prefix,
+                         LoaderSpec::MoeNaming kind);
+    // LLaMA-3.1 NTK-by-parts: synthesize the rope freq_factors tensor if
+    // `hparams_.rope_scaling_type == "llama3"`. No-op otherwise.
+    void synth_llama3_freq_factors_();
 
     // Helper: create a ggml tensor mirroring the HF tensor's shape (with
     // dims reversed) and dtype, then load the safetensor data into the
