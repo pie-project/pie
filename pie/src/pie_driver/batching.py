@@ -92,8 +92,13 @@ class Batch:
         t0 = time.perf_counter()
 
         # Process per-request data
-        flattened_masks_u32 = _decode_u32(args["flattened_masks"]).astype(np.int32)
-        mask_indptr = _decode_u32(args["mask_indptr"]).astype(np.int32)
+        # `.view(np.int32)` reinterprets the same bytes as int32 with zero
+        # copy. Values are non-negative BRLE run lengths well within int32
+        # range so semantics are unchanged. Numba's existing int32
+        # specialization for `decode_brle_batch` is faster than its u32 one,
+        # which is why we view rather than just drop the conversion.
+        flattened_masks_u32 = _decode_u32(args["flattened_masks"]).view(np.int32)
+        mask_indptr = _decode_u32(args["mask_indptr"]).view(np.int32)
 
         # The decode kernel is a specialization of the prefill kernel that
         # drops `custom_mask` for efficiency. Rust now sets `single_token_mode`
@@ -210,10 +215,11 @@ class Batch:
         # ===== SAMPLING MASK HANDLING =====
         self.sampling_masks = None
         if vocab_size is not None and "sampling_masks" in args:
-            sampling_masks_u32 = _decode_u32(args["sampling_masks"]).astype(np.int32)
-            sampling_mask_indptr = _decode_u32(args["sampling_mask_indptr"]).astype(
-                np.int32
-            )
+            # `.view(np.int32)` is a zero-copy reinterpret; values are
+            # non-negative and within int32 range. See note on
+            # `flattened_masks_u32` above for why we view rather than skip.
+            sampling_masks_u32 = _decode_u32(args["sampling_masks"]).view(np.int32)
+            sampling_mask_indptr = _decode_u32(args["sampling_mask_indptr"]).view(np.int32)
 
             # Check if we have any sampling masks at all
             if len(sampling_masks_u32) > 0:
@@ -266,8 +272,9 @@ class Batch:
         self.context_ids = list(args.get("context_ids", []))
 
         # ===== LOGIT MASKS (BRLE per request → bool matrix) =====
-        logit_masks_u32 = _decode_u32(args["logit_masks"]).astype(np.int32)
-        logit_mask_indptr = _decode_u32(args["logit_mask_indptr"]).astype(np.int32)
+        # `.view(np.int32)` zero-copy reinterpret; see flattened_masks_u32 note.
+        logit_masks_u32 = _decode_u32(args["logit_masks"]).view(np.int32)
+        logit_mask_indptr = _decode_u32(args["logit_mask_indptr"]).view(np.int32)
         if len(logit_masks_u32) > 0 and vocab_size is not None:
             self.logit_masks = decode_sampling_masks(
                 logit_masks_u32, logit_mask_indptr, num_requests, vocab_size

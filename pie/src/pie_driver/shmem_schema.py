@@ -214,6 +214,91 @@ def parse_request(view: memoryview) -> dict:
 
 _struct_header_pack = None  # lazy init
 
+# Sampler types that produce non-token outputs (dist / logits / logprobs /
+# entropies). Presence of any of these in `batch.sampler_types` forces the
+# msgpack-fallback path because the flat token-only schema can't carry
+# their payloads.
+_SPECIAL_SAMPLERS = frozenset({0, 7, 8, 9, 10})
+
+
+def write_response_v2(sampling_results, batch, dst_buf, msgpack_module=None) -> int:
+    """Direct shmem encode bypassing `Batch.create_responses`.
+
+    Detects the fast path (no special-typed samplers, no spec-verify, no
+    spec-out drafts) and writes counts + tokens straight into the shmem
+    response buffer. Falls back to building a result dict via
+    `create_responses` and msgpack-encoding it for the advanced path.
+
+    Saves the per-request Python `ForwardPassResponse` and dict allocations
+    that `create_responses` + the calling site otherwise pay for every
+    iteration.
+    """
+    global _struct_header_pack
+    if _struct_header_pack is None:
+        import struct as _struct
+        _struct_header_pack = _struct.Struct("<IIII").pack_into
+
+    sampler_types = batch.sampler_types  # list[int]
+    spec_accepted = sampling_results.get("spec_accepted_tokens")
+    spec_tokens_all = sampling_results.get("spec_tokens")
+
+    fast_path = (
+        spec_accepted is None
+        and (spec_tokens_all is None
+             or not any(t is not None for t in spec_tokens_all))
+        and not any(t in _SPECIAL_SAMPLERS for t in sampler_types)
+    )
+
+    if not fast_path:
+        # Slow path: build the dict via create_responses, msgpack-encode it.
+        responses = batch.create_responses(sampling_results)
+        results = [
+            {
+                "tokens": resp.tokens,
+                "dists": resp.dists,
+                "logits": getattr(resp, "logits", []) or [],
+                "logprobs": getattr(resp, "logprobs", []) or [],
+                "entropies": getattr(resp, "entropies", []) or [],
+                "spec_tokens": getattr(resp, "spec_tokens", []) or [],
+                "spec_positions": getattr(resp, "spec_positions", []) or [],
+            }
+            for resp in responses
+        ]
+        return write_response({"results": results}, dst_buf, msgpack_module)
+
+    # Fast path: counts come straight from `request_output_counts`, tokens
+    # from `sampling_results['tokens']` (already in flat order).
+    counts = batch.request_output_counts
+    tokens = sampling_results["tokens"]
+
+    if not isinstance(counts, np.ndarray) or counts.dtype != np.uint32:
+        counts = np.asarray(counts, dtype=np.uint32)
+    if not isinstance(tokens, np.ndarray) or tokens.dtype != np.uint32:
+        tokens = np.asarray(tokens, dtype=np.uint32)
+
+    n_req = counts.size
+    n_tokens = tokens.size
+    body_size = (n_req + n_tokens) * 4
+    total = RESP_HEADER_SIZE + body_size
+    dst_capacity = len(dst_buf)
+    if total > dst_capacity:
+        raise ValueError(
+            f"shmem response (flat-v2) {total} > dst {dst_capacity}; "
+            f"raise the SHMEM_RESP_BUF constant in worker.py / device.rs"
+        )
+
+    _struct_header_pack(
+        dst_buf, 0, RESP_MAGIC, RESP_MODE_FLAT, n_req, n_tokens
+    )
+    counts_off = RESP_HEADER_SIZE
+    tokens_off = counts_off + n_req * 4
+    if n_req > 0:
+        dst_buf[counts_off:tokens_off] = counts.tobytes()
+    if n_tokens > 0:
+        dst_buf[tokens_off:total] = tokens.tobytes()
+
+    return total
+
 
 def write_response(result: dict, dst_buf, msgpack_module=None) -> int:
     """Write a worker `result` dict directly into the shmem response buffer.
