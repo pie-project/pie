@@ -751,7 +751,13 @@ class ForwardPass:
         local_num_key_value_heads = self.model_config.num_kv_heads // self.tp_size
 
         if single_token_inference_mode:
-            if self.use_cuda_graphs:
+            # The graphed path captures with `adapter_subpass=None`, so it
+            # silently drops adapter deltas if we route an adapter-bearing
+            # batch through it. Fall back to the non-graphed path whenever
+            # adapters are active. (`llama3` / `mistral3` already guard
+            # this — see their `transform`.) Adapter-aware graph capture
+            # is a separate piece of work; see pie_kernels/cond_graph.py.
+            if self.use_cuda_graphs and adapter_subpass is None:
                 return self._run_layers_graphed(
                     hidden_states=input_embeds,
                     position_ids=position_ids,

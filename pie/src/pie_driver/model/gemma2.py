@@ -801,7 +801,9 @@ class ForwardPass:
         local_num_key_value_heads = self.model_config.num_kv_heads // self.tp_size
 
         if single_token_inference_mode:
-            if self.use_cuda_graphs:
+            # See qwen3.py for the full rationale: the graphed path captures
+            # with adapter_subpass=None and would silently drop adapters.
+            if self.use_cuda_graphs and adapter_subpass is None:
                 return self._run_layers_graphed(
                     hidden_states=input_embeds,
                     position_ids=position_ids,
