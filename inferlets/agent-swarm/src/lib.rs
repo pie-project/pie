@@ -8,7 +8,7 @@ use inferlet::{
     Context, model::Model, runtime,
     messaging, SubscriptionExt,
     Result,
-    inference::Sampler,
+    sample::Sampler,
 };
 use serde::Deserialize;
 
@@ -121,13 +121,13 @@ async fn main(input: Input) -> Result<String> {
     ctx.cue();
 
     let contribution = ctx
-        .generate(Sampler::ARGMAX)
-        .with_max_tokens(tokens_per_step)
+        .generate(Sampler::Argmax)
+        .max_tokens(tokens_per_step)
         .collect_text()
         .await?;
 
     // Strip any EOS token text from the contribution
-    let stop_tokens = inferlet::instruct::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens(&model);
     let stop_text: Vec<String> = stop_tokens
         .iter()
         .filter_map(|&t| tokenizer.decode(&[t]).ok())

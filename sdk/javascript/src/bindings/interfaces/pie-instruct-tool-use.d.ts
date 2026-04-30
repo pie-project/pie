@@ -12,10 +12,16 @@ export function answer(model: Model, name: string, value: string): Uint32Array;
  */
 export function createDecoder(model: Model): Decoder;
 /**
+ * Returns the grammar that constrains well-formed tool-call output for
+ * this model and toolset, or none if the model has no enforceable format.
+ */
+export function format(model: Model, tools: Array<string>): Grammar | undefined;
+/**
  * Create a grammar matcher to force-generate tool calls
  */
 export function createMatcher(model: Model, tools: Array<string>): Matcher;
 export type Model = import('./pie-core-model.js').Model;
+export type Grammar = import('./pie-core-inference.js').Grammar;
 export type Matcher = import('./pie-core-inference.js').Matcher;
 export type Error = import('./pie-core-types.js').Error;
 export type Event = EventStart | EventCall;

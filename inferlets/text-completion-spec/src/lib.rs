@@ -14,7 +14,7 @@
 
 use inferlet::{
     Context,
-    inference::Sampler,
+    sample::Sampler,
     model::Model,
     runtime,
     Result,
@@ -76,33 +76,35 @@ async fn main(input: Input) -> Result<Output> {
     ctx.cue();
 
     let sampler = if input.temperature <= 0.0 {
-        Sampler::ARGMAX
+        Sampler::Argmax
     } else {
-        Sampler::top_p(input.temperature, input.top_p)
+        Sampler::TopP { temperature: input.temperature, p: input.top_p }
     };
 
     let mut stream = ctx
         .generate(sampler)
-        .with_max_tokens(input.max_tokens);
+        .max_tokens(input.max_tokens)
+        .system_speculation();
 
-    // The first `next()` call does prefill + the first decode step in one
-    // shot — its latency is dominated by the prompt processing, not by
-    // decode, so we time it separately from the rest. NGRAM only affects
-    // decode (drafts can't accept prompt tokens), so the speedup
-    // comparison should focus on the decode loop.
+    // The first step does prefill + the first decode step in one shot —
+    // its latency is dominated by prompt processing, not by decode, so
+    // we time it separately. NGRAM only affects decode (drafts can't
+    // accept prompt tokens), so the speedup comparison should focus on
+    // the decode loop.
     let mut all_tokens: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let mut steps: usize = 0;
     let prefill_start = Instant::now();
-    let first = stream.next().await?;
-    let prefill_elapsed = prefill_start.elapsed();
-    if let Some(tokens) = first {
-        all_tokens.extend_from_slice(&tokens);
+    if let Some(step) = stream.next()? {
+        let out = step.execute().await?;
+        all_tokens.extend_from_slice(&out.tokens);
         steps += 1;
     }
+    let prefill_elapsed = prefill_start.elapsed();
 
     let decode_start = Instant::now();
-    while let Some(tokens) = stream.next().await? {
-        all_tokens.extend_from_slice(&tokens);
+    while let Some(step) = stream.next()? {
+        let out = step.execute().await?;
+        all_tokens.extend_from_slice(&out.tokens);
         steps += 1;
     }
     let decode_elapsed = decode_start.elapsed();

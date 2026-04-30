@@ -3,7 +3,7 @@
 //! The agent loops {generate → run code → feed result back} until the
 //! model emits a `Final Answer:` line.
 
-use inferlet::{inference::Sampler, model::Model, runtime, Context, Result};
+use inferlet::{sample::Sampler, model::Model, runtime, Context, Result};
 use serde::Deserialize;
 
 mod js;
@@ -74,8 +74,8 @@ async fn main(input: Input) -> Result<String> {
 
     for _ in 0..input.num_function_calls {
         let response = ctx
-            .generate(Sampler::ARGMAX)
-            .with_max_tokens(input.tokens_between_calls)
+            .generate(Sampler::Argmax)
+            .max_tokens(input.tokens_between_calls)
             .collect_text()
             .await?;
 

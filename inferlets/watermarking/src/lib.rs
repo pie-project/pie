@@ -1,14 +1,16 @@
-//! Demonstrates text watermarking for text generation.
+//! Demonstrates text watermarking for LLM generation.
 //!
 //! Uses a green/red list approach where tokens are partitioned based on the
 //! hash of the previous token, and green-listed tokens receive a probability
-//! boost during sampling. The watermark is applied via manual ForwardPass
-//! decoding with Sampler::distribution to get distributions, then custom sampling.
+//! boost during sampling. The watermark is applied via a manual decode loop:
+//! `Probe::Distribution` returns the host distribution per step, and the
+//! green-list bias + sampling are applied in user code.
 
 use inferlet::{
-    Context, model::Model, runtime,
-    ForwardPassExt, Result,
-    inference::{ForwardPass, Output, Sampler},
+    Context, Result,
+    model::Model,
+    runtime,
+    sample::Distribution,
 };
 use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -41,11 +43,7 @@ impl WatermarkState {
             (0.0..=1.0).contains(&gamma),
             "gamma must be between 0.0 and 1.0."
         );
-        Self {
-            gamma,
-            delta,
-            previous_token: None,
-        }
+        Self { gamma, delta, previous_token: None }
     }
 
     fn get_seed(&self) -> u64 {
@@ -67,11 +65,8 @@ impl WatermarkState {
         }
 
         let seed = self.get_seed();
-
-        // Deterministic green list generation using Fisher-Yates with seeded state
         let green_list_size = (ids.len() as f32 * self.gamma).round() as usize;
 
-        // Create deterministic index permutation seeded by previous token hash
         let mut indices: Vec<usize> = (0..ids.len()).collect();
         deterministic_shuffle(&mut indices, seed);
 
@@ -80,26 +75,22 @@ impl WatermarkState {
             is_green[idx] = true;
         }
 
-        // Apply bias to green-listed tokens
         let exp_delta = self.delta.exp();
-        let mut watermarked_probs: Vec<f32> = probs
+        let mut watermarked: Vec<f32> = probs
             .iter()
             .enumerate()
             .map(|(i, &p)| if is_green[i] { p * exp_delta } else { p })
             .collect();
 
-        // Normalize
-        let prob_sum: f32 = watermarked_probs.iter().sum();
+        let prob_sum: f32 = watermarked.iter().sum();
         if prob_sum > 0.0 {
-            for p in &mut watermarked_probs {
+            for p in &mut watermarked {
                 *p /= prob_sum;
             }
         }
 
-        // Deterministic-weighted sampling using accumulated probabilities + hash
-        let chosen_idx = weighted_sample(&watermarked_probs, seed.wrapping_add(1));
+        let chosen_idx = weighted_sample(&watermarked, seed.wrapping_add(1));
         let chosen_id = ids[chosen_idx];
-
         self.previous_token = Some(chosen_id);
         chosen_id
     }
@@ -118,10 +109,8 @@ fn deterministic_shuffle(indices: &mut [usize], mut seed: u64) {
 
 /// Simple weighted sampling without external RNG.
 fn weighted_sample(probs: &[f32], seed: u64) -> usize {
-    // Generate a pseudo-random value in [0, 1) from the seed
     let r = (seed as f64 % 1_000_000.0) / 1_000_000.0;
     let r = r as f32;
-
     let mut cumulative = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         cumulative += p;
@@ -134,87 +123,58 @@ fn weighted_sample(probs: &[f32], seed: u64) -> usize {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let prompt = input.prompt;
-    let max_num_outputs = input.max_tokens;
-
     let start = Instant::now();
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
     let tokenizer = model.tokenizer();
-    let stop_tokens = inferlet::instruct::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens(&model);
 
     let mut ctx = Context::new(&model)?;
-
-    let mut pending_tokens: Vec<u32> = Vec::new();
-    pending_tokens.extend(inferlet::instruct::chat::system(&model, "You are a helpful, respectful and honest assistant."));
-    pending_tokens.extend(inferlet::instruct::chat::user(&model, &prompt));
-    pending_tokens.extend(inferlet::instruct::chat::cue(&model));
-
-    // Manual decode loop with watermark sampling
     let mut watermark = WatermarkState::new(0.5, 2.0);
     let mut generated_tokens = Vec::new();
 
-    for step in 0..max_num_outputs {
-        if pending_tokens.is_empty() {
-            break;
-        }
+    // Build the prompt ourselves so the first Pass feeds it through the
+    // forward pass and lands the cue tokens in KV exactly once (auto-
+    // commit handles the rest). Subsequent iterations feed one chosen
+    // token at a time.
+    let mut pending: Vec<u32> = Vec::new();
+    pending.extend(inferlet::chat::system(
+        &model,
+        "You are a helpful, respectful and honest assistant.",
+    ));
+    pending.extend(inferlet::chat::user(&model, &input.prompt));
+    pending.extend(inferlet::chat::cue(&model));
 
-        let page_size = ctx.page_size();
-        let wpt = ctx.inner().working_page_token_count();
-        let seq_len = ctx.inner().committed_page_count() * page_size + wpt;
-        let current_working_pages = ctx.inner().working_page_count();
-        let total_tokens_after = wpt + pending_tokens.len() as u32;
-        let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
-        let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
-        if additional_pages > 0 {
-            ctx.inner().reserve_working_pages(additional_pages)
-                .map_err(|e| format!("Failed to reserve pages at step {}: {}", step, e))?;
-        }
+    for _ in 0..input.max_tokens {
+        let mut pass = ctx.forward();
+        pass.input(&pending);
+        let last_idx = (pending.len() - 1) as u32;
+        // `k = 0` returns the full vocabulary so the watermark can bias
+        // every token, not just the top-k.
+        let h = pass.probe(last_idx, Distribution { temperature: 0.0, k: 0 });
+        let out = pass.execute().await?;
 
-        let pass = ForwardPass::new(&model);
-        pass.context(ctx.inner());
-        let positions: Vec<u32> = (seq_len..seq_len + pending_tokens.len() as u32).collect();
-        pass.input_tokens(&pending_tokens, &positions);
-
-        // Use Dist sampler to get the probability distribution
-        let last_idx = (pending_tokens.len() - 1) as u32;
-        pass.sampler(&[last_idx], &Sampler::distribution(0.0, 0));
-
-        let output = pass.execute_async().await
-            .map_err(|e| format!("Forward pass failed at step {}: {}", step, e))?;
-
-        // Commit pages
-        let new_wpt = wpt + pending_tokens.len() as u32;
-        let pages_to_commit = new_wpt / page_size;
-        if pages_to_commit > 0 {
-            ctx.inner().commit_working_pages(pages_to_commit)
-                .map_err(|e| format!("Failed to commit pages: {}", e))?;
-        }
-
-        // Extract distribution and apply watermark sampling
-        let chosen_token = match output.first_distribution() {
-            Some((ids, probs)) => watermark.sample(ids, probs),
+        let (ids, probs) = match out.distribution(h) {
+            Some(d) => d,
             None => break,
         };
 
-        // Check for stop tokens
-        if stop_tokens.contains(&chosen_token) {
+        let chosen = watermark.sample(ids, probs);
+        if stop_tokens.contains(&chosen) {
             break;
         }
 
-        generated_tokens.push(chosen_token);
-        pending_tokens = vec![chosen_token];
+        generated_tokens.push(chosen);
+        pending = vec![chosen];
     }
 
     let text = tokenizer.decode(&generated_tokens)?;
     println!("Output: {:?} (total elapsed: {:?})", text, start.elapsed());
-
     if !generated_tokens.is_empty() {
         println!(
             "Per token latency: {:?}",
             start.elapsed() / (generated_tokens.len() as u32)
         );
     }
-
     Ok(String::new())
 }

@@ -3,28 +3,22 @@
 //! Owns the native context handle, caches page metadata, buffers instruct
 //! tokens, and exposes ergonomic fill / flush / generate methods.
 
-mod decoder;
 mod constraint;
-mod speculation;
-mod stream;
 
 // Re-export submodule public types.
-pub use decoder::*;
 pub use constraint::*;
-pub use speculation::*;
-pub use stream::*;
 
-use crate::inference::{ForwardPass, Sampler};
+use crate::inference::ForwardPass;
 use crate::model::Model;
 use crate::ForwardPassExt;
 use crate::Result;
+use crate::sample::Sampler;
 
 /// The raw WIT context resource, re-exported for power users.
 pub use crate::pie::core::context::Context as RawContext;
 
 // Instruct WIT bindings.
 use crate::pie::instruct::chat;
-use crate::pie::instruct::tool_use;
 
 /// Budget-exhausting bid: the maximum per-page-per-step rent the process
 /// can sustain over `μ` steps of generation without going bankrupt.
@@ -72,7 +66,7 @@ pub(crate) fn compute_bid(
 /// - **Buffered instruct fills** (`system`, `user`, `cue`, …) that accumulate
 ///   tokens locally.
 /// - **`flush()`** to drain the buffer through a forward pass and commit pages.
-/// - **`generate()`** to create a [`TokenStream`] for token-by-token generation.
+/// - **`generate()`** to create a [`Generator`](crate::generation::Generator) for token-by-token generation.
 /// - **Cached page metadata** (`seq_len`, `committed_pages`, `working_tokens`)
 ///   to avoid redundant WIT host calls.
 pub struct Context {
@@ -180,84 +174,59 @@ impl Context {
         self.inner.suspend()
     }
 
-    /// Set bid (willingness to pay per page per step).
-    /// Higher bid = harder to evict, restored first.
+    /// Override the auto-computed bid (willingness to pay per page per
+    /// step). Higher bid = harder to evict, restored first under
+    /// contention. Bids are bounded below by zero; the runtime refuses
+    /// negative values.
     ///
-    /// Bids are bounded below by zero; the runtime refuses negative values.
-    /// Stopping forward progress when the compute budget is spent is handled
-    /// on the **token wallet**, not here — calling `forward_pass()` after
-    /// `tokens_remaining == 0` fails with an error, independent of any bid
-    /// you set. Setting a low bid only affects admission under contention.
-    pub fn bid(&self, value: f64) {
+    /// Most callers should NOT use this — the [`Generator`] auto-bids
+    /// every step using a budget-exhausting strategy that drains the
+    /// wallet over the horizon. Reach for `set_bid` only when you have a
+    /// strategy of your own.
+    ///
+    /// Stopping forward progress when the compute budget is spent is
+    /// handled on the **token wallet**, not here — calling forward
+    /// passes after `tokens_remaining == 0` fails with an error,
+    /// independent of any bid you set. A low bid only affects admission
+    /// under contention.
+    ///
+    /// [`Generator`]: crate::generation::Generator
+    pub fn set_bid(&self, value: f64) {
         self.inner.bid(value);
     }
 
-    /// Yield priority for the duration of an external wait.
+    /// Mark this context as idle: drop the bid to zero so other
+    /// contexts can take its pages under contention. Returns an opaque
+    /// RAII guard; the truthful generation bid is restored on drop.
     ///
-    /// Under critical-value (Vickrey) payments, the process pays the
-    /// clearing price regardless of its bid. Bidding above clearing price
-    /// costs the same — only eviction risk changes. The rational strategy:
-    ///
-    /// - **Hold** (keep generation bid): costs `rent × pages` per step,
-    ///   but ensures instant resumption.
-    /// - **Fold** (bid zero): costs nothing, but risks restore-queue delay.
-    ///
-    /// The process can afford to hold for `W` idle steps iff the surplus
-    /// covers the idle rent. From the bid formula:
-    ///
-    /// ```text
-    /// W / remaining  <  (bid − rent) / rent
-    /// ```
-    ///
-    /// Processes well above the clearing price absorb long waits (large
-    /// surplus). Marginal processes fold immediately (no surplus). The
-    /// threshold is endogenous — no tuning parameter required.
-    ///
-    /// ## Common case: free holds on uncontended devices
-    ///
-    /// The runtime charges zero rent when the device has free capacity and
-    /// no contexts are waiting for pages — holding across a tool call costs
-    /// nothing, and this function returns without changing the bid. This is
-    /// the dominant regime at normal load. The hold-vs-fold math only
-    /// matters on a saturated device.
-    ///
-    /// Returns a [`BidGuard`] that restores the generation bid on drop.
+    /// Use across an external wait (HTTP, tool call, anything off-GPU)
+    /// where holding the bid would buy you nothing:
     ///
     /// ```ignore
-    /// let _guard = ctx.yield_bid(Duration::from_millis(200));
-    /// let result = tool_call().await;
-    /// // guard dropped → bid restored
+    /// let _idle = ctx.idle();
+    /// let result = http_get(url).await?;
+    /// // _idle dropped here → bid restored
     /// ```
-    pub fn yield_bid(&self, expected_wait: core::time::Duration) -> BidGuard<'_> {
-        let balance = crate::scheduling::balance(&self.model);
-        let rent = crate::scheduling::rent(&self.inner);
-        let dividend = crate::scheduling::dividend(&self.model);
-        let latency = crate::scheduling::latency(&self.inner);
+    ///
+    /// On an uncontended device the runtime charges zero rent anyway —
+    /// `idle` is a no-op cost-wise but still safe to call. Under load,
+    /// it yields priority to other workloads for the duration of the
+    /// wait.
+    pub fn idle(&self) -> Idle<'_> {
+        // Snapshot the truthful bid to restore on drop. If pages == 0
+        // (rare), there's nothing to bid for; default to 0.0.
         let pages = (self.committed_pages + self.working_pages) as f64;
-
-        // Budget-exhausting bid (§5 of SCHED.md) with geometric prior (cv²=1).
-        // No horizon info available inside yield_bid → conservative μ = 4096.
-        let mu = 4096.0_f64;
-        let page_size = self.page_size as f64;
-        let generation_bid = if pages > 0.0 {
-            compute_bid(balance, pages, mu, 1.0, page_size, dividend)
-        } else { 0.0 };
-
-        let step_secs = latency.max(0.001);
-        let wait_steps = expected_wait.as_secs_f64() / step_secs;
-
-        // Hold if either:
-        //   - `rent == 0`: device uncontended, holding is free (common case);
-        //   - surplus covers the idle rent (§7): W/remaining < (bid-rent)/rent.
-        let hold = rent == 0.0
-            || (generation_bid > rent
-                && wait_steps < mu * (generation_bid - rent) / rent);
-
-        if !hold {
-            self.inner.bid(0.0);
-        }
-
-        BidGuard { ctx: self, saved_bid: generation_bid }
+        let saved = if pages > 0.0 {
+            let balance = crate::scheduling::balance(&self.model);
+            let dividend = crate::scheduling::dividend(&self.model);
+            let page_size = self.page_size as f64;
+            // Conservative μ = 4096; no per-generation horizon visible here.
+            compute_bid(balance, pages, 4096.0, 1.0, page_size, dividend)
+        } else {
+            0.0
+        };
+        self.inner.bid(0.0);
+        Idle { ctx: self, saved }
     }
 
     // ── Accessors (no WIT calls) ────────────────────────────────────
@@ -328,25 +297,29 @@ impl Context {
         self
     }
 
-    /// Register available tools (list of JSON schema strings).
-    pub fn equip_tools(&mut self, tools: &[String]) -> Result<&mut Self> {
-        let tools_vec: Vec<String> = tools.to_vec();
-        let tokens = tool_use::equip(&self.model, &tools_vec)?;
-        self.buffer.extend(tokens);
-        Ok(self)
-    }
-
-    /// Provide a tool result after a tool call.
-    pub fn answer_tool(&mut self, name: &str, value: &str) -> &mut Self {
-        let tokens = tool_use::answer(&self.model, name, value);
-        self.buffer.extend(tokens);
-        self
-    }
-
     /// Append raw tokens to the buffer directly.
     pub fn append(&mut self, tokens: &[u32]) -> &mut Self {
         self.buffer.extend_from_slice(tokens);
         self
+    }
+
+    /// Drop the trailing `n` tokens from the working pages and re-sync the
+    /// cached page/seq counters from the host.
+    ///
+    /// Use after a forward pass that wrote speculative draft tokens, to
+    /// roll back the rejected suffix. `n` counts only working-page tokens —
+    /// pages that already committed cannot be truncated through this API.
+    pub fn truncate(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        self.inner.truncate_working_page_tokens(n);
+        // Re-sync from the host: truncation can release pages, and the
+        // safe thing is to read the authoritative counts back.
+        self.committed_pages = self.inner.committed_page_count();
+        self.working_pages = self.inner.working_page_count();
+        self.working_tokens = self.inner.working_page_token_count();
+        self.seq_len = self.committed_pages * self.page_size + self.working_tokens;
     }
 
     // ── Flush ───────────────────────────────────────────────────────
@@ -403,35 +376,43 @@ impl Context {
         Ok(())
     }
 
+    // ── Pass ────────────────────────────────────────────────────────
+
+    /// Build a single [`Forward`](crate::forward::Forward) — a forward pass with
+    /// automatic page reservation, position derivation, and post-execute
+    /// commit. Use for prefill, scoring, custom decode loops, and anywhere
+    /// the [`generate`](Self::generate) loop is too high-level.
+    pub fn forward(&mut self) -> crate::forward::Forward<'_> {
+        crate::forward::Forward::new(self)
+    }
+
     // ── Generate ────────────────────────────────────────────────────
 
-    /// Creates a [`TokenStream`] for generation.
-    ///
-    /// Any tokens already in the buffer will be consumed on the first
-    /// `step()`. The user can continue to fill tokens mid-generation
-    /// (e.g., tool outputs) via [`TokenStream::ctx()`].
-    pub fn generate(&mut self, sampler: Sampler) -> TokenStream<'_> {
-        TokenStream::new(self, sampler)
+    /// Build a [`Generator`](crate::generation::Generator) — the
+    /// multi-step token-generation state machine. Any tokens already in
+    /// the buffer (from `system / user / cue / …`) are drained on the
+    /// first step.
+    pub fn generate(&mut self, sampler: Sampler) -> crate::generation::Generator<'_> {
+        crate::generation::Generator::new(self, sampler)
     }
+
 }
 
 // =============================================================================
-// BidGuard — RAII bid restoration
+// Idle — RAII guard returned by Context::idle()
 // =============================================================================
 
-/// Restores the generation bid when dropped.
-///
-/// Created by [`Context::yield_bid()`]. During the wait, the bid is
-/// either held (surplus covers idle rent) or set to zero (fold).
-/// On drop, the truthful generation bid is restored.
-pub struct BidGuard<'a> {
+/// Opaque RAII guard. Created by [`Context::idle`]. Drops the bid to
+/// zero for the duration of the guard's lifetime; restores the
+/// truthful bid on drop.
+pub struct Idle<'a> {
     ctx: &'a Context,
-    saved_bid: f64,
+    saved: f64,
 }
 
-impl<'a> Drop for BidGuard<'a> {
+impl<'a> Drop for Idle<'a> {
     fn drop(&mut self) {
-        self.ctx.bid(self.saved_bid);
+        self.ctx.inner.bid(self.saved);
     }
 }
 

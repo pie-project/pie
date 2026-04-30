@@ -10,7 +10,7 @@ export type PageId = import('./pie-core-context.js').PageId;
  * binary run-length encoding
  */
 export type Brle = Uint32Array;
-export type Sampler = SamplerMultinomial | SamplerTopK | SamplerTopP | SamplerMinP | SamplerTopKTopP | SamplerEmbedding | SamplerDist;
+export type Sampler = SamplerMultinomial | SamplerTopK | SamplerTopP | SamplerMinP | SamplerTopKTopP | SamplerEmbedding | SamplerDist | SamplerRawLogits | SamplerLogprob | SamplerLogprobs | SamplerEntropy;
 export interface SamplerMultinomial {
   tag: 'multinomial',
   val: [number, number],
@@ -38,28 +38,110 @@ export interface SamplerDist {
   tag: 'dist',
   val: [number, number],
 }
-export type Output = OutputNone | OutputTokens | OutputTokensWithSpeculation | OutputEmbeddings | OutputDistributions;
-export interface OutputNone {
-  tag: 'none',
-}
-export interface OutputTokens {
-  tag: 'tokens',
-  val: Uint32Array,
-}
-export interface OutputTokensWithSpeculation {
-  tag: 'tokens-with-speculation',
-  val: [Uint32Array, Uint32Array, Uint32Array],
+/**
+ * Returns the model's raw, unscaled logits (pre-softmax) for each
+ * requested position. No sampling is performed. The host returns the
+ * logits via output.logits as a packed little-endian f32 byte buffer
+ * of length `vocab-size * 4` per requested position.
+ */
+export interface SamplerRawLogits {
+  tag: 'raw-logits',
 }
 /**
- * accepted tokens, next spec tokens, next spec positions
+ * Returns log p(token | context) — the natural log of the model's
+ * probability for the given token at this position. Computed via
+ * log_softmax(logits) with NO temperature scaling. Result is a single
+ * f32 per slot, surfaced via output.logprobs as a length-1 inner list.
  */
-export interface OutputEmbeddings {
-  tag: 'embeddings',
-  val: Array<Uint8Array>,
+export interface SamplerLogprob {
+  tag: 'logprob',
+  val: number,
 }
-export interface OutputDistributions {
-  tag: 'distributions',
-  val: Array<[Uint32Array, Float32Array]>,
+/**
+ * Returns log p(t | context) for each `t` in the supplied list at the
+ * same position — useful for multi-candidate scoring (yes/no, A/B/C/D,
+ * reranking). One inner list per slot, one f32 per candidate, in the
+ * order the labels were provided.
+ */
+export interface SamplerLogprobs {
+  tag: 'logprobs',
+  val: Uint32Array,
+}
+/**
+ * Returns the Shannon entropy H(p) = -sum(p * log p) of the
+ * (unscaled) next-token distribution at this position. One f32 per
+ * slot via output.entropies. Useful for uncertainty / confidence /
+ * adaptive-sampling decisions.
+ */
+export interface SamplerEntropy {
+  tag: 'entropy',
+}
+/**
+ * One typed result per `forward-pass.sampler(...)` slot, in the order
+ * the sampler calls were attached. Lets a single forward pass mix
+ * arbitrary sampler kinds (e.g. multinomial AND entropy on the same
+ * position) without losing any output to a single-variant pick.
+ */
+export type SlotOutput = SlotOutputToken | SlotOutputDistribution | SlotOutputLogits | SlotOutputLogprobs | SlotOutputEntropy | SlotOutputEmbedding;
+/**
+ * Sampled token id. Produced by multinomial / top-k / top-p /
+ * min-p / top-k-top-p samplers, and by spec-mode verification.
+ */
+export interface SlotOutputToken {
+  tag: 'token',
+  val: number,
+}
+/**
+ * Top-k token ids paired with their (post-softmax, temperature-
+ * scaled) probabilities. Produced by `sampler.dist`.
+ */
+export interface SlotOutputDistribution {
+  tag: 'distribution',
+  val: [Uint32Array, Float32Array],
+}
+/**
+ * Native-endian f32 bytes, length = vocab-size * 4. Produced by
+ * `sampler.raw-logits`.
+ */
+export interface SlotOutputLogits {
+  tag: 'logits',
+  val: Uint8Array,
+}
+/**
+ * Length 1 for `sampler.logprob`; length K for `sampler.logprobs`
+ * (parallel to the requested label list). Computed via log-softmax
+ * with no temperature scaling.
+ */
+export interface SlotOutputLogprobs {
+  tag: 'logprobs',
+  val: Float32Array,
+}
+/**
+ * Shannon entropy `H(p)` of the unscaled distribution at this
+ * position. Produced by `sampler.entropy`.
+ */
+export interface SlotOutputEntropy {
+  tag: 'entropy',
+  val: number,
+}
+/**
+ * Hidden-state embedding bytes for this position. Produced by
+ * `sampler.embedding` (placeholder; not yet wired end-to-end).
+ */
+export interface SlotOutputEmbedding {
+  tag: 'embedding',
+  val: Uint8Array,
+}
+/**
+ * Result of one `forward-pass.execute`. `slots` mirrors the order of
+ * `forward-pass.sampler` calls. `spec-tokens` / `spec-positions` are a
+ * per-request side channel for the next iteration's draft tokens
+ * (empty in non-speculative flows).
+ */
+export interface Output {
+  slots: Array<SlotOutput>,
+  specTokens: Uint32Array,
+  specPositions: Uint32Array,
 }
 
 export class ForwardPass {
@@ -117,6 +199,11 @@ export class Grammar {
   * Construct from an EBNF grammar string.
   */
   static fromEbnf(ebnf: string): Grammar;
+  /**
+  * Debug representation of the grammar. Format is unspecified and
+  * may differ across grammar kinds; do not parse.
+  */
+  toString(): string;
 }
 
 export class Matcher {

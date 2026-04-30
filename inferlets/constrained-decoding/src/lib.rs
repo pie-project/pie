@@ -4,7 +4,7 @@
 //! token is masked to keep the output a valid sentence in the grammar.
 
 use inferlet::{
-    Context, Result, Schema, inference::Sampler, model::Model, runtime,
+    Context, Result, Schema, sample::Sampler, model::Model, runtime,
 };
 use serde::Deserialize;
 
@@ -42,9 +42,9 @@ number ::= [0-9]+
     let start = std::time::Instant::now();
 
     let text = ctx
-        .generate(Sampler::ARGMAX)
-        .with_max_tokens(max_tokens)
-        .with_schema(Schema::Ebnf(grammar))?
+        .generate(Sampler::Argmax)
+        .max_tokens(max_tokens)
+        .constrain_with(inferlet::Ebnf(grammar))?
         .collect_text()
         .await?;
 

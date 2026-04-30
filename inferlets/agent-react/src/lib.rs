@@ -6,7 +6,7 @@
 use chrono::{NaiveDate, Utc};
 use evalexpr::eval;
 use inferlet::{
-    Context, inference::Sampler, model::Model,
+    Context, sample::Sampler, model::Model,
     runtime, Result,
 };
 use serde::Deserialize;
@@ -91,8 +91,8 @@ async fn main(input: Input) -> Result<String> {
 
     for _ in 0..num_function_calls {
         let response = ctx
-            .generate(Sampler::ARGMAX)
-            .with_max_tokens(tokens_between_calls)
+            .generate(Sampler::Argmax)
+            .max_tokens(tokens_between_calls)
             .collect_text()
             .await?;
 

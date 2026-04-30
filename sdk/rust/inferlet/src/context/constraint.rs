@@ -1,23 +1,23 @@
 //! Sampling constraints for grammar-guided generation.
 //!
 //! The common path is declarative: pass a [`Schema`] to
-//! [`super::TokenStream::constrain`] and the SDK builds the matcher for you.
-//! For custom logic (banned tokens, learned constraints, etc.), implement
-//! [`Constrain`] and pass it via [`super::TokenStream::constrain_with`].
-//! Constraints compose — every applied constraint contributes a mask, and
-//! the masks are AND-ed before each forward pass.
+//! [`Generator::constrain_with`](crate::generation::Generator::constrain_with)
+//! and the SDK compiles the matcher for you. For custom logic (banned
+//! tokens, learned constraints, etc.), implement [`Constrain`] and pass
+//! it via [`Generator::constrain`](crate::generation::Generator::constrain).
+//! Constraints compose — every applied constraint contributes a mask,
+//! and the masks are AND-ed before each forward pass.
 
 use crate::inference::Grammar;
 use crate::model::Model;
 use crate::Result;
-
-use super::Matcher;
+use crate::pie::core::inference::Matcher;
 
 /// Token sampling constraint.
 ///
-/// On each generation step, the [`super::TokenStream`] passes any newly
-/// accepted tokens (or `&[]` on the first step) and gets back the BRLE-encoded
-/// logit mask for the next position.
+/// On each generation step, the [`Generator`](crate::generation::Generator)
+/// passes any newly accepted tokens (or `&[]` on the first step) and gets
+/// back the BRLE-encoded logit mask for the next position.
 ///
 /// Returning `&[]` (empty mask) means "no restriction" and is treated as
 /// transparent during composition.
@@ -29,36 +29,78 @@ pub trait Constrain: Send {
 
 /// Declarative description of a constraint.
 ///
-/// Use with [`super::TokenStream::with_schema`]. The SDK compiles the schema
-/// into a [`GrammarConstraint`] internally.
+/// Implementors are passed to
+/// [`Generator::constrain_with`](crate::generation::Generator::constrain_with),
+/// which compiles them into a [`GrammarConstraint`].
+///
+/// Built-in implementors:
+///
+/// - [`JsonSchema`] — JSON conforming to a schema string
+/// - [`AnyJson`]    — any valid JSON
+/// - [`Regex`]      — strings matching a regex pattern
+/// - [`Ebnf`]       — custom EBNF grammar
+/// - `&Grammar`     — a pre-compiled grammar resource
+///
+/// User code can implement `Schema` for custom grammar sources (Lark,
+/// GBNF, ProtoBuf, …):
 ///
 /// ```ignore
-/// ctx.generate(Sampler::ARGMAX)
-///     .with_schema(Schema::Ebnf(grammar_str))?
+/// struct MyGrammar(String);
+/// impl inferlet::Schema for MyGrammar {
+///     fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
+///         let g = compile_to_pie_grammar(&self.0)?;
+///         Ok(GrammarConstraint::from_grammar(&g, model))
+///     }
+/// }
+///
+/// ctx.generate(Sampler::Argmax)
+///     .constrain_with(MyGrammar(my_lark_source))?
 ///     .collect_text().await?;
 /// ```
-pub enum Schema<'a> {
-    /// Constrain to JSON valid against the given JSON Schema string.
-    JsonSchema(&'a str),
-    /// Constrain to any valid JSON.
-    Json,
-    /// Constrain to strings matching the regular expression.
-    Regex(&'a str),
-    /// Constrain to a custom EBNF grammar.
-    Ebnf(&'a str),
-    /// Constrain to a pre-compiled grammar (compile once, reuse).
-    Grammar(&'a Grammar),
+pub trait Schema {
+    /// Compile this schema into a [`GrammarConstraint`] for `model`.
+    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint>;
 }
 
-impl Schema<'_> {
-    pub(crate) fn build(&self, model: &Model) -> Result<GrammarConstraint> {
-        match self {
-            Self::JsonSchema(s) => GrammarConstraint::from_json_schema(s, model),
-            Self::Json => Ok(GrammarConstraint::json(model)),
-            Self::Regex(p) => GrammarConstraint::from_regex(p, model),
-            Self::Ebnf(g) => GrammarConstraint::from_ebnf(g, model),
-            Self::Grammar(g) => Ok(GrammarConstraint::from_grammar(g, model)),
-        }
+/// JSON conforming to a JSON Schema string.
+pub struct JsonSchema<'a>(pub &'a str);
+
+/// Any valid JSON value.
+pub struct AnyJson;
+
+/// Strings matching a regular expression pattern.
+pub struct Regex<'a>(pub &'a str);
+
+/// A custom EBNF grammar.
+pub struct Ebnf<'a>(pub &'a str);
+
+impl Schema for JsonSchema<'_> {
+    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
+        GrammarConstraint::from_json_schema(self.0, model)
+    }
+}
+
+impl Schema for AnyJson {
+    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
+        Ok(GrammarConstraint::json(model))
+    }
+}
+
+impl Schema for Regex<'_> {
+    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
+        GrammarConstraint::from_regex(self.0, model)
+    }
+}
+
+impl Schema for Ebnf<'_> {
+    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
+        GrammarConstraint::from_ebnf(self.0, model)
+    }
+}
+
+impl Schema for &Grammar {
+    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
+        Ok(GrammarConstraint::from_grammar(self, model))
     }
 }
 
@@ -66,7 +108,7 @@ impl Schema<'_> {
 ///
 /// Most callers should reach for [`Schema`] instead — `GrammarConstraint`
 /// is the lower-level type for callers that want to keep a constraint
-/// instance around (e.g., to compose with [`super::TokenStream::with_constraint`]).
+/// instance around (e.g., to compose with [`Generator::constrain`](crate::generation::Generator::constrain)).
 pub struct GrammarConstraint {
     matcher: Matcher,
     /// Cached mask returned from the last `step()`. Reused so `step` can

@@ -17,16 +17,16 @@ from ._async import await_future
 def send(message: Any) -> None:
     """Send a message to the client.
 
-    Strings are sent verbatim. Pydantic v2 models are serialized via
-    ``model_dump_json()``. Everything else is JSON-serialized via
-    ``json.dumps`` (dicts, lists, numbers, bools, None).
+    Strings are sent verbatim. Anything else is JSON-serialized via
+    ``json.dumps`` (dicts, lists, numbers, bools, None). Objects with a
+    ``model_dump_json`` method (e.g. future WASM-compatible
+    pydantic-shaped classes) are handed off to it instead.
 
     ::
 
         session.send("plain text")
         session.send({"event": "tick", "n": 3})       # dict → JSON
         session.send([1, 2, 3])                       # list → JSON
-        session.send(person)                          # pydantic model → JSON
     """
     if isinstance(message, str):
         _session.send(message)

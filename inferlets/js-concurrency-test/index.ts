@@ -5,18 +5,19 @@
 
 import {
     Model, Context, Sampler,
+    chat,
     session, runtime,
 } from 'inferlet';
 
 export async function main(_input: Record<string, unknown>) {
     const model = Model.load(runtime.models()[0]);
 
-    // Create two separate contexts with different prompts
-    const ctx1 = Context.create(model);
+    // Create two separate contexts with different prompts.
+    const ctx1 = new Context(model);
     ctx1.system('You are helpful.');
     ctx1.user('Count from 1 to 5.');
 
-    const ctx2 = Context.create(model);
+    const ctx2 = new Context(model);
     ctx2.system('You are helpful.');
     ctx2.user('Name 3 colors.');
 
@@ -26,21 +27,21 @@ export async function main(_input: Record<string, unknown>) {
         log.push(`[${label}] START`);
         session.send(`[${label}] START`);
 
-        let stepCount = 0;
-        const stream = await ctx.generate({
-            sampler: Sampler.topP(0.6, 0.95),
-            maxTokens: 20,
-            decode: { reasoning: true },
-        });
+        const gen = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 20 });
+        const dec = new chat.Decoder(model);
 
-        for await (const event of stream) {
+        let stepCount = 0;
+        for await (const step of gen) {
             stepCount++;
-            if (event.type === 'text' || event.type === 'thinking') {
-                const msg = `[${label}] step=${stepCount} ${event.text}`;
+            const out = await step.execute();
+            const ev = dec.feed(out.tokens);
+            if (ev.type === 'delta') {
+                const msg = `[${label}] step=${stepCount} ${ev.text}`;
                 log.push(msg);
                 session.send(msg);
+            } else if (ev.type === 'done') {
+                break;
             }
-            if (event.type === 'done') break;
         }
 
         log.push(`[${label}] END`);

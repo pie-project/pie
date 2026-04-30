@@ -6,7 +6,7 @@
 
 use futures::future;
 use inferlet::{
-    Context, inference::Sampler, model::Model,
+    Context, sample::Sampler, model::Model,
     runtime, Result,
 };
 use serde::Deserialize;
@@ -77,8 +77,8 @@ async fn main(input: Input) -> Result<String> {
                 propose_ctx.cue();
 
                 propose_ctx
-                    .generate(Sampler::TopP((0.6, 0.95)))
-                    .with_max_tokens(max_tokens_per_step)
+                    .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+                    .max_tokens(max_tokens_per_step)
                     .collect_text()
                     .await?;
 
@@ -92,8 +92,8 @@ async fn main(input: Input) -> Result<String> {
                         Ok(async move {
                             execute_ctx.cue();
                             execute_ctx
-                                .generate(Sampler::TopP((0.6, 0.95)))
-                                .with_max_tokens(max_tokens_per_step)
+                                .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+                                .max_tokens(max_tokens_per_step)
                                 .collect_text()
                                 .await?;
 
@@ -107,8 +107,8 @@ async fn main(input: Input) -> Result<String> {
                                     Ok(async move {
                                         reflect_ctx.cue();
                                         reflect_ctx
-                                            .generate(Sampler::TopP((0.6, 0.95)))
-                                            .with_max_tokens(max_tokens_per_step)
+                                            .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+                                            .max_tokens(max_tokens_per_step)
                                             .collect_text()
                                             .await?;
                                         Ok::<_, String>(())

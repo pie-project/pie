@@ -12,10 +12,10 @@
 //! produced by the model are discarded; we only care about timing.
 
 use inferlet::{
-    Context, ForwardPassExt, RawContext, Result,
-    inference::{ForwardPass, Sampler},
+    Context, Result,
     model::Model,
     runtime,
+    sample::Sampler,
 };
 use serde::Deserialize;
 use std::time::Instant;
@@ -52,29 +52,10 @@ fn build_sink_mask(seq_len: u32, sink: u32, window: u32) -> Vec<u32> {
     }
 }
 
-/// Reserve enough working pages to cover `wpt + new_tokens` tokens.
-fn ensure_pages(
-    inner: &RawContext,
-    page_size: u32,
-    wpt: u32,
-    new_tokens: u32,
-) -> Result<()> {
-    let total_after = wpt + new_tokens;
-    let needed = total_after.div_ceil(page_size);
-    let cur = inner.working_page_count();
-    if needed > cur {
-        inner
-            .reserve_working_pages(needed - cur)
-            .map_err(|e| format!("reserve_working_pages: {e}"))?;
-    }
-    Ok(())
-}
-
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let model = Model::load(runtime::models().first().ok_or("No models available")?)?;
-    let ctx = Context::new(&model)?;
-    let page_size = ctx.page_size();
+    let mut ctx = Context::new(&model)?;
 
     // Synthetic prompt tokens. We avoid tokens 0..999 to dodge any reserved
     // special-token range; modulo by 30000 keeps every id well inside any
@@ -83,62 +64,36 @@ async fn main(input: Input) -> Result<String> {
         .map(|i| 1000 + (i % 30000))
         .collect();
 
-    let positions: Vec<u32> = (0..input.prompt_tokens).collect();
-
-    // ------------------------------------------------------------------
-    // Prefill
-    // ------------------------------------------------------------------
+    // ── Prefill ──────────────────────────────────────────────────────
     let prefill_start = Instant::now();
-    ensure_pages(ctx.inner(), page_size, 0, input.prompt_tokens)?;
-    let pass = ForwardPass::new(&model);
-    pass.context(ctx.inner());
-    pass.input_tokens(&prompt, &positions);
+    let mut pass = ctx.forward();
+    pass.input(&prompt);
     if input.use_mask {
         let masks: Vec<Vec<u32>> = (0..input.prompt_tokens as usize)
             .map(|i| build_sink_mask((i + 1) as u32, input.sink_size, input.window_size))
             .collect();
         pass.attention_mask(&masks);
     }
-    pass.sampler(&[input.prompt_tokens - 1], &Sampler::ARGMAX);
-    let output = pass.execute_async().await?;
-    let mut next_token = output.tokens().next().ok_or("empty prefill output")?;
+    let h = pass.sample(&[input.prompt_tokens - 1], Sampler::Argmax);
+    let out = pass.execute().await?;
+    let mut next_token = out.token(h).ok_or("empty prefill output")?;
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Commit complete pages so subsequent decode steps see them as committed.
-    let pages_to_commit = input.prompt_tokens / page_size;
-    if pages_to_commit > 0 {
-        ctx.inner().commit_working_pages(pages_to_commit)
-            .map_err(|e| format!("commit_working_pages: {e}"))?;
-    }
-
-    // ------------------------------------------------------------------
-    // Decode loop
-    // ------------------------------------------------------------------
+    // ── Decode loop ──────────────────────────────────────────────────
     let decode_start = Instant::now();
     for _ in 0..input.decode_steps {
-        let wpt = ctx.inner().working_page_token_count();
-        let seq_len = ctx.inner().committed_page_count() * page_size + wpt;
-
-        ensure_pages(ctx.inner(), page_size, wpt, 1)?;
-
-        let pass = ForwardPass::new(&model);
-        pass.context(ctx.inner());
-        pass.input_tokens(&[next_token], &[seq_len]);
+        let mut pass = ctx.forward();
+        pass.input(&[next_token]);
         if input.use_mask {
-            let total_seq = seq_len + 1;
+            // The new token lands at `start_position()`; the attention
+            // mask covers everything up to and including that slot.
+            let total_seq = pass.start_position() + 1;
             let mask = build_sink_mask(total_seq, input.sink_size, input.window_size);
             pass.attention_mask(&[mask]);
         }
-        pass.sampler(&[0], &Sampler::ARGMAX);
-        let output = pass.execute_async().await?;
-        next_token = output.tokens().next().ok_or("empty decode output")?;
-
-        let new_wpt = wpt + 1;
-        let to_commit = new_wpt / page_size;
-        if to_commit > 0 {
-            ctx.inner().commit_working_pages(to_commit)
-                .map_err(|e| format!("commit_working_pages: {e}"))?;
-        }
+        let h = pass.sample(&[0], Sampler::Argmax);
+        let out = pass.execute().await?;
+        next_token = out.token(h).ok_or("empty decode output")?;
     }
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
     let dec_per_step_ms = decode_ms / input.decode_steps as f64;
@@ -148,7 +103,7 @@ async fn main(input: Input) -> Result<String> {
         f64::INFINITY
     };
 
-    // Machine-readable summary parsed by benches/page_trim.py.
+    let page_size = ctx.page_size();
     println!("=== page-trim-bench ===");
     println!("prompt_tokens={}", input.prompt_tokens);
     println!("decode_steps={}", input.decode_steps);

@@ -3,10 +3,12 @@
 // Demonstrates:
 // - Loading a model
 // - Using Context for chat-style prompt building
-// - Streaming generation with EventStream + callback API
+// - Manual streaming with `chat.Decoder` + optional `reasoning.Decoder`,
+//   composed by hand (no implicit suppression).
 
 import {
     Model, Context, Sampler,
+    chat, reasoning,
     session, runtime,
 } from 'inferlet';
 
@@ -18,30 +20,44 @@ interface Input {
     top_p?: number;
 }
 
-export async function main(_input: Input) {
-    // Load model
+export async function main(input: Input) {
     const model = Model.load(runtime.models()[0]);
 
-    // Build context
-    const ctx = Context.create(model);
-    ctx.system('You are a helpful assistant.');
-    ctx.user('What is the capital of France? Tell me a joke.');
+    using ctx = new Context(model);
+    ctx.system(input.system ?? 'You are a helpful assistant.');
+    ctx.user(input.prompt ?? 'What is the capital of France? Tell me a joke.');
 
-    // Stream the response
+    const sampler = Sampler.topP(
+        input.temperature ?? 0.6,
+        input.top_p ?? 0.95,
+    );
+    const gen = ctx.generate(sampler, { maxTokens: input.max_tokens ?? 256 });
+
+    const chatDec = new chat.Decoder(model);
+    const reasoningDec = new reasoning.Decoder(model);
+
     let output = '';
-    const stream = await ctx.generate({
-        sampler: Sampler.topP(0.6, 0.95),
-        maxTokens: 256,
-        decode: { reasoning: true },
-    });
+    for await (const step of gen) {
+        const out = await step.execute();
 
-    await stream
-        .on('thinking', text => session.send(text))
-        .on('text', text => { session.send(text); output += text; })
-        .run();
+        // Reasoning chunks (independent decoder; no implicit suppression).
+        const rev = reasoningDec.feed(out.tokens);
+        if (rev.type === 'delta') session.send(rev.text);
+
+        // Visible chat text.
+        const cev = chatDec.feed(out.tokens);
+        if (cev.type === 'delta') {
+            session.send(cev.text);
+            output += cev.text;
+        } else if (cev.type === 'done') {
+            output = cev.text;
+            break;
+        }
+    }
 
     // Mirror python-example: emit [done] unconditionally after the stream.
-    // The 'done' chat event doesn't fire if the model produces zero tokens.
+    // The chat decoder's 'done' event doesn't fire if the model produced
+    // zero tokens (e.g. immediately hit max-tokens at zero).
     session.send('\n[done]');
     return output;
 }

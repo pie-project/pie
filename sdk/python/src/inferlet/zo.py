@@ -8,13 +8,17 @@ from __future__ import annotations
 
 from wit_world.imports import zo as _zo
 
-from .forward import ForwardPass
 from .adapter import Adapter
 
 
-def adapter_seed(forward_pass: ForwardPass, seed: int) -> None:
-    """Set the adapter seed for a forward pass."""
-    _zo.adapter_seed(forward_pass._handle, seed)
+def adapter_seed(forward, seed: int) -> None:
+    """Set the adapter seed for a forward pass.
+
+    Accepts either a :class:`Forward` (the SDK builder) or a raw WIT
+    ``ForwardPass`` resource.
+    """
+    handle = forward._handle if hasattr(forward, "_handle") else forward
+    _zo.adapter_seed(handle, seed)
 
 
 def initialize(

@@ -538,6 +538,14 @@ def _build_mock_modules():
     zo_mod.initialize = lambda adapter, rank, alpha, pop, mu, sigma: None
     zo_mod.update = lambda adapter, scores, seeds, max_sigma: None
 
+    # scheduling
+    scheduling_mod = types.ModuleType("wit_world.imports.scheduling")
+    scheduling_mod.balance = lambda model: 1000.0
+    scheduling_mod.rent = lambda ctx: 0.0
+    scheduling_mod.dividend = lambda model: 0.0
+    scheduling_mod.latency = lambda ctx: 0.01
+    scheduling_mod.price = lambda: 1.0
+
     # Install all
     modules = {
         "componentize_py_types": cpy_types,
@@ -558,6 +566,7 @@ def _build_mock_modules():
         "wit_world.imports.adapter": adapter_mod,
         "wit_world.imports.client": client_mod,
         "wit_world.imports.zo": zo_mod,
+        "wit_world.imports.scheduling": scheduling_mod,
     }
 
     for name, mod in modules.items():
@@ -566,7 +575,7 @@ def _build_mock_modules():
     for attr in [
         "poll", "pie_core_types", "pie_mcp_types", "model", "context",
         "inference", "chat", "reasoning", "tool_use", "runtime",
-        "messaging", "session", "adapter", "client", "zo",
+        "messaging", "session", "adapter", "client", "zo", "scheduling",
     ]:
         setattr(wit_imports, attr, sys.modules[f"wit_world.imports.{attr}"])
 

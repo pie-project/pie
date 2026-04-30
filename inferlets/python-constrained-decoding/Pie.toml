@@ -12,4 +12,3 @@ python-runtime = "^0.3.0"
 [parameters]
 prompt = {type = "string", optional = true, description = "Description of what to generate"}
 max_tokens = {type = "int", optional = true, description = "Max generation tokens (default: 512)"}
-mode = {type = "string", optional = true, description = "Either 'dict' (default, generate_json) or 'pydantic' (generate_pydantic)"}

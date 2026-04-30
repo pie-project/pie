@@ -8,7 +8,7 @@
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, future};
 use inferlet::{
-    Context, inference::Sampler, model::Model,
+    Context, sample::Sampler, model::Model,
     runtime, Result,
 };
 use serde::Deserialize;
@@ -59,8 +59,8 @@ async fn run_hierarchical_aggregation(
             Ok(async move {
                 ctx.cue();
                 let proposal_text = ctx
-                    .generate(Sampler::TopP((0.6, 0.95)))
-                    .with_max_tokens(max_tokens)
+                    .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+                    .max_tokens(max_tokens)
                     .collect_text()
                     .await?;
                 Ok::<_, String>((proposal_text, ctx))
@@ -86,8 +86,8 @@ async fn run_hierarchical_aggregation(
 
             first_aggregation_tasks.push(async move {
                 let aggregation_text = proposal_ctx
-                    .generate(Sampler::TopP((0.6, 0.95)))
-                    .with_max_tokens(aggregation_tokens)
+                    .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+                    .max_tokens(aggregation_tokens)
                     .collect_text()
                     .await?;
                 Ok::<_, String>((aggregation_text, proposal_ctx))
@@ -111,8 +111,8 @@ async fn run_hierarchical_aggregation(
 
             second_aggregation_tasks.push(async move {
                 aggregation_ctx
-                    .generate(Sampler::TopP((0.6, 0.95)))
-                    .with_max_tokens(aggregation_tokens)
+                    .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+                    .max_tokens(aggregation_tokens)
                     .collect_text()
                     .await
             });

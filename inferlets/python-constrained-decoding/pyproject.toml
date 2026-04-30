@@ -1,8 +1,5 @@
 [project]
 name = "python-constrained-decoding"
 version = "0.1.0"
-description = "Grammar-constrained JSON generation in Python: Schema.json_schema + pydantic"
+description = "Grammar-constrained JSON generation in Python via JsonSchema"
 requires-python = ">=3.10"
-dependencies = [
-    "pydantic>=2.0",
-]

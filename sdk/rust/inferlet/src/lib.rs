@@ -37,17 +37,36 @@ pub use pie::mcp;
 pub use pie::zo;
 
 // =============================================================================
-// Context (new wrapper module)
+// Context
 // =============================================================================
 
 mod context;
 
 pub use context::{
     Context, RawContext,
-    TokenStream, EventStream,
-    Speculate, Speculation, Constrain,
-    GrammarConstraint, Schema,
+    Constrain, GrammarConstraint, Schema,
+    AnyJson, Ebnf, JsonSchema, Regex,
 };
+
+// =============================================================================
+// Sampler / Probe + Forward primitive
+// =============================================================================
+
+pub mod sample;
+pub mod forward;
+
+// =============================================================================
+// Generation state machine + decoders + speculation
+// =============================================================================
+
+pub mod generation;
+pub mod chat;
+pub mod reasoning;
+pub mod spec;
+pub mod tools;
+
+pub use generation::{Generator, GenStep};
+pub use spec::Speculator;
 
 // =============================================================================
 // Adapter
@@ -85,166 +104,11 @@ pub mod inference {
     pub use crate::pie::core::inference::*;
 }
 
-impl crate::pie::core::inference::Sampler {
-    /// Argmax sampling — deterministic, picks the highest-probability token.
-    ///
-    /// Recommended default for grammar-constrained generation: most masked
-    /// positions have only a handful of valid tokens and stochastic sampling
-    /// rarely improves quality.
-    pub const ARGMAX: Self = Self::TopP((0.0, 1.0));
+/// Grammar matcher — re-export for callers that build their own
+/// constraints around it. Most users should reach for [`Schema`] or
+/// [`GrammarConstraint`] instead.
+pub use crate::pie::core::inference::Matcher;
 
-    /// Greedy / argmax sampling. Alias for [`ARGMAX`](Self::ARGMAX).
-    pub const fn greedy() -> Self { Self::ARGMAX }
-
-    /// Top-p (nucleus) sampling.
-    ///
-    /// `temperature = 0.0` collapses to argmax. `p = 1.0` allows the full
-    /// distribution. Common defaults: `top_p(0.6, 0.95)`.
-    pub const fn top_p(temperature: f32, p: f32) -> Self {
-        Self::TopP((temperature, p))
-    }
-
-    /// Top-k sampling: sample from the top `k` tokens by probability.
-    pub const fn top_k(temperature: f32, k: u32) -> Self {
-        Self::TopK((temperature, k))
-    }
-
-    /// Min-p sampling: keep tokens with probability ≥ `p × max_prob`.
-    pub const fn min_p(temperature: f32, p: f32) -> Self {
-        Self::MinP((temperature, p))
-    }
-
-    /// Combined top-k + top-p: first restrict to top `k`, then apply nucleus `p`.
-    pub const fn top_k_top_p(temperature: f32, k: u32, p: f32) -> Self {
-        Self::TopKTopP((temperature, k, p))
-    }
-
-    /// Plain multinomial: sample from the full distribution after temperature
-    /// scaling. The `u32` is a draws-per-sample multiplier (typically 1).
-    pub const fn multinomial(temperature: f32, draws: u32) -> Self {
-        Self::Multinomial((temperature, draws))
-    }
-
-    /// Distribution output: returns the top-`k` token IDs with their
-    /// probabilities instead of a sampled token. Useful for tree search,
-    /// best-of-n, or external samplers.
-    pub const fn distribution(temperature: f32, k: u32) -> Self {
-        Self::Dist((temperature, k))
-    }
-
-    /// Raw logits output: returns the model's pre-softmax, untemperatured
-    /// logits as a packed little-endian f32 byte buffer (length =
-    /// `vocab_size * 4`) per requested position. Decode via
-    /// `bytemuck::cast_slice::<u8, f32>(&buf)` or equivalent. Useful for
-    /// custom sampling or beam search where the full distribution matters.
-    pub const fn raw_logits() -> Self {
-        Self::RawLogits
-    }
-
-    /// Per-position log p(token | context). Returned as `Output::Logprobs`
-    /// with a length-1 inner list per slot. Computed via log_softmax with
-    /// no temperature scaling — the value reflects the model's native
-    /// distribution. Use for perplexity / cross-entropy / scoring.
-    pub const fn logprob(token_id: u32) -> Self {
-        Self::Logprob(token_id)
-    }
-
-    /// Per-position log p(t | context) for each `t` in `token_ids`. Returned
-    /// as `Output::Logprobs` with a length-K inner list per slot, in the
-    /// same order. Use for multi-candidate scoring (yes/no, multiple choice,
-    /// reranking).
-    pub fn logprobs(token_ids: Vec<u32>) -> Self {
-        Self::Logprobs(token_ids)
-    }
-
-    /// Shannon entropy `H(p) = -sum(p log p)` of the unscaled distribution
-    /// at this position. Returned as `Output::Entropies`. Useful for
-    /// uncertainty / confidence-based decisions.
-    pub const fn entropy() -> Self {
-        Self::Entropy
-    }
-}
-
-impl Default for crate::pie::core::inference::Sampler {
-    /// Argmax. The most predictable default — switch to `top_p` for creative
-    /// tasks.
-    fn default() -> Self { Self::ARGMAX }
-}
-
-// =============================================================================
-// Output helpers
-//
-// `Output` is now a `record { slots, spec-tokens, spec-positions }` and each
-// slot is a typed `SlotOutput` variant. Inferlets that attach exactly one
-// sampler want a single-line accessor; these helpers cover the common cases
-// without forcing a `match` on every call site.
-// =============================================================================
-
-impl crate::pie::core::inference::Output {
-    /// First slot's sampled token, if it's a Token slot.
-    pub fn first_token(&self) -> Option<u32> {
-        self.slots.first().and_then(|s| match s {
-            crate::pie::core::inference::SlotOutput::Token(t) => Some(*t),
-            _ => None,
-        })
-    }
-
-    /// Iterator over every Token slot, in slot order. In spec-decode mode,
-    /// these are the verifier-accepted tokens.
-    pub fn tokens(&self) -> impl Iterator<Item = u32> + '_ {
-        self.slots.iter().filter_map(|s| match s {
-            crate::pie::core::inference::SlotOutput::Token(t) => Some(*t),
-            _ => None,
-        })
-    }
-
-    /// First slot's distribution `(token_ids, probs)`, if it's a Distribution slot.
-    pub fn first_distribution(&self) -> Option<(&[u32], &[f32])> {
-        self.slots.first().and_then(|s| match s {
-            crate::pie::core::inference::SlotOutput::Distribution((ids, ps)) => {
-                Some((ids.as_slice(), ps.as_slice()))
-            }
-            _ => None,
-        })
-    }
-
-    /// First slot's raw logits buffer (native-endian f32 bytes), if any.
-    pub fn first_logits(&self) -> Option<&[u8]> {
-        self.slots.first().and_then(|s| match s {
-            crate::pie::core::inference::SlotOutput::Logits(b) => Some(b.as_slice()),
-            _ => None,
-        })
-    }
-
-    /// First slot's logprob list. Length 1 for `Sampler::logprob`, length K
-    /// for `Sampler::logprobs`.
-    pub fn first_logprobs(&self) -> Option<&[f32]> {
-        self.slots.first().and_then(|s| match s {
-            crate::pie::core::inference::SlotOutput::Logprobs(v) => Some(v.as_slice()),
-            _ => None,
-        })
-    }
-
-    /// First slot's entropy.
-    pub fn first_entropy(&self) -> Option<f32> {
-        self.slots.first().and_then(|s| match s {
-            crate::pie::core::inference::SlotOutput::Entropy(h) => Some(*h),
-            _ => None,
-        })
-    }
-}
-
-pub mod instruct {
-    pub mod chat {
-        pub use crate::pie::instruct::chat::*;
-    }
-    pub mod tool_use {
-        pub use crate::pie::instruct::tool_use::*;
-    }
-    pub mod reasoning {
-        pub use crate::pie::instruct::reasoning::*;
-    }
-}
 
 // =============================================================================
 // Async Extension Traits
@@ -296,41 +160,6 @@ impl FutureStringExt for types::FutureString {
 }
 
 // =============================================================================
-// Decoder (Unified) — re-exported from context module
-// =============================================================================
-
-pub use context::{
-    Decoder, Event,
-    // Re-exported WIT decoder / event types
-    ChatDecoder, ChatEvent,
-    ToolDecoder, ToolEvent,
-    ReasoningDecoder, ReasoningEvent,
-    Matcher,
-};
-
-// =============================================================================
-// Model Extension Trait
-// =============================================================================
-
-/// Extension trait that adds convenience methods to [`Model`].
-pub trait ModelExt {
-    /// Create a [`Decoder`] for this model.
-    ///
-    /// ```ignore
-    /// let mut decoder = model.decoder()
-    ///     .with_reasoning()
-    ///     .with_tool_use();
-    /// ```
-    fn decoder(&self) -> Decoder;
-}
-
-impl ModelExt for model::Model {
-    fn decoder(&self) -> Decoder {
-        Decoder::new(self)
-    }
-}
-
-// =============================================================================
 // Argument Parsing (re-exported from pico_args)
 // =============================================================================
 
@@ -349,15 +178,19 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 /// have to maintain a hand-rolled import grocery list.
 pub mod prelude {
     pub use crate::main;
-    pub use crate::{Context, Event, Result, Schema};
-    pub use crate::inference::{ForwardPass, Output, Sampler};
+    pub use crate::{Context, Result, Schema};
     pub use crate::model::Model;
     pub use crate::runtime;
     pub use crate::messaging;
     pub use crate::adapter::Adapter;
 
+    pub use crate::forward::{Forward, Output, SampleHandle, ProbeHandle};
+    pub use crate::sample::{Sampler, Probe};
+    pub use crate::generation::{Generator, GenStep};
+    pub use crate::{chat, reasoning, tools};
+    pub use crate::spec::Speculator;
+
     // Extension traits
-    pub use crate::ModelExt;
     pub use crate::ForwardPassExt;
     pub use crate::SubscriptionExt;
     pub use crate::FutureStringExt;

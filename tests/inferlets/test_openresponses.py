@@ -116,7 +116,7 @@ async def test_openresponses(client, args):
         assert isinstance(item.get("content"), list) and len(item["content"]) > 0
         assert item["content"][0].get("type") == "output_text"
         assert "text" in item["content"][0]
-        if not args.dummy:
+        if not args.driver == "dummy":
             assert len(item["content"][0]["text"]) > 0
 
         # --- Content-Type header ---
@@ -175,7 +175,7 @@ async def test_openresponses(client, args):
         })
         assert resp.status_code == 200
         body = resp.json()
-        if not args.dummy:
+        if not args.driver == "dummy":
             # Dummy mode produces 0 tokens, so status is "completed" not "incomplete"
             assert body.get("status") == "incomplete"
 
@@ -234,7 +234,7 @@ async def test_openresponses(client, args):
 
         # Deltas exist (skipped in dummy mode where nothing is generated)
         deltas = [e for e in json_events if e.get("type") == "response.output_text.delta"]
-        if not args.dummy:
+        if not args.driver == "dummy":
             assert len(deltas) > 0
 
         # Delta concat == final text

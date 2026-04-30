@@ -36,6 +36,9 @@
       "pie:core/adapter": [
         "./src/bindings/interfaces/pie-core-adapter.js"
       ],
+      "pie:core/scheduling": [
+        "./src/bindings/interfaces/pie-core-scheduling.js"
+      ],
       "pie:core/types": [
         "./src/bindings/interfaces/pie-core-types.js"
       ],

@@ -5,7 +5,7 @@
 //! answers and selects the most central (consensus) answer.
 
 use futures::future;
-use inferlet::{Context, Result, inference::Sampler, model::Model, runtime};
+use inferlet::{Context, Result, sample::Sampler, model::Model, runtime};
 use serde::Deserialize;
 use std::time::Instant;
 
@@ -60,8 +60,8 @@ async fn main(input: Input) -> Result<String> {
     let futs = candidate_ctxs.into_iter().map(|ctx| async move {
         let mut ctx = ctx;
         ctx.cue();
-        ctx.generate(Sampler::TopP((0.6, 0.95)))
-            .with_max_tokens(max_tokens)
+        ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+            .max_tokens(max_tokens)
             .collect_text()
             .await
     });

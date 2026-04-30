@@ -1,16 +1,12 @@
-"""E2E tests for python-constrained-decoding inferlet.
+"""E2E test for python-constrained-decoding inferlet.
 
-Verifies that the Python SDK drives a stateful grammar matcher per generated
-token (regression test for the constrained-decoding port). Without per-step
-matcher driving, output is unconstrained after the first token and would
-fail JSON parsing or schema conformance.
+Verifies that the Python SDK drives a stateful grammar matcher per
+generated token (regression test for the constrained-decoding port).
+Without per-step matcher driving, output is unconstrained after the
+first token and would fail JSON parsing or schema conformance.
 
-Two scenarios:
-- ``mode=dict``: ``generate_json(schema=...)`` → parsed dict, returned directly.
-- ``mode=pydantic``: ``generate_pydantic(Person)`` → typed instance, returned directly.
-
-Both rely on the bakery wrapper's structured-return support (dict /
-pydantic.BaseModel auto-stringified).
+Also exercises the bakery wrapper's structured-return support: the
+inferlet returns a parsed ``dict`` and the wrapper auto-stringifies.
 """
 import json
 
@@ -49,26 +45,11 @@ def _assert_person_shape(parsed: dict) -> None:
         "every skill must be a string"
 
 
-async def test_python_constrained_decoding_dict(client, args):
-    """Default 'dict' mode: generate_json(schema=...) returns a parsed dict."""
+async def test_python_constrained_decoding(client, args):
+    """``collect_json(schema=...)`` returns a parsed dict."""
     output = await run_inferlet(
         client, "python-constrained-decoding",
-        {"max_tokens": 512, "mode": "dict"},
-        timeout=max(args.timeout, 300),
-    )
-    assert "Hello " in output, "Missing greeting (typed-field access)"
-    assert "Skills:" in output, "Missing skills line"
-    assert "[done]" in output, "Missing [done] marker"
-    parsed = _extract_trailing_json(output)
-    assert parsed is not None, "No trailing JSON object in output"
-    _assert_person_shape(parsed)
-
-
-async def test_python_constrained_decoding_pydantic(client, args):
-    """'pydantic' mode: generate_pydantic(Person) returns a typed instance."""
-    output = await run_inferlet(
-        client, "python-constrained-decoding",
-        {"max_tokens": 512, "mode": "pydantic"},
+        {"max_tokens": 512},
         timeout=max(args.timeout, 300),
     )
     assert "Hello " in output, "Missing greeting (typed-field access)"
@@ -80,4 +61,4 @@ async def test_python_constrained_decoding_pydantic(client, args):
 
 
 if __name__ == "__main__":
-    run_tests([test_python_constrained_decoding_dict, test_python_constrained_decoding_pydantic])
+    run_tests([test_python_constrained_decoding])

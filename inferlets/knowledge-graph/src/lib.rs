@@ -9,7 +9,7 @@
 //! prefill is submitted asynchronously while the graph is being built on
 //! CPU, joined via `futures::join!`.
 
-use inferlet::{Context, Result, inference::Sampler, model::Model, runtime};
+use inferlet::{Context, Result, sample::Sampler, model::Model, runtime};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use serde::Deserialize;
@@ -167,8 +167,8 @@ async fn main(input: Input) -> Result<String> {
     extraction_ctx.cue();
 
     let extraction_output = extraction_ctx
-        .generate(Sampler::ARGMAX) // greedy
-        .with_max_tokens(max_tokens)
+        .generate(Sampler::Argmax) // greedy
+        .max_tokens(max_tokens)
         .collect_text()
         .await?;
 
@@ -246,8 +246,8 @@ async fn main(input: Input) -> Result<String> {
     query_ctx.cue();
 
     let answer = query_ctx
-        .generate(Sampler::ARGMAX)
-        .with_max_tokens(max_tokens)
+        .generate(Sampler::Argmax)
+        .max_tokens(max_tokens)
         .collect_text()
         .await?;
 

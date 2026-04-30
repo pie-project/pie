@@ -1,17 +1,20 @@
 //! Demonstrates Jacobi decoding — parallel speculation via fixed-point iteration.
 //!
-//! Instead of autoregressive decoding, Jacobi decoding initializes N positions with
-//! guessed tokens, then iteratively runs forward passes until the predictions converge
-//! (reach a fixed point). This can verify multiple tokens per forward pass.
+//! Instead of autoregressive decoding, Jacobi decoding initializes N positions
+//! with guessed tokens, then iteratively runs forward passes until the
+//! predictions converge (reach a fixed point). This can verify multiple
+//! tokens per forward pass.
 //!
-//! All tokens (verified anchor + speculative guesses) are sent as regular `input_tokens`
-//! and buffered beforehand so the runtime's fill() check passes. After each forward pass,
-//! only the accepted prefix is committed to the KV cache.
+//! All tokens (verified anchor + speculative guesses) are sent as regular
+//! `input` so the runtime's working-token bookkeeping stays consistent.
+//! After each forward pass, only the accepted prefix is committed to the
+//! KV cache; the rejected suffix is truncated via [`Context::truncate`].
 
 use inferlet::{
-    Context, model::Model, runtime,
-    ForwardPassExt, Result,
-    inference::{ForwardPass, Output, Sampler},
+    Context, Result,
+    model::Model,
+    runtime,
+    sample::Sampler,
 };
 use serde::Deserialize;
 use std::time::Instant;
@@ -32,7 +35,6 @@ fn default_window_size() -> usize { 5 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let prompt = input.prompt;
     let max_tokens = input.max_tokens;
     let window_size = input.window_size;
 
@@ -40,116 +42,75 @@ async fn main(input: Input) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
     let tokenizer = model.tokenizer();
-    let stop_tokens = inferlet::instruct::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens(&model);
 
     let mut ctx = Context::new(&model)?;
-    let page_size = ctx.page_size();
-
-    // Fill the prompt using the Context API and flush to run prefill.
     ctx.system("You are a helpful assistant.")
-        .user(&prompt)
+        .user(&input.prompt)
         .cue();
     ctx.flush().await?;
 
     println!(
         "--- Jacobi Decoding (window_size={}, page_size={}) ---",
-        window_size, page_size
+        window_size,
+        ctx.page_size()
     );
 
     let mut all_generated: Vec<u32> = Vec::new();
-    let sampler = Sampler::ARGMAX;
 
-    // Bootstrap: sample the first token from the prefilled context.
-    // After flush(), the context has pages allocated with prompt KV.
-    // We need to run a 1-token decode step to get the first output token.
-    {
-        let wpt = ctx.inner().working_page_token_count();
-        let seq_len = ctx.inner().committed_page_count() * page_size + wpt;
+    // Bootstrap: append the last cue token to drive a single forward pass
+    // and read its next-token prediction.
+    let cue = inferlet::chat::cue(&model);
+    let trigger = *cue.last().unwrap_or(&0);
+    let first_token = {
+        let mut pass = ctx.forward();
+        pass.input(&[trigger]);
+        let h = pass.sample(&[0], Sampler::Argmax);
+        pass.execute()
+            .await?
+            .token(h)
+            .ok_or("Bootstrap produced no token")?
+    };
+    all_generated.push(first_token);
 
-        // Use the last cue token as decode trigger
-        let cue_tokens = inferlet::instruct::chat::cue(&model);
-        let trigger = *cue_tokens.last().unwrap_or(&0);
-
-        let current_working_pages = ctx.inner().working_page_count();
-        let total_tokens_after = wpt + 1;
-        let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
-        let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
-        if additional_pages > 0 {
-            ctx.inner().reserve_working_pages(additional_pages)
-                .map_err(|e| format!("Failed to reserve pages: {}", e))?;
-        }
-
-        let pass = ForwardPass::new(&model);
-        pass.context(ctx.inner());
-        pass.input_tokens(&[trigger], &[seq_len]);
-        pass.sampler(&[0], &sampler);
-        let output = pass.execute_async().await
-            .map_err(|e| format!("Bootstrap forward pass failed: {}", e))?;
-        match output.first_token() {
-            Some(t) => all_generated.push(t),
-            None => return Err("Bootstrap sampling produced no token".to_string()),
-        }
-    }
-    let mut anchor = all_generated[0];
-
-    // Speculative guesses initialized to copies of the anchor
+    let mut anchor = first_token;
     let mut window: Vec<u32> = vec![anchor; window_size];
-    let mut total_accepted = 1; // anchor already counted
+    let mut total_accepted = 1; // anchor
 
     while total_accepted < max_tokens {
-        let wpt = ctx.inner().working_page_token_count();
-        let seq_len = ctx.inner().committed_page_count() * page_size + wpt;
-
-        // Build the full token list: [anchor] + [window guesses]
+        // Verifier pass: feed [anchor] + [window guesses] and sample at every
+        // position. Pass auto-commits the entire input window — we'll
+        // truncate the rejected suffix after seeing the accepted count.
         let mut input_all = vec![anchor];
         input_all.extend_from_slice(&window);
-
         let input_count = input_all.len();
 
-        // Reserve additional pages
-        let current_working_pages = ctx.inner().working_page_count();
-        let total_tokens_after = wpt + input_count as u32;
-        let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
-        let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
-        if additional_pages > 0 {
-            ctx.inner().reserve_working_pages(additional_pages)
-                .map_err(|e| format!("Failed to reserve pages: {}", e))?;
-        }
-
-        let pass = ForwardPass::new(&model);
-        pass.context(ctx.inner());
-
-        // All tokens go as regular input (so they're all embedded and processed)
-        let positions: Vec<u32> = (seq_len..seq_len + input_count as u32).collect();
-        pass.input_tokens(&input_all, &positions);
-
-        // Request sampling at all positions
+        let mut pass = ctx.forward();
+        pass.input(&input_all);
         let sample_indices: Vec<u32> = (0..input_count as u32).collect();
-        pass.sampler(&sample_indices, &sampler);
+        let h = pass.sample(&sample_indices, Sampler::Argmax);
+        let out = pass.execute().await?;
+        let predicted = out.tokens_at(h);
 
-        let output = pass.execute_async().await
-            .map_err(|e| format!("Forward pass failed: {}", e))?;
-
-        let predicted_tokens: Vec<u32> = output.tokens().collect();
-        if predicted_tokens.is_empty() {
+        if predicted.is_empty() {
             break;
         }
 
-        // Jacobi verification: find the longest converged prefix.
-        let mut accepted_count = 1; // Always accept the first prediction
-        for i in 1..predicted_tokens.len().min(window.len() + 1) {
+        // Jacobi verification: longest converged prefix.
+        let mut accepted_count = 1;
+        for i in 1..predicted.len().min(window.len() + 1) {
             let i_window = i - 1;
-            if i_window < window.len() && predicted_tokens[i - 1] == window[i_window] {
+            if i_window < window.len() && predicted[i - 1] == window[i_window] {
                 accepted_count += 1;
             } else {
                 break;
             }
         }
 
-        let newly_accepted: Vec<u32> = predicted_tokens[..accepted_count.min(predicted_tokens.len())]
-            .to_vec();
+        let newly_accepted: Vec<u32> =
+            predicted[..accepted_count.min(predicted.len())].to_vec();
 
-        // Check for stop tokens
+        // Stop token check.
         let mut stop_at = newly_accepted.len();
         for (i, &t) in newly_accepted.iter().enumerate() {
             if stop_tokens.contains(&t) {
@@ -158,36 +119,26 @@ async fn main(input: Input) -> Result<String> {
             }
         }
         let final_accepted = &newly_accepted[..stop_at];
-
         all_generated.extend_from_slice(final_accepted);
         total_accepted += final_accepted.len();
 
-        // Commit pages for accepted tokens only: anchor + accepted
-        let commit_count = 1 + final_accepted.len();
-        let new_wpt = wpt + commit_count as u32;
-        let pages_to_commit = new_wpt / page_size;
-        if pages_to_commit > 0 {
-            ctx.inner().commit_working_pages(pages_to_commit)
-                .map_err(|e| format!("Failed to commit pages: {}", e))?;
-        }
-
-        // Pop un-accepted speculative tokens from working pages
-        let speculative_count = input_count as u32 - commit_count as u32;
+        // Truncate the unaccepted suffix from KV.
+        let speculative_count = (input_count as u32) - (1 + final_accepted.len() as u32);
         if speculative_count > 0 {
-            ctx.inner().truncate_working_page_tokens(speculative_count);
+            ctx.truncate(speculative_count);
         }
 
         if stop_at < newly_accepted.len() || total_accepted >= max_tokens {
             break;
         }
 
-        // Prepare for next iteration
         let last_accepted = *final_accepted.last().unwrap();
         anchor = last_accepted;
 
-        // Build next window of guesses
-        window = if accepted_count < predicted_tokens.len() {
-            let mut w: Vec<u32> = predicted_tokens[accepted_count..].to_vec();
+        // Next window: take fresh predictions past the accepted prefix,
+        // padding with the anchor where short.
+        window = if accepted_count < predicted.len() {
+            let mut w: Vec<u32> = predicted[accepted_count..].to_vec();
             w.truncate(window_size);
             while w.len() < window_size {
                 w.push(last_accepted);

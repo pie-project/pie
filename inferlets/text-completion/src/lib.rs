@@ -1,14 +1,17 @@
 //! Simple text completion inferlet.
 //!
-//! Demonstrates chat-style generation using typed JSON input/output
-//! with the `EventStream` high-level API.
+//! Demonstrates chat-style generation with the explicit per-step Generator
+//! loop, fanning each token batch through both `chat::Decoder` (for the
+//! visible response) and `reasoning::Decoder` (for the thinking trace).
+//! This composes the two decoders by hand rather than leaning on a
+//! framework-provided unified event stream.
 
 use inferlet::{
-    Context, Event,
-    inference::Sampler,
+    Context, Result,
+    chat, reasoning,
     model::Model,
     runtime,
-    Result,
+    sample::Sampler,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,48 +52,64 @@ struct Output {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    // Load model
     let models = runtime::models();
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
 
-    // Create context and fill with instruct messages
     let mut ctx = Context::new(&model)?;
-    ctx.system(&input.system);
-    ctx.user(&input.prompt);
-    ctx.cue();
+    ctx.system(&input.system).user(&input.prompt).cue();
 
-    // Generate
-    let mut events = ctx
-        .generate(Sampler::top_p(input.temperature, input.top_p))
-        .with_max_tokens(input.max_tokens)
-        .decode()
-        .with_reasoning();
-
+    let mut think = reasoning::Decoder::new(&model);
+    let mut chat = chat::Decoder::new(&model);
     let mut thinking = String::new();
-    let mut output = String::new();
+    let mut text = String::new();
+    let mut in_reasoning = false;
 
-    while let Some(event) = events.next().await? {
-        match event {
-            Event::Thinking(s) => {
+    let mut g = ctx
+        .generate(Sampler::TopP {
+            temperature: input.temperature,
+            p: input.top_p,
+        })
+        .max_tokens(input.max_tokens)
+        .stop(&chat::stop_tokens(&model));
+
+    while let Some(step) = g.next()? {
+        let out = step.execute().await?;
+        if out.tokens.is_empty() {
+            continue;
+        }
+
+        // Reasoning side: Start / Delta / End. Idle is the no-op signal
+        // (tokens outside any reasoning block, or empty visible chunks).
+        match think.feed(&out.tokens)? {
+            reasoning::Event::Start => in_reasoning = true,
+            reasoning::Event::Delta(s) => {
                 eprint!("{}", s);
                 thinking.push_str(&s);
             }
-            Event::ThinkingDone(_) => {
+            reasoning::Event::End(_) => {
                 eprintln!();
+                in_reasoning = false;
             }
-            Event::Text(s) => {
+            reasoning::Event::Idle => {}
+        }
+
+        // Chat side: Delta is visible text. The `in_reasoning` guard is
+        // a defensive filter — the host should already exclude reasoning
+        // tokens from chat::Delta, but we keep it until the contract is
+        // confirmed.
+        match chat.feed(&out.tokens)? {
+            chat::Event::Delta(s) if !in_reasoning => {
                 print!("{}", s);
-                output.push_str(&s);
+                text.push_str(&s);
             }
-            Event::Done(s) => {
-                output = s;
+            chat::Event::Done(s) => {
+                text = s;
                 break;
             }
             _ => {}
         }
     }
 
-    Ok(Output { thinking, text: output })
+    Ok(Output { thinking, text })
 }
-

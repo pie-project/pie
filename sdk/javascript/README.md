@@ -1,263 +1,269 @@
-# inferlet
+# `inferlet` — JavaScript / TypeScript SDK for Pie
 
-JavaScript/TypeScript SDK for writing Pie inferlets.
+Build Pie inferlets (WASM programs that run inside the Pie runtime) from
+TypeScript or JavaScript. Bundled to a component via `jco`; the surface
+here is what your `index.ts` actually imports.
 
-## Quick Start
-
-```js
-import { Model, Context, Sampler, session, runtime } from 'inferlet';
-
-const model = Model.load(runtime.models()[0]);
-const ctx = Context.create(model);
-
-ctx.system('You are a helpful assistant.');
-ctx.user('What is the capital of France?');
-
-const text = ctx.generateText({
-  sampler: Sampler.topP(0.6, 0.95),
-  maxTokens: 256,
-});
-
-session.send(text);
-```
-
-## Examples
-
-Examples live under `sdk/examples/javascript/`:
-
-| Example | Demonstrates |
-|---------|-------------|
-| **hello-world** | Streaming with `on().run()` callback pattern |
-| **text-completion** | One-shot `generateText()` convenience |
-| **beam-search** | Forked contexts, `stream.text()`, `using` auto-dispose |
-
-Build and run an example:
-
-```bash
-# Build to WASM
-bakery build sdk/examples/javascript/hello-world/ -o hello-world.wasm
-
-# Run with dummy model
-pie run --dummy --path hello-world.wasm --manifest sdk/examples/javascript/hello-world/Pie.toml
-```
-
-## API Reference
-
-Import everything from `'inferlet'`:
+## At a glance
 
 ```typescript
-import {
-  Model, Tokenizer,         // Model loading & tokenization
-  Context,                   // Generation context (KV cache)
-  TokenStream, EventStream,  // Streaming iterators
-  Sampler,                   // Sampling strategies
-  ForwardPass,               // Low-level forward pass
-  Grammar, Matcher,          // Structured generation
-  Adapter,                   // LoRA adapters
-  session,                   // Client communication
-  runtime,                   // Runtime info & spawning
-  messaging,                 // Pub/sub messaging
-  mcp,                       // MCP tool server client
-} from 'inferlet';
-```
+import { Context, Model, Sampler, runtime, session } from 'inferlet';
 
-### Context
+export async function main(input: { prompt: string }) {
+  const model = Model.load(runtime.models()[0]);
+  using ctx = new Context(model);
 
-The main entry point for chat-based generation:
+  ctx.system('You are helpful.').user(input.prompt);
 
-```js
-const ctx = Context.create(model);       // auto-named
-const ctx = Context.create(model, 'my-ctx');  // explicit name
-
-// Chat formatting (pie:instruct/chat)
-ctx.system('You are helpful.');
-ctx.user('Hello!');
-ctx.assistant('Hi there!');   // history replay
-ctx.cue();                    // start generation header
-ctx.seal();                   // insert stop token
-
-// Text-level buffer fill
-ctx.fill('arbitrary text');          // encodes via tokenizer
-ctx.fillTokens(new Uint32Array([1, 2, 3]));  // raw tokens
-
-// Forking
-const fork = ctx.fork();              // auto-named
-const fork = ctx.fork('beam-0');      // explicit name
-
-// Cleanup
-ctx.destroy();          // manual
-using _ = ctx;          // auto-dispose via TC39 `using`
-```
-
-### Generation
-
-Three ways to generate:
-
-```js
-// 1. One-shot (simplest)
-const text = ctx.generateText({
-  sampler: Sampler.topP(0.6, 0.95),
-  maxTokens: 256,
-});
-
-// 2. Streaming with callbacks
-ctx.generate({
-  sampler: Sampler.topP(0.6, 0.95),
-  maxTokens: 256,
-  decode: {},
-})
-.on('text', text => session.send(text))
-.on('tool-call', (name, args) => { /* ... */ })
-.run();
-
-// 3. Iterator (advanced)
-for (const event of ctx.generate({ ..., decode: {} })) {
-  if (event.type === 'text') session.send(event.text);
+  return await ctx
+    .generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 })
+    .collectText();
 }
-
-// 4. Raw tokens (lowest level)
-for (const tokens of ctx.generate({ sampler, maxTokens: 128 })) {
-  // tokens: Uint32Array
-}
-const allText = stream.text();      // collect decoded text
-const allTokens = stream.tokens();  // collect token batches
 ```
 
-Stop tokens default to the model's stop tokens when omitted.
+## Three-layer surface
 
-### Sampler
+The SDK is layered. Each layer is usable independently — pick the one
+that fits your control budget.
 
-```js
-Sampler.greedy()                          // temperature=0, top-k=1
-Sampler.topP(temperature, topP)           // nucleus sampling
-Sampler.topK(temperature, topK)           // top-k sampling
-Sampler.minP(temperature, minP)           // min-p sampling
-Sampler.multinomial(temperature, topK)    // multinomial
-Sampler.topKTopP(temperature, topK, topP) // combined
-Sampler.embedding()                       // embedding extraction
-Sampler.distribution(temperature, topK)   // full distribution
-```
+### `Context`
 
-### Event Types
-
-When using `decode: {}` in generate options, events have a `type` discriminant:
-
-| `event.type` | Fields | Description |
-|--------------|--------|-------------|
-| `'text'` | `text` | Generated text chunk |
-| `'thinking'` | `text` | Reasoning/thinking chunk |
-| `'thinking-done'` | `text` | Reasoning complete (full text) |
-| `'tool-call-start'` | — | Tool call detected |
-| `'tool-call'` | `name`, `arguments` | Complete tool call |
-| `'done'` | `text` | Generation finished (full text) |
-
-Enable reasoning/tool-use detection via decoder options:
-
-```js
-ctx.generate({
-  sampler, maxTokens: 256,
-  decode: { reasoning: true, toolUse: true },
-})
-```
-
-### Tool Use
-
-```js
-ctx.equipTools([toolSchemaJson1, toolSchemaJson2]);
-// ... generate and detect tool calls ...
-ctx.answerTool('get_weather', '{"temp": 72}');
-```
-
-### Structured Generation
-
-Pass `constrain: Schema.*` to `generate()` for grammar-constrained decoding.
-The SDK compiles the schema into a stateful matcher and drives it per token:
+Stateful wrapper over the host's KV cache. Buffers tokens via chat
+fillers (`system / user / assistant / cue / seal`) or raw `append`,
+drains via `flush()` or by handing the buffer to a `Forward` /
+`Generator`. Lifecycle: `new Context(model) / fork() / save(name) /
+Context.open(model, name) / Context.take(model, name) / release()`.
 
 ```typescript
-import { Schema } from 'inferlet';
+const ctx = new Context(model);
+ctx.system('...').user('...').cue();
 
-const text = await ctx.generateText({
-  sampler: Sampler.argmax(),
-  maxTokens: 512,
-  constrain: Schema.jsonSchema(PERSON_SCHEMA),
+// Auto-released via TC39 `using`:
+{
+  using ctx = new Context(model);
+  // ... ctx[Symbol.dispose]() called on scope exit
+}
+```
+
+### `Forward` — single forward-pass primitive
+
+`ctx.forward()` returns a `Forward` builder with auto page management.
+Attach inputs, samplers, probes, masks, then `await fwd.execute()`:
+
+```typescript
+import { Sampler, Distribution, Logits } from 'inferlet';
+
+const fwd = ctx.forward();
+fwd.input(promptTokens);
+const hToken  = fwd.sample([promptTokens.length - 1], Sampler.argmax());
+const hLogits = fwd.probe(0, Logits());
+const out = await fwd.execute();
+
+const token  = out.token(hToken);
+const logits = out.logits(hLogits);
+```
+
+`Forward` covers prefill, scoring, custom decode loops, and anywhere the
+generator loop is too high-level. Page reservation, position derivation,
+and post-execute commit happen automatically. Page-level rollback (e.g.
+for speculation) goes through `ctx.truncate(n)`.
+
+### `Sampler` vs probes
+
+* **`Sampler`** produces a token: `argmax()`, `topP(t, p)`, `topK(t, k)`,
+  `minP(t, p)`, `topKTopP(t, k, p)`, `multinomial(t, draws)`.
+* **Probes** read the distribution: `Logits()`, `Distribution(t, k)`,
+  `Logprob(token)`, `Logprobs(tokens)`, `Entropy()`. Each is a tagged
+  interface that doubles as both spec and runtime marker; the typed
+  handle returned by `forward.probe(...)` selects the matching
+  `output.*` accessor.
+
+Both attach to the same forward-pass slot, so one `Forward` can sample
+at some positions and probe at others.
+
+### `Generator` — multi-step state machine
+
+`ctx.generate(sampler, options)` returns a `Generator`. Configure with
+the options object (idiomatic for TS) or chain methods. Iterate with
+`for await`:
+
+```typescript
+// Common case: one-shot
+const text = await ctx
+  .generate(Sampler.argmax(), { maxTokens: 256 })
+  .collectText();
+
+// Per-step (custom sampling, e.g. watermarking)
+const g = ctx.generate(Sampler.argmax(), {
+  maxTokens: 256,
+  autoFlush: false,
+});
+for await (const step of g) {
+  const h = step.clearSampler().probe(0, Distribution(1.0, 0));
+  const out = await step.execute();
+  const chosen = myWatermark.sample(out.distribution(h)!);
+  g.accept([chosen]);
+}
+```
+
+Auto-flush is on by default — `generate(...)` appends `cue()` and uses
+chat-template stop tokens automatically. Pass `autoFlush: false` to
+inspect the buffer before generation.
+
+### Decoders — independent, with `Idle`
+
+```typescript
+import { chat, reasoning } from 'inferlet';
+
+const chatDec  = new chat.Decoder(model);
+const thinkDec = new reasoning.Decoder(model);
+
+for await (const step of g) {
+  const out = await step.execute();
+
+  const c = chatDec.feed(out.tokens);
+  if (c.type === 'delta') process.stdout.write(c.text);
+  else if (c.type === 'done') break;
+
+  const r = thinkDec.feed(out.tokens);
+  if (r.type === 'delta') process.stderr.write(r.text);
+}
+```
+
+Per `feed()`, exactly one event fires. `event.type === 'idle'` is the
+no-op signal when the batch didn't cross a boundary worth surfacing.
+
+### `tools` — opt-in tool helpers
+
+Hand-rolling the agent loop is the default. For models with a native
+tool-call template:
+
+```typescript
+import { tools, GrammarConstraint } from 'inferlet';
+
+ctx.append(tools.equipPrefix(model, schemas));
+ctx.user('...').cue();
+
+let g = ctx.generate(Sampler.argmax(), { maxTokens: 256 });
+const matcher = tools.nativeMatcher(model, schemas);
+if (matcher !== undefined) g = g.constrain(new GrammarConstraint(matcher));
+
+const toolDec = new tools.Decoder(model);
+for await (const step of g) {
+  const out = await step.execute();
+  const ev = toolDec.feed(out.tokens);
+  if (ev.type === 'call') {
+    const result = await runTool(ev.name, ev.args);
+    ctx.append(tools.answerPrefix(model, ev.name, result));
+    ctx.cue();
+    break;
+  }
+}
+```
+
+### Schema as duck-typed interface
+
+`Schema` is a TypeScript interface — any object with a
+`buildConstraint(model)` method satisfies it. Built-in implementors are
+the factory functions `jsonSchema(...)`, `anyJson()`, `regex(...)`,
+`ebnf(...)`; user code plugs in by adding the method to its own class:
+
+```typescript
+import { GrammarConstraint, Grammar, type Schema } from 'inferlet';
+
+class MyLark implements Schema {
+  constructor(public readonly source: string) {}
+  buildConstraint(model: Model) {
+    const g = compileLarkToPie(this.source);
+    return GrammarConstraint.fromGrammar(g, model);
+  }
+}
+
+await ctx
+  .generate(Sampler.argmax(), { constrain: new MyLark(grammar) })
+  .collectText();
+```
+
+### `collectJson` — schema string, or custom validator (e.g. Zod)
+
+```typescript
+// Untyped — returns unknown
+const data = await g.collectJson({ schema: schemaStr });
+
+// Typed via TS generic
+const data = await g.collectJson<{ name: string; age: number }>({
+  schema: schemaStr,
 });
 
-// parsed JSON in one call
-const data = await ctx.generateJson({
-  sampler: Sampler.argmax(),
-  maxTokens: 512,
-  schema: PERSON_SCHEMA,
-});
-
-// typed via Zod (or arktype, yup, etc.)
+// Bring-your-own validator (Zod, arktype, ...):
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 
 const Person = z.object({ name: z.string(), age: z.number() });
-const person = await ctx.generateJson({
-  sampler: Sampler.argmax(),
-  maxTokens: 512,
-  schema: JSON.stringify(zodToJsonSchema(Person)),
-  parse: Person.parse,
-});
+const person = await ctx.generate(Sampler.argmax(), { maxTokens: 512 })
+  .collectJson({
+    schema: JSON.stringify(zodToJsonSchema(Person)),
+    parse: Person.parse,
+  });
 // person: z.infer<typeof Person>
 ```
 
-For schema choice, composition, sampler defaults, and the auto-flush
-behavior, see [`sdk/CONSTRAINED_DECODING.md`](../CONSTRAINED_DECODING.md).
+### Idle — RAII via TC39 `using`
 
-### Session & Runtime
-
-```js
-session.send('Hello');              // send text to client
-const msg = session.receive();      // receive text from client
-session.sendFile(data);             // send binary
-const file = session.receiveFile(); // receive binary
-
-runtime.version();                  // runtime version
-runtime.models();                   // available model names
-runtime.username();                 // invoking user
-runtime.spawn('pkg@1.0.0', args);   // spawn another inferlet
-```
-
-### Messaging
-
-```js
-messaging.push('topic', 'message');       // queue push
-const msg = messaging.pull('topic');      // queue pull (blocking)
-messaging.broadcast('topic', 'message');  // broadcast
-
-const sub = messaging.subscribe('topic');
-for (const msg of sub) {                  // infinite iterator
-  // process msg
-  if (done) break;
+```typescript
+{
+  using _ = ctx.idle();
+  const result = await fetch(url);
 }
-sub.unsubscribe();
+// bid restored when `_` goes out of scope
 ```
 
-## Project Structure
+Drops the bid to zero for the duration; restores the truthful generation
+bid on `Symbol.dispose`. Use across external waits (HTTP, tool calls,
+anything off-GPU). On uncontended devices it's a no-op cost-wise.
+
+## Module layout
 
 ```
-sdk/javascript/
-├── src/
-│   ├── index.ts          # Public API exports
-│   ├── context.ts        # Context, TokenStream, EventStream, Decoder
-│   ├── model.ts          # Model, Tokenizer
-│   ├── sampler.ts        # Sampler constructors
-│   ├── forward.ts        # ForwardPass (low-level)
-│   ├── grammar.ts        # Grammar, Matcher
-│   ├── adapter.ts        # LoRA Adapter
-│   ├── session.ts        # Client communication
-│   ├── runtime.ts        # Runtime info
-│   ├── messaging.ts      # Pub/sub messaging
-│   ├── mcp.ts            # MCP client
-│   ├── zo.ts             # Zeroth-order optimization
-│   ├── _async.ts         # Internal WASI future utilities
-│   └── bindings/         # Auto-generated WIT type declarations
-├── package.json
-├── tsconfig.json
-└── README.md
+sdk/javascript/src/
+    index.ts        — top-level exports
+    context.ts      — Context class
+    forward.ts      — Forward primitive + SampleHandle / ProbeHandle / Output
+    generation.ts   — Generator + GenStep
+    sample.ts       — Sampler + Probe constructors
+    chat.ts         — chat fillers + Decoder + Event
+    reasoning.ts    — Decoder + Event
+    tools.ts        — equipPrefix / answerPrefix / nativeMatcher / Decoder / Event
+    grammar.ts      — Schema interface + jsonSchema/anyJson/regex/ebnf + Grammar/Matcher/GrammarConstraint
+    spec.ts         — Speculator interface
+    scheduling.ts   — market accessors (balance / rent / dividend / latency / price)
+    model.ts        — Model + Tokenizer
+    adapter.ts      — Adapter
+    runtime.ts / messaging.ts / session.ts / mcp.ts / zo.ts — host services
+    bindings/       — auto-generated WIT type declarations
 ```
+
+See [`sdk/CONSTRAINED_DECODING.md`](../CONSTRAINED_DECODING.md) for the
+constrained-decoding details and the SDK divergence between Rust /
+Python / JS.
+
+## Differences from the Rust SDK (intentional)
+
+| Concept | Rust | TypeScript |
+| --- | --- | --- |
+| Async terminator | `.execute().await?` | `await fwd.execute()` |
+| Generator iteration | `while let Some(step) = gen.next()? { … }` | `for await (const step of gen)` |
+| RAII bid yielding | `let _idle = ctx.idle();` | `using _ = ctx.idle();` |
+| Schema | trait + structs | interface + factory functions |
+| Probe spec | marker structs | tagged interfaces (constructors + types) |
+| Decoder events | enum + match | discriminated union (`event.type`) |
+| Auto-cue / auto-flush | explicit | on by default (`autoFlush: false` to disable) |
+| Typed JSON | `collect_json::<T>()` via `schemars` | `collectJson<T>({ schema, parse })` |
+| Constructors | `Sampler::TopP { … }` | `Sampler.topP(t, p)` |
+
+The conceptual layers — `Forward` → `Generator` → independent decoders;
+`Sampler` vs probe; opt-in tools; extensible Schema — are identical
+across all three languages.
 
 ## Development
 

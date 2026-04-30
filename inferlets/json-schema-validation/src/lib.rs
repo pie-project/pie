@@ -10,7 +10,7 @@
 //! into `serde_json::Value` is the only post-processing required.
 
 use inferlet::{
-    Context, Result, Schema, inference::Sampler, model::Model, runtime,
+    Context, Result, Schema, sample::Sampler, model::Model, runtime,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -63,9 +63,9 @@ async fn main(input: Input) -> Result<String> {
     ctx.cue();
 
     let text = ctx
-        .generate(Sampler::ARGMAX)
-        .with_max_tokens(input.max_tokens)
-        .with_schema(Schema::JsonSchema(PERSON_SCHEMA))?
+        .generate(Sampler::Argmax)
+        .max_tokens(input.max_tokens)
+        .constrain_with(inferlet::JsonSchema(PERSON_SCHEMA))?
         .collect_text()
         .await?;
 

@@ -1,9 +1,9 @@
 // Grammar-constrained JSON generation — JavaScript inferlet example.
 //
 // Demonstrates:
-// - `Schema.jsonSchema(...)` to constrain output to a JSON-schema-conforming string.
+// - `jsonSchema(...)` to constrain output to a JSON-schema-conforming string.
 // - `Sampler.argmax()` for deterministic decoding (recommended for grammars).
-// - `Context.generateJson({...})` for one-shot constrained-and-parsed JSON.
+// - `Generator.collectJson({ schema })` for one-shot constrained-and-parsed JSON.
 // - Returning a structured object directly — the bakery wrapper and
 //   `session.send` both auto-stringify, so no manual `JSON.stringify` is needed.
 //
@@ -44,7 +44,7 @@ export async function main(input: Input) {
     const maxTokens = input.max_tokens ?? 512;
 
     const model = Model.load(runtime.models()[0]);
-    const ctx = Context.create(model);
+    using ctx = new Context(model);
     ctx.system(
         'You are a helpful assistant that generates structured data. ' +
         'Output ONLY a raw JSON object — no markdown, no explanation.',
@@ -52,14 +52,12 @@ export async function main(input: Input) {
 
     // Grammar guarantees parseable JSON conforming to the schema. The
     // generic + `parse` hook (e.g., Zod) would give compile-time typing;
-    // here we declare the type via a cast.
-    const person = await ctx.generateJson<Person>({
-        sampler: Sampler.argmax(),
-        maxTokens,
-        schema: PERSON_SCHEMA,
-    });
+    // here we declare the type via the generic parameter.
+    const person = await ctx
+        .generate(Sampler.argmax(), { maxTokens })
+        .collectJson<Person>({ schema: PERSON_SCHEMA });
 
-    // Use the typed object — that's the point of generateJson.
+    // Use the typed object — that's the point of collectJson.
     session.send(`Hello ${person.name}, age ${person.age}.\n`);
     session.send(`Skills: ${person.skills.join(', ')}\n`);
     session.send('[done]');

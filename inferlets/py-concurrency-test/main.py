@@ -5,7 +5,16 @@ contexts. If not, one context will finish completely before the other starts.
 """
 import asyncio
 
-from inferlet import Model, Context, Sampler, Event, runtime, session, set_return
+from inferlet import (
+    Context,
+    Model,
+    Sampler,
+    chat,
+    reasoning,
+    runtime,
+    session,
+    set_return,
+)
 
 log: list[str] = []
 
@@ -15,21 +24,32 @@ async def generate(ctx: Context, label: str) -> None:
     log.append(msg)
     session.send(msg)
 
+    chat_dec = chat.Decoder(ctx.model)
+    think = reasoning.Decoder(ctx.model)
     step_count = 0
-    async for event in await ctx.generate(
-        Sampler.top_p(0.6, 0.95),
-        max_tokens=20,
-        decode=True,
-        reasoning=True,
-    ):
+
+    g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=20)
+    async for step in g:
         step_count += 1
-        match event:
-            case Event.Thinking(text=t) | Event.Text(text=t):
-                msg = f"[{label}] step={step_count} {t}"
-                log.append(msg)
-                session.send(msg)
-            case Event.Done():
+        out = await step.execute()
+
+        match think.feed(out.tokens):
+            case reasoning.Event.Delta(text=t):
+                m = f"[{label}] step={step_count} {t}"
+                log.append(m)
+                session.send(m)
+            case _:
+                pass
+
+        match chat_dec.feed(out.tokens):
+            case chat.Event.Delta(text=t):
+                m = f"[{label}] step={step_count} {t}"
+                log.append(m)
+                session.send(m)
+            case chat.Event.Done(_):
                 break
+            case _:
+                pass
 
     msg = f"[{label}] END"
     log.append(msg)
@@ -39,14 +59,11 @@ async def generate(ctx: Context, label: str) -> None:
 async def main(input: dict) -> None:
     model = Model.load(runtime.models()[0])
 
-    # Two separate contexts with different prompts
     ctx1 = Context(model)
-    ctx1.system("You are helpful.")
-    ctx1.user("Count from 1 to 5.")
+    ctx1.system("You are helpful.").user("Count from 1 to 5.")
 
     ctx2 = Context(model)
-    ctx2.system("You are helpful.")
-    ctx2.user("Name 3 colors.")
+    ctx2.system("You are helpful.").user("Name 3 colors.")
 
     session.send("[test] starting asyncio.gather")
     await asyncio.gather(
@@ -55,8 +72,10 @@ async def main(input: dict) -> None:
     )
     session.send("[test] asyncio.gather complete")
 
-    # Analyze results: check if interleaving happened
-    labels = ["1" if l.startswith("[CTX1]") else "2" if l.startswith("[CTX2]") else "_" for l in log]
+    labels = [
+        "1" if l.startswith("[CTX1]") else "2" if l.startswith("[CTX2]") else "_"
+        for l in log
+    ]
     session.send(f"[test] order: {''.join(labels)}")
 
     switches = 0
@@ -66,6 +85,8 @@ async def main(input: dict) -> None:
             switches += 1
             last = l
     session.send(f"[test] context switches: {switches}")
-    session.send(f"[test] verdict: {'CONCURRENT' if switches > 2 else 'SEQUENTIAL'}")
+    session.send(
+        f"[test] verdict: {'CONCURRENT' if switches > 2 else 'SEQUENTIAL'}"
+    )
 
     set_return("done")

@@ -1,250 +1,244 @@
-# inferlet
+# `inferlet` — Python SDK for Pie
 
-Python SDK for writing Pie inferlets.
+Build Pie inferlets (WASM programs that run inside the Pie runtime) from
+Python. Uses `componentize-py` under the hood; the surface here is what
+your `main.py` actually imports.
 
-## Quick Start
+## At a glance
 
 ```python
-from inferlet import Model, Context, Sampler, session, runtime
+from inferlet import Context, Model, Sampler, runtime
 
-model = Model.load(runtime.models()[0])
+async def main(input: dict) -> str:
+    model = Model.load(runtime.models()[0])
+    ctx = Context(model)
+
+    ctx.system("You are helpful.").user(input["prompt"])
+
+    return await ctx.generate(
+        Sampler.top_p(0.6, 0.95),
+        max_tokens=256,
+    ).collect_text()
+```
+
+## Three-layer surface
+
+The SDK is layered. Each layer is usable independently — pick the one
+that fits your control budget.
+
+### `Context`
+
+Stateful wrapper over the host's KV cache. Buffers tokens via chat
+fillers (`system / user / assistant / cue / seal`) or raw `append`,
+drains via `flush()` or by handing the buffer to a `Forward` /
+`Generator`. Lifecycle: `Context(model) / fork() / save(name) /
+open(model, name) / take(model, name) / release()`.
+
+```python
 ctx = Context(model)
-
-ctx.system("You are a helpful assistant.")
-ctx.user("What is the capital of France?")
-
-text = ctx.generate_text(Sampler.top_p())
-session.send(text)
+ctx.system("...").user("...").cue()
+with Context(model) as ctx:
+    ...  # auto-released on exit
 ```
 
-## Examples
+### `Forward` — single forward-pass primitive
 
-Examples live under `sdk/examples/python/`:
-
-| Example | Demonstrates |
-|---------|-------------|
-| **hello-world** | One-shot `generate_text()` |
-| **text-completion** | Streaming with `Event` pattern matching |
-| **beam-search** | Forked contexts, `generate_text()` per beam |
-
-Build and run an example:
-
-```bash
-# Build to WASM
-bakery build sdk/examples/python/hello-world/ -o hello-world.wasm
-
-# Run with dummy model
-pie run --dummy --path hello-world.wasm --manifest sdk/examples/python/hello-world/Pie.toml
-```
-
-## API Reference
-
-Import everything from `inferlet`:
+`ctx.forward()` returns a `Forward` builder with auto page management.
+Attach inputs, samplers, probes, masks, then `await fwd.execute()`:
 
 ```python
-from inferlet import (
-    Model, Tokenizer,         # Model loading & tokenization
-    Context,                  # Generation context (KV cache)
-    TokenStream, EventStream, # Streaming iterators
-    Sampler,                  # Sampling strategies
-    Event, Decoder,           # Event types & unified decoder
-    ForwardPass,              # Low-level forward pass
-    Grammar, Matcher,         # Structured generation
-    Adapter,                  # LoRA adapters
-    session,                  # Client communication
-    runtime,                  # Runtime info & spawning
-    messaging,                # Pub/sub messaging
-    mcp,                      # MCP tool server client
-    zo,                       # Zeroth-order optimization
-)
+from inferlet import Sampler, Distribution, Logits
+
+fwd = ctx.forward()
+fwd.input(prompt_tokens)
+h_token = fwd.sample([len(prompt_tokens) - 1], Sampler.argmax())
+h_logits = fwd.probe(0, Logits())
+out = await fwd.execute()
+
+token = out.token(h_token)
+logits = out.logits(h_logits)
 ```
 
-### Context
+`Forward` covers prefill, scoring, custom decode loops, and anywhere the
+generator loop is too high-level. Page reservation, position derivation,
+and post-execute commit happen automatically. Page-level rollback (e.g.
+for speculation) goes through `ctx.truncate(n)`.
 
-The main entry point for chat-based generation:
+### `Sampler` vs probes
+
+* **`Sampler`** produces a token: `argmax()`, `top_p(t, p)`,
+  `top_k(t, k)`, `min_p(t, p)`, `top_k_top_p(t, k, p)`,
+  `multinomial(t, draws)`.
+* **Probes** read the distribution: `Logits()`, `Distribution(t, k)`,
+  `Logprob(token)`, `Logprobs(tokens)`, `Entropy()`. Each is a frozen
+  dataclass that doubles as both spec and runtime marker.
+
+Both attach to the same forward-pass slot, so one `Forward` can sample
+at some positions and probe at others.
+
+### `Generator` — multi-step state machine
+
+`ctx.generate(sampler, ...)` returns a `Generator`. Configure with
+kwargs (Pythonic) or chain methods. Iterate with `async for`:
 
 ```python
-ctx = Context(model)                     # auto-named
-ctx = Context(model, name="my-ctx")      # explicit name
+# Common case: one-shot
+text = await ctx.generate(Sampler.argmax(), max_tokens=256).collect_text()
 
-# Chat formatting (pie:instruct/chat)
-ctx.system("You are helpful.")
-ctx.user("Hello!")
-ctx.assistant("Hi there!")    # history replay
-ctx.cue()                     # start generation header
-ctx.seal()                    # insert stop token
-
-# Text-level buffer fill
-ctx.fill("arbitrary text")          # encodes via tokenizer
-ctx.fill_tokens([1, 2, 3])         # raw tokens
-
-# Forking
-fork = ctx.fork()                   # auto-named
-fork = ctx.fork("beam-0")          # explicit name
-
-# Cleanup
-ctx.release()             # manual
-with Context(model) as ctx:  # auto-release via context manager
-    ...
+# Per-step (custom sampling, e.g. watermarking)
+g = ctx.generate(Sampler.argmax(), max_tokens=256, auto_flush=False)
+async for step in g:
+    step.clear_sampler()
+    h = step.probe(0, Distribution(temperature=1.0, k=0))
+    out = await step.execute()
+    chosen = my_watermark.sample(out.distribution(h))
+    g.accept([chosen])
 ```
 
-### Generation
+Auto-flush is on by default — `generate(...)` appends `cue()` and uses
+chat-template stop tokens automatically. Pass `auto_flush=False` to
+inspect the buffer before generation.
 
-Three ways to generate:
+### Decoders — independent, with `Idle`
 
 ```python
-# 1. One-shot (simplest)
-text = ctx.generate_text(Sampler.top_p(), max_tokens=256)
+from inferlet import chat, reasoning
 
-# 2. Streaming events
-for event in ctx.generate(Sampler.top_p(), decode=True):
-    match event:
-        case Event.Text(text=t):
-            session.send(t)
-        case Event.Done():
+chat_dec = chat.Decoder(model)
+think    = reasoning.Decoder(model)
+
+async for step in g:
+    out = await step.execute()
+    match chat_dec.feed(out.tokens):
+        case chat.Event.Delta(text=t): print(t, end="")
+        case chat.Event.Done(text=full): break
+        case _: pass
+    match think.feed(out.tokens):
+        case reasoning.Event.Delta(text=t): print(t, file=sys.stderr, end="")
+        case _: pass
+```
+
+Per `feed()`, exactly one event fires. `Event.Idle` is the no-op signal
+when the batch didn't cross a boundary worth surfacing.
+
+### `tools` — opt-in tool helpers
+
+Hand-rolling the agent loop is the default. For models with a native
+tool-call template:
+
+```python
+from inferlet import GrammarConstraint, tools
+
+ctx.append(tools.equip_prefix(model, schemas))
+ctx.user("...").cue()
+
+g = ctx.generate(Sampler.argmax())
+matcher = tools.native_matcher(model, schemas)
+if matcher is not None:
+    g = g.constrain(GrammarConstraint(matcher))
+
+tool_dec = tools.Decoder(model)
+async for step in g:
+    out = await step.execute()
+    match tool_dec.feed(out.tokens):
+        case tools.Event.Call(name=n, args=a):
+            result = await run_tool(n, a)
+            ctx.append(tools.answer_prefix(model, n, result))
+            ctx.cue()
             break
-
-# 3. Raw tokens (lowest level)
-for tokens in ctx.generate(Sampler.top_p(), max_tokens=128, auto_flush=False):
-    # tokens: list[int]
-    pass
-stream = ctx.generate(Sampler.top_p())
-all_text = stream.text()        # collect decoded text
-all_tokens = stream.tokens()    # collect token IDs
+        case _: pass
 ```
 
-`generate()` auto-calls `cue()` + `flush()` by default. Pass `auto_flush=False` to skip.
+### Schema as Protocol
 
-### Sampler
+`Schema` is a `runtime_checkable` Protocol — any class with a
+`build_constraint(model)` method satisfies it. Built-in implementors are
+frozen dataclasses; user code plugs in by adding the method:
 
 ```python
-Sampler.greedy()                                    # deterministic
-Sampler.top_p(temperature=0.6, top_p=0.95)          # nucleus sampling
-Sampler.top_k(temperature=0.6, top_k=50)            # top-k sampling
-Sampler.min_p(temperature=0.6, min_p=0.1)           # min-p sampling
-Sampler.multinomial(temperature=1.0, seed=0)        # multinomial
-Sampler.top_k_top_p(temperature=0.6, top_k=50, top_p=0.95)  # combined
-Sampler.embedding()                                  # embedding extraction
-Sampler.distribution(temperature=1.0, top_k=0)      # full distribution
+from inferlet import GrammarConstraint, Grammar, Schema
+
+class MyLark:
+    def __init__(self, source): self.source = source
+    def build_constraint(self, model):
+        g = compile_lark_to_pie(self.source)
+        return GrammarConstraint.from_grammar(g, model)
+
+assert isinstance(MyLark("..."), Schema)  # duck-typed
+
+await ctx.generate(Sampler.argmax(), constrain=MyLark(grammar)).collect_text()
 ```
 
-### Event Types
-
-When using `decode=True` in generate, events are dataclasses:
-
-| Event class | Fields | Description |
-|-------------|--------|-------------|
-| `Event.Text` | `text` | Generated text chunk |
-| `Event.Thinking` | `text` | Reasoning/thinking chunk |
-| `Event.ThinkingDone` | `text` | Reasoning complete (full text) |
-| `Event.ToolCallStart` | — | Tool call detected |
-| `Event.ToolCall` | `name`, `arguments` | Complete tool call |
-| `Event.Done` | `text` | Generation finished (full text) |
-
-Enable reasoning/tool-use detection:
+### `collect_json` — schema string and (optional) custom validator
 
 ```python
-for event in ctx.generate(Sampler.top_p(), decode=True, reasoning=True, tool_use=True):
-    ...
-```
+# Untyped — returns dict / list / primitive
+data = await g.collect_json(schema=schema_str)
 
-### Tool Use
-
-```python
-ctx.equip_tools([tool_schema_json_1, tool_schema_json_2])
-# ... generate and detect tool calls ...
-ctx.answer_tool("get_weather", '{"temp": 72}')
-```
-
-### Structured Generation
-
-Pass `constrain=Schema.*` to `generate()` for grammar-constrained decoding.
-The SDK compiles the schema into a stateful matcher and drives it per token:
-
-```python
-from inferlet import Schema
-
-text = await ctx.generate_text(
-    Sampler.argmax(),
-    constrain=Schema.json_schema(PERSON_SCHEMA),
-    max_tokens=512,
+# Bring-your-own validator — gets the generated text post-grammar.
+city = await ctx.generate(Sampler.argmax()).collect_json(
+    schema=schema_str,
+    parse=my_validator,
 )
-
-# parsed JSON in one call
-data = await ctx.generate_json(Sampler.argmax(), schema=PERSON_SCHEMA)
-
-# typed via pydantic v2 (only available if pydantic is installed)
-class Person(pydantic.BaseModel): name: str; age: int
-person = await ctx.generate_pydantic(Person, sampler=Sampler.argmax())
 ```
 
-For schema choice, composition, sampler defaults, and the auto-flush
-behavior, see [`sdk/CONSTRAINED_DECODING.md`](../CONSTRAINED_DECODING.md).
+> **Native extensions don't load in WASM.** `componentize-py` bundles
+> pure-Python packages but cannot load native (Rust/C) extensions today,
+> so pydantic v2 (`pydantic_core`), msgspec, orjson, numpy, etc. abort
+> the inferlet at instantiation. For typed output, use
+> ``schema=schema_str`` with a pure-Python validator passed via
+> ``parse=``.
 
-### Session & Runtime
+### Idle — RAII via `with`
 
 ```python
-session.send("Hello")               # send text to client
-msg = session.receive()             # receive text (blocking)
-session.send_file(data)             # send binary
-file = session.receive_file()       # receive binary
-
-runtime.version()                   # runtime version
-runtime.models()                    # available model names
-runtime.username()                  # invoking user
-runtime.spawn("pkg@1.0.0", args)    # spawn another inferlet
+with ctx.idle():
+    result = await http_get(url)
+# bid restored on exit
 ```
 
-### Messaging
+Drops the bid to zero for the duration; restores the truthful generation
+bid on context-manager exit. Use across external waits (HTTP, tool
+calls, anything off-GPU). On uncontended devices it's a no-op cost-wise.
 
-```python
-messaging.push("topic", "message")        # queue push
-msg = messaging.pull("topic")             # queue pull (blocking)
-messaging.broadcast("topic", "message")   # broadcast
-
-with messaging.subscribe("topic") as sub:
-    for msg in sub:                       # infinite iterator
-        # process msg
-        break
-```
-
-## Project Structure
+## Module layout
 
 ```
-sdk/python/
-├── src/inferlet/
-│   ├── __init__.py       # Public API exports
-│   ├── context.py        # Context, TokenStream, EventStream, Decoder, Event
-│   ├── model.py          # Model, Tokenizer
-│   ├── sampler.py        # Sampler presets
-│   ├── forward.py        # ForwardPass (low-level)
-│   ├── grammar.py        # Grammar, Matcher
-│   ├── adapter.py        # LoRA Adapter
-│   ├── session.py        # Client communication
-│   ├── runtime.py        # Runtime info
-│   ├── messaging.py      # Pub/sub messaging
-│   ├── mcp.py            # MCP client
-│   ├── zo.py             # Zeroth-order optimization
-│   └── _async.py         # Internal WASI future utilities
-├── tests/
-├── scripts/
-├── pyproject.toml
-└── README.md
+inferlet/
+    __init__.py     — top-level: Context, Model, Sampler, runtime, Schema, etc.
+    context.py      — Context class
+    forward.py      — Forward primitive + SampleHandle / ProbeHandle / Output
+    generation.py   — Generator + GenStep
+    sample.py       — Sampler + probe dataclasses
+    chat.py         — chat fillers + Decoder + Event
+    reasoning.py    — Decoder + Event
+    tools.py        — equip_prefix / answer_prefix / native_matcher / Decoder / Event
+    grammar.py      — Schema Protocol + JsonSchema/AnyJson/Regex/Ebnf + Grammar/Matcher/GrammarConstraint
+    spec.py         — Speculator Protocol
+    scheduling.py   — market accessors (balance / rent / dividend / latency / price)
+    model.py        — Model + Tokenizer
+    adapter.py      — Adapter
+    runtime.py / messaging.py / session.py / mcp.py / zo.py — host services
 ```
 
-## Development
+See [`sdk/CONSTRAINED_DECODING.md`](../CONSTRAINED_DECODING.md) for the
+constrained-decoding details and the SDK divergence between Rust /
+Python / JS.
 
-```bash
-cd sdk/python
+## Differences from the Rust SDK (intentional)
 
-# Create virtualenv and install
-uv venv && source .venv/bin/activate
-uv pip install -e ".[dev]"
-uv pip install -e ../tools/bakery
+| Concept | Rust | Python |
+| --- | --- | --- |
+| Async terminator | `.execute().await?` | `await fwd.execute()` |
+| Generator iteration | `while let Some(step) = gen.next()? { … }` | `async for step in gen` |
+| RAII bid yielding | `let _idle = ctx.idle();` | `with ctx.idle():` |
+| Schema | trait + structs | Protocol + dataclasses |
+| Probe spec | marker structs | frozen dataclasses |
+| Decoder events | enum + match | dataclasses + match |
+| Auto-cue / auto-flush | explicit | on by default (Python convention) |
+| Typed JSON | `collect_json::<T>()` via `schemars` | `collect_json(schema=..., parse=...)` |
+| Constructors | `Sampler::TopP { … }` or `top_p(t, p)` | `Sampler.top_p(t, p)` |
 
-# Run tests
-pytest tests/
-
-# Regenerate WIT bindings (after runtime WIT changes)
-python scripts/generate_bindings.py
-```
+The conceptual layers — `Forward` → `Generator` → independent decoders;
+`Sampler` vs probe; opt-in tools; extensible Schema — are identical
+across both languages.

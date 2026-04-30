@@ -1,12 +1,16 @@
-//! Demonstrates output validation by computing normalized probabilities over candidate strings.
+//! Demonstrates output validation by computing normalized probabilities over
+//! a fixed candidate list, given a shared context prefix.
 //!
-//! This example shows how to evaluate the likelihood of different candidate outputs
-//! given a context, using the ForwardPass API with distribution sampling.
+//! For each candidate, fork the context and walk one token at a time,
+//! reading the per-position distribution via `Probe::Distribution` and
+//! accumulating log probability. The cumulative log-prob sequence is then
+//! softmax-normalized across candidates.
 
 use inferlet::{
-    Context, model::Model, runtime,
-    ForwardPassExt, Result,
-    inference::{ForwardPass, Output, Sampler},
+    Context, Result,
+    model::Model,
+    runtime,
+    sample::Distribution,
 };
 use serde::Deserialize;
 use std::time::Instant;
@@ -14,112 +18,79 @@ use std::time::Instant;
 #[derive(Deserialize)]
 struct Input {}
 
-/// Calculates the normalized probability of a list of candidate strings being generated
-/// from a given context.
-///
-/// Uses ForwardPass with Sampler::distribution to retrieve token probability distributions,
-/// then scores each candidate by its cumulative log probability.
+/// Calculate the normalized probability of each candidate string being
+/// generated from the given context.
 pub async fn validate_outputs(
     model: &Model,
-    ctx: &Context,
+    base: &Context,
     candidates: &[String],
 ) -> Result<Vec<(String, f32)>> {
     let tokenizer = model.tokenizer();
-    let mut log_probs = Vec::new();
+    let mut log_probs = Vec::with_capacity(candidates.len());
 
-    for (i, candidate) in candidates.iter().enumerate() {
-        let candidate_ctx = ctx.fork()?;
-
+    for candidate in candidates {
+        let mut ctx = base.fork()?;
         let candidate_tokens = tokenizer.encode(candidate);
-        let mut current_log_prob = 0.0f32;
-        let mut pending = vec![*tokenizer.encode("").last().unwrap_or(&0)];
 
-        // Calculate the cumulative log probability for the candidate token sequence
-        for &token_id in &candidate_tokens {
-            if pending.is_empty() {
-                current_log_prob = -1000.0;
+        // Bootstrap: feed an empty marker so the model produces a
+        // distribution at the candidate's first token position. We use the
+        // last token of the empty-string encoding as a no-op anchor.
+        let mut pending = vec![*tokenizer.encode("").last().unwrap_or(&0)];
+        let mut cumulative_log_prob = 0.0f32;
+
+        for &target in &candidate_tokens {
+            let mut pass = ctx.forward();
+            pass.input(&pending);
+            // Probe the distribution at the LAST input position (the slot
+            // index is local to the auto-input window: `len-1`).
+            let last_idx = (pending.len() - 1) as u32;
+            // `k = 0` returns the full vocabulary so we can look up `target`.
+            let h = pass.probe(last_idx, Distribution { temperature: 0.0, k: 0 });
+
+            let out = pass.execute().await?;
+            let (ids, probs) = out
+                .distribution(h)
+                .ok_or("Distribution probe missing")?;
+
+            let p = ids
+                .iter()
+                .position(|&id| id == target)
+                .map(|i| probs[i])
+                .unwrap_or(0.0);
+
+            if p > 0.0 {
+                cumulative_log_prob += p.ln();
+            } else {
+                cumulative_log_prob = -1000.0;
                 break;
             }
 
-            let current_working_pages = candidate_ctx.inner().working_page_count();
-            let page_size = candidate_ctx.page_size();
-            let wpt = candidate_ctx.inner().working_page_token_count();
-            let seq_len = candidate_ctx.inner().committed_page_count() * page_size + wpt;
-            let total_tokens_after = wpt + pending.len() as u32;
-            let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
-            let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
-            if additional_pages > 0 {
-                candidate_ctx.inner().reserve_working_pages(additional_pages)
-                    .map_err(|e| format!("Failed to reserve pages: {}", e))?;
-            }
-
-            let pass = ForwardPass::new(model);
-            pass.context(candidate_ctx.inner());
-            let positions: Vec<u32> = (seq_len..seq_len + pending.len() as u32).collect();
-            pass.input_tokens(&pending, &positions);
-
-            // Sample distributions at the last token position
-            let last_idx = (pending.len() - 1) as u32;
-            pass.sampler(&[last_idx], &Sampler::distribution(0.0, 0));
-
-            let output = pass.execute_async().await
-                .map_err(|e| format!("Forward pass failed: {}", e))?;
-
-            // Commit pages
-            let new_wpt = wpt + pending.len() as u32;
-            let pages_to_commit = new_wpt / page_size;
-            if pages_to_commit > 0 {
-                candidate_ctx.inner().commit_working_pages(pages_to_commit)
-                    .map_err(|e| format!("Failed to commit pages: {}", e))?;
-            }
-
-            // Extract distribution and find the probability of the target token
-            if let Some((ids, probs)) = output.first_distribution() {
-                if let Some(index) = ids.iter().position(|&id| id == token_id) {
-                    let prob = probs[index];
-                    if prob > 0.0 {
-                        current_log_prob += prob.ln();
-                    } else {
-                        current_log_prob = -1000.0;
-                        break;
-                    }
-                } else {
-                    current_log_prob = -1000.0;
-                    break;
-                }
-            }
-
-            // Feed the current token for the next step
-            pending = vec![token_id];
+            // Feed the realized token forward for the next step.
+            pending = vec![target];
         }
-        log_probs.push(current_log_prob);
+        log_probs.push(cumulative_log_prob);
     }
 
-    // Normalize the probabilities
     let max_log_prob = log_probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
     if max_log_prob.is_infinite() {
-        let uniform_prob = 1.0 / candidates.len() as f32;
-        return Ok(candidates
-            .iter()
-            .map(|c| (c.clone(), uniform_prob))
-            .collect());
+        let uniform = 1.0 / candidates.len() as f32;
+        return Ok(candidates.iter().map(|c| (c.clone(), uniform)).collect());
     }
 
-    let mut total_prob = 0.0;
-    let probs: Vec<f32> = log_probs
+    let mut total = 0.0f32;
+    let raw: Vec<f32> = log_probs
         .iter()
-        .map(|&log_p| {
-            let p = (log_p - max_log_prob).exp();
-            total_prob += p;
+        .map(|&lp| {
+            let p = (lp - max_log_prob).exp();
+            total += p;
             p
         })
         .collect();
 
     Ok(candidates
         .iter()
-        .zip(probs.iter())
-        .map(|(candidate, &p)| (candidate.clone(), p / total_prob))
+        .zip(raw.iter())
+        .map(|(c, &p)| (c.clone(), p / total))
         .collect())
 }
 
@@ -130,19 +101,17 @@ async fn main(_input: Input) -> Result<String> {
     let model = Model::load(models.first().ok_or("No models available")?)?;
 
     let mut ctx = Context::new(&model)?;
+    ctx.system("You are an expert at information extraction.")
+        .user(
+            "From the sentence \"The financial report was prepared by David Chen.\", \
+             extract the person's name.",
+        )
+        .cue();
 
-    let mut pending_tokens: Vec<u32> = Vec::new();
-    pending_tokens.extend(inferlet::instruct::chat::system(&model, "You are an expert at information extraction."));
-    pending_tokens.extend(inferlet::instruct::chat::user(&model,
-        "From the sentence \"The financial report was prepared by David Chen.\", \
-        extract the person's name.",
-    ));
-    pending_tokens.extend(inferlet::instruct::chat::cue(&model));
+    let prompt_tail = "The name of the person in the report is ";
+    ctx.append(&model.tokenizer().encode(prompt_tail));
+    ctx.flush().await?;
 
-    let prompt = "The name of the person in the report is ";
-    pending_tokens.extend(model.tokenizer().encode(prompt));
-
-    // Define the list of candidate outputs to validate
     let candidates = vec![
         "John Smith".to_string(),
         "Mary Anne".to_string(),
@@ -150,12 +119,11 @@ async fn main(_input: Input) -> Result<String> {
         "Chen David".to_string(),
     ];
 
-    println!("--- Context ---\n'{}'\n\n--- Candidates ---", prompt);
+    println!("--- Context ---\n'{}'\n\n--- Candidates ---", prompt_tail);
     for c in &candidates {
         println!("- {}", c);
     }
 
-    // Call the validation function
     let results = validate_outputs(&model, &ctx, &candidates).await?;
 
     println!("\n--- Validation Results ---");
@@ -168,6 +136,5 @@ async fn main(_input: Input) -> Result<String> {
     }
 
     println!("\nTotal elapsed: {:?}", start.elapsed());
-
     Ok(String::new())
 }

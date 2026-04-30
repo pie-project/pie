@@ -1,29 +1,40 @@
 """
 Grammar, Matcher, GrammarConstraint, and Schema for constrained decoding.
 
-For most use cases, build a :class:`Schema` and pass it as ``constrain=`` to
-:meth:`Context.generate` — the SDK compiles the schema into a stateful
+The common path is declarative: pass a :class:`Schema` to
+``ctx.generate(..., constrain=...)`` (or any class implementing the
+:class:`Schema` protocol), and the SDK compiles it into a stateful
 matcher and drives it per generated token::
 
-    text = await ctx.generate_text(
+    text = await ctx.generate(
         Sampler.argmax(),
-        constrain=Schema.ebnf(grammar),
+        constrain=Ebnf(grammar),
         max_tokens=512,
-    )
+    ).collect_text()
 
-For custom logic (banned tokens, learned constraints, etc.), implement the
-:class:`Constraint` protocol and pass an instance directly.
+Built-in implementors:
+
+* :class:`JsonSchema` — JSON conforming to a JSON Schema string
+* :class:`AnyJson`    — any valid JSON
+* :class:`Regex`      — strings matching a regex pattern
+* :class:`Ebnf`       — custom EBNF grammar
+
+User code can implement the :class:`Schema` protocol on any class with a
+``build_constraint(model)`` method — duck-typed, no inheritance required.
+
+For custom logic that isn't a grammar (banned tokens, learned constraints,
+etc.), implement the :class:`Constraint` protocol and pass it directly.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from wit_world.imports.inference import Grammar as _Grammar
 from wit_world.imports.inference import Matcher as _Matcher
 
-from .model import Tokenizer
+from .model import Model, Tokenizer
 
 
 # =============================================================================
@@ -71,14 +82,21 @@ class Grammar:
 class Matcher:
     """Stateful grammar matcher producing token masks.
 
-    Most callers should reach for :class:`Schema` or :class:`GrammarConstraint`
-    instead — Matcher is the lower-level resource wrapper.
+    Most callers should reach for :class:`GrammarConstraint` instead —
+    Matcher is the lower-level resource wrapper.
     """
 
     __slots__ = ("_handle",)
 
     def __init__(self, grammar: Grammar, tokenizer: Tokenizer) -> None:
         self._handle = _Matcher(grammar._handle, tokenizer._handle)
+
+    @classmethod
+    def _from_handle(cls, handle: _Matcher) -> Matcher:
+        """Internal: wrap a pre-existing host matcher."""
+        obj = object.__new__(cls)
+        obj._handle = handle
+        return obj
 
     def accept_tokens(self, token_ids: list[int]) -> None:
         """Accept tokens, advancing the matcher state."""
@@ -107,25 +125,29 @@ class Matcher:
 class Constraint(Protocol):
     """Stateful sampling constraint protocol.
 
-    On each generation step, the :class:`TokenStream` passes any newly
-    accepted tokens (or ``[]`` on the first step) and gets back the
-    BRLE-encoded logit mask for the next position.
+    On each generation step, the Generator passes any newly accepted
+    tokens (or ``[]`` on the first step) and gets back the BRLE-encoded
+    logit mask for the next position.
 
-    Returning ``[]`` means "no restriction".
+    Returning ``[]`` (empty mask) means "no restriction" and is treated
+    as transparent during composition.
     """
 
     def step(self, accepted: list[int]) -> list[int]:
-        """Advance internal state with ``accepted`` tokens, then return the
-        mask for the next position."""
+        """Advance internal state with ``accepted`` tokens, then return
+        the mask for the next position."""
         ...
 
 
 class GrammarConstraint:
-    """Grammar-driven :class:`Constraint` backed by a host :class:`Matcher`.
+    """Grammar-driven :class:`Constraint` backed by a host
+    :class:`Matcher`.
 
-    Most callers should reach for :class:`Schema` instead — `GrammarConstraint`
-    is the lower-level type for callers that want to keep a constraint
-    instance around (e.g., to compose with custom constraints)."""
+    Most callers should reach for a :class:`Schema` implementor instead
+    — :class:`GrammarConstraint` is the lower-level type for callers
+    that want to keep a constraint instance around (e.g., for use with
+    :func:`tools.native_matcher`).
+    """
 
     __slots__ = ("_matcher",)
 
@@ -133,27 +155,27 @@ class GrammarConstraint:
         self._matcher = matcher
 
     @classmethod
-    def from_grammar(cls, grammar: Grammar, model) -> GrammarConstraint:
+    def from_grammar(cls, grammar: Grammar, model: Model) -> GrammarConstraint:
         """Build from a pre-compiled grammar (compile once, reuse)."""
         return cls(Matcher(grammar, model.tokenizer()))
 
     @classmethod
-    def from_json_schema(cls, schema: str, model) -> GrammarConstraint:
+    def from_json_schema(cls, schema: str, model: Model) -> GrammarConstraint:
         """Build from a JSON Schema string."""
         return cls.from_grammar(Grammar.from_json_schema(schema), model)
 
     @classmethod
-    def json(cls, model) -> GrammarConstraint:
+    def json(cls, model: Model) -> GrammarConstraint:
         """Build a constraint that accepts any valid JSON."""
         return cls.from_grammar(Grammar.json(), model)
 
     @classmethod
-    def from_regex(cls, pattern: str, model) -> GrammarConstraint:
+    def from_regex(cls, pattern: str, model: Model) -> GrammarConstraint:
         """Build from a regular expression pattern."""
         return cls.from_grammar(Grammar.from_regex(pattern), model)
 
     @classmethod
-    def from_ebnf(cls, ebnf: str, model) -> GrammarConstraint:
+    def from_ebnf(cls, ebnf: str, model: Model) -> GrammarConstraint:
         """Build from an EBNF grammar string."""
         return cls.from_grammar(Grammar.from_ebnf(ebnf), model)
 
@@ -163,81 +185,123 @@ class GrammarConstraint:
         return self._matcher.next_token_logit_mask()
 
 
-class _StaticMaskConstraint:
-    """Wraps a static BRLE mask as a :class:`Constraint` (returned every step)."""
-
-    __slots__ = ("_mask",)
-
-    def __init__(self, mask: list[int]) -> None:
-        self._mask = mask
-
-    def step(self, accepted: list[int]) -> list[int]:
-        return self._mask
-
-
 # =============================================================================
-# Schema — declarative constraint description
+# Schema protocol + built-in implementors
 # =============================================================================
 
 
-SchemaKind = Literal["json_schema", "json", "regex", "ebnf", "grammar"]
+@runtime_checkable
+class Schema(Protocol):
+    """Declarative description of a constraint.
+
+    Implementations are passed to ``ctx.generate(constrain=...)`` (or
+    :meth:`Generator.constrain`) and compiled into a
+    :class:`GrammarConstraint`.
+
+    User code can implement this protocol on any class — duck-typed, no
+    inheritance required::
+
+        class MyLark:
+            def __init__(self, source): self.source = source
+            def build_constraint(self, model):
+                g = compile_lark_to_pie_grammar(self.source)
+                return GrammarConstraint.from_grammar(g, model)
+
+        await ctx.generate(Sampler.argmax(), constrain=MyLark(grammar)).collect_text()
+    """
+
+    def build_constraint(self, model: Model) -> GrammarConstraint:
+        """Compile this schema into a :class:`GrammarConstraint`."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
-class Schema:
-    """Declarative description of a constraint.
+class JsonSchema:
+    """JSON conforming to a JSON Schema string."""
 
-    Use with ``Context.generate(..., constrain=Schema.*)``. The SDK compiles
-    the schema into a :class:`GrammarConstraint` internally.
+    schema: str
 
-    Frozen and hashable — safe to use as a dict key or in a set.
+    def build_constraint(self, model: Model) -> GrammarConstraint:
+        return GrammarConstraint.from_json_schema(self.schema, model)
 
-    ::
 
-        Schema.json_schema('{"type": "object", ...}')
-        Schema.json()                          # any valid JSON
-        Schema.regex(r"\\d{3}-\\d{4}")
-        Schema.ebnf('root ::= "hello" | "world"')
-        Schema.grammar(precompiled_grammar)
-    """
+@dataclass(frozen=True, slots=True)
+class AnyJson:
+    """Any valid JSON value."""
 
-    kind: SchemaKind
-    value: Any = None
+    def build_constraint(self, model: Model) -> GrammarConstraint:
+        return GrammarConstraint.json(model)
 
-    @classmethod
-    def json_schema(cls, schema: str) -> Schema:
-        """Constrain to JSON valid against the given JSON Schema string."""
-        return cls("json_schema", schema)
 
-    @classmethod
-    def json(cls) -> Schema:
-        """Constrain to any valid JSON."""
-        return cls("json", None)
+@dataclass(frozen=True, slots=True)
+class Regex:
+    """Strings matching a regular expression pattern."""
 
-    @classmethod
-    def regex(cls, pattern: str) -> Schema:
-        """Constrain to strings matching the regular expression."""
-        return cls("regex", pattern)
+    pattern: str
 
-    @classmethod
-    def ebnf(cls, ebnf: str) -> Schema:
-        """Constrain to a custom EBNF grammar."""
-        return cls("ebnf", ebnf)
+    def build_constraint(self, model: Model) -> GrammarConstraint:
+        return GrammarConstraint.from_regex(self.pattern, model)
 
-    @classmethod
-    def grammar(cls, grammar: Grammar) -> Schema:
-        """Constrain to a pre-compiled :class:`Grammar` (compile once, reuse)."""
-        return cls("grammar", grammar)
 
-    def _build(self, model) -> GrammarConstraint:
-        if self.kind == "json_schema":
-            return GrammarConstraint.from_json_schema(self.value, model)
-        if self.kind == "json":
-            return GrammarConstraint.json(model)
-        if self.kind == "regex":
-            return GrammarConstraint.from_regex(self.value, model)
-        if self.kind == "ebnf":
-            return GrammarConstraint.from_ebnf(self.value, model)
-        if self.kind == "grammar":
-            return GrammarConstraint.from_grammar(self.value, model)
-        raise ValueError(f"Unknown schema kind: {self.kind}")
+@dataclass(frozen=True, slots=True)
+class Ebnf:
+    """A custom EBNF grammar."""
+
+    source: str
+
+    def build_constraint(self, model: Model) -> GrammarConstraint:
+        return GrammarConstraint.from_ebnf(self.source, model)
+
+
+# =============================================================================
+# BRLE intersection (for composing constraint masks)
+# =============================================================================
+
+
+def _brle_and(a: list[int], b: list[int]) -> list[int]:
+    """AND two BRLE-encoded masks of equal length."""
+    if not a or not b:
+        return []
+    out: list[int] = []
+    a_idx = b_idx = 0
+    a_left, b_left = a[0], b[0]
+    a_value = b_value = False
+    want_value = False
+    accum = 0
+    while True:
+        take = min(a_left, b_left)
+        result = a_value and b_value
+        if result == want_value:
+            accum += take
+        else:
+            out.append(accum)
+            accum = take
+            want_value = not want_value
+        a_left -= take
+        b_left -= take
+        if a_left == 0:
+            a_idx += 1
+            if a_idx == len(a):
+                break
+            a_left = a[a_idx]
+            a_value = not a_value
+        if b_left == 0:
+            b_idx += 1
+            if b_idx == len(b):
+                break
+            b_left = b[b_idx]
+            b_value = not b_value
+    out.append(accum)
+    return out
+
+
+def _brle_and_many(masks: list[list[int]]) -> list[int]:
+    """Reduce a list of BRLE masks via AND. Empty input returns []."""
+    if not masks:
+        return []
+    if len(masks) == 1:
+        return masks[0]
+    acc = masks[0]
+    for m in masks[1:]:
+        acc = _brle_and(acc, m)
+    return acc

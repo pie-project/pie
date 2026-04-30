@@ -18,7 +18,7 @@
 use inferlet::{
     Context, model::Model, runtime,
     Result,
-    inference::Sampler,
+    sample::Sampler,
 };
 use serde::Deserialize;
 
@@ -186,12 +186,12 @@ async fn main(input: Input) -> Result<String> {
         max_num_outputs_per_prompt
     );
 
-    let sampler = Sampler::ARGMAX;
+    let sampler = Sampler::Argmax;
     let mut results: Vec<Result<String>> = Vec::new();
 
     for ctx in ctxs.iter_mut() {
         let result = ctx.generate(sampler.clone())
-            .with_max_tokens(max_num_outputs_per_prompt)
+            .max_tokens(max_num_outputs_per_prompt)
             .collect_text()
             .await;
         results.push(result);

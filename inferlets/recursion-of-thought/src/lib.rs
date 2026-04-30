@@ -6,7 +6,7 @@
 
 use futures::future;
 use inferlet::{
-    Context, inference::Sampler, model::Model,
+    Context, sample::Sampler, model::Model,
     runtime, Result,
 };
 use serde::Deserialize;
@@ -103,8 +103,8 @@ fn divide_and_conquer<'a>(
             solve_ctx.cue();
 
             let response = solve_ctx
-                .generate(Sampler::ARGMAX)
-                .with_max_tokens(max_tokens)
+                .generate(Sampler::Argmax)
+                .max_tokens(max_tokens)
                 .collect_text()
                 .await?;
 
@@ -122,8 +122,8 @@ fn divide_and_conquer<'a>(
         divide_ctx.cue();
 
         let response = divide_ctx
-            .generate(Sampler::ARGMAX)
-            .with_max_tokens(max_tokens)
+            .generate(Sampler::Argmax)
+            .max_tokens(max_tokens)
             .collect_text()
             .await?;
 
@@ -185,8 +185,8 @@ fn divide_and_conquer<'a>(
                 merge_ctx.cue();
 
                 let response = merge_ctx
-                    .generate(Sampler::ARGMAX)
-                    .with_max_tokens(max_tokens)
+                    .generate(Sampler::Argmax)
+                    .max_tokens(max_tokens)
                     .collect_text()
                     .await?;
 

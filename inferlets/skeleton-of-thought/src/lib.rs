@@ -6,7 +6,7 @@
 
 use futures::future;
 use inferlet::{
-    Context, inference::Sampler, model::Model,
+    Context, sample::Sampler, model::Model,
     runtime, Result,
 };
 use serde::Deserialize;
@@ -49,8 +49,8 @@ async fn plan_and_generate_parallel(
     plan_ctx.cue();
 
     let output = plan_ctx
-        .generate(Sampler::TopP((0.6, 0.95)))
-        .with_max_tokens(plan_max_tokens)
+        .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+        .max_tokens(plan_max_tokens)
         .collect_text()
         .await?;
 
@@ -82,8 +82,8 @@ async fn plan_and_generate_parallel(
 
             Ok(async move {
                 elab_ctx
-                    .generate(Sampler::TopP((0.6, 0.95)))
-                    .with_max_tokens(elab_max_tokens)
+                    .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+                    .max_tokens(elab_max_tokens)
                     .collect_text()
                     .await
             })

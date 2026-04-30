@@ -364,13 +364,15 @@ class Run(exports.Run):
                 # Support both sync and async main()
                 if asyncio.iscoroutine(result):
                     result = loop.run_until_complete(result)
-                # Pass through strings; JSON-stringify everything else (dict,
-                # list, primitives, pydantic v2 models, dataclasses).
+                # Pass through strings; JSON-stringify everything else
+                # (dict, list, primitives, dataclasses). Objects with a
+                # `model_dump_json` method are handed off to it — useful
+                # for any future WASM-compatible pydantic-shaped class
+                # (pydantic v2 itself does not load in WASM today).
                 if result is None:
                     return _inferlet.get_return_value() or ""
                 if isinstance(result, str):
                     return result
-                # Pydantic v2 BaseModel — use canonical JSON dump.
                 if hasattr(result, "model_dump_json") and callable(result.model_dump_json):
                     return result.model_dump_json()
                 return json.dumps(result, default=str)

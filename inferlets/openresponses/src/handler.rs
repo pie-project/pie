@@ -8,7 +8,7 @@ use wstd::http::{IntoBody, Response};
 use wstd::io::AsyncWrite;
 
 use inferlet::Context;
-use inferlet::inference::Sampler;
+use inferlet::sample::Sampler;
 use inferlet::model::Model;
 use inferlet::runtime;
 use inferlet::{};
@@ -202,7 +202,9 @@ async fn handle_streaming_response(
         }
     };
 
-    // Fill context using 
+    // Fill context — `Generator::next()` drains the buffer on the first
+    // step, so no separate flush is needed (and would in fact leave the
+    // first forward pass with zero input tokens).
     if let Some(sys) = &system_message {
         ctx.system(sys);
     }
@@ -211,32 +213,21 @@ async fn handle_streaming_response(
     }
     ctx.cue();
 
-    // Flush the prompt
-    if let Err(e) = ctx.flush().await {
-        response.status = ResponseStatus::Failed;
-        response.error = Some(ErrorPayload {
-            error_type: "server_error".to_string(),
-            code: Some("flush_failed".to_string()),
-            message: format!("Flush failed: {}", e),
-            param: None,
-        });
-        emit!(emitter.response_failed(&response));
-        emit!(StreamEmitter::done());
-        return Finished::finish(body, Ok(()), None);
-    }
-
-    let sampler = Sampler::TopP((temperature, top_p));
+    let sampler = Sampler::TopP { temperature: temperature, p: top_p };
 
     let mut full_text = String::new();
     let mut tokens_generated: usize = 0;
 
     // Token-by-token generation loop with TRUE streaming
-    let mut stream = ctx.generate(sampler).with_max_tokens(max_tokens);
-    while let Ok(Some(tokens)) = stream.next().await {
-        tokens_generated += tokens.len();
-        let delta_text = tokenizer.decode(&tokens).unwrap_or_default();
+    let mut stream = ctx.generate(sampler).max_tokens(max_tokens);
+    while let Ok(Some(step)) = stream.next() {
+        let out = match step.execute().await {
+            Ok(o) => o,
+            Err(_) => break,
+        };
+        tokens_generated += out.tokens.len();
+        let delta_text = tokenizer.decode(&out.tokens).unwrap_or_default();
 
-        // Emit response.output_text.delta for this batch (with flush!)
         if !delta_text.is_empty() {
             emit!(emitter.output_text_delta(&message_id, 0, 0, &delta_text));
             full_text.push_str(&delta_text);
@@ -317,7 +308,9 @@ async fn handle_non_streaming_response(
         }
     };
 
-    // Fill context using 
+    // Fill context — `Generator::next()` drains the buffer on the first
+    // step, so no separate flush is needed (and would in fact leave the
+    // first forward pass with zero input tokens).
     if let Some(sys) = &system_message {
         ctx.system(sys);
     }
@@ -326,20 +319,19 @@ async fn handle_non_streaming_response(
     }
     ctx.cue();
 
-    // Flush the prompt
-    if let Err(e) = ctx.flush().await {
-        return error_response(responder, 500, "server_error", &format!("Flush failed: {}", e), None, None).await;
-    }
-
     // Generate token by token to count tokens for incomplete detection
-    let sampler = Sampler::TopP((temperature, top_p));
-    let mut stream = ctx.generate(sampler).with_max_tokens(max_tokens);
+    let sampler = Sampler::TopP { temperature: temperature, p: top_p };
+    let mut stream = ctx.generate(sampler).max_tokens(max_tokens);
     let mut full_text = String::new();
     let mut tokens_generated: usize = 0;
 
-    while let Ok(Some(tokens)) = stream.next().await {
-        tokens_generated += tokens.len();
-        let text = tokenizer.decode(&tokens).unwrap_or_default();
+    while let Ok(Some(step)) = stream.next() {
+        let out = match step.execute().await {
+            Ok(o) => o,
+            Err(_) => break,
+        };
+        tokens_generated += out.tokens.len();
+        let text = tokenizer.decode(&out.tokens).unwrap_or_default();
         full_text.push_str(&text);
     }
 

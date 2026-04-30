@@ -2,37 +2,44 @@
 
 Demonstrates:
 - Loading a model
-- Using Context for chat-style prompt building
-- Streaming generation with EventStream
+- Building chat context with chat fillers
+- Streaming generation with independent chat + reasoning decoders
+- Match-case dispatch on decoder events
 """
 
-from inferlet import Model, Context, Sampler, Event, runtime, session
+from inferlet import Context, Model, Sampler, chat, reasoning, runtime, session
 
 
 async def main(input: dict) -> str:
-    # Load model
     model = Model.load(runtime.models()[0])
 
-    # Build context
     ctx = Context(model)
     ctx.system("You are a helpful assistant.")
     ctx.user("What is the capital of France? Tell me a joke.")
 
-    # Stream the response
+    chat_dec = chat.Decoder(model)
+    think = reasoning.Decoder(model)
     output = ""
-    async for event in await ctx.generate(
-        Sampler.top_p(0.6, 0.95),
-        max_tokens=256,
-        decode=True,
-    ):
-        match event:
-            case Event.Thinking(text=t):
+
+    g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=256)
+    async for step in g:
+        out = await step.execute()
+
+        match think.feed(out.tokens):
+            case reasoning.Event.Delta(text=t):
                 session.send(t)
-            case Event.Text(text=t):
+            case _:
+                pass
+
+        match chat_dec.feed(out.tokens):
+            case chat.Event.Delta(text=t):
                 session.send(t)
                 output += t
-            case Event.Done():
+            case chat.Event.Done(text=full):
+                output = full
                 break
+            case _:
+                pass
 
     session.send("\n[done]")
     return output
