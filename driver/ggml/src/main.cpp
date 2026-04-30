@@ -39,6 +39,129 @@ void on_signal(int) {
     if (auto* s = g_server.load()) s->stop();
 }
 
+// -----------------------------------------------------------------------------
+// Offline-test scaffolding (--test-prompt-tokens and friends)
+// -----------------------------------------------------------------------------
+
+std::vector<std::uint32_t> parse_csv_u32(const std::string& s) {
+    std::vector<std::uint32_t> v;
+    std::string item;
+    for (char c : s) {
+        if (c == ',') {
+            if (!item.empty()) v.push_back(std::stoul(item));
+            item.clear();
+        } else if (!std::isspace(static_cast<unsigned char>(c))) {
+            item.push_back(c);
+        }
+    }
+    if (!item.empty()) v.push_back(std::stoul(item));
+    return v;
+}
+
+// "a,b|c,d|e" → {{a,b},{c,d},{e}}
+std::vector<std::vector<std::uint32_t>> parse_pipe_csv_u32(const std::string& s) {
+    std::vector<std::vector<std::uint32_t>> out;
+    std::string chunk;
+    for (char c : s) {
+        if (c == '|') {
+            if (!chunk.empty()) out.push_back(parse_csv_u32(chunk));
+            chunk.clear();
+        } else {
+            chunk.push_back(c);
+        }
+    }
+    if (!chunk.empty()) out.push_back(parse_csv_u32(chunk));
+    return out;
+}
+
+// 1, 2, 3, ... up to count (test-only synthetic context ids).
+std::vector<std::uint64_t> seq_ctx_ids(std::size_t count) {
+    std::vector<std::uint64_t> v(count);
+    for (std::size_t i = 0; i < count; ++i) v[i] = i + 1;
+    return v;
+}
+
+enum class OfflineTestMode {
+    Single,     // one prompt, print all tokens, report per-context tok/s
+    Multi,      // N prompts, print all, report wall-time only
+    Replicate,  // N copies of one prompt, print [0] only, report aggregate tok/s
+};
+
+// Drives generate_multi() with the supplied prompts + ctx_ids and prints
+// outputs + timing per the test mode.
+void run_offline_test(pie_ggml_driver::ForwardEngine& engine,
+                      std::vector<std::vector<std::uint32_t>> prompts,
+                      std::vector<std::uint64_t> ctx_ids,
+                      int max_new,
+                      OfflineTestMode mode) {
+    using clock = std::chrono::steady_clock;
+    const std::size_t n = prompts.size();
+
+    switch (mode) {
+        case OfflineTestMode::Single:
+            std::cerr << "[pie-driver-ggml] self-test: prompt="
+                      << prompts[0].size() << " tokens, max_new=" << max_new << "\n";
+            break;
+        case OfflineTestMode::Multi:
+            std::cerr << "[pie-driver-ggml] multi-context self-test: "
+                      << n << " contexts, max_new=" << max_new << "\n";
+            break;
+        case OfflineTestMode::Replicate:
+            std::cerr << "[pie-driver-ggml] throughput test: " << n
+                      << " concurrent contexts × " << max_new
+                      << " tokens (prompt=" << prompts[0].size()
+                      << " tokens each)\n";
+            break;
+    }
+
+    const auto t0 = clock::now();
+    auto outs = engine.generate_multi(prompts, max_new, ctx_ids);
+    const long dt_ms = static_cast<long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            clock::now() - t0).count());
+
+    if (mode == OfflineTestMode::Replicate) {
+        std::cout << "GENERATED[0]";
+        for (auto t : outs[0]) std::cout << ' ' << t;
+        std::cout << "\n";
+    } else if (mode == OfflineTestMode::Single) {
+        std::cout << "GENERATED";
+        for (auto t : outs[0]) std::cout << ' ' << t;
+        std::cout << "\n";
+    } else {
+        for (std::size_t i = 0; i < outs.size(); ++i) {
+            std::cout << "GENERATED[" << i << "]";
+            for (auto t : outs[i]) std::cout << ' ' << t;
+            std::cout << "\n";
+        }
+    }
+
+    const long denom = std::max<long>(1, dt_ms);
+    switch (mode) {
+        case OfflineTestMode::Single: {
+            std::cerr << "[pie-driver-ggml] generated " << outs[0].size()
+                      << " tokens in " << dt_ms << " ms ("
+                      << (outs[0].size() * 1000.0 / denom) << " tok/s)\n";
+            break;
+        }
+        case OfflineTestMode::Multi: {
+            const std::size_t per = outs.empty() ? 0 : outs[0].size();
+            std::cerr << "[pie-driver-ggml] generated " << per
+                      << " tokens × " << outs.size()
+                      << " contexts in " << dt_ms << " ms\n";
+            break;
+        }
+        case OfflineTestMode::Replicate: {
+            const long total = static_cast<long>(n) * max_new;
+            std::cerr << "[pie-driver-ggml] generated " << total
+                      << " tokens (" << n << " × " << max_new
+                      << ") in " << dt_ms << " ms ("
+                      << (total * 1000.0 / denom) << " tok/s aggregate)\n";
+            break;
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -148,105 +271,26 @@ int main(int argc, char** argv) {
     }
 
     // ---- Offline self-test paths. ------------------------------------------
-    auto parse_csv_u32 = [](const std::string& s) {
-        std::vector<std::uint32_t> v;
-        std::string item;
-        for (char c : s) {
-            if (c == ',') {
-                if (!item.empty()) v.push_back(std::stoul(item));
-                item.clear();
-            } else if (!std::isspace(static_cast<unsigned char>(c))) {
-                item.push_back(c);
-            }
-        }
-        if (!item.empty()) v.push_back(std::stoul(item));
-        return v;
-    };
-
     if (!test_multi_prompts.empty()) {
-        // Split on '|'.
-        std::vector<std::vector<std::uint32_t>> prompts;
-        std::vector<std::uint64_t> ctx_ids;
-        std::string chunk;
-        std::uint64_t next_ctx = 1;
-        for (char c : test_multi_prompts) {
-            if (c == '|') {
-                if (!chunk.empty()) {
-                    prompts.push_back(parse_csv_u32(chunk));
-                    ctx_ids.push_back(next_ctx++);
-                }
-                chunk.clear();
-            } else {
-                chunk.push_back(c);
-            }
-        }
-        if (!chunk.empty()) {
-            prompts.push_back(parse_csv_u32(chunk));
-            ctx_ids.push_back(next_ctx++);
-        }
-
-        std::cerr << "[pie-driver-ggml] multi-context self-test: "
-                  << prompts.size() << " contexts, max_new=" << test_max_new
-                  << "\n";
-        auto t0 = std::chrono::steady_clock::now();
-        auto outs = engine.generate_multi(prompts, test_max_new, ctx_ids);
-        auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - t0).count();
-
-        for (std::size_t i = 0; i < outs.size(); ++i) {
-            std::cout << "GENERATED[" << i << "]";
-            for (auto t : outs[i]) std::cout << ' ' << t;
-            std::cout << "\n";
-        }
-        std::cerr << "[pie-driver-ggml] generated "
-                  << (outs.empty() ? 0 : outs[0].size()) << " tokens × "
-                  << outs.size() << " contexts in " << dt_ms << " ms\n";
+        auto prompts = parse_pipe_csv_u32(test_multi_prompts);
+        auto ctx_ids = seq_ctx_ids(prompts.size());
+        run_offline_test(engine, std::move(prompts), std::move(ctx_ids),
+                         test_max_new, OfflineTestMode::Multi);
         return 0;
     }
-
     if (test_replicate > 0 && !test_prompt_tokens.empty()) {
-        auto prompt = parse_csv_u32(test_prompt_tokens);
+        auto prompt  = parse_csv_u32(test_prompt_tokens);
         std::vector<std::vector<std::uint32_t>> prompts(test_replicate, prompt);
-        std::vector<std::uint64_t> ctx_ids(test_replicate);
-        for (int i = 0; i < test_replicate; ++i) ctx_ids[i] = i + 1;
-
-        std::cerr << "[pie-driver-ggml] throughput test: "
-                  << test_replicate << " concurrent contexts × "
-                  << test_max_new << " tokens (prompt=" << prompt.size()
-                  << " tokens each)\n";
-        auto t0 = std::chrono::steady_clock::now();
-        auto outs = engine.generate_multi(prompts, test_max_new, ctx_ids);
-        auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - t0).count();
-
-        const long total_new = static_cast<long>(test_replicate) * test_max_new;
-        const double thr = total_new * 1000.0 / std::max<long>(1, dt_ms);
-        std::cerr << "[pie-driver-ggml] generated " << total_new
-                  << " tokens (" << test_replicate << " × " << test_max_new
-                  << ") in " << dt_ms << " ms (" << thr << " tok/s aggregate)\n";
-        // Print first context's output for sanity.
-        std::cout << "GENERATED[0]";
-        for (auto t : outs[0]) std::cout << ' ' << t;
-        std::cout << "\n";
+        run_offline_test(engine, std::move(prompts),
+                         seq_ctx_ids(static_cast<std::size_t>(test_replicate)),
+                         test_max_new, OfflineTestMode::Replicate);
         return 0;
     }
-
     if (!test_prompt_tokens.empty()) {
-        auto prompt = parse_csv_u32(test_prompt_tokens);
-        std::cerr << "[pie-driver-ggml] self-test: prompt=" << prompt.size()
-                  << " tokens, max_new=" << test_max_new << "\n";
-        auto t0 = std::chrono::steady_clock::now();
-        auto out = engine.generate(prompt, test_max_new, /*context_id=*/ 1);
-        auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - t0).count();
-
-        std::cout << "GENERATED";
-        for (auto t : out) std::cout << ' ' << t;
-        std::cout << "\n";
-        std::cerr << "[pie-driver-ggml] generated " << out.size()
-                  << " tokens in " << dt_ms << " ms ("
-                  << (out.size() * 1000.0 / std::max<long>(1, dt_ms))
-                  << " tok/s)\n";
+        std::vector<std::vector<std::uint32_t>> prompts{
+            parse_csv_u32(test_prompt_tokens)};
+        run_offline_test(engine, std::move(prompts), seq_ctx_ids(1),
+                         test_max_new, OfflineTestMode::Single);
         return 0;
     }
 
