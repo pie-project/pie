@@ -28,6 +28,10 @@ def main():
                    help="Append a per-request id to the prompt to defeat KV-cache reuse")
     p.add_argument("--warmup-n", type=int, default=0,
                    help="Run a warmup batch of this size before timing")
+    p.add_argument("--cuda-graphs", action="store_true",
+                   help="Enable CUDA graphs (sglang's default is enabled; this flag is for explicit-on)")
+    p.add_argument("--max-running-requests", type=int, default=None,
+                   help="Cap concurrent in-flight requests (matches pie's max_concurrent_processes)")
     args = p.parse_args()
 
     import sglang as sgl
@@ -35,7 +39,8 @@ def main():
     engine = sgl.Engine(
         model_path=args.model,
         mem_fraction_static=args.mem_frac,
-        disable_cuda_graph=True,
+        disable_cuda_graph=not args.cuda_graphs,
+        max_running_requests=args.max_running_requests,
     )
 
     base = "Write a short story about a robot."

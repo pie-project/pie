@@ -105,7 +105,6 @@ class SGLangForwardPass:
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
         single_token_inference_mode: bool,
-        total_pages_cpu: int = 0,
         custom_mask: torch.Tensor | None = None,
         adapter_subpass=None,
     ) -> torch.Tensor:

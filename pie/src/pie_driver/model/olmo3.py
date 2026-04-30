@@ -19,7 +19,7 @@ from ..schema import Schema, Source, WeightStore
 import pie_kernels as ops
 
 from . import common
-from ._base import CudaGraphForwardPass
+from ._base import DenseForwardPass
 
 
 # =============================================================================
@@ -228,17 +228,15 @@ class ModelConfig(ModelConfigBase):
         return max_num_pages
 
 
-class ForwardPass(CudaGraphForwardPass):
+class ForwardPass(DenseForwardPass):
     """Olmo3 forward pass implementation.
 
     Key differences from Qwen3:
     - POST-normalization: Applies layer norm AFTER attention/MLP blocks
     - Applies QK normalization before RoPE (similar to Qwen3)
 
-    Inherits the standard CUDA-graph capture infrastructure from
-    :class:`CudaGraphForwardPass`. Olmo3 uses a 2 GiB workspace and
-    enables ``use_tensor_cores=True`` on every decode wrapper. Adds a
-    pre-computed YaRN RoPE cos/sin cache.
+    Uses a 2 GiB workspace and enables ``use_tensor_cores=True`` on
+    the decode wrapper. Adds a pre-computed YaRN RoPE cos/sin cache.
     """
 
     WORKSPACE_BYTES = 2048 * 1024 * 1024
@@ -683,7 +681,6 @@ class ForwardPass(CudaGraphForwardPass):
         single_token_inference_mode: bool,
         # subpasses
         adapter_subpass: Optional[AdapterSubpass],
-        total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         """Main transformation pipeline through all layers."""
         # Only set CUDA device for CUDA tensors (not MPS)
@@ -712,22 +709,7 @@ class ForwardPass(CudaGraphForwardPass):
         local_num_key_value_heads = self.model_config.internal_num_kv_heads // self.tp_size
 
         if single_token_inference_mode:
-            # See qwen3.py for the full rationale: the graphed path captures
-            # with adapter_subpass=None and would silently drop adapters.
-            if self.use_cuda_graphs and adapter_subpass is None:
-                return self._run_layers_graphed(
-                    hidden_states=input_embeds,
-                    position_ids=position_ids,
-                    kv_cache_at_layer=kv_cache_at_layer,
-                    kv_page_indices=kv_page_indices,
-                    kv_page_indptr=kv_page_indptr,
-                    kv_last_page_lens=kv_last_page_lens,
-                    batch_indices=batch_indices,
-                    batch_positions=batch_positions,
-                    total_pages_cpu=total_pages_cpu,
-                )
-            # Normal decode fallback
-            wrapper = self.wrapper_decode_fallback
+            wrapper = self.wrapper_decode
             # NOTE: wrapper.plan() is now called per-layer inside _run_layers
         else:
             wrapper = self.wrapper_append

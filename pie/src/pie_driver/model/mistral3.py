@@ -18,7 +18,7 @@ from ..schema import Schema, Source, WeightStore
 import pie_kernels as ops
 
 from . import common
-from ._base import CudaGraphForwardPass
+from ._base import DenseForwardPass
 
 
 # =============================================================================
@@ -364,12 +364,10 @@ class ModelConfig(ModelConfigBase):
         return max_num_pages
 
 
-class ForwardPass(CudaGraphForwardPass):
+class ForwardPass(DenseForwardPass):
     """Mistral3 forward pass implementation.
 
-    Inherits the standard CUDA-graph capture infrastructure from
-    :class:`CudaGraphForwardPass`. Adds a precomputed YARN RoPE cos/sin
-    cache used in attention.
+    Adds a precomputed YARN RoPE cos/sin cache used in attention.
     """
 
     def __init__(
@@ -712,7 +710,6 @@ class ForwardPass(CudaGraphForwardPass):
         single_token_inference_mode: bool,
         # subpasses
         adapter_subpass: Optional[AdapterSubpass],
-        total_pages_cpu: int = 0,
     ) -> torch.Tensor:
 
         if self.runtime_config.device.type == "cuda":
@@ -740,8 +737,7 @@ class ForwardPass(CudaGraphForwardPass):
         del seq_lens
 
         if single_token_inference_mode:
-            # For standard execution (fallback) we need to plan the fallback wrapper
-            wrapper = self.wrapper_decode_fallback
+            wrapper = self.wrapper_decode
             wrapper.plan(
                 indptr=kv_page_indptr,
                 indices=kv_page_indices,
@@ -768,32 +764,18 @@ class ForwardPass(CudaGraphForwardPass):
                 q_data_type=input_embeds.dtype,
             )
 
-        # Execute layers
-        if single_token_inference_mode and self.use_cuda_graphs and not adapter_subpass:
-            hidden_states = self._run_layers_graphed(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                kv_cache_at_layer=kv_cache_at_layer,
-                kv_page_indices=kv_page_indices,
-                kv_page_indptr=kv_page_indptr,
-                kv_last_page_lens=kv_last_page_lens,
-                batch_indices=batch_indices,
-                batch_positions=batch_positions,
-                total_pages_cpu=total_pages_cpu,
-            )
-        else:
-            hidden_states = self._run_layers(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                kv_cache_at_layer=kv_cache_at_layer,
-                kv_page_indices=kv_page_indices,
-                kv_page_indptr=kv_page_indptr,
-                kv_last_page_lens=kv_last_page_lens,
-                batch_indices=batch_indices,
-                batch_positions=batch_positions,
-                adapter_subpass=adapter_subpass,
-                wrapper=wrapper,
-            )
+        hidden_states = self._run_layers(
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            kv_cache_at_layer=kv_cache_at_layer,
+            kv_page_indices=kv_page_indices,
+            kv_page_indptr=kv_page_indptr,
+            kv_last_page_lens=kv_last_page_lens,
+            batch_indices=batch_indices,
+            batch_positions=batch_positions,
+            adapter_subpass=adapter_subpass,
+            wrapper=wrapper,
+        )
 
         return hidden_states
 

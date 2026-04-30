@@ -31,7 +31,7 @@ from ..schema import Schema, Source, WeightStore
 import pie_kernels as ops
 
 from . import common
-from ._base import CudaGraphForwardPass
+from ._base import DenseForwardPass
 
 
 # =============================================================================
@@ -246,7 +246,7 @@ def _gelu_pytorch_tanh(x: torch.Tensor) -> torch.Tensor:
     return fun.gelu(x, approximate="tanh")
 
 
-class ForwardPass(CudaGraphForwardPass):
+class ForwardPass(DenseForwardPass):
     """Gemma3 forward pass implementation.
 
     Key differences from Gemma2:
@@ -254,9 +254,8 @@ class ForwardPass(CudaGraphForwardPass):
     - Uses dual RoPE (different theta for global vs local layers)
     - Sliding window pattern-based layer type detection
 
-    Inherits the standard CUDA-graph capture infrastructure from
-    :class:`CudaGraphForwardPass`. Adds two precomputed scalars used in
-    attention/embedding (``embed_normalizer`` and ``query_scale``).
+    Adds two precomputed scalars used in attention/embedding
+    (``embed_normalizer`` and ``query_scale``).
     """
 
     WORKSPACE_BYTES = 1024 * 1024 * 1024
@@ -540,7 +539,6 @@ class ForwardPass(CudaGraphForwardPass):
         custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
         adapter_subpass: Optional[AdapterSubpass],
-        total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         """Main transformation pipeline through all layers.
 
@@ -570,20 +568,6 @@ class ForwardPass(CudaGraphForwardPass):
         local_num_key_value_heads = self.model_config.num_kv_heads // self.tp_size
 
         if single_token_inference_mode:
-            # See qwen3.py for the full rationale: the graphed path captures
-            # with adapter_subpass=None and would silently drop adapters.
-            if self.use_cuda_graphs and adapter_subpass is None:
-                return self._run_layers_graphed(
-                    hidden_states=input_embeds,
-                    position_ids=position_ids,
-                    kv_cache_at_layer=kv_cache_at_layer,
-                    kv_page_indices=kv_page_indices,
-                    kv_page_indptr=kv_page_indptr,
-                    kv_last_page_lens=kv_last_page_lens,
-                    batch_indices=batch_indices,
-                    batch_positions=batch_positions,
-                    total_pages_cpu=total_pages_cpu,
-                )
             wrapper = self.wrapper_decode
             wrapper.plan(
                 indptr=kv_page_indptr,

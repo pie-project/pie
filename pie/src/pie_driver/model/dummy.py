@@ -126,7 +126,6 @@ class DummyForwardPass:
         custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
         adapter_subpass=None,
-        total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         """
         No-op transform that passes through the input embeddings.
@@ -231,14 +230,6 @@ class DummyForwardPass:
             "dists": dists,
             "nan_indices": [],
         }
-
-    def warmup_cuda_graphs(self, kv_cache_at_layer: list[torch.Tensor]) -> None:
-        """
-        No-op warmup for CUDA graphs.
-
-        Dummy mode doesn't use CUDA graphs.
-        """
-        pass
 
 
 class _DummyWeightStore:

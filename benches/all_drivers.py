@@ -116,7 +116,6 @@ def build_driver_options(driver: str, args) -> dict:
         return {
             "gpu_mem_utilization": args.gpu_mem_util,
             "max_batch_size": args.max_batch_size,
-            "use_cuda_graphs": args.use_cuda_graphs,
         }
     if driver == "sglang":
         return {

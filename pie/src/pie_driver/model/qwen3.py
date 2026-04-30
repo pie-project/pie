@@ -18,7 +18,7 @@ from ..schema import Schema, Source, WeightStore
 import pie_kernels as ops
 
 from . import common
-from ._base import CudaGraphForwardPass
+from ._base import DenseForwardPass
 
 
 # =============================================================================
@@ -192,19 +192,13 @@ class ModelConfig(ModelConfigBase):
         return max_num_pages
 
 
-class ForwardPass(CudaGraphForwardPass):
+class ForwardPass(DenseForwardPass):
     """
     Qwen3 forward pass implementation.
 
     Key differences from Qwen2:
     - Applies QK normalization before RoPE (critical for stability)
     - No QKV bias
-
-    Inherits the standard CUDA-graph capture infrastructure from
-    :class:`CudaGraphForwardPass` (workspace buffer, per-bin decode
-    wrappers, shared static buffers, ``warmup_cuda_graphs``,
-    ``_run_layers_graphed`` etc.). Qwen3 adds no extra `__init__` state,
-    so the constructor is just ``super().__init__``.
     """
 
 
@@ -532,7 +526,6 @@ class ForwardPass(CudaGraphForwardPass):
         single_token_inference_mode: bool,
         # subpasses
         adapter_subpass: Optional[AdapterSubpass],
-        total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         """Main transformation pipeline through all layers."""
         # Only set CUDA device for CUDA tensors (not MPS)
@@ -561,25 +554,6 @@ class ForwardPass(CudaGraphForwardPass):
         local_num_key_value_heads = self.model_config.num_kv_heads // self.tp_size
 
         if single_token_inference_mode:
-            # The graphed path captures with `adapter_subpass=None`, so it
-            # silently drops adapter deltas if we route an adapter-bearing
-            # batch through it. Fall back to the non-graphed path whenever
-            # adapters are active. (`llama3` / `mistral3` already guard
-            # this — see their `transform`.) Adapter-aware graph capture
-            # is a separate piece of work; see pie_kernels/cond_graph.py.
-            if self.use_cuda_graphs and adapter_subpass is None:
-                return self._run_layers_graphed(
-                    hidden_states=input_embeds,
-                    position_ids=position_ids,
-                    kv_cache_at_layer=kv_cache_at_layer,
-                    kv_page_indices=kv_page_indices,
-                    kv_page_indptr=kv_page_indptr,
-                    kv_last_page_lens=kv_last_page_lens,
-                    batch_indices=batch_indices,
-                    batch_positions=batch_positions,
-                    total_pages_cpu=total_pages_cpu,
-                )
-            # Normal decode fallback
             wrapper = self.wrapper_decode
             wrapper.plan(
                 indptr=kv_page_indptr,

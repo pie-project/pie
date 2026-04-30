@@ -144,10 +144,6 @@ class Engine:
         if hasattr(forward_pass, "compact_weights"):
             forward_pass.compact_weights()
 
-        # Warmup CUDA graphs if supported
-        if hasattr(forward_pass, "warmup_cuda_graphs"):
-            forward_pass.warmup_cuda_graphs(kv_cache_at_layer)
-
         # Allocate CPU swap pool (pinned host memory)
         host_kv, pool_size = cls._create_host_kv_cache(
             kv_cache_at_layer, config.swap_budget_bytes,
@@ -366,7 +362,6 @@ class Engine:
             custom_mask=inputs["custom_mask"],
             single_token_inference_mode=inputs["single_token_inference_mode"],
             adapter_subpass=adapter_subpass,
-            total_pages_cpu=inputs.get("total_pages_cpu", 0),
         )
 
         # Sampling pass

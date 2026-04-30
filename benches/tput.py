@@ -24,6 +24,11 @@ async def run_benchmark(args):
     from pie.server import Server
     from pie.config import Config, ModelConfig, AuthConfig
 
+    if args.driver == "native" and args.use_cuda_graphs:
+        print("ERROR: --use-cuda-graphs is not supported on the native driver.",
+              file=sys.stderr)
+        sys.exit(1)
+
     # -- Resolve paths --------------------------------------------------------
 
     script_dir = Path(__file__).parent.resolve()
@@ -85,7 +90,6 @@ async def run_benchmark(args):
         driver_subsection = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "max_batch_size": args.max_batch_size,
-            "use_cuda_graphs": args.use_cuda_graphs,
             "cpu_mem_budget_in_gb": args.cpu_mem_budget,
         }
     elif args.driver == "sglang":
@@ -265,8 +269,10 @@ def main():
     parser.add_argument("--num-samples", type=int, default=10, help="Number of output samples to save (default: 10)")
     parser.add_argument("--unique-prompts", action="store_true", help="Make each request's prompt unique (append request #N)")
     parser.add_argument("--default-token-budget", type=int, required=True, help="Default token budget per process (required)")
-    parser.add_argument("--max-concurrent-processes", type=int, default=None, help="Maximum number of concurrent processes (default: None)")
-    parser.add_argument("--max-batch-size", type=int, default=512, help="Maximum batch size for inference (default: 512)")
+    parser.add_argument("--max-concurrent-processes", type=int, default=None,
+                        help="Maximum number of concurrent processes (default: None — uncapped, saturate the GPU)")
+    parser.add_argument("--max-batch-size", type=int, default=2048,
+                        help="Maximum batch size for inference (default: 2048 — let the GPU dictate).")
     parser.add_argument("--driver", default="native", choices=["native", "vllm", "sglang", "dummy"],
                         help="Inference driver: 'native', 'vllm', 'sglang', or 'dummy'")
     parser.add_argument("--vllm-attention-backend", default=None,
@@ -274,11 +280,12 @@ def main():
     parser.add_argument("--sglang-attention-backend", default=None,
                         help="SGLang attention backend (triton / flashinfer / flex_attention / fa3). Only used when --driver=sglang")
     parser.add_argument("--use-cuda-graphs", action="store_true",
-                        help="Enable CUDA graphs (vllm: piecewise compile + graph capture; native: FlashInfer planning)")
+                        help="Enable CUDA graphs (vllm/sglang only — native driver does not support this).")
     parser.add_argument("--default-endowment-pages", type=int, default=64,
                         help="Per-process KV-page endowment used by the admission gate (lower = more concurrent processes admitted)")
-    parser.add_argument("--oversubscription-factor", type=float, default=4.0,
-                        help="Admission overbook factor (Σ endowment ≤ capacity × factor); set very high to disable")
+    parser.add_argument("--oversubscription-factor", type=float, default=1000.0,
+                        help="Admission overbook factor (Σ endowment ≤ capacity × factor). "
+                             "Default 1000.0 effectively disables the gate; lower it to study admission behavior.")
     parser.add_argument("--warmup-requests", type=int, default=0,
                         help="Number of warmup requests to run (and discard) before timing")
 

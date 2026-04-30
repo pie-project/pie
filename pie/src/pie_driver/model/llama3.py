@@ -18,7 +18,7 @@ from ..schema import Schema, Source, WeightStore
 import pie_kernels as ops
 
 from . import common
-from ._base import CudaGraphForwardPass
+from ._base import DenseForwardPass
 
 
 # =============================================================================
@@ -200,15 +200,8 @@ class ModelConfig(ModelConfigBase):
         return max_num_pages
 
 
-class ForwardPass(CudaGraphForwardPass):
-    """Llama3 forward pass implementation.
-
-    Inherits the standard CUDA-graph capture infrastructure from
-    :class:`CudaGraphForwardPass`. Llama3's `transform()` uses
-    `wrapper_decode_fallback` even on the eager decode path (rather than
-    the base's `wrapper_decode`), so the latter is allocated by the base
-    but unused by llama3 — small, harmless waste.
-    """
+class ForwardPass(DenseForwardPass):
+    """Llama3 forward pass implementation."""
 
     def embed_inputs(self, batch_metadata: dict[str, Any]) -> torch.Tensor:
         """
@@ -522,7 +515,6 @@ class ForwardPass(CudaGraphForwardPass):
         single_token_inference_mode: bool,
         # subpasses
         adapter_subpass: Optional[AdapterSubpass],
-        total_pages_cpu: int = 0,  # Added for CUDA graph (avoid .item() sync)
     ) -> torch.Tensor:
 
         # Ensure we're running on the correct CUDA device (critical for Triton kernels)
@@ -553,20 +545,13 @@ class ForwardPass(CudaGraphForwardPass):
         del seq_lens  # No longer needed
 
         if single_token_inference_mode:
-            if not adapter_subpass:
-                # We handle planning inside _run_layers_graphed for graph mode
-                # Or pass dummy wrapper if using graph mode
-                # But for fallback or pre-graph execution logic verification?
-                pass
-
-            # For standard execution (fallback) we need to plan the fallback wrapper
-            wrapper = self.wrapper_decode_fallback
+            wrapper = self.wrapper_decode
             wrapper.plan(
                 indptr=kv_page_indptr,
                 indices=kv_page_indices,
                 last_page_len=kv_last_page_lens,
-                num_qo_heads=local_num_query_heads,  # Use local head count
-                num_kv_heads=local_num_key_value_heads,  # Use local head count
+                num_qo_heads=local_num_query_heads,
+                num_kv_heads=local_num_key_value_heads,
                 head_dim=self.model_config.dim_head,
                 page_size=page_size,
                 pos_encoding_mode="NONE",
@@ -587,34 +572,18 @@ class ForwardPass(CudaGraphForwardPass):
                 q_data_type=input_embeds.dtype,
             )
 
-        # Execute layers
-        if single_token_inference_mode and self.use_cuda_graphs and not adapter_subpass:
-            # Use CUDA graphs for decode mode (no adapters, fixed shapes via padding)
-            hidden_states = self._run_layers_graphed(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                kv_cache_at_layer=kv_cache_at_layer,
-                kv_page_indices=kv_page_indices,
-                kv_page_indptr=kv_page_indptr,
-                kv_last_page_lens=kv_last_page_lens,
-                batch_indices=batch_indices,
-                batch_positions=batch_positions,
-                total_pages_cpu=total_pages_cpu,
-            )
-        else:
-            # Execute layers (FlashInfer handles CUDA graphs internally for decode mode)
-            hidden_states = self._run_layers(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                kv_cache_at_layer=kv_cache_at_layer,
-                kv_page_indices=kv_page_indices,
-                kv_page_indptr=kv_page_indptr,
-                kv_last_page_lens=kv_last_page_lens,
-                batch_indices=batch_indices,
-                batch_positions=batch_positions,
-                adapter_subpass=adapter_subpass,
-                wrapper=wrapper,
-            )
+        hidden_states = self._run_layers(
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            kv_cache_at_layer=kv_cache_at_layer,
+            kv_page_indices=kv_page_indices,
+            kv_page_indptr=kv_page_indptr,
+            kv_last_page_lens=kv_last_page_lens,
+            batch_indices=batch_indices,
+            batch_positions=batch_positions,
+            adapter_subpass=adapter_subpass,
+            wrapper=wrapper,
+        )
 
         # Returns replicated hidden_states
         return hidden_states

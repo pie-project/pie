@@ -24,7 +24,6 @@ DEFAULT_CONFIG = {
     "max_num_adapters": 32,
     "max_adapter_rank": 8,
     "gpu_mem_utilization": 0.8,
-    "use_cuda_graphs": False,
     "telemetry_enabled": False,
 }
 

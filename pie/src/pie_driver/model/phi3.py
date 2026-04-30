@@ -26,7 +26,7 @@ from ..schema import Schema, Source, WeightStore
 import pie_kernels as ops
 
 from . import common
-from ._base import CudaGraphForwardPass
+from ._base import DenseForwardPass
 
 
 # =============================================================================
@@ -121,14 +121,12 @@ class ModelConfig(ModelConfigBase):
 # =============================================================================
 
 
-class ForwardPass(CudaGraphForwardPass):
+class ForwardPass(DenseForwardPass):
     """Phi3 forward pass implementation.
 
-    Inherits the standard CUDA-graph capture infrastructure from
-    :class:`CudaGraphForwardPass`. Phi3 has no adapter integration, so the
-    graph path is never adapter-bearing; ``embed_tokens`` /
-    ``embed_inputs`` / ``sample`` use the base defaults. ``__init__``
-    rejects TP > 1 (fused qkv_proj sharding isn't wired for phi3 yet).
+    No adapter integration; ``embed_tokens`` / ``embed_inputs`` /
+    ``sample`` use the base defaults. ``__init__`` rejects TP > 1
+    (fused qkv_proj sharding isn't wired for phi3 yet).
     """
 
     def __init__(
@@ -243,7 +241,7 @@ class ForwardPass(CudaGraphForwardPass):
 
         Phi3 has no adapter integration, so ``adapter_subpass`` is
         ignored (kept in the signature to satisfy the
-        :class:`CudaGraphForwardPass` contract).
+        :class:`DenseForwardPass` contract).
         """
         del adapter_subpass
         for layer_idx in range(self.model_config.num_layers):
@@ -274,7 +272,6 @@ class ForwardPass(CudaGraphForwardPass):
         custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
         adapter_subpass: Optional[AdapterSubpass],
-        total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         if self.runtime_config.device.type == "cuda":
             torch.cuda.set_device(self.runtime_config.device)
@@ -295,20 +292,6 @@ class ForwardPass(CudaGraphForwardPass):
         group_size = local_q // local_kv
         use_decode = single_token_inference_mode and group_size in decode_supported_groups
         if use_decode:
-            # phi3 has no adapter support, so the only adapter_subpass guard
-            # we need is the same shape as qwen3/llama3: skip graph if any.
-            if self.use_cuda_graphs and adapter_subpass is None:
-                return self._run_layers_graphed(
-                    hidden_states=input_embeds,
-                    position_ids=position_ids,
-                    kv_cache_at_layer=kv_cache_at_layer,
-                    kv_page_indices=kv_page_indices,
-                    kv_page_indptr=kv_page_indptr,
-                    kv_last_page_lens=kv_last_page_lens,
-                    batch_indices=batch_indices,
-                    batch_positions=batch_positions,
-                    total_pages_cpu=total_pages_cpu,
-                )
             wrapper = self.wrapper_decode
             wrapper.plan(
                 indptr=kv_page_indptr,

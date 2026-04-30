@@ -291,7 +291,6 @@ async def run_benchmark(args):
         driver_subsection = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "max_batch_size": args.max_batch_size,
-            "use_cuda_graphs": args.use_cuda_graphs,
             "cpu_mem_budget_in_gb": args.cpu_mem_budget,
         }
     elif args.driver == "sglang":

@@ -914,7 +914,6 @@ class ForwardPass:
         custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
         adapter_subpass: Optional[AdapterSubpass],
-        total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         """Main transformation pipeline through all layers."""
         cfg = self.model_config
