@@ -1,0 +1,268 @@
+#include "model/qwen3_forward.hpp"
+
+#include <cuda_runtime.h>
+
+#include "cuda_check.hpp"
+#include "kernels/embed.hpp"
+#include "kernels/kv_paged.hpp"
+#include "kernels/rmsnorm.hpp"
+#include "kernels/rope.hpp"
+#include "kernels/swiglu.hpp"
+#include "ops/attention_flashinfer.hpp"
+#include "ops/attention_naive.hpp"
+#include "ops/attention_paged.hpp"
+#include "ops/gemm.hpp"
+
+namespace pie_cuda_driver::model {
+
+Qwen3Workspace Qwen3Workspace::allocate(const HfConfig& cfg, int max_tokens) {
+    const int H  = cfg.hidden_size;
+    const int Hq = cfg.num_attention_heads * cfg.head_dim;
+    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
+    const int I  = cfg.intermediate_size;
+    const int V  = cfg.vocab_size;
+    const int N  = max_tokens;
+
+    Qwen3Workspace ws;
+    ws.y        = DeviceTensor::allocate(DType::BF16, {N, H});
+    ws.norm_x   = DeviceTensor::allocate(DType::BF16, {N, H});
+    ws.q        = DeviceTensor::allocate(DType::BF16, {N, Hq});
+    ws.k        = DeviceTensor::allocate(DType::BF16, {N, Hk});
+    ws.v        = DeviceTensor::allocate(DType::BF16, {N, Hk});
+    ws.attn_out = DeviceTensor::allocate(DType::BF16, {N, Hq});
+    ws.norm_y   = DeviceTensor::allocate(DType::BF16, {N, H});
+    ws.gate     = DeviceTensor::allocate(DType::BF16, {N, I});
+    ws.up       = DeviceTensor::allocate(DType::BF16, {N, I});
+    ws.logits   = DeviceTensor::allocate(DType::BF16, {N, V});
+    ws.probs    = DeviceTensor::allocate(DType::FP32, {N, V});
+    return ws;
+}
+
+void qwen3_forward_prefill(
+    const Qwen3Weights& w,
+    const HfConfig& cfg,
+    Qwen3Workspace& ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    int N)
+{
+    const int H  = cfg.hidden_size;
+    const int Hq = cfg.num_attention_heads * cfg.head_dim;
+    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
+    const int I  = cfg.intermediate_size;
+    const int V  = cfg.vocab_size;
+    const int d  = cfg.head_dim;
+    const float eps = cfg.rms_norm_eps;
+    cudaStream_t stream = nullptr;  // default stream; cublas already bound here
+
+    // 1. Embed.
+    kernels::launch_embed_bf16(
+        token_ids, w.embed->data(), ws.y.data(),
+        N, H, cfg.vocab_size, stream);
+
+    for (int L = 0; L < cfg.num_hidden_layers; ++L) {
+        const auto& layer = w.layers[L];
+
+        // 2. Attention RMSNorm.
+        kernels::launch_rmsnorm_bf16(
+            ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
+            N, H, eps, stream);
+
+        // 3. QKV projections (no fusion yet).
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.q_proj->data(), ws.q.data(), N, Hq, H);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
+
+        // 4. Per-head q_norm / k_norm. Reshape Q from [N, h_q*d] to
+        //    [N*h_q, d] — same memory, just a different per-row interpretation.
+        //    The RMSNorm kernel takes (num_rows, hidden) so this is free.
+        kernels::launch_rmsnorm_bf16(
+            ws.q.data(), layer.q_norm->data(), ws.q.data(),
+            N * cfg.num_attention_heads, d, eps, stream);
+        kernels::launch_rmsnorm_bf16(
+            ws.k.data(), layer.k_norm->data(), ws.k.data(),
+            N * cfg.num_key_value_heads, d, eps, stream);
+
+        // 5. RoPE (in place on Q and K).
+        kernels::launch_rope_bf16(
+            ws.q.data(), ws.k.data(), positions,
+            N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+            cfg.rope_theta, stream);
+
+        // 6. Attention (naive O(N^2) over full sequence).
+        ops::launch_attention_naive_bf16(
+            ws.q.data(), ws.k.data(), ws.v.data(), ws.attn_out.data(),
+            N, cfg.num_attention_heads, cfg.num_key_value_heads, d, stream);
+
+        // 7. Output projection + residual: y = y + attn_out @ o_proj^T.
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
+            N, H, Hq, /*beta=*/1.f);
+
+        // 8. MLP RMSNorm.
+        kernels::launch_rmsnorm_bf16(
+            ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
+            N, H, eps, stream);
+
+        // 9. Gate / up projections.
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_y.data(), layer.gate_proj->data(), ws.gate.data(), N, I, H);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_y.data(), layer.up_proj->data(),   ws.up.data(),   N, I, H);
+
+        // 10. SwiGLU into ws.gate (in place: gate <- silu(gate) * up).
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+
+        // 11. Down projection + residual: y = y + gate @ down_proj^T.
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.gate.data(), layer.down_proj->data(), ws.y.data(),
+            N, H, I, /*beta=*/1.f);
+    }
+
+    // 12. Final RMSNorm.
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
+        N, H, eps, stream);
+
+    // 13. lm_head: logits[N, V] = norm_x[N, H] @ lm_head[V, H]^T.
+    ops::gemm_act_x_wt_bf16(cublas.handle(),
+        ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
+        N, V, H);
+}
+
+void qwen3_forward_paged(
+    const Qwen3Weights& w,
+    const HfConfig& cfg,
+    Qwen3Workspace& ws,
+    KvCache& cache,
+    AttentionWorkspace& attn_ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int N,
+    int R,
+    int max_kv_len,
+    bool is_pure_decode)
+{
+    const int H  = cfg.hidden_size;
+    const int Hq = cfg.num_attention_heads * cfg.head_dim;
+    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
+    const int I  = cfg.intermediate_size;
+    const int V  = cfg.vocab_size;
+    const int d  = cfg.head_dim;
+    const float eps = cfg.rms_norm_eps;
+    cudaStream_t stream = nullptr;
+
+    // 1. Embed.
+    kernels::launch_embed_bf16(
+        token_ids, w.embed->data(), ws.y.data(),
+        N, H, cfg.vocab_size, stream);
+
+    for (int L = 0; L < cfg.num_hidden_layers; ++L) {
+        const auto& layer = w.layers[L];
+
+        // 2. attn norm
+        kernels::launch_rmsnorm_bf16(
+            ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
+            N, H, eps, stream);
+
+        // 3. QKV
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.q_proj->data(), ws.q.data(), N, Hq, H);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
+
+        // 4. q/k norm
+        kernels::launch_rmsnorm_bf16(
+            ws.q.data(), layer.q_norm->data(), ws.q.data(),
+            N * cfg.num_attention_heads, d, eps, stream);
+        kernels::launch_rmsnorm_bf16(
+            ws.k.data(), layer.k_norm->data(), ws.k.data(),
+            N * cfg.num_key_value_heads, d, eps, stream);
+
+        // 5. RoPE
+        kernels::launch_rope_bf16(
+            ws.q.data(), ws.k.data(), positions,
+            N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+            cfg.rope_theta, stream);
+
+        // 6. Write current K/V into the page table for this layer.
+        kernels::launch_write_kv_to_pages_bf16(
+            cache.k(L), cache.v(L),
+            ws.k.data(), ws.v.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+
+        // 7. Paged attention. flashinfer decode for pure-decode batches,
+        // flashinfer prefill (causal) otherwise. The naive paged kernel is
+        // retained as a debug fallback but is no longer on the hot path.
+        if (is_pure_decode) {
+            ops::launch_attention_flashinfer_decode_bf16(
+                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                kv_page_indptr_h,
+                R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                cache.page_size(), attn_ws, stream);
+        } else {
+            ops::launch_attention_flashinfer_prefill_bf16(
+                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h,
+                kv_page_indptr_h,
+                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                cache.page_size(), attn_ws, stream);
+        }
+
+        // 8. O proj + residual
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
+            N, H, Hq, /*beta=*/1.f);
+
+        // 9. mlp norm
+        kernels::launch_rmsnorm_bf16(
+            ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
+            N, H, eps, stream);
+
+        // 10. gate / up
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_y.data(), layer.gate_proj->data(), ws.gate.data(), N, I, H);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_y.data(), layer.up_proj->data(),   ws.up.data(),   N, I, H);
+
+        // 11. SwiGLU (in-place into ws.gate)
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+
+        // 12. down + residual
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.gate.data(), layer.down_proj->data(), ws.y.data(),
+            N, H, I, /*beta=*/1.f);
+    }
+
+    // 13. final norm
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
+        N, H, eps, stream);
+
+    // 14. lm_head
+    ops::gemm_act_x_wt_bf16(cublas.handle(),
+        ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
+        N, V, H);
+}
+
+}  // namespace pie_cuda_driver::model

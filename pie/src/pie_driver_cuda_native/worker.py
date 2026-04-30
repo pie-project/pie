@@ -32,6 +32,17 @@ from pie.capabilities import DriverCapabilities
 from .config import CudaNativeDriverConfig
 
 
+# `pie/server.py` calls `worker.calculate_topology(world_size, tp_degree)`
+# during bootstrap to plan process groups. cuda_native is single-rank-only
+# in M1; reuse the trivial implementation from pie_driver.
+def calculate_topology(world_size: int, tp_degree: int) -> list[list[int]]:
+    if world_size % tp_degree != 0:
+        raise ValueError(
+            f"World size ({world_size}) must be divisible by TP degree ({tp_degree})")
+    num_groups = world_size // tp_degree
+    return [list(range(g * tp_degree, (g + 1) * tp_degree)) for g in range(num_groups)]
+
+
 # =============================================================================
 # Binary discovery
 # =============================================================================
@@ -104,9 +115,7 @@ def _write_startup_toml(
         f"kv_page_size = {driver_cfg.kv_page_size}",
         f"max_batch_tokens = {driver_cfg.max_batch_tokens}",
         f"max_batch_size = {driver_cfg.max_batch_size}",
-        # max_num_kv_pages is computed by the binary from gpu_mem_utilization;
-        # we still pass it as an upper bound.
-        f"max_num_kv_pages = {driver_cfg.max_batch_tokens}",
+        f"max_num_kv_pages = {driver_cfg.max_num_kv_pages}",
         "",
     ]
     out_path.write_text("\n".join(lines))

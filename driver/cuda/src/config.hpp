@@ -19,6 +19,7 @@ struct ShmemConfig {
 
 struct ModelConfig {
     std::string hf_repo;
+    std::string snapshot_dir;     // local path to weights + config.json
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
 };
@@ -52,9 +53,10 @@ inline Config load_config(const std::filesystem::path& path) {
         c.shmem.spin_us   = (*s)["spin_us"].value_or<int64_t>(c.shmem.spin_us);
     }
     if (auto m = tbl["model"].as_table()) {
-        c.model.hf_repo = (*m)["hf_repo"].value_or(std::string{});
-        c.model.device  = (*m)["device"].value_or(c.model.device);
-        c.model.dtype   = (*m)["dtype"].value_or(c.model.dtype);
+        c.model.hf_repo      = (*m)["hf_repo"].value_or(std::string{});
+        c.model.snapshot_dir = (*m)["snapshot_dir"].value_or(std::string{});
+        c.model.device       = (*m)["device"].value_or(c.model.device);
+        c.model.dtype        = (*m)["dtype"].value_or(c.model.dtype);
     }
     if (auto b = tbl["batching"].as_table()) {
         c.batching.kv_page_size     = (*b)["kv_page_size"].value_or<int64_t>(c.batching.kv_page_size);

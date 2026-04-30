@@ -48,6 +48,27 @@ add_executable(pie_driver_cuda
   src/main.cpp
   src/shmem_ipc.cpp
   src/shmem_schema.cpp
+  src/tensor.cpp
+  src/engine.cpp
+  src/loader/hf_config.cpp
+  src/loader/safetensors.cpp
+  src/model/qwen3.cpp
+  src/model/qwen3_forward.cpp
+  src/kv_cache.cpp
+  src/ops/gemm.cpp
+  src/ops/attention_naive.cu
+  src/ops/attention_paged.cu
+  src/response_writer.cpp
+  src/kernels/rmsnorm.cu
+  src/kernels/embed.cu
+  src/kernels/swiglu.cu
+  src/kernels/rope.cu
+  src/kernels/argmax.cu
+  src/kernels/kv_paged.cu
+  src/kernels/sample_temp.cu
+  src/kernels/sample_flashinfer.cu
+  src/attention_workspace.cpp
+  src/ops/attention_flashinfer.cu
 )
 
 target_compile_options(pie_driver_cuda PRIVATE
@@ -64,7 +85,22 @@ target_compile_options(pie_driver_cuda PRIVATE
 target_include_directories(pie_driver_cuda
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${flashinfer_SOURCE_DIR}/include)
+    ${flashinfer_SOURCE_DIR}/include
+    ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
+    ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
+    ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
+
+# Standalone test for flashinfer sampling debugging.
+add_executable(sample_flashinfer_test tests/sample_flashinfer_test.cu)
+target_include_directories(sample_flashinfer_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${flashinfer_SOURCE_DIR}/include
+    ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
+    ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
+    ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
+target_compile_options(sample_flashinfer_test PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(sample_flashinfer_test PRIVATE CUDA::cudart)
 
 target_link_libraries(pie_driver_cuda PRIVATE
   CLI11::CLI11
@@ -72,6 +108,7 @@ target_link_libraries(pie_driver_cuda PRIVATE
   zstd
   nlohmann_json::nlohmann_json
   rt
+  CUDA::cudart
   CUDA::cublas
   CUDA::cublasLt
 )

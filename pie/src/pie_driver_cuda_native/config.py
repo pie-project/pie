@@ -25,6 +25,10 @@ class CudaNativeDriverConfig:
     kv_page_size: int = 32
     max_batch_tokens: int = 10240
     max_batch_size: int = 512
+    # KV cache page count. M1.4 default = 1024 (32k token slots at page=32).
+    # M1.6 will compute this from gpu_mem_utilization, matching the Python
+    # native driver.
+    max_num_kv_pages: int = 1024
     weight_dtype: str = "bfloat16"
 
     # ── handshake ─────────────────────────────────────────────────────────
