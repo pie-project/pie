@@ -5,6 +5,10 @@
 //! Each physical device runs as a service actor that owns its RPC connection.
 //! Public functions provide a typed interface over message-passing:
 //! [`call()`], [`notify()`], and [`get_spec()`].
+//!
+//! `fire_batch` always takes the shared-memory zero-copy fast path; all other
+//! RPC methods (adapter ops, page copies, query/ping) use the ipc-channel
+//! transport. There are no env-var toggles.
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -17,6 +21,17 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 use crate::service::{ServiceArray, ServiceHandler};
+
+/// Default shmem region name (one worker per host).
+const SHMEM_NAME: &str = "/pie_shmem";
+/// Number of slots in the shmem ring (bounds in-flight shmem concurrency).
+const SHMEM_SLOTS: usize = 8;
+/// Per-slot request payload buffer size.
+const SHMEM_REQ_BUF: usize = 4 * 1024 * 1024;
+/// Per-slot response payload buffer size.
+const SHMEM_RESP_BUF: usize = 1 * 1024 * 1024;
+/// Busy-spin window (µs) before yielding while waiting on resp_seq.
+const SHMEM_SPIN_US: u64 = 10_000;
 
 /// Device identifier.
 pub type DeviceId = usize;
@@ -93,12 +108,51 @@ pub fn notify<T: Serialize>(device_idx: usize, method: &str, args: &T) -> Result
 // Convenience Wrappers
 // =============================================================================
 
-/// Fires a batched forward pass on the given device (30 s timeout).
+/// Fires a batched forward pass on the given device via the zero-copy
+/// shared-memory fast path.
 pub async fn fire_batch(
     device_idx: usize,
     batch: &crate::inference::request::BatchedForwardPassRequest,
 ) -> Result<crate::inference::request::BatchedForwardPassResponse> {
-    call_with_timeout(device_idx, "fire_batch", batch, Duration::from_secs(30)).await
+    let client = get_or_init_shmem_client(device_idx)?;
+    let req_id = SHMEM_REQ_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    let send_walltime_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+
+    let (resp_bytes, _ts) = tokio::task::block_in_place(|| {
+        client.call_with(
+            req_id,
+            crate::shmem_ipc::METHOD_TAG_FIRE_BATCH,
+            send_walltime_us,
+            |buf| crate::shmem_schema::write_request(batch, buf),
+        )
+    })?;
+    crate::shmem_schema::read_response(&resp_bytes)
+}
+
+/// Lazy-initialized shmem clients keyed by device index. All devices share
+/// one client today (one shmem region per worker).
+static SHMEM_CLIENTS: LazyLock<DashMap<usize, Arc<crate::shmem_ipc::ShmemClient>>> =
+    LazyLock::new(DashMap::new);
+
+static SHMEM_REQ_ID: AtomicU64 = AtomicU64::new(1);
+
+fn get_or_init_shmem_client(_device_idx: usize) -> Result<Arc<crate::shmem_ipc::ShmemClient>> {
+    if let Some(c) = SHMEM_CLIENTS.get(&0) {
+        return Ok(c.clone());
+    }
+    let client = crate::shmem_ipc::ShmemClient::open(
+        SHMEM_NAME,
+        SHMEM_SLOTS,
+        SHMEM_REQ_BUF,
+        SHMEM_RESP_BUF,
+        SHMEM_SPIN_US,
+    )?;
+    let arc = Arc::new(client);
+    SHMEM_CLIENTS.insert(0, arc.clone());
+    Ok(arc)
 }
 
 /// GPU → CPU page copy (fire-and-forget).
@@ -246,6 +300,10 @@ pub struct IpcRequest {
     pub request_id: u64,
     pub method: String,
     pub payload: Vec<u8>,
+    /// Wall-clock micros (UNIX epoch) when sender prepared this request.
+    /// Default 0 means unset.
+    #[serde(default)]
+    pub send_walltime_us: u64,
 }
 
 /// Response message sent over IPC.
@@ -253,6 +311,9 @@ pub struct IpcRequest {
 pub struct IpcResponse {
     pub request_id: u64,
     pub payload: Vec<u8>,
+    /// Wall-clock micros when worker dispatched the response.
+    #[serde(default)]
+    pub respond_walltime_us: u64,
 }
 
 // =============================================================================
@@ -365,10 +426,22 @@ impl RpcServer {
 
     /// Send a response back to the client.
     pub fn respond(&self, request_id: u64, payload: Vec<u8>) -> Result<()> {
+        self.respond_with_ts(request_id, payload, 0)
+    }
+
+    /// Same as `respond` but allows the caller to embed a wall-clock micros
+    /// timestamp that the client can use to measure backward IPC transit.
+    pub fn respond_with_ts(
+        &self,
+        request_id: u64,
+        payload: Vec<u8>,
+        respond_walltime_us: u64,
+    ) -> Result<()> {
         let tx = self.response_tx.lock().unwrap();
         tx.send(IpcResponse {
             request_id,
             payload,
+            respond_walltime_us,
         })?;
         Ok(())
     }
@@ -428,7 +501,9 @@ impl RpcClient {
 
         let response_rx = channels.response_rx;
 
-        // Spawn blocking thread to route responses to pending oneshot channels
+        // Blocking-recv router for cold-path RPCs (adapter ops, page copies,
+        // query/ping). The hot-path `fire_batch` goes via shared memory and
+        // never reaches this thread, so a busy-spin would just burn CPU.
         std::thread::spawn(move || {
             loop {
                 match response_rx.recv() {
@@ -452,11 +527,15 @@ impl RpcClient {
     /// Send a request and await the response.
     pub async fn call(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-
+        let send_walltime_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
         let request = IpcRequest {
             request_id,
             method: method.to_string(),
             payload,
+            send_walltime_us,
         };
 
         // Register pending response
@@ -472,7 +551,6 @@ impl RpcClient {
             return Err(e.into());
         }
 
-        // Await response
         response_rx
             .await
             .map_err(|_| anyhow!("Response channel closed"))
@@ -485,6 +563,7 @@ impl RpcClient {
             request_id,
             method: method.to_string(),
             payload,
+            send_walltime_us: 0,
         };
 
         let tx = self.request_tx.lock().unwrap();

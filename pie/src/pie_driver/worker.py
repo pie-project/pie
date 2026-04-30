@@ -494,10 +494,16 @@ def _leader_loop(
         _kv_page_size = engine.capabilities().kv_page_size
     _max_dist_size = getattr(config, "max_dist_size", 32)
 
-    def _handle_fire_batch(**kwargs) -> dict:
+    def _run_fire_batch_inner(kwargs):
+        """Run the model + verify-drafts + populate-drafts steps and return
+        `(sampling_results, batch, timings)` where `timings` is a dict ready
+        to feed StepTiming.
+
+        Used by both the dict-returning `_handle_fire_batch` (cold-path
+        compatibility) and the shmem fast path that encodes directly.
+        """
         t_start = time.perf_counter()
 
-        # Build batch
         t0 = time.perf_counter()
         batch = Batch(
             kwargs,
@@ -515,10 +521,6 @@ def _leader_loop(
 
         device = config.device
 
-        # Create GPU tensors. When the batch carries draft tokens, use the
-        # spec-expanded views so the forward pass embeds drafts alongside
-        # pending tokens and the sampler emits an extra verification block
-        # whose tokens `batch.verify_drafts` consumes after fire_batch.
         t0 = time.perf_counter()
         if batch.has_speculative_inputs:
             inputs = batch.get_spec_expanded_model_inputs(device)
@@ -559,30 +561,54 @@ def _leader_loop(
             )
         t_broadcast = time.perf_counter() - t0
 
-        # TP barrier
         if config.world_size > 1 and compute_pg is not None:
             if dist.get_world_size(group=compute_pg) > 1:
                 dist.barrier(group=compute_pg)
 
-        # Execute inference
         t0 = time.perf_counter()
         sampling_results = engine.fire_batch(inputs, sampling_metadata)
         t_inference = time.perf_counter() - t0
 
-        # Verify drafts (no-op for non-spec batches). Mutates sampling_results
-        # to add per-request `spec_accepted_tokens` so create_responses can
-        # emit Output::TokensWithSpeculation for spec-mode requests.
         if batch.has_speculative_inputs:
             batch.verify_drafts(sampling_results)
-
-        # Driver-supplied next-iteration drafts (NGRAM on sglang). Engines
-        # without a `spec_step` method (e.g. native flashinfer) skip this
-        # block entirely. We only ask the engine for drafts on requests that
-        # set output_speculative_tokens(true) — otherwise the response would
-        # drop them at packaging anyway.
         _populate_next_drafts(batch, sampling_results, engine)
 
-        # Package responses
+        timings = {
+            "t_start": t_start,
+            "build_batch": t_build_batch,
+            "get_inputs": t_get_inputs,
+            "get_sampling_meta": t_get_sampling_meta,
+            "broadcast": t_broadcast,
+            "inference": t_inference,
+            "build_timing": build_timing,
+            "traceparent": kwargs.get("trace_context"),
+        }
+        return sampling_results, batch, timings
+
+    def _record_step_timing(timings, t_create_responses):
+        latency_stats.record_span(
+            StepTiming(
+                build_batch=timings["build_batch"],
+                get_inputs=timings["get_inputs"],
+                get_sampling_meta=timings["get_sampling_meta"],
+                broadcast=timings["broadcast"],
+                inference=timings["inference"],
+                create_responses=t_create_responses,
+                total=time.perf_counter() - timings["t_start"],
+                decode_u32=timings["build_timing"]["decode_u32"],
+                mask_loop=timings["build_timing"]["mask_loop"],
+                brle_decode=timings["build_timing"]["brle_decode"],
+                sampler_loop=timings["build_timing"]["sampler_loop"],
+            ),
+            traceparent=timings["traceparent"],
+        )
+
+    def _handle_fire_batch(**kwargs) -> dict:
+        """Cold-path entry: returns a dict (msgpack-serializable). Used by
+        the legacy ipc-channel transport. The shmem fast path bypasses this
+        and encodes directly into the response buffer.
+        """
+        sampling_results, batch, timings = _run_fire_batch_inner(kwargs)
         t0 = time.perf_counter()
         responses = batch.create_responses(sampling_results)
         results = [
@@ -598,27 +624,7 @@ def _leader_loop(
             for resp in responses
         ]
         t_create_responses = time.perf_counter() - t0
-
-        t_total = time.perf_counter() - t_start
-
-        # Record latency stats
-        latency_stats.record_span(
-            StepTiming(
-                build_batch=t_build_batch,
-                get_inputs=t_get_inputs,
-                get_sampling_meta=t_get_sampling_meta,
-                broadcast=t_broadcast,
-                inference=t_inference,
-                create_responses=t_create_responses,
-                total=t_total,
-                decode_u32=build_timing["decode_u32"],
-                mask_loop=build_timing["mask_loop"],
-                brle_decode=build_timing["brle_decode"],
-                sampler_loop=build_timing["sampler_loop"],
-            ),
-            traceparent=kwargs.get("trace_context"),
-        )
-
+        _record_step_timing(timings, t_create_responses)
         return {"results": results}
 
     def _handle_copy_d2h(**kwargs) -> None:
@@ -717,6 +723,7 @@ def _leader_loop(
 
     # Method dispatch table
     methods = {
+        "ping": lambda **kw: {"ok": True},
         "query": _handle_query,
         "fire_batch": _handle_fire_batch,
         "embed_image": _handle_embed_image,
@@ -732,25 +739,98 @@ def _leader_loop(
         "copy_h2h": _handle_copy_h2h,
     }
 
-    try:
-        while not stop_event.is_set():
-            # Poll the RPC server (releases GIL while waiting)
-            request = server.poll_blocking(poll_timeout_ms)
-            if request is None:
-                continue  # Timeout, try again
+    import os as _os, sys as _sys, time as _time
 
-            request_id, method, payload = request
+    # ---- Shmem fast-path setup -----------------------------------------------
+    # `fire_batch` always runs over shared memory with the zero-copy schema;
+    # all other RPCs (adapter ops, page copies, query/ping) use the legacy
+    # ipc-channel transport on `server`.
+    SHMEM_NAME = "/pie_shmem"
+    SHMEM_SLOTS = 8
+    SHMEM_REQ_BUF = 4 * 1024 * 1024
+    SHMEM_RESP_BUF = 1 * 1024 * 1024
+    SHMEM_BUSY_US = 10_000
+
+    from pie_driver import shmem_ipc as _shm
+    from pie_driver import shmem_schema as _shm_schema
+    import threading as _threading
+    _shmem_server = _shm.ShmemServer(
+        SHMEM_NAME, num_slots=SHMEM_SLOTS,
+        req_buf=SHMEM_REQ_BUF, resp_buf=SHMEM_RESP_BUF,
+    )
+    print(f"[shmem] Worker created shmem region '{SHMEM_NAME}' "
+          f"({SHMEM_SLOTS} slots) — fast path enabled.")
+
+    import signal as _signal
+
+    def _shmem_loop():
+        while not stop_event.is_set():
+            req = _shmem_server.busy_poll_any_slot(SHMEM_BUSY_US)
+            if req is None:
+                continue
+            req_id, method_tag, payload_len, slot, send_walltime_us = req
+
+            # Zero-copy view of the request payload bytes (flat schema).
+            view = _shmem_server.request_payload_view(slot, payload_len)
+            args = _shm_schema.parse_request(memoryview(view))
+
+            try:
+                sampling_results, batch, timings = _run_fire_batch_inner(args)
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[Shmem Worker Error] fire_batch: {e}\n{tb}")
+                response = msgpack.packb(str(e))
+                _shmem_server.respond(slot, response, 0)
+                continue
+            t_after_handler = _time.perf_counter()
+
+            # Direct encode: bypass Batch.create_responses + dict comp on
+            # the fast path; falls back to msgpack only when the batch
+            # has special samplers / spec output.
+            resp_view = _shmem_server.respond_view(slot)
+            resp_len = _shm_schema.write_response_v2(
+                sampling_results, batch, resp_view, msgpack
+            )
+            _shmem_server.commit_respond(slot, resp_len, 0)
+
+            _record_step_timing(timings, _time.perf_counter() - t_after_handler)
+
+    _shmem_thread = _threading.Thread(target=_shmem_loop, name="shmem-fire-batch", daemon=True)
+    _shmem_thread.start()
+
+    # Best-effort cleanup on signal-induced exit (mp.spawn daemon=True sends
+    # SIGTERM on parent exit, which bypasses atexit).
+    def _shmem_signal_cleanup(signum, frame):
+        try:
+            _shmem_server.close()
+        except Exception:
+            pass
+        _os._exit(0)
+    for _sig in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            _signal.signal(_sig, _shmem_signal_cleanup)
+        except Exception:
+            pass
+
+    try:
+        # Cold-path RPC loop: adapter ops, page copies, query/ping. Busy-spin
+        # for 10 ms before blocking — these calls are infrequent, so the
+        # busy window is mostly there to keep latency low when they do fire.
+        while not stop_event.is_set():
+            req = server.poll_busy(SHMEM_BUSY_US, poll_timeout_ms)
+            if req is None:
+                continue
+            request_id, method, payload, send_walltime_us = req
 
             try:
                 args = msgpack.unpackb(payload)
-
                 fn = methods.get(method)
                 if fn is None:
                     response = msgpack.packb(f"Method not found: {method}")
-                    server.respond(request_id, response)
+                    server.respond(request_id, response, 0)
                     continue
 
-                # Call handler
                 if isinstance(args, dict):
                     result = fn(**args)
                 elif isinstance(args, (list, tuple)):
@@ -759,7 +839,7 @@ def _leader_loop(
                     result = fn(args)
 
                 response = msgpack.packb(result)
-                server.respond(request_id, response)
+                server.respond(request_id, response, 0)
 
             except Exception as e:
                 import traceback
@@ -768,7 +848,15 @@ def _leader_loop(
                 response = msgpack.packb(str(e))
                 server.respond(request_id, response)
     finally:
-        # Shutdown: broadcast STOP to followers
+        # Shutdown: stop shmem thread and broadcast STOP to followers
+        try:
+            _shmem_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            _shmem_server.close()
+        except Exception:
+            pass
         print("[RPC Worker] Shutting down...")
         if config.world_size > 1 and config.rank == 0 and compute_pg is not None:
             try:
