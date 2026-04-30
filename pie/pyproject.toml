@@ -116,7 +116,7 @@ flashinfer-jit-cache = [
 
 [tool.maturin]
 python-source = "src"
-python-packages = ["pie", "pie_cli", "pie_driver", "pie_driver_cuda_native", "pie_driver_vllm", "pie_driver_sgl", "pie_driver_dummy", "pie_kernels"]
+python-packages = ["pie", "pie_cli", "pie_driver", "pie_driver_cuda_native", "pie_driver_ggml", "pie_driver_vllm", "pie_driver_sgl", "pie_driver_dummy", "pie_kernels"]
 module-name = "pie._runtime"
 manifest-path = "../runtime/Cargo.toml"
 features = ["pyo3/extension-module"]
