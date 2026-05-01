@@ -555,14 +555,18 @@ void plan_single_request(const PlanArrays& a,
             "plan: request " + std::to_string(r) +
             " has 0 BPIQ sampling indices; expected ≥1");
     }
-    const std::int32_t primary_idx =
+    // Runtime emits sampling_indices as per-request relative offsets
+    // (0 = first token of that request's qo range, n_tok-1 = last).
+    // We carry global flat-array positions through the plan, so add
+    // qo_start to translate.
+    const std::int32_t rel_primary =
         static_cast<std::int32_t>(a.sampling_idx[s_start]);
-    if (primary_idx < qo_start || primary_idx >= qo_end) {
+    const std::int32_t primary_idx = qo_start + rel_primary;
+    if (rel_primary < 0 || rel_primary >= n_tok) {
         throw std::runtime_error(
             "plan: request " + std::to_string(r) +
-            " sampling_index " + std::to_string(primary_idx) +
-            " out of [" + std::to_string(qo_start) + "," +
-            std::to_string(qo_end) + ")");
+            " sampling_index " + std::to_string(rel_primary) +
+            " out of relative [0," + std::to_string(n_tok) + ")");
     }
 
     // Per-token: tokens, positions, and write idxs.
