@@ -69,19 +69,31 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                bool paged)
 {
     auto engine = pie_cuda_driver::Engine::load(cfg);
+    const auto& mt_for_parity = engine.hf_config().model_type;
+    const bool is_gpt_oss = (mt_for_parity == "gpt_oss");
     {
-        const auto& mt = engine.hf_config().model_type;
         const bool supported =
-            mt == "qwen3" || mt == "qwen3_5"
-         || mt == "qwen2"
-         || mt == "llama" || mt == "llama3"
-         || mt == "mistral" || mt == "mistral3";
+            mt_for_parity == "qwen3" || mt_for_parity == "qwen3_5"
+         || mt_for_parity == "qwen2"
+         || mt_for_parity == "llama" || mt_for_parity == "llama3"
+         || mt_for_parity == "mistral" || mt_for_parity == "mistral3"
+         || is_gpt_oss;
         if (!supported) {
-            std::cerr << "[parity] unsupported model_type: " << mt << "\n";
+            std::cerr << "[parity] unsupported model_type: " << mt_for_parity << "\n";
+            return 2;
+        }
+        if (is_gpt_oss && !paged) {
+            std::cerr << "[parity] gpt_oss requires --parity-paged\n";
             return 2;
         }
     }
-    const auto weights = pie_cuda_driver::model::bind_llama_like(engine);
+    pie_cuda_driver::model::Qwen3Weights weights;
+    pie_cuda_driver::model::MixtralWeights weights_mixtral;
+    if (is_gpt_oss) {
+        weights_mixtral = pie_cuda_driver::model::bind_gpt_oss(engine);
+    } else {
+        weights = pie_cuda_driver::model::bind_llama_like(engine);
+    }
 
     // Read tokens from disk.
     std::vector<std::int32_t> host_tokens;
@@ -153,14 +165,47 @@ int run_parity(const pie_cuda_driver::Config& cfg,
         // flashinfer's decode kernel only supports qo_len==1; we'll add a
         // separate decode-shaped parity test in Phase 1.4.
         auto parity_attn_ws = pie_cuda_driver::AttentionWorkspace::allocate();
-        pie_cuda_driver::model::qwen3_forward_paged(
-            weights, engine.hf_config(), ws, cache, parity_attn_ws, cublas,
-            d_tokens, d_positions,
-            d_qo, d_pi, d_pp, d_lpl,
-            /*qo_indptr_h=*/h_qo_indptr.data(),
-            /*kv_page_indptr_h=*/h_kv_page_indptr.data(),
-            /*total_tokens=*/N, /*num_requests=*/1,
-            /*is_pure_decode=*/false);
+        if (is_gpt_oss) {
+            // Mirror what main.cpp's serving path builds: per-layer
+            // sliding window from layer_types, YaRN params, force prefill
+            // path (we only need the prefill flow here).
+            pie_cuda_driver::model::LlamaLikeForwardCfg fwd_cfg{};
+            const auto& hf = engine.hf_config();
+            fwd_cfg.use_qkv_bias = hf.attention_bias;
+            fwd_cfg.rope_kind    = hf.has_rope_scaling
+                ? pie_cuda_driver::model::RopeKind::YaRN
+                : pie_cuda_driver::model::RopeKind::Standard;
+            fwd_cfg.yarn_factor               = hf.rope_factor;
+            fwd_cfg.yarn_low_freq_factor      = hf.rope_low_freq_factor;
+            fwd_cfg.yarn_high_freq_factor     = hf.rope_high_freq_factor;
+            fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
+            fwd_cfg.sliding_window            = hf.sliding_window;
+            for (const auto& t : hf.layer_types) {
+                const bool is_sliding = (t == "sliding_attention");
+                fwd_cfg.per_layer_window_left.push_back(
+                    is_sliding ? hf.sliding_window : -1);
+            }
+            fwd_cfg.force_prefill_path = true;
+            pie_cuda_driver::model::mixtral_forward_paged(
+                weights_mixtral, engine.hf_config(), fwd_cfg,
+                hf.num_experts, hf.num_experts_per_tok,
+                ws, cache, parity_attn_ws, cublas,
+                d_tokens, d_positions,
+                d_qo, d_pi, d_pp, d_lpl,
+                /*qo_indptr_h=*/h_qo_indptr.data(),
+                /*kv_page_indptr_h=*/h_kv_page_indptr.data(),
+                /*total_tokens=*/N, /*num_requests=*/1,
+                /*is_pure_decode=*/false);
+        } else {
+            pie_cuda_driver::model::qwen3_forward_paged(
+                weights, engine.hf_config(), ws, cache, parity_attn_ws, cublas,
+                d_tokens, d_positions,
+                d_qo, d_pi, d_pp, d_lpl,
+                /*qo_indptr_h=*/h_qo_indptr.data(),
+                /*kv_page_indptr_h=*/h_kv_page_indptr.data(),
+                /*total_tokens=*/N, /*num_requests=*/1,
+                /*is_pure_decode=*/false);
+        }
 
         cudaFree(d_qo); cudaFree(d_pi); cudaFree(d_pp); cudaFree(d_lpl);
     } else {
