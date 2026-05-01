@@ -105,14 +105,15 @@ ggml_tensor* build_qwen3_5_linear_layer(
     const std::int32_t n_tokens = x_r->ne[1];
     const std::int32_t n_seqs   = x_r->ne[2];
 
-    // Reference assumes head_k_dim == head_v_dim and n_k_heads == n_v_heads
-    // (the latter holds in Qwen3.5-0.8B; broader GQA via repeat — TBD).
+    // Reference assumes head_k_dim == head_v_dim. The k_heads vs v_heads
+    // GQA case is handled below via repeat_interleave on Q/K.
     GGML_ASSERT(hk == hv);
-    GGML_ASSERT(n_kh == n_vh);
+    GGML_ASSERT(n_vh % n_kh == 0);
     GGML_ASSERT(ssm_state_r->ne[3] == n_seqs);
     GGML_ASSERT(conv_state_r->ne[2] == n_seqs);
-    const std::int32_t S = hv;       // head dim (== head_k == head_v)
-    const std::int32_t H = n_vh;     // n_heads
+    const std::int32_t S      = hv;       // head dim (== head_k == head_v)
+    const std::int32_t H      = n_vh;     // n_heads after GQA expansion
+    const std::int32_t gqa_f  = n_vh / n_kh;  // 1 → no expansion
 
     // ---- 1. Input projections (batched over n_seqs).
     auto* qkv   = ggml_mul_mat(ctx, L.lin_in_proj_qkv, x_r); // [conv_dim, n_tokens, n_seqs]
@@ -159,9 +160,23 @@ ggml_tensor* build_qwen3_5_linear_layer(
         qkv_conv->nb[1], qkv_conv->nb[2],
         static_cast<std::size_t>(2 * key_dim) * qkv_conv->nb[0]));
 
-    auto* q = ggml_reshape_4d(ctx, q_flat, S, H, n_tokens, n_seqs);
-    auto* k = ggml_reshape_4d(ctx, k_flat, S, H, n_tokens, n_seqs);
-    auto* v = ggml_reshape_4d(ctx, v_flat, S, H, n_tokens, n_seqs);
+    auto* q = ggml_reshape_4d(ctx, q_flat, S, n_kh, n_tokens, n_seqs);
+    auto* k = ggml_reshape_4d(ctx, k_flat, S, n_kh, n_tokens, n_seqs);
+    auto* v = ggml_reshape_4d(ctx, v_flat, S, n_vh, n_tokens, n_seqs);
+
+    // ---- 3a. GQA: repeat_interleave Q/K along the head axis to match V.
+    //   Q' [s, k*f+i, t, b] = Q[s, k, t, b] for all i in [0, f).
+    //   Implemented as reshape→repeat_4d (tile along inserted dim)→reshape.
+    if (gqa_f > 1) {
+        auto interleave = [&](ggml_tensor* x) {
+            x = ggml_reshape_4d(ctx, x, S, 1, n_kh, n_tokens * n_seqs);
+            x = ggml_repeat_4d(ctx, x, S, gqa_f, n_kh, n_tokens * n_seqs);
+            x = ggml_cont(ctx, x);
+            return ggml_reshape_4d(ctx, x, S, H, n_tokens, n_seqs);
+        };
+        q = interleave(q);
+        k = interleave(k);
+    }
 
     // ---- 4. L2-norm + Q scaling.
     q = ggml_l2_norm(ctx, q, h.rms_norm_eps);
@@ -380,10 +395,33 @@ ggml_tensor* build_qwen3_5_full_layer(
     return ggml_mul_mat(ctx, L.o_proj, attn_2d);
 }
 
-// SwiGLU FFN (same on both layer types).
+// FFN — dense SwiGLU (Qwen 3.5) or top-K MoE + shared-expert (Qwen 3.6,
+// qwen3_5_moe). The MoE path mirrors HF's Qwen3_5MoeSparseMoeBlock:
+//   y = experts(x, top_k)  +  sigmoid(shared_gate(x)) * shared_expert(x)
 ggml_tensor* build_qwen3_5_ffn(ggml_context* ctx,
                                ggml_tensor* cur,
-                               const LayerWeights& L) {
+                               const LayerWeights& L,
+                               const Hparams& h) {
+    if (h.num_experts > 0) {
+        auto* moe = build_moe_ffn(ctx, cur,
+                                   L.moe_router,
+                                   L.moe_gate_exps, L.moe_up_exps, L.moe_down_exps,
+                                   h.num_experts, h.num_experts_per_tok,
+                                   MoeActivation::Silu, h.norm_topk_prob);
+        if (!L.moe_shared_gate_proj) return moe;
+
+        // Shared dense expert (SwiGLU MLP).
+        auto* sh_gate = ggml_mul_mat(ctx, L.moe_shared_gate_proj, cur);
+        auto* sh_up   = ggml_mul_mat(ctx, L.moe_shared_up_proj,   cur);
+        sh_gate = ggml_silu(ctx, sh_gate);
+        auto* sh_gated = ggml_mul(ctx, sh_gate, sh_up);
+        auto* shared = ggml_mul_mat(ctx, L.moe_shared_down_proj, sh_gated);
+
+        // Sigmoid mixer: scalar weight per token, broadcast across hidden.
+        auto* mix = ggml_sigmoid(ctx, ggml_mul_mat(ctx, L.moe_shared_gate, cur));
+        shared = ggml_mul(ctx, shared, mix);
+        return ggml_add(ctx, moe, shared);
+    }
     auto* gate = ggml_mul_mat(ctx, L.gate_proj, cur);
     auto* up   = ggml_mul_mat(ctx, L.up_proj,   cur);
     gate = ggml_silu(ctx, gate);
@@ -510,7 +548,7 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
             auto* ffn_in = ggml_add(ctx, attn_out, inpSA);
             auto* cur2 = ggml_rms_norm(ctx, ffn_in, h.rms_norm_eps);
             cur2 = norm_scale(ctx, cur2, L.ffn_norm, /*plus_one=*/true);
-            auto* ffn_out = build_qwen3_5_ffn(ctx, cur2, L);
+            auto* ffn_out = build_qwen3_5_ffn(ctx, cur2, L, h);
             x = ggml_add(ctx, ffn_out, ffn_in);
         }
         // Flatten [hidden, n_tokens, n_seqs] back to [hidden, n_total].
@@ -583,7 +621,7 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
                 auto* ffn_in = ggml_add(ctx, attn_out, inpSA);
                 auto* cur2 = ggml_rms_norm(ctx, ffn_in, h.rms_norm_eps);
                 cur2 = norm_scale(ctx, cur2, L.ffn_norm, /*plus_one=*/true);
-                auto* ffn_out = build_qwen3_5_ffn(ctx, cur2, L);
+                auto* ffn_out = build_qwen3_5_ffn(ctx, cur2, L, h);
                 x_r_3d = ggml_add(ctx, ffn_out, ffn_in);
             }
             per_req_finals.push_back(

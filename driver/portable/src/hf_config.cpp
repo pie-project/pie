@@ -288,6 +288,8 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
         get_or<std::int32_t>(text, "moe_intermediate_size",
             h.intermediate_size);  // fallback
     h.norm_topk_prob = get_or<bool>(text, "norm_topk_prob", true);
+    h.shared_expert_intermediate_size =
+        get_or<std::int32_t>(text, "shared_expert_intermediate_size", 0);
 
     // ── Qwen 3.5 / 3.6 ──
     if (h.arch == PieArch::Qwen3_5) {

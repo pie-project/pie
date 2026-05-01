@@ -93,6 +93,14 @@ struct LayerWeights {
     ggml_tensor* moe_up_exps_b   = nullptr; // [ff, n_experts]
     ggml_tensor* moe_down_exps_b = nullptr; // [hidden, n_experts]
 
+    // ── Qwen 3.6 (qwen3_5_moe) shared-expert path ──
+    // Per HF Qwen3_5MoeSparseMoeBlock: top-K routed experts run in parallel
+    // with one always-active dense MLP, gated by sigmoid(shared_gate(x)).
+    ggml_tensor* moe_shared_gate_proj = nullptr; // [hidden, shared_ff]
+    ggml_tensor* moe_shared_up_proj   = nullptr; // [hidden, shared_ff]
+    ggml_tensor* moe_shared_down_proj = nullptr; // [shared_ff, hidden]
+    ggml_tensor* moe_shared_gate      = nullptr; // [hidden, 1]   sigmoid mixer
+
     // ── Qwen 3.5 / 3.6 linear-attention layer (gated-delta-rule) ──
     // Populated only for layers where hparams.layer_types[il] == 'l'.
     // Tensor names mirror modeling_qwen3_5.py::Qwen3_5GatedDeltaNet.
@@ -284,6 +292,22 @@ private:
     void load_moe_layer_(std::int32_t i,
                          const std::string& path_prefix,
                          LoaderSpec::MoeNaming kind);
+    // Qwen 3.6 MoE layer: fused 3D `gate_up_proj` + 3D `down_proj`
+    // expert tensors plus a shared dense expert path. Different from the
+    // qwen3_moe / mixtral / gpt-oss layouts handled by `load_moe_layer_`.
+    void load_qwen3_5_moe_layer_(std::int32_t i,
+                                 const std::string& path_prefix);
+    // Helper: declare a stacked-expert F32/BF16 tensor backed by ONE
+    // 3D HF safetensor source (shape [n_exp, out_dim, in_dim]), with an
+    // optional intra-expert byte offset (for splitting fused gate_up).
+    ggml_tensor* declare_stacked_experts_from_3d_(
+        const std::string& dbg_name,
+        const std::string& src_hf_name,
+        std::int64_t in_dim, std::int64_t out_dim,
+        std::int32_t n_experts,
+        std::size_t  src_per_expert_bytes,
+        std::size_t  src_intra_offset_bytes,
+        ggml_type    dtype);
     // LLaMA-3.1 NTK-by-parts: synthesize the rope freq_factors tensor if
     // `hparams_.rope_scaling_type == "llama3"`. No-op otherwise.
     void synth_llama3_freq_factors_();

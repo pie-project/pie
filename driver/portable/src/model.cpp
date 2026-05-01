@@ -510,6 +510,99 @@ void Model::load_moe_layer_(std::int32_t i,
         p + "moe_down", ff, hidden, n_exp, down_names, w_dtype);
 }
 
+ggml_tensor* Model::declare_stacked_experts_from_3d_(
+        const std::string& dbg_name,
+        const std::string& src_hf_name,
+        std::int64_t in_dim, std::int64_t out_dim,
+        std::int32_t n_experts,
+        std::size_t  src_per_expert_bytes,
+        std::size_t  src_intra_offset_bytes,
+        ggml_type    dtype) {
+    auto* tensor = ggml_new_tensor_3d(ctx_, dtype, in_dim, out_dim, n_experts);
+    ggml_set_name(tensor, dbg_name.c_str());
+
+    const std::size_t expert_bytes =
+        ggml_nbytes(tensor) / static_cast<std::size_t>(n_experts);
+
+    // Sanity-check the source size: each expert occupies at least
+    // intra_offset + expert_bytes within its src_per_expert_bytes slab.
+    if (src_intra_offset_bytes + expert_bytes > src_per_expert_bytes) {
+        throw std::runtime_error(
+            "model: stacked-expert source slice out of range for '" +
+            dbg_name + "'");
+    }
+    const auto& src = archive_->at(src_hf_name);
+    const std::size_t expected =
+        src_per_expert_bytes * static_cast<std::size_t>(n_experts);
+    if (src.nbytes != expected) {
+        throw std::runtime_error(
+            "model: stacked-expert source nbytes mismatch for '" +
+            src_hf_name + "': expected " + std::to_string(expected) +
+            ", got " + std::to_string(src.nbytes));
+    }
+
+    for (std::int32_t e = 0; e < n_experts; ++e) {
+        DeclaredTensor d;
+        d.hf_name          = src_hf_name;
+        d.tensor           = tensor;
+        d.src_offset_bytes = static_cast<std::size_t>(e) * src_per_expert_bytes
+                           + src_intra_offset_bytes;
+        d.copy_bytes       = expert_bytes;
+        d.dst_offset_bytes = static_cast<std::size_t>(e) * expert_bytes;
+        declared_.push_back(std::move(d));
+    }
+    return tensor;
+}
+
+void Model::load_qwen3_5_moe_layer_(std::int32_t i, const std::string& p) {
+    const auto& h = hparams_;
+    auto& L = weights_.layers[i];
+
+    const std::int32_t n_exp  = h.num_experts;
+    const std::int64_t hidden = h.hidden_size;
+    const std::int64_t ff     = h.moe_intermediate_size;
+
+    // Router: HF naming `mlp.gate.weight`, shape [num_experts, hidden].
+    L.moe_router = declare_(p + "mlp.gate.weight");
+
+    // Fused experts. Source `mlp.experts.gate_up_proj` is one 3D safetensor
+    // [n_exp, 2*ff, hidden]; we split into separate stacked gate / up
+    // tensors at load time so the existing build_moe_ffn helper applies.
+    const std::string gate_up_name = p + "mlp.experts.gate_up_proj";
+    const std::string down_name    = p + "mlp.experts.down_proj";
+    const ggml_type w_dtype =
+        st_to_ggml_dtype(archive_->at(gate_up_name).dtype, gate_up_name);
+    const std::size_t row_bytes = static_cast<std::size_t>(hidden) *
+                                   ggml_type_size(w_dtype);
+    const std::size_t per_expert_bytes =
+        static_cast<std::size_t>(2 * ff) * row_bytes;
+    const std::size_t up_intra_offset =
+        static_cast<std::size_t>(ff) * row_bytes;
+
+    L.moe_gate_exps = declare_stacked_experts_from_3d_(
+        p + "moe_gate", gate_up_name, hidden, ff, n_exp,
+        per_expert_bytes, /*intra_off=*/0, w_dtype);
+    L.moe_up_exps   = declare_stacked_experts_from_3d_(
+        p + "moe_up",   gate_up_name, hidden, ff, n_exp,
+        per_expert_bytes, /*intra_off=*/up_intra_offset, w_dtype);
+    // down_proj source is [n_exp, hidden, ff] → per-expert [hidden, ff]
+    // with bytes ff * hidden * dtype_size.
+    const std::size_t down_per_expert_bytes =
+        static_cast<std::size_t>(hidden) *
+        static_cast<std::size_t>(ff) * ggml_type_size(w_dtype);
+    L.moe_down_exps = declare_stacked_experts_from_3d_(
+        p + "moe_down", down_name, ff, hidden, n_exp,
+        down_per_expert_bytes, 0, w_dtype);
+
+    // Shared expert (always-active dense path).
+    if (h.shared_expert_intermediate_size > 0) {
+        L.moe_shared_gate_proj = declare_(p + "mlp.shared_expert.gate_proj.weight");
+        L.moe_shared_up_proj   = declare_(p + "mlp.shared_expert.up_proj.weight");
+        L.moe_shared_down_proj = declare_(p + "mlp.shared_expert.down_proj.weight");
+        L.moe_shared_gate      = declare_(p + "mlp.shared_expert_gate.weight");
+    }
+}
+
 // Shared dense / dense+MoE skeleton used by every arch that doesn't need a
 // custom per-layer loop. phi3, gemma4, gpt_oss have their own builders.
 void Model::build_dense_(LoaderSpec spec) {
@@ -1143,6 +1236,7 @@ void Model::build_qwen3_5_() {
     const std::int32_t value_dim = n_v_heads * hv;
     const std::int32_t conv_dim  = 2 * key_dim + value_dim;
 
+    const bool is_moe = h.num_experts > 0;
     for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
         const std::string p = tname_(layer_path(i));
         auto& L = weights_.layers[i];
@@ -1151,10 +1245,21 @@ void Model::build_qwen3_5_() {
         L.attn_norm = declare_(p + "input_layernorm.weight");
         L.ffn_norm  = declare_(p + "post_attention_layernorm.weight");
 
-        // SwiGLU FFN (same on both layer types).
-        L.gate_proj = declare_(p + "mlp.gate_proj.weight");
-        L.up_proj   = declare_(p + "mlp.up_proj.weight");
-        L.down_proj = declare_(p + "mlp.down_proj.weight");
+        // FFN: dense SwiGLU on Qwen 3.5; fused-stacked MoE + shared expert
+        // on Qwen 3.6 (qwen3_5_moe). The MoE layout matches HF's
+        // `Qwen3_5MoeExperts`:
+        //   mlp.experts.gate_up_proj  shape [E, 2*ff, hidden] (fused)
+        //   mlp.experts.down_proj     shape [E, hidden, ff]
+        //   mlp.gate.weight           [num_experts, hidden]   (router)
+        //   mlp.shared_expert.{gate,up,down}_proj.weight      (dense MLP)
+        //   mlp.shared_expert_gate.weight                     [1, hidden]
+        if (is_moe) {
+            load_qwen3_5_moe_layer_(i, p);
+        } else {
+            L.gate_proj = declare_(p + "mlp.gate_proj.weight");
+            L.up_proj   = declare_(p + "mlp.up_proj.weight");
+            L.down_proj = declare_(p + "mlp.down_proj.weight");
+        }
 
         const char kind = h.layer_types[i];
         if (kind == 'l') {

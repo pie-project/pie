@@ -132,6 +132,9 @@ struct Hparams {
     // norm_topk_prob (qwen-moe / mixtral) — renormalize the selected
     // top-k expert weights so they sum to 1.
     bool norm_topk_prob = true;
+    // Qwen 3.6 (qwen3_5_moe): shared dense expert that runs alongside the
+    // routed experts. 0 disables (Qwen-MoE / Mixtral / gpt-oss don't have it).
+    std::int32_t shared_expert_intermediate_size = 0;
 
     // ── Qwen 3.5 / 3.6 ──
     // Hybrid arch: 3-of-4 layers are gated-delta-rule "linear attention"
