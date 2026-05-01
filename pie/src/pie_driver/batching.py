@@ -100,14 +100,6 @@ class Batch:
         flattened_masks_u32 = _decode_u32(args["flattened_masks"]).view(np.int32)
         mask_indptr = _decode_u32(args["mask_indptr"]).view(np.int32)
 
-        # The decode kernel is a specialization of the prefill kernel that
-        # drops `custom_mask` for efficiency. Rust now sets `single_token_mode`
-        # correctly: it forces the prefill path whenever any request supplied
-        # a user `attention_mask` (regardless of token count), so we trust the
-        # flag here. `has_custom_mask` is kept as a tensor-allocation gate
-        # downstream.
-        self.has_custom_mask = len(flattened_masks_u32) > 0
-
         num_requests = len(args["adapter_indices"])
 
         # [OPTIMIZATION] Vectorized computation of per-request token counts
@@ -133,17 +125,27 @@ class Batch:
         request_contexts = np.repeat(context_lens, req_token_counts)
         position_ids_np = global_indices - request_starts + request_contexts
 
-        # [OPTIMIZATION] Vectorized cumsum for bit offsets
-        token_acc_seq_lens_np = np.zeros(self.total_tokens + 1, dtype=np.int32)
-        np.cumsum(all_seq_lens, out=token_acc_seq_lens_np[1:])
-
         self.timing["mask_loop"] = time.perf_counter() - t0
 
-        # Call batch decoder ONCE for all tokens
+        # The flat per-token attention mask is only consumed by the prefill
+        # wrapper (`wrapper_append.plan(custom_mask=...)`); the decode
+        # wrapper ignores it. When every request has query_len=1 (and no
+        # user mask elsewhere — the runtime sets `single_token_mode=False`
+        # in that case) we can skip the BRLE decode entirely.
+        # Speculative-decoding rebuilds its own mask in
+        # `get_spec_expanded_model_inputs`, so spec batches also don't need
+        # this initial decode — but spec adds drafts which makes
+        # `single_token_mode` False on the spec path's input dict. Either
+        # way, gating on `self.single_token_mode` is sufficient.
         t_brle = time.perf_counter()
-        self.attention_masks = decode_brle_batch(
-            flattened_masks_u32, mask_indptr, position_ids_np, token_acc_seq_lens_np
-        )
+        if self.single_token_mode:
+            self.attention_masks = None
+        else:
+            token_acc_seq_lens_np = np.zeros(self.total_tokens + 1, dtype=np.int32)
+            np.cumsum(all_seq_lens, out=token_acc_seq_lens_np[1:])
+            self.attention_masks = decode_brle_batch(
+                flattened_masks_u32, mask_indptr, position_ids_np, token_acc_seq_lens_np
+            )
         self.timing["brle_decode"] = time.perf_counter() - t_brle
 
         # Helper to decode bytes as f32 array.
@@ -287,6 +289,38 @@ class Batch:
         """True if any request in this batch supplied draft tokens to verify."""
         return self.spec_token_ids.size > 0
 
+    # ------------------------------------------------------------------
+    # Shared input-dict pieces. Both `get_model_inputs` (no spec) and
+    # `get_spec_expanded_model_inputs` produce dicts with overlapping
+    # KV-paging and adapter blocks; pulling them into helpers keeps the
+    # two methods focused on what's actually different (token / mask
+    # tensors are extended in the spec path).
+    # ------------------------------------------------------------------
+
+    def _shared_kv_inputs(self, device: torch.device) -> dict[str, Any]:
+        """KV-paging tensors that don't depend on speculative drafts."""
+        return {
+            "kv_page_indices": torch.as_tensor(
+                self.kv_page_indices, device=device, dtype=torch.int32
+            ).contiguous(),
+            "kv_page_indptr": torch.as_tensor(
+                self.kv_page_indptr, device=device, dtype=torch.int32
+            ).contiguous(),
+        }
+
+    def _adapter_inputs(self, device: torch.device) -> dict[str, Any]:
+        """Adapter-subpass tensors. Empty/None when no adapter is active."""
+        return {
+            "adapter_indices": (
+                self.adapter_indices if self.adapter_subpass_needed else []
+            ),
+            "adapter_seeds": (
+                torch.as_tensor(self.adapter_seeds, device=device, dtype=torch.long)
+                if self.adapter_subpass_needed
+                else None
+            ),
+        }
+
     def get_model_inputs(self, device: torch.device) -> dict[str, Any]:
         """
         Finalize batch preparation and create input tensors for the model.
@@ -330,28 +364,20 @@ class Batch:
             "qo_indptr": torch.as_tensor(
                 self.qo_indptr, device=device, dtype=torch.int32
             ),
-            "kv_page_indices": torch.as_tensor(
-                self.kv_page_indices, device=device, dtype=torch.int32
-            ).contiguous(),
-            "kv_page_indptr": torch.as_tensor(
-                self.kv_page_indptr, device=device, dtype=torch.int32
-            ).contiguous(),
+            **self._shared_kv_inputs(device),
             "kv_last_page_lens": torch.as_tensor(
                 self.kv_last_page_lens, device=device, dtype=torch.int32
             ),
-            "custom_mask": torch.as_tensor(
-                self.attention_masks, device=device, dtype=torch.bool
-            ),
-            "has_custom_mask": self.has_custom_mask,
-            "single_token_inference_mode": self.single_token_mode,
-            "adapter_indices": (
-                self.adapter_indices if self.adapter_subpass_needed else []
-            ),
-            "adapter_seeds": (
-                torch.as_tensor(self.adapter_seeds, device=device, dtype=torch.long)
-                if self.adapter_subpass_needed
+            # `attention_masks` is None for pure-decode batches (skipped at
+            # build time in __init__); the model's decode wrapper ignores
+            # `custom_mask` so we don't materialize a no-op tensor.
+            "custom_mask": (
+                torch.as_tensor(self.attention_masks, device=device, dtype=torch.bool)
+                if self.attention_masks is not None
                 else None
             ),
+            "single_token_inference_mode": self.single_token_mode,
+            **self._adapter_inputs(device),
             "spec_token_ids": (
                 torch.as_tensor(self.spec_token_ids, device=device, dtype=torch.long)
                 if len(self.spec_token_ids) > 0
@@ -546,12 +572,7 @@ class Batch:
                 position_ids_ext, device=device, dtype=torch.int32
             ),
             "qo_indptr": torch.as_tensor(qo_indptr_ext, device=device, dtype=torch.int32),
-            "kv_page_indices": torch.as_tensor(
-                self.kv_page_indices, device=device, dtype=torch.int32
-            ).contiguous(),
-            "kv_page_indptr": torch.as_tensor(
-                self.kv_page_indptr, device=device, dtype=torch.int32
-            ).contiguous(),
+            **self._shared_kv_inputs(device),
             "kv_last_page_lens": torch.as_tensor(
                 kv_last_page_lens_ext, device=device, dtype=torch.int32
             ),
@@ -559,14 +580,7 @@ class Batch:
                 attention_masks_ext, device=device, dtype=torch.bool
             ),
             "single_token_inference_mode": single_token_mode_ext,
-            "adapter_indices": (
-                self.adapter_indices if self.adapter_subpass_needed else []
-            ),
-            "adapter_seeds": (
-                torch.as_tensor(self.adapter_seeds, device=device, dtype=torch.long)
-                if self.adapter_subpass_needed
-                else None
-            ),
+            **self._adapter_inputs(device),
         }
 
     def get_sampling_metadata(

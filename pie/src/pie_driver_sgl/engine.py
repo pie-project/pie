@@ -304,16 +304,17 @@ class SGLangEngine:
                 qo_indptr=inputs["qo_indptr"],
             )
 
+        # User-supplied attention masks are silently dropped: this driver
+        # runs causal-only attention. The capability is advertised via
+        # DriverCapabilities; the runtime is responsible for routing
+        # mask-dependent inferlets to a driver that supports them.
         gathered_logits = self.forward_pass.transform(
             input_embeds=passthrough,
             position_ids=inputs["position_ids"],
             qo_indptr=inputs["qo_indptr"],
-            kv_cache_at_layer=self.kv_cache_at_layer,
             kv_page_indices=inputs["kv_page_indices"],
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
-            single_token_inference_mode=inputs["single_token_inference_mode"],
-            custom_mask=inputs.get("custom_mask"),
             adapter_subpass=adapter_subpass,
         )
         return self.forward_pass.sample(gathered_logits, sampling_metadata)
@@ -511,6 +512,10 @@ class SGLangEngine:
             vocab_size=int(sglang_mc.vocab_size),
             max_model_len=int(sglang_mc.context_len),
             activation_dtype=str(self.config.activation_dtype).removeprefix("torch."),
+            # sglang's attention path is causal-only from pie's perspective;
+            # user-supplied masks are silently dropped. Inferlets that need
+            # non-causal patterns must run on `native`.
+            supports_user_attention_mask=False,
             snapshot_dir=str(self.snapshot_dir),
         )
 

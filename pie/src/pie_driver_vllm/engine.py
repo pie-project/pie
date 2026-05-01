@@ -92,7 +92,6 @@ class VllmEngine:
         from .forward_pass import VllmForwardPass
         from .kv_cache import allocate_and_bind_kv_cache, allocate_host_pool
         from .loader import load_vllm_model
-        from .mask_strategies import install_mask_strategies
 
         def _log(msg: str, level: str = "INFO"):
             if log_queue is not None:
@@ -116,12 +115,6 @@ class VllmEngine:
             config, driver_config, log_queue=log_queue, compute_pg=compute_process_group
         )
         _log("Loaded vllm model", "DEBUG")
-
-        # Wrap each attn layer's impl in a mask-aware proxy. Idempotent;
-        # an absent `pie_attn_extras` makes the proxy a single dict.get
-        # plus a delegating call. See mask_strategies.py for the per-
-        # backend strategies and the refusal policy on unsupported impls.
-        install_mask_strategies(loaded.vllm_config)
 
         kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
         host_kv, pool_size = allocate_host_pool(kv_cache_at_layer, config.swap_budget_bytes)
@@ -150,23 +143,19 @@ class VllmEngine:
 
     @torch.inference_mode()
     def fire_batch(self, inputs: dict, sampling_metadata: dict) -> list:
+        # This driver runs causal-only attention; user-supplied masks are
+        # silently dropped. The capability is advertised via
+        # DriverCapabilities so the runtime can route mask-dependent
+        # inferlets elsewhere (currently only `native`).
         input_embeds = self.forward_pass.embed_inputs(inputs)
 
         hidden_states = self.forward_pass.transform(
             input_embeds=input_embeds,
             position_ids=inputs["position_ids"],
             qo_indptr=inputs["qo_indptr"],
-            kv_cache_at_layer=self.kv_cache_at_layer,
             kv_page_indices=inputs["kv_page_indices"],
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
-            # Only forward the mask when there's something to apply — the
-            # mask-aware impl proxy checks `pie_attn_extras` presence as the
-            # zero-overhead signal. `inputs["custom_mask"]` is always
-            # populated (BRLE-decoded to all-True when no mask was supplied),
-            # so we gate on the explicit `has_custom_mask` flag instead.
-            custom_mask=inputs["custom_mask"] if inputs.get("has_custom_mask") else None,
-            single_token_inference_mode=inputs["single_token_inference_mode"],
         )
 
         return self.forward_pass.sample(hidden_states, sampling_metadata)
@@ -391,5 +380,11 @@ class VllmEngine:
             vocab_size=int(mc.get_vocab_size()),
             max_model_len=int(mc.max_model_len),
             activation_dtype=dtype_str,
+            # vLLM's V1 attention backends (FLASHINFER, FLEX_ATTENTION, ...)
+            # don't have an efficient path for arbitrary user masks under
+            # pie's per-batch BRLE layout. The bridge currently runs plain
+            # causal attention and silently drops user masks. Inferlets
+            # that need non-causal patterns must run on `native`.
+            supports_user_attention_mask=False,
             snapshot_dir=str(self.snapshot_dir),
         )

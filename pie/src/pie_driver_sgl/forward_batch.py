@@ -22,24 +22,11 @@ rather than running a second numba kernel).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import numba
 import numpy as np
 import torch
-
-
-@dataclass(frozen=True)
-class BatchMeta:
-    """Per-batch state the mask strategies and forward_pass need after the
-    `ForwardBatch` is built. Returned alongside the FB so we don't tunnel
-    fields through `_pie_*` attributes on a torch dataclass.
-    """
-
-    seq_lens_np: np.ndarray         # int32, (batch,) — full kv length per request
-    qo_indptr_np: np.ndarray        # int32, (batch+1,) — pie's CSR
-    mask_indptr: torch.Tensor       # int64, (batch+1,) on device — flat mask offsets
 
 
 @numba.njit(cache=True, parallel=False)
@@ -64,39 +51,14 @@ def _build_req_to_token_rows(
             out[r, i] = block_id * page_size + (i % page_size)
 
 
-def _compute_mask_indptr(
-    qo_indptr_np: np.ndarray,
-    seq_lens_np: np.ndarray,
-    device: torch.device,
-) -> torch.Tensor:
-    """Cumulative offset into pie's flat BRLE-decoded mask buffer.
-
-    For request r with `query_len_r = qo_indptr[r+1] - qo_indptr[r]` query
-    tokens and `seq_lens[r]` total kv tokens, the mask occupies
-    `query_len_r * seq_lens[r]` consecutive bools. mask_indptr is the
-    cumulative-sum of those sizes.
-
-    Matches `cur_seq_mask_start_idx = mask_indptr[r]` in
-    sglang/layers/attention/triton_ops/extend_attention.py:286.
-    """
-    batch = qo_indptr_np.shape[0] - 1
-    if batch == 0:
-        return torch.zeros(1, dtype=torch.int64, device=device)
-    query_lens = (qo_indptr_np[1:] - qo_indptr_np[:-1]).astype(np.int64)
-    per_req = query_lens * seq_lens_np.astype(np.int64)
-    indptr_np = np.zeros(batch + 1, dtype=np.int64)
-    np.cumsum(per_req, out=indptr_np[1:])
-    return torch.from_numpy(indptr_np).to(device, non_blocking=True)
-
-
 def build_sglang_forward_batch(
     *,
     runner: Any,                     # sglang ModelRunner
     inputs: dict,
     page_size: int,
     device: torch.device,
-) -> tuple[Any, BatchMeta]:
-    """Build a `ForwardBatch` + `BatchMeta` from pie's `inputs` dict."""
+) -> Any:
+    """Build a `ForwardBatch` from pie's `inputs` dict."""
     from sglang.srt.model_executor.forward_batch_info import (
         ForwardBatch,
         ForwardMode,
@@ -189,9 +151,4 @@ def build_sglang_forward_batch(
         token_to_kv_pool=runner.token_to_kv_pool,
         attn_backend=runner.attn_backend,
     )
-    meta = BatchMeta(
-        seq_lens_np=seq_lens_np,
-        qo_indptr_np=qo_indptr_np,
-        mask_indptr=_compute_mask_indptr(qo_indptr_np, seq_lens_np, device),
-    )
-    return fb, meta
+    return fb

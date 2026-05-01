@@ -13,6 +13,11 @@ LogitsProcessor with `_HiddenCapture`, which stashes the full per-token
 hidden state tensor; `sample()` then applies pie's per-output
 `indices_for_logits` gather + the LM head + sampling itself via
 `pie_driver.model.common.sample_common`.
+
+Custom attention masks: this bridge runs SGLang's standard causal attention
+and silently drops any user-supplied mask. The driver advertises that
+behavior via `DriverCapabilities.supports_user_attention_mask=False`;
+inferlets that need non-causal patterns must run on the `native` driver.
 """
 
 from __future__ import annotations
@@ -25,7 +30,6 @@ from pie_driver.config import RuntimeConfig
 from pie_driver.model.common import sample_common
 
 from .forward_batch import build_sglang_forward_batch
-from .mask_hooks import make_mask_strategy
 
 
 class _HiddenCapture(torch.nn.Module):
@@ -72,11 +76,11 @@ class SGLangForwardPass:
         self.page_size = page_size
         self.device = torch.device(runtime_config.device)
 
-        # One-shot install: hidden-state capture replaces the LogitsProcessor;
-        # mask strategy patches the attention backend.
+        # One-shot install: hidden-state capture replaces the LogitsProcessor.
+        # User-supplied attention masks are silently dropped — the driver runs
+        # causal-only attention via sglang's stock backend.
         self._capture = _HiddenCapture()
         runner.model.logits_processor = self._capture
-        self._mask_strategy = make_mask_strategy(runner.attn_backend)
 
         # ParallelLMHead with TP > 1 needs an all-gather; for v1 we only
         # support TP=1 and the matmul-against-weight path matches sglang's
@@ -100,15 +104,12 @@ class SGLangForwardPass:
         input_embeds: dict,
         position_ids: torch.Tensor,
         qo_indptr: torch.Tensor,
-        kv_cache_at_layer: list[torch.Tensor],
         kv_page_indices: torch.Tensor,
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
-        single_token_inference_mode: bool,
-        custom_mask: torch.Tensor | None = None,
         adapter_subpass=None,
     ) -> torch.Tensor:
-        fb, meta = build_sglang_forward_batch(
+        fb = build_sglang_forward_batch(
             runner=self.runner,
             inputs={
                 "token_ids": input_embeds["token_ids"],
@@ -122,14 +123,6 @@ class SGLangForwardPass:
             device=self.device,
         )
 
-        # Pie always emits a mask; strategies apply it either via
-        # `apply_to_forward_batch` (FlashInfer) or via their hooked
-        # `init_forward_metadata` (Triton/Flex/TorchNative), reading from
-        # `set()` state.
-        if custom_mask is not None:
-            self._mask_strategy.set(custom_mask, meta.mask_indptr)
-            self._mask_strategy.apply_to_forward_batch(fb)
-
         # CMA-ES adapter: hand the per-batch subpass to the QKV wrappers
         # via the slot they hold a reference to. No-op when adapter mode
         # is disabled (slot is None) or when this batch has no adapter
@@ -142,7 +135,6 @@ class SGLangForwardPass:
         try:
             self.runner.forward(fb)
         finally:
-            self._mask_strategy.clear()
             if slot is not None:
                 slot.current = None
 

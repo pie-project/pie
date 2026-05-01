@@ -505,5 +505,8 @@ class Engine:
             vocab_size=vocab_size,
             max_model_len=max_model_len,
             activation_dtype=str(self.config.activation_dtype).removeprefix("torch."),
+            # Native uses pie's BRLE mask path on every layer's flashinfer
+            # call — fully respects user-supplied attention masks.
+            supports_user_attention_mask=True,
             snapshot_dir=str(self.snapshot_dir) if self.snapshot_dir else "",
         )

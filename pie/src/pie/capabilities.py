@@ -72,8 +72,19 @@ class DriverCapabilities:
     # Resolved activation dtype, never "auto". Currently Python-only.
     activation_dtype: str
 
+    # ── Feature support ────────────────────────────────────────────────
+    # Whether the driver implements user-supplied attention masks (i.e.,
+    # respects `req.has_user_mask` from pie's runtime). False means the
+    # driver computes plain causal attention regardless of any inferlet-
+    # supplied mask. Inferlets that depend on non-causal patterns must be
+    # routed to a driver that returns True (currently only `native`).
+    # Defaults False so a driver that omits the field is treated as
+    # mask-unaware. Python-only today; the Rust runtime gains an admission
+    # hook in a follow-up.
+    supports_user_attention_mask: bool = False
+
     # ── Filesystem ─────────────────────────────────────────────────────
     # Local directory containing tokenizer.json + config.json. The Rust
     # runtime reads tokenizer.json from `<snapshot_dir>/tokenizer.json`.
     # Forwarded to Rust as part of ModelConfig.tokenizer_path.
-    snapshot_dir: str
+    snapshot_dir: str = ""
