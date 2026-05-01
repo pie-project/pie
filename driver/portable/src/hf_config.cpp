@@ -48,7 +48,8 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
     if (hf_model_type == "qwen3_moe")   return PieArch::Qwen3Moe;
     if (hf_model_type == "qwen3_5" ||
         hf_model_type == "qwen3_5_text" ||
-        hf_model_type == "qwen3_5_moe")    return PieArch::Qwen3_5;
+        hf_model_type == "qwen3_5_moe" ||
+        hf_model_type == "qwen3_5_moe_text") return PieArch::Qwen3_5;
     throw std::runtime_error(
         "hf_config: unsupported model_type '" + hf_model_type + "'");
 }
