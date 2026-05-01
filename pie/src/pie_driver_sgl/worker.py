@@ -41,7 +41,7 @@ def worker_main(
         model_config=model_config,
         group_topology=group_topology,
         ready_queue=ready_queue,
-        build_engine=lambda cfg, pg: SGLangEngine.load(cfg, sgl_cfg, compute_process_group=pg),
+        build_engine=lambda cfg: SGLangEngine.load(cfg, sgl_cfg),
         # `cpu_mem_budget_in_gb` is the only universal pie knob carried on
         # SGLangDriverConfig; forward it so RuntimeConfig.swap_budget_bytes
         # gets sized correctly.

@@ -268,7 +268,7 @@ class ForwardPass(DenseForwardPass):
         # Output: [seq_len, hidden_size] (full hidden dimension)
         # Output: [seq_len, hidden_size] (full hidden dimension)
         gathered_list = [torch.empty_like(local_embeds) for _ in range(self.tp_size)]
-        dist.all_gather(gathered_list, local_embeds, group=self.compute_process_group)
+        dist.all_gather(gathered_list, local_embeds)
 
         # Concatenate along hidden dimension (last dim)
         full_embeds = torch.cat(gathered_list, dim=-1)
@@ -326,7 +326,7 @@ class ForwardPass(DenseForwardPass):
         local_logits = fun.linear(local_normed, weight)  # [seq, vocab]
 
         # 3. All-reduce to combine partial logits (sum of partial projections = full projection)
-        dist.all_reduce(local_logits, group=self.compute_process_group)
+        dist.all_reduce(local_logits)
 
         return local_logits
 
@@ -370,7 +370,7 @@ class ForwardPass(DenseForwardPass):
 
         # ALL-REDUCE: Sum partial outputs from all ranks (only if TP > 1)
         if self.tp_size > 1:
-            dist.all_reduce(down, group=self.compute_process_group)
+            dist.all_reduce(down)
 
         # 5. Residual Connection
         return residual + down
@@ -493,7 +493,7 @@ class ForwardPass(DenseForwardPass):
 
         # ALL-REDUCE: Sum partial outputs from all ranks (only if TP > 1)
         if self.tp_size > 1:
-            dist.all_reduce(attn_proj, group=self.compute_process_group)
+            dist.all_reduce(attn_proj)
 
         # 9. First Residual Connection
         # residual (replicated) + attn_proj (now replicated)

@@ -168,7 +168,6 @@ class ForwardPass:
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
-        compute_process_group: Any = None,
     ):
         if runtime_config.tensor_parallel_size > 1:
             raise NotImplementedError(

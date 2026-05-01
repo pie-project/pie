@@ -247,9 +247,8 @@ class ForwardPass(DenseForwardPass):
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
-        compute_process_group: dist.ProcessGroup | None = None,
     ):
-        super().__init__(model_config, runtime_config, weights, compute_process_group)
+        super().__init__(model_config, runtime_config, weights)
         # Pre-compute YaRN RoPE cos/sin cache (olmo3-specific).
         self.cos_sin_cache = self._build_yarn_cos_sin_cache(
             device=self.runtime_config.device,
@@ -356,7 +355,7 @@ class ForwardPass(DenseForwardPass):
         # 2. All-gather to combine partial hidden states from all ranks
         # Output: [seq_len, hidden_size] (full hidden dimension)
         gathered_list = [torch.empty_like(local_embeds) for _ in range(self.tp_size)]
-        dist.all_gather(gathered_list, local_embeds, group=self.compute_process_group)
+        dist.all_gather(gathered_list, local_embeds)
 
         # Concatenate along hidden dimension (last dim)
         full_embeds = torch.cat(gathered_list, dim=-1)
@@ -454,11 +453,14 @@ class ForwardPass(DenseForwardPass):
         # We need to gather them.
         
         local_logits = fun.linear(
-            normed, 
+            normed,
             self.weights.get("lm_head")
         )
 
-        return self.compute_process_group.all_gather(local_logits, dim=-1)
+        # Column-parallel: each rank holds [N, V/TP]; all-gather along vocab.
+        gathered = [torch.empty_like(local_logits) for _ in range(self.tp_size)]
+        dist.all_gather(gathered, local_logits)
+        return torch.cat(gathered, dim=-1)
 
     def mlp(self, hidden_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """
@@ -495,7 +497,7 @@ class ForwardPass(DenseForwardPass):
 
         # ALL-REDUCE: Sum partial outputs from all ranks (only if TP > 1)
         if self.tp_size > 1:
-            dist.all_reduce(down, group=self.compute_process_group)
+            dist.all_reduce(down)
 
         return down
 
@@ -661,7 +663,7 @@ class ForwardPass(DenseForwardPass):
 
         # ALL-REDUCE: Sum partial outputs from all ranks (only if TP > 1)
         if self.tp_size > 1:
-            dist.all_reduce(attn_proj, group=self.compute_process_group)
+            dist.all_reduce(attn_proj)
 
         return attn_proj
 

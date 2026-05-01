@@ -352,15 +352,16 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
 
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
 
-    // Lockstep bump on the four "total_*" caps. wasmtime defaults all
+    // Lockstep bump on the five "total_*" caps. wasmtime defaults all
     // of them to 1000; we bump them together because every pie
     // inferlet uses exactly one of each (one core instance, one
-    // component instance, one memory, one table).
+    // component instance, one memory, one table, one async fiber stack).
     if let Some(n) = runtime.wasm_max_instances {
         pooling_config.total_core_instances(n);
         pooling_config.total_component_instances(n);
         pooling_config.total_memories(n);
         pooling_config.total_tables(n);
+        pooling_config.total_stacks(n);
     }
     if let Some(mb) = runtime.wasm_max_memory_mb {
         pooling_config.max_memory_size(mb.saturating_mul(1024 * 1024));

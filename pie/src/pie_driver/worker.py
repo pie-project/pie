@@ -48,10 +48,28 @@ def calculate_topology(world_size: int, tp_degree: int) -> list[list[int]]:
 # =============================================================================
 
 
-def _init_distributed(rank: int, world_size: int, master_port: int, device: str):
-    """Initialize torch.distributed for a given rank.
+def _init_distributed(
+    tp_local_rank: int,
+    tp_degree: int,
+    group_id: int,
+    master_port: int,
+    device: str,
+):
+    """Initialize torch.distributed for one TP group.
 
-    Sets up CUDA device and process group using FileStore for rendezvous.
+    Each DP replica brings up its own torch.distributed *world* whose size
+    is just `tp_degree`. The default process group thus equals the TP
+    group — no global PG, no subgroups. This matches sglang's native
+    multi-process DP architecture (each replica owns a private nccl init)
+    and lets sglang's `parallel_state.initialize_model_parallel` read the
+    correct world from the default PG without any swap hacks.
+
+    Cross-replica coordination in pie happens at the Rust runtime / RPC
+    layer (request routing + KV swap framing), not via torch.distributed,
+    so removing the global PG is a no-op for the rest of the system.
+
+    The FileStore path is namespaced by `(master_port, group_id)` so each
+    TP group rendezvous independently when multiple groups share a host.
     """
     import datetime
     import torch
@@ -64,8 +82,11 @@ def _init_distributed(rank: int, world_size: int, master_port: int, device: str)
         "ignore", message=".*barrier.*device under current context.*"
     )
 
-    # FileStore for robust rendezvous (avoids port conflicts)
-    store = dist.FileStore(f"/tmp/pie_dist_store_{master_port}", world_size)
+    # Per-TP-group FileStore — distinct from sibling DP replicas on the
+    # same box.
+    store = dist.FileStore(
+        f"/tmp/pie_dist_store_{master_port}_g{group_id}", tp_degree
+    )
     timeout = datetime.timedelta(seconds=300)
 
     backend = "nccl" if torch.cuda.is_available() else "gloo"
@@ -77,33 +98,11 @@ def _init_distributed(rank: int, world_size: int, master_port: int, device: str)
     dist.init_process_group(
         backend,
         store=store,
-        rank=rank,
-        world_size=world_size,
+        rank=tp_local_rank,
+        world_size=tp_degree,
         timeout=timeout,
         device_id=device_id,
     )
-
-
-def _setup_process_groups(group_topology: list[list[int]]) -> dict:
-    """Create ProcessGroups for each execution group (Rank 0 + Group Workers)."""
-    import torch.distributed as dist
-
-    pg_map = {}
-    for i, group_ranks in enumerate(group_topology):
-        comm_ranks = sorted(set([0] + group_ranks))
-        pg_map[i] = dist.new_group(comm_ranks)
-    return pg_map
-
-
-def _setup_compute_process_groups(group_topology: list[list[int]]) -> dict:
-    """Create ProcessGroups for Tensor Parallel computation (TP ranks only)."""
-    import torch.distributed as dist
-
-    pg_map = {}
-    for i, group_ranks in enumerate(group_topology):
-        comm_ranks = sorted(set(group_ranks))
-        pg_map[i] = dist.new_group(comm_ranks)
-    return pg_map
 
 
 # =============================================================================
@@ -126,11 +125,17 @@ def run_worker(
 ):
     """Generic worker body shared across drivers (native / vllm / dummy).
 
-    Owns the universal lifecycle: tqdm lock, torch.distributed init, group
-    setup, RuntimeConfig assembly, ready-queue handshake, and leader/follower
+    Owns the universal lifecycle: tqdm lock, per-replica torch.distributed
+    init, RuntimeConfig assembly, ready-queue handshake, and leader/follower
     dispatch. Driver-specific work happens inside `build_engine`:
 
-        engine = build_engine(runtime_config, compute_pg)
+        engine = build_engine(runtime_config)
+
+    The default PG ends up being the TP group itself (each DP replica brings
+    up its own torch.distributed world via FileStore on a per-group path —
+    matches sglang's native multi-process DP architecture). Collectives in
+    driver code call `dist.all_reduce(t)` / `dist.broadcast(t, src=0)` etc.
+    with no explicit group; they hit the default PG, which is the TP group.
 
     `runtime_config_extras` is merged into the kwargs passed to
     `<config_cls>.from_args` after `model_config`. Drivers whose knobs live
@@ -145,6 +150,7 @@ def run_worker(
     crashed worker.
     """
     import gc
+    import os
     import threading
     import inspect
 
@@ -175,18 +181,23 @@ def run_worker(
                 break
         tp_degree = len(group_topology[my_group_id])
 
-        # Distributed init (TP > 1 only; single-rank skips for latency)
-        if world_size > 1:
-            _init_distributed(rank, world_size, master_port, devices[rank])
-            # Side-effect: also creates leader-inclusive groups used by
-            # downstream broadcast paths.
-            _setup_process_groups(group_topology)
-            compute_pg_map = _setup_compute_process_groups(group_topology)
+        # Per-replica MASTER_PORT so DP replicas on the same host don't
+        # collide on downstream nccl ports (sglang derives `nccl_port =
+        # MASTER_PORT + 1`; with the default 29500 every replica would try
+        # to bind 29501). Stride by 10 leaves room for sglang's auxiliary
+        # ports without crossing into the next replica.
+        os.environ["MASTER_PORT"] = str(master_port + my_group_id * 10)
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+
+        # Distributed init: per-TP-group, NOT global. Default PG ends up
+        # being the TP group itself. Skipped entirely when this group has
+        # only one rank (no collectives to do).
+        if tp_degree > 1:
+            _init_distributed(tp_rank, tp_degree, my_group_id, master_port, devices[rank])
         else:
             device_str = devices[rank]
             if device_str.startswith("cuda"):
                 torch.cuda.set_device(device_str)
-            compute_pg_map = {}
 
         # Build the runtime config (lean RuntimeConfig for vllm,
         # NativeRuntimeConfig for native/dummy). Universal kwargs come from
@@ -208,8 +219,7 @@ def run_worker(
             tensor_parallel_size=tp_degree,
         )
 
-        compute_pg = compute_pg_map.get(my_group_id)
-        engine = build_engine(config, compute_pg)
+        engine = build_engine(config)
 
         if dist.is_initialized():
             dist.barrier()
@@ -226,17 +236,12 @@ def run_worker(
                     engine=engine,
                     server=server,
                     stop_event=stop_event,
-                    compute_pg=compute_pg,
-                    group_topology=group_topology,
                     group_id=my_group_id,
                 )
             else:
                 ready_queue.put((rank, None, None))
                 _follower_loop(
                     engine=engine,
-                    compute_pg=compute_pg,
-                    leader_rank=group_topology[my_group_id][0],
-                    group_id=my_group_id,
                     config=config,
                 )
         finally:
@@ -283,7 +288,7 @@ def worker_main(
         model_config=model_config,
         group_topology=group_topology,
         ready_queue=ready_queue,
-        build_engine=lambda cfg, pg: Engine.load(cfg, compute_process_group=pg),
+        build_engine=lambda cfg: Engine.load(cfg),
         runtime_config_extras=driver_config,
         config_cls=NativeRuntimeConfig,
     )
@@ -386,8 +391,6 @@ def _leader_loop(
     engine,
     server,
     stop_event,
-    compute_pg,
-    group_topology: list[list[int]],
     group_id: int,
     poll_timeout_ms: int = 100,
 ) -> None:
@@ -426,14 +429,12 @@ def _leader_loop(
             "mu_fraction": req.mu_fraction,
             "initial_sigma": req.initial_sigma,
         }
-        # Broadcast to TP followers
-        if config.world_size > 1 and compute_pg is not None:
-            leader_global_rank = group_topology[group_id][0]
+        # Broadcast to TP followers; default PG IS the TP group post-init.
+        if config.world_size > 1:
             utils.broadcast_struct(
                 {"type": "INIT_ADAPTER", "kwargs": args},
-                src=leader_global_rank,
+                src=0,
                 device=config.device,
-                group=compute_pg,
             )
         engine.init_adapter(**args)
 
@@ -445,13 +446,11 @@ def _leader_loop(
             "seeds": req.seeds,
             "max_sigma": req.max_sigma,
         }
-        if config.world_size > 1 and compute_pg is not None:
-            leader_global_rank = group_topology[group_id][0]
+        if config.world_size > 1:
             utils.broadcast_struct(
                 {"type": "UPDATE_ADAPTER", "kwargs": args},
-                src=leader_global_rank,
+                src=0,
                 device=config.device,
-                group=compute_pg,
             )
         engine.update_adapter(**args)
 
@@ -461,26 +460,22 @@ def _leader_loop(
         if isinstance(data, list):
             data = bytes(data)
         args = {"adapter_ptr": req.adapter_ptr, "name": req.name, "data": data}
-        if config.world_size > 1 and compute_pg is not None:
-            leader_global_rank = group_topology[group_id][0]
+        if config.world_size > 1:
             utils.broadcast_struct(
                 {"type": "LOAD_ADAPTER", "kwargs": args},
-                src=leader_global_rank,
+                src=0,
                 device=config.device,
-                group=compute_pg,
             )
         engine.load_adapter(**args)
 
     def _handle_save_adapter(**kwargs) -> None:
         req = message.SaveAdapterRequest(**kwargs)
         args = {"adapter_ptr": req.adapter_ptr, "name": req.name}
-        if config.world_size > 1 and compute_pg is not None:
-            leader_global_rank = group_topology[group_id][0]
+        if config.world_size > 1:
             utils.broadcast_struct(
                 {"type": "SAVE_ADAPTER", "kwargs": args},
-                src=leader_global_rank,
+                src=0,
                 device=config.device,
-                group=compute_pg,
             )
         engine.save_adapter(**args)
 
@@ -539,31 +534,26 @@ def _leader_loop(
             )
         t_get_sampling_meta = time.perf_counter() - t0
 
-        # Broadcast to TP followers if multi-GPU
+        # Broadcast to TP followers if multi-GPU. The default PG IS the
+        # TP group after the per-replica torch.distributed init (see
+        # `_init_distributed`), so leader = local rank 0 and no `group=`
+        # argument is needed.
         t0 = time.perf_counter()
-        should_broadcast = (
-            config.world_size > 1
-            and config.rank == 0
-            and compute_pg is not None
-        )
+        should_broadcast = config.world_size > 1 and config.rank == 0
         if should_broadcast:
-            leader_global_rank = group_topology[group_id][0]
             utils.broadcast_struct(
                 {
                     "type": "STEP",
                     "inputs": inputs,
                     "sampling_metadata": sampling_metadata,
                 },
-                src=leader_global_rank,
+                src=0,
                 device=device,
-                group=compute_pg,
-                group_id=group_id,
             )
         t_broadcast = time.perf_counter() - t0
 
-        if config.world_size > 1 and compute_pg is not None:
-            if dist.get_world_size(group=compute_pg) > 1:
-                dist.barrier(group=compute_pg)
+        if config.world_size > 1:
+            dist.barrier()
 
         t0 = time.perf_counter()
         sampling_results = engine.fire_batch(inputs, sampling_metadata)
@@ -745,7 +735,16 @@ def _leader_loop(
     # `fire_batch` always runs over shared memory with the zero-copy schema;
     # all other RPCs (adapter ops, page copies, query/ping) use the legacy
     # ipc-channel transport on `server`.
-    SHMEM_NAME = "/pie_shmem"
+    #
+    # Per-DP-replica shmem region. POSIX shm names are global per-host, so a
+    # hardcoded "/pie_shmem" used to collide silently across DP replicas —
+    # one replica's leader would create the region, the other would either
+    # fail or attach to the same backing store, mixing requests across
+    # replicas. The runtime mirrors this naming in `device.rs`
+    # (`shmem_name(device_idx)` → `/pie_shmem_g{idx}`); device_idx in Rust
+    # equals group_id in Python because pie/server.py builds DeviceConfig
+    # in group order.
+    SHMEM_NAME = f"/pie_shmem_g{group_id}"
     SHMEM_SLOTS = 8
     SHMEM_REQ_BUF = 4 * 1024 * 1024
     # Sized to hold a full-vocab `Distribution` probe / `Sampler::Dist`
@@ -768,6 +767,20 @@ def _leader_loop(
     import signal as _signal
 
     def _shmem_loop():
+        # `torch.cuda.set_device()` is thread-local. The main thread's
+        # device assignment doesn't propagate to this poll thread, which
+        # would land Triton kernel launches in the default cuda:0 context
+        # while sglang's allocated tensors live on cuda:N (N = this
+        # replica's gpu). Result: Triton reports "cpu tensor?" because
+        # the cross-device pointer is unmappable. Pin the shmem thread
+        # to the same device the engine loaded onto.
+        try:
+            import torch as _torch
+            dev = config.device
+            if str(dev).startswith("cuda"):
+                _torch.cuda.set_device(dev)
+        except Exception:
+            pass
         while not stop_event.is_set():
             req = _shmem_server.busy_poll_any_slot(SHMEM_BUSY_US)
             if req is None:
@@ -867,14 +880,12 @@ def _leader_loop(
     finally:
         _stop_shmem()
         print("[RPC Worker] Shutting down...")
-        if config.world_size > 1 and config.rank == 0 and compute_pg is not None:
+        if config.world_size > 1 and config.rank == 0:
             try:
-                leader_global_rank = group_topology[group_id][0]
                 utils.broadcast_struct(
                     "STOP",
-                    src=leader_global_rank,
+                    src=0,
                     device=config.device,
-                    group=compute_pg,
                 )
             except Exception:
                 pass
@@ -887,9 +898,6 @@ def _leader_loop(
 
 def _follower_loop(
     engine,
-    compute_pg,
-    leader_rank: int,
-    group_id: int,
     config=None,
 ) -> None:
     """Broadcast loop for TP followers.
@@ -914,10 +922,11 @@ def _follower_loop(
     signal.signal(signal.SIGINT, sigterm_handler)
 
     while not shutdown_requested:
-        # Receive control message from leader
+        # Receive control message from leader (rank 0 of the TP group,
+        # which is the only group in this worker's torch.distributed world).
         try:
             msg = utils.broadcast_struct(
-                None, src=leader_rank, device=device, group=compute_pg
+                None, src=0, device=device,
             )
         except Exception:
             break
@@ -935,10 +944,9 @@ def _follower_loop(
                 inputs = msg["inputs"]
                 sampling_metadata = msg["sampling_metadata"]
                 try:
-                    # TP barrier
-                    if config and config.world_size > 1 and compute_pg is not None:
-                        if dist.get_world_size(group=compute_pg) > 1:
-                            dist.barrier(group=compute_pg)
+                    # TP barrier — default PG is the TP group post-init.
+                    if config and config.world_size > 1:
+                        dist.barrier()
 
                     engine.fire_batch(inputs, sampling_metadata)
                 except Exception as e:

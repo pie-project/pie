@@ -239,9 +239,8 @@ class ForwardPass(DenseForwardPass):
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
-        compute_process_group: dist.ProcessGroup | None = None,
     ):
-        super().__init__(model_config, runtime_config, weights, compute_process_group)
+        super().__init__(model_config, runtime_config, weights)
         # Gemma2-specific scalars (computed once, used in attention/embed).
         self.embed_normalizer = math.sqrt(model_config.dim_hidden)
         self.query_scale = model_config.query_pre_attn_scalar ** -0.5
@@ -311,7 +310,7 @@ class ForwardPass(DenseForwardPass):
         # 2. All-gather to combine partial hidden states from all ranks
         # Output: [seq_len, hidden_size] (full hidden dimension)
         gathered_list = [torch.empty_like(local_embeds) for _ in range(self.tp_size)]
-        dist.all_gather(gathered_list, local_embeds, group=self.compute_process_group)
+        dist.all_gather(gathered_list, local_embeds)
 
         # Concatenate along hidden dimension (last dim)
         full_embeds = torch.cat(gathered_list, dim=-1)
@@ -373,7 +372,7 @@ class ForwardPass(DenseForwardPass):
             logits = fun.linear(local_normed, weight)
 
             # 3. All-reduce to combine partial logits
-            dist.all_reduce(logits, group=self.compute_process_group)
+            dist.all_reduce(logits)
 
         # Gemma2: apply final logit softcapping
         if self.model_config.final_logit_softcapping is not None:
@@ -424,7 +423,7 @@ class ForwardPass(DenseForwardPass):
 
         # ALL-REDUCE: Sum partial outputs from all ranks (only if TP > 1)
         if self.tp_size > 1:
-            dist.all_reduce(down, group=self.compute_process_group)
+            dist.all_reduce(down)
 
         # 5. Post-feedforward RMSNorm (Gemma2-style) - before residual
         down = self._gemma2_rms_norm(
@@ -552,7 +551,7 @@ class ForwardPass(DenseForwardPass):
 
         # ALL-REDUCE: Sum partial outputs from all ranks (only if TP > 1)
         if self.tp_size > 1:
-            dist.all_reduce(attn_proj, group=self.compute_process_group)
+            dist.all_reduce(attn_proj)
 
         # 9. Post-attention RMSNorm (Gemma2-style) - before residual
         attn_proj = self._gemma2_rms_norm(

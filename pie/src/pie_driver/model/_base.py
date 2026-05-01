@@ -50,12 +50,10 @@ class DenseForwardPass(ABC):
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
-        compute_process_group: "dist.ProcessGroup | None" = None,
     ):
         self.model_config = model_config
         self.runtime_config = runtime_config
         self.weights = weights
-        self.compute_process_group = compute_process_group
         self.tp_size = runtime_config.tensor_parallel_size
         self.tp_rank = runtime_config.rank % self.tp_size
 

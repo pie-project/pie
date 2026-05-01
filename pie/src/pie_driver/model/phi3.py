@@ -134,7 +134,6 @@ class ForwardPass(DenseForwardPass):
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
-        compute_process_group: Any = None,
     ):
         if runtime_config.tensor_parallel_size > 1:
             # The pre-fused qkv_proj weight needs an interleaved-by-head
@@ -143,7 +142,7 @@ class ForwardPass(DenseForwardPass):
             raise NotImplementedError(
                 "phi3: TP>1 not supported (fused qkv_proj sharding not wired)"
             )
-        super().__init__(model_config, runtime_config, weights, compute_process_group)
+        super().__init__(model_config, runtime_config, weights)
 
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         normed = fun.rms_norm(

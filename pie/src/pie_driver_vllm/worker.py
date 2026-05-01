@@ -41,5 +41,5 @@ def worker_main(
         model_config=model_config,
         group_topology=group_topology,
         ready_queue=ready_queue,
-        build_engine=lambda cfg, pg: VllmEngine.load(cfg, vllm_cfg, compute_process_group=pg),
+        build_engine=lambda cfg: VllmEngine.load(cfg, vllm_cfg),
     )

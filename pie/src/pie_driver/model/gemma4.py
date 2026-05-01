@@ -393,12 +393,10 @@ class ForwardPass:
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
-        compute_process_group: dist.ProcessGroup | None = None,
     ):
         self.model_config = model_config
         self.runtime_config = runtime_config
         self.weights = weights
-        self.compute_process_group = compute_process_group
         self.tp_size = runtime_config.tensor_parallel_size
         self.tp_rank = runtime_config.rank % self.tp_size
         # Q/MLP/embed are sharded across ranks; K/V are replicated (see schema).
@@ -521,7 +519,7 @@ class ForwardPass:
         if self.tp_size > 1:
             # embed_token is row-sharded along hidden_size; gather to full.
             gathered = [torch.empty_like(embeds) for _ in range(self.tp_size)]
-            dist.all_gather(gathered, embeds, group=self.compute_process_group)
+            dist.all_gather(gathered, embeds)
             embeds = torch.cat(gathered, dim=-1)
         return embeds * self.embed_normalizer
 
@@ -587,7 +585,7 @@ class ForwardPass:
             start = self.tp_rank * hidden_per_rank
             local_normed = normed[..., start:start + hidden_per_rank]
             logits = fun.linear(local_normed, weight)
-            dist.all_reduce(logits, group=self.compute_process_group)
+            dist.all_reduce(logits)
         cap = self.model_config.final_logit_softcapping
         if cap is not None:
             logits = torch.tanh(logits / cap) * cap
@@ -636,7 +634,7 @@ class ForwardPass:
         del hidden, gate, up, gate_up
 
         if self.tp_size > 1:
-            dist.all_reduce(down, group=self.compute_process_group)
+            dist.all_reduce(down)
 
         down = self._gemma_rms_norm(
             down, self.weights.get(f"layers.{layer_idx}.norm_mlp_post")
@@ -933,7 +931,7 @@ class ForwardPass:
 
         attn_proj = fun.linear(attn_out, self.weights.get(f"layers.{layer_idx}.proj_o"))
         if self.tp_size > 1:
-            dist.all_reduce(attn_proj, group=self.compute_process_group)
+            dist.all_reduce(attn_proj)
         attn_proj = self._gemma_rms_norm(
             attn_proj, self.weights.get(f"layers.{layer_idx}.norm_attn_post")
         )

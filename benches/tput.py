@@ -73,7 +73,7 @@ async def run_benchmark(args):
     print()
 
     from pie.config import (
-        ServerConfig, TelemetryConfig, DriverConfig,
+        ServerConfig, TelemetryConfig, DriverConfig, SchedulerConfig,
     )
 
     # Build the [model.X.driver.<type>] subsection. Each driver expresses
@@ -125,7 +125,16 @@ async def run_benchmark(args):
         ),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        runtime=RuntimeConfig(worker_threads=args.worker_threads),
+        runtime=RuntimeConfig(
+            worker_threads=args.worker_threads,
+            # Size the wasm instance pool for the workload. Default wasmtime
+            # cap is 1000; each pie inferlet allocates ~3 core instances, so
+            # bump well above num_requests*3 to avoid "maximum concurrent
+            # limit reached" at high concurrency.
+            wasm_max_instances=max(
+                4096, (args.num_requests + args.warmup_requests) * 4
+            ),
+        ),
         models={
             "default": ModelConfig(
                 name="default",
@@ -133,9 +142,11 @@ async def run_benchmark(args):
                 default_token_budget=args.default_token_budget,
                 default_endowment_pages=args.default_endowment_pages,
                 oversubscription_factor=args.oversubscription_factor,
+                scheduler=SchedulerConfig(policy=args.policy),
                 driver=DriverConfig(
                     type=args.driver,
                     device=device,
+                    tensor_parallel_size=args.tp_size,
                     options=driver_subsection,
                 ),
             )
@@ -288,6 +299,11 @@ def main():
     parser.add_argument("--driver", default="native",
                         choices=["native", "vllm", "sglang", "dummy", "cuda_native", "portable"],
                         help="Inference driver: 'native', 'vllm', 'sglang', 'dummy', 'cuda_native', or 'portable'")
+    parser.add_argument("--tp-size", type=int, default=1,
+                        help="Tensor-parallel size; DP = len(--device) // --tp-size")
+    parser.add_argument("--policy", default="adaptive",
+                        choices=["adaptive", "eager", "greedy"],
+                        help="Scheduler policy")
     parser.add_argument("--cuda-native-kv-pages", dest="cuda_native_kv_pages",
                         type=int, default=2048,
                         help="KV pages for the cuda_native driver. Each page = kv_page_size tokens.")

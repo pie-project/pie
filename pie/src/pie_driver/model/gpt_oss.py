@@ -373,13 +373,11 @@ class ForwardPass:
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
-        compute_process_group: dist.ProcessGroup | None = None,
     ):
         """Initialize the forward pass with weights and attention wrappers."""
         self.model_config = model_config
         self.runtime_config = runtime_config
         self.weights = weights
-        self.compute_process_group = compute_process_group
         self.tp_size = runtime_config.tensor_parallel_size
         self.tp_rank = runtime_config.rank % self.tp_size
 
@@ -658,7 +656,7 @@ class ForwardPass:
             torch.empty_like(local_embeds)
             for _ in range(self.tp_size)
         ]
-        dist.all_gather(gathered_list, local_embeds, group=self.compute_process_group)
+        dist.all_gather(gathered_list, local_embeds)
 
         return torch.cat(gathered_list, dim=-1)
 
@@ -686,7 +684,7 @@ class ForwardPass:
         local_logits = fun.linear(local_normed, self._lm_head)
 
         # 3. All-reduce
-        dist.all_reduce(local_logits, group=self.compute_process_group)
+        dist.all_reduce(local_logits)
 
         return local_logits
 
@@ -799,7 +797,7 @@ class ForwardPass:
 
         # All-reduce output projection
         if self.tp_size > 1:
-            dist.all_reduce(attn_proj, group=self.compute_process_group)
+            dist.all_reduce(attn_proj)
 
         # Residual
         result = residual + attn_proj
@@ -895,7 +893,7 @@ class ForwardPass:
         # All-reduce MLP output (must be contiguous for NCCL)
         if self.tp_size > 1:
             output = output.contiguous()
-            dist.all_reduce(output, group=self.compute_process_group)
+            dist.all_reduce(output)
 
         # Residual
         result = residual + output

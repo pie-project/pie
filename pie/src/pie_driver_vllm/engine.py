@@ -85,7 +85,6 @@ class VllmEngine:
         config: RuntimeConfig,
         driver_config,
         log_queue: object = None,
-        compute_process_group=None,
     ) -> "VllmEngine":
         _require_vllm()
 
@@ -112,7 +111,7 @@ class VllmEngine:
 
         _log("Loading vllm model", "DEBUG")
         loaded = load_vllm_model(
-            config, driver_config, log_queue=log_queue, compute_pg=compute_process_group
+            config, driver_config, log_queue=log_queue,
         )
         _log("Loaded vllm model", "DEBUG")
 

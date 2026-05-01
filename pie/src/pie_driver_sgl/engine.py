@@ -79,7 +79,6 @@ class SGLangEngine:
         config: RuntimeConfig,
         driver_config: SGLangDriverConfig,
         log_queue: object = None,
-        compute_process_group=None,
     ) -> "SGLangEngine":
         _require_sglang()
 
@@ -100,11 +99,18 @@ class SGLangEngine:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(config.random_seed)
 
+        # SGLang's `parallel_state.initialize_model_parallel` reads world
+        # size from torch's default process group. Pie's worker now brings
+        # up torch.distributed at the *TP-group* scale (one private nccl
+        # init per DP replica — matches sglang's native multi-process DP
+        # architecture), so the default PG is exactly sglang's expected
+        # `tp_size × pp_size` world. No PG-swap workarounds needed.
         loaded = load_sglang_model(
             config, driver_config, log_queue=log_queue,
         )
-        # Rebind sglang's k_buffer/v_buffer to pie-shaped storage so the swap
-        # RPC handlers see the canonical (num_blocks, 2, page_size, h, d) layout.
+        # Rebind sglang's k_buffer/v_buffer to pie-shaped storage so the
+        # swap RPC handlers see the canonical (num_blocks, 2, page_size,
+        # h, d) layout.
         kv_cache_at_layer, num_blocks = _rebind_pool_buffers(loaded, config)
         config.max_num_kv_pages = num_blocks
 
@@ -114,8 +120,8 @@ class SGLangEngine:
             page_size=int(loaded.runner.page_size),
         )
 
-        # The loader deferred `init_device_graphs()` so pie's hook could be
-        # installed first; capture now that the hook is in place.
+        # The loader deferred `init_device_graphs()` so pie's hook could
+        # be installed first; capture now that the hook is in place.
         if loaded.graph_capture_deferred:
             loaded.runner.init_device_graphs()
 

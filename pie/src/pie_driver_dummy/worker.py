@@ -34,7 +34,7 @@ def worker_main(
         model_config=model_config,
         group_topology=group_topology,
         ready_queue=ready_queue,
-        build_engine=lambda cfg, pg: Engine.load(cfg, compute_process_group=pg),
+        build_engine=lambda cfg: Engine.load(cfg),
         # Dummy uses NativeRuntimeConfig with `dummy_mode=True` so Engine.load
         # takes its dummy branch (no real weight load, returns random tokens).
         runtime_config_extras={**driver_config, "dummy_mode": True},

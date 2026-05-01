@@ -265,9 +265,8 @@ class ForwardPass(DenseForwardPass):
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
-        compute_process_group: dist.ProcessGroup | None = None,
     ):
-        super().__init__(model_config, runtime_config, weights, compute_process_group)
+        super().__init__(model_config, runtime_config, weights)
         # Gemma3-specific scalars (computed once, used in attention/embed).
         self.embed_normalizer = math.sqrt(model_config.dim_hidden)
         self.query_scale = model_config.query_pre_attn_scalar ** -0.5
@@ -307,7 +306,7 @@ class ForwardPass(DenseForwardPass):
 
         local_embeds = fun.embedding(token_ids, self.weights.get("embed_token"))
         gathered_list = [torch.empty_like(local_embeds) for _ in range(self.tp_size)]
-        dist.all_gather(gathered_list, local_embeds, group=self.compute_process_group)
+        dist.all_gather(gathered_list, local_embeds)
         full_embeds = torch.cat(gathered_list, dim=-1)
         return full_embeds * self.embed_normalizer
 
@@ -361,7 +360,7 @@ class ForwardPass(DenseForwardPass):
                 else self.weights.get("lm_head")
             )
             logits = fun.linear(local_normed, weight)
-            dist.all_reduce(logits, group=self.compute_process_group)
+            dist.all_reduce(logits)
 
         # Gemma3: NO softcapping (this is a key difference from Gemma2)
         return logits
@@ -396,7 +395,7 @@ class ForwardPass(DenseForwardPass):
         del hidden, gate, up, gate_up
 
         if self.tp_size > 1:
-            dist.all_reduce(down, group=self.compute_process_group)
+            dist.all_reduce(down)
 
         # 5. Post-feedforward RMSNorm
         down = self._gemma_rms_norm(
@@ -516,7 +515,7 @@ class ForwardPass(DenseForwardPass):
         del attn_output
 
         if self.tp_size > 1:
-            dist.all_reduce(attn_proj, group=self.compute_process_group)
+            dist.all_reduce(attn_proj)
 
         # 9. Post-attention RMSNorm
         attn_proj = self._gemma_rms_norm(

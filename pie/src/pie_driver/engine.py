@@ -78,14 +78,15 @@ class Engine:
         cls,
         config: RuntimeConfig,
         log_queue: object = None,
-        compute_process_group=None,
     ) -> "Engine":
         """Load a model from config and return an Engine.
 
         Args:
             config: Runtime configuration
             log_queue: Optional queue for sending logs back to controller
-            compute_process_group: Optional process group for tensor parallelism
+
+        TP collectives use torch.distributed's default process group, which
+        in pie is the per-replica TP group brought up by `_init_distributed`.
         """
 
         def _log(msg: str, level: str = "INFO"):
@@ -131,7 +132,6 @@ class Engine:
             model_config,
             config,
             weights,
-            compute_process_group=compute_process_group,
         )
 
         adapter_at_layer = mod.create_adapter_cache(model_config, config)

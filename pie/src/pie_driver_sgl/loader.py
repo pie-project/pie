@@ -161,9 +161,11 @@ def load_sglang_model(
         gpu_id = config.rank
 
     # ModelRunner.init_torch_distributed reads MASTER_ADDR/MASTER_PORT/RANK/etc.
-    # from env. Pie's worker.run_worker has already brought torch.distributed
-    # up via FileStore; we just need the env vars set so sglang's idempotent
-    # init doesn't blow up on a fresh single-rank path.
+    # from env on its idempotent / from-scratch path. Pie's worker.run_worker
+    # has already brought torch.distributed up via FileStore at the TP-group
+    # scale (see `_init_distributed`), so these env vars are only consulted
+    # if sglang touches a code path that re-reads them; we set the values
+    # consistent with our per-replica torch.dist init.
     import os
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")

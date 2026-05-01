@@ -375,9 +375,8 @@ class ForwardPass(DenseForwardPass):
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
-        compute_process_group: dist.ProcessGroup | None = None,
     ):
-        super().__init__(model_config, runtime_config, weights, compute_process_group)
+        super().__init__(model_config, runtime_config, weights)
         # Pre-compute YARN RoPE cos/sin cache (mistral3-specific).
         self._rope_cos_sin_cache = self._compute_rope_cache()
 
@@ -511,7 +510,7 @@ class ForwardPass(DenseForwardPass):
         # Column-parallel embedding
         local_embeds = fun.embedding(token_ids, self.weights.get("embed_token"))
         gathered_list = [torch.empty_like(local_embeds) for _ in range(self.tp_size)]
-        dist.all_gather(gathered_list, local_embeds, group=self.compute_process_group)
+        dist.all_gather(gathered_list, local_embeds)
         full_embeds = torch.cat(gathered_list, dim=-1)
         return full_embeds
 
@@ -546,7 +545,7 @@ class ForwardPass(DenseForwardPass):
         )
         local_logits = fun.linear(local_normed, weight)
 
-        dist.all_reduce(local_logits, group=self.compute_process_group)
+        dist.all_reduce(local_logits)
 
         return local_logits
 
@@ -583,7 +582,7 @@ class ForwardPass(DenseForwardPass):
         del hidden, gate, up, gate_up
 
         if self.tp_size > 1:
-            dist.all_reduce(down, group=self.compute_process_group)
+            dist.all_reduce(down)
 
         # 5. Residual Connection
         return residual + down
@@ -689,7 +688,7 @@ class ForwardPass(DenseForwardPass):
         del attn_output
 
         if self.tp_size > 1:
-            dist.all_reduce(attn_proj, group=self.compute_process_group)
+            dist.all_reduce(attn_proj)
 
         # 9. Residual Connection
         return residual + attn_proj

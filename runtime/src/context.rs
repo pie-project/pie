@@ -787,6 +787,12 @@ pub(crate) struct ContextManager {
     pub(crate) oversubscription_factor: f64,
     /// Diagnostic counters for scheduler health.
     pub(crate) sched_counters: SchedCounters,
+    /// Round-robin counter for new-context device assignment. Used when
+    /// `least_loaded_device()` would otherwise tie (which it does for
+    /// every burst-arriving context until at least one of them allocates
+    /// pages — `available()` doesn't reflect in-flight allocations). Without
+    /// this, every burst pins to the same device and DP collapses to DP=1.
+    next_device_rr: usize,
 }
 
 impl ContextManager {
@@ -822,6 +828,7 @@ impl ContextManager {
             default_tokens_remaining,
             oversubscription_factor,
             sched_counters: SchedCounters::default(),
+            next_device_rr: 0,
         }
     }
 
@@ -901,10 +908,32 @@ impl ContextManager {
         let id = self.next_id; self.next_id += 1; id
     }
 
-    fn least_loaded_device(&self) -> usize {
-        self.gpu_stores.iter().enumerate()
-            .max_by_key(|(_, d)| d.available())
-            .map(|(i, _)| i).unwrap_or(0)
+    /// Pick a device for a brand-new context.
+    ///
+    /// `available()` reflects only *allocated* pages, not pages claimed by
+    /// concurrently-arriving contexts that haven't allocated yet. For a
+    /// burst of N contexts admitted back-to-back (e.g. a benchmark firing
+    /// `launch_process` async tasks in parallel), every call sees the same
+    /// `available()` and `max_by_key` deterministically returns the same
+    /// device — collapsing DP to a single GPU. We tiebreak with a
+    /// round-robin counter so bursty arrivals spread across devices.
+    fn least_loaded_device(&mut self) -> usize {
+        // Find the maximum `available()` and tally how many devices share it.
+        let max_avail = self.gpu_stores.iter().map(|d| d.available()).max().unwrap_or(0);
+        let tied: Vec<usize> = self.gpu_stores.iter().enumerate()
+            .filter(|(_, d)| d.available() == max_avail)
+            .map(|(i, _)| i)
+            .collect();
+        if tied.is_empty() {
+            return 0;
+        }
+        if tied.len() == 1 {
+            return tied[0];
+        }
+        // On ties, round-robin among the tied devices.
+        let pick = tied[self.next_device_rr % tied.len()];
+        self.next_device_rr = self.next_device_rr.wrapping_add(1);
+        pick
     }
 
     // ==================== Core Operations ====================

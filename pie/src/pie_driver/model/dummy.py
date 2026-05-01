@@ -76,7 +76,6 @@ class DummyForwardPass:
         model_config: DummyModelConfig,
         runtime_config: RuntimeConfig,
         weights=None,  # Ignored - no weights needed
-        compute_process_group=None,  # Ignored
     ):
         """
         Initialize the dummy forward pass.
@@ -85,7 +84,6 @@ class DummyForwardPass:
             model_config: Dummy model configuration
             runtime_config: Runtime configuration
             weights: Ignored (no weights needed)
-            compute_process_group: Ignored
         """
         self.model_config = model_config
         self.runtime_config = runtime_config

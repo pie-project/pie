@@ -168,7 +168,6 @@ def load_vllm_model(
     config: RuntimeConfig,
     driver_config,
     log_queue: object = None,
-    compute_pg=None,
 ) -> LoadedModel:
     """Construct a vllm model on the local rank's device and load its weights."""
 
