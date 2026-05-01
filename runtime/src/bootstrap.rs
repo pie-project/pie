@@ -44,8 +44,9 @@ pub struct Config {
     pub python_snapshot: bool,
 }
 
-/// Tokio runtime tuning. All fields are opt-in — leaving them at their
-/// defaults yields the stock `tokio::runtime::Runtime::new()` behavior.
+/// Runtime tuning — tokio worker pool + wasmtime engine pool. All
+/// fields are opt-in; leaving them at their defaults yields stock
+/// tokio + stock wasmtime behavior.
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeConfig {
     /// Number of tokio worker threads. `None` = let tokio default to
@@ -54,6 +55,32 @@ pub struct RuntimeConfig {
     /// context-switch overhead and can give a substantial throughput
     /// win — see comments in `RuntimeConfig` on the Python side.
     pub worker_threads: Option<usize>,
+
+    // ── wasmtime engine pool ────────────────────────────────────────
+    //
+    // The pooling allocator caps four resource classes at 1000 each by
+    // default. In pie every inferlet uses one of each, so we expose
+    // them as a single `wasm_max_instances` knob and bump them in
+    // lockstep.
+
+    /// Concurrent-inferlet cap. Bumps wasmtime's
+    /// `total_core_instances`, `total_component_instances`,
+    /// `total_memories`, and `total_tables` together. `None` = use
+    /// wasmtime's default of 1000.
+    pub wasm_max_instances: Option<u32>,
+
+    /// Per-inferlet linear-memory cap, in MiB. `None` = use wasmtime's
+    /// default of 10 MiB.
+    pub wasm_max_memory_mb: Option<usize>,
+
+    /// RAM kept warm per slot to skip remapping on inferlet respawn,
+    /// in MiB. RSS-vs-spawn-latency tradeoff. `None` = wasmtime
+    /// default of 0 (don't keep memory warm).
+    pub wasm_warm_memory_mb: Option<usize>,
+
+    /// Prepared-but-idle inferlet slots kept ready for fast respawn.
+    /// `None` = wasmtime default of 100.
+    pub wasm_warm_slots: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,7 +147,7 @@ pub async fn bootstrap(
     if !config.skip_tracing {
         init_tracing(&config.log_dir, config.verbose, &config.telemetry)?;
     }
-    let wasm_engine = init_wasmtime();
+    let wasm_engine = init_wasmtime(&config.runtime);
 
     // Load the Python runtime shared modules (full + stripped variants) before
     // the linker and program services spawn, so both can read from the shared
@@ -237,11 +264,32 @@ fn verify_config(config: &Config) -> Result<()> {
 }
 
 
-fn init_wasmtime() -> wasmtime::Engine {
+fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
     wasm_config.async_support(true);
 
-    let pooling_config = wasmtime::PoolingAllocationConfig::default();
+    let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
+
+    // Lockstep bump on the four "total_*" caps. wasmtime defaults all
+    // of them to 1000; we bump them together because every pie
+    // inferlet uses exactly one of each (one core instance, one
+    // component instance, one memory, one table).
+    if let Some(n) = runtime.wasm_max_instances {
+        pooling_config.total_core_instances(n);
+        pooling_config.total_component_instances(n);
+        pooling_config.total_memories(n);
+        pooling_config.total_tables(n);
+    }
+    if let Some(mb) = runtime.wasm_max_memory_mb {
+        pooling_config.max_memory_size(mb.saturating_mul(1024 * 1024));
+    }
+    if let Some(mb) = runtime.wasm_warm_memory_mb {
+        pooling_config.linear_memory_keep_resident(mb.saturating_mul(1024 * 1024));
+    }
+    if let Some(n) = runtime.wasm_warm_slots {
+        pooling_config.max_unused_warm_slots(n);
+    }
+
     wasm_config
         .allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling_config));
 

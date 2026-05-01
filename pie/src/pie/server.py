@@ -402,6 +402,10 @@ def _bootstrap(
         telemetry_service_name=config.telemetry.service_name,
         runtime=pie_runtime.RuntimeConfig(
             worker_threads=config.runtime.worker_threads,
+            wasm_max_instances=config.runtime.wasm_max_instances,
+            wasm_max_memory_mb=config.runtime.wasm_max_memory_mb,
+            wasm_warm_memory_mb=config.runtime.wasm_warm_memory_mb,
+            wasm_warm_slots=config.runtime.wasm_warm_slots,
         ),
         models=[py_model],
         allow_filesystem=config.server.allow_filesystem,

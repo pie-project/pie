@@ -81,28 +81,66 @@ class TelemetryConfig:
 
 @dataclass
 class RuntimeConfig:
-    """Tokio runtime tuning (the `[runtime]` block).
+    """The `[runtime]` block: tokio worker pool + wasmtime engine pool.
 
-    All fields are opt-in — leaving the section out yields the stock
-    `tokio::runtime::Runtime::new()` defaults.
+    All fields are opt-in. Leaving the section out yields stock tokio
+    + stock wasmtime defaults; we only diverge when a field is set.
 
-    `worker_threads`: number of tokio worker threads. `None` (default)
-    lets tokio pick `num_cpus`. On boxes with high logical-core counts
-    and many in-flight tasks (e.g. 96 cores at high request
-    concurrency), the default can cause heavy migration / context-switch
-    overhead; lowering this (commonly to 8) substantially improves
-    throughput. For real GPU backends where Python compute dominates,
-    the default is fine — leave this unset unless a profile shows
-    benefit.
+    Tokio:
+      * `worker_threads` — number of tokio worker threads. `None`
+        (default) lets tokio pick `num_cpus`. On boxes with high
+        logical-core counts and many in-flight tasks (e.g. 96 cores at
+        high request concurrency), the default can cause heavy
+        migration / context-switch overhead; lowering this (commonly
+        to 8) substantially improves throughput. For real GPU backends
+        where Python compute dominates, the default is fine — leave
+        this unset unless a profile shows benefit.
+
+    Wasmtime engine pool:
+      * `wasm_max_instances` — concurrent-inferlet cap. Bumps
+        wasmtime's `total_core_instances`, `total_component_instances`,
+        `total_memories`, and `total_tables` together; pie uses one of
+        each per inferlet. `None` = wasmtime default of 1000.
+      * `wasm_max_memory_mb` — per-inferlet linear-memory cap, in MiB.
+        `None` = wasmtime default of 10.
+      * `wasm_warm_memory_mb` — RAM kept warm per slot to skip
+        remapping on respawn, in MiB. RSS-vs-spawn-latency tradeoff.
+        `None` = wasmtime default of 0.
+      * `wasm_warm_slots` — prepared-but-idle inferlet slots kept
+        ready for fast respawn. `None` = wasmtime default of 100.
     """
 
     worker_threads: int | None = None
+    wasm_max_instances: int | None = None
+    wasm_max_memory_mb: int | None = None
+    wasm_warm_memory_mb: int | None = None
+    wasm_warm_slots: int | None = None
 
     def __post_init__(self):
         if self.worker_threads is not None and self.worker_threads <= 0:
             raise ValueError(
                 f"runtime.worker_threads must be > 0 if set "
                 f"(got {self.worker_threads!r})"
+            )
+        if self.wasm_max_instances is not None and self.wasm_max_instances <= 0:
+            raise ValueError(
+                f"runtime.wasm_max_instances must be > 0 if set "
+                f"(got {self.wasm_max_instances!r})"
+            )
+        if self.wasm_max_memory_mb is not None and self.wasm_max_memory_mb <= 0:
+            raise ValueError(
+                f"runtime.wasm_max_memory_mb must be > 0 if set "
+                f"(got {self.wasm_max_memory_mb!r})"
+            )
+        if self.wasm_warm_memory_mb is not None and self.wasm_warm_memory_mb < 0:
+            raise ValueError(
+                f"runtime.wasm_warm_memory_mb must be >= 0 if set "
+                f"(got {self.wasm_warm_memory_mb!r})"
+            )
+        if self.wasm_warm_slots is not None and self.wasm_warm_slots < 0:
+            raise ValueError(
+                f"runtime.wasm_warm_slots must be >= 0 if set "
+                f"(got {self.wasm_warm_slots!r})"
             )
 
 
@@ -250,10 +288,12 @@ endpoint = "http://localhost:4317"
 service_name = "pie"
 
 # [runtime]
-# Tokio runtime tuning. Leave the section out for stock defaults.
-# Lower `worker_threads` on boxes with many logical cores when you see
-# high context-switch / migration overhead under concurrency.
-# worker_threads = 8
+# Tokio + wasmtime tuning. Leave the section out for stock defaults.
+# worker_threads = 8        # tokio worker count; lower on many-core boxes
+# wasm_max_instances = 4096 # concurrent-inferlet cap (default 1000)
+# wasm_max_memory_mb = 64   # per-inferlet memory cap, MiB (default 10)
+# wasm_warm_memory_mb = 0   # RAM kept warm for fast respawn, MiB (default 0)
+# wasm_warm_slots = 100     # prepared-but-idle slots (default 100)
 
 [model.default]
 hf_repo = "{DEFAULT_MODEL}"
@@ -423,9 +463,17 @@ def load_config(
         raise ValueError(
             f"[runtime] must be a TOML table, got {type(runtime_raw).__name__}."
         )
-    worker_threads = runtime_raw.get("worker_threads")
+
+    def _opt_int(key: str) -> int | None:
+        v = runtime_raw.get(key)
+        return None if v is None else int(v)
+
     runtime_cfg = RuntimeConfig(
-        worker_threads=int(worker_threads) if worker_threads is not None else None,
+        worker_threads=_opt_int("worker_threads"),
+        wasm_max_instances=_opt_int("wasm_max_instances"),
+        wasm_max_memory_mb=_opt_int("wasm_max_memory_mb"),
+        wasm_warm_memory_mb=_opt_int("wasm_warm_memory_mb"),
+        wasm_warm_slots=_opt_int("wasm_warm_slots"),
     )
 
     return Config(

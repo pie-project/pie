@@ -176,8 +176,9 @@ impl RpcServer {
 // Configuration Types
 // =============================================================================
 
-/// Tokio runtime tuning. All fields opt-in — empty `RuntimeConfig`
-/// reproduces the stock `tokio::runtime::Runtime::new()` defaults.
+/// Runtime tuning — tokio worker pool + wasmtime engine pool. All
+/// fields opt-in; empty `RuntimeConfig` reproduces stock tokio +
+/// stock wasmtime defaults.
 #[pyclass(name = "RuntimeConfig")]
 #[derive(Clone, Default)]
 pub struct RuntimeConfig {
@@ -185,18 +186,59 @@ pub struct RuntimeConfig {
     /// `num_cpus`.
     #[pyo3(get, set)]
     pub worker_threads: Option<usize>,
+    /// Concurrent-inferlet cap (bumps wasmtime's `total_*` caps in
+    /// lockstep). `None` = wasmtime default of 1000.
+    #[pyo3(get, set)]
+    pub wasm_max_instances: Option<u32>,
+    /// Per-inferlet linear-memory cap, MiB. `None` = wasmtime default of 10.
+    #[pyo3(get, set)]
+    pub wasm_max_memory_mb: Option<usize>,
+    /// RAM kept warm per slot to skip remap on respawn, MiB. `None` =
+    /// wasmtime default of 0.
+    #[pyo3(get, set)]
+    pub wasm_warm_memory_mb: Option<usize>,
+    /// Prepared-but-idle inferlet slots. `None` = wasmtime default of 100.
+    #[pyo3(get, set)]
+    pub wasm_warm_slots: Option<u32>,
 }
 
 #[pymethods]
 impl RuntimeConfig {
     #[new]
-    #[pyo3(signature = (worker_threads = None))]
-    fn new(worker_threads: Option<usize>) -> Self {
-        RuntimeConfig { worker_threads }
+    #[pyo3(signature = (
+        worker_threads = None,
+        wasm_max_instances = None,
+        wasm_max_memory_mb = None,
+        wasm_warm_memory_mb = None,
+        wasm_warm_slots = None,
+    ))]
+    fn new(
+        worker_threads: Option<usize>,
+        wasm_max_instances: Option<u32>,
+        wasm_max_memory_mb: Option<usize>,
+        wasm_warm_memory_mb: Option<usize>,
+        wasm_warm_slots: Option<u32>,
+    ) -> Self {
+        RuntimeConfig {
+            worker_threads,
+            wasm_max_instances,
+            wasm_max_memory_mb,
+            wasm_warm_memory_mb,
+            wasm_warm_slots,
+        }
     }
 
     fn __repr__(&self) -> String {
-        format!("RuntimeConfig(worker_threads={:?})", self.worker_threads)
+        format!(
+            "RuntimeConfig(worker_threads={:?}, wasm_max_instances={:?}, \
+             wasm_max_memory_mb={:?}, wasm_warm_memory_mb={:?}, \
+             wasm_warm_slots={:?})",
+            self.worker_threads,
+            self.wasm_max_instances,
+            self.wasm_max_memory_mb,
+            self.wasm_warm_memory_mb,
+            self.wasm_warm_slots,
+        )
     }
 }
 
@@ -464,6 +506,10 @@ impl From<Config> for BootstrapConfig {
             },
             runtime: BootstrapRuntimeConfig {
                 worker_threads: cfg.runtime.worker_threads,
+                wasm_max_instances: cfg.runtime.wasm_max_instances,
+                wasm_max_memory_mb: cfg.runtime.wasm_max_memory_mb,
+                wasm_warm_memory_mb: cfg.runtime.wasm_warm_memory_mb,
+                wasm_warm_slots: cfg.runtime.wasm_warm_slots,
             },
             models: cfg
                 .models
