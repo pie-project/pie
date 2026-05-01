@@ -14,7 +14,7 @@ namespace pie_cuda_driver {
 
 void dispatch_sampling(
     model::Qwen3Workspace& ws,
-    DeviceBuffer<std::int32_t>& d_sampled,
+    std::int32_t* d_sampled_out,
     const SamplingPlan& plan,
     int N,
     int num_sampling,
@@ -53,7 +53,7 @@ void dispatch_sampling(
         for (int k = 0; k < num_sampling; ++k) {
             h_all_sampled[plan.sample_idx[k]] = h_per_sample_token[k];
         }
-        CUDA_CHECK(cudaMemcpy(d_sampled.data(), h_all_sampled.data(),
+        CUDA_CHECK(cudaMemcpy(d_sampled_out, h_all_sampled.data(),
                               sizeof(std::int32_t) * N,
                               cudaMemcpyHostToDevice));
     } else {
@@ -66,7 +66,7 @@ void dispatch_sampling(
         kernels::launch_sample_temp_bf16(
             ws.logits.data(),
             d_temp.data(), d_min_p.data(), d_seed.data(),
-            d_sampled.data(),
+            d_sampled_out,
             N, vocab_size, /*stream=*/nullptr);
     }
 }

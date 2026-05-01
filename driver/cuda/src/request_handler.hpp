@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <span>
 
+#include "forward_graph.hpp"
+#include "persistent_inputs.hpp"
+
 namespace pie_cuda_driver {
 
 class Engine;
@@ -37,6 +40,12 @@ struct ForwardContext {
     AttentionWorkspace& attn_ws;
     ops::CublasHandle& cublas;
     int max_workspace_tokens;
+    // Pre-allocated input buffers — refreshed per fire via memcpy
+    // rather than re-allocated. See `persistent_inputs.hpp`.
+    PersistentInputs& inputs;
+    // Optional CUDA-graph cache. When non-null, decode-only fires
+    // attempt graph capture/replay; otherwise the forward runs directly.
+    ForwardGraphCache* graph_cache = nullptr;
 };
 
 // Decode a `fire_batch` BPIQ payload, run the forward pass + sampling

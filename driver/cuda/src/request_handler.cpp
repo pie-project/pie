@@ -44,15 +44,12 @@ std::size_t handle_fire_batch(
     auto& kv_cache             = ctx.kv_cache;
     auto& attn_ws              = ctx.attn_ws;
     auto& cublas               = ctx.cublas;
+    auto& pi                   = ctx.inputs;  // persistent input slabs
     const int max_workspace_tokens = ctx.max_workspace_tokens;
 
-    // Outer-scope device buffers (managed by RAII; freed on scope exit
-    // and on exception). Held here so the forward call further down can
-    // reach them without re-uploading.
-    DeviceBuffer<std::uint32_t> d_tokens, d_positions, d_qo, d_kvpi, d_kvpp, d_kvlpl;
-    DeviceBuffer<std::int32_t>  d_sampled;
-    DeviceBuffer<std::uint8_t>  d_custom_mask;
-    DeviceBuffer<std::int32_t>  d_custom_mask_indptr;
+    // Track whether the custom-mask path was populated this fire so the
+    // forward kernel knows whether to consume `pi.custom_mask`.
+    bool have_custom_mask = false;
 
     try {
         namespace S = pie_cuda_driver::schema;
@@ -155,13 +152,15 @@ std::size_t handle_fire_batch(
             if (h_qo[r + 1] - h_qo[r] != 1u) is_pure_decode = false;
         }
 
-        // Upload BPIQ control arrays.
-        d_tokens    = DeviceBuffer<std::uint32_t>::from_host(tok_view);
-        d_positions = DeviceBuffer<std::uint32_t>::from_host(pos_view);
-        d_qo        = DeviceBuffer<std::uint32_t>::from_host(qo_view);
-        d_kvpi      = DeviceBuffer<std::uint32_t>::from_host(kvpi_view);
-        d_kvpp      = DeviceBuffer<std::uint32_t>::from_host(kvpp_view);
-        d_kvlpl     = DeviceBuffer<std::uint32_t>::from_host(kvlpl_view);
+        // Refill persistent device buffers with this fire's BPIQ inputs.
+        // Same device addresses every fire — required for graph-replay
+        // safety; cheap (single async memcpy each) on its own.
+        pi.tokens.copy_from_host(tok_view);
+        pi.positions.copy_from_host(pos_view);
+        pi.qo_indptr.copy_from_host(qo_view);
+        pi.kv_page_indices.copy_from_host(kvpi_view);
+        pi.kv_page_indptr.copy_from_host(kvpp_view);
+        pi.kv_last_page_lens.copy_from_host(kvlpl_view);
 
         // BRLE attention masks. For prefill batches that aren't pure
         // causal, decode + upload a packed bitmap and route through the
@@ -207,10 +206,9 @@ std::size_t handle_fire_batch(
                     }
                 }
             }
-            d_custom_mask = DeviceBuffer<std::uint8_t>::from_host(
-                std::span<const std::uint8_t>(packed));
-            d_custom_mask_indptr = DeviceBuffer<std::int32_t>::from_host(
-                std::span<const std::int32_t>(ind));
+            pi.custom_mask.copy_from_host(std::span<const std::uint8_t>(packed));
+            pi.custom_mask_indptr.copy_from_host(std::span<const std::int32_t>(ind));
+            have_custom_mask = true;
         } else if (!is_pure_decode && !fmask_view.empty()) {
             const auto qo_span =
                 std::span<const std::uint32_t>(qo_view.data(), qo_view.size());
@@ -226,25 +224,71 @@ std::size_t handle_fire_batch(
                     fmask_view, mskptr_view,
                     qo_span, kvpp_span, kvlpl_span,
                     kv_cache.page_size());
-                d_custom_mask = DeviceBuffer<std::uint8_t>::from_host(
+                pi.custom_mask.copy_from_host(
                     std::span<const std::uint8_t>(decoded.packed));
-                d_custom_mask_indptr = DeviceBuffer<std::int32_t>::from_host(
+                pi.custom_mask_indptr.copy_from_host(
                     std::span<const std::int32_t>(decoded.mask_indptr));
+                have_custom_mask = true;
             }
         }
 
-        // Run the paged forward pass. (Token IDs are u32 on the wire but
-        // bitwise-identical to i32 for any vocab < 2^31.)
-        pie_cuda_driver::model::qwen3_forward_paged(
-            weights, engine.hf_config(), ws, kv_cache, attn_ws, cublas,
-            reinterpret_cast<const std::int32_t*>(d_tokens.data()),
-            reinterpret_cast<const std::int32_t*>(d_positions.data()),
-            d_qo.data(), d_kvpi.data(), d_kvpp.data(), d_kvlpl.data(),
-            /*qo_indptr_h=*/h_qo,
-            /*kv_page_indptr_h=*/h_kvpp,
-            N, R, std::max(max_kv_len, 1),
-            is_pure_decode,
-            d_custom_mask.data(), d_custom_mask_indptr.data());
+        // Forward pass. The graph-capture path activates only when the
+        // request handler decided this fire is pure-decode AND the
+        // caller passed a graph cache (`--cuda-graphs`). All other
+        // fires take the direct dispatch path that just calls the
+        // forward function.
+        const bool try_graphs =
+            ctx.graph_cache != nullptr && is_pure_decode && !have_custom_mask;
+        if (try_graphs) {
+            const ForwardGraphKey key{R};
+            cudaGraphExec_t exec = ctx.graph_cache->get(key);
+            if (exec == nullptr) {
+                // First fire of this shape: capture. Forward writes its
+                // output to `ws` workspace buffers + `cache.k/v` pages.
+                // Persistent inputs (pi.*) provide stable kernel-arg
+                // pointers; the next replay reads new contents from the
+                // same addresses.
+                cudaStream_t cstream = nullptr;
+                CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
+                CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
+                pie_cuda_driver::model::qwen3_forward_paged(
+                    weights, engine.hf_config(), ws, kv_cache, attn_ws, cublas,
+                    reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
+                    reinterpret_cast<const std::int32_t*>(pi.positions.data()),
+                    pi.qo_indptr.data(), pi.kv_page_indices.data(),
+                    pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
+                    h_qo, h_kvpp,
+                    N, R, is_pure_decode, nullptr, nullptr);
+                cudaGraph_t graph = nullptr;
+                CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
+                CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+                cudaGraphDestroy(graph);
+                cudaStreamDestroy(cstream);
+                ctx.graph_cache->put(key, exec);
+                // Throttle the capture log: first 4 captures, then every
+                // 16th. At saturation R can swing across many distinct
+                // values, and one line per shape blows up the log.
+                const auto sz = ctx.graph_cache->size();
+                if (sz <= 4 || sz % 16 == 0) {
+                    std::cerr << "[pie-driver-cuda] graph captured: R=" << R
+                              << " (cache size=" << sz << ")\n";
+                }
+            } else {
+                CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
+            }
+        } else {
+            pie_cuda_driver::model::qwen3_forward_paged(
+                weights, engine.hf_config(), ws, kv_cache, attn_ws, cublas,
+                reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
+                reinterpret_cast<const std::int32_t*>(pi.positions.data()),
+                pi.qo_indptr.data(), pi.kv_page_indices.data(),
+                pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
+                /*qo_indptr_h=*/h_qo,
+                /*kv_page_indptr_h=*/h_kvpp,
+                N, R, is_pure_decode,
+                have_custom_mask ? pi.custom_mask.data()        : nullptr,
+                have_custom_mask ? pi.custom_mask_indptr.data() : nullptr);
+        }
 
         // Sampler param views (temp_view, top_k_view, …, rns_view) were
         // hoisted to the top of the request handler to support the spec
@@ -351,7 +395,8 @@ std::size_t handle_fire_batch(
             sampler_off += ns;
         }
 
-        d_sampled = DeviceBuffer<std::int32_t>::alloc(static_cast<std::size_t>(N));
+        // d_sampled lives in `pi.sampled` (capacity = max_workspace_tokens).
+        // Only the first N rows are written/read this fire.
 
         // Map each sampling slot to its global logit-row index. Only the
         // topk+top-p path uses this; we build it unconditionally so the
@@ -369,7 +414,7 @@ std::size_t handle_fire_batch(
         }
 
         dispatch_sampling(
-            ws, d_sampled,
+            ws, pi.sampled.data(),
             SamplingPlan{
                 any_topk_topp,
                 std::span<const float>(h_per_temp),
@@ -382,7 +427,12 @@ std::size_t handle_fire_batch(
             N, num_sampling, engine.hf_config().vocab_size,
             /*prng_offset=*/static_cast<std::uint64_t>(handled));
 
-        const std::vector<std::int32_t> all_sampled = d_sampled.to_host();
+        // Only copy the first N entries — `pi.sampled` is sized for
+        // max_workspace_tokens, but only [0, N) are valid this fire.
+        std::vector<std::int32_t> all_sampled(N);
+        CUDA_CHECK(cudaMemcpy(all_sampled.data(), pi.sampled.data(),
+                              sizeof(std::int32_t) * N,
+                              cudaMemcpyDeviceToHost));
 
         // Flat-path arrays: token sampler is the only slot type allowed
         // here (need_msgpack would have flipped otherwise), so counts

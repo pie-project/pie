@@ -154,7 +154,6 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             /*qo_indptr_h=*/h_qo_indptr.data(),
             /*kv_page_indptr_h=*/h_kv_page_indptr.data(),
             /*total_tokens=*/N, /*num_requests=*/1,
-            /*max_kv_len=*/N,
             /*is_pure_decode=*/false);
 
         cudaFree(d_qo); cudaFree(d_pi); cudaFree(d_pp); cudaFree(d_lpl);
@@ -220,6 +219,11 @@ int main(int argc, char** argv) {
                        "Where to write the last-token logits as bf16 [vocab]");
     parity->add_flag("--parity-paged", parity_paged,
                      "Run the paged forward path (BPIQ-shaped KV layout)");
+
+    bool use_cuda_graphs = false;
+    app.add_flag("--cuda-graphs", use_cuda_graphs,
+                 "Capture decode forward into CUDA graphs and replay per "
+                 "shape bucket. Experimental; default off.");
 
     int control_fd = -1;
     app.add_option("--control-fd", control_fd,
@@ -299,6 +303,22 @@ int main(int argc, char** argv) {
         engine.hf_config().head_dim);
 
     pie_cuda_driver::ops::CublasHandle cublas;
+
+    // Persistent input buffers, sized for the configured worst case so
+    // device pointers stay stable across fires (prereq for graphs).
+    // Worst-case mask is qo_len × kv_len bits per request. Bound:
+    //   max_qo == max_workspace_tokens, max_kv == num_pages × page_size.
+    const std::size_t max_kv_tokens =
+        static_cast<std::size_t>(kv_cache.num_pages()) * kv_cache.page_size();
+    const std::size_t max_mask_bits =
+        static_cast<std::size_t>(max_workspace_tokens) * max_kv_tokens;
+    const std::size_t max_mask_bytes = (max_mask_bits + 7) / 8;
+    auto persistent_inputs = pie_cuda_driver::PersistentInputs::allocate(
+        max_workspace_tokens,
+        /*max_requests=*/max_workspace_tokens,  // each request has ≥1 token
+        /*max_kv_pages=*/kv_cache.num_pages(),
+        max_mask_bytes);
+
     std::cerr << "[pie-driver-cuda] kv_cache: "
               << kv_cache.num_pages() << " pages × "
               << kv_cache.page_size() << " tokens; "
@@ -383,9 +403,15 @@ int main(int argc, char** argv) {
 
     std::uint64_t handled = 0;
 
+    pie_cuda_driver::ForwardGraphCache graph_cache;
     pie_cuda_driver::ForwardContext fwd_ctx{
-        engine, weights, ws, kv_cache, attn_ws, cublas, max_workspace_tokens
+        engine, weights, ws, kv_cache, attn_ws, cublas,
+        max_workspace_tokens, persistent_inputs,
+        use_cuda_graphs ? &graph_cache : nullptr,
     };
+    if (use_cuda_graphs) {
+        std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
+    }
 
     server.serve_forever([&](const pie_cuda_driver::SlotRequest& req,
                              std::span<std::uint8_t> response) -> std::size_t {

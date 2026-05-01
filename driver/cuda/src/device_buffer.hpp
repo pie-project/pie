@@ -17,6 +17,8 @@
 #include <cstddef>
 #include <cstring>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -101,6 +103,44 @@ public:
                                   cudaMemcpyDeviceToHost));
         }
         return result;
+    }
+
+    // Copy from a host span into the existing device allocation (no
+    // alloc). Throws if `src.size() > size()`. Used by the persistent-
+    // buffer path that pre-allocates capacity at startup and refills
+    // contents per fire — gives kernels stable device pointers across
+    // fires (a prerequisite for CUDA-graph capture).
+    //
+    // Issues against the default stream; the kernel queue is
+    // in-order, so subsequent kernel launches see the new contents.
+    void copy_from_host(std::span<const T> src) {
+        if (src.size() > count_) {
+            throw std::runtime_error(
+                "DeviceBuffer::copy_from_host: src size " +
+                std::to_string(src.size()) + " > capacity " +
+                std::to_string(count_));
+        }
+        if (!src.empty()) {
+            CUDA_CHECK(cudaMemcpyAsync(ptr_, src.data(),
+                                       src.size() * sizeof(T),
+                                       cudaMemcpyHostToDevice));
+        }
+    }
+
+    // Same as `copy_from_host(span<const T>)` but takes a raw byte view —
+    // the BPIQ wire-format case where the source bytes alias `T`.
+    // Length must be a multiple of `sizeof(T)`.
+    void copy_from_bytes(std::span<const std::uint8_t> bytes) {
+        if (bytes.size() / sizeof(T) > count_) {
+            throw std::runtime_error(
+                "DeviceBuffer::copy_from_bytes: src elements " +
+                std::to_string(bytes.size() / sizeof(T)) +
+                " > capacity " + std::to_string(count_));
+        }
+        if (!bytes.empty()) {
+            CUDA_CHECK(cudaMemcpyAsync(ptr_, bytes.data(), bytes.size(),
+                                       cudaMemcpyHostToDevice));
+        }
     }
 
     T*       data()       noexcept { return ptr_; }

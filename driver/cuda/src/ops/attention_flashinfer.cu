@@ -67,11 +67,28 @@ struct DecodeWorkEstimator {
 
 }  // namespace
 
-void launch_attention_flashinfer_decode_bf16(
-    const void* q, void* k_pages, void* v_pages, void* o,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
+// ── DecodePlanCache (private impl) ─────────────────────────────────────────
+
+struct DecodePlanCache {
+    ::flashinfer::DecodePlanInfo plan_info;
+    int num_requests = 0;
+    int num_q_heads = 0;
+    int num_kv_heads = 0;
+    int head_dim = 0;
+    int page_size = 0;
+    bool valid = false;
+};
+
+void DecodePlanCacheDeleter::operator()(DecodePlanCache* p) const noexcept {
+    delete p;
+}
+
+DecodePlanCachePtr make_decode_plan() {
+    return DecodePlanCachePtr(new DecodePlanCache{});
+}
+
+void plan_attention_flashinfer_decode_bf16(
+    DecodePlanCache& cache,
     const std::uint32_t* kv_page_indptr_h,
     int num_requests,
     int num_q_heads, int num_kv_heads, int head_dim, int page_size,
@@ -84,23 +101,6 @@ void launch_attention_flashinfer_decode_bf16(
     }
     const int gqa_group_size = num_q_heads / num_kv_heads;
 
-    // 1. Build paged_kv_t over the device pool. The runtime sends u32
-    //    indices/indptr; flashinfer wants IdType=int32. They're the same
-    //    bit-width so we reinterpret in place.
-    ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
-        /*num_heads=*/static_cast<uint32_t>(num_kv_heads),
-        /*page_size=*/static_cast<uint32_t>(page_size),
-        /*head_dim=*/static_cast<uint32_t>(head_dim),
-        /*batch_size=*/static_cast<uint32_t>(num_requests),
-        /*layout=*/::flashinfer::QKVLayout::kNHD,
-        static_cast<DTypeKV*>(k_pages),
-        static_cast<DTypeKV*>(v_pages),
-        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indices_d)),
-        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indptr_d)),
-        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_last_page_lens_d)));
-
-    // 2. Plan: schedule per-request work into the workspace.
-    ::flashinfer::DecodePlanInfo plan_info;
     std::vector<IdType> indptr_h_buf(num_requests + 1);
     for (int r = 0; r <= num_requests; ++r) {
         indptr_h_buf[r] = static_cast<IdType>(kv_page_indptr_h[r]);
@@ -111,18 +111,15 @@ void launch_attention_flashinfer_decode_bf16(
             workspace.float_buffer(), workspace.float_bytes(),
             workspace.int_buffer(), workspace.page_locked_int(),
             workspace.int_bytes(),
-            plan_info,
+            cache.plan_info,
             indptr_h_buf.data(),
             static_cast<uint32_t>(num_requests),
             static_cast<uint32_t>(num_q_heads),
             static_cast<uint32_t>(page_size),
-            /*enable_cuda_graph=*/false,
+            /*enable_cuda_graph=*/true,
             stream, work_estimator);
     };
 
-    // Dispatch on GQA ratio. Adding a new ratio = one more case here, which
-    // triggers one more explicit instantiation of the work-estimation
-    // template (a member of DecodeWorkEstimator<G>).
     cudaError_t status;
     switch (gqa_group_size) {
         case 1: status = plan_for(DecodeWorkEstimator<1>{}); break;
@@ -137,7 +134,41 @@ void launch_attention_flashinfer_decode_bf16(
     }
     CUDA_CHECK(status);
 
-    // 3. Build params from PlanInfo.
+    cache.num_requests = num_requests;
+    cache.num_q_heads  = num_q_heads;
+    cache.num_kv_heads = num_kv_heads;
+    cache.head_dim     = head_dim;
+    cache.page_size    = page_size;
+    cache.valid        = true;
+}
+
+void dispatch_attention_flashinfer_decode_bf16(
+    const DecodePlanCache& cache,
+    const void* q, void* k_pages, void* v_pages, void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream)
+{
+    if (!cache.valid) {
+        throw std::runtime_error(
+            "dispatch_attention_flashinfer_decode_bf16: cache is empty; "
+            "call plan_attention_flashinfer_decode_bf16 first");
+    }
+
+    ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
+        static_cast<uint32_t>(cache.num_kv_heads),
+        static_cast<uint32_t>(cache.page_size),
+        static_cast<uint32_t>(cache.head_dim),
+        static_cast<uint32_t>(cache.num_requests),
+        ::flashinfer::QKVLayout::kNHD,
+        static_cast<DTypeKV*>(k_pages),
+        static_cast<DTypeKV*>(v_pages),
+        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indices_d)),
+        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indptr_d)),
+        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_last_page_lens_d)));
+
     DecodeParams params;
     params.q = const_cast<DTypeQ*>(static_cast<const DTypeQ*>(q));
     params.q_rope_offset = nullptr;
@@ -145,37 +176,36 @@ void launch_attention_flashinfer_decode_bf16(
     params.o = static_cast<DTypeO*>(o);
     params.lse = nullptr;
     params.maybe_alibi_slopes = nullptr;
-    params.num_qo_heads = static_cast<uint32_t>(num_q_heads);
-    params.q_stride_n = static_cast<IdType>(num_q_heads * head_dim);
-    params.q_stride_h = static_cast<IdType>(head_dim);
+    params.num_qo_heads = static_cast<uint32_t>(cache.num_q_heads);
+    params.q_stride_n = static_cast<IdType>(cache.num_q_heads * cache.head_dim);
+    params.q_stride_h = static_cast<IdType>(cache.head_dim);
     params.window_left = -1;
     params.logits_soft_cap = 0.f;
-    params.sm_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    params.sm_scale = 1.0f / std::sqrt(static_cast<float>(cache.head_dim));
     params.rope_rcp_scale = 1.0f;
     params.rope_rcp_theta = 1.0f;
 
     void* int_buf = workspace.int_buffer();
     void* float_buf = workspace.float_buffer();
-    params.request_indices    = offset_ptr<IdType>(int_buf, plan_info.request_indices_offset);
-    params.kv_tile_indices    = offset_ptr<IdType>(int_buf, plan_info.kv_tile_indices_offset);
-    params.o_indptr           = offset_ptr<IdType>(int_buf, plan_info.o_indptr_offset);
-    params.kv_chunk_size_ptr  = offset_ptr<IdType>(int_buf, plan_info.kv_chunk_size_ptr_offset);
-    params.padded_batch_size  = static_cast<uint32_t>(plan_info.padded_batch_size);
-    params.partition_kv       = plan_info.split_kv;
+    params.request_indices    = offset_ptr<IdType>(int_buf, cache.plan_info.request_indices_offset);
+    params.kv_tile_indices    = offset_ptr<IdType>(int_buf, cache.plan_info.kv_tile_indices_offset);
+    params.o_indptr           = offset_ptr<IdType>(int_buf, cache.plan_info.o_indptr_offset);
+    params.kv_chunk_size_ptr  = offset_ptr<IdType>(int_buf, cache.plan_info.kv_chunk_size_ptr_offset);
+    params.padded_batch_size  = static_cast<uint32_t>(cache.plan_info.padded_batch_size);
+    params.partition_kv       = cache.plan_info.split_kv;
 
     DTypeO* tmp_v = nullptr;
     float*  tmp_s = nullptr;
-    if (plan_info.split_kv) {
-        tmp_v = offset_ptr<DTypeO>(float_buf, plan_info.v_offset);
-        tmp_s = offset_ptr<float>(float_buf, plan_info.s_offset);
-        if (plan_info.enable_cuda_graph) {
+    if (cache.plan_info.split_kv) {
+        tmp_v = offset_ptr<DTypeO>(float_buf, cache.plan_info.v_offset);
+        tmp_s = offset_ptr<float>(float_buf, cache.plan_info.s_offset);
+        if (cache.plan_info.enable_cuda_graph) {
             params.block_valid_mask =
-                offset_ptr<bool>(int_buf, plan_info.block_valid_mask_offset);
+                offset_ptr<bool>(int_buf, cache.plan_info.block_valid_mask_offset);
         }
     }
 
-    // 4. Dispatch.
-    status = ::flashinfer::BatchDecodeWithPagedKVCacheDispatched<
+    cudaError_t status = ::flashinfer::BatchDecodeWithPagedKVCacheDispatched<
         HEAD_DIM, POS_ENC, AttnVariant, DecodeParams>(
         params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
     CUDA_CHECK(status);

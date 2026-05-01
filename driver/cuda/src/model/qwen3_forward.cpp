@@ -157,7 +157,6 @@ void qwen3_forward_paged(
     const std::uint32_t* kv_page_indptr_h,
     int N,
     int R,
-    int max_kv_len,
     bool is_pure_decode,
     const std::uint8_t*  custom_mask_d,
     const std::int32_t*  custom_mask_indptr_d)
@@ -175,6 +174,26 @@ void qwen3_forward_paged(
     kernels::launch_embed_bf16(
         token_ids, w.embed->data(), ws.y.data(),
         N, H, cfg.vocab_size, stream);
+
+    // Hoist the flashinfer decode plan out of the per-layer loop. The
+    // plan depends only on (kv_page_indptr_h, num_requests, num_q_heads,
+    // num_kv_heads, head_dim, page_size) — all stable across layers.
+    // Doing it once here saves 27 redundant DecodePlan calls per fire
+    // (each ~25 µs of host work + a small device kernel).
+    ops::DecodePlanCachePtr decode_plan;
+    if (is_pure_decode) {
+        decode_plan = ops::make_decode_plan();
+        ops::plan_attention_flashinfer_decode_bf16(
+            *decode_plan,
+            kv_page_indptr_h,
+            R,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            d,
+            cache.page_size(),
+            attn_ws,
+            stream);
+    }
 
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
@@ -225,12 +244,13 @@ void qwen3_forward_paged(
             // single-query-per-request shape can't express arbitrary
             // patterns). Custom-mask decode workloads would need to route
             // through prefill instead — TODO if any inferlet hits that.
-            ops::launch_attention_flashinfer_decode_bf16(
+            // Plan is hoisted (computed once before the loop); each layer
+            // only does the dispatch.
+            ops::dispatch_attention_flashinfer_decode_bf16(
+                *decode_plan,
                 ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                kv_page_indptr_h,
-                R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-                cache.page_size(), attn_ws, stream);
+                attn_ws, stream);
         } else if (custom_mask_d) {
             ops::launch_attention_flashinfer_prefill_custom_bf16(
                 ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),

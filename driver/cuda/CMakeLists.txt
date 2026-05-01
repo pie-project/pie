@@ -46,6 +46,7 @@ cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 # no ZMQ/protobuf needed. Consumed by the Python wrapper `pie_driver_cuda_native`.
 add_executable(pie_driver_cuda
   src/main.cpp
+  src/persistent_inputs.cpp
   src/request_handler.cpp
   src/msgpack_subpass.cpp
   src/sampling_dispatch.cpp

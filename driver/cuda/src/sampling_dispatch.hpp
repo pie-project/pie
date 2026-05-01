@@ -45,9 +45,13 @@ struct SamplingPlan {
     std::span<const std::int32_t> sample_idx;
 };
 
+// `d_sampled_out` must point at a device buffer of capacity ≥ N
+// `int32_t`s. Non-sample rows are left unspecified; only positions
+// listed in `plan.sample_idx` are written by the topk+top-p path,
+// while the temp/min-p path writes every row.
 void dispatch_sampling(
     model::Qwen3Workspace& ws,
-    DeviceBuffer<std::int32_t>& d_sampled,
+    std::int32_t* d_sampled_out,
     const SamplingPlan& plan,
     int N,
     int num_sampling,

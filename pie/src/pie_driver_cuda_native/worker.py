@@ -417,6 +417,11 @@ def worker_main(
     # serve loop (one recv = one request).
     ctrl_client = None
     binary_argv = [str(binary), "--config", str(toml_path)]
+    # Optional: opt into CUDA-graph capture for the decode forward pass
+    # via `PIE_CUDA_GRAPHS=1` in the driver's environment. Off by
+    # default while we shake out correctness on more workloads.
+    if os.environ.get("PIE_CUDA_GRAPHS") == "1":
+        binary_argv.append("--cuda-graphs")
     pass_fds: tuple = ()
     wrapper_sock = None
     binary_sock = None
