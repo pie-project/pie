@@ -316,7 +316,11 @@ int main(int argc, char** argv) {
          || mt == "mixtral"
          || mt == "gpt_oss"
          || mt == "phi3"
-         || mt == "olmo" || mt == "olmo3"
+         // OLMo-V1 (`mt == "olmo"`) used LayerNorm, not RMSNorm — its
+         // schema is genuinely different and was never wired up. OLMo-2
+         // and OLMo-3 share the post-norm + q/k-norm + RMSNorm setup
+         // that `bind_olmo3` materialises, so we accept both here.
+         || mt == "olmo2" || mt == "olmo3"
          || mt == "gemma2"
          || mt == "gemma3" || mt == "gemma3_text"
          || mt == "gemma4" || mt == "gemma4_text";
@@ -348,7 +352,7 @@ int main(int argc, char** argv) {
 
     if (mt_for_bind == "phi3") {
         weights_llama = pie_cuda_driver::model::bind_phi3(engine);
-    } else if (mt_for_bind == "olmo3") {
+    } else if (mt_for_bind == "olmo2" || mt_for_bind == "olmo3") {
         weights_llama = pie_cuda_driver::model::bind_olmo3(engine);
     } else if (mt_for_bind == "mistral3") {
         weights_llama = pie_cuda_driver::model::bind_mistral3(engine);
@@ -544,14 +548,16 @@ int main(int argc, char** argv) {
         const std::string& mt = hf.model_type;
         fwd_cfg.use_qk_norm        = hf.use_qk_norm;
         fwd_cfg.use_qkv_bias       = hf.attention_bias;
-        // OLMo-3 is the only currently-supported post-norm architecture;
-        // its q/k norms and YaRN scaling are picked up via use_qk_norm /
-        // has_rope_scaling on the same HfConfig.
-        fwd_cfg.norm_placement = (mt == "olmo3")
+        // OLMo-2 and OLMo-3 are the post-norm + q/k-norm architectures
+        // bind_olmo3 materialises; everything else uses the standard
+        // Llama pre-norm placement. q/k norms are forced on regardless
+        // of the (sometimes missing) `use_qk_norm` config field.
+        const bool is_olmo_post_norm = (mt == "olmo2" || mt == "olmo3");
+        fwd_cfg.norm_placement = is_olmo_post_norm
             ? pie_cuda_driver::model::NormPlacement::Post
             : pie_cuda_driver::model::NormPlacement::Pre;
-        if (mt == "olmo3") {
-            fwd_cfg.use_qk_norm = true;  // OLMo-3 always has q/k norms.
+        if (is_olmo_post_norm) {
+            fwd_cfg.use_qk_norm = true;
         }
         fwd_cfg.rope_kind = hf.has_rope_scaling
             ? pie_cuda_driver::model::RopeKind::YaRN
