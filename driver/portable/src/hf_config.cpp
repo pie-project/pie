@@ -136,7 +136,11 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     h.num_key_value_heads =
         get_or<std::int32_t>(text, "num_key_value_heads", h.num_attention_heads);
     h.hidden_size = text.at("hidden_size").get<std::int32_t>();
-    h.intermediate_size = text.at("intermediate_size").get<std::int32_t>();
+    // Pure-MoE checkpoints (Qwen 3.6) omit `intermediate_size` because
+    // every layer's FFN is the routed-expert path; the per-expert width
+    // lives in `moe_intermediate_size`. Fall back to 0 there.
+    h.intermediate_size =
+        get_or<std::int32_t>(text, "intermediate_size", 0);
     h.vocab_size = text.at("vocab_size").get<std::int32_t>();
     h.max_position_embeddings =
         get_or<std::int32_t>(text, "max_position_embeddings", 4096);
@@ -154,9 +158,14 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     h.rope_theta = get_or<float>(text, "rope_theta", 1e6f);
     h.rope_local_base_freq = get_or<float>(text, "rope_local_base_freq", 0.0f);
     // HF's PretrainedConfig defaults this to True; specific archs override
-    // (Llama-3 base / Llama-3.1+ untie). When the config omits the flag,
-    // assume tied.
-    h.tie_word_embeddings = get_or<bool>(text, "tie_word_embeddings", true);
+    // (Llama-3 base / Llama-3.1+ untie). Multimodal wrappers (Qwen 3.6 MoE,
+    // Gemma 4 etc.) put the flag on the OUTER config — the inner
+    // `text_config` doesn't carry it. Outer wins; otherwise default tied.
+    if (j.contains("tie_word_embeddings") && !j["tie_word_embeddings"].is_null()) {
+        h.tie_word_embeddings = j["tie_word_embeddings"].get<bool>();
+    } else {
+        h.tie_word_embeddings = get_or<bool>(text, "tie_word_embeddings", true);
+    }
 
     if (auto sw = get_opt<std::int32_t>(text, "sliding_window")) {
         h.sliding_window = sw;
@@ -309,7 +318,8 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
         h.qwen35_linear_conv_kernel =
             get_or<std::int32_t>(text, "linear_conv_kernel_dim", 4);
 
-        // mrope (multimodal RoPE) lives under rope_parameters.
+        // mrope (multimodal RoPE) lives under rope_parameters. Qwen 3.6's
+        // config carries rope_theta there too (no flat top-level copy).
         if (auto rp_it = text.find("rope_parameters");
             rp_it != text.end() && rp_it->is_object()) {
             const auto& rp = *rp_it;
@@ -317,6 +327,9 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
                 get_or<bool>(rp, "mrope_interleaved", false);
             h.qwen35_partial_rotary_factor =
                 get_or<float>(rp, "partial_rotary_factor", 1.0f);
+            if (rp.contains("rope_theta") && !rp["rope_theta"].is_null()) {
+                h.rope_theta = rp["rope_theta"].get<float>();
+            }
             if (auto sec_it = rp.find("mrope_section");
                 sec_it != rp.end() && sec_it->is_array() &&
                 sec_it->size() == 3) {

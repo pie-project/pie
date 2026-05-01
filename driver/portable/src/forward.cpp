@@ -718,6 +718,13 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
             std::fprintf(stderr, " %.6f", buf[i]);
         }
         std::fprintf(stderr, "\n");
+        if (const char* path = std::getenv("PIE_QWEN35_DUMP_BIN")) {
+            std::FILE* f = std::fopen(path, "wb");
+            if (f) {
+                std::fwrite(buf.data(), sizeof(float), n_elem, f);
+                std::fclose(f);
+            }
+        }
     }
 
     const std::int32_t n_slots =

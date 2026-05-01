@@ -403,12 +403,32 @@ ggml_tensor* build_qwen3_5_ffn(ggml_context* ctx,
                                const LayerWeights& L,
                                const Hparams& h) {
     if (h.num_experts > 0) {
-        auto* moe = build_moe_ffn(ctx, cur,
+        // build_moe_ffn assumes 2D [hidden, n_total] input. Our batched
+        // outer hands us 3D [hidden, n_tokens, n_seqs] when n_seqs > 1;
+        // flatten the trailing dims, run MoE, then restore the shape.
+        const std::int32_t hidden    = cur->ne[0];
+        const std::int32_t n_tokens  = cur->ne[1];
+        const std::int32_t n_seqs    = cur->ne[2];
+        const bool         was_3d    = (n_seqs > 1);
+        ggml_tensor* cur_flat = was_3d
+            ? ggml_reshape_2d(ctx, ggml_cont(ctx, cur),
+                               hidden, n_tokens * n_seqs)
+            : cur;
+
+        auto* moe = build_moe_ffn(ctx, cur_flat,
                                    L.moe_router,
                                    L.moe_gate_exps, L.moe_up_exps, L.moe_down_exps,
                                    h.num_experts, h.num_experts_per_tok,
                                    MoeActivation::Silu, h.norm_topk_prob);
-        if (!L.moe_shared_gate_proj) return moe;
+        if (!L.moe_shared_gate_proj) {
+            return was_3d
+                ? ggml_reshape_3d(ctx, moe, hidden, n_tokens, n_seqs)
+                : moe;
+        }
+        // Shared expert path also operates on the flattened input.
+        ggml_tensor* sh_in = cur_flat;
+        // Override `cur` for the shared-expert ops below.
+        cur = sh_in;
 
         // Shared dense expert (SwiGLU MLP).
         auto* sh_gate = ggml_mul_mat(ctx, L.moe_shared_gate_proj, cur);
@@ -420,7 +440,10 @@ ggml_tensor* build_qwen3_5_ffn(ggml_context* ctx,
         // Sigmoid mixer: scalar weight per token, broadcast across hidden.
         auto* mix = ggml_sigmoid(ctx, ggml_mul_mat(ctx, L.moe_shared_gate, cur));
         shared = ggml_mul(ctx, shared, mix);
-        return ggml_add(ctx, moe, shared);
+        auto* out = ggml_add(ctx, moe, shared);
+        return was_3d
+            ? ggml_reshape_3d(ctx, out, hidden, n_tokens, n_seqs)
+            : out;
     }
     auto* gate = ggml_mul_mat(ctx, L.gate_proj, cur);
     auto* up   = ggml_mul_mat(ctx, L.up_proj,   cur);
@@ -550,6 +573,28 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
             cur2 = norm_scale(ctx, cur2, L.ffn_norm, /*plus_one=*/true);
             auto* ffn_out = build_qwen3_5_ffn(ctx, cur2, L, h);
             x = ggml_add(ctx, ffn_out, ffn_in);
+
+            // Optional per-layer post-FFN tap (for MoE bring-up debugging).
+            // Set PIE_QWEN35_DUMP=x_after_l<N> or attn_out_l<N> or ffn_out_l<N>.
+            if (dbg_tap_name && !dbg_tap_out) {
+                ggml_tensor* sel = nullptr;
+                const std::string base = dbg_tap_name;
+                const std::string suffix = "_l" + std::to_string(il);
+                auto match = [&](const char* prefix) {
+                    return base == std::string(prefix) + suffix;
+                };
+                if      (match("attn_out"))     sel = attn_out;
+                else if (match("ffn_pre_norm")) sel = ffn_in;
+                else if (match("ffn_normed"))   sel = cur2;
+                else if (match("ffn_out"))      sel = ffn_out;
+                else if (match("x_after"))      sel = x;
+                if (sel) {
+                    dbg_tap_out = ggml_cont(ctx, sel);
+                    ggml_set_name(dbg_tap_out, "qwen35_dbg_tap");
+                    ggml_set_output(dbg_tap_out);
+                    ggml_build_forward_expand(gf, dbg_tap_out);
+                }
+            }
         }
         // Flatten [hidden, n_tokens, n_seqs] back to [hidden, n_total].
         finals = ggml_reshape_2d(ctx, ggml_cont(ctx, x),
@@ -643,6 +688,26 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
     auto* sampled = ggml_get_rows(ctx, cur, in.out_idx);
     ggml_tensor* lm_head_w = h.tie_word_embeddings ? w.tok_embd : w.output_head;
     auto* logits = ggml_mul_mat(ctx, lm_head_w, sampled);
+
+    if (dbg_tap_name && !dbg_tap_out) {
+        ggml_tensor* sel = nullptr;
+        if      (std::strcmp(dbg_tap_name, "final_norm") == 0) sel = cur;
+        else if (std::strcmp(dbg_tap_name, "sampled")    == 0) sel = sampled;
+        else if (std::strcmp(dbg_tap_name, "logits")     == 0) sel = logits;
+        else if (std::strcmp(dbg_tap_name, "lm_head_w")  == 0) {
+            // Cast to F32 so the host-side dump is comparable.
+            sel = ggml_cast(ctx, lm_head_w, GGML_TYPE_F32);
+        }
+        else if (std::strcmp(dbg_tap_name, "tok_embd_w") == 0) {
+            sel = ggml_cast(ctx, w.tok_embd, GGML_TYPE_F32);
+        }
+        if (sel) {
+            dbg_tap_out = ggml_cont(ctx, sel);
+            ggml_set_name(dbg_tap_out, "qwen35_dbg_tap");
+            ggml_set_output(dbg_tap_out);
+            ggml_build_forward_expand(gf, dbg_tap_out);
+        }
+    }
 
     // Optional GPU-side sampler (mirrors graph_qwen3 fast paths). Saves
     // the ~vocab*n_slots*4-byte logits download on greedy / uniform-top-K
