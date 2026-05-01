@@ -731,7 +731,8 @@ struct GraphInputs {
 
 struct GraphResult {
     ggml_cgraph* gf;
-    ggml_tensor* logits;      // F32 [vocab_size, n_request]
+    ggml_tensor* logits;      // F32 [vocab_size, n_request] (null when all_greedy)
+    ggml_tensor* tokens_out;  // I32 [n_slots]                (null unless all_greedy)
     GraphInputs  in;
 };
 
@@ -1062,14 +1063,31 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         logits = ggml_scale(ctx, logits, spec.final_softcap);
     }
 
-    ggml_set_name(logits, "logits");
-    ggml_set_output(logits);
-
-    ggml_build_forward_expand(gf, logits);
+    ggml_tensor* tokens_out = nullptr;
+    if (plan.all_greedy) {
+        // Greedy fast path: argmax along vocab axis on the GPU. Caller
+        // downloads only n_slots i32 ids; the F32 logits buffer never
+        // needs to be a graph output, so gallocr can avoid the
+        // ~vocab*n_slots*4-byte materialization. (CPU argmax in our
+        // host sampler uses first-wins-on-tie; the CUDA reduction picks
+        // a different tied index in rare exact-tie cases — both are
+        // valid greedy choices.)
+        tokens_out = ggml_argmax(ctx, logits);
+        ggml_set_name(tokens_out, "tokens_out");
+        ggml_set_output(tokens_out);
+        ggml_build_forward_expand(gf, tokens_out);
+    } else {
+        ggml_set_name(logits, "logits");
+        ggml_set_output(logits);
+        ggml_build_forward_expand(gf, logits);
+    }
 
     GraphResult res{};
     res.gf = gf;
-    res.logits = logits;
+    // logits is exposed only when sampling happens host-side; greedy
+    // surfaces tokens_out and skips materializing the F32 block.
+    res.logits = plan.all_greedy ? nullptr : logits;
+    res.tokens_out = tokens_out;
     res.in = std::move(in);
     return res;
 }
@@ -1340,6 +1358,31 @@ std::vector<SamplerOutput> sample_batch(const ForwardEngine::BatchPlan& plan,
     return sampled;
 }
 
+// Greedy fast path: every slot's token came from a GPU argmax; we just
+// stitch the i32 ids back into per-request SamplerOutput, running the
+// spec-decode verifier walk where applicable. Skips the per-slot logit
+// mask + softmax + sort the host-side sampler does.
+std::vector<SamplerOutput> sample_batch_greedy(const ForwardEngine::BatchPlan& plan,
+                                               const std::int32_t* slot_tokens) {
+    const std::int32_t n_req = static_cast<std::int32_t>(plan.reqs.size());
+    std::vector<SamplerOutput> sampled(n_req);
+    std::int32_t slot_off = 0;
+    for (std::int32_t r = 0; r < n_req; ++r) {
+        const auto& rp = plan.reqs[r];
+        const std::int32_t n_slots =
+            static_cast<std::int32_t>(rp.sampling_positions.size());
+        std::vector<SlotOutput> slot_out(n_slots);
+        for (std::int32_t s = 0; s < n_slots; ++s) {
+            slot_out[s].token = static_cast<std::uint32_t>(slot_tokens[slot_off + s]);
+        }
+        // resolve_request_output handles the plain (single-token) and
+        // spec-decode (verifier walk) cases identically to the slow path.
+        resolve_request_output(rp, std::move(slot_out), sampled[r]);
+        slot_off += n_slots;
+    }
+    return sampled;
+}
+
 }  // namespace
 
 // =============================================================================
@@ -1446,6 +1489,25 @@ ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req)
         build_pure_decode_packing(plan, arrays.n_request, spec);
     }
 
+    // GPU-greedy detection: every slot is sampled by argmax (temperature
+    // ≤ ε), and no request applies a logit mask. When set, the graph
+    // builder substitutes `argmax(logits)` for the logits output.
+    plan.all_greedy = !plan.reqs.empty();
+    for (const auto& rp : plan.reqs) {
+        const auto& s = rp.sampler;
+        const bool greedy_temp = s.temperature <= 1e-5f;
+        const bool token_producing =
+               s.type == SamplerType::Multinomial
+            || s.type == SamplerType::TopK
+            || s.type == SamplerType::TopP
+            || s.type == SamplerType::MinP
+            || s.type == SamplerType::TopKTopP;
+        if (!greedy_temp || !token_producing || !rp.logit_mask_runs.empty()) {
+            plan.all_greedy = false;
+            break;
+        }
+    }
+
     // Resolve the active adapter via the pool. If lookup fails, the
     // adapter wasn't registered yet — fall through to base-model behavior.
     if (active_adapter_id >= 0 && adapters_) {
@@ -1525,6 +1587,7 @@ ForwardEngine::BatchPlan ForwardEngine::plan_test_simple_(
     rp.sampler.temperature = 0.0f; // greedy for offline test mode
     plan.sampling_pos_i32.push_back(sampling_pos);
     plan.reqs.push_back(std::move(rp));
+    plan.all_greedy = true;
 
     // Detect pure-decode (single token) for the M11 fast path.
     if (n_tok == 1) {
@@ -1591,17 +1654,28 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
     }
     take_us(timings_.compute_us);
 
-    const std::int32_t vocab_size = model_.hparams().vocab_size;
     const std::int32_t n_slots =
         static_cast<std::int32_t>(plan.sampling_pos_i32.size());
-    std::vector<float> all_logits(
-        static_cast<std::size_t>(vocab_size) * n_slots);
-    ggml_backend_tensor_get(g.logits, all_logits.data(), 0,
-                            all_logits.size() * sizeof(float));
-    take_us(timings_.logits_dl_us);
 
-    auto out = sample_batch(plan, all_logits.data(), vocab_size);
-    take_us(timings_.sample_us);
+    std::vector<SamplerOutput> out;
+    if (plan.all_greedy) {
+        // GPU-greedy fast path: download only the int32 token ids.
+        std::vector<std::int32_t> tokens(n_slots);
+        ggml_backend_tensor_get(g.tokens_out, tokens.data(), 0,
+                                tokens.size() * sizeof(std::int32_t));
+        take_us(timings_.logits_dl_us);
+        out = sample_batch_greedy(plan, tokens.data());
+        take_us(timings_.sample_us);
+    } else {
+        const std::int32_t vocab_size = model_.hparams().vocab_size;
+        std::vector<float> all_logits(
+            static_cast<std::size_t>(vocab_size) * n_slots);
+        ggml_backend_tensor_get(g.logits, all_logits.data(), 0,
+                                all_logits.size() * sizeof(float));
+        take_us(timings_.logits_dl_us);
+        out = sample_batch(plan, all_logits.data(), vocab_size);
+        take_us(timings_.sample_us);
+    }
     timings_.total_us += std::chrono::duration_cast<std::chrono::microseconds>(
                             clock::now() - t_compute_start).count();
     ++timings_.n_calls;
@@ -1795,6 +1869,7 @@ std::vector<std::vector<std::uint32_t>> ForwardEngine::generate_multi(
         // Activate the M11 packed-decode fast path for this multi-context
         // step (every request has n_tokens=1, no custom attention masks).
         plan.pure_decode = true;
+        plan.all_greedy = true;
         plan.max_n_kv = 0;
         for (const auto& rp : plan.reqs) plan.max_n_kv = std::max(plan.max_n_kv, rp.n_kv);
         plan.packed_gather_idxs.assign(

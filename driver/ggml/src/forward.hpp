@@ -106,6 +106,14 @@ public:
         // M9 LoRA: active adapter for this whole batch (single-adapter-
         // per-batch v1 restriction). nullptr = no adapter.
         const Adapter*              active_adapter = nullptr;
+
+        // GPU-greedy fast path. True iff every request's sampler is a
+        // token-producing type at temperature ≤ 1e-5 (i.e. argmax) AND
+        // there are no per-request logit masks. When set, the graph
+        // builder emits a `tokens_out` int32 tensor via ggml_argmax and
+        // compute_() downloads only those n_slots * 4 bytes instead of
+        // the full [vocab_size, n_slots] F32 logits block.
+        bool                        all_greedy = false;
     };
 
     // Per-stage timing accumulators. Used both for offline benchmarks
