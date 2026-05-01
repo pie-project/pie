@@ -105,6 +105,12 @@ async def run_benchmark(args):
             "max_batch_size": args.max_batch_size,
             "max_num_kv_pages": args.cuda_native_kv_pages,
         }
+    elif args.driver == "ggml":
+        driver_subsection = {
+            "max_batch_size": args.max_batch_size,
+            "max_num_kv_pages": args.cuda_native_kv_pages,
+            "n_gpu_layers": -1,
+        }
     else:  # dummy
         driver_subsection = {}
 
@@ -273,8 +279,8 @@ def main():
     parser.add_argument("--max-concurrent-processes", type=int, default=None, help="Maximum number of concurrent processes (default: None)")
     parser.add_argument("--max-batch-size", type=int, default=512, help="Maximum batch size for inference (default: 512)")
     parser.add_argument("--driver", default="native",
-                        choices=["native", "vllm", "sglang", "dummy", "cuda_native"],
-                        help="Inference driver: 'native', 'vllm', 'sglang', 'dummy', or 'cuda_native'")
+                        choices=["native", "vllm", "sglang", "dummy", "cuda_native", "ggml"],
+                        help="Inference driver: 'native', 'vllm', 'sglang', 'dummy', 'cuda_native', or 'ggml'")
     parser.add_argument("--cuda-native-kv-pages", dest="cuda_native_kv_pages",
                         type=int, default=2048,
                         help="KV pages for the cuda_native driver. Each page = kv_page_size tokens.")
