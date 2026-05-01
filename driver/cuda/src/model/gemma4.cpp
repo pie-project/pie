@@ -322,13 +322,18 @@ void gemma4_forward_paged(
     //     per_layer_proj   = rms_norm(per_layer_proj, ple_model_norm)  [per ple_dim row]
     //     per_layer_inputs = (per_layer_proj + per_layer_token) * 1/sqrt(2)
     //
-    // Reuses `ws.gate` (sized [max_tokens, intermediate], always
-    // ≥ N*L*ple_dim for any production config) and `ws.up` for the two
-    // intermediate buffers; we overwrite both before any later layer-
-    // local use.
+    // Allocate dedicated scratch for these — `ws.gate`/`ws.up` would
+    // get clobbered by the per-layer MLP GEMM in step 3 before the
+    // PLE block reads back the slice for layer N. Earlier versions
+    // shared the buffers and silently produced wrong PLE residuals
+    // for every token (most visibly token 0).
     const int per_layer_total = L * ple_dim;
-    void* per_layer_token = ws.gate.data();   // [N, L*ple_dim]
-    void* per_layer_proj  = ws.up.data();     // [N, L*ple_dim]
+    DeviceTensor per_layer_token_buf = DeviceTensor::allocate(
+        DType::BF16, {N, per_layer_total});
+    DeviceTensor per_layer_proj_buf = DeviceTensor::allocate(
+        DType::BF16, {N, per_layer_total});
+    void* per_layer_token = per_layer_token_buf.data();
+    void* per_layer_proj  = per_layer_proj_buf.data();
     {
         // Embed lookup into the per-layer table.
         kernels::launch_embed_bf16(
@@ -366,6 +371,9 @@ void gemma4_forward_paged(
     // (l+1)*ple_dim]` per layer below by pointer-arithmetic.
     auto* per_layer_base = static_cast<std::uint8_t*>(per_layer_proj);
     constexpr int bf16_bytes = 2;
+    cudaDeviceSynchronize();
+    dbg_dump_bf16("per_layer_inputs", per_layer_proj,
+                  static_cast<std::size_t>(N) * L * ple_dim);
 
     // Hoist decode plan(s). Gemma-4 has dual head_dim so we plan twice
     // — once at sliding head_dim, once at global head_dim. Both reuse
@@ -602,6 +610,9 @@ void gemma4_forward_paged(
         // Wrapped in a block so debugging can disable the whole step
         // (env `PIE_NO_PLE=1`) without touching the surrounding flow.
         if (getenv("PIE_NO_PLE") == nullptr) {
+        cudaDeviceSynchronize();
+        dump_l0("ple_residual_in", ws.y.data(),
+                static_cast<std::size_t>(N) * H);
         // Gather this layer's slice of per_layer_inputs:
         //   ple_signal[n, :] = per_layer_proj[n, l*ple_dim:(l+1)*ple_dim]
         // The base tensor is already laid out as [N, L*ple_dim]; we
@@ -614,6 +625,9 @@ void gemma4_forward_paged(
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.y.data(), layer.ple_input_gate->data(), ws.norm_x.data(),
             N, ple_dim, H);
+        cudaDeviceSynchronize();
+        dump_l0("ple_gate_pre_gelu", ws.norm_x.data(),
+                static_cast<std::size_t>(N) * ple_dim);
         // GeGLU(tanh) but with the per-layer input acting as the "up"
         // signal. We don't have a strided-input GeGLU kernel; instead
         // use a temporary stride-pack: copy the layer's PLE slice into
@@ -631,9 +645,15 @@ void gemma4_forward_paged(
                                        ple_dim * bf16_bytes,
                                        cudaMemcpyDeviceToDevice, stream));
         }
+        cudaDeviceSynchronize();
+        dump_l0("ple_signal_slice", ws.norm_y.data(),
+                static_cast<std::size_t>(N) * ple_dim);
         kernels::launch_geglu_tanh_bf16(
             ws.norm_x.data(), ws.norm_y.data(), ws.norm_x.data(),
             N * ple_dim, stream);
+        cudaDeviceSynchronize();
+        dump_l0("ple_gated", ws.norm_x.data(),
+                static_cast<std::size_t>(N) * ple_dim);
         // Project back to hidden, post-norm, add to residual.
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.ple_projection->data(), ws.norm_y.data(),
