@@ -18,19 +18,29 @@ __global__ void attn_sink_rescale_bf16_kernel(
     const int h = blockIdx.y;
     if (t >= N || h >= num_q_heads) return;
 
-    // r = sigmoid(lse[t,h] - sink[h]). lse is +∞ on causal masked-out
-    // rows that flashinfer fills with -inf max — it would normally
-    // produce 0 output through the `m == -inf ? 0 : 1/d` guard in the
-    // OutputTransform; we propagate that by treating non-finite lse as
-    // "no contribution" (r=1, leaves o untouched, since o is already 0).
+    // r = sigmoid(lse_natural - sink[h]).
+    //
+    // flashinfer's state_t::get_lse() returns `m + log2(d)` — that's
+    // log_2(Σ_kv exp(z · sm_scale)), not the natural log. (See
+    // `flashinfer/attention/state.cuh`; both prefill and decode kernels
+    // write this base-2 form into `params.lse`.) The HF gpt-oss sink
+    // formulation extends the softmax denominator with `exp(sink)` in
+    // natural log space — so we have to convert by `ln(2)` before
+    // taking the difference. Without this conversion the rescale was
+    // off by a factor of 0.693 in the sigmoid argument, which matches
+    // HF top-1 by accident on most prompts but produces accumulating
+    // drift that degenerates greedy decoding past a few steps on some
+    // inputs.
+    constexpr float kLn2 = 0.69314718055994530942f;
     const float lse_val = lse[t * num_q_heads + h];
     const float sink    = __bfloat162float(sinks[h]);
     float r;
     if (!isfinite(lse_val)) {
+        // lse=-inf on causal-masked-out rows; o is already 0 there, so
+        // the rescale factor is don't-care. Leave r=1.
         r = 1.0f;
     } else {
-        const float diff = lse_val - sink;
-        // sigmoid(x) = 1 / (1 + exp(-x)). Stable for both signs.
+        const float diff = lse_val * kLn2 - sink;
         r = 1.0f / (1.0f + __expf(-diff));
     }
 
