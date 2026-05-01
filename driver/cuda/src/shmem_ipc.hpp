@@ -16,7 +16,11 @@
 namespace pie_cuda_driver {
 
 inline constexpr std::uint32_t MAGIC = 0x50494533;  // 'PIE3'
-inline constexpr std::uint32_t SCHEMA_VERSION = 1;
+// Bump in lockstep with `runtime/src/shmem_ipc.rs::SCHEMA_VERSION` and
+// `pie_driver/shmem_ipc.py::SCHEMA_VERSION`. v2 added req_buf_size and
+// resp_buf_size to the global header so the Rust client no longer
+// hardcodes geometry.
+inline constexpr std::uint32_t SCHEMA_VERSION = 2;
 inline constexpr std::size_t HEADER_SIZE = 64;
 inline constexpr std::size_t SLOT_HEADER_SIZE = 64;
 

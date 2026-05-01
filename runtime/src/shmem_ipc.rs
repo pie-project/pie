@@ -1,15 +1,24 @@
 //! Shared-memory IPC fast path for `fire_batch`.
 //!
-//! Layout matches `pie_driver/shmem_ipc.py`. Both sides agree on:
+//! Layout matches `pie_driver/shmem_ipc.py` and the C++ servers under
+//! `driver/{cuda,portable}/src/shmem_ipc.{cpp,hpp}`. Both sides agree on:
 //!
-//! - 64-byte global header
+//! - 64-byte global header (magic, schema, num_slots, slot_stride,
+//!   req_buf_size, resp_buf_size — server is the source of truth)
 //! - N slots, each `slot_stride` bytes
 //! - Per-slot 64-byte header (req_seq, resp_seq, ids, lengths, timestamps)
 //! - Then `req_buf` bytes for request payload, then `resp_buf` for response
 //!
 //! Sync is via the two atomics in the slot header. Rust bumps `req_seq`
-//! after writing payload+lengths; Python bumps `resp_seq` after writing
+//! after writing payload+lengths; the server bumps `resp_seq` after writing
 //! the response. Both sides busy-spin (configurable via env vars).
+//!
+//! Geometry (`num_slots`, `req_buf_size`, `resp_buf_size`) is owned by
+//! whichever process creates the region (the driver) — only it knows how
+//! big its responses can get (e.g. full-vocab distribution probes). The
+//! Rust client reads those values out of the header at attach time rather
+//! than asserting them against compile-time constants, so the driver can
+//! resize without touching the runtime.
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -18,11 +27,23 @@ use std::sync::Mutex;
 use anyhow::{anyhow, Context, Result};
 
 pub const MAGIC: u32 = 0x50494533; // 'PIE3'
-pub const SCHEMA_VERSION: u32 = 1;
+/// Bump in lockstep with `pie_driver/shmem_ipc.py::SCHEMA_VERSION` and the
+/// `SCHEMA_VERSION` constant in `driver/{cuda,portable}/src/shmem_ipc.hpp`.
+/// v2 added `req_buf_size` / `resp_buf_size` to the global header so the
+/// client no longer hardcodes geometry.
+pub const SCHEMA_VERSION: u32 = 2;
 pub const HEADER_SIZE: usize = 64;
 pub const SLOT_HEADER_SIZE: usize = 64;
 
 pub const METHOD_TAG_FIRE_BATCH: u32 = 0;
+
+/// Global-header field offsets (relative to base).
+const HDR_OFF_MAGIC: usize = 0;
+const HDR_OFF_SCHEMA: usize = 4;
+const HDR_OFF_NUM_SLOTS: usize = 8;
+const HDR_OFF_SLOT_STRIDE: usize = 12;
+const HDR_OFF_REQ_BUF: usize = 16;
+const HDR_OFF_RESP_BUF: usize = 20;
 
 /// Slot header offsets relative to the start of the slot.
 const OFF_REQ_SEQ: usize = 0;
@@ -62,17 +83,10 @@ unsafe impl Send for ShmemClient {}
 unsafe impl Sync for ShmemClient {}
 
 impl ShmemClient {
-    /// Open an existing shmem region created by the Python server.
-    pub fn open(
-        name: &str,
-        num_slots: usize,
-        req_buf_size: usize,
-        resp_buf_size: usize,
-        spin_us: u64,
-    ) -> Result<Self> {
-        let slot_stride = SLOT_HEADER_SIZE + req_buf_size + resp_buf_size;
-        let total_size = HEADER_SIZE + num_slots * slot_stride;
-
+    /// Attach to an existing shmem region created by the driver. Geometry
+    /// (`num_slots`, `slot_stride`, `req_buf_size`, `resp_buf_size`) is read
+    /// out of the global header — the driver is the source of truth.
+    pub fn open(name: &str, spin_us: u64) -> Result<Self> {
         let cname = CString::new(name)?;
         let fd = unsafe { shm_open(cname.as_ptr(), libc::O_RDWR, 0o600) };
         if fd < 0 {
@@ -81,6 +95,23 @@ impl ShmemClient {
                 std::io::Error::last_os_error()
             ));
         }
+
+        // The driver `ftruncate`d the region to its full size before
+        // publishing it, so `fstat` is enough to learn how much to mmap.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st as *mut _) } != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(anyhow!("fstat({name}) failed: {err}"));
+        }
+        let total_size = st.st_size as usize;
+        if total_size < HEADER_SIZE {
+            unsafe { libc::close(fd) };
+            return Err(anyhow!(
+                "shmem region {name} too small: {total_size} < {HEADER_SIZE}"
+            ));
+        }
+
         let base = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -99,22 +130,54 @@ impl ShmemClient {
         unsafe { libc::close(fd) };
 
         let base = base as *mut u8;
+        let read_u32 = |off: usize| -> u32 {
+            unsafe { (base.add(off) as *const u32).read_volatile() }
+        };
 
-        // Validate header.
-        let magic = unsafe { (base as *const u32).read_volatile() };
-        let schema = unsafe { (base.add(4) as *const u32).read_volatile() };
-        let n_slots = unsafe { (base.add(8) as *const u32).read_volatile() } as usize;
-        let stride = unsafe { (base.add(12) as *const u32).read_volatile() } as usize;
+        let magic = read_u32(HDR_OFF_MAGIC);
         if magic != MAGIC {
-            return Err(anyhow!("shmem magic mismatch: got 0x{:08x}, want 0x{:08x}", magic, MAGIC));
-        }
-        if schema != SCHEMA_VERSION {
-            return Err(anyhow!("shmem schema version mismatch: got {}, want {}", schema, SCHEMA_VERSION));
-        }
-        if n_slots != num_slots || stride != slot_stride {
+            unsafe { libc::munmap(base as *mut _, total_size) };
             return Err(anyhow!(
-                "shmem geometry mismatch: server has slots={n_slots} stride={stride}, client wants slots={num_slots} stride={slot_stride}"
+                "shmem magic mismatch: got 0x{:08x}, want 0x{:08x}",
+                magic, MAGIC
             ));
+        }
+        let schema = read_u32(HDR_OFF_SCHEMA);
+        if schema != SCHEMA_VERSION {
+            unsafe { libc::munmap(base as *mut _, total_size) };
+            return Err(anyhow!(
+                "shmem schema version mismatch: got {}, want {}. \
+                 Rebuild the driver and runtime against the same tree.",
+                schema, SCHEMA_VERSION
+            ));
+        }
+        let num_slots = read_u32(HDR_OFF_NUM_SLOTS) as usize;
+        let slot_stride = read_u32(HDR_OFF_SLOT_STRIDE) as usize;
+        let req_buf_size = read_u32(HDR_OFF_REQ_BUF) as usize;
+        let resp_buf_size = read_u32(HDR_OFF_RESP_BUF) as usize;
+
+        // Cross-check: stride must be slot header + req + resp, and the
+        // file must be exactly header + N·stride. Anything else means the
+        // driver wrote an inconsistent header — bail loudly rather than
+        // silently overrunning a buffer.
+        let expected_stride = SLOT_HEADER_SIZE + req_buf_size + resp_buf_size;
+        if slot_stride != expected_stride {
+            unsafe { libc::munmap(base as *mut _, total_size) };
+            return Err(anyhow!(
+                "shmem header inconsistent: slot_stride={slot_stride} \
+                 != SLOT_HEADER_SIZE({SLOT_HEADER_SIZE}) + req_buf({req_buf_size}) + resp_buf({resp_buf_size}) = {expected_stride}"
+            ));
+        }
+        let expected_total = HEADER_SIZE + num_slots * slot_stride;
+        if total_size != expected_total {
+            unsafe { libc::munmap(base as *mut _, total_size) };
+            return Err(anyhow!(
+                "shmem size mismatch: file is {total_size} bytes, header implies {expected_total} (slots={num_slots} stride={slot_stride})"
+            ));
+        }
+        if num_slots == 0 {
+            unsafe { libc::munmap(base as *mut _, total_size) };
+            return Err(anyhow!("shmem header reports num_slots=0"));
         }
 
         let slot_locks = (0..num_slots).map(|_| Mutex::new(())).collect();

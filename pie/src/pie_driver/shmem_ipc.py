@@ -7,6 +7,8 @@ Layout of the shmem region:
       4:  u32 schema_version
       8:  u32 num_slots
       12: u32 slot_stride
+      16: u32 req_buf_size       (per-slot request payload buffer size)
+      20: u32 resp_buf_size      (per-slot response payload buffer size)
       ... rest reserved ...
 
     [N slots, each slot_stride bytes]
@@ -23,6 +25,13 @@ Layout of the shmem region:
         64: request payload bytes
         ...:  response payload bytes
 
+The server (this module + the C++ servers under driver/{cuda,portable}) is
+the source of truth for geometry — only it knows how big its responses can
+get (e.g. full-vocab distribution probes). The Rust client at
+``runtime/src/shmem_ipc.rs`` reads ``num_slots`` / ``slot_stride`` /
+``req_buf_size`` / ``resp_buf_size`` out of the header at attach time
+rather than asserting them against compile-time constants.
+
 For one in-flight at a time per slot, both sides spin on req_seq/resp_seq.
 """
 
@@ -34,13 +43,18 @@ import os
 import time
 from typing import Optional, Tuple
 
-# Shmem layout constants — must match Rust side (runtime/src/shmem_ipc.rs).
+# Shmem layout constants — must match Rust side (runtime/src/shmem_ipc.rs)
+# and the C++ servers (driver/{cuda,portable}/src/shmem_ipc.hpp). Bump
+# SCHEMA_VERSION in lockstep across all three.
 MAGIC = 0x50494533  # 'PIE3'
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HEADER_SIZE = 64
 SLOT_HEADER_SIZE = 64
 DEFAULT_SLOTS = 8
-# Each slot holds REQUEST_BUF + RESPONSE_BUF after slot header.
+# Each slot holds REQUEST_BUF + RESPONSE_BUF after slot header. These are
+# only defaults — drivers pick whatever sizes match their workload (e.g.
+# pie_driver/worker.py uses an 8 MiB resp_buf to fit full-vocab probes)
+# and the values are written into the header for the Rust client to read.
 DEFAULT_REQ_BUF = 4 * 1024 * 1024   # 4 MB
 DEFAULT_RESP_BUF = 1 * 1024 * 1024  # 1 MB
 DEFAULT_SLOT_STRIDE = SLOT_HEADER_SIZE + DEFAULT_REQ_BUF + DEFAULT_RESP_BUF
@@ -100,12 +114,16 @@ class ShmemServer:
         self._buf = (ctypes.c_uint8 * self.total_size).from_buffer(self._mm)
         self._addr = ctypes.addressof(self._buf)
 
-        # Initialize header
+        # Initialize header. Layout matches the Rust client's
+        # `HDR_OFF_*` constants in runtime/src/shmem_ipc.rs; geometry
+        # fields here are what the client reads to size its mmap.
         ctypes.memset(self._addr, 0, HEADER_SIZE)
         self._u32_at(0, MAGIC)
         self._u32_at(4, SCHEMA_VERSION)
         self._u32_at(8, num_slots)
         self._u32_at(12, self.slot_stride)
+        self._u32_at(16, req_buf)
+        self._u32_at(20, resp_buf)
 
         # Zero out slot headers
         for i in range(num_slots):

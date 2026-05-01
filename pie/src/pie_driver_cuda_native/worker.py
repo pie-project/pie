@@ -106,7 +106,13 @@ def _write_startup_toml(
         'name = "/pie_shmem"',
         "num_slots = 8",
         "req_buf = 4194304",
-        "resp_buf = 4194304",
+        # 8 MiB resp_buf matches what pie_driver/worker.py uses for native
+        # — sized to fit a full-vocab Sampler::Dist payload (vocab × 8 bytes,
+        # ≈2.6 MiB on 150K-vocab models) plus per-request overhead and the
+        # spec-mode multi-slot tail. The Rust client reads this from the
+        # shmem header at attach time, so changing it is purely a driver-side
+        # decision.
+        "resp_buf = 8388608",
         "spin_us = 0",
         "",
         "[model]",

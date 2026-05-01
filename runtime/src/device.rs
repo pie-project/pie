@@ -22,19 +22,10 @@ use tokio::sync::oneshot;
 
 use crate::service::{ServiceArray, ServiceHandler};
 
-/// Default shmem region name (one worker per host).
+/// Default shmem region name (one worker per host). Geometry of the region
+/// — slot count, request/response buffer sizes — is owned by the driver
+/// and read out of the header at attach time; see `shmem_ipc::ShmemClient`.
 const SHMEM_NAME: &str = "/pie_shmem";
-/// Number of slots in the shmem ring (bounds in-flight shmem concurrency).
-const SHMEM_SLOTS: usize = 8;
-/// Per-slot request payload buffer size.
-const SHMEM_REQ_BUF: usize = 4 * 1024 * 1024;
-/// Per-slot response payload buffer size. Sized to hold a full-vocab
-/// `Distribution` probe / `Sampler::Dist` payload (vocab × 8 bytes ≈
-/// 2.6 MiB on 150K-vocab models) plus per-request overhead and the
-/// spec-mode multi-slot tail. 1 MiB is too small the moment a
-/// distribution probe is active; 4 MiB is too tight on multi-slot
-/// batches; 8 MiB gives comfortable headroom.
-const SHMEM_RESP_BUF: usize = 8 * 1024 * 1024;
 /// Busy-spin window (µs) before yielding while waiting on resp_seq.
 const SHMEM_SPIN_US: u64 = 10_000;
 
@@ -148,13 +139,7 @@ fn get_or_init_shmem_client(_device_idx: usize) -> Result<Arc<crate::shmem_ipc::
     if let Some(c) = SHMEM_CLIENTS.get(&0) {
         return Ok(c.clone());
     }
-    let client = crate::shmem_ipc::ShmemClient::open(
-        SHMEM_NAME,
-        SHMEM_SLOTS,
-        SHMEM_REQ_BUF,
-        SHMEM_RESP_BUF,
-        SHMEM_SPIN_US,
-    )?;
+    let client = crate::shmem_ipc::ShmemClient::open(SHMEM_NAME, SHMEM_SPIN_US)?;
     let arc = Arc::new(client);
     SHMEM_CLIENTS.insert(0, arc.clone());
     Ok(arc)

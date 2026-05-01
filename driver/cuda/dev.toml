@@ -1,11 +1,16 @@
 # Sample driver/cuda config. Pass via `pie_driver_cuda --config dev.toml`.
 
-# Shmem IPC channel — must match the runtime's `[model.<name>.driver]` config.
+# Shmem IPC channel. Geometry is owned by the driver: the values written
+# here go straight into the shmem header, and the Rust runtime reads them
+# at attach time (runtime/src/shmem_ipc.rs). Only `name` is shared by
+# convention with the runtime side.
 [shmem]
-# Hardcoded across the stack (runtime/src/device.rs, pie_driver/worker.py).
 name = "/pie_shmem"
 num_slots = 8
 req_buf = 4194304   # 4 MiB
+# Standalone-test default. When launched via pie_driver_cuda_native the
+# wrapper writes a 8 MiB resp_buf to fit full-vocab Distribution probes;
+# 1 MiB is fine for the bench harness in tests/.
 resp_buf = 1048576  # 1 MiB
 spin_us = 0         # 0 = pure busy spin
 
