@@ -13,21 +13,19 @@ import os
 import torch
 import torch.nn as nn
 import math
-from .rand_mv import RAND_MV_AVAILABLE
 
-if RAND_MV_AVAILABLE:
-    from . import rand_mv
-
-# Fast path uses the CUDA backend's sectioned variants to fuse Q/K/V
-# noise calls into single launches per layer. Metal lacks them, so it
-# falls back to the legacy 4-call path. Set PIE_ADAPTER_FORCE_SLOW=1
-# to force the legacy path for debugging.
-_HAS_FUSED_RAND_MV = (
-    RAND_MV_AVAILABLE
-    and hasattr(rand_mv, "batched_randn_matmul_sectioned")
-    and hasattr(rand_mv, "batched_randn_matmul_sectioned_per_input")
-    and not bool(int(os.environ.get("PIE_ADAPTER_FORCE_SLOW", "0") or "0"))
-)
+# rand_mv (the noise-injection / random-matmul kernel under
+# `pie_driver_sgl.rand_mv`) is not connected for this release. The code
+# is preserved for the CMA-ES adapter path but is gated off at the
+# module boundary so that nothing in the sglang driver's import graph
+# pulls in the rand_mv module — and therefore no JIT-compiled CUDA
+# kernel ever has to load on server boot.
+#
+# To re-enable the adapter math: import RAND_MV_AVAILABLE / rand_mv
+# inside the methods that use them and drop the False overrides below.
+RAND_MV_AVAILABLE = False
+rand_mv = None
+_HAS_FUSED_RAND_MV = False
 
 
 def run_length_encode(data: list[int]) -> list[tuple[int, int]]:
