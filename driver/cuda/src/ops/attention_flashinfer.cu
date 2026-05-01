@@ -198,11 +198,17 @@ void plan_attention_flashinfer_decode_bf16(
                 num_requests, num_q_heads, page_size, gqa_group_size,
                 workspace, stream);
             break;
+        case 512:
+            status = plan_decode_for_head_dim<512>(
+                cache, indptr_h_buf,
+                num_requests, num_q_heads, page_size, gqa_group_size,
+                workspace, stream);
+            break;
         default:
             throw std::runtime_error(
                 "flashinfer decode: unsupported head_dim " +
                 std::to_string(head_dim) +
-                " (instantiated: 64, 96, 128, 256)");
+                " (instantiated: 64, 128, 256, 512)");
     }
     CUDA_CHECK(status);
 
@@ -347,6 +353,10 @@ void dispatch_attention_flashinfer_decode_bf16(
             status = dispatch_decode_for_head_dim<256>(cache, q, k_pages, v_pages, o,
                 kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale);
             break;
+        case 512:
+            status = dispatch_decode_for_head_dim<512>(cache, q, k_pages, v_pages, o,
+                kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale);
+            break;
         default:
             throw std::runtime_error(
                 "flashinfer decode dispatch: unsupported head_dim " +
@@ -400,9 +410,9 @@ void launch_attention_flashinfer_prefill_bf16(
     float logits_soft_cap,
     float sm_scale)
 {
-    if (head_dim != 64 && head_dim != 128 && head_dim != 256) {
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
         throw std::runtime_error(
-            "flashinfer prefill: instantiated for HEAD_DIM ∈ {64, 128, 256}; got " +
+            "flashinfer prefill: instantiated for HEAD_DIM ∈ {64, 128, 256, 512}; got " +
             std::to_string(head_dim));
     }
 
@@ -517,6 +527,9 @@ void launch_attention_flashinfer_prefill_bf16(
         } else if (head_dim == 256) {
             return prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kCausal, Variant>(
                 params, plan_info, tmp_v, tmp_s, stream);
+        } else if (head_dim == 512) {
+            return prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kCausal, Variant>(
+                params, plan_info, tmp_v, tmp_s, stream);
         } else {
             return prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kCausal, Variant>(
                 params, plan_info, tmp_v, tmp_s, stream);
@@ -563,9 +576,9 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     cudaStream_t stream,
     int /* window_left */)  // ignored — kCustom owns the mask
 {
-    if (head_dim != 64 && head_dim != 128 && head_dim != 256) {
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
         throw std::runtime_error(
-            "flashinfer prefill (custom mask): instantiated for HEAD_DIM ∈ {64, 128, 256}; got " +
+            "flashinfer prefill (custom mask): instantiated for HEAD_DIM ∈ {64, 128, 256, 512}; got " +
             std::to_string(head_dim));
     }
 
@@ -670,6 +683,9 @@ void launch_attention_flashinfer_prefill_custom_bf16(
             params, plan_info, tmp_v, tmp_s, stream);
     } else if (head_dim == 256) {
         status = prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kCustom, AttnVariantCustom>(
+            params, plan_info, tmp_v, tmp_s, stream);
+    } else if (head_dim == 512) {
+        status = prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kCustom, AttnVariantCustom>(
             params, plan_info, tmp_v, tmp_s, stream);
     } else {
         status = prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kCustom, AttnVariantCustom>(

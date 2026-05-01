@@ -164,4 +164,79 @@ void launch_rope_yarn_bf16(
         static_cast<float>(original_max_position));
 }
 
+// ── Partial rotary (Gemma-4 full-attention layers) ─────────────────────────
+
+namespace {
+
+// Same as `rope_bf16_kernel` but rotates only `rotary_dim` of each head's
+// `head_dim` channels. Pairs are (i, i + rotary_dim/2). Channels in
+// `[rotary_dim, head_dim)` are left untouched.
+__global__ void rope_partial_bf16_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const std::int32_t* __restrict__ positions,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta)
+{
+    const int n = blockIdx.x;
+    const int total_heads = num_q_heads + num_kv_heads;
+    const int half = rotary_dim / 2;
+    const int pos = positions[n];
+
+    for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
+        const int head_idx = t / half;
+        const int dim_pair = t % half;
+
+        const float freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) /
+                   static_cast<float>(rotary_dim));
+        const float ang = static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+
+        if (head_idx < num_q_heads) {
+            __nv_bfloat16* qp = q +
+                (static_cast<long long>(n) * num_q_heads + head_idx) * head_dim;
+            const float a = __bfloat162float(qp[dim_pair]);
+            const float b = __bfloat162float(qp[dim_pair + half]);
+            qp[dim_pair]        = __float2bfloat16(a * cos_v - b * sin_v);
+            qp[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
+        } else {
+            const int kv_h = head_idx - num_q_heads;
+            __nv_bfloat16* kp = k +
+                (static_cast<long long>(n) * num_kv_heads + kv_h) * head_dim;
+            const float a = __bfloat162float(kp[dim_pair]);
+            const float b = __bfloat162float(kp[dim_pair + half]);
+            kp[dim_pair]        = __float2bfloat16(a * cos_v - b * sin_v);
+            kp[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
+        }
+    }
+}
+
+}  // namespace
+
+void launch_rope_partial_bf16(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid(num_tokens);
+    dim3 block(BLOCK);
+    rope_partial_bf16_kernel<<<grid, block, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(q),
+        static_cast<__nv_bfloat16*>(k),
+        positions,
+        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
+}
+
 }  // namespace pie_cuda_driver::kernels

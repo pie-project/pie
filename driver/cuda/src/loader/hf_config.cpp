@@ -37,17 +37,28 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open config.json: " + path.string());
 
-    nlohmann::json j;
-    in >> j;
+    nlohmann::json j_root;
+    in >> j_root;
     const auto path_str = path.string();
 
     HfConfig cfg;
 
-    if (!j.contains("architectures") || !j["architectures"].is_array() || j["architectures"].empty()) {
+    if (!j_root.contains("architectures") || !j_root["architectures"].is_array() || j_root["architectures"].empty()) {
         throw std::runtime_error("config.json: missing or empty 'architectures'");
     }
-    cfg.arch_name = j["architectures"][0].get<std::string>();
-    cfg.model_type = optional<std::string>(j, "model_type", "");
+    cfg.arch_name = j_root["architectures"][0].get<std::string>();
+
+    // Gemma-4 (and other multimodal Gemma checkpoints) nest the text-
+    // tower's hyperparameters under `text_config` while keeping the
+    // architecture name + a stub `model_type=gemma4` at the top level.
+    // Dereference once so the rest of the parser reads from the text
+    // sub-config when present.
+    const auto& j = j_root.contains("text_config") &&
+                            j_root["text_config"].is_object()
+                        ? j_root["text_config"]
+                        : j_root;
+    cfg.model_type = optional<std::string>(j, "model_type",
+                       optional<std::string>(j_root, "model_type", ""));
 
     cfg.hidden_size              = require<int>(j, "hidden_size", path_str);
     cfg.intermediate_size        = require<int>(j, "intermediate_size", path_str);
@@ -168,6 +179,32 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.gemma_attn_logit_softcap = 0.f;
     if (j.contains("attn_logit_softcapping") && !j["attn_logit_softcapping"].is_null()) {
         cfg.gemma_attn_logit_softcap = j["attn_logit_softcapping"].get<float>();
+    }
+    cfg.gemma_hidden_size_per_layer_input =
+        optional<int>(j, "hidden_size_per_layer_input", 0);
+    cfg.num_kv_shared_layers = optional<int>(j, "num_kv_shared_layers", 0);
+
+    // Gemma-4 nests RoPE settings under `rope_parameters` keyed by
+    // attention type. Each entry has `rope_theta` and (full only)
+    // `partial_rotary_factor`. We pre-expand into per-layer vectors
+    // so the forward doesn't have to consult layer_types twice.
+    if (j.contains("rope_parameters") && j["rope_parameters"].is_object()
+            && !cfg.layer_types.empty()) {
+        const auto& rope_params = j["rope_parameters"];
+        cfg.gemma_per_layer_rope_theta.assign(
+            cfg.layer_types.size(), cfg.rope_theta);
+        cfg.gemma_per_layer_partial_rotary_factor.assign(
+            cfg.layer_types.size(), 1.0f);
+        for (std::size_t i = 0; i < cfg.layer_types.size(); ++i) {
+            const auto& t = cfg.layer_types[i];
+            if (rope_params.contains(t) && rope_params[t].is_object()) {
+                const auto& e = rope_params[t];
+                cfg.gemma_per_layer_rope_theta[i] =
+                    optional<float>(e, "rope_theta", cfg.rope_theta);
+                cfg.gemma_per_layer_partial_rotary_factor[i] =
+                    optional<float>(e, "partial_rotary_factor", 1.0f);
+            }
+        }
     }
 
     cfg.torch_dtype = optional<std::string>(j, "torch_dtype", "bfloat16");

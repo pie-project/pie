@@ -53,4 +53,19 @@ void launch_rope_yarn_bf16(
     int   original_max_position,
     cudaStream_t stream);
 
+// Partial rotary embedding (Gemma-4 full-attention layers). Rotates
+// only the first `rotary_dim` of each head's `head_dim` channels;
+// the trailing `head_dim - rotary_dim` channels pass through
+// unchanged. The pair convention is HF's (i, i + rotary_dim/2).
+void launch_rope_partial_bf16(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

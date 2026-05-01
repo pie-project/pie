@@ -94,6 +94,20 @@ struct HfConfig {
     float gemma_final_logit_softcap;
     float gemma_attn_logit_softcap;
 
+    // Gemma-4 — Per-Layer Embeddings + KV-cache sharing. `ple_dim` is
+    // 0 on every other model (no PLE residual block runs). When
+    // `num_kv_shared_layers > 0` the last N layers reuse K/V from a
+    // source layer of the same `layer_types[i]`.
+    int gemma_hidden_size_per_layer_input;
+    int num_kv_shared_layers;
+
+    // Gemma-4 per-layer rope_theta (HF nests under `rope_parameters`),
+    // including `partial_rotary_factor` for full-attention layers
+    // (typically 0.25 — only the first 25% of head_dim is rotated).
+    // Empty for non-Gemma-4 models. Indexed by layer.
+    std::vector<float> gemma_per_layer_rope_theta;
+    std::vector<float> gemma_per_layer_partial_rotary_factor;
+
     // ── Storage dtype as declared on disk (for the safetensors loader).
     std::string torch_dtype;   // "bfloat16", "float16", "float32".
 };

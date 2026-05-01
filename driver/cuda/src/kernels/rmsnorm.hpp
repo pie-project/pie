@@ -32,4 +32,16 @@ void launch_rmsnorm_gemma_bf16(
     float eps,
     cudaStream_t stream);
 
+// RMSNorm with no learnable scale (gamma == 1). Used by Gemma-4's
+// V-Norm — `v / rms(v)` per-head, no weight. Equivalent to running
+// `launch_rmsnorm_bf16` against an all-ones weight tensor, but
+// allocation-free.
+void launch_rmsnorm_no_scale_bf16(
+    const void* x,
+    void* y,
+    int num_rows,
+    int hidden,
+    float eps,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels
