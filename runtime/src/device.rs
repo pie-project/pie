@@ -29,9 +29,11 @@ const SHMEM_SLOTS: usize = 8;
 /// Per-slot request payload buffer size.
 const SHMEM_REQ_BUF: usize = 4 * 1024 * 1024;
 /// Per-slot response payload buffer size. Sized to hold a full-vocab
-/// `Distribution` probe (vocab × 8 bytes) plus per-request overhead and
-/// the spec-mode multi-slot tail; 1 MiB is too small for models with
-/// ~150K vocab once a distribution probe is active.
+/// `Distribution` probe / `Sampler::Dist` payload (vocab × 8 bytes ≈
+/// 2.6 MiB on 150K-vocab models) plus per-request overhead and the
+/// spec-mode multi-slot tail. 1 MiB is too small the moment a
+/// distribution probe is active; 4 MiB is too tight on multi-slot
+/// batches; 8 MiB gives comfortable headroom.
 const SHMEM_RESP_BUF: usize = 8 * 1024 * 1024;
 /// Busy-spin window (µs) before yielding while waiting on resp_seq.
 const SHMEM_SPIN_US: u64 = 10_000;

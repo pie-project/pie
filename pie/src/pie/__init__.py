@@ -38,7 +38,7 @@ from pie import _runtime  # noqa: F401
 # extras aren't installed.
 
 def _register_known_drivers() -> None:
-    for module_name in ("pie_driver", "pie_driver_dummy", "pie_driver_vllm", "pie_driver_sgl"):
+    for module_name in ("pie_driver", "pie_driver_cuda_native", "pie_driver_portable", "pie_driver_dummy", "pie_driver_vllm", "pie_driver_sgl"):
         try:
             __import__(module_name)
         except ImportError:

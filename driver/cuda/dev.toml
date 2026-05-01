@@ -1,0 +1,22 @@
+# Sample driver/cuda config. Pass via `pie_driver_cuda --config dev.toml`.
+
+# Shmem IPC channel — must match the runtime's `[model.<name>.driver]` config.
+[shmem]
+# Hardcoded across the stack (runtime/src/device.rs, pie_driver/worker.py).
+name = "/pie_shmem"
+num_slots = 8
+req_buf = 4194304   # 4 MiB
+resp_buf = 1048576  # 1 MiB
+spin_us = 0         # 0 = pure busy spin
+
+[model]
+hf_repo = "Qwen/Qwen3-0.6B"
+device = "cuda:0"
+dtype = "bfloat16"
+
+# KV cache / batching — same knobs the Python driver exposes.
+[batching]
+kv_page_size = 32
+max_num_kv_pages = 1024
+max_batch_tokens = 10240
+max_batch_size = 512

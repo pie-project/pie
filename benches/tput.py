@@ -104,6 +104,17 @@ async def run_benchmark(args):
         }
         if args.sglang_attention_backend is not None:
             driver_subsection["attention_backend"] = args.sglang_attention_backend
+    elif args.driver == "cuda_native":
+        driver_subsection = {
+            "max_batch_size": args.max_batch_size,
+            "max_num_kv_pages": args.cuda_native_kv_pages,
+        }
+    elif args.driver == "portable":
+        driver_subsection = {
+            "max_batch_size": args.max_batch_size,
+            "max_num_kv_pages": args.cuda_native_kv_pages,
+            "n_gpu_layers": -1,
+        }
     else:  # dummy
         driver_subsection = {}
 
@@ -274,8 +285,12 @@ def main():
                         help="Maximum number of concurrent processes (default: None — uncapped, saturate the GPU)")
     parser.add_argument("--max-batch-size", type=int, default=2048,
                         help="Maximum batch size for inference (default: 2048 — let the GPU dictate).")
-    parser.add_argument("--driver", default="native", choices=["native", "vllm", "sglang", "dummy"],
-                        help="Inference driver: 'native', 'vllm', 'sglang', or 'dummy'")
+    parser.add_argument("--driver", default="native",
+                        choices=["native", "vllm", "sglang", "dummy", "cuda_native", "portable"],
+                        help="Inference driver: 'native', 'vllm', 'sglang', 'dummy', 'cuda_native', or 'portable'")
+    parser.add_argument("--cuda-native-kv-pages", dest="cuda_native_kv_pages",
+                        type=int, default=2048,
+                        help="KV pages for the cuda_native driver. Each page = kv_page_size tokens.")
     parser.add_argument("--vllm-attention-backend", default=None,
                         help="vLLM attention backend (FLASH_ATTN / FLASHINFER / etc.). Only used when --driver=vllm")
     parser.add_argument("--sglang-attention-backend", default=None,
