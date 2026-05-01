@@ -355,7 +355,8 @@ def _bootstrap(
         f"swap_pool={group0_caps.swap_pool_size}, "
         f"vocab={group0_caps.vocab_size}, "
         f"max_model_len={group0_caps.max_model_len}, "
-        f"dtype={group0_caps.activation_dtype}[/dim]"
+        f"dtype={group0_caps.activation_dtype}, "
+        f"user_mask={'yes' if group0_caps.supports_user_attention_mask else 'no'}[/dim]"
     )
 
     # Build Rust config from the per-group capabilities.

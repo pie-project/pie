@@ -432,6 +432,14 @@ pub struct BatchedForwardPassRequest {
 
     // === Inference hints ===
     pub single_token_mode: bool,
+    /// True iff at least one request in this batch supplied a user attention
+    /// mask. Distinct from `flattened_masks.is_empty()` because the runtime
+    /// synthesizes a causal-default mask for any inferlet that didn't provide
+    /// one. Used internally by `single_token_mode` (a real user mask forces
+    /// the prefill path) and exposed for future routing: drivers advertise
+    /// `DriverCapabilities.supports_user_attention_mask`, and the runtime
+    /// routes mask-dependent requests to a driver that returns True.
+    pub has_user_mask: bool,
 
     // === Routing ===
     pub device_id: DeviceId,
@@ -469,6 +477,7 @@ impl BatchedForwardPassRequest {
             output_spec_flags: Vec::new(),
             context_ids: Vec::new(),
             single_token_mode: true,
+            has_user_mask: false,
             device_id,
         }
     }
@@ -605,6 +614,9 @@ impl BatchedForwardPassRequest {
         // built-in causal already covers them.
         if req.tokens.len() > 1 || req.has_user_mask {
             self.single_token_mode = false;
+        }
+        if req.has_user_mask {
+            self.has_user_mask = true;
         }
     }
 

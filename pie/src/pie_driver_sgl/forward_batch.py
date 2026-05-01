@@ -22,24 +22,11 @@ rather than running a second numba kernel).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import numba
 import numpy as np
 import torch
-
-
-@dataclass(frozen=True)
-class BatchMeta:
-    """Per-batch state the mask strategies and forward_pass need after the
-    `ForwardBatch` is built. Returned alongside the FB so we don't tunnel
-    fields through `_pie_*` attributes on a torch dataclass.
-    """
-
-    seq_lens_np: np.ndarray         # int32, (batch,) — full kv length per request
-    qo_indptr_np: np.ndarray        # int32, (batch+1,) — pie's CSR
-    mask_indptr: torch.Tensor       # int64, (batch+1,) on device — flat mask offsets
 
 
 @numba.njit(cache=True, parallel=False)
@@ -64,41 +51,15 @@ def _build_req_to_token_rows(
             out[r, i] = block_id * page_size + (i % page_size)
 
 
-def _compute_mask_indptr(
-    qo_indptr_np: np.ndarray,
-    seq_lens_np: np.ndarray,
-    device: torch.device,
-) -> torch.Tensor:
-    """Cumulative offset into pie's flat BRLE-decoded mask buffer.
-
-    For request r with `query_len_r = qo_indptr[r+1] - qo_indptr[r]` query
-    tokens and `seq_lens[r]` total kv tokens, the mask occupies
-    `query_len_r * seq_lens[r]` consecutive bools. mask_indptr is the
-    cumulative-sum of those sizes.
-
-    Matches `cur_seq_mask_start_idx = mask_indptr[r]` in
-    sglang/layers/attention/triton_ops/extend_attention.py:286.
-    """
-    batch = qo_indptr_np.shape[0] - 1
-    if batch == 0:
-        return torch.zeros(1, dtype=torch.int64, device=device)
-    query_lens = (qo_indptr_np[1:] - qo_indptr_np[:-1]).astype(np.int64)
-    per_req = query_lens * seq_lens_np.astype(np.int64)
-    indptr_np = np.zeros(batch + 1, dtype=np.int64)
-    np.cumsum(per_req, out=indptr_np[1:])
-    return torch.from_numpy(indptr_np).to(device, non_blocking=True)
-
-
 def build_sglang_forward_batch(
     *,
     runner: Any,                     # sglang ModelRunner
     inputs: dict,
     page_size: int,
     device: torch.device,
-) -> tuple[Any, BatchMeta]:
-    """Build a `ForwardBatch` + `BatchMeta` from pie's `inputs` dict."""
+) -> Any:
+    """Build a `ForwardBatch` from pie's `inputs` dict."""
     from sglang.srt.model_executor.forward_batch_info import (
-        CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
     )
@@ -161,22 +122,18 @@ def build_sglang_forward_batch(
     extend_prefix_lens_t = torch.from_numpy(extend_prefix_lens_np).to(device, non_blocking=True)
     positions = inputs["position_ids"].to(device=device, dtype=torch.int64, non_blocking=True)
 
-    # Pick DECODE when every request contributes one query token AND no user
-    # mask is set (`single_token_inference_mode` upstream guarantees both).
-    # DECODE is materially faster than EXTEND on the cuda-graph fast path
-    # (~+33% req/s eager, plus another ~30% from the captured replay). The
-    # graph capture is wired through `_HiddenCapture` writing into a stable
-    # buffer; the loader defers `init_device_graphs()` until after that
-    # hook is installed (see forward_pass.py / loader.py).
-    use_decode = (
-        bool(inputs.get("single_token_inference_mode"))
-        and num_query_tokens == batch_size
-    )
-
-    # `capture_hidden_mode=NULL` is required so sglang's
-    # `cuda_graph_runner.can_run()` max() doesn't choke on a None default;
-    # pie owns hidden-state capture via `_HiddenCapture`.
-    fb_kwargs = dict(
+    # We always use EXTEND. SGLang's decode kernel doesn't accept custom_mask
+    # nor pie's caller-supplied positions; the extend kernel handles
+    # query_len=1 fine via per-request `extend_seq_lens=1, prefix_lens=N`.
+    #
+    # NOTE: this means sglang's CUDA graphs (captured for the DECODE kernel)
+    # can't be used at high concurrency — pie throughput on sglang plateaus
+    # around 100 req/s on c=256 workloads on a 4090 because every step runs
+    # the prefill kernel. Proper fix requires routing single-token-no-mask
+    # batches through ForwardMode.DECODE plus the missing graph-runner
+    # plumbing (`capture_hidden_mode`, etc.) — out of scope for now.
+    fb = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
         batch_size=batch_size,
         input_ids=inputs["token_ids"].to(device=device, dtype=torch.int32, non_blocking=True),
         req_pool_indices=req_pool_indices_t,
@@ -185,29 +142,13 @@ def build_sglang_forward_batch(
         seq_lens_sum=int(seq_lens_np.sum()),
         seq_lens_cpu=seq_lens_cpu_t,
         positions=positions,
+        extend_num_tokens=int(extend_seq_lens_np.sum()),
+        extend_seq_lens=extend_seq_lens_t,
+        extend_prefix_lens=extend_prefix_lens_t,
+        extend_prefix_lens_cpu=extend_prefix_lens_np.tolist(),
+        extend_seq_lens_cpu=extend_seq_lens_np.tolist(),
         req_to_token_pool=runner.req_to_token_pool,
         token_to_kv_pool=runner.token_to_kv_pool,
         attn_backend=runner.attn_backend,
-        capture_hidden_mode=CaptureHiddenMode.NULL,
     )
-
-    if use_decode:
-        fb = ForwardBatch(forward_mode=ForwardMode.DECODE, **fb_kwargs)
-    else:
-        # EXTEND covers prefill (multi-token) batches and any batch carrying
-        # a user-supplied mask, since DECODE can't honor `custom_mask`.
-        fb = ForwardBatch(
-            forward_mode=ForwardMode.EXTEND,
-            extend_num_tokens=int(extend_seq_lens_np.sum()),
-            extend_seq_lens=extend_seq_lens_t,
-            extend_prefix_lens=extend_prefix_lens_t,
-            extend_prefix_lens_cpu=extend_prefix_lens_np.tolist(),
-            extend_seq_lens_cpu=extend_seq_lens_np.tolist(),
-            **fb_kwargs,
-        )
-    meta = BatchMeta(
-        seq_lens_np=seq_lens_np,
-        qo_indptr_np=qo_indptr_np,
-        mask_indptr=_compute_mask_indptr(qo_indptr_np, seq_lens_np, device),
-    )
-    return fb, meta
+    return fb
