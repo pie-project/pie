@@ -748,7 +748,7 @@ def _leader_loop(
     SHMEM_NAME = "/pie_shmem"
     SHMEM_SLOTS = 8
     SHMEM_REQ_BUF = 4 * 1024 * 1024
-    SHMEM_RESP_BUF = 1 * 1024 * 1024
+    SHMEM_RESP_BUF = 4 * 1024 * 1024
     SHMEM_BUSY_US = 10_000
 
     from pie_driver import shmem_ipc as _shm

@@ -5,6 +5,7 @@
 // `BatchedForwardPassRequest`s, logs them, and replies with an empty payload.
 // Model loading + flashinfer-backed forward pass are the next milestones.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -13,6 +14,7 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <utility>
 
 #include <CLI/CLI.hpp>
 #include <cuda_bf16.h>
@@ -22,7 +24,9 @@
 #include <vector>
 
 #include "attention_workspace.hpp"
+#include "brle.hpp"
 #include "config.hpp"
+#include "control_socket.hpp"
 #include "cuda_check.hpp"
 #include "engine.hpp"
 #include "kernels/argmax.hpp"
@@ -31,10 +35,12 @@
 #include "kv_cache.hpp"
 #include "model/qwen3.hpp"
 #include "model/qwen3_forward.hpp"
+#include "swap_pool.hpp"
+#include <thread>
+#include <unistd.h>
 #include "ops/gemm.hpp"
-#include "response_writer.hpp"
+#include "request_handler.hpp"
 #include "shmem_ipc.hpp"
-#include "shmem_schema.hpp"
 
 namespace {
 
@@ -57,13 +63,19 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                bool paged)
 {
     auto engine = pie_cuda_driver::Engine::load(cfg);
-    if (engine.hf_config().model_type != "qwen3" &&
-        engine.hf_config().model_type != "qwen3_5") {
-        std::cerr << "[parity] unsupported model_type: "
-                  << engine.hf_config().model_type << "\n";
-        return 2;
+    {
+        const auto& mt = engine.hf_config().model_type;
+        const bool supported =
+            mt == "qwen3" || mt == "qwen3_5"
+         || mt == "qwen2"
+         || mt == "llama" || mt == "llama3"
+         || mt == "mistral" || mt == "mistral3";
+        if (!supported) {
+            std::cerr << "[parity] unsupported model_type: " << mt << "\n";
+            return 2;
+        }
     }
-    const auto weights = pie_cuda_driver::model::bind_qwen3(engine);
+    const auto weights = pie_cuda_driver::model::bind_llama_like(engine);
 
     // Read tokens from disk.
     std::vector<std::int32_t> host_tokens;
@@ -208,6 +220,11 @@ int main(int argc, char** argv) {
                        "Where to write the last-token logits as bf16 [vocab]");
     parity->add_flag("--parity-paged", parity_paged,
                      "Run the paged forward path (BPIQ-shaped KV layout)");
+
+    int control_fd = -1;
+    app.add_option("--control-fd", control_fd,
+                   "Pre-opened SOCK_SEQPACKET fd for the wrapper control "
+                   "channel (copy_d2h / copy_h2d / copy_d2d / copy_h2h).");
     CLI11_PARSE(app, argc, argv);
 
     const auto cfg = pie_cuda_driver::load_config(config_path);
@@ -231,16 +248,28 @@ int main(int argc, char** argv) {
 
     auto engine = pie_cuda_driver::Engine::load(cfg);
 
-    if (engine.hf_config().model_type != "qwen3" &&
-        engine.hf_config().model_type != "qwen3_5") {
-        std::cerr << "[pie-driver-cuda] arch '"
-                  << engine.hf_config().model_type
-                  << "' not yet supported (only qwen3 / qwen3_5 in M1.4)\n";
-        return 2;
+    {
+        const auto& mt = engine.hf_config().model_type;
+        // Llama-like family. Same RMSNorm + RoPE + GQA + SwiGLU graph; the
+        // only branch is whether per-head q/k_norm exists (Qwen3 quirk),
+        // which is captured in HfConfig.use_qk_norm.
+        const bool supported =
+            mt == "qwen3" || mt == "qwen3_5"
+         || mt == "qwen2"
+         || mt == "llama" || mt == "llama3"
+         || mt == "mistral" || mt == "mistral3";
+        if (!supported) {
+            std::cerr << "[pie-driver-cuda] arch '" << mt
+                      << "' not yet supported (Qwen2/3/3.5, Llama 3, Mistral)\n";
+            return 2;
+        }
     }
-    const auto weights = pie_cuda_driver::model::bind_qwen3(engine);
-    std::cerr << "[pie-driver-cuda] qwen3 schema bound: "
-              << weights.layers.size() << " layers\n";
+    const auto weights = pie_cuda_driver::model::bind_llama_like(engine);
+    std::cerr << "[pie-driver-cuda] schema bound: "
+              << weights.layers.size() << " layers ("
+              << engine.hf_config().model_type
+              << (engine.hf_config().use_qk_norm ? ", q/k norm" : "")
+              << ")\n";
 
     // Pre-allocate persistent state for serving.
     //
@@ -262,11 +291,58 @@ int main(int argc, char** argv) {
 
     auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate();
 
+    auto swap_pool = pie_cuda_driver::SwapPool::allocate(
+        engine.hf_config().num_hidden_layers,
+        static_cast<int>(cfg.batching.swap_pool_size),
+        static_cast<int>(cfg.batching.kv_page_size),
+        engine.hf_config().num_key_value_heads,
+        engine.hf_config().head_dim);
+
     pie_cuda_driver::ops::CublasHandle cublas;
     std::cerr << "[pie-driver-cuda] kv_cache: "
               << kv_cache.num_pages() << " pages × "
               << kv_cache.page_size() << " tokens; "
-              << "workspace tokens=" << max_workspace_tokens << "\n";
+              << "workspace tokens=" << max_workspace_tokens
+              << "; swap_pool=" << swap_pool.num_pages() << " pages\n";
+
+    // Cold-path control thread. Runtime → wrapper (RPC) → us (socketpair)
+    // for KV swap operations. Gated on the wrapper having passed a valid
+    // --control-fd; otherwise we just don't service swap requests, which is
+    // fine when swap_pool_size==0 (admission control prevents the runtime
+    // from issuing them).
+    std::thread control_thread;
+    if (control_fd >= 0) {
+        control_thread = std::thread([&swap_pool, &kv_cache, control_fd] {
+            pie_cuda_driver::serve_control_socket(
+                control_fd,
+                [&swap_pool, &kv_cache](
+                    const pie_cuda_driver::CtrlRequest& req) -> std::uint32_t {
+                    using namespace pie_cuda_driver;
+                    std::span<const std::uint32_t> srcs(
+                        req.src_dst_pairs, req.num_pairs);
+                    std::span<const std::uint32_t> dsts(
+                        req.src_dst_pairs + req.num_pairs, req.num_pairs);
+                    // Pairs are laid out as [src_0, src_1, ..., dst_0, dst_1, ...]
+                    // so we can pass two contiguous spans without rebuilding.
+                    switch (req.method) {
+                        case CTRL_METHOD_COPY_D2H:
+                            swap_pool.copy_d2h(kv_cache, srcs, dsts);
+                            return 0;
+                        case CTRL_METHOD_COPY_H2D:
+                            swap_pool.copy_h2d(kv_cache, srcs, dsts);
+                            return 0;
+                        case CTRL_METHOD_COPY_D2D:
+                            swap_pool.copy_d2d(kv_cache, srcs, dsts);
+                            return 0;
+                        case CTRL_METHOD_COPY_H2H:
+                            swap_pool.copy_h2h(srcs, dsts);
+                            return 0;
+                        default:
+                            return 3;  // unknown method
+                    }
+                });
+        });
+    }
 
     pie_cuda_driver::ShmemServer server(
         cfg.shmem.name,
@@ -283,6 +359,7 @@ int main(int argc, char** argv) {
     auto c = engine.capabilities();
     c.total_pages = kv_cache.num_pages();
     c.max_batch_tokens = max_workspace_tokens;
+    c.swap_pool_size = swap_pool.num_pages();
     nlohmann::json caps = {
         {"total_pages",      c.total_pages},
         {"kv_page_size",     c.kv_page_size},
@@ -306,12 +383,8 @@ int main(int argc, char** argv) {
 
     std::uint64_t handled = 0;
 
-    auto upload_u32 = [](std::span<const std::uint8_t> view) -> std::uint32_t* {
-        std::uint32_t* dev = nullptr;
-        if (view.empty()) return dev;
-        CUDA_CHECK(cudaMalloc(&dev, view.size()));
-        CUDA_CHECK(cudaMemcpy(dev, view.data(), view.size(), cudaMemcpyHostToDevice));
-        return dev;
+    pie_cuda_driver::ForwardContext fwd_ctx{
+        engine, weights, ws, kv_cache, attn_ws, cublas, max_workspace_tokens
     };
 
     server.serve_forever([&](const pie_cuda_driver::SlotRequest& req,
@@ -322,285 +395,19 @@ int main(int argc, char** argv) {
                       << req.method_tag << " req_id=" << req.req_id << "\n";
             return 0;
         }
-
-        std::uint32_t *d_tokens = nullptr, *d_positions = nullptr;
-        std::uint32_t *d_qo = nullptr, *d_kvpi = nullptr,
-                      *d_kvpp = nullptr, *d_kvlpl = nullptr;
-        std::int32_t* d_sampled = nullptr;
-
-        try {
-            namespace S = pie_cuda_driver::schema;
-            const auto dec = S::decode_request(req.payload);
-
-            const auto tok_view  = dec.as<std::uint32_t>(S::A_TOKEN_IDS);
-            const auto pos_view  = dec.as<std::uint32_t>(S::A_POSITION_IDS);
-            const auto qo_view   = dec.as<std::uint32_t>(S::A_QO_INDPTR);
-            const auto kvpi_view = dec.as<std::uint32_t>(S::A_KV_PAGE_INDICES);
-            const auto kvpp_view = dec.as<std::uint32_t>(S::A_KV_PAGE_INDPTR);
-            const auto kvlpl_view = dec.as<std::uint32_t>(S::A_KV_LAST_PAGE_LENS);
-            const auto sidx_view = dec.as<std::uint32_t>(S::A_SAMPLING_INDICES);
-            const auto sptr_view = dec.as<std::uint32_t>(S::A_SAMPLING_INDPTR);
-
-            const int N = static_cast<int>(tok_view.size());
-            const int R = static_cast<int>(qo_view.size()) - 1;
-            const int num_sampling = static_cast<int>(sidx_view.size());
-
-            if (N == 0 || R <= 0) {
-                // Empty batch — emit a zero-token flat response.
-                std::vector<std::uint32_t> counts(std::max(R, 0), 0u);
-                return pie_cuda_driver::response::write_flat_response(
-                    response, counts, {});
-            }
-            if (N > max_workspace_tokens) {
-                std::cerr << "[pie-driver-cuda] batch tokens=" << N
-                          << " exceeds workspace=" << max_workspace_tokens << "\n";
-                return 0;
-            }
-
-            // Compute max KV length across requests for shmem sizing.
-            // Also detect "pure decode" (every request has qo_len == 1) so
-            // we can dispatch flashinfer's decode kernel on the hot path.
-            const int page_size = kv_cache.page_size();
-            int max_kv_len = 0;
-            const std::uint32_t* h_kvpp  = kvpp_view.data();
-            const std::uint32_t* h_kvlpl = kvlpl_view.data();
-            const std::uint32_t* h_qo    = qo_view.data();
-            bool is_pure_decode = (R > 0);
-            for (int r = 0; r < R; ++r) {
-                const int num_pages_r = static_cast<int>(h_kvpp[r + 1] - h_kvpp[r]);
-                if (num_pages_r <= 0) continue;
-                const int kv_len_r = (num_pages_r - 1) * page_size +
-                                     static_cast<int>(h_kvlpl[r]);
-                if (kv_len_r > max_kv_len) max_kv_len = kv_len_r;
-                if (h_qo[r + 1] - h_qo[r] != 1u) is_pure_decode = false;
-            }
-
-            // Upload BPIQ control arrays.
-            d_tokens   = upload_u32({reinterpret_cast<const std::uint8_t*>(tok_view.data()),
-                                     tok_view.size() * 4});
-            d_positions = upload_u32({reinterpret_cast<const std::uint8_t*>(pos_view.data()),
-                                      pos_view.size() * 4});
-            d_qo       = upload_u32({reinterpret_cast<const std::uint8_t*>(qo_view.data()),
-                                     qo_view.size() * 4});
-            d_kvpi     = upload_u32({reinterpret_cast<const std::uint8_t*>(kvpi_view.data()),
-                                     kvpi_view.size() * 4});
-            d_kvpp     = upload_u32({reinterpret_cast<const std::uint8_t*>(kvpp_view.data()),
-                                     kvpp_view.size() * 4});
-            d_kvlpl    = upload_u32({reinterpret_cast<const std::uint8_t*>(kvlpl_view.data()),
-                                     kvlpl_view.size() * 4});
-
-            // Run the paged forward pass. (Token IDs are u32 on the wire but
-            // bitwise-identical to i32 for any vocab < 2^31.)
-            pie_cuda_driver::model::qwen3_forward_paged(
-                weights, engine.hf_config(), ws, kv_cache, attn_ws, cublas,
-                reinterpret_cast<const std::int32_t*>(d_tokens),
-                reinterpret_cast<const std::int32_t*>(d_positions),
-                d_qo, d_kvpi, d_kvpp, d_kvlpl,
-                /*qo_indptr_h=*/h_qo,
-                /*kv_page_indptr_h=*/h_kvpp,
-                N, R, std::max(max_kv_len, 1),
-                is_pure_decode);
-
-            // Build per-row temperature / seed arrays. For non-sampling rows
-            // we leave T=0 so the kernel collapses to argmax (cheap, output
-            // ignored). For sampling rows we look up each request's first
-            // sampler and apply it across that request's sample positions —
-            // a simplification of the full per-position sampler mapping that
-            // M2.5 will implement. Top-k / top-p / min-p still pending.
-            const auto temp_view  = dec.as<float>(S::A_SAMPLER_TEMPERATURES);
-            const auto top_k_view = dec.as<std::uint32_t>(S::A_SAMPLER_TOP_K);
-            const auto top_p_view = dec.as<float>(S::A_SAMPLER_TOP_P);
-            const auto min_p_view = dec.as<float>(S::A_SAMPLER_MIN_P);
-            const auto seed_view  = dec.as<std::uint32_t>(S::A_SAMPLER_SEEDS);
-            const auto rns_view   = dec.as<std::uint32_t>(S::A_REQUEST_NUM_SAMPLERS);
-
-            std::vector<float> h_per_temp(N, 0.f);
-            std::vector<float> h_per_min_p(N, 0.f);
-            std::vector<float> h_per_top_p(N, 1.f);
-            std::vector<std::int32_t> h_per_top_k(N, 0);
-            std::vector<std::uint32_t> h_per_seed(N, 0u);
-
-            const std::uint32_t* h_sptr  = sptr_view.data();
-            const std::uint32_t* h_sidx  = sidx_view.data();
-            const std::uint32_t* h_rns   = rns_view.data();
-            const float*         h_temp  = temp_view.data();
-            const std::uint32_t* h_top_k = top_k_view.data();
-            const float*         h_top_p = top_p_view.data();
-            const float*         h_min_p = min_p_view.data();
-            const std::uint32_t* h_seed  = seed_view.data();
-
-            bool any_topk_topp = false;
-            std::uint32_t sampler_off = 0;
-            for (int r = 0; r < R; ++r) {
-                const std::uint32_t nsamplers_r =
-                    (rns_view.size() > static_cast<std::size_t>(r)) ? h_rns[r] : 0u;
-                if (nsamplers_r > 0 && temp_view.size() > sampler_off) {
-                    const float T   = h_temp[sampler_off];
-                    const float Tp  = (top_p_view.size() > sampler_off) ? h_top_p[sampler_off] : 1.f;
-                    const float Mp  = (min_p_view.size() > sampler_off) ? h_min_p[sampler_off] : 0.f;
-                    // BPIQ uses 0 to mean "no top-k filter"; flashinfer
-                    // interprets 0 as "keep zero tokens" (always returns 0).
-                    // Map to vocab so the filter is a no-op.
-                    const std::int32_t Tk_raw =
-                        (top_k_view.size() > sampler_off)
-                            ? static_cast<std::int32_t>(h_top_k[sampler_off]) : 0;
-                    const std::int32_t Tk =
-                        (Tk_raw == 0) ? engine.hf_config().vocab_size : Tk_raw;
-                    const std::uint32_t s = h_seed[sampler_off];
-
-                    if ((Tk_raw > 0 || Tp < 1.f) && T > 0.f) any_topk_topp = true;
-
-                    // sampling_indices is per-request relative — global row =
-                    // qo_indptr[r] + sampling_indices[k]. (Matches the
-                    // pie_driver Python path; see batching.py.)
-                    const std::uint32_t qo_lo = h_qo[r];
-                    for (std::uint32_t k = h_sptr[r]; k < h_sptr[r + 1]; ++k) {
-                        const std::uint32_t row = qo_lo + h_sidx[k];
-                        if (row < static_cast<std::uint32_t>(N)) {
-                            h_per_temp[row]  = T;
-                            h_per_top_k[row] = Tk;
-                            h_per_top_p[row] = Tp;
-                            h_per_min_p[row] = Mp;
-                            h_per_seed[row]  = s;
-                        }
-                    }
-                }
-                sampler_off += nsamplers_r;
-            }
-
-            CUDA_CHECK(cudaMalloc(&d_sampled, sizeof(std::int32_t) * N));
-
-            if (any_topk_topp) {
-                std::vector<std::uint64_t> h_per_seed64(N);
-                for (int i = 0; i < N; ++i) {
-                    h_per_seed64[i] = static_cast<std::uint64_t>(h_per_seed[i]);
-                }
-                std::vector<std::int32_t> h_sample_idx(num_sampling, 0);
-                {
-                    int k_g = 0;
-                    for (int r = 0; r < R; ++r) {
-                        const std::uint32_t qo_lo = h_qo[r];
-                        for (std::uint32_t k = h_sptr[r]; k < h_sptr[r + 1]; ++k, ++k_g) {
-                            h_sample_idx[k_g] =
-                                static_cast<std::int32_t>(qo_lo + h_sidx[k]);
-                        }
-                    }
-                }
-
-                float*         d_temp_f = nullptr;
-                float*         d_top_p_f = nullptr;
-                std::int32_t*  d_top_k = nullptr;
-                std::uint64_t* d_seed64 = nullptr;
-                std::int32_t*  d_sample_idx = nullptr;
-                std::int32_t*  d_per_sample_token = nullptr;
-                bool*          d_valid = nullptr;
-                CUDA_CHECK(cudaMalloc(&d_temp_f,           sizeof(float)         * N));
-                CUDA_CHECK(cudaMalloc(&d_top_p_f,          sizeof(float)         * N));
-                CUDA_CHECK(cudaMalloc(&d_top_k,            sizeof(std::int32_t)  * N));
-                CUDA_CHECK(cudaMalloc(&d_seed64,           sizeof(std::uint64_t) * N));
-                CUDA_CHECK(cudaMalloc(&d_sample_idx,       sizeof(std::int32_t)  * num_sampling));
-                CUDA_CHECK(cudaMalloc(&d_per_sample_token, sizeof(std::int32_t)  * num_sampling));
-                CUDA_CHECK(cudaMalloc(&d_valid,            sizeof(bool)          * num_sampling));
-                CUDA_CHECK(cudaMemcpy(d_temp_f,     h_per_temp.data(),   sizeof(float)         * N,           cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(d_top_p_f,    h_per_top_p.data(),  sizeof(float)         * N,           cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(d_top_k,      h_per_top_k.data(),  sizeof(std::int32_t)  * N,           cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(d_seed64,     h_per_seed64.data(), sizeof(std::uint64_t) * N,           cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(d_sample_idx, h_sample_idx.data(), sizeof(std::int32_t)  * num_sampling, cudaMemcpyHostToDevice));
-
-                pie_cuda_driver::kernels::launch_sample_topk_topp_bf16(
-                    ws.logits.data(), ws.probs.data(),
-                    d_temp_f, d_sample_idx, d_top_k, d_top_p_f, d_seed64,
-                    d_valid, d_per_sample_token,
-                    N, num_sampling, engine.hf_config().vocab_size,
-                    /*prng_offset=*/static_cast<std::uint64_t>(handled),
-                    /*stream=*/nullptr);
-
-                std::vector<std::int32_t> h_per_sample_token(num_sampling);
-                CUDA_CHECK(cudaMemcpy(h_per_sample_token.data(), d_per_sample_token,
-                                      sizeof(std::int32_t) * num_sampling,
-                                      cudaMemcpyDeviceToHost));
-                std::vector<std::int32_t> h_all_sampled(N, 0);
-                for (int k = 0; k < num_sampling; ++k) {
-                    h_all_sampled[h_sample_idx[k]] = h_per_sample_token[k];
-                }
-                CUDA_CHECK(cudaMemcpy(d_sampled, h_all_sampled.data(),
-                                      sizeof(std::int32_t) * N,
-                                      cudaMemcpyHostToDevice));
-
-                cudaFree(d_temp_f); cudaFree(d_top_p_f);
-                cudaFree(d_top_k); cudaFree(d_seed64);
-                cudaFree(d_sample_idx); cudaFree(d_per_sample_token);
-                cudaFree(d_valid);
-            } else {
-                // No top-k/p configured → existing temperature + min-p path.
-                float* d_temp = nullptr;
-                float* d_min_p = nullptr;
-                std::uint32_t* d_seed = nullptr;
-                CUDA_CHECK(cudaMalloc(&d_temp,  sizeof(float) * N));
-                CUDA_CHECK(cudaMalloc(&d_min_p, sizeof(float) * N));
-                CUDA_CHECK(cudaMalloc(&d_seed,  sizeof(std::uint32_t) * N));
-                CUDA_CHECK(cudaMemcpy(d_temp,  h_per_temp.data(),
-                                      sizeof(float) * N, cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(d_min_p, h_per_min_p.data(),
-                                      sizeof(float) * N, cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(d_seed,  h_per_seed.data(),
-                                      sizeof(std::uint32_t) * N, cudaMemcpyHostToDevice));
-
-                pie_cuda_driver::kernels::launch_sample_temp_bf16(
-                    ws.logits.data(), d_temp, d_min_p, d_seed, d_sampled,
-                    N, engine.hf_config().vocab_size, /*stream=*/nullptr);
-                cudaFree(d_temp); cudaFree(d_min_p); cudaFree(d_seed);
-            }
-
-            std::vector<std::int32_t> all_sampled(N);
-            CUDA_CHECK(cudaMemcpy(all_sampled.data(), d_sampled,
-                                  sizeof(std::int32_t) * N, cudaMemcpyDeviceToHost));
-
-            std::vector<std::uint32_t> per_request_counts(R);
-            std::vector<std::uint32_t> sampled_tokens;
-            sampled_tokens.reserve(num_sampling);
-            for (int r = 0; r < R; ++r) {
-                const std::uint32_t lo = h_sptr[r];
-                const std::uint32_t hi = h_sptr[r + 1];
-                const std::uint32_t qo_lo = h_qo[r];
-                per_request_counts[r] = hi - lo;
-                for (std::uint32_t k = lo; k < hi; ++k) {
-                    const std::uint32_t row = qo_lo + h_sidx[k];
-                    sampled_tokens.push_back(
-                        static_cast<std::uint32_t>(all_sampled[row]));
-                }
-            }
-
-            const std::size_t resp_bytes =
-                pie_cuda_driver::response::write_flat_response(
-                    response, per_request_counts, sampled_tokens);
-
-            cudaFree(d_tokens);
-            cudaFree(d_positions);
-            cudaFree(d_qo); cudaFree(d_kvpi); cudaFree(d_kvpp); cudaFree(d_kvlpl);
-            cudaFree(d_sampled);
-
-            if (handled <= 4 || handled % 100 == 0) {
-                std::cerr << "[pie-driver-cuda] req_id=" << req.req_id
-                          << " R=" << R << " N=" << N
-                          << " sampled=" << num_sampling
-                          << " max_kv=" << max_kv_len
-                          << " resp=" << resp_bytes << "B\n";
-            }
-            return resp_bytes;
-
-        } catch (const std::exception& e) {
-            std::cerr << "[pie-driver-cuda] fire_batch failed for req_id="
-                      << req.req_id << ": " << e.what() << "\n";
-            cudaFree(d_tokens); cudaFree(d_positions);
-            cudaFree(d_qo); cudaFree(d_kvpi); cudaFree(d_kvpp); cudaFree(d_kvlpl);
-            cudaFree(d_sampled);
-            return 0;
-        }
+        return pie_cuda_driver::handle_fire_batch(req, response, fwd_ctx, handled);
     });
 
     g_server.store(nullptr);
     std::cerr << "[pie-driver-cuda] shutting down (handled " << handled
               << " requests)\n";
+
+    if (control_thread.joinable()) {
+        // Closing the wrapper-side fd makes recv() return 0 and the thread
+        // exits cleanly. We don't have that fd here, so close ours; SEQPACKET
+        // will EOF on either side closing.
+        ::close(control_fd);
+        control_thread.join();
+    }
     return 0;
 }

@@ -19,8 +19,12 @@ import json
 import os
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import threading
+
+from . import control_protocol as _proto
 from dataclasses import asdict
 from pathlib import Path
 
@@ -102,7 +106,7 @@ def _write_startup_toml(
         'name = "/pie_shmem"',
         "num_slots = 8",
         "req_buf = 4194304",
-        "resp_buf = 1048576",
+        "resp_buf = 4194304",
         "spin_us = 0",
         "",
         "[model]",
@@ -116,6 +120,7 @@ def _write_startup_toml(
         f"max_batch_tokens = {driver_cfg.max_batch_tokens}",
         f"max_batch_size = {driver_cfg.max_batch_size}",
         f"max_num_kv_pages = {driver_cfg.max_num_kv_pages}",
+        f"swap_pool_size = {driver_cfg.swap_pool_size}",
         "",
     ]
     out_path.write_text("\n".join(lines))
@@ -187,7 +192,42 @@ def _stream_stderr(proc: subprocess.Popen) -> None:
 # =============================================================================
 
 
-def _make_methods():
+class _CtrlClient:
+    """Wrapper-side client for the C++ binary's control socket.
+
+    Sends `copy_d2h / copy_h2d / copy_d2d / copy_h2h` over a `SOCK_SEQPACKET`
+    socketpair. Wire format and method tags live in
+    `control_protocol.py` (kept in sync with `control_socket.hpp`).
+    """
+
+    # Method tags re-exported on the class for backwards-compat with
+    # call sites that already use `_CtrlClient.METHOD_COPY_*`.
+    METHOD_COPY_D2H = _proto.METHOD_COPY_D2H
+    METHOD_COPY_H2D = _proto.METHOD_COPY_H2D
+    METHOD_COPY_D2D = _proto.METHOD_COPY_D2D
+    METHOD_COPY_H2H = _proto.METHOD_COPY_H2H
+
+    def __init__(self, sock: socket.socket):
+        self._sock = sock
+        self._lock = threading.Lock()
+
+    def call(self, method: int, layer: int,
+             srcs: list[int], dsts: list[int]) -> int:
+        if len(srcs) != len(dsts):
+            raise ValueError(f"src/dst length mismatch: {len(srcs)} vs {len(dsts)}")
+        n = len(srcs)
+        msg = (_proto.HEADER.pack(method, layer, n, 0)
+               + struct.pack(f"<{n}I", *srcs)
+               + struct.pack(f"<{n}I", *dsts))
+        with self._lock:
+            self._sock.send(msg)
+            resp = self._sock.recv(_proto.RESPONSE_SIZE)
+        if len(resp) != _proto.RESPONSE_SIZE:
+            raise RuntimeError(f"control socket truncated response ({len(resp)} bytes)")
+        return struct.unpack("<I", resp)[0]
+
+
+def _make_methods(ctrl: "_CtrlClient | None" = None):
     """Returns the cold-path method table. The fast path (`fire_batch`) is
     served by the binary; we never see it on this channel."""
 
@@ -206,6 +246,52 @@ def _make_methods():
             )
         return stub
 
+    def _require_ctrl(name):
+        if ctrl is None:
+            raise RuntimeError(
+                f"{name!r} called but cuda_native was started without a "
+                "control socket — set swap_pool_size > 0 and re-spawn the "
+                "driver to enable KV-page swap."
+            )
+
+    # Pie's runtime passes argument names that mirror `pie_driver`:
+    #   swap_out / swap_in / copy_d2h / copy_h2d → phys_ids, slots
+    #   copy_d2d                                → src_phys_ids, dst_phys_ids
+    #   copy_h2h                                → src_slots, dst_slots
+    # We don't pass a layer index — the binary applies copies across every
+    # layer (matches Python's per-layer index_copy_ loop).
+    def _swap_out(**kw):
+        _require_ctrl("copy_d2h")
+        srcs, dsts = list(kw["phys_ids"]), list(kw["slots"])
+        s = ctrl.call(_CtrlClient.METHOD_COPY_D2H, 0, srcs, dsts)
+        if s != 0: raise RuntimeError(f"copy_d2h failed: status={s}")
+        return {"ok": True}
+
+    def _swap_in(**kw):
+        _require_ctrl("copy_h2d")
+        # pie_driver's H2D contract: `phys_ids` are GPU destinations,
+        # `slots` are CPU sources. Wire format is (src, dst) — flip.
+        srcs, dsts = list(kw["slots"]), list(kw["phys_ids"])
+        s = ctrl.call(_CtrlClient.METHOD_COPY_H2D, 0, srcs, dsts)
+        if s != 0: raise RuntimeError(f"copy_h2d failed: status={s}")
+        return {"ok": True}
+
+    def _copy_d2d(**kw):
+        _require_ctrl("copy_d2d")
+        srcs = list(kw["src_phys_ids"])
+        dsts = list(kw["dst_phys_ids"])
+        s = ctrl.call(_CtrlClient.METHOD_COPY_D2D, 0, srcs, dsts)
+        if s != 0: raise RuntimeError(f"copy_d2d failed: status={s}")
+        return {"ok": True}
+
+    def _copy_h2h(**kw):
+        _require_ctrl("copy_h2h")
+        srcs = list(kw.get("src_slots", kw.get("src_phys_ids", [])))
+        dsts = list(kw.get("dst_slots", kw.get("dst_phys_ids", [])))
+        s = ctrl.call(_CtrlClient.METHOD_COPY_H2H, 0, srcs, dsts)
+        if s != 0: raise RuntimeError(f"copy_h2h failed: status={s}")
+        return {"ok": True}
+
     return {
         "ping": _ping,
         "query": _query,
@@ -215,12 +301,12 @@ def _make_methods():
         "update_adapter": _unimplemented("update_adapter"),
         "load_adapter": _unimplemented("load_adapter"),
         "save_adapter": _unimplemented("save_adapter"),
-        "swap_out_pages": _unimplemented("swap_out_pages"),
-        "swap_in_pages": _unimplemented("swap_in_pages"),
-        "copy_d2h": _unimplemented("copy_d2h"),
-        "copy_h2d": _unimplemented("copy_h2d"),
-        "copy_d2d": _unimplemented("copy_d2d"),
-        "copy_h2h": _unimplemented("copy_h2h"),
+        "swap_out_pages": _swap_out,
+        "swap_in_pages":  _swap_in,
+        "copy_d2h": _swap_out,
+        "copy_h2d": _swap_in,
+        "copy_d2d": _copy_d2d,
+        "copy_h2h": _copy_h2h,
     }
 
 
@@ -326,14 +412,35 @@ def worker_main(
     server = RpcServer.create()
     server_name = server.server_name()
 
+    # Set up the wrapper↔binary control socket if KV swap is enabled.
+    # SOCK_SEQPACKET keeps message boundaries, which simplifies the binary's
+    # serve loop (one recv = one request).
+    ctrl_client = None
+    binary_argv = [str(binary), "--config", str(toml_path)]
+    pass_fds: tuple = ()
+    wrapper_sock = None
+    binary_sock = None
+    if driver_cfg.swap_pool_size > 0:
+        wrapper_sock, binary_sock = socket.socketpair(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        # Make sure the binary's fd survives exec().
+        os.set_inheritable(binary_sock.fileno(), True)
+        binary_argv += ["--control-fd", str(binary_sock.fileno())]
+        pass_fds = (binary_sock.fileno(),)
+        ctrl_client = _CtrlClient(wrapper_sock)
+
     # Spawn the binary.
     proc = subprocess.Popen(
-        [str(binary), "--config", str(toml_path)],
+        binary_argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,  # line-buffered
+        pass_fds=pass_fds,
     )
+    if binary_sock is not None:
+        # Parent doesn't need the binary's end of the pair anymore.
+        binary_sock.close()
 
     try:
         caps_dict = _wait_for_ready(proc, driver_cfg.ready_timeout_s)
@@ -367,7 +474,7 @@ def worker_main(
     ready_queue.put((rank, server_name, caps))
 
     stop_event = threading.Event()
-    methods = _make_methods()
+    methods = _make_methods(ctrl_client)
 
     def _shutdown(signum, frame):
         stop_event.set()
@@ -378,6 +485,12 @@ def worker_main(
     try:
         _run_rpc_loop(server, stop_event, methods)
     finally:
+        # Close control socket so the binary's serve thread sees EOF.
+        if wrapper_sock is not None:
+            try:
+                wrapper_sock.close()
+            except Exception:
+                pass
         # Tear the binary down cleanly.
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)

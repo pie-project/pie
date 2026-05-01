@@ -46,6 +46,10 @@ cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 # no ZMQ/protobuf needed. Consumed by the Python wrapper `pie_driver_cuda_native`.
 add_executable(pie_driver_cuda
   src/main.cpp
+  src/request_handler.cpp
+  src/msgpack_subpass.cpp
+  src/sampling_dispatch.cpp
+  src/spec_expansion.cpp
   src/shmem_ipc.cpp
   src/shmem_schema.cpp
   src/tensor.cpp
@@ -57,7 +61,6 @@ add_executable(pie_driver_cuda
   src/kv_cache.cpp
   src/ops/gemm.cpp
   src/ops/attention_naive.cu
-  src/ops/attention_paged.cu
   src/response_writer.cpp
   src/kernels/rmsnorm.cu
   src/kernels/embed.cu
@@ -67,7 +70,14 @@ add_executable(pie_driver_cuda
   src/kernels/kv_paged.cu
   src/kernels/sample_temp.cu
   src/kernels/sample_flashinfer.cu
+  src/kernels/entropy.cu
+  src/kernels/logprobs.cu
+  src/kernels/dist.cu
+  src/kernels/gather_rows.cu
   src/attention_workspace.cpp
+  src/brle.cpp
+  src/control_socket.cpp
+  src/swap_pool.cpp
   src/ops/attention_flashinfer.cu
 )
 
@@ -101,6 +111,26 @@ target_include_directories(sample_flashinfer_test PRIVATE
 target_compile_options(sample_flashinfer_test PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(sample_flashinfer_test PRIVATE CUDA::cudart)
+
+# Wire-format unit tests. Pure C++ (no CUDA), short runtime; CTest runs
+# them under `cmake --build build --target test`. The msgpack roundtrip
+# verification is delegated to a sibling pytest that reads the binary's
+# output files.
+add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
+target_include_directories(test_brle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(test_response_writer
+  tests/test_response_writer.cpp
+  src/response_writer.cpp)
+target_include_directories(test_response_writer PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+enable_testing()
+add_test(NAME brle COMMAND test_brle)
+add_test(NAME response_writer
+  COMMAND test_response_writer
+    ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_flat.bin
+    ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_msgpack.bin)
 
 target_link_libraries(pie_driver_cuda PRIVATE
   CLI11::CLI11

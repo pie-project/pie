@@ -29,6 +29,9 @@ class CudaNativeDriverConfig:
     # M1.6 will compute this from gpu_mem_utilization, matching the Python
     # native driver.
     max_num_kv_pages: int = 1024
+    # Pinned host KV-page count for swap-out. 0 = disabled (admission gate
+    # never schedules swap). Set non-zero to opt into long-context support.
+    swap_pool_size: int = 0
     weight_dtype: str = "bfloat16"
 
     # ── handshake ─────────────────────────────────────────────────────────

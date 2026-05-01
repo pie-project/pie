@@ -312,4 +312,140 @@ void launch_attention_flashinfer_prefill_bf16(
     CUDA_CHECK(status);
 }
 
+// ── Prefill with custom mask ───────────────────────────────────────────────
+
+namespace {
+
+using AttnVariantCustom = ::flashinfer::DefaultAttention<
+    /*use_custom_mask=*/true,
+    /*use_sliding_window=*/false,
+    /*use_logits_soft_cap=*/false,
+    /*use_alibi=*/false>;
+
+}  // namespace
+
+void launch_attention_flashinfer_prefill_custom_bf16(
+    const void* q, void* k_pages, void* v_pages, void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint8_t*  mask_d,
+    const std::int32_t*  mask_indptr_d,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads, int num_kv_heads, int head_dim, int page_size,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream)
+{
+    if (head_dim != static_cast<int>(HEAD_DIM)) {
+        throw std::runtime_error(
+            "flashinfer prefill (custom mask): only HEAD_DIM=128 instantiated");
+    }
+
+    // 1. paged_kv_t (same as kCausal path).
+    ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
+        static_cast<uint32_t>(num_kv_heads),
+        static_cast<uint32_t>(page_size),
+        static_cast<uint32_t>(head_dim),
+        static_cast<uint32_t>(num_requests),
+        ::flashinfer::QKVLayout::kNHD,
+        static_cast<DTypeKV*>(k_pages),
+        static_cast<DTypeKV*>(v_pages),
+        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indices_d)),
+        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indptr_d)),
+        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_last_page_lens_d)));
+
+    // 2. Plan (same as kCausal — the planner doesn't care about mask mode).
+    ::flashinfer::PrefillPlanInfo plan_info;
+    std::vector<IdType> qo_h(num_requests + 1);
+    std::vector<IdType> kv_h(num_requests + 1);
+    for (int r = 0; r <= num_requests; ++r) {
+        qo_h[r] = static_cast<IdType>(qo_indptr_h[r]);
+        kv_h[r] = static_cast<IdType>(kv_page_indptr_h[r]);
+    }
+
+    auto status = ::flashinfer::PrefillPlan<IdType>(
+        workspace.float_buffer(), workspace.float_bytes(),
+        workspace.int_buffer(), workspace.page_locked_int(),
+        workspace.int_bytes(),
+        plan_info,
+        qo_h.data(), kv_h.data(),
+        static_cast<uint32_t>(total_tokens),
+        static_cast<uint32_t>(num_requests),
+        static_cast<uint32_t>(num_q_heads),
+        static_cast<uint32_t>(num_kv_heads),
+        HEAD_DIM, HEAD_DIM,
+        static_cast<uint32_t>(page_size),
+        /*enable_cuda_graph=*/false,
+        sizeof(DTypeO),
+        /*window_left=*/-1,
+        /*fixed_split_size=*/-1,
+        /*disable_split_kv=*/false,
+        /*num_colocated_ctas=*/0,
+        stream);
+    CUDA_CHECK(status);
+
+    // 3. Build params, including custom mask pointers.
+    PrefillParams params;
+    params.q = const_cast<DTypeQ*>(static_cast<const DTypeQ*>(q));
+    params.paged_kv = paged_kv;
+    params.maybe_custom_mask = const_cast<std::uint8_t*>(mask_d);
+    params.q_indptr = const_cast<IdType*>(reinterpret_cast<const IdType*>(qo_indptr_d));
+    params.maybe_mask_indptr = const_cast<IdType*>(mask_indptr_d);
+    params.maybe_q_rope_offset = nullptr;
+    params.o = static_cast<DTypeO*>(o);
+    params.lse = nullptr;
+    params.maybe_alibi_slopes = nullptr;
+    params.group_size = ::flashinfer::uint_fastdiv(
+        static_cast<uint32_t>(num_q_heads / num_kv_heads));
+    params.num_qo_heads = static_cast<uint32_t>(num_q_heads);
+    params.q_stride_n = static_cast<IdType>(num_q_heads * head_dim);
+    params.q_stride_h = static_cast<IdType>(head_dim);
+    params.window_left = -1;
+    params.logits_soft_cap = 0.f;
+    params.sm_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    params.rope_rcp_scale = 1.0f;
+    params.rope_rcp_theta = 1.0f;
+
+    void* int_buf   = workspace.int_buffer();
+    void* float_buf = workspace.float_buffer();
+    params.request_indices   = offset_ptr<IdType>(int_buf, plan_info.request_indices_offset);
+    params.qo_tile_indices   = offset_ptr<IdType>(int_buf, plan_info.qo_tile_indices_offset);
+    params.kv_tile_indices   = offset_ptr<IdType>(int_buf, plan_info.kv_tile_indices_offset);
+    params.o_indptr          = offset_ptr<IdType>(int_buf, plan_info.o_indptr_offset);
+    params.kv_chunk_size_ptr = offset_ptr<IdType>(int_buf, plan_info.kv_chunk_size_ptr_offset);
+    params.padded_batch_size = static_cast<uint32_t>(plan_info.padded_batch_size);
+    params.partition_kv      = plan_info.split_kv;
+    params.max_total_num_rows = static_cast<uint32_t>(plan_info.total_num_rows);
+    params.merge_indptr      = nullptr;
+    params.block_valid_mask  = nullptr;
+    params.total_num_rows    = nullptr;
+    params.maybe_prefix_len_ptr = nullptr;
+    params.maybe_token_pos_in_items_ptr = nullptr;
+    params.token_pos_in_items_len = 0;
+    params.maybe_max_item_len_ptr = nullptr;
+
+    DTypeO* tmp_v = nullptr;
+    float*  tmp_s = nullptr;
+    if (plan_info.split_kv) {
+        params.merge_indptr = offset_ptr<IdType>(int_buf, plan_info.merge_indptr_offset);
+        tmp_v = offset_ptr<DTypeO>(float_buf, plan_info.v_offset);
+        tmp_s = offset_ptr<float>(float_buf, plan_info.s_offset);
+    }
+
+    // 4. Dispatch on cta_tile_q with kCustom + AttnVariantCustom (use_custom_mask=true).
+    DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+        status = ::flashinfer::BatchPrefillWithPagedKVCacheDispatched<
+            CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENC,
+            /*USE_FP16_QK_REDUCTION=*/false,
+            ::flashinfer::MaskMode::kCustom,
+            AttnVariantCustom, PrefillParams>(
+            params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
+    });
+    CUDA_CHECK(status);
+}
+
 }  // namespace pie_cuda_driver::ops

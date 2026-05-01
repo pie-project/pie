@@ -29,6 +29,8 @@ struct BatchingConfig {
     std::uint32_t max_num_kv_pages = 1024;
     std::uint32_t max_batch_tokens = 10240;
     std::uint32_t max_batch_size = 512;
+    // Pinned host KV slots for swap-out. 0 = swap disabled.
+    std::uint32_t swap_pool_size = 0;
 };
 
 struct Config {
@@ -63,6 +65,7 @@ inline Config load_config(const std::filesystem::path& path) {
         c.batching.max_num_kv_pages = (*b)["max_num_kv_pages"].value_or<int64_t>(c.batching.max_num_kv_pages);
         c.batching.max_batch_tokens = (*b)["max_batch_tokens"].value_or<int64_t>(c.batching.max_batch_tokens);
         c.batching.max_batch_size   = (*b)["max_batch_size"].value_or<int64_t>(c.batching.max_batch_size);
+        c.batching.swap_pool_size   = (*b)["swap_pool_size"].value_or<int64_t>(c.batching.swap_pool_size);
     }
 
     if (c.model.hf_repo.empty()) {
