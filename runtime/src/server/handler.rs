@@ -111,7 +111,12 @@ impl Session {
             }
             self.inflight_uploads.insert(
                 program_hash.clone(),
-                InFlightUpload::new(total_chunks, manifest, force_overwrite),
+                InFlightUpload::new(
+                    total_chunks,
+                    manifest,
+                    force_overwrite,
+                    self.state.max_upload_bytes,
+                ),
             );
         }
 
@@ -369,7 +374,12 @@ impl Session {
             }
             self.inflight_uploads.insert(
                 file_hash.clone(),
-                InFlightUpload::new(total_chunks, String::new(), false),
+                InFlightUpload::new(
+                    total_chunks,
+                    String::new(),
+                    false,
+                    self.state.max_upload_bytes,
+                ),
             );
         }
 

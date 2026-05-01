@@ -410,6 +410,7 @@ def _bootstrap(
             fs_scratch_dir=config.runtime.fs_scratch_dir,
             allow_network=config.runtime.allow_network,
             network_allowed_hosts=config.runtime.network_allowed_hosts,
+            max_upload_mb=config.runtime.max_upload_mb,
         ),
         models=[py_model],
         max_concurrent_processes=config.server.max_concurrent_processes,

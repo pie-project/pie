@@ -130,6 +130,13 @@ class RuntimeConfig:
         and connects directly). For tight IP-level control over
         outbound HTTP, set ``allow_network = false`` and have your
         inferlet use ``wasi:sockets`` directly.
+
+    Uploads:
+      * `max_upload_mb` — per-upload cap on cumulative bytes across
+        chunks (program installs and ``session.send_file`` blob
+        transfers). Checked on every chunk so a malicious sender
+        can't grow the in-flight buffer without bound. ``None``
+        (default) = use the runtime's built-in default of 256 MiB.
     """
 
     worker_threads: int | None = None
@@ -141,6 +148,7 @@ class RuntimeConfig:
     fs_scratch_dir: str | None = None
     allow_network: bool = True
     network_allowed_hosts: list[str] = field(default_factory=lambda: ["*"])
+    max_upload_mb: int | None = None
 
     def __post_init__(self):
         if self.worker_threads is not None and self.worker_threads <= 0:
@@ -174,6 +182,11 @@ class RuntimeConfig:
             raise ValueError(
                 f"runtime.network_allowed_hosts must be a list of strings "
                 f"(got {self.network_allowed_hosts!r})"
+            )
+        if self.max_upload_mb is not None and self.max_upload_mb <= 0:
+            raise ValueError(
+                f"runtime.max_upload_mb must be > 0 if set "
+                f"(got {self.max_upload_mb!r})"
             )
 
 
@@ -343,6 +356,9 @@ service_name = "pie"
                                           #   ["10.0.0.0/8", "127.0.0.1"]
                                           #   ["10.0.0.0/8:443"]
                                           #   ["10.0.0.0/8:1024-65535"]
+#
+# Uploads
+# max_upload_mb = 256                     # per-upload cumulative cap; default 256
 
 [model.default]
 hf_repo = "{DEFAULT_MODEL}"
@@ -542,6 +558,7 @@ def load_config(
         fs_scratch_dir=str(fs_scratch_dir_raw) if fs_scratch_dir_raw is not None else None,
         allow_network=bool(runtime_raw.get("allow_network", True)),
         network_allowed_hosts=[str(h) for h in network_allowed_hosts_raw],
+        max_upload_mb=_opt_int("max_upload_mb"),
     )
 
     return Config(

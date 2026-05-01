@@ -216,6 +216,11 @@ pub struct RuntimeConfig {
     /// no restriction. Empty list ≡ `allow_network = false`.
     #[pyo3(get, set)]
     pub network_allowed_hosts: Vec<String>,
+    /// Per-upload byte cap, in MiB. `None` = use the built-in default
+    /// of 256 MiB. Applies to both program installs and `send_file`
+    /// blob transfers.
+    #[pyo3(get, set)]
+    pub max_upload_mb: Option<usize>,
 }
 
 impl Default for RuntimeConfig {
@@ -230,6 +235,7 @@ impl Default for RuntimeConfig {
             fs_scratch_dir: None,
             allow_network: true,
             network_allowed_hosts: vec!["*".to_string()],
+            max_upload_mb: None,
         }
     }
 }
@@ -247,6 +253,7 @@ impl RuntimeConfig {
         fs_scratch_dir = None,
         allow_network = true,
         network_allowed_hosts = vec!["*".to_string()],
+        max_upload_mb = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -259,6 +266,7 @@ impl RuntimeConfig {
         fs_scratch_dir: Option<String>,
         allow_network: bool,
         network_allowed_hosts: Vec<String>,
+        max_upload_mb: Option<usize>,
     ) -> Self {
         RuntimeConfig {
             worker_threads,
@@ -270,6 +278,7 @@ impl RuntimeConfig {
             fs_scratch_dir,
             allow_network,
             network_allowed_hosts,
+            max_upload_mb,
         }
     }
 
@@ -278,7 +287,8 @@ impl RuntimeConfig {
             "RuntimeConfig(worker_threads={:?}, wasm_max_instances={:?}, \
              wasm_max_memory_mb={:?}, wasm_warm_memory_mb={:?}, \
              wasm_warm_slots={:?}, allow_fs={}, fs_scratch_dir={:?}, \
-             allow_network={}, network_allowed_hosts={:?})",
+             allow_network={}, network_allowed_hosts={:?}, \
+             max_upload_mb={:?})",
             self.worker_threads,
             self.wasm_max_instances,
             self.wasm_max_memory_mb,
@@ -288,6 +298,7 @@ impl RuntimeConfig {
             self.fs_scratch_dir,
             self.allow_network,
             self.network_allowed_hosts,
+            self.max_upload_mb,
         )
     }
 }
@@ -558,6 +569,7 @@ impl From<Config> for BootstrapConfig {
                 fs_scratch_dir: cfg.runtime.fs_scratch_dir.map(PathBuf::from),
                 allow_network: cfg.runtime.allow_network,
                 network_allowed_hosts: cfg.runtime.network_allowed_hosts,
+                max_upload_mb: cfg.runtime.max_upload_mb,
             },
             models: cfg
                 .models
