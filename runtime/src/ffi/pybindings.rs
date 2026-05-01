@@ -177,96 +177,52 @@ impl RpcServer {
 // =============================================================================
 
 /// Runtime tuning — tokio worker pool + wasmtime engine pool +
-/// per-instance security policies. All fields opt-in; empty
-/// `RuntimeConfig` reproduces stock tokio, stock wasmtime, no
-/// filesystem, and unrestricted network (legacy hardcoded behavior).
+/// per-instance security policies.
+///
+/// Every field is required from Python. Python (`pie.config.RuntimeConfig`)
+/// is the source of truth for defaults; this pyclass is a transport.
 #[pyclass(name = "RuntimeConfig")]
 #[derive(Clone)]
 pub struct RuntimeConfig {
-    /// Number of tokio worker threads. `None` = let tokio default to
-    /// `num_cpus`.
-    #[pyo3(get, set)]
-    pub worker_threads: Option<usize>,
-    /// Concurrent-inferlet cap (bumps wasmtime's `total_*` caps in
-    /// lockstep). `None` = wasmtime default of 1000.
-    #[pyo3(get, set)]
-    pub wasm_max_instances: Option<u32>,
-    /// Per-inferlet linear-memory cap, MiB. `None` = wasmtime default of 10.
-    #[pyo3(get, set)]
-    pub wasm_max_memory_mb: Option<usize>,
-    /// RAM kept warm per slot to skip remap on respawn, MiB. `None` =
-    /// wasmtime default of 0.
-    #[pyo3(get, set)]
-    pub wasm_warm_memory_mb: Option<usize>,
-    /// Prepared-but-idle inferlet slots. `None` = wasmtime default of 100.
-    #[pyo3(get, set)]
-    pub wasm_warm_slots: Option<u32>,
-    /// If true, mount per-process scratch dir at `/scratch` with full RW.
-    /// Default: false.
-    #[pyo3(get, set)]
-    pub allow_fs: bool,
-    /// Base dir for per-process scratch. `None` = `${TMPDIR}/pie`.
-    #[pyo3(get, set)]
-    pub fs_scratch_dir: Option<String>,
-    /// If true, expose host network to inferlets (subject to
-    /// `network_allowed_hosts`). Default: true.
-    #[pyo3(get, set)]
-    pub allow_network: bool,
-    /// Allowlist of `cidr[:port]` / `cidr:lo-hi`. `["*"]` (default) =
-    /// no restriction. Empty list ≡ `allow_network = false`.
-    #[pyo3(get, set)]
-    pub network_allowed_hosts: Vec<String>,
-    /// Per-upload byte cap, in MiB. `None` = use the built-in default
-    /// of 256 MiB. Applies to both program installs and `send_file`
-    /// blob transfers.
-    #[pyo3(get, set)]
-    pub max_upload_mb: Option<usize>,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        RuntimeConfig {
-            worker_threads: None,
-            wasm_max_instances: None,
-            wasm_max_memory_mb: None,
-            wasm_warm_memory_mb: None,
-            wasm_warm_slots: None,
-            allow_fs: false,
-            fs_scratch_dir: None,
-            allow_network: true,
-            network_allowed_hosts: vec!["*".to_string()],
-            max_upload_mb: None,
-        }
-    }
+    #[pyo3(get, set)] pub worker_threads: usize,
+    #[pyo3(get, set)] pub wasm_max_instances: u32,
+    #[pyo3(get, set)] pub wasm_max_memory_mb: usize,
+    #[pyo3(get, set)] pub wasm_warm_memory_mb: usize,
+    #[pyo3(get, set)] pub wasm_warm_slots: u32,
+    #[pyo3(get, set)] pub allow_fs: bool,
+    #[pyo3(get, set)] pub fs_scratch_dir: String,
+    #[pyo3(get, set)] pub allow_network: bool,
+    #[pyo3(get, set)] pub network_allowed_hosts: Vec<String>,
+    #[pyo3(get, set)] pub max_upload_mb: usize,
 }
 
 #[pymethods]
 impl RuntimeConfig {
     #[new]
     #[pyo3(signature = (
-        worker_threads = None,
-        wasm_max_instances = None,
-        wasm_max_memory_mb = None,
-        wasm_warm_memory_mb = None,
-        wasm_warm_slots = None,
-        allow_fs = false,
-        fs_scratch_dir = None,
-        allow_network = true,
-        network_allowed_hosts = vec!["*".to_string()],
-        max_upload_mb = None,
+        worker_threads,
+        wasm_max_instances,
+        wasm_max_memory_mb,
+        wasm_warm_memory_mb,
+        wasm_warm_slots,
+        allow_fs,
+        fs_scratch_dir,
+        allow_network,
+        network_allowed_hosts,
+        max_upload_mb,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        worker_threads: Option<usize>,
-        wasm_max_instances: Option<u32>,
-        wasm_max_memory_mb: Option<usize>,
-        wasm_warm_memory_mb: Option<usize>,
-        wasm_warm_slots: Option<u32>,
+        worker_threads: usize,
+        wasm_max_instances: u32,
+        wasm_max_memory_mb: usize,
+        wasm_warm_memory_mb: usize,
+        wasm_warm_slots: u32,
         allow_fs: bool,
-        fs_scratch_dir: Option<String>,
+        fs_scratch_dir: String,
         allow_network: bool,
         network_allowed_hosts: Vec<String>,
-        max_upload_mb: Option<usize>,
+        max_upload_mb: usize,
     ) -> Self {
         RuntimeConfig {
             worker_threads,
@@ -303,45 +259,61 @@ impl RuntimeConfig {
     }
 }
 
-/// Scheduler configuration for a model.
+/// Scheduler configuration for a model — batch policy + per-process
+/// admission/market knobs. Every field is required from Python; Python
+/// (`pie.config.SchedulerConfig`) is the source of truth for defaults.
 #[pyclass(name = "SchedulerConfig")]
 #[derive(Clone)]
 pub struct SchedulerConfig {
-    #[pyo3(get, set)]
-    pub request_timeout_secs: u64,
-    /// Batch-firing policy: `"adaptive"` (default), `"eager"`, or
-    /// `"greedy"`. `None` = use built-in default.
-    #[pyo3(get, set)]
-    pub policy: Option<String>,
+    #[pyo3(get, set)] pub batch_policy: String,
+    #[pyo3(get, set)] pub request_timeout_secs: u64,
+    #[pyo3(get, set)] pub default_token_limit: Option<usize>,
+    #[pyo3(get, set)] pub default_endowment_pages: usize,
+    #[pyo3(get, set)] pub admission_oversubscription_factor: f64,
+    #[pyo3(get, set)] pub restore_pause_at_utilization: f64,
 }
 
 #[pymethods]
 impl SchedulerConfig {
     #[new]
-    #[pyo3(signature = (request_timeout_secs = 120, policy = None))]
-    fn new(request_timeout_secs: u64, policy: Option<String>) -> Self {
-        SchedulerConfig { request_timeout_secs, policy }
+    #[pyo3(signature = (
+        batch_policy,
+        request_timeout_secs,
+        default_token_limit,
+        default_endowment_pages,
+        admission_oversubscription_factor,
+        restore_pause_at_utilization,
+    ))]
+    fn new(
+        batch_policy: String,
+        request_timeout_secs: u64,
+        default_token_limit: Option<usize>,
+        default_endowment_pages: usize,
+        admission_oversubscription_factor: f64,
+        restore_pause_at_utilization: f64,
+    ) -> Self {
+        SchedulerConfig {
+            batch_policy,
+            request_timeout_secs,
+            default_token_limit,
+            default_endowment_pages,
+            admission_oversubscription_factor,
+            restore_pause_at_utilization,
+        }
     }
 }
 
+/// Per-device capabilities published by the worker handshake.
+/// `hostname` is the IPC server name from `RpcServer.server_name()`;
+/// the rest are the device's own admission/batch limits.
 #[pyclass(name = "DeviceConfig")]
 #[derive(Clone)]
 pub struct DeviceConfig {
-    /// IPC server name from `RpcServer.server_name()`
-    #[pyo3(get, set)]
-    pub hostname: String,
-    /// Total KV cache pages available on this device group
-    #[pyo3(get, set)]
-    pub total_pages: usize,
-    /// Pre-allocated CPU swap pages for this device
-    #[pyo3(get, set)]
-    pub cpu_pages: usize,
-    /// Maximum batch tokens this device can handle
-    #[pyo3(get, set)]
-    pub max_batch_tokens: usize,
-    /// Maximum batch size this device can handle
-    #[pyo3(get, set)]
-    pub max_batch_size: usize,
+    #[pyo3(get, set)] pub hostname: String,
+    #[pyo3(get, set)] pub total_pages: usize,
+    #[pyo3(get, set)] pub cpu_pages: usize,
+    #[pyo3(get, set)] pub max_batch_tokens: usize,
+    #[pyo3(get, set)] pub max_batch_size: usize,
 }
 
 #[pymethods]
@@ -362,27 +334,12 @@ impl DeviceConfig {
 #[pyclass(name = "ModelConfig")]
 #[derive(Clone)]
 pub struct ModelConfig {
-    #[pyo3(get, set)]
-    pub name: String,
-    #[pyo3(get, set)]
-    pub arch_name: String,
-    #[pyo3(get, set)]
-    pub kv_page_size: usize,
-    #[pyo3(get, set)]
-    pub tokenizer_path: String,
-    #[pyo3(get, set)]
-    pub devices: Vec<DeviceConfig>,
-    #[pyo3(get, set)]
-    pub scheduler: SchedulerConfig,
-    /// Default compute-wallet cap. `None` = unlimited (default); `Some(n)`
-    /// caps any process launched without an explicit token_budget at `n`.
-    #[pyo3(get, set)]
-    pub default_token_budget: Option<usize>,
-    /// Default market endowment in KV pages.
-    #[pyo3(get, set)]
-    pub default_endowment_pages: usize,
-    #[pyo3(get, set)]
-    pub oversubscription_factor: f64,
+    #[pyo3(get, set)] pub name: String,
+    #[pyo3(get, set)] pub arch_name: String,
+    #[pyo3(get, set)] pub kv_page_size: usize,
+    #[pyo3(get, set)] pub tokenizer_path: String,
+    #[pyo3(get, set)] pub devices: Vec<DeviceConfig>,
+    #[pyo3(get, set)] pub scheduler: SchedulerConfig,
 }
 
 #[pymethods]
@@ -394,10 +351,7 @@ impl ModelConfig {
         kv_page_size,
         tokenizer_path,
         devices,
-        default_token_budget = None,
-        scheduler = None,
-        oversubscription_factor = 4.0,
-        default_endowment_pages = 64,
+        scheduler,
     ))]
     fn new(
         name: String,
@@ -405,10 +359,7 @@ impl ModelConfig {
         kv_page_size: usize,
         tokenizer_path: String,
         devices: Vec<DeviceConfig>,
-        default_token_budget: Option<usize>,
-        scheduler: Option<SchedulerConfig>,
-        oversubscription_factor: f64,
-        default_endowment_pages: usize,
+        scheduler: SchedulerConfig,
     ) -> Self {
         ModelConfig {
             name,
@@ -416,57 +367,32 @@ impl ModelConfig {
             kv_page_size,
             tokenizer_path,
             devices,
-            scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(120, None)),
-            default_token_budget,
-            default_endowment_pages,
-            oversubscription_factor,
+            scheduler,
         }
     }
 }
 
-/// Top-level server configuration exposed to Python.
-/// Maps directly to `bootstrap::Config`.
+/// Top-level server configuration exposed to Python — pure transport.
+/// Every field is required; Python (`pie.config.Config`) is the source
+/// of truth for defaults. Maps directly to `bootstrap::Config`.
 #[pyclass]
 #[derive(Clone)]
 pub struct Config {
-    #[pyo3(get, set)]
-    pub host: String,
-    #[pyo3(get, set)]
-    pub port: u16,
-    #[pyo3(get, set)]
-    pub verbose: bool,
-    #[pyo3(get, set)]
-    pub registry: String,
-    // Auth
-    #[pyo3(get, set)]
-    pub auth_enabled: bool,
-    #[pyo3(get, set)]
-    pub auth_dir: String,
-    // Program/cache directory
-    #[pyo3(get, set)]
-    pub program_dir: String,
-    // Log directory
-    #[pyo3(get, set)]
-    pub log_dir: String,
-    // Telemetry
-    #[pyo3(get, set)]
-    pub telemetry_enabled: bool,
-    #[pyo3(get, set)]
-    pub telemetry_endpoint: String,
-    #[pyo3(get, set)]
-    pub telemetry_service_name: String,
-    // Runtime tuning (tokio)
-    #[pyo3(get, set)]
-    pub runtime: RuntimeConfig,
-    // Models
-    #[pyo3(get, set)]
-    pub models: Vec<ModelConfig>,
-    /// Hard cap on concurrent processes. None = no limit.
-    #[pyo3(get, set)]
-    pub max_concurrent_processes: Option<usize>,
-    /// Whether to apply host-side snapshot optimization to Python components.
-    #[pyo3(get, set)]
-    pub python_snapshot: bool,
+    #[pyo3(get, set)] pub host: String,
+    #[pyo3(get, set)] pub port: u16,
+    #[pyo3(get, set)] pub verbose: bool,
+    #[pyo3(get, set)] pub registry: String,
+    #[pyo3(get, set)] pub auth_enabled: bool,
+    #[pyo3(get, set)] pub auth_dir: String,
+    #[pyo3(get, set)] pub program_dir: String,
+    #[pyo3(get, set)] pub log_dir: String,
+    #[pyo3(get, set)] pub telemetry_enabled: bool,
+    #[pyo3(get, set)] pub telemetry_endpoint: String,
+    #[pyo3(get, set)] pub telemetry_service_name: String,
+    #[pyo3(get, set)] pub runtime: RuntimeConfig,
+    #[pyo3(get, set)] pub models: Vec<ModelConfig>,
+    #[pyo3(get, set)] pub max_concurrent_processes: Option<usize>,
+    #[pyo3(get, set)] pub python_snapshot: bool,
 }
 
 #[pymethods]
@@ -475,19 +401,19 @@ impl Config {
     #[pyo3(signature = (
         host,
         port,
-        verbose = false,
-        registry = "https://registry.pie-project.org/".to_string(),
-        auth_enabled = false,
-        auth_dir = "".to_string(),
-        program_dir = "".to_string(),
-        log_dir = "".to_string(),
-        telemetry_enabled = false,
-        telemetry_endpoint = "http://localhost:4317".to_string(),
-        telemetry_service_name = "pie".to_string(),
-        runtime = None,
-        models = vec![],
-        max_concurrent_processes = None,
-        python_snapshot = true,
+        verbose,
+        registry,
+        auth_enabled,
+        auth_dir,
+        program_dir,
+        log_dir,
+        telemetry_enabled,
+        telemetry_endpoint,
+        telemetry_service_name,
+        runtime,
+        models,
+        max_concurrent_processes,
+        python_snapshot,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -502,7 +428,7 @@ impl Config {
         telemetry_enabled: bool,
         telemetry_endpoint: String,
         telemetry_service_name: String,
-        runtime: Option<RuntimeConfig>,
+        runtime: RuntimeConfig,
         models: Vec<ModelConfig>,
         max_concurrent_processes: Option<usize>,
         python_snapshot: bool,
@@ -519,7 +445,7 @@ impl Config {
             telemetry_enabled,
             telemetry_endpoint,
             telemetry_service_name,
-            runtime: runtime.unwrap_or_default(),
+            runtime,
             models,
             max_concurrent_processes,
             python_snapshot,
@@ -566,7 +492,7 @@ impl From<Config> for BootstrapConfig {
                 wasm_warm_memory_mb: cfg.runtime.wasm_warm_memory_mb,
                 wasm_warm_slots: cfg.runtime.wasm_warm_slots,
                 allow_fs: cfg.runtime.allow_fs,
-                fs_scratch_dir: cfg.runtime.fs_scratch_dir.map(PathBuf::from),
+                fs_scratch_dir: PathBuf::from(cfg.runtime.fs_scratch_dir),
                 allow_network: cfg.runtime.allow_network,
                 network_allowed_hosts: cfg.runtime.network_allowed_hosts,
                 max_upload_mb: cfg.runtime.max_upload_mb,
@@ -591,12 +517,15 @@ impl From<Config> for BootstrapConfig {
                         })
                         .collect(),
                     scheduler: BootstrapSchedulerConfig {
+                        batch_policy: m.scheduler.batch_policy,
                         request_timeout_secs: m.scheduler.request_timeout_secs,
-                        policy: m.scheduler.policy.clone(),
+                        default_token_limit: m.scheduler.default_token_limit,
+                        default_endowment_pages: m.scheduler.default_endowment_pages,
+                        admission_oversubscription_factor:
+                            m.scheduler.admission_oversubscription_factor,
+                        restore_pause_at_utilization:
+                            m.scheduler.restore_pause_at_utilization,
                     },
-                    default_token_budget: m.default_token_budget,
-                    default_endowment_pages: m.default_endowment_pages,
-                    oversubscription_factor: m.oversubscription_factor,
                 })
                 .collect(),
             skip_tracing: false,
@@ -669,17 +598,12 @@ fn py_bootstrap(py: Python<'_>, config: Config) -> PyResult<RuntimeHandle> {
     py.allow_threads(|| {
         let bootstrap_config: BootstrapConfig = config.into();
 
-        // Honor the worker-thread override if provided. `worker_threads(0)`
-        // would panic in tokio, so treat any non-positive value as "use
-        // default" — matches the contract that `None` and `Some(0)` are
-        // equivalent no-ops.
+        // Python is the source of truth for `worker_threads`; it
+        // resolves the default (typically `os.cpu_count()`) and validates
+        // `> 0` before sending. Apply unconditionally.
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.enable_all();
-        if let Some(n) = bootstrap_config.runtime.worker_threads {
-            if n > 0 {
-                builder.worker_threads(n);
-            }
-        }
+        builder.worker_threads(bootstrap_config.runtime.worker_threads);
         let rt = Arc::new(
             builder
                 .build()

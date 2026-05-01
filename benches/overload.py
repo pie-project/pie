@@ -91,8 +91,8 @@ async def run_one(client, pkg, inputs, timeout):
 async def main_async(args):
     from pie.server import Server
     from pie.config import (
-        AuthConfig, Config, DriverConfig, ModelConfig, ServerConfig,
-        TelemetryConfig,
+        AuthConfig, Config, DriverConfig, ModelConfig, SchedulerConfig,
+        ServerConfig, TelemetryConfig,
     )
 
     inferlet_name = args.inferlet
@@ -110,18 +110,18 @@ async def main_async(args):
         server=ServerConfig(port=0, max_concurrent_processes=max(max_c * 2, 32)),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        models={
-            "default": ModelConfig(
+        models=[
+            ModelConfig(
                 name="default",
                 hf_repo=args.model,
-                default_token_budget=args.default_token_budget,
+                scheduler=SchedulerConfig(default_token_limit=args.default_token_limit),
                 driver=DriverConfig(
                     type=args.driver,
                     device=device,
                     options=driver_options(args.driver, args),
                 ),
-            )
-        },
+            ),
+        ],
     )
 
     print(f"Driver: {args.driver}")
@@ -177,7 +177,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--gpu-mem-util", type=float, default=0.85)
     parser.add_argument("--max-batch-size", type=int, default=128)
-    parser.add_argument("--default-token-budget", type=int, default=200_000)
+    parser.add_argument("--default-token-limit", type=int, default=200_000)
     parser.add_argument("--use-cuda-graphs", action="store_true")
     parser.add_argument("--sglang-attention-backend", default=None,
                         help="Override sglang's attention_backend (triton, flashinfer, ...)")

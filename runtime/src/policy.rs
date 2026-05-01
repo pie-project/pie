@@ -19,20 +19,14 @@ use ipnet::IpNet;
 ///
 /// Today this is "all-or-nothing scratch": when `allow` is true a
 /// per-process directory is mounted at `/scratch` with full RW; when
-/// false, no `wasi:filesystem` access at all.
+/// false, no `wasi:filesystem` access at all. The base directory is
+/// always supplied by the caller — Python is the source of truth.
 #[derive(Debug, Clone)]
 pub struct FsPolicy {
     pub allow: bool,
     /// Base directory under which per-process scratch dirs are created.
     /// Each instance gets `<base_dir>/<process_id>`.
     pub base_dir: PathBuf,
-}
-
-impl FsPolicy {
-    /// Default scratch base dir: `${TMPDIR}/pie`.
-    pub fn default_base_dir() -> PathBuf {
-        std::env::temp_dir().join("pie")
-    }
 }
 
 // =============================================================================
@@ -128,15 +122,6 @@ impl NetworkPolicy {
             unrestricted: false,
             rules: rules?.into(),
         })
-    }
-
-    /// Always-allow shortcut for the common `["*"]` default.
-    pub fn unrestricted() -> Self {
-        NetworkPolicy {
-            allow: true,
-            unrestricted: true,
-            rules: Arc::new([]),
-        }
     }
 
     /// True if the policy is `allow_network = true` + `["*"]` — the legacy

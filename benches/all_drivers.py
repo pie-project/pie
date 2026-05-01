@@ -225,8 +225,8 @@ async def run_concurrent(
 async def bench_driver(driver: str, args, output_dir: Path) -> list[RunResult]:
     from pie.server import Server
     from pie.config import (
-        AuthConfig, Config, DriverConfig, ModelConfig, ServerConfig,
-        TelemetryConfig,
+        AuthConfig, Config, DriverConfig, ModelConfig, SchedulerConfig,
+        ServerConfig, TelemetryConfig,
     )
 
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
@@ -240,18 +240,18 @@ async def bench_driver(driver: str, args, output_dir: Path) -> list[RunResult]:
         ),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        models={
-            "default": ModelConfig(
+        models=[
+            ModelConfig(
                 name="default",
                 hf_repo=args.model,
-                default_token_budget=args.default_token_budget,
+                scheduler=SchedulerConfig(default_token_limit=args.default_token_limit),
                 driver=DriverConfig(
                     type=driver,
                     device=device,
                     options=driver_opts,
                 ),
-            )
-        },
+            ),
+        ],
     )
 
     print(f"\n{'#' * 70}\n# Driver: {driver}\n{'#' * 70}", flush=True)
@@ -430,7 +430,7 @@ def main():
     parser.add_argument("--output-dir", default="/tmp/bench-runs")
     parser.add_argument("--gpu-mem-util", type=float, default=0.85)
     parser.add_argument("--max-batch-size", type=int, default=64)
-    parser.add_argument("--default-token-budget", type=int, default=200_000)
+    parser.add_argument("--default-token-limit", type=int, default=200_000)
     parser.add_argument("--use-cuda-graphs", action="store_true")
     parser.add_argument("--max-concurrency-per-workload", type=int, default=16,
                         help="Cap concurrency per workload to avoid total OOM")

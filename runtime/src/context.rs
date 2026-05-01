@@ -235,16 +235,21 @@ impl Market {
 /// Spawns a new context manager for a model.
 ///
 /// - `default_endowment_pages`: market weight assigned to processes that
-///   don't declare an explicit `token_budget` at admission.
-/// - `default_tokens_remaining`: compute-wallet cap for the same;
+///   don't declare an explicit token limit at admission.
+/// - `default_token_limit`: compute-wallet cap for the same;
 ///   `None` means unlimited (the system-wide default).
+/// - `admission_oversubscription_factor`: admission gate — `Σ endowment` must not
+///   exceed `total_pages × factor`.
+/// - `restore_pause_at_utilization`: the restore loop pauses when any
+///   device's GPU page utilization exceeds this fraction.
 pub fn spawn(
     page_size: usize,
     num_gpu_pages: Vec<usize>,
     num_cpu_pages: Vec<usize>,
     default_endowment_pages: usize,
-    default_tokens_remaining: Option<usize>,
-    oversubscription_factor: f64,
+    default_token_limit: Option<usize>,
+    admission_oversubscription_factor: f64,
+    restore_pause_at_utilization: f64,
 ) -> usize {
     PAGE_SIZES.push(page_size);
     MARKET.push(Market::new(default_endowment_pages));
@@ -254,8 +259,9 @@ pub fn spawn(
         &num_gpu_pages,
         &num_cpu_pages,
         default_endowment_pages,
-        default_tokens_remaining,
-        oversubscription_factor,
+        default_token_limit,
+        admission_oversubscription_factor,
+        restore_pause_at_utilization,
     )).expect("Failed to spawn context manager")
 }
 
@@ -303,7 +309,7 @@ pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
 /// Called from `InstanceState::new` before any context operations.
 ///
 /// Fails fast if any model's admission gate would refuse the request (the
-/// `Σ endowment ≤ capacity × oversubscription_factor` invariant).
+/// `Σ endowment ≤ capacity × admission_oversubscription_factor` invariant).
 /// On partial failure — e.g., model 0 admits but model 1 refuses — the
 /// successful registrations are rolled back so no orphan state remains.
 pub async fn register_process(pid: ProcessId, token_budget: Option<usize>) -> Result<()> {
@@ -781,28 +787,28 @@ pub(crate) struct ContextManager {
     /// Default compute-wallet cap for new processes that do not declare
     /// an explicit token_budget at admission.
     /// `None` = unlimited (the system-wide default); `Some(n)` = cap at `n`.
-    pub(crate) default_tokens_remaining: Option<usize>,
-    /// Admission cap: `Σ endowment ≤ total_gpu_capacity × oversubscription_factor`.
+    pub(crate) default_token_limit: Option<usize>,
+    /// Admission cap: `Σ endowment ≤ total_gpu_capacity × admission_oversubscription_factor`.
     /// At 1.0 strictly bound by physical capacity; > 1.0 allows overbook.
-    pub(crate) oversubscription_factor: f64,
+    pub(crate) admission_oversubscription_factor: f64,
+    /// Hard admission gate for the restore loop: pause restoring suspended
+    /// contexts when any device's page utilization exceeds this fraction.
+    /// Prevents the evict→restore→re-evict thrash cascade.
+    pub(crate) restore_pause_at_utilization: f64,
     /// Diagnostic counters for scheduler health.
     pub(crate) sched_counters: SchedCounters,
 }
 
 impl ContextManager {
-    /// Hard admission control threshold: don't restore when any device
-    /// exceeds this page utilization fraction. Prevents the
-    /// evict→restore→re-evict thrashing cascade.
-    const RESTORE_UTILIZATION_CAP: f64 = 0.85;
-
     pub(crate) fn new(
         model_idx: usize,
         page_size: usize,
         num_gpu_pages: &[usize],
         num_cpu_pages: &[usize],
         default_endowment_pages: usize,
-        default_tokens_remaining: Option<usize>,
-        oversubscription_factor: f64,
+        default_token_limit: Option<usize>,
+        admission_oversubscription_factor: f64,
+        restore_pause_at_utilization: f64,
     ) -> Self {
         let gpu_stores: Vec<_> = num_gpu_pages.iter()
             .map(|&n| PageStore::new(page_size, n))
@@ -819,8 +825,9 @@ impl ContextManager {
             restore_queue: BinaryHeap::new(),
             auction_results: vec![AuctionResult::default(); num_gpu_pages.len()],
             default_endowment: default_endowment_pages as f64,
-            default_tokens_remaining,
-            oversubscription_factor,
+            default_token_limit,
+            admission_oversubscription_factor,
+            restore_pause_at_utilization,
             sched_counters: SchedCounters::default(),
         }
     }
@@ -1260,7 +1267,7 @@ impl ContextManager {
         let over_capacity = self.gpu_stores.iter().any(|d| {
             let (used, total) = d.stats();
             let utilization = used as f64 / total.max(1) as f64;
-            utilization > Self::RESTORE_UTILIZATION_CAP
+            utilization > self.restore_pause_at_utilization
         });
         if over_capacity {
             return;

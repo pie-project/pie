@@ -150,8 +150,8 @@ async def run_once(
 async def run_benchmark(args):
     from pie.server import Server
     from pie.config import (
-        AuthConfig, Config, DriverConfig, ModelConfig, ServerConfig,
-        TelemetryConfig,
+        AuthConfig, Config, DriverConfig, ModelConfig, SchedulerConfig,
+        ServerConfig, TelemetryConfig,
     )
 
     wasm_path, manifest_path = find_paths()
@@ -169,18 +169,18 @@ async def run_benchmark(args):
         server=ServerConfig(port=0, max_concurrent_processes=4),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        models={
-            "default": ModelConfig(
+        models=[
+            ModelConfig(
                 name="default",
                 hf_repo=args.model,
-                default_token_budget=args.default_token_budget,
+                scheduler=SchedulerConfig(default_token_limit=args.default_token_limit),
                 driver=DriverConfig(
                     type=args.driver,
                     device=device,
                     options=driver_opts,
                 ),
-            )
-        },
+            ),
+        ],
     )
 
     prompt_lengths = [int(x) for x in args.prompt_tokens.split(",") if x.strip()]
@@ -287,7 +287,7 @@ def main():
     )
     parser.add_argument("--gpu-mem-util", type=float, default=0.8)
     parser.add_argument("--max-batch-size", type=int, default=64)
-    parser.add_argument("--default-token-budget", type=int, default=200_000)
+    parser.add_argument("--default-token-limit", type=int, default=200_000)
     parser.add_argument("--use-cuda-graphs", action="store_true")
     parser.add_argument("--vllm-attention-backend", default=None)
     parser.add_argument("--sglang-attention-backend", default=None)

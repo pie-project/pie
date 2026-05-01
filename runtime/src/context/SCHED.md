@@ -551,13 +551,13 @@ endowment is physical (§2.4) — one unit = one page of long-run residency
 — the admission rule is an integer compare:
 
 ```
-admit iff  Σ E_live + E_new  ≤  capacity × oversubscription_factor
+admit iff  Σ E_live + E_new  ≤  capacity × admission_oversubscription_factor
 ```
 
 - `Σ E_live`: sum of endowments of currently admitted processes.
 - `E_new`: endowment requested by the new process (`⌈T / page_size⌉`).
 - `capacity`: total GPU pages across all devices.
-- `oversubscription_factor ∈ (0, ∞)`: a provider-chosen knob.
+- `admission_oversubscription_factor ∈ (0, ∞)`: a provider-chosen knob.
 
 **Regimes:**
 
