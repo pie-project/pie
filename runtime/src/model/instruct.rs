@@ -110,7 +110,9 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
     use self::qwen3::{QwenInstruct, ChatMLConfig};
 
     match arch_name {
-        "qwen3" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
+        "qwen3" |
+        "qwen3_5" | "qwen3_5_text" |
+        "qwen3_5_moe" | "qwen3_5_moe_text" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
             has_thinking: true,
             has_tools: true,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
@@ -120,7 +122,11 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         "llama3" | "l4ma" => Arc::new(self::llama3::LlamaInstruct::new(tokenizer)),
         "r1" | "deepseek_v3" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
         "gptoss" | "gpt_oss" => Arc::new(self::gptoss::GptOssInstruct::new(tokenizer)),
-        "gemma2" | "gemma3" | "gemma3_text" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
+        // Gemma-3n shares the multi-piece `<start_of_turn>` /
+        // `<end_of_turn>` chat template with Gemma 2/3 (Gemma 4
+        // switched to single-token `<|turn>` / `<turn|>`).
+        "gemma2" | "gemma3" | "gemma3_text" |
+        "gemma3n" | "gemma3n_text" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
         "gemma4" | "gemma4_text" => Arc::new(self::gemma4::Gemma4Instruct::new(tokenizer)),
         "mistral3" | "ministral3" => Arc::new(self::mistral3::MistralInstruct::new(tokenizer)),
         "olmo2" => Arc::new(self::olmo2::Olmo2Instruct::new(tokenizer)),

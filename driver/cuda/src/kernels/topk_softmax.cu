@@ -8,7 +8,10 @@ namespace pie_cuda_driver::kernels {
 namespace {
 
 constexpr int BLOCK = 64;
-constexpr int MAX_EXPERTS = 64;
+// Qwen3.6-35B-A3B uses 256 experts top-K=8; bump the static shmem
+// allocation to fit. 256 floats == 1 KB shared memory per block — well
+// under the budget on every supported GPU.
+constexpr int MAX_EXPERTS = 256;
 
 // One block per token. Phase 1: thread-local max-reduce + exp+sum-reduce
 // for softmax. Phase 2: K iterations of argmax-with-exclusion to pick the

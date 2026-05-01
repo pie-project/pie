@@ -561,6 +561,12 @@ using AttnVariantCustom = ::flashinfer::DefaultAttention<
     /*use_logits_soft_cap=*/false,
     /*use_alibi=*/false>;
 
+using AttnVariantCustomSoftcap = ::flashinfer::DefaultAttention<
+    /*use_custom_mask=*/true,
+    /*use_sliding_window=*/false,
+    /*use_logits_soft_cap=*/true,
+    /*use_alibi=*/false>;
+
 }  // namespace
 
 void launch_attention_flashinfer_prefill_custom_bf16(
@@ -579,6 +585,8 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     AttentionWorkspace& workspace,
     cudaStream_t stream,
     int /* window_left */,  // ignored — kCustom owns the mask
+    float logits_soft_cap,
+    float sm_scale,
     float* lse_out)
 {
     if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
@@ -651,8 +659,10 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     params.q_stride_n = static_cast<IdType>(num_q_heads * head_dim);
     params.q_stride_h = static_cast<IdType>(head_dim);
     params.window_left = -1;  // kCustom — caller-supplied bitmap is the source of truth
-    params.logits_soft_cap = 0.f;
-    params.sm_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    params.logits_soft_cap = logits_soft_cap;
+    params.sm_scale = (sm_scale > 0.f)
+        ? sm_scale
+        : 1.0f / std::sqrt(static_cast<float>(head_dim));
     params.rope_rcp_scale = 1.0f;
     params.rope_rcp_theta = 1.0f;
 
@@ -682,19 +692,28 @@ void launch_attention_flashinfer_prefill_custom_bf16(
         tmp_s = offset_ptr<float>(float_buf, plan_info.s_offset);
     }
 
-    // 4. Dispatch on (HEAD_DIM, cta_tile_q) with kCustom + AttnVariantCustom.
-    if (head_dim == 64) {
-        status = prefill_dispatch_for_head_dim<64, ::flashinfer::MaskMode::kCustom, AttnVariantCustom>(
-            params, plan_info, tmp_v, tmp_s, stream);
-    } else if (head_dim == 256) {
-        status = prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kCustom, AttnVariantCustom>(
-            params, plan_info, tmp_v, tmp_s, stream);
-    } else if (head_dim == 512) {
-        status = prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kCustom, AttnVariantCustom>(
-            params, plan_info, tmp_v, tmp_s, stream);
+    // 4. Dispatch on (HEAD_DIM, cta_tile_q) with kCustom; pick variant
+    //    based on logits_soft_cap (mirrors the kCausal path's dispatch).
+    auto dispatch = [&](auto variant_tag) {
+        using V = typename decltype(variant_tag)::type;
+        if (head_dim == 64) {
+            return prefill_dispatch_for_head_dim<64, ::flashinfer::MaskMode::kCustom, V>(
+                params, plan_info, tmp_v, tmp_s, stream);
+        } else if (head_dim == 256) {
+            return prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kCustom, V>(
+                params, plan_info, tmp_v, tmp_s, stream);
+        } else if (head_dim == 512) {
+            return prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kCustom, V>(
+                params, plan_info, tmp_v, tmp_s, stream);
+        } else {
+            return prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kCustom, V>(
+                params, plan_info, tmp_v, tmp_s, stream);
+        }
+    };
+    if (logits_soft_cap > 0.f) {
+        status = dispatch(::std::type_identity<AttnVariantCustomSoftcap>{});
     } else {
-        status = prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kCustom, AttnVariantCustom>(
-            params, plan_info, tmp_v, tmp_s, stream);
+        status = dispatch(::std::type_identity<AttnVariantCustom>{});
     }
     CUDA_CHECK(status);
 }

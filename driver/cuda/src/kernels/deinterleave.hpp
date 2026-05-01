@@ -41,4 +41,19 @@ void launch_deinterleave_vec_bf16(
     int         I,
     cudaStream_t stream);
 
+// Qwen3.5 full-attention q_proj produces a fused `[N, num_heads,
+// 2*head_dim]` tensor where each head's first `head_dim` channels are
+// the query and the next `head_dim` are the per-token output gate.
+// Split into separate `[N, Hq]` query/gate tensors (Hq = num_heads *
+// head_dim).
+//
+//     q[n, h*d + i]    = packed[n, h*2*d + i]
+//     gate[n, h*d + i] = packed[n, h*2*d + d + i]
+void launch_split_q_gate_bf16(
+    const void* packed,    // bf16 [N, num_heads * 2 * head_dim]
+    void*       q_out,     // bf16 [N, num_heads * head_dim]
+    void*       gate_out,  // bf16 [N, num_heads * head_dim]
+    int N, int num_heads, int head_dim,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

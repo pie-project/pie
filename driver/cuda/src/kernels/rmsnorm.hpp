@@ -44,4 +44,21 @@ void launch_rmsnorm_no_scale_bf16(
     float eps,
     cudaStream_t stream);
 
+// RMSNorm fused with sigmoid-gating (Qwen3.5 GatedDeltaNet's `norm`
+// step on `core_attn_out`). Per-row:
+//
+//   x_hat = x * rsqrt(mean(x^2) + eps)
+//   y     = weight * x_hat * silu(gate)
+//
+// Plain weight (no `1+w` convention). `gate` matches `x` in shape.
+void launch_rmsnorm_gated_bf16(
+    const void* x,
+    const void* gate,
+    const void* weight,
+    void* y,
+    int num_rows,
+    int hidden,
+    float eps,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

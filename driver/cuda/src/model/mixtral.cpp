@@ -257,6 +257,7 @@ void mixtral_forward_paged(
                 N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
                 cache.page_size(), attn_ws, stream,
                 /*window_left=*/-1,
+                /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f,
                 layer_lse);
         } else {
             ops::launch_attention_flashinfer_prefill_bf16(

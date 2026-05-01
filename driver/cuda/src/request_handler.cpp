@@ -451,6 +451,13 @@ std::size_t handle_fire_batch(
                     static_cast<std::uint32_t>(all_sampled[row]));
             }
         }
+        if (const char* dbg = std::getenv("PIE_DEBUG_SAMPLED");
+            dbg && std::string(dbg) == "1") {
+            std::cerr << "[pie-driver-cuda] sampled tokens for handled=" << handled
+                      << ":";
+            for (auto t : sampled_tokens) std::cerr << ' ' << t;
+            std::cerr << '\n';
+        }
 
         std::size_t resp_bytes;
         if (need_msgpack) {

@@ -61,7 +61,28 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
                        optional<std::string>(j_root, "model_type", ""));
 
     cfg.hidden_size              = require<int>(j, "hidden_size", path_str);
-    cfg.intermediate_size        = require<int>(j, "intermediate_size", path_str);
+    // `intermediate_size` is normally a scalar, but Gemma-3n stores a
+    // per-layer list. Accept either; populate
+    // `gemma3n_per_layer_intermediate` from the list and mirror the
+    // first element into the scalar field for back-compat.
+    if (j.contains("intermediate_size") && j["intermediate_size"].is_array()) {
+        const auto& arr = j["intermediate_size"];
+        if (arr.empty()) {
+            throw std::runtime_error(
+                "config.json (" + path_str + "): intermediate_size list is empty");
+        }
+        cfg.gemma3n_per_layer_intermediate.reserve(arr.size());
+        for (const auto& v : arr) {
+            cfg.gemma3n_per_layer_intermediate.push_back(v.get<int>());
+        }
+        cfg.intermediate_size = cfg.gemma3n_per_layer_intermediate.front();
+    } else {
+        // qwen3_5_moe and similar pure-MoE configs omit `intermediate_size`
+        // and use only `moe_intermediate_size` / `shared_expert_intermediate_size`.
+        // Default the scalar to 0 in that case; the bind side reads the MoE-
+        // specific fields directly.
+        cfg.intermediate_size = optional<int>(j, "intermediate_size", 0);
+    }
     cfg.num_hidden_layers        = require<int>(j, "num_hidden_layers", path_str);
     cfg.num_attention_heads      = require<int>(j, "num_attention_heads", path_str);
     cfg.num_key_value_heads      = optional<int>(j, "num_key_value_heads", cfg.num_attention_heads);
@@ -145,9 +166,10 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // the right per-arch default here saves a "lm_head missing" load
     // failure on every Gemma checkpoint.
     const bool tie_default =
-        cfg.model_type == "gemma" || cfg.model_type == "gemma2" ||
+        cfg.model_type == "gemma"  || cfg.model_type == "gemma2" ||
         cfg.model_type == "gemma3" || cfg.model_type == "gemma3_text" ||
-        cfg.model_type == "gemma4";
+        cfg.model_type == "gemma4" || cfg.model_type == "gemma4_text" ||
+        cfg.model_type == "gemma3n" || cfg.model_type == "gemma3n_text";
     cfg.tie_word_embeddings = optional<bool>(j, "tie_word_embeddings", tie_default);
     // `attention_bias` is what Llama-3 / Qwen-3 use to flag bias on
     // QKV. Qwen-2 always ships biased QKV but its HF config omits the
@@ -213,6 +235,69 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
                 cfg.gemma_per_layer_partial_rotary_factor[i] =
                     optional<float>(e, "partial_rotary_factor", 1.0f);
             }
+        }
+    }
+
+    // Qwen3.6-MoE knobs (zero on non-MoE archs).
+    cfg.moe_intermediate_size =
+        optional<int>(j, "moe_intermediate_size", 0);
+    cfg.shared_expert_intermediate_size =
+        optional<int>(j, "shared_expert_intermediate_size", 0);
+
+    // Qwen3.5 hybrid (linear-attention SSM) knobs. Defaults are zero so
+    // non-qwen3.5 models leave the linear-attn dimensions unset; the
+    // bind side branches on `linear_num_value_heads > 0`.
+    cfg.linear_num_value_heads  = optional<int>(j, "linear_num_value_heads", 0);
+    cfg.linear_num_key_heads    = optional<int>(j, "linear_num_key_heads", 0);
+    cfg.linear_key_head_dim     = optional<int>(j, "linear_key_head_dim", 0);
+    cfg.linear_value_head_dim   = optional<int>(j, "linear_value_head_dim", 0);
+    cfg.linear_conv_kernel_dim  = optional<int>(j, "linear_conv_kernel_dim", 0);
+    cfg.attn_output_gate        = optional<bool>(j, "attn_output_gate",
+                                                 cfg.model_type == "qwen3_5" ||
+                                                 cfg.model_type == "qwen3_5_text");
+
+    // Partial RoPE (Qwen3.5). HF stores it under `rope_parameters` for
+    // qwen3_5 (single dict, not per-layer-type) and at the top level for
+    // some other models. Defaults to 1.0 (full rotation) for everything
+    // else.
+    cfg.partial_rotary_factor = 1.0f;
+    if (j.contains("rope_parameters") && j["rope_parameters"].is_object()
+            && j["rope_parameters"].contains("partial_rotary_factor")) {
+        cfg.partial_rotary_factor =
+            j["rope_parameters"]["partial_rotary_factor"].get<float>();
+    } else {
+        cfg.partial_rotary_factor =
+            optional<float>(j, "partial_rotary_factor", 1.0f);
+    }
+    // Qwen3.5 stores `rope_theta` under `rope_parameters` rather than
+    // at the top level. Use that as the source of truth when present.
+    if (j.contains("rope_parameters") && j["rope_parameters"].is_object()
+            && j["rope_parameters"].contains("rope_theta")
+            && cfg.layer_types.empty()) {
+        // Only apply when not Gemma-4-style per-layer-type rope_parameters
+        // (those have nested objects keyed by layer type).
+        const auto& rp = j["rope_parameters"];
+        if (rp["rope_theta"].is_number()) {
+            cfg.rope_theta = rp["rope_theta"].get<float>();
+        }
+    }
+
+    // Gemma-3n knobs. Defaults match HF's GptOssConfig defaults so non-
+    // gemma3n models leave them inert (laurel_rank=0 disables Laurel,
+    // altup_num_inputs=0 disables AltUp from the bind side).
+    cfg.altup_num_inputs    = optional<int>(j, "altup_num_inputs", 0);
+    cfg.altup_active_idx    = optional<int>(j, "altup_active_idx", 0);
+    cfg.altup_correct_scale = optional<bool>(j, "altup_correct_scale", false);
+    cfg.altup_coef_clip     = optional<float>(j, "altup_coef_clip", 0.f);
+    cfg.laurel_rank         = optional<int>(j, "laurel_rank", 0);
+    cfg.vocab_size_per_layer_input =
+        optional<int>(j, "vocab_size_per_layer_input", 0);
+    cfg.gemma3n_rope_local_base_freq =
+        optional<float>(j, "rope_local_base_freq", cfg.rope_local_base_freq);
+    if (j.contains("activation_sparsity_pattern") &&
+        j["activation_sparsity_pattern"].is_array()) {
+        for (const auto& v : j["activation_sparsity_pattern"]) {
+            cfg.gemma3n_activation_sparsity.push_back(v.get<float>());
         }
     }
 

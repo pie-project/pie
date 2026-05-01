@@ -107,4 +107,93 @@ void launch_geglu_tanh_bf16(
         num_elements);
 }
 
+namespace {
+
+__global__ void sigmoid_gate_inplace_bf16_kernel(
+    __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ gate,
+    int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float xv = __bfloat162float(x[i]);
+    const float gv = __bfloat162float(gate[i]);
+    const float s  = 1.f / (1.f + __expf(-gv));
+    x[i] = __float2bfloat16(xv * s);
+}
+
+}  // namespace
+
+void launch_sigmoid_gate_inplace_bf16(
+    void* x, const void* gate, int n, cudaStream_t stream)
+{
+    if (n <= 0) return;
+    constexpr int BLOCK = 256;
+    const int grid = (n + BLOCK - 1) / BLOCK;
+    sigmoid_gate_inplace_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(x),
+        static_cast<const __nv_bfloat16*>(gate),
+        n);
+}
+
+namespace {
+
+__global__ void chunked_swiglu_bf16_kernel(
+    const __nv_bfloat16* __restrict__ packed,
+    __nv_bfloat16*       __restrict__ y,
+    int N, int I)
+{
+    const int n = blockIdx.x;
+    const int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (n >= N || i >= I) return;
+    const float g = __bfloat162float(packed[(long long)n * 2 * I + i]);
+    const float u = __bfloat162float(packed[(long long)n * 2 * I + I + i]);
+    const float silu = g / (1.f + __expf(-g));
+    y[(long long)n * I + i] = __float2bfloat16(silu * u);
+}
+
+}  // namespace
+
+void launch_chunked_swiglu_bf16(
+    const void* packed, void* y, int N, int I, cudaStream_t stream)
+{
+    if (N <= 0 || I <= 0) return;
+    constexpr int BLOCK = 128;
+    dim3 grid(N, (I + BLOCK - 1) / BLOCK);
+    chunked_swiglu_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(packed),
+        static_cast<__nv_bfloat16*>(y),
+        N, I);
+}
+
+namespace {
+
+__global__ void sigmoid_scalar_gate_inplace_bf16_kernel(
+    __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ scalar_gate,
+    int N, int H)
+{
+    const int n = blockIdx.x;
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (n >= N || h >= H) return;
+    const float gv = __bfloat162float(scalar_gate[n]);
+    const float s  = 1.f / (1.f + __expf(-gv));
+    const long long i = (long long)n * H + h;
+    x[i] = __float2bfloat16(__bfloat162float(x[i]) * s);
+}
+
+}  // namespace
+
+void launch_sigmoid_scalar_gate_inplace_bf16(
+    void* x, const void* scalar_gate, int N, int H, cudaStream_t stream)
+{
+    if (N <= 0 || H <= 0) return;
+    constexpr int BLOCK = 128;
+    dim3 grid(N, (H + BLOCK - 1) / BLOCK);
+    sigmoid_scalar_gate_inplace_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(x),
+        static_cast<const __nv_bfloat16*>(scalar_gate),
+        N, H);
+}
+
 }  // namespace pie_cuda_driver::kernels

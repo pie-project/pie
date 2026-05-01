@@ -136,6 +136,8 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     AttentionWorkspace& workspace,
     cudaStream_t stream,
     int window_left = -1,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
     // See decode entry point. [total_tokens, num_q_heads] fp32, nullptr = skip.
     float* lse_out = nullptr);
 

@@ -134,4 +134,69 @@ void launch_rmsnorm_no_scale_bf16(
         hidden, eps);
 }
 
+namespace {
+
+// y = weight * (x * rsqrt(mean(x^2) + eps)) * silu(gate). One block per
+// row; both the variance reduction and the writeback are vectorized
+// the same way as the plain RMSNorm kernel.
+//
+// `weight` is fp32 — Qwen3.5 ships RMSNormGated weights in fp32 alongside
+// bf16 activations.
+template <int BLOCK>
+__global__ void rmsnorm_gated_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ gate,
+    const float*         __restrict__ weight,
+    __nv_bfloat16*       __restrict__ y,
+    int hidden, float eps)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const __nv_bfloat16* xr = x    + row * hidden;
+    const __nv_bfloat16* gr = gate + row * hidden;
+    __nv_bfloat16*       yr = y    + row * hidden;
+
+    float local = 0.f;
+    for (int i = tid; i < hidden; i += BLOCK) {
+        const float v = __bfloat162float(xr[i]);
+        local += v * v;
+    }
+
+    __shared__ float buf[BLOCK];
+    buf[tid] = local;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) buf[tid] += buf[tid + off];
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(hidden) + eps);
+
+    for (int i = tid; i < hidden; i += BLOCK) {
+        const float xv = __bfloat162float(xr[i]) * inv_rms;
+        const float wv = weight[i];
+        const float gv = __bfloat162float(gr[i]);
+        // silu(z) = z / (1 + exp(-z)) = z * sigmoid(z).
+        const float sg = gv / (1.f + __expf(-gv));
+        yr[i] = __float2bfloat16(wv * xv * sg);
+    }
+}
+
+}  // namespace
+
+void launch_rmsnorm_gated_bf16(
+    const void* x, const void* gate, const void* weight, void* y,
+    int num_rows, int hidden, float eps, cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid(num_rows);
+    dim3 block(BLOCK);
+    rmsnorm_gated_bf16_kernel<BLOCK><<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x),
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const float*>(weight),
+        static_cast<__nv_bfloat16*>(y),
+        hidden, eps);
+}
+
 }  // namespace pie_cuda_driver::kernels

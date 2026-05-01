@@ -63,6 +63,7 @@ add_executable(pie_driver_cuda
   src/model/mixtral.cpp
   src/model/gemma2.cpp
   src/model/gemma4.cpp
+  src/model/gemma3n.cpp
   src/model/mistral3.cpp
   src/model/gpt_oss.cpp
   src/model/qwen3_5.cpp
@@ -94,6 +95,15 @@ add_executable(pie_driver_cuda
   src/kernels/head_dim_pad.cu
   src/kernels/attn_sink.cu
   src/kernels/deinterleave.cu
+  src/kernels/gaussian_topk.cu
+  src/kernels/altup.cu
+  src/kernels/altup_aux.cu
+  src/kernels/causal_conv1d.cu
+  src/kernels/gated_delta_net.cu
+  src/qwen3_5_state_cache.cpp
+  src/model/qwen3_5_forward.cpp
+  src/model/qwen3_5_moe.cpp
+  src/model/qwen3_5_moe_forward.cpp
   src/attention_workspace.cpp
   src/brle.cpp
   src/control_socket.cpp

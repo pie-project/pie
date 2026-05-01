@@ -124,6 +124,63 @@ struct HfConfig {
     std::vector<float> gemma_per_layer_rope_theta;
     std::vector<float> gemma_per_layer_partial_rotary_factor;
 
+    // ── Qwen3.6-MoE specific ─────────────────────────────────────────
+    // Sparse-MoE block dims (zero on non-MoE archs). `moe_intermediate_size`
+    // is the per-expert hidden width; `shared_expert_intermediate_size`
+    // is the (always-on) shared expert's MLP width.
+    int moe_intermediate_size;
+    int shared_expert_intermediate_size;
+
+    // ── Qwen3.5 hybrid (linear-attention SSM + full attention) ──────
+    // Per-layer attention type is in `layer_types` (values
+    // "linear_attention" / "full_attention"). The linear layers run a
+    // Gated DeltaNet recurrence; the full layers run standard scaled-
+    // dot-product attention with a per-token output gate (a' = a *
+    // sigmoid(gate), where gate is the second half of `q_proj`).
+    //
+    // Linear-attention dimensions. Inert (zero) on every other model.
+    int   linear_num_value_heads;     // 32 on Qwen3.5-4B
+    int   linear_num_key_heads;       // 16 on Qwen3.5-4B
+    int   linear_key_head_dim;        // 128 on Qwen3.5-4B
+    int   linear_value_head_dim;      // 128 on Qwen3.5-4B
+    int   linear_conv_kernel_dim;     // 4 (depthwise causal conv kernel)
+    // Full-attention output gating: q_proj output is split (query, gate);
+    // attn output is multiplied by sigmoid(gate) before o_proj.
+    bool  attn_output_gate;
+    // Partial RoPE: only the first `partial_rotary_factor * head_dim`
+    // dimensions are rotated. Defaults to 1.0 (full rotation).
+    float partial_rotary_factor;
+
+    // Gemma-3n (E2B / E4B "Nano") additions on top of Gemma-4.
+    // Gemma-3n is a *different* architecture from Gemma-4 (despite the
+    // overlapping E2B / E4B naming) — it adds three new building blocks:
+    //
+    //   * AltUp ("Alternating Updates"): each layer maintains
+    //     `altup_num_inputs` (4 by default) parallel residual streams; the
+    //     active one (idx `altup_active_idx`) flows through attention +
+    //     MLP, the others are updated via per-layer prediction /
+    //     correction matmuls routed by a per-token "modality" vector.
+    //   * Laurel ("Learned Augmented Residual Layer"): a per-layer
+    //     low-rank skip — `linear_left` (H → laurel_rank), `linear_right`
+    //     (laurel_rank → H), then RMSNorm and residual-add.
+    //   * Activation sparsity: per-layer hard sparsity gate on the SwiGLU
+    //     gate via Gaussian-quantile cutoff (only nonzero on the early
+    //     layers of E2B per `activation_sparsity_pattern`).
+    //
+    // Plus `intermediate_size` is per-layer (HF stores it as a list).
+    // We populate `gemma3n_per_layer_intermediate` from that list and
+    // mirror the first element into the scalar `intermediate_size` for
+    // back-compat with code that reads it as a scalar.
+    int   altup_num_inputs;       // 4 on E2B/E4B
+    int   altup_active_idx;       // 0 on E2B/E4B
+    bool  altup_correct_scale;    // true on E2B/E4B
+    float altup_coef_clip;        // 120.0 on E2B/E4B (training-only clip)
+    int   laurel_rank;            // 64 on E2B/E4B
+    int   vocab_size_per_layer_input;  // 262144 on E2B
+    float gemma3n_rope_local_base_freq; // sliding-layer rope theta
+    std::vector<int>   gemma3n_per_layer_intermediate;
+    std::vector<float> gemma3n_activation_sparsity;
+
     // ── Storage dtype as declared on disk (for the safetensors loader).
     std::string torch_dtype;   // "bfloat16", "float16", "float32".
 };
