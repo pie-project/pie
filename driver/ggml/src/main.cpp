@@ -88,7 +88,9 @@ enum class OfflineTestMode {
 };
 
 // Drives generate_multi() with the supplied prompts + ctx_ids and prints
-// outputs + timing per the test mode.
+// outputs + timing per the test mode. After the run, the engine's
+// per-stage timing breakdown is logged (covers the prefill + decode loop
+// across all contexts).
 void run_offline_test(pie_ggml_driver::ForwardEngine& engine,
                       std::vector<std::vector<std::uint32_t>> prompts,
                       std::vector<std::uint64_t> ctx_ids,
@@ -114,6 +116,7 @@ void run_offline_test(pie_ggml_driver::ForwardEngine& engine,
             break;
     }
 
+    engine.reset_timings();
     const auto t0 = clock::now();
     auto outs = engine.generate_multi(prompts, max_new, ctx_ids);
     const long dt_ms = static_cast<long>(
@@ -160,6 +163,10 @@ void run_offline_test(pie_ggml_driver::ForwardEngine& engine,
             break;
         }
     }
+    // Per-stage breakdown (covers every compute_() call across prefill +
+    // decode). Useful for spotting whether time is going into graph
+    // build, the GPU compute itself, the logits download, or sampling.
+    engine.log_timings("offline-test");
 }
 
 }  // namespace

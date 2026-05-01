@@ -108,6 +108,26 @@ public:
         const Adapter*              active_adapter = nullptr;
     };
 
+    // Per-stage timing accumulators. Used both for offline benchmarks
+    // and to validate optimization changes. Each counter accumulates
+    // microseconds; `n_calls` counts compute_() invocations. Print on
+    // demand (or at engine destruction when calls > 0).
+    struct PhaseTimings {
+        std::uint64_t plan_us         = 0;
+        std::uint64_t graph_build_us  = 0;
+        std::uint64_t graph_alloc_us  = 0;
+        std::uint64_t upload_us       = 0;
+        std::uint64_t compute_us      = 0;     // backend graph compute
+        std::uint64_t logits_dl_us    = 0;
+        std::uint64_t sample_us       = 0;
+        std::uint64_t response_pack_us = 0;
+        std::uint64_t total_us        = 0;     // wall time of run()
+        std::uint64_t n_calls         = 0;
+    };
+    const PhaseTimings& timings() const noexcept { return timings_; }
+    void reset_timings() noexcept { timings_ = {}; }
+    void log_timings(const char* label) const;
+
 private:
     BatchPlan plan_(const schema::DecodedRequest& req);
     BatchPlan plan_test_simple_(std::span<const std::uint32_t> token_ids,
@@ -120,6 +140,7 @@ private:
     KvCachePaged   kv_;
     ggml_gallocr_t galloc_ = nullptr;
     AdapterPool*   adapters_ = nullptr;
+    mutable PhaseTimings timings_;
 };
 
 }  // namespace pie_ggml_driver

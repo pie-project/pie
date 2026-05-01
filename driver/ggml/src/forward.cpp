@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -1366,6 +1368,42 @@ ForwardEngine::~ForwardEngine() {
     if (galloc_) ggml_gallocr_free(galloc_);
 }
 
+void ForwardEngine::log_timings(const char* label) const {
+    if (timings_.n_calls == 0) return;
+    const double n = static_cast<double>(timings_.n_calls);
+    auto pct = [&](std::uint64_t b) {
+        return timings_.total_us
+            ? 100.0 * static_cast<double>(b) / static_cast<double>(timings_.total_us)
+            : 0.0;
+    };
+    auto avg = [&](std::uint64_t b) {
+        return static_cast<double>(b) / n / 1000.0;  // ms
+    };
+
+    std::ostream& o = std::cerr;
+    o << std::fixed << std::setprecision(3);
+    o << "[forward.timings] " << label << " — "
+      << timings_.n_calls << " call(s), avg "
+      << avg(timings_.total_us) << " ms / call\n";
+    o << "  plan      : " << avg(timings_.plan_us)        << " ms ("
+                          << pct(timings_.plan_us)        << "%)\n";
+    o << "  graph_bld : " << avg(timings_.graph_build_us) << " ms ("
+                          << pct(timings_.graph_build_us) << "%)\n";
+    o << "  graph_alc : " << avg(timings_.graph_alloc_us) << " ms ("
+                          << pct(timings_.graph_alloc_us) << "%)\n";
+    o << "  upload    : " << avg(timings_.upload_us)      << " ms ("
+                          << pct(timings_.upload_us)      << "%)\n";
+    o << "  compute   : " << avg(timings_.compute_us)     << " ms ("
+                          << pct(timings_.compute_us)     << "%)\n";
+    o << "  logits_dl : " << avg(timings_.logits_dl_us)   << " ms ("
+                          << pct(timings_.logits_dl_us)   << "%)\n";
+    o << "  sample    : " << avg(timings_.sample_us)      << " ms ("
+                          << pct(timings_.sample_us)      << "%)\n";
+    o << "  resp_pack : " << avg(timings_.response_pack_us) << " ms ("
+                          << pct(timings_.response_pack_us) << "%)\n";
+    o.unsetf(std::ios_base::floatfield);
+}
+
 // -----------------------------------------------------------------------------
 // Plan: BPIQ → BatchPlan (real page-table)
 // -----------------------------------------------------------------------------
@@ -1510,6 +1548,16 @@ ForwardEngine::BatchPlan ForwardEngine::plan_test_simple_(
 std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
     // Tensor metadata + graph node arrays. Sized to match GRAPH_MAX_NODES
     // (the same budget the graph builder uses).
+    using clock = std::chrono::steady_clock;
+    const auto t_compute_start = clock::now();
+    auto stage_start = t_compute_start;
+    auto take_us = [&](std::uint64_t& bucket) {
+        const auto now = clock::now();
+        bucket += std::chrono::duration_cast<std::chrono::microseconds>(
+                      now - stage_start).count();
+        stage_start = now;
+    };
+
     const std::size_t mem_size =
         ggml_tensor_overhead() * (1ull << 20) +
         ggml_graph_overhead_custom(GRAPH_MAX_NODES, false);
@@ -1526,18 +1574,22 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
         ctx, &ggml_free);
 
     const GraphResult g = build_qwen3_graph(ctx, model_, kv_, plan);
+    take_us(timings_.graph_build_us);
 
     if (!ggml_gallocr_alloc_graph(galloc_, g.gf)) {
         throw std::runtime_error("compute: gallocr_alloc_graph failed");
     }
+    take_us(timings_.graph_alloc_us);
 
     upload_graph_inputs(g, plan);
+    take_us(timings_.upload_us);
 
     const auto status = ggml_backend_graph_compute(model_.backend(), g.gf);
     if (status != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("compute: graph_compute status=" +
                                  std::to_string(static_cast<int>(status)));
     }
+    take_us(timings_.compute_us);
 
     const std::int32_t vocab_size = model_.hparams().vocab_size;
     const std::int32_t n_slots =
@@ -1546,8 +1598,14 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
         static_cast<std::size_t>(vocab_size) * n_slots);
     ggml_backend_tensor_get(g.logits, all_logits.data(), 0,
                             all_logits.size() * sizeof(float));
+    take_us(timings_.logits_dl_us);
 
-    return sample_batch(plan, all_logits.data(), vocab_size);
+    auto out = sample_batch(plan, all_logits.data(), vocab_size);
+    take_us(timings_.sample_us);
+    timings_.total_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                            clock::now() - t_compute_start).count();
+    ++timings_.n_calls;
+    return out;
 }
 
 // -----------------------------------------------------------------------------
@@ -1556,6 +1614,15 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
 
 std::size_t ForwardEngine::run(const schema::DecodedRequest& req,
                                std::span<std::uint8_t> response) {
+    using clock = std::chrono::steady_clock;
+    auto t_stage = clock::now();
+    auto take_us = [&](std::uint64_t& bucket) {
+        const auto now = clock::now();
+        bucket += std::chrono::duration_cast<std::chrono::microseconds>(
+                      now - t_stage).count();
+        t_stage = now;
+    };
+
     BatchPlan plan;
     try {
         plan = plan_(req);
@@ -1563,6 +1630,7 @@ std::size_t ForwardEngine::run(const schema::DecodedRequest& req,
         std::cerr << "[forward] plan failed: " << e.what() << "\n";
         return 0;
     }
+    take_us(timings_.plan_us);
 
     std::vector<SamplerOutput> sampled;
     try {
@@ -1571,23 +1639,29 @@ std::size_t ForwardEngine::run(const schema::DecodedRequest& req,
         std::cerr << "[forward] compute failed: " << e.what() << "\n";
         return 0;
     }
+    // compute_() credits its own sub-buckets + total + n_calls.
+    t_stage = clock::now();
 
+    std::size_t resp_size;
     if (needs_msgpack_mode(sampled)) {
-        return write_msgpack_response(response, sampled);
+        resp_size = write_msgpack_response(response, sampled);
+    } else {
+        // Flat fast path — every slot is token-producing. Variable-length
+        // per-request tokens (M8 spec decode) are concatenated; the per-
+        // request count goes into the counts table.
+        std::vector<std::uint32_t> tokens_per_req;
+        std::vector<std::uint32_t> tokens;
+        tokens_per_req.reserve(sampled.size());
+        for (const auto& s : sampled) {
+            tokens_per_req.push_back(static_cast<std::uint32_t>(s.tokens.size()));
+            tokens.insert(tokens.end(), s.tokens.begin(), s.tokens.end());
+        }
+        resp_size = write_flat_response(response,
+                                        std::span<const std::uint32_t>(tokens_per_req),
+                                        std::span<const std::uint32_t>(tokens));
     }
-    // Flat fast path — every slot is token-producing. Variable-length
-    // per-request tokens (M8 spec decode) are concatenated; the per-
-    // request count goes into the counts table.
-    std::vector<std::uint32_t> tokens_per_req;
-    std::vector<std::uint32_t> tokens;
-    tokens_per_req.reserve(sampled.size());
-    for (const auto& s : sampled) {
-        tokens_per_req.push_back(static_cast<std::uint32_t>(s.tokens.size()));
-        tokens.insert(tokens.end(), s.tokens.begin(), s.tokens.end());
-    }
-    return write_flat_response(response,
-                               std::span<const std::uint32_t>(tokens_per_req),
-                               std::span<const std::uint32_t>(tokens));
+    take_us(timings_.response_pack_us);
+    return resp_size;
 }
 
 std::vector<std::uint32_t> ForwardEngine::generate(
