@@ -386,5 +386,10 @@ int main(int argc, char** argv) {
     g_server.store(nullptr);
     std::cerr << "[pie-driver-ggml] shutting down (handled " << handled
               << " requests)\n";
+    // Print per-stage timings on demand (e.g. e2e benchmarks). Default
+    // off so production logs stay quiet.
+    if (std::getenv("PIE_GGML_LOG_TIMINGS")) {
+        engine.log_timings("shmem-loop");
+    }
     return 0;
 }

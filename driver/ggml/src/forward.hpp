@@ -114,6 +114,21 @@ public:
         // compute_() downloads only those n_slots * 4 bytes instead of
         // the full [vocab_size, n_slots] F32 logits block.
         bool                        all_greedy = false;
+
+        // GPU non-greedy fast path (uniform top-K). True iff:
+        //   - not all_greedy (greedy takes precedence)
+        //   - every slot has a token-producing sampler != Multinomial
+        //   - every slot uses the same temperature (>1e-5)
+        //   - no slot has a logit mask
+        // When set, the graph emits top-K sorted [probs, indices] per
+        // slot (size K * n_slots) and compute_() downloads ~K * n_slots
+        // small tensors. Per-slot top-p / min-p / top-k cuts and the
+        // categorical sample run on host over the tiny K-sized list.
+        bool                        uniform_top_sample = false;
+        // K used when uniform_top_sample is set (max of any per-slot
+        // top_k, clamped against vocab_size; default 256 if no slot
+        // specifies a top_k).
+        std::int32_t                uniform_top_k = 0;
     };
 
     // Per-stage timing accumulators. Used both for offline benchmarks

@@ -735,8 +735,15 @@ struct GraphInputs {
 
 struct GraphResult {
     ggml_cgraph* gf;
-    ggml_tensor* logits;      // F32 [vocab_size, n_request] (null when all_greedy)
-    ggml_tensor* tokens_out;  // I32 [n_slots]                (null unless all_greedy)
+    // Exactly one of the three output tensors is non-null per call,
+    // matched against the corresponding BatchPlan flag:
+    //   all_greedy        → tokens_out
+    //   uniform_top_sample → top_k_idx + top_k_probs
+    //   else              → logits
+    ggml_tensor* logits      = nullptr;  // F32 [vocab, n_slots]
+    ggml_tensor* tokens_out  = nullptr;  // I32 [n_slots]
+    ggml_tensor* top_k_idx   = nullptr;  // I32 [K, n_slots]
+    ggml_tensor* top_k_probs = nullptr;  // F32 [K, n_slots]
     GraphInputs  in;
 };
 
@@ -1067,7 +1074,9 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         logits = ggml_scale(ctx, logits, spec.final_softcap);
     }
 
-    ggml_tensor* tokens_out = nullptr;
+    ggml_tensor* tokens_out  = nullptr;
+    ggml_tensor* top_k_idx   = nullptr;
+    ggml_tensor* top_k_probs = nullptr;
     if (plan.all_greedy) {
         // Greedy fast path: argmax along vocab axis on the GPU. Caller
         // downloads only n_slots i32 ids; the F32 logits buffer never
@@ -1080,6 +1089,33 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         ggml_set_name(tokens_out, "tokens_out");
         ggml_set_output(tokens_out);
         ggml_build_forward_expand(gf, tokens_out);
+    } else if (plan.uniform_top_sample) {
+        // Non-greedy uniform fast path: temperature-scale + softmax →
+        // probs, take top-K indices, gather K probs. Caller downloads
+        // only K * n_slots * 8 bytes (vs vocab * n_slots * 4 bytes for
+        // the slow path) and finalizes per-slot top-p / min-p / sample
+        // host-side.
+        const float inv_t = 1.0f / plan.reqs[0].sampler.temperature;
+        ggml_tensor* probs = ggml_soft_max_ext(ctx, logits, /*mask=*/ nullptr,
+                                               /*scale=*/ inv_t, /*max_bias=*/ 0.0f);
+        // ggml_top_k returns indices [K, n_slots] sorted descending.
+        top_k_idx = ggml_top_k(ctx, probs, plan.uniform_top_k);
+
+        // Gather the K probabilities matching those indices, mirroring
+        // the get_rows trick used by the MoE router (build_moe_ffn).
+        // probs reshaped to [1, vocab, n_slots]; get_rows along ne[1]
+        // with index [K, n_slots] yields [1, K, n_slots] → reshape.
+        ggml_tensor* probs_3d = ggml_reshape_3d(
+            ctx, probs, 1, h.vocab_size, n_req);
+        ggml_tensor* gathered = ggml_get_rows(ctx, probs_3d, top_k_idx);
+        top_k_probs = ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_req);
+
+        ggml_set_name(top_k_idx, "top_k_idx");
+        ggml_set_name(top_k_probs, "top_k_probs");
+        ggml_set_output(top_k_idx);
+        ggml_set_output(top_k_probs);
+        ggml_build_forward_expand(gf, top_k_idx);
+        ggml_build_forward_expand(gf, top_k_probs);
     } else {
         ggml_set_name(logits, "logits");
         ggml_set_output(logits);
@@ -1088,10 +1124,17 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
 
     GraphResult res{};
     res.gf = gf;
-    // logits is exposed only when sampling happens host-side; greedy
-    // surfaces tokens_out and skips materializing the F32 block.
-    res.logits = plan.all_greedy ? nullptr : logits;
-    res.tokens_out = tokens_out;
+    // Only one output is materialized depending on the chosen sampling
+    // path. The other two stay null and gallocr skips their backing
+    // buffers (most importantly the [vocab, n_slots] F32 logits block).
+    if (plan.all_greedy) {
+        res.tokens_out = tokens_out;
+    } else if (plan.uniform_top_sample) {
+        res.top_k_idx   = top_k_idx;
+        res.top_k_probs = top_k_probs;
+    } else {
+        res.logits = logits;
+    }
     res.in = std::move(in);
     return res;
 }
@@ -1362,6 +1405,112 @@ std::vector<SamplerOutput> sample_batch(const ForwardEngine::BatchPlan& plan,
     return sampled;
 }
 
+// GPU uniform-top-sample fast path: per-slot list of top-K (prob, idx)
+// pairs already sorted descending and temperature-softmaxed by the
+// graph. Apply per-slot top-K / top-P / min-P cuts on the small list,
+// renormalize, and categorical sample.
+std::vector<SamplerOutput> sample_batch_uniform_top(
+        const ForwardEngine::BatchPlan& plan,
+        const std::int32_t* top_idx_flat,   // [K, n_slots]
+        const float*        top_prob_flat,  // [K, n_slots]
+        std::int32_t        K) {
+    const std::int32_t n_req = static_cast<std::int32_t>(plan.reqs.size());
+    std::vector<SamplerOutput> sampled(n_req);
+    std::int32_t slot_off = 0;
+    std::vector<std::pair<float, std::uint32_t>> scratch;
+    scratch.reserve(K);
+    for (std::int32_t r = 0; r < n_req; ++r) {
+        const auto& rp = plan.reqs[r];
+        const std::int32_t n_slots =
+            static_cast<std::int32_t>(rp.sampling_positions.size());
+        std::vector<SlotOutput> slot_out(n_slots);
+        for (std::int32_t s = 0; s < n_slots; ++s) {
+            const std::int32_t global_slot = slot_off + s;
+            const std::size_t base = static_cast<std::size_t>(global_slot) * K;
+            scratch.clear();
+            for (std::int32_t k = 0; k < K; ++k) {
+                const float p = top_prob_flat[base + k];
+                if (p > 0.0f) {
+                    scratch.emplace_back(
+                        p, static_cast<std::uint32_t>(top_idx_flat[base + k]));
+                }
+            }
+            if (scratch.empty()) {
+                // Numerically degenerate slot — emit the gathered top-1.
+                slot_out[s].token =
+                    static_cast<std::uint32_t>(top_idx_flat[base]);
+                continue;
+            }
+
+            std::size_t keep = scratch.size();
+            const auto& sp = rp.sampler;
+            // Per-slot top-K cap (graph K is the global max; an
+            // individual slot may have asked for less).
+            if (sp.type == SamplerType::TopK || sp.type == SamplerType::TopKTopP) {
+                if (sp.top_k > 0 && static_cast<std::size_t>(sp.top_k) < keep) {
+                    keep = sp.top_k;
+                }
+            }
+            // Top-P cumulative cutoff.
+            if (sp.type == SamplerType::TopP || sp.type == SamplerType::TopKTopP) {
+                const float thr = std::clamp(sp.top_p, 0.0f, 1.0f);
+                if (thr < 1.0f) {
+                    float cum = 0.0f;
+                    for (std::size_t i = 0; i < keep; ++i) {
+                        cum += scratch[i].first;
+                        if (cum >= thr) { keep = i + 1; break; }
+                    }
+                }
+            }
+            // Min-P ratio cutoff.
+            if (sp.type == SamplerType::MinP) {
+                const float thr = sp.min_p * scratch[0].first;
+                std::size_t cut = 0;
+                for (; cut < keep; ++cut) {
+                    if (scratch[cut].first < thr) break;
+                }
+                if (cut > 0) keep = cut;
+            }
+
+            // Renormalize + categorical sample over the small list.
+            double total = 0.0;
+            for (std::size_t i = 0; i < keep; ++i) total += scratch[i].first;
+            const std::uint64_t seed_u64 = sp.seed != 0
+                ? static_cast<std::uint64_t>(sp.seed)
+                : 0x9E3779B97F4A7C15ULL ^ static_cast<std::uint64_t>(global_slot);
+            // Cheap PCG state — same constants as sampler.cpp's Pcg32 but
+            // inlined to avoid pulling its private API.
+            std::uint64_t state = 0;
+            const std::uint64_t inc = (0xda3e39cb94b95bdbULL << 1u) | 1u;
+            auto next_u32 = [&]() {
+                const std::uint64_t old = state;
+                state = old * 6364136223846793005ULL + inc;
+                const std::uint32_t xs =
+                    static_cast<std::uint32_t>(((old >> 18u) ^ old) >> 27u);
+                const std::uint32_t rot = static_cast<std::uint32_t>(old >> 59u);
+                return (xs >> rot) | (xs << ((-static_cast<std::int32_t>(rot)) & 31));
+            };
+            // 2-step seed init (mirrors Pcg32 ctor).
+            next_u32();
+            state += seed_u64;
+            next_u32();
+            const float u = (next_u32() >> 8) * (1.0f / static_cast<float>(1ull << 24));
+
+            float target = u * static_cast<float>(total);
+            float acc = 0.0f;
+            std::uint32_t pick = scratch[keep - 1].second;
+            for (std::size_t i = 0; i < keep; ++i) {
+                acc += scratch[i].first;
+                if (target < acc) { pick = scratch[i].second; break; }
+            }
+            slot_out[s].token = pick;
+        }
+        resolve_request_output(rp, std::move(slot_out), sampled[r]);
+        slot_off += n_slots;
+    }
+    return sampled;
+}
+
 // Greedy fast path: every slot's token came from a GPU argmax; we just
 // stitch the i32 ids back into per-request SamplerOutput, running the
 // spec-decode verifier walk where applicable. Skips the per-slot logit
@@ -1509,6 +1658,48 @@ ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req)
         if (!greedy_temp || !token_producing || !rp.logit_mask_runs.empty()) {
             plan.all_greedy = false;
             break;
+        }
+    }
+
+    // GPU uniform-top-sample detection (non-greedy fast path). All slots
+    // must use the same temperature, none can have a logit mask, and
+    // none can be Multinomial (which needs the full vocab distribution).
+    // Per-slot top_k / top_p / min_p remain heterogeneous — they're
+    // applied host-side on the downloaded top-K list.
+    if (!plan.all_greedy && !plan.reqs.empty()) {
+        const auto& first = plan.reqs[0].sampler;
+        bool ok = true;
+        std::int32_t k_max = 0;
+        for (const auto& rp : plan.reqs) {
+            const auto& s = rp.sampler;
+            if (s.temperature <= 1e-5f
+                || s.temperature != first.temperature
+                || s.type == SamplerType::Multinomial
+                || s.type == SamplerType::Distribution
+                || s.type == SamplerType::RawLogits
+                || s.type == SamplerType::Logprob
+                || s.type == SamplerType::Logprobs
+                || s.type == SamplerType::Entropy
+                || !rp.logit_mask_runs.empty()) {
+                ok = false;
+                break;
+            }
+            // top_k == 0 means "no K cap" → we still pick a generous
+            // default for nucleus sampling; otherwise honor the slot's K.
+            const std::int32_t k = s.top_k > 0
+                ? static_cast<std::int32_t>(s.top_k) : 0;
+            if (k > k_max) k_max = k;
+        }
+        if (ok) {
+            // Default K of 256 covers >99% of nucleus mass for typical
+            // top-p≥0.9 traffic on transformer models. Bump if any slot
+            // explicitly asked for more.
+            constexpr std::int32_t kDefaultK = 256;
+            const std::int32_t v = hpar.vocab_size;
+            std::int32_t k = std::max(k_max, kDefaultK);
+            if (k > v) k = v;
+            plan.uniform_top_sample = true;
+            plan.uniform_top_k      = k;
         }
     }
 
@@ -1669,6 +1860,19 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
                                 tokens.size() * sizeof(std::int32_t));
         take_us(timings_.logits_dl_us);
         out = sample_batch_greedy(plan, tokens.data());
+        take_us(timings_.sample_us);
+    } else if (plan.uniform_top_sample) {
+        // GPU non-greedy fast path: download top-K probs + indices and
+        // finalize per-slot host-side. K * n_slots * 8 bytes total.
+        const std::int32_t K = plan.uniform_top_k;
+        std::vector<std::int32_t> top_idx(static_cast<std::size_t>(K) * n_slots);
+        std::vector<float>        top_prob(static_cast<std::size_t>(K) * n_slots);
+        ggml_backend_tensor_get(g.top_k_idx, top_idx.data(), 0,
+                                top_idx.size() * sizeof(std::int32_t));
+        ggml_backend_tensor_get(g.top_k_probs, top_prob.data(), 0,
+                                top_prob.size() * sizeof(float));
+        take_us(timings_.logits_dl_us);
+        out = sample_batch_uniform_top(plan, top_idx.data(), top_prob.data(), K);
         take_us(timings_.sample_us);
     } else {
         const std::int32_t vocab_size = model_.hparams().vocab_size;
