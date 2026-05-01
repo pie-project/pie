@@ -196,7 +196,9 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             const int conv_dim = 2 * K_dim + V_dim;
             q35_la_ws = pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace::allocate(
                 N, conv_dim, cfg_q.linear_num_value_heads,
-                cfg_q.linear_key_head_dim, cfg_q.linear_value_head_dim);
+                cfg_q.linear_num_key_heads,
+                cfg_q.linear_key_head_dim, cfg_q.linear_value_head_dim,
+                /*hq=*/cfg_q.num_attention_heads * cfg_q.head_dim);
             const std::size_t num_layers = is_qwen3_5
                 ? weights_qwen3_5.layers.size()
                 : weights_qwen3_5_moe.layers.size();
@@ -346,6 +348,27 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                      /*total_n=*/1, /*kv_n=*/N, /*is_decode=*/true);
             // The decode call wrote logits for one token at row 0.
             dump_row = 0;
+        }
+
+        // Optional decode-microbench (PIE_PARITY_BENCH_DECODE=K): replay K
+        // additional decode steps after the parity step, timing the total
+        // wall clock. Logits at the dump_row are unchanged (we use the
+        // last step's output).
+        if (const char* dbg = std::getenv("PIE_PARITY_BENCH_DECODE")) {
+            const int extra = std::max(1, std::atoi(dbg));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int s = 0; s < extra; ++s) {
+                run_call(d_tokens + (N - 1), d_positions + (N - 1),
+                         /*total_n=*/1, /*kv_n=*/N + s + 1, /*is_decode=*/true);
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ms =
+                std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::cerr << "[bench-decode] " << extra << " steps in "
+                      << ms << " ms => " << (extra * 1000.0 / ms)
+                      << " tok/s (single-stream, single-request)\n";
         }
     } else {
         pie_cuda_driver::model::qwen3_forward_prefill(
@@ -626,8 +649,10 @@ int main(int argc, char** argv) {
         qwen3_5_la_ws = pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace::allocate(
             max_workspace_tokens, conv_dim,
             cfg_q.linear_num_value_heads,
+            cfg_q.linear_num_key_heads,
             cfg_q.linear_key_head_dim,
-            cfg_q.linear_value_head_dim);
+            cfg_q.linear_value_head_dim,
+            /*hq=*/cfg_q.num_attention_heads * cfg_q.head_dim);
         const std::size_t num_layers = is_qwen3_5_arch
             ? weights_qwen3_5.layers.size()
             : weights_qwen3_5_moe.layers.size();

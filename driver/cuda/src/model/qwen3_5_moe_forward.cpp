@@ -139,54 +139,45 @@ void linear_attn_body(
             N, conv_dim, conv_K, stream);
     }
 
-    DeviceBuffer<std::uint16_t> q_raw =
-        DeviceBuffer<std::uint16_t>::alloc((std::size_t)N * K_dim);
-    DeviceBuffer<std::uint16_t> k_raw =
-        DeviceBuffer<std::uint16_t>::alloc((std::size_t)N * K_dim);
-    DeviceBuffer<std::uint16_t> v_raw =
-        DeviceBuffer<std::uint16_t>::alloc((std::size_t)N * V_dim);
     auto* qkv_base = la.mixed_qkv_post.data();
     const std::size_t bf16 = sizeof(std::uint16_t);
     CUDA_CHECK(cudaMemcpy2DAsync(
-        q_raw.data(), K_dim * bf16,
+        la.q_raw.data(), K_dim * bf16,
         qkv_base, conv_dim * bf16,
         K_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaMemcpy2DAsync(
-        k_raw.data(), K_dim * bf16,
+        la.k_raw.data(), K_dim * bf16,
         qkv_base + K_dim, conv_dim * bf16,
         K_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaMemcpy2DAsync(
-        v_raw.data(), V_dim * bf16,
+        la.v_raw.data(), V_dim * bf16,
         qkv_base + 2 * K_dim, conv_dim * bf16,
         V_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
 
-    DeviceBuffer<float> q_pre = DeviceBuffer<float>::alloc((std::size_t)N * K_h * K_d);
-    DeviceBuffer<float> k_pre = DeviceBuffer<float>::alloc((std::size_t)N * K_h * K_d);
-
     const float scale = 1.f / std::sqrt(static_cast<float>(K_d));
     kernels::launch_l2norm_scale_bf16_to_fp32(
-        q_raw.data(), q_pre.data(), N * K_h, K_d, scale, /*eps=*/1e-6f, stream);
+        la.q_raw.data(), la.q_pre.data(), N * K_h, K_d, scale, /*eps=*/1e-6f, stream);
     kernels::launch_l2norm_scale_bf16_to_fp32(
-        k_raw.data(), k_pre.data(), N * K_h, K_d, /*scale=*/1.f, /*eps=*/1e-6f, stream);
+        la.k_raw.data(), la.k_pre.data(), N * K_h, K_d, /*scale=*/1.f, /*eps=*/1e-6f, stream);
 
     if (V_h != K_h) {
         kernels::launch_repeat_interleave_heads_fp32(
-            q_pre.data(), la.q_norm.data(), N, K_h, V_h, K_d, stream);
+            la.q_pre.data(), la.q_norm.data(), N, K_h, V_h, K_d, stream);
         kernels::launch_repeat_interleave_heads_fp32(
-            k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d, stream);
+            la.k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d, stream);
     } else {
         CUDA_CHECK(cudaMemcpyAsync(
-            la.q_norm.data(), q_pre.data(),
+            la.q_norm.data(), la.q_pre.data(),
             (std::size_t)N * K_h * K_d * sizeof(float),
             cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(
-            la.k_norm.data(), k_pre.data(),
+            la.k_norm.data(), la.k_pre.data(),
             (std::size_t)N * K_h * K_d * sizeof(float),
             cudaMemcpyDeviceToDevice, stream));
     }
 
     kernels::launch_bf16_to_fp32(
-        v_raw.data(), la.v_fp32.data(),
+        la.v_raw.data(), la.v_fp32.data(),
         (std::size_t)N * V_dim, stream);
 
     kernels::launch_gated_delta_g_beta(
@@ -228,6 +219,7 @@ void full_attn_body(
     const Qwen3_5MoeLayerWeights& Lw,
     const HfConfig& cfg,
     Qwen3Workspace& ws,
+    Qwen3_5LinearAttnWorkspace& la,
     KvCache& cache, AttentionWorkspace& attn_ws,
     int kv_layer, int N, int R, bool is_pure_decode,
     const std::int32_t* positions,
@@ -247,16 +239,11 @@ void full_attn_body(
         2 * static_cast<int>(0.5f * cfg.partial_rotary_factor * d));
     const float eps = cfg.rms_norm_eps;
 
-    DeviceBuffer<std::uint16_t> qg_packed =
-        DeviceBuffer<std::uint16_t>::alloc((std::size_t)N * 2 * Hq);
-    DeviceBuffer<std::uint16_t> gate =
-        DeviceBuffer<std::uint16_t>::alloc((std::size_t)N * Hq);
-
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.fa_q_proj->data(),
-        qg_packed.data(), N, 2 * Hq, H);
+        la.fa_qg_packed.data(), N, 2 * Hq, H);
     kernels::launch_split_q_gate_bf16(
-        qg_packed.data(), ws.q.data(), gate.data(),
+        la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
         N, cfg.num_attention_heads, d, stream);
 
     ops::gemm_act_x_wt_bf16(cublas.handle(),
@@ -293,7 +280,7 @@ void full_attn_body(
         cache.page_size(), attn_ws, stream);
 
     kernels::launch_sigmoid_gate_inplace_bf16(
-        ws.attn_out.data(), gate.data(), N * Hq, stream);
+        ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
 
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.attn_out.data(), Lw.fa_o_proj->data(),
@@ -487,7 +474,7 @@ void qwen3_5_moe_forward_paged(
                 static_cast<int>(L), N, is_pure_decode, cublas, stream);
         } else {
             full_attn_body(
-                Lw, cfg, ws, cache, attn_ws, Lw.kv_layer,
+                Lw, cfg, ws, la_ws, cache, attn_ws, Lw.kv_layer,
                 N, num_requests, is_pure_decode,
                 positions, qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,

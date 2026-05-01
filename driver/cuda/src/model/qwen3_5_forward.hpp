@@ -35,8 +35,23 @@ struct Qwen3_5LinearAttnWorkspace {
 
     DeviceBuffer<std::uint16_t> core_out_bf16;  // [N, V_dim] bf16
 
+    // Hoisted from per-layer-call temp allocs. Sized to max_tokens
+    // capacity once at startup; reused across layers + steps.
+    DeviceBuffer<std::uint16_t> q_raw;   // [N, K_dim] bf16 (= K_h*K_d)
+    DeviceBuffer<std::uint16_t> k_raw;   // [N, K_dim] bf16
+    DeviceBuffer<std::uint16_t> v_raw;   // [N, V_dim] bf16
+    DeviceBuffer<float>         q_pre;   // [N, K_h, K_d] fp32 (pre-repeat)
+    DeviceBuffer<float>         k_pre;   // [N, K_h, K_d] fp32 (pre-repeat)
+
+    // Full-attention layers (Qwen3.5 / 3.6-MoE) need a 2x-wide q+gate
+    // packed buffer plus a separate gate buffer. Hoisted alongside the
+    // linear-attn scratch so the same workspace covers both layer kinds.
+    DeviceBuffer<std::uint16_t> fa_qg_packed;  // [N, 2*Hq] bf16
+    DeviceBuffer<std::uint16_t> fa_gate;       // [N, Hq]   bf16
+
     static Qwen3_5LinearAttnWorkspace allocate(
-        int max_tokens, int conv_dim, int v_h, int k_d, int v_d);
+        int max_tokens, int conv_dim, int v_h, int k_h, int k_d, int v_d,
+        int hq);
 };
 
 // Forward pass over `total_tokens` tokens packed as a flat [N, H]
