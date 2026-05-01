@@ -318,8 +318,8 @@ else:
             batched_randn_generate=generate,
         )
 
-    # Only BM7 (the default) is eager — the rest compile on first access so
-    # that `import rand_mv_cuda` in a fresh env doesn't build every variant.
+    # All variants compile on first access so `import rand_mv_cuda` is
+    # side-effect free (no nvcc/ninja invocation at startup).
     class _LazyVariant:
         def __init__(self, rng_method: int, rounds: int):
             self._rng_method = rng_method
@@ -332,7 +332,7 @@ else:
         def __getattr__(self, name):
             return getattr(self._resolve(), name)
 
-    BM7    = _bind(_get_ext(0,  7))
+    BM7    = _LazyVariant(0,  7)
     BM     = _LazyVariant(0, 10)
     PROBIT = _LazyVariant(1, 10)
     ZIG    = _LazyVariant(2, 10)

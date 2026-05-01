@@ -196,10 +196,10 @@ else:
             ext=ext,
         )
 
-    # Only BM7 (the default) is eager — the rest compile on first access so
-    # that `import rand_mv_cuda` in a fresh env doesn't build every variant.
-    # After first resolution, attributes are copied to the instance so
-    # subsequent accesses skip ``__getattr__`` (saves ~1 μs/call in hot paths).
+    # All variants compile on first access so `import rand_mv_cuda` is
+    # side-effect free (no nvcc/ninja invocation at startup). After first
+    # resolution, attributes are copied onto the instance so subsequent
+    # accesses skip ``__getattr__`` (saves ~1 μs/call in hot paths).
     class _LazyVariant:
         def __init__(self, rng_method: int, rounds: int):
             self._rng_method = rng_method
@@ -216,26 +216,29 @@ else:
             # the bound namespace).
             return getattr(self._resolve(), name)
 
-    BM7    = _bind(_get_ext(0,  7))
+    BM7    = _LazyVariant(0,  7)
     BM     = _LazyVariant(0, 10)
     PROBIT = _LazyVariant(1, 10)
     ZIG    = _LazyVariant(2, 10)
-    # BM is the default n_rounds=10 variant — every hot-path top-level call
-    # routes to it. Resolve eagerly so dispatch doesn't pay the __getattr__
-    # tax on the first batch of every fresh run.
-    BM._resolve()
 
     # Public top-level API.
     #
-    # The default n_rounds=10 (BM) path is a *direct alias* to BM's wrapper —
-    # zero dispatch overhead. Callers needing the BM7 variant must use the
-    # `BM7.*` namespace directly, or the `_route(n_rounds, fn)` helper below.
-    # No production caller passes a non-default n_rounds, so flattening this
-    # is worth ~9 μs/call of kwarg repacking on the hot path.
-    batched_randn_matmul                       = BM.batched_randn_matmul
-    batched_randn_matmul_sectioned             = BM.batched_randn_matmul_sectioned
-    batched_randn_matmul_multi_input_sectioned = BM.batched_randn_matmul_multi_input_sectioned
-    batched_randn_generate                     = BM.batched_randn_generate
+    # The default n_rounds=10 (BM) path goes through one extra level of
+    # function-call indirection so that *importing* this module does not
+    # trigger a JIT compile. Compilation is deferred until the first call.
+    # After the first call, _LazyVariant copies attributes onto itself so
+    # `BM.batched_randn_matmul` is a direct attribute lookup (no __getattr__).
+    def batched_randn_matmul(*args, **kwargs):
+        return BM.batched_randn_matmul(*args, **kwargs)
+
+    def batched_randn_matmul_sectioned(*args, **kwargs):
+        return BM.batched_randn_matmul_sectioned(*args, **kwargs)
+
+    def batched_randn_matmul_multi_input_sectioned(*args, **kwargs):
+        return BM.batched_randn_matmul_multi_input_sectioned(*args, **kwargs)
+
+    def batched_randn_generate(*args, **kwargs):
+        return BM.batched_randn_generate(*args, **kwargs)
 
     # ==================================================================
     #  Tests (mirror baseline.py's run_tests() but driven by our impls).

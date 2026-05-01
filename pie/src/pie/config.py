@@ -333,7 +333,7 @@ service_name = "pie"
 #
 # Filesystem
 # allow_fs = false                        # mount /scratch RW; default false
-# fs_scratch_dir = "/var/lib/pie/scratch" # base dir; default ${TMPDIR}/pie
+# fs_scratch_dir = "/var/lib/pie/scratch" # base dir; default ${{TMPDIR}}/pie
 #
 # Network. Filtering is by IP post-DNS — hostnames don't survive DNS,
 # so use IP / CIDR allowlists, or front the inferlet with a proxy.

@@ -26,17 +26,38 @@ _HAS_MULTI_INPUT_SECTIONED = RAND_MV_AVAILABLE and hasattr(
 #
 # We use the 10-round BM variant (the wrappers' n_rounds=10 default) so
 # the noise sequence matches what the wrappers would produce.
+#
+# The lookup is deferred: touching `BM.ext` forces a JIT compile via
+# torch.utils.cpp_extension.load (which shells out to ninja/nvcc), which we
+# explicitly do not want at module-import time. The first call to
+# `_resolve_fast_ext()` pays for it; subsequent calls are cached.
+_BM10 = None
 _EXT_SECTIONED = None
 _EXT_MULTI_INPUT_SECTIONED = None
 if RAND_MV_AVAILABLE:
     try:
         from pie_kernels.cuda.rand_mv_new import BM as _BM10
-        # BM is a _LazyVariant — touching .ext forces compilation/binding.
-        _ext_mod = _BM10.ext
-        _EXT_SECTIONED = _ext_mod.batched_randn_matmul_sectioned
-        _EXT_MULTI_INPUT_SECTIONED = _ext_mod.batched_randn_matmul_multi_input_sectioned
-    except (ImportError, AttributeError):
-        pass
+    except ImportError:
+        _BM10 = None
+
+
+def _resolve_fast_ext():
+    """Lazily fetch the raw pybind callables for the BM10 sectioned kernels.
+
+    First call triggers a JIT compile via the underlying _LazyVariant. Returns
+    `(ext_sectioned, ext_multi_input_sectioned)` on success; `(None, None)`
+    when CUDA isn't available or the kernel isn't loadable on this host.
+    """
+    global _EXT_SECTIONED, _EXT_MULTI_INPUT_SECTIONED
+    if _EXT_SECTIONED is None and _BM10 is not None:
+        try:
+            ext = _BM10.ext
+            _EXT_SECTIONED = ext.batched_randn_matmul_sectioned
+            _EXT_MULTI_INPUT_SECTIONED = ext.batched_randn_matmul_multi_input_sectioned
+        except (AttributeError, RuntimeError):
+            _EXT_SECTIONED = None
+            _EXT_MULTI_INPUT_SECTIONED = None
+    return _EXT_SECTIONED, _EXT_MULTI_INPUT_SECTIONED
 
 
 def run_length_encode(data: list[int]) -> list[tuple[int, int]]:
@@ -216,8 +237,8 @@ class AdapterSubpass:
     ):
         # Direct ext.* calls — bypass the Python wrappers (no asserts, no
         # seeds.to(), no list(tuple), no float() — all preformatted in plan).
-        ext_s = _EXT_SECTIONED
-        ext_mi = _EXT_MULTI_INPUT_SECTIONED
+        # First call resolves (and JIT-compiles) the BM10 sectioned kernels.
+        ext_s, ext_mi = _resolve_fast_ext()
         # Wrapper kept for the rare 3-UP fallback path.
         _matmul = rand_mv.batched_randn_matmul
         for p in self._fast_plans:
