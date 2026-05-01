@@ -1,7 +1,7 @@
 """vLLM driver config — typed view of a `vllm.engine.arg_utils.EngineArgs`
 subset. Field names mirror EngineArgs exactly so values flow verbatim:
 
-    [model.X.driver.vllm]
+    [model.driver.options]    # with [model.driver].type = "vllm"
     attention_backend = "FLASHINFER"      → EngineArgs.attention_backend
     enforce_eager = false                 → EngineArgs.enforce_eager
     gpu_memory_utilization = 0.85         → EngineArgs.gpu_memory_utilization

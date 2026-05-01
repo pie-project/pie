@@ -10,7 +10,7 @@
 //!     GPU before firing. Kept in `Wait` while the GPU is busy so
 //!     incoming arrivals during decode keep growing the next batch.
 //!
-//! Selection via the per-model `[model.X.scheduler.policy]` field in
+//! Selection via the per-model `[model.scheduler].policy` field in
 //! the TOML config (default = `adaptive`). The other two are retained
 //! as references: greedy for sanity-checking the scheduler itself,
 //! eager as a slightly simpler alternative that's marginally faster

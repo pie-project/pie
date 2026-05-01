@@ -1,7 +1,7 @@
 """SGLang driver config — typed view of the `ServerArgs` subset pie cares
 about. Field names mirror sglang's `ServerArgs` so values flow verbatim.
 
-    [model.X.driver.sglang]
+    [model.driver.options]    # with [model.driver].type = "sglang"
     attention_backend = "triton"        → ServerArgs.attention_backend
     mem_fraction_static = 0.85          → ServerArgs.mem_fraction_static
     page_size = 16                      → ServerArgs.page_size

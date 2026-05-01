@@ -85,6 +85,8 @@ ShmemServer::ShmemServer(std::string name,
     write_u32(4, SCHEMA_VERSION);
     write_u32(8, static_cast<std::uint32_t>(num_slots_));
     write_u32(12, static_cast<std::uint32_t>(slot_stride_));
+    write_u32(16, static_cast<std::uint32_t>(req_buf_size_));
+    write_u32(20, static_cast<std::uint32_t>(resp_buf_size_));
 }
 
 ShmemServer::~ShmemServer() {

@@ -17,7 +17,8 @@ from pie_client import Event
 async def run(args):
     from pie.server import Server
     from pie.config import (
-        Config, ModelConfig, AuthConfig, ServerConfig, TelemetryConfig, DriverConfig,
+        Config, ModelConfig, AuthConfig, ServerConfig, TelemetryConfig,
+        DriverConfig, SchedulerConfig,
     )
 
     script_dir = Path(__file__).parent.resolve()
@@ -35,11 +36,11 @@ async def run(args):
         server=ServerConfig(port=0, max_concurrent_processes=args.max_concurrent_processes),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        models={"default": ModelConfig(
+        models=[ModelConfig(
             name="default", hf_repo=args.model,
-            default_token_budget=args.default_token_budget,
+            scheduler=SchedulerConfig(default_token_limit=args.default_token_limit),
             driver=DriverConfig(type=args.driver, device=["cuda:0"], options={}),
-        )},
+        )],
     )
 
     async with Server(cfg) as server:
@@ -115,7 +116,7 @@ def main():
     p.add_argument("--prompt", default="Write a short story about a robot.")
     p.add_argument("--max-tokens", type=int, default=100)
     p.add_argument("--temperature", type=float, default=0.6)
-    p.add_argument("--default-token-budget", type=int, default=256)
+    p.add_argument("--default-token-limit", type=int, default=256)
     p.add_argument("--max-concurrent-processes", type=int, default=None)
     asyncio.run(run(p.parse_args()))
 

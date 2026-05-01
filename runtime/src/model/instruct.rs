@@ -20,10 +20,13 @@ pub mod decoders;
 // Model implementations
 pub mod gemma2;
 pub mod gemma3;
+pub mod gemma4;
+pub mod phi3;
 pub mod gptoss;
 pub mod llama2;
 pub mod llama3;
 pub mod mistral3;
+pub mod olmo2;
 pub mod olmo3;
 pub mod qwen2;
 pub mod qwen3;
@@ -117,9 +120,12 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         "llama3" | "l4ma" => Arc::new(self::llama3::LlamaInstruct::new(tokenizer)),
         "r1" | "deepseek_v3" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
         "gptoss" | "gpt_oss" => Arc::new(self::gptoss::GptOssInstruct::new(tokenizer)),
-        "gemma2" | "gemma3" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
+        "gemma2" | "gemma3" | "gemma3_text" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
+        "gemma4" | "gemma4_text" => Arc::new(self::gemma4::Gemma4Instruct::new(tokenizer)),
         "mistral3" | "ministral3" => Arc::new(self::mistral3::MistralInstruct::new(tokenizer)),
+        "olmo2" => Arc::new(self::olmo2::Olmo2Instruct::new(tokenizer)),
         "olmo3" => Arc::new(self::olmo3::OlmoInstruct::new(tokenizer)),
+        "phi3" => Arc::new(self::phi3::Phi3Instruct::new(tokenizer)),
         _ => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
             has_thinking: false,
             has_tools: false,

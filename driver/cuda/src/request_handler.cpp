@@ -39,12 +39,12 @@ std::size_t handle_fire_batch(
     // when it lived as a `[&]`-capturing lambda in main.cpp. Avoids a
     // mechanical rename across ~900 lines.
     auto& engine               = ctx.engine;
-    auto& weights              = ctx.weights;
     auto& ws                   = ctx.ws;
     auto& kv_cache             = ctx.kv_cache;
     auto& attn_ws              = ctx.attn_ws;
     auto& cublas               = ctx.cublas;
     auto& pi                   = ctx.inputs;  // persistent input slabs
+    auto& forward_fn           = ctx.forward_fn;
     const int max_workspace_tokens = ctx.max_workspace_tokens;
 
     // Track whether the custom-mask path was populated this fire so the
@@ -251,8 +251,8 @@ std::size_t handle_fire_batch(
                 cudaStream_t cstream = nullptr;
                 CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
                 CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
-                pie_cuda_driver::model::qwen3_forward_paged(
-                    weights, engine.hf_config(), ws, kv_cache, attn_ws, cublas,
+                forward_fn(
+                    ws, kv_cache, attn_ws, cublas,
                     reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
                     reinterpret_cast<const std::int32_t*>(pi.positions.data()),
                     pi.qo_indptr.data(), pi.kv_page_indices.data(),
@@ -277,8 +277,8 @@ std::size_t handle_fire_batch(
                 CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
             }
         } else {
-            pie_cuda_driver::model::qwen3_forward_paged(
-                weights, engine.hf_config(), ws, kv_cache, attn_ws, cublas,
+            forward_fn(
+                ws, kv_cache, attn_ws, cublas,
                 reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
                 reinterpret_cast<const std::int32_t*>(pi.positions.data()),
                 pi.qo_indptr.data(), pi.kv_page_indices.data(),

@@ -749,8 +749,9 @@ def _leader_loop(
     SHMEM_REQ_BUF = 4 * 1024 * 1024
     # Sized to hold a full-vocab `Distribution` probe / `Sampler::Dist`
     # payload (vocab × 8 bytes ≈ 2.6 MiB on 150K-vocab models) plus
-    # per-request overhead and the spec-mode multi-slot tail. Must
-    # match SHMEM_RESP_BUF in runtime/src/device.rs.
+    # per-request overhead and the spec-mode multi-slot tail. The Rust
+    # client picks this up from the shmem header at attach time, so it's
+    # a purely driver-side knob.
     SHMEM_RESP_BUF = 8 * 1024 * 1024
     SHMEM_BUSY_US = 10_000
 

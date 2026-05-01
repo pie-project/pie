@@ -59,6 +59,13 @@ public:
     // Allocate uninitialised device memory. Caller writes into `data()`.
     static DeviceTensor allocate(DType dtype, std::vector<std::int64_t> shape);
 
+    // Non-owning view into existing device memory (e.g. a slice of an
+    // already-loaded fused tensor). The caller is responsible for
+    // keeping the backing allocation alive at least as long as the
+    // view; the destructor here intentionally does not free.
+    static DeviceTensor view(void* ptr, DType dtype,
+                             std::vector<std::int64_t> shape);
+
     DeviceTensor(const DeviceTensor&) = delete;
     DeviceTensor& operator=(const DeviceTensor&) = delete;
 
@@ -67,10 +74,12 @@ public:
           dtype_(other.dtype_),
           shape_(std::move(other.shape_)),
           numel_(other.numel_),
-          nbytes_(other.nbytes_) {
+          nbytes_(other.nbytes_),
+          owns_memory_(other.owns_memory_) {
         other.ptr_ = nullptr;
         other.numel_ = 0;
         other.nbytes_ = 0;
+        other.owns_memory_ = false;
     }
 
     DeviceTensor& operator=(DeviceTensor&& other) noexcept {
@@ -81,9 +90,11 @@ public:
             shape_ = std::move(other.shape_);
             numel_ = other.numel_;
             nbytes_ = other.nbytes_;
+            owns_memory_ = other.owns_memory_;
             other.ptr_ = nullptr;
             other.numel_ = 0;
             other.nbytes_ = 0;
+            other.owns_memory_ = false;
         }
         return *this;
     }
@@ -108,6 +119,9 @@ private:
     std::vector<std::int64_t> shape_;
     std::size_t numel_ = 0;
     std::size_t nbytes_ = 0;
+    // True for `allocate`d tensors (own + free on destruct), false for
+    // non-owning views (`view(...)`). Move semantics propagate ownership.
+    bool owns_memory_ = false;
 };
 
 }  // namespace pie_cuda_driver

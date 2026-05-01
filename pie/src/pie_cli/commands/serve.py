@@ -58,16 +58,17 @@ def serve(
     if no_snapshot:
         cfg.server.python_snapshot = False
 
-    model = cfg.primary_model
     lines = Text()
     lines.append(f"{'Host':<15}", style="white")
     lines.append(f"{cfg.server.host}:{cfg.server.port}\n", style="dim")
-    lines.append(f"{'Model':<15}", style="white")
-    lines.append(f"{model.name} ({model.hf_repo})\n", style="dim")
-    lines.append(f"{'Driver':<15}", style="white")
-    lines.append(f"{model.driver.type}\n", style="dim")
-    lines.append(f"{'Device':<15}", style="white")
-    lines.append(", ".join(model.driver.device), style="dim")
+    for i, model in enumerate(cfg.models):
+        prefix = "Model" if i == 0 else ""
+        lines.append(f"{prefix:<15}", style="white")
+        lines.append(
+            f"{model.name} ({model.hf_repo}) — {model.driver.type} on "
+            f"{', '.join(model.driver.device)}\n",
+            style="dim",
+        )
 
     console.print()
     console.print(Panel(lines, title="Pie Engine", title_align="left", border_style="dim"))
@@ -81,7 +82,7 @@ def serve(
                 from pie_cli.monitor.app import LLMMonitorApp
                 from pie_cli.monitor.provider import PieMetricsProvider
 
-                model_cfg = cfg.primary_model
+                model_cfg = cfg.models[0]
                 provider = PieMetricsProvider(
                     host=cfg.server.host,
                     port=cfg.server.port,
@@ -89,7 +90,7 @@ def serve(
                     config={
                         "model": model_cfg.name,
                         "tp_size": model_cfg.driver.tensor_parallel_size,
-                        "max_batch": model_cfg.max_batch_tokens or 32,
+                        "max_batch": 32,
                     },
                 )
                 provider.start()

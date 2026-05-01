@@ -44,6 +44,30 @@ void plan_attention_flashinfer_decode_bf16(
 
 // Per-layer dispatch reusing the cached plan. `q`/`k_pages`/`v_pages`/`o`
 // vary per layer; everything else comes from the cache + workspace.
+//
+// `window_left`: non-negative enables sliding-window attention (only the
+// last `window_left + 1` KV tokens are visible to each query). `-1`
+// means full causal — the same flashinfer kernel is used either way
+// (the variant is compiled with `use_sliding_window=true` but the
+// runtime check is a no-op when `window_left == -1`).
+//
+// `logits_soft_cap`: positive enables Gemma-2 style `cap*tanh(logits/cap)`
+// inside the attention softmax. Zero disables — no overhead, no
+// alternative compile path is taken (a second template variant is
+// compiled with `use_logits_soft_cap=true`; we runtime-dispatch).
+// `sm_scale`: softmax scaling factor before the exp(). Negative means
+// "use `1/sqrt(head_dim)`" (the default flashinfer behaviour).
+// Override is needed when (a) the model wants a non-standard scale —
+// e.g. Gemma-4 sets `sm_scale=1.0` because q/k norm absorbs the
+// `1/sqrt(d)` factor — or (b) the kernel runs at a *padded* HEAD_DIM
+// (e.g. Phi-3 at 128 with logical head_dim=96), in which case
+// `1/sqrt(96)` rather than `1/sqrt(128)` is the correct scale.
+// `lse_out`: when non-null, flashinfer writes per-(token, q_head) log-sum-exp
+// (natural log of the unnormalized softmax denominator) into this buffer
+// before the final divide. Used by GPT-OSS sink-attention to apply the
+// post-hoc denominator-extension correction `o *= sigmoid(lse - sink_h)`.
+// Layout: row-major [num_tokens, num_q_heads] floats. nullptr = skip
+// (default; no overhead).
 void dispatch_attention_flashinfer_decode_bf16(
     const DecodePlanCache& cache,
     const void* q,
@@ -53,10 +77,16 @@ void dispatch_attention_flashinfer_decode_bf16(
     const std::uint32_t* kv_page_indptr_d,
     const std::uint32_t* kv_last_page_lens_d,
     AttentionWorkspace& workspace,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int window_left = -1,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
+    float* lse_out = nullptr);
 
 // Prefill (or mixed prefill+decode): per-request qo_len comes from
 // qo_indptr. Causal mask is hard-wired (DefaultAttention + MaskMode::kCausal).
+// `window_left` mirrors the decode entry point — non-negative enables
+// sliding-window attention.
 void launch_attention_flashinfer_prefill_bf16(
     const void* q,                                 // [total_tokens, h_q, d]
     void* k_pages, void* v_pages,                  // [num_pages, page_size, h_kv, d]
@@ -74,7 +104,12 @@ void launch_attention_flashinfer_prefill_bf16(
     int head_dim,
     int page_size,
     AttentionWorkspace& workspace,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int window_left = -1,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
+    // See decode entry point. [total_tokens, num_q_heads] fp32, nullptr = skip.
+    float* lse_out = nullptr);
 
 // Same prefill, with a custom packed-bit mask per request. `mask_d` is the
 // concatenation of all per-request bitmaps; `mask_indptr_d[r]` is the byte
@@ -99,6 +134,9 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     int head_dim,
     int page_size,
     AttentionWorkspace& workspace,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int window_left = -1,
+    // See decode entry point. [total_tokens, num_q_heads] fp32, nullptr = skip.
+    float* lse_out = nullptr);
 
 }  // namespace pie_cuda_driver::ops

@@ -41,7 +41,9 @@ impl InstancePolicy {
         InstancePolicy {
             fs: FsPolicy {
                 allow: false,
-                base_dir: FsPolicy::default_base_dir(),
+                // Never used because allow=false blocks scratch creation;
+                // an empty path is fine here.
+                base_dir: std::path::PathBuf::new(),
             },
             network: NetworkPolicy::parse(false, &[]).expect("deny-all parse"),
         }

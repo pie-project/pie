@@ -13,16 +13,34 @@ use crate::model::tokenizer::Tokenizer;
 
 // ─── GenericChatDecoder ──────────────────────────────────────
 
-/// Chat decoder that accumulates text and stops on any of the given token IDs.
+/// Chat decoder that accumulates tokens, emits incremental text deltas,
+/// and stops on any of the given token IDs.
+///
+/// Decoding strategy: SentencePiece-based tokenizers (Phi-3, Llama-1/2,
+/// some Mistral variants) encode word-leading whitespace as a `▁`
+/// prefix that gets re-stripped by the tokenizer's `Strip(start=1)`
+/// rule. Calling `decode([single_token])` on each new token therefore
+/// loses every inter-token space — output looks like
+/// `Onceuponatime`. Avoid that by accumulating *tokens*, decoding the
+/// full sequence each fire, and emitting only the suffix not yet seen.
+/// Byte-level BPE tokenizers (Qwen, Llama-3, Gemma) already encode
+/// spaces in-token, so this code path is a no-op cost on them but
+/// keeps the contract uniform.
 pub struct GenericChatDecoder {
     tokenizer: Arc<Tokenizer>,
     stop_ids: Vec<u32>,
-    accumulated: String,
+    token_buf: Vec<u32>,
+    text_emitted: usize,
 }
 
 impl GenericChatDecoder {
     pub fn new(tokenizer: Arc<Tokenizer>, stop_ids: Vec<u32>) -> Self {
-        Self { tokenizer, stop_ids, accumulated: String::new() }
+        Self {
+            tokenizer,
+            stop_ids,
+            token_buf: Vec::new(),
+            text_emitted: 0,
+        }
     }
 }
 
@@ -30,16 +48,26 @@ impl ChatDecoder for GenericChatDecoder {
     fn feed(&mut self, tokens: &[u32]) -> ChatEvent {
         for &t in tokens {
             if self.stop_ids.contains(&t) {
-                return ChatEvent::Done(std::mem::take(&mut self.accumulated));
+                let full = self.tokenizer.decode(&self.token_buf, false);
+                self.token_buf.clear();
+                self.text_emitted = 0;
+                return ChatEvent::Done(full);
             }
+            self.token_buf.push(t);
         }
-        let delta = self.tokenizer.decode(tokens, false);
-        self.accumulated.push_str(&delta);
+        let full = self.tokenizer.decode(&self.token_buf, false);
+        let delta = if full.len() > self.text_emitted {
+            full[self.text_emitted..].to_string()
+        } else {
+            String::new()
+        };
+        self.text_emitted = full.len();
         ChatEvent::Delta(delta)
     }
 
     fn reset(&mut self) {
-        self.accumulated.clear();
+        self.token_buf.clear();
+        self.text_emitted = 0;
     }
 }
 

@@ -51,6 +51,13 @@ public:
     }
     const DeviceTensor& get(const std::string& name) const;
 
+    // Register a tensor (typically a non-owning view from
+    // `DeviceTensor::view(...)`) under `name`. Used by per-arch bind
+    // functions that synthesise virtual q/k/v slots from a fused
+    // `qkv_proj.weight` (Phi-3) without copying the underlying data.
+    // Throws if `name` is already registered.
+    void insert(std::string name, DeviceTensor tensor);
+
 private:
     // M1.2.1 stores all weights by their HF name. M1.2.2 will introduce a
     // "model schema" layer that fuses Q/K/V into a single device buffer and

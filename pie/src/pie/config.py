@@ -5,7 +5,6 @@ Schema layout (TOML):
     [server]
     host = "127.0.0.1"
     port = 8080
-    # primary_model = "default"
 
     [auth]
     enabled = false
@@ -15,48 +14,53 @@ Schema layout (TOML):
     endpoint = "http://localhost:4317"
 
     [runtime]
-    # Per-instance security policies (defaults shown):
+    # Per-instance security policies + tokio + wasmtime tuning.
     allow_fs = false
     allow_network = true
     network_allowed_hosts = ["*"]
-    # Optional tuning (omit for built-in defaults):
-    # worker_threads, wasm_max_instances, wasm_max_memory_mb,
-    # wasm_warm_memory_mb, wasm_warm_slots,
-    # fs_scratch_dir, max_upload_mb
 
-    [model.default]
+    [[model]]
+    name = "default"
     hf_repo = "Qwen/Qwen3-0.6B"
-    default_token_budget = 10000          # admission policy lives flat under [model.X]
-    default_endowment_pages = 64
-    oversubscription_factor = 4.0
 
-    [model.default.driver]
-    type = "native"                       # discriminator
+    [model.scheduler]
+    batch_policy = "adaptive"
+    request_timeout_secs = 120
+    default_endowment_pages = 64
+    admission_oversubscription_factor = 4.0
+    restore_pause_at_utilization = 0.85
+
+    [model.driver]
+    type = "native"
     device = ["cuda:0"]
     tensor_parallel_size = 1
     activation_dtype = "bfloat16"
 
-    [model.default.driver.native]
-    # Driver-specific knobs in the driver's native vocabulary.
-    # Loaded into NativeDriverConfig (or whichever config_cls the driver registers).
+    [model.driver.options]
     gpu_mem_utilization = 0.8
-    max_batch_tokens = 10240
-    max_batch_size = 512
 
-Four concerns kept separate by section:
-  - `[server]`                : host/port + global admission caps
+Concerns kept separate by section:
+  - `[server]`                : host/port + global admission cap
   - `[runtime]`               : tokio + wasmtime + per-instance security
-  - `[model.X]`               : model identity + admission policy
-  - `[model.X.driver]`        : driver-agnostic execution (discriminator,
-                                device, parallelism, dtype)
-  - `[model.X.driver.<type>]` : driver-specific knobs in that driver's
-                                vocabulary (no translation layer)
+  - `[[model]]`               : one entry per model — identity only
+  - `[model.scheduler]`       : batch policy + per-process admission/market knobs
+  - `[model.driver]`          : driver discriminator + universal driver fields
+  - `[model.driver.options]`  : driver-specific knobs in that driver's vocabulary
+
+Multi-model: append additional `[[model]]` blocks. Each model's `name` must
+be unique and its `device` list must not overlap with any other model's.
+The first `[[model]]` is the implicit default for inferlets that don't
+specify a model name.
 """
 
 from __future__ import annotations
 
+import math
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import toml
 
@@ -76,7 +80,6 @@ class ServerConfig:
     registry: str = "https://registry.pie-project.org/"
     max_concurrent_processes: int | None = None
     python_snapshot: bool = True
-    primary_model: str | None = None     # which model is "primary"; default = first
 
     def __post_init__(self):
         if self.max_concurrent_processes is not None and self.max_concurrent_processes <= 0:
@@ -100,101 +103,68 @@ class TelemetryConfig:
 
 @dataclass
 class RuntimeConfig:
-    """The `[runtime]` block: tokio worker pool + wasmtime engine pool
-    + per-instance security policies (filesystem / network).
+    """The `[runtime]` block: tokio + wasmtime + per-instance security.
 
-    All fields are opt-in. Leaving the section out yields stock tokio,
-    stock wasmtime, no filesystem, and unrestricted network — the
-    legacy hardcoded behavior.
-
-    Tokio:
-      * `worker_threads` — number of tokio worker threads. `None`
-        (default) lets tokio pick `num_cpus`. On boxes with high
-        logical-core counts and many in-flight tasks (e.g. 96 cores at
-        high request concurrency), the default can cause heavy
-        migration / context-switch overhead; lowering this (commonly
-        to 8) substantially improves throughput. For real GPU backends
-        where Python compute dominates, the default is fine — leave
-        this unset unless a profile shows benefit.
-
-    Wasmtime engine pool:
-      * `wasm_max_instances` — concurrent-inferlet cap. Bumps
-        wasmtime's `total_core_instances`, `total_component_instances`,
-        `total_memories`, and `total_tables` together; pie uses one of
-        each per inferlet. `None` = wasmtime default of 1000.
-      * `wasm_max_memory_mb` — per-inferlet linear-memory cap, in MiB.
-        `None` = wasmtime default of 10.
-      * `wasm_warm_memory_mb` — RAM kept warm per slot to skip
-        remapping on respawn, in MiB. RSS-vs-spawn-latency tradeoff.
-        `None` = wasmtime default of 0.
-      * `wasm_warm_slots` — prepared-but-idle inferlet slots kept
-        ready for fast respawn. `None` = wasmtime default of 100.
-
-    Filesystem:
-      * `allow_fs` — when True, mount a per-process scratch dir at
-        `/scratch` with full RW. When False (default), no
-        ``wasi:filesystem`` access at all.
-      * `fs_scratch_dir` — base directory for per-process scratch
-        dirs. ``None`` (default) = ``${TMPDIR}/pie``.
-
-    Network:
-      * `allow_network` — when True (default), inferlets can use both
-        ``wasi:sockets`` and ``wasi:http``. When False, all socket
-        operations are denied and the ``wasi:http`` linker binding is
-        dropped entirely.
-      * `network_allowed_hosts` — list of ``cidr[:port]`` /
-        ``cidr:lo-hi`` strings. ``["*"]`` (default) means "no
-        restriction". Empty list ≡ ``allow_network = false``.
-        IMPORTANT: only filters ``wasi:sockets``; ``wasi:http``
-        bypasses the per-socket hook (its host stack does its own DNS
-        and connects directly). For tight IP-level control over
-        outbound HTTP, set ``allow_network = false`` and have your
-        inferlet use ``wasi:sockets`` directly.
-
-    Uploads:
-      * `max_upload_mb` — per-upload cap on cumulative bytes across
-        chunks (program installs and ``session.send_file`` blob
-        transfers). Checked on every chunk so a malicious sender
-        can't grow the in-flight buffer without bound. ``None``
-        (default) = use the runtime's built-in default of 256 MiB.
+    Defaults are explicit Python values — Rust applies them unconditionally,
+    no fallback logic. Wasmtime / tokio defaults are pinned in this file so
+    pie's behavior is decoupled from upstream changes.
     """
 
-    worker_threads: int | None = None
-    wasm_max_instances: int | None = None
-    wasm_max_memory_mb: int | None = None
-    wasm_warm_memory_mb: int | None = None
-    wasm_warm_slots: int | None = None
+    # Tokio
+    worker_threads: int = field(default_factory=lambda: os.cpu_count() or 4)
+
+    # Wasmtime engine pool
+    # Defaults match wasmtime 41 on 64-bit (pinned here so pie's behavior
+    # is decoupled from upstream wasmtime version bumps). 4 GiB is large
+    # but it's a per-slot virtual reservation; only touched memory is
+    # actually mapped. Lower wasm_max_memory_mb to e.g. 64 if you need
+    # tight RSS control and your inferlets fit.
+    wasm_max_instances: int = 1000
+    wasm_max_memory_mb: int = 4096
+    wasm_warm_memory_mb: int = 0
+    wasm_warm_slots: int = 100
+
+    # Filesystem
     allow_fs: bool = False
-    fs_scratch_dir: str | None = None
+    fs_scratch_dir: str = field(
+        default_factory=lambda: str(Path(tempfile.gettempdir()) / "pie")
+    )
+
+    # Network
+    #
+    # `network_allowed_hosts` filters wasi:sockets only. wasi:http bypasses
+    # the per-socket hook (its host stack does its own DNS). Set
+    # `allow_network = false` for tight outbound HTTP control.
     allow_network: bool = True
     network_allowed_hosts: list[str] = field(default_factory=lambda: ["*"])
-    max_upload_mb: int | None = None
+
+    # Uploads
+    max_upload_mb: int = 256
 
     def __post_init__(self):
-        if self.worker_threads is not None and self.worker_threads <= 0:
+        if self.worker_threads <= 0:
             raise ValueError(
-                f"runtime.worker_threads must be > 0 if set "
-                f"(got {self.worker_threads!r})"
+                f"runtime.worker_threads must be > 0 (got {self.worker_threads!r})"
             )
-        if self.wasm_max_instances is not None and self.wasm_max_instances <= 0:
+        if self.wasm_max_instances <= 0:
             raise ValueError(
-                f"runtime.wasm_max_instances must be > 0 if set "
-                f"(got {self.wasm_max_instances!r})"
+                f"runtime.wasm_max_instances must be > 0 (got {self.wasm_max_instances!r})"
             )
-        if self.wasm_max_memory_mb is not None and self.wasm_max_memory_mb <= 0:
+        if self.wasm_max_memory_mb <= 0:
             raise ValueError(
-                f"runtime.wasm_max_memory_mb must be > 0 if set "
-                f"(got {self.wasm_max_memory_mb!r})"
+                f"runtime.wasm_max_memory_mb must be > 0 (got {self.wasm_max_memory_mb!r})"
             )
-        if self.wasm_warm_memory_mb is not None and self.wasm_warm_memory_mb < 0:
+        if self.wasm_warm_memory_mb < 0:
             raise ValueError(
-                f"runtime.wasm_warm_memory_mb must be >= 0 if set "
-                f"(got {self.wasm_warm_memory_mb!r})"
+                f"runtime.wasm_warm_memory_mb must be >= 0 (got {self.wasm_warm_memory_mb!r})"
             )
-        if self.wasm_warm_slots is not None and self.wasm_warm_slots < 0:
+        if self.wasm_warm_slots < 0:
             raise ValueError(
-                f"runtime.wasm_warm_slots must be >= 0 if set "
-                f"(got {self.wasm_warm_slots!r})"
+                f"runtime.wasm_warm_slots must be >= 0 (got {self.wasm_warm_slots!r})"
+            )
+        if self.max_upload_mb <= 0:
+            raise ValueError(
+                f"runtime.max_upload_mb must be > 0 (got {self.max_upload_mb!r})"
             )
         if not isinstance(self.network_allowed_hosts, list) or not all(
             isinstance(h, str) for h in self.network_allowed_hosts
@@ -203,48 +173,77 @@ class RuntimeConfig:
                 f"runtime.network_allowed_hosts must be a list of strings "
                 f"(got {self.network_allowed_hosts!r})"
             )
-        if self.max_upload_mb is not None and self.max_upload_mb <= 0:
-            raise ValueError(
-                f"runtime.max_upload_mb must be > 0 if set "
-                f"(got {self.max_upload_mb!r})"
-            )
 
 
 @dataclass
 class SchedulerConfig:
-    """The `[model.X.scheduler]` block.
+    """The `[model.scheduler]` block: batch-firing policy + per-process
+    admission/market knobs.
 
-    `policy` selects the batch-firing policy (see
-    `runtime/src/inference/adaptive_policy.rs` for the choices and their
-    tradeoffs). Recognized values: `"adaptive"` (default), `"eager"`,
-    `"greedy"`.
+    `batch_policy` selects the batch-firing strategy (see
+    `runtime/src/inference/adaptive_policy.rs`): `"adaptive"`, `"eager"`,
+    or `"greedy"`.
+
+    The `default_*` and `admission_*` fields apply at process admission
+    when the launch request doesn't specify them explicitly.
     """
 
+    # Policy
+    batch_policy: str = "adaptive"
     request_timeout_secs: int = 120
-    policy: str | None = None
+
+    # Per-process admission & market policy
+    default_token_limit: int | None = None
+    default_endowment_pages: int = 64
+    admission_oversubscription_factor: float = 4.0
+    restore_pause_at_utilization: float = 0.85
 
     def __post_init__(self):
+        if self.batch_policy not in ("adaptive", "eager", "greedy"):
+            raise ValueError(
+                f"scheduler.batch_policy must be one of "
+                f"'adaptive' | 'eager' | 'greedy' (got {self.batch_policy!r})"
+            )
         if self.request_timeout_secs <= 0:
             raise ValueError(
                 f"scheduler.request_timeout_secs must be > 0 "
                 f"(got {self.request_timeout_secs!r})"
             )
-        if self.policy is not None and self.policy not in ("adaptive", "eager", "greedy"):
+        if self.default_token_limit is not None and self.default_token_limit <= 0:
             raise ValueError(
-                f"scheduler.policy must be one of "
-                f"'adaptive' | 'eager' | 'greedy' (got {self.policy!r})"
+                f"scheduler.default_token_limit must be > 0 if set "
+                f"(got {self.default_token_limit!r})"
+            )
+        if self.default_endowment_pages <= 0:
+            raise ValueError(
+                f"scheduler.default_endowment_pages must be > 0 "
+                f"(got {self.default_endowment_pages!r})"
+            )
+        if (
+            self.admission_oversubscription_factor <= 0.0
+            or not math.isfinite(self.admission_oversubscription_factor)
+        ):
+            raise ValueError(
+                f"scheduler.admission_oversubscription_factor must be a "
+                f"finite > 0 number "
+                f"(got {self.admission_oversubscription_factor!r})"
+            )
+        if not 0.0 < self.restore_pause_at_utilization <= 1.0:
+            raise ValueError(
+                f"scheduler.restore_pause_at_utilization must be in (0.0, 1.0] "
+                f"(got {self.restore_pause_at_utilization!r})"
             )
 
 
 @dataclass
 class DriverConfig:
-    """The `[model.X.driver]` block.
+    """The `[model.driver]` block.
 
     `type` is the discriminator (looked up in the driver registry). The
-    universal fields (device, tensor_parallel_size, activation_dtype) apply
-    to every driver. `options` is the raw `[model.X.driver.<type>]` subsection
-    as a dict; it gets parsed into the driver's typed config dataclass at
-    server.py / worker.py time, after the registry resolves which class.
+    universal fields apply to every driver. `options` is the
+    `[model.driver.options]` sub-table — driver-specific knobs in the
+    driver's own vocabulary, parsed by the driver's typed config dataclass
+    at server.py / worker.py time.
     """
 
     type: str
@@ -257,62 +256,34 @@ class DriverConfig:
 
 @dataclass
 class ModelConfig:
-    """One model entry — `[model.<name>]`.
+    """One `[[model]]` entry — model identity + dispatched subsections.
 
-    `name` is the TOML table key (also the inferlet-side lookup key for
-    `Model::load(name)`).
+    `name` is the inferlet-side lookup key for `Model::load(name)`. Must be
+    unique across `[[model]]` entries.
+
+    Per-process admission policy lives in `[model.scheduler]`, not here.
     """
 
     name: str
     hf_repo: str
     driver: DriverConfig
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-    # Admission policy (pie's market mechanism)
-    default_token_budget: int | None = None
-    default_endowment_pages: int = 64
-    oversubscription_factor: float = 4.0
 
     def __post_init__(self):
-        if self.default_token_budget is not None and self.default_token_budget <= 0:
-            raise ValueError(
-                f"Model {self.name!r}: default_token_budget must be > 0 if set "
-                f"(got {self.default_token_budget!r})"
-            )
-        if self.default_endowment_pages <= 0:
-            raise ValueError(
-                f"Model {self.name!r}: default_endowment_pages must be > 0 "
-                f"(got {self.default_endowment_pages!r})"
-            )
-        if self.oversubscription_factor <= 0.0:
-            raise ValueError(
-                f"Model {self.name!r}: oversubscription_factor must be > 0 "
-                f"(got {self.oversubscription_factor!r})"
-            )
+        if not self.name:
+            raise ValueError("model.name must be a non-empty string")
 
 
 @dataclass
 class Config:
-    """Top-level pie config."""
+    """Top-level pie config. Models are an ordered list; the first entry
+    is the implicit default."""
 
     server: ServerConfig = field(default_factory=ServerConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    models: dict[str, ModelConfig] = field(default_factory=dict)
-
-    @property
-    def primary_model(self) -> ModelConfig:
-        if not self.models:
-            raise ValueError("No model configurations defined")
-        if self.server.primary_model is not None:
-            if self.server.primary_model not in self.models:
-                raise ValueError(
-                    f"server.primary_model = {self.server.primary_model!r} but "
-                    f"no [model.{self.server.primary_model}] section exists. "
-                    f"Available: {sorted(self.models)}"
-                )
-            return self.models[self.server.primary_model]
-        return next(iter(self.models.values()))
+    models: list[ModelConfig] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +305,15 @@ def get_default_device() -> str:
 
 
 def create_default_config_content() -> str:
+    """Render the default config TOML.
+
+    Default values for `[runtime]` come from `RuntimeConfig()` so the
+    template can't drift from the dataclass.
+    """
     device = get_default_device()
+    rt = RuntimeConfig()
+    fs_scratch_dir = rt.fs_scratch_dir.replace("\\", "\\\\")  # TOML escape
+
     return f"""\
 [server]
 host = "127.0.0.1"
@@ -343,7 +322,6 @@ verbose = false
 registry = "https://registry.pie-project.org/"
 python_snapshot = true
 # max_concurrent_processes = 64           # global cap on in-flight inferlets
-# primary_model = "default"                # which [model.X] is the default
 
 [auth]
 enabled = false
@@ -354,52 +332,73 @@ endpoint = "http://localhost:4317"
 service_name = "pie"
 
 [runtime]
-# Per-instance security policies — defaults shown explicitly so the
-# behavior is visible in the config file. Edit to tighten.
+# Tokio + wasmtime tuning. Defaults below are pinned by pie (decoupled
+# from upstream wasmtime changes). Edit any value to override.
+worker_threads = {rt.worker_threads}
+wasm_max_instances = {rt.wasm_max_instances}
+wasm_max_memory_mb = {rt.wasm_max_memory_mb}
+wasm_warm_memory_mb = {rt.wasm_warm_memory_mb}
+wasm_warm_slots = {rt.wasm_warm_slots}
 
-# Filesystem. When allow_fs = true, every inferlet gets a per-process
-# scratch dir mounted at /scratch with full RW.
-allow_fs = false
-# fs_scratch_dir = "/var/lib/pie/scratch"  # base dir; default ${{TMPDIR}}/pie
+# Filesystem. allow_fs = true mounts a per-process /scratch dir with full RW.
+allow_fs = {str(rt.allow_fs).lower()}
+fs_scratch_dir = "{fs_scratch_dir}"
 
-# Network. Filtering is by IP post-DNS — hostnames don't survive DNS
-# resolution, so use IP / CIDR allowlists. NOTE: network_allowed_hosts
-# only filters wasi:sockets. wasi:http bypasses the per-socket hook
-# (it uses the host's HTTP stack with its own DNS). For tight outbound
-# HTTP control, set allow_network = false and have the inferlet use
-# wasi:sockets directly.
-allow_network = true
+# Network. `network_allowed_hosts` filters wasi:sockets only — wasi:http
+# bypasses the per-socket hook (its host stack does its own DNS). Set
+# allow_network = false for tight outbound HTTP control.
+allow_network = {str(rt.allow_network).lower()}
 network_allowed_hosts = ["*"]
 # Examples:
 #   network_allowed_hosts = ["10.0.0.0/8", "127.0.0.1"]
 #   network_allowed_hosts = ["10.0.0.0/8:443"]
-#   network_allowed_hosts = ["10.0.0.0/8:1024-65535"]
 
-# Optional tuning — omit any field to use the runtime's built-in default.
-# worker_threads = 8                       # tokio workers (default: num_cpus)
-# wasm_max_instances = 4096                # concurrent-inferlet cap (default 1000)
-# wasm_max_memory_mb = 64                  # per-inferlet memory cap, MiB (default 10)
-# wasm_warm_memory_mb = 0                  # RAM kept warm per slot, MiB (default 0)
-# wasm_warm_slots = 100                    # idle warm slots (default 100)
-# max_upload_mb = 256                      # per-upload cumulative cap (default 256)
+# Uploads
+max_upload_mb = {rt.max_upload_mb}
 
-[model.default]
+[[model]]
+name = "default"
 hf_repo = "{DEFAULT_MODEL}"
-# Admission policy (per-model)
-default_endowment_pages = 64
-oversubscription_factor = 4.0
 
-[model.default.driver]
+[model.scheduler]
+# Batch firing — adaptive | eager | greedy
+# (see runtime/src/inference/adaptive_policy.rs)
+batch_policy = "adaptive"
+
+# Wall-clock cap on a single forward-pass request (seconds).
+request_timeout_secs = 120
+
+# Per-process compute cap (tokens). Uncomment for a hard limit.
+# default_token_limit = 100000
+
+# Per-process GPU-page claim under contention (KV pages). Bigger = more
+# pages this process is guaranteed to hold when others compete.
+default_endowment_pages = 64
+
+# Admission overbook ratio: Σ endowment ≤ total_pages × this. 1.0 = no
+# overbook (every claim honored at all times); 4.0 = sell 4× capacity,
+# betting on non-peak duty cycles (like an airline).
+admission_oversubscription_factor = 4.0
+
+# Pause restoring suspended processes when any device exceeds this GPU
+# page utilization (0.0–1.0). Prevents evict→restore→re-evict thrash.
+restore_pause_at_utilization = 0.85
+
+[model.driver]
 type = "native"
 device = ["{device}"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 random_seed = 42
 
-[model.default.driver.native]
+[model.driver.options]
 gpu_mem_utilization = 0.8
 max_batch_tokens = 10240
 max_batch_size = 512
+
+# To add a second model, append another [[model]] block with a unique name
+# and a non-overlapping device list. The first [[model]] is the implicit
+# default for inferlets that don't specify a model name.
 """
 
 
@@ -412,13 +411,9 @@ _DRIVER_UNIVERSAL_KEYS = {
     "type", "device", "tensor_parallel_size", "activation_dtype", "random_seed",
 }
 
-# Tight schemas for top-level sections — typos like `worker_thread`
-# (singular) would otherwise silently no-op and the user would never
-# know their tuning didn't apply. The driver subsection has its own
-# guard via `_DRIVER_UNIVERSAL_KEYS`.
 _SERVER_KEYS = {
     "host", "port", "verbose", "registry", "max_concurrent_processes",
-    "python_snapshot", "primary_model",
+    "python_snapshot",
 }
 _RUNTIME_KEYS = {
     "worker_threads",
@@ -427,6 +422,14 @@ _RUNTIME_KEYS = {
     "allow_fs", "fs_scratch_dir",
     "allow_network", "network_allowed_hosts",
     "max_upload_mb",
+}
+_TELEMETRY_KEYS = {"enabled", "endpoint", "service_name"}
+_AUTH_KEYS = {"enabled"}
+_MODEL_KEYS = {"name", "hf_repo", "scheduler", "driver"}
+_SCHEDULER_KEYS = {
+    "batch_policy", "request_timeout_secs",
+    "default_token_limit", "default_endowment_pages",
+    "admission_oversubscription_factor", "restore_pause_at_utilization",
 }
 
 
@@ -442,90 +445,137 @@ def _reject_unknown(section: str, raw: dict, allowed: set[str]) -> None:
 def _parse_driver(model_name: str, raw: dict) -> DriverConfig:
     if not isinstance(raw, dict):
         raise ValueError(
-            f"Model {model_name!r}: [model.{model_name}.driver] must be a TOML "
-            f"table, got {type(raw).__name__}."
+            f"Model {model_name!r}: [model.driver] must be a TOML table, "
+            f"got {type(raw).__name__}."
         )
     if "type" not in raw:
         raise ValueError(
-            f"Model {model_name!r}: [model.{model_name}.driver] is missing the "
-            f"`type` field. Set type = \"vllm\" / \"native\" / \"dummy\" / etc."
+            f"Model {model_name!r}: [model.driver] is missing the `type` field."
         )
     if "device" not in raw:
         raise ValueError(
-            f"Model {model_name!r}: [model.{model_name}.driver] is missing the "
-            f"`device` field. Set device = [\"cuda:0\"] (or similar)."
+            f"Model {model_name!r}: [model.driver] is missing the `device` field."
         )
 
-    driver_type = raw["type"]
+    options = raw.get("options", {})
+    if not isinstance(options, dict):
+        raise ValueError(
+            f"Model {model_name!r}: [model.driver.options] must be a table, "
+            f"got {type(options).__name__}."
+        )
+
+    # Refuse stray top-level keys at [model.driver]. Driver-specific knobs
+    # belong inside [model.driver.options].
+    extra = [
+        k for k in raw
+        if k not in _DRIVER_UNIVERSAL_KEYS and k != "options"
+    ]
+    if extra:
+        raise ValueError(
+            f"Model {model_name!r}: unexpected key(s) under [model.driver]: "
+            f"{sorted(extra)}. Driver-specific knobs belong under "
+            f"[model.driver.options]."
+        )
+
     device = raw["device"]
     if isinstance(device, str):
         device = [device]
-
-    # Type-specific subsection: `[model.X.driver.<type>]` lives at raw[<type>]
-    # and is the only sibling of the universal fields that's a sub-table.
-    type_specific = raw.get(driver_type, {})
-    if not isinstance(type_specific, dict):
+    elif not isinstance(device, list) or not all(isinstance(d, str) for d in device):
         raise ValueError(
-            f"Model {model_name!r}: [model.{model_name}.driver.{driver_type}] "
-            f"must be a table, got {type(type_specific).__name__}."
+            f"Model {model_name!r}: [model.driver].device must be a string "
+            f"or a list of strings (got {device!r})."
         )
-
-    # Refuse stray top-level keys that aren't universal and aren't a known
-    # driver subsection — catches typos like `attn_backend` placed at driver
-    # level instead of inside `[model.X.driver.vllm]`.
-    extra = [k for k in raw
-             if k not in _DRIVER_UNIVERSAL_KEYS
-             and not isinstance(raw[k], dict)]
-    if extra:
+    if not device:
         raise ValueError(
-            f"Model {model_name!r}: unexpected key(s) under "
-            f"[model.{model_name}.driver]: {extra}. Driver-specific knobs "
-            f"belong under [model.{model_name}.driver.{driver_type}]."
+            f"Model {model_name!r}: [model.driver].device must be non-empty."
         )
 
     return DriverConfig(
-        type=driver_type,
-        device=device,
+        type=str(raw["type"]),
+        device=list(device),
         tensor_parallel_size=int(raw.get("tensor_parallel_size", 1)),
         activation_dtype=str(raw.get("activation_dtype", "bfloat16")),
         random_seed=int(raw.get("random_seed", 42)),
-        options=type_specific,
+        options=options,
     )
 
 
-def _parse_model(name: str, raw: dict) -> ModelConfig:
+def _parse_model(raw: dict, index: int) -> ModelConfig:
+    """Parse one `[[model]]` entry."""
     if not isinstance(raw, dict):
         raise ValueError(
-            f"[model.{name}] must be a TOML table, got {type(raw).__name__}."
+            f"[[model]] #{index} must be a TOML table, got {type(raw).__name__}."
         )
+    if "name" not in raw:
+        raise ValueError(f"[[model]] #{index} is missing the required `name` field.")
     if "hf_repo" not in raw:
-        raise ValueError(f"[model.{name}] is missing required `hf_repo`.")
+        raise ValueError(
+            f"[[model]] {raw['name']!r}: missing the required `hf_repo` field."
+        )
     if "driver" not in raw:
         raise ValueError(
-            f"[model.{name}] is missing the [model.{name}.driver] subsection."
+            f"[[model]] {raw['name']!r}: missing the [model.driver] subsection."
         )
 
+    # Friendly migration errors for fields that moved to [model.scheduler].
+    moved = {
+        "default_token_budget": "default_token_limit",
+        "default_endowment_pages": "default_endowment_pages",
+        "oversubscription_factor": "admission_oversubscription_factor",
+    }
+    for old_key, new_key in moved.items():
+        if old_key in raw:
+            renamed = "" if old_key == new_key else f" (renamed to `{new_key}`)"
+            raise ValueError(
+                f"[[model]] {raw['name']!r}: `{old_key}` has moved to "
+                f"[model.scheduler]{renamed}. Move admission/market policy "
+                f"under [model.scheduler]."
+            )
+
+    _reject_unknown(f"[[model]] {raw['name']!r}", raw, _MODEL_KEYS)
+
+    name = str(raw["name"])
     driver = _parse_driver(name, raw["driver"])
+
     sched_raw = raw.get("scheduler", {})
     if not isinstance(sched_raw, dict):
         raise ValueError(
-            f"[model.{name}.scheduler] must be a TOML table, "
+            f"Model {name!r}: [model.scheduler] must be a table, "
             f"got {type(sched_raw).__name__}."
         )
-    scheduler = SchedulerConfig(
-        request_timeout_secs=int(sched_raw.get("request_timeout_secs", 120)),
-        policy=sched_raw.get("policy"),
-    )
+    if "policy" in sched_raw:
+        raise ValueError(
+            f"Model {name!r}: [model.scheduler].policy has been renamed to "
+            f"`batch_policy`."
+        )
+    _reject_unknown(f"model.{name}.scheduler", sched_raw, _SCHEDULER_KEYS)
+    sched_kwargs: dict[str, Any] = {
+        k: sched_raw[k] for k in _SCHEDULER_KEYS if k in sched_raw
+    }
+    scheduler = SchedulerConfig(**sched_kwargs)
 
     return ModelConfig(
         name=name,
         hf_repo=str(raw["hf_repo"]),
         driver=driver,
         scheduler=scheduler,
-        default_token_budget=raw.get("default_token_budget"),
-        default_endowment_pages=int(raw.get("default_endowment_pages", 64)),
-        oversubscription_factor=float(raw.get("oversubscription_factor", 4.0)),
     )
+
+
+def _check_devices_disjoint(models: list[ModelConfig]) -> None:
+    """Each device string must belong to exactly one model. Sharing a GPU
+    across models in one pie process isn't supported — run two pies if
+    you need it."""
+    seen: dict[str, str] = {}
+    for m in models:
+        for dev in m.driver.device:
+            if dev in seen:
+                raise ValueError(
+                    f"Device {dev!r} claimed by both model {seen[dev]!r} and "
+                    f"model {m.name!r}. Each device must belong to exactly one "
+                    f"[[model]]."
+                )
+            seen[dev] = m.name
 
 
 def load_config(
@@ -548,17 +598,25 @@ def load_config(
     auth_raw = raw.get("auth", {})
     telemetry_raw = raw.get("telemetry", {})
     runtime_raw = raw.get("runtime", {})
-    model_raw = raw.get("model", {})
+    model_raw = raw.get("model", [])
 
-    if not isinstance(model_raw, dict) or not model_raw:
+    # Old-shape detection: [model.foo] / [model.bar] would parse as a dict.
+    # Reject with a migration message — the new shape is [[model]].
+    if isinstance(model_raw, dict):
         raise ValueError(
-            "No models configured. At least one [model.<name>] section is required."
+            "Config schema migrated: dotted-key models like [model.default] "
+            "are no longer supported. Convert each [model.<name>] to an "
+            "array-of-tables [[model]] entry with `name = \"<name>\"` as a "
+            "field. Driver-specific options move from "
+            "[model.<name>.driver.<type>] to [model.driver.options]. "
+            "Run `pie config init` for the new template."
+        )
+    if not isinstance(model_raw, list) or not model_raw:
+        raise ValueError(
+            "At least one [[model]] section is required."
         )
 
-    models: dict[str, ModelConfig] = {}
-    for name, m in model_raw.items():
-        models[name] = _parse_model(name, m)
-
+    # Server
     if "allow_filesystem" in server_raw:
         raise ValueError(
             "[server].allow_filesystem has moved to [runtime].allow_fs. "
@@ -566,7 +624,13 @@ def load_config(
             "add `allow_fs = true` to [runtime] (or omit it for the default "
             "of false)."
         )
-
+    if "primary_model" in server_raw:
+        raise ValueError(
+            "[server].primary_model has been removed. The first [[model]] "
+            "entry is the implicit default for inferlets that don't specify "
+            "a model name. Reorder your [[model]] blocks to change which is "
+            "default."
+        )
     _reject_unknown("server", server_raw, _SERVER_KEYS)
 
     server = ServerConfig(
@@ -577,41 +641,39 @@ def load_config(
                  else str(server_raw.get("registry", "https://registry.pie-project.org/")),
         max_concurrent_processes=server_raw.get("max_concurrent_processes"),
         python_snapshot=bool(server_raw.get("python_snapshot", True)),
-        primary_model=server_raw.get("primary_model"),
     )
 
+    # Auth
+    _reject_unknown("auth", auth_raw, _AUTH_KEYS)
     auth_enabled = (not no_auth) and bool(auth_raw.get("enabled", True))
 
+    # Telemetry
+    _reject_unknown("telemetry", telemetry_raw, _TELEMETRY_KEYS)
+
+    # Runtime — pass only present keys so dataclass defaults fire for missing ones.
     if not isinstance(runtime_raw, dict):
         raise ValueError(
             f"[runtime] must be a TOML table, got {type(runtime_raw).__name__}."
         )
     _reject_unknown("runtime", runtime_raw, _RUNTIME_KEYS)
+    runtime_kwargs: dict[str, Any] = {
+        k: runtime_raw[k] for k in _RUNTIME_KEYS if k in runtime_raw
+    }
+    runtime_cfg = RuntimeConfig(**runtime_kwargs)
 
-    def _opt_int(key: str) -> int | None:
-        v = runtime_raw.get(key)
-        return None if v is None else int(v)
-
-    network_allowed_hosts_raw = runtime_raw.get("network_allowed_hosts", ["*"])
-    if not isinstance(network_allowed_hosts_raw, list):
-        raise ValueError(
-            f"[runtime].network_allowed_hosts must be a list of strings, "
-            f"got {type(network_allowed_hosts_raw).__name__}."
-        )
-
-    fs_scratch_dir_raw = runtime_raw.get("fs_scratch_dir")
-    runtime_cfg = RuntimeConfig(
-        worker_threads=_opt_int("worker_threads"),
-        wasm_max_instances=_opt_int("wasm_max_instances"),
-        wasm_max_memory_mb=_opt_int("wasm_max_memory_mb"),
-        wasm_warm_memory_mb=_opt_int("wasm_warm_memory_mb"),
-        wasm_warm_slots=_opt_int("wasm_warm_slots"),
-        allow_fs=bool(runtime_raw.get("allow_fs", False)),
-        fs_scratch_dir=str(fs_scratch_dir_raw) if fs_scratch_dir_raw is not None else None,
-        allow_network=bool(runtime_raw.get("allow_network", True)),
-        network_allowed_hosts=[str(h) for h in network_allowed_hosts_raw],
-        max_upload_mb=_opt_int("max_upload_mb"),
-    )
+    # Models
+    models: list[ModelConfig] = []
+    seen_names: set[str] = set()
+    for i, m in enumerate(model_raw):
+        cfg = _parse_model(m, index=i)
+        if cfg.name in seen_names:
+            raise ValueError(
+                f"Duplicate [[model]] name: {cfg.name!r}. Each [[model]] must "
+                f"have a unique name."
+            )
+        seen_names.add(cfg.name)
+        models.append(cfg)
+    _check_devices_disjoint(models)
 
     return Config(
         server=server,

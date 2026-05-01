@@ -1,0 +1,388 @@
+#include "model/mixtral.hpp"
+
+#include <algorithm>
+#include <stdexcept>
+#include <vector>
+
+#include <cuda_runtime.h>
+
+#include "cuda_check.hpp"
+#include "device_buffer.hpp"
+#include "kernels/add_bias.hpp"
+#include "kernels/attn_sink.hpp"
+#include "kernels/embed.hpp"
+#include "kernels/gather_rows.hpp"
+#include "kernels/kv_paged.hpp"
+#include "kernels/moe_dispatch.hpp"
+#include "kernels/rmsnorm.hpp"
+#include "kernels/rope.hpp"
+#include "kernels/swiglu.hpp"
+#include "kernels/topk_softmax.hpp"
+#include "ops/gemm.hpp"
+#include "ops/attention_flashinfer.hpp"
+
+namespace pie_cuda_driver::model {
+
+namespace {
+
+const DeviceTensor& must(const Engine& e, const std::string& name) {
+    if (!e.has(name)) {
+        throw std::runtime_error("mixtral: missing weight '" + name + "'");
+    }
+    return e.get(name);
+}
+
+}  // namespace
+
+MixtralWeights bind_mixtral(const Engine& engine) {
+    const auto& cfg = engine.hf_config();
+    const int E = cfg.num_experts;
+    if (E <= 0) {
+        throw std::runtime_error(
+            "mixtral: hf_config.num_experts must be > 0; check the loader");
+    }
+
+    MixtralWeights w;
+    w.embed      = &must(engine, "model.embed_tokens.weight");
+    w.final_norm = &must(engine, "model.norm.weight");
+    if (engine.has("lm_head.weight")) {
+        w.lm_head = &engine.get("lm_head.weight");
+    } else if (cfg.tie_word_embeddings) {
+        w.lm_head = w.embed;
+    } else {
+        throw std::runtime_error(
+            "mixtral: lm_head missing and tie_word_embeddings=false");
+    }
+
+    w.layers.resize(static_cast<std::size_t>(cfg.num_hidden_layers));
+    for (int i = 0; i < cfg.num_hidden_layers; ++i) {
+        const std::string p = "model.layers." + std::to_string(i) + ".";
+        auto& L = w.layers[i];
+        L.attn_norm = &must(engine, p + "input_layernorm.weight");
+        L.mlp_norm  = &must(engine, p + "post_attention_layernorm.weight");
+        L.q_proj    = &must(engine, p + "self_attn.q_proj.weight");
+        L.k_proj    = &must(engine, p + "self_attn.k_proj.weight");
+        L.v_proj    = &must(engine, p + "self_attn.v_proj.weight");
+        L.o_proj    = &must(engine, p + "self_attn.o_proj.weight");
+
+        L.router    = &must(engine, p + "block_sparse_moe.gate.weight");
+        L.experts.resize(static_cast<std::size_t>(E));
+        for (int e = 0; e < E; ++e) {
+            const std::string ep = p + "block_sparse_moe.experts." +
+                                   std::to_string(e) + ".";
+            // HF Mixtral expert weight layout: w1=gate, w2=down, w3=up.
+            L.experts[e].w_gate = &must(engine, ep + "w1.weight");
+            L.experts[e].w_down = &must(engine, ep + "w2.weight");
+            L.experts[e].w_up   = &must(engine, ep + "w3.weight");
+        }
+    }
+    return w;
+}
+
+namespace {
+
+// Build per-expert (token, weight) lists from a [N, K] topk decision.
+// Returns one vector<int32> of token indices and one matching vector<float>
+// of routing weights per expert. CPU-side because routing is O(N·K) and
+// the per-expert dense GEMMs dominate runtime.
+struct ExpertRouting {
+    std::vector<std::vector<std::int32_t>> token_idx;
+    std::vector<std::vector<float>>        weights;
+};
+
+ExpertRouting build_routing(
+    const std::vector<std::int32_t>& topk_idx_h,
+    const std::vector<float>& topk_w_h,
+    int N, int K, int E)
+{
+    ExpertRouting r;
+    r.token_idx.assign(E, {});
+    r.weights.assign(E, {});
+    for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; ++k) {
+            const int e = topk_idx_h[n * K + k];
+            if (e < 0 || e >= E) continue;
+            r.token_idx[e].push_back(n);
+            r.weights[e].push_back(topk_w_h[n * K + k]);
+        }
+    }
+    return r;
+}
+
+}  // namespace
+
+void mixtral_forward_paged(
+    const MixtralWeights& w,
+    const HfConfig& cfg,
+    const LlamaLikeForwardCfg& fwd_cfg,
+    int num_experts,
+    int top_k,
+    Qwen3Workspace& ws,
+    KvCache& cache,
+    AttentionWorkspace& attn_ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int N,
+    int R,
+    bool is_pure_decode,
+    const std::uint8_t* custom_mask_d,
+    const std::int32_t* custom_mask_indptr_d)
+{
+    const int H = cfg.hidden_size;
+    const int Hq = cfg.num_attention_heads * cfg.head_dim;
+    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
+    const int I  = cfg.intermediate_size;
+    const int V  = cfg.vocab_size;
+    const int d  = cfg.head_dim;
+    const float eps = cfg.rms_norm_eps;
+    cudaStream_t stream = nullptr;
+
+    const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
+    const bool any_sinks = [&]{
+        for (const auto& L : w.layers) {
+            if (L.attn_sinks != nullptr) return true;
+        }
+        return false;
+    }();
+    // [N, num_attention_heads] fp32 — written by flashinfer per layer when
+    // sinks are active, then consumed by the rescale post-pass. Per-layer
+    // overwrite is fine; we only need the layer's own lse during its own
+    // rescale step. Allocate once per fire instead of once per layer.
+    DeviceBuffer<float> d_lse;
+    float* lse_ptr = nullptr;
+    if (any_sinks) {
+        d_lse = DeviceBuffer<float>::alloc(
+            static_cast<std::size_t>(N) * cfg.num_attention_heads);
+        lse_ptr = d_lse.data();
+    }
+
+    kernels::launch_embed_bf16(
+        token_ids, w.embed->data(), ws.y.data(), N, H, V, stream);
+
+    ops::DecodePlanCachePtr decode_plan;
+    if (use_decode_path) {
+        decode_plan = ops::make_decode_plan();
+        ops::plan_attention_flashinfer_decode_bf16(
+            *decode_plan, kv_page_indptr_h, R,
+            cfg.num_attention_heads, cfg.num_key_value_heads, d,
+            cache.page_size(), attn_ws, stream);
+    }
+
+    // Per-fire scratch for MoE routing. Sized for the worst case (N
+    // tokens × K experts each); reallocated per call which is fine
+    // since N changes, but the host-side vectors avoid touching cuda
+    // alloc. Device-side topk buffers go through DeviceBuffer for ABI
+    // simplicity; if profiling shows alloc latency we can hoist these
+    // into Qwen3Workspace.
+    auto d_topk_idx = DeviceBuffer<std::int32_t>::alloc(
+        static_cast<std::size_t>(N) * top_k);
+    auto d_topk_w   = DeviceBuffer<float>::alloc(
+        static_cast<std::size_t>(N) * top_k);
+    // Per-expert scratch for gathered inputs and projection outputs.
+    // Worst case: a single expert receives all N*K routes. Pre-size to
+    // that bound to avoid re-allocating inside the layer loop.
+    const std::size_t max_routed = static_cast<std::size_t>(N) * top_k;
+    auto d_expert_in    = DeviceBuffer<std::uint16_t>::alloc(max_routed * H);
+    auto d_expert_gate  = DeviceBuffer<std::uint16_t>::alloc(max_routed * I);
+    auto d_expert_up    = DeviceBuffer<std::uint16_t>::alloc(max_routed * I);
+    auto d_expert_out   = DeviceBuffer<std::uint16_t>::alloc(max_routed * H);
+    auto d_expert_idx   = DeviceBuffer<std::int32_t>::alloc(max_routed);
+    auto d_expert_w     = DeviceBuffer<float>::alloc(max_routed);
+
+    for (int L = 0; L < cfg.num_hidden_layers; ++L) {
+        const auto& layer = w.layers[L];
+
+        // Per-layer attention window: full causal (-1) for plain Mixtral;
+        // GPT-OSS alternates sliding/full per `fwd_cfg.per_layer_window_left`.
+        const int layer_window =
+            (L < (int)fwd_cfg.per_layer_window_left.size())
+                ? fwd_cfg.per_layer_window_left[L]
+                : fwd_cfg.sliding_window;
+
+        // ── Attention block (identical to llama_like pre-norm path) ──
+        kernels::launch_rmsnorm_bf16(
+            ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
+            N, H, eps, stream);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.q_proj->data(), ws.q.data(), N, Hq, H);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
+        if (layer.q_bias) kernels::launch_add_bias_bf16(
+            ws.q.data(), layer.q_bias->data(), N, Hq, stream);
+        if (layer.k_bias) kernels::launch_add_bias_bf16(
+            ws.k.data(), layer.k_bias->data(), N, Hk, stream);
+        if (layer.v_bias) kernels::launch_add_bias_bf16(
+            ws.v.data(), layer.v_bias->data(), N, Hk, stream);
+
+        kernels::launch_rope_bf16(
+            ws.q.data(), ws.k.data(), positions,
+            N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+            cfg.rope_theta, stream);
+
+        kernels::launch_write_kv_to_pages_bf16(
+            cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+
+        // Only ask flashinfer for lse on layers that actually use sinks.
+        // Saves a per-layer kernel write on plain Mixtral, and on
+        // gpt-oss layers that turn out to have nullptr sinks.
+        float* layer_lse = (layer.attn_sinks != nullptr) ? lse_ptr : nullptr;
+
+        if (use_decode_path) {
+            ops::dispatch_attention_flashinfer_decode_bf16(
+                *decode_plan,
+                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                attn_ws, stream,
+                /*window_left=*/layer_window,
+                /*logits_soft_cap=*/0.f,
+                /*sm_scale=*/-1.f,
+                layer_lse);
+        } else if (custom_mask_d) {
+            ops::launch_attention_flashinfer_prefill_custom_bf16(
+                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                custom_mask_d, custom_mask_indptr_d,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                cache.page_size(), attn_ws, stream,
+                /*window_left=*/-1,
+                layer_lse);
+        } else {
+            ops::launch_attention_flashinfer_prefill_bf16(
+                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                cache.page_size(), attn_ws, stream,
+                /*window_left=*/layer_window,
+                /*logits_soft_cap=*/0.f,
+                /*sm_scale=*/-1.f,
+                layer_lse);
+        }
+
+        // GPT-OSS: rescale o by `sigmoid(lse - sink_h)` to apply the
+        // softmax-denominator extension that flashinfer's DefaultAttention
+        // doesn't emit natively.
+        if (layer.attn_sinks != nullptr) {
+            kernels::launch_attention_sink_rescale_bf16(
+                ws.attn_out.data(), layer_lse, layer.attn_sinks->data(),
+                N, cfg.num_attention_heads, d, stream);
+        }
+
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
+            N, H, Hq, /*beta=*/1.f);
+        if (layer.o_bias) kernels::launch_add_bias_bf16(
+            ws.y.data(), layer.o_bias->data(), N, H, stream);
+
+        // ── Sparse-MoE block ──
+        kernels::launch_rmsnorm_bf16(
+            ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
+            N, H, eps, stream);
+
+        // 1. Router logits, top-K + softmax + renormalize. We piggy-back
+        // on `ws.gate` as scratch for the [N, num_experts] router logits
+        // — its allocation is `[max_tokens, intermediate]` which is
+        // always ≥ [N, num_experts] for any production config (E ≤ 64,
+        // I ≥ 4096).
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_y.data(), layer.router->data(), ws.gate.data(),
+            N, num_experts, H);
+        if (layer.router_bias) kernels::launch_add_bias_bf16(
+            ws.gate.data(), layer.router_bias->data(), N, num_experts, stream);
+        kernels::launch_topk_softmax_bf16(
+            ws.gate.data(), d_topk_idx.data(), d_topk_w.data(),
+            N, num_experts, top_k, stream);
+
+        // 2. D2H copy of routing decisions; build per-expert lists.
+        std::vector<std::int32_t> topk_idx_h(static_cast<std::size_t>(N) * top_k);
+        std::vector<float>        topk_w_h  (static_cast<std::size_t>(N) * top_k);
+        CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), d_topk_idx.data(),
+                                   topk_idx_h.size() * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(topk_w_h.data(), d_topk_w.data(),
+                                   topk_w_h.size() * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto routing = build_routing(topk_idx_h, topk_w_h,
+                                           N, top_k, num_experts);
+
+        // 3. Per-expert dispatch.
+        for (int e = 0; e < num_experts; ++e) {
+            const auto& tok_idx = routing.token_idx[e];
+            const auto& weights = routing.weights[e];
+            const int Ne = static_cast<int>(tok_idx.size());
+            if (Ne == 0) continue;
+
+            CUDA_CHECK(cudaMemcpyAsync(
+                d_expert_idx.data(), tok_idx.data(),
+                Ne * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                d_expert_w.data(), weights.data(),
+                Ne * sizeof(float), cudaMemcpyHostToDevice, stream));
+
+            // Gather norm_y rows routed to this expert.
+            kernels::launch_gather_bf16_rows(
+                static_cast<const std::uint16_t*>(ws.norm_y.data()),
+                d_expert_idx.data(),
+                d_expert_in.data(),
+                Ne, H, stream);
+
+            // SwiGLU MLP.
+            const auto& expert = layer.experts[e];
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                d_expert_in.data(), expert.w_gate->data(),
+                d_expert_gate.data(), Ne, I, H);
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                d_expert_in.data(), expert.w_up->data(),
+                d_expert_up.data(), Ne, I, H);
+            if (expert.b_gate) kernels::launch_add_bias_bf16(
+                d_expert_gate.data(), expert.b_gate->data(), Ne, I, stream);
+            if (expert.b_up) kernels::launch_add_bias_bf16(
+                d_expert_up.data(), expert.b_up->data(), Ne, I, stream);
+            if (cfg.swiglu_limit > 0.f) {
+                kernels::launch_gpt_oss_glu_bf16(
+                    d_expert_gate.data(), d_expert_up.data(),
+                    d_expert_gate.data(),
+                    static_cast<int>(static_cast<std::size_t>(Ne) * I), stream,
+                    /*limit=*/cfg.swiglu_limit);
+            } else {
+                kernels::launch_swiglu_bf16(
+                    d_expert_gate.data(), d_expert_up.data(),
+                    d_expert_gate.data(),
+                    static_cast<std::size_t>(Ne) * I, stream);
+            }
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                d_expert_gate.data(), expert.w_down->data(),
+                d_expert_out.data(), Ne, H, I);
+            if (expert.b_down) kernels::launch_add_bias_bf16(
+                d_expert_out.data(), expert.b_down->data(), Ne, H, stream);
+
+            // Scatter into ws.y with routing weight, residual-add style.
+            kernels::launch_scatter_add_weighted_bf16(
+                ws.y.data(), d_expert_out.data(),
+                d_expert_idx.data(), d_expert_w.data(),
+                Ne, H, stream);
+        }
+    }
+
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
+        N, H, eps, stream);
+    ops::gemm_act_x_wt_bf16(cublas.handle(),
+        ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
+        N, V, H);
+}
+
+}  // namespace pie_cuda_driver::model

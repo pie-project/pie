@@ -234,7 +234,7 @@ impl BatchScheduler {
         max_batch_size: usize,
         max_batch_tokens: usize,
         request_timeout_secs: u64,
-        policy: Option<String>,
+        batch_policy: String,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let stats = Arc::new(SchedulerStats::default());
@@ -243,7 +243,7 @@ impl BatchScheduler {
             page_size,
             max_batch_size, max_batch_tokens,
             request_timeout_secs,
-            policy,
+            batch_policy,
             stats.clone(),
         ));
 
@@ -285,7 +285,7 @@ impl BatchScheduler {
         max_batch_size: usize,
         max_batch_tokens: usize,
         request_timeout_secs: u64,
-        policy_from_config: Option<String>,
+        batch_policy: String,
         stats: Arc<SchedulerStats>,
     ) {
         let request_timeout = Duration::from_secs(request_timeout_secs);
@@ -293,15 +293,14 @@ impl BatchScheduler {
         // Per-device state
         let mut batch = BatchAccumulator::new(max_batch_size, max_batch_tokens);
         // Policy selection from config — see `adaptive_policy.rs` for the
-        // design rationale. The per-model `[model.X.scheduler.policy]`
-        // setting picks one of "adaptive" (default), "eager", "greedy".
-        let policy_name = policy_from_config.unwrap_or_else(|| "adaptive".to_string());
-        let mut policy: Box<dyn SchedulingPolicy> = match policy_name.as_str() {
+        // design rationale. The per-model `[model.scheduler].batch_policy`
+        // setting picks one of "adaptive", "eager", "greedy".
+        let mut policy: Box<dyn SchedulingPolicy> = match batch_policy.as_str() {
             "greedy" => Box::new(GreedyPolicy::new()),
             "eager" => Box::new(EagerPolicy::new(max_batch_size, device_idx)),
             "adaptive" => Box::new(AdaptivePolicy::new(max_batch_size, device_idx)),
             other => panic!(
-                "Unknown scheduler.policy {other:?}; expected one of \
+                "Unknown scheduler.batch_policy {other:?}; expected one of \
                 'adaptive' | 'eager' | 'greedy'"
             ),
         };

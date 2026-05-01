@@ -320,7 +320,7 @@ class SGLangEngine:
         Sources values from the loaded SGLang `ModelRunner` so the user's
         preferences are reconciled against what the chosen attention
         kernel actually supports (page_size in particular may differ from
-        what was requested via `[model.X.driver.sglang]`).
+        what was requested via `[model.driver.options]`).
         """
         from pie.capabilities import DriverCapabilities
 

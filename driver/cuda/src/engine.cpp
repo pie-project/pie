@@ -63,7 +63,22 @@ EngineCapabilities Engine::capabilities() const {
     c.swap_pool_size = 0;
     c.max_batch_tokens = static_cast<int>(boot_.batching.max_batch_tokens);
     c.max_batch_size = static_cast<int>(boot_.batching.max_batch_size);
-    c.arch_name = hf_.arch_name;
+    // The runtime's `model::instruct::create` dispatches on the
+    // PIE-arch key ("llama3", "gemma3", …) not HF's `architectures[0]`
+    // ("LlamaForCausalLM") nor the raw HF model_type ("llama",
+    // "gemma3_text"). The Python `pie_driver` normalises via the
+    // `HF_TO_PIE_ARCH` table; we mirror that table here so the
+    // runtime gets the same key from both backends.
+    auto normalise_arch = [](const std::string& mt) -> std::string {
+        if (mt == "llama")        return "llama3";
+        if (mt == "gemma3_text")  return "gemma3";
+        if (mt == "gemma4_text")  return "gemma4";
+        if (mt == "ministral3")   return "mistral3";
+        return mt;  // qwen2 / qwen3 / gemma2 / olmo3 / phi3 / mistral3 / mixtral
+    };
+    c.arch_name = hf_.model_type.empty()
+        ? hf_.arch_name
+        : normalise_arch(hf_.model_type);
     c.vocab_size = hf_.vocab_size;
     c.max_model_len = hf_.max_position_embeddings;
     c.activation_dtype = boot_.model.dtype;
@@ -83,6 +98,13 @@ const DeviceTensor& Engine::get(const std::string& name) const {
         throw std::runtime_error("engine: weight not loaded: " + name);
     }
     return it->second;
+}
+
+void Engine::insert(std::string name, DeviceTensor tensor) {
+    auto [it, inserted] = weights_.emplace(std::move(name), std::move(tensor));
+    if (!inserted) {
+        throw std::runtime_error("engine: weight already registered: " + it->first);
+    }
 }
 
 }  // namespace pie_cuda_driver

@@ -1,4 +1,4 @@
-"""TOML-shape config for `[model.X.driver.portable]`."""
+"""TOML-shape config for `[model.driver.options]` when `type = "portable"`."""
 
 from __future__ import annotations
 
