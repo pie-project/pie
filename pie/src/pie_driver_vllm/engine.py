@@ -127,7 +127,7 @@ class VllmEngine:
             model_config=loaded.model_config,
         )
 
-        return cls(
+        engine = cls(
             config=config,
             driver_config=driver_config,
             model_config=loaded.model_config,
@@ -139,6 +139,146 @@ class VllmEngine:
             snapshot_dir=loaded.snapshot_dir,
             kv_cache_at_layer_host=host_kv,
             swap_pool_size=pool_size,
+        )
+
+        # Compile + JIT warmup. Drives a synthetic prefill+decode forward
+        # so torch.compile (Dynamo + AOT) and FlashInfer JIT (ninja/nvcc)
+        # complete during init rather than on the inferlet's first
+        # fire_batch. Without this, cold-start cost (15–60+ s on sm_89
+        # depending on caches) shows up as visible first-request latency
+        # — and on the shmem fast path it can exceed the call deadline
+        # and surface downstream as flashinfer "max() iterable empty".
+        try:
+            engine._warmup_compile(_log)
+        except Exception as _e:
+            import traceback as _tb
+            print(f"[vllm warmup] FAILED: {_e}\n{_tb.format_exc()}", flush=True)
+            raise
+
+        return engine
+
+    @torch.inference_mode()
+    def _warmup_compile(self, log_fn=None) -> None:
+        """Drive synthetic prefill + decode passes so torch.compile and
+        FlashInfer JIT complete during engine init.
+
+        Uses physical page 0 of the KV pool as scratch and zeroes the
+        layer caches afterwards so no stale activations leak into the
+        first real context. Both a multi-token prefill batch and a
+        single-token decode batch are exercised because FlashInfer's
+        plan builder selects different kernels for the two query-length
+        regimes; only pre-planning both leaves the inferlet's first
+        fire_batch on a fully-warm path.
+        """
+        import time as _time
+        import traceback as _tb
+
+        device = self.forward_pass.device
+
+        def _log(msg: str, level: str = "INFO") -> None:
+            print(f"[vllm warmup] {msg}", flush=True)
+            if log_fn is not None:
+                log_fn(msg, level)
+
+        if not torch.cuda.is_available() or not str(device).startswith("cuda"):
+            # CPU/Metal warmup is unnecessary — the cold-start tail is a
+            # CUDA-only phenomenon (torch.compile + FlashInfer JIT).
+            _log(f"skipped (device={device})", "INFO")
+            return
+
+        _log("starting", "INFO")
+
+        # Page-size from the resolved KV spec. embed_inputs / transform
+        # both depend on this, so prime the metadata builder once.
+        self.forward_pass._ensure_metadata_builder()
+        page_size = int(self.forward_pass._kv_spec.block_size)
+
+        # 8 tokens fits in a single page for any sane page_size; leaves
+        # room for the +1 decode position without crossing the boundary.
+        # token_id 0 is universally valid (typically <pad> / <unk>).
+        n_prefill = max(1, min(8, page_size - 1))
+
+        prefill_inputs = {
+            "token_ids": torch.zeros(n_prefill, dtype=torch.long),
+            "position_ids": torch.arange(n_prefill, dtype=torch.int32, device=device),
+            "qo_indptr": torch.tensor([0, n_prefill], dtype=torch.int32, device=device),
+            "kv_page_indices": torch.tensor([0], dtype=torch.int32, device=device),
+            "kv_page_indptr": torch.tensor([0, 1], dtype=torch.int32, device=device),
+            "kv_last_page_lens": torch.tensor([n_prefill], dtype=torch.int32, device=device),
+        }
+
+        t0 = _time.perf_counter()
+        embeds = self.forward_pass.embed_inputs(prefill_inputs)
+        self.forward_pass.transform(
+            input_embeds=embeds,
+            position_ids=prefill_inputs["position_ids"],
+            qo_indptr=prefill_inputs["qo_indptr"],
+            kv_page_indices=prefill_inputs["kv_page_indices"],
+            kv_page_indptr=prefill_inputs["kv_page_indptr"],
+            kv_last_page_lens=prefill_inputs["kv_last_page_lens"],
+        )
+        torch.cuda.synchronize()
+        t_prefill = _time.perf_counter() - t0
+
+        # Decode: 1 query token at position n_prefill, attending to the
+        # KV just written by prefill. last_page_len advances by 1.
+        decode_inputs = {
+            "token_ids": torch.zeros(1, dtype=torch.long),
+            "position_ids": torch.tensor([n_prefill], dtype=torch.int32, device=device),
+            "qo_indptr": torch.tensor([0, 1], dtype=torch.int32, device=device),
+            "kv_page_indices": torch.tensor([0], dtype=torch.int32, device=device),
+            "kv_page_indptr": torch.tensor([0, 1], dtype=torch.int32, device=device),
+            "kv_last_page_lens": torch.tensor([n_prefill + 1], dtype=torch.int32, device=device),
+        }
+
+        t0 = _time.perf_counter()
+        embeds = self.forward_pass.embed_inputs(decode_inputs)
+        decode_hidden = self.forward_pass.transform(
+            input_embeds=embeds,
+            position_ids=decode_inputs["position_ids"],
+            qo_indptr=decode_inputs["qo_indptr"],
+            kv_page_indices=decode_inputs["kv_page_indices"],
+            kv_page_indptr=decode_inputs["kv_page_indptr"],
+            kv_last_page_lens=decode_inputs["kv_last_page_lens"],
+        )
+        torch.cuda.synchronize()
+        t_decode = _time.perf_counter() - t0
+
+        # Sampling path warmup: lm_head (compute_logits) + flashinfer
+        # top_k_top_p sampling kernel each carry their own JIT cost on
+        # first call (~tens of seconds combined on cold sm_89). Without
+        # this, the inferlet's first fire_batch pays them after transform
+        # is already warm — pushing total cold-start past the 60s shmem
+        # IPC timeout. Synthetic call uses the decode hidden_states slice
+        # so dtype/device match production exactly.
+        t0 = _time.perf_counter()
+        try:
+            from flashinfer.sampling import top_k_top_p_sampling_from_probs
+
+            logits = self.forward_pass.model.compute_logits(decode_hidden)
+            # compute_logits returns (n, vocab); softmax to probs to match
+            # sample_common's scaled_softmax → flashinfer call shape.
+            probs = torch.softmax(logits.float(), dim=-1)
+            n_rows = probs.shape[0]
+            top_k_t = torch.full((n_rows,), 50, dtype=torch.int32, device=device)
+            top_p_t = torch.full((n_rows,), 0.9, dtype=torch.float32, device=device)
+            _ = top_k_top_p_sampling_from_probs(probs, top_k=top_k_t, top_p=top_p_t)
+            torch.cuda.synchronize()
+            t_sample = _time.perf_counter() - t0
+            _log(f"sample warmup: lm_head + flashinfer top_k_top_p {t_sample:.2f}s", "INFO")
+        except Exception as _e:
+            _log(f"sample warmup skipped: {_e}\n{_tb.format_exc()}", "WARN")
+
+        # Zero physical page 0 in every KV layer so the first real
+        # context that gets allocated this page doesn't read stale
+        # warmup activations as committed K/V.
+        for layer_kv in self.kv_cache_at_layer:
+            layer_kv[0].zero_()
+
+        _log(
+            f"vllm engine warmup: prefill ({n_prefill} tok) {t_prefill:.2f}s, "
+            f"decode (1 tok) {t_decode:.2f}s",
+            "INFO",
         )
 
     @torch.inference_mode()
