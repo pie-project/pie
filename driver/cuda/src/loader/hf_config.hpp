@@ -83,6 +83,22 @@ struct HfConfig {
     int num_experts;
     int num_experts_per_tok;
 
+    // GPT-OSS-specific knobs. Inert on every other model.
+    //   * `swiglu_limit` — clipping threshold applied to gate values
+    //     before SiLU (`x = clamp(x, -limit, limit)`). 0 = no clip.
+    //   * `mlp_has_bias` — gate_up / down each carry an additive bias
+    //     vector per expert.
+    //   * `router_has_bias` — router projection has a bias term added
+    //     before the top-K softmax.
+    //   * `attention_has_sinks` — per-head learnable sink scalar that
+    //     extends the softmax denominator (`Z + exp(sink_h)`). The
+    //     forward path applies this as a post-attention rescale based
+    //     on the kernel's log-sum-exp output.
+    float swiglu_limit;
+    bool  mlp_has_bias;
+    bool  router_has_bias;
+    bool  attention_has_sinks;
+
     // ── Gemma family ─────────────────────────────────────────────────
     // `query_pre_attn_scalar` defaults to `head_dim` so non-Gemma models
     // that don't set the field still get the standard `1/sqrt(head_dim)`

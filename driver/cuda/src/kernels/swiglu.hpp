@@ -13,12 +13,20 @@
 
 namespace pie_cuda_driver::kernels {
 
+// `clip_limit > 0` enables the GPT-OSS variant:
+//     gate'  = clamp(gate, -limit, +limit)
+//     up'    = clamp(up,   -limit, +limit)
+//     y      = silu(gate') · (up' + 1)
+// (The `+1` shifts the residual so a zero-init expert outputs the
+// identity contribution.) `clip_limit == 0` is the standard
+// `silu(gate) * up` used by Llama / Qwen / Mistral / Mixtral.
 void launch_swiglu_bf16(
     const void* gate,
     const void* up,
     void* y,
     int num_elements,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    float clip_limit = 0.f);
 
 // GeLU-tanh-glu (Gemma).
 void launch_geglu_tanh_bf16(

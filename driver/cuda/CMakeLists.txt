@@ -92,6 +92,7 @@ add_executable(pie_driver_cuda
   src/kernels/dequant_fp4.cu
   src/kernels/dequant_fp8.cu
   src/kernels/head_dim_pad.cu
+  src/kernels/attn_sink.cu
   src/attention_workspace.cpp
   src/brle.cpp
   src/control_socket.cpp

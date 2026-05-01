@@ -21,14 +21,42 @@ __global__ void swiglu_bf16_kernel(
     y[idx] = __float2bfloat16(silu * u);
 }
 
+__global__ void swiglu_clipped_bf16_kernel(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ y,
+    int n,
+    float limit)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float g = __bfloat162float(gate[idx]);
+    float u = __bfloat162float(up[idx]);
+    g = fminf(fmaxf(g, -limit), limit);
+    u = fminf(fmaxf(u, -limit), limit);
+    const float silu = g / (1.f + expf(-g));
+    // GPT-OSS expert: silu(gate') * (up' + 1).
+    y[idx] = __float2bfloat16(silu * (u + 1.f));
+}
+
 }  // namespace
 
 void launch_swiglu_bf16(
     const void* gate, const void* up, void* y,
-    int num_elements, cudaStream_t stream)
+    int num_elements, cudaStream_t stream,
+    float clip_limit)
 {
     constexpr int BLOCK = 256;
     const int grid = (num_elements + BLOCK - 1) / BLOCK;
+    if (clip_limit > 0.f) {
+        swiglu_clipped_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(gate),
+            static_cast<const __nv_bfloat16*>(up),
+            static_cast<__nv_bfloat16*>(y),
+            num_elements, clip_limit);
+        return;
+    }
     swiglu_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(gate),
         static_cast<const __nv_bfloat16*>(up),

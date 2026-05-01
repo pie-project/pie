@@ -8,6 +8,8 @@
 
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
+#include "kernels/add_bias.hpp"
+#include "kernels/attn_sink.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
 #include "kernels/kv_paged.hpp"
@@ -143,6 +145,23 @@ void mixtral_forward_paged(
     cudaStream_t stream = nullptr;
 
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
+    const bool any_sinks = [&]{
+        for (const auto& L : w.layers) {
+            if (L.attn_sinks != nullptr) return true;
+        }
+        return false;
+    }();
+    // [N, num_attention_heads] fp32 — written by flashinfer per layer when
+    // sinks are active, then consumed by the rescale post-pass. Per-layer
+    // overwrite is fine; we only need the layer's own lse during its own
+    // rescale step. Allocate once per fire instead of once per layer.
+    DeviceBuffer<float> d_lse;
+    float* lse_ptr = nullptr;
+    if (any_sinks) {
+        d_lse = DeviceBuffer<float>::alloc(
+            static_cast<std::size_t>(N) * cfg.num_attention_heads);
+        lse_ptr = d_lse.data();
+    }
 
     kernels::launch_embed_bf16(
         token_ids, w.embed->data(), ws.y.data(), N, H, V, stream);
@@ -180,6 +199,13 @@ void mixtral_forward_paged(
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
 
+        // Per-layer attention window: full causal (-1) for plain Mixtral;
+        // GPT-OSS alternates sliding/full per `fwd_cfg.per_layer_window_left`.
+        const int layer_window =
+            (L < (int)fwd_cfg.per_layer_window_left.size())
+                ? fwd_cfg.per_layer_window_left[L]
+                : fwd_cfg.sliding_window;
+
         // ── Attention block (identical to llama_like pre-norm path) ──
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
@@ -190,6 +216,12 @@ void mixtral_forward_paged(
             ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
+        if (layer.q_bias) kernels::launch_add_bias_bf16(
+            ws.q.data(), layer.q_bias->data(), N, Hq, stream);
+        if (layer.k_bias) kernels::launch_add_bias_bf16(
+            ws.k.data(), layer.k_bias->data(), N, Hk, stream);
+        if (layer.v_bias) kernels::launch_add_bias_bf16(
+            ws.v.data(), layer.v_bias->data(), N, Hk, stream);
 
         kernels::launch_rope_bf16(
             ws.q.data(), ws.k.data(), positions,
@@ -201,12 +233,21 @@ void mixtral_forward_paged(
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
 
+        // Only ask flashinfer for lse on layers that actually use sinks.
+        // Saves a per-layer kernel write on plain Mixtral, and on
+        // gpt-oss layers that turn out to have nullptr sinks.
+        float* layer_lse = (layer.attn_sinks != nullptr) ? lse_ptr : nullptr;
+
         if (use_decode_path) {
             ops::dispatch_attention_flashinfer_decode_bf16(
                 *decode_plan,
                 ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                attn_ws, stream);
+                attn_ws, stream,
+                /*window_left=*/layer_window,
+                /*logits_soft_cap=*/0.f,
+                /*sm_scale=*/-1.f,
+                layer_lse);
         } else if (custom_mask_d) {
             ops::launch_attention_flashinfer_prefill_custom_bf16(
                 ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
@@ -214,19 +255,36 @@ void mixtral_forward_paged(
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
                 N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-                cache.page_size(), attn_ws, stream);
+                cache.page_size(), attn_ws, stream,
+                /*window_left=*/-1,
+                layer_lse);
         } else {
             ops::launch_attention_flashinfer_prefill_bf16(
                 ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
                 N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-                cache.page_size(), attn_ws, stream);
+                cache.page_size(), attn_ws, stream,
+                /*window_left=*/layer_window,
+                /*logits_soft_cap=*/0.f,
+                /*sm_scale=*/-1.f,
+                layer_lse);
+        }
+
+        // GPT-OSS: rescale o by `sigmoid(lse - sink_h)` to apply the
+        // softmax-denominator extension that flashinfer's DefaultAttention
+        // doesn't emit natively.
+        if (layer.attn_sinks != nullptr) {
+            kernels::launch_attention_sink_rescale_bf16(
+                ws.attn_out.data(), layer_lse, layer.attn_sinks->data(),
+                N, cfg.num_attention_heads, d, stream);
         }
 
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
             N, H, Hq, /*beta=*/1.f);
+        if (layer.o_bias) kernels::launch_add_bias_bf16(
+            ws.y.data(), layer.o_bias->data(), N, H, stream);
 
         // ── Sparse-MoE block ──
         kernels::launch_rmsnorm_bf16(
@@ -241,6 +299,8 @@ void mixtral_forward_paged(
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_y.data(), layer.router->data(), ws.gate.data(),
             N, num_experts, H);
+        if (layer.router_bias) kernels::launch_add_bias_bf16(
+            ws.gate.data(), layer.router_bias->data(), N, num_experts, stream);
         kernels::launch_topk_softmax_bf16(
             ws.gate.data(), d_topk_idx.data(), d_topk_w.data(),
             N, num_experts, top_k, stream);
@@ -280,18 +340,26 @@ void mixtral_forward_paged(
                 Ne, H, stream);
 
             // SwiGLU MLP.
+            const auto& expert = layer.experts[e];
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_in.data(), layer.experts[e].w_gate->data(),
+                d_expert_in.data(), expert.w_gate->data(),
                 d_expert_gate.data(), Ne, I, H);
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_in.data(), layer.experts[e].w_up->data(),
+                d_expert_in.data(), expert.w_up->data(),
                 d_expert_up.data(), Ne, I, H);
+            if (expert.b_gate) kernels::launch_add_bias_bf16(
+                d_expert_gate.data(), expert.b_gate->data(), Ne, I, stream);
+            if (expert.b_up) kernels::launch_add_bias_bf16(
+                d_expert_up.data(), expert.b_up->data(), Ne, I, stream);
             kernels::launch_swiglu_bf16(
                 d_expert_gate.data(), d_expert_up.data(), d_expert_gate.data(),
-                static_cast<std::size_t>(Ne) * I, stream);
+                static_cast<std::size_t>(Ne) * I, stream,
+                /*clip_limit=*/cfg.swiglu_limit);
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_gate.data(), layer.experts[e].w_down->data(),
+                d_expert_gate.data(), expert.w_down->data(),
                 d_expert_out.data(), Ne, H, I);
+            if (expert.b_down) kernels::launch_add_bias_bf16(
+                d_expert_out.data(), expert.b_down->data(), Ne, H, stream);
 
             // Scatter into ws.y with routing weight, residual-add style.
             kernels::launch_scatter_add_weighted_bf16(

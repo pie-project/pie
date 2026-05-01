@@ -36,7 +36,9 @@
 #include "kv_cache.hpp"
 #include "model/gemma2.hpp"
 #include "model/gemma4.hpp"
+#include "model/gpt_oss.hpp"
 #include "model/llama_like.hpp"
+#include "model/mixtral.hpp"
 #include "model/qwen3.hpp"
 #include "model/qwen3_forward.hpp"
 #include "swap_pool.hpp"
@@ -266,6 +268,8 @@ int main(int argc, char** argv) {
          || mt == "qwen2"
          || mt == "llama" || mt == "llama3"
          || mt == "mistral" || mt == "mistral3"
+         || mt == "mixtral"
+         || mt == "gpt_oss"
          || mt == "phi3"
          || mt == "olmo" || mt == "olmo3"
          || mt == "gemma2"
@@ -274,7 +278,7 @@ int main(int argc, char** argv) {
         if (!supported) {
             std::cerr << "[pie-driver-cuda] arch '" << mt
                       << "' not yet supported (Qwen 2/3, Llama-3, "
-                      << "Mistral, Phi-3, OLMo-3, Gemma-2/3/4)\n";
+                      << "Mistral, Mixtral, GPT-OSS, Phi-3, OLMo-3, Gemma-2/3/4)\n";
             return 2;
         }
     }
@@ -284,14 +288,18 @@ int main(int argc, char** argv) {
     // them on the stack; only the one matching `mt_for_bind` is
     // populated. The dispatch below wraps the right (weights, cfg,
     // forward function) triple into a single `ForwardFn` closure.
-    pie_cuda_driver::model::Qwen3Weights  weights_llama;
-    pie_cuda_driver::model::Gemma2Weights weights_gemma;
-    pie_cuda_driver::model::Gemma4Weights weights_gemma4;
+    pie_cuda_driver::model::Qwen3Weights   weights_llama;
+    pie_cuda_driver::model::Gemma2Weights  weights_gemma;
+    pie_cuda_driver::model::Gemma4Weights  weights_gemma4;
+    pie_cuda_driver::model::MixtralWeights weights_mixtral;
     const bool is_gemma_arch =
         (mt_for_bind == "gemma2" || mt_for_bind == "gemma3" ||
          mt_for_bind == "gemma3_text");
     const bool is_gemma4_arch =
         (mt_for_bind == "gemma4" || mt_for_bind == "gemma4_text");
+    const bool is_gpt_oss_arch = (mt_for_bind == "gpt_oss");
+    const bool is_mixtral_arch =
+        (mt_for_bind == "mixtral") || is_gpt_oss_arch;  // both use mixtral fwd
 
     if (mt_for_bind == "phi3") {
         weights_llama = pie_cuda_driver::model::bind_phi3(engine);
@@ -305,13 +313,18 @@ int main(int argc, char** argv) {
         weights_gemma = pie_cuda_driver::model::bind_gemma3(engine);
     } else if (is_gemma4_arch) {
         weights_gemma4 = pie_cuda_driver::model::bind_gemma4(engine);
+    } else if (is_gpt_oss_arch) {
+        weights_mixtral = pie_cuda_driver::model::bind_gpt_oss(engine);
+    } else if (mt_for_bind == "mixtral") {
+        weights_mixtral = pie_cuda_driver::model::bind_mixtral(engine);
     } else {
         weights_llama = pie_cuda_driver::model::bind_llama_like(engine);
     }
     const std::size_t num_layers_bound =
-        is_gemma4_arch ? weights_gemma4.layers.size()
-      : is_gemma_arch  ? weights_gemma.layers.size()
-                       : weights_llama.layers.size();
+        is_gemma4_arch  ? weights_gemma4.layers.size()
+      : is_gemma_arch   ? weights_gemma.layers.size()
+      : is_mixtral_arch ? weights_mixtral.layers.size()
+                        : weights_llama.layers.size();
     std::cerr << "[pie-driver-cuda] schema bound: "
               << num_layers_bound << " layers ("
               << engine.hf_config().model_type
@@ -604,6 +617,35 @@ int main(int argc, char** argv) {
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
             pie_cuda_driver::model::gemma2_forward_paged(
                 weights_gemma, engine.hf_config(), gemma_fwd_cfg,
+                ws, cache, attn_ws, cublas,
+                tok, pos,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, is_pure_decode, mask_d, mask_indptr_d);
+        };
+    } else if (is_mixtral_arch) {
+        // Mixtral reuses LlamaLikeForwardCfg for its (identical) attention
+        // half. The MoE block reads num_experts / num_experts_per_tok
+        // straight from HfConfig.
+        const int num_experts = engine.hf_config().num_experts;
+        const int top_k       = engine.hf_config().num_experts_per_tok;
+        forward_fn = [&engine, &weights_mixtral, fwd_cfg, num_experts, top_k](
+            pie_cuda_driver::model::Qwen3Workspace& ws,
+            pie_cuda_driver::KvCache& cache,
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            pie_cuda_driver::ops::CublasHandle& cublas,
+            const std::int32_t* tok, const std::int32_t* pos,
+            const std::uint32_t* qo_indptr,
+            const std::uint32_t* kv_page_indices,
+            const std::uint32_t* kv_page_indptr,
+            const std::uint32_t* kv_last_page_lens,
+            const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indptr_h,
+            int N, int R, bool is_pure_decode,
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            pie_cuda_driver::model::mixtral_forward_paged(
+                weights_mixtral, engine.hf_config(), fwd_cfg,
+                num_experts, top_k,
                 ws, cache, attn_ws, cublas,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,

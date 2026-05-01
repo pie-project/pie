@@ -163,6 +163,15 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
                                             optional<int>(j, "num_experts", 0));
     cfg.num_experts_per_tok = optional<int>(j, "num_experts_per_tok", 0);
 
+    // GPT-OSS knobs. The flags are inferred from `model_type` (rather
+    // than from explicit fields) because HF's gpt_oss config doesn't
+    // carry them — the architecture itself encodes them. `swiglu_limit`
+    // is set explicitly in the config as the activation clip threshold.
+    cfg.swiglu_limit         = optional<float>(j, "swiglu_limit", 0.f);
+    cfg.mlp_has_bias         = (cfg.model_type == "gpt_oss");
+    cfg.router_has_bias      = (cfg.model_type == "gpt_oss");
+    cfg.attention_has_sinks  = (cfg.model_type == "gpt_oss");
+
     // Gemma-family knobs. Both are "missing means default" — Gemma's
     // attention scale defaults to `head_dim` (i.e. `1/sqrt(head_dim)`,
     // matching standard scaled-dot-product) and the final-logit soft-cap

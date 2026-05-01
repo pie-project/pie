@@ -31,6 +31,13 @@ struct MixtralExpertWeights {
     const DeviceTensor* w_gate = nullptr;  // [intermediate, hidden] (HF: w1)
     const DeviceTensor* w_up   = nullptr;  // [intermediate, hidden] (HF: w3)
     const DeviceTensor* w_down = nullptr;  // [hidden, intermediate] (HF: w2)
+
+    // Optional per-expert biases. Mixtral's reference release ships
+    // bias-free MLPs; GPT-OSS adds them. Nullptr → bias-add step is
+    // skipped at runtime (no overhead for plain Mixtral).
+    const DeviceTensor* b_gate = nullptr;  // [intermediate] (gpt-oss)
+    const DeviceTensor* b_up   = nullptr;  // [intermediate] (gpt-oss)
+    const DeviceTensor* b_down = nullptr;  // [hidden]       (gpt-oss)
 };
 
 struct MixtralLayerWeights {
@@ -42,8 +49,21 @@ struct MixtralLayerWeights {
     const DeviceTensor* v_proj    = nullptr;
     const DeviceTensor* o_proj    = nullptr;
 
+    // Optional QKV/O biases. GPT-OSS has them on every linear; plain
+    // Mixtral / Qwen-3 have none. Nullptr → step skipped.
+    const DeviceTensor* q_bias    = nullptr;
+    const DeviceTensor* k_bias    = nullptr;
+    const DeviceTensor* v_bias    = nullptr;
+    const DeviceTensor* o_bias    = nullptr;
+
+    // Per-head learnable attention sink. GPT-OSS only. Shape
+    // [num_attention_heads], bf16. Nullptr → skip post-attention
+    // sink rescale.
+    const DeviceTensor* attn_sinks = nullptr;
+
     // Sparse-MoE block.
-    const DeviceTensor* router    = nullptr;     // [num_experts, hidden]
+    const DeviceTensor* router      = nullptr;   // [num_experts, hidden]
+    const DeviceTensor* router_bias = nullptr;   // [num_experts] (gpt-oss)
     std::vector<MixtralExpertWeights> experts;   // size = num_experts
 };
 
@@ -52,6 +72,13 @@ struct MixtralWeights {
     const DeviceTensor* final_norm  = nullptr;
     const DeviceTensor* lm_head     = nullptr;
     std::vector<MixtralLayerWeights> layers;
+
+    // Owns the bf16 expert tensors that bind_gpt_oss synthesises by
+    // dequantising MXFP4 fused weights. Plain bind_mixtral leaves this
+    // empty (per-expert tensors live in the Engine). Kept here so they
+    // outlive any lookup-by-name path; pointers in `experts[*]` index
+    // into this vector.
+    std::vector<DeviceTensor> owned_expert_buffers;
 };
 
 MixtralWeights bind_mixtral(const Engine& engine);

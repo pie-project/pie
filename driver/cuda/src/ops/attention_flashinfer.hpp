@@ -62,6 +62,12 @@ void plan_attention_flashinfer_decode_bf16(
 // `1/sqrt(d)` factor — or (b) the kernel runs at a *padded* HEAD_DIM
 // (e.g. Phi-3 at 128 with logical head_dim=96), in which case
 // `1/sqrt(96)` rather than `1/sqrt(128)` is the correct scale.
+// `lse_out`: when non-null, flashinfer writes per-(token, q_head) log-sum-exp
+// (natural log of the unnormalized softmax denominator) into this buffer
+// before the final divide. Used by GPT-OSS sink-attention to apply the
+// post-hoc denominator-extension correction `o *= sigmoid(lse - sink_h)`.
+// Layout: row-major [num_tokens, num_q_heads] floats. nullptr = skip
+// (default; no overhead).
 void dispatch_attention_flashinfer_decode_bf16(
     const DecodePlanCache& cache,
     const void* q,
@@ -74,7 +80,8 @@ void dispatch_attention_flashinfer_decode_bf16(
     cudaStream_t stream,
     int window_left = -1,
     float logits_soft_cap = 0.f,
-    float sm_scale = -1.f);
+    float sm_scale = -1.f,
+    float* lse_out = nullptr);
 
 // Prefill (or mixed prefill+decode): per-request qo_len comes from
 // qo_indptr. Causal mask is hard-wired (DefaultAttention + MaskMode::kCausal).
@@ -100,7 +107,9 @@ void launch_attention_flashinfer_prefill_bf16(
     cudaStream_t stream,
     int window_left = -1,
     float logits_soft_cap = 0.f,
-    float sm_scale = -1.f);
+    float sm_scale = -1.f,
+    // See decode entry point. [total_tokens, num_q_heads] fp32, nullptr = skip.
+    float* lse_out = nullptr);
 
 // Same prefill, with a custom packed-bit mask per request. `mask_d` is the
 // concatenation of all per-request bitmaps; `mask_indptr_d[r]` is the byte
@@ -126,6 +135,8 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     int page_size,
     AttentionWorkspace& workspace,
     cudaStream_t stream,
-    int window_left = -1);
+    int window_left = -1,
+    // See decode entry point. [total_tokens, num_q_heads] fp32, nullptr = skip.
+    float* lse_out = nullptr);
 
 }  // namespace pie_cuda_driver::ops

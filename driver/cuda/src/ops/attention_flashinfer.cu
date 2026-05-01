@@ -233,7 +233,8 @@ cudaError_t dispatch_decode_for_head_dim_v(
     cudaStream_t stream,
     int window_left,
     float logits_soft_cap,
-    float sm_scale)
+    float sm_scale,
+    float* lse_out)
 {
     ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
         static_cast<uint32_t>(cache.num_kv_heads),
@@ -252,7 +253,7 @@ cudaError_t dispatch_decode_for_head_dim_v(
     params.q_rope_offset = nullptr;
     params.paged_kv = paged_kv;
     params.o = static_cast<DTypeO*>(o);
-    params.lse = nullptr;
+    params.lse = lse_out;
     params.maybe_alibi_slopes = nullptr;
     params.num_qo_heads = static_cast<uint32_t>(cache.num_q_heads);
     params.q_stride_n = static_cast<IdType>(cache.num_q_heads * cache.head_dim);
@@ -306,18 +307,19 @@ cudaError_t dispatch_decode_for_head_dim(
     cudaStream_t stream,
     int window_left,
     float logits_soft_cap,
-    float sm_scale)
+    float sm_scale,
+    float* lse_out)
 {
     if (logits_soft_cap > 0.f) {
         return dispatch_decode_for_head_dim_v<HEAD_DIM, AttnVariantSoftcap>(
             cache, q, k_pages, v_pages, o,
             kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-            workspace, stream, window_left, logits_soft_cap, sm_scale);
+            workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
     }
     return dispatch_decode_for_head_dim_v<HEAD_DIM, AttnVariant>(
         cache, q, k_pages, v_pages, o,
         kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-        workspace, stream, window_left, /*soft_cap=*/0.f, sm_scale);
+        workspace, stream, window_left, /*soft_cap=*/0.f, sm_scale, lse_out);
 }
 
 }  // namespace
@@ -332,7 +334,8 @@ void dispatch_attention_flashinfer_decode_bf16(
     cudaStream_t stream,
     int window_left,
     float logits_soft_cap,
-    float sm_scale)
+    float sm_scale,
+    float* lse_out)
 {
     if (!cache.valid) {
         throw std::runtime_error(
@@ -343,19 +346,19 @@ void dispatch_attention_flashinfer_decode_bf16(
     switch (cache.head_dim) {
         case 64:
             status = dispatch_decode_for_head_dim<64>(cache, q, k_pages, v_pages, o,
-                kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale);
+                kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
             break;
         case 128:
             status = dispatch_decode_for_head_dim<128>(cache, q, k_pages, v_pages, o,
-                kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale);
+                kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
             break;
         case 256:
             status = dispatch_decode_for_head_dim<256>(cache, q, k_pages, v_pages, o,
-                kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale);
+                kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
             break;
         case 512:
             status = dispatch_decode_for_head_dim<512>(cache, q, k_pages, v_pages, o,
-                kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale);
+                kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
             break;
         default:
             throw std::runtime_error(
@@ -408,7 +411,8 @@ void launch_attention_flashinfer_prefill_bf16(
     cudaStream_t stream,
     int window_left,
     float logits_soft_cap,
-    float sm_scale)
+    float sm_scale,
+    float* lse_out)
 {
     if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
         throw std::runtime_error(
@@ -476,7 +480,7 @@ void launch_attention_flashinfer_prefill_bf16(
     params.maybe_mask_indptr = nullptr;
     params.maybe_q_rope_offset = nullptr;
     params.o = static_cast<DTypeO*>(o);
-    params.lse = nullptr;
+    params.lse = lse_out;
     params.maybe_alibi_slopes = nullptr;
     params.group_size = ::flashinfer::uint_fastdiv(
         static_cast<uint32_t>(num_q_heads / num_kv_heads));
@@ -574,7 +578,8 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     int num_q_heads, int num_kv_heads, int head_dim, int page_size,
     AttentionWorkspace& workspace,
     cudaStream_t stream,
-    int /* window_left */)  // ignored — kCustom owns the mask
+    int /* window_left */,  // ignored — kCustom owns the mask
+    float* lse_out)
 {
     if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
         throw std::runtime_error(
@@ -638,7 +643,7 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     params.maybe_mask_indptr = const_cast<IdType*>(mask_indptr_d);
     params.maybe_q_rope_offset = nullptr;
     params.o = static_cast<DTypeO*>(o);
-    params.lse = nullptr;
+    params.lse = lse_out;
     params.maybe_alibi_slopes = nullptr;
     params.group_size = ::flashinfer::uint_fastdiv(
         static_cast<uint32_t>(num_q_heads / num_kv_heads));
