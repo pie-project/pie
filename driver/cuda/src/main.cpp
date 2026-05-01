@@ -1,3 +1,4 @@
+#include "model/mistral3.hpp"
 // pie_driver_cuda — native CUDA backend, sibling to ../../runtime (Rust)
 // and ../../pie (Python driver). Consumed by `pie_driver_cuda_native`.
 //
@@ -33,6 +34,9 @@
 #include "kernels/sample_flashinfer.hpp"
 #include "kernels/sample_temp.hpp"
 #include "kv_cache.hpp"
+#include "model/gemma2.hpp"
+#include "model/gemma4.hpp"
+#include "model/llama_like.hpp"
 #include "model/qwen3.hpp"
 #include "model/qwen3_forward.hpp"
 #include "swap_pool.hpp"
@@ -261,16 +265,55 @@ int main(int argc, char** argv) {
             mt == "qwen3" || mt == "qwen3_5"
          || mt == "qwen2"
          || mt == "llama" || mt == "llama3"
-         || mt == "mistral" || mt == "mistral3";
+         || mt == "mistral" || mt == "mistral3"
+         || mt == "phi3"
+         || mt == "olmo" || mt == "olmo3"
+         || mt == "gemma2"
+         || mt == "gemma3" || mt == "gemma3_text"
+         || mt == "gemma4" || mt == "gemma4_text";
         if (!supported) {
             std::cerr << "[pie-driver-cuda] arch '" << mt
-                      << "' not yet supported (Qwen2/3/3.5, Llama 3, Mistral)\n";
+                      << "' not yet supported (Qwen 2/3, Llama-3, "
+                      << "Mistral, Phi-3, OLMo-3, Gemma-2/3/4)\n";
             return 2;
         }
     }
-    const auto weights = pie_cuda_driver::model::bind_llama_like(engine);
+    const std::string& mt_for_bind = engine.hf_config().model_type;
+
+    // Per-arch weights live in their own struct shape. We hold one of
+    // them on the stack; only the one matching `mt_for_bind` is
+    // populated. The dispatch below wraps the right (weights, cfg,
+    // forward function) triple into a single `ForwardFn` closure.
+    pie_cuda_driver::model::Qwen3Weights  weights_llama;
+    pie_cuda_driver::model::Gemma2Weights weights_gemma;
+    pie_cuda_driver::model::Gemma4Weights weights_gemma4;
+    const bool is_gemma_arch =
+        (mt_for_bind == "gemma2" || mt_for_bind == "gemma3" ||
+         mt_for_bind == "gemma3_text");
+    const bool is_gemma4_arch =
+        (mt_for_bind == "gemma4" || mt_for_bind == "gemma4_text");
+
+    if (mt_for_bind == "phi3") {
+        weights_llama = pie_cuda_driver::model::bind_phi3(engine);
+    } else if (mt_for_bind == "olmo3") {
+        weights_llama = pie_cuda_driver::model::bind_olmo3(engine);
+    } else if (mt_for_bind == "mistral3") {
+        weights_llama = pie_cuda_driver::model::bind_mistral3(engine);
+    } else if (mt_for_bind == "gemma2") {
+        weights_gemma = pie_cuda_driver::model::bind_gemma2(engine);
+    } else if (mt_for_bind == "gemma3" || mt_for_bind == "gemma3_text") {
+        weights_gemma = pie_cuda_driver::model::bind_gemma3(engine);
+    } else if (is_gemma4_arch) {
+        weights_gemma4 = pie_cuda_driver::model::bind_gemma4(engine);
+    } else {
+        weights_llama = pie_cuda_driver::model::bind_llama_like(engine);
+    }
+    const std::size_t num_layers_bound =
+        is_gemma4_arch ? weights_gemma4.layers.size()
+      : is_gemma_arch  ? weights_gemma.layers.size()
+                       : weights_llama.layers.size();
     std::cerr << "[pie-driver-cuda] schema bound: "
-              << weights.layers.size() << " layers ("
+              << num_layers_bound << " layers ("
               << engine.hf_config().model_type
               << (engine.hf_config().use_qk_norm ? ", q/k norm" : "")
               << ")\n";
@@ -283,15 +326,44 @@ int main(int argc, char** argv) {
     //   this can grow.
     // - KV cache sized at `max_num_kv_pages` × `kv_page_size`.
     const int max_workspace_tokens = std::min<int>(cfg.batching.max_batch_tokens, 8192);
-    auto ws = pie_cuda_driver::model::Qwen3Workspace::allocate(
-        engine.hf_config(), max_workspace_tokens);
+    // Per-arch worst-case workspace dims. Gemma-4 has both
+    // `use_double_wide_mlp` (intermediate doubles on shared layers)
+    // and dual head_dim (sliding=256 vs full=512), so ws.q/k/v need
+    // the full-attention sizing. Other archs use the single config
+    // values.
+    int max_mlp_intermediate = engine.hf_config().intermediate_size;
+    int max_Hq = engine.hf_config().num_attention_heads * engine.hf_config().head_dim;
+    int max_Hk = engine.hf_config().num_key_value_heads * engine.hf_config().head_dim;
+    if (is_gemma4_arch) {
+        for (int v : weights_gemma4.per_layer_intermediate) {
+            if (v > max_mlp_intermediate) max_mlp_intermediate = v;
+        }
+        for (int d : weights_gemma4.per_layer_head_dim) {
+            const int Hq = engine.hf_config().num_attention_heads * d;
+            const int Hk = engine.hf_config().num_key_value_heads * d;
+            if (Hq > max_Hq) max_Hq = Hq;
+            if (Hk > max_Hk) max_Hk = Hk;
+        }
+    }
+    auto ws = pie_cuda_driver::model::Qwen3Workspace::allocate_full(
+        engine.hf_config(), max_workspace_tokens,
+        max_mlp_intermediate, max_Hq, max_Hk);
 
-    auto kv_cache = pie_cuda_driver::KvCache::allocate(
-        engine.hf_config().num_hidden_layers,
-        static_cast<int>(cfg.batching.max_num_kv_pages),
-        static_cast<int>(cfg.batching.kv_page_size),
-        engine.hf_config().num_key_value_heads,
-        engine.hf_config().head_dim);
+    auto kv_cache =
+        is_gemma4_arch
+            ? pie_cuda_driver::KvCache::allocate_per_layer(
+                  engine.hf_config().num_hidden_layers,
+                  static_cast<int>(cfg.batching.max_num_kv_pages),
+                  static_cast<int>(cfg.batching.kv_page_size),
+                  engine.hf_config().num_key_value_heads,
+                  weights_gemma4.per_layer_head_dim,
+                  weights_gemma4.kv_source_layer)
+            : pie_cuda_driver::KvCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  static_cast<int>(cfg.batching.max_num_kv_pages),
+                  static_cast<int>(cfg.batching.kv_page_size),
+                  engine.hf_config().num_key_value_heads,
+                  engine.hf_config().head_dim_kernel);
 
     auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate();
 
@@ -300,7 +372,7 @@ int main(int argc, char** argv) {
         static_cast<int>(cfg.batching.swap_pool_size),
         static_cast<int>(cfg.batching.kv_page_size),
         engine.hf_config().num_key_value_heads,
-        engine.hf_config().head_dim);
+        engine.hf_config().head_dim_kernel);
 
     pie_cuda_driver::ops::CublasHandle cublas;
 
@@ -404,9 +476,168 @@ int main(int argc, char** argv) {
     std::uint64_t handled = 0;
 
     pie_cuda_driver::ForwardGraphCache graph_cache;
+
+    // Per-arch forward knobs from the loaded HF config.
+    pie_cuda_driver::model::LlamaLikeForwardCfg fwd_cfg{};
+    pie_cuda_driver::model::Gemma2ForwardCfg gemma_fwd_cfg{};
+    pie_cuda_driver::model::Gemma4ForwardCfg gemma4_fwd_cfg{};
+    {
+        const auto& hf = engine.hf_config();
+        const std::string& mt = hf.model_type;
+        fwd_cfg.use_qk_norm        = hf.use_qk_norm;
+        fwd_cfg.use_qkv_bias       = hf.attention_bias;
+        // OLMo-3 is the only currently-supported post-norm architecture;
+        // its q/k norms and YaRN scaling are picked up via use_qk_norm /
+        // has_rope_scaling on the same HfConfig.
+        fwd_cfg.norm_placement = (mt == "olmo3")
+            ? pie_cuda_driver::model::NormPlacement::Post
+            : pie_cuda_driver::model::NormPlacement::Pre;
+        if (mt == "olmo3") {
+            fwd_cfg.use_qk_norm = true;  // OLMo-3 always has q/k norms.
+        }
+        fwd_cfg.rope_kind = hf.has_rope_scaling
+            ? pie_cuda_driver::model::RopeKind::YaRN
+            : pie_cuda_driver::model::RopeKind::Standard;
+        fwd_cfg.yarn_factor               = hf.rope_factor;
+        fwd_cfg.yarn_low_freq_factor      = hf.rope_low_freq_factor;
+        fwd_cfg.yarn_high_freq_factor     = hf.rope_high_freq_factor;
+        fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
+        fwd_cfg.sliding_window            = hf.sliding_window;
+        // flashinfer's decode kernel only instantiates GQA group sizes
+        // {1, 2, 3, 4, 8}. Models like Qwen2-0.5B (group=7), Qwen2-1.5B
+        // (group=6) need the prefill kernel even for decode-only fires.
+        const int gqa = hf.num_attention_heads / hf.num_key_value_heads;
+        const bool gqa_in_decode_set = (gqa == 1 || gqa == 2 || gqa == 3
+                                        || gqa == 4 || gqa == 8);
+        fwd_cfg.force_prefill_path = !gqa_in_decode_set;
+
+        // Gemma-2 / Gemma-3 forward knobs. `query_pre_attn_scalar` and
+        // `final_logit_softcapping` come straight from the HF config —
+        // see `loader/hf_config.cpp` for the parsing.
+        gemma_fwd_cfg.query_pre_attn_scalar = hf.gemma_query_pre_attn_scalar;
+        gemma_fwd_cfg.final_logit_softcap   = hf.gemma_final_logit_softcap;
+        gemma_fwd_cfg.attn_logit_softcap    = hf.gemma_attn_logit_softcap;
+        gemma_fwd_cfg.use_qk_norm           = (mt == "gemma3" || mt == "gemma3_text");
+        gemma_fwd_cfg.force_prefill_path    = !gqa_in_decode_set;
+
+        // Build the per-layer attention type → window_left + rope_theta
+        // tables. Sliding layers get the configured window; full layers
+        // pass -1 (kept for symmetry — flashinfer treats `-1` as "no
+        // sliding"). For Gemma-3, sliding layers use the local-base
+        // RoPE freq while full layers stick with `rope_theta`.
+        const bool homogeneous = hf.layer_types.empty();
+        if (!homogeneous) {
+            gemma_fwd_cfg.per_layer_window_left.reserve(hf.layer_types.size());
+            gemma_fwd_cfg.per_layer_rope_theta.reserve(hf.layer_types.size());
+            fwd_cfg.per_layer_window_left.reserve(hf.layer_types.size());
+            for (const auto& t : hf.layer_types) {
+                const bool is_sliding = (t == "sliding_attention");
+                const int window = is_sliding ? hf.sliding_window : -1;
+                gemma_fwd_cfg.per_layer_window_left.push_back(window);
+                fwd_cfg.per_layer_window_left.push_back(window);
+                const float theta =
+                    (is_sliding && hf.rope_local_base_freq > 0.f)
+                        ? hf.rope_local_base_freq
+                        : hf.rope_theta;
+                gemma_fwd_cfg.per_layer_rope_theta.push_back(theta);
+            }
+        }
+
+        std::cerr << "[pie-driver-cuda] model_type=" << mt
+                  << " use_qk_norm=" << fwd_cfg.use_qk_norm
+                  << " use_qkv_bias=" << fwd_cfg.use_qkv_bias
+                  << " rope=" << (fwd_cfg.rope_kind ==
+                       pie_cuda_driver::model::RopeKind::YaRN ? "yarn" : "standard")
+                  << "\n";
+    }
+
+    if (is_gemma4_arch) {
+        const auto& hf = engine.hf_config();
+        gemma4_fwd_cfg.final_logit_softcap = hf.gemma_final_logit_softcap;
+        const int gqa = hf.num_attention_heads / hf.num_key_value_heads;
+        const bool gqa_in_decode_set = (gqa == 1 || gqa == 2 || gqa == 3
+                                        || gqa == 4 || gqa == 8);
+        gemma4_fwd_cfg.force_prefill_path = !gqa_in_decode_set;
+    }
+
+    // Build the type-erased forward closure once. The captures live in
+    // `main`'s scope (weights_*, fwd_cfg, gemma_fwd_cfg) and persist for
+    // the lifetime of the server.
+    pie_cuda_driver::ForwardFn forward_fn;
+    if (is_gemma4_arch) {
+        forward_fn = [&engine, &weights_gemma4, gemma4_fwd_cfg](
+            pie_cuda_driver::model::Qwen3Workspace& ws,
+            pie_cuda_driver::KvCache& cache,
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            pie_cuda_driver::ops::CublasHandle& cublas,
+            const std::int32_t* tok, const std::int32_t* pos,
+            const std::uint32_t* qo_indptr,
+            const std::uint32_t* kv_page_indices,
+            const std::uint32_t* kv_page_indptr,
+            const std::uint32_t* kv_last_page_lens,
+            const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indptr_h,
+            int N, int R, bool is_pure_decode,
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            pie_cuda_driver::model::gemma4_forward_paged(
+                weights_gemma4, engine.hf_config(), gemma4_fwd_cfg,
+                ws, cache, attn_ws, cublas,
+                tok, pos,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, is_pure_decode, mask_d, mask_indptr_d);
+        };
+    } else if (is_gemma_arch) {
+        forward_fn = [&engine, &weights_gemma, gemma_fwd_cfg](
+            pie_cuda_driver::model::Qwen3Workspace& ws,
+            pie_cuda_driver::KvCache& cache,
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            pie_cuda_driver::ops::CublasHandle& cublas,
+            const std::int32_t* tok, const std::int32_t* pos,
+            const std::uint32_t* qo_indptr,
+            const std::uint32_t* kv_page_indices,
+            const std::uint32_t* kv_page_indptr,
+            const std::uint32_t* kv_last_page_lens,
+            const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indptr_h,
+            int N, int R, bool is_pure_decode,
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            pie_cuda_driver::model::gemma2_forward_paged(
+                weights_gemma, engine.hf_config(), gemma_fwd_cfg,
+                ws, cache, attn_ws, cublas,
+                tok, pos,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, is_pure_decode, mask_d, mask_indptr_d);
+        };
+    } else {
+        forward_fn = [&engine, &weights_llama, fwd_cfg](
+            pie_cuda_driver::model::Qwen3Workspace& ws,
+            pie_cuda_driver::KvCache& cache,
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            pie_cuda_driver::ops::CublasHandle& cublas,
+            const std::int32_t* tok, const std::int32_t* pos,
+            const std::uint32_t* qo_indptr,
+            const std::uint32_t* kv_page_indices,
+            const std::uint32_t* kv_page_indptr,
+            const std::uint32_t* kv_last_page_lens,
+            const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indptr_h,
+            int N, int R, bool is_pure_decode,
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            pie_cuda_driver::model::llama_like_forward_paged(
+                weights_llama, engine.hf_config(), fwd_cfg,
+                ws, cache, attn_ws, cublas,
+                tok, pos,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, is_pure_decode, mask_d, mask_indptr_d);
+        };
+    }
+
     pie_cuda_driver::ForwardContext fwd_ctx{
-        engine, weights, ws, kv_cache, attn_ws, cublas,
-        max_workspace_tokens, persistent_inputs,
+        engine, ws, kv_cache, attn_ws, cublas,
+        max_workspace_tokens, persistent_inputs, std::move(forward_fn),
         use_cuda_graphs ? &graph_cache : nullptr,
     };
     if (use_cuda_graphs) {

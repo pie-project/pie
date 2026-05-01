@@ -117,7 +117,8 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         "llama3" | "l4ma" => Arc::new(self::llama3::LlamaInstruct::new(tokenizer)),
         "r1" | "deepseek_v3" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
         "gptoss" | "gpt_oss" => Arc::new(self::gptoss::GptOssInstruct::new(tokenizer)),
-        "gemma2" | "gemma3" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
+        "gemma2" | "gemma3" | "gemma3_text" |
+        "gemma4" | "gemma4_text" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
         "mistral3" | "ministral3" => Arc::new(self::mistral3::MistralInstruct::new(tokenizer)),
         "olmo3" => Arc::new(self::olmo3::OlmoInstruct::new(tokenizer)),
         _ => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {

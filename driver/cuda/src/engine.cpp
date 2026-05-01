@@ -85,4 +85,11 @@ const DeviceTensor& Engine::get(const std::string& name) const {
     return it->second;
 }
 
+void Engine::insert(std::string name, DeviceTensor tensor) {
+    auto [it, inserted] = weights_.emplace(std::move(name), std::move(tensor));
+    if (!inserted) {
+        throw std::runtime_error("engine: weight already registered: " + it->first);
+    }
+}
+
 }  // namespace pie_cuda_driver
