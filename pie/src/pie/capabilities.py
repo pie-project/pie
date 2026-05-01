@@ -2,10 +2,11 @@
 
 Pie's configuration has two distinct concepts that this module separates:
 
-  * **Budgets** (top-down, user-set in `ModelConfig`): "you may use up to this
-    much" — `gpu_mem_utilization`, `swap_budget_bytes`, scheduler timing knobs,
-    `default_token_budget`, etc. These flow from the user's config file into
-    the worker and are consumed there. They never come back.
+  * **Budgets** (top-down, user-set in `ModelConfig` / `SchedulerConfig`):
+    "you may use up to this much" — `gpu_mem_utilization`, `swap_budget_bytes`,
+    `default_token_limit`, scheduler timing knobs, etc. These flow from the
+    user's config file into the worker and are consumed there. They never
+    come back.
 
   * **Capacities** (bottom-up, driver-computed in this dataclass): "given
     that budget plus the kernel's real ceiling, here is what I actually

@@ -170,7 +170,7 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     print(f"Driver: {args.driver}")
     print()
 
-    # Build the [model.X.driver.<type>] subsection content.
+    # Build the [model.driver.options] subsection content.
     driver_subsection: dict = {}
     if args.driver == "vllm" and args.vllm_attention_backend is not None:
         driver_subsection["attention_backend"] = args.vllm_attention_backend
@@ -186,8 +186,8 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         server=ServerConfig(port=0),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        models={
-            "default": ModelConfig(
+        models=[
+            ModelConfig(
                 name="default",
                 hf_repo=args.model,
                 driver=DriverConfig(
@@ -195,8 +195,8 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
                     device=device,
                     options=driver_subsection,
                 ),
-            )
-        },
+            ),
+        ],
     )
     async with Server(cfg) as server:
         client = await server.connect()

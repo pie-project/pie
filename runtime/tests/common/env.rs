@@ -9,7 +9,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use pie::bootstrap::{
-    AuthConfig, Config, DeviceConfig, ModelConfig, SchedulerConfig, TelemetryConfig,
+    AuthConfig, Config, DeviceConfig, ModelConfig, RuntimeConfig, SchedulerConfig,
+    TelemetryConfig,
 };
 
 use super::mock_device::{Behavior, MockBackend};
@@ -99,17 +100,29 @@ pub fn create_mock_env(
             tokenizer_path,
             devices,
             scheduler: SchedulerConfig {
+                batch_policy: "adaptive".into(),
                 request_timeout_secs: 30,
-                policy: None,
+                default_token_limit: None,           // unlimited by default
+                default_endowment_pages: 4,          // small endowment for mock GPUs
+                // Permissive for tests: allow up to 32× overbook so fixtures
+                // don't trip the admission gate on small-capacity mock devices.
+                admission_oversubscription_factor: 32.0,
+                restore_pause_at_utilization: 0.85,
             },
-            default_token_budget: None,     // unlimited by default
-            default_endowment_pages: 4,     // small endowment for small mock GPUs
-            // Permissive for tests: allow up to 32× overbook so fixtures
-            // don't trip the admission gate on small-capacity mock devices.
-            oversubscription_factor: 32.0,
         }],
+        runtime: RuntimeConfig {
+            worker_threads: 4,
+            wasm_max_instances: 1000,
+            wasm_max_memory_mb: 4096,
+            wasm_warm_memory_mb: 0,
+            wasm_warm_slots: 100,
+            allow_fs: false,
+            fs_scratch_dir: temp_cache.path().to_path_buf(),
+            allow_network: false,
+            network_allowed_hosts: vec![],
+            max_upload_mb: 256,
+        },
         skip_tracing: true,
-        allow_filesystem: false,
         max_concurrent_processes: None,
         python_snapshot: false,
     };

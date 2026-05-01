@@ -43,106 +43,57 @@ pub struct Config {
 }
 
 /// Runtime tuning — tokio worker pool + wasmtime engine pool +
-/// per-instance security policies (filesystem / network). All fields
-/// are opt-in; leaving them at their defaults yields stock tokio,
-/// stock wasmtime, no filesystem, and unrestricted network (matching
-/// the legacy hardcoded behavior).
+/// per-instance security policies (filesystem / network).
+///
+/// Every field is required: Python is the source of truth for defaults,
+/// Rust just consumes whatever the caller sends. No fallback logic.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    /// Number of tokio worker threads. `None` = let tokio default to
-    /// `num_cpus`. On boxes with high logical-core counts and many
-    /// in-flight tasks, lowering this (e.g. to 8) cuts migration /
-    /// context-switch overhead and can give a substantial throughput
-    /// win — see comments in `RuntimeConfig` on the Python side.
-    pub worker_threads: Option<usize>,
+    /// Number of tokio worker threads.
+    pub worker_threads: usize,
 
     // ── wasmtime engine pool ────────────────────────────────────────
     //
-    // The pooling allocator caps four resource classes at 1000 each by
-    // default. In pie every inferlet uses one of each, so we expose
-    // them as a single `wasm_max_instances` knob and bump them in
-    // lockstep.
+    // The pooling allocator caps four resource classes (core_instances,
+    // component_instances, memories, tables) — pie uses one of each per
+    // inferlet, so we expose them as a single `wasm_max_instances` knob
+    // and bump them in lockstep.
 
-    /// Concurrent-inferlet cap. Bumps wasmtime's
-    /// `total_core_instances`, `total_component_instances`,
-    /// `total_memories`, and `total_tables` together. `None` = use
-    /// wasmtime's default of 1000.
-    pub wasm_max_instances: Option<u32>,
-
-    /// Per-inferlet linear-memory cap, in MiB. `None` = use wasmtime's
-    /// default of 10 MiB.
-    pub wasm_max_memory_mb: Option<usize>,
-
-    /// RAM kept warm per slot to skip remapping on inferlet respawn,
-    /// in MiB. RSS-vs-spawn-latency tradeoff. `None` = wasmtime
-    /// default of 0 (don't keep memory warm).
-    pub wasm_warm_memory_mb: Option<usize>,
-
+    /// Concurrent-inferlet cap (sets all four wasmtime `total_*` caps).
+    pub wasm_max_instances: u32,
+    /// Per-inferlet linear-memory cap, in MiB.
+    pub wasm_max_memory_mb: usize,
+    /// RAM kept warm per slot to skip remapping on respawn, in MiB.
+    pub wasm_warm_memory_mb: usize,
     /// Prepared-but-idle inferlet slots kept ready for fast respawn.
-    /// `None` = wasmtime default of 100.
-    pub wasm_warm_slots: Option<u32>,
+    pub wasm_warm_slots: u32,
 
     // ── filesystem ───────────────────────────────────────────────────
 
-    /// If true, mount a per-process scratch directory at `/scratch`
-    /// with full read+write. If false, no `wasi:filesystem` access.
-    /// Default: false.
+    /// Mount per-process scratch dir at `/scratch` with full read+write.
     pub allow_fs: bool,
-
-    /// Base directory under which per-process scratch dirs are
-    /// created. Each instance gets `<base>/<process_id>`. `None` =
-    /// `${TMPDIR}/pie`.
-    pub fs_scratch_dir: Option<PathBuf>,
+    /// Base dir under which per-process scratch dirs are created.
+    /// Each instance gets `<base>/<process_id>`.
+    pub fs_scratch_dir: PathBuf,
 
     // ── network ──────────────────────────────────────────────────────
 
-    /// If true, expose the host network to inferlets (both
-    /// `wasi:sockets` and `wasi:http`). If false, deny all socket
-    /// operations and drop the `wasi:http` linker binding entirely.
-    /// Default: true (matches legacy `inherit_network()`).
+    /// Expose the host network to inferlets (both `wasi:sockets` and
+    /// `wasi:http`). When false, sockets are denied and the `wasi:http`
+    /// linker binding is dropped entirely.
     pub allow_network: bool,
-
-    /// Allowlist of `cidr[:port]` / `cidr:lo-hi` strings. `["*"]` (the
-    /// default) means "no restriction". Empty list ≡ `allow_network =
-    /// false`. NOTE: only filters `wasi:sockets`; `wasi:http` is
-    /// gated by `allow_network` alone (its host stack does its own
-    /// DNS resolution and bypasses the per-socket hook). For tight
-    /// IP-level control over outbound HTTP, set `allow_network =
-    /// false` and have inferlets use `wasi:sockets` directly.
+    /// Allowlist of `cidr[:port]` / `cidr:lo-hi`. `["*"]` = no
+    /// restriction. NOTE: only filters `wasi:sockets`; `wasi:http`
+    /// bypasses the per-socket hook. Set `allow_network = false` for
+    /// tight outbound HTTP control.
     pub network_allowed_hosts: Vec<String>,
 
     // ── upload cap ───────────────────────────────────────────────────
 
-    /// Per-upload cap on total bytes accumulated across chunks, in
-    /// MiB. Applies to inferlet program installs and
-    /// `session.send_file` blob transfers. Checked on every chunk so
-    /// a malicious sender can't grow the in-flight buffer without
-    /// bound. `None` = use the built-in default of 256 MiB.
-    pub max_upload_mb: Option<usize>,
+    /// Per-upload cap on cumulative bytes (program installs +
+    /// `session.send_file` blobs), in MiB.
+    pub max_upload_mb: usize,
 }
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        RuntimeConfig {
-            worker_threads: None,
-            wasm_max_instances: None,
-            wasm_max_memory_mb: None,
-            wasm_warm_memory_mb: None,
-            wasm_warm_slots: None,
-            allow_fs: false,
-            fs_scratch_dir: None,
-            allow_network: true,
-            network_allowed_hosts: vec!["*".to_string()],
-            max_upload_mb: None,
-        }
-    }
-}
-
-/// Built-in default for `max_upload_mb` when the field is `None`.
-/// 256 MiB is large enough for any current inferlet (12 MiB JS bundles
-/// are the biggest we ship) plus headroom, and small enough that a
-/// runaway upload doesn't exhaust host RAM before failing.
-pub const DEFAULT_MAX_UPLOAD_MB: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -152,21 +103,6 @@ pub struct ModelConfig {
     pub tokenizer_path: PathBuf,
     pub devices: Vec<DeviceConfig>,
     pub scheduler: SchedulerConfig,
-    /// Default compute-wallet cap for processes that do not declare an
-    /// explicit token budget at launch. `None` = unlimited (no cap); most
-    /// deployments should leave this as `None` and let clients opt into
-    /// caps per-launch. `Some(n)` = default hard cap at `n` tokens.
-    pub default_token_budget: Option<usize>,
-    /// Default market endowment (in KV pages) assigned to processes that
-    /// do not declare an explicit token budget. One endowment unit = one
-    /// page of long-run guaranteed GPU residency under contention.
-    pub default_endowment_pages: usize,
-    /// Admission oversubscription factor: maximum allowed ratio of
-    /// `Σ endowment / total_gpu_pages`. Must be > 0. At 1.0 the provider
-    /// guarantees every admitted process its full endowment at all times;
-    /// at higher values the provider sells more entitlement than physical
-    /// capacity, betting on non-peak duty cycles (like a typical airline).
-    pub oversubscription_factor: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -180,10 +116,28 @@ pub struct DeviceConfig {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
+    /// Batch-firing policy. Recognized: `"adaptive"`, `"eager"`, `"greedy"`.
+    pub batch_policy: String,
+    /// Wall-clock cap on a single forward-pass request, in seconds.
     pub request_timeout_secs: u64,
-    /// Optional batch-firing policy. `None` = use built-in default.
-    /// Recognized values: `"adaptive"`, `"eager"`, `"greedy"`.
-    pub policy: Option<String>,
+    /// Default compute-wallet cap for processes that do not declare an
+    /// explicit token limit at launch. `None` = unlimited (no cap).
+    /// `Some(n)` = default hard cap at `n` tokens.
+    pub default_token_limit: Option<usize>,
+    /// Default market endowment (in KV pages) for processes that do not
+    /// declare an explicit token limit. One endowment unit = one page of
+    /// long-run guaranteed GPU residency under contention.
+    pub default_endowment_pages: usize,
+    /// Admission oversubscription factor: maximum allowed ratio of
+    /// `Σ endowment / total_gpu_pages`. Must be > 0. At 1.0 the provider
+    /// guarantees every admitted process its full endowment at all times;
+    /// at higher values the provider sells more entitlement than physical
+    /// capacity, betting on non-peak duty cycles (like a typical airline).
+    pub admission_oversubscription_factor: f64,
+    /// Hard admission gate for the restore loop: pause restoring suspended
+    /// contexts when any device's GPU page utilization exceeds this fraction.
+    /// Prevents the evict→restore→re-evict thrash cascade. Range: (0.0, 1.0].
+    pub restore_pause_at_utilization: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -199,10 +153,7 @@ pub struct AuthConfig {
     pub authorized_users_dir: PathBuf,
 }
 
-pub async fn bootstrap(
-    config: Config,
-) -> Result<String> {
-
+pub async fn bootstrap(config: Config) -> Result<String> {
     verify_config(&config)?;
 
     if !config.skip_tracing {
@@ -231,11 +182,7 @@ pub async fn bootstrap(
     // rules, etc.) — better here than on the first inferlet launch.
     let fs_policy = crate::policy::FsPolicy {
         allow: config.runtime.allow_fs,
-        base_dir: config
-            .runtime
-            .fs_scratch_dir
-            .clone()
-            .unwrap_or_else(crate::policy::FsPolicy::default_base_dir),
+        base_dir: config.runtime.fs_scratch_dir.clone(),
     };
     let network_policy = crate::policy::NetworkPolicy::parse(
         config.runtime.allow_network,
@@ -243,17 +190,12 @@ pub async fn bootstrap(
     )?;
 
     linker::spawn(&wasm_engine, fs_policy, network_policy);
-    let max_upload_bytes = config
-        .runtime
-        .max_upload_mb
-        .unwrap_or(DEFAULT_MAX_UPLOAD_MB)
-        .saturating_mul(1024 * 1024);
+    let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
     server::spawn(&config.host, config.port, max_upload_bytes);
     messaging::spawn();
     process::init_admission(config.max_concurrent_processes);
-    
-    for cfg in config.models.iter() {
 
+    for cfg in config.models.iter() {
         model::register(
             cfg.name.clone(),
             &cfg.arch_name,
@@ -272,26 +214,30 @@ pub async fn bootstrap(
             cfg.kv_page_size,
             num_gpu_pages,
             num_cpu_pages,
-            cfg.default_endowment_pages.max(1),
-            cfg.default_token_budget,
-            cfg.oversubscription_factor,
+            cfg.scheduler.default_endowment_pages.max(1),
+            cfg.scheduler.default_token_limit,
+            cfg.scheduler.admission_oversubscription_factor,
+            cfg.scheduler.restore_pause_at_utilization,
         );
         inference::spawn(
             &devices,
             cfg.kv_page_size as u32,
             cfg.scheduler.request_timeout_secs,
-            cfg.scheduler.policy.clone(),
+            cfg.scheduler.batch_policy.clone(),
         ).await;
         adapter::spawn(&devices);
     }
 
-
-
     Ok(auth::get_internal_auth_token().await?)
 }
 
+/// Boot-time checks for the values pie's Python layer cannot validate
+/// itself: filesystem-side effects (cache/auth dirs) and worker-handshake
+/// outputs (tokenizer file, device capability numbers). Field-level
+/// validation of user-supplied scalars (`batch_policy`, timeouts, market
+/// knobs, etc.) happens in `pie.config.*.__post_init__` — by the time
+/// they reach Rust they're already known-good.
 fn verify_config(config: &Config) -> Result<()> {
-
     fs::create_dir_all(&config.cache_dir)
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
 
@@ -300,46 +246,19 @@ fn verify_config(config: &Config) -> Result<()> {
             .with_context(|| format!("Could not create auth users dir: {:?}", config.auth.authorized_users_dir))?;
     }
 
-    ensure!(!config.models.is_empty(), "No models configured");
-
-    let mut seen_names = std::collections::HashSet::new();
     for model in &config.models {
-        ensure!(
-            seen_names.insert(&model.name),
-            "Duplicate model name: {:?}", model.name
-        );
-        ensure!(!model.name.is_empty(), "Model name must not be empty");
-        ensure!(!model.devices.is_empty(), "Model {:?} has no devices", model.name);
         ensure!(
             model.tokenizer_path.exists(),
             "Model {:?}: tokenizer not found at {:?}", model.name, model.tokenizer_path
         );
-        if let Some(t) = model.default_token_budget {
-            ensure!(
-                t > 0,
-                "Model {:?}: default_token_budget, when set, must be > 0 (got {})",
-                model.name, t
-            );
-        }
-        ensure!(
-            model.default_endowment_pages > 0,
-            "Model {:?}: default_endowment_pages must be > 0 (got {})",
-            model.name, model.default_endowment_pages
-        );
-        ensure!(
-            model.oversubscription_factor > 0.0 && model.oversubscription_factor.is_finite(),
-            "Model {:?}: oversubscription_factor must be > 0 and finite (got {})",
-            model.name, model.oversubscription_factor
-        );
-
         for (i, dev) in model.devices.iter().enumerate() {
-            ensure!(dev.total_pages > 0, "Model {:?} device {i}: total_pages must be > 0", model.name);
-            ensure!(dev.max_batch_size > 0, "Model {:?} device {i}: max_batch_size must be > 0", model.name);
-            ensure!(dev.max_batch_tokens > 0, "Model {:?} device {i}: max_batch_tokens must be > 0", model.name);
+            ensure!(dev.total_pages > 0,
+                "Model {:?} device {i}: total_pages must be > 0", model.name);
+            ensure!(dev.max_batch_size > 0,
+                "Model {:?} device {i}: max_batch_size must be > 0", model.name);
+            ensure!(dev.max_batch_tokens > 0,
+                "Model {:?} device {i}: max_batch_tokens must be > 0", model.name);
         }
-
-        let sched = &model.scheduler;
-        ensure!(sched.request_timeout_secs > 0, "Model {:?}: request_timeout_secs must be > 0", model.name);
     }
 
     Ok(())
@@ -350,27 +269,19 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
     wasm_config.async_support(true);
 
+    // Every wasmtime knob comes from the caller — Python is the source
+    // of truth for defaults. The `wasm_max_instances` knob covers four
+    // wasmtime resource classes (pie uses one of each per inferlet).
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
-
-    // Lockstep bump on the four "total_*" caps. wasmtime defaults all
-    // of them to 1000; we bump them together because every pie
-    // inferlet uses exactly one of each (one core instance, one
-    // component instance, one memory, one table).
-    if let Some(n) = runtime.wasm_max_instances {
-        pooling_config.total_core_instances(n);
-        pooling_config.total_component_instances(n);
-        pooling_config.total_memories(n);
-        pooling_config.total_tables(n);
-    }
-    if let Some(mb) = runtime.wasm_max_memory_mb {
-        pooling_config.max_memory_size(mb.saturating_mul(1024 * 1024));
-    }
-    if let Some(mb) = runtime.wasm_warm_memory_mb {
-        pooling_config.linear_memory_keep_resident(mb.saturating_mul(1024 * 1024));
-    }
-    if let Some(n) = runtime.wasm_warm_slots {
-        pooling_config.max_unused_warm_slots(n);
-    }
+    pooling_config.total_core_instances(runtime.wasm_max_instances);
+    pooling_config.total_component_instances(runtime.wasm_max_instances);
+    pooling_config.total_memories(runtime.wasm_max_instances);
+    pooling_config.total_tables(runtime.wasm_max_instances);
+    pooling_config.max_memory_size(runtime.wasm_max_memory_mb.saturating_mul(1024 * 1024));
+    pooling_config.linear_memory_keep_resident(
+        runtime.wasm_warm_memory_mb.saturating_mul(1024 * 1024),
+    );
+    pooling_config.max_unused_warm_slots(runtime.wasm_warm_slots);
 
     wasm_config
         .allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling_config));

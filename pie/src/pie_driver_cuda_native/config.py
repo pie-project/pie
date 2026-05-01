@@ -1,4 +1,4 @@
-"""TOML-shape config for `[model.X.driver.cuda_native]`."""
+"""TOML-shape config for `[model.driver.options]` when `type = "cuda_native"`."""
 
 from __future__ import annotations
 

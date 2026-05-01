@@ -17,8 +17,8 @@ You can sweep multiple RPS points in a single server boot via
 
 Usage::
 
-    uv run python benches/tput_rps.py --rps 4 --duration 15 --default-token-budget 256
-    uv run python benches/tput_rps.py --rps-sweep 1,4,16,64 --duration 12 --default-token-budget 256
+    uv run python benches/tput_rps.py --rps 4 --duration 15 --default-token-limit 256
+    uv run python benches/tput_rps.py --rps-sweep 1,4,16,64 --duration 12 --default-token-limit 256
 """
 
 import argparse
@@ -308,15 +308,17 @@ async def run_benchmark(args):
         server=ServerConfig(port=0, max_concurrent_processes=args.max_concurrent_processes),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        models={
-            "default": ModelConfig(
+        models=[
+            ModelConfig(
                 name="default",
                 hf_repo=args.model,
-                default_token_budget=args.default_token_budget,
-                scheduler=SchedulerConfig(policy=args.policy),
+                scheduler=SchedulerConfig(
+                    batch_policy=args.batch_policy,
+                    default_token_limit=args.default_token_limit,
+                ),
                 driver=DriverConfig(type=args.driver, device=device, options=driver_subsection),
-            )
-        },
+            ),
+        ],
     )
 
     churn_phases: list[tuple[float, float]] | None = None
@@ -408,7 +410,7 @@ def main():
     parser.add_argument("--gpu-mem-util", type=float, default=0.8)
     parser.add_argument("--cpu-mem-budget", type=int, default=0)
     parser.add_argument("--unique-prompts", action="store_true")
-    parser.add_argument("--default-token-budget", type=int, required=True)
+    parser.add_argument("--default-token-limit", type=int, required=True)
     parser.add_argument("--max-concurrent-processes", type=int, default=None)
     parser.add_argument("--max-batch-size", type=int, default=512)
     parser.add_argument("--driver", default="native", choices=["native", "vllm", "sglang", "dummy"])
@@ -432,9 +434,9 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--churn", type=str, default=None,
                         help="Phase-alternating workload, e.g. '32:6,1:6,32:6,1:6'.")
-    parser.add_argument("--policy", type=str, default=None,
-                        choices=[None, "adaptive", "eager", "greedy"],
-                        help="Scheduler policy via config (None = use built-in default).")
+    parser.add_argument("--batch-policy", type=str, default="adaptive",
+                        choices=["adaptive", "eager", "greedy"],
+                        help="Batch-firing policy (default: adaptive).")
 
     args = parser.parse_args()
     try:

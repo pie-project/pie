@@ -125,17 +125,18 @@ def run(
         console.print(f"[red]✗[/red] {e}")
         raise typer.Exit(1)
 
-    model = cfg.primary_model
     inferlet_display = str(path) if path else inferlet
     lines = Text()
     lines.append(f"{'Inferlet':<15}", style="white")
     lines.append(f"{inferlet_display}\n", style="dim")
-    lines.append(f"{'Model':<15}", style="white")
-    lines.append(f"{model.name} ({model.hf_repo})\n", style="dim")
-    lines.append(f"{'Driver':<15}", style="white")
-    lines.append(f"{model.driver.type}\n", style="dim")
-    lines.append(f"{'Device':<15}", style="white")
-    lines.append(", ".join(model.driver.device), style="dim")
+    for i, model in enumerate(cfg.models):
+        prefix = "Model" if i == 0 else ""
+        lines.append(f"{prefix:<15}", style="white")
+        lines.append(
+            f"{model.name} ({model.hf_repo}) — {model.driver.type} on "
+            f"{', '.join(model.driver.device)}\n",
+            style="dim",
+        )
 
     console.print()
     console.print(Panel(lines, title="Pie Run", title_align="left", border_style="dim"))

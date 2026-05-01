@@ -305,7 +305,7 @@ class NativeRuntimeConfig(RuntimeConfig):
 
 
 # ---------------------------------------------------------------------------
-# TOML-shaped driver config (`[model.X.driver.native]`)
+# TOML-shaped driver config (`[model.driver.options]` with type = "native")
 # ---------------------------------------------------------------------------
 
 

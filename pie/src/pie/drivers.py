@@ -7,10 +7,13 @@ to the right worker module without hardcoding driver names.
 
 Driver selection at TOML level:
 
-    [model.qwen-small.driver]
+    [[model]]
+    name = "qwen-small"
+
+    [model.driver]
     type = "vllm"           # ← discriminator looked up here
 
-    [model.qwen-small.driver.vllm]
+    [model.driver.options]
     # vllm-specific fields, parsed into DriverSpec.config_cls
 
 Each driver's `config_cls` is a typed dataclass whose field names mirror
@@ -28,7 +31,7 @@ class DriverSpec:
     """Everything pie needs to dispatch a model to a driver."""
 
     name: str
-    """Discriminator string. Matches `[model.X.driver].type` in TOML."""
+    """Discriminator string. Matches `[model.driver].type` in TOML."""
 
     config_cls: type
     """Dataclass describing the driver's TOML subsection. Field names mirror
