@@ -21,6 +21,7 @@ const char* pie_arch_name(PieArch a) {
         case PieArch::GptOss:   return "gptoss";
         case PieArch::Phi3:     return "phi3";
         case PieArch::Mixtral:  return "mixtral";
+        case PieArch::Qwen3Moe: return "qwen3_moe";
         case PieArch::Qwen3_5:  return "qwen3_5";
     }
     return "?";
@@ -44,8 +45,10 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
     if (hf_model_type == "gptoss")      return PieArch::GptOss;
     if (hf_model_type == "phi3")        return PieArch::Phi3;
     if (hf_model_type == "mixtral")     return PieArch::Mixtral;
-    if (hf_model_type == "qwen3_5")     return PieArch::Qwen3_5;
-    if (hf_model_type == "qwen3_moe")   return PieArch::Qwen3_5;
+    if (hf_model_type == "qwen3_moe")   return PieArch::Qwen3Moe;
+    if (hf_model_type == "qwen3_5" ||
+        hf_model_type == "qwen3_5_text" ||
+        hf_model_type == "qwen3_5_moe")    return PieArch::Qwen3_5;
     throw std::runtime_error(
         "hf_config: unsupported model_type '" + hf_model_type + "'");
 }
@@ -86,23 +89,59 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
 
     Hparams h;
 
-    h.hf_model_type = j.at("model_type").get<std::string>();
-    h.arch = hf_model_type_to_pie_arch(h.hf_model_type);
-    h.torch_dtype = get_or<std::string>(j, "torch_dtype", "float16");
+    // Multimodal wrappers (gemma4, mistral3, gemma3 multimodal) nest the
+    // text decoder config under `text_config`. Resolve once: the rest of
+    // this function reads from the unwrapped JSON. We still derive `arch`
+    // from the *outer* model_type because the runtime catalogue keys on
+    // it (e.g. "gemma4" → Gemma4ForConditionalGeneration wraps gemma4_text).
+    const std::string outer_model_type =
+        j.contains("model_type") && !j["model_type"].is_null()
+            ? j["model_type"].get<std::string>() : std::string();
+    nlohmann::json text = j;
+    if (j.contains("text_config") && j["text_config"].is_object()) {
+        text = j["text_config"];
+    }
 
-    h.num_hidden_layers = j.at("num_hidden_layers").get<std::int32_t>();
-    h.num_attention_heads = j.at("num_attention_heads").get<std::int32_t>();
+    h.hf_model_type =
+        text.contains("model_type") && !text["model_type"].is_null()
+            ? text["model_type"].get<std::string>()
+            : outer_model_type;
+    // Use the outer wrapper's model_type for arch dispatch when present;
+    // it's how the wrapper architecture is declared. For Ministral 3 the
+    // outer says "mistral3" which is the registered HF type.
+    h.arch = hf_model_type_to_pie_arch(
+        !outer_model_type.empty() ? outer_model_type : h.hf_model_type);
+    h.torch_dtype =
+        get_or<std::string>(text, "torch_dtype",
+            get_or<std::string>(j, "torch_dtype",
+                get_or<std::string>(j, "dtype", "float16")));
+
+    // FUTURE — quantized HF checkpoint support.
+    // The safetensors loader currently accepts only F32 / F16 / BF16
+    // (plus the MXFP4 path bolted on for gpt-oss in build_gpt_oss_).
+    // Some shipped checkpoints use other formats:
+    //   - Ministral 3 Instruct (mistralai/Ministral-3-3B-Instruct-2512):
+    //     fp8 weight format (`quantization_config.quant_method == "fp8"`,
+    //     with `weight_scale_inv` + `activation_scale` companion tensors
+    //     per linear). The Base variant is BF16 and works today; supporting
+    //     Instruct would require an FP8-block dequant similar to MXFP4.
+    //   - Other potentially-quantized arch checkpoints (GPTQ, AWQ, etc.)
+    //     likewise unsupported. We ignore `quantization_config` here; the
+    //     safetensors loader throws on the first unsupported dtype.
+
+    h.num_hidden_layers = text.at("num_hidden_layers").get<std::int32_t>();
+    h.num_attention_heads = text.at("num_attention_heads").get<std::int32_t>();
     // Some configs default num_key_value_heads to num_attention_heads.
     h.num_key_value_heads =
-        get_or<std::int32_t>(j, "num_key_value_heads", h.num_attention_heads);
-    h.hidden_size = j.at("hidden_size").get<std::int32_t>();
-    h.intermediate_size = j.at("intermediate_size").get<std::int32_t>();
-    h.vocab_size = j.at("vocab_size").get<std::int32_t>();
+        get_or<std::int32_t>(text, "num_key_value_heads", h.num_attention_heads);
+    h.hidden_size = text.at("hidden_size").get<std::int32_t>();
+    h.intermediate_size = text.at("intermediate_size").get<std::int32_t>();
+    h.vocab_size = text.at("vocab_size").get<std::int32_t>();
     h.max_position_embeddings =
-        get_or<std::int32_t>(j, "max_position_embeddings", 4096);
+        get_or<std::int32_t>(text, "max_position_embeddings", 4096);
 
-    if (j.contains("head_dim") && !j["head_dim"].is_null()) {
-        h.head_dim = j["head_dim"].get<std::int32_t>();
+    if (text.contains("head_dim") && !text["head_dim"].is_null()) {
+        h.head_dim = text["head_dim"].get<std::int32_t>();
     } else {
         if (h.num_attention_heads <= 0) {
             throw std::runtime_error("hf_config: num_attention_heads is zero");
@@ -110,23 +149,41 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
         h.head_dim = h.hidden_size / h.num_attention_heads;
     }
 
-    h.rms_norm_eps = get_or<float>(j, "rms_norm_eps", 1e-6f);
-    h.rope_theta = get_or<float>(j, "rope_theta", 1e6f);
-    h.rope_local_base_freq = get_or<float>(j, "rope_local_base_freq", 0.0f);
+    h.rms_norm_eps = get_or<float>(text, "rms_norm_eps", 1e-6f);
+    h.rope_theta = get_or<float>(text, "rope_theta", 1e6f);
+    h.rope_local_base_freq = get_or<float>(text, "rope_local_base_freq", 0.0f);
     // HF's PretrainedConfig defaults this to True; specific archs override
     // (Llama-3 base / Llama-3.1+ untie). When the config omits the flag,
     // assume tied.
-    h.tie_word_embeddings = get_or<bool>(j, "tie_word_embeddings", true);
+    h.tie_word_embeddings = get_or<bool>(text, "tie_word_embeddings", true);
 
-    if (auto sw = get_opt<std::int32_t>(j, "sliding_window")) {
+    if (auto sw = get_opt<std::int32_t>(text, "sliding_window")) {
         h.sliding_window = sw;
     }
-    h.use_sliding_window = get_or<bool>(j, "use_sliding_window", false);
+    h.use_sliding_window = get_or<bool>(text, "use_sliding_window", false);
 
-    auto rs_it = j.find("rope_scaling");
-    if (rs_it != j.end() && !rs_it->is_null()) {
+    // RoPE scaling. Two HF schemas:
+    //   - `rope_scaling` (older; olmo3, llama3.1, gpt-oss)
+    //   - `rope_parameters` (newer; ministral3) — when a single dict, same
+    //     shape as `rope_scaling`. Gemma4 uses a per-attention-type dict-of-
+    //     dicts and is parsed in build_gemma4_().
+    const nlohmann::json* rs_ptr = nullptr;
+    auto rs_it = text.find("rope_scaling");
+    if (rs_it != text.end() && !rs_it->is_null()) rs_ptr = &(*rs_it);
+    if (!rs_ptr) {
+        auto rp_it = text.find("rope_parameters");
+        if (rp_it != text.end() && rp_it->is_object()) {
+            // Skip per-attention-type dicts (gemma4-style); only consume a
+            // flat dict.
+            const auto& rp = *rp_it;
+            const bool nested = !rp.empty() && rp.begin().value().is_object()
+                && rp.begin().value().contains("rope_type");
+            if (!nested) rs_ptr = &rp;
+        }
+    }
+    if (rs_ptr) {
         h.has_rope_scaling = true;
-        const auto& rs = *rs_it;
+        const auto& rs = *rs_ptr;
         // Newer HF configs use `rope_type`; older ones use `type`.
         h.rope_scaling_type =
             get_or<std::string>(rs, "rope_type",
@@ -138,15 +195,84 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
             get_or<float>(rs, "high_freq_factor", 4.0f);
         h.rope_scaling_original_max_position =
             get_or<std::int32_t>(rs, "original_max_position_embeddings", 0);
+        // Ministral 3's rope_parameters carries `rope_theta` (overrides the
+        // top-level rope_theta when present). Olmo3 keeps rope_theta at the
+        // outer scope; this branch is harmless there.
+        if (rs.contains("rope_theta") && !rs["rope_theta"].is_null()) {
+            h.rope_theta = rs["rope_theta"].get<float>();
+        }
+        // YaRN-specific.
+        h.rope_yarn_attention_factor =
+            get_or<float>(rs, "attention_factor", 0.0f);
+        h.rope_yarn_beta_fast = get_or<float>(rs, "beta_fast", 32.0f);
+        h.rope_yarn_beta_slow = get_or<float>(rs, "beta_slow", 1.0f);
     }
 
-    if (auto v = get_opt<float>(j, "attn_logit_softcapping")) {
+    // ── Gemma 4 specifics ──
+    if (h.arch == PieArch::Gemma4) {
+        h.gemma4_head_dim_global =
+            get_or<std::int32_t>(text, "global_head_dim", h.head_dim);
+        h.gemma4_num_kv_shared_layers =
+            get_or<std::int32_t>(text, "num_kv_shared_layers", 0);
+        h.gemma4_ple_dim =
+            get_or<std::int32_t>(text, "hidden_size_per_layer_input", 0);
+        h.gemma4_ple_vocab =
+            get_or<std::int32_t>(text, "vocab_size_per_layer_input", 0);
+        h.gemma4_use_double_wide_mlp =
+            get_or<bool>(text, "use_double_wide_mlp", false);
+        // rope_parameters in gemma4 is a dict keyed by attention type.
+        if (auto rp_it = text.find("rope_parameters");
+            rp_it != text.end() && rp_it->is_object()) {
+            const auto& rp = *rp_it;
+            auto read_kind = [&](const char* key, float default_theta,
+                                  float& theta_out, float& partial_out) {
+                auto it = rp.find(key);
+                if (it == rp.end() || !it->is_object()) {
+                    theta_out = default_theta;
+                    partial_out = 1.0f;
+                    return;
+                }
+                theta_out = get_or<float>(*it, "rope_theta", default_theta);
+                partial_out = get_or<float>(*it, "partial_rotary_factor", 1.0f);
+            };
+            read_kind("full_attention", 1e6f,
+                      h.gemma4_rope_theta_full,
+                      h.gemma4_rope_partial_factor_full);
+            read_kind("sliding_attention", 1e4f,
+                      h.gemma4_rope_theta_sliding,
+                      h.gemma4_rope_partial_factor_sliding);
+        } else {
+            h.gemma4_rope_theta_full = h.rope_theta;
+            h.gemma4_rope_theta_sliding =
+                (h.rope_local_base_freq > 0.0f) ? h.rope_local_base_freq : 1e4f;
+        }
+    }
+
+    // Per-layer attention type list (olmo3, gemma4, gpt-oss, qwen3.5).
+    // Encodes:
+    //   's' = sliding_attention
+    //   'g' = full_attention (global)
+    //   'l' = linear_attention (Qwen 3.5 / 3.6 gated-delta-rule layer)
+    if (auto lt_it = text.find("layer_types");
+        lt_it != text.end() && lt_it->is_array()) {
+        h.layer_types.reserve(lt_it->size());
+        for (const auto& v : *lt_it) {
+            const auto s = v.get<std::string>();
+            if (s == "sliding_attention")  h.layer_types.push_back('s');
+            else if (s == "full_attention")   h.layer_types.push_back('g');
+            else if (s == "linear_attention") h.layer_types.push_back('l');
+            else throw std::runtime_error(
+                "hf_config: unknown layer_type '" + s + "'");
+        }
+    }
+
+    if (auto v = get_opt<float>(text, "attn_logit_softcapping")) {
         h.attn_logit_softcapping = v;
     }
-    if (auto v = get_opt<float>(j, "final_logit_softcapping")) {
+    if (auto v = get_opt<float>(text, "final_logit_softcapping")) {
         h.final_logit_softcapping = v;
     }
-    if (auto v = get_opt<float>(j, "query_pre_attn_scalar")) {
+    if (auto v = get_opt<float>(text, "query_pre_attn_scalar")) {
         h.query_pre_attn_scalar = v;
     }
 
@@ -154,14 +280,50 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     // Different repos use different field names: Mixtral uses
     // `num_local_experts`, Qwen-MoE / GPT-OSS use `num_experts`.
     h.num_experts =
-        get_or<std::int32_t>(j, "num_experts",
-            get_or<std::int32_t>(j, "num_local_experts", 0));
+        get_or<std::int32_t>(text, "num_experts",
+            get_or<std::int32_t>(text, "num_local_experts", 0));
     h.num_experts_per_tok =
-        get_or<std::int32_t>(j, "num_experts_per_tok", 0);
+        get_or<std::int32_t>(text, "num_experts_per_tok", 0);
     h.moe_intermediate_size =
-        get_or<std::int32_t>(j, "moe_intermediate_size",
+        get_or<std::int32_t>(text, "moe_intermediate_size",
             h.intermediate_size);  // fallback
-    h.norm_topk_prob = get_or<bool>(j, "norm_topk_prob", true);
+    h.norm_topk_prob = get_or<bool>(text, "norm_topk_prob", true);
+
+    // ── Qwen 3.5 / 3.6 ──
+    if (h.arch == PieArch::Qwen3_5) {
+        h.qwen35_attn_output_gate =
+            get_or<bool>(text, "attn_output_gate", false);
+        h.qwen35_full_attn_interval =
+            get_or<std::int32_t>(text, "full_attention_interval", 4);
+        h.qwen35_linear_num_k_heads =
+            get_or<std::int32_t>(text, "linear_num_key_heads", 0);
+        h.qwen35_linear_num_v_heads =
+            get_or<std::int32_t>(text, "linear_num_value_heads", 0);
+        h.qwen35_linear_k_head_dim =
+            get_or<std::int32_t>(text, "linear_key_head_dim", 0);
+        h.qwen35_linear_v_head_dim =
+            get_or<std::int32_t>(text, "linear_value_head_dim", 0);
+        h.qwen35_linear_conv_kernel =
+            get_or<std::int32_t>(text, "linear_conv_kernel_dim", 4);
+
+        // mrope (multimodal RoPE) lives under rope_parameters.
+        if (auto rp_it = text.find("rope_parameters");
+            rp_it != text.end() && rp_it->is_object()) {
+            const auto& rp = *rp_it;
+            h.qwen35_mrope_interleaved =
+                get_or<bool>(rp, "mrope_interleaved", false);
+            h.qwen35_partial_rotary_factor =
+                get_or<float>(rp, "partial_rotary_factor", 1.0f);
+            if (auto sec_it = rp.find("mrope_section");
+                sec_it != rp.end() && sec_it->is_array() &&
+                sec_it->size() == 3) {
+                for (std::size_t i = 0; i < 3; ++i) {
+                    h.qwen35_mrope_section[i] =
+                        (*sec_it)[i].get<std::int32_t>();
+                }
+            }
+        }
+    }
 
     return h;
 }

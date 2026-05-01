@@ -30,7 +30,9 @@ enum class PieArch {
     GptOss,
     Phi3,
     Mixtral,
-    Qwen3_5,
+    Qwen3Moe,    // Qwen3-MoE family (Qwen3-30B-A3B etc.); HF model_type "qwen3_moe"
+    Qwen3_5,     // Qwen 3.5 / 3.6 hybrid (gated delta + GQA);
+                 // HF model_type "qwen3_5" (dense) or "qwen3_5_moe" (MoE)
 };
 
 const char* pie_arch_name(PieArch a);
@@ -78,6 +80,38 @@ struct Hparams {
     float rope_scaling_low_freq_factor = 1.0f;
     float rope_scaling_high_freq_factor = 4.0f;
     std::int32_t rope_scaling_original_max_position = 0;
+    // YaRN-specific (olmo3, Ministral 3, gpt-oss). Defaults match HF.
+    float rope_yarn_attention_factor = 0.0f;   // 0 = use 0.1*ln(factor)+1
+    float rope_yarn_beta_fast = 32.0f;
+    float rope_yarn_beta_slow = 1.0f;
+
+    // Per-layer attention type list (olmo3, gpt-oss, gemma4 etc.). One char
+    // per layer: 's' (sliding_attention) or 'g' (full_attention). Empty if
+    // the config doesn't specify a per-layer pattern.
+    std::vector<char> layer_types;
+
+    // ── Gemma 4 / 3n ──
+    // Per-attention-type RoPE (gemma4 uses a `rope_parameters` dict keyed by
+    // "full_attention" / "sliding_attention" with per-entry rope_theta and
+    // partial_rotary_factor). For non-gemma4 archs these stay defaulted and
+    // are unused.
+    float gemma4_rope_theta_full = 1e6f;
+    float gemma4_rope_theta_sliding = 1e4f;
+    float gemma4_rope_partial_factor_full = 1.0f;     // 1.0 = full rotation
+    float gemma4_rope_partial_factor_sliding = 1.0f;
+    // Per-layer-type head_dim. Sliding head_dim lives in `head_dim`; full
+    // attention reads `gemma4_head_dim_global`. 0 = same as head_dim.
+    std::int32_t gemma4_head_dim_global = 0;
+    // KV-cache sharing: last `gemma4_num_kv_shared_layers` layers reuse
+    // upstream non-shared layer's K/V (matched by attention type). 0 = no
+    // sharing. The shared layers still have k_proj/v_proj weights in the
+    // safetensors; the driver loads them but never feeds them at inference.
+    std::int32_t gemma4_num_kv_shared_layers = 0;
+    // Per-Layer Embeddings: extra ple_dim residual injected after MLP each
+    // layer. 0 = PLE disabled (gemma4 always >0 in shipped checkpoints).
+    std::int32_t gemma4_ple_dim = 0;
+    std::int32_t gemma4_ple_vocab = 0;
+    bool         gemma4_use_double_wide_mlp = false;
 
     // Logit softcap (gemma2; future gemma).
     std::optional<float> attn_logit_softcapping;
@@ -98,6 +132,22 @@ struct Hparams {
     // norm_topk_prob (qwen-moe / mixtral) — renormalize the selected
     // top-k expert weights so they sum to 1.
     bool norm_topk_prob = true;
+
+    // ── Qwen 3.5 / 3.6 ──
+    // Hybrid arch: 3-of-4 layers are gated-delta-rule "linear attention"
+    // with recurrent matrix state, every 4th layer is standard GQA with
+    // mrope + output gate. Vision tower + multi-token-prediction head
+    // are present in checkpoints but ignored by the driver.
+    bool         qwen35_attn_output_gate     = false;
+    std::int32_t qwen35_full_attn_interval   = 0;
+    std::int32_t qwen35_linear_num_k_heads   = 0;
+    std::int32_t qwen35_linear_num_v_heads   = 0;
+    std::int32_t qwen35_linear_k_head_dim    = 0;
+    std::int32_t qwen35_linear_v_head_dim    = 0;
+    std::int32_t qwen35_linear_conv_kernel   = 0;
+    bool         qwen35_mrope_interleaved    = false;
+    std::int32_t qwen35_mrope_section[3]     = {0, 0, 0};
+    float        qwen35_partial_rotary_factor = 1.0f;
 };
 
 Hparams parse_hf_config(const std::filesystem::path& config_json_path);

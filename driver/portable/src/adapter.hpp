@@ -62,12 +62,10 @@ public:
     Adapter(const Adapter&) = delete;
     Adapter& operator=(const Adapter&) = delete;
 
-    std::int32_t rank()  const noexcept { return rank_; }
     float        scale() const noexcept { return scale_; }
     const std::vector<AdapterLayerWeights>& layers() const noexcept { return layers_; }
 
 private:
-    std::int32_t          rank_;
     float                 scale_;
     ggml_context*         ctx_ = nullptr;
     ggml_backend_buffer_t buf_ = nullptr;
@@ -82,8 +80,6 @@ public:
 
     // Look up an adapter by id. Returns nullptr if not loaded.
     const Adapter* get(std::uint64_t id) const;
-
-    bool empty() const;
 
 private:
     mutable std::mutex mu_;

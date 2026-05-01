@@ -54,6 +54,14 @@ add_executable(pie_driver_portable
   src/hf_config.cpp
   src/model.cpp
   src/kv_cache.cpp
+  src/state_cache.cpp
+  src/arch_spec.cpp
+  src/plan.cpp
+  src/graph_common.cpp
+  src/graph_qwen3.cpp
+  src/graph_gemma4.cpp
+  src/graph_qwen3_5.cpp
+  src/response.cpp
   src/forward.cpp
   src/sampler.cpp
   src/aux_server.cpp

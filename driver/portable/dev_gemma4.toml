@@ -1,0 +1,18 @@
+# Gemma 4 E2B-it smoke-test config.
+[shmem]
+name = "/pie_shmem"
+num_slots = 8
+req_buf = 4194304
+resp_buf = 1048576
+spin_us = 0
+
+[model]
+hf_path = "/root/.cache/huggingface/hub/models--google--gemma-4-E2B-it/snapshots/6b7e72c67d3c4556f42b56d5a68b4b8e864c63b4"
+n_gpu_layers = -1
+n_ctx = 8192
+
+[batching]
+kv_page_size = 32
+max_num_kv_pages = 256
+max_batch_tokens = 4096
+max_batch_size = 64

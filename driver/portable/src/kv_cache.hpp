@@ -33,10 +33,20 @@ namespace pie_portable_driver {
 
 class KvCachePaged {
 public:
+    // Uniform: one head_dim across all layers (qwen3, llama3, gemma2/3 etc.).
     KvCachePaged(ggml_backend_t backend,
                  std::int32_t n_layers,
                  std::int32_t n_kv_heads,
                  std::int32_t head_dim,
+                 std::int32_t total_pages,
+                 std::int32_t page_size,
+                 ggml_type    dtype);
+    // Per-layer: each layer carries its own head_dim. Used by Gemma 4
+    // where sliding layers store [head_dim] and full layers [head_dim_global]
+    // KV. `per_layer_head_dim.size()` must equal `n_layers`.
+    KvCachePaged(ggml_backend_t backend,
+                 std::int32_t n_kv_heads,
+                 std::vector<std::int32_t> per_layer_head_dim,
                  std::int32_t total_pages,
                  std::int32_t page_size,
                  ggml_type    dtype);
@@ -45,26 +55,39 @@ public:
     KvCachePaged(const KvCachePaged&) = delete;
     KvCachePaged& operator=(const KvCachePaged&) = delete;
 
-    // Each tensor is shape `[n_embd_gqa, total_pages * page_size]`.
+    // Per-layer K/V cache tensor. Shape: [n_embd_gqa_layer, total_pages * page_size].
     ggml_tensor* k(std::int32_t layer) const noexcept { return k_layers_[layer]; }
     ggml_tensor* v(std::int32_t layer) const noexcept { return v_layers_[layer]; }
 
     std::int32_t n_layers()    const noexcept { return n_layers_; }
     std::int32_t n_kv_heads()  const noexcept { return n_kv_heads_; }
-    std::int32_t head_dim()    const noexcept { return head_dim_; }
-    std::int32_t n_embd_gqa()  const noexcept { return n_kv_heads_ * head_dim_; }
+    // head_dim of layer 0 — kept for backwards compatibility on uniform
+    // archs. Per-layer code paths should use head_dim_at(layer).
+    std::int32_t head_dim()    const noexcept { return per_layer_head_dim_[0]; }
+    std::int32_t head_dim_at(std::int32_t layer) const noexcept {
+        return per_layer_head_dim_[layer];
+    }
+    std::int32_t n_embd_gqa()  const noexcept {
+        return n_kv_heads_ * per_layer_head_dim_[0];
+    }
+    std::int32_t n_embd_gqa_at(std::int32_t layer) const noexcept {
+        return n_kv_heads_ * per_layer_head_dim_[layer];
+    }
     std::int32_t total_pages() const noexcept { return total_pages_; }
     std::int32_t page_size()   const noexcept { return page_size_; }
     std::int32_t total_slots() const noexcept { return total_pages_ * page_size_; }
     std::size_t  buffer_size() const noexcept;
 
 private:
+    void allocate_();
+
     ggml_backend_t        backend_;
     std::int32_t          n_layers_;
     std::int32_t          n_kv_heads_;
-    std::int32_t          head_dim_;
+    std::vector<std::int32_t> per_layer_head_dim_;
     std::int32_t          total_pages_;
     std::int32_t          page_size_;
+    ggml_type             dtype_;
 
     ggml_context*         ctx_ = nullptr;
     ggml_backend_buffer_t buf_ = nullptr;

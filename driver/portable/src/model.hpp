@@ -2,13 +2,15 @@
 
 // Model: HF safetensors → ggml backend tensors.
 //
-// Owns the Hparams, the safetensors mmap, the ggml metadata context, and the
-// backend buffer. Per-arch tensor name tables live in `model.cpp` and select
-// from the HF-canonical names (e.g. "model.layers.N.self_attn.q_proj.weight")
-// — no GGUF involved.
+// Owns the Hparams, the safetensors mmap, the ggml metadata context, and
+// the backend buffer. Per-arch builders live in model.cpp; they resolve
+// HF-canonical tensor names (e.g. "model.layers.N.self_attn.q_proj.weight")
+// — no GGUF involved. Multimodal-wrapper checkpoints (Ministral 3, Gemma 4)
+// substitute the canonical "model." prefix via Model::tname_().
 //
-// For v1 the only supported backend is CPU. CUDA / Metal will plug in via the
-// same `ggml_backend_t` API in M11.
+// Backend selection follows ggml's registered devices: prefer_gpu picks
+// CUDA / Metal / Vulkan via ggml_backend_init_best() and falls back to
+// CPU when no GPU device is available.
 
 #include <cstdint>
 #include <filesystem>
@@ -42,14 +44,34 @@ struct LayerWeights {
     ggml_tensor* k_proj   = nullptr;
     ggml_tensor* v_proj   = nullptr;
     ggml_tensor* o_proj   = nullptr;
-    // Optional QKV biases (qwen2 has them; qwen3/llama3 don't).
+    // Optional QKV biases (qwen2 has them; qwen3/llama3 don't). gpt-oss
+    // also has an o_proj bias.
     ggml_tensor* q_proj_b = nullptr;
     ggml_tensor* k_proj_b = nullptr;
     ggml_tensor* v_proj_b = nullptr;
+    ggml_tensor* o_proj_b = nullptr;
 
     // QK normalization (qwen3 only).
     ggml_tensor* q_norm = nullptr;
     ggml_tensor* k_norm = nullptr;
+
+    // gpt-oss attention sinks. One learned scalar per Q-head; passed to
+    // ggml_flash_attn_ext_add_sinks at the per-layer attention call. Null
+    // for archs without sinks. Shape: [num_q_heads], stored F32 after the
+    // BF16→F32 conversion (ggml's flash_attn_ext_add_sinks expects F32).
+    ggml_tensor* attn_sinks = nullptr;
+
+    // ── Gemma 4 ──
+    // layer_scalar: per-layer learnable scalar applied to the layer's
+    // output residual (shape [1] in shipped E2B/E4B). Null for non-gemma4.
+    ggml_tensor* layer_scalar = nullptr;
+    // PLE (Per-Layer Embeddings): each layer carries a small auxiliary
+    // residual block that mixes a per-layer per-token signal back into the
+    // hidden stream. Shapes (E2B): ple_gate [ple_dim, hidden],
+    // ple_proj [hidden, ple_dim], ple_norm [hidden].
+    ggml_tensor* ple_gate = nullptr;
+    ggml_tensor* ple_proj = nullptr;
+    ggml_tensor* ple_norm = nullptr;
 
     // MLP — gated SwiGLU. For dense (non-MoE) archs, these hold the
     // single-expert weights. For MoE archs they're nullptr and the
@@ -63,6 +85,30 @@ struct LayerWeights {
     ggml_tensor* moe_gate_exps = nullptr;  // [hidden, ff, n_experts]
     ggml_tensor* moe_up_exps   = nullptr;  // [hidden, ff, n_experts]
     ggml_tensor* moe_down_exps = nullptr;  // [ff, hidden, n_experts]
+
+    // gpt-oss MoE biases (router + per-expert per-output-dim biases). Null
+    // on Mixtral / Qwen3-MoE.
+    ggml_tensor* moe_router_b   = nullptr;  // [n_experts]
+    ggml_tensor* moe_gate_exps_b = nullptr; // [ff, n_experts]
+    ggml_tensor* moe_up_exps_b   = nullptr; // [ff, n_experts]
+    ggml_tensor* moe_down_exps_b = nullptr; // [hidden, n_experts]
+
+    // ── Qwen 3.5 / 3.6 linear-attention layer (gated-delta-rule) ──
+    // Populated only for layers where hparams.layer_types[il] == 'l'.
+    // Tensor names mirror modeling_qwen3_5.py::Qwen3_5GatedDeltaNet.
+    ggml_tensor* lin_in_proj_qkv = nullptr;  // [hidden, 2*key_dim+value_dim]
+    ggml_tensor* lin_in_proj_z   = nullptr;  // [hidden, value_dim]
+    ggml_tensor* lin_in_proj_a   = nullptr;  // [hidden, num_v_heads]
+    ggml_tensor* lin_in_proj_b   = nullptr;  // [hidden, num_v_heads]
+    ggml_tensor* lin_conv1d      = nullptr;  // [conv_kernel, conv_dim] after squeeze
+    ggml_tensor* lin_A_log       = nullptr;  // [num_v_heads]
+    ggml_tensor* lin_dt_bias     = nullptr;  // [num_v_heads]
+    ggml_tensor* lin_norm        = nullptr;  // [head_v_dim] — per-head RMSNorm
+    ggml_tensor* lin_out_proj    = nullptr;  // [value_dim, hidden]
+
+    // Qwen 3.5 full-attention layer with attn_output_gate=true: q_proj
+    // output is 2× expected (split [Q, gate]). Loader uses the existing
+    // q_proj field; the graph builder slices it.
 };
 
 struct ModelWeights {
@@ -72,6 +118,22 @@ struct ModelWeights {
     // RoPE per-dim frequency factors (LLaMA-3.1+ NTK-by-parts). nullptr
     // for models that use plain θ-only RoPE.
     ggml_tensor* freq_factors = nullptr;
+
+    // ── Gemma 4 ──
+    // Proportional-RoPE freq_factors for full-attention layers. Shape
+    // [head_dim_global/2] F32. Null on archs without proportional RoPE.
+    ggml_tensor* gemma4_rope_full_factors = nullptr;
+
+    // ── Gemma 4 PLE — top-level ──
+    // embed_tokens_per_layer: token-identity component, shape
+    // [num_layers * ple_dim, vocab]. Null when PLE is disabled.
+    ggml_tensor* ple_token_embed   = nullptr;
+    // per_layer_model_projection: context component projection from main
+    // hidden state to all layers' PLE inputs. Shape [num_layers*ple_dim, hidden].
+    ggml_tensor* ple_model_proj    = nullptr;
+    // per_layer_projection_norm: RMSNorm scale [ple_dim].
+    ggml_tensor* ple_model_norm    = nullptr;
+
     std::vector<LayerWeights> layers;
 };
 
@@ -111,17 +173,27 @@ private:
     // loader helpers can drive all of them. Specialized cases that don't fit
     // (phi3's fused QKV, llama3's rope freq factors) are layered on top.
     struct LoaderSpec {
+        // Per-layer "input_layernorm" present (true for L4MA / Gemma /
+        // Qwen / Phi / Mistral). Olmo3 is post-norm only — set to false to
+        // skip loading it.
+        bool has_input_layernorm = true;
+
         // Suffix of the per-layer norm sitting on the FFN side. Most archs
         // reuse "post_attention_layernorm"; the gemma family puts a
         // pre-FFN norm at "pre_feedforward_layernorm" and adds extras.
+        // Empty string = no pre-FFN norm (olmo3 post-norm-only).
         std::string ffn_norm_name = "post_attention_layernorm";
 
-        // Gemma family: extra norms on the post-attention and post-FFN
-        // residual paths.
+        // Gemma family + Olmo3: extra norms on the post-attention and
+        // post-FFN residual paths. For Gemma these sandwich the existing
+        // pre-norms; for Olmo3 they're the only norms (input + pre-FFN
+        // norms are absent).
         bool has_post_attn_norm = false;
         bool has_post_ffn_norm  = false;
 
-        // QKV biases (qwen2 only) and per-head Q/K RMSNorm (qwen3, gemma3).
+        // QKV biases (qwen2 only) and per-head Q/K RMSNorm (qwen3, gemma3,
+        // olmo3). Olmo3 stores its q_norm/k_norm with full hidden-dim
+        // weights (not per-head); both shapes load identically here.
         bool has_qkv_bias = false;
         bool has_qk_norm  = false;
 
@@ -134,6 +206,13 @@ private:
         MoeNaming moe = MoeNaming::None;
     };
 
+    // Shared dense / dense+MoE skeleton: load_top_level_() then
+    // load_layer_(i, spec) for every layer. Used by every arch that
+    // doesn't need a custom per-layer loop (qwen2/qwen3/llama3/mistral3/
+    // gemma2/gemma3/olmo3/qwen3_moe/mixtral). phi3, gemma4, gpt-oss have
+    // their own builders below.
+    void build_dense_(LoaderSpec spec);
+
     void build_qwen3_();
     void build_qwen2_();
     void build_llama3_();
@@ -142,9 +221,59 @@ private:
     void build_gemma2_();
     void build_gemma3_();
     void build_gemma4_();
+    void build_olmo3_();
+    // Gemma 4 proportional-RoPE: synthesize a freq_factors tensor that
+    // makes ggml's rope_ext rotate only the first `rope_angles` dim-pairs
+    // while pairing them at the model's head_dim/2 offset (not the rotary
+    // dim's natural offset). Stored in synth_ so it lives alongside weights.
+    ggml_tensor* synth_proportional_rope_factors_(std::int32_t head_dim,
+                                                   std::int32_t rope_angles);
     void build_gpt_oss_();
-    void build_qwen3_5_();   // qwen3-moe family
+
+    // Synth-allocate a stacked-experts tensor whose data comes from MXFP4-
+    // quantized source tensors, dequanted to BF16 at load time. Optionally
+    // de-interleaves rows (for gpt-oss's fused gate_up: gate at even rows,
+    // up at odd rows) via row_stride/row_offset.
+    //
+    //   in_dim, out_dim, n_experts: result tensor ne = [in_dim, out_dim, n_experts]
+    //   blocks_hf_name: U8 tensor [n_experts, out_dim_full, in_dim/32, 16]
+    //   scales_hf_name: U8 tensor [n_experts, out_dim_full, in_dim/32]
+    //   row_stride=1 row_offset=0: take every row (out_dim == out_dim_full)
+    //   row_stride=2 row_offset=0: take even rows (gate from gate_up)
+    //   row_stride=2 row_offset=1: take odd  rows (up from gate_up)
+    ggml_tensor* declare_synth_dequanted_mxfp4_experts_(
+        const std::string& dbg_name,
+        std::int64_t in_dim, std::int64_t out_dim, std::int32_t n_experts,
+        const std::string& blocks_hf_name,
+        const std::string& scales_hf_name,
+        int row_stride, int row_offset);
+    // Synth-allocate a per-expert F32 bias by selecting strided rows from
+    // a source [n_experts, out_dim_full] BF16 tensor. Used for gpt-oss's
+    // de-interleaved gate / up biases. The dtype switch (F32 vs BF16)
+    // hoists the per-batch ggml_cast that build_moe_ffn would otherwise
+    // emit — ggml_add_id requires an F32 src1 on the CUDA backend.
+    ggml_tensor* declare_synth_strided_bias_(
+        const std::string& dbg_name,
+        std::int64_t out_dim, std::int32_t n_experts,
+        const std::string& bias_hf_name,
+        int row_stride, int row_offset);
+
+    // Synth-allocate an F32 tensor whose values are the BF16 source's
+    // values converted at load time. Used for tensors that are consumed
+    // by CUDA kernels asserting / preferring F32 (gpt-oss attn_sinks,
+    // gemma4 layer_scalar). Avoids a per-batch in-graph ggml_cast.
+    ggml_tensor* declare_synth_f32_from_bf16_(const std::string& hf_name);
+    void build_qwen3_moe_();   // qwen3-moe family
     void build_mixtral_();
+    void build_qwen3_5_();     // Qwen 3.5 / 3.6 hybrid (gated delta + GQA)
+
+    // Qwen 3.5 conv1d.weight ships as [conv_dim, 1, conv_kernel] (HF
+    // convention: [out_ch, in_ch, kernel]). ggml_ssm_conv wants
+    // [conv_kernel, conv_dim]. Synth-load with a flat copy + reshape
+    // since the underlying byte layout matches modulo the squeeze.
+    ggml_tensor* declare_qwen3_5_conv1d_(const std::string& hf_name,
+                                         std::int32_t conv_dim,
+                                         std::int32_t conv_kernel);
 
     // Load tok_embd / output_norm / (optional) output_head and resize the
     // per-layer vector. Common to all archs.
@@ -158,6 +287,19 @@ private:
     // LLaMA-3.1 NTK-by-parts: synthesize the rope freq_factors tensor if
     // `hparams_.rope_scaling_type == "llama3"`. No-op otherwise.
     void synth_llama3_freq_factors_();
+
+    // Resolve the per-arch HF tensor-name prefix once, right after
+    // hparams_ are parsed. Multimodal wrappers nest the text decoder
+    // under a sub-namespace; canonical "model.foo" tensor names get
+    // the `model.` → `tensor_prefix_` substitution applied via tname_().
+    // Text-only checkpoints keep tensor_prefix_ empty.
+    void resolve_tensor_prefix_();
+
+    // Apply tensor_prefix_ to a canonical "model.foo" name, producing
+    // the actual HF tensor name to look up in the safetensors archive.
+    // Empty prefix → returns `name` unchanged. Non-empty prefix → strips
+    // the leading "model." (when present) and prepends `tensor_prefix_`.
+    std::string tname_(const std::string& name) const;
 
     // Helper: create a ggml tensor mirroring the HF tensor's shape (with
     // dims reversed) and dtype, then load the safetensor data into the
@@ -179,6 +321,14 @@ private:
 
     std::filesystem::path snapshot_dir_;
     Hparams               hparams_;
+
+    // Prefix prepended to every HF tensor name. Empty for plain text
+    // checkpoints (qwen, llama, olmo, gemma2/3, etc.). Multimodal
+    // checkpoints that wrap the text decoder (Ministral 3 ⇒
+    // "language_model.", Gemma 4 ⇒ "model.language_model." stripping
+    // — the per-arch builder is responsible for setting this before
+    // calling the standard load_*_ helpers).
+    std::string           tensor_prefix_;
 
     std::unique_ptr<SafetensorsArchive> archive_;
     ggml_backend_t        backend_ = nullptr;

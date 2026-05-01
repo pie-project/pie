@@ -4,8 +4,6 @@
 #include <stdexcept>
 #include <string>
 
-#include <ggml-cpu.h>
-
 #include "safetensors.hpp"
 
 namespace pie_portable_driver {
@@ -43,11 +41,11 @@ ggml_tensor* new_tensor_from_st(ggml_context* ctx,
 
 Adapter::Adapter(ggml_backend_t backend,
                  std::int32_t   n_layers,
-                 std::int32_t   rank,
+                 std::int32_t   /*rank*/,
                  float          scale,
                  const std::filesystem::path& safetensors_path,
                  const Hparams& /*hparams*/)
-    : rank_(rank), scale_(scale) {
+    : scale_(scale) {
     SafetensorsShard shard(safetensors_path);
     const auto& tensors = shard.tensors();
 
@@ -134,11 +132,6 @@ const Adapter* AdapterPool::get(std::uint64_t id) const {
     std::lock_guard<std::mutex> g(mu_);
     auto it = map_.find(id);
     return it == map_.end() ? nullptr : it->second.get();
-}
-
-bool AdapterPool::empty() const {
-    std::lock_guard<std::mutex> g(mu_);
-    return map_.empty();
 }
 
 }  // namespace pie_portable_driver
