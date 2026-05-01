@@ -121,7 +121,7 @@ def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriver
     # universal pie knobs that don't correspond to sglang ServerArgs:
     #   - cpu_mem_budget_in_gb sizes pie's host KV pool.
     #   - spec_ngram_* drive pie's own NGRAM drafter (engine-side, see
-    #     SGLangEngine.spec_propose); they don't map to sglang's
+    #     SGLangEngine.spec_step); they don't map to sglang's
     #     speculative_algorithm path.
     _NON_SGLANG_FIELDS = {
         "cpu_mem_budget_in_gb",
@@ -129,19 +129,15 @@ def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriver
         "spec_ngram_num_drafts",
         "spec_ngram_max_depth",
         "spec_ngram_capacity",
-        "enable_adapter",
-        "max_num_adapters",
-        "max_adapter_rank",
     }
     server_kwargs.update({
         k: v for k, v in asdict(driver_config).items()
         if v is not None and k not in _NON_SGLANG_FIELDS
     })
-    # Adapter mode requires graph-mode-OFF in v1: the QKVAdapterWrapper's
-    # subpass-or-not branch needs a record-with / record-without-adapter
-    # graph pair to be capture-safe, which we haven't built yet.
-    if driver_config.enable_adapter:
-        server_kwargs["disable_cuda_graph"] = True
+    # Pie owns prefix sharing via its own scheduler; sglang's radix cache
+    # on top would just be wasted work. Hardcoded rather than configurable
+    # because there's no scenario where False is correct under pie.
+    server_kwargs["disable_radix_cache"] = True
     return ServerArgs(**server_kwargs)
 
 
@@ -149,7 +145,6 @@ def load_sglang_model(
     config: RuntimeConfig,
     driver_config: SGLangDriverConfig,
     log_queue: object = None,
-    compute_pg=None,
 ) -> LoadedModel:
     """Construct an SGLang ModelRunner on the local rank's device."""
 
@@ -187,9 +182,8 @@ def load_sglang_model(
     from sglang.srt.model_executor.model_runner import ModelRunner
 
     # Skip ModelRunner's in-construction graph capture so the engine can
-    # install pie's `_HiddenCapture` hook first. Adapter mode runs eager
-    # anyway, so deferring there is pointless.
-    want_graph = not server_args.disable_cuda_graph and not driver_config.enable_adapter
+    # install pie's `_HiddenCapture` hook first.
+    want_graph = not server_args.disable_cuda_graph
     with _defer_graph_capture(want_graph):
         runner = ModelRunner(
             model_config=sglang_model_config,

@@ -83,6 +83,16 @@ class DriverCapabilities:
     # hook in a follow-up.
     supports_user_attention_mask: bool = False
 
+    # Whether the driver implements CMA-ES / LoRA adapter operations
+    # (`init_adapter`, `update_adapter`, `load_adapter`, `save_adapter`,
+    # plus per-batch noise injection at Q/K/V). False means the driver
+    # raises NotImplementedError on adapter calls; inferlets that exercise
+    # adapter paths must run on a driver that returns True (currently only
+    # `native`). Defaults False so a driver that omits the field is treated
+    # as adapter-unaware. Python-only today; the Rust runtime gains an
+    # admission hook in a follow-up.
+    supports_adapters: bool = False
+
     # ── Filesystem ─────────────────────────────────────────────────────
     # Local directory containing tokenizer.json + config.json. The Rust
     # runtime reads tokenizer.json from `<snapshot_dir>/tokenizer.json`.

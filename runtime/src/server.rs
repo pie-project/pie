@@ -50,10 +50,13 @@ pub type ClientId = u32;
 
 static SERVICE: LazyLock<Service<ServerMessage>> = LazyLock::new(Service::new);
 
-/// Starts the server on the given address.
-pub fn spawn(host: &str, port: u16) {
+/// Starts the server on the given address. `max_upload_bytes` caps
+/// per-upload buffer growth (program installs + blob transfers).
+pub fn spawn(host: &str, port: u16, max_upload_bytes: usize) {
     let addr = format!("{}:{}", host, port);
-    SERVICE.spawn::<Server, _>(|| Server::new(addr)).expect("Server already spawned");
+    SERVICE
+        .spawn::<Server, _>(move || Server::new(addr, max_upload_bytes))
+        .expect("Server already spawned");
 }
 
 // =============================================================================
@@ -143,6 +146,8 @@ struct ServerState {
     next_client_id: AtomicU32,
     /// Active client sessions (for graceful shutdown).
     clients: DashMap<ClientId, JoinHandle<()>>,
+    /// Per-upload byte cap (program installs + blob transfers).
+    pub(super) max_upload_bytes: usize,
 }
 
 // =============================================================================
@@ -154,15 +159,16 @@ struct Server {
     state: Arc<ServerState>,
 }
 
-impl Server {   
-    fn new(addr: String) -> Self {
+impl Server {
+    fn new(addr: String, max_upload_bytes: usize) -> Self {
         let state = Arc::new(ServerState {
             next_client_id: AtomicU32::new(1),
             clients: DashMap::new(),
+            max_upload_bytes,
         });
 
         task::spawn(Self::listener_loop(addr, state.clone()));
-        
+
         Server { state }
     }
 

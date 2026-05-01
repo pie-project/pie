@@ -30,25 +30,38 @@ import torch
 
 
 @numba.njit(cache=True, parallel=False)
-def _build_req_to_token_rows(
+def _build_pool_rows_and_out_loc(
+    qo_indptr: np.ndarray,          # int32 (batch+1,)
     kv_page_indices: np.ndarray,    # int32 (total_pages,)
     kv_page_indptr: np.ndarray,     # int32 (batch+1,)
     seq_lens: np.ndarray,           # int32 (batch,)
     page_size: int,
-    out: np.ndarray,                # int32 (batch, max_seq_len)
+    rows: np.ndarray,               # int32 (batch, max_seq_len) — output
+    out_cache_loc: np.ndarray,      # int64 (num_query_tokens,) — output
 ):
-    """Expand CSR block IDs into a `(batch, max_seq_len)` per-token slot table.
+    """One pass: fill (a) per-request per-token slot table for sglang's
+    `req_to_token_pool`, and (b) per-query-token destination slot for
+    `out_cache_loc`. Both share the same per-token slot computation, so
+    doing them together avoids a second pass — and a Python-level
+    `for r in range(batch_size)` GPU index-copy fan-out at the call site.
 
-    Each row r is filled with `seq_lens[r]` valid slot indices; the rest is
-    left as zeros (SGLang's kernels guard via `seq_lens`).
+    `rows` is filled `seq_lens[r]` wide per row; the rest stays zero
+    (SGLang's kernels guard via `seq_lens`). `out_cache_loc[q_start:q_end]`
+    receives the slot for each query token in request r.
     """
-    batch = kv_page_indptr.shape[0] - 1
+    batch = qo_indptr.shape[0] - 1
     for r in range(batch):
         s_r = seq_lens[r]
         page_base = kv_page_indptr[r]
+        q_start = qo_indptr[r]
+        q_end = qo_indptr[r + 1]
+        prefix = s_r - (q_end - q_start)
         for i in range(s_r):
             block_id = kv_page_indices[page_base + i // page_size]
-            out[r, i] = block_id * page_size + (i % page_size)
+            slot = block_id * page_size + (i % page_size)
+            rows[r, i] = slot
+            if i >= prefix:
+                out_cache_loc[q_start + (i - prefix)] = slot
 
 
 def build_sglang_forward_batch(
@@ -79,38 +92,25 @@ def build_sglang_forward_batch(
     extend_seq_lens_np = (qo_indptr_np[1:] - qo_indptr_np[:-1]).astype(np.int32)
     extend_prefix_lens_np = (seq_lens_np - extend_seq_lens_np).astype(np.int32)
 
-    # ---- req_to_token rows (per-request, per-token slot table) ----
-    # We claim the first `batch_size` slots; pie's runtime owns block IDs and
-    # the pool's free-list bookkeeping is unused.
+    # ---- req_to_token rows + out_cache_loc, built in one numba pass ----
+    # We claim the first `batch_size` slots in sglang's req_to_token_pool;
+    # pie's runtime owns block IDs and the pool's free-list bookkeeping is
+    # unused. `out_cache_loc[q]` is the destination slot for query token q.
     req_pool_indices_np = np.arange(batch_size, dtype=np.int32)
 
     if batch_size > 0:
         max_seq_len = int(seq_lens_np.max())
         rows_np = np.zeros((batch_size, max_seq_len), dtype=np.int32)
-        _build_req_to_token_rows(
-            kv_idx_np, kv_indptr_np, seq_lens_np, page_size, rows_np
+        out_cache_loc_np = np.zeros(num_query_tokens, dtype=np.int64)
+        _build_pool_rows_and_out_loc(
+            qo_indptr_np, kv_idx_np, kv_indptr_np, seq_lens_np,
+            page_size, rows_np, out_cache_loc_np,
         )
-    else:
-        max_seq_len = 0
-        rows_np = np.zeros((0, 0), dtype=np.int32)
 
-    rows = torch.from_numpy(rows_np).to(device, non_blocking=True)
-
-    # Write rows into sglang's pool at our chosen slots.
-    if batch_size > 0:
+        rows = torch.from_numpy(rows_np).to(device, non_blocking=True)
+        out_cache_loc = torch.from_numpy(out_cache_loc_np).to(device, non_blocking=True)
         req_pool_indices_t = torch.from_numpy(req_pool_indices_np).to(device)
         runner.req_to_token_pool.req_to_token[req_pool_indices_t, :max_seq_len] = rows
-
-    # ---- out_cache_loc (per-query-token destination slot) ----
-    # For request r the query tokens occupy positions [s_r - q_r, s_r) within
-    # the request. Their slot indices are exactly that slice of `rows[r]`.
-    if num_query_tokens > 0:
-        out_cache_loc = torch.empty(num_query_tokens, dtype=torch.int64, device=device)
-        for r in range(batch_size):
-            q_start, q_end = int(qo_indptr_np[r]), int(qo_indptr_np[r + 1])
-            q_len = q_end - q_start
-            first_pos = int(seq_lens_np[r]) - q_len
-            out_cache_loc[q_start:q_end] = rows[r, first_pos:first_pos + q_len]
     else:
         out_cache_loc = torch.empty(0, dtype=torch.int64, device=device)
 

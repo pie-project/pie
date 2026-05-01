@@ -1,8 +1,8 @@
 # Experimental: vLLM + SGLang drivers in pie's venv
 
-**Status:** experimental, not part of `pyproject.toml`. Recreates manually after every `uv sync`.
+**Status:** wired into `pyproject.toml` as the `vllm` and `sglang` extras (mutually exclusive with `cu126` / `cu128` / `metal`).
 
-Pie ships `pie_driver_vllm` and `pie_driver_sgl` as optional drivers. Their wheels do not co-resolve with pie's default `cu128` extra (torch 2.11.0 + flashinfer 0.6.8.post1) — neither vLLM nor SGLang publishes a release that lines up with that pair. This document records the most-recent set of wheels that *do* co-resolve with each other, at the cost of downgrading pie's torch.
+Pie ships `pie_driver_vllm` and `pie_driver_sgl` as optional drivers. Their wheels do not co-resolve with pie's default `cu128` extra (torch 2.11.0 + flashinfer 0.6.8.post1) — neither vLLM nor SGLang publishes a release that lines up with that pair. The `vllm` and `sglang` extras encode the most-recent set of wheels that *do* co-resolve with each other, at the cost of downgrading pie's torch.
 
 ## Target versions
 
@@ -40,32 +40,17 @@ We force vLLM's versions. SGLang's structured-output paths (guided JSON, regex/E
 
 ## Install
 
-The pie venv lives at `pie/.venv`. Run from anywhere — paths are absolute.
-
 ```bash
-cat > /tmp/pie-vllm-sgl-overrides.txt <<'EOF'
-llguidance>=1.3.0,<1.4.0
-xgrammar==0.1.29
-outlines-core==0.2.11
-outlines>=1.2.0,<1.3.0
-EOF
+# vLLM driver
+cd pie && uv sync --extra vllm
 
-uv pip install \
-  --python ./pie/.venv/bin/python \
-  --only-binary=:all: \
-  --index-strategy unsafe-best-match \
-  --override /tmp/pie-vllm-sgl-overrides.txt \
-  --extra-index-url https://download.pytorch.org/whl/cu128 \
-  --extra-index-url https://flashinfer.ai/whl/cu128 \
-  'torch==2.9.1' 'torchvision==0.24.1' 'torchaudio==2.9.1' \
-  'vllm==0.16.0' 'sglang==0.5.9' \
-  'flashinfer-python==0.6.3' 'flashinfer-cubin==0.6.3' 'flashinfer-jit-cache==0.6.3'
+# OR SGLang driver (mutually exclusive)
+cd pie && uv sync --extra sglang
 ```
 
-Notes on the flags:
-- `--only-binary=:all:` — refuses to fall back to source builds.
-- `--index-strategy unsafe-best-match` — required because PyPI carries a stale vLLM mirror on the PyTorch index that uv would otherwise pin to.
-- `--override` — forces the four structured-decoding pins above; without it the resolver fails on `llguidance` (vLLM 1.3.x vs SGLang 0.7.x) and on `outlines-core` (0.2.11 vs 0.1.26).
+`pyproject.toml` carries the cohort pins (torch 2.9.1+cu128, vllm 0.16.0 / sglang 0.5.9, flashinfer 0.6.3, etc.) and `[tool.uv].override-dependencies` resolves the four structured-decoding pin conflicts (llguidance, xgrammar, outlines, outlines-core) plus a numba pin (vLLM 0.16 wants 0.61.2 vs pie's base 0.63+).
+
+The two extras are listed in `[tool.uv].conflicts` together with `cu126` / `cu128` / `metal`, so the resolver enforces the choice — you can't have both vLLM and SGLang in the same lock, and you can't combine either with the default `cu128` cohort.
 
 ## Verify
 
@@ -97,13 +82,13 @@ ok
 
 ## Caveats
 
-1. **Not in `pyproject.toml` or `uv.lock`.** Any `uv sync` will undo this and restore the torch 2.11 cohort. Re-run the install block above to recreate.
-2. **`torchao` is downgraded** from `>=0.14.1` (pie's `[cu128]` pin) to `0.9.0` (SGLang's hard pin). Pie features that rely on torchao ≥ 0.14 quantization APIs will not work in this venv.
-3. **`flashinfer` is downgraded** from `0.6.8.post1` to `0.6.3`. Pie's `flashinfer-jit-cache` pin in `pyproject.toml` is at `0.6.8.post1+cu128`; this install replaces it with `0.6.3+cu128`.
-4. **SGLang structured outputs are likely broken** (see override table). Confirm against your actual usage before relying on guided generation through the SGLang driver.
-5. **vLLM 0.16.0 wheel is CUDA 12.8-compiled** — works on cu128 hosts. vLLM 0.20.0's PyPI wheel needs `libcudart.so.13` (CUDA 13) and will not load against torch+cu128, which is one reason we are not on 0.20.0.
+1. **`torchao` is downgraded** from `>=0.14.1` (pie's `[cu128]` pin) to `0.9.0` (SGLang's hard pin) on the `vllm` / `sglang` extras. Pie features that rely on torchao ≥ 0.14 quantization APIs will not work under these extras.
+2. **`flashinfer` is downgraded** from `0.6.8.post1` to `0.6.3`. The `flashinfer-jit-cache` pin in `pyproject.toml` for `cu128` is `0.6.8.post1+cu128`; the `vllm` and `sglang` extras override it to `0.6.3+cu128`.
+3. **SGLang structured outputs are likely broken** under the override pins (llguidance / xgrammar / outlines all forced to vLLM's versions). Confirm against your actual usage before relying on guided generation through the SGLang driver.
+4. **vLLM 0.16.0 wheel is CUDA 12.8-compiled** — works on cu128 hosts. vLLM 0.20.0's PyPI wheel needs `libcudart.so.13` (CUDA 13) and will not load against torch+cu128, which is one reason we are not on 0.20.0.
+5. **rand_mv adapter math is disconnected** in this release. `pie_driver/adapter.py` and `pie_driver_sgl/adapter.py` hard-set `RAND_MV_AVAILABLE = False` so the rand_mv kernel is never loaded or JIT-compiled (no ninja / nvcc dependency on server boot). The CMA-ES adapter `update()` method raises `RuntimeError` if invoked. Re-enable by restoring the `from .rand_mv import ...` lines in those files when the adapter feature lands.
 
-## Revert
+## Switching back to the default cohort
 
 ```bash
 cd pie && uv sync --extra cu128

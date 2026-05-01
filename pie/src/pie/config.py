@@ -5,7 +5,7 @@ Schema layout (TOML):
     [server]
     host = "127.0.0.1"
     port = 8080
-    # primary_model = "qwen-small"
+    # primary_model = "default"
 
     [auth]
     enabled = false
@@ -14,25 +14,38 @@ Schema layout (TOML):
     enabled = false
     endpoint = "http://localhost:4317"
 
-    [model.qwen-small]
+    [runtime]
+    # Per-instance security policies (defaults shown):
+    allow_fs = false
+    allow_network = true
+    network_allowed_hosts = ["*"]
+    # Optional tuning (omit for built-in defaults):
+    # worker_threads, wasm_max_instances, wasm_max_memory_mb,
+    # wasm_warm_memory_mb, wasm_warm_slots,
+    # fs_scratch_dir, max_upload_mb
+
+    [model.default]
     hf_repo = "Qwen/Qwen3-0.6B"
     default_token_budget = 10000          # admission policy lives flat under [model.X]
     default_endowment_pages = 64
     oversubscription_factor = 4.0
 
-    [model.qwen-small.driver]
-    type = "vllm"                         # discriminator
+    [model.default.driver]
+    type = "native"                       # discriminator
     device = ["cuda:0"]
     tensor_parallel_size = 1
     activation_dtype = "bfloat16"
 
-    [model.qwen-small.driver.vllm]
+    [model.default.driver.native]
     # Driver-specific knobs in the driver's native vocabulary.
-    # Loaded into VllmDriverConfig (or whichever config_cls the driver registers).
-    attention_backend = "FLASHINFER"
-    gpu_memory_utilization = 0.85
+    # Loaded into NativeDriverConfig (or whichever config_cls the driver registers).
+    gpu_mem_utilization = 0.8
+    max_batch_tokens = 10240
+    max_batch_size = 512
 
-Three concerns are kept separate by section:
+Four concerns kept separate by section:
+  - `[server]`                : host/port + global admission caps
+  - `[runtime]`               : tokio + wasmtime + per-instance security
   - `[model.X]`               : model identity + admission policy
   - `[model.X.driver]`        : driver-agnostic execution (discriminator,
                                 device, parallelism, dtype)
@@ -64,6 +77,13 @@ class ServerConfig:
     max_concurrent_processes: int | None = None
     python_snapshot: bool = True
     primary_model: str | None = None     # which model is "primary"; default = first
+
+    def __post_init__(self):
+        if self.max_concurrent_processes is not None and self.max_concurrent_processes <= 0:
+            raise ValueError(
+                f"server.max_concurrent_processes must be > 0 if set "
+                f"(got {self.max_concurrent_processes!r})"
+            )
 
 
 @dataclass
@@ -130,6 +150,13 @@ class RuntimeConfig:
         and connects directly). For tight IP-level control over
         outbound HTTP, set ``allow_network = false`` and have your
         inferlet use ``wasi:sockets`` directly.
+
+    Uploads:
+      * `max_upload_mb` — per-upload cap on cumulative bytes across
+        chunks (program installs and ``session.send_file`` blob
+        transfers). Checked on every chunk so a malicious sender
+        can't grow the in-flight buffer without bound. ``None``
+        (default) = use the runtime's built-in default of 256 MiB.
     """
 
     worker_threads: int | None = None
@@ -141,6 +168,7 @@ class RuntimeConfig:
     fs_scratch_dir: str | None = None
     allow_network: bool = True
     network_allowed_hosts: list[str] = field(default_factory=lambda: ["*"])
+    max_upload_mb: int | None = None
 
     def __post_init__(self):
         if self.worker_threads is not None and self.worker_threads <= 0:
@@ -174,6 +202,11 @@ class RuntimeConfig:
             raise ValueError(
                 f"runtime.network_allowed_hosts must be a list of strings "
                 f"(got {self.network_allowed_hosts!r})"
+            )
+        if self.max_upload_mb is not None and self.max_upload_mb <= 0:
+            raise ValueError(
+                f"runtime.max_upload_mb must be > 0 if set "
+                f"(got {self.max_upload_mb!r})"
             )
 
 
@@ -309,8 +342,8 @@ port = 8080
 verbose = false
 registry = "https://registry.pie-project.org/"
 python_snapshot = true
-# max_concurrent_processes = 64
-# primary_model = "default"
+# max_concurrent_processes = 64           # global cap on in-flight inferlets
+# primary_model = "default"                # which [model.X] is the default
 
 [auth]
 enabled = false
@@ -320,29 +353,35 @@ enabled = false
 endpoint = "http://localhost:4317"
 service_name = "pie"
 
-# [runtime]
-# Tokio + wasmtime tuning + per-instance security policies.
-# Leave the section out for stock defaults.
-#
-# Tokio + wasmtime
-# worker_threads = 8        # tokio worker count; lower on many-core boxes
-# wasm_max_instances = 4096 # concurrent-inferlet cap (default 1000)
-# wasm_max_memory_mb = 64   # per-inferlet memory cap, MiB (default 10)
-# wasm_warm_memory_mb = 0   # RAM kept warm for fast respawn, MiB (default 0)
-# wasm_warm_slots = 100     # prepared-but-idle slots (default 100)
-#
-# Filesystem
-# allow_fs = false                        # mount /scratch RW; default false
-# fs_scratch_dir = "/var/lib/pie/scratch" # base dir; default ${{TMPDIR}}/pie
-#
-# Network. Filtering is by IP post-DNS — hostnames don't survive DNS,
-# so use IP / CIDR allowlists, or front the inferlet with a proxy.
-# allow_network = true                    # default: true
-# network_allowed_hosts = ["*"]           # ["*"] = unrestricted (default).
-                                          # Examples:
-                                          #   ["10.0.0.0/8", "127.0.0.1"]
-                                          #   ["10.0.0.0/8:443"]
-                                          #   ["10.0.0.0/8:1024-65535"]
+[runtime]
+# Per-instance security policies — defaults shown explicitly so the
+# behavior is visible in the config file. Edit to tighten.
+
+# Filesystem. When allow_fs = true, every inferlet gets a per-process
+# scratch dir mounted at /scratch with full RW.
+allow_fs = false
+# fs_scratch_dir = "/var/lib/pie/scratch"  # base dir; default ${{TMPDIR}}/pie
+
+# Network. Filtering is by IP post-DNS — hostnames don't survive DNS
+# resolution, so use IP / CIDR allowlists. NOTE: network_allowed_hosts
+# only filters wasi:sockets. wasi:http bypasses the per-socket hook
+# (it uses the host's HTTP stack with its own DNS). For tight outbound
+# HTTP control, set allow_network = false and have the inferlet use
+# wasi:sockets directly.
+allow_network = true
+network_allowed_hosts = ["*"]
+# Examples:
+#   network_allowed_hosts = ["10.0.0.0/8", "127.0.0.1"]
+#   network_allowed_hosts = ["10.0.0.0/8:443"]
+#   network_allowed_hosts = ["10.0.0.0/8:1024-65535"]
+
+# Optional tuning — omit any field to use the runtime's built-in default.
+# worker_threads = 8                       # tokio workers (default: num_cpus)
+# wasm_max_instances = 4096                # concurrent-inferlet cap (default 1000)
+# wasm_max_memory_mb = 64                  # per-inferlet memory cap, MiB (default 10)
+# wasm_warm_memory_mb = 0                  # RAM kept warm per slot, MiB (default 0)
+# wasm_warm_slots = 100                    # idle warm slots (default 100)
+# max_upload_mb = 256                      # per-upload cumulative cap (default 256)
 
 [model.default]
 hf_repo = "{DEFAULT_MODEL}"
@@ -372,6 +411,32 @@ max_batch_size = 512
 _DRIVER_UNIVERSAL_KEYS = {
     "type", "device", "tensor_parallel_size", "activation_dtype", "random_seed",
 }
+
+# Tight schemas for top-level sections — typos like `worker_thread`
+# (singular) would otherwise silently no-op and the user would never
+# know their tuning didn't apply. The driver subsection has its own
+# guard via `_DRIVER_UNIVERSAL_KEYS`.
+_SERVER_KEYS = {
+    "host", "port", "verbose", "registry", "max_concurrent_processes",
+    "python_snapshot", "primary_model",
+}
+_RUNTIME_KEYS = {
+    "worker_threads",
+    "wasm_max_instances", "wasm_max_memory_mb",
+    "wasm_warm_memory_mb", "wasm_warm_slots",
+    "allow_fs", "fs_scratch_dir",
+    "allow_network", "network_allowed_hosts",
+    "max_upload_mb",
+}
+
+
+def _reject_unknown(section: str, raw: dict, allowed: set[str]) -> None:
+    extra = sorted(k for k in raw if k not in allowed)
+    if extra:
+        raise ValueError(
+            f"[{section}]: unknown key(s) {extra}. "
+            f"Allowed: {sorted(allowed)}."
+        )
 
 
 def _parse_driver(model_name: str, raw: dict) -> DriverConfig:
@@ -502,6 +567,8 @@ def load_config(
             "of false)."
         )
 
+    _reject_unknown("server", server_raw, _SERVER_KEYS)
+
     server = ServerConfig(
         host=host if host is not None else server_raw.get("host", "127.0.0.1"),
         port=port if port is not None else int(server_raw.get("port", 8080)),
@@ -519,6 +586,7 @@ def load_config(
         raise ValueError(
             f"[runtime] must be a TOML table, got {type(runtime_raw).__name__}."
         )
+    _reject_unknown("runtime", runtime_raw, _RUNTIME_KEYS)
 
     def _opt_int(key: str) -> int | None:
         v = runtime_raw.get(key)
@@ -542,6 +610,7 @@ def load_config(
         fs_scratch_dir=str(fs_scratch_dir_raw) if fs_scratch_dir_raw is not None else None,
         allow_network=bool(runtime_raw.get("allow_network", True)),
         network_allowed_hosts=[str(h) for h in network_allowed_hosts_raw],
+        max_upload_mb=_opt_int("max_upload_mb"),
     )
 
     return Config(

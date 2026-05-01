@@ -58,8 +58,8 @@ class SGLangForwardPass:
 
     Contract:
       - `embed_inputs(inputs)`: passthrough — sglang owns input embedding.
-      - `transform(...)`: build a `ForwardBatch`, hand pie's mask to the
-        strategy, run `runner.forward()`, return per-token hidden states.
+      - `transform(...)`: build a `ForwardBatch`, run `runner.forward()`,
+        return per-token hidden states.
       - `sample(hidden, sampling_metadata)`: gather pie's requested
         indices, apply the LM head, run pie's sampler.
     """
@@ -87,10 +87,6 @@ class SGLangForwardPass:
         # `_compute_lm_head` (layers/logits_processor.py:891-913).
         self._lm_head_module = runner.model.lm_head
 
-        # Set by `Engine.load` when adapter mode is enabled; stays None
-        # otherwise so `transform()` skips the slot writes.
-        self.adapter_subpass_slot = None
-
     # ------------------------------------------------------------------
     # Pie contract
     # ------------------------------------------------------------------
@@ -107,7 +103,6 @@ class SGLangForwardPass:
         kv_page_indices: torch.Tensor,
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
-        adapter_subpass=None,
     ) -> torch.Tensor:
         fb = build_sglang_forward_batch(
             runner=self.runner,
@@ -123,20 +118,8 @@ class SGLangForwardPass:
             device=self.device,
         )
 
-        # CMA-ES adapter: hand the per-batch subpass to the QKV wrappers
-        # via the slot they hold a reference to. No-op when adapter mode
-        # is disabled (slot is None) or when this batch has no adapter
-        # tokens (subpass is None).
-        slot = self.adapter_subpass_slot
-        if slot is not None:
-            slot.current = adapter_subpass
-
         self._capture.captured = None
-        try:
-            self.runner.forward(fb)
-        finally:
-            if slot is not None:
-                slot.current = None
+        self.runner.forward(fb)
 
         if self._capture.captured is None:
             raise RuntimeError(

@@ -110,6 +110,15 @@ pub struct RuntimeConfig {
     /// IP-level control over outbound HTTP, set `allow_network =
     /// false` and have inferlets use `wasi:sockets` directly.
     pub network_allowed_hosts: Vec<String>,
+
+    // ── upload cap ───────────────────────────────────────────────────
+
+    /// Per-upload cap on total bytes accumulated across chunks, in
+    /// MiB. Applies to inferlet program installs and
+    /// `session.send_file` blob transfers. Checked on every chunk so
+    /// a malicious sender can't grow the in-flight buffer without
+    /// bound. `None` = use the built-in default of 256 MiB.
+    pub max_upload_mb: Option<usize>,
 }
 
 impl Default for RuntimeConfig {
@@ -124,9 +133,16 @@ impl Default for RuntimeConfig {
             fs_scratch_dir: None,
             allow_network: true,
             network_allowed_hosts: vec!["*".to_string()],
+            max_upload_mb: None,
         }
     }
 }
+
+/// Built-in default for `max_upload_mb` when the field is `None`.
+/// 256 MiB is large enough for any current inferlet (12 MiB JS bundles
+/// are the biggest we ship) plus headroom, and small enough that a
+/// runaway upload doesn't exhaust host RAM before failing.
+pub const DEFAULT_MAX_UPLOAD_MB: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -227,7 +243,12 @@ pub async fn bootstrap(
     )?;
 
     linker::spawn(&wasm_engine, fs_policy, network_policy);
-    server::spawn(&config.host, config.port);
+    let max_upload_bytes = config
+        .runtime
+        .max_upload_mb
+        .unwrap_or(DEFAULT_MAX_UPLOAD_MB)
+        .saturating_mul(1024 * 1024);
+    server::spawn(&config.host, config.port, max_upload_bytes);
     messaging::spawn();
     process::init_admission(config.max_concurrent_processes);
     
