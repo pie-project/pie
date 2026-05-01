@@ -1407,8 +1407,8 @@ std::vector<SamplerOutput> sample_batch(const ForwardEngine::BatchPlan& plan,
 
 // GPU uniform-top-sample fast path: per-slot list of top-K (prob, idx)
 // pairs already sorted descending and temperature-softmaxed by the
-// graph. Apply per-slot top-K / top-P / min-P cuts on the small list,
-// renormalize, and categorical sample.
+// graph. Walk per-slot, dispatch to sampler::sample_token_from_topk,
+// and stitch through resolve_request_output (which handles spec-decode).
 std::vector<SamplerOutput> sample_batch_uniform_top(
         const ForwardEngine::BatchPlan& plan,
         const std::int32_t* top_idx_flat,   // [K, n_slots]
@@ -1417,8 +1417,6 @@ std::vector<SamplerOutput> sample_batch_uniform_top(
     const std::int32_t n_req = static_cast<std::int32_t>(plan.reqs.size());
     std::vector<SamplerOutput> sampled(n_req);
     std::int32_t slot_off = 0;
-    std::vector<std::pair<float, std::uint32_t>> scratch;
-    scratch.reserve(K);
     for (std::int32_t r = 0; r < n_req; ++r) {
         const auto& rp = plan.reqs[r];
         const std::int32_t n_slots =
@@ -1427,83 +1425,9 @@ std::vector<SamplerOutput> sample_batch_uniform_top(
         for (std::int32_t s = 0; s < n_slots; ++s) {
             const std::int32_t global_slot = slot_off + s;
             const std::size_t base = static_cast<std::size_t>(global_slot) * K;
-            scratch.clear();
-            for (std::int32_t k = 0; k < K; ++k) {
-                const float p = top_prob_flat[base + k];
-                if (p > 0.0f) {
-                    scratch.emplace_back(
-                        p, static_cast<std::uint32_t>(top_idx_flat[base + k]));
-                }
-            }
-            if (scratch.empty()) {
-                // Numerically degenerate slot — emit the gathered top-1.
-                slot_out[s].token =
-                    static_cast<std::uint32_t>(top_idx_flat[base]);
-                continue;
-            }
-
-            std::size_t keep = scratch.size();
-            const auto& sp = rp.sampler;
-            // Per-slot top-K cap (graph K is the global max; an
-            // individual slot may have asked for less).
-            if (sp.type == SamplerType::TopK || sp.type == SamplerType::TopKTopP) {
-                if (sp.top_k > 0 && static_cast<std::size_t>(sp.top_k) < keep) {
-                    keep = sp.top_k;
-                }
-            }
-            // Top-P cumulative cutoff.
-            if (sp.type == SamplerType::TopP || sp.type == SamplerType::TopKTopP) {
-                const float thr = std::clamp(sp.top_p, 0.0f, 1.0f);
-                if (thr < 1.0f) {
-                    float cum = 0.0f;
-                    for (std::size_t i = 0; i < keep; ++i) {
-                        cum += scratch[i].first;
-                        if (cum >= thr) { keep = i + 1; break; }
-                    }
-                }
-            }
-            // Min-P ratio cutoff.
-            if (sp.type == SamplerType::MinP) {
-                const float thr = sp.min_p * scratch[0].first;
-                std::size_t cut = 0;
-                for (; cut < keep; ++cut) {
-                    if (scratch[cut].first < thr) break;
-                }
-                if (cut > 0) keep = cut;
-            }
-
-            // Renormalize + categorical sample over the small list.
-            double total = 0.0;
-            for (std::size_t i = 0; i < keep; ++i) total += scratch[i].first;
-            const std::uint64_t seed_u64 = sp.seed != 0
-                ? static_cast<std::uint64_t>(sp.seed)
-                : 0x9E3779B97F4A7C15ULL ^ static_cast<std::uint64_t>(global_slot);
-            // Cheap PCG state — same constants as sampler.cpp's Pcg32 but
-            // inlined to avoid pulling its private API.
-            std::uint64_t state = 0;
-            const std::uint64_t inc = (0xda3e39cb94b95bdbULL << 1u) | 1u;
-            auto next_u32 = [&]() {
-                const std::uint64_t old = state;
-                state = old * 6364136223846793005ULL + inc;
-                const std::uint32_t xs =
-                    static_cast<std::uint32_t>(((old >> 18u) ^ old) >> 27u);
-                const std::uint32_t rot = static_cast<std::uint32_t>(old >> 59u);
-                return (xs >> rot) | (xs << ((-static_cast<std::int32_t>(rot)) & 31));
-            };
-            // 2-step seed init (mirrors Pcg32 ctor).
-            next_u32();
-            state += seed_u64;
-            next_u32();
-            const float u = (next_u32() >> 8) * (1.0f / static_cast<float>(1ull << 24));
-
-            float target = u * static_cast<float>(total);
-            float acc = 0.0f;
-            std::uint32_t pick = scratch[keep - 1].second;
-            for (std::size_t i = 0; i < keep; ++i) {
-                acc += scratch[i].first;
-                if (target < acc) { pick = scratch[i].second; break; }
-            }
-            slot_out[s].token = pick;
+            slot_out[s].token = sample_token_from_topk(
+                top_idx_flat + base, top_prob_flat + base, K,
+                rp.sampler, static_cast<std::uint64_t>(global_slot));
         }
         resolve_request_output(rp, std::move(slot_out), sampled[r]);
         slot_off += n_slots;

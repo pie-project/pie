@@ -91,6 +91,22 @@ std::uint32_t sample_token(const float* logits,
                            std::int32_t vocab_size,
                            const SamplerParams& params);
 
+// Host-side finalize for the GPU non-greedy fast path. The graph
+// emitted top-K per slot already sorted descending and softmaxed at
+// the requested temperature. This routine applies the per-slot top-K
+// cap / top-P / min-P cutoff, renormalizes, and categorical-samples
+// one token. Multinomial without filtering is not supported here
+// (needs the full distribution); greedy is handled by ggml_argmax.
+//
+// `seed_xor` mixes extra entropy in when `params.seed == 0` — pass
+// the global slot index so different slots draw different streams.
+std::uint32_t sample_token_from_topk(
+    const std::int32_t*  top_idx,    // [K] descending-sorted indices
+    const float*         top_probs,  // [K] matching softmaxed probs
+    std::int32_t         K,
+    const SamplerParams& params,
+    std::uint64_t        seed_xor);
+
 // Apply a BRLE-encoded logit mask in place. Sets logits[v] = -INF for
 // vocab indices the mask says are forbidden. Wire format mirrors
 // `runtime/src/inference/brle.rs`:

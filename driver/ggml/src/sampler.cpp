@@ -409,4 +409,54 @@ std::uint32_t sample_token(const float* logits,
     return categorical_sample(sorted, static_cast<float>(total), rng);
 }
 
+std::uint32_t sample_token_from_topk(
+        const std::int32_t*  top_idx,
+        const float*         top_probs,
+        std::int32_t         K,
+        const SamplerParams& params,
+        std::uint64_t        seed_xor) {
+    using T = SamplerType;
+    if (params.type == T::Multinomial) {
+        throw std::runtime_error(
+            "sample_token_from_topk: Multinomial without filter requires "
+            "the full distribution; pre-sorted top-K is insufficient");
+    }
+
+    // Build the (prob, id) list. Drop zeroed-out entries; a near-empty
+    // slot falls back to the gathered top-1 to stay safe.
+    std::vector<std::pair<float, std::uint32_t>> sorted;
+    sorted.reserve(K);
+    for (std::int32_t i = 0; i < K; ++i) {
+        if (top_probs[i] > 0.0f) {
+            sorted.emplace_back(top_probs[i],
+                                static_cast<std::uint32_t>(top_idx[i]));
+        }
+    }
+    if (sorted.empty()) return static_cast<std::uint32_t>(top_idx[0]);
+    std::size_t keep = sorted.size();
+
+    // Per-slot top-K cap: the graph K is the batch-wide max, so an
+    // individual slot may want fewer candidates.
+    if ((params.type == T::TopK || params.type == T::TopKTopP)
+        && params.top_k > 0
+        && static_cast<std::size_t>(params.top_k) < keep) {
+        keep = params.top_k;
+    }
+    if (params.type == T::TopP || params.type == T::TopKTopP) {
+        keep = apply_top_p(sorted, params.top_p, keep);
+    }
+    if (params.type == T::MinP) {
+        keep = apply_min_p(sorted, params.min_p, keep);
+    }
+
+    Pcg32 rng(params.seed != 0
+                  ? static_cast<std::uint64_t>(params.seed)
+                  : default_rng_seed() ^ seed_xor);
+    double total = 0.0;
+    for (std::size_t i = 0; i < keep; ++i) total += sorted[i].first;
+    if (total <= 0.0) return sorted[0].second;
+    sorted.resize(keep);
+    return categorical_sample(sorted, static_cast<float>(total), rng);
+}
+
 }  // namespace pie_ggml_driver
