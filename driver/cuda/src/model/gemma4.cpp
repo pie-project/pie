@@ -496,6 +496,9 @@ void gemma4_forward_paged(
             static_cast<std::size_t>(N) * H, stream);
 
         // ── 3c. PLE residual ───────────────────────────────────────────
+        // Wrapped in a block so debugging can disable the whole step
+        // (env `PIE_NO_PLE=1`) without touching the surrounding flow.
+        if (getenv("PIE_NO_PLE") == nullptr) {
         // Gather this layer's slice of per_layer_inputs:
         //   ple_signal[n, :] = per_layer_proj[n, l*ple_dim:(l+1)*ple_dim]
         // The base tensor is already laid out as [N, L*ple_dim]; we
@@ -538,6 +541,7 @@ void gemma4_forward_paged(
         kernels::launch_residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
+        }  // end PLE-bypass guard
 
         // ── 3d. Per-layer learnable scalar ────────────────────────────
         if (layer.layer_scalar && getenv("PIE_NO_LAYER_SCALAR") == nullptr) {
