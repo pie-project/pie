@@ -73,5 +73,7 @@ target_link_libraries(pie_driver_ggml PRIVATE
   tomlplusplus::tomlplusplus
   nlohmann_json::nlohmann_json
   ggml
-  rt
 )
+if(NOT APPLE)
+  target_link_libraries(pie_driver_ggml PRIVATE rt)
+endif()

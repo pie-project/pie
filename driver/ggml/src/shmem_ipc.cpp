@@ -31,8 +31,8 @@ void atomic_store_u64(std::uint8_t* p, std::uint64_t v) noexcept {
 }
 
 std::uint64_t atomic_load_u64(const std::uint8_t* p) noexcept {
-    return std::atomic_ref<const std::uint64_t>{
-        *reinterpret_cast<const std::uint64_t*>(p)}
+    return std::atomic_ref<std::uint64_t>{
+        *reinterpret_cast<std::uint64_t*>(const_cast<std::uint8_t*>(p))}
         .load(std::memory_order_acquire);
 }
 
