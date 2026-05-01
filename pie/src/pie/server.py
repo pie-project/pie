@@ -406,9 +406,12 @@ def _bootstrap(
             wasm_max_memory_mb=config.runtime.wasm_max_memory_mb,
             wasm_warm_memory_mb=config.runtime.wasm_warm_memory_mb,
             wasm_warm_slots=config.runtime.wasm_warm_slots,
+            allow_fs=config.runtime.allow_fs,
+            fs_scratch_dir=config.runtime.fs_scratch_dir,
+            allow_network=config.runtime.allow_network,
+            network_allowed_hosts=config.runtime.network_allowed_hosts,
         ),
         models=[py_model],
-        allow_filesystem=config.server.allow_filesystem,
         max_concurrent_processes=config.server.max_concurrent_processes,
         python_snapshot=config.server.python_snapshot,
     )

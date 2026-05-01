@@ -15,6 +15,7 @@ use wasmtime::{Engine, Store};
 
 use crate::api;
 use crate::instance::InstanceState;
+use crate::policy::{FsPolicy, NetworkPolicy};
 use crate::process::ProcessId;
 use crate::program::python::runtime as py_runtime;
 use crate::program::{self, InstalledComponent, ProgramName};
@@ -24,10 +25,34 @@ use crate::service::{Service, ServiceHandler};
 
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
+/// Per-instance security policies. Compiled once at bootstrap and
+/// shared by reference into every spawned inferlet.
+#[derive(Clone)]
+pub struct InstancePolicy {
+    pub fs: FsPolicy,
+    pub network: NetworkPolicy,
+}
+
+impl InstancePolicy {
+    /// Maximally restrictive policy: no filesystem, no network. Used
+    /// by code paths that instantiate a component for inspection only
+    /// (e.g. python-runtime snapshotting), not user execution.
+    pub fn deny_all() -> Self {
+        InstancePolicy {
+            fs: FsPolicy {
+                allow: false,
+                base_dir: FsPolicy::default_base_dir(),
+            },
+            network: NetworkPolicy::parse(false, &[]).expect("deny-all parse"),
+        }
+    }
+}
+
 /// Spawns the linker service with the given engine.
-pub fn spawn(engine: &Engine, allow_filesystem: bool) {
+pub fn spawn(engine: &Engine, fs: FsPolicy, network: NetworkPolicy) {
+    let policy = InstancePolicy { fs, network };
     SERVICE
-        .spawn(|| Linker::new(engine, allow_filesystem))
+        .spawn(|| Linker::new(engine, policy))
         .expect("linker already spawned");
 }
 
@@ -57,14 +82,14 @@ pub async fn instantiate(
 
 struct Linker {
     engine: Engine,
-    allow_filesystem: bool,
+    policy: InstancePolicy,
 }
 
 impl Linker {
-    fn new(engine: &Engine, allow_filesystem: bool) -> Self {
+    fn new(engine: &Engine, policy: InstancePolicy) -> Self {
         Linker {
             engine: engine.clone(),
-            allow_filesystem,
+            policy,
         }
     }
 
@@ -114,7 +139,7 @@ impl Linker {
             process_id,
             username,
             capture_outputs,
-            self.allow_filesystem,
+            &self.policy,
             token_budget,
             py_runtime_dir_for_state,
         ).await?;
@@ -125,8 +150,18 @@ impl Linker {
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .expect("Failed to link WASI");
-        wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
-            .expect("Failed to link WASI HTTP");
+
+        // wasi:http operates above wasi:sockets and bypasses the per-socket
+        // policy hook (it uses the host's hyper stack with its own DNS).
+        // Drop the binding entirely when the network is disabled so the
+        // policy is honored end-to-end. With allow_network=true the hook
+        // is wired; the allowlist still applies to wasi:sockets but
+        // wasi:http is unrestricted (pre-DNS hostname allowlisting would
+        // require a DNS shim — not in v1).
+        if self.policy.network.allow {
+            wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
+                .expect("Failed to link WASI HTTP");
+        }
 
         api::add_to_linker(&mut linker)?;
 

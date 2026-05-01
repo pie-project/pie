@@ -78,6 +78,7 @@ smallvec = "1"
 lru = "0.16.3"
 ahash = "0.8.12"
 libc = "0.2"
+ipnet = "2"
 
 [dev-dependencies]
 tempfile = "3"

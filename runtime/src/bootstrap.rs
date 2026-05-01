@@ -31,8 +31,6 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     pub runtime: RuntimeConfig,
     pub models: Vec<ModelConfig>,
-    /// Allow inferlets to access a sandboxed scratch filesystem.
-    pub allow_filesystem: bool,
     /// Skip tracing initialization (for tests — can only init once per process).
     pub skip_tracing: bool,
     /// Hard cap on the number of concurrent processes.
@@ -44,10 +42,12 @@ pub struct Config {
     pub python_snapshot: bool,
 }
 
-/// Runtime tuning — tokio worker pool + wasmtime engine pool. All
-/// fields are opt-in; leaving them at their defaults yields stock
-/// tokio + stock wasmtime behavior.
-#[derive(Debug, Clone, Default)]
+/// Runtime tuning — tokio worker pool + wasmtime engine pool +
+/// per-instance security policies (filesystem / network). All fields
+/// are opt-in; leaving them at their defaults yields stock tokio,
+/// stock wasmtime, no filesystem, and unrestricted network (matching
+/// the legacy hardcoded behavior).
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     /// Number of tokio worker threads. `None` = let tokio default to
     /// `num_cpus`. On boxes with high logical-core counts and many
@@ -81,6 +81,51 @@ pub struct RuntimeConfig {
     /// Prepared-but-idle inferlet slots kept ready for fast respawn.
     /// `None` = wasmtime default of 100.
     pub wasm_warm_slots: Option<u32>,
+
+    // ── filesystem ───────────────────────────────────────────────────
+
+    /// If true, mount a per-process scratch directory at `/scratch`
+    /// with full read+write. If false, no `wasi:filesystem` access.
+    /// Default: false.
+    pub allow_fs: bool,
+
+    /// Base directory under which per-process scratch dirs are
+    /// created. Each instance gets `<base>/<process_id>`. `None` =
+    /// `${TMPDIR}/pie`.
+    pub fs_scratch_dir: Option<PathBuf>,
+
+    // ── network ──────────────────────────────────────────────────────
+
+    /// If true, expose the host network to inferlets (both
+    /// `wasi:sockets` and `wasi:http`). If false, deny all socket
+    /// operations and drop the `wasi:http` linker binding entirely.
+    /// Default: true (matches legacy `inherit_network()`).
+    pub allow_network: bool,
+
+    /// Allowlist of `cidr[:port]` / `cidr:lo-hi` strings. `["*"]` (the
+    /// default) means "no restriction". Empty list ≡ `allow_network =
+    /// false`. NOTE: only filters `wasi:sockets`; `wasi:http` is
+    /// gated by `allow_network` alone (its host stack does its own
+    /// DNS resolution and bypasses the per-socket hook). For tight
+    /// IP-level control over outbound HTTP, set `allow_network =
+    /// false` and have inferlets use `wasi:sockets` directly.
+    pub network_allowed_hosts: Vec<String>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        RuntimeConfig {
+            worker_threads: None,
+            wasm_max_instances: None,
+            wasm_max_memory_mb: None,
+            wasm_warm_memory_mb: None,
+            wasm_warm_slots: None,
+            allow_fs: false,
+            fs_scratch_dir: None,
+            allow_network: true,
+            network_allowed_hosts: vec!["*".to_string()],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -165,7 +210,23 @@ pub async fn bootstrap(
         config.cache_dir.clone(),
     );
 
-    linker::spawn(&wasm_engine, config.allow_filesystem);
+    // Compile per-instance security policies once. Network policy
+    // parsing fails fast on bad config (typo'd CIDRs, `"*"` mixed with
+    // rules, etc.) — better here than on the first inferlet launch.
+    let fs_policy = crate::policy::FsPolicy {
+        allow: config.runtime.allow_fs,
+        base_dir: config
+            .runtime
+            .fs_scratch_dir
+            .clone()
+            .unwrap_or_else(crate::policy::FsPolicy::default_base_dir),
+    };
+    let network_policy = crate::policy::NetworkPolicy::parse(
+        config.runtime.allow_network,
+        &config.runtime.network_allowed_hosts,
+    )?;
+
+    linker::spawn(&wasm_engine, fs_policy, network_policy);
     server::spawn(&config.host, config.port);
     messaging::spawn();
     process::init_admission(config.max_concurrent_processes);

@@ -12,6 +12,7 @@ pub mod instance;
 pub mod messaging;
 pub mod model;
 pub mod path;
+pub mod policy;
 pub mod program;
 pub mod server;
 pub mod linker;

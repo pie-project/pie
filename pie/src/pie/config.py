@@ -61,7 +61,6 @@ class ServerConfig:
     port: int = 8080
     verbose: bool = False
     registry: str = "https://registry.pie-project.org/"
-    allow_filesystem: bool = False
     max_concurrent_processes: int | None = None
     python_snapshot: bool = True
     primary_model: str | None = None     # which model is "primary"; default = first
@@ -81,10 +80,12 @@ class TelemetryConfig:
 
 @dataclass
 class RuntimeConfig:
-    """The `[runtime]` block: tokio worker pool + wasmtime engine pool.
+    """The `[runtime]` block: tokio worker pool + wasmtime engine pool
+    + per-instance security policies (filesystem / network).
 
-    All fields are opt-in. Leaving the section out yields stock tokio
-    + stock wasmtime defaults; we only diverge when a field is set.
+    All fields are opt-in. Leaving the section out yields stock tokio,
+    stock wasmtime, no filesystem, and unrestricted network — the
+    legacy hardcoded behavior.
 
     Tokio:
       * `worker_threads` — number of tokio worker threads. `None`
@@ -108,6 +109,27 @@ class RuntimeConfig:
         `None` = wasmtime default of 0.
       * `wasm_warm_slots` — prepared-but-idle inferlet slots kept
         ready for fast respawn. `None` = wasmtime default of 100.
+
+    Filesystem:
+      * `allow_fs` — when True, mount a per-process scratch dir at
+        `/scratch` with full RW. When False (default), no
+        ``wasi:filesystem`` access at all.
+      * `fs_scratch_dir` — base directory for per-process scratch
+        dirs. ``None`` (default) = ``${TMPDIR}/pie``.
+
+    Network:
+      * `allow_network` — when True (default), inferlets can use both
+        ``wasi:sockets`` and ``wasi:http``. When False, all socket
+        operations are denied and the ``wasi:http`` linker binding is
+        dropped entirely.
+      * `network_allowed_hosts` — list of ``cidr[:port]`` /
+        ``cidr:lo-hi`` strings. ``["*"]`` (default) means "no
+        restriction". Empty list ≡ ``allow_network = false``.
+        IMPORTANT: only filters ``wasi:sockets``; ``wasi:http``
+        bypasses the per-socket hook (its host stack does its own DNS
+        and connects directly). For tight IP-level control over
+        outbound HTTP, set ``allow_network = false`` and have your
+        inferlet use ``wasi:sockets`` directly.
     """
 
     worker_threads: int | None = None
@@ -115,6 +137,10 @@ class RuntimeConfig:
     wasm_max_memory_mb: int | None = None
     wasm_warm_memory_mb: int | None = None
     wasm_warm_slots: int | None = None
+    allow_fs: bool = False
+    fs_scratch_dir: str | None = None
+    allow_network: bool = True
+    network_allowed_hosts: list[str] = field(default_factory=lambda: ["*"])
 
     def __post_init__(self):
         if self.worker_threads is not None and self.worker_threads <= 0:
@@ -141,6 +167,13 @@ class RuntimeConfig:
             raise ValueError(
                 f"runtime.wasm_warm_slots must be >= 0 if set "
                 f"(got {self.wasm_warm_slots!r})"
+            )
+        if not isinstance(self.network_allowed_hosts, list) or not all(
+            isinstance(h, str) for h in self.network_allowed_hosts
+        ):
+            raise ValueError(
+                f"runtime.network_allowed_hosts must be a list of strings "
+                f"(got {self.network_allowed_hosts!r})"
             )
 
 
@@ -288,12 +321,28 @@ endpoint = "http://localhost:4317"
 service_name = "pie"
 
 # [runtime]
-# Tokio + wasmtime tuning. Leave the section out for stock defaults.
+# Tokio + wasmtime tuning + per-instance security policies.
+# Leave the section out for stock defaults.
+#
+# Tokio + wasmtime
 # worker_threads = 8        # tokio worker count; lower on many-core boxes
 # wasm_max_instances = 4096 # concurrent-inferlet cap (default 1000)
 # wasm_max_memory_mb = 64   # per-inferlet memory cap, MiB (default 10)
 # wasm_warm_memory_mb = 0   # RAM kept warm for fast respawn, MiB (default 0)
 # wasm_warm_slots = 100     # prepared-but-idle slots (default 100)
+#
+# Filesystem
+# allow_fs = false                        # mount /scratch RW; default false
+# fs_scratch_dir = "/var/lib/pie/scratch" # base dir; default ${TMPDIR}/pie
+#
+# Network. Filtering is by IP post-DNS — hostnames don't survive DNS,
+# so use IP / CIDR allowlists, or front the inferlet with a proxy.
+# allow_network = true                    # default: true
+# network_allowed_hosts = ["*"]           # ["*"] = unrestricted (default).
+                                          # Examples:
+                                          #   ["10.0.0.0/8", "127.0.0.1"]
+                                          #   ["10.0.0.0/8:443"]
+                                          #   ["10.0.0.0/8:1024-65535"]
 
 [model.default]
 hf_repo = "{DEFAULT_MODEL}"
@@ -445,13 +494,20 @@ def load_config(
     for name, m in model_raw.items():
         models[name] = _parse_model(name, m)
 
+    if "allow_filesystem" in server_raw:
+        raise ValueError(
+            "[server].allow_filesystem has moved to [runtime].allow_fs. "
+            "Update your config: remove `allow_filesystem` from [server] and "
+            "add `allow_fs = true` to [runtime] (or omit it for the default "
+            "of false)."
+        )
+
     server = ServerConfig(
         host=host if host is not None else server_raw.get("host", "127.0.0.1"),
         port=port if port is not None else int(server_raw.get("port", 8080)),
         verbose=verbose or bool(server_raw.get("verbose", False)),
         registry=registry if registry is not None
                  else str(server_raw.get("registry", "https://registry.pie-project.org/")),
-        allow_filesystem=bool(server_raw.get("allow_filesystem", False)),
         max_concurrent_processes=server_raw.get("max_concurrent_processes"),
         python_snapshot=bool(server_raw.get("python_snapshot", True)),
         primary_model=server_raw.get("primary_model"),
@@ -468,12 +524,24 @@ def load_config(
         v = runtime_raw.get(key)
         return None if v is None else int(v)
 
+    network_allowed_hosts_raw = runtime_raw.get("network_allowed_hosts", ["*"])
+    if not isinstance(network_allowed_hosts_raw, list):
+        raise ValueError(
+            f"[runtime].network_allowed_hosts must be a list of strings, "
+            f"got {type(network_allowed_hosts_raw).__name__}."
+        )
+
+    fs_scratch_dir_raw = runtime_raw.get("fs_scratch_dir")
     runtime_cfg = RuntimeConfig(
         worker_threads=_opt_int("worker_threads"),
         wasm_max_instances=_opt_int("wasm_max_instances"),
         wasm_max_memory_mb=_opt_int("wasm_max_memory_mb"),
         wasm_warm_memory_mb=_opt_int("wasm_warm_memory_mb"),
         wasm_warm_slots=_opt_int("wasm_warm_slots"),
+        allow_fs=bool(runtime_raw.get("allow_fs", False)),
+        fs_scratch_dir=str(fs_scratch_dir_raw) if fs_scratch_dir_raw is not None else None,
+        allow_network=bool(runtime_raw.get("allow_network", True)),
+        network_allowed_hosts=[str(h) for h in network_allowed_hosts_raw],
     )
 
     return Config(

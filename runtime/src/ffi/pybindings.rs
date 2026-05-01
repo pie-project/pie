@@ -176,11 +176,12 @@ impl RpcServer {
 // Configuration Types
 // =============================================================================
 
-/// Runtime tuning — tokio worker pool + wasmtime engine pool. All
-/// fields opt-in; empty `RuntimeConfig` reproduces stock tokio +
-/// stock wasmtime defaults.
+/// Runtime tuning — tokio worker pool + wasmtime engine pool +
+/// per-instance security policies. All fields opt-in; empty
+/// `RuntimeConfig` reproduces stock tokio, stock wasmtime, no
+/// filesystem, and unrestricted network (legacy hardcoded behavior).
 #[pyclass(name = "RuntimeConfig")]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RuntimeConfig {
     /// Number of tokio worker threads. `None` = let tokio default to
     /// `num_cpus`.
@@ -200,6 +201,37 @@ pub struct RuntimeConfig {
     /// Prepared-but-idle inferlet slots. `None` = wasmtime default of 100.
     #[pyo3(get, set)]
     pub wasm_warm_slots: Option<u32>,
+    /// If true, mount per-process scratch dir at `/scratch` with full RW.
+    /// Default: false.
+    #[pyo3(get, set)]
+    pub allow_fs: bool,
+    /// Base dir for per-process scratch. `None` = `${TMPDIR}/pie`.
+    #[pyo3(get, set)]
+    pub fs_scratch_dir: Option<String>,
+    /// If true, expose host network to inferlets (subject to
+    /// `network_allowed_hosts`). Default: true.
+    #[pyo3(get, set)]
+    pub allow_network: bool,
+    /// Allowlist of `cidr[:port]` / `cidr:lo-hi`. `["*"]` (default) =
+    /// no restriction. Empty list ≡ `allow_network = false`.
+    #[pyo3(get, set)]
+    pub network_allowed_hosts: Vec<String>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        RuntimeConfig {
+            worker_threads: None,
+            wasm_max_instances: None,
+            wasm_max_memory_mb: None,
+            wasm_warm_memory_mb: None,
+            wasm_warm_slots: None,
+            allow_fs: false,
+            fs_scratch_dir: None,
+            allow_network: true,
+            network_allowed_hosts: vec!["*".to_string()],
+        }
+    }
 }
 
 #[pymethods]
@@ -211,13 +243,22 @@ impl RuntimeConfig {
         wasm_max_memory_mb = None,
         wasm_warm_memory_mb = None,
         wasm_warm_slots = None,
+        allow_fs = false,
+        fs_scratch_dir = None,
+        allow_network = true,
+        network_allowed_hosts = vec!["*".to_string()],
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         worker_threads: Option<usize>,
         wasm_max_instances: Option<u32>,
         wasm_max_memory_mb: Option<usize>,
         wasm_warm_memory_mb: Option<usize>,
         wasm_warm_slots: Option<u32>,
+        allow_fs: bool,
+        fs_scratch_dir: Option<String>,
+        allow_network: bool,
+        network_allowed_hosts: Vec<String>,
     ) -> Self {
         RuntimeConfig {
             worker_threads,
@@ -225,6 +266,10 @@ impl RuntimeConfig {
             wasm_max_memory_mb,
             wasm_warm_memory_mb,
             wasm_warm_slots,
+            allow_fs,
+            fs_scratch_dir,
+            allow_network,
+            network_allowed_hosts,
         }
     }
 
@@ -232,12 +277,17 @@ impl RuntimeConfig {
         format!(
             "RuntimeConfig(worker_threads={:?}, wasm_max_instances={:?}, \
              wasm_max_memory_mb={:?}, wasm_warm_memory_mb={:?}, \
-             wasm_warm_slots={:?})",
+             wasm_warm_slots={:?}, allow_fs={}, fs_scratch_dir={:?}, \
+             allow_network={}, network_allowed_hosts={:?})",
             self.worker_threads,
             self.wasm_max_instances,
             self.wasm_max_memory_mb,
             self.wasm_warm_memory_mb,
             self.wasm_warm_slots,
+            self.allow_fs,
+            self.fs_scratch_dir,
+            self.allow_network,
+            self.network_allowed_hosts,
         )
     }
 }
@@ -400,9 +450,6 @@ pub struct Config {
     // Models
     #[pyo3(get, set)]
     pub models: Vec<ModelConfig>,
-    // WASI capabilities
-    #[pyo3(get, set)]
-    pub allow_filesystem: bool,
     /// Hard cap on concurrent processes. None = no limit.
     #[pyo3(get, set)]
     pub max_concurrent_processes: Option<usize>,
@@ -428,7 +475,6 @@ impl Config {
         telemetry_service_name = "pie".to_string(),
         runtime = None,
         models = vec![],
-        allow_filesystem = false,
         max_concurrent_processes = None,
         python_snapshot = true,
     ))]
@@ -447,7 +493,6 @@ impl Config {
         telemetry_service_name: String,
         runtime: Option<RuntimeConfig>,
         models: Vec<ModelConfig>,
-        allow_filesystem: bool,
         max_concurrent_processes: Option<usize>,
         python_snapshot: bool,
     ) -> Self {
@@ -465,7 +510,6 @@ impl Config {
             telemetry_service_name,
             runtime: runtime.unwrap_or_default(),
             models,
-            allow_filesystem,
             max_concurrent_processes,
             python_snapshot,
         }
@@ -510,6 +554,10 @@ impl From<Config> for BootstrapConfig {
                 wasm_max_memory_mb: cfg.runtime.wasm_max_memory_mb,
                 wasm_warm_memory_mb: cfg.runtime.wasm_warm_memory_mb,
                 wasm_warm_slots: cfg.runtime.wasm_warm_slots,
+                allow_fs: cfg.runtime.allow_fs,
+                fs_scratch_dir: cfg.runtime.fs_scratch_dir.map(PathBuf::from),
+                allow_network: cfg.runtime.allow_network,
+                network_allowed_hosts: cfg.runtime.network_allowed_hosts,
             },
             models: cfg
                 .models
@@ -540,7 +588,6 @@ impl From<Config> for BootstrapConfig {
                 })
                 .collect(),
             skip_tracing: false,
-            allow_filesystem: cfg.allow_filesystem,
             max_concurrent_processes: cfg.max_concurrent_processes,
             python_snapshot: cfg.python_snapshot,
         }

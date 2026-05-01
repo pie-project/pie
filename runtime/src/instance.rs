@@ -14,6 +14,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 use self::output::LogStream;
 
 use crate::context;
+use crate::linker::InstancePolicy;
 use crate::process::ProcessId;
 
 pub struct InstanceState {
@@ -70,7 +71,7 @@ impl InstanceState {
         id: ProcessId,
         username: String,
         capture_outputs: bool,
-        allow_filesystem: bool,
+        policy: &InstancePolicy,
         token_budget: Option<usize>,
         py_runtime_dir: Option<&Path>,
     ) -> anyhow::Result<Self> {
@@ -81,19 +82,29 @@ impl InstanceState {
         context::register_process(id, token_budget).await?;
 
         let mut builder = WasiCtx::builder();
-        builder.inherit_network(); // TODO: Replace with socket_addr_check later.
+
+        // Network capability. `inherit_network` exposes the host network;
+        // `socket_addr_check` filters per-connect/per-bind. Skipping
+        // `inherit_network` denies all socket operations entirely.
+        if policy.network.allow {
+            builder.inherit_network();
+            if !policy.network.is_unrestricted() {
+                let net = policy.network.clone();
+                builder.socket_addr_check(move |addr, _use| {
+                    let ok = net.check(&addr);
+                    Box::pin(async move { ok })
+                });
+            }
+        }
 
         if capture_outputs {
             builder.stdout(LogStream::new_stdout(id));
             builder.stderr(LogStream::new_stderr(id));
         }
 
-        // Cross-platform temp dir: /tmp on Linux, %TEMP% on Windows, etc.
-        let scratch_dir = std::env::temp_dir()
-            .join("pie")
-            .join(id.to_string());
+        let scratch_dir = policy.fs.base_dir.join(id.to_string());
 
-        if allow_filesystem {
+        if policy.fs.allow {
             std::fs::create_dir_all(&scratch_dir)
                 .expect("failed to create scratch dir");
 

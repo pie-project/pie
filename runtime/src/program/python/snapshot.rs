@@ -1313,12 +1313,13 @@ pub(crate) async fn snapshot_from_bytes(
             .unwrap_or_else(|e| panic!("Failed to register shared module '{name}': {e}"));
     }
 
+    let snapshot_policy = crate::linker::InstancePolicy::deny_all();
     let inst_state = InstanceState::new(
         uuid::Uuid::new_v4(),
         "snapshot".to_string(),
-        false, // capture_outputs
-        false, // allow_filesystem
-        None,  // token_budget
+        false,             // capture_outputs
+        &snapshot_policy,  // deny fs + deny network — snapshot init only
+        None,              // token_budget
         py_runtime::dir(),
     ).await?;
     let mut store = Store::new(engine, inst_state);
