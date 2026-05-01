@@ -351,10 +351,18 @@ void mixtral_forward_paged(
                 d_expert_gate.data(), expert.b_gate->data(), Ne, I, stream);
             if (expert.b_up) kernels::launch_add_bias_bf16(
                 d_expert_up.data(), expert.b_up->data(), Ne, I, stream);
-            kernels::launch_swiglu_bf16(
-                d_expert_gate.data(), d_expert_up.data(), d_expert_gate.data(),
-                static_cast<std::size_t>(Ne) * I, stream,
-                /*clip_limit=*/cfg.swiglu_limit);
+            if (cfg.swiglu_limit > 0.f) {
+                kernels::launch_gpt_oss_glu_bf16(
+                    d_expert_gate.data(), d_expert_up.data(),
+                    d_expert_gate.data(),
+                    static_cast<int>(static_cast<std::size_t>(Ne) * I), stream,
+                    /*limit=*/cfg.swiglu_limit);
+            } else {
+                kernels::launch_swiglu_bf16(
+                    d_expert_gate.data(), d_expert_up.data(),
+                    d_expert_gate.data(),
+                    static_cast<std::size_t>(Ne) * I, stream);
+            }
             ops::gemm_act_x_wt_bf16(cublas.handle(),
                 d_expert_gate.data(), expert.w_down->data(),
                 d_expert_out.data(), Ne, H, I);

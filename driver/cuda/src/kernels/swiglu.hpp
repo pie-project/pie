@@ -13,20 +13,14 @@
 
 namespace pie_cuda_driver::kernels {
 
-// `clip_limit > 0` enables the GPT-OSS variant:
-//     gate'  = clamp(gate, -limit, +limit)
-//     up'    = clamp(up,   -limit, +limit)
-//     y      = silu(gate') · (up' + 1)
-// (The `+1` shifts the residual so a zero-init expert outputs the
-// identity contribution.) `clip_limit == 0` is the standard
-// `silu(gate) * up` used by Llama / Qwen / Mistral / Mixtral.
+// Standard SwiGLU. Used by Llama / Qwen / Mistral / Mixtral.
+//     y = silu(gate) * up = gate * sigmoid(gate) * up
 void launch_swiglu_bf16(
     const void* gate,
     const void* up,
     void* y,
     int num_elements,
-    cudaStream_t stream,
-    float clip_limit = 0.f);
+    cudaStream_t stream);
 
 // GeLU-tanh-glu (Gemma).
 void launch_geglu_tanh_bf16(
@@ -35,5 +29,24 @@ void launch_geglu_tanh_bf16(
     void* y,
     int num_elements,
     cudaStream_t stream);
+
+// GPT-OSS expert activation. Distinct from SwiGLU on three counts:
+//
+//   * Asymmetric clamp on gate (upper-only): `gate' = min(gate, +limit)`.
+//   * QuickGELU-style activation: `glu = gate' * sigmoid(alpha * gate')`
+//     with `alpha = 1.702`. (Standard SwiGLU uses `alpha = 1`.)
+//   * Symmetric clamp on up plus a `+1` residual shift:
+//         up' = clamp(up, -limit, +limit)
+//         y   = (up' + 1) * glu
+//
+// Matches `transformers/models/gpt_oss/modeling_gpt_oss.py::_apply_gate`.
+void launch_gpt_oss_glu_bf16(
+    const void* gate,
+    const void* up,
+    void* y,
+    int num_elements,
+    cudaStream_t stream,
+    float limit,
+    float alpha = 1.702f);
 
 }  // namespace pie_cuda_driver::kernels
