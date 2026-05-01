@@ -19,4 +19,17 @@ void launch_rmsnorm_bf16(
     float eps,
     cudaStream_t stream);
 
+// Gemma family RMSNorm — applies `(1 + w) * x_hat` instead of `w * x_hat`.
+// HF stores Gemma's RMSNorm gamma centered at zero; this lets the loaded
+// tensor be inspected/initialized like a residual gate, but downstream
+// math expects the +1 shift.
+void launch_rmsnorm_gemma_bf16(
+    const void* x,
+    const void* weight,
+    void* y,
+    int num_rows,
+    int hidden,
+    float eps,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

@@ -28,8 +28,15 @@ struct Qwen3LayerWeights {
     const DeviceTensor* v_proj = nullptr;      // [num_kv_heads*head_dim, hidden]
     const DeviceTensor* o_proj = nullptr;      // [hidden, num_q_heads*head_dim]
 
-    // Per-head QK normalization (Qwen3 quirk; weight length = head_dim).
-    // Null on Llama 3 / Qwen 2 / Mistral, which don't have these.
+    // Optional QKV bias terms. Set on Qwen-2 / OLMo-3 / GPT-OSS, null on
+    // Llama-3 / Qwen-3 / Phi-3 / Mistral. When non-null, applied
+    // post-projection via `launch_add_bias_bf16`.
+    const DeviceTensor* q_bias = nullptr;      // [num_q_heads*head_dim]
+    const DeviceTensor* k_bias = nullptr;      // [num_kv_heads*head_dim]
+    const DeviceTensor* v_bias = nullptr;      // [num_kv_heads*head_dim]
+
+    // Per-head QK normalization (Qwen3 / Gemma-3 / OLMo-3; weight length
+    // = head_dim). Null on Llama 3 / Qwen 2 / Mistral.
     const DeviceTensor* q_norm = nullptr;
     const DeviceTensor* k_norm = nullptr;
 
@@ -49,10 +56,27 @@ struct Qwen3Weights {
 /// Build the schema by name-binding tensors out of the engine. Throws if a
 /// required weight is missing; tolerates a missing `lm_head` (falls back to
 /// `embed` when `tie_word_embeddings` is set). Reads `cfg.use_qk_norm` to
-/// decide whether to require q/k_norm weights or leave them null.
+/// decide whether to require q/k_norm weights, and `cfg.use_qkv_bias` to
+/// decide whether to bind q/k/v bias terms.
 Qwen3Weights bind_llama_like(const Engine& engine);
 
 // Backward-compatible alias for callers still using `bind_qwen3`.
 inline Qwen3Weights bind_qwen3(const Engine& engine) { return bind_llama_like(engine); }
+
+// Phi-3 ships fused `qkv_proj` and `gate_up_proj` weights. The bind
+// function below splits them into the standard q/k/v/gate/up slots
+// expected by the Llama-like forward, by registering virtual sub-views
+// in the engine's weight pool. Returns the same `Qwen3Weights` shape.
+Qwen3Weights bind_phi3(Engine& engine);
+
+// OLMo-3 ships separate Q/K/V (no fused weights), but stores its norms
+// at HF positions that don't match Llama. Map:
+//   * `post_attention_layernorm` → attn_norm (used as the post-attn
+//     RMSNorm in the post-norm forward graph).
+//   * `post_feedforward_layernorm` → mlp_norm (post-MLP).
+// OLMo-3 has no `input_layernorm` because the architecture is
+// post-norm. The forward path for OLMo-3 selects post-norm via
+// `LlamaLikeForwardCfg::norm_placement = NormPlacement::Post`.
+Qwen3Weights bind_olmo3(const Engine& engine);
 
 }  // namespace pie_cuda_driver::model

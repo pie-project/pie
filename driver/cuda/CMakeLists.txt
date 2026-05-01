@@ -59,6 +59,13 @@ add_executable(pie_driver_cuda
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
   src/model/qwen3_forward.cpp
+  src/model/llama_like.cpp
+  src/model/mixtral.cpp
+  src/model/gemma2.cpp
+  src/model/mistral3.cpp
+  src/model/gpt_oss.cpp
+  src/model/gemma4.cpp
+  src/model/qwen3_5.cpp
   src/kv_cache.cpp
   src/ops/gemm.cpp
   src/ops/attention_naive.cu
@@ -75,6 +82,15 @@ add_executable(pie_driver_cuda
   src/kernels/logprobs.cu
   src/kernels/dist.cu
   src/kernels/gather_rows.cu
+  src/kernels/add_bias.cu
+  src/kernels/residual_add.cu
+  src/kernels/topk_softmax.cu
+  src/kernels/moe_dispatch.cu
+  src/kernels/softcap.cu
+  src/kernels/scalar_mul.cu
+  src/kernels/dequant_fp4.cu
+  src/kernels/dequant_fp8.cu
+  src/kernels/head_dim_pad.cu
   src/attention_workspace.cpp
   src/brle.cpp
   src/control_socket.cpp

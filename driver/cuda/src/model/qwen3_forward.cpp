@@ -34,6 +34,19 @@ Qwen3Workspace Qwen3Workspace::allocate(const HfConfig& cfg, int max_tokens) {
     ws.up       = DeviceTensor::allocate(DType::BF16, {N, I});
     ws.logits   = DeviceTensor::allocate(DType::BF16, {N, V});
     ws.probs    = DeviceTensor::allocate(DType::FP32, {N, V});
+
+    // Padded q/k/v/attn_out only when head_dim != head_dim_kernel
+    // (currently only Phi-3 at 96 → 128). Empty allocations otherwise
+    // — the forward path detects the empty-state and aliases the
+    // packed buffers.
+    if (cfg.head_dim != cfg.head_dim_kernel) {
+        const int Hq_pad = cfg.num_attention_heads * cfg.head_dim_kernel;
+        const int Hk_pad = cfg.num_key_value_heads * cfg.head_dim_kernel;
+        ws.q_padded        = DeviceTensor::allocate(DType::BF16, {N, Hq_pad});
+        ws.k_padded        = DeviceTensor::allocate(DType::BF16, {N, Hk_pad});
+        ws.v_padded        = DeviceTensor::allocate(DType::BF16, {N, Hk_pad});
+        ws.attn_out_padded = DeviceTensor::allocate(DType::BF16, {N, Hq_pad});
+    }
     return ws;
 }
 
