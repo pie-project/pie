@@ -66,7 +66,8 @@ namespace {
 int run_parity(const pie_cuda_driver::Config& cfg,
                const std::string& tokens_in,
                const std::string& logits_out,
-               bool paged)
+               bool paged,
+               bool decode_after_prefill = false)
 {
     auto engine = pie_cuda_driver::Engine::load(cfg);
     const auto& mt_for_parity = engine.hf_config().model_type;
@@ -129,85 +130,128 @@ int run_parity(const pie_cuda_driver::Config& cfg,
     auto ws = pie_cuda_driver::model::Qwen3Workspace::allocate(engine.hf_config(), N);
     pie_cuda_driver::ops::CublasHandle cublas;
 
+    // For `decode_after_prefill`, the row index in `ws.logits` we want to
+    // dump at the end is the LAST row written by the *last* call. Default
+    // (single-prefill) is N-1; decode mode overwrites only row 0 in the
+    // second call, so the dump position becomes 0.
+    int dump_row = N - 1;
+
     if (paged) {
         // Build a single-request paged layout that mirrors what the runtime
         // would send for a fresh request: pages [0..ceil(N/page_size)],
         // last_page_len computed accordingly.
-        const int page_size = static_cast<int>(cfg.batching.kv_page_size);
-        const int num_pages_needed = (N + page_size - 1) / page_size;
+        //
+        // `decode_after_prefill` mode: instead of one prefill of N tokens,
+        // do (a) prefill of the first N-1 tokens followed by (b) a single
+        // decode-shaped step (qo_len=1) at position N-1. The dumped
+        // logits come from step (b) — they should match HF's logits at
+        // position N-1, just produced via the decode kernel + cached KV
+        // read instead of a fresh prefill. Catches decode-only bugs that
+        // multi-step prefill parity can't see.
+        if (decode_after_prefill && N < 2) {
+            std::cerr << "[parity] --parity-decode-after-prefill requires "
+                         "at least 2 tokens; got " << N << "\n";
+            return 5;
+        }
+        const int prefill_N  = decode_after_prefill ? (N - 1) : N;
+        const int page_size  = static_cast<int>(cfg.batching.kv_page_size);
+        const int total_pages = (N + page_size - 1) / page_size;
 
         auto cache = pie_cuda_driver::KvCache::allocate(
             engine.hf_config().num_hidden_layers,
-            std::max(num_pages_needed, 1),
+            std::max(total_pages, 1),
             page_size,
             engine.hf_config().num_key_value_heads,
             engine.hf_config().head_dim);
 
-        std::vector<std::uint32_t> h_qo_indptr      = {0u, static_cast<std::uint32_t>(N)};
-        std::vector<std::uint32_t> h_kv_page_indptr = {0u, static_cast<std::uint32_t>(num_pages_needed)};
-        std::vector<std::uint32_t> h_kv_page_indices(num_pages_needed);
-        for (int i = 0; i < num_pages_needed; ++i) h_kv_page_indices[i] = static_cast<std::uint32_t>(i);
-        std::vector<std::uint32_t> h_kv_last_page_lens = {
-            static_cast<std::uint32_t>(((N - 1) % page_size) + 1)
-        };
-
-        std::uint32_t *d_qo, *d_pi, *d_pp, *d_lpl;
-        CUDA_CHECK(cudaMalloc(&d_qo,  4 * h_qo_indptr.size()));
-        CUDA_CHECK(cudaMalloc(&d_pi,  4 * h_kv_page_indices.size()));
-        CUDA_CHECK(cudaMalloc(&d_pp,  4 * h_kv_page_indptr.size()));
-        CUDA_CHECK(cudaMalloc(&d_lpl, 4 * h_kv_last_page_lens.size()));
-        CUDA_CHECK(cudaMemcpy(d_qo,  h_qo_indptr.data(),         4 * h_qo_indptr.size(),         cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_pi,  h_kv_page_indices.data(),   4 * h_kv_page_indices.size(),   cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_pp,  h_kv_page_indptr.data(),    4 * h_kv_page_indptr.size(),    cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_lpl, h_kv_last_page_lens.data(), 4 * h_kv_last_page_lens.size(), cudaMemcpyHostToDevice));
-
-        // Parity harness uses the naive paged path (single prefill, qo_len=N).
-        // flashinfer's decode kernel only supports qo_len==1; we'll add a
-        // separate decode-shaped parity test in Phase 1.4.
         auto parity_attn_ws = pie_cuda_driver::AttentionWorkspace::allocate();
+
+        // Build the per-arch fwd_cfg once; reused across the prefill and
+        // (optional) decode calls.
+        pie_cuda_driver::model::LlamaLikeForwardCfg fwd_cfg{};
         if (is_gpt_oss) {
-            // Mirror what main.cpp's serving path builds: per-layer
-            // sliding window from layer_types, YaRN params, force prefill
-            // path (we only need the prefill flow here).
-            pie_cuda_driver::model::LlamaLikeForwardCfg fwd_cfg{};
             const auto& hf = engine.hf_config();
             fwd_cfg.use_qkv_bias = hf.attention_bias;
             fwd_cfg.rope_kind    = hf.has_rope_scaling
                 ? pie_cuda_driver::model::RopeKind::YaRN
                 : pie_cuda_driver::model::RopeKind::Standard;
-            fwd_cfg.yarn_factor               = hf.rope_factor;
-            fwd_cfg.yarn_low_freq_factor      = hf.rope_low_freq_factor;
-            fwd_cfg.yarn_high_freq_factor     = hf.rope_high_freq_factor;
+            fwd_cfg.yarn_factor                = hf.rope_factor;
+            fwd_cfg.yarn_low_freq_factor       = hf.rope_low_freq_factor;
+            fwd_cfg.yarn_high_freq_factor      = hf.rope_high_freq_factor;
             fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
-            fwd_cfg.sliding_window            = hf.sliding_window;
+            fwd_cfg.sliding_window             = hf.sliding_window;
             for (const auto& t : hf.layer_types) {
-                const bool is_sliding = (t == "sliding_attention");
                 fwd_cfg.per_layer_window_left.push_back(
-                    is_sliding ? hf.sliding_window : -1);
+                    (t == "sliding_attention") ? hf.sliding_window : -1);
             }
-            fwd_cfg.force_prefill_path = true;
-            pie_cuda_driver::model::mixtral_forward_paged(
-                weights_mixtral, engine.hf_config(), fwd_cfg,
-                hf.num_experts, hf.num_experts_per_tok,
-                ws, cache, parity_attn_ws, cublas,
-                d_tokens, d_positions,
-                d_qo, d_pi, d_pp, d_lpl,
-                /*qo_indptr_h=*/h_qo_indptr.data(),
-                /*kv_page_indptr_h=*/h_kv_page_indptr.data(),
-                /*total_tokens=*/N, /*num_requests=*/1,
-                /*is_pure_decode=*/false);
-        } else {
-            pie_cuda_driver::model::qwen3_forward_paged(
-                weights, engine.hf_config(), ws, cache, parity_attn_ws, cublas,
-                d_tokens, d_positions,
-                d_qo, d_pi, d_pp, d_lpl,
-                /*qo_indptr_h=*/h_qo_indptr.data(),
-                /*kv_page_indptr_h=*/h_kv_page_indptr.data(),
-                /*total_tokens=*/N, /*num_requests=*/1,
-                /*is_pure_decode=*/false);
+            // Decode-after-prefill mode exercises both the prefill and
+            // decode kernels in sequence. force_prefill_path would defeat
+            // the purpose of the test, so leave it false.
+            fwd_cfg.force_prefill_path = !decode_after_prefill;
         }
 
-        cudaFree(d_qo); cudaFree(d_pi); cudaFree(d_pp); cudaFree(d_lpl);
+        // Helper to run one paged forward call. `total_n` is qo_len, `kv_n`
+        // is the post-write KV length (for the indptr/last_page_len math).
+        // `tok_d` / `pos_d` are device pointers to the inputs for this call.
+        auto run_call = [&](const std::int32_t* tok_d,
+                            const std::int32_t* pos_d,
+                            int total_n, int kv_n, bool is_decode) {
+            const int n_pages_kv = (kv_n + page_size - 1) / page_size;
+            std::vector<std::uint32_t> h_qo  = {0u, (std::uint32_t)total_n};
+            std::vector<std::uint32_t> h_pp  = {0u, (std::uint32_t)n_pages_kv};
+            std::vector<std::uint32_t> h_pi(n_pages_kv);
+            for (int i = 0; i < n_pages_kv; ++i) h_pi[i] = (std::uint32_t)i;
+            std::vector<std::uint32_t> h_lpl = {
+                (std::uint32_t)(((kv_n - 1) % page_size) + 1)
+            };
+
+            std::uint32_t *d_qo, *d_pi, *d_pp, *d_lpl;
+            CUDA_CHECK(cudaMalloc(&d_qo,  4 * h_qo.size()));
+            CUDA_CHECK(cudaMalloc(&d_pi,  4 * h_pi.size()));
+            CUDA_CHECK(cudaMalloc(&d_pp,  4 * h_pp.size()));
+            CUDA_CHECK(cudaMalloc(&d_lpl, 4 * h_lpl.size()));
+            CUDA_CHECK(cudaMemcpy(d_qo,  h_qo.data(),  4 * h_qo.size(),  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_pi,  h_pi.data(),  4 * h_pi.size(),  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_pp,  h_pp.data(),  4 * h_pp.size(),  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_lpl, h_lpl.data(), 4 * h_lpl.size(), cudaMemcpyHostToDevice));
+
+            if (is_gpt_oss) {
+                const auto& hf = engine.hf_config();
+                pie_cuda_driver::model::mixtral_forward_paged(
+                    weights_mixtral, engine.hf_config(), fwd_cfg,
+                    hf.num_experts, hf.num_experts_per_tok,
+                    ws, cache, parity_attn_ws, cublas,
+                    tok_d, pos_d,
+                    d_qo, d_pi, d_pp, d_lpl,
+                    /*qo_indptr_h=*/h_qo.data(),
+                    /*kv_page_indptr_h=*/h_pp.data(),
+                    /*total_tokens=*/total_n, /*num_requests=*/1,
+                    /*is_pure_decode=*/is_decode);
+            } else {
+                pie_cuda_driver::model::qwen3_forward_paged(
+                    weights, engine.hf_config(), ws, cache, parity_attn_ws, cublas,
+                    tok_d, pos_d,
+                    d_qo, d_pi, d_pp, d_lpl,
+                    /*qo_indptr_h=*/h_qo.data(),
+                    /*kv_page_indptr_h=*/h_pp.data(),
+                    /*total_tokens=*/total_n, /*num_requests=*/1,
+                    /*is_pure_decode=*/is_decode);
+            }
+
+            cudaFree(d_qo); cudaFree(d_pi); cudaFree(d_pp); cudaFree(d_lpl);
+        };
+
+        // Prefill on the first prefill_N tokens.
+        run_call(d_tokens, d_positions, prefill_N, prefill_N, /*is_decode=*/false);
+
+        if (decode_after_prefill) {
+            // Single decode step at position N-1, reading KV [0, N-1) and
+            // appending the K/V for position N-1.
+            run_call(d_tokens + (N - 1), d_positions + (N - 1),
+                     /*total_n=*/1, /*kv_n=*/N, /*is_decode=*/true);
+            // The decode call wrote logits for one token at row 0.
+            dump_row = 0;
+        }
     } else {
         pie_cuda_driver::model::qwen3_forward_prefill(
             weights, engine.hf_config(), ws, cublas, d_tokens, d_positions, N);
@@ -217,15 +261,20 @@ int run_parity(const pie_cuda_driver::Config& cfg,
     // Greedy sample over all rows on the GPU, then echo the last-token
     // id to stderr — the parity harness picks it up and cross-checks
     // against numpy.argmax of the dumped logits.
+    // The last call wrote `last_n_rows` rows of logits into ws.logits.
+    // For single-prefill: N rows, dump row N-1. For decode-after-prefill:
+    // the decode call wrote 1 row at index 0, dump row 0.
+    const int last_n_rows = decode_after_prefill ? 1 : N;
     {
         const int V = engine.hf_config().vocab_size;
         std::int32_t* d_sampled = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_sampled, sizeof(std::int32_t) * N));
+        CUDA_CHECK(cudaMalloc(&d_sampled, sizeof(std::int32_t) * last_n_rows));
         pie_cuda_driver::kernels::launch_argmax_bf16(
-            ws.logits.data(), d_sampled, N, V, /*stream=*/nullptr);
-        std::vector<std::int32_t> host_sampled(N);
+            ws.logits.data(), d_sampled, last_n_rows, V, /*stream=*/nullptr);
+        std::vector<std::int32_t> host_sampled(last_n_rows);
         CUDA_CHECK(cudaMemcpy(host_sampled.data(), d_sampled,
-                              sizeof(std::int32_t) * N, cudaMemcpyDeviceToHost));
+                              sizeof(std::int32_t) * last_n_rows,
+                              cudaMemcpyDeviceToHost));
         cudaFree(d_sampled);
         std::cerr << "[parity] gpu argmax last-token id = "
                   << host_sampled.back() << "\n";
@@ -236,7 +285,7 @@ int run_parity(const pie_cuda_driver::Config& cfg,
     std::vector<std::uint16_t> host_logits(V);  // bf16 viewed as u16
     const auto* base = static_cast<const std::uint16_t*>(ws.logits.data());
     CUDA_CHECK(cudaMemcpy(host_logits.data(),
-                          base + static_cast<std::size_t>(N - 1) * V,
+                          base + static_cast<std::size_t>(dump_row) * V,
                           V * sizeof(std::uint16_t),
                           cudaMemcpyDeviceToHost));
 
@@ -263,6 +312,7 @@ int main(int argc, char** argv) {
 
     std::string parity_tokens, parity_out;
     bool parity_paged = false;
+    bool parity_decode_after_prefill = false;
     auto* parity = app.add_option_group("parity", "Numeric-parity test entry");
     parity->add_option("--parity-tokens", parity_tokens,
                        "Path to a binary file of i32 token ids");
@@ -270,6 +320,11 @@ int main(int argc, char** argv) {
                        "Where to write the last-token logits as bf16 [vocab]");
     parity->add_flag("--parity-paged", parity_paged,
                      "Run the paged forward path (BPIQ-shaped KV layout)");
+    parity->add_flag("--parity-decode-after-prefill", parity_decode_after_prefill,
+                     "After prefill on the first N-1 tokens, run a single "
+                     "qo_len=1 decode step at position N-1 and dump that "
+                     "step's logits. Exercises the decode kernel + KV-cache "
+                     "read path in addition to prefill. Requires --parity-paged.");
 
     bool use_cuda_graphs = false;
     app.add_flag("--cuda-graphs", use_cuda_graphs,
@@ -289,7 +344,12 @@ int main(int argc, char** argv) {
             std::cerr << "--parity-tokens requires --parity-out\n";
             return 1;
         }
-        return run_parity(cfg, parity_tokens, parity_out, parity_paged);
+        if (parity_decode_after_prefill && !parity_paged) {
+            std::cerr << "--parity-decode-after-prefill requires --parity-paged\n";
+            return 1;
+        }
+        return run_parity(cfg, parity_tokens, parity_out, parity_paged,
+                          parity_decode_after_prefill);
     }
 
     // Informational logs go to stderr — stdout is reserved for the READY
