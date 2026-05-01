@@ -1,8 +1,12 @@
 #include "model/gemma4.hpp"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -211,6 +215,28 @@ Gemma4Weights bind_gemma4(const Engine& engine) {
 
 namespace {
 
+// Parity-dump helper: write a bf16 tensor of `numel` elements to
+// `<dir>/<tag>.bin` as raw bf16 bytes. We only record the *first* fire
+// of a session (typically the prefill) — subsequent decode fires would
+// overwrite the prefill's intermediates with decode-shaped tensors,
+// which is not what the PyTorch parity harness compares against.
+inline bool& dbg_first_fire_flag() {
+    static bool first = true;
+    return first;
+}
+inline void dbg_dump_bf16(const char* tag, const void* dev_ptr,
+                          std::size_t numel) {
+    static const char* dir = std::getenv("PIE_GEMMA4_DUMP_DIR");
+    if (dir == nullptr) return;
+    if (!dbg_first_fire_flag()) return;
+    std::vector<std::uint16_t> tmp(numel);
+    cudaMemcpy(tmp.data(), dev_ptr, numel * 2, cudaMemcpyDeviceToHost);
+    std::string path = std::string(dir) + "/" + tag + ".bin";
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return;
+    out.write(reinterpret_cast<const char*>(tmp.data()), numel * 2);
+}
+
 // Read a single bf16 tensor's first element to host. Used for the
 // per-layer learnable scalar — there's one float per layer; copying
 // one bf16 value at startup is cheap and lets the forward avoid a
@@ -259,11 +285,32 @@ void gemma4_forward_paged(
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
 
     // ── 1. Embed + √hidden scale ──────────────────────────────────────────
+    // Dump input tokens to disk so the parity harness can confirm
+    // it's running HF on the same prefix. Only on the first fire
+    // (the prefill) — subsequent decode fires would clobber the
+    // file with a single-token dump.
+    {
+        const char* dir = std::getenv("PIE_GEMMA4_DUMP_DIR");
+        if (dir != nullptr && dbg_first_fire_flag()) {
+            std::vector<std::int32_t> tmp(N);
+            cudaMemcpy(tmp.data(), token_ids, N * sizeof(std::int32_t),
+                       cudaMemcpyDeviceToHost);
+            std::ofstream out(std::string(dir) + "/tokens.bin", std::ios::binary);
+            if (out) out.write(reinterpret_cast<const char*>(tmp.data()),
+                               N * sizeof(std::int32_t));
+        }
+    }
     kernels::launch_embed_bf16(
         token_ids, w.embed->data(), ws.y.data(), N, H, V, stream);
+    cudaDeviceSynchronize();
+    dbg_dump_bf16("embed_pre_scale", ws.y.data(),
+                  static_cast<std::size_t>(N) * H);
     kernels::launch_scalar_mul_bf16(
         ws.y.data(), std::sqrt(static_cast<float>(H)),
         static_cast<std::size_t>(N) * H, stream);
+    cudaDeviceSynchronize();
+    dbg_dump_bf16("embed_post_scale", ws.y.data(),
+                  static_cast<std::size_t>(N) * H);
 
     // ── 2. Per-layer inputs (PLE) ────────────────────────────────────────
     // Compute once per fire; sliced per layer below.
@@ -334,6 +381,12 @@ void gemma4_forward_paged(
     }
     for (int l = 0; l < debug_max_layers; ++l) {
         const auto& layer = w.layers[l];
+        const bool dump_this = (l == 0);
+        auto dump_l0 = [&](const char* tag, const void* p, std::size_t n) {
+            if (!dump_this) return;
+            std::string t = std::string("L0_") + tag;
+            dbg_dump_bf16(t.c_str(), p, n);
+        };
         const int d  = layer.head_dim;
         const int Hq = cfg.num_attention_heads * d;
         const int Hk = cfg.num_key_value_heads * d;
@@ -345,6 +398,9 @@ void gemma4_forward_paged(
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.attn_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
+        cudaDeviceSynchronize();
+        dump_l0("attn_norm_pre", ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H);
 
         // Q-projection always runs.
         ops::gemm_act_x_wt_bf16(cublas.handle(),
@@ -358,6 +414,15 @@ void gemma4_forward_paged(
             ops::gemm_act_x_wt_bf16(cublas.handle(),
                 ws.norm_x.data(), layer.v_proj->data(), ws.v.data(),
                 N, Hk, H);
+        }
+
+        // Pre-norm dumps for parity.
+        if (l == 0 && !layer.is_shared) {
+            cudaDeviceSynchronize();
+            dump_l0("v_pre_norm", ws.v.data(),
+                    static_cast<std::size_t>(N) * cfg.num_key_value_heads * d);
+            dump_l0("q_pre_norm", ws.q.data(),
+                    static_cast<std::size_t>(N) * cfg.num_attention_heads * d);
         }
 
         // Per-head Q/K RMSNorm (Gemma-4 always has it).
@@ -376,6 +441,13 @@ void gemma4_forward_paged(
                     ws.v.data(), ws.v.data(),
                     N * cfg.num_key_value_heads, d, eps, stream);
             }
+        }
+        if (l == 0 && !layer.is_shared) {
+            cudaDeviceSynchronize();
+            dump_l0("v_post_norm", ws.v.data(),
+                    static_cast<std::size_t>(N) * cfg.num_key_value_heads * d);
+            dump_l0("q_post_norm", ws.q.data(),
+                    static_cast<std::size_t>(N) * cfg.num_attention_heads * d);
         }
 
         // RoPE: partial rotary on full-attention layers
@@ -463,25 +535,38 @@ void gemma4_forward_paged(
                 /*sm_scale=*/1.0f);
         }
 
+        cudaDeviceSynchronize();
+        dump_l0("attn_out", ws.attn_out.data(),
+                static_cast<std::size_t>(N) * Hq);
+
         // o_proj → norm_x scratch, post-attn norm, residual-add y.
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
             N, H, Hq, /*beta=*/0.f);
+        cudaDeviceSynchronize();
+        dump_l0("o_proj_out", ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H);
         kernels::launch_rmsnorm_bf16(
             ws.norm_x.data(), layer.attn_norm_post->data(), ws.norm_y.data(),
             N, H, eps, stream);
+        cudaDeviceSynchronize();
+        dump_l0("attn_norm_post", ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H);
         kernels::launch_residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
+        cudaDeviceSynchronize();
+        dump_l0("post_attn_y", ws.y.data(),
+                static_cast<std::size_t>(N) * H);
 
         // ── 3b. MLP block ──────────────────────────────────────────────
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.mlp_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
+        cudaDeviceSynchronize();
+        dump_l0("mlp_norm_pre", ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H);
 
-        // Gate / up GEMMs at this layer's intermediate (which may be
-        // double-wide on shared layers). We size `ws.gate`/`ws.up` for
-        // the worst case at startup so per-layer width ≤ allocation.
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.gate_proj->data(), ws.gate.data(),
             N, I, H);
@@ -491,15 +576,27 @@ void gemma4_forward_paged(
         kernels::launch_geglu_tanh_bf16(
             ws.gate.data(), ws.up.data(), ws.gate.data(),
             N * I, stream);
+        cudaDeviceSynchronize();
+        dump_l0("mlp_geglu", ws.gate.data(),
+                static_cast<std::size_t>(N) * I);
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.gate.data(), layer.down_proj->data(), ws.norm_x.data(),
             N, H, I, /*beta=*/0.f);
+        cudaDeviceSynchronize();
+        dump_l0("mlp_down", ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H);
         kernels::launch_rmsnorm_bf16(
             ws.norm_x.data(), layer.mlp_norm_post->data(), ws.norm_y.data(),
             N, H, eps, stream);
+        cudaDeviceSynchronize();
+        dump_l0("mlp_norm_post", ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H);
         kernels::launch_residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
+        cudaDeviceSynchronize();
+        dump_l0("post_mlp_y", ws.y.data(),
+                static_cast<std::size_t>(N) * H);
 
         // ── 3c. PLE residual ───────────────────────────────────────────
         // Wrapped in a block so debugging can disable the whole step
@@ -549,6 +646,16 @@ void gemma4_forward_paged(
             static_cast<std::size_t>(N) * H, stream);
         }  // end PLE-bypass guard
 
+        // Parity dump: residual stream after attention/MLP/PLE for
+        // the first few layers.
+        if (l < 4) {
+            cudaDeviceSynchronize();
+            char tag[32];
+            std::snprintf(tag, sizeof tag, "layer_%d_post_ple_y", l);
+            dbg_dump_bf16(tag, ws.y.data(),
+                          static_cast<std::size_t>(N) * H);
+        }
+
         // ── 3d. Per-layer learnable scalar ────────────────────────────
         if (layer.layer_scalar && getenv("PIE_NO_LAYER_SCALAR") == nullptr) {
             // Read the bf16 scalar to host once at this point. The
@@ -562,6 +669,16 @@ void gemma4_forward_paged(
                     ws.y.data(), s,
                     static_cast<std::size_t>(N) * H, stream);
             }
+        }
+
+        // Post-layer_scalar dump for parity comparison against HF's
+        // `hidden_states[layer+1]` (which is after the scalar mul).
+        if (l < 4) {
+            cudaDeviceSynchronize();
+            char tag[32];
+            std::snprintf(tag, sizeof tag, "layer_%d_post_scalar_y", l);
+            dbg_dump_bf16(tag, ws.y.data(),
+                          static_cast<std::size_t>(N) * H);
         }
     }
 
@@ -577,6 +694,14 @@ void gemma4_forward_paged(
             ws.logits.data(), fwd_cfg.final_logit_softcap,
             static_cast<std::size_t>(N) * V, stream);
     }
+    cudaDeviceSynchronize();
+    dbg_dump_bf16("logits_last", static_cast<const std::uint16_t*>(ws.logits.data())
+                                  + static_cast<std::size_t>(N - 1) * V,
+                  static_cast<std::size_t>(V));
+    // After the first fire, freeze the dumps so subsequent decode
+    // fires don't overwrite the prefill intermediates we want to
+    // parity-check.
+    dbg_first_fire_flag() = false;
 }
 
 }  // namespace pie_cuda_driver::model
