@@ -328,7 +328,11 @@ void gemma4_forward_paged(
     // for small batches than maintaining two cached plans.
 
     // ── 3. Layer loop ────────────────────────────────────────────────────
-    for (int l = 0; l < L; ++l) {
+    int debug_max_layers = L;
+    if (const char* lim = getenv("PIE_GEMMA4_MAX_LAYERS")) {
+        debug_max_layers = std::min(L, std::atoi(lim));
+    }
+    for (int l = 0; l < debug_max_layers; ++l) {
         const auto& layer = w.layers[l];
         const int d  = layer.head_dim;
         const int Hq = cfg.num_attention_heads * d;
@@ -357,19 +361,21 @@ void gemma4_forward_paged(
         }
 
         // Per-head Q/K RMSNorm (Gemma-4 always has it).
-        kernels::launch_rmsnorm_bf16(
-            ws.q.data(), layer.q_norm->data(), ws.q.data(),
-            N * cfg.num_attention_heads, d, eps, stream);
-        if (!layer.is_shared) {
+        if (getenv("PIE_NO_QK_NORM") == nullptr) {
             kernels::launch_rmsnorm_bf16(
-                ws.k.data(), layer.k_norm->data(), ws.k.data(),
-                N * cfg.num_key_value_heads, d, eps, stream);
-            // V-Norm: pure RMSNorm (no learnable scale) on V before the
-            // KV write. Gemma-4 trained against this; skipping it
-            // produces gibberish even though softmax stays well-formed.
-            kernels::launch_rmsnorm_no_scale_bf16(
-                ws.v.data(), ws.v.data(),
-                N * cfg.num_key_value_heads, d, eps, stream);
+                ws.q.data(), layer.q_norm->data(), ws.q.data(),
+                N * cfg.num_attention_heads, d, eps, stream);
+            if (!layer.is_shared) {
+                kernels::launch_rmsnorm_bf16(
+                    ws.k.data(), layer.k_norm->data(), ws.k.data(),
+                    N * cfg.num_key_value_heads, d, eps, stream);
+                // V-Norm: pure RMSNorm (no learnable scale) on V before the
+                // KV write. Gemma-4 trained against this; skipping it
+                // produces gibberish even though softmax stays well-formed.
+                kernels::launch_rmsnorm_no_scale_bf16(
+                    ws.v.data(), ws.v.data(),
+                    N * cfg.num_key_value_heads, d, eps, stream);
+            }
         }
 
         // RoPE: partial rotary on full-attention layers
