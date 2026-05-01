@@ -14,11 +14,14 @@
 
 namespace pie_cuda_driver::model {
 
-Qwen3Workspace Qwen3Workspace::allocate(const HfConfig& cfg, int max_tokens) {
+Qwen3Workspace Qwen3Workspace::allocate_full(
+    const HfConfig& cfg, int max_tokens,
+    int max_intermediate, int max_Hq, int max_Hk)
+{
     const int H  = cfg.hidden_size;
-    const int Hq = cfg.num_attention_heads * cfg.head_dim;
-    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
-    const int I  = cfg.intermediate_size;
+    const int Hq = max_Hq;
+    const int Hk = max_Hk;
+    const int I  = max_intermediate;
     const int V  = cfg.vocab_size;
     const int N  = max_tokens;
 
@@ -48,6 +51,18 @@ Qwen3Workspace Qwen3Workspace::allocate(const HfConfig& cfg, int max_tokens) {
         ws.attn_out_padded = DeviceTensor::allocate(DType::BF16, {N, Hq_pad});
     }
     return ws;
+}
+
+Qwen3Workspace Qwen3Workspace::allocate_with_max_intermediate(
+    const HfConfig& cfg, int max_tokens, int max_intermediate)
+{
+    const int Hq = cfg.num_attention_heads * cfg.head_dim;
+    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
+    return allocate_full(cfg, max_tokens, max_intermediate, Hq, Hk);
+}
+
+Qwen3Workspace Qwen3Workspace::allocate(const HfConfig& cfg, int max_tokens) {
+    return allocate_with_max_intermediate(cfg, max_tokens, cfg.intermediate_size);
 }
 
 void qwen3_forward_prefill(

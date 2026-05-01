@@ -40,6 +40,24 @@ struct Qwen3Workspace {
     DeviceTensor attn_out_padded; // [max_tokens, h_q  * head_dim_kernel]
 
     static Qwen3Workspace allocate(const HfConfig& cfg, int max_tokens);
+
+    // Variant for architectures whose per-layer MLP `intermediate_size`
+    // exceeds the base `cfg.intermediate_size` (Gemma-4's
+    // `use_double_wide_mlp` doubles the width on shared layers).
+    // Caller passes the worst-case value; ws.gate / ws.up / logits are
+    // sized accordingly. Other shapes match the standard `allocate`.
+    static Qwen3Workspace allocate_with_max_intermediate(
+        const HfConfig& cfg, int max_tokens, int max_intermediate);
+
+    // Variant for architectures whose per-layer attention dimensions
+    // (Hq = num_q_heads * head_dim, Hk = num_kv_heads * head_dim) vary
+    // across layers — Gemma-4's full-attention layers run at
+    // head_dim_global=512 while sliding layers run at head_dim=256, so
+    // a single ws.q sized at the sliding width overflows on full
+    // layers. Caller passes the worst-case `Hq` and `Hk`.
+    static Qwen3Workspace allocate_full(
+        const HfConfig& cfg, int max_tokens,
+        int max_intermediate, int max_Hq, int max_Hk);
 };
 
 // Run prefill on `num_tokens` consecutive tokens starting at position 0.

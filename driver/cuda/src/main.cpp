@@ -326,8 +326,28 @@ int main(int argc, char** argv) {
     //   this can grow.
     // - KV cache sized at `max_num_kv_pages` × `kv_page_size`.
     const int max_workspace_tokens = std::min<int>(cfg.batching.max_batch_tokens, 8192);
-    auto ws = pie_cuda_driver::model::Qwen3Workspace::allocate(
-        engine.hf_config(), max_workspace_tokens);
+    // Per-arch worst-case workspace dims. Gemma-4 has both
+    // `use_double_wide_mlp` (intermediate doubles on shared layers)
+    // and dual head_dim (sliding=256 vs full=512), so ws.q/k/v need
+    // the full-attention sizing. Other archs use the single config
+    // values.
+    int max_mlp_intermediate = engine.hf_config().intermediate_size;
+    int max_Hq = engine.hf_config().num_attention_heads * engine.hf_config().head_dim;
+    int max_Hk = engine.hf_config().num_key_value_heads * engine.hf_config().head_dim;
+    if (is_gemma4_arch) {
+        for (int v : weights_gemma4.per_layer_intermediate) {
+            if (v > max_mlp_intermediate) max_mlp_intermediate = v;
+        }
+        for (int d : weights_gemma4.per_layer_head_dim) {
+            const int Hq = engine.hf_config().num_attention_heads * d;
+            const int Hk = engine.hf_config().num_key_value_heads * d;
+            if (Hq > max_Hq) max_Hq = Hq;
+            if (Hk > max_Hk) max_Hk = Hk;
+        }
+    }
+    auto ws = pie_cuda_driver::model::Qwen3Workspace::allocate_full(
+        engine.hf_config(), max_workspace_tokens,
+        max_mlp_intermediate, max_Hq, max_Hk);
 
     auto kv_cache =
         is_gemma4_arch
