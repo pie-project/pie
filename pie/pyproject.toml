@@ -66,6 +66,11 @@ cu128 = [
     "flashinfer-jit-cache==0.6.8.post1",
 ]
 
+cu129 = [
+    "torch>=2.11.0",
+    "torchao>=0.14.1",
+]
+
 # --- Metal (macOS) ---
 metal = [
     "torch>=2.7.1",
@@ -92,6 +97,11 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
 name = "flashinfer-cu128"
 url = "https://flashinfer.ai/whl/cu128"
 explicit = true
@@ -105,9 +115,11 @@ pie-bakery = { path = "../sdk/tools/bakery", editable = true }
 torch = [
     { index = "pytorch-cu126", extra = "cu126" },
     { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu129", extra = "cu129" },
 ]
 torchao = [
     { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu129", extra = "cu129" },
 ]
 
 flashinfer-jit-cache = [
@@ -128,6 +140,7 @@ conflicts = [
     [
         { extra = "cu126" },
         { extra = "cu128" },
+        { extra = "cu129" },
         { extra = "metal" },
     ],
 ]
