@@ -386,5 +386,7 @@ class VllmEngine:
             # causal attention and silently drops user masks. Inferlets
             # that need non-causal patterns must run on `native`.
             supports_user_attention_mask=False,
+            # Adapter operations raise NotImplementedError on this driver.
+            supports_adapters=False,
             snapshot_dir=str(self.snapshot_dir),
         )

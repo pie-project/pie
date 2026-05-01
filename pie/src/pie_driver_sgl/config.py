@@ -21,9 +21,10 @@ class SGLangDriverConfig:
 
     # Attention backend selection (triton / flashinfer / flex_attention /
     # fa3 / fa4 / aiter / wave / torch_native / ...). "triton" is pie's
-    # default — it has the cleanest custom-mask support and works on any
-    # NVIDIA SM 7.5+. See sglang/srt/layers/attention/attention_registry.py
-    # for the full list.
+    # default — it works on any NVIDIA SM 7.5+ and is stable across
+    # sglang versions. See sglang/srt/layers/attention/attention_registry.py
+    # for the full list; flashinfer/fa3 are usually faster on modern
+    # hardware if the host supports them.
     attention_backend: str = "triton"
 
     # Fraction of free GPU memory to reserve for KV cache + activations.
@@ -66,33 +67,11 @@ class SGLangDriverConfig:
     # Optional explicit context length cap. None = read from HF config.
     context_length: int | None = None
 
-    # Disable sglang's radix prefix cache. Pie owns prefix sharing via its
-    # own scheduler; running sglang's on top is wasted work.
-    disable_radix_cache: bool = True
-
     # Universal pie knob (not an sglang ServerArgs field). Sized in GiB; sets
     # the pinned host KV pool that backs D2H/H2D swap. 0 disables swap. The
     # worker forwards this into `RuntimeConfig.swap_budget_bytes`; the loader
     # filters it out when splatting into `ServerArgs`.
     cpu_mem_budget_in_gb: int = 0
-
-    # ---- CMA-ES adapter (zero-order training) ----
-    # When True, allocates per-layer adapter storage and class-swaps
-    # `QKVParallelLinear` on every decoder layer for an adapter-aware
-    # wrapper that adds the noisy DOWN/UP-projection contribution to
-    # Q/K/V at forward time. Required for ZO/CMA-ES training inferlets
-    # (e.g., sdk/demo/zo-training/). Disabled by default — enabling
-    # forces `disable_cuda_graph=True` since the v1 wrapper isn't graph-
-    # capture-friendly (the sub pass-or-not branch needs a record-with /
-    # record-without-adapter pair to be CUDA-graph safe; deferred).
-    enable_adapter: bool = False
-    # Per-engine adapter slot capacity and max LoRA rank. Mirror of the
-    # fields on `pie_driver.config.NativeRuntimeConfig`; placed here
-    # rather than on the base RuntimeConfig so the change is sglang-
-    # scoped (matches the user's "no cross-cutting native changes for
-    # now" guidance).
-    max_num_adapters: int = 32
-    max_adapter_rank: int = 8
 
     # ---- Speculative decoding (NGRAM, driver-supplied drafts) ----
     # When True, the engine maintains an n-gram trie of recently-accepted

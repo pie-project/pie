@@ -508,5 +508,8 @@ class Engine:
             # Native uses pie's BRLE mask path on every layer's flashinfer
             # call — fully respects user-supplied attention masks.
             supports_user_attention_mask=True,
+            # Native owns the CMA-ES adapter math (rand_mv noise injection
+            # at Q/K/V down/up). The vllm/sglang bridges raise.
+            supports_adapters=True,
             snapshot_dir=str(self.snapshot_dir) if self.snapshot_dir else "",
         )
