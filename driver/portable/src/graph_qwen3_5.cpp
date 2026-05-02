@@ -11,71 +11,24 @@
 #include "plan.hpp"
 
 // Qwen 3.5 / 3.6 graph (hybrid: gated-delta-rule "linear attention" +
-// GQA full attention with mrope/output-gate). Linear-attn math follows
-// HF transformers `torch_recurrent_gated_delta_rule` per token, threading
-// state through. Standard RMSNorms apply `(1.0 + weight)` (Gemma-style);
-// only `linear_attn.norm` (the gated SSM norm) uses bare `weight`.
+// GQA full attention with mrope/output-gate). Linear-attn delegates to
+// the fused `ggml_gated_delta_net` op (introduced in llama.cpp #19468);
+// the per-token recurrence we used to unroll by hand is now a single
+// kernel launch per layer with built-in CUDA / Metal implementations.
+// Standard RMSNorms apply `(1.0 + weight)` (Gemma-style); only
+// `linear_attn.norm` (the gated SSM norm) uses bare `weight`.
 //
 // Optional debug-tap: set PIE_QWEN35_DUMP=<name> to capture an
 // intermediate tensor from layer 0 of request 0 — forward.cpp downloads
-// it and prints first 16 floats + l2. Tap names: x_r_input, embed,
-// qkv_proj, conv_out, q_post_l2, k_post_l2, v_post_conv, g_exp, beta,
-// state_final, y_concat, y_normed, gated, lin_out.
+// it and prints first 16 floats + l2. Available taps: x_r_input, embed,
+// qkv_proj, conv_out, q_post_l2, k_post_l2, v_post_conv, g, beta,
+// y_block, new_state, y_normed, gated, lin_out, ffn_pre_norm_l<N>,
+// ffn_normed_l<N>, ffn_out_l<N>, attn_out_l<N>, x_after_l<N>,
+// final_norm, sampled, logits, lm_head_w, tok_embd_w.
 
 namespace pie_portable_driver {
 
 namespace {
-
-// Per-token gated-delta-rule update. Builds one iteration of the
-// recurrence directly with ggml primitives, mirroring llama.cpp's
-// `build_delta_net_autoregressive` (pull/19468). Inputs are single-token
-// 4D tensors; state is updated in-place. Returns (output_token, new_state).
-//
-// State convention here matches OUR state cache layout: ne[0] = key
-// axis (S), ne[1] = value axis (S). (The reference uses the opposite
-// labeling — ne[0]=v, ne[1]=k — but since head_k_dim == head_v_dim for
-// Qwen 3.5 the byte layout is identical; we just align the per-token
-// reshapes to our labeling.)
-//
-//   q_t, k_t : [S, H, 1, B] post-l2norm; q already scaled by 1/sqrt(S)
-//   v_t      : [S, H, 1, B]
-//   g_t      : [1, 1, H, B] already exp'd
-//   beta_t   : [1, 1, H, B] already sigmoid'd
-//   state_in : [S, S, H, B] ne[0]=k axis, ne[1]=v axis
-//   B is the request batch (n_seqs).
-struct DeltaStep { ggml_tensor* y; ggml_tensor* state_out; };
-
-DeltaStep delta_step(ggml_context* ctx,
-                     ggml_tensor* q_t, ggml_tensor* k_t, ggml_tensor* v_t,
-                     ggml_tensor* g_t, ggml_tensor* beta_t,
-                     ggml_tensor* state_in,
-                     int S, int H) {
-    const int B = state_in->ne[3];
-
-    // 1. Decay: state *= g_t (broadcast over [S, S, H, B])
-    auto* state = ggml_mul(ctx, state_in, g_t);
-
-    auto* k_t_unsq = ggml_reshape_4d(ctx, k_t, S, 1, H, B);
-    auto* v_t_unsq = ggml_reshape_4d(ctx, v_t, 1, S, H, B);
-
-    // 2./3. delta = β·(v_t - kv_mem)
-    auto* sk     = ggml_mul(ctx, state, k_t_unsq);
-    auto* kv_mem = ggml_sum_rows(ctx, sk);             // [1, S, H, B]
-    auto* v_diff = ggml_sub(ctx, v_t_unsq, kv_mem);
-    auto* delta  = ggml_mul(ctx, v_diff, beta_t);      // [1, S, H, B]
-
-    // 4. state[k, v] += k_t[k] * delta[v]
-    auto* k_t_outer = ggml_repeat_4d(ctx, k_t_unsq, S, S, H, B);
-    auto* k_outer   = ggml_mul(ctx, k_t_outer, delta);
-    state = ggml_add(ctx, state, k_outer);
-
-    // 5. out[v] = sum_k state[k, v] * q_t[k]
-    auto* q_t_unsq = ggml_reshape_4d(ctx, q_t, S, 1, H, B);
-    auto* sq       = ggml_mul(ctx, state, q_t_unsq);
-    auto* out      = ggml_sum_rows(ctx, sq);
-    // out shape: [1, S, H, B]
-    return {out, state};
-}
 
 // Build the gated-delta-rule "linear attention" block, batched across
 // `n_seqs` requests. Modeled on llama.cpp PR #19468 / HF's
@@ -126,9 +79,7 @@ ggml_tensor* build_qwen3_5_linear_layer(
         ? L.lin_dt_bias
         : ggml_cast(ctx, L.lin_dt_bias, GGML_TYPE_F32);
     auto* alpha_dt = ggml_add(ctx, alpha, dt_bias);
-    // softplus(x) = log(1 + exp(x)) — our ggml b6993 lacks ggml_softplus.
-    auto* sp_alpha = ggml_log(ctx,
-        ggml_scale_bias(ctx, ggml_exp(ctx, alpha_dt), 1.0f, 1.0f));
+    auto* sp_alpha = ggml_softplus(ctx, alpha_dt);
     auto* A_pos = ggml_exp(ctx, L.lin_A_log);                  // [H]
     auto* g = ggml_mul(ctx, sp_alpha, A_pos);                  // [H, n_tokens, n_seqs]
     g = ggml_scale(ctx, g, -1.0f);
@@ -178,68 +129,54 @@ ggml_tensor* build_qwen3_5_linear_layer(
         k = interleave(k);
     }
 
-    // ---- 4. L2-norm + Q scaling.
+    // ---- 4. L2-norm. The fused op applies the 1/sqrt(S) Q-scale itself
+    // (see ggml-cuda/gated_delta_net.cu: `scale = 1/sqrtf(S_v)`); we
+    // would double-scale if we did it here too.
     q = ggml_l2_norm(ctx, q, h.rms_norm_eps);
     k = ggml_l2_norm(ctx, k, h.rms_norm_eps);
-    q = ggml_scale(ctx, q, 1.0f / std::sqrt(static_cast<float>(S)));
-    auto* beta = ggml_sigmoid(ctx, b_inp);                     // [H, n_tokens, n_seqs]
-    auto* g_exp = ggml_exp(ctx, g);                            // [H, n_tokens, n_seqs]
+    auto* beta_2d = ggml_sigmoid(ctx, b_inp);                  // [H, n_tokens, n_seqs]
 
-    // Read state slot. ssm_state_r is already [S, S, H, n_seqs].
-    ggml_tensor* state = ssm_state_r;
+    // ---- 5. Fused gated-delta-rule. ggml_gated_delta_net wants:
+    //   q,k    : [S_v, H_v, T, B] (with H_k <= H_v; op handles GQA broadcast)
+    //   v      : [S_v, H_v, T, B]
+    //   g      : [1,   H_v, T, B] — log-domain (kernel applies `exp` itself)
+    //   beta   : [1,   H_v, T, B] — already sigmoid'd
+    //   state  : [S_v, S_v, H_v, B]
+    // Returns a fused tensor concatenating [S_v*H_v, T*B] output and
+    // [S_v*H_v, S_v*B] new_state along ne[1]. We slice both views out.
+    auto* g_4d    = ggml_reshape_4d(ctx, g,        1, H, n_tokens, n_seqs);
+    auto* beta_4d = ggml_reshape_4d(ctx, beta_2d,  1, H, n_tokens, n_seqs);
 
-    // ---- 5. Per-token recurrence loop (autoregressive across n_tokens,
-    //         batched across n_seqs). Each step processes one token per
-    //         sequence and threads state.
-    std::vector<ggml_tensor*> outs;
-    outs.reserve(n_tokens);
-    for (std::int32_t t = 0; t < n_tokens; ++t) {
-        // q_t/k_t/v_t: [S, H, 1, n_seqs] — slice on token axis.
-        auto* q_t = ggml_view_4d(ctx, q, S, H, 1, n_seqs,
-            q->nb[1], q->nb[2], q->nb[3],
-            static_cast<std::size_t>(t) * q->nb[2]);
-        auto* k_t = ggml_view_4d(ctx, k, S, H, 1, n_seqs,
-            k->nb[1], k->nb[2], k->nb[3],
-            static_cast<std::size_t>(t) * k->nb[2]);
-        auto* v_t = ggml_view_4d(ctx, v, S, H, 1, n_seqs,
-            v->nb[1], v->nb[2], v->nb[3],
-            static_cast<std::size_t>(t) * v->nb[2]);
-        // g_t/beta_t: [1, 1, H, n_seqs] — broadcast over (S, S) state plane.
-        auto* g_t_view = ggml_view_3d(ctx, g_exp, H, 1, n_seqs,
-            g_exp->nb[1], g_exp->nb[2],
-            static_cast<std::size_t>(t) * g_exp->nb[1]);
-        auto* g_t = ggml_reshape_4d(ctx, ggml_cont(ctx, g_t_view),
-                                     1, 1, H, n_seqs);
-        auto* beta_t_view = ggml_view_3d(ctx, beta, H, 1, n_seqs,
-            beta->nb[1], beta->nb[2],
-            static_cast<std::size_t>(t) * beta->nb[1]);
-        auto* beta_t = ggml_reshape_4d(ctx, ggml_cont(ctx, beta_t_view),
-                                       1, 1, H, n_seqs);
+    auto* fused = ggml_gated_delta_net(ctx, q, k, v, g_4d, beta_4d, ssm_state_r);
+    // Output view: [S, H, n_tokens, n_seqs] at offset 0.
+    auto* y_block = ggml_view_4d(
+        ctx, fused,
+        S, H, n_tokens, n_seqs,
+        ggml_row_size(fused->type, S),
+        ggml_row_size(fused->type, S * H),
+        ggml_row_size(fused->type, S * H * n_tokens), 0);
+    // New-state view: [S, S, H, n_seqs] starting after the output block.
+    const std::size_t new_state_offset =
+        ggml_row_size(fused->type, S * H * n_tokens * n_seqs);
+    auto* new_state = ggml_view_4d(
+        ctx, fused,
+        S, S, H, n_seqs,
+        ggml_row_size(fused->type, S),
+        ggml_row_size(fused->type, S * S),
+        ggml_row_size(fused->type, S * S * H),
+        new_state_offset);
 
-        auto step = delta_step(ctx, q_t, k_t, v_t, g_t, beta_t, state, S, H);
-        outs.push_back(step.y);
-        state = step.state_out;
-    }
-
-    // Persist updated state slots.
+    // Persist updated state slots: cpy new_state → ssm_state_r.
     const std::int64_t state_n_elem =
         static_cast<std::int64_t>(S) * S * H * n_seqs;
     auto* state_flat_dst = ggml_view_1d(ctx, ssm_state_r, state_n_elem, 0);
-    auto* state_flat_new = ggml_view_1d(ctx, state,       state_n_elem, 0);
+    auto* state_flat_new = ggml_view_1d(
+        ctx, ggml_cont(ctx, new_state), state_n_elem, 0);
     ggml_build_forward_expand(gf, ggml_cpy(ctx, state_flat_new, state_flat_dst));
 
-    // ---- 6. Concat per-token outputs along the token axis.
-    //   Each `outs[t]` is [1, S, H, n_seqs]. Reshape to [S, 1, H, n_seqs]
-    //   (no-op since ne[0]=1), then concat along ne[1].
-    for (auto*& y : outs) {
-        y = ggml_reshape_4d(ctx, ggml_cont(ctx, y), S, 1, H, n_seqs);
-    }
-    ggml_tensor* y_concat = outs[0];
-    for (std::int32_t t = 1; t < n_tokens; ++t) {
-        y_concat = ggml_concat(ctx, y_concat, outs[t], /*dim=*/1);
-    }
-    // y_concat: [S, n_tokens, H, n_seqs]. Permute to [S, H, n_tokens, n_seqs].
-    y_concat = ggml_cont(ctx, ggml_permute(ctx, y_concat, 0, 2, 1, 3));
+    // ---- 6. Reshape output for the gated-norm path.
+    //   y_block: [S, H, n_tokens, n_seqs]. Flatten per-head columns.
+    auto* y_concat = ggml_cont(ctx, y_block);
     auto* y_2d_for_norm = ggml_reshape_2d(ctx, y_concat, S, H * n_tokens * n_seqs);
 
     // ---- 7. z-gated norm: rmsnorm(y) * silu(z) * lin_norm.
@@ -261,10 +198,10 @@ ggml_tensor* build_qwen3_5_linear_layer(
         else if (std::strcmp(dbg_tap_name, "q_post_l2")       == 0) sel = q;
         else if (std::strcmp(dbg_tap_name, "k_post_l2")       == 0) sel = k;
         else if (std::strcmp(dbg_tap_name, "v_post_conv")     == 0) sel = v;
-        else if (std::strcmp(dbg_tap_name, "g_exp")           == 0) sel = g_exp;
-        else if (std::strcmp(dbg_tap_name, "beta")            == 0) sel = beta;
-        else if (std::strcmp(dbg_tap_name, "state_final")     == 0) sel = state;
-        else if (std::strcmp(dbg_tap_name, "y_concat")        == 0) sel = y_concat;
+        else if (std::strcmp(dbg_tap_name, "g")               == 0) sel = g;
+        else if (std::strcmp(dbg_tap_name, "beta")            == 0) sel = beta_2d;
+        else if (std::strcmp(dbg_tap_name, "y_block")         == 0) sel = y_block;
+        else if (std::strcmp(dbg_tap_name, "new_state")       == 0) sel = new_state;
         else if (std::strcmp(dbg_tap_name, "y_normed")        == 0) sel = y_normed;
         else if (std::strcmp(dbg_tap_name, "gated")           == 0) sel = gated;
         else if (std::strcmp(dbg_tap_name, "lin_out")         == 0) sel = lin_out;

@@ -27,7 +27,7 @@ include(cmake/CPM.cmake)
 cpmaddpackage(
   NAME llama
   GITHUB_REPOSITORY ggerganov/llama.cpp
-  GIT_TAG b6993
+  GIT_TAG b8994
   EXCLUDE_FROM_ALL YES
   OPTIONS
     "LLAMA_BUILD_TESTS OFF"

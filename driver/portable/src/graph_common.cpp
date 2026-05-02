@@ -45,6 +45,15 @@ GraphInputs declare_graph_inputs(ggml_context* ctx,
             static_cast<std::int64_t>(MASK_PAD), 1, n_req);
         ggml_set_name(in.packed_mask, "kq_mask.packed");
         ggml_set_input(in.packed_mask);
+
+        // Optional no-SWA companion (Gemma 4 full-attention layers).
+        if (!plan.packed_mask_full_f16.empty()) {
+            in.packed_mask_full = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_F16, plan.max_n_kv,
+                static_cast<std::int64_t>(MASK_PAD), 1, n_req);
+            ggml_set_name(in.packed_mask_full, "kq_mask.packed.full");
+            ggml_set_input(in.packed_mask_full);
+        }
     } else {
         in.masks.reserve(n_req);
         in.gather_idxs.reserve(n_req);
@@ -319,6 +328,12 @@ void upload_graph_inputs(const GraphResult& g,
         ggml_backend_tensor_set(g.in.packed_mask,
                                 plan.packed_mask_f16.data(), 0,
                                 plan.packed_mask_f16.size() * sizeof(std::uint16_t));
+        if (g.in.packed_mask_full) {
+            ggml_backend_tensor_set(
+                g.in.packed_mask_full,
+                plan.packed_mask_full_f16.data(), 0,
+                plan.packed_mask_full_f16.size() * sizeof(std::uint16_t));
+        }
     } else {
         for (std::size_t r = 0; r < plan.reqs.size(); ++r) {
             const auto& mask = plan.reqs[r].mask_f16;

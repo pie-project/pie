@@ -100,7 +100,11 @@ struct GraphInputs {
     std::vector<ggml_tensor*> gather_idxs; // I32 [n_kv_r] gather idxs per req
     // Fast path (pure-decode, M11): packed gather + mask, single attn call.
     ggml_tensor*              packed_gather = nullptr; // I32 [n_req * max_n_kv]
-    ggml_tensor*              packed_mask   = nullptr; // F16 [max_n_kv, 64, 1, n_req]
+    ggml_tensor*              packed_mask   = nullptr; // F16 [max_n_kv, 64, 1, n_req] — SWA-clipped
+    // Companion "no-SWA" mask for archs with mixed sliding+full
+    // attention patterns (Gemma 4). Null unless the engine populated
+    // packed_mask_full_f16 in the BatchPlan.
+    ggml_tensor*              packed_mask_full = nullptr;
 };
 
 // Per-arch graph builders return one of these. Exactly one of the three

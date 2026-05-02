@@ -27,9 +27,7 @@ inline std::int32_t gemma4_kv_source(const std::string& pattern,
 
 }  // namespace
 
-// Gemma 4 / 3n-style graph. Single-request, no M11 fast path.
-//
-// Differs from build_qwen3_graph in:
+// Gemma 4 / 3n-style graph. Differs from build_qwen3_graph in:
 //   - per-layer head_dim (sliding=head_dim, full=gemma4_head_dim_global),
 //   - per-layer-type rope_theta + proportional rotary factor,
 //   - V-norm (pure rms_norm, no learnable weight) before KV write,
@@ -40,20 +38,12 @@ inline std::int32_t gemma4_kv_source(const std::string& pattern,
 //   - KV-cache sharing for the last gemma4_first_shared..n_layers-1 layers
 //     (those layers skip K/V matmul + writes and read upstream's KV slot).
 //
-// FUTURE WORK (correctness-complete; speed not optimal):
-// 1. Multi-request batching: this builder runs the per-request slow path
-//    (one flash_attn / SDPA call per request per layer), bypassing the
-//    M11 packed-decode fast path that build_qwen3_graph uses. For decode-
-//    heavy serving workloads with many concurrent contexts this leaves
-//    significant throughput on the table. Adding M11 support requires a
-//    packed-mask + packed-gather path that handles per-layer head_dim
-//    correctly (sliding=256, full=512 → cannot share a single packed
-//    tensor across layer types) and the manual-SDPA branch for full
-//    layers (head_dim=512 isn't supported by ggml's flash_attn).
-// 2. GPU-greedy / uniform-top-K fast paths: the graph emits only `logits`
-//    (no tokens_out / top_k_idx). plan_test_simple_, plan_(), and
-//    generate_multi explicitly disable both fast paths for Gemma 4. Adding
-//    them requires emitting argmax / top-K outputs after the final softcap.
+// Attention layout: when `plan.pure_decode`, the whole batch attention
+// is one packed call per layer (M11 fast path). Sliding layers go
+// through `ggml_flash_attn_ext` with `in.packed_mask` (SWA-clipped);
+// full layers (head_dim=512, beyond flash_attn_ext's max) fall through
+// to a manual SDPA + `in.packed_mask_full` (no-SWA companion). The
+// existing per-request slow path is kept verbatim for prefill.
 GraphResult build_gemma4_graph(ggml_context* ctx,
                                const Model& model,
                                KvCachePaged& kv,
@@ -201,57 +191,128 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
             static_cast<std::size_t>(head_dim_il) * n_q_heads *
             ggml_type_size(Q->type);
 
-        std::vector<ggml_tensor*> attn_out_per_req;
-        attn_out_per_req.reserve(n_req);
-        for (std::int32_t r = 0; r < n_req; ++r) {
-            const auto& R = plan.reqs[r];
+        ggml_tensor* attn_2d = nullptr;
+
+        if (plan.pure_decode) {
+            // M11 packed path: single attention call per layer. Uses the
+            // sliding-clipped mask on 's' layers and the no-SWA mask on
+            // 'g' layers (built by build_pure_decode_packing with
+            // also_build_no_swa_mask=true).
+            auto* mask = is_full ? in.packed_mask_full : in.packed_mask;
+            // n_total == n_req in pure_decode (one token per request).
+            auto* Q_4d = ggml_reshape_4d(ctx, Q,
+                                          head_dim_il, 1, n_q_heads, n_req);
+            auto* K_gather = ggml_get_rows(ctx, k_cached, in.packed_gather);
+            auto* V_gather = ggml_get_rows(ctx, v_cached, in.packed_gather);
+            auto* K_4d = ggml_reshape_4d(ctx, K_gather,
+                                          head_dim_il, n_kv_heads,
+                                          plan.max_n_kv, n_req);
+            auto* V_4d = ggml_reshape_4d(ctx, V_gather,
+                                          head_dim_il, n_kv_heads,
+                                          plan.max_n_kv, n_req);
 
             ggml_tensor* attn = nullptr;
             if (head_dim_il <= kFlashAttnMaxHeadDim) {
-                attn = build_request_flash_attn(
-                    ctx, Q, k_cached, v_cached,
-                    in.gather_idxs[r], in.masks[r],
-                    R.qo_start, R.n_tokens, R.n_kv,
-                    head_dim_il, n_kv_heads, n_q_heads,
-                    layer_kq_scale, spec.attn_softcap,
-                    /*sinks=*/nullptr);
+                // Sliding layers (head_dim=256): single flash_attn_ext.
+                auto* K_perm = ggml_permute(ctx, K_4d, 0, 2, 1, 3);
+                auto* V_perm = ggml_permute(ctx, V_4d, 0, 2, 1, 3);
+                attn = ggml_flash_attn_ext(ctx, Q_4d, K_perm, V_perm,
+                                           mask, layer_kq_scale,
+                                           /*max_bias=*/0.0f,
+                                           /*logit_softcap=*/spec.attn_softcap);
+                ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
             } else {
-                // Manual SDPA fallback.
-                auto* Q_r = ggml_view_3d(ctx, Q,
-                                         head_dim_il, n_q_heads, R.n_tokens,
-                                         Q->nb[1], Q->nb[2],
-                                         static_cast<std::size_t>(R.qo_start) * Q_stride_ne2);
-                auto* K_gather = ggml_get_rows(ctx, k_cached, in.gather_idxs[r]);
-                auto* V_gather = ggml_get_rows(ctx, v_cached, in.gather_idxs[r]);
-                auto* K_r = ggml_reshape_3d(ctx, K_gather,
-                                            head_dim_il, n_kv_heads, R.n_kv);
-                auto* V_r = ggml_reshape_3d(ctx, V_gather,
-                                            head_dim_il, n_kv_heads, R.n_kv);
-
-                auto* Q_perm = ggml_cont(ctx, ggml_permute(ctx, Q_r, 0, 2, 1, 3));
-                auto* K_perm = ggml_cont(ctx, ggml_permute(ctx, K_r, 0, 2, 1, 3));
-                auto* KQ = ggml_mul_mat(ctx, K_perm, Q_perm);
-
-                auto* mask_full = in.masks[r];
-                auto* mask_view = ggml_view_4d(
-                    ctx, mask_full,
-                    mask_full->ne[0], R.n_tokens, mask_full->ne[2], mask_full->ne[3],
-                    mask_full->nb[1], mask_full->nb[2], mask_full->nb[3],
-                    /*offset=*/0);
-                auto* KQ_soft = ggml_soft_max_ext(ctx, KQ, mask_view,
-                                                  layer_kq_scale, /*max_bias=*/0.0f);
-
-                auto* V_T = ggml_cont(ctx,
-                    ggml_permute(ctx, V_r, /*ax0=*/1, /*ax1=*/2,
-                                 /*ax2=*/0, /*ax3=*/3));
+                // Full layers (head_dim=512): manual SDPA, batched over
+                // n_req via ne[3]. GQA expands K/V from n_kv_heads to
+                // n_q_heads via repeat_4d so mul_mat lines up per head.
+                const std::int32_t gqa_factor = n_q_heads / n_kv_heads;
+                ggml_tensor* K_h = K_4d;
+                ggml_tensor* V_h = V_4d;
+                if (gqa_factor > 1) {
+                    K_h = ggml_repeat_4d(
+                        ctx, K_4d, head_dim_il, n_q_heads,
+                        plan.max_n_kv, n_req);
+                    V_h = ggml_repeat_4d(
+                        ctx, V_4d, head_dim_il, n_q_heads,
+                        plan.max_n_kv, n_req);
+                }
+                // K_perm: [head_dim, max_n_kv, n_q_heads, n_req]
+                // Q_4d  : [head_dim, 1,        n_q_heads, n_req]
+                // KQ = mul_mat(K_perm, Q_4d) → [max_n_kv, 1, n_q_heads, n_req]
+                auto* K_perm = ggml_cont(ctx, ggml_permute(ctx, K_h, 0, 2, 1, 3));
+                auto* KQ = ggml_mul_mat(ctx, K_perm, Q_4d);
+                // mask shape [max_n_kv, MASK_PAD, 1, n_req]; broadcast
+                // ne[2]=1 onto KQ's ne[2]=n_q_heads.
+                auto* KQ_soft = ggml_soft_max_ext(
+                    ctx, KQ, mask,
+                    layer_kq_scale, /*max_bias=*/0.0f);
+                // V_T: transpose kv-axis and head-axis to feed mul_mat.
+                // Want [max_n_kv, head_dim, n_q_heads, n_req] for V^T @ KQ_soft.
+                auto* V_T = ggml_cont(
+                    ctx, ggml_permute(ctx, V_h, 1, 2, 0, 3));
+                // mul_mat: [head_dim, 1, n_q_heads, n_req]
                 attn = ggml_mul_mat(ctx, V_T, KQ_soft);
-                attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
+                ggml_set_name(attn, "gemma4_full_attn_out");
             }
-            attn_out_per_req.push_back(attn);
-        }
+            // attn shape: [head_dim, n_q_heads, 1, n_req]. Repack to
+            // [head_dim*n_q_heads, n_total] so the existing o_proj path
+            // applies unchanged.
+            attn_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, attn),
+                                       head_dim_il * n_q_heads, n_total);
+        } else {
+            // Slow path (prefill, custom masks).
+            std::vector<ggml_tensor*> attn_out_per_req;
+            attn_out_per_req.reserve(n_req);
+            for (std::int32_t r = 0; r < n_req; ++r) {
+                const auto& R = plan.reqs[r];
 
-        auto* attn_2d = concat_per_request_attn(
-            ctx, attn_out_per_req, head_dim_il, n_q_heads, n_total);
+                ggml_tensor* attn = nullptr;
+                if (head_dim_il <= kFlashAttnMaxHeadDim) {
+                    attn = build_request_flash_attn(
+                        ctx, Q, k_cached, v_cached,
+                        in.gather_idxs[r], in.masks[r],
+                        R.qo_start, R.n_tokens, R.n_kv,
+                        head_dim_il, n_kv_heads, n_q_heads,
+                        layer_kq_scale, spec.attn_softcap,
+                        /*sinks=*/nullptr);
+                } else {
+                    auto* Q_r = ggml_view_3d(ctx, Q,
+                                             head_dim_il, n_q_heads, R.n_tokens,
+                                             Q->nb[1], Q->nb[2],
+                                             static_cast<std::size_t>(R.qo_start) * Q_stride_ne2);
+                    auto* K_gather = ggml_get_rows(ctx, k_cached, in.gather_idxs[r]);
+                    auto* V_gather = ggml_get_rows(ctx, v_cached, in.gather_idxs[r]);
+                    auto* K_r = ggml_reshape_3d(ctx, K_gather,
+                                                head_dim_il, n_kv_heads, R.n_kv);
+                    auto* V_r = ggml_reshape_3d(ctx, V_gather,
+                                                head_dim_il, n_kv_heads, R.n_kv);
+
+                    auto* Q_perm = ggml_cont(ctx, ggml_permute(ctx, Q_r, 0, 2, 1, 3));
+                    auto* K_perm = ggml_cont(ctx, ggml_permute(ctx, K_r, 0, 2, 1, 3));
+                    auto* KQ = ggml_mul_mat(ctx, K_perm, Q_perm);
+
+                    auto* mask_full_r = in.masks[r];
+                    auto* mask_view = ggml_view_4d(
+                        ctx, mask_full_r,
+                        mask_full_r->ne[0], R.n_tokens,
+                        mask_full_r->ne[2], mask_full_r->ne[3],
+                        mask_full_r->nb[1], mask_full_r->nb[2], mask_full_r->nb[3],
+                        /*offset=*/0);
+                    auto* KQ_soft = ggml_soft_max_ext(ctx, KQ, mask_view,
+                                                      layer_kq_scale, /*max_bias=*/0.0f);
+
+                    auto* V_T = ggml_cont(ctx,
+                        ggml_permute(ctx, V_r, /*ax0=*/1, /*ax1=*/2,
+                                     /*ax2=*/0, /*ax3=*/3));
+                    attn = ggml_mul_mat(ctx, V_T, KQ_soft);
+                    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
+                }
+                attn_out_per_req.push_back(attn);
+            }
+
+            attn_2d = concat_per_request_attn(
+                ctx, attn_out_per_req, head_dim_il, n_q_heads, n_total);
+        }
 
         auto* attn_out = ggml_mul_mat(ctx, L.o_proj, attn_2d);
         // Post-attn norm.
@@ -324,13 +385,41 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
         logits = ggml_scale(ctx, logits, spec.final_softcap);
     }
 
+    // GPU-side sampler fast paths (mirror graph_qwen3 / graph_qwen3_5).
+    ggml_tensor* tokens_out  = nullptr;
+    ggml_tensor* top_k_idx   = nullptr;
+    ggml_tensor* top_k_probs = nullptr;
+    if (plan.all_greedy) {
+        tokens_out = ggml_argmax(ctx, logits);
+        ggml_set_name(tokens_out, "tokens_out");
+        ggml_set_output(tokens_out);
+        ggml_build_forward_expand(gf, tokens_out);
+    } else if (plan.uniform_top_sample) {
+        const float inv_t = 1.0f / plan.reqs[0].sampler.temperature;
+        ggml_tensor* probs = ggml_soft_max_ext(ctx, logits, /*mask=*/nullptr,
+                                                /*scale=*/inv_t, /*max_bias=*/0.0f);
+        top_k_idx = ggml_top_k(ctx, probs, plan.uniform_top_k);
+        ggml_tensor* probs_3d = ggml_reshape_3d(ctx, probs, 1, h.vocab_size, n_req);
+        ggml_tensor* gathered = ggml_get_rows(ctx, probs_3d, top_k_idx);
+        top_k_probs = ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_req);
+        ggml_set_name(top_k_idx,   "top_k_idx");
+        ggml_set_name(top_k_probs, "top_k_probs");
+        ggml_set_output(top_k_idx);
+        ggml_set_output(top_k_probs);
+        ggml_build_forward_expand(gf, top_k_idx);
+        ggml_build_forward_expand(gf, top_k_probs);
+    } else {
+        ggml_set_name(logits, "logits");
+        ggml_set_output(logits);
+        ggml_build_forward_expand(gf, logits);
+    }
+
     GraphResult res{};
     res.gf = gf;
-    res.logits = logits;
+    if (plan.all_greedy)              res.tokens_out = tokens_out;
+    else if (plan.uniform_top_sample) { res.top_k_idx = top_k_idx; res.top_k_probs = top_k_probs; }
+    else                               res.logits = logits;
     res.in = in;
-    ggml_set_name(logits, "logits");
-    ggml_set_output(logits);
-    ggml_build_forward_expand(gf, logits);
     return res;
 }
 

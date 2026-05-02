@@ -108,7 +108,12 @@ public:
         bool                        pure_decode = false;
         std::int32_t                max_n_kv = 0;
         std::vector<std::int32_t>   packed_gather_idxs;  // [n_req * max_n_kv]
-        std::vector<std::uint16_t>  packed_mask_f16;     // [max_n_kv, 64, 1, n_req]
+        std::vector<std::uint16_t>  packed_mask_f16;     // [max_n_kv, 64, 1, n_req] — SWA-clipped
+        // Optional companion "no-SWA" mask for archs with mixed
+        // sliding+full attention patterns (Gemma 4): full-attention
+        // layers attend the entire context, so they need a different
+        // packed mask. Empty unless the engine builds it.
+        std::vector<std::uint16_t>  packed_mask_full_f16;
 
         // M9 LoRA: active adapter for this whole batch (single-adapter-
         // per-batch v1 restriction). nullptr = no adapter.

@@ -341,13 +341,22 @@ void plan_single_request(const PlanArrays& a,
 
 void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
                                std::int32_t n_request,
-                               std::int32_t sliding_window) {
+                               std::int32_t sliding_window,
+                               bool also_build_no_swa_mask) {
     const std::int32_t M = plan.max_n_kv;
     const std::int32_t N = n_request;
     plan.packed_gather_idxs.assign(static_cast<std::size_t>(M) * N, 0);
     plan.packed_mask_f16.assign(
         static_cast<std::size_t>(M) * MASK_PAD * N,
         ggml_fp32_to_fp16(-INFINITY));
+    const bool build_full = also_build_no_swa_mask && sliding_window > 0;
+    if (build_full) {
+        plan.packed_mask_full_f16.assign(
+            static_cast<std::size_t>(M) * MASK_PAD * N,
+            ggml_fp32_to_fp16(-INFINITY));
+    } else {
+        plan.packed_mask_full_f16.clear();
+    }
     const auto zero = ggml_fp32_to_fp16(0.0f);
     const std::int32_t W = sliding_window;
     for (std::int32_t r = 0; r < N; ++r) {
@@ -356,13 +365,20 @@ void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
             plan.packed_gather_idxs[
                 static_cast<std::size_t>(r) * M + k] = rp.gather_idxs[k];
         }
-        // For stream r, row b=0 (the single query at pos = n_kv_r-1)
-        // attends [max(0, n_kv_r - W), n_kv_r) when SWA; else full range.
+        // SWA-clipped row.
         std::uint16_t* row = plan.packed_mask_f16.data()
             + static_cast<std::size_t>(r) * M * MASK_PAD;
         const std::int32_t lo = (W > 0) ? std::max(0, rp.n_kv - W) : 0;
         for (std::int32_t k = lo; k < rp.n_kv; ++k) {
             row[k] = zero;
+        }
+        // Full (no SWA) row — only when caller asked for it.
+        if (build_full) {
+            std::uint16_t* row_full = plan.packed_mask_full_f16.data()
+                + static_cast<std::size_t>(r) * M * MASK_PAD;
+            for (std::int32_t k = 0; k < rp.n_kv; ++k) {
+                row_full[k] = zero;
+            }
         }
     }
 }

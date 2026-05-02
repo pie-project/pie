@@ -135,8 +135,13 @@ void plan_single_request(const PlanArrays& a,
 // plan.max_n_kv to the max n_kv across the batch's ReqPlans before
 // calling. `sliding_window > 0` clips per-stream attention to
 // [n_kv - W, n_kv); pass 0 for plain causal.
+// `also_build_no_swa_mask`: when true AND sliding_window > 0, ALSO
+// builds an additional mask in `packed_mask_full_f16` with NO sliding
+// clip. Used by archs with mixed sliding+full layer patterns (Gemma 4)
+// so the full-attention layers can attend the entire context.
 void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
                                std::int32_t n_request,
-                               std::int32_t sliding_window);
+                               std::int32_t sliding_window,
+                               bool also_build_no_swa_mask = false);
 
 }  // namespace pie_portable_driver

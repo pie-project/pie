@@ -405,16 +405,12 @@ void ForwardEngine::log_timings(const char* label) const {
 ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req) {
     const auto& hpar = model_.hparams();
     const ArchSpec spec = arch_spec_for(hpar.arch, hpar);
-    // build_gemma4_graph doesn't yet implement the M11 packed-decode path
-    // (per-layer head_dim + KV-share complicate the single packed mask),
-    // GPU-greedy, or GPU uniform-top-K — emits only `logits`. All three
-    // fast paths gate on this flag below.
-    // Both Gemma 4 and Qwen 3.5 emit only `logits` and run their layer
-    // stacks per-request (Gemma 4: per-layer head_dim + KV-share;
-    // Qwen 3.5: state-bearing linear layers). All M11 / GPU-fast-path
-    // gates fold into this flag.
-    const bool slow_only = hpar.arch == PieArch::Gemma4 ||
-                           hpar.arch == PieArch::Qwen3_5;
+    // Qwen 3.5 still runs per-request (state-bearing linear layers
+    // require per-request slot views). Gemma 4 supports the M11 packed-
+    // decode path: sliding-attn layers use flash_attn_ext with the
+    // SWA-clipped mask, full-attn layers (head_dim=512, beyond
+    // flash_attn_ext) use a batched manual SDPA with the no-SWA mask.
+    const bool slow_only = hpar.arch == PieArch::Qwen3_5;
 
     const PlanArrays arrays = extract_plan_arrays(req);
     validate_plan_top_level(arrays);
@@ -455,7 +451,12 @@ ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req)
         // contribute exp(-INF)=0 to the softmax, so output is unchanged.
         const std::int32_t bucket = kv_.page_size();
         plan.max_n_kv = ((plan.max_n_kv + bucket - 1) / bucket) * bucket;
-        build_pure_decode_packing(plan, arrays.n_request, spec.sliding_window);
+        // Gemma 4 has mixed sliding+full-attention layers, so the
+        // packing builder must emit BOTH a sliding-clipped mask (for
+        // 's' layers) and a full-context mask (for 'g' layers).
+        const bool need_full_mask = hpar.arch == PieArch::Gemma4;
+        build_pure_decode_packing(plan, arrays.n_request, spec.sliding_window,
+                                  need_full_mask);
     }
 
     // GPU-greedy detection: every slot is sampled by argmax (temperature
@@ -607,19 +608,22 @@ ForwardEngine::BatchPlan ForwardEngine::plan_test_simple_(
     rp.state_slot = 0;             // single-context test harness
     plan.sampling_pos_i32.push_back(sampling_pos);
     plan.reqs.push_back(std::move(rp));
-    // Gemma 4 emits only `logits` and runs the slow per-request path.
     // Qwen 3.5 has GPU-greedy but no M11 packed-decode (recurrent state
-    // requires per-request slot views).
-    const bool slow_only = model_.hparams().arch == PieArch::Gemma4;
+    // requires per-request slot views). Gemma 4 supports both via the
+    // packed-decode path with two mask variants (sliding + full).
+    const bool slow_only = model_.hparams().arch == PieArch::Qwen3_5;
     plan.all_greedy = !slow_only;
 
-    // Detect pure-decode (single token) for the M11 fast path. The test
-    // harness has no SWA / custom-mask state; pass sliding_window=0.
+    // Detect pure-decode (single token) for the M11 fast path.
     if (n_tok == 1 && !slow_only) {
         plan.pure_decode = true;
         const std::int32_t bucket = kv_.page_size();
         plan.max_n_kv = ((seq_len + bucket - 1) / bucket) * bucket;
-        build_pure_decode_packing(plan, /*n_request=*/1, /*sliding_window=*/0);
+        const auto& h = model_.hparams();
+        const std::int32_t W = h.sliding_window.value_or(0);
+        const bool need_full_mask = h.arch == PieArch::Gemma4 && W > 0;
+        build_pure_decode_packing(plan, /*n_request=*/1, W,
+                                  need_full_mask);
     }
     return plan;
 }
@@ -969,13 +973,12 @@ std::vector<std::vector<std::uint32_t>> ForwardEngine::generate_multi(
 
         // Activate the M11 packed-decode fast path for this multi-context
         // step (every request has n_tokens=1, no custom attention masks).
-        // Gemma 4 falls back to the slow path entirely. Qwen 3.5 supports
-        // GPU-greedy but stays on slow per-request for attention (recurrent
-        // state requires per-request slot views).
-        const bool gemma4 = model_.hparams().arch == PieArch::Gemma4;
+        // Qwen 3.5 stays on slow per-request for attention (recurrent
+        // state requires per-request slot views); everything else,
+        // including Gemma 4 with mixed sliding+full layers, batches.
         const bool qwen35 = model_.hparams().arch == PieArch::Qwen3_5;
-        plan.pure_decode = !(gemma4 || qwen35);
-        plan.all_greedy  = !gemma4;
+        plan.pure_decode = !qwen35;
+        plan.all_greedy  = true;
         // Stamp the per-request state slot so Qwen 3.5's StateCache
         // assigns each context a stable slot for the run. Other archs
         // ignore this.
@@ -986,12 +989,18 @@ std::vector<std::vector<std::uint32_t>> ForwardEngine::generate_multi(
         for (const auto& rp : plan.reqs) plan.max_n_kv = std::max(plan.max_n_kv, rp.n_kv);
         if (plan.pure_decode) {
             // Bucket to a kv-page boundary so the cache hits across
-            // consecutive decode steps. Test harness — no SWA.
+            // consecutive decode steps.
             const std::int32_t bucket = kv_.page_size();
             plan.max_n_kv = ((plan.max_n_kv + bucket - 1) / bucket) * bucket;
+            // Gemma 4 needs both sliding-clipped and full-context masks;
+            // pick the SWA value from hparams (other archs pass 0).
+            const auto& h = model_.hparams();
+            const bool gemma4 = h.arch == PieArch::Gemma4;
+            const std::int32_t W = gemma4 ? h.sliding_window.value_or(0) : 0;
             build_pure_decode_packing(plan,
                                       static_cast<std::int32_t>(n_req),
-                                      /*sliding_window=*/0);
+                                      W,
+                                      /*also_build_no_swa_mask=*/gemma4);
         }
 
         auto sampled = compute_(plan);
