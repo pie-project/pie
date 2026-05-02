@@ -115,6 +115,7 @@ Saved snapshots persist across inferlet runs as long as the engine is up.
 | `ctx.seal() -> &mut Context` | Close the current assistant turn. |
 | `ctx.append(tokens: &[u32]) -> &mut Context` | Append raw tokens. |
 | `ctx.flush() -> impl Future<Output = Result<()>>` | Run prefill on buffered tokens; commit pages. |
+| `ctx.truncate(n: u32) -> Result<()>` | Drop the trailing `n` working-page tokens (rollback primitive). Pages already committed cannot be truncated through this API — go through `ctx.inner()` if you need to. |
 
 ### Inspection
 
@@ -168,8 +169,16 @@ let g = ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
 | `.speculator(s)` | Plug in a custom speculator. |
 | `.system_speculation()` | Use the runtime's draft model. |
 | `.adapter(&a)` | Apply a LoRA adapter. |
+| `.zo_seed(seed: i64)` | Set an Evolution Strategies seed for every step. |
 | `.horizon(n)` | Hint expected output length for bid planning. |
 | `.probe_each_step(idx, p)` | Attach a probe to every step (returns a handle). |
+
+### Inspection
+
+| Method | Description |
+|---|---|
+| `g.is_done() -> bool` | `true` after generation has terminated. |
+| `g.tokens_generated() -> usize` | Tokens accepted so far. |
 
 ### Per-step iteration
 
@@ -214,7 +223,15 @@ let token = out.token(h);
 | `.sample(&indices, sampler)` | Attach a sampler at output positions. Returns `SampleHandle`. |
 | `.probe(index, probe)` | Attach a probe at one position. Returns `ProbeHandle<P>`. |
 | `.adapter(&adapter)` | Use a LoRA adapter for this pass. |
+| `.zo_seed(seed: i64)` | Set an Evolution Strategies seed for this pass. |
 | `.execute().await -> Result<Output>` | Run the pass. |
+
+### Inspection
+
+| Method | Description |
+|---|---|
+| `fwd.start_position() -> u32` | Position the first auto-input token will occupy. Equals the owning context's `seq_len()` at `pass()` time. |
+| `fwd.page_size() -> u32` | Page size of the owning context — for sizing per-position structures (masks etc.) without re-querying. |
 
 ### Output access
 
@@ -226,8 +243,9 @@ let token = out.token(h);
 | `out.logits(h)` | `Option<&[u8]>` (cast with `bytemuck`) | `Logits` probe. |
 | `out.logprobs(h)` | `Option<&[f32]>` | `Logprob(t)` or `Logprobs(ts)` probe. |
 | `out.entropy(h)` | `Option<f32>` | `Entropy` probe. |
-| `out.tokens` | `&[u32]` | All tokens the forward pass accepted. |
-| `out.raw().slots` | underlying slot list | Advanced cases. |
+| `out.tokens` | `&[u32]` | Generator-accepted tokens this step (post stop / max-tokens truncation). Empty for raw `Forward::execute`. |
+| `out.auto_sampler() -> Option<SampleHandle>` | Handle for the Generator's auto-attached sampler. `None` for raw Forward and after `clear_sampler()`. |
+| `out.raw() -> &RawOutput` | Underlying slot list + speculative side channel. |
 
 Mismatched access (a sampler slot through a probe handle, or vice versa) returns `None`.
 
@@ -272,19 +290,23 @@ A single forward pass can mix samplers and probes at different slots.
 
 ### Schema
 
-```rust
-use inferlet::Schema;
+`Schema` is a trait. Five built-in implementors are re-exported at the crate root:
 
-ctx.generate(sampler).constrain_with(Schema::JsonSchema(s))?;
+```rust
+use inferlet::{AnyJson, JsonSchema, Regex, Ebnf, Schema};
+
+ctx.generate(sampler).constrain_with(JsonSchema(s))?;
 ```
 
-| Variant | Description |
+| Type | Description |
 |---|---|
-| `Schema::Json` | Any valid JSON. |
-| `Schema::JsonSchema(s: &str)` | JSON matching the JSON Schema. |
-| `Schema::Regex(p: &str)` | Strings matching the regex. |
-| `Schema::Ebnf(g: &str)` | Custom EBNF grammar (Lark format). |
-| `Schema::Grammar(&grammar)` | Pre-compiled grammar object. |
+| `AnyJson` | Any valid JSON. Unit struct. |
+| `JsonSchema<'a>(pub &'a str)` | JSON matching the JSON Schema string. |
+| `Regex<'a>(pub &'a str)` | Strings matching the regex. |
+| `Ebnf<'a>(pub &'a str)` | Custom EBNF grammar (Lark format). |
+| `&Grammar` | Pre-compiled grammar resource (the `Schema` impl is on `&Grammar`, so pass a borrow). |
+
+User code can implement `Schema` for custom grammar sources by providing `fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint>`.
 
 `constrain_with` returns `Result` because parsing can fail. Multiple constraints AND together.
 
@@ -304,7 +326,7 @@ pub trait Constrain: Send {
 ### GrammarConstraint
 
 ```rust
-use inferlet::context::GrammarConstraint;
+use inferlet::GrammarConstraint;
 
 let gc = GrammarConstraint::from_ebnf(my_grammar, &model)?;
 ```
@@ -345,21 +367,24 @@ Speculation is **off** by default. Opt in by calling `g.system_speculation()` (r
 use inferlet::spec::Speculator;
 
 pub trait Speculator: Send {
-    /// Generate draft tokens and their positions.
-    fn draft(&self) -> (Vec<u32>, Vec<u32>);
+    /// Produce draft tokens and their absolute positions for the next
+    /// forward pass. Empty vec = "no speculation this step."
+    fn draft(&mut self) -> (Vec<u32>, Vec<u32>);
 
-    /// Called with the accepted prefix of draft tokens.
-    fn accept(&mut self, tokens: &[u32]);
+    /// Called with the verifier's accepted token sequence. The first
+    /// accepted token corresponds to the anchor's own next-token
+    /// prediction; the rest (if any) are matched drafts.
+    fn accept(&mut self, accepted: &[u32]);
 
-    /// Reset to initial state.
-    fn reset(&mut self);
+    /// Roll back the last `n` drafted tokens. Default impl is a no-op.
+    fn rollback(&mut self, n: u32) { let _ = n; }
 
-    /// Roll back the last N accepted tokens.
-    fn rollback(&mut self, num_tokens: usize);
+    /// Reset to initial state. Default impl is a no-op.
+    fn reset(&mut self) {}
 }
 ```
 
-Plug in with `g.speculator(spec)` on the generator builder.
+Plug in with `g.speculator(spec)` on the generator builder. Only `draft` and `accept` are required — `rollback` and `reset` have empty default impls.
 
 ## Adapters and fine-tuning
 
@@ -435,8 +460,9 @@ Helpers:
 |---|---|
 | `tools::equip_prefix(&model, &[schema, ...]) -> Result<Vec<u32>>` | Prefix tokens that equip the model with a tool list. |
 | `tools::answer_prefix(&model, name, result_json) -> Vec<u32>` | Prefix tokens that feed a tool result back. |
-| `tools::parse_call(&model, text) -> Option<(String, String)>` | One-shot extract from a finished string. |
+| `tools::parse_call(&model, text) -> Option<(String, String)>` | One-shot extract of a single completed call from a finished string. |
 | `tools::native_grammar(&model, &[schema, ...]) -> Option<Grammar>` | Compiled grammar over the model's native tool-call format. `None` if the model has no native template. |
+| `tools::native_matcher(&model, &[schema, ...]) -> Option<Matcher>` | Stateful matcher over the model's native tool-call format. Pass via `GrammarConstraint::new(matcher)`. |
 
 Decoders are stateful. Call `reset()` between turns or after a terminal event so the decoder is ready for the next.
 

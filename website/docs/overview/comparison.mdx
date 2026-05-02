@@ -21,10 +21,11 @@ For workloads that *are* a sequence of stateless prompts, you do not need Pie's 
 
 ```toml
 # config.toml: route a model to the vLLM driver
-[model.llama]
+[[model]]
+name = "llama"
 hf_repo = "meta-llama/Llama-3.1-8B-Instruct"
 
-[model.llama.driver]
+[model.driver]
 type = "vllm"
 device = ["cuda:0"]
 ```

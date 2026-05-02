@@ -269,7 +269,7 @@ dec = tools.Decoder(model)
 async for step in g:
     out = await step.execute()
     match dec.feed(out.tokens):
-        case tools.Event.Call(name=n, arguments=a):
+        case tools.Event.Call(name=n, args=a):
             result = run_tool(n, a)
             answer = tools.answer_prefix(model, n, result)
             ctx.append(answer)
@@ -292,7 +292,7 @@ for await (const step of g) {
     const out = await step.execute();
     const ev = dec.feed(out.tokens);
     if (ev.type === 'call') {
-        const result = runTool(ev.name, ev.arguments);
+        const result = runTool(ev.name, ev.args);
         const answer = tools.answerPrefix(model, ev.name, JSON.stringify(result));
         ctx.append(answer);
         ctx.cue();
@@ -353,7 +353,7 @@ pending: list[tuple[str, str]] = []
 async for step in g:
     out = await step.execute()
     match dec.feed(out.tokens):
-        case tools.Event.Call(name=n, arguments=a):
+        case tools.Event.Call(name=n, args=a):
             pending.append((n, a))
         case tools.Event.Start():
             pass
@@ -373,16 +373,16 @@ async for step in g:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-const pending: { name: string; arguments: string }[] = [];
+const pending: { name: string; args: string }[] = [];
 
 for await (const step of g) {
     const out = await step.execute();
     const ev = dec.feed(out.tokens);
-    if (ev.type === 'call') pending.push({ name: ev.name, arguments: ev.arguments });
+    if (ev.type === 'call') pending.push({ name: ev.name, args: ev.args });
 
     if (turnJustEnded(out)) {
         const results = await Promise.all(
-            pending.map(p => runToolAsync(p.name, p.arguments)),
+            pending.map(p => runToolAsync(p.name, p.args)),
         );
         pending.forEach((p, i) => {
             ctx.append(tools.answerPrefix(model, p.name, JSON.stringify(results[i])));
@@ -399,9 +399,9 @@ for await (const step of g) {
 
 `turn_just_ended` is workload-specific: in the simplest form, the chat parser's `Done` event for the same step indicates the turn closed. With native tool-call templates, the template's end-of-turn marker is the signal.
 
-## One-shot parsing
+## One-shot parsing (Rust only)
 
-If you don't need streaming, `tools::parse_call` extracts a single completed call from a finished string.
+If you don't need streaming, the Rust SDK exposes `tools::parse_call` to extract a single completed call from a finished string. The Python and JavaScript SDKs do not ship a one-shot helper — feed the full token output through `tools.Decoder` and read the first `Call` event.
 
 <Tabs groupId="lang" queryString>
 <TabItem value="rust" label="Rust" default>
@@ -417,22 +417,24 @@ if let Some((name, args_json)) = tools::parse_call(&model, &response) {
 <TabItem value="python" label="Python">
 
 ```python
-response = await ctx.generate(Sampler.argmax(), max_tokens=512).collect_text()
-parsed = tools.parse_call(model, response)
-if parsed:
-    name, args_json = parsed
-    result = run_tool(name, args_json)
+tokens = await ctx.generate(Sampler.argmax(), max_tokens=512).collect_tokens()
+dec = tools.Decoder(model)
+match dec.feed(tokens):
+    case tools.Event.Call(name=n, args=a):
+        result = run_tool(n, a)
+    case _:
+        pass
 ```
 
 </TabItem>
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-const response = await ctx.generate(Sampler.argmax(), { maxTokens: 512 }).collectText();
-const parsed = tools.parseCall(model, response);
-if (parsed) {
-    const [name, argsJson] = parsed;
-    const result = runTool(name, argsJson);
+const tokens = await ctx.generate(Sampler.argmax(), { maxTokens: 512 }).collectTokens();
+const dec = new tools.Decoder(model);
+const ev = dec.feed(tokens);
+if (ev.type === 'call') {
+    const result = runTool(ev.name, ev.args);
 }
 ```
 
@@ -465,12 +467,12 @@ if let Some(grammar) = tools::native_grammar(&model, &[calculator_schema]) {
 ```python
 from inferlet import Sampler, GrammarConstraint, tools
 
-grammar = tools.native_grammar(model, [json.dumps(calculator_schema)])
-if grammar:
+matcher = tools.native_matcher(model, [json.dumps(calculator_schema)])
+if matcher:
     response = await ctx.generate(
         Sampler.argmax(),
         max_tokens=512,
-        constrain=GrammarConstraint.from_grammar(grammar, model),
+        constrain=GrammarConstraint(matcher),
     ).collect_text()
 ```
 
@@ -478,13 +480,13 @@ if grammar:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler, grammar as gschema, tools } from 'inferlet';
+import { Sampler, GrammarConstraint, tools } from 'inferlet';
 
-const g = tools.nativeGrammar(model, [JSON.stringify(calculatorSchema)]);
-if (g) {
+const matcher = tools.nativeMatcher(model, [JSON.stringify(calculatorSchema)]);
+if (matcher) {
     const response = await ctx.generate(Sampler.argmax(), {
         maxTokens: 512,
-        constrain: gschema(g),
+        constrain: new GrammarConstraint(matcher),
     }).collectText();
 }
 ```
@@ -492,7 +494,7 @@ if (g) {
 </TabItem>
 </Tabs>
 
-`native_grammar` returns `None` (or `null`) for models without a native tool-call template. Fall back to the hand-rolled approach in that case.
+The Rust `tools::native_grammar` returns a compiled `Grammar`; the Python `tools.native_matcher` and JavaScript `tools.nativeMatcher` return a stateful `Matcher` (wrap with `GrammarConstraint`). All three return `None` / `undefined` for models without a native tool-call template — fall back to the hand-rolled approach in that case.
 
 ## Next
 

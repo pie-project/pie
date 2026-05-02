@@ -137,12 +137,15 @@ const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
 | Field | Type | Description |
 |---|---|---|
 | `maxTokens` | `number` | Stop after `n` tokens. |
-| `stop` | `Iterable<number>` | Stop-token IDs. |
-| `constrain` | `Schema \| Constraint` | Attach a constraint (or use `g.constrain(...)` to chain). |
+| `stop` | `Iterable<number>` | Stop-token IDs. With `autoFlush: true` (default), defaults to the chat template's stop tokens. |
+| `constrain` | `Schema \| Constraint \| Array<Schema \| Constraint>` | Attach one or more constraints. Multiple compose by AND-ing per-step BRLE masks. |
+| `logitMask` | `Brle` | Static BRLE mask applied every step. Composes with `constrain`. |
 | `speculator` | `Speculator` | Custom speculator. |
 | `systemSpeculation` | `boolean` | Use the runtime's built-in n-gram drafter. Default `false`. |
 | `adapter` | `Adapter` | LoRA adapter to apply. |
+| `zoSeed` | `number` | Evolution Strategies seed for every forward pass. |
 | `horizon` | `number` | Hint expected output length. |
+| `autoFlush` | `boolean` | When `true` (default), append `cue()` to the buffer before returning the Generator and use chat-template stop tokens by default. |
 
 `speculator` and `systemSpeculation` are mutually exclusive.
 
@@ -156,6 +159,8 @@ const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
 | `g.constrain(c): this` | Add a constraint. |
 | `g.horizon(n): this` | Hint expected output length. |
 | `g.adapter(a): this` | Apply an adapter. |
+| `g.zoSeed(seed): this` | Set an Evolution Strategies seed for every step. |
+| `g.probeEachStep(idx, probe): ProbeHandle` | Attach a probe at `idx` on every step. |
 
 ### Inspection
 
@@ -212,6 +217,7 @@ const token = out.token(h);
 | `fwd.sample(indices, sampler): SampleHandle` | Attach a sampler. |
 | `fwd.probe(idx, probe): ProbeHandle` | Attach a probe. |
 | `fwd.adapter(a): this` | Apply an adapter. |
+| `fwd.zoSeed(seed): this` | Set an Evolution Strategies seed for this pass. |
 | `await fwd.execute(): Promise<Output>` | Run the pass. |
 
 ### Inspection
@@ -227,10 +233,12 @@ const token = out.token(h);
 | `out.token(h)` | `number \| undefined` | Single-index sampler. |
 | `out.tokensAt(h)` | `Uint32Array` | Multi-index sampler. |
 | `out.distribution(h)` | `[Uint32Array, Float32Array] \| undefined` | `Distribution(...)` probe. |
-| `out.logits(h)` | `Uint8Array \| undefined` | `Logits()` probe. Decode as packed f32 LE. |
+| `out.logits(h)` | `Uint8Array \| undefined` | `Logits()` probe. Length `vocab_size * 4`, native-endian f32. |
 | `out.logprobs(h)` | `Float32Array \| undefined` | `Logprob` or `Logprobs` probe. |
 | `out.entropy(h)` | `number \| undefined` | `Entropy()` probe. |
-| `out.tokens` | `Uint32Array` | All tokens accepted. |
+| `out.tokens` | `Uint32Array` | Generator-accepted tokens this step (post stop / max-tokens truncation). Empty for raw `Forward.execute()`. |
+| `out.autoSampler` | `SampleHandle \| undefined` | Handle for the Generator's auto-attached sampler. `undefined` for raw Forward and after `clearSampler()`. |
+| `out.raw` | underlying WIT object | Property. The raw slot list + speculative side channel. |
 
 ## Samplers
 
@@ -255,7 +263,7 @@ import { Logits, Distribution, Logprob, Logprobs, Entropy } from 'inferlet';
 
 | Probe | Output accessor | Returns |
 |---|---|---|
-| `Logits()` | `out.logits(h)` | `Uint8Array` (packed f32 LE). |
+| `Logits()` | `out.logits(h)` | `Uint8Array` (length `vocab_size * 4`, native-endian f32). |
 | `Distribution(temperature, k)` | `out.distribution(h)` | `[ids, probs]`. `k=0` for full vocab. |
 | `Logprob(token)` | `out.logprobs(h)` | Length-1 `Float32Array`. |
 | `Logprobs(tokens)` | `out.logprobs(h)` | Length-K `Float32Array` (input order). |
@@ -407,16 +415,15 @@ import { tools } from 'inferlet';
 | Event `type` | Fields | Meaning |
 |---|---|---|
 | `'start'` | (none) | Tool call assembling. |
-| `'call'` | `name: string`, `arguments: string` | Call complete. `arguments` is JSON-encoded. |
+| `'call'` | `name: string`, `args: string` | Call complete. `args` is JSON-encoded. |
 
 Helpers:
 
 | Function | Description |
 |---|---|
-| `tools.equipPrefix(model, schemas)` | Tokens that equip the model with a tool list. |
-| `tools.answerPrefix(model, name, value)` | Tokens that feed a tool result back. |
-| `tools.parseCall(model, text)` | Extract a single completed call from a finished string. |
-| `tools.nativeMatcher(model, schemas)` | Compiled `Matcher` over the model's native tool-call format, or `undefined`. |
+| `tools.equipPrefix(model, schemas)` | Tokens that register the tool schemas in the chat template. Append before your user message via `Context.append`. |
+| `tools.answerPrefix(model, name, value)` | Tokens that frame a tool result for the next turn. `value` may be a string, object, or array (non-strings are JSON-encoded). |
+| `tools.nativeMatcher(model, schemas)` | Build a `Matcher` over the model's native tool-call format. Returns `undefined` if the model has no enforceable format — fall through to free-form generation + your own parser. Wrap with `new GrammarConstraint(matcher)` to pass to `Generator.constrain`. |
 
 ## I/O
 

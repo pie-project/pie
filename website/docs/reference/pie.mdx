@@ -233,10 +233,12 @@ as such, comma-separated values become lists, everything else is a string.
 pie config set server.host 0.0.0.0
 pie config set server.port 9090
 pie config set auth.enabled true
-pie config set model.default.hf_repo meta-llama/Llama-3.2-1B
-pie config set model.default.driver.device "cuda:0,cuda:1"
+pie config set model.0.hf_repo meta-llama/Llama-3.2-1B
+pie config set model.0.driver.device "cuda:0,cuda:1"
 pie config set telemetry.enabled true
 ```
+
+Keys must be addressed by their full dot-path under the section they live in (e.g. `server.host`, not `host`). Numeric segments index into TOML arrays-of-tables — `model.0.hf_repo` targets the first `[[model]]` block.
 
 There is no `pie config update` command. Use `config set` for individual
 edits, or edit the file directly.

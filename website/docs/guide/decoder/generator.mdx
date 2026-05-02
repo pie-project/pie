@@ -72,11 +72,12 @@ Every option below has the same shape across SDKs: a Rust builder method, a Pyth
 | `.stop(&[id, ...])` | `stop=[id, ...]` | `stop: [id, ...]` | Stop when the model emits any of these token IDs. |
 | `.constrain(c)` | `constrain=c` | `constrain: c` | Attach a `Constrain` / `Constraint` instance. |
 | `.constrain_with(schema)` | `constrain=schema` | `constrain: schema` | Attach a `Schema` (the SDK compiles it into a constraint). |
-| `.speculator(s)` | `speculator=s` | `speculator: s` | Use a custom speculator for drafting. Rust only. |
+| `.speculator(s)` | `speculator=s` | `speculator: s` | Use a custom speculator for drafting. |
 | `.system_speculation()` | `system_speculation=True` | `systemSpeculation: true` | Use the runtime's built-in n-gram drafter. |
 | `.adapter(&a)` | `adapter=a` | `adapter: a` | Apply a LoRA adapter on every step. |
+| `.zo_seed(seed)` | `zo_seed=seed` | `zoSeed: seed` | Set an Evolution Strategies seed for every step. |
 | `.horizon(n)` | `horizon=n` | `horizon: n` | Tell the credit bidder you expect about `n` more steps. |
-| `.probe_each_step(idx, probe)` | (Rust only today) | (Rust only today) | Attach a probe at `idx` on every step. Returns a typed handle. |
+| `.probe_each_step(idx, probe)` | `g.probe_each_step(idx, probe)` | `g.probeEachStep(idx, probe)` | Attach a probe at `idx` on every step. Returns a typed handle. Builder method on the Generator (no constructor-option equivalent). |
 
 Two compatibility notes:
 
@@ -248,9 +249,9 @@ const g = ctx.generate(sampler, { maxTokens: 512, stop: stops });
 
 ## Inspect
 
-`g.is_done()` (Rust) reports whether the Generator has terminated. Useful when you split the loop across functions.
+`g.is_done()` (Rust) / `g.is_done` (Python) / `g.isDone()` (JavaScript) reports whether the Generator has terminated. Useful when you split the loop across functions.
 
-The Generator does not expose a "tokens generated so far" counter. Track it yourself by summing `out.tokens.len()` each step.
+`g.tokens_generated()` (Rust) / `g.tokens_generated` (Python) / `g.tokensGenerated` (JavaScript) is the running count of tokens accepted so far. Useful for progress reporting or for budget checks inside a custom loop.
 
 ## Next
 

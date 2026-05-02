@@ -28,7 +28,7 @@ let json: serde_json::Value = ctx
     .generate(Sampler::Argmax)
     .constrain_with(AnyJson)?
     .max_tokens(256)
-    .collect_json()
+    .collect_json::<serde_json::Value>()
     .await?;
 
 // JSON Schema

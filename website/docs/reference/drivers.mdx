@@ -1,83 +1,89 @@
 ---
 title: Drivers
-description: Choose between native, vLLM, SGLang, and dummy backends
+description: Choose between native, cuda_native, portable, vLLM, SGLang, and dummy backends
 sidebar_position: 10
 ---
 
 # Drivers
 
-The Pie *driver* is the inference backend a model runs on. Pie ships four
+The Pie *driver* is the inference backend a model runs on. Pie ships six
 drivers and lets you pick per-model in `~/.pie/config.toml`:
 
 | `type` | Code | Use it for |
 |---|---|---|
 | `native` | `pie/src/pie_driver/` | The default. Pie's own batched scheduler, FlashInfer / Metal kernels, full inferlet feature set (custom forward pass, page-level cache control, adapters, Zo). |
+| `cuda_native` | `pie/src/pie_driver_cuda_native/` | Same feature set as `native`, but the forward-pass executor is the standalone `pie_driver_cuda` C++/CUDA binary built from `driver/cuda/`. Lower Python overhead, narrower model coverage. |
+| `portable` | `pie/src/pie_driver_portable/` | The standalone `pie_driver_portable` binary built from `driver/portable/` on top of libggml. CPU-only by default; CUDA / Vulkan / Metal / HIP / SYCL backends are linker-side build flags. |
 | `vllm` | `pie/src/pie_driver_vllm/` | Delegate inference to vLLM. Mature decode kernels, broad model coverage, vLLM's spec-decoding. |
-| `sgl` | `pie/src/pie_driver_sgl/` | Delegate to SGLang. Strong custom-mask support, spec-decoding via SGLang. |
+| `sglang` | `pie/src/pie_driver_sgl/` | Delegate to SGLang. Strong custom-mask support, spec-decoding via SGLang. |
 | `dummy` | `pie/src/pie_driver_dummy/` | No model loaded; returns random tokens. For protocol / inferlet tests without a GPU. |
 
-The `type` is a discriminator. Driver-agnostic fields
-(device, tensor parallel, dtype) live in `[model.X.driver]`; driver-specific
-knobs in `[model.X.driver.<type>]`.
+The `type` is a discriminator. Driver-agnostic fields (device, tensor parallel, dtype) live in `[model.driver]`; driver-specific knobs go under `[model.driver.options]`.
 
 ## Picking a driver
 
 ```toml
 # ~/.pie/config.toml
 
-[model.default]
+[[model]]
+name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
-[model.default.driver]
-type = "native"                # native | vllm | sgl | dummy
+[model.driver]
+type = "native"                  # native | cuda_native | portable | vllm | sglang | dummy
 device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
+
+[model.driver.options]
+gpu_mem_utilization = 0.8
 ```
 
 Or via the CLI:
 
 ```bash
-pie config set model.default.driver.type vllm
+pie config set model.0.driver.type vllm
 ```
 
-The vLLM and SGLang Python packages must be installed separately for the non-native drivers:
+The vLLM and SGLang Python packages are wired as `pie-server` extras:
 
 ```bash
-pip install vllm                         # vLLM
-pip install sglang                       # SGLang
+pip install 'pie-server[vllm]'           # vLLM
+pip install 'pie-server[sglang]'         # SGLang
 ```
 
-(There are no `pie-server` extras for `vllm` or `sgl`.)
+The CUDA extras (`cu126` / `cu128`) and the macOS extra (`metal`) cover the `native` and `cuda_native` drivers; the `portable` driver has no Python extras (its CPU backend is unconditional, GPU backends are selected at C++ build time).
 
 ## Universal driver fields
 
-Every driver consumes these from `[model.X.driver]`:
+Every driver consumes these from `[model.driver]`:
 
 | Key | Default | Description |
 |---|---|---|
-| `type` | (no default) | Which driver to load. Required. |
-| `device` | (no default) | List of devices, e.g. `["cuda:0"]` or `["cuda:0", "cuda:1"]`. Required. |
+| `type` | required | Which driver to load. |
+| `device` | required | List of devices, e.g. `["cuda:0"]` or `["cuda:0", "cuda:1"]`. A bare string is normalized to a one-element list. |
 | `tensor_parallel_size` | `1` | Devices in one TP group. The remaining devices are used for DP. |
 | `activation_dtype` | `"bfloat16"` | Activation precision. |
 | `random_seed` | `42` | Deterministic seed for the worker. |
 
+Driver-specific knobs live in `[model.driver.options]`. Pie does not validate them centrally; each driver's typed config dataclass parses the table at server / worker startup, with field names usually mirroring the upstream backend's vocabulary so values flow through verbatim.
+
 ## Native driver
 
-`type = "native"`. Pie's first-party inference path.
+`type = "native"`. Pie's first-party PyTorch inference path.
 
 ```toml
-[model.default.driver.native]
-gpu_mem_utilization  = 0.8       # fraction of free GPU memory
-max_batch_tokens     = 10240     # max tokens per fire_batch
-max_batch_size       = 512       # max sequences per fire_batch
-max_dist_size        = 32        # max top-k for Distribution probes
-max_num_embeds       = 128       # max embedding lookups per batch
-max_num_adapters     = 32        # adapter slot capacity per engine
-max_adapter_rank     = 8         # max LoRA rank
-kv_page_size         = 16        # KV cache page size (tokens)
-weight_dtype         = "auto"    # auto / float16 / bfloat16 / int4 / int8 / float8
-cpu_mem_budget_in_gb = 0         # pinned host KV pool for D2H/H2D swap (0 disables)
+[model.driver.options]            # type = "native"
+gpu_mem_utilization  = 0.8        # fraction of free GPU memory
+max_batch_tokens     = 10240      # max tokens per fire_batch
+max_batch_size       = 512        # max sequences per fire_batch
+max_dist_size        = 32         # max top-k for Distribution probes
+max_num_embeds       = 128        # max embedding lookups per batch
+max_num_adapters     = 32         # adapter slot capacity per engine
+max_adapter_rank     = 8          # max LoRA rank
+kv_page_size         = 16         # KV cache page size (tokens)
+weight_dtype         = "auto"     # auto / float16 / bfloat16 / float32 / int4 / int8 / float8
+cpu_mem_budget_in_gb = 0          # pinned host KV pool for D2H/H2D swap (0 disables)
 ```
 
 | Key | Default | Description |
@@ -90,7 +96,7 @@ cpu_mem_budget_in_gb = 0         # pinned host KV pool for D2H/H2D swap (0 disab
 | `max_num_adapters` | `32` | Adapter slot capacity. |
 | `max_adapter_rank` | `8` | Maximum LoRA rank for any adapter. |
 | `kv_page_size` | `16` | KV cache page size in tokens. |
-| `weight_dtype` | `"auto"` | `auto`, `float16`, `bfloat16`, `int4`, `int8`, or `float8`. |
+| `weight_dtype` | `"auto"` | `auto`, `float32`, `float16`, `bfloat16`, `int4`, `int8`, or `float8`. |
 | `cpu_mem_budget_in_gb` | `0` | Pinned host pool for KV swap, in GiB. `0` disables swap. |
 
 The native driver implements the full inferlet feature set:
@@ -100,22 +106,81 @@ The native driver implements the full inferlet feature set:
 - All sampler variants including raw-logits / logprobs / entropy.
 - LoRA adapters (see [Adapters](../guide/forward/adapters)).
 
-Quantization options are wired through `weight_dtype`. The float types
-load full-precision weights; `int4`/`int8`/`float8` go through the
-quantization path in `pie_driver/quantization.py`.
+Quantization options are wired through `weight_dtype`. The float types load full-precision weights; `int4` / `int8` / `float8` go through the quantization path in `pie_driver/quantization.py`.
+
+## cuda_native driver
+
+`type = "cuda_native"`. Same feature set as the native driver, but the executor is a standalone C++/CUDA binary (`pie_driver_cuda`) built from `driver/cuda/`. Pie spawns the binary, hands it a TOML fragment, and talks to it over the shared-memory IPC ring.
+
+```toml
+[model.driver.options]            # type = "cuda_native"
+binary_path          = ""         # override; empty resolves via $PIE_CUDA_DRIVER_BIN, then PATH
+gpu_mem_utilization  = 0.85
+kv_page_size         = 32
+max_batch_tokens     = 10240
+max_batch_size       = 512
+max_num_kv_pages     = 1024
+swap_pool_size       = 0
+weight_dtype         = "bfloat16"
+ready_timeout_s      = 120.0
+shutdown_timeout_s   = 5.0
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `binary_path` | `""` | Override path to the `pie_driver_cuda` executable. Empty resolves via `$PIE_CUDA_DRIVER_BIN`, then `which pie_driver_cuda`, then a relative search next to the source tree (`<repo>/driver/cuda/build/bin/`). |
+| `gpu_mem_utilization` | `0.85` | Fraction of free GPU memory the binary claims. |
+| `kv_page_size` | `32` | KV cache page size in tokens. |
+| `max_batch_tokens` | `10240` | Cap on tokens per fire_batch. |
+| `max_batch_size` | `512` | Cap on sequences per fire_batch. |
+| `max_num_kv_pages` | `1024` | KV cache page count (KV memory scales linearly). Will be auto-computed from `gpu_mem_utilization` in a later milestone. |
+| `swap_pool_size` | `0` | Pinned host KV-page count for swap-out. `0` disables swap. |
+| `weight_dtype` | `"bfloat16"` | Weight precision. |
+| `ready_timeout_s` | `120.0` | Seconds to wait for the binary's `READY` line on stdout before giving up. |
+| `shutdown_timeout_s` | `5.0` | Seconds to wait for graceful shutdown after SIGTERM before SIGKILL. |
+
+## portable driver
+
+`type = "portable"`. Standalone C++ binary (`pie_driver_portable`) built from `driver/portable/` on top of libggml (vendored via llama.cpp). Loads HuggingFace safetensors directly — no GGUF conversion. CPU is the default backend; CUDA / Vulkan / Metal / HIP / SYCL backends are selected at C++ build time via `GGML_*=ON` CMake flags.
+
+```toml
+[model.driver.options]            # type = "portable"
+binary_path          = ""         # override; empty resolves via $PIE_PORTABLE_DRIVER_BIN, then PATH
+kv_page_size         = 32
+max_num_kv_pages     = 1024
+max_batch_tokens     = 10240
+max_batch_size       = 512
+cpu_pages            = 0
+n_ctx                = 4096
+n_gpu_layers         = 0
+ready_timeout_s      = 120.0
+shutdown_timeout_s   = 5.0
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `binary_path` | `""` | Override path to the `pie_driver_portable` executable. Empty resolves via `$PIE_PORTABLE_DRIVER_BIN`, then `which pie_driver_portable`, then a relative search next to the source tree. |
+| `kv_page_size` | `32` | KV cache page size in tokens. |
+| `max_num_kv_pages` | `1024` | KV pool size — KV memory scales linearly. |
+| `max_batch_tokens` | `10240` | Cap on tokens per fire_batch. |
+| `max_batch_size` | `512` | Cap on sequences per fire_batch. |
+| `cpu_pages` | `0` | Host-side swap pool capacity. `0` = no swap. |
+| `n_ctx` | `4096` | Informational max position the binary will accept. Real KV capacity is `max_num_kv_pages * kv_page_size` slots flexibly shared across contexts. |
+| `n_gpu_layers` | `0` | `0` = CPU only, `-1` = offload all layers to a GPU backend, `N` = first `N` layers. Takes effect only when GPU backends are linked into the binary. |
+| `ready_timeout_s` | `120.0` | Seconds to wait for `READY` on stdout. |
+| `shutdown_timeout_s` | `5.0` | Seconds to wait for graceful shutdown after SIGTERM. |
 
 ## vLLM driver
 
-`type = "vllm"`. Pie wraps vLLM's `EngineArgs`; field names mirror vLLM
-verbatim:
+`type = "vllm"`. Pie wraps vLLM's `EngineArgs`; field names mirror vLLM verbatim:
 
 ```toml
-[model.default.driver.vllm]
+[model.driver.options]            # type = "vllm"
 attention_backend       = "FLASHINFER"   # FLASH_ATTN / TRITON_ATTN / FLEX_ATTENTION / …
-gpu_memory_utilization  = 0.85
+gpu_memory_utilization  = 0.9
 max_num_seqs            = 256
-max_num_batched_tokens  = 8192
-block_size              = 16             # KV block size; vllm picks if unset
+# max_num_batched_tokens  = 8192         # default: vllm picks
+# block_size              = 16           # default: vllm picks per attention backend
 enforce_eager           = false          # disable CUDA graphs
 
 # n-gram speculative decoding (driver-supplied drafts)
@@ -125,37 +190,41 @@ spec_ngram_min_n        = 2
 spec_ngram_max_n        = 4
 ```
 
-Trade-offs: vLLM has the broadest model zoo and best decode-batch
-throughput on stock setups. Some inferlet features that depend on raw
-forward-pass control (custom attention masks, page-trim, raw-logits
-samplers) are not available. They require the native driver.
+| Key | Default | Description |
+|---|---|---|
+| `attention_backend` | unset | `FLASHINFER` / `FLASH_ATTN` / `TRITON_ATTN` / `FLEX_ATTENTION` / etc. Unset lets vLLM auto-pick per platform. |
+| `gpu_memory_utilization` | `0.9` | Fraction of free GPU memory for KV cache + activations. |
+| `max_num_seqs` | `256` | Max concurrent sequences in a batch. |
+| `max_num_batched_tokens` | unset | Max tokens (across all sequences) in a batch. Unset = vLLM's default. |
+| `block_size` | unset | KV cache block size override. Unset = vLLM picks based on attention backend's allowed sizes (FlashInfer: 16/32/64; FlashAttention: 16/32). |
+| `enforce_eager` | `false` | Disable `torch.compile` and CUDA graphs. |
+| `spec_ngram_enabled` | `false` | Enable n-gram speculative decoding (vLLM-side drafting). |
+| `spec_ngram_num_drafts` | `4` | Drafts proposed per accepted iteration. |
+| `spec_ngram_min_n` | `2` | n-gram match window minimum. |
+| `spec_ngram_max_n` | `4` | n-gram match window maximum. |
+
+Trade-offs: vLLM has the broadest model zoo and best decode-batch throughput on stock setups. Inferlet features that depend on raw forward-pass control (custom attention masks, page-trim, raw-logits samplers) are not available — they require the native driver.
 
 ## SGLang driver
 
-`type = "sgl"`. Mirrors SGLang's `ServerArgs`:
+`type = "sglang"`. Mirrors SGLang's `ServerArgs`:
 
 ```toml
-[model.default.driver.sgl]
+[model.driver.options]            # type = "sglang"
 attention_backend       = "triton"       # triton / flashinfer / fa3 / fa4 / …
 mem_fraction_static     = 0.65
 page_size               = 16
 disable_cuda_graph      = false
-cuda_graph_max_bs       = 256            # cap captured graph batch size
-max_running_requests    = 256
-max_total_tokens        = 65536
-chunked_prefill_size    = 8192
+# cuda_graph_max_bs       = 256          # default: sglang auto-picks
+# max_running_requests    = 256          # default: sglang auto-picks
+# max_total_tokens        = 65536        # default: sglang auto-picks
+# chunked_prefill_size    = 8192         # default: sglang auto-picks
 kv_cache_dtype          = "auto"
 trust_remote_code       = true
-disable_radix_cache     = true           # pie owns prefix sharing
-context_length          = 8192
+# context_length          = 8192         # default: read from HF config
 
 # Pinned-host KV pool for D2H/H2D swap (GiB). 0 = disabled.
 cpu_mem_budget_in_gb    = 0
-
-# LoRA adapter slots. Forces disable_cuda_graph = true.
-enable_adapter          = false
-max_num_adapters        = 32
-max_adapter_rank        = 8
 
 # n-gram speculative decoding (driver-supplied drafts)
 spec_ngram_enabled      = false
@@ -164,24 +233,37 @@ spec_ngram_max_depth    = 18
 spec_ngram_capacity     = 1_000_000
 ```
 
-The adapter knobs (`max_num_adapters`, `max_adapter_rank`) only take effect when `enable_adapter = true`. The spec-ngram knobs only take effect when `spec_ngram_enabled = true`; the inferlet then opts into seeing drafts via `output_speculative_tokens(true)` on its forward pass.
+| Key | Default | Description |
+|---|---|---|
+| `attention_backend` | `"triton"` | `triton` / `flashinfer` / `flex_attention` / `fa3` / `fa4` / `aiter` / `wave` / `torch_native` / etc. `triton` works on any NVIDIA SM 7.5+ and is stable across sglang versions. |
+| `mem_fraction_static` | `0.65` | Fraction of free GPU memory reserved for KV cache + activations. Lower than sglang's standalone `0.88` because pie's KV-rebind allocates a parallel tensor in pie's canonical layout. |
+| `page_size` | `16` | KV cache page size override. Unset lets sglang pick. |
+| `disable_cuda_graph` | `false` | Run eager (no `torch.compile`, no CUDA graphs). |
+| `cuda_graph_max_bs` | unset | Override the largest CUDA-graph batch-size bin sglang captures. Unset = sglang's auto-pick. |
+| `max_running_requests` | unset | Cap on simultaneously-running requests. Unset = sglang's auto-pick based on `max_total_tokens`. |
+| `max_total_tokens` | unset | Cap on total tokens (across requests) per fire_batch. Unset = sglang's auto-pick. |
+| `chunked_prefill_size` | unset | Chunked-prefill size override. |
+| `kv_cache_dtype` | `"auto"` | KV cache element dtype. `auto` inherits the activation dtype. |
+| `trust_remote_code` | `true` | Trust user-supplied remote code in HF repos (needed for some models). |
+| `context_length` | unset | Explicit context length cap. Unset reads from HF config. |
+| `cpu_mem_budget_in_gb` | `0` | Pinned-host KV pool for D2H/H2D swap, in GiB. `0` disables swap. (Pie knob — not an sglang ServerArgs field.) |
+| `spec_ngram_enabled` | `false` | Enable n-gram speculative decoding (sglang-side drafting). The inferlet opts in to seeing drafts via `output_speculative_tokens(true)` on its forward pass; otherwise they are dropped. |
+| `spec_ngram_num_drafts` | `4` | Drafts proposed per accepted iteration. |
+| `spec_ngram_max_depth` | `18` | Maximum n-gram trie depth. |
+| `spec_ngram_capacity` | `1_000_000` | Approximate node budget for the trie. |
 
-Trade-offs: SGLang has clean custom-mask support (hence Pie's recent
-spec-decoding work runs through it) and `triton` works on any NVIDIA
-SM 7.5+. Like vLLM, some native-only features are off the menu.
+Trade-offs: SGLang has clean custom-mask support (hence Pie's recent spec-decoding work runs through it), and `triton` works on any NVIDIA SM 7.5+. Like vLLM, some native-only features are off the menu.
 
 ## Dummy driver
 
-`type = "dummy"`. No weights are loaded and no real compute runs. The driver returns random
-token IDs. Use it to exercise the engine + protocol path without a GPU,
-or to bench the runtime independently of model load:
+`type = "dummy"`. No weights are loaded and no real compute runs. The driver returns random token IDs. Use it to exercise the engine + protocol path without a GPU, or to bench the runtime independently of model load:
 
 ```toml
-[model.default.driver]
+[model.driver]
 type = "dummy"
 device = ["cpu"]
 
-[model.default.driver.dummy]
+[model.driver.options]            # type = "dummy"
 gpu_mem_utilization  = 0.2
 max_batch_tokens     = 4096
 max_batch_size       = 128
@@ -194,17 +276,15 @@ weight_dtype         = "bfloat16"
 cpu_mem_budget_in_gb = 0
 ```
 
-Most fields mirror the native driver so the dummy can stand in for native in tests.
-
-You will not get useful generations. Only the runtime is exercised.
+Most fields mirror the native driver so the dummy can stand in for native in tests. You will not get useful generations — only the runtime is exercised.
 
 ## Choosing
 
 - **Default → native.** Full feature set, best fit for advanced inferlets.
-- **Need a model native doesn't support yet → vLLM**, if it's in the vLLM zoo.
-- **Need spec-decoding or strong custom-mask support → SGLang.**
-- **CI / runtime tests / no GPU → dummy.**
+- **Want lower Python overhead than `native` → `cuda_native`** (NVIDIA only).
+- **CPU-only or a non-NVIDIA GPU (Vulkan / Metal / HIP / SYCL) → `portable`.**
+- **Need a model native doesn't support yet → `vllm`**, if it's in the vLLM zoo.
+- **Need spec-decoding or strong custom-mask support → `sglang`.**
+- **CI / runtime tests / no GPU → `dummy`.**
 
-The driver registry lives in `pie/src/pie/drivers.py`. Each driver's
-`__init__.py` calls `register_driver(DriverSpec(...))` at import time, so
-adding a new driver is mostly: write the engine, register the spec.
+The driver registry lives in `pie/src/pie/drivers.py`. Each driver's `__init__.py` calls `register_driver(DriverSpec(...))` at import time, so adding a new driver is mostly: write the engine, register the spec.

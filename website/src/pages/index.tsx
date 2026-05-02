@@ -187,8 +187,8 @@ function Hero() {
                     A <span>programmable</span> LLM serving system.
                 </h1>
                 <p className={styles.heroSubtitle}>
-                    Low-latency, high-throughput inference where you write the loop.
-                    The KV cache and decoder are library calls in your inferlet.
+                    High-performance inference engine where you write the loop. <br />
+                    Forward passes are library calls in your inferlet.
                 </p>
                 <div className={styles.heroLinks}>
                     <Link className="button button--primary button--lg" to="/docs/overview/what-is-pie">
@@ -198,7 +198,6 @@ function Hero() {
                         GitHub
                     </Link>
                 </div>
-                <p className={styles.heroNote}>Research prototype. APIs are unstable.</p>
             </div>
         </header>
     );
@@ -210,12 +209,12 @@ function ServingLoop() {
             <div className="container">
                 <h2 className={styles.sectionTitle}>Serve programs, not prompts</h2>
                 <p className={styles.sectionSubtitle}>
-                    In a conventional engine, the inference loop is hidden inside the engine.
+                    In existing serving systems, the inference workflow is baked into the engine.
                     In Pie, you write it.
                 </p>
                 <div className={styles.figuresGrid}>
                     <div className={styles.figureCard}>
-                        <h3>Conventional engine</h3>
+                        <h3>Conventional serving systems</h3>
                         <ThemedImage
                             sources={{
                                 light: useBaseUrl('/img/current-serving.svg'),
@@ -229,7 +228,7 @@ function ServingLoop() {
                         </p>
                     </div>
                     <div className={styles.figureCard}>
-                        <h3>Pie</h3>
+                        <h3>Programmable serving system - Pie</h3>
                         <ThemedImage
                             sources={{
                                 light: useBaseUrl('/img/programmable-serving.svg'),
@@ -238,8 +237,8 @@ function ServingLoop() {
                             alt="Pie's serving model. Each application runs as an inferlet inside the engine, calling into the model's KV cache and forward pass through a control layer."
                         />
                         <p>
-                            Each inferlet runs its own loop inside the engine.
-                            It reads the KV cache and drives the decoder directly.
+                            Each inferlet runs its own workflow inside the engine.
+                            It controls the KV cache, forward pass, and tool calls directly.
                         </p>
                     </div>
                 </div>
@@ -255,7 +254,8 @@ function Sample() {
             <div className="container">
                 <h2 className={styles.sectionTitle}>More to optimize, more to customize</h2>
                 <p className={styles.sectionSubtitle}>
-                    Each tab is an inferlet that customizes or optimizes the inference loop.
+                    Pie unlocks opportunities for optimization and custom model behavior. <br />
+                    Each tab is an inferlet that customizes the inference loop in a different way.
                 </p>
                 <div className={styles.codeContainer}>
                     <div className={styles.codeTabs}>
@@ -301,7 +301,7 @@ function GetStarted() {
 export default function Home(): ReactNode {
     return (
         <Layout
-            title="Home"
+            title="Programmable LLM serving"
             description="Pie is a programmable serving system for LLM inference."
         >
             <Hero />

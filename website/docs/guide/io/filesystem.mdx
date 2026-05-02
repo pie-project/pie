@@ -56,16 +56,17 @@ Standard filesystem code works as written. The WASI sandbox redirects calls to t
 
 ## Enable filesystem access
 
-Filesystem access is gated by `[server].allow_filesystem` in `~/.pie/config.toml`. It defaults off:
+Filesystem access is gated by `[runtime].allow_fs` in `~/.pie/config.toml`. It defaults off:
 
 ```toml
-[server]
-allow_filesystem = true
+[runtime]
+allow_fs = true
+# fs_scratch_dir = "/tmp/pie"   # optional override; default is <tempdir>/pie
 ```
 
-When enabled, the engine creates a host-side scratch directory (under the engine's data path) and preopens it at `/scratch` for every inferlet on this server. Restart the engine to apply.
+When enabled, the engine creates a host-side scratch directory under `[runtime].fs_scratch_dir` and preopens a per-process subdirectory at `/scratch` for every inferlet on this server. Restart the engine to apply.
 
-When disabled (the default), the inferlet's filesystem syscalls return errors immediately. There is no way to expose a different host path or split scratch space per inferlet today; every inferlet on the engine shares the same `/scratch`.
+When disabled (the default), the inferlet's filesystem syscalls return errors immediately. Each inferlet gets its own subdirectory under the configured scratch root.
 
 See [Configuration](../../reference/configuration) for the full schema.
 
@@ -179,4 +180,4 @@ For the multi-tenant story (per-tenant mounts, read-only paths, host-controlled 
 
 - [HTTP](./http): the network alternative for state that lives elsewhere.
 - [MCP](./mcp): structured tool servers, which often use the filesystem internally.
-- [Configuration](../../reference/configuration): the `[server].allow_filesystem` flag and the rest of the schema.
+- [Configuration](../../reference/configuration): the `[runtime].allow_fs` flag and the rest of the schema.

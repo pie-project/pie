@@ -88,20 +88,20 @@ ctx = Context(model)
 | `ctx.append(tokens) -> Context` | Append raw token IDs. |
 | `await ctx.flush()` | Run prefill on buffered tokens; commit pages. |
 
-### Inspection (properties)
+### Inspection
 
-| Property | Type | Description |
-|---|---|---|
-| `ctx.model` | `Model` | The bound model. |
-| `ctx.page_size` | `int` | Tokens per KV page. |
-| `ctx.seq_len` | `int` | Total committed + working tokens (excludes the SDK buffer). |
-| `ctx.buffer` | `list[int]` | SDK-side buffered tokens not yet flushed. |
+| Member | Kind | Type | Description |
+|---|---|---|---|
+| `ctx.model` | property | `Model` | The bound model. |
+| `ctx.page_size` | property | `int` | Tokens per KV page. |
+| `ctx.seq_len` | property | `int` | Total committed + working tokens (excludes the SDK buffer). |
+| `ctx.buffer()` | method | `list[int]` | SDK-side buffered tokens not yet flushed. |
 
 ### Truncate
 
 | Method | Description |
 |---|---|
-| `ctx.truncate(n)` | Drop the trailing `n` tokens from working pages. Rollback primitive. |
+| `ctx.truncate(n)` | Drop the trailing `n` working-page tokens. Rollback primitive. Pages already committed cannot be truncated through this API. |
 
 The Python SDK does not expose `ctx.inner()` for raw page operations; those are Rust-only.
 
@@ -122,12 +122,15 @@ g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=256)
 | Kwarg | Type | Description |
 |---|---|---|
 | `max_tokens` | `int \| None` | Stop after `n` accepted tokens. |
-| `stop` | `Iterable[int]` | Extra stop-token IDs. |
-| `constrain` | `Schema \| Constraint \| None` | Attach a constraint. May be passed multiple times by chaining `.constrain(...)` on the result. |
-| `speculator` | `Speculator \| None` | Custom speculator (Python-side classes implementing the protocol). |
+| `stop` | `Iterable[int] \| None` | Extra stop-token IDs. With `auto_flush=True`, defaults to the chat template's stop tokens. |
+| `constrain` | `Schema \| Constraint \| list[Schema \| Constraint] \| None` | Attach one or more constraints. Multiple constraints compose by AND-ing their per-step BRLE masks. |
+| `logit_mask` | `list[int] \| None` | Static BRLE mask applied every step. Composes with `constrain` like any other constraint. |
+| `speculator` | `Speculator \| None` | Custom speculator (any class implementing the protocol). |
 | `system_speculation` | `bool` | Use the runtime's built-in n-gram drafter. Default `False`. |
 | `adapter` | `Adapter \| None` | LoRA adapter to apply on every step. |
+| `zo_seed` | `int \| None` | Evolution Strategies seed for every forward pass. |
 | `horizon` | `int \| None` | Hint expected output length for credit pacing. |
+| `auto_flush` | `bool` | When `True` (default), append `cue()` to the buffer before returning the Generator and use chat-template stop tokens by default. Set `False` to inspect the buffer or call `cue()` yourself. |
 
 `speculator` and `system_speculation` are mutually exclusive.
 
@@ -141,6 +144,7 @@ g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=256)
 | `g.constrain(c)` | Add a constraint. Composes with previously attached ones. |
 | `g.horizon(n)` | Hint expected output length. |
 | `g.adapter(a)` | Apply an adapter. |
+| `g.zo_seed(seed)` | Set an Evolution Strategies seed for every step. |
 | `g.probe_each_step(idx, probe) -> ProbeHandle` | Attach a probe to every step. |
 
 ### Inspection
@@ -201,13 +205,14 @@ token = out.token(h)
 | `fwd.sample(indices, sampler) -> SampleHandle` | Attach a sampler at output positions. |
 | `fwd.probe(idx, probe) -> ProbeHandle` | Attach a probe at one position. |
 | `fwd.adapter(a) -> Forward` | Apply an adapter. |
+| `fwd.zo_seed(seed) -> Forward` | Set an Evolution Strategies seed for this pass. |
 | `await fwd.execute() -> Output` | Run the pass. |
 
 ### Inspection
 
-| Property | Description |
+| Method | Description |
 |---|---|
-| `fwd.start_position` | Position the first auto-input token will occupy. |
+| `fwd.start_position()` | Position the first auto-input token will occupy. Equal to `ctx.seq_len` at the time `forward()` was called. |
 
 ### Output access
 
@@ -216,11 +221,12 @@ token = out.token(h)
 | `out.token(h: SampleHandle)` | `int \| None` | Single-index sampler. |
 | `out.tokens_at(h: SampleHandle)` | `list[int]` | Multi-index sampler. |
 | `out.distribution(h)` | `tuple[list[int], list[float]] \| None` | `Distribution(...)` probe. |
-| `out.logits(h)` | `bytes \| None` | `Logits()` probe. Cast as packed f32 LE. |
+| `out.logits(h)` | `bytes \| None` | `Logits()` probe. Length `vocab_size * 4`, native-endian f32. |
 | `out.logprobs(h)` | `list[float] \| None` | `Logprob(t)` or `Logprobs(ts)` probe. |
 | `out.entropy(h)` | `float \| None` | `Entropy()` probe. |
-| `out.tokens` | `list[int]` | All tokens accepted by the pass. |
-| `out.raw()` | underlying object | Advanced cases. |
+| `out.tokens` | `list[int]` | Generator-accepted tokens this step (post stop / max-tokens truncation). Empty for raw `Forward.execute()`. |
+| `out.auto_sampler` | `SampleHandle \| None` | Handle for the Generator's auto-attached sampler. `None` for raw Forward and after `clear_sampler()`. |
+| `out.raw` | underlying WIT object | Property. The raw slot list + speculative side channel. |
 
 ## Samplers
 
@@ -245,7 +251,7 @@ from inferlet import Logits, Distribution, Logprob, Logprobs, Entropy
 
 | Probe | Output accessor | Returns |
 |---|---|---|
-| `Logits()` | `out.logits(h)` | Packed f32 LE bytes. |
+| `Logits()` | `out.logits(h)` | Native-endian f32 bytes (length `vocab_size * 4`). |
 | `Distribution(temperature, k)` | `out.distribution(h)` | Top-`k` ids and probs. `k=0` for full vocab. |
 | `Logprob(token_id)` | `out.logprobs(h)` | Length-1 list. |
 | `Logprobs(token_ids)` | `out.logprobs(h)` | Length-K list (input order). |
@@ -394,16 +400,15 @@ from inferlet import tools
 | Event | Payload | Meaning |
 |---|---|---|
 | `Start` | (none) | Tool call assembling. |
-| `Call(name, arguments)` | name, JSON-encoded args | Call complete. |
+| `Call(name, args)` | name, JSON-encoded args | Call complete. |
 
 Helpers:
 
 | Function | Description |
 |---|---|
-| `tools.equip_prefix(model, schemas)` | Tokens that equip the model with a tool list. |
-| `tools.answer_prefix(model, name, value)` | Tokens that feed a tool result back. `value` may be a string, dict, or list. |
-| `tools.parse_call(model, text)` | Extract a single completed call from a finished string. |
-| `tools.native_matcher(model, schemas)` | Compiled grammar over the model's native tool-call format, or `None`. |
+| `tools.equip_prefix(model, schemas)` | Tokens that register the tool schemas in the chat template. Append before your user message via `Context.append`. |
+| `tools.answer_prefix(model, name, value)` | Tokens that frame a tool result for the next turn. `value` may be a string, dict, or list (non-strings are JSON-encoded). |
+| `tools.native_matcher(model, schemas)` | Build a `Matcher` over the model's native tool-call format. Returns `None` if the model has no enforceable format — fall through to free-form generation + your own parser. Wrap with `GrammarConstraint` to pass to `Generator.constrain`. |
 
 ## I/O
 

@@ -14,29 +14,29 @@ import type { PrismTheme } from 'prism-react-renderer';
 const PIE_PALETTE = {
   // Light mode (theme.css :root)
   light: {
-    bg:         '#fdfbf3',  // --pie-code-block-bg  (--ifm-pre-background) — very light beige
-    ink:        '#2c2722',  // --pie-ink-900
-    inkSoft:    '#54473b',  // --pie-ink-800
-    inkMuted:   '#9b8c75',  // a touch lighter than --pie-ink-600 for italic comments
-    operator:   '#7a6a55',  // operator/url
-    primary:    '#c25e3d',  // slightly muted from --pie-accent-600 (keywords) — terracotta
-    copper:     '#6b7a30',  // olive (strings) — warm green-brown contrast
-    gold:       '#9a5a1f',  // burnt gold (numbers)
-    rust:       '#a4502d',  // rust (functions)
-    plum:       '#7a3e6a',  // --pie-plum (class names, properties)
+    bg: '#fdfbf3',  // --pie-code-block-bg  (--ifm-pre-background) — very light beige
+    ink: '#2c2722',  // --pie-ink-900
+    inkSoft: '#54473b',  // --pie-ink-800
+    inkMuted: '#9b8c75',  // a touch lighter than --pie-ink-600 for italic comments
+    operator: '#7a6a55',  // operator/url
+    primary: '#c25e3d',  // slightly muted from --pie-accent-600 (keywords) — terracotta
+    copper: '#6b7a30',  // olive (strings) — warm green-brown contrast
+    gold: '#9a5a1f',  // burnt gold (numbers)
+    rust: '#a4502d',  // rust (functions)
+    plum: '#7a3e6a',  // --pie-plum (class names, properties)
   },
   // Dark mode (theme.css [data-theme='dark'])
   dark: {
-    bg:         '#2a241d',  // --pie-demi-850 (--pie-tint dark) (--ifm-pre-background)
-    ink:        '#ede5d2',  // --pie-demi-100
-    inkSoft:    '#c8bda6',  // --pie-demi-200
-    inkMuted:   '#8a7c6a',  // mid-warm — for italic comments
-    operator:   '#a89b85',  // --pie-demi-300
-    primary:    '#e08a6f',  // lifted terracotta (keywords)
-    copper:     '#b8c47a',  // sage-light (strings)
-    gold:       '#d4a45c',  // --pie-amber-light (numbers)
-    rust:       '#e0a47a',  // --pie-peach-light (functions)
-    plum:       '#d8a8c0',  // --pie-rose-light (class names, properties)
+    bg: '#2a241d',  // --pie-demi-850 (--pie-tint dark) (--ifm-pre-background)
+    ink: '#ede5d2',  // --pie-demi-100
+    inkSoft: '#c8bda6',  // --pie-demi-200
+    inkMuted: '#8a7c6a',  // mid-warm — for italic comments
+    operator: '#a89b85',  // --pie-demi-300
+    primary: '#e08a6f',  // lifted terracotta (keywords)
+    copper: '#b8c47a',  // sage-light (strings)
+    gold: '#d4a45c',  // --pie-amber-light (numbers)
+    rust: '#e0a47a',  // --pie-peach-light (functions)
+    plum: '#d8a8c0',  // --pie-rose-light (class names, properties)
   },
 } as const;
 
@@ -47,20 +47,28 @@ function buildPrismTheme(p: typeof PIE_PALETTE.light): PrismTheme {
     plain: { color: p.ink, backgroundColor: p.bg },
     styles: [
       { types: ['comment', 'prolog', 'doctype', 'cdata'], style: { color: p.inkMuted, fontStyle: 'italic' } },
-      { types: ['punctuation'],                            style: { color: p.inkSoft } },
-      { types: ['namespace'],                              style: { opacity: 0.7 } },
-      { types: ['keyword', 'tag', 'selector', 'important', 'atrule', 'rule', 'builtin'],
-                                                            style: { color: p.primary, fontWeight: '600' } },
-      { types: ['string', 'char', 'attr-value', 'regex', 'inserted'],
-                                                            style: { color: p.copper } },
-      { types: ['number', 'boolean', 'symbol', 'constant', 'deleted', 'attr-name'],
-                                                            style: { color: p.gold } },
-      { types: ['function', 'function-variable'],           style: { color: p.rust } },
-      { types: ['class-name', 'maybe-class-name', 'property'],
-                                                            style: { color: p.plum, fontWeight: '600' } },
-      { types: ['operator', 'entity', 'url'],               style: { color: p.operator } },
-      { types: ['variable'],                                style: { color: p.ink } },
-      { types: ['parameter'],                               style: { color: p.inkSoft } },
+      { types: ['punctuation'], style: { color: p.inkSoft } },
+      { types: ['namespace'], style: { opacity: 0.7 } },
+      {
+        types: ['keyword', 'tag', 'selector', 'important', 'atrule', 'rule', 'builtin'],
+        style: { color: p.primary, fontWeight: '600' }
+      },
+      {
+        types: ['string', 'char', 'attr-value', 'regex', 'inserted'],
+        style: { color: p.copper }
+      },
+      {
+        types: ['number', 'boolean', 'symbol', 'constant', 'deleted', 'attr-name'],
+        style: { color: p.gold }
+      },
+      { types: ['function', 'function-variable'], style: { color: p.rust } },
+      {
+        types: ['class-name', 'maybe-class-name', 'property'],
+        style: { color: p.plum, fontWeight: '600' }
+      },
+      { types: ['operator', 'entity', 'url'], style: { color: p.operator } },
+      { types: ['variable'], style: { color: p.ink } },
+      { types: ['parameter'], style: { color: p.inkSoft } },
     ],
   };
 }
@@ -213,7 +221,7 @@ const config: Config = {
           ],
         },
       ],
-      copyright: `Built in the open under Apache 2.0. Issues and pull requests welcome on GitHub.<br/>© ${new Date().getFullYear()} The Pie Project.`,
+      copyright: `Pie ♥ Open Source<br/>Started as a research project at Yale`,
     },
 
     prism: {

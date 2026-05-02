@@ -68,7 +68,7 @@ Use the monitor to spot:
 For protocol testing without loading real weights:
 
 ```bash
-pie config set model.default.driver.type dummy
+pie config set model.0.driver.type dummy
 pie serve
 ```
 
@@ -116,9 +116,10 @@ Set `worker_threads` to the number of CPU cores you want to dedicate to the runt
 The native driver runs tensor-parallel inference across multiple GPUs:
 
 ```toml
-[model.large.driver]
+[model.driver]
 type = "native"
 device = ["cuda:0", "cuda:1"]
+tensor_parallel_size = 2
 ```
 
 Restart `pie serve` to apply. The engine shards the model across the listed devices automatically. From the inferlet side, the model handle is the same; the engine schedules forward passes across all listed devices.
@@ -126,22 +127,24 @@ Restart `pie serve` to apply. The engine shards the model across the listed devi
 ## Multiple models
 
 ```toml
-[model.small]
+[[model]]
+name = "small"
 hf_repo = "Qwen/Qwen3-0.6B"
 
-[model.small.driver]
+[model.driver]
 type = "native"
 device = ["cuda:0"]
 
-[model.large]
+[[model]]
+name = "large"
 hf_repo = "Qwen/Qwen2.5-7B-Instruct"
 
-[model.large.driver]
+[model.driver]
 type = "native"
 device = ["cuda:1"]
 ```
 
-Both load on startup. Inside an inferlet, bind by name (`Model::load("small")` / `Model::load("large")`). See [Loading and selecting models](../model/loading) for the inferlet-side surface.
+Both load on startup. Each `[[model]]` block's `device` list must be disjoint from every other model's. Inside an inferlet, bind by name (`Model::load("small")` / `Model::load("large")`). See [Loading and selecting models](../model/loading) for the inferlet-side surface.
 
 ## Next
 

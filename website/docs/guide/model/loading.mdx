@@ -57,17 +57,19 @@ const model = Model.load(names[0]);
 Add more models to `~/.pie/config.toml`:
 
 ```toml
-[model.default]
+[[model]]
+name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
-[model.default.driver]
+[model.driver]
 type = "native"
 device = ["cuda:0"]
 
-[model.large]
+[[model]]
+name = "large"
 hf_repo = "Qwen/Qwen2.5-7B-Instruct"
 
-[model.large.driver]
+[model.driver]
 type = "native"
 device = ["cuda:1"]
 ```
@@ -129,9 +131,10 @@ Inferlets that bind by hardcoded name (`Model::load("large")`) are tied to the e
 A single model can span multiple devices:
 
 ```toml
-[model.large.driver]
+[model.driver]
 type = "native"
 device = ["cuda:0", "cuda:1"]
+tensor_parallel_size = 2
 ```
 
 The native driver handles tensor parallelism. From the inferlet's side, the model handle is the same; the engine schedules forward passes across the listed devices. See [Drivers](../../reference/drivers) for the per-driver behavior.

@@ -54,33 +54,30 @@ pie model remove <repo>  # delete from cache
 ## Configuring the model
 
 ```toml
-[model.default]
+[[model]]
+name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
-[model.default.driver]
+[model.driver]
 type = "native"
 device = ["cuda:0"]
 
-[model.default.driver.native]
+[model.driver.options]
 gpu_mem_utilization = 0.8
 ```
 
 Multi-GPU (tensor parallel × data parallel):
 
 ```toml
-[model.default.driver]
+[model.driver]
 type = "native"
 device = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
 tensor_parallel_size = 4    # 4-way TP, 1× DP
 ```
 
-If `device` has more entries than `tensor_parallel_size`, the leftovers
-form data-parallel replicas (e.g. `device = [...8 GPUs]` with
-`tensor_parallel_size = 4` runs as 2 DP groups of 4-way TP).
+If `device` has more entries than `tensor_parallel_size`, the leftovers form data-parallel replicas (e.g. `device = [...8 GPUs]` with `tensor_parallel_size = 4` runs as 2 DP groups of 4-way TP).
 
-You can have multiple `[model.<name>]` blocks. The first one (or whatever
-`server.primary_model` names) is the default; inferlets address the
-others via `Model::load(name)`.
+You can have multiple `[[model]]` blocks. The first entry is the implicit default; inferlets address the others via `Model::load("<name>")`. Each model's `device` list must be disjoint from the others.
 
 ## Quantization
 
@@ -89,10 +86,10 @@ choice maps to a torchao config under the hood
 (`pie_driver/quantization.py`).
 
 ```toml
-[model.default.driver]
+[model.driver]
 activation_dtype = "bfloat16"
 
-[model.default.driver.native]
+[model.driver.options]
 weight_dtype = "float8"     # auto / float32 / float16 / bfloat16 / int4 / int8 / float8
 ```
 
@@ -104,12 +101,9 @@ weight_dtype = "float8"     # auto / float32 / float16 / bfloat16 / int4 / int8 
 | `"int4"` | int4 weight-only quantization (torchao). |
 | `"float8"` | float8 weights (torchao). |
 
-`activation_dtype` (one level up under `[model.X.driver]`) is independent,
-typically `bfloat16`.
+`activation_dtype` (one level up under `[model.driver]`) is independent, typically `bfloat16`.
 
-vLLM and SGLang have their own quantization knobs; configure those in
-the driver-specific subtable (`[model.X.driver.vllm]` /
-`[model.X.driver.sglang]`).
+vLLM and SGLang have their own quantization knobs; configure those in `[model.driver.options]` with `type = "vllm"` or `"sglang"` on the driver block.
 
 ## Adding model support
 

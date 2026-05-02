@@ -24,7 +24,7 @@ private_key_path = "~/.ssh/id_ed25519"
 enable_auth = true
 ```
 
-`pie-client config init` walks an interactive prompt to write this file. `pie-client config show` prints the current config. `pie-client config update` patches one key at a time.
+`pie-client config init` walks an interactive prompt to write this file. `pie-client config show` prints the current config. `pie-client config update` patches individual fields by passing the matching `--host` / `--port` / `--username` / `--private-key-path` / `--enable-auth` option.
 
 Every command also accepts `--host`, `--port`, `--username`, `--private-key-path`, and `--config <PATH>` to override or supplement the file.
 
@@ -138,9 +138,9 @@ Manage the per-user config file.
 
 | Subcommand | Description |
 |---|---|
-| `pie-client config init` | Interactive prompt; writes `~/.pie-client/config.toml`. |
-| `pie-client config show` | Pretty-print the current config. |
-| `pie-client config update --key <KEY> --value <VALUE>` | Update one key in the file. |
+| `pie-client config init [--no-enable-auth] [--path FILE]` | Writes `~/.pie-client/config.toml` (or `--path FILE`). Picks up an existing `~/.ssh/id_ed25519` / `id_rsa` / `id_ecdsa` key if found; otherwise points at the default `~/.ssh/id_ed25519` path. |
+| `pie-client config show [--path FILE]` | Pretty-print the current config. |
+| `pie-client config update [--host HOST] [--port PORT] [--username NAME] [--private-key-path PATH] [--enable-auth BOOL] [--path FILE]` | Patch one or more fields. Pass any subset; only provided fields are updated. |
 
 ## Exit codes
 
