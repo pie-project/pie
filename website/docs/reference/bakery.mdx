@@ -1,0 +1,100 @@
+---
+title: Bakery
+description: Reference for the bakery CLI (scaffold, build, publish inferlets)
+---
+
+# Bakery
+
+`bakery` is the developer-side CLI for inferlets. It wraps the Cargo / npm build, talks to the Pie registry, and produces packaged WASM artifacts.
+
+For the end-to-end workflow narrative, see [Your first inferlet](../guide/first-inferlet) (build) and [Deploy and publish](../guide/deploy/serve) (publish). This page is the command reference.
+
+## Install
+
+```bash
+pip install -e sdk/tools/bakery        # from a Pie checkout
+```
+
+When developing inside a Pie checkout, set `PIE_SDK` so bakery can find the SDK libraries:
+
+```bash
+export PIE_SDK=/path/to/pie/sdk
+```
+
+## Commands
+
+```
+bakery [COMMAND]
+  create        Scaffold a new inferlet project
+  build         Build a project (Rust crate or JS/TS) to WASM
+  login         Authenticate with the Pie Registry (GitHub OAuth)
+  inferlet      Manage published inferlets (search / info / publish)
+```
+
+## bakery create
+
+```bash
+bakery create my-inferlet              # Rust template (default)
+bakery create my-inferlet --ts         # TypeScript template
+bakery create my-inferlet -o ./out     # custom output directory
+```
+
+The template lays down `Cargo.toml` (or `package.json`), `Pie.toml`, and a working `lib.rs` / `index.ts` against the current SDK.
+
+## bakery build
+
+```bash
+bakery build <input> -o <output.wasm> [--debug]
+```
+
+| Argument | Description |
+|---|---|
+| `<input>` | Path to a project directory (Rust: contains `Cargo.toml`; JS/TS: contains `package.json`) or a single `.js`/`.ts` file. |
+| `-o, --output <FILE>` | Where to write the `.wasm`. **Required**. |
+| `--debug` | Debug build (JS/TS only): includes source maps. |
+
+```bash
+bakery build ./my-rust-inferlet  -o build/my-inferlet.wasm
+bakery build ./my-ts-inferlet    -o build/my-inferlet.wasm
+bakery build ./index.ts          -o build/single-file.wasm
+```
+
+The platform is auto-detected from the input. For Rust projects bakery just runs the right `cargo build --target wasm32-wasip2 --release` under the hood.
+
+## bakery login
+
+```bash
+bakery login
+```
+
+Opens a GitHub OAuth flow. The token is stored in `~/.pie/auth/registry.json` and used by `bakery inferlet publish`.
+
+## bakery inferlet
+
+```
+bakery inferlet
+  search <query>       Search published inferlets
+  info <name>          Show metadata for a published inferlet
+  publish <path>       Build and publish an inferlet directory
+```
+
+```bash
+bakery inferlet search agent
+bakery inferlet info text-completion
+bakery inferlet publish ./my-inferlet
+```
+
+`bakery inferlet publish` reads `Pie.toml`, locates an existing `.wasm` (next to the manifest, or under `target/wasm32-wasip2/release/`), and uploads it with the manifest to the registry. **It does not build.** Run `bakery build . -o <name>.wasm` before `publish`.
+
+## Requirements
+
+| Platform | What you need |
+|---|---|
+| Rust inferlets | `cargo`, `rustup target add wasm32-wasip2` |
+| JS / TS inferlets | Node.js v18+, `npm`/`npx` |
+
+## Related
+
+- [Your first inferlet](../guide/first-inferlet): build a custom inferlet.
+- [Deploy and publish](../guide/deploy/serve): publish to the registry.
+- [`pie run`](./pie#run): running a built `.wasm` against a one-shot engine.

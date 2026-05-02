@@ -62,7 +62,7 @@ function HomepageHeader() {
                     <Link className="button button--primary button--lg" to="https://github.com/pie-project/pie">
                         View on GitHub
                     </Link>
-                    <Link className="button button--secondary button--lg" to="/docs/welcome">
+                    <Link className="button button--secondary button--lg" to="/docs/overview/what-is-pie">
                         Documentation
                     </Link>
                 </div>
@@ -309,7 +309,7 @@ export default function Home(): JSX.Element {
                             Ready to see how it works? Check out our documentation and get started with Pie today.
                         </p>
                         <div className={styles.ctaActions}>
-                            <Link className="button button--primary button--lg" to="/docs/getting-started">
+                            <Link className="button button--primary button--lg" to="/docs/guide/install">
                                 Getting Started
                             </Link>
 

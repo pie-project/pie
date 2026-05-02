@@ -1,0 +1,182 @@
+---
+title: Filesystem
+description: Read and write the sandboxed scratch directory the host preopens
+sidebar_position: 5
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Filesystem
+
+An inferlet can read and write files inside a single sandboxed directory the host preopens at `/scratch`. Files persist across inferlet runs as long as the engine is up. This is the right place for episodic memory, checkpoints, and any state that should outlive an individual process. Read this after [I/O overview](./overview).
+
+The current filesystem story is intentionally narrow: a single guest path (`/scratch`) backed by one host directory the engine controls. A multi-mount, per-tenant table is on the roadmap; today the contract is "either filesystem access is enabled, or it isn't, and the inferlet sees one directory."
+
+## Read and write
+
+The interface is the language's standard filesystem API.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let s: String = std::fs::read_to_string("/scratch/in.txt")
+    .map_err(|e| e.to_string())?;
+
+std::fs::write("/scratch/out.json", &json_str)
+    .map_err(|e| e.to_string())?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+with open("/scratch/in.txt") as f:
+    s = f.read()
+
+with open("/scratch/out.json", "w") as f:
+    f.write(json_str)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { readFile, writeFile } from 'node:fs/promises';
+
+const s = await readFile('/scratch/in.txt', 'utf-8');
+await writeFile('/scratch/out.json', jsonStr);
+```
+
+</TabItem>
+</Tabs>
+
+Standard filesystem code works as written. The WASI sandbox redirects calls to the preopened directory; paths outside `/scratch` return permission errors.
+
+## Enable filesystem access
+
+Filesystem access is gated by `[server].allow_filesystem` in `~/.pie/config.toml`. It defaults off:
+
+```toml
+[server]
+allow_filesystem = true
+```
+
+When enabled, the engine creates a host-side scratch directory (under the engine's data path) and preopens it at `/scratch` for every inferlet on this server. Restart the engine to apply.
+
+When disabled (the default), the inferlet's filesystem syscalls return errors immediately. There is no way to expose a different host path or split scratch space per inferlet today; every inferlet on the engine shares the same `/scratch`.
+
+See [Configuration](../../reference/configuration) for the full schema.
+
+## Patterns
+
+### Episodic memory
+
+Every run appends a structured event to a JSONL file. The next run reads recent events back into context.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use std::io::Write;
+
+let mut f = std::fs::OpenOptions::new()
+    .append(true).create(true)
+    .open("/scratch/memory.jsonl")
+    .map_err(|e| e.to_string())?;
+
+writeln!(f, "{}", serde_json::json!({"role": "user", "text": question}).to_string())
+    .map_err(|e| e.to_string())?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+import json
+
+with open("/scratch/memory.jsonl", "a") as f:
+    f.write(json.dumps({"role": "user", "text": question}) + "\n")
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { appendFile } from 'node:fs/promises';
+
+await appendFile(
+    '/scratch/memory.jsonl',
+    JSON.stringify({ role: 'user', text: question }) + '\n',
+);
+```
+
+</TabItem>
+</Tabs>
+
+### Checkpoint and resume
+
+Long-running optimization (e.g. ZO) checkpoints adapter weights and progress to disk. The next invocation resumes from the checkpoint.
+
+```rust
+adapter.save("/scratch/adapters/draft-v1.bin")?;
+adapter.load("/scratch/adapters/draft-v1.bin")?;
+```
+
+See [Adapters](../forward/adapters) for the full lifecycle.
+
+### Per-inferlet subdirectories
+
+Because every inferlet on the engine sees the same `/scratch`, build a stable per-inferlet directory yourself if you want isolation:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let dir = "/scratch/research-agent";
+std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+std::fs::write(format!("{dir}/state.json"), &json_str)
+    .map_err(|e| e.to_string())?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+import os
+os.makedirs("/scratch/research-agent", exist_ok=True)
+with open("/scratch/research-agent/state.json", "w") as f:
+    f.write(json_str)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { mkdir, writeFile } from 'node:fs/promises';
+
+await mkdir('/scratch/research-agent', { recursive: true });
+await writeFile('/scratch/research-agent/state.json', jsonStr);
+```
+
+</TabItem>
+</Tabs>
+
+This is a convention, not a sandbox. Other inferlets on the same engine can read and write the same paths.
+
+## Sandbox boundary
+
+Inferlets cannot:
+
+- Access paths outside `/scratch`. `std::fs::read("/etc/passwd")` returns `Err(NotFound)` (or `PermissionDenied`, depending on the platform).
+- Discover the host's directory structure. The only mount the inferlet sees is `/scratch`.
+- Talk to other inferlets through the filesystem in any privileged sense — they share the same `/scratch`, but the runtime does not enforce per-inferlet isolation today.
+
+For the multi-tenant story (per-tenant mounts, read-only paths, host-controlled grants), see the runtime roadmap.
+
+## Next
+
+- [HTTP](./http): the network alternative for state that lives elsewhere.
+- [MCP](./mcp): structured tool servers, which often use the filesystem internally.
+- [Configuration](../../reference/configuration): the `[server].allow_filesystem` flag and the rest of the schema.

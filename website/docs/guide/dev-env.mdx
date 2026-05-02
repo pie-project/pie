@@ -1,0 +1,115 @@
+---
+title: Development environment
+description: Install the toolchain you need to write and build your own inferlets
+sidebar_position: 3
+---
+
+# Development environment
+
+This page sets up the toolchain for writing your own inferlets. Skip it if you only plan to run published inferlets through `pie run`. Read this after [Initial setup](./setup).
+
+The build chain depends on the language. All three end at a `.wasm` component you can run with `pie run --path` or upload to a server.
+
+## Pick a language
+
+| Language | Build tool | Compiler / runtime |
+|---|---|---|
+| Rust | bakery + cargo | rustc + `wasm32-wasip2` target |
+| TypeScript / JavaScript | bakery | JS inferlet runtime (bundled with bakery) |
+| Python | hand-authored project (no scaffold) | Python 3.14 inferlet runtime (downloaded by `pie config init`) |
+
+Rust is the canonical SDK. A few advanced primitives (custom speculators, the `Constrain` trait, the raw `ctx.inner()` page operations) are Rust-only today.
+
+`bakery create` ships scaffolds for Rust (default) and TypeScript (`--ts`). For Python inferlets, copy the [`python-example`](https://github.com/pie-project/pie/tree/main/inferlets/python-example) tree as a starting point — its `Pie.toml` and `pyproject.toml` show what an inferlet needs.
+
+## bakery
+
+`bakery` is the inferlet toolchain. It scaffolds projects, compiles to WebAssembly, and publishes to the registry. It ships with `pie-server`:
+
+```bash
+bakery --version
+```
+
+Common commands:
+
+| Command | What it does |
+|---|---|
+| `bakery create <name>` | Scaffold a new Rust inferlet. |
+| `bakery create <name> --ts` | Scaffold a TypeScript inferlet. |
+| `bakery build <dir> -o <output.wasm>` | Compile to a `.wasm` component (Rust crate, TS/JS project, or single `.ts` / `.js` file). |
+| `bakery login` | GitHub OAuth flow for the Pie registry. |
+| `bakery inferlet publish <dir>` | Publish to the registry. |
+| `bakery inferlet search <query>` | Search the registry. |
+| `bakery inferlet info <name>` | Show registry metadata for a published inferlet. |
+
+See [bakery reference](../reference/bakery) for the full flag list.
+
+## Rust toolchain
+
+For Rust inferlets you need rustc and the `wasm32-wasip2` target.
+
+```bash
+# Install rustup if you do not already have it.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Add the WebAssembly target.
+rustup target add wasm32-wasip2
+```
+
+A minimum Rust version of 1.85 is required.
+
+To verify, scaffold and build the helloworld inferlet:
+
+```bash
+bakery create hello
+cd hello
+bakery build . -o hello.wasm
+pie run --path ./hello.wasm --manifest ./Pie.toml
+```
+
+If `bakery build` succeeds and `pie run` prints a hello message, the Rust toolchain is configured.
+
+## Python and JavaScript runtimes
+
+`pie config init` downloads the Python 3.14 inferlet runtime into `~/.pie/`. The JavaScript runtime is bundled with bakery itself, so no separate download step is needed for TypeScript / JavaScript projects.
+
+```bash
+pie config init           # writes ~/.pie/config.toml + downloads the Python runtime
+```
+
+For Python inferlets, declare your dependencies in `pyproject.toml`. `bakery build` resolves them, packages everything with the inferlet runtime, and emits a single `.wasm`. The Python runtime supports the standard library plus pure-Python packages; native extensions are not supported today.
+
+For TypeScript / JavaScript inferlets, write TS or JS and declare deps in `package.json`. `bakery build` runs the bundler and links against the JS runtime.
+
+## Local-build run
+
+`pie run` with no path argument resolves the inferlet name through the registry. To run a local build, point at the `.wasm` and its manifest:
+
+```bash
+pie run \
+  --path ./target/wasm32-wasip2/release/my_inferlet.wasm \
+  --manifest ./Pie.toml \
+  --prompt "hello"
+```
+
+`--path` accepts the bakery output (`./hello.wasm`) or the raw cargo output (`target/wasm32-wasip2/release/...`). Both are the same component.
+
+## Iterate
+
+The dev loop is edit, build, run.
+
+```bash
+# After editing your source:
+bakery build . -o hello.wasm
+pie run --path ./hello.wasm --manifest ./Pie.toml --prompt "..."
+```
+
+A Rust rebuild after a one-line change is typically a few seconds. Python and JavaScript rebuilds are faster because they skip native compilation.
+
+To stream stderr from your inferlet during development, write to stderr the language-native way: `eprintln!` in Rust, `print(file=sys.stderr)` in Python, `console.error` in JavaScript. `pie run` mirrors stderr to your terminal.
+
+## Next
+
+- [Your first inferlet](./first-inferlet): scaffold, write, and build a Rust inferlet step by step.
+- [Tutorial](./tutorial/build): build a parallel research agent in any of the three languages.
+- [bakery reference](../reference/bakery): every command and flag.

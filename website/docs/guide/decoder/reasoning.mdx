@@ -1,0 +1,188 @@
+---
+title: Reasoning parser
+description: Surface a thinking-mode model's reasoning trace as its own event stream
+sidebar_position: 4
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Reasoning parser
+
+Reasoning models like Qwen3 and DeepSeek-R1 emit a thinking block before the visible reply. The block is wrapped in model-specific markers (e.g. `<think>...</think>`) and contains the model's intermediate reasoning. `reasoning::Decoder` is a stateful parser that surfaces those blocks as their own event stream so you can route them separately from the visible answer. Read this after [Chat parser](./chat).
+
+## The two parsers are independent
+
+The chat parser and the reasoning parser consume the same tokens but emit disjoint events. Tokens inside a reasoning block produce `reasoning::Event::Delta` and are suppressed by the chat parser. Tokens after the block produce `chat::Event::Delta` and are ignored by the reasoning parser.
+
+You instantiate both, feed each step's tokens to both, and dispatch on whichever event you care about.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::{chat, reasoning, sample::Sampler};
+
+let mut g = ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+    .max_tokens(512);
+
+let mut chat_dec  = chat::Decoder::new(&model);
+let mut think_dec = reasoning::Decoder::new(&model);
+
+while let Some(step) = g.next()? {
+    let out = step.execute().await?;
+
+    if let reasoning::Event::Delta(s) = think_dec.feed(&out.tokens)? {
+        eprint!("[think] {s}");
+    }
+
+    match chat_dec.feed(&out.tokens)? {
+        chat::Event::Delta(s) => print!("{s}"),
+        chat::Event::Done(_)  => break,
+        _ => {}
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+import sys
+from inferlet import Sampler, chat, reasoning
+
+g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=512)
+
+chat_dec = chat.Decoder(model)
+think = reasoning.Decoder(model)
+
+async for step in g:
+    out = await step.execute()
+
+    match think.feed(out.tokens):
+        case reasoning.Event.Delta(text=t):
+            print(f"[think] {t}", end="", file=sys.stderr)
+        case _:
+            pass
+
+    match chat_dec.feed(out.tokens):
+        case chat.Event.Delta(text=t):
+            print(t, end="")
+        case chat.Event.Done(text=_):
+            break
+        case _:
+            pass
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Sampler, chat, reasoning } from 'inferlet';
+
+const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 512 });
+
+const chatDec = new chat.Decoder(model);
+const thinkDec = new reasoning.Decoder(model);
+
+for await (const step of g) {
+    const out = await step.execute();
+
+    const rev = thinkDec.feed(out.tokens);
+    if (rev.type === 'delta') process.stderr.write(`[think] ${rev.text}`);
+
+    const cev = chatDec.feed(out.tokens);
+    if (cev.type === 'delta') process.stdout.write(cev.text);
+    else if (cev.type === 'done') break;
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Events
+
+| Event | When |
+|---|---|
+| `Idle` | This step had no reasoning content. |
+| `Start` | The reasoning block opened. |
+| `Delta(text)` | New reasoning text. |
+| `End(text)` | The reasoning block closed. `text` is the full reasoning content. |
+
+`Start` and `End` are useful for UI work: open a "thinking" panel on `Start`, append `Delta`s, close the panel on `End`.
+
+## Suppressing reasoning entirely
+
+If you don't want to show the thinking content, instantiate `reasoning::Decoder` and discard its events. The chat parser independently strips template control tokens around the thinking block but does not suppress its content; the reasoning parser is what *captures* it so you can choose what to do with it. Both parsers are stateless about each other — the suppression is a consequence of where each fires, not of either parser knowing about the other.
+
+## Forcing reasoning off
+
+Some chat templates expose a "no-think" mode. The way to use it is model-specific. Qwen3, for example, accepts a `nothink` flag in the chat template. Set it through the SDK's chat-template options where available, or handcraft the prompt with `ctx.append(...)` if you need full control.
+
+## Routing reasoning to the client
+
+In an interactive UI you usually want to show the reasoning trace separately from the answer. Stream reasoning to one channel and chat to another:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::pie::core::session;
+
+if let reasoning::Event::Delta(s) = think_dec.feed(&out.tokens)? {
+    session::send(&format!(r#"{{"channel":"think","text":{}}}"#, serde_json::to_string(&s).unwrap()));
+}
+
+if let chat::Event::Delta(s) = chat_dec.feed(&out.tokens)? {
+    session::send(&format!(r#"{{"channel":"answer","text":{}}}"#, serde_json::to_string(&s).unwrap()));
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import session
+
+match think.feed(out.tokens):
+    case reasoning.Event.Delta(text=t):
+        session.send({"channel": "think", "text": t})
+
+match chat_dec.feed(out.tokens):
+    case chat.Event.Delta(text=t):
+        session.send({"channel": "answer", "text": t})
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { session } from 'inferlet';
+
+const rev = thinkDec.feed(out.tokens);
+if (rev.type === 'delta') session.send({ channel: 'think', text: rev.text });
+
+const cev = chatDec.feed(out.tokens);
+if (cev.type === 'delta') session.send({ channel: 'answer', text: cev.text });
+```
+
+</TabItem>
+</Tabs>
+
+The client side dispatches on the `channel` field.
+
+## Reasoning models supported today
+
+Models with template-recognized thinking blocks include the Qwen3 family, DeepSeek-R1 distillations, and OLMo 3 thinking variants. The reasoning decoder reads the template's marker tokens, so the same code works for any model whose template registers thinking-mode markers.
+
+## Patterns
+
+- **CoT monitoring.** Stream reasoning to a side panel, surface it for review without showing it to the model's downstream consumers.
+- **Verbose mode.** Toggle reasoning visibility with a flag on the inferlet's input.
+- **Reasoning-bounded budgets.** Stop generation if the reasoning trace exceeds a length cap (probe `End` event or count tokens between `Start` and `End`).
+
+## Next
+
+- [Tool-call parser](./tool-calling): the parser for tool calls.
+- [Generator](./generator): the multi-step source the parser composes with.
+- [Chat parser](./chat): the parser for visible chat text, paired with this one.

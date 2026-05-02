@@ -1,0 +1,19 @@
+---
+title: Speculative decoding
+description: Custom drafters
+sidebar_position: 6
+---
+
+# Speculative decoding
+
+Inferlets that implement custom draft strategies on top of Pie's `Speculator` trait. For the runtime-managed n-gram path, see `text-completion-spec` under [Chat and generation](./chat).
+
+| Inferlet | What it shows |
+|---|---|
+| [`jacobi-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/jacobi-decoding) | Parallel Jacobi decoding (custom drafter). |
+| [`cacheback-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/cacheback-decoding) | Cache-based drafter via n-gram matching. |
+
+## Related guide
+
+- [Speculative decoding](../forward/speculation): the `Speculator` trait, system speculation, and the verify path.
+- [The forward pass](../forward/overview): position IDs that drafts share with their target.

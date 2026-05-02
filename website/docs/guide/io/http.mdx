@@ -1,0 +1,214 @@
+---
+title: HTTP
+description: Issue HTTP requests from inside an inferlet
+sidebar_position: 4
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# HTTP
+
+An inferlet can issue HTTP requests to external services from inside the sandbox. This page covers the request and response shape. Read this after [I/O overview](./overview).
+
+:::note[Pie SDK status]
+HTTP is fully supported in the Rust SDK today via the `wstd::http` crate. The Python and JavaScript SDKs do not yet bind WASI HTTP. The non-Rust tabs below show the intended API shape; the runtime support is in progress. For a working three-language tutorial against this API shape, see [Tutorial: build the agent](../tutorial/build).
+:::
+
+## Single request
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::wstd::http::{Client, Method, Request};
+use inferlet::wstd::io::{empty, AsyncRead};
+use inferlet::Result;
+
+async fn fetch(url: &str) -> Result<Vec<u8>> {
+    let client = Client::new();
+    let req = Request::builder()
+        .uri(url)
+        .method(Method::GET)
+        .body(empty())
+        .map_err(|e| e.to_string())?;
+
+    let resp = client.send(req).await.map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    resp.into_body()
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(buf)
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+import requests
+
+def fetch(url: str) -> bytes:
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    return r.content
+```
+
+In an async context, wrap with `asyncio.to_thread(requests.get, url)` to avoid blocking the event loop.
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+async function fetchBlob(url: string): Promise<Uint8Array> {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return new Uint8Array(await r.arrayBuffer());
+}
+```
+
+</TabItem>
+</Tabs>
+
+The Rust path uses WASI HTTP through `wstd::http::Client`. Connections multiplex automatically: many concurrent requests reuse the underlying transport without you managing it.
+
+## Concurrent requests
+
+Issue many requests in parallel with the language's standard async primitive.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use futures::future;
+
+let urls = vec!["https://a.example/", "https://b.example/", "https://c.example/"];
+let results = future::join_all(urls.iter().map(|u| fetch(u))).await;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+import asyncio
+
+async def fetch_async(url: str) -> bytes:
+    return await asyncio.to_thread(requests.get, url, timeout=10)
+
+urls = ["https://a.example/", "https://b.example/", "https://c.example/"]
+results = await asyncio.gather(*(fetch_async(u) for u in urls))
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const urls = ['https://a.example/', 'https://b.example/', 'https://c.example/'];
+const results = await Promise.all(urls.map(u => fetchBlob(u)));
+```
+
+</TabItem>
+</Tabs>
+
+Concurrent fetches share the inferlet's event loop. The model's forward passes do not stall on HTTP: while requests are in flight, `g.next()?` continues to schedule passes.
+
+## JSON request and response
+
+A common pattern: POST a JSON body, read JSON back.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::wstd::http::{Client, Method, Request};
+use inferlet::wstd::io::AsyncRead;
+
+async fn post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+    let client = Client::new();
+    let req = Request::builder()
+        .uri(url)
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(body.to_string().into())
+        .map_err(|e| e.to_string())?;
+
+    let resp = client.send(req).await.map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    resp.into_body()
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::from_slice(&buf).map_err(|e| e.to_string())
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+import requests
+
+def post_json(url: str, body: dict) -> dict:
+    r = requests.post(url, json=body, timeout=10)
+    r.raise_for_status()
+    return r.json()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+async function postJson(url: string, body: unknown): Promise<unknown> {
+    const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Streaming response bodies
+
+For server-sent events or chunked responses, read the body incrementally:
+
+```rust
+use inferlet::wstd::http::{Client, Method, Request};
+use inferlet::wstd::io::{empty, AsyncRead};
+
+let resp = client.send(req).await.map_err(|e| e.to_string())?;
+let mut body = resp.into_body();
+let mut chunk = vec![0u8; 4096];
+
+loop {
+    let n = body.read(&mut chunk).await.map_err(|e| e.to_string())?;
+    if n == 0 { break; }
+    process_chunk(&chunk[..n]);
+}
+```
+
+The [`http-server`](https://github.com/pie-project/pie/tree/main/inferlets/http-server) inferlet shows the inverse pattern: an inferlet that *serves* HTTP, including SSE streaming.
+
+## Sandbox boundary
+
+HTTP requests leave the inferlet's sandbox and reach the network through the engine. The engine does not currently enforce per-host allowlists, but the policy may tighten in future releases. Treat outbound HTTP as a privileged operation when you are deciding what an untrusted inferlet should do.
+
+## Common services
+
+Examples of services that work well from inside an inferlet:
+
+- **Wikipedia REST API** (`https://en.wikipedia.org/api/rest_v1/`). No auth, free, ideal for retrieval examples.
+- **Search APIs** (Bing, Google CSE, Brave). Bring your own key.
+- **Vector store endpoints** (Pinecone, Qdrant, Weaviate). Authenticate with the API key from `runtime::env(...)` (when supported) or pass it as inferlet input.
+- **Internal HTTP services** for tool execution, code sandboxes, or document parsers.
+
+## Next
+
+- [Filesystem](./filesystem): persistent local storage.
+- [MCP](./mcp): structured tool servers as an alternative to raw HTTP.
+- [Tutorial: build a parallel research agent](../tutorial/build): parallel HTTP fetches as a worked example.

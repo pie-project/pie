@@ -1,0 +1,162 @@
+---
+title: Context overview
+description: What a Context is and how it relates to the running inferlet
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Context overview
+
+A `Context` is the unit of conversation state inside an inferlet. It owns a token sequence, a KV cache, and an optional name. Most generation goes through one. This page explains the model. Read this after [Loading and selecting models](../model/loading).
+
+## What a context owns
+
+Two things, both bound to a model:
+
+- **A token sequence.** The text you've fed in (system prompt, user turns, assistant turns) plus tokens generated so far, encoded as token IDs.
+- **A KV cache.** The transformer's per-layer key/value tensors for those tokens, organized as fixed-size [pages](./pages).
+
+Plus a small staging buffer. When you call `ctx.user("...")`, the SDK appends bytes to a pending buffer; the engine sees nothing until `flush()` or `generate()` runs prefill. The pending buffer is part of the context's logical state but does not yet exist as KV.
+
+A context is bound to one model for its lifetime. To use two models in the same inferlet, allocate one context per model.
+
+## Create one
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::{Context, model::Model, runtime, Result};
+
+let model = Model::load(runtime::models().first().ok_or("no models")?)?;
+let mut ctx = Context::new(&model)?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Context, Model, runtime
+
+model = Model.load(runtime.models()[0])
+ctx = Context(model)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Context, Model, runtime } from 'inferlet';
+
+const model = Model.load(runtime.models()[0]);
+const ctx = new Context(model);
+```
+
+</TabItem>
+</Tabs>
+
+A fresh context is anonymous: its KV pages are released when the inferlet exits or when the handle drops.
+
+## Fill it
+
+A context exposes the model's chat template directly. Methods return `&mut self` (Rust), `self` (Python), or `this` (JS) so they chain.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+ctx.system("You are a helpful assistant.")
+   .user("What is the capital of France?")
+   .cue();
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+(ctx
+   .system("You are a helpful assistant.")
+   .user("What is the capital of France?")
+   .cue())
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+ctx.system('You are a helpful assistant.')
+   .user('What is the capital of France?')
+   .cue();
+```
+
+</TabItem>
+</Tabs>
+
+| Method | Description |
+|---|---|
+| `system(text)` | Append a system message. |
+| `user(text)` | Append a user message. |
+| `assistant(text)` | Append a pre-filled assistant turn. |
+| `cue()` | Mark the position where the model takes over. |
+| `seal()` | Close the current assistant turn. |
+| `append(tokens)` | Append raw token IDs (skip the chat template). |
+
+The chat template (role tags, BOS, EOS, thinking-mode markers) is applied automatically. If you need raw token-level control, use `append(token_ids)` instead.
+
+## Run something on it
+
+A filled context goes one of two places:
+
+- **`ctx.generate(...)`**: the high-level autoregressive loop. See [Generation overview](../decoder/overview).
+- **`ctx.forward()`**: a single forward pass. See [The forward pass](../forward/overview).
+
+Both implicitly flush any pending tokens. You rarely call `flush()` directly; the case where you do is when you want to commit a long prefix once and then fork from it.
+
+## Lifecycle
+
+A context lives as long as the handle exists, plus any time it spends as a named snapshot.
+
+- **Anonymous**: no name. Pages release when the handle drops or the inferlet exits.
+- **Saved**: `ctx.save("my-prefix")` creates a snapshot. The snapshot persists past the inferlet's exit until the engine restarts or you `Context::delete` it.
+- **Forked**: `ctx.fork()` is a copy-on-write clone. See [Forking and saving](./sharing).
+
+## Inspect
+
+A context exposes its own metrics:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let len = ctx.seq_len();          // total tokens (committed + working)
+let psize = ctx.page_size();      // tokens per page
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+len_ = ctx.seq_len               # total tokens (committed + working)
+psize = ctx.page_size            # tokens per page
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const len = ctx.seqLen;           // total tokens (committed + working)
+const psize = ctx.pageSize;       // tokens per page
+```
+
+</TabItem>
+</Tabs>
+
+For lower-level counts (committed vs working pages, working-page token count, the pending buffer), see the [SDK reference](../../reference/sdk-rust).
+
+## Next
+
+- [Pages](./pages): the page model, prefill, and the committed-vs-working distinction.
+- [Forking and saving](./sharing): branch a context, snapshot a prefix, share state across runs.
+- [Scheduling and budgets](./scheduling): the credit auction that prices forward passes.

@@ -1,0 +1,505 @@
+---
+title: JavaScript SDK reference
+description: Full inferlet SDK API for JavaScript / TypeScript
+---
+
+# JavaScript SDK reference
+
+The full inferlet SDK API for JavaScript and TypeScript. The [Guide](../guide/install) walks through how to use these APIs with runnable code; this page enumerates the surface.
+
+## Inferlet entry point
+
+```typescript
+export async function main(input: Input): Promise<Output> {
+    // ...
+}
+```
+
+The JS inferlet runtime invokes a top-level `export async function main(input)`. `input` is a parsed JSON object whose shape matches the manifest's `[parameters]` block. The return value is JSON-serialized into the `Return` event the client receives.
+
+Throw to fail the run; the message becomes the `Error` event.
+
+## Imports
+
+The whole SDK lives under `inferlet`:
+
+```typescript
+import {
+    Model, Tokenizer, Context, Adapter,
+    Forward, Output, Generator, GenStep,
+    Sampler, Logits, Distribution, Logprob, Logprobs, Entropy,
+    Grammar, GrammarConstraint,
+    jsonSchema, anyJson, regex, ebnf, grammar,
+    chat, reasoning, tools,
+    runtime, scheduling, session, messaging, mcp,
+} from 'inferlet';
+```
+
+## Runtime
+
+```typescript
+import { runtime } from 'inferlet';
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `runtime.models()` | `string[]` | Names of every model the engine has loaded. |
+| `runtime.version()` | `string` | Pie runtime version string. |
+| `runtime.instanceId()` | `string` | Unique identifier for this engine instance. |
+| `runtime.username()` | `string` | Username of the user who launched the inferlet. |
+
+## Model
+
+```typescript
+import { Model } from 'inferlet';
+```
+
+| Method | Description |
+|---|---|
+| `Model.load(name: string): Model` | Bind to a loaded model. |
+| `model.tokenizer(): Tokenizer` | The model's tokenizer. |
+
+## Tokenizer
+
+| Method | Returns | Description |
+|---|---|---|
+| `tk.encode(text)` | `Uint32Array` | Text to token IDs. |
+| `tk.decode(tokens)` | `string` | Token IDs to text. |
+| `tk.vocabs()` | `[Uint32Array, Uint8Array[]]` | Full vocabulary as parallel arrays. |
+| `tk.specialTokens()` | `[Uint32Array, Uint8Array[]]` | Special token IDs. |
+| `tk.splitRegex()` | `string` | The split regex used during BPE pre-tokenization. |
+
+## Context
+
+```typescript
+import { Context } from 'inferlet';
+
+using ctx = new Context(model);
+```
+
+`Context` implements `Disposable`, so `using` (TC39 Explicit Resource Management) releases pages on scope exit.
+
+### Construction and lifecycle
+
+| Method | Description |
+|---|---|
+| `new Context(model)` | Fresh anonymous context. |
+| `Context.open(model, name): Context \| undefined` | Clone a saved snapshot. |
+| `Context.take(model, name): Context \| undefined` | Take ownership of a snapshot (snapshot removed). |
+| `Context.delete(model, name): void` | Drop a saved snapshot. |
+| `ctx.fork(): Context` | Copy-on-write clone. O(1). |
+| `ctx.save(name): void` | Snapshot under a user-chosen name. |
+| `ctx.snapshot(): string` | Snapshot under a runtime-generated name. Returns the name. |
+| `ctx.release(): void` | Force-destroy this context immediately. |
+
+### Filling
+
+| Method | Description |
+|---|---|
+| `ctx.system(text): this` | Add a system message. |
+| `ctx.user(text): this` | Add a user message. |
+| `ctx.assistant(text): this` | Add a pre-filled assistant turn. |
+| `ctx.cue(): this` | Mark the current position as the model's start. |
+| `ctx.seal(): this` | Close the current assistant turn. |
+| `ctx.append(tokens): this` | Append raw token IDs. |
+| `ctx.appendText(text): this` | Tokenize and append text. |
+| `await ctx.flush()` | Run prefill on buffered tokens; commit pages. |
+
+### Inspection
+
+| Property / method | Type | Description |
+|---|---|---|
+| `ctx.model` | `Model` | The bound model. |
+| `ctx.pageSize` | `number` | Tokens per KV page. |
+| `ctx.seqLen` | `number` | Total committed + working tokens. |
+| `ctx.buffer()` | `Uint32Array` | SDK-side buffered tokens. |
+
+### Truncate
+
+| Method | Description |
+|---|---|
+| `ctx.truncate(n)` | Drop the trailing `n` tokens from working pages. |
+
+The JS SDK does not expose raw page operations (`reserve_working_pages`, `commit_working_pages`, etc.); those are Rust-only.
+
+## Generator
+
+```typescript
+import { Sampler } from 'inferlet';
+
+const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
+```
+
+`ctx.generate(sampler, options)` returns a `Generator`. Drive it with one of the collectors, with `for await`, or manually.
+
+### `GenerateOptions`
+
+| Field | Type | Description |
+|---|---|---|
+| `maxTokens` | `number` | Stop after `n` tokens. |
+| `stop` | `Iterable<number>` | Stop-token IDs. |
+| `constrain` | `Schema \| Constraint` | Attach a constraint (or use `g.constrain(...)` to chain). |
+| `speculator` | `Speculator` | Custom speculator. |
+| `systemSpeculation` | `boolean` | Use the runtime's built-in n-gram drafter. Default `false`. |
+| `adapter` | `Adapter` | LoRA adapter to apply. |
+| `horizon` | `number` | Hint expected output length. |
+
+`speculator` and `systemSpeculation` are mutually exclusive.
+
+### Builder methods
+
+| Method | Description |
+|---|---|
+| `g.maxTokens(n): this` | Hard cap on tokens. |
+| `g.stop(tokens): this` | Replace the stop set. |
+| `g.addStop(tokens): this` | Append to the stop set. |
+| `g.constrain(c): this` | Add a constraint. |
+| `g.horizon(n): this` | Hint expected output length. |
+| `g.adapter(a): this` | Apply an adapter. |
+
+### Inspection
+
+| Property | Description |
+|---|---|
+| `g.tokensGenerated` | Tokens accepted so far. |
+| `g.isDone` | `true` after termination. |
+
+### Collectors
+
+| Method | Returns | Description |
+|---|---|---|
+| `await g.collectTokens()` | `Uint32Array` | Drain; return all tokens. |
+| `await g.collectText()` | `string` | Drain, run a chat decoder internally, return the assembled string. |
+| `await g.collectJson<T>(opts?)` | `Promise<T>` | Add a JSON-schema constraint, drain, parse. Options: `schema?: string`, `parse?: (val) => T`. |
+
+### Per-step iteration
+
+```typescript
+for await (const step of g) {
+    const out = await step.execute();
+    // inspect; optionally call g.accept(...)
+}
+```
+
+| `GenStep` method | Description |
+|---|---|
+| `step.clearSampler(): this` | Drop the auto-attached sampler. |
+| `step.probe(idx, probe): ProbeHandle` | Attach an extra probe for this iteration. |
+| `await step.execute(): Promise<Output>` | Run the forward pass. |
+
+| Generator method | Description |
+|---|---|
+| `g.accept(tokens): Uint32Array` | Register manually-sampled tokens. |
+
+## Forward
+
+```typescript
+const fwd = ctx.forward();
+fwd.input(tokenIds);
+const h = fwd.sample([0], Sampler.argmax());
+const out = await fwd.execute();
+const token = out.token(h);
+```
+
+### Builder methods
+
+| Method | Description |
+|---|---|
+| `fwd.input(tokens): this` | Token IDs with auto-derived positions. |
+| `fwd.inputAt(tokens, positions): this` | Token IDs with explicit positions. |
+| `fwd.attentionMask(masks): this` | Per-input-token attention masks. |
+| `fwd.mask(brle): this` | Logit mask. |
+| `fwd.sample(indices, sampler): SampleHandle` | Attach a sampler. |
+| `fwd.probe(idx, probe): ProbeHandle` | Attach a probe. |
+| `fwd.adapter(a): this` | Apply an adapter. |
+| `await fwd.execute(): Promise<Output>` | Run the pass. |
+
+### Inspection
+
+| Method | Description |
+|---|---|
+| `fwd.startPosition()` | Position the first auto-input token will occupy. |
+
+### Output access
+
+| Method | Returns | Use after |
+|---|---|---|
+| `out.token(h)` | `number \| undefined` | Single-index sampler. |
+| `out.tokensAt(h)` | `Uint32Array` | Multi-index sampler. |
+| `out.distribution(h)` | `[Uint32Array, Float32Array] \| undefined` | `Distribution(...)` probe. |
+| `out.logits(h)` | `Uint8Array \| undefined` | `Logits()` probe. Decode as packed f32 LE. |
+| `out.logprobs(h)` | `Float32Array \| undefined` | `Logprob` or `Logprobs` probe. |
+| `out.entropy(h)` | `number \| undefined` | `Entropy()` probe. |
+| `out.tokens` | `Uint32Array` | All tokens accepted. |
+
+## Samplers
+
+```typescript
+import { Sampler } from 'inferlet';
+```
+
+| Constructor | Description |
+|---|---|
+| `Sampler.argmax()` | Greedy. |
+| `Sampler.topP(temperature, p)` | Nucleus sampling. |
+| `Sampler.topK(temperature, k)` | Top-k sampling. |
+| `Sampler.minP(temperature, p)` | Min-p sampling. |
+| `Sampler.topKTopP(temperature, k, p)` | Top-k filter, then nucleus. |
+| `Sampler.multinomial(temperature, draws)` | Multinomial draws. |
+
+## Probes
+
+```typescript
+import { Logits, Distribution, Logprob, Logprobs, Entropy } from 'inferlet';
+```
+
+| Probe | Output accessor | Returns |
+|---|---|---|
+| `Logits()` | `out.logits(h)` | `Uint8Array` (packed f32 LE). |
+| `Distribution(temperature, k)` | `out.distribution(h)` | `[ids, probs]`. `k=0` for full vocab. |
+| `Logprob(token)` | `out.logprobs(h)` | Length-1 `Float32Array`. |
+| `Logprobs(tokens)` | `out.logprobs(h)` | Length-K `Float32Array` (input order). |
+| `Entropy()` | `out.entropy(h)` | `number`. |
+
+## Constraints
+
+### Schema
+
+```typescript
+import { jsonSchema, anyJson, regex, ebnf, grammar } from 'inferlet';
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `anyJson()` | `Schema` | Any valid JSON. |
+| `jsonSchema(s)` | `Schema` | JSON conforming to a JSON Schema string. |
+| `regex(p)` | `Schema` | Strings matching a regex. |
+| `ebnf(g)` | `Schema` | Custom EBNF grammar. |
+| `grammar(g)` | `Schema` | Pre-compiled `Grammar`. |
+
+Pass to `ctx.generate(sampler, { constrain })` or `g.constrain(...)`.
+
+### Custom Schema
+
+```typescript
+class MySchema {
+    buildConstraint(model: Model): GrammarConstraint { /* ... */ }
+}
+```
+
+Any object with a `buildConstraint(model)` method satisfies the `Schema` interface.
+
+### Custom Constraint
+
+```typescript
+import type { Constraint } from 'inferlet';
+
+class MyConstraint implements Constraint {
+    step(accepted: Uint32Array): Uint32Array {
+        // return a BRLE-encoded logit mask
+    }
+}
+```
+
+Return an empty `Uint32Array` for "no restriction this step."
+
+### Grammar / GrammarConstraint / Matcher
+
+```typescript
+import { Grammar, GrammarConstraint, Matcher } from 'inferlet';
+```
+
+| Method | Description |
+|---|---|
+| `Grammar.fromJsonSchema(s)` | Build from JSON Schema. |
+| `Grammar.json()` | Free-form JSON. |
+| `Grammar.fromRegex(p)` | Regex pattern. |
+| `Grammar.fromEbnf(g)` | EBNF (Lark) grammar. |
+| `GrammarConstraint.fromGrammar(g, model)` | Pre-compiled grammar. |
+| `GrammarConstraint.fromJsonSchema(s, model)` | JSON Schema. |
+| `GrammarConstraint.json(model)` | Free-form JSON. |
+| `GrammarConstraint.fromRegex(p, model)` | Regex. |
+| `GrammarConstraint.fromEbnf(g, model)` | EBNF. |
+| `new Matcher(grammar, tokenizer)` | Stateful walker. |
+| `m.acceptTokens(ids)` | Advance the matcher state. |
+| `m.nextTokenLogitMask()` | BRLE mask. |
+| `m.isTerminated()` | Whether the matcher reached a terminal state. |
+| `m.reset()` | Reset to initial state. |
+
+## Speculative decoding
+
+```typescript
+import type { Speculator } from 'inferlet';
+
+class MySpec implements Speculator {
+    draft(): [Uint32Array, Uint32Array] { /* ... */ }
+    accept(tokens: Uint32Array): void { /* ... */ }
+    rollback(n: number): void { /* ... */ }
+    reset(): void { /* ... */ }
+}
+```
+
+Pass via `ctx.generate(sampler, { speculator: new MySpec() })`. `systemSpeculation: true` opts into the runtime's built-in n-gram drafter (mutually exclusive with `speculator`).
+
+## Adapters
+
+```typescript
+import { Adapter } from 'inferlet';
+```
+
+| Method | Description |
+|---|---|
+| `Adapter.create(model, name): Adapter` | Create a new LoRA overlay. |
+| `Adapter.open(model, name): Adapter \| undefined` | Open an existing one. |
+| `a.fork(newName): Adapter` | Copy under a new name. |
+| `a.save(path): void` | Serialize to disk. |
+| `a.load(path): void` | Load weights from disk. |
+| `a.destroy(): void` | Drop the registry slot. |
+
+`Adapter` implements `Disposable`. Use with `using`:
+
+```typescript
+using a = Adapter.create(model, 'draft');
+```
+
+## Decoders (parsers)
+
+All three follow the same shape: `new chat.Decoder(model)` constructor, `feed(tokens)` returning an event, `reset()`.
+
+### chat.Decoder
+
+```typescript
+import { chat } from 'inferlet';
+
+const dec = new chat.Decoder(model);
+const ev = dec.feed(tokens);
+if (ev.type === 'delta') { /* ... */ }
+```
+
+| Event `type` | Fields | Meaning |
+|---|---|---|
+| `'idle'` | (none) | No semantic boundary. |
+| `'delta'` | `text: string` | Streaming visible text. |
+| `'done'` | `text: string` | End of turn. |
+| `'interrupt'` | `token: number` | Template control token. |
+
+Helpers: `chat.system(model, msg)`, `chat.user(...)`, `chat.assistant(...)`, `chat.cue(model)`, `chat.seal(model)`, `chat.stopTokens(model)` — return token-ID arrays for use with `ctx.append(...)`.
+
+### reasoning.Decoder
+
+```typescript
+import { reasoning } from 'inferlet';
+```
+
+| Event `type` | Fields | Meaning |
+|---|---|---|
+| `'idle'` | (none) | No reasoning content. |
+| `'start'` | (none) | Entering a reasoning block. |
+| `'delta'` | `text: string` | Reasoning text. |
+| `'end'` | `text: string` | Reasoning block closed. |
+
+### tools.Decoder
+
+```typescript
+import { tools } from 'inferlet';
+```
+
+| Event `type` | Fields | Meaning |
+|---|---|---|
+| `'start'` | (none) | Tool call assembling. |
+| `'call'` | `name: string`, `arguments: string` | Call complete. `arguments` is JSON-encoded. |
+
+Helpers:
+
+| Function | Description |
+|---|---|
+| `tools.equipPrefix(model, schemas)` | Tokens that equip the model with a tool list. |
+| `tools.answerPrefix(model, name, value)` | Tokens that feed a tool result back. |
+| `tools.parseCall(model, text)` | Extract a single completed call from a finished string. |
+| `tools.nativeMatcher(model, schemas)` | Compiled `Matcher` over the model's native tool-call format, or `undefined`. |
+
+## I/O
+
+### Session
+
+```typescript
+import { session } from 'inferlet';
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `session.send(message)` | — | Send to the client. Strings go through verbatim; other types JSON-encoded. |
+| `session.sendFile(data: Uint8Array)` | — | Send a binary blob. |
+| `await session.receive()` | `string` | Wait for the next inbound message. |
+| `await session.receiveFile()` | `Uint8Array` | Wait for the next inbound file. |
+
+Signals from `proc.signal(...)` arrive through `session.receive`.
+
+### Messaging
+
+```typescript
+import { messaging, Subscription } from 'inferlet';
+```
+
+| Function | Description |
+|---|---|
+| `messaging.broadcast(topic, message)` | Publish to every subscriber. |
+| `messaging.subscribe(topic): Subscription` | Open a subscription. |
+| `messaging.push(topic, message)` | Push onto a queue. |
+| `await messaging.pull(topic): string` | Wait for the next queued message. |
+
+`Subscription` (implements `AsyncIterable<string>` and `Disposable`):
+
+| Method | Description |
+|---|---|
+| `await sub.next(): Promise<string \| undefined>` | Wait for the next broadcast. |
+| `sub.unsubscribe(): void` | Drop the subscription. |
+| `for await (const msg of sub)` | Async-iterable shorthand. |
+
+### MCP
+
+```typescript
+import { mcp, McpSession } from 'inferlet';
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `mcp.availableServers()` | `string[]` | Names of registered servers. |
+| `mcp.connect(name): McpSession` | session | Open a session. |
+
+`McpSession`:
+
+| Method | Returns | Description |
+|---|---|---|
+| `s.listTools()` | `string` (JSON) | Raw `tools/list` result. |
+| `s.callTool(name, args)` | `string` (JSON) | Raw `tools/call` result. |
+| `s.listResources()` | `string` (JSON) | Raw `resources/list` result. |
+| `s.readResource(uri)` | `string` (JSON) | Raw `resources/read` result. |
+| `s.listPrompts()` | `string` (JSON) | Raw `prompts/list` result. |
+| `s.getPrompt(name, args)` | `string` (JSON) | Raw `prompts/get` result. |
+
+## Scheduling
+
+```typescript
+import { scheduling } from 'inferlet';
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `scheduling.balance(model)` | `number` | Current credit balance. |
+| `scheduling.rent(ctx)` | `number` | Clearing price from the most recent auction. |
+| `scheduling.dividend(model)` | `number` | Endowment-proportional dividend last step. |
+| `scheduling.latency(ctx)` | `number` | Per-tick wall time in seconds. |
+| `scheduling.price()` | `number` | Cost in credits per new KV page. |
+
+To override the default bid: `ctx.setBid(value)`. To skip bidding for a scope: `using _ = ctx.idle();`.
+
+## Filesystem and HTTP
+
+The JS SDK does not currently expose Pie-specific HTTP or filesystem APIs. Use Node's built-in `fetch` and `node:fs/promises` against the host-preopened `/scratch` directory. Native HTTP support inside the inferlet sandbox is in progress; see [I/O / HTTP](../guide/io/http) for the intended API shape.
+
+## Related
+
+- [Rust SDK reference](./sdk-rust): the canonical SDK.
+- [Python SDK reference](./sdk-python): the Python counterpart.
+- [Inferlet manifest](./manifest): the `Pie.toml` schema.

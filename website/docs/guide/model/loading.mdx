@@ -1,0 +1,143 @@
+---
+title: Loading and selecting models
+description: Bind to a loaded model from inside an inferlet
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Loading and selecting models
+
+Every inferlet starts by binding to a model. The engine has already loaded weights onto the GPU; your inferlet just acquires a handle. This page covers how to ask the engine which models are loaded and how to bind to one. Read this after [Initial setup](../setup).
+
+## What `Model::load` does
+
+`Model::load(name)` returns a handle to a model the engine has already loaded. It does not read weights from disk, copy parameters, or allocate GPU memory. Multiple inferlets can hold handles to the same model concurrently.
+
+The `name` is the key under `[model.<name>]` in `~/.pie/config.toml`. The default config has one model, named `default`.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::{model::Model, runtime, Result};
+
+let names = runtime::models();
+let model = Model::load(names.first().ok_or("no models")?)?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Model, runtime
+
+names = runtime.models()
+model = Model.load(names[0])
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Model, runtime } from 'inferlet';
+
+const names = runtime.models();
+const model = Model.load(names[0]);
+```
+
+</TabItem>
+</Tabs>
+
+`runtime::models()` returns the list of names from the engine's config in declaration order. If the config has only one model, indexing the first element is safe. If it has several, see [Selecting by name](#selecting-by-name) below.
+
+## Selecting by name
+
+Add more models to `~/.pie/config.toml`:
+
+```toml
+[model.default]
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.default.driver]
+type = "native"
+device = ["cuda:0"]
+
+[model.large]
+hf_repo = "Qwen/Qwen2.5-7B-Instruct"
+
+[model.large.driver]
+type = "native"
+device = ["cuda:1"]
+```
+
+Restart the engine. Both models load on startup. Inside an inferlet, bind by name:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let small = Model::load("default")?;
+let large = Model::load("large")?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+small = Model.load("default")
+large = Model.load("large")
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const small = Model.load('default');
+const large = Model.load('large');
+```
+
+</TabItem>
+</Tabs>
+
+This is the pattern for the **Oracle and Worker** topology: a small fast model handles routing, a large model handles the chosen task. Both are running. Switching between them inside an inferlet is a `Model::load` call away.
+
+## What you can do with a `Model`
+
+The `Model` handle is intentionally minimal. Two things hang off it:
+
+- `model.tokenizer()` returns the model's [Tokenizer](./tokenizer).
+- `Context::new(&model)` allocates a fresh KV cache against this model. See [Context overview](../context/overview).
+
+A `Model` does not expose architecture details, vocab size, or parameter counts. Those live in the engine config and the HuggingFace repo card. If you need them inside an inferlet, request them through `runtime::query(...)`.
+
+## Naming conventions
+
+The model name in the config is freely chosen. Conventions that work well:
+
+| Use case | Suggested name |
+|---|---|
+| Single-model deployments | `default` |
+| Two-model setups | `small` and `large`, or `router` and `worker` |
+| Per-domain | `code`, `math`, `chat`, `vision` |
+
+Inferlets that bind by hardcoded name (`Model::load("large")`) are tied to the engine config. Inferlets that take the name as input or use `runtime::models().first()` are portable across configs.
+
+## Multiple devices
+
+A single model can span multiple devices:
+
+```toml
+[model.large.driver]
+type = "native"
+device = ["cuda:0", "cuda:1"]
+```
+
+The native driver handles tensor parallelism. From the inferlet's side, the model handle is the same; the engine schedules forward passes across the listed devices. See [Drivers](../../reference/drivers) for the per-driver behavior.
+
+## Next
+
+- [Tokenizers](./tokenizer): encode and decode text, inspect special tokens.
+- [Context overview](../context/overview): allocate a KV context against a loaded model.
+- [Supported models](../../reference/models): which architectures the native driver handles.

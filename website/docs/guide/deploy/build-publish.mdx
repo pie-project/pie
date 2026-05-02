@@ -1,0 +1,109 @@
+---
+title: Build and publish
+description: Compile inferlets to WebAssembly with bakery and publish them to the registry
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Build and publish
+
+`bakery` compiles your inferlet to a WebAssembly component and uploads it to the Pie registry. Once published, anyone connected to the same registry can launch it by name. Read this after [Deployment overview](./overview).
+
+## Build
+
+```bash
+bakery build . -o my-inferlet.wasm
+```
+
+The platform is auto-detected from the source tree. Rust crates compile through `cargo build --target wasm32-wasip2 --release`. Python projects bundle with the Python 3.14 inferlet runtime. JavaScript / TypeScript projects bundle with the JS runtime. All three produce a single `.wasm` file.
+
+| Source | Required tooling | Output |
+|---|---|---|
+| Rust crate | `cargo`, `rustup target add wasm32-wasip2` | `<name>.wasm` |
+| Python project | bundled (downloaded by `pie config init`) | `<name>.wasm` |
+| TS / JS project | Node 18+ | `<name>.wasm` |
+
+Pass `--debug` for JavaScript projects to keep source maps. Rust uses release mode unconditionally.
+
+See the [bakery reference](../../reference/bakery) for every flag.
+
+## Verify the build
+
+`pie run` runs the local artifact end to end. Use this before publishing to confirm the build is healthy.
+
+```bash
+pie run \
+  --path ./my-inferlet.wasm \
+  --manifest ./Pie.toml \
+  --question "test input"
+```
+
+If `pie run` succeeds with the same input shape your clients will use, the inferlet is ready to publish.
+
+## The Pie registry
+
+The registry is the shared store for published inferlets. Its job is one thing: map a `(name, version)` pair to a `(.wasm, Pie.toml)` artifact. Engines pull on first launch and cache locally.
+
+The registry is keyed by name. Two inferlets cannot share a name across publishers (today's registry has a flat namespace). Pick a name distinctive enough to avoid collisions, or scope it with your username (`alice/research-agent`) until per-user namespaces ship.
+
+## Authenticate
+
+Before your first publish, `bakery login` opens a GitHub OAuth flow and stores a token in `~/.pie/bakery/config.toml`. The token persists; subsequent publishes reuse it. Override the location by setting `BAKERY_HOME`.
+
+```bash
+bakery login
+```
+
+If the token expires or you want to re-authenticate, run `bakery login` again.
+
+## Publish
+
+```bash
+bakery inferlet publish ./my-inferlet
+```
+
+`publish` reads `Pie.toml`, runs `bakery build` if needed, and uploads both the `.wasm` and the manifest to the registry. The version in `Pie.toml` becomes the registry version; bumping it is your responsibility.
+
+After publishing, anyone connected to the same registry can launch it:
+
+```bash
+pie run my-inferlet --question "..."             # latest version
+pie run my-inferlet@0.1.0 --question "..."       # pinned
+```
+
+The first run on a fresh engine pulls the artifact and caches it. Subsequent runs are local.
+
+## Versioning
+
+`Pie.toml` declares a `[package].version`. The registry treats this as the canonical version. Two policies that work:
+
+- **Semver-ish**: bump the patch version every publish, the minor on a behavior change, the major on a breaking change. Standard.
+- **Date-stamped**: `0.1.0+20251231` style. Useful when versioning fast-moving research code where semver is friction.
+
+Clients that pin (`my-inferlet@0.1.0`) get reproducibility. Clients that don't (`my-inferlet`) follow the registry's "latest" pointer, which advances on every publish.
+
+## Discover
+
+```bash
+bakery inferlet search agent
+bakery inferlet info text-completion
+```
+
+`search` matches against name and description. `info` prints metadata for one inferlet (versions, authors, declared parameters). Both query the registry directly.
+
+## Skip the registry
+
+If your deployment pulls images through CI or you do not want to use the public registry, two options exist:
+
+- **Client-uploaded builds.** A client process uploads the `.wasm` and `Pie.toml` to a specific engine via the SDK's `add_program` / `install_program`. The engine keeps the upload while it is running. See [Connecting clients](./clients).
+- **Direct local runs.** `pie run --path ./out.wasm --manifest ./Pie.toml ...` reads from disk. The engine launches one-shot. See [Tutorial: run](../tutorial/run).
+
+Both paths skip the registry. The trade is that the inferlet is no longer addressable by name across engines.
+
+## Next
+
+- [Run a server](./serve): start an engine that can pull and run published inferlets.
+- [Connecting clients](./clients): launch published inferlets from your application.
+- [Bakery reference](../../reference/bakery): every command and flag.

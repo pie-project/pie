@@ -1,0 +1,162 @@
+---
+title: Profiling and benchmarks
+description: Measure inferlet latency and throughput, read the monitor, run the bench scripts
+sidebar_position: 5
+---
+
+# Profiling and benchmarks
+
+This page covers how to measure what an inferlet is doing on a Pie engine: latency, throughput, batch occupancy, and where the time goes. Read this once you have an inferlet running on a `pie serve` instance.
+
+The right tool depends on the question you are asking.
+
+| Question | Tool |
+|---|---|
+| Is the engine doing work? | `pie serve --monitor` (TUI). |
+| Is throughput in the expected range? | `benches/tput.py` and friends. |
+| Is one inferlet hot-spotting? | Per-process view in the monitor. |
+| Where in the inferlet is the time going? | Manual timing from inside the inferlet. |
+| How does Pie compare to vLLM / SGLang? | `benches/all_drivers.py`. |
+
+## The monitor TUI
+
+```bash
+pie serve --monitor
+```
+
+A live TUI showing:
+
+- **Model row.** Which model is loaded, on which devices, on which driver.
+- **Batch occupancy.** Tokens per batch this tick, peak batch size, GPU utilization.
+- **Per-process rows.** One row per running inferlet: PID, owner, program, batch share, current bid, current balance.
+- **Throughput.** Tokens per second, requests per second, average latency per token.
+
+Press `q` to leave the TUI; the engine keeps running.
+
+The monitor is the right first stop when something feels slow. Three quick reads:
+
+- **Empty batches** mean the engine is starved for work or processes are blocked on I/O.
+- **One process consuming the batch** means a single inferlet is dominating; check its bid and the [scheduling](../context/scheduling) surface.
+- **Latency per token climbing over time** usually means KV cache pressure (forks accumulating, snapshots not being deleted).
+
+## The bench scripts
+
+The repo's [`benches/`](https://github.com/pie-project/pie/tree/main/benches) directory has scripts that drive the engine through known workloads and report tokens per second, latency, and per-step timing.
+
+```bash
+# Pie native driver, throughput sweep
+uv run python benches/tput.py
+
+# vLLM driver, same workload shape
+uv run python benches/tput_vllm.py
+
+# SGLang driver, same workload shape
+uv run python benches/tput_sglang.py
+
+# All three drivers on the same workload
+uv run python benches/all_drivers.py
+
+# Phase breakdown (prefill vs decode)
+uv run python benches/tput_phase.py
+
+# Per-RPS sweep
+uv run python benches/tput_rps.py
+```
+
+Each script writes a CSV next to itself. Hardware and model live at the top of the file. Edit them in place to match your environment.
+
+## Manual timing inside an inferlet
+
+For "where in my inferlet is the time going," instrument with the language's clock and emit timings as events.
+
+```rust
+use std::time::Instant;
+use inferlet::pie::core::session;
+
+let start = Instant::now();
+
+ctx.flush().await?;
+session::send(&format!("[time] flush: {} ms", start.elapsed().as_millis()));
+
+let g_start = Instant::now();
+let text = ctx.generate(sampler).max_tokens(256).collect_text().await?;
+session::send(&format!("[time] generate: {} ms", g_start.elapsed().as_millis()));
+
+session::send(&format!("[time] total: {} ms", start.elapsed().as_millis()));
+```
+
+The same pattern works in Python (`time.perf_counter()`) and JavaScript (`performance.now()`). Route the timings to a separate session channel so the UI can split them out.
+
+## Reading the per-process scheduling state
+
+Inside an inferlet, the [scheduling](../context/scheduling) surface exposes the inputs the auctioneer sees:
+
+- `scheduling::balance(model)` — your credit holdings.
+- `scheduling::rent(ctx)` — the clearing price last tick.
+- `scheduling::dividend(model)` — your share of last tick's revenue.
+- `scheduling::latency(ctx)` — per-tick latency on this device.
+
+Sample these between forward passes to see whether the auction is funding your work as expected. A persistent low balance with high rent means the workload is starved; a persistent high balance with low rent means you are over-funded relative to the load.
+
+## Common slow patterns and what to do
+
+### Re-prefilling on every turn
+
+**Symptom**: latency on turn N+1 close to turn 1's latency, even though the conversation is the same.
+
+**Cause**: a fresh `Context::new` per turn instead of reusing the saved session.
+
+**Fix**: save the context after each turn, open it on the next turn. See [Forking and saving](../context/sharing).
+
+### A fork that copies more than it should
+
+**Symptom**: memory grows on every fork, even when the divergent tokens are few.
+
+**Cause**: the parent's working page has many tokens at fork time. The child copies that page.
+
+**Fix**: `flush()` before forking so the working page commits and forks share it. See [Pages](../context/pages).
+
+### Tool-call round trips
+
+**Symptom**: each tool call adds tens of milliseconds of overhead beyond the tool's own latency.
+
+**Cause**: the tool runs outside the inferlet, requiring a round trip through the client.
+
+**Fix**: run the tool inside the inferlet via [HTTP](../io/http) or [MCP](../io/mcp).
+
+### Constrained decoding eating margin
+
+**Symptom**: throughput drops sharply when you turn on a JSON schema constraint.
+
+**Cause**: the speculator's accept rate falls when the masked distribution is narrow.
+
+**Fix**: check [`speculation`](../forward/speculation) acceptance rates. For long structured outputs, write a custom drafter that follows the same grammar.
+
+## End-to-end client-side measurement
+
+For "how long does my application wait," time the client-side calls. The bench scripts do this; for an ad hoc measurement:
+
+```python
+import time, asyncio
+from pie_client import PieClient, Event
+
+async def measure(client, question):
+    t0 = time.perf_counter()
+    proc = await client.launch_process("research-agent@0.1.0", input={"question": question})
+    first_token = None
+    while True:
+        event, value = await proc.recv()
+        if event == Event.Stdout and first_token is None:
+            first_token = time.perf_counter() - t0
+        if event == Event.Return:
+            total = time.perf_counter() - t0
+            return first_token, total
+```
+
+`first_token` is the time-to-first-token. `total` is the end-to-end latency. The difference between them is the streaming portion.
+
+## Next
+
+- [Run a server](./serve): `--monitor` flag and config tuning.
+- [Pie: a programmable serving system](https://ingim.org/papers/gim2025pie.pdf): the SOSP paper, including the full evaluation methodology.
+- [Benchmarks](../../overview/benchmarks): published numbers and what they mean.

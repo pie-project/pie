@@ -3,30 +3,40 @@
   <defs>
     <style>
       .cls-1 {
-        stroke: #f15a24;
-        stroke-width: 4px;
+        stroke: #54473b;
+        stroke-width: 1.5px;
       }
 
       .cls-1, .cls-2, .cls-3 {
         fill: none;
-        stroke-linecap: square;
+        stroke-linecap: round;
         stroke-miterlimit: 10;
       }
 
-      .cls-4, .cls-5 {
-        fill: #f15a24;
+      .cls-4 {
+        fill: #54473b;
+      }
+
+      .cls-5 {
+        fill: #7a6a55;
+        font-family: 'IBM Plex Serif', Charter, Georgia, serif;
+        font-size: 26px;
+        font-style: italic;
       }
 
       .cls-6 {
-        fill: gray;
+        fill: #54473b;
       }
 
       .cls-7 {
-        fill: #e6e6e6;
+        fill: #fdfbf3;
+        stroke: #54473b;
+        stroke-width: 1.5px;
       }
 
-      .cls-8, .cls-5 {
-        font-family: HelveticaNeue, 'Helvetica Neue';
+      .cls-8 {
+        fill: #2c2722;
+        font-family: 'IBM Plex Serif', Charter, Georgia, serif;
         font-size: 26px;
       }
 
@@ -35,7 +45,7 @@
       }
 
       .cls-2, .cls-3 {
-        stroke: gray;
+        stroke: #54473b;
         stroke-width: 1.4px;
       }
 
@@ -48,7 +58,9 @@
       }
 
       .cls-11 {
-        fill: #f2f2f2;
+        fill: #fdfbf3;
+        stroke: #54473b;
+        stroke-width: 1.5px;
       }
 
       .cls-12 {
@@ -65,7 +77,7 @@
   <rect class="cls-11" x="247.57" y="337.91" width="110" height="50" rx="7.5" ry="7.5"/>
   <text class="cls-8" transform="translate(261.14 369.56)"><tspan x="0" y="0">Embed</tspan></text>
   <rect class="cls-11" x="389.89" y="337.91" width="198.04" height="50" rx="7.5" ry="7.5"/>
-  <text class="cls-8" transform="translate(407.01 371.23)"><tspan x="0" y="0">P</tspan><tspan class="cls-13" x="16.85" y="0">r</tspan><tspan class="cls-9" x="25.04" y="0">efill/Decode</tspan></text>
+  <text class="cls-8" transform="translate(407.01 371.23)"><tspan x="0" y="0">Prefill/Decode</tspan></text>
   <rect class="cls-11" x="612.96" y="337.91" width="110" height="50" rx="7.5" ry="7.5"/>
   <text class="cls-8" transform="translate(625.35 369.56)"><tspan x="0" y="0">Sample</tspan></text>
   <line class="cls-1" x1="78.49" y1="449.35" x2="739.94" y2="449.35"/>
@@ -96,8 +108,8 @@
     <line class="cls-1" x1="673.15" y1="336.65" x2="673.15" y2="279.24"/>
     <path class="cls-4" d="M673.15,268.86c1.81,4.88,4.9,10.94,8.18,14.7l-8.18-2.96-8.18,2.96c3.28-3.76,6.37-9.82,8.18-14.7Z"/>
   </g>
-  <text class="cls-8" transform="translate(318.73 223.25)"><tspan x="0" y="0">p</tspan><tspan class="cls-13" x="15.42" y="0">r</tspan><tspan class="cls-9" x="23.61" y="0">ompts</tspan></text>
-  <text class="cls-8" transform="translate(171.43 299.91)"><tspan x="0" y="0">new p</tspan><tspan class="cls-13" x="70.77" y="0">r</tspan><tspan class="cls-9" x="78.96" y="0">ompts</tspan></text>
+  <text class="cls-8" transform="translate(318.73 223.25)"><tspan x="0" y="0">prompts</tspan></text>
+  <text class="cls-8" transform="translate(171.43 299.91)"><tspan x="0" y="0">new prompts</tspan></text>
   <text class="cls-8" transform="translate(509.28 306.99)"><tspan x="0" y="0">output token</tspan></text>
   <text class="cls-8" transform="translate(27.02 223.25)"><tspan x="0" y="0">LLM serving system</tspan></text>
   <path class="cls-6" d="M748.85,260.65c7.51,0,13.62,6.11,13.62,13.62v190.95c0,7.51-6.11,13.62-13.62,13.62H65.16c-7.51,0-13.62-6.11-13.62-13.62v-190.95c0-7.51,6.11-13.62,13.62-13.62h683.69M748.85,259.25H65.16c-8.3,0-15.02,6.72-15.02,15.02v190.95c0,8.3,6.72,15.02,15.02,15.02h683.69c8.3,0,15.02-6.72,15.02-15.02v-190.95c0-8.3-6.72-15.02-15.02-15.02h0Z"/>
@@ -118,7 +130,7 @@
     <polygon class="cls-6" points="300.93 137.6 295.8 150.14 300.93 147.16 306.05 150.14 300.93 137.6"/>
     <path class="cls-6" d="M300.93,255.94c-1.33-3.58-3.59-8.02-5.99-10.77l5.99,2.17,5.99-2.17c-2.4,2.75-4.66,7.19-5.99,10.77Z"/>
   </g>
-  <text class="cls-5" transform="translate(248.43 431.88)"><tspan x="0" y="0">Global auto</tspan><tspan class="cls-13" x="134.34" y="0">r</tspan><tspan x="142.53" y="0">eg</tspan><tspan class="cls-12" x="171.41" y="0">r</tspan><tspan class="cls-10" x="179.6" y="0">essive loop</tspan></text>
+  <text class="cls-5" transform="translate(248.43 431.88)"><tspan x="0" y="0">Global autoregressive loop</tspan></text>
   <rect class="cls-7" x="417.62" y="77.65" width="139.72" height="50.94" rx="7.5" ry="7.5"/>
   <rect class="cls-7" x="607.58" y="77.65" width="139.72" height="50.94" rx="7.5" ry="7.5"/>
   <rect class="cls-7" x="227.67" y="77.65" width="139.72" height="50.94" rx="7.5" ry="7.5"/>

@@ -1,0 +1,150 @@
+---
+title: Run a server
+description: Start a long-lived Pie engine and authorize clients
+sidebar_position: 3
+---
+
+# Run a server
+
+`pie serve` starts a long-lived engine. Use it when you need multiple clients, persistent state across runs, or the ability to share an inferlet through the registry. Read this after [Build and publish](./build-publish).
+
+## Start
+
+```bash
+pie serve
+```
+
+```
+╭─ Pie Engine ─────────────────────────────────╮
+│ Host         127.0.0.1:8080                  │
+│ Model        default (Qwen/Qwen3-0.6B)       │
+│ Driver       native                          │
+│ Device       cuda:0                          │
+╰──────────────────────────────────────────────╯
+
+✓ Server ready at ws://127.0.0.1:8080
+```
+
+The server now accepts WebSocket clients. The model loads once at startup and serves every request from the same loaded weights.
+
+## Common flags
+
+| Option | Description |
+|---|---|
+| `-c`, `--config <PATH>` | Use a non-default config file. |
+| `--host <HOST>` | Override `[server].host`. |
+| `--port <PORT>` | Override `[server].port`. |
+| `--no-auth` | Disable authentication for this run. |
+| `-v`, `--verbose` | Verbose logging. |
+| `-m`, `--monitor` | Launch the TUI alongside the server. |
+| `--no-snapshot` | Disable the host-side Python snapshot optimization. |
+
+```bash
+# Custom port, no auth, verbose (dev)
+pie serve --port 9000 --no-auth -v
+
+# Alternate config (e.g. for staging)
+pie serve -c ./staging.toml
+```
+
+See the [CLI reference](../../reference/pie#serve) for the full list.
+
+## Monitor mode
+
+```bash
+pie serve -m
+```
+
+A real-time TUI showing the running model, batch utilization, throughput, and per-process status. Press `q` to exit the TUI; the server keeps running until `Ctrl-C`.
+
+Use the monitor to spot:
+
+- Per-process credit balance and bid (the [scheduling](../context/scheduling) surface in action).
+- Batch occupancy. A consistently low number suggests undersized request load or oversized tensor parallelism.
+- Per-step latency. Spikes correlate with prefill bursts.
+
+## Dummy backend
+
+For protocol testing without loading real weights:
+
+```bash
+pie config set model.default.driver.type dummy
+pie serve
+```
+
+The engine returns random tokens but every other code path runs (scheduler, KV cache, decoders, sessions, registry). Useful for client integration tests.
+
+## Authorize clients
+
+When `[auth].enabled = true`, only registered users can connect. Add a public key:
+
+```bash
+cat ~/.ssh/id_ed25519.pub | pie auth add alice laptop
+pie auth list
+```
+
+`pie auth remove alice [key_name]` revokes a single key or the whole user.
+
+For development without auth, pass `--no-auth` or set `[auth].enabled = false` in the config file. Leave auth on whenever the port is reachable from off-host.
+
+## Graceful shutdown
+
+`Ctrl-C`:
+
+```
+^C
+✓ Shutdown complete
+```
+
+The engine stops accepting new connections, lets running processes finish, tears down driver workers, and exits. In-flight processes get up to a configured grace period to complete.
+
+For a hard kill (no grace period), send `SIGKILL`. Saved contexts and adapters survive a graceful shutdown but not a hard kill.
+
+## Tuning forward-pass parallelism
+
+The native driver runs forward passes on a Tokio worker pool. The default is fine for most deployments. To override:
+
+```toml
+[runtime]
+worker_threads = 8
+```
+
+Set `worker_threads` to the number of CPU cores you want to dedicate to the runtime. Too low and the scheduler bottlenecks; too high and oversubscription hurts throughput. The bench scripts in [Profiling](./profiling) help find the right value.
+
+## Multi-GPU on one host
+
+The native driver runs tensor-parallel inference across multiple GPUs:
+
+```toml
+[model.large.driver]
+type = "native"
+device = ["cuda:0", "cuda:1"]
+```
+
+Restart `pie serve` to apply. The engine shards the model across the listed devices automatically. From the inferlet side, the model handle is the same; the engine schedules forward passes across all listed devices.
+
+## Multiple models
+
+```toml
+[model.small]
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.small.driver]
+type = "native"
+device = ["cuda:0"]
+
+[model.large]
+hf_repo = "Qwen/Qwen2.5-7B-Instruct"
+
+[model.large.driver]
+type = "native"
+device = ["cuda:1"]
+```
+
+Both load on startup. Inside an inferlet, bind by name (`Model::load("small")` / `Model::load("large")`). See [Loading and selecting models](../model/loading) for the inferlet-side surface.
+
+## Next
+
+- [Connecting clients](./clients): launch processes against this engine.
+- [Profiling](./profiling): measure throughput and latency.
+- [Configuration](../../reference/configuration): the full config schema.

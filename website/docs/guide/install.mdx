@@ -1,0 +1,85 @@
+---
+title: Installation
+description: Install Pie on Linux or macOS, optionally with vLLM or SGLang drivers
+sidebar_position: 1
+---
+
+# Installation
+
+This page covers getting `pie-server` onto your machine. After this, see [Initial setup](./setup) to configure it and run your first prompt.
+
+## Supported platforms
+
+| Platform | Hardware | Backend |
+|---|---|---|
+| Linux x86_64 | NVIDIA GPU (Ampere or newer) | CUDA 12.6 or 12.8 + FlashInfer kernels |
+| macOS (Apple Silicon) | M-series | Metal kernels |
+| Linux x86_64 | CPU only | Supported for development; throughput is low |
+
+Other combinations (Windows native, AMD GPUs, Intel GPUs) are not supported in this release.
+
+## Install from PyPI
+
+The fastest path. Pick the extra that matches your platform:
+
+```bash
+# Linux + NVIDIA GPU (CUDA 12.6 toolchain)
+pip install "pie-server[cu126]"
+
+# Linux + NVIDIA GPU (CUDA 12.8 toolchain)
+pip install "pie-server[cu128]"
+
+# macOS (Apple Silicon)
+pip install "pie-server[metal]"
+```
+
+The extra determines which Torch wheel index and which kernel backend get pulled in. Picking the wrong extra for your hardware produces an install that boots but cannot load models.
+
+## Optional driver backends
+
+Pie ships with a built-in driver (`type = "native"`). It also wires up vLLM and SGLang as alternative drivers when those packages are available. The vLLM and SGLang drivers do not have their own `pie-server` extras today — install Pie with one of the platform extras above, then `pip install vllm` or `pip install sglang` separately when you want to route a model block to one of them.
+
+```bash
+pip install "pie-server[cu128]"
+pip install vllm                    # for the vLLM driver
+pip install sglang                  # for the SGLang driver
+```
+
+See [Configuration](../reference/configuration) and [Drivers](../reference/drivers) for how to point a model block at a specific driver.
+
+## Install from source
+
+For development or to track the tip:
+
+```bash
+git clone https://github.com/pie-project/pie.git
+cd pie/pie
+
+# uv resolves the right Torch / FlashInfer / kernel set per extra.
+uv sync --extra cu128            # or cu126 / metal
+```
+
+When working from a source checkout, prefix commands with `uv run`:
+
+```bash
+uv run pie config init
+uv run pie serve
+```
+
+`uv run` selects the correct virtual environment without you having to activate it.
+
+## Verify the install
+
+```bash
+pie --version
+```
+
+If the command resolves and prints a version string, the install worked. Move on to [Initial setup](./setup) to configure Pie and run your first prompt.
+
+If `pie` is not on your PATH after `pip install`, the issue is almost always that Python's user-level scripts directory is not in PATH. Either activate a venv before installing, or add `python -m site --user-base`'s `bin` directory to PATH.
+
+## Next
+
+- [Initial setup](./setup): configure Pie, download a model, run a prompt.
+- [Development environment](./dev-env): install the toolchain for writing your own inferlets.
+- [Configuration](../reference/configuration): the full `~/.pie/config.toml` schema.

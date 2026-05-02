@@ -1,0 +1,121 @@
+---
+title: Inferlet manifest (Pie.toml)
+description: The Pie.toml schema bakery and pie run consume
+---
+
+# Inferlet manifest (`Pie.toml`)
+
+Every inferlet ships with a `Pie.toml` manifest. The file is read by `bakery build` (to compile the inferlet against the right runtime) and by `pie run` and the registry (to display metadata). This page documents every key.
+
+## Schema
+
+```toml
+[package]
+name = "research-agent"
+version = "0.1.0"
+description = "Parallel research agent"
+authors = ["You <you@example.com>"]
+repository = "https://github.com/example/research-agent"   # optional
+readme = "README.md"                                       # optional
+
+[runtime]
+core = "^0.2.0"
+mcp  = "^0.2.0"                  # optional, only if the inferlet uses MCP
+python-runtime = "^0.3.0"        # required for Python inferlets only
+
+[parameters]
+question   = { type = "string", description = "The question to research" }
+max_tokens = { type = "int", optional = true, description = "Token budget" }
+verbose    = { type = "bool", optional = true, description = "Verbose output" }
+```
+
+## `[package]`
+
+Identity for the inferlet. The values map onto registry metadata.
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | yes | Registry name. Lowercase, hyphen-separated. The CLI launches an inferlet by `name@version`. |
+| `version` | string | yes | Semver string (`MAJOR.MINOR.PATCH`, optionally with build metadata). |
+| `description` | string | yes | One-line summary. Shown in `bakery inferlet info`. |
+| `authors` | list of strings | no | Author names (and optional email). |
+| `repository` | string | no | Source URL. |
+| `readme` | string | no | Path to README. Uploaded to the registry on publish. |
+
+## `[runtime]`
+
+Runtime version constraints. Each key is a Pie runtime component the inferlet links against. The constraint syntax follows Cargo / npm semver caret rules.
+
+| Key | When to set | Description |
+|---|---|---|
+| `core` | Always | The Pie inferlet runtime version. Set to `^0.2.0` (or whatever matches your SDK). |
+| `mcp` | If the inferlet uses MCP | Pie's MCP integration version. |
+| `python-runtime` | Python inferlets only | The Python 3.14 inferlet runtime version. Bakery downloads this runtime via `pie config init`. |
+
+`bakery build` checks the constraint against the installed SDK at compile time. Mismatches fail the build with a clear error.
+
+## `[parameters]`
+
+Declares the JSON input shape the inferlet expects. The block is **descriptive metadata**, not enforcement. `pie run` does not validate flags against it today; the registry surfaces the descriptions in `bakery inferlet info`. From inside the inferlet you still need to deserialize the input dict against your own type and handle missing or wrongly-typed fields yourself.
+
+Each parameter is an inline table. The keys:
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | yes | One of `"string"`, `"int"`, `"float"`, `"bool"`. Documents the intended type. |
+| `optional` | bool | no | Defaults to `false`. Documents whether the parameter is required. |
+| `description` | string | no | Help text. Surfaced by `bakery inferlet info`. |
+
+The parameter name on the left of `=` becomes the JSON key. From inside the inferlet, deserialize against your own type:
+
+```rust
+#[derive(Deserialize)]
+struct Input {
+    question: String,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    verbose: bool,
+}
+```
+
+```python
+async def main(input: dict) -> str:
+    question = input["question"]
+    max_tokens = input.get("max_tokens", 256)
+    verbose = input.get("verbose", False)
+```
+
+```typescript
+interface Input {
+    question: string;
+    max_tokens?: number;
+    verbose?: boolean;
+}
+```
+
+## How the CLI folds flags into input
+
+`pie run <name> --question "What is 2+2?" --max-tokens 64 --verbose` produces:
+
+```json
+{
+  "question": "What is 2+2?",
+  "max_tokens": 64,
+  "verbose": true
+}
+```
+
+`pie run` walks the trailing flags and turns each `--flag value` pair into a JSON entry. Hyphens in long-form flag names become underscores in JSON keys (`--max-tokens` → `"max_tokens"`). Types are inferred from the value itself, not from `[parameters]`: `pie run` tries `int`, then `float`, then `bool`, then falls back to `string`. The manifest's declared `type` is documentation; the CLI does not consult it.
+
+A bare `--flag` (no value) becomes `"flag": true`.
+
+## Where the file lives
+
+`Pie.toml` sits at the root of the inferlet project, next to `Cargo.toml` (Rust), `pyproject.toml` (Python), or `package.json` (JavaScript). `bakery create <name>` lays one down for you in Rust and TypeScript projects; for Python you copy the [`python-example`](https://github.com/pie-project/pie/tree/main/inferlets/python-example) tree as a starting point.
+
+## Related
+
+- [bakery](./bakery): the CLI that reads this file at build and publish time.
+- [pie run](./pie#run): the CLI that reads this file at launch time.
+- [Your first inferlet](../guide/first-inferlet): scaffold and build a Rust inferlet.

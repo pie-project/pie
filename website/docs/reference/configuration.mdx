@@ -1,0 +1,141 @@
+---
+title: Configuration
+description: The pie config file schema and environment variables
+---
+
+# Configuration
+
+Pie reads its configuration from `~/.pie/config.toml` by default. The file has four sections plus one or more `[model.<name>]` blocks. `pie config init` writes a working default; this page documents every key.
+
+## Schema
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 8080
+verbose = false
+registry = "https://registry.pie-project.org/"
+python_snapshot = true
+# primary_model = "default"            # which [model.<name>] is the primary
+# max_concurrent_processes = 64
+# allow_filesystem = false
+
+[auth]
+enabled = false
+
+[telemetry]
+enabled = false
+endpoint = "http://localhost:4317"
+service_name = "pie"
+
+[runtime]
+# worker_threads = 8                     # opt-in; unset lets tokio pick num_cpus
+
+# One or more model blocks. The TOML key after `model.` is the lookup name
+# you'd pass to `Model::load("default")` from inside an inferlet.
+[model.default]
+hf_repo = "Qwen/Qwen3-0.6B"
+default_endowment_pages = 64
+oversubscription_factor = 4.0
+# default_token_budget = 10000
+
+[model.default.driver]
+type = "native"                          # native | vllm | sgl | dummy
+device = ["cuda:0"]                      # ["cuda:0", "cuda:1"] for tp=2
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+random_seed = 42
+
+# Driver-specific knobs go in a sub-table named after the driver `type`.
+[model.default.driver.native]
+gpu_mem_utilization = 0.8
+max_batch_tokens = 10240
+max_batch_size = 512
+```
+
+The driver `type` is a discriminator: vLLM-specific knobs go under `[model.default.driver.vllm]`, SGLang under `[model.default.driver.sgl]`, and so on. See [Drivers](./drivers) for what each backend accepts.
+
+## Server keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `host` | `127.0.0.1` | Bind address for the WebSocket server. |
+| `port` | `8080` | TCP port for client connections. |
+| `verbose` | `false` | Enable verbose engine logs (also reachable via `pie serve -v`). |
+| `registry` | `https://registry.pie-project.org/` | Inferlet registry the engine fetches from when `pie run <name>` is used without `--path`. |
+| `python_snapshot` | `true` | Use the host-side Python snapshot to skip cold-start interpreter init for Python inferlets. Disable with `--no-snapshot` for debugging. |
+| `primary_model` | unset | Name of the `[model.<name>]` block to treat as the default. When unset, the first model in the file is primary. `pie run` and `pie serve` use this to pick a model when the inferlet does not name one. |
+| `max_concurrent_processes` | unset | Cap on simultaneously running inferlets. When set, an admission semaphore gates spawn requests; new processes wait for a slot. `None` or `0` mean unlimited. |
+| `allow_filesystem` | `false` | When true, every inferlet receives a preopened scratch directory at `/scratch` inside the sandbox (mapped to a per-process subdirectory under the OS temp dir). Inferlets without this flag have no host filesystem visibility. |
+
+## Auth keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` (template) / `false` (in-process) | Require client public-key auth on the WebSocket. Disable with `pie serve --no-auth` for development. The keystore is managed via `pie auth add|remove|list`. |
+
+## Telemetry keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Emit OpenTelemetry traces and metrics. |
+| `endpoint` | `http://localhost:4317` | OTLP gRPC endpoint. |
+| `service_name` | `pie` | Service name reported in spans. |
+
+## Runtime keys
+
+The `[runtime]` block tunes the tokio worker pool. All fields are opt-in.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `worker_threads` | unset | Number of tokio worker threads. Unset lets tokio pick `num_cpus`. On hosts with many logical cores under high request concurrency, the default can cause migration overhead; lowering to ~8 often improves throughput. Leave unset for typical GPU backends. |
+
+## Per-model keys
+
+Inside each `[model.<name>]` block:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `hf_repo` | required | HuggingFace repo id to load. The repo must be cached locally (`pie model download <repo>`). |
+| `default_token_budget` | unset | Initial credit budget assigned to a new process for this model when the client does not pass one. Unset means the engine grants endowment-based pages without a hard token cap. |
+| `default_endowment_pages` | `64` | Per-process endowment in KV pages. Sets the process's initial weight in the bidding market. Higher values push your process to the front of the auction. |
+| `oversubscription_factor` | `4.0` | How much logical KV memory the market overcommits relative to physical. Higher factors raise concurrency at the cost of more frequent eviction. |
+
+The `[model.<name>.scheduler]` sub-block controls batch firing:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `request_timeout_secs` | `120` | Maximum wall time for a single inference request before the runtime drops it. |
+| `policy` | unset | Batch-firing policy. One of `adaptive`, `eager`, `greedy`. Unset lets the engine pick a default. See `runtime/src/inference/adaptive_policy.rs` for the tradeoffs. |
+
+## Editing the config
+
+Use `pie config` rather than hand-editing when possible:
+
+```bash
+pie config show              # pretty-print ~/.pie/config.toml
+pie config set server.port 9090
+pie config set model.default.hf_repo Qwen/Qwen2.5-3B-Instruct
+```
+
+`pie config init` regenerates the default file; existing keys are preserved.
+
+## Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `PIE_HOME` | Override the default Pie home directory (`~/.pie`). |
+| `HF_HOME` | HuggingFace cache directory (used by `pie model …`). |
+| `PIE_SDK` | Override the SDK lookup path used by `bakery` / `pie build` for editable in-tree development. Without it, bakery searches its install location and the current working directory. |
+
+## Registry authentication
+
+`pie build` does not need authentication; it produces a local `.wasm` file. Publishing to the registry is done through the `bakery` toolchain.
+
+`bakery login` walks a GitHub OAuth device-code flow and stores the resulting token under the user's bakery state directory. After login, `bakery inferlet publish` uploads a built `.wasm` plus its `Pie.toml` to the registry server configured in `[server].registry`. To revoke, delete the stored token file or revoke the token from your GitHub account settings. See `bakery <cmd> --help` for the full publish/search/info surface.
+
+## Related
+
+- [CLI reference](./pie): every `pie` command and flag.
+- [Drivers](./drivers): driver-specific config keys.
+- [Supported models](./models): what `hf_repo` values work with each driver.

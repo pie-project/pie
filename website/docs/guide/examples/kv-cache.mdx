@@ -1,0 +1,23 @@
+---
+title: Context and KV cache
+description: Forking, prefix sharing, sliding windows
+sidebar_position: 5
+---
+
+# Context and KV cache
+
+Inferlets that exercise the page-based KV cache — forking from a shared prefix, building prefix trees, sliding-window attention, and the runtime's automatic page-trim.
+
+| Inferlet | What it shows |
+|---|---|
+| [`parallel-generation`](https://github.com/pie-project/pie/tree/main/inferlets/parallel-generation) | Forked contexts that share committed pages and decode in parallel. |
+| [`prefix-tree`](https://github.com/pie-project/pie/tree/main/inferlets/prefix-tree) | Prefix-tree caching with concurrent generation from one shared context. |
+| [`windowed-attention`](https://github.com/pie-project/pie/tree/main/inferlets/windowed-attention) | Sliding window: bounded-memory generation by masking + releasing pages. |
+| [`attention-sink`](https://github.com/pie-project/pie/tree/main/inferlets/attention-sink) | Sink + sliding window ([StreamingLLM](https://arxiv.org/abs/2309.17453)). |
+| [`page-trim-bench`](https://github.com/pie-project/pie/tree/main/inferlets/page-trim-bench) | Benchmarks the runtime's page-trim optimization on a sink+window mask. |
+
+## Related guide
+
+- [Pages](../context/pages): the page model and committed-vs-working distinction.
+- [Forking and saving](../context/sharing): copy-on-write branching and named snapshots.
+- [Inputs](../forward/inputs): BRLE attention masks for sliding windows and sinks.

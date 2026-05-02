@@ -1,0 +1,74 @@
+---
+title: Benchmarks
+description: End-to-end agent latency, throughput, and the cost of programmability
+sidebar_position: 4
+---
+
+# Benchmarks
+
+This page reports two questions. First, does the inferlet model give you something a black-box endpoint cannot, on a workload where the difference should show? Second, what does the inferlet model cost you on a workload where it should not help (a stateless prompt at high throughput)? The short answer to both is "yes, and the cost is small." Numbers below.
+
+This page is for engineers comparing Pie to vLLM or SGLang on a specific workload. If you want a qualitative comparison, see [Comparison with other systems](./comparison).
+
+:::note[Reproducibility]
+The benchmark scripts live in [`benches/`](https://github.com/pie-project/pie/tree/main/benches). Hardware and model are listed under each plot.
+:::
+
+## Agent workload: end-to-end latency and throughput
+
+A multi-turn agent has a long prompt that grows on every step. The black-box API re-prefills the conversation each turn. Pie keeps the KV cache across turns inside the inferlet. The gap shows up in both latency and tokens per second.
+
+![Agentic workflow latency and throughput. Pie compared to vLLM and SGLang on a multi-turn agent loop.](./agent_latency_tput.svg)
+
+*Llama 3.2 1B on an L40 GPU.*
+
+The shape: at the same throughput, Pie's per-turn latency is lower because the KV state from the previous turn is already on the GPU. At the same latency budget, Pie sustains higher throughput because each turn does less prefill.
+
+## Stateless prompt throughput
+
+The same comparison on the workload that vLLM and SGLang are tuned for: a stream of independent prompts with no shared state across requests.
+
+![Throughput vs. latency for stateless prompts. Pie native driver compared to vLLM and SGLang.](./bench_latency_tput.svg)
+
+*Llama 3.2 1B on an L40 GPU.*
+
+The takeaway: Pie's native driver is in the same regime as vLLM and SGLang on stateless workloads. The inferlet model does not impose a throughput penalty large enough to matter when there is nothing for it to optimize.
+
+## Programmability tax
+
+The "programmability tax" is the overhead Pie's machinery adds on a workload where it provides no benefit. We measure it by running the same generation as a Pie inferlet and as a direct call to the underlying driver.
+
+:::note[Numbers pending]
+The breakdown of the programmability tax (Wasm dispatch, scheduler, KV bookkeeping) is reported in the SOSP '25 paper. Specific numbers will land here once transcribed from the paper. Until then, see [Pie: a programmable serving system for emerging LLM applications](https://ingim.org/papers/gim2025pie.pdf), Section 6.
+:::
+
+The headline result, from the paper: the overhead from running an inferlet versus calling the driver directly is bounded by the cost of one Wasm trap per forward pass, plus per-token bookkeeping that does not scale with prompt length. On a single-token decode this is the dominant per-step cost; on a prefill it is invisible.
+
+## Caveats
+
+- **Single-GPU numbers.** The plots above are on one L40. Multi-GPU and multi-node behavior is a separate topic, covered in the SOSP paper.
+- **Small model.** Llama 3.2 1B is small enough that scheduler and dispatch overhead is most visible. Larger models compress the relative gap.
+- **Workload mix matters.** On workloads where the request is genuinely a stateless prompt, the inferlet model gives you nothing extra. Use a black-box engine if that is your workload.
+
+## Reproducing
+
+The bench scripts live in [`benches/`](https://github.com/pie-project/pie/tree/main/benches):
+
+```bash
+git clone https://github.com/pie-project/pie.git
+cd pie
+uv sync --extra cu128
+
+uv run python benches/tput.py            # Pie native throughput sweep
+uv run python benches/tput_vllm.py       # vLLM, same shape
+uv run python benches/tput_sglang.py     # SGLang, same shape
+uv run python benches/all_drivers.py     # all three on the same workload
+```
+
+Each script writes a CSV next to itself. Hardware and model are configured at the top of the file.
+
+## Next
+
+- [Comparison with other systems](./comparison). Where Pie fits.
+- [Drivers](../reference/drivers). Routing to vLLM or SGLang for a side-by-side.
+- [Pie: a programmable serving system for emerging LLM applications](https://ingim.org/papers/gim2025pie.pdf). The full evaluation.

@@ -1,0 +1,73 @@
+---
+title: FAQ
+description: Common questions about Pie's status, scope, and design choices
+sidebar_position: 5
+---
+
+# FAQ
+
+Common questions about Pie's status, scope, and design choices. If you cannot find an answer here, open a [GitHub Discussion](https://github.com/pie-project/pie/discussions) or file an [issue](https://github.com/pie-project/pie/issues).
+
+## Is Pie production ready?
+
+No. Pie is a research prototype under active development. APIs change between releases without deprecation cycles. The supported model families and drivers are listed in [Supported models](../reference/models) and [Drivers](../reference/drivers); anything outside that list is not guaranteed to work. Use Pie for research, prototyping, and internal deployments where you can update with the project.
+
+## Do I have to write Rust?
+
+No. Inferlets can be written in Rust, Python, or TypeScript. Rust is the canonical SDK, and a few advanced primitives (the raw `forward()` API, custom speculators, custom adapters) are Rust-only today. The Python and TypeScript SDKs cover generation, KV cache control, structured output, MCP, and tool calling. See [Your first inferlet](../guide/first-inferlet) for the Rust path and the `python-example` and `js-example` inferlets for the other two.
+
+## What models are supported?
+
+The native driver implements Llama 3.x, Qwen 2/3, Gemma 2/3/4, Mistral 3, OLMo 3, and the GPT-OSS family. The vLLM and SGLang drivers extend the list to whatever those engines support, with the trade-off that some inferlet features are native-only (custom attention masks, page-trim, raw-logits sampling). See [Supported models](../reference/models).
+
+## Does Pie support multi-GPU and multi-node?
+
+The native driver supports tensor-parallel inference across multiple GPUs on one host (`device = ["cuda:0", "cuda:1"]` in the model block). Multi-node is not in the native driver today. If you need multi-node, route the model to the vLLM or SGLang driver and use their distribution support. The inferlet abstraction does not change.
+
+## How do I bring my own model?
+
+If your model is one of the supported architectures (Llama, Qwen, Gemma, etc.), point the model block at its HuggingFace repo. `pie model download <repo>` pulls the weights; `pie model list` reports compatibility. If your model is a new architecture, you write a Python module under `pie/src/pie_driver/model/` that implements the forward pass against Pie's kernel set. Existing modules (e.g. `llama3.py`, `qwen3.py`) are the reference. For models supported by vLLM or SGLang but not by the native driver, the alternate drivers cover the gap.
+
+## Why WebAssembly?
+
+Three reasons:
+
+1. **Sandboxing.** Inferlets run inside the engine process. WebAssembly gives memory safety and a deny-by-default capability model. An untrusted inferlet cannot read another's memory or escape to the host.
+2. **Language agnostic.** Rust, Python, and TypeScript all compile to the same Wasm component target. The engine speaks one ABI.
+3. **Fast cold start.** Wasm modules instantiate in milliseconds. A new inferlet process per request is feasible.
+
+The cost is a per-call boundary between Wasm and the host. The [benchmarks](./benchmarks) page reports the size of that overhead.
+
+## How does Pie relate to vLLM and SGLang?
+
+Pie is a different abstraction, not a faster engine. vLLM and SGLang serve a fixed request shape (prompt in, tokens out) at high throughput. Pie's primitive is a running program with access to the KV cache, the forward pass, and I/O. For workloads that *are* a stateless prompt, you do not need Pie. For agents, reasoning chains, and tool-driven pipelines, the inferlet abstraction is the difference. Pie also ships vLLM and SGLang as alternative drivers, so an inferlet can run on top of either when you want their throughput characteristics. See [Comparison with other systems](./comparison).
+
+## How does Pie relate to LangChain, LlamaIndex, or DSPy?
+
+Those are application frameworks that run on top of a serving system. They orchestrate prompts, manage memory, and call tools, but they call the model through a black-box endpoint. Pie is the serving system underneath. You could in principle run a LangChain agent against a Pie endpoint and get nothing extra; the value of Pie is moving the orchestration logic *into* the engine, where it can share the KV cache and avoid client round trips. An inferlet is an alternative to that orchestration layer, not a replacement for prompt templates or document loaders.
+
+## Can I use Pie as a drop-in OpenAI-compatible endpoint?
+
+Yes, through the `openresponses` inferlet. It exposes an OpenAI Responses-compatible HTTP API on top of the engine. For OpenAI Chat Completions specifically, you write a small inferlet that translates the schema; the [examples](../guide/examples/overview) page lists relevant building blocks.
+
+## Is Pie open source?
+
+Yes, Apache 2.0. Source on [GitHub](https://github.com/pie-project/pie). Issues and discussions are public.
+
+## How do I cite Pie?
+
+The SOSP '25 paper is the citation:
+
+```
+In Gim, Zhiyao Ma, Seung-Seob Lee, and Lin Zhong.
+"Pie: A Programmable Serving System for Emerging LLM Applications."
+Proceedings of the 30th ACM Symposium on Operating Systems Principles (SOSP '25).
+```
+
+The vision is in [Serve Programs, Not Prompts](https://ingim.org/papers/gim2025serve.pdf) (HotOS '25).
+
+## Where do I get help?
+
+- [GitHub Discussions](https://github.com/pie-project/pie/discussions) for questions and design feedback.
+- [GitHub Issues](https://github.com/pie-project/pie/issues) for bugs and feature requests.
+- The [Examples](../guide/examples/overview) page for working code on most common patterns.

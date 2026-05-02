@@ -1,0 +1,38 @@
+---
+title: Examples
+description: A catalog of every runnable inferlet shipped with Pie
+sidebar_position: 1
+---
+
+# Examples
+
+Every inferlet listed in this section is a complete, runnable project under [`inferlets/`](https://github.com/pie-project/pie/tree/main/inferlets) in the repo. Click the name on any sub-page to jump to the source.
+
+Build and run any of them locally:
+
+```bash
+pie run --path target/wasm32-wasip2/release/<name>.wasm \
+        --manifest inferlets/<name>/Pie.toml \
+        --prompt "..."
+```
+
+For a published version: `pie run <name> --prompt "..."`.
+
+## Categories
+
+- [Chat and generation](./chat). Minimal text generation in Rust, Python, and JavaScript.
+- [Samplers and probes](./samplers). Sampler outputs, scoring, watermarking.
+- [Structured output](./structured). Grammar, JSON Schema, and template-driven generation.
+- [Context and KV cache](./kv-cache). Forking, prefix sharing, sliding windows.
+- [Speculative decoding](./speculation). Custom drafters.
+- [Reasoning patterns](./reasoning). Tree, graph, and recursion of thought.
+- [Agents](./agents). ReAct, CodeACT, multi-agent swarms.
+- [I/O and integration](./integration). HTTP, MCP, OpenAI Responses, concurrency tests.
+
+Each sub-page is a small table of inferlets plus a pointer to the Guide section that teaches the underlying primitive.
+
+## What you'll see
+
+- **Length.** Most inferlets are 50–300 lines. Read end-to-end in a few minutes.
+- **Languages.** Rust is the canonical SDK. Python and JavaScript variants exist where the surface differs (constrained decoding, MCP, basic chat).
+- **Status.** Some inferlets are demos, some are microbenchmarks. Each entry's "What it shows" makes the role clear.

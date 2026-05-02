@@ -1,0 +1,143 @@
+---
+title: Adapters
+description: LoRA adapters scoped to a model
+sidebar_position: 5
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Adapters
+
+LoRA adapters are runtime-managed overlays scoped to a model. The full lifecycle (create, open, fork, save, load, destroy) is available in all three SDKs. This page covers using an adapter at inference. Read this after [The forward pass](./overview).
+
+## Using an adapter
+
+Attach an adapter to a `Generator` or to a manual `forward()` pass. The adapter applies to that one pass; subsequent passes default to no adapter unless you attach again.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::adapter::Adapter;
+
+let adapter = Adapter::open(&model, "my-adapter")?;
+
+let text = ctx
+    .generate(sampler)
+    .adapter(&adapter)
+    .max_tokens(256)
+    .collect_text()
+    .await?;
+
+// Or on a manual forward pass:
+let mut fwd = ctx.forward();
+fwd.adapter(&adapter);
+fwd.input_at(&tokens, &positions);
+let out = fwd.execute().await?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Adapter
+
+adapter = Adapter.open(model, "my-adapter")
+
+text = await ctx.generate(
+    sampler, max_tokens=256, adapter=adapter,
+).collect_text()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Adapter } from 'inferlet';
+
+const adapter = Adapter.open(model, 'my-adapter');
+
+const text = await ctx
+    .generate(sampler, { maxTokens: 256, adapter })
+    .collectText();
+```
+
+</TabItem>
+</Tabs>
+
+Adapters compose with all other forward-pass primitives. You can attach an adapter and apply a constraint and sample with `TopP` on the same pass.
+
+## Lifecycle
+
+Adapters are named at the engine level. The lifecycle methods follow the same shape across SDKs.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::adapter::Adapter;
+
+// Create an empty adapter
+let a = Adapter::create(&model, "draft-adapter")?;
+
+// Open an existing adapter
+let a = Adapter::open(&model, "draft-adapter").ok_or("not found")?;
+
+// Fork: O(1) copy-on-write clone under a new name
+let a2 = a.fork("draft-adapter-v2");
+
+// Save weights to a file (host filesystem)
+a.save("/data/adapters/draft-v1.bin")?;
+
+// Load weights back
+let a = Adapter::create(&model, "draft-adapter")?;
+a.load("/data/adapters/draft-v1.bin")?;
+
+// Drop the registry slot (instance method, consumes the handle)
+a.destroy();
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Adapter
+
+a = Adapter.create(model, "draft-adapter")
+a = Adapter.open(model, "draft-adapter")     # returns Adapter | None
+a2 = a.fork("draft-adapter-v2")              # fork takes the new name
+a.save("/data/adapters/draft-v1.bin")
+a.load("/data/adapters/draft-v1.bin")
+# Python adapters drop on garbage-collect; no explicit destroy.
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Adapter } from 'inferlet';
+
+const a = Adapter.create(model, 'draft-adapter');
+const a2 = a.fork('draft-adapter-v2');       // fork takes the new name
+a.save('/data/adapters/draft-v1.bin');
+a.load('/data/adapters/draft-v1.bin');
+a.destroy();                                 // instance method
+```
+
+</TabItem>
+</Tabs>
+
+A few details that bite the first time:
+
+- `fork(new_name)` requires the new adapter's name. Adapters are registered at the engine level, so the fork needs an identity.
+- `destroy()` is an instance method that consumes the handle (Rust) or releases the slot (JS). Python has no explicit `destroy`; the slot drops on garbage-collect.
+- `Adapter::open` returns `Option<Adapter>` (Rust) / `Adapter | None` (Python) / `Adapter | undefined` (JS). Check before use.
+
+Like saved contexts, adapters persist across inferlet runs as long as the engine is up. They do not survive a server restart unless you `save()` to disk and `load()` back on startup.
+
+## Next
+
+- [Speculative decoding](./speculation): the next layer down on the forward pass.
+- [The forward pass](./overview): the primitive an adapter attaches to.
+- [Pages](../context/pages): page rollback, useful for branching workloads on top of adapters.

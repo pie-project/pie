@@ -4,6 +4,11 @@
 # Production
 /build
 
+# Re-include the docs/build/ subtree (the parent repo's .gitignore has a
+# generic `build/` rule that would otherwise hide it).
+!docs/build/
+!docs/build/**
+
 # Generated files
 .docusaurus
 .cache-loader

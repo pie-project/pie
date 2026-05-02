@@ -1,0 +1,21 @@
+---
+title: Agents
+description: ReAct, CodeACT, multi-agent swarms
+sidebar_position: 8
+---
+
+# Agents
+
+Agent-shaped inferlets that loop generation against tools, code execution, or other agents.
+
+| Inferlet | What it shows |
+|---|---|
+| [`agent-react`](https://github.com/pie-project/pie/tree/main/inferlets/agent-react) | ReAct (Reasoning + Acting) loop with tool execution. |
+| [`agent-codeact`](https://github.com/pie-project/pie/tree/main/inferlets/agent-codeact) | CodeACT: JavaScript code execution as the action space. |
+| [`agent-swarm`](https://github.com/pie-project/pie/tree/main/inferlets/agent-swarm) | Collaborative agent swarm coordinating via `messaging::broadcast/subscribe`. |
+
+## Related guide
+
+- [Tool-call parser](../decoder/tool-calling): hand-rolled and native tool-call loops.
+- [Inferlet ↔ inferlet messaging](../io/messaging): pub/sub and queues — the swarm's coordination layer.
+- [HTTP](../io/http) and [MCP](../io/mcp): tool transports for agent calls.

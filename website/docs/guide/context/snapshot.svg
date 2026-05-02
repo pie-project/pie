@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 240" width="720" height="240" role="img" aria-labelledby="ss-title ss-desc">
+  <title id="ss-title">Snapshot reuse: two requests fork from a shared saved snapshot</title>
+  <desc id="ss-desc">A saved snapshot named system-prompt-v1 contains four committed pages. Two separate requests fork from the same snapshot; the snapshot itself stays unchanged.</desc>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#54473b"/>
+    </marker>
+  </defs>
+
+  <style>
+    text  { font-family: 'IBM Plex Serif', Charter, Georgia, serif; font-size: 13px; }
+    .ink   { fill: #2c2722; }
+    .sub   { fill: #54473b; }
+    .muted { fill: #7a6a55; font-style: italic; }
+  </style>
+
+  <!-- Snapshot container -->
+  <rect x="24" y="24" width="672" height="128" rx="10" ry="10"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="48" y="52">system-prompt-v1</text>
+
+  <!-- Pages inside snapshot -->
+  <rect x="60"  y="76" width="132" height="56" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="126" y="108" text-anchor="middle">Page 0</text>
+
+  <rect x="216" y="76" width="132" height="56" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="282" y="108" text-anchor="middle">Page 1</text>
+
+  <rect x="372" y="76" width="132" height="56" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="438" y="108" text-anchor="middle">Page 2</text>
+
+  <rect x="528" y="76" width="132" height="56" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="594" y="108" text-anchor="middle">Page 3</text>
+
+  <!-- Fork arrows down to two requests -->
+  <line x1="200" y1="156" x2="200" y2="196"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-end="url(#ah)"/>
+  <text class="muted" x="200" y="216" text-anchor="middle">Request 1</text>
+
+  <line x1="520" y1="156" x2="520" y2="196"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-end="url(#ah)"/>
+  <text class="muted" x="520" y="216" text-anchor="middle">Request 2</text>
+</svg>

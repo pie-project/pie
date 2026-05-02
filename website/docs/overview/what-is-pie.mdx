@@ -1,0 +1,107 @@
+---
+title: What is Pie?
+description: Pie is an LLM serving system that lets application logic run inside the engine
+sidebar_position: 1
+---
+
+# What is Pie?
+
+Pie is an LLM serving system. A serving system is the software that sits between your inference requests and the model's parameters on a GPU: it loads weights, batches forward passes, manages the KV cache, and exposes an interface to clients. Pie does this with one twist on the standard model. Instead of accepting prompts and returning tokens through a fixed endpoint, Pie accepts *programs* that the engine runs next to the model. This page explains why that matters.
+
+This page is for engineers evaluating whether to use or contribute to Pie. If you want to install and run something first, jump to [Install and first run](../guide/install).
+
+:::warning[Research prototype]
+Pie is a research prototype under active development. APIs and features change without notice.
+:::
+
+## Why a new serving system?
+
+vLLM, SGLang, and TensorRT-LLM are excellent at the workload they target: high-throughput batched inference behind a `/completions` endpoint. They treat the model as a black box. The client sends a prompt; the engine returns tokens. Anything richer than that lives in a separate process on the client side.
+
+That model fits a single-turn chatbot. It fits agents and reasoning workloads poorly. Three problems show up in practice:
+
+1. **KV cache is invisible to the application.** A multi-turn agent re-prefills its history on every step. A best-of-N sampler decodes the same prompt N times. A tree search explores branches that share a prefix, but the engine cannot tell. The cache lives inside the engine and the application cannot reach it.
+2. **Tool calls are network round trips.** ReAct, function calling, and MCP all generate a tool request, send it to the client, wait for a result, then resume. Every loop iteration is a TCP handshake away from inference.
+3. **Custom decoding requires forking the engine.** Speculative decoding, constrained decoding, and custom samplers cannot be expressed at the API. To add one, you patch the serving system itself.
+
+The result is that the interesting workloads of 2025 (agents, reasoning chains, tool-driven retrieval) sit awkwardly on top of an interface designed for "prompt in, tokens out."
+
+## Serve programs, not prompts
+
+Pie's primitive is the *inferlet*: a small program you write in Rust, Python, or TypeScript that compiles to WebAssembly and runs inside the engine. The inferlet has direct access to the KV cache, the token stream, and the forward pass. The client launches an inferlet by name; the inferlet runs to completion; tokens and events stream back through it.
+
+Here is a four-way best-of-N implemented as an inferlet:
+
+```rust
+use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Input { prompt: String }
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<String> {
+    let model = Model::load(runtime::models().first().ok_or("no models")?)?;
+    let mut ctx = Context::new(&model)?;
+
+    ctx.system("Solve the problem step by step.")
+       .user(&input.prompt)
+       .cue();
+    ctx.flush().await?;
+
+    let sampler = Sampler::TopP { temperature: 0.7, p: 0.95 };
+    let mut candidates = Vec::new();
+    for _ in 0..4 {
+        let branch = ctx.fork()?;
+        let text = branch.generate(sampler.clone()).max_tokens(256).collect_text().await?;
+        candidates.push(text);
+    }
+    Ok(candidates.join("\n\n---\n\n"))
+}
+```
+
+`ctx.fork()` is O(1). All four branches share the system prompt and user message in the KV cache. Compute and memory scale with the divergent tokens, not the prompt length. The same code on a black-box endpoint pays for the prompt four times.
+
+The inferlet is just a program. It calls regular library functions to generate tokens, to fork contexts, to issue HTTP requests, to call MCP tools. It runs in a sandbox, so you can run an untrusted one safely. The engine schedules its forward passes alongside every other inferlet's, so the GPU stays busy.
+
+## What this enables
+
+Three classes of workload that are awkward on a black-box endpoint become straightforward inside an inferlet:
+
+- **Branching workflows that share state.** Best-of-N, tree of thought, beam search, speculative reasoning. Each branch is a `fork()`. The KV cache is shared across branches by the engine. You write a loop; the engine handles the cache.
+- **Agent loops with no client round trip.** A ReAct agent generates a tool call, calls the tool over WASI HTTP or MCP, appends the result, and continues. The KV cache from the previous step is right there. Tool calls do not cost a network round trip back to the client.
+- **Custom decoding without engine changes.** Speculative decoders (Jacobi, n-gram, draft-and-verify), constrained decoding from a grammar or JSON schema, custom samplers, and watermarking are all written as library code on top of the same forward pass primitive. New strategies do not require a fork of the engine.
+
+The [Examples](../guide/examples/overview) page lists the inferlets that ship with the repo. Tree of thought, graph of thought, ReAct, CodeACT, and a handful of speculative decoders are all there as concrete code.
+
+## How the pieces fit
+
+![Client, Pie engine, inferlet, and model on GPU.](./how-pieces-fit.svg)
+
+Three pieces:
+
+- **The engine** (`pie serve`) loads models onto GPUs, schedules forward passes, and accepts WebSocket connections.
+- **An inferlet** is a sandboxed WebAssembly program that runs inside the engine. You write it in Rust, Python, or TypeScript.
+- **A client** connects over WebSocket and asks the engine to launch an inferlet by name.
+
+What happens during a request:
+
+1. The client calls `launch_process("text-completion@0.1.0", {"prompt": "..."})` over the WebSocket.
+2. The engine instantiates a fresh Wasm sandbox and runs the inferlet's `main`.
+3. The inferlet builds a prompt and calls `ctx.generate(...)`. Each generated token is a forward pass that the engine batches with passes from other live processes.
+4. Tokens stream back through the inferlet to the client.
+
+A *process* is one running instance of an inferlet. The engine can host many at once. Forks created inside a process share KV pages copy-on-write. Saved contexts persist across processes.
+
+## Where next
+
+- [Key features](./key-features). What inferlets give you access to: forward pass, KV cache, I/O.
+- [Comparison with other systems](./comparison). How Pie relates to vLLM, SGLang, llama.cpp, and HF Transformers.
+- [Install and first run](../guide/install). Get Pie running on your machine.
+
+## Further reading
+
+Two papers describe the design and the motivation in depth.
+
+- [Serve Programs, Not Prompts](https://ingim.org/papers/gim2025serve.pdf) (HotOS '25). The vision behind the inferlet abstraction.
+- [Pie: a programmable serving system for emerging LLM applications](https://ingim.org/papers/gim2025pie.pdf) (SOSP '25). The design and implementation, with measurements.
