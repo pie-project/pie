@@ -56,12 +56,21 @@ impl ChatDecoder for GenericChatDecoder {
             self.token_buf.push(t);
         }
         let full = self.tokenizer.decode(&self.token_buf, false);
-        let delta = if full.len() > self.text_emitted {
-            full[self.text_emitted..].to_string()
+        // Byte-level BPE tokenizers (Qwen, Llama-3, Gemma) split multi-byte
+        // characters across tokens. When only part of a character has
+        // arrived, HF's decode emits trailing U+FFFD replacements; the
+        // *next* fire will re-decode the same prefix into the real char,
+        // shifting byte offsets. Slicing by raw byte length therefore
+        // lands inside a multi-byte char and panics. Hold back any
+        // trailing replacements (and stop on the last safe char boundary)
+        // until later fires complete them.
+        let safe_end = safe_emit_end(&full);
+        let delta = if safe_end > self.text_emitted {
+            full[self.text_emitted..safe_end].to_string()
         } else {
             String::new()
         };
-        self.text_emitted = full.len();
+        self.text_emitted = safe_end;
         ChatEvent::Delta(delta)
     }
 
@@ -69,6 +78,18 @@ impl ChatDecoder for GenericChatDecoder {
         self.token_buf.clear();
         self.text_emitted = 0;
     }
+}
+
+/// Byte length of the longest prefix of `s` that is safe to emit now —
+/// i.e., does not end in a U+FFFD replacement char. Returns 0 if every
+/// char in `s` is U+FFFD.
+fn safe_emit_end(s: &str) -> usize {
+    for (i, c) in s.char_indices().rev() {
+        if c != '\u{FFFD}' {
+            return i + c.len_utf8();
+        }
+    }
+    0
 }
 
 // ─── ThinkingDecoder ─────────────────────────────────────────
@@ -319,6 +340,48 @@ mod tests {
             ReasoningEvent::Delta(s) => assert_eq!(s, "reason"),
             other => panic!("expected Delta, got {:?}", other),
         }
+    }
+
+    // ─── safe_emit_end ───────────────────────────────────────
+
+    #[test]
+    fn safe_end_no_replacements() {
+        assert_eq!(safe_emit_end("hello"), 5);
+        assert_eq!(safe_emit_end(""), 0);
+    }
+
+    #[test]
+    fn safe_end_holds_back_trailing_replacement() {
+        // 'abc' (3 bytes) + U+FFFD (3 bytes) = 6 bytes total; safe end = 3
+        let s = "abc\u{FFFD}";
+        assert_eq!(s.len(), 6);
+        assert_eq!(safe_emit_end(s), 3);
+    }
+
+    #[test]
+    fn safe_end_holds_back_multiple_trailing_replacements() {
+        let s = "x\u{FFFD}\u{FFFD}\u{FFFD}";
+        assert_eq!(safe_emit_end(s), 1);
+    }
+
+    #[test]
+    fn safe_end_keeps_internal_replacement() {
+        // Replacement in the middle is committed; only trailing ones held.
+        let s = "a\u{FFFD}b";
+        assert_eq!(safe_emit_end(s), s.len());
+    }
+
+    #[test]
+    fn safe_end_all_replacements_returns_zero() {
+        let s = "\u{FFFD}\u{FFFD}";
+        assert_eq!(safe_emit_end(s), 0);
+    }
+
+    #[test]
+    fn safe_end_with_multibyte_char_at_end() {
+        let s = "ab\u{1F9E0}"; // 🧠 — 4 bytes
+        assert_eq!(s.len(), 6);
+        assert_eq!(safe_emit_end(s), 6);
     }
 
     // ─── No-op Decoders ──────────────────────────────────────
