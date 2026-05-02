@@ -16,7 +16,7 @@
 
 .sectionTitle {
   font-family: var(--pie-font-serif);
-  font-size: var(--pie-text-2xl);
+  font-size: var(--pie-text-3xl);
   text-align: center;
   margin: 0 0 var(--space-3);
   font-weight: 600;
@@ -51,7 +51,6 @@
 }
 
 .heroBanner::after {
-  /* subtle grain to evoke paper */
   content: "";
   position: absolute;
   inset: 0;
@@ -101,22 +100,38 @@
 }
 
 .heroLinks :global(.button) {
-  padding: 0.6rem 1.4rem;
-  font-size: var(--pie-text-sm);
+  padding: 0.9rem 2rem;
+  font-size: var(--pie-text-lg);
+}
+
+.heroNote {
+  margin-top: var(--space-3);
+  margin-bottom: 0;
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-xs);
+  color: var(--pie-ink-muted);
+  font-style: italic;
 }
 
 /* =====================================================================
-   Architecture
+   Figures (the two-up serving loop comparison)
    ===================================================================== */
-.architectureGrid {
+.figuresGrid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: 1fr;
   gap: var(--space-4);
   max-width: 1100px;
   margin-inline: auto;
+  align-items: stretch;
 }
 
-.archCard {
+@media (min-width: 900px) {
+  .figuresGrid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.figureCard {
   background: var(--pie-bg-elev);
   border: 1px solid var(--pie-border);
   border-radius: 14px;
@@ -124,263 +139,49 @@
   text-align: center;
   box-shadow: var(--ifm-global-shadow-lw);
   transition: border-color 180ms ease, transform 180ms ease;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
 }
 
-.archCard:hover {
+.figureCard:hover {
   transform: translateY(-2px);
   border-color: var(--pie-border-strong);
 }
 
-.archCard h3 {
+.figureCard h3 {
   font-family: var(--pie-font-serif);
-  margin: 0 0 var(--space-2);
-  font-size: var(--pie-text-lg);
+  margin: 0;
+  font-size: var(--pie-text-xl);
   font-weight: 600;
   color: var(--pie-ink);
   letter-spacing: -0.01em;
 }
 
-.archCard img {
+.figureCard img {
   width: 100%;
   height: auto;
   max-width: 520px;
-  margin: 0 auto var(--space-2);
-  border-radius: 8px;
+  margin: 0 auto;
   display: block;
 }
 
-.archCard p {
-  color: var(--pie-ink-soft);
-  line-height: 1.6;
-  font-size: var(--pie-text-base);
+.figureCard p {
+  margin: 0;
   font-family: var(--pie-font-serif);
-}
-
-/* =====================================================================
-   CTA
-   ===================================================================== */
-.ctaSection {
-  background:
-    radial-gradient(70% 55% at 50% -15%,
-      color-mix(in oklab, var(--ifm-color-primary) 9%, transparent) 0%,
-      transparent 75%),
-    var(--pie-bg);
-  border-top: 1px solid var(--pie-border);
-}
-
-.ctaSection .sectionTitle {
-  color: var(--pie-ink);
-  font-size: var(--pie-text-2xl);
-}
-
-.ctaSection .sectionSubtitle {
   color: var(--pie-ink-soft);
-  margin-bottom: var(--space-4);
+  font-size: var(--pie-text-base);
+  line-height: 1.6;
 }
 
-.ctaActions {
-  display: flex;
-  justify-content: center;
-  gap: var(--space-3);
-  flex-wrap: wrap;
-}
-
-/* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
-  .archCard,
-  .pagination-nav__link {
+  .figureCard {
     transition: none;
   }
 
-  .archCard:hover {
+  .figureCard:hover {
     transform: none;
   }
-}
-
-/* =====================================================================
-   Contrast: Weakness → Pie Strength
-   ===================================================================== */
-.contrastSection {
-  background: var(--pie-bg-sunken);
-}
-
-.contrastGrid {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: var(--space-4);
-  max-width: 1180px;
-  margin-inline: auto;
-}
-
-@media (min-width: 900px) {
-  .contrastGrid {
-    grid-template-columns: 1fr auto 1fr;
-    column-gap: var(--space-3);
-    row-gap: var(--space-4);
-  }
-}
-
-.contrastRow {
-  display: contents;
-}
-
-/* Cards */
-.weakCard,
-.goodCard {
-  border-radius: 14px;
-  padding: 1.5rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-/* Weak = paper, flat */
-.weakCard {
-  background: var(--pie-bg-elev);
-  border: 1px solid var(--pie-border);
-  border-left: 3px solid var(--pie-border-strong);
-  box-shadow: none;
-}
-
-/* Good = warm primary panel */
-.goodCard {
-  background: var(--ifm-color-primary);
-  border: 0;
-  box-shadow: var(--ifm-global-shadow-md);
-  position: relative;
-  overflow: hidden;
-}
-
-.goodCard::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: radial-gradient(120% 80% at 100% 0%,
-    rgba(255, 245, 220, 0.18) 0%,
-    transparent 60%);
-  pointer-events: none;
-}
-
-.goodCard > * {
-  position: relative;
-}
-
-.goodCard .cardTitle,
-.goodCard .cardBody,
-.goodCard .cardEyebrow,
-.goodCard .cardIcon {
-  color: var(--pie-on-primary);
-}
-
-.goodCard a {
-  color: var(--pie-on-primary);
-  text-decoration: underline;
-}
-
-.goodCard a:hover {
-  opacity: 0.85;
-}
-
-/* Card content */
-.cardEyebrow {
-  font-family: var(--pie-font-serif);
-  font-size: var(--pie-text-micro);
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--pie-ink-muted);
-  margin: 0;
-  font-weight: 600;
-}
-
-.cardTitle {
-  margin: 0;
-  font-family: var(--pie-font-serif);
-  font-size: var(--pie-text-lg);
-  font-weight: 600;
-  color: var(--pie-ink);
-  letter-spacing: -0.01em;
-  line-height: 1.3;
-}
-
-.cardBody {
-  margin: 0;
-  font-family: var(--pie-font-serif);
-  color: var(--pie-ink-soft);
-  line-height: 1.6;
-  font-size: var(--pie-text-base);
-}
-
-.cardIcon {
-  font-size: var(--pie-text-2xl);
-  line-height: 1;
-  margin-bottom: 0.25rem;
-  color: currentColor;
-}
-
-.cardEyebrowLogo {
-  inline-size: 42px;
-  block-size: 20px;
-  margin-bottom: 0.25rem;
-  color: currentColor;
-}
-
-.goodCard .cardEyebrowLogo {
-  color: var(--pie-on-primary);
-}
-
-.weakCard .cardEyebrowLogo {
-  color: var(--pie-ink-muted);
-}
-
-/* Arrows */
-.flowArrow {
-  display: none;
-}
-
-@media (min-width: 900px) {
-  .flowArrow {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding-inline: 0.25rem;
-    color: var(--pie-ink-muted);
-  }
-}
-
-.flowArrow svg {
-  width: 32px;
-  height: 32px;
-}
-
-.mobileArrow {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin: 0.25rem 0 0.5rem;
-  color: var(--pie-ink-muted);
-  font-family: var(--pie-font-serif);
-  font-size: var(--pie-text-xs);
-  letter-spacing: 0.05em;
-}
-
-@media (min-width: 900px) {
-  .mobileArrow {
-    display: none;
-  }
-}
-
-/* A11y helper */
-.srOnly {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  border: 0;
-  padding: 0;
-  white-space: nowrap;
-  clip-path: inset(100%);
-  clip: rect(0 0 0 0);
-  overflow: hidden;
 }
 
 /* =====================================================================
@@ -403,6 +204,7 @@
   margin-bottom: -1px;
   position: relative;
   z-index: 1;
+  flex-wrap: wrap;
 }
 
 .codeTab {
@@ -436,72 +238,29 @@
 }
 
 /* =====================================================================
-   How It Works
+   CTA
    ===================================================================== */
-.stepsGrid {
+.ctaSection {
+  background:
+    radial-gradient(70% 55% at 50% -15%,
+      color-mix(in oklab, var(--ifm-color-primary) 9%, transparent) 0%,
+      transparent 75%),
+    var(--pie-bg);
+  border-top: 1px solid var(--pie-border);
+}
+
+.ctaSection .sectionTitle {
+  margin-bottom: var(--space-4);
+}
+
+.ctaActions {
   display: flex;
-  align-items: flex-start;
   justify-content: center;
-  gap: var(--space-2);
-  max-width: 940px;
-  margin-inline: auto;
+  gap: var(--space-3);
   flex-wrap: wrap;
 }
 
-.stepCard {
-  flex: 1 1 220px;
-  max-width: 280px;
-  text-align: center;
-  padding: var(--space-3);
-}
-
-.stepNumber {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background: var(--ifm-color-primary);
-  color: var(--pie-on-primary);
-  font-family: var(--pie-font-serif);
-  font-style: italic;
+.ctaActions :global(.button) {
+  padding: 0.9rem 2rem;
   font-size: var(--pie-text-lg);
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin: 0 auto var(--space-2);
-  box-shadow: var(--pie-shadow-primary);
-}
-
-.stepCard h3 {
-  font-family: var(--pie-font-serif);
-  font-size: var(--pie-text-lg);
-  font-weight: 600;
-  margin: 0 0 0.5rem;
-  color: var(--pie-ink);
-  letter-spacing: -0.01em;
-}
-
-.stepCard p {
-  font-family: var(--pie-font-serif);
-  font-size: var(--pie-text-base);
-  color: var(--pie-ink-soft);
-  line-height: 1.6;
-}
-
-.stepArrow {
-  font-size: var(--pie-text-xl);
-  color: var(--pie-ink-muted);
-  align-self: center;
-  padding-top: 1rem;
-}
-
-@media (max-width: 600px) {
-  .stepArrow {
-    display: none;
-  }
-
-  .stepsGrid {
-    flex-direction: column;
-    align-items: center;
-  }
 }

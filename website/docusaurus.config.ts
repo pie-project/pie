@@ -186,6 +186,36 @@ const config: Config = {
       ],
     },
 
+    footer: {
+      style: 'light',
+      links: [
+        {
+          title: 'Project',
+          items: [
+            { label: 'GitHub', href: 'https://github.com/pie-project/pie' },
+            { label: 'Roadmap', to: '/roadmap' },
+            { label: 'Apache 2.0 license', href: 'https://github.com/pie-project/pie/blob/main/LICENSE' },
+          ],
+        },
+        {
+          title: 'Docs',
+          items: [
+            { label: 'Overview', to: '/docs/overview/what-is-pie' },
+            { label: 'Guide', to: '/docs/guide/install' },
+            { label: 'Reference', to: '/docs/reference/sdk-rust' },
+          ],
+        },
+        {
+          title: 'Community',
+          items: [
+            { label: 'Discussions', href: 'https://github.com/pie-project/pie/discussions' },
+            { label: 'Getting involved', to: '/community' },
+          ],
+        },
+      ],
+      copyright: `Built in the open under Apache 2.0. Issues and pull requests welcome on GitHub.<br/>© ${new Date().getFullYear()} The Pie Project.`,
+    },
+
     prism: {
       theme: piePrismLight,
       darkTheme: piePrismDark,

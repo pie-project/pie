@@ -11,15 +11,15 @@
       }
 
       .cls-1, .cls-5 {
-        fill: #fdfbf3;
+        fill: #2a241d;
       }
 
       .cls-2 {
-        fill: #2c2722;
+        fill: #ede5d2;
       }
 
       .cls-6 {
-        stroke: #54473b;
+        stroke: #c8bda6;
         stroke-width: 1.5px;
       }
 
@@ -30,25 +30,25 @@
       }
 
       .cls-9 {
-        fill: #54473b;
+        fill: #c8bda6;
       }
 
       .cls-orange {
-        fill: #c96442;
+        fill: #e08a6f;
       }
 
       .cls-10 {
-        fill: #54473b;
+        fill: #c8bda6;
       }
 
       .cls-11 {
-        fill: #fdfbf3;
-        stroke: #54473b;
+        fill: #2a241d;
+        stroke: #c8bda6;
         stroke-width: 1.5px;
       }
 
       .cls-3 {
-        fill: #2c2722;
+        fill: #ede5d2;
         font-size: 25.61px;
       }
 
@@ -57,12 +57,12 @@
       }
 
       .cls-7, .cls-8 {
-        stroke: #54473b;
+        stroke: #c8bda6;
         stroke-width: 1.4px;
       }
 
       .cls-12 {
-        fill: #2c2722;
+        fill: #ede5d2;
         font-family: 'IBM Plex Serif', Charter, Georgia, serif;
         font-size: 17px;
         font-weight: 700;
@@ -79,12 +79,12 @@
       }
 
       .cls-4 {
-        fill: #2c2722;
+        fill: #ede5d2;
       }
 
       .cls-14 {
-        fill: #fdfbf3;
-        stroke: #54473b;
+        fill: #2a241d;
+        stroke: #c8bda6;
         stroke-width: 1.5px;
       }
 
