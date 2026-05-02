@@ -1,25 +1,13 @@
-//! JavaScript execution helpers for the CodeACT agent.
-//!
-//! Wraps the Boa engine and extracts ```javascript blocks from
-//! model responses.
+//! JavaScript execution helper for the CodeACT agent. The agent now feeds
+//! plain JS source through a JSON-Schema field, so there's no fence-
+//! extraction to do — just evaluate.
 
 use boa_engine::{Context, Source};
 
-/// If `text` contains a ```javascript code block, evaluate it with Boa
-/// and return the result. Returns `None` when no block is present.
-pub fn try_eval_block(text: &str) -> Option<String> {
-    let code = extract_block(text)?;
-    Some(eval(&code))
-}
-
-fn extract_block(text: &str) -> Option<String> {
-    // Use the last block — thinking models may emit several during reasoning.
-    let start = text.rfind("```javascript")? + "```javascript".len();
-    let end = text[start..].find("```")?;
-    Some(text[start..start + end].trim().to_string())
-}
-
-fn eval(code: &str) -> String {
+/// Evaluate `code` and return the last expression's value as a string.
+/// Errors come back as `"Execution Error: …"` so the caller can detect
+/// and surface them as observations.
+pub fn eval(code: &str) -> String {
     let mut ctx = Context::default();
     match ctx.eval(Source::from_bytes(code)) {
         Ok(value) => value

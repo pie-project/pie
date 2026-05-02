@@ -1,15 +1,22 @@
-//! Demonstrates Recursion-of-Thought (RoT) for divide-and-conquer problem solving.
+//! Recursion-of-Thought (RoT): solve a problem by recursively dividing it
+//! into independent subproblems whose answers compose into the final
+//! answer.
 //!
-//! The model recursively decides whether to solve a problem directly (leaf node)
-//! or divide it into two independent subtasks (branch node). Solutions from
-//! subtasks are merged to produce the final answer.
+//! Pie features exercised:
+//!   - `Context::fork()` — every recursive call branches off a shared
+//!     prefix, so the system prompt + chat template are KV-cached once.
+//!   - `Generator::constrain_with(Ebnf)` — the divide/merge steps emit a
+//!     small JSON shape under a hand-rolled grammar that forbids the
+//!     whitespace stalls JSON-Schema's auto-grammar permits.
+//!   - `futures::future::join` over forked contexts — sibling subtasks
+//!     run concurrently and the runtime batches their forward passes.
 
 use futures::future;
 use inferlet::{
-    Context, sample::Sampler, model::Model,
-    runtime, Result,
+    Context, Result, sample::Sampler, model::Model, runtime,
 };
 use serde::Deserialize;
+use serde_json::Value;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,67 +34,126 @@ struct Input {
     verbose: bool,
 }
 
-fn default_question() -> String { "Please calculate the expression (42 + 3) * 5 / 15.".to_string() }
-fn default_max_depth() -> usize { 5 }
-fn default_max_tokens() -> usize { 128 }
+fn default_question() -> String {
+    "Compute the sum 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8.".to_string()
+}
+fn default_max_depth() -> usize { 2 }
+fn default_max_tokens() -> usize { 256 }
 
-/// Prints a message only if verbose mode is enabled.
-macro_rules! verbose_println {
-    ($verbose:expr, $($arg:tt)*) => {
-        if $verbose {
-            println!($($arg)*)
-        }
-    };
+/// EBNF grammar for the divide step. We hand-roll it instead of using
+/// JSON-Schema because the auto-generated JSON grammar permits arbitrary
+/// whitespace between `:` and the value, which under any sampler tends to
+/// trap small models in a "emit space until budget runs out" state. This
+/// grammar admits no whitespace; control characters that slip into the
+/// string body are stripped on the parse side (`sanitize_json`).
+const PLAN_GRAMMAR: &str = r#"
+root      ::= leaf | branch
+leaf      ::= "{\"mode\":\"leaf\",\"answer\":\"" chars "\"}"
+branch    ::= "{\"mode\":\"branch\",\"subtasks\":[\"" chars "\",\"" chars "\"]}"
+chars     ::= char chars | char
+char      ::= [^"\\] | "\\\""
+"#;
+
+/// EBNF for the merge step: a single non-empty answer field.
+const MERGE_GRAMMAR: &str = r#"
+root   ::= "{\"answer\":\"" chars "\"}"
+chars  ::= char chars | char
+char   ::= [^"\\] | "\\\""
+"#;
+
+/// Strip ASCII control characters (besides space and printable ASCII)
+/// from raw model output before handing it to `serde_json`. Small models
+/// occasionally emit a literal newline / NUL inside the string body; the
+/// EBNF lets them, but `serde_json` rejects unescaped control chars in
+/// JSON strings. We treat them as noise rather than parse failures.
+fn sanitize_json(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_ascii_control() || *c == '\t')
+        .collect()
 }
 
-const DIVIDE_PROMPT_TEMPLATE: &str = "\
-Your task is to analyze the given problem and decide whether it can be solved directly or needs \
-to be divided into smaller subproblems. If the problem is simple and can be solved immediately, \
-provide the solution wrapped in `<leaf>THE ANSWER</leaf>`. If not, divide the problem into \
-exactly two independent subtasks such that solving these subtasks and combining their solutions \
-will lead to the solution of the original problem. Present the subtasks wrapped in \
-`<branch>SUBTASK 1</branch>` and `<branch>SUBTASK 2</branch>`. Be concise and ensure the \
-subtasks are distinct and solvable. Please also ensure that the description of the subtasks is \
-clear and self-contained, that is, each subtask should be able to be solved independently of the \
-other. One subtask should not depend on the result of the other subtask. Problem: {}";
+const PLAN_SYSTEM: &str = "\
+You are a careful problem solver. For each problem, decide if you can solve \
+it directly with a short, confident answer (mode=\"leaf\"), or if it should \
+be split into exactly two simpler, independent subproblems (mode=\"branch\"). \
+Prefer branching whenever the problem has two or more clearly separable \
+sub-expressions, products, or distinct quantities. Each subproblem must be \
+self-contained: solvable without seeing the other subproblem's answer.
 
-const SOLVE_PROMPT: &str =
-    "Now, please solve the problem. Reason step-by-step. Make your response short.";
+When you pick leaf, write the full computation in `answer` — show the \
+expression and the final value, e.g. \"12 + 5 = 17\". Always state the \
+final value at the end so the merge step can read it.
 
-const MERGE_PROMPT: &str =
-    "Now, please merge the two solutions into one. Make your response short.";
+Two short examples:
 
+  User: Compute 12 + 5.
+  Assistant: {\"mode\":\"leaf\",\"answer\":\"12 + 5 = 17\"}
+
+  User: Compute (12 + 5) * (6 - 2).
+  Assistant: {\"mode\":\"branch\",\"subtasks\":[\"Compute 12 + 5\",\"Compute 6 - 2\"]}
+
+Output JSON only — no explanation, no markdown, no extra whitespace.";
+
+const MERGE_SYSTEM: &str = "\
+You will be given the answers to two independent subproblems and asked to \
+combine them into the final answer. Be concise. Output JSON only.";
+
+/// Macro: `println!` only when verbose.
+macro_rules! vlog {
+    ($v:expr, $($arg:tt)*) => { if $v { println!($($arg)*) } };
+}
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
-/// Parses the model's response to extract either a leaf answer or two branch subtasks.
-fn parse_response(response: &str) -> std::result::Result<(Option<String>, Option<(String, String)>), String> {
-    if let Some(start) = response.find("<leaf>") {
-        if let Some(end) = response.find("</leaf>") {
-            let answer = response[start + 6..end].trim().to_string();
-            return Ok((Some(answer), None));
+#[derive(Debug)]
+enum Plan {
+    Leaf(String),
+    Branch(String, String),
+}
+
+/// Parse the model's plan-step JSON into a Plan.
+fn parse_plan(json: &str) -> std::result::Result<Plan, String> {
+    let v: Value = serde_json::from_str(&sanitize_json(json))
+        .map_err(|e| format!("JSON parse: {e}"))?;
+    let mode = v.get("mode").and_then(Value::as_str).ok_or("missing mode")?;
+    match mode {
+        "leaf" => {
+            let answer = v.get("answer")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("leaf with empty answer")?;
+            Ok(Plan::Leaf(answer.to_string()))
         }
-    }
-
-    let branches: Vec<String> = response
-        .match_indices("<branch>")
-        .zip(response.match_indices("</branch>"))
-        .map(|((start, _), (end, _))| response[start + 8..end].trim().to_string())
-        .collect();
-
-    if branches.len() == 2 {
-        Ok((None, Some((branches[0].clone(), branches[1].clone()))))
-    } else {
-        Err(format!(
-            "Error: Expected a <leaf> tag or exactly two <branch> tags, but found {} branches.",
-            branches.len()
-        ))
+        "branch" => {
+            let subtasks = v.get("subtasks")
+                .and_then(Value::as_array)
+                .ok_or("missing subtasks")?;
+            if subtasks.len() != 2 {
+                return Err(format!("branch needs 2 subtasks, got {}", subtasks.len()));
+            }
+            let t1 = subtasks[0].as_str().ok_or("subtask 1 not a string")?.trim();
+            let t2 = subtasks[1].as_str().ok_or("subtask 2 not a string")?.trim();
+            Ok(Plan::Branch(t1.to_string(), t2.to_string()))
+        }
+        m => Err(format!("unknown mode: {m}")),
     }
 }
 
-/// Recursively divides a problem, solves sub-problems, and merges the solutions.
-fn divide_and_conquer<'a>(
-    ctx: &'a Context,
+fn parse_answer(json: &str) -> std::result::Result<String, String> {
+    let v: Value = serde_json::from_str(&sanitize_json(json))
+        .map_err(|e| format!("JSON parse: {e}"))?;
+    v.get("answer")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing answer".to_string())
+}
+
+/// Recursive divide-solve-merge. Branches run concurrently when not verbose.
+fn solve<'a>(
+    plan_root: &'a Context,
+    merge_root: &'a Context,
     question: &'a str,
     path: String,
     max_depth: usize,
@@ -95,147 +161,108 @@ fn divide_and_conquer<'a>(
     verbose: bool,
 ) -> BoxFuture<'a, Result<String>> {
     Box::pin(async move {
-        // Base Case: If max depth is reached, solve the problem directly.
-        if path.len() >= max_depth {
-            let mut solve_ctx = ctx.fork()?;
-            let solve_prompt = format!("{} {}", SOLVE_PROMPT, question);
-            solve_ctx.user(&solve_prompt);
-            solve_ctx.cue();
+        // Force a leaf at max depth.
+        let force_leaf = path.len() >= max_depth;
 
-            let response = solve_ctx
-                .generate(Sampler::Argmax)
-                .max_tokens(max_tokens)
-                .collect_text()
-                .await?;
+        vlog!(verbose, "[{path}] {} {question}",
+              if force_leaf { "leaf (max depth):" } else { "plan:" });
 
-            verbose_println!(verbose, "Reached max depth at path {:?}", path);
-            verbose_println!(verbose, "Response: {}", response.trim());
-            verbose_println!(verbose, "");
-            return Ok(response);
-        }
+        let mut ctx = plan_root.fork()?;
+        let prompt = if force_leaf {
+            format!("Solve this directly. Set mode=\"leaf\" and put the answer in \
+                     `answer`. Leave `subtasks` empty. Problem: {question}")
+        } else {
+            format!("Decide leaf vs branch for this problem. Problem: {question}")
+        };
+        ctx.user(&prompt);
+        ctx.cue();
 
-        // Recursive Step: Try to divide the problem.
-        verbose_println!(verbose, "Analysing problem at path {:?}", path);
-        let mut divide_ctx = ctx.fork()?;
-        let divide_prompt = DIVIDE_PROMPT_TEMPLATE.replace("{}", question);
-        divide_ctx.user(&divide_prompt);
-        divide_ctx.cue();
-
-        let response = divide_ctx
+        let json = ctx
             .generate(Sampler::Argmax)
             .max_tokens(max_tokens)
+            .constrain_with(inferlet::Ebnf(PLAN_GRAMMAR))?
             .collect_text()
             .await?;
 
-        verbose_println!(verbose, "Response: {}", response.trim());
+        let plan = parse_plan(&json)
+            .map_err(|e| format!("plan parse at {path:?}: {e} (raw: {json})"))?;
 
-        match parse_response(&response) {
-            // Case 1: The model provided a direct answer (leaf node).
-            Ok((Some(answer), None)) => {
-                verbose_println!(verbose, "Leaf node found at path {:?}", path);
-                verbose_println!(verbose, "Response: {}", answer.trim());
-                verbose_println!(verbose, "");
+        match plan {
+            Plan::Leaf(answer) => {
+                vlog!(verbose, "[{path}] -> {answer}");
                 Ok(answer)
             }
-            // Case 2: The model divided the problem into two subtasks (branch node).
-            Ok((None, Some((task1, task2)))) => {
-                verbose_println!(verbose, "Branch node found at path {:?}", path);
-                verbose_println!(verbose, "Subtask 1: {}", task1.trim());
-                verbose_println!(verbose, "Subtask 2: {}", task2.trim());
-                verbose_println!(verbose, "");
+            Plan::Branch(t1, t2) => {
+                vlog!(verbose, "[{path}] split:\n  L: {t1}\n  R: {t2}");
 
-                let solution1_future = divide_and_conquer(
-                    ctx,
-                    &task1,
-                    format!("{}l", path),
-                    max_depth,
-                    max_tokens,
-                    verbose,
-                );
-                let solution2_future = divide_and_conquer(
-                    ctx,
-                    &task2,
-                    format!("{}r", path),
-                    max_depth,
-                    max_tokens,
-                    verbose,
-                );
-
-                let solution1;
-                let solution2;
-
-                // If verbose mode is enabled, run the subtask solutions sequentially, so that
-                // the output is not interleaved.
-                if verbose {
-                    solution1 = solution1_future.await?;
-                    solution2 = solution2_future.await?;
+                let f1 = solve(plan_root, merge_root, &t1,
+                               format!("{path}l"), max_depth, max_tokens, verbose);
+                let f2 = solve(plan_root, merge_root, &t2,
+                               format!("{path}r"), max_depth, max_tokens, verbose);
+                let (a1, a2) = if verbose {
+                    (f1.await?, f2.await?)
                 } else {
-                    let (r1, r2) = future::join(solution1_future, solution2_future).await;
-                    solution1 = r1?;
-                    solution2 = r2?;
-                }
+                    let (r1, r2) = future::join(f1, f2).await;
+                    (r1?, r2?)
+                };
 
-                verbose_println!(verbose, "Merging solutions at path {:?}", path);
-                let mut merge_ctx = ctx.fork()?;
-                let merge_prompt = format!(
-                    "Subtask 1 solution: {}\nSubtask 2 solution: {}\n{}",
-                    solution1, solution2, MERGE_PROMPT
-                );
-                merge_ctx.user(&merge_prompt);
-                merge_ctx.cue();
-
-                let response = merge_ctx
+                let mut mctx = merge_root.fork()?;
+                mctx.user(&format!(
+                    "Original problem: {question}\n\
+                     Subproblem 1 answer: {a1}\n\
+                     Subproblem 2 answer: {a2}\n\
+                     Compose the final answer to the original problem."
+                ));
+                mctx.cue();
+                let merged = mctx
                     .generate(Sampler::Argmax)
                     .max_tokens(max_tokens)
+                    .constrain_with(inferlet::Ebnf(MERGE_GRAMMAR))?
                     .collect_text()
                     .await?;
-
-                verbose_println!(verbose, "Response: {}", response.trim());
-                verbose_println!(verbose, "");
-                Ok(response)
+                let answer = parse_answer(&merged)
+                    .map_err(|e| format!("merge parse at {path:?}: {e}"))?;
+                vlog!(verbose, "[{path}] merge -> {answer}");
+                Ok(answer)
             }
-            // Case 3: Error in parsing the response.
-            Err(e) => Ok(format!("Parsing Error: {}", e)),
-            // Case 4: Invalid response format.
-            _ => Ok("Error: Invalid response format from model.".to_string()),
         }
     })
 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let question = input.question;
-    let max_depth = input.max_depth;
-    let max_tokens = input.max_tokens;
-    let verbose = input.verbose;
+    let start = Instant::now();
+    let model_name = runtime::models()
+        .first()
+        .cloned()
+        .ok_or("No models available")?;
+    let model = Model::load(&model_name)?;
 
-    let start_time = Instant::now();
-    println!("--- Initializing Model and Context ---");
+    // One context per system prompt — the divide step and merge step want
+    // different framing. Both share a clean fork point so each call gets
+    // its own KV without leaking state across siblings.
+    let mut plan_root = Context::new(&model)?;
+    plan_root.system(PLAN_SYSTEM);
+    plan_root.flush().await?;
 
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
+    let mut merge_root = Context::new(&model)?;
+    merge_root.system(MERGE_SYSTEM);
+    merge_root.flush().await?;
 
-    let mut ctx = Context::new(&model)?;
-    ctx.system("You are a helpful, respectful and honest assistant.");
-    ctx.flush().await?;
+    println!("--- Recursion-of-Thought (max_depth={}, max_tokens={}) ---",
+             input.max_depth, input.max_tokens);
+    println!("Question: {}", input.question);
 
-    println!("--- Starting Recursion-of-Thought (RoT) ---");
-    println!("Question: {}", question);
-    println!("Max Depth: {}, Max Tokens: {}", max_depth, max_tokens);
+    let answer = solve(
+        &plan_root, &merge_root,
+        &input.question,
+        String::new(),
+        input.max_depth,
+        input.max_tokens,
+        input.verbose,
+    ).await?;
 
-    let solution = divide_and_conquer(
-        &ctx,
-        &question,
-        "".to_string(),
-        max_depth,
-        max_tokens,
-        verbose,
-    )
-    .await?;
-
-    println!("\n--- ✅ RoT Complete in {:?} ---", start_time.elapsed());
-    println!("\nFinal solution: {}", solution);
-
+    println!("\n--- ✅ RoT Complete in {:?} ---", start.elapsed());
+    println!("Final solution: {answer}");
     Ok(String::new())
 }

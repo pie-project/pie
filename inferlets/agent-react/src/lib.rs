@@ -1,247 +1,177 @@
-//! Demonstrates ReAct-style (Reasoning + Acting) agent workflow.
+//! ReAct-style agent on top of Pie. Each step the model emits a
+//! `{thought, tool, input}` JSON object under a JSON-Schema constraint;
+//! the host runs the tool and feeds the observation back as the next
+//! user turn.
 //!
-//! This example implements a ReAct agent that performs sequential
-//! Thought/Action/Observation cycles with actual tool execution.
+//! Pie features exercised:
+//!   - `Context` chat-template helpers (`system`, `user`, `cue`).
+//!   - `Generator::constrain_with(JsonSchema)` for guaranteed-shape output.
+//!   - **Per-step grammar switching:** the schema starts as the full tool
+//!     menu and is swapped to a `FinalAnswer`-only variant on the last
+//!     iteration. Pie applies the new constraint to the very next decode
+//!     so termination is guaranteed without any post-hoc parsing or
+//!     output rewriting.
+//!   - `Sampler::Multinomial` — small temperature breaks Argmax loops on
+//!     identical contexts.
 
 use chrono::{NaiveDate, Utc};
 use evalexpr::eval;
 use inferlet::{
-    Context, sample::Sampler, model::Model,
-    runtime, Result,
+    Context, Result, sample::Sampler, model::Model, runtime,
 };
 use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Deserialize)]
 struct Input {
-    #[serde(default = "default_num_function_calls")]
-    num_function_calls: u32,
-    #[serde(default = "default_tokens_between_calls")]
-    tokens_between_calls: usize,
+    #[serde(default = "default_max_steps")]
+    max_steps: u32,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_question")]
+    question: String,
 }
 
-fn default_num_function_calls() -> u32 { 5 }
-fn default_tokens_between_calls() -> usize { 512 }
-
-/// Result of parsing and executing an action from the assistant's response.
-enum ActionResult {
-    /// A tool was executed successfully (observation returned).
-    Tool(String),
-    /// A final answer was provided (observation returned).
-    FinalAnswer(String),
-    /// No valid action was found in the response.
-    NotFound,
+fn default_max_steps() -> u32 { 5 }
+fn default_max_tokens() -> usize { 256 }
+fn default_question() -> String {
+    "What is 17 multiplied by 24, plus 13?".to_string()
 }
 
-const SYSTEM_PROMPT: &str = "
-You are a helpful assistant that understands how to break down a complex question into \
-a series of steps. \
-The following tools are available:
+const SYSTEM_PROMPT: &str = "\
+You are a tool-using assistant. At every step output one JSON object \
+{thought, tool, input} that picks a single tool call:
 
-- `Calculator[expression]`: Evaluates a mathematical expression \
-                            (e.g., \"15 * 30\", \"100 / 2.5\", \"5 + 3 * 2\").
-- `CurrentDate[]`: Returns today's date in YYYY-MM-DD format.
-- `DaysBetween[YYYY-MM-DD, YYYY-MM-DD]`: Calculates the number of days between \
-                                         two dates (from first date to second date).
-- `FinalAnswer[answer]`: Reports your final answer to the user's question.
+  - Calculator   input is a single arithmetic expression with operators \
+                 +, -, *, /, e.g. \"17 * 24\", \"408 + 13\".
+  - CurrentDate  input is ignored. Returns today's date YYYY-MM-DD.
+  - DaysBetween  input is two ISO dates joined by ONE comma, e.g. \
+                 \"2026-05-02,2030-12-31\".
+  - FinalAnswer  input is the final answer to the user.
 
-Please respond with one tool use at a time, and don't nest tool calls.
+As soon as the most recent Observation IS the value the user is asking \
+for, your next action MUST be FinalAnswer with that observation as \
+`input`. Do not run extra calculations once the answer has appeared.
 
-The user's question might be complicated, so it may require multiple steps to answer. \
-You will receive a history of the interactions with the tools so far. Use this history \
-to reason about the next action to take. If you don't see a history, it means that the \
-conversation has just started.
+Worked example:
 
-You need to answer next action to take, you must output your thoughts and the action \
-to take. The format should be:
+  User: Question: What is 5 + 3 - 1?
+  Assistant: {\"thought\":\"Compute 5 + 3.\",\"tool\":\"Calculator\",\"input\":\"5 + 3\"}
+  User: Observation: 8
+  Assistant: {\"thought\":\"Subtract 1.\",\"tool\":\"Calculator\",\"input\":\"8 - 1\"}
+  User: Observation: 7
+  Assistant: {\"thought\":\"7 is the answer.\",\"tool\":\"FinalAnswer\",\"input\":\"7\"}";
 
-Thought: Your reasoning for the next action.
-Action: The tool to use, in the format `ToolName[input]`.
+const ACTION_SCHEMA: &str = r#"{
+    "type": "object",
+    "properties": {
+        "thought": { "type": "string", "minLength": 1 },
+        "tool":    {
+            "type": "string",
+            "enum": ["Calculator", "CurrentDate", "DaysBetween", "FinalAnswer"]
+        },
+        "input":   { "type": "string" }
+    },
+    "required": ["thought", "tool", "input"],
+    "additionalProperties": false
+}"#;
 
-When possible, please prefer using the tools that are available.
-
-In the interaction history, you will see the results of the previous tool calls with \
-the following format:
-
-Observation: The result of the tool call.
-
-As a reminder, you must respond only the next action to take and end the conversation, \
-and use only one tool call at a time.";
-
-const USER_PROMPT: &str = "\
-If I save $12.50 per day starting today, how much money \
-will I have saved by the end of the year 2030?";
+/// Same shape as `ACTION_SCHEMA` but with `tool` locked to FinalAnswer.
+/// We swap to this on the final iteration so the loop is guaranteed to
+/// terminate even when the model would otherwise keep proposing more
+/// Calculator calls. Demonstrates Pie's per-decode grammar switching.
+const FINAL_SCHEMA: &str = r#"{
+    "type": "object",
+    "properties": {
+        "thought": { "type": "string", "minLength": 1 },
+        "tool":    { "type": "string", "const": "FinalAnswer" },
+        "input":   { "type": "string", "minLength": 1 }
+    },
+    "required": ["thought", "tool", "input"],
+    "additionalProperties": false
+}"#;
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let num_function_calls = input.num_function_calls;
-    let tokens_between_calls = input.tokens_between_calls;
-
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
+    let model_name = runtime::models()
+        .first()
+        .cloned()
+        .ok_or("No models available")?;
+    let model = Model::load(&model_name)?;
 
     let mut ctx = Context::new(&model)?;
     ctx.system(SYSTEM_PROMPT);
-    ctx.user(&format!(
-        "{USER_PROMPT} What is the next step to solve this problem?"
-    ));
+    ctx.user(&format!("Question: {q}\nWhat is the next action?", q = input.question));
     ctx.cue();
 
-    let mut final_answer = None;
+    let mut final_answer: Option<String> = None;
 
-    for _ in 0..num_function_calls {
-        let response = ctx
-            .generate(Sampler::Argmax)
-            .max_tokens(tokens_between_calls)
+    for step in 1..=input.max_steps {
+        // Last iteration: swap the schema to force a FinalAnswer turn.
+        let schema = if step == input.max_steps { FINAL_SCHEMA } else { ACTION_SCHEMA };
+
+        let raw = ctx
+            .generate(Sampler::Multinomial { temperature: 0.7, draws: 0 })
+            .max_tokens(input.max_tokens)
+            .constrain_with(inferlet::JsonSchema(schema))?
             .collect_text()
             .await?;
 
-        // Parse and execute any action in the response
-        let action_result = parse_and_execute_action(&response);
+        let action = serde_json::from_str::<Value>(&raw)
+            .map_err(|e| format!("step {step}: JSON parse: {e} (raw: {raw})"))?;
+        let thought = action.get("thought").and_then(Value::as_str).unwrap_or("");
+        let tool = action.get("tool").and_then(Value::as_str).unwrap_or("");
+        let arg = action.get("input").and_then(Value::as_str).unwrap_or("");
 
-        let observation = match &action_result {
-            ActionResult::Tool(obs) => obs.clone(),
-            ActionResult::FinalAnswer(obs) => {
-                final_answer = Some(obs.clone());
+        println!("\n[step {step}] thought: {thought}");
+        println!("[step {step}] {tool}({arg:?})");
+
+        let observation = match tool {
+            "Calculator"  => calculator(arg),
+            "CurrentDate" => current_date(),
+            "DaysBetween" => days_between(arg),
+            "FinalAnswer" => {
+                final_answer = Some(arg.trim().to_string());
                 break;
             }
-            ActionResult::NotFound => {
-                "No action detected. Please use the format: Action: ToolName[input]".to_string()
-            }
+            other => format!("Error: unknown tool {other}"),
         };
 
+        println!("[step {step}] observation: {observation}");
         ctx.user(&format!(
-            "Observation: {observation}\n What is the next step to solve this problem?"
+            "Observation: {observation}\nQuestion (reminder): {q}\nWhat is \
+             the next action?",
+            q = input.question
         ));
         ctx.cue();
     }
 
-    if let Some(final_answer) = final_answer {
-        println!("Final answer: {}", final_answer);
-    } else {
-        println!("No final answer found.");
+    match final_answer {
+        Some(a) => println!("\nFinal answer: {a}"),
+        None => println!("\nNo final answer found within the iteration limit."),
     }
-
     Ok(String::new())
 }
 
-/// Parses the assistant's response looking for an Action and executes it.
-/// Scans backwards to find the last action, which is important for thinking models
-/// that may generate multiple action patterns during their reasoning process.
-fn parse_and_execute_action(text: &str) -> ActionResult {
-    // Scan backwards through lines to find the last action
-    for line in text.lines().rev() {
-        let line = line.trim();
-        if let Some(action_part) = line.strip_prefix("Action:") {
-            let action_part = action_part.trim();
-
-            // Try to parse Calculator[expression]
-            if let Some(inner) = extract_tool_input(action_part, "Calculator") {
-                return ActionResult::Tool(execute_calculator(&inner));
-            }
-
-            // Try to parse CurrentDate[]
-            if let Some(inner) = extract_tool_input(action_part, "CurrentDate") {
-                return ActionResult::Tool(execute_current_date(&inner));
-            }
-
-            // Try to parse DaysBetween[date_from, date_until]
-            if let Some(inner) = extract_tool_input(action_part, "DaysBetween") {
-                return ActionResult::Tool(execute_days_between(&inner));
-            }
-
-            // Try to parse FinalAnswer[answer]
-            if let Some(inner) = extract_tool_input(action_part, "FinalAnswer") {
-                return ActionResult::FinalAnswer(execute_final_answer(&inner));
-            }
-        }
-    }
-
-    ActionResult::NotFound
-}
-
-/// Extracts the input from "ToolName[input]" format.
-fn extract_tool_input(text: &str, tool_name: &str) -> Option<String> {
-    let text = text.trim();
-    if text.contains(tool_name) {
-        if let Some(start) = text.find('[') {
-            if let Some(end) = text.rfind(']') {
-                if start < end {
-                    return Some(text[start + 1..end].to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Executes a calculator expression.
-fn execute_calculator(expression: &str) -> String {
-    match eval(expression) {
-        Ok(result) => format!("The result is: {}", result),
-        Err(e) => format!("Error evaluating expression: {}", e),
+fn calculator(expr: &str) -> String {
+    match eval(expr) {
+        Ok(v) => format!("{v}"),
+        Err(e) => format!("Error evaluating {expr:?}: {e}"),
     }
 }
 
-/// Returns the current date.
-fn execute_current_date(_input: &str) -> String {
-    let today = Utc::now().date_naive();
-    format!("Today's date is: {}", today.format("%Y-%m-%d"))
+fn current_date() -> String {
+    Utc::now().date_naive().format("%Y-%m-%d").to_string()
 }
 
-/// Calculates days between two dates.
-fn execute_days_between(input: &str) -> String {
-    // Parse input expecting "date_from, date_until"
-    let parts: Vec<&str> = input.split(',').map(|s| s.trim()).collect();
-
+fn days_between(arg: &str) -> String {
+    let parts: Vec<&str> = arg.split(',').map(str::trim).collect();
     if parts.len() != 2 {
-        return format!(
-            "Error: DaysBetween requires exactly 2 dates separated by comma. \
-            Expected format: DaysBetween[YYYY-MM-DD, YYYY-MM-DD]"
-        );
+        return format!("Error: DaysBetween needs YYYY-MM-DD,YYYY-MM-DD (got {arg:?})");
     }
-
-    let date_from_str = parts[0];
-    let date_until_str = parts[1];
-
-    let date_from = match NaiveDate::parse_from_str(date_from_str, "%Y-%m-%d") {
-        Ok(date) => date,
-        Err(e) => {
-            return format!(
-                "Error parsing start date '{}': {}. Expected format: YYYY-MM-DD",
-                date_from_str, e
-            );
-        }
-    };
-
-    let date_until = match NaiveDate::parse_from_str(date_until_str, "%Y-%m-%d") {
-        Ok(date) => date,
-        Err(e) => {
-            return format!(
-                "Error parsing end date '{}': {}. Expected format: YYYY-MM-DD",
-                date_until_str, e
-            );
-        }
-    };
-
-    let days = (date_until - date_from).num_days();
-
-    if days > 0 {
-        format!(
-            "There are {} days from {} to {}",
-            days, date_from_str, date_until_str
-        )
-    } else if days == 0 {
-        format!("Both dates are the same: {}", date_from_str)
-    } else {
-        format!(
-            "The date {} is {} days before {}",
-            date_until_str, -days, date_from_str
-        )
+    let parse = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d");
+    match (parse(parts[0]), parse(parts[1])) {
+        (Ok(a), Ok(b)) => (b - a).num_days().to_string(),
+        (Err(e), _) | (_, Err(e)) => format!("Error parsing date: {e}"),
     }
-}
-
-/// Reports the final answer.
-fn execute_final_answer(answer: &str) -> String {
-    format!("Task completed. Final answer: {}", answer.trim())
 }

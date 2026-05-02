@@ -1,109 +1,131 @@
-//! CodeACT agent: solves problems by generating and executing JavaScript.
+//! CodeACT agent on top of Pie. Each step the model emits a
+//! `{thought, kind, code, answer}` JSON object under a JSON-Schema
+//! constraint; the host either runs `code` (Boa-evaluated JavaScript) and
+//! feeds the value back as the next observation, or accepts `answer` as
+//! the terminal output.
 //!
-//! The agent loops {generate → run code → feed result back} until the
-//! model emits a `Final Answer:` line.
+//! Pie features exercised:
+//!   - `Context` chat-template helpers (`system`, `user`, `cue`).
+//!   - `Generator::constrain_with(JsonSchema)` for guaranteed-shape output.
+//!   - `Sampler::Multinomial` — Argmax tends to lock identical contexts
+//!     into the same continuation every step, so a small temperature is
+//!     standard for agent loops even with grammar constraints.
 
 use inferlet::{sample::Sampler, model::Model, runtime, Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 
 mod js;
 
 #[derive(Deserialize)]
 struct Input {
-    #[serde(default = "default_steps")]
-    num_function_calls: u32,
-    #[serde(default = "default_tokens")]
-    tokens_between_calls: usize,
+    #[serde(default = "default_max_steps")]
+    max_steps: u32,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_task")]
+    task: String,
 }
 
-fn default_steps() -> u32 { 5 }
-fn default_tokens() -> usize { 512 }
+fn default_max_steps() -> u32 { 5 }
+fn default_max_tokens() -> usize { 384 }
+fn default_task() -> String {
+    "Compute 25 squared, then add 17 to it.".to_string()
+}
 
 const SYSTEM_PROMPT: &str = "\
-You are CodeACT, a highly intelligent AI assistant that solves problems by writing \
-and executing JavaScript code step by step.
+You are CodeACT, a problem-solver that thinks one short JavaScript step at \
+a time. Each turn output one JSON object {thought, kind, code, answer}:
 
-## Interaction Format
+  - kind=\"code\":  put a JS snippet in `code` and leave `answer` empty. \
+                  The host evaluates the snippet; the LAST expression's \
+                  value comes back as the next Observation. Each \
+                  evaluation is stateless — re-define helpers each turn.
+  - kind=\"final\": you are done. Put the final answer in `answer` (the \
+                  value from the latest Observation) and leave `code` empty.
 
-You will be given a task to solve, and you need to respond with the code that carries out \
-the next step to solve the task. You may also receive a history of previous steps and their \
-execution results reported by the user.
+Worked example:
 
-If you receive a history of previous steps and their execution results, it will be \
-formatted as follows:
-Code execution result: [Execution result here]
+  User: Task: Compute (12 * 7) + 5.
+  Assistant: {\"thought\":\"Multiply.\",\"kind\":\"code\",\"code\":\"12 * 7\",\"answer\":\"\"}
+  User: Observation: 84
+  Assistant: {\"thought\":\"Add 5.\",\"kind\":\"code\",\"code\":\"84 + 5\",\"answer\":\"\"}
+  User: Observation: 89
+  Assistant: {\"thought\":\"Done.\",\"kind\":\"final\",\"code\":\"\",\"answer\":\"89\"}
 
-If you don't receive a history of previous steps and their execution results, it means that \
-the conversation has just started. You must generate the code for the first step to solve \
-the task.
+Each `code` block is a single self-contained JS expression or short \
+statement list — do not fence with backticks, just put the source in \
+the `code` field.";
 
-You must generate the code for the NEXT STEP ONLY. Do not repeat previous steps or generate \
-multiple code blocks at once. Respond with the following format:
-
-Thought: Your reasoning about what to do next based on the history.
-```javascript
-// JavaScript code for this step only
-```
-
-When you have the final answer and no more code needs to be executed, respond with:
-
-Thought: I have the answer.
-Final Answer: [Your final answer here]
-
-Important Notes:
-
-- Each code execution is stateless - you cannot reference variables from previous executions.
-- If you need helper functions, you must redefine them in each code block.
-- The last expression in your code block will be returned as the result.
-- Keep each code block focused on a single step of your solution.
-
-Reminder: You must respond with the code for the NEXT STEP ONLY. Do not repeat previous \
-steps or generate multiple code blocks at once.";
-
-const TASK: &str = "Calculate the sum of the first 10 prime numbers.";
+const STEP_SCHEMA: &str = r#"{
+    "type": "object",
+    "properties": {
+        "thought": { "type": "string", "minLength": 1 },
+        "kind":    { "type": "string", "enum": ["code", "final"] },
+        "code":    { "type": "string" },
+        "answer":  { "type": "string" }
+    },
+    "required": ["thought", "kind", "code", "answer"],
+    "additionalProperties": false
+}"#;
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model_name = runtime::models().first().cloned().ok_or("No models available")?;
+    let model_name = runtime::models()
+        .first()
+        .cloned()
+        .ok_or("No models available")?;
     let model = Model::load(&model_name)?;
 
     let mut ctx = Context::new(&model)?;
     ctx.system(SYSTEM_PROMPT);
-    ctx.user(&format!("{TASK}\n\nWhat is the first step?"));
+    ctx.user(&format!("Task: {t}\nWhat is the next step?", t = input.task));
     ctx.cue();
 
-    for _ in 0..input.num_function_calls {
-        let response = ctx
-            .generate(Sampler::Argmax)
-            .max_tokens(input.tokens_between_calls)
+    let mut final_answer: Option<String> = None;
+
+    for step in 1..=input.max_steps {
+        let raw = ctx
+            .generate(Sampler::Multinomial { temperature: 0.7, draws: 0 })
+            .max_tokens(input.max_tokens)
+            .constrain_with(inferlet::JsonSchema(STEP_SCHEMA))?
             .collect_text()
             .await?;
 
-        match js::try_eval_block(&response) {
-            Some(result) => {
+        let v = serde_json::from_str::<Value>(&raw)
+            .map_err(|e| format!("step {step}: JSON parse: {e} (raw: {raw})"))?;
+        let thought = v.get("thought").and_then(Value::as_str).unwrap_or("");
+        let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+        let code = v.get("code").and_then(Value::as_str).unwrap_or("");
+        let answer = v.get("answer").and_then(Value::as_str).unwrap_or("");
+
+        println!("\n[step {step}] thought: {thought}");
+
+        match kind {
+            "code" => {
+                println!("[step {step}] code: {code}");
+                let observation = js::eval(code);
+                println!("[step {step}] observation: {observation}");
                 ctx.user(&format!(
-                    "Code execution result: {result}\n\nWhat is the next step?"
+                    "Observation: {observation}\nTask (reminder): {t}\nWhat is \
+                     the next step?",
+                    t = input.task
                 ));
                 ctx.cue();
             }
-            None => {
-                println!("Final answer: {}", final_answer(&response));
-                return Ok(String::new());
+            "final" => {
+                let answer = answer.trim().to_string();
+                println!("[step {step}] final: {answer}");
+                final_answer = Some(answer);
+                break;
             }
+            _ => unreachable!("schema enforces kind ∈ {{code, final}}"),
         }
     }
 
-    println!("No final answer found within the iteration limit.");
+    match final_answer {
+        Some(a) => println!("\nFinal answer: {a}"),
+        None => println!("\nNo final answer found within the iteration limit."),
+    }
     Ok(String::new())
-}
-
-/// Extracts the last `Final Answer:` line, falling back to the last
-/// non-empty line of the response.
-fn final_answer(text: &str) -> String {
-    text.lines()
-        .rev()
-        .find_map(|l| l.trim().strip_prefix("Final Answer:").map(str::trim))
-        .or_else(|| text.lines().rev().map(str::trim).find(|l| !l.is_empty()))
-        .unwrap_or("Unknown")
-        .to_string()
 }
