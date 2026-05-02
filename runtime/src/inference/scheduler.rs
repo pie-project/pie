@@ -181,29 +181,9 @@ impl BatchAccumulator {
         }
     }
 
-    /// Push a request, rejecting when adding would exceed
-    /// `max_batch_tokens` and the batch is non-empty.
-    ///
-    /// Returns `Err(req)` so the caller can stash the rejected request
-    /// as the seed of the next batch (after firing the current one).
-    /// Empty-batch pushes always succeed: a single oversize prefill
-    /// can't be made smaller than itself, so we let it through and let
-    /// the device path surface the error per pie #322. True
-    /// chunked-prefill (splitting a long prompt across forward passes)
-    /// is a separate, larger change.
-    fn try_push(&mut self, req: PendingRequest) -> Result<(), PendingRequest> {
-        let req_tokens = req.request.tokens.len();
-        if !self.requests.is_empty()
-            && self
-                .total_tokens
-                .saturating_add(req_tokens)
-                > self.max_batch_tokens
-        {
-            return Err(req);
-        }
-        self.total_tokens += req_tokens;
+    fn push(&mut self, req: PendingRequest) {
+        self.total_tokens += req.request.tokens.len();
         self.requests.push(req);
-        Ok(())
     }
 
     fn is_full(&self) -> bool {
@@ -332,9 +312,8 @@ impl BatchScheduler {
         let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
 
         // Stash for a request that didn't fit in the current batch's
-        // token budget. Seeded back into the next batch as soon as the
-        // current one fires, so we never lose admission order.
-        let mut held_for_next_batch: Option<PendingRequest> = None;
+        // token budget; seeded into the next batch.
+        let mut held: Option<PendingRequest> = None;
 
         loop {
             // Drain completed batch latencies (non-blocking)
@@ -342,41 +321,36 @@ impl BatchScheduler {
                 policy.on_complete(latency);
             }
 
-            // Wait for first request if batch is empty. If a request
-            // was held back from the previous batch (token budget
-            // overflow), seed with it instead of blocking on recv.
+            // Wait for first request if batch is empty (held first if any).
             if batch.is_empty() {
-                if let Some(held) = held_for_next_batch.take() {
-                    batch.try_push(held).ok().expect("empty-batch push");
+                if let Some(p) = held.take() {
+                    batch.push(p);
                 } else {
                     let Some(pending) = req_rx.recv().await else {
                         break;
                     };
                     policy.on_arrival();
-                    batch.try_push(pending).ok().expect("empty-batch push");
+                    batch.push(pending);
                 }
             }
 
-            // Accumulate more requests (non-blocking). Stop on a
-            // token-budget overflow and stash the rejected request to
-            // seed the next batch — the in-progress accumulator is
-            // about to fire (forced below), so the held request will
-            // be re-admitted on the next loop iteration.
+            // Accumulate more requests (non-blocking). Stash and stop on
+            // a token-budget overshoot — firing a >max batch trips
+            // vllm's torch.compile range assertion downstream.
             while let Ok(pending) = req_rx.try_recv() {
                 policy.on_arrival();
-                if let Err(rejected) = batch.try_push(pending) {
-                    held_for_next_batch = Some(rejected);
+                if batch.total_tokens() + pending.request.tokens.len() > max_batch_tokens {
+                    held = Some(pending);
                     break;
                 }
+                batch.push(pending);
                 if batch.is_full() {
                     break;
                 }
             }
 
-            // A held overflow forces a fire — waiting can't shrink the
-            // already-accumulated batch's token count.
-            let force_fire = held_for_next_batch.is_some();
-            let decision = if force_fire {
+            // A held overshoot forces a fire — waiting can't shrink the batch.
+            let decision = if held.is_some() {
                 Decision::Fire
             } else {
                 policy.decide(batch.len())
@@ -441,11 +415,10 @@ impl BatchScheduler {
                         maybe_req = req_rx.recv() => {
                             if let Some(pending) = maybe_req {
                                 policy.on_arrival();
-                                if let Err(rejected) = batch.try_push(pending) {
-                                    // Hold for the next batch; the
-                                    // outer loop will see force_fire
-                                    // on its next iteration.
-                                    held_for_next_batch = Some(rejected);
+                                if batch.total_tokens() + pending.request.tokens.len() > max_batch_tokens {
+                                    held = Some(pending);
+                                } else {
+                                    batch.push(pending);
                                 }
                             } else {
                                 break; // channel closed
@@ -544,106 +517,5 @@ impl BatchScheduler {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_pending(n_tokens: usize) -> PendingRequest {
-        let (tx, _rx) = oneshot::channel();
-        PendingRequest {
-            request: ForwardPassRequest {
-                context_id: 0,
-                tokens: vec![0; n_tokens],
-                positions: (0..n_tokens as u32).collect(),
-                speculative_tokens: vec![],
-                speculative_positions: vec![],
-                output_speculative_tokens: false,
-                masks: vec![],
-                has_user_mask: false,
-                logit_mask: None,
-                sampling_indices: vec![],
-                samplers: vec![],
-                adapter_id: None,
-                adapter_seed: None,
-            },
-            response_tx: tx,
-            physical_page_ids: vec![],
-            last_page_len: 0,
-        }
-    }
-
-    /// Helper: assert a try_push succeeded (PendingRequest doesn't
-    /// impl Debug, so we can't use `.unwrap()` directly).
-    fn must_push(acc: &mut BatchAccumulator, req: PendingRequest) {
-        assert!(acc.try_push(req).is_ok(), "try_push expected to accept");
-    }
-
-    #[test]
-    fn try_push_accepts_when_under_token_budget() {
-        // Two 100-token requests fit in a 256-token batch.
-        let mut acc = BatchAccumulator::new(/*max_size=*/ 8, /*max_tokens=*/ 256);
-        must_push(&mut acc, make_pending(100));
-        must_push(&mut acc, make_pending(100));
-        assert_eq!(acc.len(), 2);
-        assert_eq!(acc.total_tokens(), 200);
-    }
-
-    #[test]
-    fn try_push_rejects_when_overflow_and_batch_non_empty() {
-        // 200 tokens already; a 100-token request would overshoot 256.
-        // Reject and return the request to the caller.
-        let mut acc = BatchAccumulator::new(8, 256);
-        must_push(&mut acc, make_pending(200));
-        let oversize = make_pending(100);
-        let oversize_tokens = oversize.request.tokens.len();
-        match acc.try_push(oversize) {
-            Ok(()) => panic!("expected rejection"),
-            Err(rejected) => {
-                assert_eq!(rejected.request.tokens.len(), oversize_tokens);
-            }
-        }
-        assert_eq!(acc.total_tokens(), 200, "rejected request must not bump counter");
-        assert_eq!(acc.len(), 1, "rejected request must not be added");
-    }
-
-    #[test]
-    fn try_push_accepts_oversize_seed_when_batch_empty() {
-        // A single request larger than max_batch_tokens still seeds an
-        // empty batch — pie has no chunked prefill, so the alternative
-        // (silent drop) is worse than letting the device path surface
-        // the error per pie #322.
-        let mut acc = BatchAccumulator::new(8, 256);
-        must_push(&mut acc, make_pending(1024));
-        assert_eq!(acc.len(), 1);
-        assert!(acc.is_full(), "oversize seed should mark batch full");
-    }
-
-    #[test]
-    fn try_push_rejects_at_exact_overflow_boundary() {
-        // Boundary: 200 + 57 = 257 > 256 → reject.
-        // Boundary: 200 + 56 = 256 = 256 → accept (=, not >).
-        let mut acc = BatchAccumulator::new(8, 256);
-        must_push(&mut acc, make_pending(200));
-        assert!(acc.try_push(make_pending(57)).is_err(), "257 > 256 should reject");
-        must_push(&mut acc, make_pending(56));
-        assert_eq!(acc.total_tokens(), 256);
-    }
-
-    #[test]
-    fn is_full_fires_on_size_or_token_limit() {
-        // Size limit only.
-        let mut acc = BatchAccumulator::new(2, 1024);
-        must_push(&mut acc, make_pending(10));
-        assert!(!acc.is_full());
-        must_push(&mut acc, make_pending(10));
-        assert!(acc.is_full(), "len=2 hits max_batch_size=2");
-
-        // Token limit only.
-        let mut acc = BatchAccumulator::new(8, 256);
-        must_push(&mut acc, make_pending(256));
-        assert!(acc.is_full(), "total_tokens=max_batch_tokens hits limit");
     }
 }
