@@ -55,7 +55,7 @@ const OFF_RESP_LEN: usize = 28;
 const OFF_SEND_WT: usize = 32;
 const OFF_RESPOND_WT: usize = 40;
 
-#[link(name = "rt")]
+#[cfg_attr(target_os = "linux", link(name = "rt"))]
 unsafe extern "C" {
     fn shm_open(name: *const libc::c_char, oflag: libc::c_int, mode: libc::mode_t) -> libc::c_int;
 }
@@ -168,11 +168,14 @@ impl ShmemClient {
                  != SLOT_HEADER_SIZE({SLOT_HEADER_SIZE}) + req_buf({req_buf_size}) + resp_buf({resp_buf_size}) = {expected_stride}"
             ));
         }
+        // The header fields are the canonical bound; macOS rounds the shm
+        // region up to a page (16 KiB on Apple Silicon), so tolerate a
+        // larger file but reject one that's actually short.
         let expected_total = HEADER_SIZE + num_slots * slot_stride;
-        if total_size != expected_total {
+        if total_size < expected_total {
             unsafe { libc::munmap(base as *mut _, total_size) };
             return Err(anyhow!(
-                "shmem size mismatch: file is {total_size} bytes, header implies {expected_total} (slots={num_slots} stride={slot_stride})"
+                "shmem size too small: file is {total_size} bytes, header implies {expected_total} (slots={num_slots} stride={slot_stride})"
             ));
         }
         if num_slots == 0 {
