@@ -118,13 +118,38 @@ class VllmEngine:
         kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
         host_kv, pool_size = allocate_host_pool(kv_cache_at_layer, config.swap_budget_bytes)
 
+        # Wire vllm's CUDA-graph dispatcher when capture is enabled (i.e.
+        # `enforce_eager=False`). With it disabled, set cg_dispatcher=None
+        # and forward_pass falls through to the eager path everywhere.
+        cg_dispatcher = _maybe_init_cg_dispatcher(loaded.vllm_config)
+
         forward_pass = VllmForwardPass(
             model=loaded.model,
             vllm_config=loaded.vllm_config,
             attn_backend=loaded.attn_backend,
             runtime_config=config,
             model_config=loaded.model_config,
+            cg_dispatcher=cg_dispatcher,
         )
+
+        if cg_dispatcher is not None:
+            max_cg_n = (
+                loaded.vllm_config.compilation_config.max_cudagraph_capture_size
+                or 0
+            )
+            forward_pass.setup_cg_buffers(
+                max_n=max_cg_n,
+                hidden_size=int(loaded.vllm_config.model_config.get_hidden_size()),
+            )
+
+            _log("Capturing vllm CUDA graphs", "INFO")
+            _capture_vllm_cudagraphs(
+                forward_pass=forward_pass,
+                cg_dispatcher=cg_dispatcher,
+                vllm_config=loaded.vllm_config,
+                config=config,
+            )
+            _log("Capture done", "INFO")
 
         return cls(
             config=config,
@@ -388,4 +413,192 @@ class VllmEngine:
             # Adapter operations raise NotImplementedError on this driver.
             supports_adapters=False,
             snapshot_dir=str(self.snapshot_dir),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# vllm CUDA-graph piggybacking
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# When `enforce_eager=False`, vllm decorates the model's forward with
+# `@support_torch_compile` and stands up a CUDAGraphWrapper for each captured
+# (mode, batch_descriptor). At runtime the wrapper consults
+# `forward_context.cudagraph_runtime_mode`/`batch_descriptor` to decide
+# whether to replay the captured graph or fall through to eager.
+#
+# Pie's adapter previously bypassed this entirely — calling `model.forward`
+# without setting those context fields — which on multi-rank deadlocked
+# because the two ranks took different code paths inside the wrapper and
+# issued mismatched all-reduces.
+#
+# We piggyback the standard way: build a `CudagraphDispatcher`, drive a
+# capture warmup pass that mirrors `gpu_model_runner._capture_cudagraphs`,
+# and let `transform()` ask the dispatcher per fire. No CUDA-specific code
+# in pie — vllm's `current_platform.graph_capture` handles platform
+# routing (CUDA Graphs on NVIDIA, HIP Graphs on ROCm, no-op elsewhere).
+
+
+def _maybe_init_cg_dispatcher(vllm_config) -> object | None:
+    """Construct + initialize a CudagraphDispatcher, or None if cudagraph
+    capture is disabled in vllm_config (i.e. enforce_eager=True)."""
+    from ._vllm_compat import CUDAGraphMode, CudagraphDispatcher
+
+    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+    if cudagraph_mode is None or cudagraph_mode == CUDAGraphMode.NONE:
+        return None
+
+    dispatcher = CudagraphDispatcher(vllm_config)
+    # uniform_decode_query_len = 1 for plain decode; 1 + num_speculative
+    # if speculative decoding is enabled at the vllm level. Pie currently
+    # drives spec decoding above vllm (NGRAM via VllmEngine.spec_step), not
+    # through vllm's spec config, so 1 is correct here.
+    dispatcher.initialize_cudagraph_keys(
+        cudagraph_mode, uniform_decode_query_len=1,
+    )
+    return dispatcher
+
+
+def _capture_vllm_cudagraphs(
+    *,
+    forward_pass,
+    cg_dispatcher,
+    vllm_config,
+    config: RuntimeConfig,
+) -> None:
+    """Drive the model forward at every captured (mode, descriptor) so vllm's
+    CUDAGraphWrapper records a graph for each.
+
+    Two phases, mirroring `gpu_worker.compile_or_warm_up_model`:
+    1. Warmup OUTSIDE graph_capture — runs each shape with mode=NONE so the
+       wrapper falls through to its Dynamo-compiled function, triggering
+       Inductor compile. Inductor compile clones CUDA RNG state, which
+       fails if it runs inside graph_capture, so it has to happen first.
+    2. Capture INSIDE graph_capture, set_cudagraph_capturing_enabled=True —
+       runs each shape with the dispatcher-provided mode so the wrapper
+       enters its capture branch and records a CUDA graph (or HIP graph
+       on ROCm; vllm's `current_platform.graph_capture` handles routing).
+
+    Inputs come from pie's existing metadata builder so the build stays
+    backend-agnostic — no per-attention-backend dummy-input plumbing in pie.
+    """
+    from ._vllm_compat import (
+        CUDAGraphMode,
+        graph_capture,
+        set_cudagraph_capturing_enabled,
+        set_forward_context,
+    )
+
+    forward_pass._ensure_metadata_builder()
+    page_size = forward_pass._kv_spec.block_size
+    device = forward_pass.device
+    embed_dim = vllm_config.model_config.get_hidden_size()
+    dtype = config.activation_dtype
+
+    capture_descs = [
+        (mode, desc)
+        for mode, descs in cg_dispatcher.get_capture_descs()
+        if mode != CUDAGraphMode.NONE
+        for desc in descs
+    ]
+
+    # Phase 1: compile (mode=NONE → wrapper falls through to compiled fn).
+    with torch.inference_mode():
+        for _mode, desc in capture_descs:
+            _run_one_shape(
+                forward_pass=forward_pass,
+                runtime_mode=CUDAGraphMode.NONE,
+                desc=desc,
+                page_size=page_size,
+                device=device,
+                embed_dim=embed_dim,
+                dtype=dtype,
+                vllm_config=vllm_config,
+                set_forward_context=set_forward_context,
+            )
+    torch.cuda.synchronize()
+
+    # Phase 2: capture.
+    set_cudagraph_capturing_enabled(True)
+    try:
+        with torch.inference_mode(), graph_capture(device=device):
+            for mode, desc in capture_descs:
+                _run_one_shape(
+                    forward_pass=forward_pass,
+                    runtime_mode=mode,
+                    desc=desc,
+                    page_size=page_size,
+                    device=device,
+                    embed_dim=embed_dim,
+                    dtype=dtype,
+                    vllm_config=vllm_config,
+                    set_forward_context=set_forward_context,
+                )
+            torch.cuda.synchronize()
+    finally:
+        set_cudagraph_capturing_enabled(False)
+
+
+def _run_one_shape(
+    *,
+    forward_pass,
+    runtime_mode,
+    desc,
+    page_size: int,
+    device: torch.device,
+    embed_dim: int,
+    dtype: torch.dtype,
+    vllm_config,
+    set_forward_context,
+) -> None:
+    """Run one dummy forward at (mode, num_tokens) for compile-warmup or
+    capture (caller decides via `runtime_mode`). Builds pie-style metadata
+    for a uniform-decode batch of `desc.num_tokens` × 1-token requests
+    (highest-volume runtime shape — decode phase). PIECEWISE captures
+    accept any `num_reqs` per the wrapper's relax_for_mixed_batch logic,
+    so this single shape covers both PIECEWISE and FULL captures pie will
+    dispatch to at runtime."""
+    from .attn_metadata import build_common_metadata
+
+    n = desc.num_tokens
+    # Uniform decode: n requests, 1 query token each, 1 KV page of length 1.
+    qo_indptr = torch.arange(n + 1, dtype=torch.int32, device=device)
+    kv_page_indices = torch.arange(n, dtype=torch.int32, device=device)
+    kv_page_indptr = torch.arange(n + 1, dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.ones(n, dtype=torch.int32, device=device)
+
+    common = build_common_metadata(
+        qo_indptr=qo_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_page_indptr=kv_page_indptr,
+        kv_last_page_lens=kv_last_page_lens,
+        page_size=page_size,
+        device=device,
+    )
+    backend_metadata = forward_pass._builder.build(
+        common_prefix_len=0, common_attn_metadata=common,
+    )
+    slot_mapping_dict = {
+        name: common.slot_mapping for name in forward_pass._layer_names
+    }
+
+    # Use the persistent buffers as inputs so the addresses captured here
+    # match what transform() will pass at runtime. The values don't matter
+    # for capture (only the shape and address do); zero them defensively.
+    forward_pass._buf_input_embeds[:n].zero_()
+    forward_pass._buf_positions[:n].zero_()
+    input_embeds = forward_pass._buf_input_embeds[:n]
+    positions = forward_pass._buf_positions[:n]
+
+    with set_forward_context(
+        attn_metadata=backend_metadata,
+        vllm_config=vllm_config,
+        num_tokens=n,
+        slot_mapping=slot_mapping_dict,
+        cudagraph_runtime_mode=runtime_mode,
+        batch_descriptor=desc,
+    ):
+        forward_pass.model.forward(
+            input_ids=None,
+            positions=positions,
+            inputs_embeds=input_embeds,
         )

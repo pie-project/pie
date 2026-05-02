@@ -108,6 +108,25 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
         if v is not None:
             engine_kwargs[k] = v
 
+    # When piggybacking on vllm's CUDA-graph dispatch (enforce_eager=False),
+    # vllm bakes a fixed `compile_ranges` into the piecewise backend at load
+    # time and asserts at fire time that `num_tokens` falls inside one of
+    # them — chunked prefill's default 2048 is far below pie's batched
+    # peak. Default `max_num_batched_tokens` to the model's context length
+    # so any pie batch fits the compile range.
+    if (
+        not engine_kwargs.get("enforce_eager", False)
+        and engine_kwargs.get("max_num_batched_tokens") is None
+    ):
+        from transformers import AutoConfig
+        try:
+            hf_cfg = AutoConfig.from_pretrained(config.hf_repo, trust_remote_code=True)
+            mml = int(getattr(hf_cfg, "max_position_embeddings", 0)) or None
+        except Exception:
+            mml = None
+        if mml is not None:
+            engine_kwargs["max_num_batched_tokens"] = mml
+
     args = EngineArgs(**engine_kwargs)
     return args.create_engine_config()
 

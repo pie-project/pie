@@ -43,6 +43,7 @@ class VllmForwardPass:
         attn_backend: Any,
         runtime_config: RuntimeConfig,
         model_config: Any,
+        cg_dispatcher: Any | None = None,
     ):
         self.model = model
         self.vllm_config = vllm_config
@@ -55,6 +56,39 @@ class VllmForwardPass:
         self._builder = None
         self._kv_spec = None
         self._layer_names: list[str] = []
+
+        # vllm's CUDA-graph dispatcher; None if cudagraph capture is disabled
+        # (enforce_eager=True / --no-cuda-graphs). When set, transform() asks
+        # the dispatcher for the runtime mode + padded shape and forwards
+        # those into vllm's set_forward_context — vllm's CUDAGraphWrapper
+        # then either replays the captured graph or transparently falls
+        # through to eager. Construction lives in VllmEngine.load.
+        self.cg_dispatcher = cg_dispatcher
+
+        # Persistent input buffers for cudagraph replay. Captured graphs
+        # bake in tensor *addresses*, not values — pie must copy_ each
+        # fire's data into the same buffers and pass slices off them.
+        # Sized to the largest captured shape; `None` until set up by the
+        # engine's capture warmup (which knows max_cudagraph_capture_size).
+        self._buf_input_embeds: torch.Tensor | None = None
+        self._buf_positions: torch.Tensor | None = None
+        self._buf_max_n: int = 0
+
+    def setup_cg_buffers(self, max_n: int, hidden_size: int) -> None:
+        """Allocate the persistent input_embeds / positions buffers used as
+        the input slice during both capture and replay. Idempotent — safe
+        to call multiple times with the same max_n."""
+        if self._buf_input_embeds is not None and self._buf_max_n >= max_n:
+            return
+        self._buf_max_n = max_n
+        self._buf_input_embeds = torch.zeros(
+            max_n, hidden_size,
+            dtype=self.runtime_config.activation_dtype,
+            device=self.device,
+        )
+        self._buf_positions = torch.zeros(
+            max_n, dtype=torch.int64, device=self.device,
+        )
 
     def _ensure_metadata_builder(self) -> None:
         """Construct the per-backend AttentionMetadataBuilder once.
@@ -111,7 +145,7 @@ class VllmForwardPass:
         kv_last_page_lens: torch.Tensor,
     ) -> torch.Tensor:
         """Run the model's transformer trunk inside `set_forward_context`."""
-        from ._vllm_compat import set_forward_context
+        from ._vllm_compat import CUDAGraphMode, BatchDescriptor, set_forward_context
 
         self._ensure_metadata_builder()
 
@@ -141,19 +175,94 @@ class VllmForwardPass:
         # vllm's RoPE kernel expects int64 positions; pie uses int32.
         positions = position_ids.to(self.device, dtype=torch.int64, non_blocking=True)
 
+        # Ask vllm whether a captured graph applies to this num_tokens. If
+        # mode is NONE the wrapper falls through to eager and we run the
+        # model unmodified. Otherwise we route through the persistent
+        # buffers — captured graphs replay against fixed input *addresses*,
+        # so pie must copy_ each fire's data into the same buffers it
+        # passed at capture time and slice off them.
+        actual_n = common.num_actual_tokens
+        if self.cg_dispatcher is not None:
+            cg_mode, batch_desc = self.cg_dispatcher.dispatch(
+                num_tokens=actual_n,
+                uniform_decode=False,
+                has_lora=False,
+                disable_full=False,
+            )
+        else:
+            cg_mode, batch_desc = CUDAGraphMode.NONE, BatchDescriptor(actual_n)
+
+        forward_n = batch_desc.num_tokens
+        if cg_mode != CUDAGraphMode.NONE:
+            assert self._buf_input_embeds is not None, (
+                "cg_dispatcher returned non-NONE mode but persistent buffers "
+                "are not initialized — engine.load must call setup_cg_buffers."
+            )
+            self._buf_input_embeds[:actual_n].copy_(input_embeds, non_blocking=True)
+            if forward_n > actual_n:
+                self._buf_input_embeds[actual_n:forward_n].zero_()
+            self._buf_positions[:actual_n].copy_(positions, non_blocking=True)
+            if forward_n > actual_n:
+                self._buf_positions[actual_n:forward_n].zero_()
+            input_embeds_in = self._buf_input_embeds[:forward_n]
+            positions_in = self._buf_positions[:forward_n]
+
+            if forward_n > actual_n:
+                slot_mapping_dict = self._pad_slot_mapping(
+                    slot_mapping_dict, forward_n
+                )
+        else:
+            input_embeds_in = input_embeds
+            positions_in = positions
+
         with set_forward_context(
             attn_metadata=backend_metadata,
             vllm_config=self.vllm_config,
-            num_tokens=common.num_actual_tokens,
+            num_tokens=forward_n,
             slot_mapping=slot_mapping_dict,
+            cudagraph_runtime_mode=cg_mode,
+            batch_descriptor=batch_desc,
         ):
             hidden_states = self.model.forward(
                 input_ids=None,
-                positions=positions,
-                inputs_embeds=input_embeds,
+                positions=positions_in,
+                inputs_embeds=input_embeds_in,
             )
 
+        if forward_n > actual_n:
+            hidden_states = hidden_states[:actual_n]
         return hidden_states
+
+    @staticmethod
+    def _pad_to(t: torch.Tensor, target_len: int) -> torch.Tensor:
+        """Right-pad a 1-D or 2-D tensor's leading dim with zeros up to
+        `target_len`. Caller has already checked target_len > t.shape[0]."""
+        pad_rows = target_len - t.shape[0]
+        if t.ndim == 1:
+            pad = torch.zeros(pad_rows, dtype=t.dtype, device=t.device)
+        else:
+            pad = torch.zeros(
+                (pad_rows, *t.shape[1:]), dtype=t.dtype, device=t.device,
+            )
+        return torch.cat([t, pad], dim=0)
+
+    def _pad_slot_mapping(
+        self, slot_mapping_dict: dict, target_len: int,
+    ) -> dict:
+        """Pad each layer's slot_mapping tensor up to target_len with -1
+        (vllm's PAD_SLOT_ID). Attention-write kernels skip slot_id == -1
+        so the trailing padded tokens compute-then-discard their KV."""
+        out = {}
+        for name, sm in slot_mapping_dict.items():
+            if sm.shape[0] >= target_len:
+                out[name] = sm
+                continue
+            pad_rows = target_len - sm.shape[0]
+            pad = torch.full(
+                (pad_rows,), -1, dtype=sm.dtype, device=sm.device,
+            )
+            out[name] = torch.cat([sm, pad], dim=0)
+        return out
 
     def sample(self, hidden_states: torch.Tensor, sampling_metadata: dict) -> dict:
         """Sample via pie_driver's sample_common; vllm's LM head is the lm_head_fn."""
