@@ -181,9 +181,20 @@ impl BatchAccumulator {
         }
     }
 
-    fn push(&mut self, req: PendingRequest) {
-        self.total_tokens += req.request.tokens.len();
+    /// Push if the request fits in the token budget.
+    ///
+    /// Returns `Err(req)` (unchanged batch) when the request would push
+    /// `total_tokens` past `max_batch_tokens`. An *empty* batch always
+    /// accepts so a single oversized request can still make progress.
+    /// (`max_batch_size` is enforced separately via `is_full`.)
+    fn try_push(&mut self, req: PendingRequest) -> Result<(), PendingRequest> {
+        let new_total = self.total_tokens + req.request.tokens.len();
+        if !self.requests.is_empty() && new_total > self.max_batch_tokens {
+            return Err(req);
+        }
+        self.total_tokens = new_total;
         self.requests.push(req);
+        Ok(())
     }
 
     fn is_full(&self) -> bool {
@@ -234,7 +245,7 @@ impl BatchScheduler {
         max_batch_size: usize,
         max_batch_tokens: usize,
         request_timeout_secs: u64,
-        batch_policy: String,
+        policy: Option<String>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let stats = Arc::new(SchedulerStats::default());
@@ -243,7 +254,7 @@ impl BatchScheduler {
             page_size,
             max_batch_size, max_batch_tokens,
             request_timeout_secs,
-            batch_policy,
+            policy,
             stats.clone(),
         ));
 
@@ -285,7 +296,7 @@ impl BatchScheduler {
         max_batch_size: usize,
         max_batch_tokens: usize,
         request_timeout_secs: u64,
-        batch_policy: String,
+        policy_from_config: Option<String>,
         stats: Arc<SchedulerStats>,
     ) {
         let request_timeout = Duration::from_secs(request_timeout_secs);
@@ -293,14 +304,15 @@ impl BatchScheduler {
         // Per-device state
         let mut batch = BatchAccumulator::new(max_batch_size, max_batch_tokens);
         // Policy selection from config — see `adaptive_policy.rs` for the
-        // design rationale. The per-model `[model.scheduler].batch_policy`
-        // setting picks one of "adaptive", "eager", "greedy".
-        let mut policy: Box<dyn SchedulingPolicy> = match batch_policy.as_str() {
+        // design rationale. The per-model `[model.X.scheduler.policy]`
+        // setting picks one of "adaptive" (default), "eager", "greedy".
+        let policy_name = policy_from_config.unwrap_or_else(|| "adaptive".to_string());
+        let mut policy: Box<dyn SchedulingPolicy> = match policy_name.as_str() {
             "greedy" => Box::new(GreedyPolicy::new()),
             "eager" => Box::new(EagerPolicy::new(max_batch_size, device_idx)),
             "adaptive" => Box::new(AdaptivePolicy::new(max_batch_size, device_idx)),
             other => panic!(
-                "Unknown scheduler.batch_policy {other:?}; expected one of \
+                "Unknown scheduler.policy {other:?}; expected one of \
                 'adaptive' | 'eager' | 'greedy'"
             ),
         };
@@ -310,32 +322,51 @@ impl BatchScheduler {
         // Channel for batch completion latency feedback to the policy.
         let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
 
+        // Carries an overshoot request from one iteration to the next.
+        // While `Some`, the loop must fire to make room.
+        let mut held: Option<PendingRequest> = None;
+
         loop {
             // Drain completed batch latencies (non-blocking)
             while let Ok(latency) = latency_rx.try_recv() {
                 policy.on_complete(latency);
             }
 
-            // Wait for first request if batch is empty
+            // Seed an empty batch from `held` first, otherwise block
+            // on the channel.
             if batch.is_empty() {
-                let Some(pending) = req_rx.recv().await else {
-                    break;
+                let pending = match held.take() {
+                    Some(p) => p,
+                    None => {
+                        let Some(p) = req_rx.recv().await else { break };
+                        policy.on_arrival();
+                        p
+                    }
                 };
-                policy.on_arrival();
-                batch.push(pending);
-            }
-
-            // Accumulate more requests (non-blocking)
-            while let Ok(pending) = req_rx.try_recv() {
-                policy.on_arrival();
-                batch.push(pending);
-                if batch.is_full() {
-                    break;
+                if batch.try_push(pending).is_err() {
+                    unreachable!("BatchAccumulator::try_push must accept on empty batch");
                 }
             }
 
-            // Ask the policy what to do
-            match policy.decide(batch.len()) {
+            // Drain pending arrivals (non-blocking) until the batch is
+            // full or one overshoots into `held`.
+            while !batch.is_full() && held.is_none() {
+                let Ok(pending) = req_rx.try_recv() else { break };
+                policy.on_arrival();
+                if let Err(p) = batch.try_push(pending) {
+                    held = Some(p);
+                }
+            }
+
+            // An overshoot forces a fire — waiting can't shrink the batch,
+            // and firing a >max batch trips vllm's torch.compile range
+            // assertion downstream.
+            let decision = if held.is_some() {
+                Decision::Fire
+            } else {
+                policy.decide(batch.len())
+            };
+            match decision {
                 Decision::Fire => {
                     // Acquire a permit (may wait if at in-flight limit)
                     // if in_flight.available_permits() == 0 {
@@ -393,11 +424,10 @@ impl BatchScheduler {
                     tokio::select! {
                         _ = tokio::time::sleep(wait_duration) => {}
                         maybe_req = req_rx.recv() => {
-                            if let Some(pending) = maybe_req {
-                                policy.on_arrival();
-                                batch.push(pending);
-                            } else {
-                                break; // channel closed
+                            let Some(pending) = maybe_req else { break };
+                            policy.on_arrival();
+                            if let Err(p) = batch.try_push(pending) {
+                                held = Some(p);
                             }
                         }
                         latency = latency_rx.recv() => {
