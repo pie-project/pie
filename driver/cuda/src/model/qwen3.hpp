@@ -10,9 +10,11 @@
 // extra RMSNorm in that case.
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "engine.hpp"
+#include "ops/gemm.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::model {
@@ -44,7 +46,35 @@ struct Qwen3LayerWeights {
     const DeviceTensor* gate_proj = nullptr;   // [intermediate, hidden]
     const DeviceTensor* up_proj   = nullptr;   // [intermediate, hidden]
     const DeviceTensor* down_proj = nullptr;   // [hidden, intermediate]
+
+    // Optional QuantMeta companions for each weight. Null when the
+    // weight is plain bf16 (the common case). When set, the forward
+    // pass routes the corresponding GEMM through ops::gemm_act_x_w with
+    // a quantized WeightView (FP8 / INT4 / etc.). Bind functions
+    // populate these by calling `engine.quant_meta(weight_name)` after
+    // resolving each pointer. The QuantMeta value lives in the engine's
+    // side-map; this is just a pointer into it.
+    std::optional<QuantMeta> q_proj_quant;
+    std::optional<QuantMeta> k_proj_quant;
+    std::optional<QuantMeta> v_proj_quant;
+    std::optional<QuantMeta> o_proj_quant;
+    std::optional<QuantMeta> gate_proj_quant;
+    std::optional<QuantMeta> up_proj_quant;
+    std::optional<QuantMeta> down_proj_quant;
 };
+
+// Pick the right WeightView for a (weight, optional-quant-meta) pair.
+// When `meta` is null, returns a plain bf16 view; when set, returns a
+// quantized view that the GEMM dispatcher routes to the appropriate
+// kernel (cuBLASLt FP8, marlin int4, …). Same call shape works for
+// every model that wires QuantMeta companions in.
+inline ops::WeightView make_weight_view(const DeviceTensor* w,
+                                        const std::optional<QuantMeta>& meta) {
+    if (meta.has_value()) {
+        return ops::WeightView::quantized(*w, *meta);
+    }
+    return ops::WeightView(*w);
+}
 
 struct Qwen3Weights {
     const DeviceTensor* embed       = nullptr;  // [vocab, hidden]

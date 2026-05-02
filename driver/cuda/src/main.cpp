@@ -87,7 +87,7 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                bool decode_after_prefill = false,
                pie_cuda_driver::NcclComm* tp_comm = nullptr)
 {
-    auto engine = pie_cuda_driver::Engine::load(cfg);
+    auto engine = pie_cuda_driver::Engine::load(cfg, tp_comm);
     const auto& mt_for_parity = engine.hf_config().model_type;
     const bool is_gpt_oss  = (mt_for_parity == "gpt_oss");
     const bool is_gemma3n  = (mt_for_parity == "gemma3n" || mt_for_parity == "gemma3n_text");
@@ -726,7 +726,8 @@ int main(int argc, char** argv) {
     const bool is_tp_follower =
         cfg.distributed.tp_size > 1 && cfg.distributed.tp_rank > 0;
 
-    auto engine = pie_cuda_driver::Engine::load(cfg);
+    auto engine = pie_cuda_driver::Engine::load(
+        cfg, (cfg.distributed.tp_size > 1) ? &tp_comm : nullptr);
 
     {
         const auto& mt = engine.hf_config().model_type;

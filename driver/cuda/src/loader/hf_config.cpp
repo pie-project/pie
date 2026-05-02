@@ -303,6 +303,68 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
 
     cfg.torch_dtype = optional<std::string>(j, "torch_dtype", "bfloat16");
 
+    // Multimodal text-tower extraction. The CUDA driver runs the LLM
+    // forward only; for vision-language ckpts we strip the
+    // "language_model." prefix from every weight and skip the vision-
+    // side tensors entirely. Detection key is the top-level model_type:
+    // mistral3 (Mistral-Small-3.1-FP8), llava (Llava-1.6), llava_next,
+    // qwen2_5_vl, gemma3 (multimodal variant has vision_config), …
+    const std::string root_model_type =
+        optional<std::string>(j_root, "model_type", "");
+    const bool has_vision_config =
+        j_root.contains("vision_config") && j_root["vision_config"].is_object();
+    const bool is_multimodal_wrapper =
+        has_vision_config && j_root.contains("text_config");
+    if (is_multimodal_wrapper) {
+        cfg.mm_lm_strip_prefix = "language_model.";
+        cfg.mm_skip_prefixes = {
+            "vision_tower.",
+            "vision_model.",
+            "multi_modal_projector.",
+        };
+    }
+
+    // ── quantization_config ─────────────────────────────────────────
+    // GPTQ / AWQ checkpoints attach a `quantization_config` block. We
+    // read just enough to drive marlin dispatch — the loader can match
+    // GPTQ's tensor names independently of this block, but the block
+    // tells us which layout to expect (sym/asym, group_size, desc_act).
+    //
+    // compressed-tensors style FP8 (RedHatAI mistral3-FP8) is also
+    // tagged here with `quant_method = "compressed-tensors"`; the FP8
+    // path doesn't currently use these fields and treats it like an
+    // un-tagged ckpt. M1 follow-up.
+    // Mistral3 / Llava-style multimodal configs put `quantization_config`
+    // at the top level (alongside `text_config` / `vision_config`). The
+    // text-only branch reads it from `j` (= text_config); fall back to the
+    // root when it's only present there.
+    const nlohmann::json* qcfg_src = nullptr;
+    if (j.contains("quantization_config") && j["quantization_config"].is_object()) {
+        qcfg_src = &j["quantization_config"];
+    } else if (j_root.contains("quantization_config") && j_root["quantization_config"].is_object()) {
+        qcfg_src = &j_root["quantization_config"];
+    }
+    if (qcfg_src) {
+        const auto& q = *qcfg_src;
+        cfg.quant_method = optional<std::string>(q, "quant_method", "");
+        cfg.quant_bits = optional<int>(q, "bits", 0);
+        cfg.quant_group_size = optional<int>(q, "group_size", 0);
+        cfg.quant_desc_act = optional<bool>(q, "desc_act", false);
+        cfg.quant_sym = optional<bool>(q, "sym", true);
+        // GPTQ's `sym=true` implies no zero points; AWQ's `zero_point=true`
+        // is set explicitly even when sym is unset. Treat them as
+        // independent signals.
+        cfg.quant_zero_point = optional<bool>(q, "zero_point", !cfg.quant_sym);
+        // Compressed-tensors-style KV cache quantization. If non-null
+        // the ckpt expects the runtime to store K/V in FP8/INT8 with a
+        // per-tensor or per-token scale. We currently always use bf16
+        // KV — surface the mismatch so the user knows quality may be
+        // slightly off vs the calibrated reference.
+        if (q.contains("kv_cache_scheme") && !q["kv_cache_scheme"].is_null()) {
+            cfg.kv_cache_scheme_present = true;
+        }
+    }
+
     return cfg;
 }
 

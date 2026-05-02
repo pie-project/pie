@@ -109,6 +109,8 @@ async def run_benchmark(args):
             "max_batch_size": args.max_batch_size,
             "max_num_kv_pages": args.cuda_native_kv_pages,
         }
+        if getattr(args, "runtime_quant", ""):
+            driver_subsection["runtime_quant"] = args.runtime_quant
     elif args.driver == "portable":
         driver_subsection = {
             "max_batch_size": args.max_batch_size,
@@ -310,6 +312,13 @@ def main():
     parser.add_argument("--cuda-native-kv-pages", dest="cuda_native_kv_pages",
                         type=int, default=2048,
                         help="KV pages for the cuda_native driver. Each page = kv_page_size tokens.")
+    parser.add_argument("--runtime-quant", dest="runtime_quant", default="",
+                        choices=["", "fp8", "int8"],
+                        help="cuda_native: quantize projection weights at load. "
+                             "'fp8' = per-channel symmetric FP8_E4M3 (sm89+ "
+                             "native; sm80 falls through to bf16). "
+                             "'int8' = per-channel symmetric W8A8 INT8 with "
+                             "per-token activation quant.")
     parser.add_argument("--vllm-attention-backend", default=None,
                         help="vLLM attention backend (FLASH_ATTN / FLASHINFER / etc.). Only used when --driver=vllm")
     parser.add_argument("--sglang-attention-backend", default=None,

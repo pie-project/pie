@@ -35,10 +35,9 @@ void dequant_fp8_in_place(
 {
     if (!engine.has(fp8_name)) return;
     const auto& fp8 = engine.get(fp8_name);
-    if (fp8.dtype() != DType::UINT8) {
-        // The safetensors loader maps F8_E4M3 to UINT8 (raw bits) — if
-        // we see something else under this name, the checkpoint is
-        // already dequantized and there's nothing to do.
+    if (fp8.dtype() != DType::FP8_E4M3) {
+        // If the tensor is already bf16 (a non-quantized variant of the
+        // checkpoint, or a previous dequant pass), there's nothing to do.
         return;
     }
 

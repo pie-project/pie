@@ -175,12 +175,15 @@ void llama_like_forward_paged(
             qkv_in = ws.norm_x.data();
         }
 
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            qkv_in, layer.q_proj->data(), ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            qkv_in, layer.k_proj->data(), ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            qkv_in, layer.v_proj->data(), ws.v.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            qkv_in, make_weight_view(layer.q_proj, layer.q_proj_quant),
+            ws.q.data(), N, Hq, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            qkv_in, make_weight_view(layer.k_proj, layer.k_proj_quant),
+            ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            qkv_in, make_weight_view(layer.v_proj, layer.v_proj_quant),
+            ws.v.data(), N, Hk, H);
 
         if (fwd_cfg.use_qkv_bias) {
             maybe_add_bias(ws.q.data(), layer.q_bias, N, Hq, stream);
@@ -286,13 +289,13 @@ void llama_like_forward_paged(
             // (ws.norm_x is free here — it held the QKV input before),
             // all-reduce the partials, then add to the residual.
             if (T == 1) {
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
-                    N, H, Hq, /*beta=*/1.f);
+                ops::gemm_act_x_w(cublas.handle(),
+                    ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
+                    ws.y.data(), N, H, Hq, /*beta=*/1.f);
             } else {
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
-                    N, H, Hq, /*beta=*/0.f);
+                ops::gemm_act_x_w(cublas.handle(),
+                    ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
+                    ws.norm_x.data(), N, H, Hq, /*beta=*/0.f);
                 tp->all_reduce_bf16(ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
                 kernels::launch_residual_add_bf16(
@@ -301,9 +304,9 @@ void llama_like_forward_paged(
         } else {
             // Post-norm: o_proj writes to norm_x (a scratch we own here),
             // norm_attn(norm_x) → norm_y, then y += norm_y.
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
-                N, H, Hq, /*beta=*/0.f);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
+                ws.norm_x.data(), N, H, Hq, /*beta=*/0.f);
             if (T > 1) {
                 tp->all_reduce_bf16(ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
@@ -324,10 +327,12 @@ void llama_like_forward_paged(
             mlp_in = ws.norm_y.data();
         }
 
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            mlp_in, layer.gate_proj->data(), ws.gate.data(), N, I, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            mlp_in, layer.up_proj->data(),   ws.up.data(),   N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            mlp_in, make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            mlp_in, make_weight_view(layer.up_proj, layer.up_proj_quant),
+            ws.up.data(),   N, I, H);
         kernels::launch_swiglu_bf16(
             ws.gate.data(), ws.up.data(), ws.gate.data(),
             N * I, stream);
@@ -338,13 +343,13 @@ void llama_like_forward_paged(
             // mlp pre-norm input on the post-norm path; on pre-norm it
             // hasn't been touched since QKV).
             if (T == 1) {
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.gate.data(), layer.down_proj->data(), ws.y.data(),
-                    N, H, I, /*beta=*/1.f);
+                ops::gemm_act_x_w(cublas.handle(),
+                    ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
+                    ws.y.data(), N, H, I, /*beta=*/1.f);
             } else {
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.gate.data(), layer.down_proj->data(), ws.norm_x.data(),
-                    N, H, I, /*beta=*/0.f);
+                ops::gemm_act_x_w(cublas.handle(),
+                    ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
+                    ws.norm_x.data(), N, H, I, /*beta=*/0.f);
                 tp->all_reduce_bf16(ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
                 kernels::launch_residual_add_bf16(
@@ -352,9 +357,9 @@ void llama_like_forward_paged(
             }
         } else {
             // Post-norm MLP: down_proj → norm_x scratch, norm_mlp, += y.
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.gate.data(), layer.down_proj->data(), ws.norm_x.data(),
-                N, H, I, /*beta=*/0.f);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
+                ws.norm_x.data(), N, H, I, /*beta=*/0.f);
             if (T > 1) {
                 tp->all_reduce_bf16(ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
@@ -370,8 +375,8 @@ void llama_like_forward_paged(
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
         N, H, eps, stream);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), *w.lm_head, ws.logits.data(),
         N, V, H);
 }
 

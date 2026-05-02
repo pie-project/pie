@@ -35,6 +35,22 @@ __global__ void dequant_fp8_e4m3_kernel(
     dst[i] = __float2bfloat16(f);
 }
 
+__global__ void dequant_fp8_e4m3_per_channel_kernel(
+    const __nv_fp8_storage_t* __restrict__ src,
+    __nv_bfloat16*            __restrict__ dst,
+    const float*              __restrict__ scale_inv,  // [rows]
+    int                                    cols)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float s = scale_inv[row];
+    const std::size_t off = static_cast<std::size_t>(row) * cols;
+    for (int j = tid; j < cols; j += BLOCK) {
+        const __half h = __nv_cvt_fp8_to_halfraw(src[off + j], __NV_E4M3);
+        dst[off + j] = __float2bfloat16(__half2float(h) * s);
+    }
+}
+
 }  // namespace
 
 void launch_dequant_fp8_e4m3_to_bf16(
@@ -47,6 +63,17 @@ void launch_dequant_fp8_e4m3_to_bf16(
         reinterpret_cast<const __nv_fp8_storage_t*>(fp8_in),
         static_cast<__nv_bfloat16*>(bf16_out),
         scale, n);
+}
+
+void launch_dequant_fp8_e4m3_to_bf16_per_channel(
+    const std::uint8_t* fp8_in, void* bf16_out,
+    const float* scale_inv_dev, int rows, int cols, cudaStream_t stream)
+{
+    if (rows == 0 || cols == 0) return;
+    dequant_fp8_e4m3_per_channel_kernel<<<rows, BLOCK, 0, stream>>>(
+        reinterpret_cast<const __nv_fp8_storage_t*>(fp8_in),
+        static_cast<__nv_bfloat16*>(bf16_out),
+        scale_inv_dev, cols);
 }
 
 }  // namespace pie_cuda_driver::kernels

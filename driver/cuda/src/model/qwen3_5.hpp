@@ -23,10 +23,12 @@
 //       of head_dim is rotated.
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "device_buffer.hpp"
 #include "engine.hpp"
+#include "ops/gemm.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::model {
@@ -69,6 +71,19 @@ struct Qwen3_5LayerWeights {
     const DeviceTensor* gate_proj = nullptr;  // [I, H] bf16
     const DeviceTensor* up_proj   = nullptr;  // [I, H] bf16
     const DeviceTensor* down_proj = nullptr;  // [H, I] bf16
+
+    // Optional QuantMeta companions for the GEMM-fed projections —
+    // populated when runtime_quant or an offline-quantized checkpoint
+    // tags these weights via `Engine::set_quant_meta`. Linear-attn
+    // weights stay bf16 for now (their fused [K1|K2|V] block layout
+    // needs per-block scale handling that isn't wired yet).
+    std::optional<QuantMeta> fa_q_proj_quant;
+    std::optional<QuantMeta> fa_k_proj_quant;
+    std::optional<QuantMeta> fa_v_proj_quant;
+    std::optional<QuantMeta> fa_o_proj_quant;
+    std::optional<QuantMeta> gate_proj_quant;
+    std::optional<QuantMeta> up_proj_quant;
+    std::optional<QuantMeta> down_proj_quant;
 
     // KV cache slot for full-attn layers; -1 for linear-attn layers
     // (their state lives in the recurrent/conv state caches).

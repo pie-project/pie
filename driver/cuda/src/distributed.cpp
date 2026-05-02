@@ -80,6 +80,12 @@ void NcclComm::all_reduce_bf16(void* sendrecv, std::size_t count,
                              comm_, stream));
 }
 
+void NcclComm::all_reduce_fp32(void* sendrecv, std::size_t count,
+                               ncclRedOp_t op, cudaStream_t stream) {
+    NCCL_CHECK(ncclAllReduce(sendrecv, sendrecv, count, ncclFloat32, op,
+                             comm_, stream));
+}
+
 void NcclComm::all_gather_bf16(const void* send, void* recv,
                                std::size_t count_per_rank,
                                cudaStream_t stream) {

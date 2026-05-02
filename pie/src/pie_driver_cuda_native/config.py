@@ -34,6 +34,14 @@ class CudaNativeDriverConfig:
     swap_pool_size: int = 0
     weight_dtype: str = "bfloat16"
 
+    # Runtime quantization mode. Empty (default) → no quantization;
+    # `"fp8"` → per-tensor symmetric FP8_E4M3 on every llama-like
+    # projection weight, applied immediately after load. Currently only
+    # wired for model_type=qwen3 (other archs follow once their forward
+    # paths migrate to ops::gemm_act_x_w). M3 will add `"int4"` for
+    # offline GPTQ/AWQ checkpoints.
+    runtime_quant: str = ""
+
     # ── handshake ─────────────────────────────────────────────────────────
     # Seconds to wait for the binary's `READY` line on stdout before giving up.
     ready_timeout_s: float = 120.0

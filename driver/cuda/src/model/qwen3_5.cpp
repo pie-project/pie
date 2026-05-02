@@ -176,6 +176,9 @@ Qwen3_5Weights bind_qwen3_5(Engine& engine) {
         Lw.gate_proj = &must(engine, lp + "mlp.gate_proj.weight");
         Lw.up_proj   = &must(engine, lp + "mlp.up_proj.weight");
         Lw.down_proj = &must(engine, lp + "mlp.down_proj.weight");
+        Lw.gate_proj_quant = engine.quant_meta(lp + "mlp.gate_proj.weight");
+        Lw.up_proj_quant   = engine.quant_meta(lp + "mlp.up_proj.weight");
+        Lw.down_proj_quant = engine.quant_meta(lp + "mlp.down_proj.weight");
 
         if (kind == "linear_attention") {
             Lw.kind = Qwen3_5LayerWeights::Kind::LinearAttn;
@@ -232,6 +235,10 @@ Qwen3_5Weights bind_qwen3_5(Engine& engine) {
             Lw.fa_o_proj = &must(engine, fa + "o_proj.weight");
             Lw.fa_q_norm = &must(engine, fa + "q_norm.weight");
             Lw.fa_k_norm = &must(engine, fa + "k_norm.weight");
+            Lw.fa_q_proj_quant = engine.quant_meta(fa + "q_proj.weight");
+            Lw.fa_k_proj_quant = engine.quant_meta(fa + "k_proj.weight");
+            Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
+            Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
             Lw.kv_layer = kv_slot++;
         } else {
             throw std::runtime_error(

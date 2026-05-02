@@ -5,6 +5,7 @@
 // shmem request handler for forward-pass execution.
 
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -14,6 +15,33 @@
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
+
+// Per-weight metadata for quantized tensors. Lives on a side-map keyed by
+// the weight's name; absent entries mean "use the raw bf16/fp16/fp32 path".
+//
+// The pointers reference DeviceTensors registered separately under their
+// own names in Engine::weights_ — Engine::set_quant_meta does not own them
+// and validates that they were inserted first.
+//
+// `kind` describes the scale layout:
+//   * PerTensor  — `scale` shape: scalar [].
+//   * PerChannel — `scale` shape: [N], one per output channel.
+//                  `channel_axis` selects which weight axis N corresponds
+//                  to (axis=0 for HF row-major `[N, K]` projections).
+//   * PerGroup   — `scale` shape: [groups, N] for GPTQ-style row groups
+//                  along the K axis. `group_size` is the K-axis stride
+//                  per group (e.g. 128).
+//
+// `zero_point` is null for symmetric quantization; populated for asymmetric
+// (e.g. AWQ int4 with zero_point=true).
+struct QuantMeta {
+    enum class Kind { PerTensor, PerChannel, PerGroup };
+    Kind kind = Kind::PerTensor;
+    const DeviceTensor* scale = nullptr;
+    const DeviceTensor* zero_point = nullptr;
+    int group_size = 0;
+    int channel_axis = 0;
+};
 
 struct EngineCapabilities {
     int total_pages = 0;          // populated when KV cache lands (M1.2.2/3)
@@ -28,10 +56,15 @@ struct EngineCapabilities {
     std::string snapshot_dir;
 };
 
+class NcclComm;  // distributed.hpp
+
 class Engine {
 public:
     /// Load weights + config from disk. Throws on missing files / wrong dtypes.
-    static Engine load(const Config& boot_cfg);
+    /// Pass `tp_comm` when `boot_cfg.distributed.tp_size > 1` to enable
+    /// TP-aware runtime quantization (cross-rank absmax all-reduce for
+    /// row-parallel weights). For single-GPU (tp_size=1) this can be null.
+    static Engine load(const Config& boot_cfg, NcclComm* tp_comm = nullptr);
 
     Engine() = default;
     Engine(const Engine&) = delete;
@@ -59,6 +92,16 @@ public:
     // Throws if `name` is already registered.
     void insert(std::string name, DeviceTensor tensor);
 
+    // Attach quantization metadata for an already-inserted weight. The
+    // weight tensor must be in `weights_`; the scale / zero_point tensors
+    // referenced by `meta` must also already be inserted (so that name
+    // typos in bind code surface here rather than at GEMM dispatch time).
+    void set_quant_meta(const std::string& name, QuantMeta meta);
+
+    // Lookup quantization metadata for a weight. Returns std::nullopt if
+    // the weight is plain bf16/fp16/fp32 (the common case).
+    std::optional<QuantMeta> quant_meta(const std::string& name) const;
+
 private:
     // M1.2.1 stores all weights by their HF name. M1.2.2 will introduce a
     // "model schema" layer that fuses Q/K/V into a single device buffer and
@@ -66,6 +109,7 @@ private:
     Config boot_;
     HfConfig hf_;
     std::unordered_map<std::string, DeviceTensor> weights_;
+    std::unordered_map<std::string, QuantMeta> quant_meta_;
 };
 
 }  // namespace pie_cuda_driver

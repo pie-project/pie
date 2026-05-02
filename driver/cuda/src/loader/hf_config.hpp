@@ -183,6 +183,45 @@ struct HfConfig {
 
     // ── Storage dtype as declared on disk (for the safetensors loader).
     std::string torch_dtype;   // "bfloat16", "float16", "float32".
+
+    // ── Offline-quantized checkpoint metadata ────────────────────────
+    // Empty `quant_method` means an unquantized (bf16/fp16/fp32) ckpt.
+    // Recognised values:
+    //   * "gptq"  — GPTQ INT4/INT8 with packed `qweight`/`qzeros`/
+    //               `scales` (+ optional `g_idx` for desc_act).
+    //   * "awq"   — AWQ INT4 with similar tensors but distinct packing
+    //               and asymmetric (zero_point) by default.
+    //   * "fp8"   — compressed-tensors / static FP8 (handled elsewhere).
+    //
+    // `quant_bits` is 4 or 8 for gptq/awq.
+    // `quant_group_size` is the per-group axis-K stride (typical 128;
+    // -1 = per-channel, no group dim).
+    // `quant_desc_act` (GPTQ act-order) and `quant_sym` (symmetric vs
+    // zero-point) gate the dispatch path; v1 supports `desc_act=false`
+    // and `sym=true` only.
+    std::string quant_method;
+    int   quant_bits = 0;
+    int   quant_group_size = 0;
+    bool  quant_desc_act = false;
+    bool  quant_sym = true;
+    bool  quant_zero_point = false;
+    // True when a compressed-tensors ckpt sets a non-null
+    // `quantization_config.kv_cache_scheme` (FP8 / INT8 KV cache). We
+    // don't yet store K/V quantized — surface the mismatch loudly so
+    // the user knows generation may drift slightly vs the calibrated
+    // reference. Wiring quantized KV is its own milestone.
+    bool  kv_cache_scheme_present = false;
+
+    // ── Multimodal text-tower extraction ────────────────────────────
+    // For multimodal checkpoints (Mistral3ForConditionalGeneration,
+    // LlavaForConditionalGeneration, …) HF stores the LLM weights under
+    // a top-level prefix ("language_model.") alongside vision tower /
+    // projector weights. The CUDA driver currently only runs the LLM
+    // forward, so the loader strips `mm_lm_strip_prefix` from each name
+    // and skips any tensor whose name starts with one of the entries in
+    // `mm_skip_prefixes`. Empty for text-only checkpoints.
+    std::string mm_lm_strip_prefix;
+    std::vector<std::string> mm_skip_prefixes;
 };
 
 // Parse `<snapshot_dir>/config.json`. Throws on missing required fields.

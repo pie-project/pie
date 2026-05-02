@@ -123,6 +123,8 @@ def _write_startup_toml(
         f'snapshot_dir = "{snapshot_dir}"',
         f'device = "{device}"',
         f'dtype = "{driver_cfg.weight_dtype}"',
+        *([f'runtime_quant = "{driver_cfg.runtime_quant}"']
+            if driver_cfg.runtime_quant else []),
         "",
         "[batching]",
         f"kv_page_size = {driver_cfg.kv_page_size}",

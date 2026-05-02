@@ -83,20 +83,23 @@ void linear_attn_layer_body(
     const int conv_K   = cfg.linear_conv_kernel_dim;
 
     // ── In-projections ────────────────────────────────────────────
+    // Linear-attn projections stay bf16 (no QuantMeta companion in
+    // Qwen3_5LayerWeights) — the implicit WeightView ctor pulls the
+    // bf16 tensor through unchanged.
     // mixed_qkv [N, conv_dim] = norm_x @ in_proj_qkv.T
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.la_in_proj_qkv->data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), *Lw.la_in_proj_qkv,
         la.mixed_qkv.data(), N, conv_dim, H);
     // z [N, V_dim] = norm_x @ in_proj_z.T
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.la_in_proj_z->data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), *Lw.la_in_proj_z,
         la.z.data(), N, V_dim, H);
     // a [N, V_h] = norm_x @ in_proj_a.T   (b symmetric)
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.la_in_proj_a->data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), *Lw.la_in_proj_a,
         la.a.data(), N, V_h, H);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.la_in_proj_b->data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), *Lw.la_in_proj_b,
         la.b.data(), N, V_h, H);
 
     // ── Causal depthwise conv1d (kernel=K, fused silu) ────────────
@@ -213,12 +216,12 @@ void linear_attn_layer_body(
     //    all-reduce, then residual-add into y.
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
     if (T == 1) {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            la.core_out_bf16.data(), Lw.la_out_proj->data(),
+        ops::gemm_act_x_w(cublas.handle(),
+            la.core_out_bf16.data(), *Lw.la_out_proj,
             ws.y.data(), N, H, V_dim, /*beta=*/1.f);
     } else {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            la.core_out_bf16.data(), Lw.la_out_proj->data(),
+        ops::gemm_act_x_w(cublas.handle(),
+            la.core_out_bf16.data(), *Lw.la_out_proj,
             ws.norm_y.data(), N, H, V_dim, /*beta=*/0.f);
         tp->all_reduce_bf16(ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, ncclSum, stream);
@@ -265,18 +268,18 @@ void full_attn_layer_body(
 
     // ── q/k/v projections (q is 2× wide for the output gate) ──────
     // qg_packed [N, 2*Hq] = norm_x @ q_proj.T
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.fa_q_proj->data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
         la.fa_qg_packed.data(), N, 2 * Hq, H);
     kernels::launch_split_q_gate_bf16(
         la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
         N, num_q_heads_local, d, stream);
 
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.fa_k_proj->data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
         ws.k.data(), N, Hk, H);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.fa_v_proj->data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
         ws.v.data(), N, Hk, H);
 
     // ── q_norm / k_norm (gemma-style (1+w)·x_hat) ─────────────────
@@ -324,12 +327,12 @@ void full_attn_layer_body(
     // ── o_proj fused with post-attn residual on TP=1; on TP>1 row-
     //    parallel: write to scratch, all-reduce, residual-add to y.
     if (T == 1) {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.attn_out.data(), Lw.fa_o_proj->data(),
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.attn_out.data(), make_weight_view(Lw.fa_o_proj, Lw.fa_o_proj_quant),
             ws.y.data(), N, H, Hq, /*beta=*/1.f);
     } else {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.attn_out.data(), Lw.fa_o_proj->data(),
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.attn_out.data(), make_weight_view(Lw.fa_o_proj, Lw.fa_o_proj_quant),
             ws.norm_y.data(), N, H, Hq, /*beta=*/0.f);
         tp->all_reduce_bf16(ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, ncclSum, stream);
@@ -360,9 +363,21 @@ void prepare_qwen3_5_decode_plan(
     if (!state.decode_plan) {
         state.decode_plan = ops::make_decode_plan();
     }
+    // The decode kernel runs on per-rank slices of Q / KV — its tile
+    // geometry must be planned for the per-rank head count, not the
+    // full unsharded count. (Mistral-7B TP=2 happens to work with
+    // either value because gqa is invariant under sharding *and* the
+    // sharded Q tile size still rounds favorably; Qwen3.6-MoE
+    // (head_dim=256, num_heads=16, num_kv=2 → 16/2=8 per-rank-q,
+    // 1 per-rank-kv) does not — flashinfer's chunk-metadata read
+    // overruns its 256-byte allocation when the full 16/2 plan meets
+    // a small per-rank kv_chunks count.)
+    const int T = std::max(1, fwd_cfg.tp_size);
     ops::plan_attention_flashinfer_decode_bf16(
         *state.decode_plan, kv_page_indptr_h, num_requests,
-        cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+        cfg.num_attention_heads / T,
+        cfg.num_key_value_heads / T,
+        cfg.head_dim,
         cache.page_size(), attn_ws, stream);
 }
 
@@ -453,11 +468,11 @@ void qwen3_5_forward_paged(
         const int T_mlp = std::max(1, fwd_cfg.tp_size);
         const int I = cfg.intermediate_size / T_mlp;
         NcclComm* tp_mlp = (T_mlp > 1) ? fwd_cfg.tp_comm : nullptr;
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), Lw.gate_proj->data(),
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.gate_proj, Lw.gate_proj_quant),
             ws.gate.data(), N, I, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), Lw.up_proj->data(),
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.up_proj, Lw.up_proj_quant),
             ws.up.data(), N, I, H);
         kernels::launch_swiglu_bf16(
             ws.gate.data(), ws.up.data(), ws.gate.data(),
@@ -465,12 +480,12 @@ void qwen3_5_forward_paged(
         // down_proj: TP=1 fuses residual via beta=1; TP>1 is row-parallel
         // — write to scratch, all-reduce, residual-add.
         if (T_mlp == 1) {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.gate.data(), Lw.down_proj->data(),
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.gate.data(), make_weight_view(Lw.down_proj, Lw.down_proj_quant),
                 ws.y.data(), N, H, I, /*beta=*/1.f);
         } else {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.gate.data(), Lw.down_proj->data(),
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.gate.data(), make_weight_view(Lw.down_proj, Lw.down_proj_quant),
                 ws.norm_y.data(), N, H, I, /*beta=*/0.f);
             tp_mlp->all_reduce_bf16(ws.norm_y.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
@@ -486,8 +501,8 @@ void qwen3_5_forward_paged(
         N, H, eps, stream);
 
     // 4. lm_head.
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), w.lm_head->data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), *w.lm_head,
         ws.logits.data(), N, V, H);
 }
 

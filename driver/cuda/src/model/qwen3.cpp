@@ -64,6 +64,16 @@ Qwen3Weights bind_llama_like(const Engine& engine) {
         L.gate_proj = &must(engine, p + "mlp.gate_proj.weight");
         L.up_proj   = &must(engine, p + "mlp.up_proj.weight");
         L.down_proj = &must(engine, p + "mlp.down_proj.weight");
+
+        // Pull QuantMeta side-map entries — one per projection. Stays
+        // empty for unquantized models (the common case).
+        L.q_proj_quant    = engine.quant_meta(p + "self_attn.q_proj.weight");
+        L.k_proj_quant    = engine.quant_meta(p + "self_attn.k_proj.weight");
+        L.v_proj_quant    = engine.quant_meta(p + "self_attn.v_proj.weight");
+        L.o_proj_quant    = engine.quant_meta(p + "self_attn.o_proj.weight");
+        L.gate_proj_quant = engine.quant_meta(p + "mlp.gate_proj.weight");
+        L.up_proj_quant   = engine.quant_meta(p + "mlp.up_proj.weight");
+        L.down_proj_quant = engine.quant_meta(p + "mlp.down_proj.weight");
     }
 
     return w;

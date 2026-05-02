@@ -97,12 +97,15 @@ void qwen3_forward_prefill(
             N, H, eps, stream);
 
         // 3. QKV projections (no fusion yet).
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.q_proj->data(), ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
+            ws.q.data(), N, Hq, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
+            ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
+            ws.v.data(), N, Hk, H);
 
         // 4. Per-head q_norm / k_norm. Qwen3-only — Llama 3 / Mistral /
         //    Qwen 2 leave these null and skip the extra RMSNorm. Reshape Q
@@ -131,9 +134,9 @@ void qwen3_forward_prefill(
             N, cfg.num_attention_heads, cfg.num_key_value_heads, d, stream);
 
         // 7. Output projection + residual: y = y + attn_out @ o_proj^T.
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
-            N, H, Hq, /*beta=*/1.f);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
+            ws.y.data(), N, H, Hq, /*beta=*/1.f);
 
         // 8. MLP RMSNorm.
         kernels::launch_rmsnorm_bf16(
@@ -141,10 +144,12 @@ void qwen3_forward_prefill(
             N, H, eps, stream);
 
         // 9. Gate / up projections.
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_y.data(), layer.gate_proj->data(), ws.gate.data(), N, I, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_y.data(), layer.up_proj->data(),   ws.up.data(),   N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
+            ws.up.data(),   N, I, H);
 
         // 10. SwiGLU into ws.gate (in place: gate <- silu(gate) * up).
         kernels::launch_swiglu_bf16(
@@ -152,9 +157,9 @@ void qwen3_forward_prefill(
             N * I, stream);
 
         // 11. Down projection + residual: y = y + gate @ down_proj^T.
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.gate.data(), layer.down_proj->data(), ws.y.data(),
-            N, H, I, /*beta=*/1.f);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
+            ws.y.data(), N, H, I, /*beta=*/1.f);
     }
 
     // 12. Final RMSNorm.
@@ -163,8 +168,10 @@ void qwen3_forward_prefill(
         N, H, eps, stream);
 
     // 13. lm_head: logits[N, V] = norm_x[N, H] @ lm_head[V, H]^T.
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
+    // (lm_head is currently always bf16; if it ever gets quantized, plumb
+    //  a top-level QuantMeta companion on Qwen3Weights for it.)
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), *w.lm_head, ws.logits.data(),
         N, V, H);
 }
 
@@ -232,12 +239,15 @@ void qwen3_forward_paged(
             N, H, eps, stream);
 
         // 3. QKV
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.q_proj->data(), ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
+            ws.q.data(), N, Hq, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
+            ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
+            ws.v.data(), N, Hk, H);
 
         // 4. q/k norm (Qwen3 only — null on Llama-likes).
         if (layer.q_norm) {
@@ -298,9 +308,9 @@ void qwen3_forward_paged(
         }
 
         // 8. O proj + residual
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
-            N, H, Hq, /*beta=*/1.f);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
+            ws.y.data(), N, H, Hq, /*beta=*/1.f);
 
         // 9. mlp norm
         kernels::launch_rmsnorm_bf16(
@@ -308,10 +318,12 @@ void qwen3_forward_paged(
             N, H, eps, stream);
 
         // 10. gate / up
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_y.data(), layer.gate_proj->data(), ws.gate.data(), N, I, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_y.data(), layer.up_proj->data(),   ws.up.data(),   N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
+            ws.up.data(),   N, I, H);
 
         // 11. SwiGLU (in-place into ws.gate)
         kernels::launch_swiglu_bf16(
@@ -319,9 +331,9 @@ void qwen3_forward_paged(
             N * I, stream);
 
         // 12. down + residual
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.gate.data(), layer.down_proj->data(), ws.y.data(),
-            N, H, I, /*beta=*/1.f);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
+            ws.y.data(), N, H, I, /*beta=*/1.f);
     }
 
     // 13. final norm
@@ -330,8 +342,8 @@ void qwen3_forward_paged(
         N, H, eps, stream);
 
     // 14. lm_head
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), *w.lm_head, ws.logits.data(),
         N, V, H);
 }
 

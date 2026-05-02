@@ -22,6 +22,13 @@ struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
+    // Runtime quantization mode applied after weight load. Empty (default)
+    // = no quantization. Recognised values:
+    //   * "fp8"  — per-tensor symmetric FP8_E4M3 on every projection
+    //              weight (Q/K/V/O/gate/up/down). Norms, biases,
+    //              embeddings, lm_head stay in their native dtype.
+    // M3 will add `"int4"` for offline GPTQ/AWQ; M2 may add `"int8"`.
+    std::string runtime_quant;
 };
 
 struct BatchingConfig {
@@ -66,10 +73,11 @@ inline Config load_config(const std::filesystem::path& path) {
         c.shmem.spin_us   = (*s)["spin_us"].value_or<int64_t>(c.shmem.spin_us);
     }
     if (auto m = tbl["model"].as_table()) {
-        c.model.hf_repo      = (*m)["hf_repo"].value_or(std::string{});
-        c.model.snapshot_dir = (*m)["snapshot_dir"].value_or(std::string{});
-        c.model.device       = (*m)["device"].value_or(c.model.device);
-        c.model.dtype        = (*m)["dtype"].value_or(c.model.dtype);
+        c.model.hf_repo       = (*m)["hf_repo"].value_or(std::string{});
+        c.model.snapshot_dir  = (*m)["snapshot_dir"].value_or(std::string{});
+        c.model.device        = (*m)["device"].value_or(c.model.device);
+        c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
+        c.model.runtime_quant = (*m)["runtime_quant"].value_or(std::string{});
     }
     if (auto b = tbl["batching"].as_table()) {
         c.batching.kv_page_size     = (*b)["kv_page_size"].value_or<int64_t>(c.batching.kv_page_size);

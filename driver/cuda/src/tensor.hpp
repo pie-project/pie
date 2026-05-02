@@ -21,30 +21,53 @@ enum class DType : std::uint8_t {
     INT32 = 4,
     INT64 = 5,
     UINT8 = 6,
+    // Quantized scalar types. Storage size = 1 byte per logical element.
+    // The kernels that consume these read the raw bytes via the matching
+    // CUDA fp8 storage type (`__nv_fp8_storage_t` for E4M3 / E5M2). The
+    // dtype tag exists so the GEMM dispatcher can pick the right cuBLAS
+    // path; everything else (loader, scale tensor, dequant kernel) is
+    // unchanged.
+    FP8_E4M3 = 7,
+    FP8_E5M2 = 8,
+    // Marlin-packed INT4. Storage convention matches marlin's expected
+    // input to its W4A16 GEMM: a 2-D tensor whose logical shape is the
+    // marlin tile-packed layout produced by `gptq_marlin_repack` (i.e.
+    // `[K / tile_k_size, N * tile_k_size / pack_factor]` where
+    // tile_k_size = 16 and pack_factor = 8 for int4). Each storage
+    // element is one byte holding two 4-bit values; the GEMM dispatcher
+    // reads `(M, N, K)` from the QuantMeta companion (group_size /
+    // channel_axis) plus the tensor shape rather than from the dtype.
+    INT4_PACKED = 9,
 };
 
 inline std::size_t dtype_bytes(DType d) {
     switch (d) {
-        case DType::BF16:  return 2;
-        case DType::FP16:  return 2;
-        case DType::FP32:  return 4;
-        case DType::INT8:  return 1;
-        case DType::INT32: return 4;
-        case DType::INT64: return 8;
-        case DType::UINT8: return 1;
+        case DType::BF16:     return 2;
+        case DType::FP16:     return 2;
+        case DType::FP32:     return 4;
+        case DType::INT8:     return 1;
+        case DType::INT32:    return 4;
+        case DType::INT64:    return 8;
+        case DType::UINT8:    return 1;
+        case DType::FP8_E4M3: return 1;
+        case DType::FP8_E5M2: return 1;
+        case DType::INT4_PACKED: return 1;  // 1 byte holds 2 nibbles
     }
     throw std::runtime_error("unknown dtype");
 }
 
 inline const char* dtype_name(DType d) {
     switch (d) {
-        case DType::BF16:  return "bf16";
-        case DType::FP16:  return "fp16";
-        case DType::FP32:  return "fp32";
-        case DType::INT8:  return "int8";
-        case DType::INT32: return "int32";
-        case DType::INT64: return "int64";
-        case DType::UINT8: return "u8";
+        case DType::BF16:     return "bf16";
+        case DType::FP16:     return "fp16";
+        case DType::FP32:     return "fp32";
+        case DType::INT8:     return "int8";
+        case DType::INT32:    return "int32";
+        case DType::INT64:    return "int64";
+        case DType::UINT8:    return "u8";
+        case DType::FP8_E4M3: return "fp8e4m3";
+        case DType::FP8_E5M2: return "fp8e5m2";
+        case DType::INT4_PACKED: return "int4-packed";
     }
     return "?";
 }

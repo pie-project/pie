@@ -104,6 +104,8 @@ add_executable(pie_driver_cuda
   src/kernels/scalar_mul.cu
   src/kernels/dequant_fp4.cu
   src/kernels/dequant_fp8.cu
+  src/kernels/dtype_cast.cu
+  src/kernels/quant_bf16_to_fp8.cu
   src/kernels/head_dim_pad.cu
   src/kernels/attn_sink.cu
   src/kernels/deinterleave.cu
@@ -144,6 +146,29 @@ target_include_directories(pie_driver_cuda
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
+
+# ── Marlin (W4A16 GEMM via vendored vLLM kernel) ─────────────────────
+# Off by default while M3 plumbing lands. Vendored sources live under
+# `third_party/marlin/`; the wrapper exposes a torch-free C++ API.
+# Compile cost is ~3 minutes on first build (heavy templates) so we
+# gate it behind an explicit switch until a model actually uses it.
+option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16 GEMM" OFF)
+if(PIE_CUDA_BUILD_MARLIN)
+    # Include the generated per-arch kernel instantiations alongside the
+    # core driver. `generate_kernels.py` produced sm80 variants targeting
+    # A100; rerun with a different arch to add Hopper / Ada coverage.
+    file(GLOB MARLIN_SM_KERNELS
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/sm*_kernel_*.cu")
+    target_sources(pie_driver_cuda PRIVATE
+        third_party/marlin/marlin.cu
+        third_party/marlin/gptq_marlin_repack.cu
+        third_party/marlin/awq_marlin_repack.cu
+        third_party/marlin/marlin_wrapper.cpp
+        ${MARLIN_SM_KERNELS})
+    target_include_directories(pie_driver_cuda PRIVATE
+        third_party/marlin)
+    target_compile_definitions(pie_driver_cuda PRIVATE PIE_CUDA_HAS_MARLIN=1)
+endif()
 
 # Standalone test for flashinfer sampling debugging.
 add_executable(sample_flashinfer_test tests/sample_flashinfer_test.cu)
