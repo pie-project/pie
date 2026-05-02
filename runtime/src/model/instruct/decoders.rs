@@ -106,7 +106,13 @@ pub struct ThinkingDecoder {
     start_ids: Vec<u32>,
     end_ids: Vec<u32>,
     inside: bool,
-    accumulated: String,
+    /// Tokens accumulated while Inside (excluding the closing match).
+    /// Re-decoded in full each fire so partial multi-byte chars from a
+    /// previous fire resolve when their trailing bytes arrive.
+    token_buf: Vec<u32>,
+    /// Byte offset into `decode(token_buf)` of text already emitted as
+    /// Delta. Maintained at a U+FFFD-free boundary.
+    text_emitted: usize,
     match_pos: usize,
     starts_inside: bool,
 }
@@ -119,7 +125,8 @@ impl ThinkingDecoder {
             start_ids,
             end_ids,
             inside: starts_inside,
-            accumulated: String::new(),
+            token_buf: Vec::new(),
+            text_emitted: 0,
             match_pos: 0,
             starts_inside,
         }
@@ -137,6 +144,8 @@ impl ReasoningDecoder for ThinkingDecoder {
                     if self.match_pos == self.start_ids.len() {
                         self.inside = true;
                         self.match_pos = 0;
+                        self.token_buf.clear();
+                        self.text_emitted = 0;
                         return ReasoningEvent::Start;
                     }
                 } else {
@@ -151,25 +160,40 @@ impl ReasoningDecoder for ThinkingDecoder {
                 {
                     self.match_pos += 1;
                     if self.match_pos == self.end_ids.len() {
+                        // Closing match — flush the full accumulated decode
+                        // (mirrors GenericChatDecoder::Done; any trailing
+                        // U+FFFD that never resolved are surfaced here, the
+                        // standard outcome on truncated multi-byte input).
+                        let full = self.tokenizer.decode(&self.token_buf, false);
                         self.inside = false;
                         self.match_pos = 0;
-                        return ReasoningEvent::Complete(
-                            std::mem::take(&mut self.accumulated),
-                        );
+                        self.token_buf.clear();
+                        self.text_emitted = 0;
+                        return ReasoningEvent::Complete(full);
                     }
                 } else {
                     self.match_pos = 0;
                 }
+                // Tokens that don't complete the end match — including the
+                // ones that started a partial match and reset — are content.
+                self.token_buf.push(t);
             }
-            let delta = self.tokenizer.decode(tokens, false);
-            self.accumulated.push_str(&delta);
+            let full = self.tokenizer.decode(&self.token_buf, false);
+            let safe_end = safe_emit_end(&full);
+            let delta = if safe_end > self.text_emitted {
+                full[self.text_emitted..safe_end].to_string()
+            } else {
+                String::new()
+            };
+            self.text_emitted = safe_end;
             ReasoningEvent::Delta(delta)
         }
     }
 
     fn reset(&mut self) {
         self.inside = self.starts_inside;
-        self.accumulated.clear();
+        self.token_buf.clear();
+        self.text_emitted = 0;
         self.match_pos = 0;
     }
 }
