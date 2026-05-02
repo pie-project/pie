@@ -54,11 +54,18 @@ const char* st_dtype_name(StDtype dt);
 
 struct StTensor {
     StDtype dtype;
-    std::vector<std::int64_t> shape;
-    // Pointer into the mmap'd shard. Valid for the lifetime of the
-    // owning SafetensorsArchive.
+    std::vector<std::int64_t> shape;        // HF order: outermost first.
+    // Pointer into the mmap'd shard (safetensors) or the mmap'd GGUF
+    // file. Valid for the lifetime of the owning archive.
     const std::uint8_t* data;
     std::size_t nbytes;
+
+    // GGUF: when set (>= 0), specifies the ggml tensor type directly
+    // (Q4_K, Q5_K, F16, ...). The `dtype` field is ignored when this is
+    // set; `shape` is still kept in HF order so the existing shape
+    // reversal in `new_tensor_from_st` produces the right ggml ne[]
+    // layout. Safetensors path leaves this at -1.
+    std::int32_t ggml_type_override = -1;
 };
 
 class SafetensorsShard {
@@ -88,17 +95,29 @@ private:
     void close_mmap() noexcept;
 };
 
-// Top-level archive: handles single-file or sharded models. Construct from
-// a HuggingFace snapshot directory; it auto-discovers the layout.
-class SafetensorsArchive {
+// Polymorphic weight archive. Two implementations:
+//   * SafetensorsArchive — HF native, F32 / F16 / BF16
+//   * GGUFArchive       — llama.cpp GGUF, plus all ggml quant types
+// Both expose tensors by HF-style canonical names (the GGUF archive
+// translates `blk.{N}.attn_q.weight` → `model.layers.{N}.self_attn.q_proj.weight`
+// internally so the per-arch loaders don't branch).
+class WeightArchive {
+public:
+    virtual ~WeightArchive() = default;
+    virtual const StTensor* find(const std::string& name) const noexcept = 0;
+    virtual const StTensor& at(const std::string& name) const = 0;
+    virtual std::size_t num_tensors() const noexcept = 0;
+};
+
+// Top-level safetensors archive: handles single-file or sharded models.
+// Construct from a HuggingFace snapshot directory; auto-discovers layout.
+class SafetensorsArchive : public WeightArchive {
 public:
     explicit SafetensorsArchive(const std::filesystem::path& snapshot_dir);
 
-    // Returns nullptr if `name` is not in the archive.
-    const StTensor* find(const std::string& name) const noexcept;
-
-    // Like find() but throws if missing.
-    const StTensor& at(const std::string& name) const;
+    const StTensor* find(const std::string& name) const noexcept override;
+    const StTensor& at(const std::string& name) const override;
+    std::size_t num_tensors() const noexcept override;
 
     // Iterate all (name, tensor) pairs across all shards.
     template <typename F>
@@ -110,7 +129,6 @@ public:
         }
     }
 
-    std::size_t num_tensors() const noexcept;
     std::size_t num_shards() const noexcept { return shards_.size(); }
 
 private:

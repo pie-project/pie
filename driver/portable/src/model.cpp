@@ -9,6 +9,9 @@
 
 #include <ggml-cpu.h>
 
+#include "gguf_archive.hpp"
+#include "gguf_hparams.hpp"
+
 namespace pie_portable_driver {
 
 namespace {
@@ -101,7 +104,11 @@ ggml_tensor* new_tensor_from_st(ggml_context* ctx,
             "model: tensor '" + dbg_name + "' has unsupported rank " +
             std::to_string(t.shape.size()));
     }
-    const auto type = st_to_ggml_dtype(t.dtype, dbg_name);
+    // GGUF path: ggml_type_override carries the actual ggml type
+    // (Q4_K, Q5_K, F16, ...). Safetensors path: derive from StDtype.
+    const auto type = (t.ggml_type_override >= 0)
+        ? static_cast<ggml_type>(t.ggml_type_override)
+        : st_to_ggml_dtype(t.dtype, dbg_name);
 
     std::int64_t ne[4] = {1, 1, 1, 1};
     for (std::size_t i = 0; i < t.shape.size(); ++i) {
@@ -122,13 +129,27 @@ ggml_tensor* new_tensor_from_st(ggml_context* ctx,
 
 Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
     : snapshot_dir_(snapshot_dir) {
-    if (!std::filesystem::is_directory(snapshot_dir_)) {
+    // The "snapshot" can be either:
+    //   * an HF snapshot directory (config.json + *.safetensors)
+    //   * a single .gguf file (llama.cpp-style, includes Q-formats)
+    const bool is_gguf_file =
+        std::filesystem::is_regular_file(snapshot_dir_) &&
+        snapshot_dir_.extension() == ".gguf";
+    const bool is_hf_dir = std::filesystem::is_directory(snapshot_dir_);
+    if (!is_gguf_file && !is_hf_dir) {
         throw std::runtime_error(
-            "model: not a directory: " + snapshot_dir_.string());
+            "model: expected an HF snapshot dir or a .gguf file, got: " +
+            snapshot_dir_.string());
     }
 
-    hparams_ = parse_hf_config(snapshot_dir_ / "config.json");
-    archive_ = std::make_unique<SafetensorsArchive>(snapshot_dir_);
+    if (is_gguf_file) {
+        auto gguf = std::make_unique<GGUFArchive>(snapshot_dir_);
+        hparams_ = parse_gguf_hparams(gguf->meta());
+        archive_ = std::move(gguf);
+    } else {
+        hparams_ = parse_hf_config(snapshot_dir_ / "config.json");
+        archive_ = std::make_unique<SafetensorsArchive>(snapshot_dir_);
+    }
     resolve_tensor_prefix_();
 
     // Backend selection. With `GGML_CUDA=ON` (or Metal / Vulkan) at build

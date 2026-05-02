@@ -354,7 +354,9 @@ private:
     // calling the standard load_*_ helpers).
     std::string           tensor_prefix_;
 
-    std::unique_ptr<SafetensorsArchive> archive_;
+    // Underlying weight archive — either SafetensorsArchive (HF
+    // snapshot dir) or GGUFArchive (single .gguf file).
+    std::unique_ptr<WeightArchive> archive_;
     ggml_backend_t        backend_ = nullptr;
     ggml_context*         ctx_     = nullptr;
     ggml_backend_buffer_t buf_     = nullptr;

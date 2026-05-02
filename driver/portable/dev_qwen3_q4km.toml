@@ -1,0 +1,18 @@
+# Qwen3-0.6B Q4_K_M GGUF — first end-to-end test of GGUF + quant support.
+[shmem]
+name = "/pie_shmem"
+num_slots = 8
+req_buf = 4194304
+resp_buf = 1048576
+spin_us = 0
+
+[model]
+hf_path = "/root/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf"
+n_gpu_layers = -1
+n_ctx = 4096
+
+[batching]
+kv_page_size = 32
+max_num_kv_pages = 256
+max_batch_tokens = 2048
+max_batch_size = 16

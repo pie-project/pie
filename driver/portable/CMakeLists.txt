@@ -52,6 +52,8 @@ add_executable(pie_driver_portable
   src/shmem_schema.cpp
   src/safetensors.cpp
   src/hf_config.cpp
+  src/gguf_archive.cpp
+  src/gguf_hparams.cpp
   src/model.cpp
   src/kv_cache.cpp
   src/state_cache.cpp
