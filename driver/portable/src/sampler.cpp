@@ -224,15 +224,16 @@ std::vector<float> log_softmax(const float* logits, std::int32_t vocab_size) {
 
 void run_distribution(const float* logits, std::int32_t vocab_size,
                       const SamplerParams& params, SlotOutput& out) {
-    // Top-K probs (with default temperature scaling). Pie's reference
-    // uses the same temperature/top_k params as token-producing samplers
-    // for the top-K size. Default K = 8 if unspecified.
+    // Top-K probs with temperature scaling. The inferlet SDK
+    // (`sdk/rust/inferlet/src/sample.rs::Distribution`) defines `k = 0`
+    // as "return the full vocabulary"; this is what
+    // `inferlets/output-validation` relies on to look up a target token.
     std::vector<float> probs(logits, logits + vocab_size);
     softmax_with_temperature(probs.data(), vocab_size, params.temperature);
 
     const std::int32_t k = params.top_k > 0
         ? std::min<std::int32_t>(params.top_k, vocab_size)
-        : std::min<std::int32_t>(8, vocab_size);
+        : vocab_size;
 
     std::vector<std::pair<float, std::int32_t>> sorted;
     sorted.reserve(vocab_size);

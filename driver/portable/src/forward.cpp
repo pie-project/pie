@@ -178,6 +178,10 @@ std::vector<SlotOutput> sample_request_slots(const ForwardEngine::ReqPlan& rp,
 void resolve_request_output(const ForwardEngine::ReqPlan& rp,
                             std::vector<SlotOutput>&& slot_out,
                             SamplerOutput& dst) {
+    // Prefill-only requests carry no sampler slots — emit nothing.
+    if (slot_out.empty()) {
+        return;
+    }
     if (any_slot_special(slot_out)) {
         dst.special_slots = std::move(slot_out);
         return;

@@ -60,12 +60,37 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
                              "(sglang and vllm drivers).")
     parser.add_argument("--spec-num-drafts", type=int, default=4,
                         help="Number of NGRAM draft tokens proposed per iteration.")
+    parser.add_argument("--output-dir", default=None,
+                        help="If set, write each test's captured inferlet output to "
+                             "<dir>/<test-name>.txt (one file per test, multiple "
+                             "run_inferlet calls concatenated with separators).")
+    parser.add_argument("--portable-n-gpu-layers", type=int, default=None,
+                        help="(--driver portable only) Override n_gpu_layers; "
+                             "-1 = all layers on GPU, 0 = CPU only, N = first N.")
     return parser
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Per-test scratchpad: each `run_inferlet` call appends `(inferlet, output)`.
+# `_run` clears the list before each test and dumps it after, so multiple
+# calls within one test land in one file in order.
+_captured: list[tuple[str, str]] = []
+
+
+def _dump_captured(path: Path, captured: list[tuple[str, str]]) -> None:
+    n = len(captured)
+    with open(path, "w") as f:
+        for i, (inf, out) in enumerate(captured):
+            if i > 0:
+                f.write("\n")
+            f.write(f"=== {inf} (call {i + 1}/{n}) ===\n")
+            f.write(out)
+            if not out.endswith("\n"):
+                f.write("\n")
+
 
 def _clear_wasmtime_cache():
     """Remove the on-disk wasmtime module cache.
@@ -135,7 +160,9 @@ async def run_inferlet(
                 output_parts.append(msg)
             elif event == Event.Return:
                 output_parts.append(msg)
-                return "".join(output_parts)
+                output = "".join(output_parts)
+                _captured.append((name, output))
+                return output
             elif event == Event.Error:
                 raise RuntimeError(msg)
     except asyncio.TimeoutError:
@@ -181,6 +208,8 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     if args.driver in ("sglang", "vllm") and args.spec_ngram:
         driver_subsection["spec_ngram_enabled"] = True
         driver_subsection["spec_ngram_num_drafts"] = args.spec_num_drafts
+    if args.driver == "portable" and args.portable_n_gpu_layers is not None:
+        driver_subsection["n_gpu_layers"] = args.portable_n_gpu_layers
 
     cfg = Config(
         server=ServerConfig(port=0),
@@ -198,6 +227,10 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
             ),
         ],
     )
+    out_dir = Path(args.output_dir) if args.output_dir else None
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
     async with Server(cfg) as server:
         client = await server.connect()
         results: list[tuple[str, str, str]] = []
@@ -206,6 +239,7 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
             name = test_fn.__name__.removeprefix("test_").replace("_", "-")
             print(f"🔄 {name:30s} ", end="", flush=True)
             start = time.time()
+            _captured.clear()
 
             try:
                 await test_fn(client, args)
@@ -225,6 +259,9 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
                     for line in e.output.splitlines()[:20]:
                         print(f"   | {line}")
                 results.append((name, "FAIL", detail))
+
+            if out_dir is not None and _captured:
+                _dump_captured(out_dir / f"{name}.txt", _captured)
 
         # Summary
         print(f"\n{'─' * 70}")

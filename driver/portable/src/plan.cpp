@@ -150,11 +150,11 @@ void plan_single_request(const PlanArrays& a,
                          std::int32_t total_pages,
                          const ArchSpec& spec,
                          ForwardEngine::BatchPlan& plan) {
-    // M8 spec decode allows multi-slot per request. v1 expects ≥1 slot.
-    if (a.request_num_samplers[r] < 1) {
-        throw std::runtime_error(
-            "plan: request " + std::to_string(r) + " has 0 sampler slots");
-    }
+    // 0 sampler slots = prefill-only (e.g. `Context::flush`): write KV for
+    // the supplied tokens, no logit sampling. Decode is 1 slot, M8
+    // spec-decode is 1 + n_drafts.
+    const bool prefill_only = (a.request_num_samplers[r] == 0);
+
     const std::int32_t qo_start = static_cast<std::int32_t>(a.qo_indptr[r]);
     const std::int32_t qo_end   = static_cast<std::int32_t>(a.qo_indptr[r + 1]);
     const std::int32_t n_tok    = qo_end - qo_start;
@@ -186,29 +186,17 @@ void plan_single_request(const PlanArrays& a,
         }
     }
 
-    // BPIQ provides 1 slot per request (the last-pending position that
-    // predicts the first draft / next token). Spec decode grows this to
-    // 1 + n_drafts.
+    // BPIQ slot count must agree with the prefill/decode mode.
     const std::int32_t s_start = static_cast<std::int32_t>(a.sampling_indptr[r]);
     const std::int32_t s_end   = static_cast<std::int32_t>(a.sampling_indptr[r + 1]);
     const std::int32_t n_bpiq_slots = s_end - s_start;
-    if (n_bpiq_slots < 1) {
+    const std::int32_t expected_min = prefill_only ? 0 : 1;
+    if (n_bpiq_slots < expected_min || (prefill_only && n_bpiq_slots != 0)) {
         throw std::runtime_error(
-            "plan: request " + std::to_string(r) +
-            " has 0 BPIQ sampling indices; expected ≥1");
-    }
-    // Runtime emits sampling_indices as per-request relative offsets
-    // (0 = first token of that request's qo range, n_tok-1 = last).
-    // We carry global flat-array positions through the plan, so add
-    // qo_start to translate.
-    const std::int32_t rel_primary =
-        static_cast<std::int32_t>(a.sampling_idx[s_start]);
-    const std::int32_t primary_idx = qo_start + rel_primary;
-    if (rel_primary < 0 || rel_primary >= n_tok) {
-        throw std::runtime_error(
-            "plan: request " + std::to_string(r) +
-            " sampling_index " + std::to_string(rel_primary) +
-            " out of relative [0," + std::to_string(n_tok) + ")");
+            "plan: request " + std::to_string(r) + " has " +
+            std::to_string(a.request_num_samplers[r]) +
+            " sampler slot(s) but " + std::to_string(n_bpiq_slots) +
+            " BPIQ sampling indices");
     }
 
     // Per-token: tokens, positions, and write idxs.
@@ -231,39 +219,6 @@ void plan_single_request(const PlanArrays& a,
     rp.n_tokens     = n_tok;
     rp.n_tokens_pad = ((n_tok + MASK_PAD - 1) / MASK_PAD) * MASK_PAD;
     rp.n_kv         = seq_len;
-
-    // Sampling slots: primary first, then one per draft.
-    rp.sampling_positions.push_back(primary_idx);
-    plan.sampling_pos_i32.push_back(primary_idx);
-
-    if (a.batch_has_drafts) {
-        const std::int32_t d_start = static_cast<std::int32_t>(a.spec_indptr[r]);
-        const std::int32_t d_end   = static_cast<std::int32_t>(a.spec_indptr[r + 1]);
-        const std::int32_t n_drafts = d_end - d_start;
-        if (n_drafts > 0) {
-            rp.draft_tokens.assign(a.spec_token_ids.data() + d_start,
-                                   a.spec_token_ids.data() + d_end);
-            // Each draft sits at the unique batch index i where
-            // positions_i32[i] == draft_pos.
-            for (std::int32_t k = 0; k < n_drafts; ++k) {
-                const std::int32_t draft_pos =
-                    static_cast<std::int32_t>(a.spec_position_ids[d_start + k]);
-                std::int32_t idx = -1;
-                for (std::int32_t i = qo_start; i < qo_end; ++i) {
-                    if (static_cast<std::int32_t>(a.position_ids[i]) == draft_pos) {
-                        idx = i; break;
-                    }
-                }
-                if (idx < 0) {
-                    throw std::runtime_error(
-                        "plan: spec draft at position " + std::to_string(draft_pos) +
-                        " not found in request " + std::to_string(r) + "'s qo range");
-                }
-                rp.sampling_positions.push_back(idx);
-                plan.sampling_pos_i32.push_back(idx);
-            }
-        }
-    }
 
     rp.gather_idxs.resize(seq_len);
     for (std::int32_t k = 0; k < seq_len; ++k) {
@@ -297,6 +252,59 @@ void plan_single_request(const PlanArrays& a,
                         plan.positions_i32.data() + qo_start,
                         a.batch_has_attn_masks ? per_token_runs.data() : nullptr,
                         spec.sliding_window);
+
+    if (prefill_only) {
+        // No sampling slots; sampler/labels/logit_mask stay default and the
+        // host-side sample loop emits an empty SamplerOutput for this request.
+        plan.reqs.push_back(std::move(rp));
+        return;
+    }
+
+    // Decode-only: sampling slots, sampler params, optional logit mask.
+
+    // Runtime emits sampling_indices as per-request relative offsets
+    // (0 = first token of that request's qo range, n_tok-1 = last). We
+    // carry global flat-array positions through the plan, so add qo_start.
+    const std::int32_t rel_primary =
+        static_cast<std::int32_t>(a.sampling_idx[s_start]);
+    if (rel_primary < 0 || rel_primary >= n_tok) {
+        throw std::runtime_error(
+            "plan: request " + std::to_string(r) +
+            " sampling_index " + std::to_string(rel_primary) +
+            " out of relative [0," + std::to_string(n_tok) + ")");
+    }
+    const std::int32_t primary_idx = qo_start + rel_primary;
+    rp.sampling_positions.push_back(primary_idx);
+    plan.sampling_pos_i32.push_back(primary_idx);
+
+    if (a.batch_has_drafts) {
+        const std::int32_t d_start = static_cast<std::int32_t>(a.spec_indptr[r]);
+        const std::int32_t d_end   = static_cast<std::int32_t>(a.spec_indptr[r + 1]);
+        const std::int32_t n_drafts = d_end - d_start;
+        if (n_drafts > 0) {
+            rp.draft_tokens.assign(a.spec_token_ids.data() + d_start,
+                                   a.spec_token_ids.data() + d_end);
+            // Each draft sits at the unique batch index i where
+            // positions_i32[i] == draft_pos.
+            for (std::int32_t k = 0; k < n_drafts; ++k) {
+                const std::int32_t draft_pos =
+                    static_cast<std::int32_t>(a.spec_position_ids[d_start + k]);
+                std::int32_t idx = -1;
+                for (std::int32_t i = qo_start; i < qo_end; ++i) {
+                    if (static_cast<std::int32_t>(a.position_ids[i]) == draft_pos) {
+                        idx = i; break;
+                    }
+                }
+                if (idx < 0) {
+                    throw std::runtime_error(
+                        "plan: spec draft at position " + std::to_string(draft_pos) +
+                        " not found in request " + std::to_string(r) + "'s qo range");
+                }
+                rp.sampling_positions.push_back(idx);
+                plan.sampling_pos_i32.push_back(idx);
+            }
+        }
+    }
 
     // Sampler params (slot index = s_start in v1, where each request has 1 slot).
     if (s_start >= static_cast<std::int32_t>(a.sampler_types.size())) {
