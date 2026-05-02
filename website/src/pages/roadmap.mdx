@@ -107,36 +107,7 @@ This roadmap is **directional**. Priorities may evolve based on user feedback an
 
 ## Planned
 
-### Engineering
-
-- **Multimodal: image embedding inputs** <span className="r-tag r-runtime">runtime</span> <span className="r-tag r-api">api</span>
-  Vision-capable model loading and image-token bridging. Worker-side stub already in `pie_driver/worker.py`.
-
-- **MCP transports beyond stdio** <span className="r-tag r-runtime">runtime</span>
-  Streamable HTTP and SSE transports for connecting to remote MCP servers without forking a local subprocess.
-
-- **More driver backends** <span className="r-tag r-runtime">runtime</span>
-  Candidates: TensorRT-LLM (NVIDIA-maximal), MLX (Apple-Silicon-maximal), llama.cpp (CPU + heavy quantization).
-
-- **Streaming structured output** <span className="r-tag r-api">api</span>
-  Surface partial-JSON / partial-regex matches as the model decodes, instead of only after `collect_json` completes.
-
-- **Native driver: more architectures** <span className="r-tag r-runtime">runtime</span>
-  Demand-driven additions to `pie_driver/model/`. Open issues call out specific HuggingFace `model_type`s; community implementations welcome.
-
-### Research
-
-- **Cross-engine context migration** <span className="r-tag r-research">research</span>
-  Today's suspend / restore is engine-local. Migrating a suspended context to another engine instance is the natural next step toward the "LLM serving systems are operating systems" framing.
-
-- **Multi-node knapsack auction** <span className="r-tag r-research">research</span> <span className="r-tag r-perf">performance</span>
-  The SOSP-paper auction operates on one engine. Multi-engine bidding (and dividend distribution) opens fairness questions worth working through publicly.
-
-- **Draft-model speculators (EAGLE / Medusa)** <span className="r-tag r-research">research</span>
-  The `Speculator` trait already lets the caller plug a small draft model into a larger target. Reference implementations of EAGLE-style and Medusa-style drafters would help adopters.
-
-- **Reasoning-bounded budgets** <span className="r-tag r-research">research</span>
-  Cap thinking-block length under a credit budget and study quality versus latency. The reasoning parser already surfaces `Start` / `End` events.
+WIP
 
 ---
 
