@@ -8,10 +8,12 @@
 
 #include "attention_workspace.hpp"
 #include "device_buffer.hpp"
+#include "distributed.hpp"
 #include "kv_cache.hpp"
 #include "model/qwen3.hpp"
 #include "model/qwen3_5.hpp"
 #include "model/qwen3_forward.hpp"  // for Qwen3Workspace (reused)
+#include "ops/attention_flashinfer.hpp"  // DecodePlanCachePtr
 #include "ops/gemm.hpp"
 #include "qwen3_5_state_cache.hpp"
 
@@ -54,6 +56,51 @@ struct Qwen3_5LinearAttnWorkspace {
         int hq);
 };
 
+// Per-fire knobs that control how the forward dispatches to flashinfer
+// for the full-attention layers. `force_prefill_path = true` keeps every
+// fire on the prefill kernel even when `is_pure_decode == true` — useful
+// for parity-mode where we want the same dispatch shape across the run.
+// In serving (request_handler) we leave it false so the graph-capturable
+// decode kernel is picked when `is_pure_decode` fires, which is the
+// only mode the graph cache key supports.
+struct Qwen3_5ForwardCfg {
+    bool force_prefill_path = false;
+
+    // Tensor-parallel state. tp_size > 1 activates sharded dims for both
+    // full-attention layers (Q/K/V column-parallel, O row-parallel) and
+    // linear-attention layers (per-rank head shares of the conv1d, the
+    // mixed_qkv mix, and the recurrent state). bind_qwen3_5 has
+    // already produced per-rank tensors for the fused QKV/conv1d weights;
+    // forward just needs to use the local-head dims.
+    int tp_size = 1;
+    NcclComm* tp_comm = nullptr;
+};
+
+// Persistent decode-plan cache. Owned by main.cpp's serving setup so
+// the same cache pointer is read both by the per-fire `prepare` hook
+// (which calls `prepare_qwen3_5_decode_plan`) and by `qwen3_5_forward_paged`
+// itself when it dispatches the captured attention kernel. Plan() is the
+// host-side work that breaks graph capture if folded into the body — by
+// hoisting it here we let the request handler refresh it once per fire,
+// outside any cudaStream capture region.
+struct Qwen3_5PlanState {
+    ops::DecodePlanCachePtr decode_plan;
+};
+
+// Refresh the decode plan for the current fire. Caller is expected to
+// invoke this BEFORE either a direct forward call OR a graph replay,
+// outside any capture region. No-op when `is_pure_decode == false`.
+void prepare_qwen3_5_decode_plan(
+    Qwen3_5PlanState& state,
+    AttentionWorkspace& attn_ws,
+    KvCache& cache,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    const std::uint32_t* kv_page_indptr_h,
+    int num_requests,
+    bool is_pure_decode,
+    cudaStream_t stream = nullptr);
+
 // Forward pass over `total_tokens` tokens packed as a flat [N, H]
 // stream. The state caches are SINGLE-REQUEST for now — `R == 1` is
 // enforced; multi-request batching for the linear-attn path will land
@@ -69,6 +116,8 @@ struct Qwen3_5LinearAttnWorkspace {
 void qwen3_5_forward_paged(
     const Qwen3_5Weights& w,
     const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3_5PlanState& plan_state,
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,

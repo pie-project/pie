@@ -54,10 +54,40 @@ inline void apply_rope(
 
 }  // namespace
 
+void prepare_llama_like_decode_plan(
+    LlamaLikePlanState& state,
+    AttentionWorkspace& attn_ws,
+    KvCache& cache,
+    const HfConfig& cfg,
+    const LlamaLikeForwardCfg& fwd_cfg,
+    const std::uint32_t* kv_page_indptr_h,
+    int num_requests,
+    bool is_pure_decode)
+{
+    // The prepare hook runs OUTSIDE any cuStreamCapture region. It updates
+    // pinned/device buffers in `attn_ws` that the captured body reads via
+    // cudaMemcpyAsync at replay time, so the same captured graph stays
+    // correct across fires with different KV lengths.
+    if (!is_pure_decode || fwd_cfg.force_prefill_path) {
+        return;
+    }
+    if (!state.decode_plan) {
+        state.decode_plan = ops::make_decode_plan();
+    }
+    const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+    const int num_q_heads_local  = cfg.num_attention_heads / T;
+    const int num_kv_heads_local = cfg.num_key_value_heads / T;
+    ops::plan_attention_flashinfer_decode_bf16(
+        *state.decode_plan, kv_page_indptr_h, num_requests,
+        num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
+        cache.page_size(), attn_ws, /*stream=*/nullptr);
+}
+
 void llama_like_forward_paged(
     const Qwen3Weights& w,
     const HfConfig& cfg,
     const LlamaLikeForwardCfg& fwd_cfg,
+    const LlamaLikePlanState& plan_state,
     Qwen3Workspace& ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
@@ -76,19 +106,30 @@ void llama_like_forward_paged(
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d)
 {
+    // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
+    // shapes; the local *_local fields just shadow the unsharded value.
+    // Every tp-aware dim (q/k heads, intermediate, lm_head bound to embed)
+    // must divide cleanly by tp_size — checked at engine load.
+    const int T  = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
     const int H  = cfg.hidden_size;
-    const int Hq = cfg.num_attention_heads * cfg.head_dim;
-    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
-    const int I  = cfg.intermediate_size;
+    const int Hq_full = cfg.num_attention_heads * cfg.head_dim;
+    const int Hk_full = cfg.num_key_value_heads * cfg.head_dim;
+    const int I_full  = cfg.intermediate_size;
+    const int Hq = Hq_full / T;
+    const int Hk = Hk_full / T;
+    const int I  = I_full / T;
+    const int num_q_heads_local  = cfg.num_attention_heads / T;
+    const int num_kv_heads_local = cfg.num_key_value_heads / T;
     const int V  = cfg.vocab_size;
     const int d  = cfg.head_dim;
     const int dk = cfg.head_dim_kernel;            // padded HEAD_DIM the
                                                    // attention kernel runs at
-    const int Hq_kern = cfg.num_attention_heads * dk;
-    const int Hk_kern = cfg.num_key_value_heads * dk;
+    const int Hq_kern = num_q_heads_local * dk;
+    const int Hk_kern = num_kv_heads_local * dk;
     const bool head_dim_padded = (d != dk);
     const float eps = cfg.rms_norm_eps;
     cudaStream_t stream = nullptr;
+    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
     // When head_dim is padded, the attention kernel runs at `dk`
     // (e.g. 128) and consumes Q/K/V from the *padded* workspace
@@ -111,17 +152,12 @@ void llama_like_forward_paged(
     // a single bool: anything past the plan_attention call uses it.
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
 
-    // Hoist decode plan once per fire (matches qwen3_forward). Plan
-    // runs at the kernel head_dim (`dk`) so the work estimator picks
-    // the right shared-memory footprint for the actual kernel launch.
-    ops::DecodePlanCachePtr decode_plan;
-    if (use_decode_path) {
-        decode_plan = ops::make_decode_plan();
-        ops::plan_attention_flashinfer_decode_bf16(
-            *decode_plan, kv_page_indptr_h, R,
-            cfg.num_attention_heads, cfg.num_key_value_heads, dk,
-            cache.page_size(), attn_ws, stream);
-    }
+    // Decode plan was set up by the prepare hook (runs outside any
+    // cudaStream capture region) — the body just reads from
+    // `plan_state.decode_plan`. Keeps the body purely device-side so
+    // the request handler can capture it into a CUDA graph.
+    const ops::DecodePlanCache* decode_plan =
+        plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;
 
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
 
@@ -155,17 +191,17 @@ void llama_like_forward_paged(
         if (fwd_cfg.use_qk_norm && layer.q_norm) {
             kernels::launch_rmsnorm_bf16(
                 ws.q.data(), layer.q_norm->data(), ws.q.data(),
-                N * cfg.num_attention_heads, d, eps, stream);
+                N * num_q_heads_local, d, eps, stream);
         }
         if (fwd_cfg.use_qk_norm && layer.k_norm) {
             kernels::launch_rmsnorm_bf16(
                 ws.k.data(), layer.k_norm->data(), ws.k.data(),
-                N * cfg.num_key_value_heads, d, eps, stream);
+                N * num_kv_heads_local, d, eps, stream);
         }
 
         apply_rope(fwd_cfg, cfg,
                    ws.q.data(), ws.k.data(), positions,
-                   N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                   N, num_q_heads_local, num_kv_heads_local, d,
                    stream);
 
         // Pad Q/K/V to `dk` when the model's head_dim isn't a flashinfer
@@ -180,13 +216,13 @@ void llama_like_forward_paged(
         if (head_dim_padded) {
             kernels::launch_pad_head_dim_bf16(
                 ws.q.data(), ws.q_padded.data(),
-                N, cfg.num_attention_heads, d, dk, stream);
+                N, num_q_heads_local, d, dk, stream);
             kernels::launch_pad_head_dim_bf16(
                 ws.k.data(), ws.k_padded.data(),
-                N, cfg.num_key_value_heads, d, dk, stream);
+                N, num_kv_heads_local, d, dk, stream);
             kernels::launch_pad_head_dim_bf16(
                 ws.v.data(), ws.v_padded.data(),
-                N, cfg.num_key_value_heads, d, dk, stream);
+                N, num_kv_heads_local, d, dk, stream);
             attn_q = ws.q_padded.data();
             attn_k = ws.k_padded.data();
             attn_v = ws.v_padded.data();
@@ -197,7 +233,7 @@ void llama_like_forward_paged(
             cache.k(L), cache.v(L),
             const_cast<void*>(attn_k), const_cast<void*>(attn_v),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, cache.page_size(), cfg.num_key_value_heads, dk, stream);
+            N, R, cache.page_size(), num_kv_heads_local, dk, stream);
 
         // Per-layer sliding-window dispatch (OLMo-3, Mistral). When
         // `per_layer_window_left` is empty we fall back to the global
@@ -222,14 +258,14 @@ void llama_like_forward_paged(
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, dk,
+                N, R, num_q_heads_local, num_kv_heads_local, dk,
                 cache.page_size(), attn_ws, stream);
         } else {
             ops::launch_attention_flashinfer_prefill_bf16(
                 attn_q, cache.k(L), cache.v(L), attn_out_buf,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, dk,
+                N, R, num_q_heads_local, num_kv_heads_local, dk,
                 cache.page_size(), attn_ws, stream, layer_window_left,
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         }
@@ -240,20 +276,38 @@ void llama_like_forward_paged(
         if (head_dim_padded) {
             kernels::launch_strip_head_dim_bf16(
                 attn_out_buf, ws.attn_out.data(),
-                N, cfg.num_attention_heads, d, dk, stream);
+                N, num_q_heads_local, d, dk, stream);
         }
 
         if (!post_norm) {
-            // Pre-norm: o_proj accumulates into y (residual add).
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
-                N, H, Hq, /*beta=*/1.f);
+            // o_proj is row-parallel: each rank's GEMM produces a partial
+            // [N, H] contribution. Single-GPU fuses it into y as a
+            // residual-add (beta=1); under TP we go via a scratch
+            // (ws.norm_x is free here — it held the QKV input before),
+            // all-reduce the partials, then add to the residual.
+            if (T == 1) {
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
+                    N, H, Hq, /*beta=*/1.f);
+            } else {
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
+                    N, H, Hq, /*beta=*/0.f);
+                tp->all_reduce_bf16(ws.norm_x.data(),
+                    static_cast<std::size_t>(N) * H, ncclSum, stream);
+                kernels::launch_residual_add_bf16(
+                    ws.y.data(), ws.norm_x.data(), N * H, stream);
+            }
         } else {
             // Post-norm: o_proj writes to norm_x (a scratch we own here),
             // norm_attn(norm_x) → norm_y, then y += norm_y.
             ops::gemm_act_x_wt_bf16(cublas.handle(),
                 ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
                 N, H, Hq, /*beta=*/0.f);
+            if (T > 1) {
+                tp->all_reduce_bf16(ws.norm_x.data(),
+                    static_cast<std::size_t>(N) * H, ncclSum, stream);
+            }
             kernels::launch_rmsnorm_bf16(
                 ws.norm_x.data(), layer.attn_norm->data(), ws.norm_y.data(),
                 N, H, eps, stream);
@@ -279,14 +333,32 @@ void llama_like_forward_paged(
             N * I, stream);
 
         if (!post_norm) {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.gate.data(), layer.down_proj->data(), ws.y.data(),
-                N, H, I, /*beta=*/1.f);
+            // down_proj is row-parallel: same all-reduce + residual-add
+            // dance as o_proj. ws.norm_x is free here (it last held the
+            // mlp pre-norm input on the post-norm path; on pre-norm it
+            // hasn't been touched since QKV).
+            if (T == 1) {
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    ws.gate.data(), layer.down_proj->data(), ws.y.data(),
+                    N, H, I, /*beta=*/1.f);
+            } else {
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    ws.gate.data(), layer.down_proj->data(), ws.norm_x.data(),
+                    N, H, I, /*beta=*/0.f);
+                tp->all_reduce_bf16(ws.norm_x.data(),
+                    static_cast<std::size_t>(N) * H, ncclSum, stream);
+                kernels::launch_residual_add_bf16(
+                    ws.y.data(), ws.norm_x.data(), N * H, stream);
+            }
         } else {
             // Post-norm MLP: down_proj → norm_x scratch, norm_mlp, += y.
             ops::gemm_act_x_wt_bf16(cublas.handle(),
                 ws.gate.data(), layer.down_proj->data(), ws.norm_x.data(),
                 N, H, I, /*beta=*/0.f);
+            if (T > 1) {
+                tp->all_reduce_bf16(ws.norm_x.data(),
+                    static_cast<std::size_t>(N) * H, ncclSum, stream);
+            }
             kernels::launch_rmsnorm_bf16(
                 ws.norm_x.data(), layer.mlp_norm->data(), ws.norm_y.data(),
                 N, H, eps, stream);

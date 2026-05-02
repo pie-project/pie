@@ -52,6 +52,13 @@ Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
     ws.shared_gate_logit = DeviceBuffer<std::uint16_t>::alloc(N * 1);
 
     ws.moe_out = DeviceBuffer<std::uint16_t>::alloc(N * H);
+    ws.a_gu_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
+    ws.b_gu_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
+    ws.c_gu_ptrs     = DeviceBuffer<std::uint16_t*>::alloc(top_k);
+    ws.a_dn_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
+    ws.b_dn_ptrs     = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
+    ws.c_dn_ptrs     = DeviceBuffer<std::uint16_t*>::alloc(top_k);
+    ws.batch_weights = DeviceBuffer<float>::alloc(top_k);
     return ws;
 }
 
@@ -96,21 +103,24 @@ ExpertRouting build_routing(
 void linear_attn_body(
     const Qwen3_5MoeLayerWeights& Lw,
     const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la,
     Qwen3_5StateCache& state_cache,
     int layer_idx, int N, bool is_pure_decode,
     ops::CublasHandle& cublas, cudaStream_t stream)
 {
+    const int T        = std::max(1, fwd_cfg.tp_size);
     const int H        = cfg.hidden_size;
-    const int K_h      = cfg.linear_num_key_heads;
-    const int V_h      = cfg.linear_num_value_heads;
+    const int K_h      = cfg.linear_num_key_heads / T;
+    const int V_h      = cfg.linear_num_value_heads / T;
     const int K_d      = cfg.linear_key_head_dim;
     const int V_d      = cfg.linear_value_head_dim;
     const int K_dim    = K_h * K_d;
     const int V_dim    = V_h * V_d;
     const int conv_dim = 2 * K_dim + V_dim;
     const int conv_K   = cfg.linear_conv_kernel_dim;
+    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.la_in_proj_qkv->data(),
@@ -209,19 +219,34 @@ void linear_attn_body(
         la.core_out_bf16.data(), la.z.data(), Lw.la_norm_w_fp32,
         la.core_out_bf16.data(),
         N * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        la.core_out_bf16.data(), Lw.la_out_proj->data(),
-        ws.norm_y.data(), N, H, V_dim);
+    // out_proj: TP=1 fuses residual via beta=1; TP>1 row-parallel +
+    // all-reduce + residual-add.
+    if (T == 1) {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            la.core_out_bf16.data(), Lw.la_out_proj->data(),
+            ws.y.data(), N, H, V_dim, /*beta=*/1.f);
+    } else {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            la.core_out_bf16.data(), Lw.la_out_proj->data(),
+            ws.norm_y.data(), N, H, V_dim, /*beta=*/0.f);
+        tp->all_reduce_bf16(ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, ncclSum, stream);
+        kernels::launch_residual_add_bf16(
+            ws.y.data(), ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, stream);
+    }
 }
 
 // Full-attention body (replica of qwen3_5_forward.cpp's logic).
 void full_attn_body(
     const Qwen3_5MoeLayerWeights& Lw,
     const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la,
     KvCache& cache, AttentionWorkspace& attn_ws,
-    int kv_layer, int N, int R, bool is_pure_decode,
+    const ops::DecodePlanCachePtr& decode_plan,
+    int kv_layer, int N, int R,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
     const std::uint32_t* kv_page_indices,
@@ -231,20 +256,24 @@ void full_attn_body(
     const std::uint32_t* kv_page_indptr_h,
     ops::CublasHandle& cublas, cudaStream_t stream)
 {
+    const int T  = std::max(1, fwd_cfg.tp_size);
     const int H  = cfg.hidden_size;
-    const int Hq = cfg.num_attention_heads * cfg.head_dim;
-    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
+    const int num_q_heads_local  = cfg.num_attention_heads / T;
+    const int num_kv_heads_local = cfg.num_key_value_heads / T;
+    const int Hq = num_q_heads_local * cfg.head_dim;
+    const int Hk = num_kv_heads_local * cfg.head_dim;
     const int d  = cfg.head_dim;
     const int rotary_dim = std::max<int>(2,
         2 * static_cast<int>(0.5f * cfg.partial_rotary_factor * d));
     const float eps = cfg.rms_norm_eps;
+    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.fa_q_proj->data(),
         la.fa_qg_packed.data(), N, 2 * Hq, H);
     kernels::launch_split_q_gate_bf16(
         la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
-        N, cfg.num_attention_heads, d, stream);
+        N, num_q_heads_local, d, stream);
 
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.fa_k_proj->data(),
@@ -255,53 +284,86 @@ void full_attn_body(
 
     kernels::launch_rmsnorm_gemma_bf16(
         ws.q.data(), Lw.fa_q_norm->data(), ws.q.data(),
-        N * cfg.num_attention_heads, d, eps, stream);
+        N * num_q_heads_local, d, eps, stream);
     kernels::launch_rmsnorm_gemma_bf16(
         ws.k.data(), Lw.fa_k_norm->data(), ws.k.data(),
-        N * cfg.num_key_value_heads, d, eps, stream);
+        N * num_kv_heads_local, d, eps, stream);
 
     kernels::launch_rope_partial_bf16(
         ws.q.data(), ws.k.data(), positions,
-        N, cfg.num_attention_heads, cfg.num_key_value_heads,
+        N, num_q_heads_local, num_kv_heads_local,
         d, rotary_dim, cfg.rope_theta, stream);
 
     kernels::launch_write_kv_to_pages_bf16(
         cache.k(kv_layer), cache.v(kv_layer), ws.k.data(), ws.v.data(),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+        N, R, cache.page_size(), num_kv_heads_local, d, stream);
 
-    // Same prefill-only path as qwen3_5_forward — see comment there.
-    (void)is_pure_decode;
-    ops::launch_attention_flashinfer_prefill_bf16(
-        ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
-        qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        qo_indptr_h, kv_page_indptr_h,
-        N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-        cache.page_size(), attn_ws, stream);
+    // Decode path: pre-planned (graph-friendly). Prefill: includes host
+    // work in the launcher (PrefillPlan), so non-graph-capturable.
+    if (decode_plan) {
+        ops::dispatch_attention_flashinfer_decode_bf16(
+            *decode_plan,
+            ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            attn_ws, stream);
+    } else {
+        ops::launch_attention_flashinfer_prefill_bf16(
+            ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            qo_indptr_h, kv_page_indptr_h,
+            N, R, num_q_heads_local, num_kv_heads_local, d,
+            cache.page_size(), attn_ws, stream);
+    }
 
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
 
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.attn_out.data(), Lw.fa_o_proj->data(),
-        ws.norm_y.data(), N, H, Hq);
+    // o_proj: TP=1 fuses residual via beta=1; TP>1 row-parallel +
+    // all-reduce + residual-add.
+    if (T == 1) {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.attn_out.data(), Lw.fa_o_proj->data(),
+            ws.y.data(), N, H, Hq, /*beta=*/1.f);
+    } else {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.attn_out.data(), Lw.fa_o_proj->data(),
+            ws.norm_y.data(), N, H, Hq, /*beta=*/0.f);
+        tp->all_reduce_bf16(ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, ncclSum, stream);
+        kernels::launch_residual_add_bf16(
+            ws.y.data(), ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, stream);
+    }
 }
 
 // MoE block: routed experts + shared expert with sigmoid gate.
-// Reads `ws.norm_x`, writes contribution into `moe_ws.moe_out`.
+// Reads `ws.norm_x`, writes the combined routed-expert + shared-expert
+// contribution directly into `ws.norm_y` (the residual buffer the caller
+// will add into `ws.y`).
 void moe_block(
     const Qwen3_5MoeLayerWeights& Lw,
     const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
     Qwen3_5MoeMlpWorkspace& moe_ws,
     int N,
     ops::CublasHandle& cublas, cudaStream_t stream)
 {
+    const int T = std::max(1, fwd_cfg.tp_size);
     const int H = cfg.hidden_size;
     const int E = cfg.num_experts;
     const int K = cfg.num_experts_per_tok;
-    const int Im = cfg.moe_intermediate_size;
-    const int Is = cfg.shared_expert_intermediate_size;
+    // Both routed and shared experts shard along the intermediate axis
+    // (column-parallel gate/up + row-parallel down). The engine load loop
+    // streams per-rank slices of `experts.gate_up_proj` / `experts.down_proj`
+    // straight from the safetensors mmap, so each rank only allocates its
+    // own Im_local-sized portion and the per-expert GEMMs run at the
+    // sharded width. We do one all-reduce at the end of the block,
+    // covering both routed and shared partial sums.
+    const int Im = cfg.moe_intermediate_size / T;            // routed: sharded
+    const int Is = cfg.shared_expert_intermediate_size / T;  // shared: sharded
+    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
     // ── Routed experts ────────────────────────────────────────────
     // 1. Router logits.
@@ -314,72 +376,141 @@ void moe_block(
         moe_ws.topk_idx.data(), moe_ws.topk_weights.data(),
         N, E, K, stream);
 
-    // 3. D2H copy of routing.
-    std::vector<std::int32_t> topk_idx_h((std::size_t)N * K);
-    std::vector<float>        topk_w_h((std::size_t)N * K);
-    CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), moe_ws.topk_idx.data(),
-                               topk_idx_h.size() * sizeof(std::int32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(topk_w_h.data(), moe_ws.topk_weights.data(),
-                               topk_w_h.size() * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
+    // 3. Routing decisions. The N=1 (decode) path stays entirely on-device
+    //    (so the layer is graph-capturable); the general path needs them
+    //    on-host to bucket tokens per expert and we D2H-sync below.
+    std::vector<std::int32_t> topk_idx_h;
+    std::vector<float>        topk_w_h;
+    if (N != 1) {
+        topk_idx_h.resize((std::size_t)N * K);
+        topk_w_h.resize((std::size_t)N * K);
+        CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), moe_ws.topk_idx.data(),
+                                   topk_idx_h.size() * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(topk_w_h.data(), moe_ws.topk_weights.data(),
+                                   topk_w_h.size() * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
-    // 4. Zero moe_out (we'll scatter-accumulate per-expert outputs).
-    CUDA_CHECK(cudaMemsetAsync(moe_ws.moe_out.data(), 0,
-        (std::size_t)N * H * sizeof(std::uint16_t), stream));
+    // 4. (For the N>1 path only: zero moe_out before scatter_add.) The
+    //    N=1 fast-path's `batched_weighted_sum` overwrites moe_out, so the
+    //    memset there would be wasted work.
 
     // 5. Per-expert dispatch.
     const std::size_t expert_stride_gu =
         static_cast<std::size_t>(2) * Im * H;  // bf16 elements per expert in gate_up_proj
     const std::size_t expert_stride_dn =
         static_cast<std::size_t>(H) * Im;       // bf16 elements per expert in down_proj
-    for (int e = 0; e < E; ++e) {
-        const auto& tok_idx = routing.token_idx[e];
-        const auto& wts     = routing.weights[e];
-        const int Ne = static_cast<int>(tok_idx.size());
-        if (Ne == 0) continue;
 
-        CUDA_CHECK(cudaMemcpyAsync(
-            moe_ws.expert_idx.data(), tok_idx.data(),
-            Ne * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(
-            moe_ws.expert_w.data(), wts.data(),
-            Ne * sizeof(float), cudaMemcpyHostToDevice, stream));
+    if (N == 1) {
+        // Decode fast-path. Fully on-device pipeline (graph-capturable):
+        //   1. `build_moe_ptrs_decode` reads topk_idx + topk_w and writes
+        //      the gate_up + down per-expert cuBLAS pointer arrays
+        //      directly to fixed device buffers — no D2H, no host loop.
+        //   2. `cublasGemmBatchedEx` for gate_up (top_k batches, M=1).
+        //   3. `chunked_swiglu` over [top_k, 2*Im].
+        //   4. `cublasGemmBatchedEx` for down_proj (top_k batches, M=1).
+        //   5. `batched_weighted_sum` collapses [top_k, H] → moe_out[0].
+        //
+        // Every step has fixed kernel topology and stable device-pointer
+        // arguments, so the request handler's graph-capture path can fire
+        // for the whole forward.
+        kernels::launch_build_moe_ptrs_decode_bf16(
+            moe_ws.topk_idx.data(),
+            moe_ws.topk_weights.data(),
+            Lw.moe_gate_up_proj->data(),
+            Lw.moe_down_proj->data(),
+            ws.norm_x.data(),
+            moe_ws.expert_gate_up.data(),
+            moe_ws.expert_act.data(),
+            moe_ws.expert_out.data(),
+            reinterpret_cast<const void**>(moe_ws.a_gu_ptrs.data()),
+            reinterpret_cast<const void**>(moe_ws.b_gu_ptrs.data()),
+            reinterpret_cast<void**>(moe_ws.c_gu_ptrs.data()),
+            reinterpret_cast<const void**>(moe_ws.a_dn_ptrs.data()),
+            reinterpret_cast<const void**>(moe_ws.b_dn_ptrs.data()),
+            reinterpret_cast<void**>(moe_ws.c_dn_ptrs.data()),
+            moe_ws.batch_weights.data(),
+            K, H, Im, stream);
 
-        kernels::launch_gather_bf16_rows(
-            static_cast<const std::uint16_t*>(ws.norm_x.data()),
-            moe_ws.expert_idx.data(),
-            moe_ws.expert_in.data(),
-            Ne, H, stream);
+        // gate_up batched GEMM: M=1, N=2*Im, K=H, batch=top_k.
+        ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+            reinterpret_cast<const void* const*>(moe_ws.b_gu_ptrs.data()),
+            reinterpret_cast<const void* const*>(moe_ws.a_gu_ptrs.data()),
+            reinterpret_cast<void* const*>(moe_ws.c_gu_ptrs.data()),
+            /*M=*/1, /*N=*/2 * Im, /*K=*/H,
+            /*batch_count=*/K);
 
-        // gate_up_proj[e]: pointer offset into the fused [E, 2*Im, H] tensor.
-        auto* gate_up_w = static_cast<const std::uint16_t*>(
-                              Lw.moe_gate_up_proj->data())
-                          + e * expert_stride_gu;
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            moe_ws.expert_in.data(), gate_up_w,
-            moe_ws.expert_gate_up.data(), Ne, 2 * Im, H);
-
-        // Chunked SwiGLU: silu(gate) * up.
+        // SwiGLU on [top_k, 2*Im] → [top_k, Im].
         kernels::launch_chunked_swiglu_bf16(
             moe_ws.expert_gate_up.data(),
             moe_ws.expert_act.data(),
-            Ne, Im, stream);
+            K, Im, stream);
 
-        // down_proj[e]: offset into [E, H, Im] tensor.
-        auto* down_w = static_cast<const std::uint16_t*>(
-                           Lw.moe_down_proj->data())
-                       + e * expert_stride_dn;
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            moe_ws.expert_act.data(), down_w,
-            moe_ws.expert_out.data(), Ne, H, Im);
+        // down_proj batched GEMM: M=1, N=H, K=Im, batch=top_k.
+        ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+            reinterpret_cast<const void* const*>(moe_ws.b_dn_ptrs.data()),
+            reinterpret_cast<const void* const*>(moe_ws.a_dn_ptrs.data()),
+            reinterpret_cast<void* const*>(moe_ws.c_dn_ptrs.data()),
+            /*M=*/1, /*N=*/H, /*K=*/Im,
+            /*batch_count=*/K);
 
-        kernels::launch_scatter_add_weighted_bf16(
-            moe_ws.moe_out.data(), moe_ws.expert_out.data(),
-            moe_ws.expert_idx.data(), moe_ws.expert_w.data(),
-            Ne, H, stream);
+        // Sum K outputs into moe_out.
+        kernels::launch_batched_weighted_sum_bf16(
+            ws.norm_y.data(), moe_ws.expert_out.data(),
+            moe_ws.batch_weights.data(),
+            K, H, stream);
+    } else {
+        // General path (prefill / multi-token). Build per-expert routing
+        // lists on host and gather/scatter via the existing kernels.
+        // Zero moe_out before the scatter_add accumulation.
+        CUDA_CHECK(cudaMemsetAsync(ws.norm_y.data(), 0,
+            (std::size_t)N * H * sizeof(std::uint16_t), stream));
+        const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
+        for (int e = 0; e < E; ++e) {
+            const auto& tok_idx = routing.token_idx[e];
+            const auto& wts     = routing.weights[e];
+            const int Ne = static_cast<int>(tok_idx.size());
+            if (Ne == 0) continue;
+
+            CUDA_CHECK(cudaMemcpyAsync(
+                moe_ws.expert_idx.data(), tok_idx.data(),
+                Ne * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                moe_ws.expert_w.data(), wts.data(),
+                Ne * sizeof(float), cudaMemcpyHostToDevice, stream));
+
+            kernels::launch_gather_bf16_rows(
+                static_cast<const std::uint16_t*>(ws.norm_x.data()),
+                moe_ws.expert_idx.data(),
+                moe_ws.expert_in.data(),
+                Ne, H, stream);
+
+            const auto* gate_up_w = static_cast<const std::uint16_t*>(
+                                        Lw.moe_gate_up_proj->data())
+                                    + e * expert_stride_gu;
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                moe_ws.expert_in.data(), gate_up_w,
+                moe_ws.expert_gate_up.data(), Ne, 2 * Im, H);
+
+            kernels::launch_chunked_swiglu_bf16(
+                moe_ws.expert_gate_up.data(),
+                moe_ws.expert_act.data(),
+                Ne, Im, stream);
+
+            const auto* down_w = static_cast<const std::uint16_t*>(
+                                     Lw.moe_down_proj->data())
+                                 + e * expert_stride_dn;
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                moe_ws.expert_act.data(), down_w,
+                moe_ws.expert_out.data(), Ne, H, Im);
+
+            kernels::launch_scatter_add_weighted_bf16(
+                ws.norm_y.data(), moe_ws.expert_out.data(),
+                moe_ws.expert_idx.data(), moe_ws.expert_w.data(),
+                Ne, H, stream);
+        }
     }
 
     // ── Shared expert (always-on, dense MLP + sigmoid gate) ───────
@@ -408,16 +539,19 @@ void moe_block(
         moe_ws.shared_out.data(), moe_ws.shared_gate_logit.data(),
         N, H, stream);
 
-    // moe_out += shared_out (residual-add style).
+    // moe_out += shared_out — both terms are this rank's partial sum
+    // (routed: row-parallel down_proj; shared: row-parallel down_proj).
+    // We accumulate into ws.norm_y first and all-reduce the combined
+    // partial once, so the block fires a single collective regardless
+    // of routed/shared split.
     kernels::launch_residual_add_bf16(
-        moe_ws.moe_out.data(), moe_ws.shared_out.data(),
+        ws.norm_y.data(), moe_ws.shared_out.data(),
         (std::size_t)N * H, stream);
 
-    // Copy moe_out → ws.norm_y so the caller can do `y += norm_y`.
-    CUDA_CHECK(cudaMemcpyAsync(
-        ws.norm_y.data(), moe_ws.moe_out.data(),
-        (std::size_t)N * H * sizeof(std::uint16_t),
-        cudaMemcpyDeviceToDevice, stream));
+    if (T > 1) {
+        tp->all_reduce_bf16(ws.norm_y.data(),
+            (std::size_t)N * H, ncclSum, stream);
+    }
 }
 
 }  // namespace
@@ -425,6 +559,8 @@ void moe_block(
 void qwen3_5_moe_forward_paged(
     const Qwen3_5MoeWeights& w,
     const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3_5PlanState& plan_state,
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     Qwen3_5MoeMlpWorkspace& moe_ws,
@@ -457,6 +593,10 @@ void qwen3_5_moe_forward_paged(
 
     if (!is_pure_decode) state_cache.reset(stream);
 
+    // Decode plan was refreshed by `prepare_qwen3_5_decode_plan` before
+    // this body call. Avoids host work inside any cudaStream capture.
+    const ops::DecodePlanCachePtr& decode_plan = plan_state.decode_plan;
+
     kernels::launch_embed_bf16(
         token_ids, w.embed->data(), ws.y.data(),
         N, H, cfg.vocab_size, stream);
@@ -470,25 +610,26 @@ void qwen3_5_moe_forward_paged(
 
         if (Lw.kind == Qwen3_5MoeLayerWeights::Kind::LinearAttn) {
             linear_attn_body(
-                Lw, cfg, ws, la_ws, state_cache,
+                Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
                 static_cast<int>(L), N, is_pure_decode, cublas, stream);
         } else {
             full_attn_body(
-                Lw, cfg, ws, la_ws, cache, attn_ws, Lw.kv_layer,
-                N, num_requests, is_pure_decode,
+                Lw, cfg, fwd_cfg, ws, la_ws, cache, attn_ws, decode_plan,
+                Lw.kv_layer,
+                N, num_requests,
                 positions, qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
                 cublas, stream);
         }
-        kernels::launch_residual_add_bf16(
-            ws.y.data(), ws.norm_y.data(),
-            (std::size_t)N * H, stream);
+        // (Post-attention residual fused into the body's final GEMM
+        //  via beta=1 on TP=1; on TP>1 the body did the all-reduce and
+        //  residual_add itself. ws.y holds the post-attention state.)
 
         // Post-attention norm + MoE block + residual.
         kernels::launch_rmsnorm_gemma_bf16(
             ws.y.data(), Lw.mlp_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
-        moe_block(Lw, cfg, ws, moe_ws, N, cublas, stream);
+        moe_block(Lw, cfg, fwd_cfg, ws, moe_ws, N, cublas, stream);
         kernels::launch_residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             (std::size_t)N * H, stream);

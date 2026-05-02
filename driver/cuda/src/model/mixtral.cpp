@@ -12,6 +12,7 @@
 #include "kernels/attn_sink.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
+#include "kernels/residual_add.hpp"
 #include "kernels/kv_paged.hpp"
 #include "kernels/moe_dispatch.hpp"
 #include "kernels/rmsnorm.hpp"
@@ -135,14 +136,23 @@ void mixtral_forward_paged(
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d)
 {
+    // TP-local dims. tp_size == 1 keeps the original single-GPU shapes.
+    // For Mixtral we shard *within* each expert (per-expert TP), not
+    // across experts: every rank still runs the full expert routing but
+    // each expert's gate/up/down weights are split along axis 0 / axis 1.
+    const int T  = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
     const int H = cfg.hidden_size;
-    const int Hq = cfg.num_attention_heads * cfg.head_dim;
-    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
-    const int I  = cfg.intermediate_size;
+    const int Hq = (cfg.num_attention_heads * cfg.head_dim) / T;
+    const int Hk = (cfg.num_key_value_heads * cfg.head_dim) / T;
+    const int I  = cfg.intermediate_size / T;
+    const int num_q_heads_local  = cfg.num_attention_heads / T;
+    const int num_kv_heads_local = cfg.num_key_value_heads / T;
     const int V  = cfg.vocab_size;
     const int d  = cfg.head_dim;
     const float eps = cfg.rms_norm_eps;
     cudaStream_t stream = nullptr;
+    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
+    const bool tp_is_leader = (T == 1) || (tp != nullptr && tp->rank() == 0);
 
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
     const bool any_sinks = [&]{
@@ -159,7 +169,7 @@ void mixtral_forward_paged(
     float* lse_ptr = nullptr;
     if (any_sinks) {
         d_lse = DeviceBuffer<float>::alloc(
-            static_cast<std::size_t>(N) * cfg.num_attention_heads);
+            static_cast<std::size_t>(N) * num_q_heads_local);
         lse_ptr = d_lse.data();
     }
 
@@ -171,7 +181,7 @@ void mixtral_forward_paged(
         decode_plan = ops::make_decode_plan();
         ops::plan_attention_flashinfer_decode_bf16(
             *decode_plan, kv_page_indptr_h, R,
-            cfg.num_attention_heads, cfg.num_key_value_heads, d,
+            num_q_heads_local, num_kv_heads_local, d,
             cache.page_size(), attn_ws, stream);
     }
 
@@ -225,13 +235,13 @@ void mixtral_forward_paged(
 
         kernels::launch_rope_bf16(
             ws.q.data(), ws.k.data(), positions,
-            N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+            N, num_q_heads_local, num_kv_heads_local, d,
             cfg.rope_theta, stream);
 
         kernels::launch_write_kv_to_pages_bf16(
             cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+            N, R, cache.page_size(), num_kv_heads_local, d, stream);
 
         // Only ask flashinfer for lse on layers that actually use sinks.
         // Saves a per-layer kernel write on plain Mixtral, and on
@@ -254,7 +264,7 @@ void mixtral_forward_paged(
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                N, R, num_q_heads_local, num_kv_heads_local, d,
                 cache.page_size(), attn_ws, stream,
                 /*window_left=*/-1,
                 /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f,
@@ -264,7 +274,7 @@ void mixtral_forward_paged(
                 ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                N, R, num_q_heads_local, num_kv_heads_local, d,
                 cache.page_size(), attn_ws, stream,
                 /*window_left=*/layer_window,
                 /*logits_soft_cap=*/0.f,
@@ -274,18 +284,35 @@ void mixtral_forward_paged(
 
         // GPT-OSS: rescale o by `sigmoid(lse - sink_h)` to apply the
         // softmax-denominator extension that flashinfer's DefaultAttention
-        // doesn't emit natively.
+        // doesn't emit natively. Per-rank shard count under TP.
         if (layer.attn_sinks != nullptr) {
             kernels::launch_attention_sink_rescale_bf16(
                 ws.attn_out.data(), layer_lse, layer.attn_sinks->data(),
-                N, cfg.num_attention_heads, d, stream);
+                N, num_q_heads_local, d, stream);
         }
 
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
-            N, H, Hq, /*beta=*/1.f);
-        if (layer.o_bias) kernels::launch_add_bias_bf16(
-            ws.y.data(), layer.o_bias->data(), N, H, stream);
+        // o_proj is row-parallel under TP: write to scratch, all-reduce,
+        // residual-add into y. o_bias (replicated; e.g. GPT-OSS) only goes
+        // in once on the leader so the all-reduce sums it exactly once.
+        if (T == 1) {
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                ws.attn_out.data(), layer.o_proj->data(), ws.y.data(),
+                N, H, Hq, /*beta=*/1.f);
+            if (layer.o_bias) kernels::launch_add_bias_bf16(
+                ws.y.data(), layer.o_bias->data(), N, H, stream);
+        } else {
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
+                N, H, Hq, /*beta=*/0.f);
+            if (layer.o_bias && tp_is_leader) {
+                kernels::launch_add_bias_bf16(
+                    ws.norm_x.data(), layer.o_bias->data(), N, H, stream);
+            }
+            tp->all_reduce_bf16(ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H, ncclSum, stream);
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_x.data(), N * H, stream);
+        }
 
         // ── Sparse-MoE block ──
         kernels::launch_rmsnorm_bf16(
@@ -318,6 +345,21 @@ void mixtral_forward_paged(
         CUDA_CHECK(cudaStreamSynchronize(stream));
         const auto routing = build_routing(topk_idx_h, topk_w_h,
                                            N, top_k, num_experts);
+
+        // Under TP every rank computes 1/T of every expert's down_proj.
+        // Each scatter_add accumulates a *partial* contribution; we
+        // collect those in ws.norm_x (zero-initialised), all-reduce after
+        // all experts, then residual-add the full MoE delta into ws.y.
+        // tp_size == 1 keeps the original "scatter directly into ws.y"
+        // path so single-GPU performance is unchanged.
+        void* moe_target = ws.y.data();
+        if (T > 1) {
+            CUDA_CHECK(cudaMemsetAsync(
+                ws.norm_x.data(), 0,
+                static_cast<std::size_t>(N) * H * sizeof(std::uint16_t),
+                stream));
+            moe_target = ws.norm_x.data();
+        }
 
         // 3. Per-expert dispatch.
         for (int e = 0; e < num_experts; ++e) {
@@ -367,14 +409,25 @@ void mixtral_forward_paged(
             ops::gemm_act_x_wt_bf16(cublas.handle(),
                 d_expert_gate.data(), expert.w_down->data(),
                 d_expert_out.data(), Ne, H, I);
-            if (expert.b_down) kernels::launch_add_bias_bf16(
+            // b_down is replicated across ranks; only the leader applies
+            // it so the all-reduce sums it once. Plain Mixtral has no
+            // b_down so this branch is dead until GPT-OSS.
+            if (expert.b_down && tp_is_leader) kernels::launch_add_bias_bf16(
                 d_expert_out.data(), expert.b_down->data(), Ne, H, stream);
 
-            // Scatter into ws.y with routing weight, residual-add style.
+            // Scatter into ws.y (TP=1) or moe_target scratch (TP>1) with
+            // routing weight, residual-add style.
             kernels::launch_scatter_add_weighted_bf16(
-                ws.y.data(), d_expert_out.data(),
+                moe_target, d_expert_out.data(),
                 d_expert_idx.data(), d_expert_w.data(),
                 Ne, H, stream);
+        }
+
+        if (T > 1) {
+            tp->all_reduce_bf16(ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H, ncclSum, stream);
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_x.data(), N * H, stream);
         }
     }
 

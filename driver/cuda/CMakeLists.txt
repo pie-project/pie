@@ -21,6 +21,18 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
 
+# NCCL for tensor-parallel collectives. Single-GPU runs never load it (the
+# call sites are gated on tp_size > 1), but we always link so a TP-enabled
+# wrapper can talk to the same binary. System NCCL only — vendoring via CPM
+# is impractical (kernel-heavy build).
+find_path(NCCL_INCLUDE_DIR nccl.h
+  HINTS ${CUDAToolkit_INCLUDE_DIRS} /usr/include /usr/local/include
+  REQUIRED)
+find_library(NCCL_LIBRARY nccl
+  HINTS ${CUDAToolkit_LIBRARY_DIR} /usr/lib/x86_64-linux-gnu /usr/local/lib
+  REQUIRED)
+message(STATUS "Using NCCL: ${NCCL_LIBRARY} (header: ${NCCL_INCLUDE_DIR})")
+
 include(cmake/CPM.cmake)
 
 # NOTE: flashinfer dropped its top-level CMakeLists.txt after v0.2.7. From
@@ -108,6 +120,8 @@ add_executable(pie_driver_cuda
   src/brle.cpp
   src/control_socket.cpp
   src/swap_pool.cpp
+  src/distributed.cpp
+  src/custom_all_reduce.cu
   src/ops/attention_flashinfer.cu
 )
 
@@ -125,6 +139,7 @@ target_compile_options(pie_driver_cuda PRIVATE
 target_include_directories(pie_driver_cuda
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
@@ -171,4 +186,6 @@ target_link_libraries(pie_driver_cuda PRIVATE
   CUDA::cudart
   CUDA::cublas
   CUDA::cublasLt
+  CUDA::cuda_driver
+  ${NCCL_LIBRARY}
 )

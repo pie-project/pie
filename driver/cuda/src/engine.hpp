@@ -40,6 +40,7 @@ public:
     Engine& operator=(Engine&&) noexcept = default;
 
     const HfConfig& hf_config() const noexcept { return hf_; }
+    const DistributedConfig& distributed() const noexcept { return boot_.distributed; }
     EngineCapabilities capabilities() const;
 
     /// Number of weights physically resident on device.

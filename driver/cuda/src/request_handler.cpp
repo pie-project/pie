@@ -1,6 +1,7 @@
 #include "request_handler.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -14,6 +15,7 @@
 #include "brle.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
+#include "distributed.hpp"
 #include "engine.hpp"
 #include "kv_cache.hpp"
 #include "msgpack_subpass.hpp"
@@ -28,6 +30,108 @@
 #include "spec_expansion.hpp"
 
 namespace pie_cuda_driver {
+
+namespace {
+
+// Broadcast header sent from rank 0 → followers before each fire's
+// per-fire payload. Followers parse it to size the subsequent broadcasts
+// + the forward call. Two magic values:
+//
+//   * TP_FIRE_MAGIC: a regular fire is incoming; payload broadcasts follow.
+//   * TP_STOP_MAGIC: shutdown sentinel; follower exits its serve loop.
+//
+// Sized at exactly 8 i32 so we can broadcast it as `8 * sizeof(int32_t)`
+// bytes without alignment surprises across compilers.
+struct TpFireHeader {
+    std::int32_t magic;
+    std::int32_t total_tokens;
+    std::int32_t num_requests;
+    std::int32_t is_pure_decode;
+    std::int32_t kv_indices_count;
+    std::int32_t mask_bytes;
+    std::int32_t mask_indptr_count;
+    std::int32_t reserved;
+};
+static_assert(sizeof(TpFireHeader) == 8 * sizeof(std::int32_t),
+              "TpFireHeader must pack into exactly 8 ints");
+constexpr std::int32_t TP_FIRE_MAGIC = 0x55504954;  // 'TPIU' tag
+constexpr std::int32_t TP_STOP_MAGIC = 0x504F5453;  // 'STOP' tag
+
+// Lazily-allocated 32-byte device buffer holding the broadcast header.
+// Both rank 0 and followers reuse it across fires; no need to plumb it
+// through ForwardContext.
+std::int32_t* tp_hdr_dev_buf() {
+    static std::int32_t* buf = nullptr;
+    if (buf == nullptr) {
+        CUDA_CHECK(cudaMalloc(&buf, sizeof(TpFireHeader)));
+    }
+    return buf;
+}
+
+// Issue every per-fire broadcast in dependency order. Caller has already
+// refilled `pi.*` with the current fire's data; this just fans them out.
+// All ops run on the default stream so they sequence correctly with the
+// kernels that follow inside `forward_fn.body`.
+void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
+                         int N, int R, bool is_pure_decode,
+                         int kv_indices_count,
+                         int mask_bytes, int mask_indptr_count,
+                         cudaStream_t stream)
+{
+    auto* d_hdr = tp_hdr_dev_buf();
+    TpFireHeader hdr{
+        TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
+        kv_indices_count, mask_bytes, mask_indptr_count, 0,
+    };
+    // Header goes first (synchronous from the followers' POV — they need
+    // to parse sizes before posting matching payload broadcasts).
+    CUDA_CHECK(cudaMemcpyAsync(d_hdr, &hdr, sizeof(hdr),
+                               cudaMemcpyHostToDevice, stream));
+    NCCL_CHECK(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,
+                             comm.comm(), stream));
+    // Group the payload broadcasts so NCCL submits them as a single batch
+    // — tens of microseconds of host-side launch overhead saved per fire,
+    // most visible at small batch sizes (decode where each broadcast is
+    // sub-KB but the fixed per-op cost dominates).
+    NCCL_CHECK(ncclGroupStart());
+    NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
+                             static_cast<std::size_t>(N) * 4, ncclChar, 0,
+                             comm.comm(), stream));
+    NCCL_CHECK(ncclBroadcast(pi.positions.data(), pi.positions.data(),
+                             static_cast<std::size_t>(N) * 4, ncclChar, 0,
+                             comm.comm(), stream));
+    NCCL_CHECK(ncclBroadcast(pi.qo_indptr.data(), pi.qo_indptr.data(),
+                             static_cast<std::size_t>(R + 1) * 4, ncclChar, 0,
+                             comm.comm(), stream));
+    NCCL_CHECK(ncclBroadcast(pi.kv_page_indptr.data(), pi.kv_page_indptr.data(),
+                             static_cast<std::size_t>(R + 1) * 4, ncclChar, 0,
+                             comm.comm(), stream));
+    if (R > 0) {
+        NCCL_CHECK(ncclBroadcast(pi.kv_last_page_lens.data(),
+                                 pi.kv_last_page_lens.data(),
+                                 static_cast<std::size_t>(R) * 4, ncclChar, 0,
+                                 comm.comm(), stream));
+    }
+    if (kv_indices_count > 0) {
+        NCCL_CHECK(ncclBroadcast(pi.kv_page_indices.data(),
+                                 pi.kv_page_indices.data(),
+                                 static_cast<std::size_t>(kv_indices_count) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+    }
+    if (mask_bytes > 0) {
+        NCCL_CHECK(ncclBroadcast(pi.custom_mask.data(),
+                                 pi.custom_mask.data(),
+                                 static_cast<std::size_t>(mask_bytes), ncclChar, 0,
+                                 comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(pi.custom_mask_indptr.data(),
+                                 pi.custom_mask_indptr.data(),
+                                 static_cast<std::size_t>(mask_indptr_count) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+    }
+    NCCL_CHECK(ncclGroupEnd());
+}
+
+}  // namespace
 
 std::size_t handle_fire_batch(
     const SlotRequest& req,
@@ -48,8 +152,12 @@ std::size_t handle_fire_batch(
     const int max_workspace_tokens = ctx.max_workspace_tokens;
 
     // Track whether the custom-mask path was populated this fire so the
-    // forward kernel knows whether to consume `pi.custom_mask`.
+    // forward kernel knows whether to consume `pi.custom_mask`. Sizes are
+    // stashed alongside so the TP broadcast knows how many bytes to fan
+    // out to followers.
     bool have_custom_mask = false;
+    int mask_bytes = 0;
+    int mask_indptr_count = 0;
 
     try {
         namespace S = pie_cuda_driver::schema;
@@ -208,6 +316,8 @@ std::size_t handle_fire_batch(
             }
             pi.custom_mask.copy_from_host(std::span<const std::uint8_t>(packed));
             pi.custom_mask_indptr.copy_from_host(std::span<const std::int32_t>(ind));
+            mask_bytes = static_cast<int>(packed.size());
+            mask_indptr_count = static_cast<int>(ind.size());
             have_custom_mask = true;
         } else if (!is_pure_decode && !fmask_view.empty()) {
             const auto qo_span =
@@ -228,30 +338,55 @@ std::size_t handle_fire_batch(
                     std::span<const std::uint8_t>(decoded.packed));
                 pi.custom_mask_indptr.copy_from_host(
                     std::span<const std::int32_t>(decoded.mask_indptr));
+                mask_bytes = static_cast<int>(decoded.packed.size());
+                mask_indptr_count = static_cast<int>(decoded.mask_indptr.size());
                 have_custom_mask = true;
             }
         }
 
-        // Forward pass. The graph-capture path activates only when the
-        // request handler decided this fire is pure-decode AND the
-        // caller passed a graph cache (`--cuda-graphs`). All other
-        // fires take the direct dispatch path that just calls the
-        // forward function.
+        // TP fan-out. Rank 0 broadcasts the per-fire payload (header +
+        // refilled persistent_inputs) to every follower so they can run
+        // the same forward kernels against an identical view of inputs.
+        // The all-reduces inside `forward_fn.body` then synchronise the
+        // ranks layer-by-layer.
+        if (ctx.tp_comm != nullptr) {
+            tp_broadcast_inputs(*ctx.tp_comm, pi,
+                                N, R, is_pure_decode,
+                                static_cast<int>(kvpi_view.size()),
+                                mask_bytes, mask_indptr_count,
+                                /*stream=*/nullptr);
+        }
+
+        // ── prepare hook ────────────────────────────────────────
+        // Always run the per-arch prepare phase first (when present).
+        // For graph-capable archs this updates pinned host / device
+        // plan state for the captured body to read. Lives outside any
+        // capture region so the host work re-runs every fire.
+        if (forward_fn.prepare) {
+            forward_fn.prepare(attn_ws, h_kvpp, R, is_pure_decode);
+        }
+
+        // ── Forward pass ────────────────────────────────────────
+        // Graph-capture path activates only when the arch declares
+        // itself graph-safe. The flag is the per-arch flip set in
+        // main.cpp once the dispatch upgrades to graph-stable kernel
+        // args (currently none — see ForwardFn::graph_safe).
         const bool try_graphs =
-            ctx.graph_cache != nullptr && is_pure_decode && !have_custom_mask;
+            ctx.graph_cache != nullptr && is_pure_decode && !have_custom_mask
+            && forward_fn.graph_safe;
         if (try_graphs) {
             const ForwardGraphKey key{R};
             cudaGraphExec_t exec = ctx.graph_cache->get(key);
             if (exec == nullptr) {
-                // First fire of this shape: capture. Forward writes its
+                // First fire of this shape: capture. Body writes its
                 // output to `ws` workspace buffers + `cache.k/v` pages.
                 // Persistent inputs (pi.*) provide stable kernel-arg
                 // pointers; the next replay reads new contents from the
-                // same addresses.
+                // same addresses, refreshed by `prepare` above.
                 cudaStream_t cstream = nullptr;
                 CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
                 CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
-                forward_fn(
+                forward_fn.body(
                     ws, kv_cache, attn_ws, cublas,
                     reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
                     reinterpret_cast<const std::int32_t*>(pi.positions.data()),
@@ -265,9 +400,6 @@ std::size_t handle_fire_batch(
                 cudaGraphDestroy(graph);
                 cudaStreamDestroy(cstream);
                 ctx.graph_cache->put(key, exec);
-                // Throttle the capture log: first 4 captures, then every
-                // 16th. At saturation R can swing across many distinct
-                // values, and one line per shape blows up the log.
                 const auto sz = ctx.graph_cache->size();
                 if (sz <= 4 || sz % 16 == 0) {
                     std::cerr << "[pie-driver-cuda] graph captured: R=" << R
@@ -277,7 +409,7 @@ std::size_t handle_fire_batch(
                 CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
             }
         } else {
-            forward_fn(
+            forward_fn.body(
                 ws, kv_cache, attn_ws, cublas,
                 reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
                 reinterpret_cast<const std::int32_t*>(pi.positions.data()),
@@ -538,6 +670,173 @@ std::size_t handle_fire_batch(
                   << req.req_id << ": " << e.what() << "\n";
         return 0;
     }
+}
+
+// ============================================================================
+// TP follower service loop
+// ============================================================================
+//
+// Symmetric counterpart of `handle_fire_batch` for ranks > 0:
+//
+//   * No shmem decode — the inputs arrive via NCCL broadcast from rank 0.
+//   * No sampling — only rank 0 owns the response buffer + sampler RNG.
+//   * No graph capture — the broadcast issues an h2d memcpy (`d_hdr`)
+//     and the body's all-reduces aren't graph-captured today; staying
+//     out of the graph path keeps semantics simple.
+//
+// The loop blocks on `ncclBroadcast` for the header. NCCL serialises ops
+// per-comm, so a follower naturally idles until rank 0 issues the
+// matching broadcast in `tp_broadcast_inputs`.
+void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
+    if (ctx.tp_comm == nullptr) {
+        std::cerr << "[pie-driver-cuda] tp_follower_serve: no tp_comm\n";
+        return;
+    }
+    auto& pi      = ctx.inputs;
+    auto& comm    = *ctx.tp_comm;
+    auto* d_hdr   = tp_hdr_dev_buf();
+    cudaStream_t stream = nullptr;
+
+    // Sized lazily; R is at most max_workspace_tokens (one request per token).
+    std::vector<std::uint32_t> h_qo, h_kvpp;
+
+    while (!stop.load()) {
+        // 1. Receive header.
+        NCCL_CHECK(ncclBroadcast(d_hdr, d_hdr, sizeof(TpFireHeader),
+                                 ncclChar, 0, comm.comm(), stream));
+        TpFireHeader hdr{};
+        CUDA_CHECK(cudaMemcpyAsync(&hdr, d_hdr, sizeof(hdr),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        if (hdr.magic == TP_STOP_MAGIC) break;
+        if (hdr.magic != TP_FIRE_MAGIC) {
+            std::cerr << "[pie-driver-cuda] tp follower: unexpected header "
+                      << "magic 0x" << std::hex << hdr.magic << std::dec
+                      << "; aborting\n";
+            break;
+        }
+
+        const int N = hdr.total_tokens;
+        const int R = hdr.num_requests;
+        const bool is_pure_decode = (hdr.is_pure_decode != 0);
+
+        // 2. Receive payloads. Mirror order in `tp_broadcast_inputs`,
+        //    grouped so NCCL submits the batch as a single op.
+        const bool have_custom_mask = (hdr.mask_bytes > 0);
+        NCCL_CHECK(ncclGroupStart());
+        NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
+                                 static_cast<std::size_t>(N) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(pi.positions.data(), pi.positions.data(),
+                                 static_cast<std::size_t>(N) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(pi.qo_indptr.data(), pi.qo_indptr.data(),
+                                 static_cast<std::size_t>(R + 1) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(pi.kv_page_indptr.data(),
+                                 pi.kv_page_indptr.data(),
+                                 static_cast<std::size_t>(R + 1) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+        if (R > 0) {
+            NCCL_CHECK(ncclBroadcast(pi.kv_last_page_lens.data(),
+                                     pi.kv_last_page_lens.data(),
+                                     static_cast<std::size_t>(R) * 4,
+                                     ncclChar, 0, comm.comm(), stream));
+        }
+        if (hdr.kv_indices_count > 0) {
+            NCCL_CHECK(ncclBroadcast(pi.kv_page_indices.data(),
+                                     pi.kv_page_indices.data(),
+                                     static_cast<std::size_t>(hdr.kv_indices_count) * 4,
+                                     ncclChar, 0, comm.comm(), stream));
+        }
+        if (have_custom_mask) {
+            NCCL_CHECK(ncclBroadcast(pi.custom_mask.data(),
+                                     pi.custom_mask.data(),
+                                     static_cast<std::size_t>(hdr.mask_bytes),
+                                     ncclChar, 0, comm.comm(), stream));
+            NCCL_CHECK(ncclBroadcast(pi.custom_mask_indptr.data(),
+                                     pi.custom_mask_indptr.data(),
+                                     static_cast<std::size_t>(hdr.mask_indptr_count) * 4,
+                                     ncclChar, 0, comm.comm(), stream));
+        }
+        NCCL_CHECK(ncclGroupEnd());
+
+        // 3. Pull the host views of qo/kv_page indptrs for the per-arch
+        // attention planner (lives outside the captured kernel sequence).
+        h_qo.resize(R + 1);
+        h_kvpp.resize(R + 1);
+        CUDA_CHECK(cudaMemcpyAsync(h_qo.data(), pi.qo_indptr.data(),
+                                   static_cast<std::size_t>(R + 1) * 4,
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_kvpp.data(), pi.kv_page_indptr.data(),
+                                   static_cast<std::size_t>(R + 1) * 4,
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // 4. Run the same forward function as rank 0. The all-reduces
+        // inside synchronise both ranks; we don't sample or write a
+        // response — that's rank-0-only.
+        if (ctx.forward_fn.prepare) {
+            ctx.forward_fn.prepare(ctx.attn_ws, h_kvpp.data(), R, is_pure_decode);
+        }
+        // Mirror rank 0's graph capture/replay decision so NCCL ops
+        // inside the body record on both ranks simultaneously (otherwise
+        // rank 0 would record while rank 1 executes, deadlocking the
+        // first capture). The same `(R)` shape key keeps the per-rank
+        // graph caches in lockstep; the captured graph on rank 1 has no
+        // sampling / response work, just the forward kernels + NCCL.
+        const bool try_graphs =
+            ctx.graph_cache != nullptr && is_pure_decode && !have_custom_mask
+            && ctx.forward_fn.graph_safe;
+        if (try_graphs) {
+            const ForwardGraphKey key{R};
+            cudaGraphExec_t exec = ctx.graph_cache->get(key);
+            if (exec == nullptr) {
+                cudaStream_t cstream = nullptr;
+                CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
+                CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
+                ctx.forward_fn.body(
+                    ctx.ws, ctx.kv_cache, ctx.attn_ws, ctx.cublas,
+                    reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
+                    reinterpret_cast<const std::int32_t*>(pi.positions.data()),
+                    pi.qo_indptr.data(), pi.kv_page_indices.data(),
+                    pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
+                    h_qo.data(), h_kvpp.data(),
+                    N, R, is_pure_decode, nullptr, nullptr);
+                cudaGraph_t graph = nullptr;
+                CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
+                CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+                cudaGraphDestroy(graph);
+                cudaStreamDestroy(cstream);
+                ctx.graph_cache->put(key, exec);
+            } else {
+                CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
+            }
+        } else {
+            ctx.forward_fn.body(
+                ctx.ws, ctx.kv_cache, ctx.attn_ws, ctx.cublas,
+                reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
+                reinterpret_cast<const std::int32_t*>(pi.positions.data()),
+                pi.qo_indptr.data(), pi.kv_page_indices.data(),
+                pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
+                h_qo.data(), h_kvpp.data(),
+                N, R, is_pure_decode,
+                have_custom_mask ? pi.custom_mask.data()        : nullptr,
+                have_custom_mask ? pi.custom_mask_indptr.data() : nullptr);
+        }
+    }
+}
+
+void tp_send_shutdown(NcclComm& comm) {
+    auto* d_hdr = tp_hdr_dev_buf();
+    cudaStream_t stream = nullptr;
+    TpFireHeader hdr{TP_STOP_MAGIC, 0, 0, 0, 0, 0, 0, 0};
+    CUDA_CHECK(cudaMemcpyAsync(d_hdr, &hdr, sizeof(hdr),
+                               cudaMemcpyHostToDevice, stream));
+    NCCL_CHECK(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,
+                             comm.comm(), stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 }  // namespace pie_cuda_driver

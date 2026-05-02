@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "distributed.hpp"
 #include "engine.hpp"
 #include "model/qwen3.hpp"           // Qwen3Weights / Qwen3Workspace shared
 #include "model/qwen3_forward.hpp"   // Qwen3Workspace (already declared)
@@ -62,13 +63,47 @@ struct LlamaLikeForwardCfg {
     // fastdiv for group_size and accepts arbitrary values; cost is
     // ~1.3× per-step latency vs the dedicated decode kernel.
     bool force_prefill_path = false;
+
+    // Tensor-parallel state. `tp_size = 1` (default) keeps the original
+    // single-GPU forward; `tp_size > 1` activates the sharded GEMM dims
+    // and drops in two NCCL all-reduces per layer (after o_proj and after
+    // down_proj). `tp_comm` must be non-null whenever tp_size > 1.
+    int tp_size = 1;
+    NcclComm* tp_comm = nullptr;
 };
 
-// Same call signature as `qwen3_forward_paged`, plus a `cfg` knob block.
+// Persistent decode-plan cache. Owned in main.cpp's serving setup so the
+// per-fire `prepare` hook (which calls `prepare_llama_like_decode_plan`)
+// can refresh the plan before the captured body reads from it. Hoisting
+// the plan out of the body lets the body live entirely inside a CUDA
+// graph capture region — no host-side work, no allocations.
+struct LlamaLikePlanState {
+    ops::DecodePlanCachePtr decode_plan;
+};
+
+// Refresh the decode plan for the current fire. Caller invokes this
+// BEFORE either a direct forward call OR a graph replay, outside any
+// capture region. No-op when `is_pure_decode == false` (the prefill
+// path doesn't use a pre-planned decode kernel).
+void prepare_llama_like_decode_plan(
+    LlamaLikePlanState& state,
+    AttentionWorkspace& attn_ws,
+    KvCache& cache,
+    const HfConfig& cfg,
+    const LlamaLikeForwardCfg& fwd_cfg,
+    const std::uint32_t* kv_page_indptr_h,
+    int num_requests,
+    bool is_pure_decode);
+
+// Same call signature as `qwen3_forward_paged`, plus a `cfg` knob block
+// and an externally-owned `LlamaLikePlanState`. The body never plans —
+// it only reads `state.decode_plan` (already populated by the prepare
+// hook) which makes the body graph-capture-safe.
 void llama_like_forward_paged(
     const Qwen3Weights& w,
     const HfConfig& cfg,
     const LlamaLikeForwardCfg& fwd_cfg,
+    const LlamaLikePlanState& plan_state,
     Qwen3Workspace& ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,

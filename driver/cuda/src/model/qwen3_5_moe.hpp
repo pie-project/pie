@@ -88,6 +88,12 @@ struct Qwen3_5MoeWeights {
     // bind time (Qwen3.6-35B-A3B ships them as bf16 even though the FLA
     // path consumes them in fp32). One pair per linear-attn layer.
     std::vector<DeviceBuffer<float>> owned_fp32_buffers;
+
+    // Owned bf16 copies of per-rank-sliced linear-attn weights and
+    // routed-expert weights. Same role as in Qwen3_5Weights — these
+    // tensors have block / fused layouts that don't shard cleanly under
+    // uniform axis-0 partitioning, so we slice them by hand at bind time.
+    std::vector<DeviceTensor> owned_bf16_buffers;
 };
 
 Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine);

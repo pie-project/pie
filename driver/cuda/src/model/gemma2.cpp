@@ -100,14 +100,19 @@ void gemma2_forward_paged(
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d)
 {
+    // TP-local dims. tp_size == 1 reverts to single-GPU shapes.
+    const int T  = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
     const int H  = cfg.hidden_size;
-    const int Hq = cfg.num_attention_heads * cfg.head_dim;
-    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
-    const int I  = cfg.intermediate_size;
+    const int Hq = (cfg.num_attention_heads * cfg.head_dim) / T;
+    const int Hk = (cfg.num_key_value_heads * cfg.head_dim) / T;
+    const int I  = cfg.intermediate_size / T;
+    const int num_q_heads_local  = cfg.num_attention_heads / T;
+    const int num_kv_heads_local = cfg.num_key_value_heads / T;
     const int V  = cfg.vocab_size;
     const int d  = cfg.head_dim;
     const float eps = cfg.rms_norm_eps;
     cudaStream_t stream = nullptr;
+    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
 
@@ -123,7 +128,7 @@ void gemma2_forward_paged(
         decode_plan = ops::make_decode_plan();
         ops::plan_attention_flashinfer_decode_bf16(
             *decode_plan, kv_page_indptr_h, R,
-            cfg.num_attention_heads, cfg.num_key_value_heads, d,
+            num_q_heads_local, num_kv_heads_local, d,
             cache.page_size(), attn_ws, stream);
     }
 
@@ -159,12 +164,12 @@ void gemma2_forward_paged(
         if (fwd_cfg.use_qk_norm && layer.q_norm) {
             kernels::launch_rmsnorm_gemma_bf16(
                 ws.q.data(), layer.q_norm->data(), ws.q.data(),
-                N * cfg.num_attention_heads, d, eps, stream);
+                N * num_q_heads_local, d, eps, stream);
         }
         if (fwd_cfg.use_qk_norm && layer.k_norm) {
             kernels::launch_rmsnorm_gemma_bf16(
                 ws.k.data(), layer.k_norm->data(), ws.k.data(),
-                N * cfg.num_key_value_heads, d, eps, stream);
+                N * num_kv_heads_local, d, eps, stream);
         }
 
         if (need_q_pre_scale) {
@@ -183,13 +188,13 @@ void gemma2_forward_paged(
 
         kernels::launch_rope_bf16(
             ws.q.data(), ws.k.data(), positions,
-            N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+            N, num_q_heads_local, num_kv_heads_local, d,
             layer_rope_theta, stream);
 
         kernels::launch_write_kv_to_pages_bf16(
             cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+            N, R, cache.page_size(), num_kv_heads_local, d, stream);
 
         const int layer_window_left =
             (!fwd_cfg.per_layer_window_left.empty() &&
@@ -209,23 +214,28 @@ void gemma2_forward_paged(
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                N, R, num_q_heads_local, num_kv_heads_local, d,
                 cache.page_size(), attn_ws, stream);
         } else {
             ops::launch_attention_flashinfer_prefill_bf16(
                 ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                N, R, num_q_heads_local, num_kv_heads_local, d,
                 cache.page_size(), attn_ws, stream,
                 layer_window_left, fwd_cfg.attn_logit_softcap);
         }
 
         // 1c. o_proj → norm_x scratch (NOT into y), apply post-attn norm,
-        //     then residual-add into y.
+        //     then residual-add into y. Under TP this is row-parallel; we
+        //     all-reduce the partial sum before the post-attn norm sees it.
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
             N, H, Hq, /*beta=*/0.f);
+        if (T > 1) {
+            tp->all_reduce_bf16(ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H, ncclSum, stream);
+        }
         kernels::launch_rmsnorm_gemma_bf16(
             ws.norm_x.data(), layer.attn_norm_post->data(), ws.norm_y.data(),
             N, H, eps, stream);
@@ -249,9 +259,14 @@ void gemma2_forward_paged(
             N * I, stream);
 
         // 2c. down → norm_x scratch, apply post-MLP norm, residual-add.
+        // Same row-parallel + all-reduce dance as o_proj.
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.gate.data(), layer.down_proj->data(), ws.norm_x.data(),
             N, H, I, /*beta=*/0.f);
+        if (T > 1) {
+            tp->all_reduce_bf16(ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H, ncclSum, stream);
+        }
         kernels::launch_rmsnorm_gemma_bf16(
             ws.norm_x.data(), layer.mlp_norm_post->data(), ws.norm_y.data(),
             N, H, eps, stream);

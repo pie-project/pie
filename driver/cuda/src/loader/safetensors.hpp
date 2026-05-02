@@ -69,6 +69,49 @@ public:
     /// is one-shot at boot, not a hot path).
     DeviceTensor load_to_device(const std::string& name);
 
+    /// Load a slice of `name` along `axis`, keeping only this rank's portion
+    /// of the world. Used by tensor-parallel binders to shard linear weights
+    /// at load time so each GPU only allocates its `1 / world_size` share.
+    ///
+    /// - 1-D tensors (biases): `axis` must be 0.
+    /// - 2-D tensors (linear weights): `axis ∈ {0, 1}`.
+    /// - The sharded dimension must be divisible by `world_size`.
+    /// - `axis < 0` (or `world_size == 1`) falls through to the unsharded
+    ///   `load_to_device` path.
+    DeviceTensor load_to_device_sharded(const std::string& name,
+                                        int axis, int rank, int world_size);
+
+    /// Load a contiguous row range `[row_offset, row_offset + rows)` of a
+    /// 2-D tensor, then shard *that range* along axis=0 across `world_size`,
+    /// returning this rank's slice. Used to unfuse phi-3-style fused
+    /// `qkv_proj.weight = [Hq | Hk | Hk, H]` into per-rank Q/K/V tensors
+    /// without ever materialising the full fused weight on a rank — naive
+    /// axis-0 sharding of the fused tensor would straddle the Q/K/V
+    /// block boundaries and is wrong.
+    /// Requires `rows % world_size == 0`. Returns a `[rows / world_size, H]`
+    /// owned device tensor.
+    DeviceTensor load_to_device_row_range_sharded(
+        const std::string& name,
+        std::int64_t row_offset, std::int64_t rows,
+        int rank, int world_size);
+
+    /// Load an MoE fused-experts gate_up tensor `[E, 2*Im, H]` and shard
+    /// each expert's `[gate(Im) | up(Im), H]` block along the Im axis,
+    /// returning `[E, 2*Im_local, H]` where `Im_local = Im / world_size`.
+    /// Reads strided slices straight from the mmap into the per-rank
+    /// device buffer — never materialises the full fused tensor on the
+    /// rank, which is what allowed Qwen3.6-35B-A3B to OOM at TP=2.
+    DeviceTensor load_to_device_moe_gate_up_sharded(
+        const std::string& name, int rank, int world_size);
+
+    /// Load an MoE fused-experts down_proj tensor `[E, H, Im]` and shard
+    /// it along the Im axis, returning `[E, H, Im_local]` where
+    /// `Im_local = Im / world_size`. Same direct-from-mmap strategy as
+    /// `load_to_device_moe_gate_up_sharded`. Caller is responsible for
+    /// the cross-rank all-reduce after the down-proj GEMM.
+    DeviceTensor load_to_device_moe_down_sharded(
+        const std::string& name, int rank, int world_size);
+
 private:
     struct Shard {
         std::filesystem::path path;

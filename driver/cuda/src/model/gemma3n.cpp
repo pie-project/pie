@@ -266,12 +266,19 @@ void gemma3n_forward_paged(
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d)
 {
+    // TP-local dims. tp_size == 1 keeps single-GPU semantics. AltUp /
+    // Laurel / activation-sparsity / PLE work on the full [N, H] residual
+    // stream and stay replicated across ranks.
+    const int T  = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
     const int H  = cfg.hidden_size;
-    const int Hq = cfg.num_attention_heads * cfg.head_dim;
-    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
+    const int Hq = (cfg.num_attention_heads * cfg.head_dim) / T;
+    const int Hk = (cfg.num_key_value_heads * cfg.head_dim) / T;
+    const int num_q_heads_local  = cfg.num_attention_heads / T;
+    const int num_kv_heads_local = cfg.num_key_value_heads / T;
     const int V  = cfg.vocab_size;
     const int d  = cfg.head_dim;
     const float eps = cfg.rms_norm_eps;
+    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
     const int laurel_rank = cfg.laurel_rank;
     const int K = cfg.altup_num_inputs;
     const int act_idx = cfg.altup_active_idx;
@@ -409,7 +416,7 @@ void gemma3n_forward_paged(
         decode_plan = ops::make_decode_plan();
         ops::plan_attention_flashinfer_decode_bf16(
             *decode_plan, kv_page_indptr_h, R,
-            cfg.num_attention_heads, cfg.num_key_value_heads, d,
+            num_q_heads_local, num_kv_heads_local, d,
             cache.page_size(), attn_ws, stream);
     }
 
@@ -417,7 +424,11 @@ void gemma3n_forward_paged(
 
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
-        const int I = layer.intermediate;
+        // Per-layer intermediate is itself sharded under TP — every layer
+        // must satisfy `intermediate % tp_size == 0`. The base
+        // `cfg.intermediate_size` is the divisor we already check at
+        // engine load; per-layer overrides on gemma3n match that.
+        const int I = layer.intermediate / T;
         const int kv_layer = layer.kv_source;
 
         const std::uint16_t* active_in = static_cast<std::uint16_t*>(streams_in)
@@ -489,33 +500,33 @@ void gemma3n_forward_paged(
         }
         kernels::launch_rmsnorm_bf16(
             ws.q.data(), layer.q_norm->data(), ws.q.data(),
-            N * cfg.num_attention_heads, d, eps, stream);
+            N * num_q_heads_local, d, eps, stream);
         if (!layer.is_shared) {
             kernels::launch_rmsnorm_bf16(
                 ws.k.data(), layer.k_norm->data(), ws.k.data(),
-                N * cfg.num_key_value_heads, d, eps, stream);
+                N * num_kv_heads_local, d, eps, stream);
             // Gemma3n applies a *weightless* RMSNorm to V before storing
             // into the KV cache (Gemma3nRMSNorm with `with_scale=False`).
             kernels::launch_rmsnorm_no_scale_bf16(
                 ws.v.data(), ws.v.data(),
-                N * cfg.num_key_value_heads, d, eps, stream);
+                N * num_kv_heads_local, d, eps, stream);
         }
 
         const float layer_rope_theta = w.per_layer_rope_theta[L];
         if (layer.is_shared) {
             kernels::launch_rope_bf16(
                 ws.q.data(), ws.q.data(), positions,
-                N, cfg.num_attention_heads, cfg.num_attention_heads, d,
+                N, num_q_heads_local, num_q_heads_local, d,
                 layer_rope_theta, stream);
         } else {
             kernels::launch_rope_bf16(
                 ws.q.data(), ws.k.data(), positions,
-                N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                N, num_q_heads_local, num_kv_heads_local, d,
                 layer_rope_theta, stream);
             kernels::launch_write_kv_to_pages_bf16(
                 cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+                N, R, cache.page_size(), num_kv_heads_local, d, stream);
         }
 
         const int layer_window = w.per_layer_window_left[L];
@@ -537,7 +548,7 @@ void gemma3n_forward_paged(
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                N, R, num_q_heads_local, num_kv_heads_local, d,
                 cache.page_size(), attn_ws, stream,
                 /*window_left=*/-1, /*logits_soft_cap=*/0.f, gemma3n_sm_scale);
         } else {
@@ -545,15 +556,20 @@ void gemma3n_forward_paged(
                 ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                N, R, num_q_heads_local, num_kv_heads_local, d,
                 cache.page_size(), attn_ws, stream, layer_window,
                 /*logits_soft_cap=*/0.f, gemma3n_sm_scale);
         }
 
-        // o_proj → norm_x, post-attention norm → norm_y, residual.
+        // o_proj → norm_x, post-attention norm → norm_y, residual. Under
+        // TP this is row-parallel: all-reduce the partial before post-norm.
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
             N, H, Hq, /*beta=*/0.f);
+        if (T > 1) {
+            tp->all_reduce_bf16(ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H, ncclSum, stream);
+        }
         kernels::launch_rmsnorm_bf16(
             ws.norm_x.data(), layer.attn_norm_post->data(), ws.norm_y.data(),
             N, H, eps, stream);
@@ -584,9 +600,14 @@ void gemma3n_forward_paged(
         kernels::launch_geglu_tanh_bf16(
             ws.gate.data(), ws.up.data(), ws.gate.data(),
             N * I, stream);
+        // down_proj is row-parallel under TP. Same pattern as attention-O.
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.gate.data(), layer.down_proj->data(), ws.norm_x.data(),
             N, H, I, /*beta=*/0.f);
+        if (T > 1) {
+            tp->all_reduce_bf16(ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H, ncclSum, stream);
+        }
         kernels::launch_rmsnorm_bf16(
             ws.norm_x.data(), layer.mlp_norm_post->data(), ws.norm_y.data(),
             N, H, eps, stream);

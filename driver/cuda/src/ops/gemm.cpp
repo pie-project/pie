@@ -64,4 +64,32 @@ void gemm_act_x_wt_bf16(
           "cublasGemmEx");
 }
 
+void gemm_batched_act_x_wt_bf16(
+    cublasHandle_t handle,
+    const void* const* act_ptrs_dev,
+    const void* const* W_ptrs_dev,
+    void* const*       y_ptrs_dev,
+    int M, int N, int K,
+    int batch_count,
+    float beta)
+{
+    if (batch_count <= 0) return;
+    const float alpha = 1.f;
+    // Same row-major-as-col-major reinterpretation as the unbatched
+    // wrapper above: A=W (op_T), B=act (op_N), C=y (col-major NxM).
+    check(cublasGemmBatchedEx(
+              handle,
+              /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
+              /*m=*/N, /*n=*/M, /*k=*/K,
+              &alpha,
+              /*A=*/W_ptrs_dev,   CUDA_R_16BF, /*lda=*/K,
+              /*B=*/act_ptrs_dev, CUDA_R_16BF, /*ldb=*/K,
+              &beta,
+              /*C=*/y_ptrs_dev,   CUDA_R_16BF, /*ldc=*/N,
+              batch_count,
+              CUBLAS_COMPUTE_32F,
+              CUBLAS_GEMM_DEFAULT),
+          "cublasGemmBatchedEx");
+}
+
 }  // namespace pie_cuda_driver::ops

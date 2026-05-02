@@ -144,10 +144,18 @@ class _ReadyTimeout(RuntimeError):
     pass
 
 
-def _wait_for_ready(proc: subprocess.Popen, timeout_s: float) -> dict:
+def _wait_for_ready(
+    proc: subprocess.Popen,
+    timeout_s: float,
+    on_nccl_uid=None,
+) -> dict:
     """Read lines from `proc.stdout` until a `READY {json}` arrives. Anything
     else is forwarded to stderr so the user sees binary log output during
-    startup. Raises if the binary exits, times out, or emits malformed JSON."""
+    startup. If `on_nccl_uid` is given and the binary emits a `NCCL_UID <hex>`
+    line en route to READY, the callback is invoked with the hex string —
+    used by the leader to relay the unique-id to TP followers before they
+    spawn their own processes. Raises if the binary exits, times out, or
+    emits malformed JSON."""
     import selectors
 
     if proc.stdout is None:
@@ -156,7 +164,6 @@ def _wait_for_ready(proc: subprocess.Popen, timeout_s: float) -> dict:
     sel = selectors.DefaultSelector()
     sel.register(proc.stdout, selectors.EVENT_READ)
 
-    deadline_remaining = timeout_s
     import time
     start = time.monotonic()
 
@@ -181,6 +188,12 @@ def _wait_for_ready(proc: subprocess.Popen, timeout_s: float) -> dict:
 
         if line.startswith("READY "):
             return json.loads(line[len("READY "):])
+
+        if line.startswith("NCCL_UID "):
+            if on_nccl_uid is not None:
+                on_nccl_uid(line[len("NCCL_UID "):])
+            # Don't echo the id to stderr — it's an internal handshake.
+            continue
 
         # Pass through pre-READY chatter so users see startup progress.
         print(f"[pie_driver_cuda] {line}")
@@ -371,6 +384,34 @@ def _run_rpc_loop(
 # =============================================================================
 
 
+def _nccl_uid_path(pie_home: Path, master_port: int, group_id: int) -> Path:
+    """Filesystem rendezvous point for the NCCL unique-id within a TP group.
+    The leader writes here as soon as the binary emits NCCL_UID; followers
+    poll until the file exists, then pass the contents to their binary via
+    --nccl-unique-id-hex. Keyed on master_port so concurrent pie instances
+    don't collide."""
+    return pie_home / f"cuda-native-nccl-{master_port}-g{group_id}.hex"
+
+
+def _wait_for_uid_file(path: Path, timeout_s: float) -> str:
+    """Block until `path` exists and is readable, with a timeout. Used by
+    follower workers to pick up the leader's NCCL unique-id."""
+    import time
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if path.exists():
+            try:
+                hex_id = path.read_text().strip()
+                if hex_id:
+                    return hex_id
+            except OSError:
+                pass
+        time.sleep(0.05)
+    raise _ReadyTimeout(
+        f"NCCL unique-id file {path} did not appear within {timeout_s:.1f}s"
+    )
+
+
 def worker_main(
     local_rank: int,
     world_size: int,
@@ -381,15 +422,32 @@ def worker_main(
     group_topology: list[list[int]],
     ready_queue,
 ):
-    """Entry point invoked via `mp.spawn` from `pie/server.py`."""
-    if world_size != 1 or len(group_topology) != 1 or len(group_topology[0]) != 1:
-        raise NotImplementedError(
-            "cuda_native driver supports tensor_parallel_size=1 only "
-            "(M9 will add multi-rank). Use the `native` driver for TP>1."
-        )
+    """Entry point invoked via `mp.spawn` from `pie/server.py`.
+
+    Each TP group elects rank 0 as the leader: the leader's binary opens the
+    shmem region the runtime talks to, while followers stay headless and
+    consume their inputs over NCCL from the leader. The leader's binary
+    auto-generates the NCCL unique-id and prints it on stdout; this wrapper
+    drops it in a per-group rendezvous file so the follower wrappers can
+    relay it into their own binaries via `--nccl-unique-id-hex`."""
 
     rank = local_rank
     device = devices[rank] if rank < len(devices) else "cuda:0"
+
+    # Locate this rank within group_topology: [[0,1], [2,3]] for DP=2,TP=2
+    # → rank 2 is group_id=1, tp_rank=0 (leader of the second group).
+    group_id, tp_rank = -1, -1
+    for gid, group in enumerate(group_topology):
+        if rank in group:
+            group_id = gid
+            tp_rank = group.index(rank)
+            break
+    if group_id < 0:
+        raise RuntimeError(
+            f"rank {rank} not present in group_topology {group_topology}"
+        )
+    tp_size = len(group_topology[group_id])
+    is_leader = (tp_rank == 0)
 
     # Parse driver_config dict into the typed dataclass.
     driver_cfg = CudaNativeDriverConfig(**{
@@ -426,34 +484,64 @@ def worker_main(
         group_id=my_group_id,
     )
 
-    # Create the control-plane RPC server *before* spawning so we have a
-    # `server_name` ready for the ready_queue handshake.
-    server = RpcServer.create()
-    server_name = server.server_name()
+    # NCCL rendezvous file. Leader clears any stale copy at startup so
+    # followers can't pick up an id from a previous run.
+    uid_path = _nccl_uid_path(pie_home, master_port, group_id)
+    if is_leader and tp_size > 1:
+        try:
+            uid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
-    # Set up the wrapper↔binary control socket if KV swap is enabled.
-    # SOCK_SEQPACKET keeps message boundaries, which simplifies the binary's
-    # serve loop (one recv = one request).
-    ctrl_client = None
+    # Followers block here until the leader's binary has emitted its
+    # NCCL_UID line and this wrapper has dropped it into uid_path. The
+    # 60s budget covers slow CUDA init on cold boot; we trim it tighter
+    # once the bootstrap path is mature.
+    follower_uid_hex = None
+    if not is_leader:
+        follower_uid_hex = _wait_for_uid_file(uid_path, timeout_s=60.0)
+
+    # Build binary argv. TP flags are CLI-only — keeps the TOML the same
+    # whether tp_size is 1 or N.
     binary_argv = [str(binary), "--config", str(toml_path)]
-    # Optional: opt into CUDA-graph capture for the decode forward pass
-    # via `PIE_CUDA_GRAPHS=1` in the driver's environment. Off by
-    # default while we shake out correctness on more workloads.
+    if tp_size > 1:
+        binary_argv += ["--tp-size", str(tp_size), "--tp-rank", str(tp_rank)]
+        if not is_leader:
+            binary_argv += ["--nccl-unique-id-hex", follower_uid_hex]
     if os.environ.get("PIE_CUDA_GRAPHS") == "1":
+        # Currently a no-op: the binary's per-arch `forward_fn.graph_safe`
+        # gate stays false for llama_like (flashinfer DecodePlan bakes
+        # KV-size scalars into kernel args at capture time, producing
+        # garbled output once KV grows past the capture-time bucket).
+        # Forwarded to the binary anyway so a future arch flip enables
+        # capture without touching the wrapper.
         binary_argv.append("--cuda-graphs")
+
+    # Leader-only fixtures: the RPC server (cold-path KV swap RPCs from the
+    # runtime) and, when configured, the wrapper↔binary control socket for
+    # KV-page swap. Followers don't expose any RPC surface.
+    server = None
+    server_name = None
+    ctrl_client = None
     pass_fds: tuple = ()
     wrapper_sock = None
     binary_sock = None
-    if driver_cfg.swap_pool_size > 0:
-        wrapper_sock, binary_sock = socket.socketpair(
-            socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        # Make sure the binary's fd survives exec().
-        os.set_inheritable(binary_sock.fileno(), True)
-        binary_argv += ["--control-fd", str(binary_sock.fileno())]
-        pass_fds = (binary_sock.fileno(),)
-        ctrl_client = _CtrlClient(wrapper_sock)
+    if is_leader:
+        server = RpcServer.create()
+        server_name = server.server_name()
+        if driver_cfg.swap_pool_size > 0:
+            wrapper_sock, binary_sock = socket.socketpair(
+                socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            os.set_inheritable(binary_sock.fileno(), True)
+            binary_argv += ["--control-fd", str(binary_sock.fileno())]
+            pass_fds = (binary_sock.fileno(),)
+            ctrl_client = _CtrlClient(wrapper_sock)
 
-    # Spawn the binary.
+    # Spawn the binary. NCCL transport selection is left to NCCL's
+    # auto-tuner — forcing NCCL_PROTO=LL was tried and hung the rank-0
+    # binary on the first all-reduce, suggesting our group setup
+    # (per-process unique-id, rank pinned to its own GPU) does not
+    # play well with the LL protocol path. Defaults are fine.
     proc = subprocess.Popen(
         binary_argv,
         stdout=subprocess.PIPE,
@@ -466,39 +554,58 @@ def worker_main(
         # Parent doesn't need the binary's end of the pair anymore.
         binary_sock.close()
 
-    try:
-        caps_dict = _wait_for_ready(proc, driver_cfg.ready_timeout_s)
-    except Exception:
-        proc.kill()
-        proc.wait(timeout=2)
-        raise
-
-    # Start a thread to drain stderr for the lifetime of the process.
+    # Start the stderr drain *before* waiting for READY — otherwise a binary
+    # that dies during model load (OOM, missing tensor, etc.) fills its
+    # stderr pipe to the buffer cap, blocks on write, never exits cleanly,
+    # and the user sees only "worker died exit code 1" with no detail.
     stderr_thread = threading.Thread(
         target=_stream_stderr, args=(proc,), daemon=True
     )
     stderr_thread.start()
 
-    # Translate the binary's capability JSON into DriverCapabilities. Fields
-    # the binary couldn't fill in (M1.1 stub) come back as zeros / empty
-    # strings; M1.2+ will populate them.
-    caps = DriverCapabilities(
-        total_pages=int(caps_dict.get("total_pages", 0)),
-        kv_page_size=int(caps_dict.get("kv_page_size", driver_cfg.kv_page_size)),
-        swap_pool_size=int(caps_dict.get("swap_pool_size", 0)),
-        max_batch_tokens=int(caps_dict.get("max_batch_tokens", driver_cfg.max_batch_tokens)),
-        max_batch_size=int(caps_dict.get("max_batch_size", driver_cfg.max_batch_size)),
-        arch_name=str(caps_dict.get("arch_name", "")),
-        vocab_size=int(caps_dict.get("vocab_size", 0)),
-        max_model_len=int(caps_dict.get("max_model_len", 0)),
-        activation_dtype=str(caps_dict.get("activation_dtype", driver_cfg.weight_dtype)),
-        snapshot_dir=str(caps_dict.get("snapshot_dir") or snapshot_dir),
-    )
+    caps = None
+    if is_leader:
+        # Write the NCCL unique-id out as soon as the leader binary emits
+        # it; followers spin on this file's existence. We write atomically
+        # via tmp+rename so a partial read is impossible.
+        def _on_uid(hex_id: str) -> None:
+            tmp = uid_path.with_suffix(uid_path.suffix + ".tmp")
+            tmp.write_text(hex_id)
+            os.replace(tmp, uid_path)
 
-    ready_queue.put((rank, server_name, caps))
+        try:
+            caps_dict = _wait_for_ready(
+                proc, driver_cfg.ready_timeout_s,
+                on_nccl_uid=_on_uid if tp_size > 1 else None,
+            )
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=2)
+            raise
+
+        # Translate the binary's capability JSON into DriverCapabilities.
+        caps = DriverCapabilities(
+            total_pages=int(caps_dict.get("total_pages", 0)),
+            kv_page_size=int(caps_dict.get("kv_page_size", driver_cfg.kv_page_size)),
+            swap_pool_size=int(caps_dict.get("swap_pool_size", 0)),
+            max_batch_tokens=int(caps_dict.get("max_batch_tokens", driver_cfg.max_batch_tokens)),
+            max_batch_size=int(caps_dict.get("max_batch_size", driver_cfg.max_batch_size)),
+            arch_name=str(caps_dict.get("arch_name", "")),
+            vocab_size=int(caps_dict.get("vocab_size", 0)),
+            max_model_len=int(caps_dict.get("max_model_len", 0)),
+            activation_dtype=str(caps_dict.get("activation_dtype", driver_cfg.weight_dtype)),
+            snapshot_dir=str(caps_dict.get("snapshot_dir") or snapshot_dir),
+        )
+
+
+    # Followers send (rank, None, None) — server.py only treats payloads
+    # carrying a non-None server_name as DriverCapabilities-bearing.
+    if is_leader:
+        ready_queue.put((rank, server_name, caps))
+    else:
+        ready_queue.put((rank, None, None))
 
     stop_event = threading.Event()
-    methods = _make_methods(ctrl_client)
 
     def _shutdown(signum, frame):
         stop_event.set()
@@ -507,7 +614,14 @@ def worker_main(
     signal.signal(signal.SIGINT, _shutdown)
 
     try:
-        _run_rpc_loop(server, stop_event, methods)
+        if is_leader:
+            methods = _make_methods(ctrl_client)
+            _run_rpc_loop(server, stop_event, methods)
+        else:
+            # Follower has no RPC interface to the runtime; just stay alive
+            # to keep the binary's NCCL comm in the group. The binary exits
+            # cleanly on SIGTERM (its own follower-idle loop handles that).
+            stop_event.wait()
     finally:
         # Close control socket so the binary's serve thread sees EOF.
         if wrapper_sock is not None:
@@ -527,3 +641,8 @@ def worker_main(
             toml_path.unlink(missing_ok=True)
         except Exception:
             pass
+        if is_leader and tp_size > 1:
+            try:
+                uid_path.unlink(missing_ok=True)
+            except OSError:
+                pass

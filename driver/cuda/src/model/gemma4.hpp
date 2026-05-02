@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "distributed.hpp"
 #include "engine.hpp"
 #include "kv_cache.hpp"
 #include "model/llama_like.hpp"
@@ -111,6 +112,13 @@ struct Gemma4ForwardCfg {
     // in flashinfer's decode dispatch table — same role as in
     // `LlamaLikeForwardCfg`.
     bool force_prefill_path = false;
+
+    // TP state. tp_size > 1 activates per-layer sharded dims (each layer
+    // shrinks Hq/Hk/I by tp_size) and inserts all-reduces after o_proj
+    // and down_proj. Per-layer head_dim is unaffected — only the head
+    // *count* divides.
+    int tp_size = 1;
+    NcclComm* tp_comm = nullptr;
 };
 
 // Bind helper: validates the Gemma-4 schema, populates per-layer

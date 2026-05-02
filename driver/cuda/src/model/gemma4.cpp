@@ -395,10 +395,16 @@ void gemma4_forward_paged(
             std::string t = std::string("L0_") + tag;
             dbg_dump_bf16(t.c_str(), p, n);
         };
+        // Per-layer dims sharded by tp_size on TP runs. The head/intermediate
+        // counts must be divisible by tp_size — guarded at engine load.
+        const int T  = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
         const int d  = layer.head_dim;
-        const int Hq = cfg.num_attention_heads * d;
-        const int Hk = cfg.num_key_value_heads * d;
-        const int I  = layer.intermediate;
+        const int num_q_heads_local  = cfg.num_attention_heads / T;
+        const int num_kv_heads_local = cfg.num_key_value_heads / T;
+        const int Hq = num_q_heads_local * d;
+        const int Hk = num_kv_heads_local * d;
+        const int I  = layer.intermediate / T;
+        NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
         // ── 3a. Attention block ─────────────────────────────────────────
         const void* attn_residual = ws.y.data();
@@ -428,34 +434,34 @@ void gemma4_forward_paged(
         if (l == 0 && !layer.is_shared) {
             cudaDeviceSynchronize();
             dump_l0("v_pre_norm", ws.v.data(),
-                    static_cast<std::size_t>(N) * cfg.num_key_value_heads * d);
+                    static_cast<std::size_t>(N) * num_kv_heads_local * d);
             dump_l0("q_pre_norm", ws.q.data(),
-                    static_cast<std::size_t>(N) * cfg.num_attention_heads * d);
+                    static_cast<std::size_t>(N) * num_q_heads_local * d);
         }
 
         // Per-head Q/K RMSNorm (Gemma-4 always has it).
         if (getenv("PIE_NO_QK_NORM") == nullptr) {
             kernels::launch_rmsnorm_bf16(
                 ws.q.data(), layer.q_norm->data(), ws.q.data(),
-                N * cfg.num_attention_heads, d, eps, stream);
+                N * num_q_heads_local, d, eps, stream);
             if (!layer.is_shared) {
                 kernels::launch_rmsnorm_bf16(
                     ws.k.data(), layer.k_norm->data(), ws.k.data(),
-                    N * cfg.num_key_value_heads, d, eps, stream);
+                    N * num_kv_heads_local, d, eps, stream);
                 // V-Norm: pure RMSNorm (no learnable scale) on V before the
                 // KV write. Gemma-4 trained against this; skipping it
                 // produces gibberish even though softmax stays well-formed.
                 kernels::launch_rmsnorm_no_scale_bf16(
                     ws.v.data(), ws.v.data(),
-                    N * cfg.num_key_value_heads, d, eps, stream);
+                    N * num_kv_heads_local, d, eps, stream);
             }
         }
         if (l == 0 && !layer.is_shared) {
             cudaDeviceSynchronize();
             dump_l0("v_post_norm", ws.v.data(),
-                    static_cast<std::size_t>(N) * cfg.num_key_value_heads * d);
+                    static_cast<std::size_t>(N) * num_kv_heads_local * d);
             dump_l0("q_post_norm", ws.q.data(),
-                    static_cast<std::size_t>(N) * cfg.num_attention_heads * d);
+                    static_cast<std::size_t>(N) * num_q_heads_local * d);
         }
 
         // RoPE: partial rotary on full-attention layers
@@ -468,12 +474,12 @@ void gemma4_forward_paged(
             if (partial) {
                 kernels::launch_rope_partial_bf16(
                     ws.q.data(), ws.k.data(), positions,
-                    N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                    N, num_q_heads_local, num_kv_heads_local, d,
                     rotary_dim, w.per_layer_rope_theta[l], stream);
             } else {
                 kernels::launch_rope_bf16(
                     ws.q.data(), ws.k.data(), positions,
-                    N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                    N, num_q_heads_local, num_kv_heads_local, d,
                     w.per_layer_rope_theta[l], stream);
             }
         } else {
@@ -482,12 +488,12 @@ void gemma4_forward_paged(
             if (partial) {
                 kernels::launch_rope_partial_bf16(
                     ws.q.data(), ws.q.data(), positions,
-                    N, cfg.num_attention_heads, /*num_kv_heads=*/0, d,
+                    N, num_q_heads_local, /*num_kv_heads=*/0, d,
                     rotary_dim, w.per_layer_rope_theta[l], stream);
             } else {
                 kernels::launch_rope_bf16(
                     ws.q.data(), ws.q.data(), positions,
-                    N, cfg.num_attention_heads, /*num_kv_heads=*/0, d,
+                    N, num_q_heads_local, /*num_kv_heads=*/0, d,
                     w.per_layer_rope_theta[l], stream);
             }
         }
@@ -498,7 +504,7 @@ void gemma4_forward_paged(
             kernels::launch_write_kv_to_pages_bf16(
                 cache.k(l), cache.v(l), ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+                N, R, cache.page_size(), num_kv_heads_local, d, stream);
         }
 
         // Plan + dispatch attention. Shared layers dispatch against the
@@ -513,7 +519,7 @@ void gemma4_forward_paged(
             decode_plan = ops::make_decode_plan();
             ops::plan_attention_flashinfer_decode_bf16(
                 *decode_plan, kv_page_indptr_h, R,
-                cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                num_q_heads_local, num_kv_heads_local, d,
                 cache.page_size(), attn_ws, stream);
             ops::dispatch_attention_flashinfer_decode_bf16(
                 *decode_plan,
@@ -527,7 +533,7 @@ void gemma4_forward_paged(
             ops::launch_attention_naive_paged_bf16(
                 ws.q.data(), cache.k(l), cache.v(l), ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                N, R, num_q_heads_local, num_kv_heads_local, d,
                 cache.page_size(), stream,
                 /*window_left=*/w.per_layer_window_left[l],
                 /*sm_scale=*/1.0f);
@@ -536,7 +542,7 @@ void gemma4_forward_paged(
                 ws.q.data(), cache.k(l), cache.v(l), ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                N, R, num_q_heads_local, num_kv_heads_local, d,
                 cache.page_size(), attn_ws, stream,
                 /*window_left=*/w.per_layer_window_left[l],
                 /*logits_soft_cap=*/0.f,
@@ -547,10 +553,16 @@ void gemma4_forward_paged(
         dump_l0("attn_out", ws.attn_out.data(),
                 static_cast<std::size_t>(N) * Hq);
 
-        // o_proj → norm_x scratch, post-attn norm, residual-add y.
+        // o_proj → norm_x scratch, post-attn norm, residual-add y. Under
+        // TP this is row-parallel: all-reduce the partial sums before
+        // post-norm sees them.
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
             N, H, Hq, /*beta=*/0.f);
+        if (T > 1) {
+            tp->all_reduce_bf16(ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H, ncclSum, stream);
+        }
         cudaDeviceSynchronize();
         dump_l0("o_proj_out", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
@@ -590,6 +602,10 @@ void gemma4_forward_paged(
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.gate.data(), layer.down_proj->data(), ws.norm_x.data(),
             N, H, I, /*beta=*/0.f);
+        if (T > 1) {
+            tp->all_reduce_bf16(ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H, ncclSum, stream);
+        }
         cudaDeviceSynchronize();
         dump_l0("mlp_down", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);

@@ -33,10 +33,21 @@ struct BatchingConfig {
     std::uint32_t swap_pool_size = 0;
 };
 
+// Tensor-parallel group geometry. Default {1, 0, ""} = single-GPU; nothing
+// in the forward path runs collectives. The wrapper writes these fields when
+// it spawns N>1 ranks per group; rank 0 is also the shmem leader.
+struct DistributedConfig {
+    int tp_size = 1;
+    int tp_rank = 0;
+    // Hex-encoded ncclUniqueId (256 chars). Empty when tp_size == 1.
+    std::string nccl_unique_id_hex;
+};
+
 struct Config {
     ShmemConfig shmem;
     ModelConfig model;
     BatchingConfig batching;
+    DistributedConfig distributed;
 };
 
 inline Config load_config(const std::filesystem::path& path) {
@@ -67,9 +78,27 @@ inline Config load_config(const std::filesystem::path& path) {
         c.batching.max_batch_size   = (*b)["max_batch_size"].value_or<int64_t>(c.batching.max_batch_size);
         c.batching.swap_pool_size   = (*b)["swap_pool_size"].value_or<int64_t>(c.batching.swap_pool_size);
     }
+    if (auto d = tbl["distributed"].as_table()) {
+        c.distributed.tp_size = static_cast<int>(
+            (*d)["tp_size"].value_or<int64_t>(c.distributed.tp_size));
+        c.distributed.tp_rank = static_cast<int>(
+            (*d)["tp_rank"].value_or<int64_t>(c.distributed.tp_rank));
+        c.distributed.nccl_unique_id_hex =
+            (*d)["nccl_unique_id_hex"].value_or(std::string{});
+    }
 
     if (c.model.hf_repo.empty()) {
         throw std::runtime_error("config: [model].hf_repo is required");
+    }
+    if (c.distributed.tp_size < 1) {
+        throw std::runtime_error("config: [distributed].tp_size must be >= 1");
+    }
+    if (c.distributed.tp_rank < 0 || c.distributed.tp_rank >= c.distributed.tp_size) {
+        throw std::runtime_error("config: [distributed].tp_rank out of range");
+    }
+    if (c.distributed.tp_size > 1 && c.distributed.nccl_unique_id_hex.empty()) {
+        throw std::runtime_error(
+            "config: [distributed].nccl_unique_id_hex required when tp_size > 1");
     }
     return c;
 }

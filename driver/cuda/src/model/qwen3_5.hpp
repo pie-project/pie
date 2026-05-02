@@ -87,6 +87,14 @@ struct Qwen3_5Weights {
     // whether HF ships them as fp32 (Qwen3.5-4B) or bf16 (Qwen3.6-MoE,
     // and likely other variants).
     std::vector<DeviceBuffer<float>> owned_fp32_buffers;
+
+    // Owned bf16 copies of per-rank-sliced linear-attn weights (fused
+    // in_proj_qkv [conv_dim_local, H], conv1d_w [conv_dim_local, 1, K],
+    // conv1d_b [conv_dim_local]). Only populated when tp_size > 1 — the
+    // engine loader stores these tensors replicated because the
+    // [K1 | K2 | V] block layout doesn't shard cleanly under uniform
+    // axis-0 partitioning, so we slice per-block here.
+    std::vector<DeviceTensor> owned_bf16_buffers;
 };
 
 Qwen3_5Weights bind_qwen3_5(Engine& engine);

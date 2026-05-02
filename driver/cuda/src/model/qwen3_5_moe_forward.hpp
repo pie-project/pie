@@ -43,6 +43,19 @@ struct Qwen3_5MoeMlpWorkspace {
     // Final MoE+shared sum buffer (pre residual).
     DeviceBuffer<std::uint16_t> moe_out;           // [N, H]
 
+    // Decode fast-path scratch — separate pointer arrays for gate_up
+    // and down_proj GEMMs (cuBLAS reads them at launch time, so the
+    // two GEMMs cannot share buffers). Each is a top_k device array
+    // of pointers; populated on-device by `launch_build_moe_ptrs_decode`
+    // so the whole MoE block is graph-capturable.
+    DeviceBuffer<const std::uint16_t*> a_gu_ptrs;  // [top_k]
+    DeviceBuffer<const std::uint16_t*> b_gu_ptrs;
+    DeviceBuffer<std::uint16_t*>       c_gu_ptrs;
+    DeviceBuffer<const std::uint16_t*> a_dn_ptrs;
+    DeviceBuffer<const std::uint16_t*> b_dn_ptrs;
+    DeviceBuffer<std::uint16_t*>       c_dn_ptrs;
+    DeviceBuffer<float>                batch_weights;  // [top_k] fp32
+
     static Qwen3_5MoeMlpWorkspace allocate(
         int max_tokens, int hidden, int num_experts, int top_k,
         int moe_intermediate, int shared_intermediate);
@@ -51,6 +64,8 @@ struct Qwen3_5MoeMlpWorkspace {
 void qwen3_5_moe_forward_paged(
     const Qwen3_5MoeWeights& w,
     const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3_5PlanState& plan_state,
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     Qwen3_5MoeMlpWorkspace& moe_ws,

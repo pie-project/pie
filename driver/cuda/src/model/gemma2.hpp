@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "distributed.hpp"
 #include "engine.hpp"
 #include "kv_cache.hpp"
 #include "model/llama_like.hpp"
@@ -93,6 +94,13 @@ struct Gemma2ForwardCfg {
     // base across all layers; populated for Gemma-3 (full-attention
     // layers use ~1M, sliding layers use ~10K).
     std::vector<float> per_layer_rope_theta;
+
+    // Tensor-parallel state. tp_size == 1 keeps the original
+    // single-GPU forward; tp_size > 1 activates sharded GEMM dims
+    // and drops in two NCCL all-reduces per layer (after o_proj and
+    // after down_proj). `tp_comm` must be non-null whenever tp_size > 1.
+    int tp_size = 1;
+    NcclComm* tp_comm = nullptr;
 };
 
 Gemma2Weights bind_gemma2(const Engine& engine);

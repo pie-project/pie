@@ -105,33 +105,40 @@ Qwen3Weights bind_phi3(Engine& engine) {
     const std::int64_t I  = cfg.intermediate_size;
     const DType dtype = DType::BF16;
 
-    // Phi-3 stores QKV as one fused row-major `[Hq + 2*Hk, H]`. Slice
-    // it into the q/k/v_proj names that `bind_llama_like` expects.
+    // Phi-3 stores QKV as one fused row-major `[Hq + 2*Hk, H]`. On TP=1 we
+    // load the fused tensor and expose q/k/v as non-owning sub-views; on
+    // TP>1 the engine load loop has already pre-split the fused weight
+    // into per-rank q_proj/k_proj/v_proj tensors (a naive axis-0 split of
+    // the fused tensor straddles the Q/K/V block boundaries), so this
+    // function just verifies the unfused names exist and lets
+    // `bind_llama_like` pick them up.
     for (int i = 0; i < cfg.num_hidden_layers; ++i) {
         const std::string p = "model.layers." + std::to_string(i) + ".";
         const std::string fused_qkv = p + "self_attn.qkv_proj.weight";
-        if (!engine.has(fused_qkv)) {
+        if (engine.has(fused_qkv)) {
+            register_row_slice(engine, fused_qkv, p + "self_attn.q_proj.weight",
+                               /*row_offset=*/0,           Hq, H, dtype);
+            register_row_slice(engine, fused_qkv, p + "self_attn.k_proj.weight",
+                               /*row_offset=*/Hq,          Hk, H, dtype);
+            register_row_slice(engine, fused_qkv, p + "self_attn.v_proj.weight",
+                               /*row_offset=*/Hq + Hk,     Hk, H, dtype);
+        } else if (!engine.has(p + "self_attn.q_proj.weight")) {
             throw std::runtime_error(
-                "bind_phi3: expected fused weight " + fused_qkv);
+                "bind_phi3: neither fused " + fused_qkv +
+                " nor unfused q_proj is loaded");
         }
-        register_row_slice(engine, fused_qkv, p + "self_attn.q_proj.weight",
-                           /*row_offset=*/0,           Hq, H, dtype);
-        register_row_slice(engine, fused_qkv, p + "self_attn.k_proj.weight",
-                           /*row_offset=*/Hq,          Hk, H, dtype);
-        register_row_slice(engine, fused_qkv, p + "self_attn.v_proj.weight",
-                           /*row_offset=*/Hq + Hk,     Hk, H, dtype);
 
-        // Same trick for fused `gate_up_proj`: rows 0..I are gate, rows
-        // I..2I are up.
         const std::string fused_gu = p + "mlp.gate_up_proj.weight";
-        if (!engine.has(fused_gu)) {
+        if (engine.has(fused_gu)) {
+            register_row_slice(engine, fused_gu, p + "mlp.gate_proj.weight",
+                               /*row_offset=*/0, I, H, dtype);
+            register_row_slice(engine, fused_gu, p + "mlp.up_proj.weight",
+                               /*row_offset=*/I, I, H, dtype);
+        } else if (!engine.has(p + "mlp.gate_proj.weight")) {
             throw std::runtime_error(
-                "bind_phi3: expected fused weight " + fused_gu);
+                "bind_phi3: neither fused " + fused_gu +
+                " nor unfused gate_proj is loaded");
         }
-        register_row_slice(engine, fused_gu, p + "mlp.gate_proj.weight",
-                           /*row_offset=*/0, I, H, dtype);
-        register_row_slice(engine, fused_gu, p + "mlp.up_proj.weight",
-                           /*row_offset=*/I, I, H, dtype);
     }
     return bind_llama_like(engine);
 }

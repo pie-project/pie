@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "distributed.hpp"
 #include "engine.hpp"
 #include "kv_cache.hpp"
 #include "model/qwen3.hpp"
@@ -136,6 +137,13 @@ struct Gemma3nWeights {
 struct Gemma3nForwardCfg {
     float final_logit_softcap = 30.f;  // gemma3n config sets this
     bool  force_prefill_path  = false;
+
+    // TP state. tp_size > 1 shards the per-layer attention/MLP weights
+    // and inserts all-reduces after o_proj and the per-layer down_proj.
+    // AltUp / Laurel / activation-sparsity / PLE weights stay replicated
+    // — those sub-streams operate over the full hidden dim on every rank.
+    int tp_size = 1;
+    NcclComm* tp_comm = nullptr;
 };
 
 Gemma3nWeights bind_gemma3n(Engine& engine);

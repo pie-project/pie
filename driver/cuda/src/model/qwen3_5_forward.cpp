@@ -58,6 +58,7 @@ namespace {
 void linear_attn_layer_body(
     const Qwen3_5LayerWeights& Lw,
     const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la,
     Qwen3_5StateCache& state_cache,
@@ -67,9 +68,13 @@ void linear_attn_layer_body(
     ops::CublasHandle& cublas,
     cudaStream_t stream)
 {
+    // TP-local dims for linear-attention. tp_size == 1 keeps everything
+    // unsharded. The K/V head counts must divide tp_size (checked at
+    // engine load); each rank operates on its 1/T head share.
+    const int T        = std::max(1, fwd_cfg.tp_size);
     const int H        = cfg.hidden_size;
-    const int K_h      = cfg.linear_num_key_heads;
-    const int V_h      = cfg.linear_num_value_heads;
+    const int K_h      = cfg.linear_num_key_heads / T;
+    const int V_h      = cfg.linear_num_value_heads / T;
     const int K_d      = cfg.linear_key_head_dim;
     const int V_d      = cfg.linear_value_head_dim;
     const int K_dim    = K_h * K_d;
@@ -203,10 +208,24 @@ void linear_attn_layer_body(
         la.core_out_bf16.data(),
         N * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
 
-    // ── out_proj: [N, V_dim] → [N, H], write into ws.norm_y ────────
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        la.core_out_bf16.data(), Lw.la_out_proj->data(),
-        ws.norm_y.data(), N, H, V_dim);
+    // ── out_proj: [N, V_dim] → [N, H]. On TP=1 we fuse the residual via
+    //    beta=1; on TP>1 the proj is row-parallel so we write to scratch,
+    //    all-reduce, then residual-add into y.
+    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
+    if (T == 1) {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            la.core_out_bf16.data(), Lw.la_out_proj->data(),
+            ws.y.data(), N, H, V_dim, /*beta=*/1.f);
+    } else {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            la.core_out_bf16.data(), Lw.la_out_proj->data(),
+            ws.norm_y.data(), N, H, V_dim, /*beta=*/0.f);
+        tp->all_reduce_bf16(ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, ncclSum, stream);
+        kernels::launch_residual_add_bf16(
+            ws.y.data(), ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, stream);
+    }
 }
 
 // Full-attention layer body. Reads `ws.norm_x`, writes contribution
@@ -214,13 +233,14 @@ void linear_attn_layer_body(
 void full_attn_layer_body(
     const Qwen3_5LayerWeights& Lw,
     const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
+    const ops::DecodePlanCachePtr& decode_plan,  // non-null on decode path
     int kv_layer,
     int N, int R,
-    bool is_pure_decode,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
     const std::uint32_t* kv_page_indices,
@@ -231,13 +251,17 @@ void full_attn_layer_body(
     ops::CublasHandle& cublas,
     cudaStream_t stream)
 {
+    const int T  = std::max(1, fwd_cfg.tp_size);
     const int H  = cfg.hidden_size;
-    const int Hq = cfg.num_attention_heads * cfg.head_dim;
-    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
+    const int num_q_heads_local  = cfg.num_attention_heads / T;
+    const int num_kv_heads_local = cfg.num_key_value_heads / T;
+    const int Hq = num_q_heads_local * cfg.head_dim;
+    const int Hk = num_kv_heads_local * cfg.head_dim;
     const int d  = cfg.head_dim;
     const int rotary_dim = std::max<int>(2,
         2 * static_cast<int>(0.5f * cfg.partial_rotary_factor * d));
     const float eps = cfg.rms_norm_eps;
+    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
     // ── q/k/v projections (q is 2× wide for the output gate) ──────
     // qg_packed [N, 2*Hq] = norm_x @ q_proj.T
@@ -246,7 +270,7 @@ void full_attn_layer_body(
         la.fa_qg_packed.data(), N, 2 * Hq, H);
     kernels::launch_split_q_gate_bf16(
         la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
-        N, cfg.num_attention_heads, d, stream);
+        N, num_q_heads_local, d, stream);
 
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.fa_k_proj->data(),
@@ -258,50 +282,95 @@ void full_attn_layer_body(
     // ── q_norm / k_norm (gemma-style (1+w)·x_hat) ─────────────────
     kernels::launch_rmsnorm_gemma_bf16(
         ws.q.data(), Lw.fa_q_norm->data(), ws.q.data(),
-        N * cfg.num_attention_heads, d, eps, stream);
+        N * num_q_heads_local, d, eps, stream);
     kernels::launch_rmsnorm_gemma_bf16(
         ws.k.data(), Lw.fa_k_norm->data(), ws.k.data(),
-        N * cfg.num_key_value_heads, d, eps, stream);
+        N * num_kv_heads_local, d, eps, stream);
 
     // ── Partial RoPE ──────────────────────────────────────────────
     kernels::launch_rope_partial_bf16(
         ws.q.data(), ws.k.data(), positions,
-        N, cfg.num_attention_heads, cfg.num_key_value_heads,
+        N, num_q_heads_local, num_kv_heads_local,
         d, rotary_dim, cfg.rope_theta, stream);
 
     // ── Write K/V to paged cache ──────────────────────────────────
     kernels::launch_write_kv_to_pages_bf16(
         cache.k(kv_layer), cache.v(kv_layer), ws.k.data(), ws.v.data(),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+        N, R, cache.page_size(), num_kv_heads_local, d, stream);
 
     // ── Flashinfer attention ──────────────────────────────────────
-    // Always route through the prefill kernel — it handles qo_len=1 (the
-    // decode shape) correctly. Wiring the dedicated decode kernel + plan
-    // is an optional perf win; correctness is identical.
-    (void)is_pure_decode;
-    ops::launch_attention_flashinfer_prefill_bf16(
-        ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
-        qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        qo_indptr_h, kv_page_indptr_h,
-        N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-        cache.page_size(), attn_ws, stream);
+    // Decode path: pre-planned (graph-friendly). Prefill path: includes
+    // host work inside the launcher (PrefillPlan), so non-graph-capturable.
+    if (decode_plan) {
+        ops::dispatch_attention_flashinfer_decode_bf16(
+            *decode_plan,
+            ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            attn_ws, stream);
+    } else {
+        ops::launch_attention_flashinfer_prefill_bf16(
+            ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            qo_indptr_h, kv_page_indptr_h,
+            N, R, num_q_heads_local, num_kv_heads_local, d,
+            cache.page_size(), attn_ws, stream);
+    }
 
     // ── Output gate: attn_out *= sigmoid(gate) ────────────────────
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
 
-    // ── o_proj → ws.norm_y ────────────────────────────────────────
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.attn_out.data(), Lw.fa_o_proj->data(),
-        ws.norm_y.data(), N, H, Hq);
+    // ── o_proj fused with post-attn residual on TP=1; on TP>1 row-
+    //    parallel: write to scratch, all-reduce, residual-add to y.
+    if (T == 1) {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.attn_out.data(), Lw.fa_o_proj->data(),
+            ws.y.data(), N, H, Hq, /*beta=*/1.f);
+    } else {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.attn_out.data(), Lw.fa_o_proj->data(),
+            ws.norm_y.data(), N, H, Hq, /*beta=*/0.f);
+        tp->all_reduce_bf16(ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, ncclSum, stream);
+        kernels::launch_residual_add_bf16(
+            ws.y.data(), ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, stream);
+    }
 }
 
 }  // namespace
 
+void prepare_qwen3_5_decode_plan(
+    Qwen3_5PlanState& state,
+    AttentionWorkspace& attn_ws,
+    KvCache& cache,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    const std::uint32_t* kv_page_indptr_h,
+    int num_requests,
+    bool is_pure_decode,
+    cudaStream_t stream)
+{
+    if (!is_pure_decode || fwd_cfg.force_prefill_path) {
+        // Body uses the prefill kernel — no plan to compute.
+        state.decode_plan.reset();
+        return;
+    }
+    if (!state.decode_plan) {
+        state.decode_plan = ops::make_decode_plan();
+    }
+    ops::plan_attention_flashinfer_decode_bf16(
+        *state.decode_plan, kv_page_indptr_h, num_requests,
+        cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+        cache.page_size(), attn_ws, stream);
+}
+
 void qwen3_5_forward_paged(
     const Qwen3_5Weights& w,
     const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3_5PlanState& plan_state,
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,
@@ -338,6 +407,13 @@ void qwen3_5_forward_paged(
         state_cache.reset(stream);
     }
 
+    // Decode plan was refreshed by `prepare_qwen3_5_decode_plan` before
+    // this body call (in serving) or as part of the host-side parity
+    // setup. Reading it from `plan_state` keeps host work — and its
+    // attendant cudaMemcpyAsync H2D from a stack-allocated indptr_h_buf
+    // — out of any cudaStream capture region.
+    const ops::DecodePlanCachePtr& decode_plan = plan_state.decode_plan;
+
     // 1. Embed.
     kernels::launch_embed_bf16(
         token_ids, w.embed->data(), ws.y.data(),
@@ -354,27 +430,29 @@ void qwen3_5_forward_paged(
 
         if (Lw.kind == Qwen3_5LayerWeights::Kind::LinearAttn) {
             linear_attn_layer_body(
-                Lw, cfg, ws, la_ws, state_cache,
+                Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
                 static_cast<int>(L), N, is_pure_decode, cublas, stream);
         } else {
             full_attn_layer_body(
-                Lw, cfg, ws, la_ws, cache, attn_ws, Lw.kv_layer,
-                N, num_requests, is_pure_decode,
+                Lw, cfg, fwd_cfg, ws, la_ws, cache, attn_ws, decode_plan, Lw.kv_layer,
+                N, num_requests,
                 positions, qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
                 cublas, stream);
         }
 
-        // Residual: y += norm_y.
-        kernels::launch_residual_add_bf16(
-            ws.y.data(), ws.norm_y.data(),
-            (std::size_t)N * H, stream);
+        // (Post-attention residual is fused into the body's final GEMM
+        //  via beta=1 on tp_size==1, or all-reduce + residual_add for
+        //  tp_size>1. Either way ws.y has the post-attn state at this
+        //  point.)
 
         // Post-attention norm + SwiGLU MLP + residual.
         kernels::launch_rmsnorm_gemma_bf16(
             ws.y.data(), Lw.mlp_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
-        const int I = cfg.intermediate_size;
+        const int T_mlp = std::max(1, fwd_cfg.tp_size);
+        const int I = cfg.intermediate_size / T_mlp;
+        NcclComm* tp_mlp = (T_mlp > 1) ? fwd_cfg.tp_comm : nullptr;
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), Lw.gate_proj->data(),
             ws.gate.data(), N, I, H);
@@ -384,12 +462,22 @@ void qwen3_5_forward_paged(
         kernels::launch_swiglu_bf16(
             ws.gate.data(), ws.up.data(), ws.gate.data(),
             N * I, stream);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.gate.data(), Lw.down_proj->data(),
-            ws.norm_y.data(), N, H, I);
-        kernels::launch_residual_add_bf16(
-            ws.y.data(), ws.norm_y.data(),
-            (std::size_t)N * H, stream);
+        // down_proj: TP=1 fuses residual via beta=1; TP>1 is row-parallel
+        // — write to scratch, all-reduce, residual-add.
+        if (T_mlp == 1) {
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                ws.gate.data(), Lw.down_proj->data(),
+                ws.y.data(), N, H, I, /*beta=*/1.f);
+        } else {
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                ws.gate.data(), Lw.down_proj->data(),
+                ws.norm_y.data(), N, H, I, /*beta=*/0.f);
+            tp_mlp->all_reduce_bf16(ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H, ncclSum, stream);
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H, stream);
+        }
     }
 
     // 3. Final norm.
