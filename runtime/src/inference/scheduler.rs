@@ -347,24 +347,13 @@ impl BatchScheduler {
             // overflow), seed with it instead of blocking on recv.
             if batch.is_empty() {
                 if let Some(held) = held_for_next_batch.take() {
-                    // try_push on an empty batch always succeeds — the
-                    // overflow check only fires when batch is non-empty.
-                    // Use `.expect` (NOT debug_assert!) so the call still
-                    // executes in release builds; debug_assert! discards
-                    // the entire expression under optimization.
-                    batch
-                        .try_push(held)
-                        .ok()
-                        .expect("seed try_push on empty batch must succeed");
+                    batch.try_push(held).ok().expect("empty-batch push");
                 } else {
                     let Some(pending) = req_rx.recv().await else {
                         break;
                     };
                     policy.on_arrival();
-                    batch
-                        .try_push(pending)
-                        .ok()
-                        .expect("seed try_push on empty batch must succeed");
+                    batch.try_push(pending).ok().expect("empty-batch push");
                 }
             }
 
