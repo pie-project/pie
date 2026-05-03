@@ -331,17 +331,37 @@ inline bool& dbg_first_fire_flag() {
     static bool first = true;
     return first;
 }
+// True only when `PIE_GEMMA4_DUMP_DIR` is set in the environment.
+// Cached on first call so per-fire checks are a single bool load.
+inline bool dbg_dumps_enabled() {
+    static const bool enabled = std::getenv("PIE_GEMMA4_DUMP_DIR") != nullptr;
+    return enabled;
+}
 inline void dbg_dump_bf16(const char* tag, const void* dev_ptr,
                           std::size_t numel) {
-    static const char* dir = std::getenv("PIE_GEMMA4_DUMP_DIR");
-    if (dir == nullptr) return;
+    if (!dbg_dumps_enabled()) return;
     if (!dbg_first_fire_flag()) return;
+    static const char* dir = std::getenv("PIE_GEMMA4_DUMP_DIR");
     std::vector<std::uint16_t> tmp(numel);
     cudaMemcpy(tmp.data(), dev_ptr, numel * 2, cudaMemcpyDeviceToHost);
     std::string path = std::string(dir) + "/" + tag + ".bin";
     std::ofstream out(path, std::ios::binary);
     if (!out) return;
     out.write(reinterpret_cast<const char*>(tmp.data()), numel * 2);
+}
+// Sync-then-dump: paired with `dbg_dump_bf16` to guarantee the kernel
+// preceding the dump has finished. **Only syncs when dumping is on.**
+// Replaces the previous pattern of unconditional `cudaDeviceSynchronize()
+// + dbg_dump_bf16(...)` which stalled the GPU on every layer of every
+// fire even with no dump directory configured (the dumps no-op'd, but
+// the syncs did not — they were the dominant per-step overhead in
+// Gemma-4 release builds).
+inline void dbg_sync_dump_bf16(const char* tag, const void* dev_ptr,
+                               std::size_t numel) {
+    if (!dbg_dumps_enabled()) return;
+    if (!dbg_first_fire_flag()) return;
+    cudaDeviceSynchronize();
+    dbg_dump_bf16(tag, dev_ptr, numel);
 }
 
 // Read a single bf16 tensor's first element to host. Used for the
@@ -552,14 +572,12 @@ void gemma4_forward_paged(
     }
     kernels::launch_embed_bf16(
         token_ids, w.embed->data(), ws.y.data(), N, H, V, stream);
-    cudaDeviceSynchronize();
-    dbg_dump_bf16("embed_pre_scale", ws.y.data(),
+    dbg_sync_dump_bf16("embed_pre_scale", ws.y.data(),
                   static_cast<std::size_t>(N) * H);
     kernels::launch_scalar_mul_bf16(
         ws.y.data(), std::sqrt(static_cast<float>(H)),
         static_cast<std::size_t>(N) * H, stream);
-    cudaDeviceSynchronize();
-    dbg_dump_bf16("embed_post_scale", ws.y.data(),
+    dbg_sync_dump_bf16("embed_post_scale", ws.y.data(),
                   static_cast<std::size_t>(N) * H);
 
     // ── 2. Per-layer inputs (PLE) ────────────────────────────────────────
@@ -627,8 +645,7 @@ void gemma4_forward_paged(
     // (l+1)*ple_dim]` per layer below by pointer-arithmetic.
     auto* per_layer_base = static_cast<std::uint8_t*>(per_layer_proj);
     constexpr int bf16_bytes = 2;
-    cudaDeviceSynchronize();
-    dbg_dump_bf16("per_layer_inputs", per_layer_proj,
+    dbg_sync_dump_bf16("per_layer_inputs", per_layer_proj,
                   static_cast<std::size_t>(N) * L * ple_dim);
 
     // Hoist decode plan(s). Gemma-4 has dual head_dim so we plan twice
@@ -646,8 +663,13 @@ void gemma4_forward_paged(
     for (int l = 0; l < debug_max_layers; ++l) {
         const auto& layer = w.layers[l];
         const bool dump_this = (l == 0);
+        // Pair the sync with the dump so a release run (no dump dir
+        // env var) skips both — the standalone syncs that used to
+        // precede each dump_l0 call were the dominant per-step
+        // overhead on Gemma-4 (~3-15 ms per fire across 30 layers).
         auto dump_l0 = [&](const char* tag, const void* p, std::size_t n) {
-            if (!dump_this) return;
+            if (!dump_this || !dbg_dumps_enabled() || !dbg_first_fire_flag()) return;
+            cudaDeviceSynchronize();
             std::string t = std::string("L0_") + tag;
             dbg_dump_bf16(t.c_str(), p, n);
         };
@@ -669,7 +691,6 @@ void gemma4_forward_paged(
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.attn_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
-        cudaDeviceSynchronize();
         dump_l0("attn_norm_pre", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
 
@@ -700,7 +721,6 @@ void gemma4_forward_paged(
 
         // Pre-norm dumps for parity.
         if (l == 0 && !layer.is_shared) {
-            cudaDeviceSynchronize();
             dump_l0("v_pre_norm", ws.v.data(),
                     static_cast<std::size_t>(N) * num_kv_heads_local * d);
             dump_l0("q_pre_norm", ws.q.data(),
@@ -725,7 +745,6 @@ void gemma4_forward_paged(
             }
         }
         if (l == 0 && !layer.is_shared) {
-            cudaDeviceSynchronize();
             dump_l0("v_post_norm", ws.v.data(),
                     static_cast<std::size_t>(N) * num_kv_heads_local * d);
             dump_l0("q_post_norm", ws.q.data(),
@@ -817,7 +836,6 @@ void gemma4_forward_paged(
                 /*sm_scale=*/1.0f);
         }
 
-        cudaDeviceSynchronize();
         dump_l0("attn_out", ws.attn_out.data(),
                 static_cast<std::size_t>(N) * Hq);
 
@@ -831,19 +849,16 @@ void gemma4_forward_paged(
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
         }
-        cudaDeviceSynchronize();
         dump_l0("o_proj_out", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
         kernels::launch_rmsnorm_bf16(
             ws.norm_x.data(), layer.attn_norm_post->data(), ws.norm_y.data(),
             N, H, eps, stream);
-        cudaDeviceSynchronize();
         dump_l0("attn_norm_post", ws.norm_y.data(),
                 static_cast<std::size_t>(N) * H);
         kernels::launch_residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
-        cudaDeviceSynchronize();
         dump_l0("post_attn_y", ws.y.data(),
                 static_cast<std::size_t>(N) * H);
 
@@ -851,7 +866,6 @@ void gemma4_forward_paged(
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.mlp_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
-        cudaDeviceSynchronize();
         dump_l0("mlp_norm_pre", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
 
@@ -864,7 +878,6 @@ void gemma4_forward_paged(
         kernels::launch_geglu_tanh_bf16(
             ws.gate.data(), ws.up.data(), ws.gate.data(),
             N * I, stream);
-        cudaDeviceSynchronize();
         dump_l0("mlp_geglu", ws.gate.data(),
                 static_cast<std::size_t>(N) * I);
         ops::gemm_act_x_wt_bf16(cublas.handle(),
@@ -874,7 +887,6 @@ void gemma4_forward_paged(
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
         }
-        cudaDeviceSynchronize();
         dump_l0("mlp_down", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
 
@@ -906,7 +918,6 @@ void gemma4_forward_paged(
             kernels::launch_rmsnorm_bf16(
                 ws.norm_y.data(), layer.mlp_norm_post->data(),
                 ws.norm_x.data(), N, H, eps, stream);
-            cudaDeviceSynchronize();
             dump_l0("mlp_norm_post", ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H);
             kernels::launch_residual_add_bf16(
@@ -916,14 +927,12 @@ void gemma4_forward_paged(
             kernels::launch_rmsnorm_bf16(
                 ws.norm_x.data(), layer.mlp_norm_post->data(), ws.norm_y.data(),
                 N, H, eps, stream);
-            cudaDeviceSynchronize();
             dump_l0("mlp_norm_post", ws.norm_y.data(),
                     static_cast<std::size_t>(N) * H);
             kernels::launch_residual_add_bf16(
                 ws.y.data(), ws.norm_y.data(),
                 static_cast<std::size_t>(N) * H, stream);
         }
-        cudaDeviceSynchronize();
         dump_l0("post_mlp_y", ws.y.data(),
                 static_cast<std::size_t>(N) * H);
 
@@ -934,7 +943,6 @@ void gemma4_forward_paged(
         // → `ple_dim == 0`), which doesn't ship the per-layer triple at
         // all.
         if (ple_dim > 0 && getenv("PIE_NO_PLE") == nullptr) {
-        cudaDeviceSynchronize();
         dump_l0("ple_residual_in", ws.y.data(),
                 static_cast<std::size_t>(N) * H);
         // Gather this layer's slice of per_layer_inputs:
@@ -949,7 +957,6 @@ void gemma4_forward_paged(
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.y.data(), layer.ple_input_gate->data(), ws.norm_x.data(),
             N, ple_dim, H);
-        cudaDeviceSynchronize();
         dump_l0("ple_gate_pre_gelu", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * ple_dim);
         // GeGLU(tanh) but with the per-layer input acting as the "up"
@@ -969,13 +976,11 @@ void gemma4_forward_paged(
                                        ple_dim * bf16_bytes,
                                        cudaMemcpyDeviceToDevice, stream));
         }
-        cudaDeviceSynchronize();
         dump_l0("ple_signal_slice", ws.norm_y.data(),
                 static_cast<std::size_t>(N) * ple_dim);
         kernels::launch_geglu_tanh_bf16(
             ws.norm_x.data(), ws.norm_y.data(), ws.norm_x.data(),
             N * ple_dim, stream);
-        cudaDeviceSynchronize();
         dump_l0("ple_gated", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * ple_dim);
         // Project back to hidden, post-norm, add to residual.
@@ -993,11 +998,10 @@ void gemma4_forward_paged(
         // Parity dump: residual stream after attention/MLP/PLE for
         // the first few layers.
         if (l < 4) {
-            cudaDeviceSynchronize();
             char tag[32];
             std::snprintf(tag, sizeof tag, "layer_%d_post_ple_y", l);
-            dbg_dump_bf16(tag, ws.y.data(),
-                          static_cast<std::size_t>(N) * H);
+            dbg_sync_dump_bf16(tag, ws.y.data(),
+                               static_cast<std::size_t>(N) * H);
         }
 
         // ── 3d. Per-layer learnable scalar ────────────────────────────
@@ -1018,11 +1022,10 @@ void gemma4_forward_paged(
         // Post-layer_scalar dump for parity comparison against HF's
         // `hidden_states[layer+1]` (which is after the scalar mul).
         if (l < 4) {
-            cudaDeviceSynchronize();
             char tag[32];
             std::snprintf(tag, sizeof tag, "layer_%d_post_scalar_y", l);
-            dbg_dump_bf16(tag, ws.y.data(),
-                          static_cast<std::size_t>(N) * H);
+            dbg_sync_dump_bf16(tag, ws.y.data(),
+                               static_cast<std::size_t>(N) * H);
         }
     }
 
@@ -1038,8 +1041,7 @@ void gemma4_forward_paged(
             ws.logits.data(), fwd_cfg.final_logit_softcap,
             static_cast<std::size_t>(N) * V, stream);
     }
-    cudaDeviceSynchronize();
-    dbg_dump_bf16("logits_last", static_cast<const std::uint16_t*>(ws.logits.data())
+    dbg_sync_dump_bf16("logits_last", static_cast<const std::uint16_t*>(ws.logits.data())
                                   + static_cast<std::size_t>(N - 1) * V,
                   static_cast<std::size_t>(V));
     // After the first fire, freeze the dumps so subsequent decode
