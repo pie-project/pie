@@ -84,7 +84,8 @@ int run_parity(const pie_cuda_driver::Config& cfg,
     const bool is_gpt_oss  = (mt_for_parity == "gpt_oss");
     const bool is_gemma3n  = (mt_for_parity == "gemma3n" || mt_for_parity == "gemma3n_text");
     const bool is_qwen3_5  = (mt_for_parity == "qwen3_5" || mt_for_parity == "qwen3_5_text");
-    const bool is_qwen3_5_moe = (mt_for_parity == "qwen3_5_moe" || mt_for_parity == "qwen3_5_moe_text");
+    const bool is_qwen3_5_moe = (mt_for_parity == "qwen3_5_moe" || mt_for_parity == "qwen3_5_moe_text"
+                                 || mt_for_parity == "qwen3_moe");
     {
         const bool supported =
             mt_for_parity == "qwen3" || is_qwen3_5 || is_qwen3_5_moe
@@ -628,6 +629,7 @@ int run_impl(int argc,
             mt == "qwen3"
          || mt == "qwen3_5" || mt == "qwen3_5_text"
          || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
+         || mt == "qwen3_moe"
          || mt == "qwen2"
          || mt == "llama" || mt == "llama3"
          || mt == "mistral" || mt == "mistral3" || mt == "ministral3"
@@ -675,8 +677,13 @@ int run_impl(int argc,
         (mt_for_bind == "mixtral") || is_gpt_oss_arch;  // both use mixtral fwd
     const bool is_qwen3_5_arch =
         (mt_for_bind == "qwen3_5" || mt_for_bind == "qwen3_5_text");
+    // Qwen3-MoE (Qwen3-30B-A3B, model_type="qwen3_moe") and Qwen3.5/3.6-MoE
+    // (model_type="qwen3_5_moe[_text]") share the bind + forward path —
+    // engine.cpp::is_qwen3_5_moe_arch groups them, qwen3_5_moe.cpp branches
+    // internally on model_type for the layer_types/shared-expert quirks.
     const bool is_qwen3_5_moe_arch =
-        (mt_for_bind == "qwen3_5_moe" || mt_for_bind == "qwen3_5_moe_text");
+        (mt_for_bind == "qwen3_5_moe" || mt_for_bind == "qwen3_5_moe_text"
+         || mt_for_bind == "qwen3_moe");
 
     if (mt_for_bind == "phi3") {
         weights_llama = pie_cuda_driver::model::bind_phi3(engine);
