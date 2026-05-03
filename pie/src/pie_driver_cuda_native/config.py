@@ -44,7 +44,12 @@ class CudaNativeDriverConfig:
 
     # ── handshake ─────────────────────────────────────────────────────────
     # Seconds to wait for the binary's `READY` line on stdout before giving up.
-    ready_timeout_s: float = 120.0
+    # Sized for the largest expected load: Qwen3-30B-A3B-Base ships 18,867
+    # per-expert tensors and the MoE fuse + load takes ~240s on a single H200
+    # (mmap pass plus 18,432 device-to-device cudaMemcpyAsync into fused 3-D
+    # tensors). Smaller models still READY within seconds; this is just an
+    # upper bound that prevents premature kills.
+    ready_timeout_s: float = 600.0
 
     # Seconds to wait for graceful shutdown after SIGTERM before SIGKILL.
     shutdown_timeout_s: float = 5.0
