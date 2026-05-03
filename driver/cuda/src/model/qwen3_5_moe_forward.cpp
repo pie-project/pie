@@ -1,7 +1,9 @@
 #include "model/qwen3_5_moe_forward.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 #include <cuda_runtime.h>
 
@@ -623,9 +625,23 @@ void qwen3_5_moe_forward_paged(
     const std::uint8_t* /*mask_d*/,
     const std::int32_t* /*mask_indptr_d*/)
 {
-    if (num_requests != 1) {
+    // Multi-request batching support depends on whether the model has
+    // a hybrid linear-attn schedule. Pure-Qwen3-MoE (Qwen3-30B-A3B,
+    // model_type == "qwen3_moe") is full-attention-only — `full_attn_body`
+    // already takes `R` and `moe_block` walks all N tokens irrespective
+    // of how they're partitioned across requests. Qwen3.5 / 3.6-MoE
+    // additionally fire `linear_attn_body`, which still hard-assumes R=1
+    // (per-request state cache); guard those archs explicitly.
+    const bool has_linear_attn_layers = std::any_of(
+        w.layers.begin(), w.layers.end(),
+        [](const Qwen3_5MoeLayerWeights& Lw) {
+            return Lw.kind == Qwen3_5MoeLayerWeights::Kind::LinearAttn;
+        });
+    if (num_requests != 1 && has_linear_attn_layers) {
         throw std::runtime_error(
-            "qwen3_5_moe_forward_paged: multi-request not supported yet");
+            "qwen3_5_moe_forward_paged: multi-request batching not yet "
+            "supported on the linear-attn schedule (Qwen3.5/3.6-MoE); "
+            "got R=" + std::to_string(num_requests));
     }
     const int H  = cfg.hidden_size;
     const int V  = cfg.vocab_size;
