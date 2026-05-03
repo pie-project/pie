@@ -315,8 +315,8 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
             case PieArch::Phi3Small:
                 build_phi3small_();
                 break;
-            case PieArch::PhiMoe:
-                build_phimoe_();
+            case PieArch::Phi3_5Moe:
+                build_phi3_5moe_();
                 break;
             case PieArch::Gemma2:
                 build_gemma2_();
@@ -1120,14 +1120,15 @@ void Model::build_phi3small_() {
     }
 }
 
-// Phi-3.5-MoE (phimoe): Mixtral-style per-expert w1/w2/w3 layout +
-// block_sparse_moe.gate router, plus LayerNorm-with-bias on input /
-// post-attn / final norms, biases on Q/K/V/O, and bias on lm_head.
-void Model::build_phimoe_() {
+// Phi-3.5-MoE (phi3_5moe; HF model_type "phimoe"): Mixtral-style
+// per-expert w1/w2/w3 layout + block_sparse_moe.gate router, plus
+// LayerNorm-with-bias on input / post-attn / final norms, biases on
+// Q/K/V/O, and bias on lm_head.
+void Model::build_phi3_5moe_() {
     const auto& h = hparams_;
     if (h.num_experts <= 0 || h.num_experts_per_tok <= 0) {
         throw std::runtime_error(
-            "model phimoe: missing num_experts / num_experts_per_tok");
+            "model phi3_5moe: missing num_experts / num_experts_per_tok");
     }
 
     // Top-level: embed + final LayerNorm (with bias) + lm_head (with bias).

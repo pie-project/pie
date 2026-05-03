@@ -64,7 +64,7 @@ add_executable(pie_driver_portable
   src/graph_gemma4.cpp
   src/graph_qwen3_5.cpp
   src/graph_phi3small.cpp
-  src/graph_phimoe.cpp
+  src/graph_phi3_5moe.cpp
   src/response.cpp
   src/forward.cpp
   src/sampler.cpp

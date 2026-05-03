@@ -25,7 +25,7 @@ const char* pie_arch_name(PieArch a) {
         case PieArch::Qwen3Moe: return "qwen3_moe";
         case PieArch::Qwen3_5:  return "qwen3_5";
         case PieArch::Phi3Small: return "phi3small";
-        case PieArch::PhiMoe:    return "phimoe";
+        case PieArch::Phi3_5Moe: return "phi3_5moe";
     }
     return "?";
 }
@@ -51,7 +51,7 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
     if (hf_model_type == "gptoss")      return PieArch::GptOss;
     if (hf_model_type == "phi3")        return PieArch::Phi3;
     if (hf_model_type == "phi3small")   return PieArch::Phi3Small;
-    if (hf_model_type == "phimoe")      return PieArch::PhiMoe;
+    if (hf_model_type == "phimoe")      return PieArch::Phi3_5Moe;
     if (hf_model_type == "mixtral")     return PieArch::Mixtral;
     if (hf_model_type == "qwen3_moe")   return PieArch::Qwen3Moe;
     if (hf_model_type == "qwen3_5" ||
@@ -214,6 +214,14 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
         get_or<std::int32_t>(text, "max_position_embeddings", 4096);
 
     if (h.arch == PieArch::Phi3Small) {
+        h.phi3small_block_size =
+            get_or<std::int32_t>(text, "blocksparse_block_size", 64);
+        h.phi3small_num_local_blocks =
+            get_or<std::int32_t>(text, "blocksparse_num_local_blocks", 16);
+        h.phi3small_vert_stride =
+            get_or<std::int32_t>(text, "blocksparse_vert_stride", 8);
+        h.phi3small_dense_attention_every_n_layers =
+            get_or<std::int32_t>(text, "dense_attention_every_n_layers", 2);
         // Phi-3-small spells the FFN width as `ff_intermediate_size`
         // (the standard `intermediate_size` is absent), uses
         // `layer_norm_epsilon` (not rms_norm_eps), and `rope_embedding_base`

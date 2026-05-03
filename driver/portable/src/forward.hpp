@@ -73,6 +73,10 @@ public:
         std::int32_t  n_tokens_pad;   // GGML_PAD(n_tokens, 64)
         std::int32_t  n_kv;           // total KV positions to attend (= seq_len)
         std::vector<std::uint16_t> mask_f16;     // [n_kv, n_tokens_pad] F16
+        // Phi-3-small per-request blocksparse-clipped mask. Empty for
+        // other archs and for dense layers; consumed only by the
+        // blocksparse layers in graph_phi3small.cpp.
+        std::vector<std::uint16_t> mask_blocksparse_f16;
         std::vector<std::int32_t>  gather_idxs;  // [n_kv] physical KV row indices
         SamplerParams sampler;        // per-request sampler config (shared across slots)
         std::vector<std::uint32_t> logit_mask_runs;  // BRLE; empty = no mask

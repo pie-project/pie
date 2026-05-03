@@ -97,6 +97,10 @@ struct GraphInputs {
     ggml_tensor*              out_idx;     // I32 [n_request]
     // Slow path (per-request): one mask + gather tensor per request.
     std::vector<ggml_tensor*> masks;       // F16 [n_kv_r, n_tokens_pad_r]
+    // Phi-3-small only: per-request blocksparse-clipped mask used by
+    // blocksparse layers (every layer where (il+1) % dense_every_n != 0).
+    // Empty for other archs.
+    std::vector<ggml_tensor*> masks_blocksparse;
     std::vector<ggml_tensor*> gather_idxs; // I32 [n_kv_r] gather idxs per req
     // Fast path (pure-decode, M11): packed gather + mask, single attn call.
     ggml_tensor*              packed_gather = nullptr; // I32 [n_req * max_n_kv]

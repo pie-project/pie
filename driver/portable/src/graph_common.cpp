@@ -56,6 +56,7 @@ GraphInputs declare_graph_inputs(ggml_context* ctx,
         }
     } else {
         in.masks.reserve(n_req);
+        in.masks_blocksparse.reserve(n_req);
         in.gather_idxs.reserve(n_req);
         for (std::int32_t r = 0; r < n_req; ++r) {
             const auto& R = plan.reqs[r];
@@ -64,6 +65,19 @@ GraphInputs declare_graph_inputs(ggml_context* ctx,
             ggml_set_name(m, ("kq_mask." + std::to_string(r)).c_str());
             ggml_set_input(m);
             in.masks.push_back(m);
+
+            // Phi-3-small blocksparse companion mask. Allocated only
+            // when the request carries one (else null — per-layer code
+            // falls back to in.masks[r]).
+            if (!R.mask_blocksparse_f16.empty()) {
+                auto* mbs = ggml_new_tensor_4d(
+                    ctx, GGML_TYPE_F16, R.n_kv, R.n_tokens_pad, 1, 1);
+                ggml_set_name(mbs, ("kq_mask_bs." + std::to_string(r)).c_str());
+                ggml_set_input(mbs);
+                in.masks_blocksparse.push_back(mbs);
+            } else {
+                in.masks_blocksparse.push_back(nullptr);
+            }
 
             auto* g = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, R.n_kv);
             ggml_set_name(g, ("kv_gather." + std::to_string(r)).c_str());
@@ -340,6 +354,15 @@ void upload_graph_inputs(const GraphResult& g,
             const auto& gat  = plan.reqs[r].gather_idxs;
             ggml_backend_tensor_set(g.in.masks[r], mask.data(), 0,
                                     mask.size() * sizeof(std::uint16_t));
+            // Phi-3-small blocksparse upload (when present).
+            const auto& mask_bs = plan.reqs[r].mask_blocksparse_f16;
+            if (!g.in.masks_blocksparse.empty() &&
+                g.in.masks_blocksparse[r] != nullptr &&
+                !mask_bs.empty()) {
+                ggml_backend_tensor_set(
+                    g.in.masks_blocksparse[r], mask_bs.data(), 0,
+                    mask_bs.size() * sizeof(std::uint16_t));
+            }
             ggml_backend_tensor_set(g.in.gather_idxs[r], gat.data(), 0,
                                     gat.size() * sizeof(std::int32_t));
         }

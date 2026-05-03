@@ -308,7 +308,7 @@ private:
     void build_mistral3_();
     void build_phi3_();
     void build_phi3small_();
-    void build_phimoe_();
+    void build_phi3_5moe_();
     void build_gemma2_();
     void build_gemma3_();
     void build_gemma4_();

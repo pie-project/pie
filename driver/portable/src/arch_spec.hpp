@@ -18,6 +18,13 @@
 namespace pie_portable_driver {
 
 struct ArchSpec {
+    // Phi-3-small blocksparse attention. block_size > 0 enables it; the
+    // graph builder dispatches per-layer mask choice based on
+    // phi3small_dense_attention_every_n_layers.
+    std::int32_t phi3small_block_size                  = 0;
+    std::int32_t phi3small_num_local_blocks            = 0;
+    std::int32_t phi3small_vert_stride                 = 0;
+    std::int32_t phi3small_dense_attention_every_n_layers = 0;
     bool   has_qkv_bias       = false;  // qwen2, phi3 (sometimes)
     bool   has_qk_norm        = false;  // qwen3, gemma3, olmo3
     // Qwen3 / Gemma3 store Q/K-norm weights as [head_dim] — applied per-

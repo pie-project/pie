@@ -110,11 +110,17 @@ ArchSpec arch_spec_for(PieArch a, const Hparams& h) {
             // fused QKV is handled at load time too.
             break;
         case PieArch::Phi3Small:
-            // Per-arch dispatch lives in graph_phi3small.cpp; ArchSpec
-            // is unused for this arch beyond defaults.
+            // Per-arch dispatch lives in graph_phi3small.cpp; copy
+            // blocksparse params here so plan.cpp (which only sees
+            // ArchSpec) can build the right per-request mask.
+            s.phi3small_block_size                  = h.phi3small_block_size;
+            s.phi3small_num_local_blocks            = h.phi3small_num_local_blocks;
+            s.phi3small_vert_stride                 = h.phi3small_vert_stride;
+            s.phi3small_dense_attention_every_n_layers =
+                h.phi3small_dense_attention_every_n_layers;
             break;
-        case PieArch::PhiMoe:
-            // Per-arch dispatch lives in graph_phimoe.cpp.
+        case PieArch::Phi3_5Moe:
+            // Per-arch dispatch lives in graph_phi3_5moe.cpp.
             apply_moe_flags_(s, h);
             break;
         case PieArch::Mistral3:

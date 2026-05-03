@@ -46,7 +46,7 @@ enum class PieArch {
                  // ization. v1 graph treats blocksparse as causal (correct
                  // for prompts up to num_local_blocks * block_size = 1024
                  // tokens).
-    PhiMoe,      // Phi-3.5-MoE (microsoft); HF model_type "phimoe". Mixtral-
+    Phi3_5Moe,   // Phi-3.5-MoE (microsoft); HF model_type "phimoe". Mixtral-
                  // style sparse MoE (per-expert w1/w2/w3) with LayerNorm-
                  // with-bias norms, Q/K/V/O biases, lm_head bias.
 };
@@ -81,6 +81,11 @@ struct Hparams {
     float        mup_attn_multiplier         = 0.0f;  // 0 = unused
     float        mup_embedding_multiplier    = 0.0f;
     float        mup_width_multiplier        = 0.0f;
+    // Phi-3-small blocksparse attention parameters.
+    std::int32_t phi3small_block_size                  = 0;
+    std::int32_t phi3small_num_local_blocks            = 0;
+    std::int32_t phi3small_vert_stride                 = 0;
+    std::int32_t phi3small_dense_attention_every_n_layers = 0;
     std::int32_t gemma4_moe_intermediate_size = 0;
     std::int32_t hidden_size = 0;
     std::int32_t intermediate_size = 0;

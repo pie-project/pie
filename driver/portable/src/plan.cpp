@@ -11,6 +11,44 @@
 
 namespace pie_portable_driver {
 
+// Phi-3-small blocksparse mask: like build_attn_mask_f16 (causal +
+// optional BRLE override) but additionally enforces the blocksparse
+// pattern. A position kv_pos is allowed iff:
+//   (kv_pos in local window: q_pos - kv_pos < num_local_blocks * block_size)
+// OR
+//   (kv_pos in vertical-stride block: (kv_pos / block_size) % vert_stride == 0)
+// AND causal still applies (kv_pos <= q_pos). For seq_len within the
+// local window AND no stride blocks beyond it, this is identical to
+// the causal mask — short prompts are not affected.
+void build_phi3small_blocksparse_mask_f16(
+        std::vector<std::uint16_t>& dst,
+        std::int32_t n_kv, std::int32_t n_tokens, std::int32_t n_tokens_pad,
+        const std::int32_t* positions,
+        std::int32_t block_size, std::int32_t num_local_blocks,
+        std::int32_t vert_stride) {
+    dst.assign(static_cast<std::size_t>(n_kv) * n_tokens_pad,
+               ggml_fp32_to_fp16(-INFINITY));
+    const auto zero = ggml_fp32_to_fp16(0.0f);
+    const std::int32_t W = num_local_blocks * block_size;
+    for (std::int32_t i = 0; i < n_tokens; ++i) {
+        const std::int32_t p_i = positions[i];
+        std::uint16_t* row = dst.data() + static_cast<std::size_t>(i) * n_kv;
+        const std::int32_t hi = std::min(n_kv - 1, p_i);
+        const std::int32_t local_lo = std::max(0, p_i - W + 1);
+        // Local window (causal-clipped).
+        for (std::int32_t j = local_lo; j <= hi; ++j) row[j] = zero;
+        // Vertical-stride blocks: every vert_stride-th block from start
+        // is "always attended" (subject to causal). Iterate kv blocks
+        // outside the local window.
+        const std::int32_t local_lo_block = local_lo / block_size;
+        for (std::int32_t b = 0; b < local_lo_block; b += vert_stride) {
+            const std::int32_t a = b * block_size;
+            const std::int32_t e = std::min(a + block_size, hi + 1);
+            for (std::int32_t j = a; j < e; ++j) row[j] = zero;
+        }
+    }
+}
+
 void build_attn_mask_f16(std::vector<std::uint16_t>& dst,
                          std::int32_t n_kv,
                          std::int32_t n_tokens,
@@ -252,6 +290,20 @@ void plan_single_request(const PlanArrays& a,
                         plan.positions_i32.data() + qo_start,
                         a.batch_has_attn_masks ? per_token_runs.data() : nullptr,
                         spec.sliding_window);
+
+    // Phi-3-small: also build the blocksparse mask. Diverges from
+    // mask_f16 only when seq_len exceeds num_local_blocks * block_size
+    // (= 1024 with default params), so short-prompt smoke tests are
+    // bit-identical regardless of dispatch. block_size > 0 in the spec
+    // signals the arch is Phi-3-small.
+    if (spec.phi3small_block_size > 0) {
+        build_phi3small_blocksparse_mask_f16(
+            rp.mask_blocksparse_f16, seq_len, n_tok, rp.n_tokens_pad,
+            plan.positions_i32.data() + qo_start,
+            spec.phi3small_block_size,
+            spec.phi3small_num_local_blocks,
+            spec.phi3small_vert_stride);
+    }
 
     if (prefill_only) {
         // No sampling slots; sampler/labels/logit_mask stay default and the

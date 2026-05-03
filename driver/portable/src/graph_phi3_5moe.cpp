@@ -1,4 +1,4 @@
-// graph_phimoe.cpp — Phi-3.5-MoE graph builder.
+// graph_phi3_5moe.cpp — Phi-3.5-MoE graph builder.
 //
 // Phi-3.5-MoE = Mixtral-style sparse MoE + LayerNorm-with-bias + biases on
 // Q/K/V/O and lm_head. Reuses build_moe_ffn for the routing+expert dispatch.
@@ -9,7 +9,7 @@
 //   - MoE FFN (block_sparse_moe pattern, Mixtral naming via build_moe_ffn).
 //   - lm_head with bias.
 
-#include "graph_phimoe.hpp"
+#include "graph_phi3_5moe.hpp"
 
 #include <cmath>
 
@@ -32,7 +32,7 @@ ggml_tensor* layernorm_with_bias(ggml_context* ctx, ggml_tensor* x,
 
 }  // namespace
 
-GraphResult build_phimoe_graph(ggml_context* ctx,
+GraphResult build_phi3_5moe_graph(ggml_context* ctx,
                                const Model& model,
                                KvCachePaged& kv,
                                const ForwardEngine::BatchPlan& plan) {
