@@ -701,15 +701,21 @@ def _leader_loop(
         dst = torch.tensor(dst_ids, dtype=torch.long, device=gpu_kv[0].device)
         for layer_idx in range(len(gpu_kv)):
             gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
-        # Force CPU-side wait until the d2d kernel actually runs on GPU.
-        # The Rust caller (`device::copy_d2d_async` from snapshot::fork)
-        # awaits this RPC's response and only clears `pending_d2d` on
-        # the new context after we return. If we returned without
-        # synchronizing, the response could arrive before the kernel
-        # ran — and a fire_batch on the shmem busy-poll thread could
-        # then read stale dst pages. See
-        # `project_pie_kv_bleed_d2d_fork_race.md`.
-        torch.cuda.synchronize()
+        # NOTE: no torch.cuda.synchronize() here. On the (legacy)
+        # default stream, the index_copy_ kernels above are now
+        # enqueued in stream order. The Rust caller (`copy_d2d_async`
+        # from snapshot::fork) only clears pending_d2d after this
+        # RPC's response. Any subsequent fire_batch from the shmem
+        # busy-poll thread enqueues its forward-pass kernels onto
+        # the same default stream AFTER our index_copy_ kernels, so
+        # the GPU runs them in correct order without a CPU wait. A
+        # full sync here would block for ALL pending GPU work
+        # (forward passes for unrelated contexts), adding seconds of
+        # main-thread blocking under c≥16 sustained decode. See
+        # `project_pie_kv_bleed_d2d_fork_race.md`. If a future build
+        # ever switches to per-thread default streams, this MUST be
+        # replaced with a CUDA event recorded here + waited on
+        # before the next fire_batch.
 
     def _handle_copy_h2h(**kwargs) -> None:
         """H2H: copy pinned CPU pages to other CPU pages (no GPU involved)."""

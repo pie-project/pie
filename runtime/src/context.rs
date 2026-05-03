@@ -1146,6 +1146,24 @@ impl ContextManager {
         num_input_tokens: u32,
         response: oneshot::Sender<Result<PinnedContext>>,
     ) {
+        // Defer pin if the context is Pinned with d2d/replay in flight:
+        // pin returns page IDs that fire_batch reads, so we MUST wait
+        // for the working pages to actually contain valid data. Other
+        // content-independent ops (Reserve/Commit/Append) can proceed.
+        // See `project_pie_kv_bleed_d2d_fork_race.md`.
+        if let Some(ctx) = self.contexts.get_mut(&id) {
+            if ctx.is_pinned() && (ctx.pending_replay || ctx.pending_d2d) {
+                let on_alloc = move |mgr: &mut ContextManager, _pages: Vec<pagestore::PhysicalPageId>| {
+                    mgr.pin(id, num_input_tokens, response);
+                };
+                ctx.deferred_ops.push(PendingAlloc {
+                    device: ctx.device.unwrap_or(0) as usize,
+                    num_pages: 0,
+                    on_alloc: Box::new(on_alloc),
+                });
+                return;
+            }
+        }
         self.when_active(id, move |mgr| {
             let result = (|| -> Result<PinnedContext> {
                 // Token-budget gate: refuse to pin for a forward pass when
