@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -12,13 +13,16 @@
 
 #include "cuda_check.hpp"
 #include "kernels/embed.hpp"
+#include "kernels/gather_rows.hpp"
 #include "kernels/kv_paged.hpp"
+#include "kernels/moe_dispatch.hpp"
 #include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/scalar_mul.hpp"
 #include "kernels/softcap.hpp"
 #include "kernels/swiglu.hpp"
+#include "kernels/topk_softmax.hpp"
 #include "ops/attention_naive_paged.hpp"
 
 namespace pie_cuda_driver::model {
@@ -40,6 +44,40 @@ constexpr const char* kPrefix = "model.language_model.";
 
 }  // namespace
 
+Gemma4MoeMlpWorkspace Gemma4MoeMlpWorkspace::allocate(
+    int max_tokens, int hidden, int num_experts, int top_k,
+    int moe_intermediate)
+{
+    Gemma4MoeMlpWorkspace ws;
+    const std::size_t N    = static_cast<std::size_t>(max_tokens);
+    const std::size_t maxR = N * top_k;
+    const std::size_t H    = static_cast<std::size_t>(hidden);
+    const std::size_t I    = static_cast<std::size_t>(moe_intermediate);
+
+    ws.router_x      = DeviceBuffer<std::uint16_t>::alloc(N * H);
+    ws.router_logits = DeviceBuffer<std::uint16_t>::alloc(N * num_experts);
+    ws.topk_idx      = DeviceBuffer<std::int32_t>::alloc(N * top_k);
+    ws.topk_weights  = DeviceBuffer<float>::alloc(N * top_k);
+
+    ws.moe_input    = DeviceBuffer<std::uint16_t>::alloc(N * H);
+    ws.expert_in    = DeviceBuffer<std::uint16_t>::alloc(maxR * H);
+    ws.expert_gate_up = DeviceBuffer<std::uint16_t>::alloc(maxR * 2 * I);
+    ws.expert_act   = DeviceBuffer<std::uint16_t>::alloc(maxR * I);
+    ws.expert_out   = DeviceBuffer<std::uint16_t>::alloc(maxR * H);
+    ws.expert_idx   = DeviceBuffer<std::int32_t>::alloc(maxR);
+    ws.expert_w     = DeviceBuffer<float>::alloc(maxR);
+    ws.moe_out      = DeviceBuffer<std::uint16_t>::alloc(N * H);
+
+    ws.a_gu_ptrs    = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
+    ws.b_gu_ptrs    = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
+    ws.c_gu_ptrs    = DeviceBuffer<std::uint16_t*>::alloc(top_k);
+    ws.a_dn_ptrs    = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
+    ws.b_dn_ptrs    = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
+    ws.c_dn_ptrs    = DeviceBuffer<std::uint16_t*>::alloc(top_k);
+    ws.batch_weights = DeviceBuffer<float>::alloc(top_k);
+    return ws;
+}
+
 Gemma4Weights bind_gemma4(const Engine& engine) {
     const auto& cfg = engine.hf_config();
     if (cfg.layer_types.empty()) {
@@ -53,11 +91,24 @@ Gemma4Weights bind_gemma4(const Engine& engine) {
     }
 
     Gemma4Weights w;
+    // Reserve up front: pointers into `owned_router_combined_scales`
+    // get cached on each `Gemma4LayerWeights`, so any vector reallocation
+    // would dangle them. One slot per layer when MoE is on.
+    if (cfg.gemma4_enable_moe) {
+        w.owned_router_combined_scales.reserve(
+            static_cast<std::size_t>(cfg.num_hidden_layers));
+    }
     const std::string p = kPrefix;
     w.embed           = &must(engine, p + "embed_tokens.weight");
-    w.embed_per_layer = &must(engine, p + "embed_tokens_per_layer.weight");
-    w.ple_model_proj  = &must(engine, p + "per_layer_model_projection.weight");
-    w.ple_model_norm  = &must(engine, p + "per_layer_projection_norm.weight");
+    // PLE (Per-Layer Embeddings) machinery is optional — Gemma-4 E2B /
+    // E4B / 31B all ship it (`hidden_size_per_layer_input > 0`) but the
+    // 26B-A4B MoE variant disables it (`hidden_size_per_layer_input ==
+    // 0`). Skip the PLE tensors when the config says they're inert.
+    if (cfg.gemma_hidden_size_per_layer_input > 0) {
+        w.embed_per_layer = &must(engine, p + "embed_tokens_per_layer.weight");
+        w.ple_model_proj  = &must(engine, p + "per_layer_model_projection.weight");
+        w.ple_model_norm  = &must(engine, p + "per_layer_projection_norm.weight");
+    }
     w.final_norm      = &must(engine, p + "norm.weight");
     if (engine.has("lm_head.weight")) {
         w.lm_head = &engine.get("lm_head.weight");
@@ -197,15 +248,57 @@ Gemma4Weights bind_gemma4(const Engine& engine) {
         w.per_layer_intermediate[i] = Lw.intermediate;
 
         // PLE per-layer triple. HF names match `per_layer_input_gate`,
-        // `per_layer_projection`, `post_per_layer_input_norm`.
-        Lw.ple_input_gate = &must(engine, lp + "per_layer_input_gate.weight");
-        Lw.ple_projection = &must(engine, lp + "per_layer_projection.weight");
-        Lw.ple_norm       = &must(engine, lp + "post_per_layer_input_norm.weight");
+        // `per_layer_projection`, `post_per_layer_input_norm`. Optional
+        // — see top of `bind_gemma4`.
+        if (cfg.gemma_hidden_size_per_layer_input > 0) {
+            Lw.ple_input_gate = &must(engine, lp + "per_layer_input_gate.weight");
+            Lw.ple_projection = &must(engine, lp + "per_layer_projection.weight");
+            Lw.ple_norm       = &must(engine, lp + "post_per_layer_input_norm.weight");
+        }
 
         // Per-layer learnable scalar.
         Lw.layer_scalar = engine.has(lp + "layer_scalar")
                               ? &engine.get(lp + "layer_scalar")
                               : nullptr;
+
+        // ── Sparse-MoE block (Gemma-4 26B-A4B only) ───────────────────
+        // The MoE variant runs in parallel with the dense MLP (HF
+        // `Gemma4TextDecoderLayer.forward`). When `enable_moe_block` is
+        // false the dense path runs alone and these pointers stay null.
+        if (cfg.gemma4_enable_moe) {
+            Lw.router_proj            = &must(engine, lp + "router.proj.weight");
+            Lw.router_per_expert_scale = &must(engine, lp + "router.per_expert_scale");
+            Lw.moe_gate_up_proj       = &must(engine, lp + "experts.gate_up_proj");
+            Lw.moe_down_proj          = &must(engine, lp + "experts.down_proj");
+            Lw.mlp_norm_post_dense    = &must(engine, lp + "post_feedforward_layernorm_1.weight");
+            Lw.moe_norm_pre           = &must(engine, lp + "pre_feedforward_layernorm_2.weight");
+            Lw.moe_norm_post          = &must(engine, lp + "post_feedforward_layernorm_2.weight");
+            // The router pipeline does `(rmsnorm_no_scale(x) * scale) *
+            // (1/sqrt(H))` then a linear. Bake `1/sqrt(H)` into the
+            // per-channel `scale` here so the forward collapses the
+            // first three steps into a single rmsnorm-with-weight call.
+            const auto& raw_scale = must(engine, lp + "router.scale");
+            const std::int64_t H64 = raw_scale.numel();
+            const float inv_sqrt_h = 1.f / std::sqrt(static_cast<float>(H64));
+            std::vector<std::uint16_t> host(static_cast<std::size_t>(H64));
+            CUDA_CHECK(cudaMemcpy(host.data(), raw_scale.data(),
+                                  H64 * sizeof(std::uint16_t),
+                                  cudaMemcpyDeviceToHost));
+            for (auto& bits : host) {
+                std::uint32_t f32_bits = static_cast<std::uint32_t>(bits) << 16;
+                float v;
+                std::memcpy(&v, &f32_bits, sizeof(float));
+                v *= inv_sqrt_h;
+                std::memcpy(&f32_bits, &v, sizeof(float));
+                bits = static_cast<std::uint16_t>(f32_bits >> 16);
+            }
+            DeviceTensor combined = DeviceTensor::allocate(DType::BF16, {H64});
+            CUDA_CHECK(cudaMemcpy(combined.data(), host.data(),
+                                  H64 * sizeof(std::uint16_t),
+                                  cudaMemcpyHostToDevice));
+            w.owned_router_combined_scales.push_back(std::move(combined));
+            Lw.router_scale = &w.owned_router_combined_scales.back();
+        }
 
         if (is_full) w.full_layer_indices.push_back(i);
     }
@@ -251,6 +344,148 @@ inline float read_bf16_scalar(const DeviceTensor& t) {
     return f;
 }
 
+// Per-expert routing lists from device-side topk decisions. Mirrors
+// `qwen3_5_moe_forward.cpp::build_routing` — kept local because the
+// layer-weights schema differs.
+struct ExpertRouting {
+    std::vector<std::vector<std::int32_t>> token_idx;
+    std::vector<std::vector<float>>        weights;
+};
+ExpertRouting build_routing(
+    const std::vector<std::int32_t>& topk_idx_h,
+    const std::vector<float>& topk_w_h,
+    int N, int K, int E)
+{
+    ExpertRouting r;
+    r.token_idx.assign(E, {});
+    r.weights.assign(E, {});
+    for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; ++k) {
+            const int e = topk_idx_h[n * K + k];
+            if (e < 0 || e >= E) continue;
+            r.token_idx[e].push_back(n);
+            r.weights[e].push_back(topk_w_h[n * K + k]);
+        }
+    }
+    return r;
+}
+
+// MoE block for Gemma-4 26B-A4B: parallel branch alongside the dense
+// MLP. Computes `branch_2 = post_ff_norm_2(experts(pre_ff_norm_2(y),
+// router(y)))` and writes it into `moe_ws.moe_out`.
+void gemma4_moe_block(
+    const Gemma4LayerWeights& Lw,
+    const HfConfig& cfg,
+    Qwen3Workspace& ws,
+    Gemma4MoeMlpWorkspace& moe_ws,
+    int N,
+    ops::CublasHandle& cublas, cudaStream_t stream)
+{
+    const int H  = cfg.hidden_size;
+    const int E  = cfg.num_experts;
+    const int K  = cfg.num_experts_per_tok;
+    const int Im = cfg.moe_intermediate_size;
+    const float eps = cfg.rms_norm_eps;
+
+    // ── Router ────────────────────────────────────────────────────
+    // Step 1+2: rmsnorm-no-scale(y) * (router_scale * 1/sqrt(H)).
+    // The combined scale was baked at bind time, so this collapses to
+    // a single weighted-rmsnorm call.
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), Lw.router_scale->data(), moe_ws.router_x.data(),
+        N, H, eps, stream);
+    // Step 3: linear projection to expert logits.
+    ops::gemm_act_x_wt_bf16(cublas.handle(),
+        moe_ws.router_x.data(), Lw.router_proj->data(),
+        moe_ws.router_logits.data(), N, E, H);
+    // Steps 4+5: softmax over E → top-K → renormalise.
+    kernels::launch_topk_softmax_bf16(
+        moe_ws.router_logits.data(),
+        moe_ws.topk_idx.data(), moe_ws.topk_weights.data(),
+        N, E, K, stream);
+    // Step 6: per-expert scalar gain on the chosen weights.
+    kernels::launch_apply_per_expert_scale_bf16(
+        moe_ws.topk_idx.data(), moe_ws.topk_weights.data(),
+        Lw.router_per_expert_scale->data(),
+        N, K, stream);
+
+    // ── MoE input ────────────────────────────────────────────────
+    // pre_feedforward_layernorm_2(y) → moe_input. Note: HF flattens the
+    // residual `y`, NOT the dense MLP's pre-norm (`ws.norm_x` was
+    // already overwritten by the dense path).
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), Lw.moe_norm_pre->data(), moe_ws.moe_input.data(),
+        N, H, eps, stream);
+
+    // D2H sync the routing decisions for the prefill / multi-token
+    // dispatch loop. The dense Gemma-4 forward is non-graph-capturable
+    // (per-layer head_dim, attention_factor lookups all run host code),
+    // so an extra sync here is in the noise.
+    std::vector<std::int32_t> topk_idx_h((std::size_t)N * K);
+    std::vector<float>        topk_w_h((std::size_t)N * K);
+    CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), moe_ws.topk_idx.data(),
+        topk_idx_h.size() * sizeof(std::int32_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(topk_w_h.data(), moe_ws.topk_weights.data(),
+        topk_w_h.size() * sizeof(float),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Zero `moe_out` before scatter-add accumulation.
+    CUDA_CHECK(cudaMemsetAsync(moe_ws.moe_out.data(), 0,
+        (std::size_t)N * H * sizeof(std::uint16_t), stream));
+
+    const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
+    const std::size_t expert_stride_gu =
+        static_cast<std::size_t>(2) * Im * H;  // bf16 elements per expert
+    const std::size_t expert_stride_dn =
+        static_cast<std::size_t>(H) * Im;
+
+    for (int e = 0; e < E; ++e) {
+        const auto& tok_idx = routing.token_idx[e];
+        const auto& wts     = routing.weights[e];
+        const int Ne = static_cast<int>(tok_idx.size());
+        if (Ne == 0) continue;
+
+        CUDA_CHECK(cudaMemcpyAsync(
+            moe_ws.expert_idx.data(), tok_idx.data(),
+            Ne * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            moe_ws.expert_w.data(), wts.data(),
+            Ne * sizeof(float), cudaMemcpyHostToDevice, stream));
+
+        kernels::launch_gather_bf16_rows(
+            static_cast<const std::uint16_t*>(moe_ws.moe_input.data()),
+            moe_ws.expert_idx.data(),
+            moe_ws.expert_in.data(),
+            Ne, H, stream);
+
+        const auto* gate_up_w = static_cast<const std::uint16_t*>(
+                                    Lw.moe_gate_up_proj->data())
+                                + e * expert_stride_gu;
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            moe_ws.expert_in.data(), gate_up_w,
+            moe_ws.expert_gate_up.data(), Ne, 2 * Im, H);
+
+        kernels::launch_chunked_geglu_tanh_bf16(
+            moe_ws.expert_gate_up.data(),
+            moe_ws.expert_act.data(),
+            Ne, Im, stream);
+
+        const auto* down_w = static_cast<const std::uint16_t*>(
+                                 Lw.moe_down_proj->data())
+                             + e * expert_stride_dn;
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            moe_ws.expert_act.data(), down_w,
+            moe_ws.expert_out.data(), Ne, H, Im);
+
+        kernels::launch_scatter_add_weighted_bf16(
+            moe_ws.moe_out.data(), moe_ws.expert_out.data(),
+            moe_ws.expert_idx.data(), moe_ws.expert_w.data(),
+            Ne, H, stream);
+    }
+}
+
 }  // namespace
 
 void gemma4_forward_paged(
@@ -258,6 +493,7 @@ void gemma4_forward_paged(
     const HfConfig& cfg,
     const Gemma4ForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
+    Gemma4MoeMlpWorkspace& moe_ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
     ops::CublasHandle& cublas,
@@ -313,7 +549,9 @@ void gemma4_forward_paged(
                   static_cast<std::size_t>(N) * H);
 
     // ── 2. Per-layer inputs (PLE) ────────────────────────────────────────
-    // Compute once per fire; sliced per layer below.
+    // Compute once per fire; sliced per layer below. Skipped entirely
+    // when `ple_dim == 0` (Gemma-4 26B-A4B disables PLE; the per-layer
+    // residual block at step 3c is also gated below).
     //
     //     per_layer_token = embed_per_layer[token_ids]              [N, L*ple_dim]
     //     per_layer_token *= sqrt(ple_dim)
@@ -328,13 +566,17 @@ void gemma4_forward_paged(
     // shared the buffers and silently produced wrong PLE residuals
     // for every token (most visibly token 0).
     const int per_layer_total = L * ple_dim;
-    DeviceTensor per_layer_token_buf = DeviceTensor::allocate(
-        DType::BF16, {N, per_layer_total});
-    DeviceTensor per_layer_proj_buf = DeviceTensor::allocate(
-        DType::BF16, {N, per_layer_total});
-    void* per_layer_token = per_layer_token_buf.data();
-    void* per_layer_proj  = per_layer_proj_buf.data();
-    {
+    DeviceTensor per_layer_token_buf;
+    DeviceTensor per_layer_proj_buf;
+    void* per_layer_token = nullptr;
+    void* per_layer_proj  = nullptr;
+    if (ple_dim > 0) {
+        per_layer_token_buf = DeviceTensor::allocate(
+            DType::BF16, {N, per_layer_total});
+        per_layer_proj_buf = DeviceTensor::allocate(
+            DType::BF16, {N, per_layer_total});
+        per_layer_token = per_layer_token_buf.data();
+        per_layer_proj  = per_layer_proj_buf.data();
         // Embed lookup into the per-layer table.
         kernels::launch_embed_bf16(
             token_ids, w.embed_per_layer->data(), per_layer_token,
@@ -609,15 +851,52 @@ void gemma4_forward_paged(
         cudaDeviceSynchronize();
         dump_l0("mlp_down", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
-        kernels::launch_rmsnorm_bf16(
-            ws.norm_x.data(), layer.mlp_norm_post->data(), ws.norm_y.data(),
-            N, H, eps, stream);
-        cudaDeviceSynchronize();
-        dump_l0("mlp_norm_post", ws.norm_y.data(),
-                static_cast<std::size_t>(N) * H);
-        kernels::launch_residual_add_bf16(
-            ws.y.data(), ws.norm_y.data(),
-            static_cast<std::size_t>(N) * H, stream);
+
+        // Gemma-4 26B-A4B's MoE block runs **alongside** the dense MLP
+        // and the two branches' post-norms are summed before the final
+        // `post_feedforward_layernorm`. On the dense E2B / E4B / 31B
+        // variants `cfg.gemma4_enable_moe` is false and we keep the
+        // straight-line dense path.
+        const bool moe_active = cfg.gemma4_enable_moe &&
+                                layer.router_proj != nullptr;
+        if (moe_active) {
+            // branch_1 = post_feedforward_layernorm_1(dense_out)
+            kernels::launch_rmsnorm_bf16(
+                ws.norm_x.data(), layer.mlp_norm_post_dense->data(),
+                ws.norm_y.data(), N, H, eps, stream);
+            // experts → moe_ws.moe_out (raw, no post-norm).
+            gemma4_moe_block(layer, cfg, ws, moe_ws, N, cublas, stream);
+            // branch_2 = post_feedforward_layernorm_2(moe_out) → norm_x
+            // (norm_x's prior contents — dense_out — are no longer
+            // needed).
+            kernels::launch_rmsnorm_bf16(
+                moe_ws.moe_out.data(), layer.moe_norm_post->data(),
+                ws.norm_x.data(), N, H, eps, stream);
+            // combined = branch_1 + branch_2 (in norm_y).
+            kernels::launch_residual_add_bf16(
+                ws.norm_y.data(), ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H, stream);
+            // final = post_feedforward_layernorm(combined) → norm_x.
+            kernels::launch_rmsnorm_bf16(
+                ws.norm_y.data(), layer.mlp_norm_post->data(),
+                ws.norm_x.data(), N, H, eps, stream);
+            cudaDeviceSynchronize();
+            dump_l0("mlp_norm_post", ws.norm_x.data(),
+                    static_cast<std::size_t>(N) * H);
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_x.data(),
+                static_cast<std::size_t>(N) * H, stream);
+        } else {
+            kernels::launch_rmsnorm_bf16(
+                ws.norm_x.data(), layer.mlp_norm_post->data(), ws.norm_y.data(),
+                N, H, eps, stream);
+            cudaDeviceSynchronize();
+            dump_l0("mlp_norm_post", ws.norm_y.data(),
+                    static_cast<std::size_t>(N) * H);
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H, stream);
+        }
         cudaDeviceSynchronize();
         dump_l0("post_mlp_y", ws.y.data(),
                 static_cast<std::size_t>(N) * H);
@@ -625,7 +904,10 @@ void gemma4_forward_paged(
         // ── 3c. PLE residual ───────────────────────────────────────────
         // Wrapped in a block so debugging can disable the whole step
         // (env `PIE_NO_PLE=1`) without touching the surrounding flow.
-        if (getenv("PIE_NO_PLE") == nullptr) {
+        // Skipped on Gemma-4 26B-A4B (`hidden_size_per_layer_input == 0`
+        // → `ple_dim == 0`), which doesn't ship the per-layer triple at
+        // all.
+        if (ple_dim > 0 && getenv("PIE_NO_PLE") == nullptr) {
         cudaDeviceSynchronize();
         dump_l0("ple_residual_in", ws.y.data(),
                 static_cast<std::size_t>(N) * H);

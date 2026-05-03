@@ -168,6 +168,43 @@ void launch_chunked_swiglu_bf16(
 
 namespace {
 
+// Same chunk layout as `chunked_swiglu_bf16_kernel` but applies the
+// GELU-tanh activation that Gemma-4 uses on both its dense MLP and
+// (for 26B-A4B) its routed-expert block. `gelu_tanh(x) = 0.5 * x *
+// (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))`.
+__global__ void chunked_geglu_tanh_bf16_kernel(
+    const __nv_bfloat16* __restrict__ packed,
+    __nv_bfloat16*       __restrict__ y,
+    int N, int I)
+{
+    const int n = blockIdx.x;
+    const int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (n >= N || i >= I) return;
+    const float g = __bfloat162float(packed[(long long)n * 2 * I + i]);
+    const float u = __bfloat162float(packed[(long long)n * 2 * I + I + i]);
+    constexpr float kAlpha = 0.7978845608028654f;  // sqrt(2/π)
+    constexpr float kBeta  = 0.044715f;
+    const float inner = kAlpha * (g + kBeta * g * g * g);
+    const float gelu  = 0.5f * g * (1.f + tanhf(inner));
+    y[(long long)n * I + i] = __float2bfloat16(gelu * u);
+}
+
+}  // namespace
+
+void launch_chunked_geglu_tanh_bf16(
+    const void* packed, void* y, int N, int I, cudaStream_t stream)
+{
+    if (N <= 0 || I <= 0) return;
+    constexpr int BLOCK = 128;
+    dim3 grid(N, (I + BLOCK - 1) / BLOCK);
+    chunked_geglu_tanh_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(packed),
+        static_cast<__nv_bfloat16*>(y),
+        N, I);
+}
+
+namespace {
+
 __global__ void sigmoid_scalar_gate_inplace_bf16_kernel(
     __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ scalar_gate,

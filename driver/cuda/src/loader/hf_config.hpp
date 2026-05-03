@@ -93,9 +93,14 @@ struct HfConfig {
 
     // ── Sparse MoE (Mixtral / GPT-OSS / Qwen-3.5 hybrid) ─────────────
     // Zero on dense models. `num_experts` is HF's `num_local_experts`;
-    // `num_experts_per_tok` is the top-K used by the router.
+    // `num_experts_per_tok` is the top-K used by the router. (Gemma-4
+    // calls these `num_experts` / `top_k_experts` — same fields.)
     int num_experts;
     int num_experts_per_tok;
+    // Gemma-4 26B-A4B runs **both** dense MLP and MoE in parallel per
+    // layer; the dense `intermediate_size` and `moe_intermediate_size`
+    // both apply when this is true. Inert on every other arch.
+    bool gemma4_enable_moe = false;
 
     // GPT-OSS-specific knobs. Inert on every other model.
     //   * `swiglu_limit` — clipping threshold applied to gate values

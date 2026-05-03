@@ -26,4 +26,15 @@ void launch_topk_softmax_bf16(
     int K,
     cudaStream_t stream);
 
+// Gemma-4 26B-A4B's router applies a per-expert scalar gain *after*
+// the renormalised top-K weights. Multiplies `topk_w[n, k] *=
+// per_expert_scale[topk_idx[n, k]]` in place. `per_expert_scale` is
+// stored bf16 in the ckpt; we read it bf16 → fp32.
+void launch_apply_per_expert_scale_bf16(
+    const std::int32_t* topk_idx,        // [N, K]
+    float* topk_w,                       // [N, K] in/out
+    const void* per_expert_scale_bf16,   // [num_experts] bf16
+    int N, int K,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

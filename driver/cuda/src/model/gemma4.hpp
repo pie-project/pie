@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "device_buffer.hpp"
 #include "distributed.hpp"
 #include "engine.hpp"
 #include "kv_cache.hpp"
@@ -69,6 +70,21 @@ struct Gemma4LayerWeights {
     const DeviceTensor* up_proj   = nullptr;
     const DeviceTensor* down_proj = nullptr;
 
+    // ── Sparse-MoE block (Gemma-4 26B-A4B) ────────────────────────────
+    // Runs in parallel with the dense MLP. All pointers nullptr on the
+    // dense-only Gemma-4 family (E2B / E4B / 31B). The router is a
+    // stand-alone module: RMSNorm-no-scale → channel-scale → 1/sqrt(H)
+    // → linear → softmax → top-k → renorm → per-expert-scale.
+    const DeviceTensor* router_proj            = nullptr;  // [E, H]
+    const DeviceTensor* router_scale           = nullptr;  // [H]
+    const DeviceTensor* router_per_expert_scale = nullptr; // [E]
+    const DeviceTensor* moe_gate_up_proj       = nullptr;  // [E, 2*Im, H]
+    const DeviceTensor* moe_down_proj          = nullptr;  // [E, H, Im]
+    // Three extra layernorms specific to the MoE-on-top variant.
+    const DeviceTensor* mlp_norm_post_dense    = nullptr;  // post_feedforward_layernorm_1
+    const DeviceTensor* moe_norm_pre           = nullptr;  // pre_feedforward_layernorm_2
+    const DeviceTensor* moe_norm_post          = nullptr;  // post_feedforward_layernorm_2
+
     // PLE per-layer triple.
     const DeviceTensor* ple_input_gate = nullptr;  // [hidden_per_layer_input, hidden]
     const DeviceTensor* ple_projection = nullptr;  // [hidden, hidden_per_layer_input]
@@ -94,6 +110,11 @@ struct Gemma4Weights {
     const DeviceTensor* lm_head     = nullptr;       // tied to embed unless lm_head.weight present
     std::vector<Gemma4LayerWeights> layers;
 
+    // Owned per-layer `router.scale` baked together with `1/sqrt(H)`,
+    // so the router pipeline collapses to a single rmsnorm+weight call.
+    // Empty on dense Gemma-4 ckpts; one tensor per layer when MoE is on.
+    std::vector<DeviceTensor> owned_router_combined_scales;
+
     // Cached per-layer arrays for the forward / KV-cache allocator.
     std::vector<int> per_layer_head_dim;
     std::vector<int> per_layer_intermediate;
@@ -102,6 +123,42 @@ struct Gemma4Weights {
     std::vector<float> per_layer_rope_theta;
     std::vector<float> per_layer_partial_rotary_factor;
     std::vector<int> full_layer_indices;  // for debug / introspection
+};
+
+// MoE workspace for Gemma-4 26B-A4B's parallel routed-expert block.
+// Inert (all buffers length 0) on dense Gemma-4 ckpts.
+struct Gemma4MoeMlpWorkspace {
+    // Router intermediate buffers. `router_logits` holds the full E-way
+    // softmax distribution; topk extracts the top-K weights/indices.
+    DeviceBuffer<std::uint16_t> router_x;          // [N, H] post-norm input to router proj
+    DeviceBuffer<std::uint16_t> router_logits;     // [N, E] bf16 (softmax output)
+    DeviceBuffer<std::int32_t>  topk_idx;          // [N, K]
+    DeviceBuffer<float>         topk_weights;      // [N, K]
+
+    // MoE-branch input (= pre_feedforward_layernorm_2(residual)).
+    DeviceBuffer<std::uint16_t> moe_input;         // [N, H]
+    // Per-expert worst-case scratch.
+    DeviceBuffer<std::uint16_t> expert_in;         // [N*K, H]
+    DeviceBuffer<std::uint16_t> expert_gate_up;    // [N*K, 2*Im]
+    DeviceBuffer<std::uint16_t> expert_act;        // [N*K, Im]
+    DeviceBuffer<std::uint16_t> expert_out;        // [N*K, H]
+    DeviceBuffer<std::int32_t>  expert_idx;        // [N*K]
+    DeviceBuffer<float>         expert_w;          // [N*K]
+    // Final accumulator before the post_feedforward_layernorm_2.
+    DeviceBuffer<std::uint16_t> moe_out;           // [N, H]
+
+    // Decode fast-path (N=1) batched-GEMM pointer arrays.
+    DeviceBuffer<const std::uint16_t*> a_gu_ptrs;
+    DeviceBuffer<const std::uint16_t*> b_gu_ptrs;
+    DeviceBuffer<std::uint16_t*>       c_gu_ptrs;
+    DeviceBuffer<const std::uint16_t*> a_dn_ptrs;
+    DeviceBuffer<const std::uint16_t*> b_dn_ptrs;
+    DeviceBuffer<std::uint16_t*>       c_dn_ptrs;
+    DeviceBuffer<float>                batch_weights;
+
+    static Gemma4MoeMlpWorkspace allocate(
+        int max_tokens, int hidden, int num_experts, int top_k,
+        int moe_intermediate);
 };
 
 struct Gemma4ForwardCfg {
@@ -131,6 +188,7 @@ void gemma4_forward_paged(
     const HfConfig& cfg,
     const Gemma4ForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
+    Gemma4MoeMlpWorkspace& moe_ws,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
     ops::CublasHandle& cublas,

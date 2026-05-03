@@ -218,7 +218,13 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // `num_experts` instead.
     cfg.num_experts         = optional<int>(j, "num_local_experts",
                                             optional<int>(j, "num_experts", 0));
-    cfg.num_experts_per_tok = optional<int>(j, "num_experts_per_tok", 0);
+    // `num_experts_per_tok` is the canonical name (Mixtral / Qwen MoE);
+    // Gemma-4 uses `top_k_experts`. Accept either.
+    cfg.num_experts_per_tok = optional<int>(j, "num_experts_per_tok",
+                                            optional<int>(j, "top_k_experts", 0));
+    // Gemma-4 26B-A4B sets `enable_moe_block: true` to flip its layers
+    // from dense-MLP-only to dense + parallel MoE.
+    cfg.gemma4_enable_moe   = optional<bool>(j, "enable_moe_block", false);
 
     // GPT-OSS knobs. The flags are inferred from `model_type` (rather
     // than from explicit fields) because HF's gpt_oss config doesn't

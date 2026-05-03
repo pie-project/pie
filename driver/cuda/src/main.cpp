@@ -1294,8 +1294,23 @@ int main(int argc, char** argv) {
     // `main`'s scope (weights_*, fwd_cfg, gemma_fwd_cfg) and persist for
     // the lifetime of the server.
     pie_cuda_driver::ForwardFn forward_fn;
+    // Gemma-4 26B-A4B's MoE block needs a routed-experts workspace
+    // alongside the dense forward state. Inert (zero-byte) on dense
+    // E2B / E4B / 31B variants.
+    pie_cuda_driver::model::Gemma4MoeMlpWorkspace gemma4_moe_ws;
+    if (is_gemma4_arch && engine.hf_config().gemma4_enable_moe) {
+        const auto& hf_cfg = engine.hf_config();
+        gemma4_moe_ws = pie_cuda_driver::model::Gemma4MoeMlpWorkspace::allocate(
+            max_workspace_tokens,
+            hf_cfg.hidden_size,
+            hf_cfg.num_experts,
+            hf_cfg.num_experts_per_tok,
+            hf_cfg.moe_intermediate_size /
+                std::max(1, cfg.distributed.tp_size));
+    }
     if (is_gemma4_arch) {
-        forward_fn.body = [&engine, &weights_gemma4, gemma4_fwd_cfg](
+        forward_fn.body = [&engine, &weights_gemma4, &gemma4_moe_ws,
+                           gemma4_fwd_cfg](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -1311,7 +1326,7 @@ int main(int argc, char** argv) {
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
             pie_cuda_driver::model::gemma4_forward_paged(
                 weights_gemma4, engine.hf_config(), gemma4_fwd_cfg,
-                ws, cache, attn_ws, cublas,
+                ws, gemma4_moe_ws, cache, attn_ws, cublas,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
@@ -1417,7 +1432,18 @@ int main(int argc, char** argv) {
             const std::uint32_t* kv_page_indptr_h,
             int R, bool is_pure_decode) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-            q35_fwd.force_prefill_path = false;
+            // flashinfer's decode kernel only instantiates GQA group
+            // sizes {1, 2, 3, 4, 8}. Qwen3.6-27B (q=24, kv=4 → gqa=6)
+            // and similar GQA-6 / GQA-7 ckpts must force the prefill
+            // kernel even on decode fires.
+            {
+                const auto& hf_q = engine.hf_config();
+                const int gqa_q = hf_q.num_attention_heads /
+                                  std::max(1, hf_q.num_key_value_heads);
+                q35_fwd.force_prefill_path =
+                    !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                      gqa_q == 4 || gqa_q == 8);
+            }
             q35_fwd.tp_size = q35_tp_size;
             q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
@@ -1441,7 +1467,18 @@ int main(int argc, char** argv) {
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-            q35_fwd.force_prefill_path = false;
+            // flashinfer's decode kernel only instantiates GQA group
+            // sizes {1, 2, 3, 4, 8}. Qwen3.6-27B (q=24, kv=4 → gqa=6)
+            // and similar GQA-6 / GQA-7 ckpts must force the prefill
+            // kernel even on decode fires.
+            {
+                const auto& hf_q = engine.hf_config();
+                const int gqa_q = hf_q.num_attention_heads /
+                                  std::max(1, hf_q.num_key_value_heads);
+                q35_fwd.force_prefill_path =
+                    !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                      gqa_q == 4 || gqa_q == 8);
+            }
             q35_fwd.tp_size = q35_tp_size;
             q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::qwen3_5_forward_paged(
@@ -1463,7 +1500,18 @@ int main(int argc, char** argv) {
             const std::uint32_t* kv_page_indptr_h,
             int R, bool is_pure_decode) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-            q35_fwd.force_prefill_path = false;
+            // flashinfer's decode kernel only instantiates GQA group
+            // sizes {1, 2, 3, 4, 8}. Qwen3.6-27B (q=24, kv=4 → gqa=6)
+            // and similar GQA-6 / GQA-7 ckpts must force the prefill
+            // kernel even on decode fires.
+            {
+                const auto& hf_q = engine.hf_config();
+                const int gqa_q = hf_q.num_attention_heads /
+                                  std::max(1, hf_q.num_key_value_heads);
+                q35_fwd.force_prefill_path =
+                    !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                      gqa_q == 4 || gqa_q == 8);
+            }
             q35_fwd.tp_size = q35moe_tp_size;
             q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
@@ -1488,7 +1536,18 @@ int main(int argc, char** argv) {
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-            q35_fwd.force_prefill_path = false;
+            // flashinfer's decode kernel only instantiates GQA group
+            // sizes {1, 2, 3, 4, 8}. Qwen3.6-27B (q=24, kv=4 → gqa=6)
+            // and similar GQA-6 / GQA-7 ckpts must force the prefill
+            // kernel even on decode fires.
+            {
+                const auto& hf_q = engine.hf_config();
+                const int gqa_q = hf_q.num_attention_heads /
+                                  std::max(1, hf_q.num_key_value_heads);
+                q35_fwd.force_prefill_path =
+                    !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                      gqa_q == 4 || gqa_q == 8);
+            }
             q35_fwd.tp_size = q35moe_tp_size;
             q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::qwen3_5_moe_forward_paged(

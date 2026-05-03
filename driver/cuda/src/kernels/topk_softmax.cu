@@ -99,4 +99,38 @@ void launch_topk_softmax_bf16(
         num_experts, K);
 }
 
+namespace {
+
+__global__ void apply_per_expert_scale_kernel(
+    const std::int32_t* __restrict__ topk_idx,
+    float* __restrict__ topk_w,
+    const __nv_bfloat16* __restrict__ per_expert_scale,
+    int total)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= total) return;
+    const int e = topk_idx[t];
+    const float s = __bfloat162float(per_expert_scale[e]);
+    topk_w[t] *= s;
+}
+
+}  // namespace
+
+void launch_apply_per_expert_scale_bf16(
+    const std::int32_t* topk_idx,
+    float* topk_w,
+    const void* per_expert_scale_bf16,
+    int N, int K,
+    cudaStream_t stream)
+{
+    const int total = N * K;
+    if (total <= 0) return;
+    constexpr int BLOCK_T = 256;
+    const int grid = (total + BLOCK_T - 1) / BLOCK_T;
+    apply_per_expert_scale_kernel<<<grid, BLOCK_T, 0, stream>>>(
+        topk_idx, topk_w,
+        static_cast<const __nv_bfloat16*>(per_expert_scale_bf16),
+        total);
+}
+
 }  // namespace pie_cuda_driver::kernels

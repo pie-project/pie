@@ -71,6 +71,16 @@ void launch_chunked_swiglu_bf16(
     int N, int I,
     cudaStream_t stream);
 
+// GELU-tanh variant of `chunked_swiglu_bf16` — same fused gate/up
+// split, but emits `gelu_tanh(gate) * up` instead of `silu(gate) * up`.
+// Used by Gemma-4 26B-A4B's routed-expert block (its dense MLP also
+// uses GeGLU-tanh, see `launch_geglu_tanh_bf16`).
+void launch_chunked_geglu_tanh_bf16(
+    const void* packed,  // [N, 2*I] bf16 (gate first, up second)
+    void*       y,       // [N, I]   bf16
+    int N, int I,
+    cudaStream_t stream);
+
 // In-place per-token sigmoid gate on a `[N, H]` tensor: `x[n, h] *=
 // sigmoid(scalar_gate[n])`. Used by the Qwen3.6-MoE shared-expert path,
 // where the gate is a single scalar per token (output of the `[N, 1]`
