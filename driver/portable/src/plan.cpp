@@ -132,12 +132,41 @@ PlanArrays extract_plan_arrays(const schema::DecodedRequest& req) {
     a.total_n_tokens = static_cast<std::int32_t>(a.token_ids.size());
     a.batch_has_drafts =
         a.spec_indptr.size() == static_cast<std::size_t>(a.n_request) + 1;
-    // Custom (non-causal) masks are present iff the indptr fully covers
-    // every token's row. Otherwise the M11 packed-decode fast path is safe.
-    a.batch_has_attn_masks =
-        !a.flat_attn_masks.empty() &&
+    // Detect "no user mask" so we can take the M11 packed-decode fast
+    // path. The runtime always sends an attention mask (synthesizing
+    // Brle::all_true(pos+1) per row when the user supplied none, see
+    // runtime/src/api/inference.rs:341-352), so .empty() is never true.
+    // Instead we structurally recognize the synthesized causal pattern:
+    // every BRLE row is exactly [0, pos+1] (2 u32 elements).
+    a.batch_has_attn_masks = false;
+    if (!a.flat_attn_masks.empty() &&
         a.attn_mask_indptr.size() ==
-            static_cast<std::size_t>(a.total_n_tokens) + 1;
+            static_cast<std::size_t>(a.total_n_tokens) + 1) {
+        // First-pass cheap reject: any row whose byte step != 2 u32s
+        // is necessarily a user mask.
+        bool maybe_synthesized = true;
+        for (std::int32_t i = 0; i < a.total_n_tokens; ++i) {
+            const std::uint32_t lo = a.attn_mask_indptr[i];
+            const std::uint32_t hi = a.attn_mask_indptr[i + 1];
+            if (hi - lo != 2u) { maybe_synthesized = false; break; }
+        }
+        if (maybe_synthesized) {
+            // Second pass: confirm values match [0, position+1]. Position
+            // ids are u32 here; pos+1 cannot overflow within u32 for any
+            // realistic context length.
+            for (std::int32_t i = 0; i < a.total_n_tokens; ++i) {
+                const std::uint32_t off = a.attn_mask_indptr[i];
+                const std::uint32_t v0  = a.flat_attn_masks[off + 0];
+                const std::uint32_t v1  = a.flat_attn_masks[off + 1];
+                const std::uint32_t expected = a.position_ids[i] + 1u;
+                if (v0 != 0u || v1 != expected) {
+                    maybe_synthesized = false;
+                    break;
+                }
+            }
+        }
+        a.batch_has_attn_masks = !maybe_synthesized;
+    }
     return a;
 }
 
