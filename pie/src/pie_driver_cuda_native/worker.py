@@ -48,6 +48,166 @@ def calculate_topology(world_size: int, tp_degree: int) -> list[list[int]]:
 
 
 # =============================================================================
+# Multimodal config overlay
+# =============================================================================
+
+
+def _maybe_overlay_multimodal_text_config(snapshot_dir: Path, hf_repo: str) -> Path:
+    """Return a snapshot dir whose `config.json` is fully populated.
+
+    For multimodal checkpoints (e.g. google/gemma-3-4b-pt) the on-disk
+    `config.json` nests text-side dims under `text_config` and relies on
+    the matching transformers Python config class to fill in defaults
+    (num_attention_heads, vocab_size, rms_norm_eps, …). The C++ loader
+    can't run that Python machinery, so we materialize the full text
+    config here via `AutoConfig.from_pretrained(...).text_config.to_dict()`
+    and write it over the original config in a temp overlay directory
+    that symlinks the rest of the snapshot's blobs.
+
+    Returns the original snapshot_dir unchanged when no overlay is needed.
+    """
+    cfg_path = snapshot_dir / "config.json"
+    if not cfg_path.is_file():
+        return snapshot_dir
+    try:
+        on_disk = json.loads(cfg_path.read_text())
+    except Exception:
+        return snapshot_dir
+
+    # Heuristic: only overlay when `text_config` exists and lacks a
+    # required field that the C++ loader will demand (e.g. num_attention_heads).
+    text_cfg = on_disk.get("text_config")
+    if not isinstance(text_cfg, dict):
+        return snapshot_dir
+    if "num_attention_heads" in text_cfg and "vocab_size" in text_cfg:
+        return snapshot_dir  # already complete enough
+
+    try:
+        # Lazy import; keep transformers off the hot import path.
+        from transformers import AutoConfig  # type: ignore
+    except Exception:
+        # No transformers in the worker venv — fall through and let the
+        # binary surface its existing "missing key" error.
+        return snapshot_dir
+
+    try:
+        full_cfg = AutoConfig.from_pretrained(str(snapshot_dir))
+    except Exception:
+        try:
+            full_cfg = AutoConfig.from_pretrained(hf_repo)
+        except Exception:
+            return snapshot_dir
+
+    full_text = getattr(full_cfg, "text_config", None)
+    if full_text is None:
+        return snapshot_dir
+    text_dict = full_text.to_dict()
+
+    # Build the overlay snapshot under PIE_HOME. Symlink every file from
+    # the original snapshot, write the merged config in its place.
+    # Concurrency note: TP>1 spawns multiple worker processes that all
+    # call this helper; they must not race on rmtree/rebuild. Use an
+    # atomic rename (build under a tempdir sibling, rename into place)
+    # and skip the rebuild entirely when an existing overlay matches.
+    pie_home = Path(os.environ.get("PIE_HOME", Path.home() / ".pie"))
+    overlay_root = pie_home / "cuda-snapshot-overlay"
+    overlay_root.mkdir(parents=True, exist_ok=True)
+    safe_repo = hf_repo.replace("/", "--")
+    overlay_dir = overlay_root / f"{safe_repo}__{snapshot_dir.name}"
+
+    def _build_overlay_at(target_dir: Path, merged_cfg: dict) -> None:
+        # `target_dir` already exists (tempfile.mkdtemp). Just populate.
+        for entry in snapshot_dir.iterdir():
+            if entry.name == "config.json":
+                continue
+            link_target = entry.resolve()  # resolve into HF blobs cache
+            os.symlink(link_target, target_dir / entry.name)
+        (target_dir / "config.json").write_text(
+            json.dumps(merged_cfg, indent=2))
+
+    # Preserve the multimodal architecture name + model_type so the C++
+    # loader still routes through gemma3_text. Merge text_dict into root
+    # so all required fields appear top-level (loader reads from
+    # `text_config` when present, else top-level).
+    # Keep the multimodal structure intact (root with `text_config` +
+    # `vision_config`) so the C++ loader's `is_multimodal_wrapper`
+    # detection still fires and strips the `language_model.` prefix
+    # from text-tower weights. Only fill in the keys that text_config
+    # was missing — drop transformers' null defaults so they don't
+    # shadow real values from the root or from the on-disk text_config.
+    text_filled = {k: v for k, v in text_dict.items() if v is not None}
+    # On-disk text_config wins where it has a value (transformers
+    # defaults are guesses — the checkpoint's own values are authoritative).
+    for k, v in (text_cfg or {}).items():
+        if v is not None:
+            text_filled[k] = v
+    merged = dict(on_disk)
+    merged["text_config"] = text_filled
+
+    # If an overlay already exists with this exact merged config, reuse
+    # it (this happens often: every TP rank calls this helper, plus
+    # repeated runs of the same model). Else build under a tempdir
+    # sibling and rename atomically so concurrent callers don't see a
+    # half-built dir.
+    existing_cfg_path = overlay_dir / "config.json"
+    if overlay_dir.is_dir() and existing_cfg_path.is_file():
+        try:
+            existing = json.loads(existing_cfg_path.read_text())
+            if existing == merged:
+                return overlay_dir
+        except Exception:
+            pass
+
+    import tempfile
+    tmp_dir = Path(tempfile.mkdtemp(
+        prefix=f".tmp_{safe_repo}__{snapshot_dir.name}__",
+        dir=str(overlay_root)))
+    try:
+        _build_overlay_at(tmp_dir, merged)
+        try:
+            os.rename(tmp_dir, overlay_dir)
+        except OSError:
+            # Another rank won the race; theirs is also valid.
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    return overlay_dir
+
+
+def _validate_tp_shardable(snapshot_dir: Path, hf_repo: str, tp_size: int) -> None:
+    """Raise a friendly error when the model can't be sharded across tp_size.
+
+    The C++ engine throws `engine: num_key_value_heads=N is not divisible by
+    tp_size=M ...` mid-init, but that error lands far from the user's CLI
+    `--tp-size` flag. Pull the relevant dims out of config.json (or the
+    overlay) and refuse the spawn here with a message that points at the
+    knob the user actually controls.
+    """
+    cfg_path = snapshot_dir / "config.json"
+    if not cfg_path.is_file():
+        return
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except Exception:
+        return
+    text_cfg = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    nkv = text_cfg.get("num_key_value_heads")
+    nq = text_cfg.get("num_attention_heads")
+    if nkv is None and nq is None:
+        return
+    nkv = nkv if nkv is not None else nq
+    if nkv % tp_size == 0:
+        return
+    raise RuntimeError(
+        f"cuda_native: cannot shard {hf_repo!r} across tp_size={tp_size}: "
+        f"num_key_value_heads={nkv} is not divisible by {tp_size}. "
+        f"Pick a tp_size that divides {nkv} (e.g. 1{', or ' + str(nkv) if nkv > 1 else ''}), "
+        f"or run on a single GPU."
+    )
+
+
+# =============================================================================
 # Binary discovery
 # =============================================================================
 
@@ -463,6 +623,24 @@ def worker_main(
     from pie_driver.hf_utils import get_hf_snapshot_dir  # reuse existing logic
     hf_repo = model_config["hf_repo"]
     snapshot_dir = get_hf_snapshot_dir(hf_repo)
+    # Multimodal-config shim: HF's multimodal Gemma 3 (4B/12B/27B) ships a
+    # config.json whose `text_config` only carries dims that vary by size
+    # (hidden_size, num_hidden_layers, intermediate_size). Required fields
+    # like num_attention_heads / vocab_size / rms_norm_eps are filled in by
+    # `transformers.Gemma3TextConfig` class defaults at AutoConfig.from_*.
+    # The C++ loader reads config.json directly and `require<>`s those keys,
+    # so it errors out on these checkpoints. Synthesize a flat config.json
+    # via transformers and overlay it (other files symlinked) so the driver
+    # sees a fully-populated config.
+    snapshot_dir = _maybe_overlay_multimodal_text_config(
+        Path(snapshot_dir), hf_repo)
+
+    # Pre-flight TP shardability check. Surface architectural limits at
+    # config-validation time (before the binary even spawns) instead of
+    # letting the C++ engine throw mid-init. The driver's own check fires
+    # too — but its message lands far from the user's `--tp-size` flag.
+    if tp_size > 1:
+        _validate_tp_shardable(snapshot_dir, hf_repo, tp_size)
 
     # Emit startup TOML.
     pie_home = Path(os.environ.get("PIE_HOME", Path.home() / ".pie"))
