@@ -43,7 +43,8 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
         hf_model_type == "gemma3n_text")  return PieArch::Gemma3n;
     if (hf_model_type == "mistral")     return PieArch::Mistral3;
     if (hf_model_type == "mistral3")    return PieArch::Mistral3;
-    if (hf_model_type == "olmo3")       return PieArch::Olmo3;
+    if (hf_model_type == "olmo3" ||
+        hf_model_type == "olmo2")       return PieArch::Olmo3;
     if (hf_model_type == "gpt_oss")     return PieArch::GptOss;
     if (hf_model_type == "gptoss")      return PieArch::GptOss;
     if (hf_model_type == "phi3")        return PieArch::Phi3;
