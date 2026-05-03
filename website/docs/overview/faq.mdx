@@ -10,11 +10,20 @@ Common questions about Pie's status, scope, and design choices. If you cannot fi
 
 ## Is Pie production ready?
 
-No. Pie is a research prototype under active development. APIs change between releases without deprecation cycles. The supported model families and drivers are listed in [Models](../reference/models). Anything outside that list is not guaranteed to work. Use Pie for research, prototyping, and internal deployments where you can update with the project.
+No. Pie is a research prototype under active development. APIs change between releases without deprecation cycles. The supported model families and drivers are listed on each driver's reference page ([CUDA](../reference/drivers/cuda#supported-architectures), [Portable](../reference/drivers/portable#supported-architectures), [vLLM](../reference/drivers/vllm), [SGLang](../reference/drivers/sglang)). Anything outside those lists is not guaranteed to work. Use Pie for research, prototyping, and internal deployments where you can update with the project.
 
 ## Do I have to write Rust?
 
 No. Inferlets can be written in Rust, Python, or TypeScript. Rust is the canonical SDK, and a few advanced primitives (the raw `forward()` API, custom speculators, custom adapters) are Rust-only today. The Python and TypeScript SDKs cover generation, KV cache control, structured output, MCP, and tool calling. See [Your first inferlet](../guide/first-inferlet) for the Rust path and the `python-example` and `js-example` inferlets for the other two.
+
+## Does this architecture introduce too much overhead?
+
+The accumulated per-request runtime overhead (Wasm instantiation, the tokio per-inferlet executor, Wasm/host boundary crossings, and the runtime-to-driver IPC) sits in the 100-500 microsecond range even under load. That's small relative to a forward pass. The main "programmability tax" per-step comes from two places:
+
+1. **Optimizations the driver can no longer apply.** The driver doesn't know which API calls the inferlet will issue next, so it can't pipeline CPU-side batch preparation with GPU execution, and it can't do in-place batch updates that only edit newly added tokens.
+
+2. **Sampling has to be composable.** A black-box endpoint can fuse the entire sampler into one kernel. Pie splits sampling into composable steps so inferlets can mix and match, which costs extra kernel launches.
+
 
 ## Does Pie support multi-GPU and multi-node?
 

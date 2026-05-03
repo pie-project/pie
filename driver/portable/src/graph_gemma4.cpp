@@ -217,20 +217,26 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
             auto* Q_4d = ggml_reshape_4d(ctx, Q,
                                           head_dim_il, 1, n_q_heads, n_req);
 
-            if (in.block_table != nullptr &&
+            if (in.page_indices != nullptr &&
                 head_dim_il <= kFlashAttnMaxHeadDim) {
                 // Paged-attn fast path. Same head_dim gate as the existing
                 // flash_attn_ext call below — full-attention layers
                 // (head_dim=512) stay on the manual SDPA path.
+                // Sliding-window: Gemma 4's 's' layers use SWA; FlashInfer
+                // applies it natively via window_left.
+                const int win = is_full ? -1 :
+                    (spec.sliding_window > 0 ? spec.sliding_window - 1 : -1);
+                auto* Q_bf16 = (Q_4d->type == GGML_TYPE_BF16)
+                    ? Q_4d : ggml_cast(ctx, Q_4d, GGML_TYPE_BF16);
                 auto* attn = ggml_paged_attn_ext(
-                    ctx, Q_4d, k_cached, v_cached,
-                    in.block_table, in.seq_lens, mask,
+                    ctx, Q_bf16, k_cached, v_cached,
+                    in.page_indices, in.page_indptr, in.last_page_lens,
                     kv.page_size(), head_dim_il, n_kv_heads_il,
+                    win,
                     layer_kq_scale, spec.attn_softcap);
+                auto* attn_f32 = ggml_cast(ctx, attn, GGML_TYPE_F32);
                 attn_2d = ggml_reshape_2d(
-                    ctx,
-                    ggml_is_contiguous(attn) ? attn : ggml_cont(ctx, attn),
-                    head_dim_il * n_q_heads, n_total);
+                    ctx, attn_f32, head_dim_il * n_q_heads, n_total);
             } else {
                 auto* K_gather = ggml_get_rows(ctx, k_cached, in.packed_gather);
                 auto* V_gather = ggml_get_rows(ctx, v_cached, in.packed_gather);

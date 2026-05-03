@@ -1,6 +1,6 @@
 [package]
 name = "template-generation"
-version = "0.1.0"
+version = "0.1.1"
 description = "Grammar-constrained JSON + Jinja2 template rendering"
 authors = ["Pie Team"]
 

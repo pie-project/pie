@@ -16,6 +16,10 @@ Pie has two paths for tool use:
 
 Read this after [Chat parser](./chat). For external tool servers, see [MCP](../io/mcp).
 
+:::note[Running on the dummy driver?]
+The dummy driver returns uniform random tokens, so native tool-call marker sequences (Llama 3.1 / Qwen 2.5 format) almost never appear in the stream — `tools::Decoder` will run to `max_tokens` without firing a `Call` event, and the hand-rolled ReAct parser will fail to match its action format. The "forcing valid tool calls with grammar" pattern further down *does* produce parseable tool-call JSON on the dummy because constraint masks are honored; only the field values are random.
+:::
+
 ## Hand-rolled ReAct
 
 Prompt-engineer the action format and parse the response yourself.

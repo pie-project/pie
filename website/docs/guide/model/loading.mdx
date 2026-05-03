@@ -137,10 +137,10 @@ device = ["cuda:0", "cuda:1"]
 tensor_parallel_size = 2
 ```
 
-The native driver handles tensor parallelism. From the inferlet's side, the model handle is the same; the engine schedules forward passes across the listed devices. See [Drivers](../../reference/drivers) for the per-driver behavior.
+The native driver handles tensor parallelism. From the inferlet's side, the model handle is the same; the engine schedules forward passes across the listed devices. See the [CUDA driver](../../reference/drivers/cuda) page for the per-driver behavior.
 
 ## Next
 
 - [Tokenizers](./tokenizer): encode and decode text, inspect special tokens.
 - [Context overview](../context/overview): allocate a KV context against a loaded model.
-- [Supported models](../../reference/models): which architectures the native driver handles.
+- [CUDA driver](../../reference/drivers/cuda#supported-architectures): which architectures the native driver handles.

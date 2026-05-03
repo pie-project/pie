@@ -65,7 +65,7 @@ max_batch_tokens = 10240
 max_batch_size = 512
 ```
 
-`[model.driver].type` is a discriminator looked up in the driver registry. Driver-specific knobs live in the `[model.driver.options]` sub-table; pie validates them against the driver's typed config. See [Drivers](./drivers) for what each backend accepts.
+`[model.driver].type` is a discriminator looked up in the driver registry. Driver-specific knobs live in the `[model.driver.options]` sub-table; pie validates them against the driver's typed config. See the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang)) for what each backend accepts.
 
 To add a second model, append another `[[model]]` block with a unique `name` and a `device` list that does not overlap any other model's.
 
@@ -141,7 +141,7 @@ Driver discriminator + universal driver fields:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `type` | required | Driver name (looked up in the registry). One of `native`, `cuda_native`, `portable`, `vllm`, `sglang`, `dummy`. See [Drivers](./drivers). |
+| `type` | required | Driver name (looked up in the registry). One of `native`, `cuda_native`, `portable`, `vllm`, `sglang`, `dummy`. See the per-driver reference pages. |
 | `device` | required | Device list for this model. A single string is accepted and normalized to a one-element list. The list across all `[[model]]` entries must be disjoint. |
 | `tensor_parallel_size` | `1` | TP world size. |
 | `activation_dtype` | `"bfloat16"` | Activation dtype for forward passes. |
@@ -149,7 +149,7 @@ Driver discriminator + universal driver fields:
 
 ### `[model.driver.options]`
 
-Driver-specific knobs in the driver's own vocabulary. Pie does not validate these centrally; the driver's typed config dataclass parses them at server / worker startup. See [Drivers](./drivers) for each driver's option set.
+Driver-specific knobs in the driver's own vocabulary. Pie does not validate these centrally; the driver's typed config dataclass parses them at server / worker startup. See the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang)) for each driver's option set.
 
 ## Editing the config
 
@@ -201,5 +201,5 @@ Run `pie config init` to regenerate the file in the new shape.
 ## Related
 
 - [CLI reference](./pie): every `pie` command and flag.
-- [Drivers](./drivers): driver-specific config keys.
-- [Supported models](./models): what `hf_repo` values work with each driver.
+- Per-driver options: [CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang).
+- Supported architectures are listed on each driver page (e.g. [CUDA `#supported-architectures`](./drivers/cuda#supported-architectures)).

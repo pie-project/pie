@@ -8,6 +8,10 @@ sidebar_position: 5
 
 Inferlets that exercise the page-based KV cache — forking from a shared prefix, building prefix trees, sliding-window attention, and the runtime's automatic page-trim.
 
+:::note[Running on the dummy driver?]
+`parallel-generation` and `prefix-tree` fork from a shared prefix and rely on each branch producing a related continuation. On the dummy, branches share KV pages correctly but each branch's tokens are drawn independently — the page state machine is exercised, the branch *content* is unrelated random. `windowed-attention`, `attention-sink`, and `page-trim-bench` are unaffected; they exercise mask and page-trim plumbing, not token semantics.
+:::
+
 | Inferlet | What it shows |
 |---|---|
 | [`parallel-generation`](https://github.com/pie-project/pie/tree/main/inferlets/parallel-generation) | Forked contexts that share committed pages and decode in parallel. |

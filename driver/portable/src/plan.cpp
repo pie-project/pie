@@ -447,12 +447,14 @@ void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
     } else {
         plan.packed_mask_full_f16.clear();
     }
-    // Paged-attn companion. `M` is bucketed up to a page boundary in
-    // forward.cpp::plan_(), so `max_blocks_per_req` is exact integer.
-    plan.max_blocks_per_req = M / page_size;
-    plan.block_table_i32.assign(
-        static_cast<std::size_t>(plan.max_blocks_per_req) * N, 0);
-    plan.seq_lens_i32.assign(static_cast<std::size_t>(N), 0);
+    // Paged-attn inputs (FlashInfer / vLLM shape). Derived from
+    // rp.gather_idxs: for block b, page id = gather_idxs[b*page_size] /
+    // page_size (since gather_idxs[k] = page_id[k/page_size]*page_size +
+    // (k % page_size)). Variable-length flat layout via prefix sums.
+    plan.page_indptr_i32.assign(static_cast<std::size_t>(N + 1), 0);
+    plan.last_page_lens_i32.assign(static_cast<std::size_t>(N), 0);
+    plan.page_indices_i32.clear();
+    plan.page_indices_i32.reserve(static_cast<std::size_t>(M / page_size) * N);
     const auto zero = ggml_fp32_to_fp16(0.0f);
     const std::int32_t W = sliding_window;
     for (std::int32_t r = 0; r < N; ++r) {
@@ -461,19 +463,17 @@ void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
             plan.packed_gather_idxs[
                 static_cast<std::size_t>(r) * M + k] = rp.gather_idxs[k];
         }
-        // Block table: page id for block b is gather_idxs[b * page_size]
-        // / page_size, since gather_idxs[k] = page_id[k/page_size] *
-        // page_size + (k % page_size). Beyond `num_pages_r` entries the
-        // kernel never reads (seq_lens_i32[r] gates the loop), so the
-        // tail stays at the assign-zero default.
         const std::int32_t num_pages_r =
             (rp.n_kv + page_size - 1) / page_size;
         for (std::int32_t b = 0; b < num_pages_r; ++b) {
-            plan.block_table_i32[
-                static_cast<std::size_t>(r) * plan.max_blocks_per_req + b] =
-                rp.gather_idxs[b * page_size] / page_size;
+            plan.page_indices_i32.push_back(
+                rp.gather_idxs[b * page_size] / page_size);
         }
-        plan.seq_lens_i32[r] = rp.n_kv;
+        plan.page_indptr_i32[r + 1] =
+            plan.page_indptr_i32[r] + num_pages_r;
+        // Last-page slot count: 1..page_size.
+        const std::int32_t tail = rp.n_kv - (num_pages_r - 1) * page_size;
+        plan.last_page_lens_i32[r] = tail;
         // SWA-clipped row.
         std::uint16_t* row = plan.packed_mask_f16.data()
             + static_cast<std::size_t>(r) * M * MASK_PAD;

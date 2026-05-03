@@ -117,8 +117,29 @@ async fn main(input: Input) -> Result<String> {
             .collect_text()
             .await?;
 
-        let action = serde_json::from_str::<Value>(&raw)
-            .map_err(|e| format!("step {step}: JSON parse: {e} (raw: {raw})"))?;
+        // The grammar enforces a structurally valid prefix at every
+        // step. Parse can still fail when `max_tokens` cuts mid-string
+        // — bias on real models points away from open-ended thought
+        // text, but a backend with no convergence pressure (e.g. the
+        // dummy driver) can run the `thought` field past the budget.
+        // Treat that as "step skipped" instead of aborting the loop.
+        let action = match serde_json::from_str::<Value>(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                println!(
+                    "\n[step {step}] grammar truncated at max_tokens \
+                     ({e}). Skipping to next step."
+                );
+                ctx.user(&format!(
+                    "Observation: (no action — generator hit max_tokens \
+                     mid-grammar)\nQuestion (reminder): {q}\nWhat is \
+                     the next action?",
+                    q = input.question
+                ));
+                ctx.cue();
+                continue;
+            }
+        };
         let thought = action.get("thought").and_then(Value::as_str).unwrap_or("");
         let tool = action.get("tool").and_then(Value::as_str).unwrap_or("");
         let arg = action.get("input").and_then(Value::as_str).unwrap_or("");

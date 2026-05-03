@@ -11,6 +11,10 @@ import TabItem from '@theme/TabItem';
 
 Reasoning models like Qwen3 and DeepSeek-R1 emit a thinking block before the visible reply. The block is wrapped in model-specific markers (e.g. `<think>...</think>`) and contains the model's intermediate reasoning. `reasoning::Decoder` is a stateful parser that surfaces those blocks as their own event stream so you can route them separately from the visible answer. Read this after [Chat parser](./chat).
 
+:::note[Running on the dummy driver?]
+The dummy driver returns uniform random tokens, so the model's `<think>` marker rarely appears by chance. The parser will mostly emit nothing and pass everything through as chat output.
+:::
+
 ## The two parsers are independent
 
 The chat parser and the reasoning parser consume the same tokens but emit disjoint events. Tokens inside a reasoning block produce `reasoning::Event::Delta` and are suppressed by the chat parser. Tokens after the block produce `chat::Event::Delta` and are ignored by the reasoning parser.

@@ -7,6 +7,23 @@
 
 #include "plan.hpp"  // MASK_PAD
 
+// Hook into the FlashInfer-backed paged-attn registration in
+// driver/portable/src/paged_attn_cuda.cu. The .cu file is only compiled
+// when GGML_CUDA=ON; otherwise we fall back to a no-op (the paged path
+// is never taken on CPU/Vulkan/Metal builds anyway, so the call is
+// unreachable but the linker still needs a symbol).
+extern "C" void pie_paged_attn_set_host_indptr(
+    const std::int32_t* indptr, std::size_t n_req_plus_one);
+
+#ifndef PIE_PORTABLE_HAS_CUDA
+extern "C" void pie_paged_attn_set_host_indptr(
+        const std::int32_t* /*indptr*/, std::size_t /*n_req_plus_one*/) {
+    // Stub: paged path can't be taken without a registered kernel, so
+    // upload_graph_inputs never reaches this. Defined to satisfy the
+    // linker on non-CUDA builds.
+}
+#endif
+
 namespace pie_portable_driver {
 
 GraphInputs declare_graph_inputs(ggml_context* ctx,
@@ -35,11 +52,13 @@ GraphInputs declare_graph_inputs(ggml_context* ctx,
     ggml_set_input(in.out_idx);
 
     if (plan.pure_decode) {
-        // Either paged-attn inputs (block_table + seq_lens) or the
-        // materialize path's packed_gather — never both. The allocator
-        // skips tensors not reached from graph nodes, so allocating an
-        // unused input tensor leaves it bufferless and breaks upload.
-        const bool use_paged = supports_paged_attn_ext && plan.max_blocks_per_req > 0;
+        // Either paged-attn inputs (page_indices/indptr/last_page_lens)
+        // or the materialize path's packed_gather — never both. The
+        // allocator skips tensors not reached from graph nodes, so
+        // allocating an unused input tensor leaves it bufferless and
+        // breaks upload.
+        const bool use_paged = supports_paged_attn_ext &&
+                               !plan.page_indices_i32.empty();
 
         if (!use_paged) {
             // Materialize path: single packed gather covers all requests.
@@ -50,36 +69,43 @@ GraphInputs declare_graph_inputs(ggml_context* ctx,
             ggml_set_input(in.packed_gather);
         }
 
-        // packed_mask is consumed by BOTH paths.
-        in.packed_mask = ggml_new_tensor_4d(
-            ctx, GGML_TYPE_F16, plan.max_n_kv,
-            static_cast<std::int64_t>(MASK_PAD), 1, n_req);
-        ggml_set_name(in.packed_mask, "kq_mask.packed");
-        ggml_set_input(in.packed_mask);
-
-        // Optional no-SWA companion (Gemma 4 full-attention layers).
-        if (!plan.packed_mask_full_f16.empty()) {
-            in.packed_mask_full = ggml_new_tensor_4d(
+        // packed_mask is consumed only by the materialize path; FlashInfer
+        // handles SWA natively via window_left so paged path doesn't need it.
+        // Allocating it on the paged path would leave it unused and trip
+        // the allocator-skip → bufferless upload bug.
+        if (!use_paged) {
+            in.packed_mask = ggml_new_tensor_4d(
                 ctx, GGML_TYPE_F16, plan.max_n_kv,
                 static_cast<std::int64_t>(MASK_PAD), 1, n_req);
-            ggml_set_name(in.packed_mask_full, "kq_mask.packed.full");
-            ggml_set_input(in.packed_mask_full);
+            ggml_set_name(in.packed_mask, "kq_mask.packed");
+            ggml_set_input(in.packed_mask);
+
+            // Optional no-SWA companion (Gemma 4 full-attention layers).
+            if (!plan.packed_mask_full_f16.empty()) {
+                in.packed_mask_full = ggml_new_tensor_4d(
+                    ctx, GGML_TYPE_F16, plan.max_n_kv,
+                    static_cast<std::int64_t>(MASK_PAD), 1, n_req);
+                ggml_set_name(in.packed_mask_full, "kq_mask.packed.full");
+                ggml_set_input(in.packed_mask_full);
+            }
         }
 
         if (use_paged) {
-            in.block_table = ggml_new_tensor_2d(
+            in.page_indices = ggml_new_tensor_1d(
                 ctx, GGML_TYPE_I32,
-                plan.max_blocks_per_req, n_req);
-            ggml_set_name(in.block_table, "kv_block_table");
-            ggml_set_input(in.block_table);
+                static_cast<std::int64_t>(plan.page_indices_i32.size()));
+            ggml_set_name(in.page_indices, "kv_page_indices");
+            ggml_set_input(in.page_indices);
 
-            in.seq_lens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_req);
-            ggml_set_name(in.seq_lens, "kv_seq_lens");
-            ggml_set_input(in.seq_lens);
+            in.page_indptr = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_I32, n_req + 1);
+            ggml_set_name(in.page_indptr, "kv_page_indptr");
+            ggml_set_input(in.page_indptr);
 
-            std::fprintf(stderr, "[paged-debug] declare: bt=%p sl=%p mbpr=%d n_req=%d\n",
-                         (void*) in.block_table, (void*) in.seq_lens,
-                         plan.max_blocks_per_req, n_req);
+            in.last_page_lens = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_I32, n_req);
+            ggml_set_name(in.last_page_lens, "kv_last_page_lens");
+            ggml_set_input(in.last_page_lens);
         }
     } else {
         in.masks.reserve(n_req);
@@ -368,24 +394,37 @@ void upload_graph_inputs(const GraphResult& g,
                                     plan.packed_gather_idxs.data(), 0,
                                     plan.packed_gather_idxs.size() * sizeof(std::int32_t));
         }
-        ggml_backend_tensor_set(g.in.packed_mask,
-                                plan.packed_mask_f16.data(), 0,
-                                plan.packed_mask_f16.size() * sizeof(std::uint16_t));
+        if (g.in.packed_mask) {
+            ggml_backend_tensor_set(g.in.packed_mask,
+                                    plan.packed_mask_f16.data(), 0,
+                                    plan.packed_mask_f16.size() * sizeof(std::uint16_t));
+        }
         if (g.in.packed_mask_full) {
             ggml_backend_tensor_set(
                 g.in.packed_mask_full,
                 plan.packed_mask_full_f16.data(), 0,
                 plan.packed_mask_full_f16.size() * sizeof(std::uint16_t));
         }
-        if (g.in.block_table) {
+        if (g.in.page_indices) {
             ggml_backend_tensor_set(
-                g.in.block_table,
-                plan.block_table_i32.data(), 0,
-                plan.block_table_i32.size() * sizeof(std::int32_t));
+                g.in.page_indices,
+                plan.page_indices_i32.data(), 0,
+                plan.page_indices_i32.size() * sizeof(std::int32_t));
             ggml_backend_tensor_set(
-                g.in.seq_lens,
-                plan.seq_lens_i32.data(), 0,
-                plan.seq_lens_i32.size() * sizeof(std::int32_t));
+                g.in.page_indptr,
+                plan.page_indptr_i32.data(), 0,
+                plan.page_indptr_i32.size() * sizeof(std::int32_t));
+            ggml_backend_tensor_set(
+                g.in.last_page_lens,
+                plan.last_page_lens_i32.data(), 0,
+                plan.last_page_lens_i32.size() * sizeof(std::int32_t));
+            // Stash host-side indptr for the FlashInfer planner to consume
+            // at kernel launch time without a device→host download. The
+            // symbol is provided by paged_attn_cuda.cu when GGML_CUDA is
+            // enabled; otherwise the call resolves to a stub.
+            pie_paged_attn_set_host_indptr(
+                plan.page_indptr_i32.data(),
+                plan.page_indptr_i32.size());
         }
     } else {
         for (std::size_t r = 0; r < plan.reqs.size(); ++r) {

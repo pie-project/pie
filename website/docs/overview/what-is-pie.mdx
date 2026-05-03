@@ -241,8 +241,9 @@ impl Speculator for NGram {
 </CodeTabItem>
 </CodeTabs>
 
-The examples above run end-to-end inside the engine, without client round trips or engine patches.
-This "inference programming" unlocks a few new opportunities:
+## What Pie brings us
+
+The examples above run end-to-end inside the engine, without client round trips or engine patches. Three things follow from that:
 
 - **Application-specific optimization.** The engine sees a stream of forward passes and doesn't know which KV pages will be reused. The inferlet does. A multi-turn agent pins a shared prefix across turns; a planner with cheap-to-recompute branches releases its pages under contention. Placement, prefetching, and eviction are policy decisions, and the right policy depends on what the application is doing.
 
@@ -250,25 +251,4 @@ This "inference programming" unlocks a few new opportunities:
 
 - **Less engineering.** The engine and the application logic evolve independently. The engine exposes a fixed set of primitives, and new behavior is extended on top of them rather than patched into the engine. Agent loops, KV cache policy, decoding strategy, and tool execution live in one inferlet instead of separate processes.
 
-
-## Components of Pie
-
-Pie has three parts: the **engine** that runs inferlets, the **SDKs** for writing them and talking to a running engine, and **Bakery**, the toolchain for building and publishing them.
-
-### Engine
-
-The engine is the "operating system" for inferlets, made of three pieces:
-- **Runtime** (`runtime/`). The Rust core. Hosts the Wasmtime-based WebAssembly runtime, the inferlet scheduler, KV cache mapping, contention management, and the WebSocket protocol clients connect to.
-- **Driver** (`driver/`). The hardware layer. Pie ships a CUDA driver, and a local driver for CPU and Apple Silicon. Pie also has experimental support for vLLM and SGLang as drivers.
-- **Server**. Glues the runtime and driver together, and provide CLI to configure and start them. 
-
-### SDKs
-
-Each available in Rust, Python, and JavaScript / TypeScript.
-
-- **Inferlet SDK** (`sdk/`). A library for writing inferlets. Comes with helpful utilities and macros to reduce boilerplate.
-- **Client SDK** (`client/`). A programmatic client for controlling a running Pie engine, for example install, run, and manage inferlets.
-
-### Bakery
-
-`bakery` (in `sdk/tools/bakery/`) is the inferlet toolchain, that provides CLI commands to scaffold and build inferlets. It also provides an experimental package manager to share the inferlets.
+The next page, [Components](./components), describes the engine, SDKs, and Bakery toolchain that make up the distribution.

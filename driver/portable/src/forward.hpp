@@ -113,15 +113,16 @@ public:
         std::int32_t                max_n_kv = 0;
         std::vector<std::int32_t>   packed_gather_idxs;  // [n_req * max_n_kv]
         std::vector<std::uint16_t>  packed_mask_f16;     // [max_n_kv, 64, 1, n_req] — SWA-clipped
-        // Paged-attention companion to packed_gather_idxs. Built alongside
-        // it in build_pure_decode_packing. Consumed by the per-arch graph
-        // builders' `if (model.supports_paged_attn_ext()) { ... }` branch
-        // when at least one backend ships a paged-attn kernel; otherwise
-        // unused (the materialize+flash_attn_ext fallback reads from
-        // packed_gather_idxs / packed_mask_f16 instead).
-        std::int32_t                max_blocks_per_req = 0;
-        std::vector<std::int32_t>   block_table_i32;     // [max_blocks_per_req * n_req]
-        std::vector<std::int32_t>   seq_lens_i32;        // [n_req]
+        // Paged-attention inputs (FlashInfer / vLLM convention). Built
+        // in build_pure_decode_packing alongside the materialize-path
+        // arrays above; only the `model.supports_paged_attn_ext()` branch
+        // in graph builders actually consumes them. The values are
+        // direct copies of the BPIQ wire payload (kv_page_indices /
+        // kv_page_indptr / kv_last_page_lens) — i32-cast from the
+        // u32 wire fields.
+        std::vector<std::int32_t>   page_indices_i32;     // [total_pages_in_batch] flat
+        std::vector<std::int32_t>   page_indptr_i32;      // [n_req + 1] prefix sums
+        std::vector<std::int32_t>   last_page_lens_i32;   // [n_req] last-page slot count
         // Optional companion "no-SWA" mask for archs with mixed
         // sliding+full attention patterns (Gemma 4): full-attention
         // layers attend the entire context, so they need a different

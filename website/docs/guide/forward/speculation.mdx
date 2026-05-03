@@ -11,6 +11,10 @@ import TabItem from '@theme/TabItem';
 
 Speculative decoding accelerates autoregressive generation by drafting multiple tokens cheaply and verifying them in a single forward pass. Pie supports two paths: a runtime-driven n-gram drafter (system speculation) and an arbitrary `Speculator` you write yourself. Both are off by default; you opt in per `Generator`. Read this after [Constrained generation](./constrained).
 
+:::note[Running on the dummy driver?]
+The dummy driver samples a fresh random token for every slot, including the verifier's, so every draft is rejected and the loop runs in 1-token-per-step fallback — no speedup is observable.
+:::
+
 ## System speculation
 
 Off by default. Opt in with `system_speculation()` (Rust) or the `system_speculation` / `systemSpeculation` flag on `generate(...)`. The runtime then drives drafts using its built-in n-gram drafter. Each `g.next()?` step (Rust) or async-for iteration (Python / JS) may return multiple accepted tokens.

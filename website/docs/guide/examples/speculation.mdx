@@ -8,6 +8,10 @@ sidebar_position: 6
 
 Inferlets that implement custom draft strategies on top of Pie's `Speculator` trait. For the runtime-managed n-gram path, see `text-completion-spec` under [Chat and generation](./chat).
 
+:::note[Running on the dummy driver?]
+The dummy driver samples a fresh random token for every slot, so every draft is rejected and these inferlets run in 1-token-per-step fallback — they complete correctly but no speedup is observable.
+:::
+
 | Inferlet | What it shows |
 |---|---|
 | [`jacobi-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/jacobi-decoding) | Parallel Jacobi decoding (custom drafter). |

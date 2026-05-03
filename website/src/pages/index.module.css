@@ -237,30 +237,3 @@
   margin: 0;
 }
 
-/* =====================================================================
-   CTA
-   ===================================================================== */
-.ctaSection {
-  background:
-    radial-gradient(70% 55% at 50% -15%,
-      color-mix(in oklab, var(--ifm-color-primary) 9%, transparent) 0%,
-      transparent 75%),
-    var(--pie-bg);
-  border-top: 1px solid var(--pie-border);
-}
-
-.ctaSection .sectionTitle {
-  margin-bottom: var(--space-4);
-}
-
-.ctaActions {
-  display: flex;
-  justify-content: center;
-  gap: var(--space-3);
-  flex-wrap: wrap;
-}
-
-.ctaActions :global(.button) {
-  padding: 0.9rem 2rem;
-  font-size: var(--pie-text-lg);
-}

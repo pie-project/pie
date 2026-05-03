@@ -1,6 +1,6 @@
 [package]
 name = "agent-react"
-version = "0.1.0"
+version = "0.1.1"
 description = "ReAct-style (Reasoning + Acting) agent workflow with tool execution"
 authors = ["Pie Team"]
 

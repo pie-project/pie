@@ -119,3 +119,40 @@ endif()
 
 add_executable(pie_driver_portable src/main.cpp)
 target_link_libraries(pie_driver_portable PRIVATE pie_driver_portable_lib)
+
+# ── CUDA paged-attention (FlashInfer) ─────────────────────────────────────
+#
+# When the ggml CUDA backend is enabled, register an out-of-tree paged-
+# attention kernel into ggml-cuda's GGML_OP_PAGED_ATTN_EXT dispatch hook
+# (added by patches/ggml-pie-paged-attn-ext.patch). The implementation
+# wraps FlashInfer's BatchDecodeWithPagedKVCache, which is the
+# production-quality kernel for vLLM/SGLang-style paged decode.
+#
+# Self-contained: no impact on Metal / Vulkan / CPU-only builds.
+# FlashInfer is fetched only when GGML_CUDA=ON.
+if(GGML_CUDA)
+  enable_language(CUDA)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    # Match ggml-cuda's default. Caller can override with -DCMAKE_CUDA_ARCHITECTURES=...
+    set(CMAKE_CUDA_ARCHITECTURES native)
+  endif()
+
+  # FlashInfer dropped its top-level CMakeLists after v0.2.7; pin to that
+  # last self-contained release. cuTLASS ships under 3rdparty/.
+  cpmaddpackage(
+    NAME flashinfer
+    GITHUB_REPOSITORY flashinfer-ai/flashinfer
+    GIT_TAG v0.2.7
+    DOWNLOAD_ONLY YES)
+
+  target_sources(pie_driver_portable_lib PRIVATE
+    src/paged_attn_cuda.cu)
+  set_source_files_properties(src/paged_attn_cuda.cu
+    PROPERTIES LANGUAGE CUDA)
+  target_compile_definitions(pie_driver_portable_lib PRIVATE
+    PIE_PORTABLE_HAS_CUDA=1)
+  target_include_directories(pie_driver_portable_lib PRIVATE
+    ${flashinfer_SOURCE_DIR}/include
+    ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
+    ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include)
+endif()

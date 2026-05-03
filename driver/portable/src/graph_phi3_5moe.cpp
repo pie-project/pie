@@ -98,16 +98,18 @@ GraphResult build_phi3_5moe_graph(ggml_context* ctx,
         ggml_tensor* attn_2d = nullptr;
         if (plan.pure_decode) {
             auto* Q_4d = ggml_reshape_4d(ctx, Q, head_dim, 1, n_q_heads, n_req);
-            if (in.block_table != nullptr) {
+            if (in.page_indices != nullptr) {
+                auto* Q_bf16 = (Q_4d->type == GGML_TYPE_BF16)
+                    ? Q_4d : ggml_cast(ctx, Q_4d, GGML_TYPE_BF16);
                 auto* attn = ggml_paged_attn_ext(
-                    ctx, Q_4d, k_cached, v_cached,
-                    in.block_table, in.seq_lens, in.packed_mask,
+                    ctx, Q_bf16, k_cached, v_cached,
+                    in.page_indices, in.page_indptr, in.last_page_lens,
                     kv.page_size(), head_dim, n_kv_heads,
+                    /*sliding_window=*/-1,
                     attn_scale, /*softcap=*/0.0f);
+                auto* attn_f32 = ggml_cast(ctx, attn, GGML_TYPE_F32);
                 attn_2d = ggml_reshape_2d(
-                    ctx,
-                    ggml_is_contiguous(attn) ? attn : ggml_cont(ctx, attn),
-                    head_dim * n_q_heads, n_total);
+                    ctx, attn_f32, head_dim * n_q_heads, n_total);
             } else {
                 auto* K_g = ggml_get_rows(ctx, k_cached, in.packed_gather);
                 auto* V_g = ggml_get_rows(ctx, v_cached, in.packed_gather);

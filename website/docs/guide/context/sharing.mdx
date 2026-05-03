@@ -11,6 +11,10 @@ import TabItem from '@theme/TabItem';
 
 Two operations let you reuse a context's state across branches and across runs: `fork()` clones in O(1), and `save()` snapshots under a name. This page covers both. Read this after [Pages](./pages).
 
+:::note[Running on the dummy driver?]
+Forks share KV pages correctly on the dummy, but each branch's next token is drawn independently — the parent and child diverge into unrelated random streams instead of producing related continuations from a shared prefix. The page-state machine is exercised faithfully; only the token semantics are absent.
+:::
+
 ## Fork
 
 `ctx.fork()` is a copy-on-write clone. Committed pages are shared between parent and child; only working pages and any new tokens the child writes cost extra memory.

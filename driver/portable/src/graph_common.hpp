@@ -113,9 +113,11 @@ struct GraphInputs {
     // `plan.pure_decode` AND `Model::supports_paged_attn_ext()` hold;
     // null otherwise (the materialize+flash_attn_ext fallback reads
     // from `packed_gather` / `packed_mask` instead). The graph builder
-    // tests `block_table != nullptr` to choose between paths.
-    ggml_tensor*              block_table   = nullptr;  // I32 [max_blocks_per_req, n_req]
-    ggml_tensor*              seq_lens      = nullptr;  // I32 [n_req]
+    // tests `page_indices != nullptr` to choose between paths.
+    // Layout matches FlashInfer / vLLM convention.
+    ggml_tensor*              page_indices   = nullptr;  // I32 [total_pages_in_batch]
+    ggml_tensor*              page_indptr    = nullptr;  // I32 [n_req + 1]
+    ggml_tensor*              last_page_lens = nullptr;  // I32 [n_req]
 };
 
 // Per-arch graph builders return one of these. Exactly one of the three

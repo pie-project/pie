@@ -289,8 +289,9 @@ import useBaseUrl from '@docusaurus/useBaseUrl';
 What you can run on Pie depends on three choices: the model architecture, the
 driver Pie routes inference through, and the precision and parallelism that
 driver supports for that architecture. This page is the at-a-glance matrix.
-For prose on each driver, see [Drivers](/docs/reference/drivers); for the
-native architecture registry, see [Supported Models](/docs/reference/models).
+For configuration and supported architectures of each driver, see
+[CUDA](/docs/reference/drivers/cuda), [Portable](/docs/reference/drivers/portable),
+[vLLM](/docs/reference/drivers/vllm), and [SGLang](/docs/reference/drivers/sglang).
 
 ## Drivers
 
@@ -555,7 +556,7 @@ native architecture registry, see [Supported Models](/docs/reference/models).
         <span className="m-arch-name">Qwen 3.5 MoE</span>
         <span className="m-arch-sub">qwen3_5_moe</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -587,7 +588,7 @@ native architecture registry, see [Supported Models](/docs/reference/models).
         <span className="m-arch-name">Qwen 3.6 MoE</span>
         <span className="m-arch-sub">qwen3_5_moe</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -693,8 +694,8 @@ native architecture registry, see [Supported Models](/docs/reference/models).
         <span className="m-arch-name">Gemma 3n</span>
         <span className="m-arch-sub">gemma3n, gemma3n_text</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td>
@@ -710,15 +711,29 @@ native architecture registry, see [Supported Models](/docs/reference/models).
         <span className="m-arch-sub">gemma4, gemma4_text</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
-      <td className="c"><span className="m-pill up">upstream</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/google/gemma-4-31B">31B</a>
-          <a className="m-size" href="https://huggingface.co/google/gemma-4-26B-A4B">26B-A4B</a>
           <a className="m-size" href="https://huggingface.co/google/gemma-4-E4B-it">E4B</a>
           <a className="m-size" href="https://huggingface.co/google/gemma-4-E2B-it">E2B</a>
+        </div>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <span className="m-arch-name">Gemma 4 MoE</span>
+        <span className="m-arch-sub">gemma4 (with experts)</span>
+      </td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill partial">preview</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td>
+        <div className="m-sizes">
+          <a className="m-size" href="https://huggingface.co/google/gemma-4-26B-A4B">26B-A4B</a>
         </div>
       </td>
     </tr>
@@ -749,7 +764,7 @@ native architecture registry, see [Supported Models](/docs/reference/models).
         <span className="m-arch-name">Mistral</span>
         <span className="m-arch-sub">mistral</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -823,8 +838,55 @@ native architecture registry, see [Supported Models](/docs/reference/models).
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/microsoft/Phi-3-mini-4k-instruct">mini 3.8B</a>
-          <a className="m-size" href="https://huggingface.co/microsoft/Phi-3-small-8k-instruct">small 7B</a>
           <a className="m-size" href="https://huggingface.co/microsoft/Phi-3-medium-4k-instruct">medium 14B</a>
+        </div>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <span className="m-arch-name">Phi-3-small</span>
+        <span className="m-arch-sub">phi3small</span>
+      </td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill partial">preview</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td>
+        <div className="m-sizes">
+          <a className="m-size" href="https://huggingface.co/microsoft/Phi-3-small-8k-instruct">small 7B</a>
+        </div>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <span className="m-arch-name">Phi-3.5 / Phi-4</span>
+        <span className="m-arch-sub">phi3</span>
+      </td>
+      <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td>
+        <div className="m-sizes">
+          <a className="m-size" href="https://huggingface.co/microsoft/Phi-3.5-mini-instruct">3.5 mini</a>
+          <a className="m-size" href="https://huggingface.co/microsoft/phi-4">Phi-4 14B</a>
+          <a className="m-size" href="https://huggingface.co/microsoft/Phi-4-mini-instruct">Phi-4 mini</a>
+          <a className="m-size" href="https://huggingface.co/microsoft/Phi-4-reasoning">Phi-4 reasoning</a>
+        </div>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <span className="m-arch-name">Phi-3.5-MoE</span>
+        <span className="m-arch-sub">phimoe</span>
+      </td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td>
+        <div className="m-sizes">
+          <a className="m-size" href="https://huggingface.co/microsoft/Phi-3.5-MoE-instruct">42B-A6.6B</a>
         </div>
       </td>
     </tr>
@@ -836,8 +898,8 @@ native architecture registry, see [Supported Models](/docs/reference/models).
         <span className="m-arch-name">OLMo 2</span>
         <span className="m-arch-sub">olmo2</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td>
@@ -871,7 +933,8 @@ native architecture registry, see [Supported Models](/docs/reference/models).
 </div>
 
 <div className="m-foot">
-  <p>The <code>vllm</code> and <code>sglang</code> columns reflect the pinned versions Pie ships against (vllm 0.16.0, sglang 0.5.9). Architectures merged upstream after those releases — currently Gemma 4 in both, and Qwen 3.5 / 3.6 in vllm — show as unsupported here even when newer builds carry them.</p>
+  <p>The <code>cuda</code> column reflects the <code>native</code> (PyTorch) driver, which is the default. The <code>cuda_native</code> C++/CUDA driver covers a slightly different set (e.g. it adds <code>qwen3_moe</code>, <code>qwen3_5_moe</code>, <code>gemma3n</code>, <code>olmo2</code>, plain <code>mistral</code>); see the <a href="/docs/reference/drivers/cuda">CUDA driver page</a> for details.</p>
+  <p>The <code>vllm</code> and <code>sglang</code> columns reflect the pinned versions Pie ships against (vllm 0.16.0, sglang 0.5.9). Architectures merged upstream after those releases — currently Gemma 4 / Gemma 4 MoE in both, and Qwen 3.5 / 3.6 in vllm — show as unsupported here even when newer builds carry them.</p>
   <p>Some inferlet features (custom attention masks, page-trim, raw-logits samplers) remain native-only and are not available through the delegate drivers.</p>
 </div>
 
@@ -881,8 +944,6 @@ For a one-off, route the model at the `vllm` or `sglang` driver and rely on
 the upstream zoo. To add it as a first-party architecture, drop a
 `pie/src/pie_driver/model/<name>.py` file and register it in
 `pie/src/pie_driver/model/__init__.py` against the matching HF `model_type`.
-See [Supported Models](/docs/reference/models#adding-model-support) for the
-walkthrough.
 
 If your target architecture is not in the upstream backends either,
 [open an issue](https://github.com/pie-project/pie/issues) with the
@@ -890,8 +951,10 @@ HuggingFace link.
 
 ## Next
 
-- [Drivers](/docs/reference/drivers). Per-driver configuration knobs and trade-offs.
-- [Supported Models](/docs/reference/models). Native driver registry and download commands.
+- [CUDA driver](/docs/reference/drivers/cuda). Native + cuda_native config and architectures.
+- [Portable driver](/docs/reference/drivers/portable). ggml-backed standalone binary.
+- [vLLM driver](/docs/reference/drivers/vllm). vLLM-backed inference.
+- [SGLang driver](/docs/reference/drivers/sglang). SGLang-backed inference.
 - [Configuration](/docs/reference/configuration). Full `~/.pie/config.toml` reference.
 
 </div>

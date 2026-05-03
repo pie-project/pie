@@ -3,6 +3,7 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 const sidebars: SidebarsConfig = {
   overviewSidebar: [
     'overview/what-is-pie',
+    'overview/components',
     'overview/key-features',
     'overview/comparison',
     'overview/benchmarks',
@@ -153,13 +154,21 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Drivers',
+      collapsed: false,
+      items: [
+        'reference/drivers/cuda',
+        'reference/drivers/portable',
+        'reference/drivers/vllm',
+        'reference/drivers/sglang',
+      ],
+    },
+    {
+      type: 'category',
       label: 'Configuration',
       collapsed: false,
       items: [
         'reference/configuration',
-        'reference/drivers',
-        'reference/models',
-        'reference/kernels',
       ],
     },
   ],

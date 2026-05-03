@@ -1,6 +1,6 @@
 [package]
 name = "json-schema-validation"
-version = "0.1.0"
+version = "0.1.1"
 description = "Grammar-constrained JSON generation against a runtime-string JSON schema"
 authors = ["Pie Team"]
 

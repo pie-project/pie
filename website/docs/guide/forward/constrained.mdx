@@ -13,6 +13,10 @@ Constrained decoding masks the model's logits each step so only tokens that keep
 
 The high-level entry point is `Schema`. Pass any `Schema` value to `constrain_with` (Rust) or as the `constrain` argument (Python and JavaScript) on a `generate` call. The SDK compiles it into a stateful matcher and drives the matcher per generated token.
 
+:::note[Running on the dummy driver?]
+Constraint masks are honored by the dummy driver, so output structure is in-grammar — but the *content* inside the grammar (string field values, numbers, tool arguments) is uniform random. Use a real driver if you need meaningful values.
+:::
+
 ## Schemas
 
 Each language exposes the same five built-in schema variants. Their constructors differ.

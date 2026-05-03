@@ -1,0 +1,61 @@
+---
+title: vLLM
+description: Configuration for delegating inference to vLLM, including the `EngineArgs` passthrough
+sidebar_position: 4
+---
+
+# vLLM
+
+`type = "vllm"`. Pie wraps vLLM's `EngineArgs`; field names mirror vLLM verbatim so values flow through.
+
+Pick vLLM when you need a model native doesn't support yet but vLLM does, or when you want vLLM's mature decode-batch throughput on stock setups. Inferlet features that depend on raw forward-pass control (custom attention masks, page-trim, raw-logits samplers) are not available through vLLM; those require the [CUDA `native` driver](./cuda).
+
+## Install
+
+```bash
+pip install 'pie-server[vllm]'
+```
+
+## Configuration
+
+```toml
+[model.driver]
+type = "vllm"
+device = ["cuda:0"]
+activation_dtype = "bfloat16"
+
+[model.driver.options]
+attention_backend       = "FLASHINFER"   # FLASH_ATTN / TRITON_ATTN / FLEX_ATTENTION / …
+gpu_memory_utilization  = 0.9
+max_num_seqs            = 256
+# max_num_batched_tokens  = 8192         # default: vllm picks
+# block_size              = 16           # default: vllm picks per attention backend
+enforce_eager           = false          # disable CUDA graphs
+
+# n-gram speculative decoding (driver-supplied drafts)
+spec_ngram_enabled      = false
+spec_ngram_num_drafts   = 4
+spec_ngram_min_n        = 2
+spec_ngram_max_n        = 4
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `attention_backend` | unset | `FLASHINFER` / `FLASH_ATTN` / `TRITON_ATTN` / `FLEX_ATTENTION` / etc. Unset lets vLLM auto-pick per platform. |
+| `gpu_memory_utilization` | `0.9` | Fraction of free GPU memory for KV cache + activations. |
+| `max_num_seqs` | `256` | Max concurrent sequences in a batch. |
+| `max_num_batched_tokens` | unset | Max tokens (across all sequences) in a batch. Unset = vLLM's default. |
+| `block_size` | unset | KV cache block size override. Unset = vLLM picks based on attention backend's allowed sizes (FlashInfer: 16/32/64; FlashAttention: 16/32). |
+| `enforce_eager` | `false` | Disable `torch.compile` and CUDA graphs. |
+| `spec_ngram_enabled` | `false` | Enable n-gram speculative decoding (vLLM-side drafting). |
+| `spec_ngram_num_drafts` | `4` | Drafts proposed per accepted iteration. |
+| `spec_ngram_min_n` | `2` | n-gram match window minimum. |
+| `spec_ngram_max_n` | `4` | n-gram match window maximum. |
+
+## Supported architectures
+
+vLLM accepts anything in its model zoo. See the [vLLM supported models list](https://docs.vllm.ai/en/latest/models/supported_models.html) for the authoritative roster.
+
+## Quantization
+
+vLLM has its own quantization knobs (`quantization`, `kv_cache_dtype`, etc.). Set them under `[model.driver.options]` exactly as vLLM expects.

@@ -280,24 +280,30 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
             // model's true KV layout — supports_op only inspects dtypes
             // and shape-rank, not concrete extents. Pick the smallest
             // viable head_dim/n_kv_heads to keep the probe cheap.
-            const int probe_head_dim   = 64;
+            // Q must be BF16 to match the FlashInfer wrapper's expected dtype.
+            const int probe_head_dim   = 128;
             const int probe_n_kv_heads = 1;
             const int probe_page_size  = 16;
             const int probe_n_req      = 1;
             ggml_tensor* probe_q = ggml_new_tensor_4d(
-                probe_ctx, GGML_TYPE_F32,
-                probe_head_dim, probe_n_kv_heads, 1, probe_n_req);
+                probe_ctx, GGML_TYPE_BF16,
+                probe_head_dim, /*n_q_tokens=*/ 1,
+                /*n_q_heads=*/  probe_n_kv_heads,
+                /*n_req=*/      probe_n_req);
             ggml_tensor* probe_kv_pool = ggml_new_tensor_2d(
                 probe_ctx, GGML_TYPE_F16,
                 probe_head_dim * probe_n_kv_heads, probe_page_size);
-            ggml_tensor* probe_block_table = ggml_new_tensor_2d(
-                probe_ctx, GGML_TYPE_I32, 1, probe_n_req);
-            ggml_tensor* probe_seq_lens = ggml_new_tensor_1d(
+            ggml_tensor* probe_page_indices = ggml_new_tensor_1d(
+                probe_ctx, GGML_TYPE_I32, probe_n_req);
+            ggml_tensor* probe_page_indptr = ggml_new_tensor_1d(
+                probe_ctx, GGML_TYPE_I32, probe_n_req + 1);
+            ggml_tensor* probe_last_page_lens = ggml_new_tensor_1d(
                 probe_ctx, GGML_TYPE_I32, probe_n_req);
             ggml_tensor* probe_pa = ggml_paged_attn_ext(
                 probe_ctx, probe_q, probe_kv_pool, probe_kv_pool,
-                probe_block_table, probe_seq_lens, /*mask=*/ nullptr,
+                probe_page_indices, probe_page_indptr, probe_last_page_lens,
                 probe_page_size, probe_head_dim, probe_n_kv_heads,
+                /*sliding_window=*/ -1,
                 /*scale=*/ 1.0f / 8.0f, /*softcap=*/ 0.0f);
             supports_paged_attn_ext_ =
                 ggml_backend_supports_op(backend_, probe_pa);

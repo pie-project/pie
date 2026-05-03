@@ -72,23 +72,38 @@ placeholder for each:
 Responses always use `RESP_MODE_MSGPACK` so probe slots round-trip with
 their proper shape.
 
-## Limitations
+## What the dummy honors and what it doesn't
 
+- **Constraint masks are honored.** `forward_pass.logit_mask` /
+  `Generator::constraint(...)` (JSON-schema, EBNF, regex,
+  `JsonValue<T>`, custom `Constraint` impls) all flow through to
+  `fire_batch` as a per-request BRLE bitmask, and the dummy samples a
+  uniform random token from the allowed set. Constrained-decoding
+  examples produce in-grammar output — the *content* inside the
+  grammar is random, but it parses.
 - **Probe outputs are dimensionally correct but numerically meaningless.**
-  Watermarking, log-prob reranking, etc. compile and run, but the values
-  they read are zeros — the inferlet's downstream math will produce
-  deterministic-but-not-meaningful results. For real numerics, run a real
-  driver.
+  Watermarking, log-prob reranking, entropy probes, etc. compile and
+  run, but the values they read are zeros — the inferlet's downstream
+  math will produce deterministic-but-not-meaningful results. For real
+  numerics, run a real driver.
 - **Speculative decoding without verifier semantics.** The dummy emits
   one random token per sampler slot, including spec-verifier slots, so
   custom `Speculator` impls don't crash but every draft is effectively
-  rejected (random ≠ predicted).
+  rejected (random ≠ predicted) and the loop falls back to one token
+  per step.
 - **Adapter ops are no-ops.** `Adapter::create` / `lora.load(path)` /
   swap / page-copy succeed without doing anything. The dummy ignores
-  `adapter_indices` in `fire_batch` requests entirely.
+  `adapter_indices` in `fire_batch` requests entirely, so inference
+  runs identically with and without an adapter attached.
+- **Forks share KV pages but not continuations.** `Context::fork()`
+  duplicates page state through the runtime, but each fork's next
+  random token is drawn independently — branches diverge into
+  unrelated random streams rather than producing related continuations
+  from a shared prefix.
 
-If you need real numbers, real spec acceptance, or real adapters, run a
-real driver — the dummy is for plumbing tests.
+If you need real numerics, real spec acceptance, real adapters, or
+related fork continuations, run a real driver — the dummy is for
+plumbing tests.
 
 ## Tip — running the marketing examples in `what-is-pie.mdx`
 

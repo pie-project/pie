@@ -194,6 +194,9 @@ function Hero() {
                     <Link className="button button--primary button--lg" to="/docs/overview/what-is-pie">
                         What is Pie?
                     </Link>
+                    <Link className="button button--secondary button--lg" to="/docs/guide/install">
+                        Get started
+                    </Link>
                     <Link className="button button--secondary button--lg" to="https://github.com/pie-project/pie">
                         GitHub
                     </Link>
@@ -277,27 +280,6 @@ function Sample() {
     );
 }
 
-function GetStarted() {
-    return (
-        <section className={clsx(styles.section, styles.ctaSection)}>
-            <div className="container text--center">
-                <h2 className={styles.sectionTitle}>Get started</h2>
-                <div className={styles.ctaActions}>
-                    <Link className="button button--primary button--lg" to="/docs/guide/install">
-                        Install
-                    </Link>
-                    <Link className="button button--secondary button--lg" to="/docs/guide/first-inferlet">
-                        Write your first inferlet
-                    </Link>
-                    <Link className="button button--secondary button--lg" to="/docs/guide/examples/overview">
-                        Examples
-                    </Link>
-                </div>
-            </div>
-        </section>
-    );
-}
-
 export default function Home(): ReactNode {
     return (
         <Layout
@@ -308,7 +290,6 @@ export default function Home(): ReactNode {
             <main>
                 <ServingLoop />
                 <Sample />
-                <GetStarted />
             </main>
         </Layout>
     );

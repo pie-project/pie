@@ -69,15 +69,28 @@ async fn main(input: Input) -> Result<String> {
         .collect_text()
         .await?;
 
-    // Grammar guarantees parse + schema conformance; this is just a sanity
-    // step to pretty-print the result.
-    let parsed: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("JSON parse error (should not happen under grammar constraint): {e}"))?;
-
-    println!(
-        "Generated:\n{}",
-        serde_json::to_string_pretty(&parsed).unwrap_or(text.clone()),
-    );
-
-    Ok(serde_json::to_string(&parsed).unwrap_or(text))
+    // The grammar enforces a structurally valid prefix at every step, so
+    // the happy path is `parsed = serde_json::from_str(&text)`. The parse
+    // can still fail when `max_tokens` cuts mid-grammar — e.g. while a
+    // long string field is still open. That is a normal terminal
+    // condition, not a grammar violation, so report the partial output
+    // instead of erroring.
+    match serde_json::from_str::<Value>(&text) {
+        Ok(parsed) => {
+            println!(
+                "Generated:\n{}",
+                serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| text.clone()),
+            );
+            Ok(serde_json::to_string(&parsed).unwrap_or(text))
+        }
+        Err(e) => {
+            println!("Generated (truncated at max_tokens={}):\n{}", input.max_tokens, text);
+            eprintln!(
+                "Note: output is a structurally valid grammar prefix but \
+                 max_tokens cut before the JSON closed ({e}). Increase \
+                 max_tokens or run on a model that converges sooner."
+            );
+            Ok(text)
+        }
+    }
 }

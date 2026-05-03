@@ -102,8 +102,20 @@ async fn main(input: Input) -> Result<String> {
         .collect_text()
         .await?;
 
-    let data: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("JSON parse error: {e}"))?;
+    // Grammar enforces a structurally valid prefix at every step;
+    // the parse can still fail when `max_tokens` cuts mid-string. On
+    // a real model that rarely happens because the model converges;
+    // on a backend with no convergence pressure (the dummy driver) it
+    // does. Surface the partial text instead of erroring.
+    let data: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("(grammar truncated at max_tokens={})", input.max_tokens);
+            println!("{}", text);
+            eprintln!("Note: structurally valid prefix only ({e}).");
+            return Ok(text);
+        }
+    };
 
     let rendered = render(&data)?;
     println!("{}", rendered);

@@ -11,6 +11,10 @@ import TabItem from '@theme/TabItem';
 
 LoRA adapters are runtime-managed overlays scoped to a model. The full lifecycle (create, open, fork, save, load, destroy) is available in all three SDKs. This page covers using an adapter at inference. Read this after [The forward pass](./overview).
 
+:::note[Running on the dummy driver?]
+Adapter ops are no-ops on the dummy driver — `Adapter::create`, `load`, `fork`, `save`, swap, and destroy all succeed but inference is identical with or without an adapter attached.
+:::
+
 ## Using an adapter
 
 Attach an adapter to a `Generator` or to a manual `forward()` pass. The adapter applies to that one pass; subsequent passes default to no adapter unless you attach again.
