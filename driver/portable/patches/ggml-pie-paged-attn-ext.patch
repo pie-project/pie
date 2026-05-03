@@ -188,7 +188,7 @@
 +bool ggml_cuda_paged_attn_ext_supported(int device, const ggml_tensor * dst);
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/paged_attn.cu
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,356 @@
 +// Paged attention (pie patch).
 +//
 +// Decode-only single-stage kernel. Replaces the per-layer Pie chain
@@ -356,6 +356,11 @@
 +
 +            o_acc = o_acc * alpha + beta * v_f32;
 +
++            // Barrier: all warps must finish reading state_buf[0] before
++            // thread 0 overwrites it. Without this, fast warps that race
++            // ahead see m_new on a subsequent iteration's m_old read,
++            // corrupting the online-softmax state.
++            __syncthreads();
 +            if (tid == 0) {
 +                state_buf[1] = state_buf[1] * alpha + beta;
 +                state_buf[0] = m_new;
