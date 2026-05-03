@@ -430,6 +430,7 @@ void plan_single_request(const PlanArrays& a,
 
 void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
                                std::int32_t n_request,
+                               std::int32_t page_size,
                                std::int32_t sliding_window,
                                bool also_build_no_swa_mask) {
     const std::int32_t M = plan.max_n_kv;
@@ -446,6 +447,12 @@ void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
     } else {
         plan.packed_mask_full_f16.clear();
     }
+    // Paged-attn companion. `M` is bucketed up to a page boundary in
+    // forward.cpp::plan_(), so `max_blocks_per_req` is exact integer.
+    plan.max_blocks_per_req = M / page_size;
+    plan.block_table_i32.assign(
+        static_cast<std::size_t>(plan.max_blocks_per_req) * N, 0);
+    plan.seq_lens_i32.assign(static_cast<std::size_t>(N), 0);
     const auto zero = ggml_fp32_to_fp16(0.0f);
     const std::int32_t W = sliding_window;
     for (std::int32_t r = 0; r < N; ++r) {
@@ -454,6 +461,19 @@ void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
             plan.packed_gather_idxs[
                 static_cast<std::size_t>(r) * M + k] = rp.gather_idxs[k];
         }
+        // Block table: page id for block b is gather_idxs[b * page_size]
+        // / page_size, since gather_idxs[k] = page_id[k/page_size] *
+        // page_size + (k % page_size). Beyond `num_pages_r` entries the
+        // kernel never reads (seq_lens_i32[r] gates the loop), so the
+        // tail stays at the assign-zero default.
+        const std::int32_t num_pages_r =
+            (rp.n_kv + page_size - 1) / page_size;
+        for (std::int32_t b = 0; b < num_pages_r; ++b) {
+            plan.block_table_i32[
+                static_cast<std::size_t>(r) * plan.max_blocks_per_req + b] =
+                rp.gather_idxs[b * page_size] / page_size;
+        }
+        plan.seq_lens_i32[r] = rp.n_kv;
         // SWA-clipped row.
         std::uint16_t* row = plan.packed_mask_f16.data()
             + static_cast<std::size_t>(r) * M * MASK_PAD;

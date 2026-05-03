@@ -12,7 +12,8 @@ namespace pie_portable_driver {
 GraphInputs declare_graph_inputs(ggml_context* ctx,
                                  const ForwardEngine::BatchPlan& plan,
                                  std::int32_t n_total,
-                                 std::int32_t n_req) {
+                                 std::int32_t n_req,
+                                 bool         supports_paged_attn_ext) {
     GraphInputs in{};
     in.tok_input = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_total);
     ggml_set_name(in.tok_input, "inp_tokens");
@@ -34,12 +35,22 @@ GraphInputs declare_graph_inputs(ggml_context* ctx,
     ggml_set_input(in.out_idx);
 
     if (plan.pure_decode) {
-        // M11 fast path: a single packed gather + mask covers all requests.
-        in.packed_gather = ggml_new_tensor_1d(
-            ctx, GGML_TYPE_I32, static_cast<std::int64_t>(plan.max_n_kv) * n_req);
-        ggml_set_name(in.packed_gather, "kv_gather.packed");
-        ggml_set_input(in.packed_gather);
+        // Either paged-attn inputs (block_table + seq_lens) or the
+        // materialize path's packed_gather — never both. The allocator
+        // skips tensors not reached from graph nodes, so allocating an
+        // unused input tensor leaves it bufferless and breaks upload.
+        const bool use_paged = supports_paged_attn_ext && plan.max_blocks_per_req > 0;
 
+        if (!use_paged) {
+            // Materialize path: single packed gather covers all requests.
+            in.packed_gather = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_I32,
+                static_cast<std::int64_t>(plan.max_n_kv) * n_req);
+            ggml_set_name(in.packed_gather, "kv_gather.packed");
+            ggml_set_input(in.packed_gather);
+        }
+
+        // packed_mask is consumed by BOTH paths.
         in.packed_mask = ggml_new_tensor_4d(
             ctx, GGML_TYPE_F16, plan.max_n_kv,
             static_cast<std::int64_t>(MASK_PAD), 1, n_req);
@@ -53,6 +64,22 @@ GraphInputs declare_graph_inputs(ggml_context* ctx,
                 static_cast<std::int64_t>(MASK_PAD), 1, n_req);
             ggml_set_name(in.packed_mask_full, "kq_mask.packed.full");
             ggml_set_input(in.packed_mask_full);
+        }
+
+        if (use_paged) {
+            in.block_table = ggml_new_tensor_2d(
+                ctx, GGML_TYPE_I32,
+                plan.max_blocks_per_req, n_req);
+            ggml_set_name(in.block_table, "kv_block_table");
+            ggml_set_input(in.block_table);
+
+            in.seq_lens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_req);
+            ggml_set_name(in.seq_lens, "kv_seq_lens");
+            ggml_set_input(in.seq_lens);
+
+            std::fprintf(stderr, "[paged-debug] declare: bt=%p sl=%p mbpr=%d n_req=%d\n",
+                         (void*) in.block_table, (void*) in.seq_lens,
+                         plan.max_blocks_per_req, n_req);
         }
     } else {
         in.masks.reserve(n_req);
@@ -336,9 +363,11 @@ void upload_graph_inputs(const GraphResult& g,
     ggml_backend_tensor_set(g.in.out_idx, plan.sampling_pos_i32.data(), 0,
                             plan.sampling_pos_i32.size() * sizeof(std::int32_t));
     if (plan.pure_decode) {
-        ggml_backend_tensor_set(g.in.packed_gather,
-                                plan.packed_gather_idxs.data(), 0,
-                                plan.packed_gather_idxs.size() * sizeof(std::int32_t));
+        if (g.in.packed_gather) {
+            ggml_backend_tensor_set(g.in.packed_gather,
+                                    plan.packed_gather_idxs.data(), 0,
+                                    plan.packed_gather_idxs.size() * sizeof(std::int32_t));
+        }
         ggml_backend_tensor_set(g.in.packed_mask,
                                 plan.packed_mask_f16.data(), 0,
                                 plan.packed_mask_f16.size() * sizeof(std::uint16_t));
@@ -347,6 +376,16 @@ void upload_graph_inputs(const GraphResult& g,
                 g.in.packed_mask_full,
                 plan.packed_mask_full_f16.data(), 0,
                 plan.packed_mask_full_f16.size() * sizeof(std::uint16_t));
+        }
+        if (g.in.block_table) {
+            ggml_backend_tensor_set(
+                g.in.block_table,
+                plan.block_table_i32.data(), 0,
+                plan.block_table_i32.size() * sizeof(std::int32_t));
+            ggml_backend_tensor_set(
+                g.in.seq_lens,
+                plan.seq_lens_i32.data(), 0,
+                plan.seq_lens_i32.size() * sizeof(std::int32_t));
         }
     } else {
         for (std::size_t r = 0; r < plan.reqs.size(); ++r) {

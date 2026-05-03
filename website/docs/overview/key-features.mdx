@@ -6,9 +6,8 @@ sidebar_position: 2
 
 # Key features
 
-An inferlet exposes three things to your code: the forward pass at token granularity, the KV cache as named pages you can fork and share, and an I/O surface that reaches HTTP, MCP, the filesystem, and embedded language runtimes. Most of what looks like a separate "feature" of Pie is one of these three primitives applied to a problem. This page lists those primitives and points to the guide pages that go deep.
+An inferlet exposes three things to your code: the forward pass at token granularity, the KV cache as named pages you can fork and share, and an I/O surface that reaches HTTP, MCP, the filesystem, plus embedded language runtimes (for JavaScript and Python). Most of what looks like a separate "feature" of Pie is one of these three primitives applied to a problem. This page lists those primitives and points to the guide pages that go deep.
 
-This page is for engineers deciding what they could build on Pie. If you want to write code, start with [Your first inferlet](../guide/first-inferlet).
 
 ## Token-level forward pass control
 
@@ -54,8 +53,6 @@ Patterns this supports:
 - **Sliding window and attention sink.** Drop pages that fall out of the window, keep the sink pages pinned. See the `windowed-attention` and `attention-sink` inferlets.
 - **Resumable sessions.** A named context outlives the inferlet that created it. The next request reattaches by name.
 
-The page-based KV cache is a Pie-native concept, not a vLLM PagedAttention port. The `kv-cache` guide describes the page model. See [Branch and share state](../guide/context/sharing).
-
 ## Integrated I/O
 
 An inferlet runs inside a WASI sandbox with three I/O surfaces:
@@ -73,18 +70,3 @@ These surfaces enable patterns that are awkward when application logic runs outs
 - **HTTP servers as inferlets.** An inferlet can implement `wasi:http/incoming-handler` and serve requests directly. See the `openresponses` inferlet, which exposes the OpenAI Responses API.
 
 I/O happens on the inferlet's own time, on a worker thread the engine manages. The model's forward passes do not stall waiting for HTTP.
-
-## What ties them together
-
-These three primitives are not independent features that happen to share a binary. Each enables the others:
-
-- Forward pass control lets you stop generation on a tool call boundary; integrated I/O lets you serve the call inline; KV cache control lets the next forward pass reuse the prefix.
-- KV cache control lets best-of-N share a prefix; forward pass control lets each branch use a different sampler; integrated I/O lets each branch validate its output against an external checker.
-
-What you write looks like a regular program. What runs is a program that has the GPU, the KV cache, and a network all on the same call stack.
-
-## Next
-
-- [Comparison with other systems](./comparison). What you give up and what you gain over a black-box endpoint.
-- [Your first inferlet](../guide/first-inferlet). A minimal Rust inferlet with build and run.
-- [Examples](../guide/examples/overview). The catalog of patterns implemented as inferlets.

@@ -259,7 +259,7 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
         // keeps Vulkan steady-state decode at GPU speed instead of
         // round-tripping each token through CPU for the argsort.
         ggml_init_params probe_ip{
-            /*.mem_size   =*/ ggml_tensor_overhead() * 8,
+            /*.mem_size   =*/ ggml_tensor_overhead() * 16,
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -271,11 +271,44 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
                 ggml_argsort(probe_ctx, probs, GGML_SORT_ORDER_DESC);
             supports_in_graph_topk_ =
                 ggml_backend_supports_op(backend_, sorted);
-            ggml_free(probe_ctx);
             std::cerr << "[model] in-graph top-k support on "
                       << ggml_backend_name(backend_) << ": "
                       << (supports_in_graph_topk_ ? "yes" : "no — using slow_only sampling path")
                       << "\n";
+
+            // ggml_paged_attn_ext probe. Shapes don't need to match this
+            // model's true KV layout — supports_op only inspects dtypes
+            // and shape-rank, not concrete extents. Pick the smallest
+            // viable head_dim/n_kv_heads to keep the probe cheap.
+            const int probe_head_dim   = 64;
+            const int probe_n_kv_heads = 1;
+            const int probe_page_size  = 16;
+            const int probe_n_req      = 1;
+            ggml_tensor* probe_q = ggml_new_tensor_4d(
+                probe_ctx, GGML_TYPE_F32,
+                probe_head_dim, probe_n_kv_heads, 1, probe_n_req);
+            ggml_tensor* probe_kv_pool = ggml_new_tensor_2d(
+                probe_ctx, GGML_TYPE_F16,
+                probe_head_dim * probe_n_kv_heads, probe_page_size);
+            ggml_tensor* probe_block_table = ggml_new_tensor_2d(
+                probe_ctx, GGML_TYPE_I32, 1, probe_n_req);
+            ggml_tensor* probe_seq_lens = ggml_new_tensor_1d(
+                probe_ctx, GGML_TYPE_I32, probe_n_req);
+            ggml_tensor* probe_pa = ggml_paged_attn_ext(
+                probe_ctx, probe_q, probe_kv_pool, probe_kv_pool,
+                probe_block_table, probe_seq_lens, /*mask=*/ nullptr,
+                probe_page_size, probe_head_dim, probe_n_kv_heads,
+                /*scale=*/ 1.0f / 8.0f, /*softcap=*/ 0.0f);
+            supports_paged_attn_ext_ =
+                ggml_backend_supports_op(backend_, probe_pa);
+            std::cerr << "[model] paged_attn_ext support on "
+                      << ggml_backend_name(backend_) << ": "
+                      << (supports_paged_attn_ext_
+                          ? "yes"
+                          : "no — using materialize+flash_attn_ext fallback")
+                      << "\n";
+
+            ggml_free(probe_ctx);
         }
     }
 

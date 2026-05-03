@@ -68,7 +68,8 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
     auto* gf = ggml_new_graph_custom(
         ctx, static_cast<int>(GRAPH_MAX_NODES), /*grads=*/false);
 
-    GraphInputs in = declare_graph_inputs(ctx, plan, n_total, n_req);
+    GraphInputs in = declare_graph_inputs(ctx, plan, n_total, n_req,
+                                          model.supports_paged_attn_ext());
 
     // ---- Embed ---------------------------------------------------------------
     auto* embd = ggml_get_rows(ctx, w.tok_embd, in.tok_input);
@@ -400,54 +401,70 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         ggml_tensor* attn_2d = nullptr;
 
         if (plan.pure_decode) {
-            // Packed: single flash_attn_ext per layer with ne3 = n_request.
             // Q is [head_dim, n_q_heads, n_total] with n_total == n_req.
             // Reshape (no data move; same memory layout) to
             // [head_dim, 1, n_q_heads, n_request] for ne3 broadcast.
             auto* Q_4d = ggml_reshape_4d(ctx, Q, head_dim, 1, n_q_heads, n_req);
 
-            // Gather all requests' K/V in one call. Result is
-            // [n_embd_gqa, max_n_kv * n_req] F32.
-            auto* K_gather = ggml_get_rows(ctx, k_cached, in.packed_gather);
-            auto* V_gather = ggml_get_rows(ctx, v_cached, in.packed_gather);
+            // Paged-attn fast path. `block_table` is non-null iff the
+            // backend advertised supports_op for ggml_paged_attn_ext at
+            // model-load time. attn_sinks is gpt-oss-only; v1 paged
+            // kernel doesn't implement sinks, so gpt-oss layers fall
+            // through to the materialize path below.
+            if (in.block_table != nullptr && L.attn_sinks == nullptr) {
+                auto* attn = ggml_paged_attn_ext(
+                    ctx, Q_4d, k_cached, v_cached,
+                    in.block_table, in.seq_lens, in.packed_mask,
+                    kv.page_size(), head_dim, n_kv_heads,
+                    kq_scale, spec.attn_softcap);
+                attn_2d = ggml_reshape_2d(
+                    ctx,
+                    ggml_is_contiguous(attn) ? attn : ggml_cont(ctx, attn),
+                    head_dim * n_q_heads, n_req);
+            } else {
+                // Materialize: gather all requests' K/V in one call.
+                // Result is [n_embd_gqa, max_n_kv * n_req] F32.
+                auto* K_gather = ggml_get_rows(ctx, k_cached, in.packed_gather);
+                auto* V_gather = ggml_get_rows(ctx, v_cached, in.packed_gather);
 
-            // Reshape to [head_dim, n_kv_heads, max_n_kv, n_req], then
-            // permute to [head_dim, max_n_kv, n_kv_heads, n_req] for
-            // flash_attn_ext.
-            auto* K_4d = ggml_reshape_4d(ctx, K_gather,
-                                         head_dim, n_kv_heads,
-                                         plan.max_n_kv, n_req);
-            auto* V_4d = ggml_reshape_4d(ctx, V_gather,
-                                         head_dim, n_kv_heads,
-                                         plan.max_n_kv, n_req);
-            auto* K_perm = ggml_permute(ctx, K_4d, 0, 2, 1, 3);
-            auto* V_perm = ggml_permute(ctx, V_4d, 0, 2, 1, 3);
+                // Reshape to [head_dim, n_kv_heads, max_n_kv, n_req], then
+                // permute to [head_dim, max_n_kv, n_kv_heads, n_req] for
+                // flash_attn_ext.
+                auto* K_4d = ggml_reshape_4d(ctx, K_gather,
+                                             head_dim, n_kv_heads,
+                                             plan.max_n_kv, n_req);
+                auto* V_4d = ggml_reshape_4d(ctx, V_gather,
+                                             head_dim, n_kv_heads,
+                                             plan.max_n_kv, n_req);
+                auto* K_perm = ggml_permute(ctx, K_4d, 0, 2, 1, 3);
+                auto* V_perm = ggml_permute(ctx, V_4d, 0, 2, 1, 3);
 
-            auto* attn = ggml_flash_attn_ext(ctx, Q_4d, K_perm, V_perm,
-                                             in.packed_mask, kq_scale,
-                                             /*max_bias=*/ 0.0f,
-                                             /*logit_softcap=*/ spec.attn_softcap);
-            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
-            // gpt-oss attention sinks (per Q-head learned scalar). Adds an
-            // implicit "attend to nothing" slot that absorbs probability
-            // mass when no other key is in-window. Null on archs without
-            // sinks. Sinks stored F32 [n_q_heads]; broadcasts over batch.
-            if (L.attn_sinks) {
-                // ggml_flash_attn_ext_add_sinks asserts F32; sinks are
-                // stored as BF16 in safetensors. Cast in-graph.
-                auto* sinks_f32 = (L.attn_sinks->type == GGML_TYPE_F32)
-                    ? L.attn_sinks
-                    : ggml_cast(ctx, L.attn_sinks, GGML_TYPE_F32);
-                ggml_flash_attn_ext_add_sinks(attn, sinks_f32);
+                auto* attn = ggml_flash_attn_ext(ctx, Q_4d, K_perm, V_perm,
+                                                 in.packed_mask, kq_scale,
+                                                 /*max_bias=*/ 0.0f,
+                                                 /*logit_softcap=*/ spec.attn_softcap);
+                ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+                // gpt-oss attention sinks (per Q-head learned scalar). Adds an
+                // implicit "attend to nothing" slot that absorbs probability
+                // mass when no other key is in-window. Null on archs without
+                // sinks. Sinks stored F32 [n_q_heads]; broadcasts over batch.
+                if (L.attn_sinks) {
+                    // ggml_flash_attn_ext_add_sinks asserts F32; sinks are
+                    // stored as BF16 in safetensors. Cast in-graph.
+                    auto* sinks_f32 = (L.attn_sinks->type == GGML_TYPE_F32)
+                        ? L.attn_sinks
+                        : ggml_cast(ctx, L.attn_sinks, GGML_TYPE_F32);
+                    ggml_flash_attn_ext_add_sinks(attn, sinks_f32);
+                }
+                // attn shape per ggml.h: [head_dim, n_q_heads, n_batch=1, n_req].
+                // flash_attn_ext returns a freshly allocated contiguous tensor;
+                // skip the redundant ggml_cont (saves one CPY per layer = 24
+                // extra graph nodes on Qwen2.5).
+                ggml_tensor* attn_for_reshape =
+                    ggml_is_contiguous(attn) ? attn : ggml_cont(ctx, attn);
+                attn_2d = ggml_reshape_2d(ctx, attn_for_reshape,
+                                          head_dim * n_q_heads, n_req);
             }
-            // attn shape per ggml.h: [head_dim, n_q_heads, n_batch=1, n_req].
-            // flash_attn_ext returns a freshly allocated contiguous tensor;
-            // skip the redundant ggml_cont (saves one CPY per layer = 24
-            // extra graph nodes on Qwen2.5).
-            ggml_tensor* attn_for_reshape =
-                ggml_is_contiguous(attn) ? attn : ggml_cont(ctx, attn);
-            attn_2d = ggml_reshape_2d(ctx, attn_for_reshape,
-                                      head_dim * n_q_heads, n_req);
         } else {
             // Slow path: one flash_attn_ext per request, then concat.
             std::vector<ggml_tensor*> attn_out_per_req;

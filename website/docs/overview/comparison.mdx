@@ -6,69 +6,30 @@ sidebar_position: 3
 
 # Comparison with other systems
 
-Pie occupies a different point in the design space from existing inference stacks. It does not replace vLLM or llama.cpp at what they do best. It exists because some workloads (agents, reasoning chains, tool-driven pipelines) need a different abstraction than "prompt in, tokens out." This page is for engineers deciding whether Pie fits their use case, or whether one of the other systems is the right answer.
+Pie sits in a different place from existing inference stacks. It does not replace vLLM or llama.cpp at what they do best. It exists because some workloads (agents, reasoning chains, tool-driven pipelines) need a different abstraction than "prompt in, tokens out."
 
 ## vLLM, SGLang, TensorRT-LLM
 
-These are high-throughput batched inference engines. They serve a fixed request shape (a prompt, optional sampling parameters, an output stream) at high tokens-per-second. Their schedulers and KV cache implementations are state of the art.
+These are high-throughput batched inference engines. They serve a fixed request shape (a prompt, optional sampling parameters, an output stream) at high tokens-per-second.
 
-Pie targets a different workload. The engine's primitive is a running program, not a request. The program can fork its KV cache, decode with a custom strategy, call tools inline, and coordinate with other programs. None of that is expressible at the vLLM or SGLang API.
+Pie targets a different workload. The engine's primitive is a running program. The program can control its KV cache, call tools inline, and coordinate with other programs.
 
-For workloads that *are* a sequence of stateless prompts, you do not need Pie's machinery. Two options:
+For workloads that are a sequence of stateless prompts, Pie is not a good choice, since its per-token overhead ([1% to 15% depending on the model size](benchmarks)) outweighs the benefit of custom optimizations.
 
-- **Use vLLM or SGLang directly.** Pie is not a faster vLLM. If your workload is a queue of independent prompts, run vLLM.
-- **Use them as a Pie driver.** Pie ships `vllm` and `sglang` drivers. You point a model block at one of them and the engine delegates inference. Inferlets running on a vLLM-backed model still get the inferlet programming model, with the caveat that some features (custom attention masks, page-trim, raw-logits sampling) are native-driver only.
+For infrastructures that already use vLLM or SGLang, Pie has experimental support for running them as *drivers* (backend engines), so Pie piggybacks on their kernel implementations. This can give better performance in some environments than the default driver, at the cost of a few missing features (e.g., custom attention masks). See [Drivers](../reference/drivers) for more information.
 
-```toml
-# config.toml: route a model to the vLLM driver
-[[model]]
-name = "llama"
-hf_repo = "meta-llama/Llama-3.1-8B-Instruct"
-
-[model.driver]
-type = "vllm"
-device = ["cuda:0"]
-```
-
-See [Drivers](../reference/drivers) for the full driver matrix.
 
 ## llama.cpp
 
-llama.cpp is the canonical local inference runtime. It runs quantized models on consumer hardware, including Apple Silicon, with no GPU server fleet.
+llama.cpp is a popular local inference runtime. It runs quantized models well on consumer hardware, including Apple Silicon.
+Pie also supports local inference through its native driver, built on top of ggml, the same foundation that llama.cpp uses.
 
-Pie covers single-user local inference too. The native driver runs on Metal (Apple Silicon) and on CUDA. `pie run` boots a one-shot engine on the local machine and exits. There is no requirement to deploy a server.
-
-The difference is what you do once the model is running. llama.cpp's API is a `/completions`-shaped HTTP server. Pie's API is "launch a program inside the engine." If your local workflow is a chat UI talking to a model, llama.cpp is simpler. If your local workflow is an agent that calls tools, branches over reasoning paths, or does best-of-N, the inferlet abstraction does that work for you.
 
 ## HF Transformers
 
-HF Transformers is the canonical research framework. You write Python that reaches into the model, modifies attention, samples with custom logic, and prototypes ideas quickly. It is not a serving system; deployment is your problem.
+Hugging Face Transformers provides a canonical model implementation and a great foundation for research. You write Python that reaches into the model, modifies attention, samples with custom logic, and prototypes ideas quickly.
 
-Pie aims for the same level of customizability with throughput closer to a dedicated serving engine. An inferlet has access to the same kinds of hooks Transformers gives you (logits, attention masks, KV state) but inside an engine that batches forward passes across all live processes. Research code that runs as an inferlet ships to production without a rewrite into a different codebase.
+The problem with Transformers is that it is not a serving system. Deploying it for high throughput in production takes significant engineering effort.
 
-The trade is that the inferlet model is more constrained than "do anything in PyTorch." You operate at the level of forward passes and tokens, not arbitrary tensor ops. For decoding research and serving research, that level is enough. For modeling research (changing the model architecture itself) you still write PyTorch.
-
-## At a glance
-
-| | Black-box prompt API | Custom decoding | KV cache exposed | Inline tool calls | Local inference | Multi-tenant batching |
-|---|---|---|---|---|---|---|
-| **vLLM / SGLang / TRT-LLM** | yes | hardcoded set | no | no | partial | yes |
-| **llama.cpp** | yes | hardcoded set | no | no | yes | limited |
-| **HF Transformers** | n/a | yes | yes (Python) | yes (Python) | yes | no |
-| **Pie** | yes (via inferlet) | yes (any) | yes (in inferlet) | yes (WASI / MCP) | yes | yes |
-
-"Black-box prompt API" means a stateless prompt in / tokens out interface like `/v1/completions`. Pie supports this through its `text-completion` inferlet but it is not the primary abstraction.
-
-## When to pick what
-
-- **A queue of independent prompts at high throughput.** vLLM or SGLang.
-- **A single-user chat on a laptop.** llama.cpp, or Pie's native driver if you want the inferlet model.
-- **Modeling research (new architectures, training).** HF Transformers and PyTorch.
-- **Serving an agent, a reasoning chain, or a tool-using pipeline.** Pie.
-- **Decoding research that should ship to production.** Pie.
-
-## Next
-
-- [Benchmarks](./benchmarks). End-to-end and throughput numbers.
-- [Drivers](../reference/drivers). Routing models to native, vLLM, or SGLang.
-- [Examples](../guide/examples/overview). Concrete inferlets for the workloads above.
+Pie tries to bridge that gap by providing serving infrastructure around a flexible execution model.
+The trade is that the inferlet model is more constrained than "do anything in PyTorch." You operate at the level of forward passes and tokens, not arbitrary tensor ops.

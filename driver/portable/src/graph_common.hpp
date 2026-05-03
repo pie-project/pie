@@ -109,6 +109,13 @@ struct GraphInputs {
     // attention patterns (Gemma 4). Null unless the engine populated
     // packed_mask_full_f16 in the BatchPlan.
     ggml_tensor*              packed_mask_full = nullptr;
+    // Paged-attn fast-path inputs. Allocated only when both
+    // `plan.pure_decode` AND `Model::supports_paged_attn_ext()` hold;
+    // null otherwise (the materialize+flash_attn_ext fallback reads
+    // from `packed_gather` / `packed_mask` instead). The graph builder
+    // tests `block_table != nullptr` to choose between paths.
+    ggml_tensor*              block_table   = nullptr;  // I32 [max_blocks_per_req, n_req]
+    ggml_tensor*              seq_lens      = nullptr;  // I32 [n_req]
 };
 
 // Per-arch graph builders return one of these. Exactly one of the three
@@ -146,7 +153,8 @@ void upload_graph_inputs(const GraphResult& g,
 GraphInputs declare_graph_inputs(ggml_context* ctx,
                                  const ForwardEngine::BatchPlan& plan,
                                  std::int32_t n_total,
-                                 std::int32_t n_req);
+                                 std::int32_t n_req,
+                                 bool         supports_paged_attn_ext);
 
 // Per-request attention via `ggml_flash_attn_ext`. Slices the request's
 // Q view, gathers its K/V from the paged cache, permutes for flash_attn

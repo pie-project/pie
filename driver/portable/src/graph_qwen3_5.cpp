@@ -409,7 +409,8 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
     ggml_tensor*  dbg_tap_out  = nullptr;
 
     // Standard inputs (slow-path: per-request masks + gathers).
-    GraphInputs in = declare_graph_inputs(ctx, plan, n_total, n_req);
+    GraphInputs in = declare_graph_inputs(ctx, plan, n_total, n_req,
+                                          model.supports_paged_attn_ext());
     // Replace pos_input with a 4×-wide variant for mrope. (ggml_rope_multi
     // expects 4 positions per token.) We'll upload positions repeated 4×.
     in.pos_input = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,

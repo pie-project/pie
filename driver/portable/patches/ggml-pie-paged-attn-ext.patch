@@ -1,0 +1,542 @@
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -576,6 +576,8 @@
+         GGML_OP_OPT_STEP_SGD,
+ 
+         GGML_OP_GLU,
++
++        GGML_OP_PAGED_ATTN_EXT,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -2405,6 +2407,39 @@
+             struct ggml_tensor * a,
+             struct ggml_tensor * sinks);
+ 
++    // pie patch: paged attention.
++    //
++    // Like ggml_flash_attn_ext, but Q reads K/V from a flat per-layer pool
++    // through a per-request page table. Replaces the current Pie path of
++    //   K_tmp = get_rows(K_pool, packed_gather);
++    //   V_tmp = get_rows(V_pool, packed_gather);
++    //   flash_attn_ext(Q, permute(K_tmp), permute(V_tmp), mask)
++    // which costs two extra kernel launches and a temp K/V allocation per
++    // layer. See driver/portable/src/graph_qwen3.cpp.
++    //
++    // Shapes (ggml convention: q's n_batch is ne[1], n_q_heads is ne[2]):
++    //   q            [head_dim, n_q_tokens, n_q_heads, n_req]   F32 or F16
++    //   k_pool       [head_dim * n_kv_heads, total_pages*page_size]   F16
++    //   v_pool       (same shape as k_pool)                          F16
++    //   block_table  [max_blocks_per_req, n_req]                     I32
++    //   seq_lens     [n_req]                                         I32
++    //   mask         optional, F16 (same convention as flash_attn_ext)
++    //
++    // Returns: [head_dim, n_q_heads, n_q_tokens, n_req]   F32  (permuted, matches flash_attn_ext)
++    GGML_API struct ggml_tensor * ggml_paged_attn_ext(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k_pool,
++            struct ggml_tensor  * v_pool,
++            struct ggml_tensor  * block_table,
++            struct ggml_tensor  * seq_lens,
++            struct ggml_tensor  * mask,
++            int                   page_size,
++            int                   head_dim,
++            int                   n_kv_heads,
++            float                 scale,
++            float                 softcap);
++
+     // TODO: needs to be adapted to ggml_flash_attn_ext
+     GGML_API struct ggml_tensor * ggml_flash_attn_back(
+            struct ggml_context * ctx,
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1073,9 +1073,11 @@
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++
++    "PAGED_ATTN_EXT",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
++static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1183,9 +1185,11 @@
+     "sgd(x)",
+ 
+     "glu(x)",
++
++    "paged_attn_ext(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
++static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5390,6 +5394,71 @@
+     a->src[4] = sinks;
+ }
+ 
++// ggml_paged_attn_ext (pie patch)
++//
++// Op-params layout (5 * 4 bytes = 20; fits in GGML_MAX_OP_PARAMS = 64):
++//   [0] f32  scale
++//   [1] f32  softcap        (0.0 disables tanh-softcap)
++//   [2] i32  page_size
++//   [3] i32  head_dim       (per-layer; Gemma 4 sliding vs full differ)
++//   [4] i32  n_kv_heads     (per-layer)
++//
++// src layout:
++//   src[0] = q              [head_dim, n_q_heads, n_q_tokens, n_req]
++//   src[1] = k_pool         [head_dim * n_kv_heads, total_pages*page_size]
++//   src[2] = v_pool         (same shape as k_pool)
++//   src[3] = mask           (optional, F16; same convention as flash_attn_ext)
++//   src[4] = block_table    [max_blocks_per_req, n_req] I32
++//   src[5] = seq_lens       [n_req] I32
++struct ggml_tensor * ggml_paged_attn_ext(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k_pool,
++        struct ggml_tensor  * v_pool,
++        struct ggml_tensor  * block_table,
++        struct ggml_tensor  * seq_lens,
++        struct ggml_tensor  * mask,
++        int                   page_size,
++        int                   head_dim,
++        int                   n_kv_heads,
++        float                 scale,
++        float                 softcap) {
++    GGML_ASSERT(k_pool->ne[0] == (int64_t) head_dim * n_kv_heads);
++    GGML_ASSERT(v_pool->ne[0] == (int64_t) head_dim * n_kv_heads);
++    GGML_ASSERT(block_table->type == GGML_TYPE_I32);
++    GGML_ASSERT(seq_lens->type    == GGML_TYPE_I32);
++    GGML_ASSERT(seq_lens->ne[0]   == q->ne[3]);
++    GGML_ASSERT(block_table->ne[1] == q->ne[3]);
++    if (mask) {
++        GGML_ASSERT(mask->type == GGML_TYPE_F16);
++        GGML_ASSERT(ggml_is_contiguous(mask));
++    }
++
++    // Output shape mirrors flash_attn_ext: [v_head_dim, n_q_heads, n_q_tokens, n_req].
++    // Q is laid out as [head_dim, n_q_tokens, n_q_heads, n_req] so we permute
++    // ne[1] and ne[2] to put n_q_heads first.
++    int64_t ne[4] = { q->ne[0], q->ne[2], q->ne[1], q->ne[3] };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    int32_t params_i32[5];
++    memcpy(&params_i32[0], &scale,   sizeof(float));
++    memcpy(&params_i32[1], &softcap, sizeof(float));
++    params_i32[2] = page_size;
++    params_i32[3] = head_dim;
++    params_i32[4] = n_kv_heads;
++    ggml_set_op_params(result, params_i32, sizeof(params_i32));
++
++    result->op     = GGML_OP_PAGED_ATTN_EXT;
++    result->src[0] = q;
++    result->src[1] = k_pool;
++    result->src[2] = v_pool;
++    result->src[3] = mask;
++    result->src[4] = block_table;
++    result->src[5] = seq_lens;
++
++    return result;
++}
++
+ // ggml_flash_attn_back
+ 
+ struct ggml_tensor * ggml_flash_attn_back(
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -24,6 +24,7 @@
+ #include "ggml-cuda/diag.cuh"
+ #include "ggml-cuda/fattn.cuh"
+ #include "ggml-cuda/getrows.cuh"
++#include "ggml-cuda/paged_attn.cuh"
+ #include "ggml-cuda/im2col.cuh"
+ #include "ggml-cuda/mmf.cuh"
+ #include "ggml-cuda/mmq.cuh"
+@@ -2918,6 +2919,9 @@
+             break;
+         case GGML_OP_FLASH_ATTN_EXT:
+             ggml_cuda_flash_attn_ext(ctx, dst);
++            break;
++        case GGML_OP_PAGED_ATTN_EXT:
++            ggml_cuda_paged_attn_ext(ctx, dst);
+             break;
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+             ggml_cuda_cross_entropy_loss(ctx, dst);
+@@ -5203,6 +5207,8 @@
+ #endif // GGML_USE_MUSA
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
++        case GGML_OP_PAGED_ATTN_EXT:
++            return ggml_cuda_paged_attn_ext_supported(dev_ctx->device, op);
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+         case GGML_OP_OPT_STEP_ADAMW:
+--- /dev/null
++++ b/ggml/src/ggml-cuda/paged_attn.cuh
+@@ -0,0 +1,5 @@
++#include "common.cuh"
++
++void ggml_cuda_paged_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++bool ggml_cuda_paged_attn_ext_supported(int device, const ggml_tensor * dst);
+--- /dev/null
++++ b/ggml/src/ggml-cuda/paged_attn.cu
+@@ -0,0 +1,351 @@
++// Paged attention (pie patch).
++//
++// Decode-only single-stage kernel. Replaces the per-layer Pie chain
++//   K_tmp = get_rows(K_pool, packed_gather);
++//   V_tmp = get_rows(V_pool, packed_gather);
++//   flash_attn_ext(Q, permute(K_tmp), permute(V_tmp), mask)
++// with one launch that walks the page table directly. K/V are read from
++// the contiguous per-layer pool through `block_table[req, b]`; no HBM
++// temp K/V buffer is materialized.
++//
++// Tiling: one CUDA block per (request, q_head). HEAD_DIM threads per
++// block; each thread owns one element of Q (loaded into shmem) and
++// accumulates one output element into a register. The dot products
++// Q·K reduce across the block via warp-shuffle + shmem; online-softmax
++// state (m, l) lives in shmem and is updated by thread 0 each kv_pos.
++//
++// One block_table lookup per page (cached in shmem), reused for the
++// page_size positions inside that page.
++//
++// Out of scope for v1: split-K (vLLM v2), quantized K/V, attention
++// sinks, head_dim != {64,128,256}. The op-supported probe filters
++// these out, sending them through the materialize+flash_attn_ext
++// fallback.
++
++#include "paged_attn.cuh"
++
++#include <cmath>
++
++namespace {
++
++// Warp sum-reduction.
++__device__ __forceinline__ float warp_reduce_sum_f32(float v) {
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        v += __shfl_xor_sync(0xffffffff, v, offset, 32);
++    }
++    return v;
++}
++
++template <typename T>
++__device__ __forceinline__ float to_f32(T x);
++
++template <>
++__device__ __forceinline__ float to_f32<float>(float x) { return x; }
++
++template <>
++__device__ __forceinline__ float to_f32<half>(half x) { return __half2float(x); }
++
++// Layout assumptions:
++//   q          [HEAD_DIM, 1, n_q_heads, n_req]                  (ggml ne[0..3])
++//   k_pool     [HEAD_DIM * n_kv_heads, total_pages*page_size]   (ne[0..1])
++//   v_pool     same as k_pool
++//   block_table[max_blocks_per_req, n_req]   I32                (ne[0..1])
++//   seq_lens   [n_req]                       I32
++//   mask       [max_n_kv_padded, MASK_PAD, 1, n_req]  F16  optional
++//   out        [HEAD_DIM, n_q_heads, 1, n_req] F32              (ne[0..3])
++//
++// Strides arrive in elements (caller divides ggml's nb by elt_size).
++template <int HEAD_DIM, bool USE_SOFTCAP, typename TQ, typename TKV>
++__launch_bounds__(HEAD_DIM, 2)
++__global__ void paged_attn_decode_kernel(
++        const TQ  * __restrict__ q,
++        const TKV * __restrict__ k_pool,
++        const TKV * __restrict__ v_pool,
++        const int * __restrict__ block_table,
++        const int * __restrict__ seq_lens,
++        const half * __restrict__ mask,    // nullable
++        float     * __restrict__ out,
++        int q_stride_head,                 // = Q.nb[2] / elt_size_q
++        int q_stride_req,                  // = Q.nb[3] / elt_size_q
++        int kv_stride_row,                 // = K_pool.nb[1] / elt_size_kv
++        int mask_stride_req,               // = mask.nb[3] / elt_size_msk (=2)
++        int out_stride_head,               // = out.nb[1] / 4
++        int out_stride_req,                // = out.nb[3] / 4
++        int gqa_ratio,                     // n_q_heads / n_kv_heads
++        int page_size,
++        int max_blocks_per_req,
++        float scale,
++        float softcap)                     // ignored unless USE_SOFTCAP
++{
++    const int q_head  = blockIdx.x;
++    const int req     = blockIdx.y;
++    const int tid     = threadIdx.x;
++    const int kv_head = q_head / gqa_ratio;
++
++    extern __shared__ float smem_buf[];
++    float * q_smem    = smem_buf;                         // [HEAD_DIM]
++    float * warp_buf  = smem_buf + HEAD_DIM;              // [HEAD_DIM/32]
++    // Next 3 floats: [0]=m, [1]=l, [2]=s_broadcast.
++    float * state_buf = warp_buf + (HEAD_DIM / 32);
++    int   * page_buf  = (int *)(state_buf + 3);           // [1]
++
++    // ---- Load Q[tid] ---------------------------------------------------
++    q_smem[tid] = to_f32<TQ>(q[req * q_stride_req + q_head * q_stride_head + tid]);
++    if (tid == 0) {
++        state_buf[0] = -INFINITY;   // m
++        state_buf[1] = 0.0f;        // l
++    }
++    __syncthreads();
++
++    const int seq_len = seq_lens[req];
++    const int n_pages = (seq_len + page_size - 1) / page_size;
++
++    float o_acc = 0.0f;
++
++    for (int b = 0; b < n_pages; ++b) {
++        if (tid == 0) {
++            page_buf[0] = block_table[req * max_blocks_per_req + b];
++        }
++        __syncthreads();
++        const int page_id    = page_buf[0];
++        const int kv_in_page = (b == n_pages - 1)
++            ? (seq_len - b * page_size)
++            : page_size;
++
++        for (int s = 0; s < kv_in_page; ++s) {
++            const int kv_pos       = b * page_size + s;
++            const int physical_row = page_id * page_size + s;
++
++            // Load K[tid] for this (kv_head, physical_row).
++            const TKV k_val = k_pool[
++                (size_t) physical_row * kv_stride_row
++                + kv_head * HEAD_DIM + tid];
++            const float partial = q_smem[tid] * to_f32<TKV>(k_val);
++
++            // Block-wide sum → s_val (pre-scale).
++            float s_val = warp_reduce_sum_f32(partial);
++            const int warp_id = tid / 32;
++            const int lane    = tid % 32;
++            if (lane == 0) {
++                warp_buf[warp_id] = s_val;
++            }
++            __syncthreads();
++            if (warp_id == 0) {
++                constexpr int N_WARPS = HEAD_DIM / 32;
++                float v = (lane < N_WARPS) ? warp_buf[lane] : 0.0f;
++                v = warp_reduce_sum_f32(v);
++                if (lane == 0) {
++                    v = v * scale;
++                    if (USE_SOFTCAP) {
++                        v = softcap * tanhf(v / softcap);
++                    }
++                    if (mask) {
++                        const float m_val = __half2float(
++                            mask[req * mask_stride_req + kv_pos]);
++                        v += m_val;
++                    }
++                    state_buf[2] = v;   // broadcast s_val
++                }
++            }
++            __syncthreads();
++            const float s_bcast = state_buf[2];
++
++            // Online softmax update.
++            const float m_old = state_buf[0];
++            const float m_new = fmaxf(m_old, s_bcast);
++            const float alpha = expf(m_old - m_new);
++            const float beta  = expf(s_bcast - m_new);
++
++            // Load V[tid].
++            const TKV v_val_kv = v_pool[
++                (size_t) physical_row * kv_stride_row
++                + kv_head * HEAD_DIM + tid];
++            const float v_f32 = to_f32<TKV>(v_val_kv);
++
++            o_acc = o_acc * alpha + beta * v_f32;
++
++            if (tid == 0) {
++                state_buf[1] = state_buf[1] * alpha + beta;
++                state_buf[0] = m_new;
++            }
++            __syncthreads();
++        }
++    }
++
++    const float l = state_buf[1];
++    out[req * out_stride_req + q_head * out_stride_head + tid] =
++        (l > 0.0f) ? (o_acc / l) : 0.0f;
++}
++
++template <int HEAD_DIM, bool USE_SOFTCAP, typename TQ>
++static void launch_paged_attn(
++        ggml_backend_cuda_context & ctx,
++        const TQ   * q,
++        const half * k_pool,
++        const half * v_pool,
++        const int  * block_table,
++        const int  * seq_lens,
++        const half * mask,
++        float      * out,
++        int q_stride_head, int q_stride_req,
++        int kv_stride_row,
++        int mask_stride_req,
++        int out_stride_head, int out_stride_req,
++        int n_q_heads, int n_kv_heads, int n_req,
++        int page_size, int max_blocks_per_req,
++        float scale, float softcap)
++{
++    const dim3 grid(n_q_heads, n_req, 1);
++    const dim3 block(HEAD_DIM, 1, 1);
++    const int  gqa_ratio = n_q_heads / n_kv_heads;
++
++    // shmem: HEAD_DIM (Q) + HEAD_DIM/32 (warp partials) + 3 (state) floats + 1 int.
++    const size_t shmem_bytes =
++        (HEAD_DIM + (HEAD_DIM / 32) + 3) * sizeof(float) + sizeof(int);
++
++    paged_attn_decode_kernel<HEAD_DIM, USE_SOFTCAP, TQ, half>
++        <<<grid, block, shmem_bytes, ctx.stream()>>>(
++            q, k_pool, v_pool, block_table, seq_lens, mask, out,
++            q_stride_head, q_stride_req,
++            kv_stride_row,
++            mask_stride_req,
++            out_stride_head, out_stride_req,
++            gqa_ratio,
++            page_size, max_blocks_per_req,
++            scale, softcap);
++}
++
++}  // namespace
++
++void ggml_cuda_paged_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q           = dst->src[0];
++    const ggml_tensor * K_pool      = dst->src[1];
++    const ggml_tensor * V_pool      = dst->src[2];
++    const ggml_tensor * mask        = dst->src[3];   // nullable
++    const ggml_tensor * block_table = dst->src[4];
++    const ggml_tensor * seq_lens    = dst->src[5];
++
++    GGML_ASSERT(Q->type == GGML_TYPE_F32 || Q->type == GGML_TYPE_F16);
++    GGML_ASSERT(K_pool->type == GGML_TYPE_F16);
++    GGML_ASSERT(V_pool->type == GGML_TYPE_F16);
++    GGML_ASSERT(block_table->type == GGML_TYPE_I32);
++    GGML_ASSERT(seq_lens->type    == GGML_TYPE_I32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    // Op-params: {scale f32, softcap f32, page_size i32, head_dim i32, n_kv_heads i32}
++    const float * params_f32 = (const float *) dst->op_params;
++    const int   * params_i32 = (const int   *) dst->op_params;
++    const float scale       = params_f32[0];
++    const float softcap     = params_f32[1];
++    const int   page_size   = params_i32[2];
++    const int   head_dim    = params_i32[3];
++    const int   n_kv_heads  = params_i32[4];
++
++    // Q is [head_dim, 1, n_q_heads, n_req] — matches FA convention.
++    const int n_q_tok   = Q->ne[1];
++    const int n_q_heads = Q->ne[2];
++    const int n_req     = Q->ne[3];
++    GGML_ASSERT(n_q_tok == 1 && "paged_attn_ext v1: q_token must be 1 (decode-only)");
++    GGML_ASSERT(Q->ne[0] == head_dim);
++
++    const int max_blocks_per_req = block_table->ne[0];
++
++    // Strides in element units. Tensor->nb is bytes; divide by elt size.
++    const size_t elt_size_q   = ggml_type_size(Q->type);
++    const size_t elt_size_kv  = ggml_type_size(K_pool->type);
++    const size_t elt_size_msk = mask ? ggml_type_size(mask->type) : (size_t)2;
++
++    const int q_stride_head = Q->nb[2] / elt_size_q;
++    const int q_stride_req  = Q->nb[3] / elt_size_q;
++    const int kv_stride_row = K_pool->nb[1] / elt_size_kv;
++    const int mask_stride_req = mask ? mask->nb[3] / elt_size_msk : 0;
++    const int out_stride_head = dst->nb[1] / sizeof(float);
++    const int out_stride_req  = dst->nb[3] / sizeof(float);
++
++    const bool use_softcap = (softcap != 0.0f);
++
++    const half * k_ptr    = (const half *) K_pool->data;
++    const half * v_ptr    = (const half *) V_pool->data;
++    const int  * bt_ptr   = (const int  *) block_table->data;
++    const int  * sl_ptr   = (const int  *) seq_lens->data;
++    const half * mask_ptr = mask ? (const half *) mask->data : nullptr;
++    float      * out_ptr  = (float *) dst->data;
++
++#define DISPATCH_PAGED(HEAD_DIM_LIT, SOFTCAP_LIT, TQ)                         \
++    do {                                                                      \
++        launch_paged_attn<HEAD_DIM_LIT, SOFTCAP_LIT, TQ>(                     \
++            ctx, (const TQ *) Q->data, k_ptr, v_ptr, bt_ptr, sl_ptr,          \
++            mask_ptr, out_ptr,                                                \
++            q_stride_head, q_stride_req, kv_stride_row,                       \
++            mask_stride_req,                                                  \
++            out_stride_head, out_stride_req,                                  \
++            n_q_heads, n_kv_heads, n_req,                                     \
++            page_size, max_blocks_per_req, scale, softcap);                   \
++        return;                                                               \
++    } while (0)
++
++    if (Q->type == GGML_TYPE_F16) {
++        if (use_softcap) {
++            switch (head_dim) {
++                case  64: DISPATCH_PAGED( 64, true , half);
++                case 128: DISPATCH_PAGED(128, true , half);
++                case 256: DISPATCH_PAGED(256, true , half);
++            }
++        } else {
++            switch (head_dim) {
++                case  64: DISPATCH_PAGED( 64, false, half);
++                case 128: DISPATCH_PAGED(128, false, half);
++                case 256: DISPATCH_PAGED(256, false, half);
++            }
++        }
++    } else {
++        if (use_softcap) {
++            switch (head_dim) {
++                case  64: DISPATCH_PAGED( 64, true , float);
++                case 128: DISPATCH_PAGED(128, true , float);
++                case 256: DISPATCH_PAGED(256, true , float);
++            }
++        } else {
++            switch (head_dim) {
++                case  64: DISPATCH_PAGED( 64, false, float);
++                case 128: DISPATCH_PAGED(128, false, float);
++                case 256: DISPATCH_PAGED(256, false, float);
++            }
++        }
++    }
++#undef DISPATCH_PAGED
++
++    GGML_ABORT("ggml_cuda_paged_attn_ext: unsupported head_dim=%d (expected 64/128/256)",
++               head_dim);
++}
++
++bool ggml_cuda_paged_attn_ext_supported(int device, const ggml_tensor * dst) {
++    const int cc = ggml_cuda_info().devices[device].cc;
++    if (cc < GGML_CUDA_CC_AMPERE) {
++        // Pre-Ampere lacks the warp-shuffle support we rely on.
++        return false;
++    }
++    const ggml_tensor * Q      = dst->src[0];
++    const ggml_tensor * K_pool = dst->src[1];
++    const ggml_tensor * V_pool = dst->src[2];
++    if (K_pool->type != GGML_TYPE_F16 || V_pool->type != GGML_TYPE_F16) {
++        return false;
++    }
++    if (Q->type != GGML_TYPE_F32 && Q->type != GGML_TYPE_F16) {
++        return false;
++    }
++    if (dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const int * params_i32 = (const int *) dst->op_params;
++    const int head_dim     = params_i32[3];
++    if (head_dim != 64 && head_dim != 128 && head_dim != 256) {
++        return false;
++    }
++    // q_token = 1 only (decode).
++    if (Q->ne[1] != 1) {
++        return false;
++    }
++    return true;
++}

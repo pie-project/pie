@@ -141,6 +141,7 @@ void plan_single_request(const PlanArrays& a,
 // so the full-attention layers can attend the entire context.
 void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
                                std::int32_t n_request,
+                               std::int32_t page_size,
                                std::int32_t sliding_window,
                                bool also_build_no_swa_mask = false);
 

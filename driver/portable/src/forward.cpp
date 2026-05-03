@@ -503,8 +503,8 @@ ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req)
         // packing builder must emit BOTH a sliding-clipped mask (for
         // 's' layers) and a full-context mask (for 'g' layers).
         const bool need_full_mask = hpar.arch == PieArch::Gemma4;
-        build_pure_decode_packing(plan, arrays.n_request, spec.sliding_window,
-                                  need_full_mask);
+        build_pure_decode_packing(plan, arrays.n_request, kv_.page_size(),
+                                  spec.sliding_window, need_full_mask);
     }
 
     // GPU-greedy detection: every slot is sampled by argmax (temperature
@@ -670,7 +670,7 @@ ForwardEngine::BatchPlan ForwardEngine::plan_test_simple_(
         const auto& h = model_.hparams();
         const std::int32_t W = h.sliding_window.value_or(0);
         const bool need_full_mask = h.arch == PieArch::Gemma4 && W > 0;
-        build_pure_decode_packing(plan, /*n_request=*/1, W,
+        build_pure_decode_packing(plan, /*n_request=*/1, kv_.page_size(), W,
                                   need_full_mask);
     }
     return plan;
@@ -1082,6 +1082,7 @@ std::vector<std::vector<std::uint32_t>> ForwardEngine::generate_multi(
             const std::int32_t W = gemma4 ? h.sliding_window.value_or(0) : 0;
             build_pure_decode_packing(plan,
                                       static_cast<std::int32_t>(n_req),
+                                      kv_.page_size(),
                                       W,
                                       /*also_build_no_swa_mask=*/gemma4);
         }

@@ -33,10 +33,16 @@ cpmaddpackage(
   # in `ggml_compute_forward_argsort_f32` for `std::sort`. Critical for
   # CPU sampling fast paths: a single `ggml_top_k(probs, K)` over the
   # full vocab (e.g. 152 k for Qwen3) otherwise takes ~22 s per token.
+  #
+  # patches/ggml-pie-paged-attn-ext.patch adds GGML_OP_PAGED_ATTN_EXT and
+  # the `ggml_paged_attn_ext` constructor — the op proper. Backend kernels
+  # land in follow-up patches; with no backend advertising support, the
+  # Pie graph builders take the materialize+flash_attn_ext fallback path.
+  #
   # `-N` makes the patch idempotent so re-runs don't fail; `-t` suppresses
   # interactive prompts on hunk mismatch.
-  PATCH_COMMAND patch -p1 -N -t -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fast-argsort.patch
-                || true
+  PATCH_COMMAND patch -p1 -N -t -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fast-argsort.patch          || true
+        COMMAND patch -p1 -N -t -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-pie-paged-attn-ext.patch    || true
   OPTIONS
     "LLAMA_BUILD_TESTS OFF"
     "LLAMA_BUILD_EXAMPLES OFF"
