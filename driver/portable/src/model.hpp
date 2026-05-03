@@ -480,6 +480,13 @@ private:
         // weights together are <1 MB on a 1.7 B model. See
         // `is_small_weight_for_upcast()` in model.cpp for the predicate.
         bool         upcast_bf16_to_f32 = false;
+        // When set, the source F32 bytes are downcast to BF16 in a temp
+        // buffer before upload. Mirrors llama.cpp's GGUF conversion
+        // policy: large matmul weights stored as F32 in safetensors get
+        // 2x faster matmuls and half the VRAM at the cost of trailing
+        // mantissa bits. See `is_small_weight_for_upcast()` for the
+        // norms/biases that stay F32.
+        bool         downcast_f32_to_bf16 = false;
     };
     std::vector<DeclaredTensor> declared_;
 

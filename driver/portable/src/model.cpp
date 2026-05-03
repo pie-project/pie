@@ -439,20 +439,29 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     // bf16 → f32 byte conversion happens in load_into_backend_().
     const bool upcast = t.dtype == StDtype::BF16
                      && is_small_weight_for_upcast(hf_name);
+    // Some HF releases (notably Gemma-2-2b) store weights as F32. The F32
+    // mul_mat path is ~2x slower than BF16 on tensor-core hardware and
+    // doubles VRAM. Downcast large matmul weights at load time, matching
+    // llama.cpp's GGUF default. Norms / biases stay F32 (precision).
+    const bool downcast = t.dtype == StDtype::F32
+                       && !is_small_weight_for_upcast(hf_name);
 
     ggml_tensor* tensor;
-    if (upcast) {
-        // Build the F32 tensor manually with the same shape as the
-        // safetensor (HF dim order reversed for ggml).
+    if (upcast || downcast) {
+        // Build the target tensor manually with the same shape as the
+        // safetensor (HF dim order reversed for ggml). Type differs
+        // from the source.
         std::int64_t ne[4] = {1, 1, 1, 1};
         for (std::size_t i = 0; i < t.shape.size(); ++i) {
             ne[t.shape.size() - 1 - i] = t.shape[i];
         }
-        tensor = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
-                                    ne[0], ne[1], ne[2], ne[3]);
+        const ggml_type tgt = upcast ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+        tensor = ggml_new_tensor_4d(ctx_, tgt, ne[0], ne[1], ne[2], ne[3]);
         if (!tensor) {
             throw std::runtime_error(
-                "model: ggml_new_tensor_4d (upcast) failed for '" + hf_name + "'");
+                std::string("model: ggml_new_tensor_4d (")
+                + (upcast ? "upcast" : "downcast")
+                + ") failed for '" + hf_name + "'");
         }
         ggml_set_name(tensor, hf_name.c_str());
     } else {
@@ -460,9 +469,10 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     }
 
     DeclaredTensor d;
-    d.hf_name            = hf_name;
-    d.tensor             = tensor;
-    d.upcast_bf16_to_f32 = upcast;
+    d.hf_name              = hf_name;
+    d.tensor               = tensor;
+    d.upcast_bf16_to_f32   = upcast;
+    d.downcast_f32_to_bf16 = downcast;
     declared_.push_back(std::move(d));
     return tensor;
 }
@@ -561,6 +571,23 @@ void Model::load_into_backend_() {
                 tmp.data(), n);
             ggml_backend_tensor_set(d.tensor, tmp.data(), 0,
                                     n * sizeof(float));
+        } else if (d.downcast_f32_to_bf16) {
+            // Demote f32 source bytes to bf16 in a temp buffer, then
+            // upload. Matmul weights only — norms & biases keep F32 via
+            // is_small_weight_for_upcast().
+            const std::size_t n = static_cast<std::size_t>(ggml_nelements(d.tensor));
+            if (src.nbytes != n * sizeof(float)) {
+                throw std::runtime_error(
+                    "model: f32 downcast size mismatch for '" + d.hf_name +
+                    "': expected=" + std::to_string(n * sizeof(float)) +
+                    " safetensors=" + std::to_string(src.nbytes));
+            }
+            std::vector<ggml_bf16_t> tmp(n);
+            ggml_fp32_to_bf16_row(
+                reinterpret_cast<const float*>(src.data),
+                tmp.data(), n);
+            ggml_backend_tensor_set(d.tensor, tmp.data(), 0,
+                                    n * sizeof(ggml_bf16_t));
         } else if (d.copy_bytes > 0) {
             // Sliced load (phi3 fused QKV / gate_up) OR stacked-expert
             // load (one source written into a 3D dest at dst_offset).
