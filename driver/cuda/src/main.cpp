@@ -1228,9 +1228,10 @@ int main(int argc, char** argv) {
         fwd_cfg.yarn_attention_factor     = hf.rope_attention_factor;
         fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
         fwd_cfg.sliding_window            = hf.sliding_window;
-        // flashinfer's decode kernel only instantiates GQA group sizes
-        // {1, 2, 3, 4, 8}. Models like Qwen2-0.5B (group=7), Qwen2-1.5B
-        // (group=6) need the prefill kernel even for decode-only fires.
+        // flashinfer's decode kernel (DISPATCH_GQA_GROUP_SIZE in
+        // utils.cuh) instantiates GQA group sizes {1, 2, 3, 4, 8}.
+        // Models like Qwen2-0.5B (group=7), Qwen2-1.5B (group=6) need
+        // the prefill kernel even for decode-only fires.
         const int gqa = hf.num_attention_heads / hf.num_key_value_heads;
         const bool gqa_in_decode_set = (gqa == 1 || gqa == 2 || gqa == 3
                                         || gqa == 4 || gqa == 8);

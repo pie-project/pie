@@ -141,18 +141,20 @@ cudaError_t plan_decode_for_head_dim(
             /*enable_cuda_graph=*/true,
             stream, work_estimator);
     };
+    // Must match the kernel-side DISPATCH_GQA_GROUP_SIZE set in
+    // flashinfer/utils.cuh ({1, 2, 3, 4, 8}). Other group sizes (5/6/7)
+    // are routed to the prefill path by main.cpp's force_prefill_path
+    // gate, so they never reach this dispatch.
     switch (gqa_group_size) {
         case 1: return plan_for(DecodeWorkEstimator<HEAD_DIM, 1>{});
         case 2: return plan_for(DecodeWorkEstimator<HEAD_DIM, 2>{});
+        case 3: return plan_for(DecodeWorkEstimator<HEAD_DIM, 3>{});
         case 4: return plan_for(DecodeWorkEstimator<HEAD_DIM, 4>{});
-        case 5: return plan_for(DecodeWorkEstimator<HEAD_DIM, 5>{});
-        case 6: return plan_for(DecodeWorkEstimator<HEAD_DIM, 6>{});
-        case 7: return plan_for(DecodeWorkEstimator<HEAD_DIM, 7>{});
         case 8: return plan_for(DecodeWorkEstimator<HEAD_DIM, 8>{});
     }
     throw std::runtime_error(
         "flashinfer decode: unsupported GQA group size " +
-        std::to_string(gqa_group_size) + " (instantiated: 1, 2, 4..8)");
+        std::to_string(gqa_group_size) + " (instantiated: 1, 2, 3, 4, 8)");
 }
 
 }  // namespace
