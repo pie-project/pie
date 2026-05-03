@@ -630,7 +630,7 @@ int run_impl(int argc,
          || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
          || mt == "qwen2"
          || mt == "llama" || mt == "llama3"
-         || mt == "mistral" || mt == "mistral3"
+         || mt == "mistral" || mt == "mistral3" || mt == "ministral3"
          || mt == "mixtral"
          || mt == "gpt_oss"
          || mt == "phi3"
@@ -682,7 +682,7 @@ int run_impl(int argc,
         weights_llama = pie_cuda_driver::model::bind_phi3(engine);
     } else if (mt_for_bind == "olmo2" || mt_for_bind == "olmo3") {
         weights_llama = pie_cuda_driver::model::bind_olmo3(engine);
-    } else if (mt_for_bind == "mistral3") {
+    } else if (mt_for_bind == "mistral3" || mt_for_bind == "ministral3") {
         weights_llama = pie_cuda_driver::model::bind_mistral3(engine);
     } else if (mt_for_bind == "gemma2") {
         weights_gemma = pie_cuda_driver::model::bind_gemma2(engine);
