@@ -53,6 +53,36 @@ void launch_rope_yarn_bf16(
     int   original_max_position,
     cudaStream_t stream);
 
+// Original YaRN (Peng et al. 2023) RoPE scaling. Used by OLMo-3 and
+// gpt-oss. Differs from the Llama-3 variant in two ways:
+//   1. The interpolation ramp is over **dim index**, not over wavelen.
+//      `low_dim`, `high_dim` are derived from `beta_slow`, `beta_fast`
+//      (target rotations within `original_max_pos`):
+//          correction_dim(rot) = d * ln(max_pos / (rot * 2π)) / (2 * ln(theta))
+//          low_dim  = floor(correction_dim(beta_slow))   // "low rot"
+//          high_dim = ceil(correction_dim(beta_fast))    // "high rot"
+//      Below low_dim: keep base inv_freq (extrapolation). Above
+//      high_dim: divide by `factor` (interpolation). Linear blend in
+//      the middle.
+//   2. An attention-magnitude scale `attention_factor` (a.k.a. "mscale")
+//      is multiplied into both cos and sin so that the post-rotation
+//      magnitude scales attention scores. HF passes 1.21 for
+//      `factor=8` on OLMo-3.
+void launch_rope_yarn_original_bf16(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    float factor,
+    float beta_fast,
+    float beta_slow,
+    float attention_factor,
+    int   original_max_position,
+    cudaStream_t stream);
+
 // Partial rotary embedding (Gemma-4 full-attention layers). Rotates
 // only the first `rotary_dim` of each head's `head_dim` channels;
 // the trailing `head_dim - rotary_dim` channels pass through

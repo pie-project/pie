@@ -1,5 +1,6 @@
 #include "model/qwen3_5_moe.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -44,7 +45,16 @@ DeviceBuffer<float> to_fp32(const DeviceTensor& t) {
     return buf;
 }
 
-constexpr const char* kPrefix = "model.language_model.";
+// Qwen 3.5 / 3.6 ship as multimodal containers, so their text-tower
+// weights live under `model.language_model.…`. Qwen3-MoE (Qwen3-30B-A3B)
+// is a pure text model and uses `model.…` directly. Pick the prefix from
+// what the engine actually loaded so a single bind covers both.
+const char* select_prefix(const Engine& e) {
+    if (e.has("model.language_model.embed_tokens.weight")) {
+        return "model.language_model.";
+    }
+    return "model.";
+}
 
 // Per-rank slice of fused linear-attn QKV / conv1d tensors. Shares the
 // same [K1 | K2 | V] block layout as Qwen3_5; copy the helper here
@@ -102,32 +112,47 @@ DeviceTensor slice_la_kkv_blocked(
 Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
     const auto& cfg = engine.hf_config();
     const int L = cfg.num_hidden_layers;
+    // Qwen3-MoE (Qwen3-30B-A3B) is full-attention only — its config has
+    // no `layer_types` field and no shared expert. Qwen3.5 / 3.6-MoE
+    // ship a hybrid linear-attn / full-attn layer schedule and an
+    // always-on shared expert. We bind the same struct in both cases;
+    // the per-arch flags below decide which sections to require.
+    const bool is_qwen3_moe = (cfg.model_type == "qwen3_moe");
+    const bool has_shared_expert = cfg.shared_expert_intermediate_size > 0;
 
-    if (cfg.layer_types.empty() ||
-        static_cast<int>(cfg.layer_types.size()) != L) {
+    std::vector<std::string> synth_layer_types;
+    const std::vector<std::string>* layer_types = &cfg.layer_types;
+    if (is_qwen3_moe && cfg.layer_types.empty()) {
+        synth_layer_types.assign(static_cast<std::size_t>(L), "full_attention");
+        layer_types = &synth_layer_types;
+    }
+    if (layer_types->empty() ||
+        static_cast<int>(layer_types->size()) != L) {
         throw std::runtime_error(
             "qwen3_5_moe: HfConfig.layer_types must match num_hidden_layers");
     }
-    if (cfg.linear_num_value_heads <= 0 || cfg.linear_num_key_heads <= 0
+    const bool has_linear_attn =
+        std::any_of(layer_types->begin(), layer_types->end(),
+                    [](const std::string& t) { return t == "linear_attention"; });
+    if (has_linear_attn &&
+        (cfg.linear_num_value_heads <= 0 || cfg.linear_num_key_heads <= 0
             || cfg.linear_key_head_dim <= 0 || cfg.linear_value_head_dim <= 0
-            || cfg.linear_conv_kernel_dim <= 0) {
+            || cfg.linear_conv_kernel_dim <= 0)) {
         throw std::runtime_error("qwen3_5_moe: linear-attn dimensions are unset");
     }
     if (cfg.num_experts <= 0 || cfg.num_experts_per_tok <= 0) {
         throw std::runtime_error(
             "qwen3_5_moe: num_experts and num_experts_per_tok must be > 0");
     }
-    if (cfg.moe_intermediate_size <= 0
-            || cfg.shared_expert_intermediate_size <= 0) {
+    if (cfg.moe_intermediate_size <= 0) {
         throw std::runtime_error(
-            "qwen3_5_moe: moe_intermediate_size and "
-            "shared_expert_intermediate_size must be > 0");
+            "qwen3_5_moe: moe_intermediate_size must be > 0");
     }
 
     Qwen3_5MoeWeights w;
     w.layers.resize(static_cast<std::size_t>(L));
 
-    const std::string p = kPrefix;
+    const std::string p = select_prefix(engine);
 
     w.embed      = &must(engine, p + "embed_tokens.weight");
     w.final_norm = &must(engine, p + "norm.weight");
@@ -146,7 +171,7 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
     for (int li = 0; li < L; ++li) {
         const std::string lp = p + "layers." + std::to_string(li) + ".";
         auto& Lw = w.layers[li];
-        const auto& kind = cfg.layer_types[li];
+        const auto& kind = (*layer_types)[li];
 
         Lw.attn_norm_pre = &must(engine, lp + "input_layernorm.weight");
         Lw.mlp_norm_pre  = &must(engine, lp + "post_attention_layernorm.weight");
@@ -222,10 +247,12 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
         Lw.moe_router       = &must(engine, lp + "mlp.gate.weight");
         Lw.moe_gate_up_proj = &must(engine, lp + "mlp.experts.gate_up_proj");
         Lw.moe_down_proj    = &must(engine, lp + "mlp.experts.down_proj");
-        Lw.shared_gate_proj = &must(engine, lp + "mlp.shared_expert.gate_proj.weight");
-        Lw.shared_up_proj   = &must(engine, lp + "mlp.shared_expert.up_proj.weight");
-        Lw.shared_down_proj = &must(engine, lp + "mlp.shared_expert.down_proj.weight");
-        Lw.shared_gate      = &must(engine, lp + "mlp.shared_expert_gate.weight");
+        if (has_shared_expert) {
+            Lw.shared_gate_proj = &must(engine, lp + "mlp.shared_expert.gate_proj.weight");
+            Lw.shared_up_proj   = &must(engine, lp + "mlp.shared_expert.up_proj.weight");
+            Lw.shared_down_proj = &must(engine, lp + "mlp.shared_expert.down_proj.weight");
+            Lw.shared_gate      = &must(engine, lp + "mlp.shared_expert_gate.weight");
+        }
     }
 
     return w;

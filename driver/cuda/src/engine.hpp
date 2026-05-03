@@ -85,6 +85,12 @@ public:
     }
     const DeviceTensor& get(const std::string& name) const;
 
+    /// Replace the tensor at `name` with `tensor`, or insert if absent.
+    /// Used by per-arch bind passes that materialise a bf16 view from
+    /// a quantized source under the same canonical name (e.g.
+    /// bind_mistral3 dequants FP8 weights in-place).
+    void replace(std::string name, DeviceTensor tensor);
+
     // Register a tensor (typically a non-owning view from
     // `DeviceTensor::view(...)`) under `name`. Used by per-arch bind
     // functions that synthesise virtual q/k/v slots from a fused

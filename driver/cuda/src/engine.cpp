@@ -115,7 +115,7 @@ bool supports_tp(const std::string& mt) {
     return mt == "qwen3"
         || mt == "qwen2"
         || mt == "llama" || mt == "llama3"
-        || mt == "mistral" || mt == "mistral3"
+        || mt == "mistral" || mt == "mistral3" || mt == "ministral3"
         || mt == "phi3"
         || mt == "olmo2" || mt == "olmo3"
         || mt == "gemma2"
@@ -125,7 +125,17 @@ bool supports_tp(const std::string& mt) {
         || mt == "gemma3n" || mt == "gemma3n_text"
         || mt == "gpt_oss"
         || mt == "qwen3_5" || mt == "qwen3_5_text"
-        || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text";
+        || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
+        || mt == "qwen3_moe";
+}
+
+// True for any MoE model whose forward path lives in qwen3_5_moe_forward.
+// All members share an all-MoE MLP layout (no dense `intermediate_size`),
+// so the engine's TP divisibility checks on `intermediate_size` should
+// be skipped for them.
+bool is_qwen3_5_moe_arch(const std::string& mt) {
+    return mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
+        || mt == "qwen3_moe";
 }
 
 // Slice a 2-D bf16 weight `[N, K]` per-rank along the given axis. Used
@@ -246,24 +256,33 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
         };
         require_divisible(hf.num_attention_heads, "num_attention_heads");
         require_divisible(hf.num_key_value_heads, "num_key_value_heads");
-        // Qwen3.5-MoE has no dense `intermediate_size`; the MLP lives
-        // entirely in `moe_intermediate_size` + `shared_expert_intermediate_size`.
-        const bool is_q35_moe =
-            (hf.model_type == "qwen3_5_moe" ||
-             hf.model_type == "qwen3_5_moe_text");
+        // Qwen3.5-MoE / Qwen3-MoE have no dense `intermediate_size`; the
+        // MLP lives entirely in `moe_intermediate_size` (+ `shared_expert_
+        // intermediate_size` for the 3.5/3.6 family — Qwen3-MoE has no
+        // shared expert).
+        const bool is_q35_moe = is_qwen3_5_moe_arch(hf.model_type);
         if (!is_q35_moe) {
             require_divisible(hf.intermediate_size, "intermediate_size");
         }
         // Qwen3.5 / 3.6-MoE: linear-attention head counts must shard too.
-        if (hf.model_type == "qwen3_5" || hf.model_type == "qwen3_5_text" ||
-            is_q35_moe) {
+        // Qwen3-MoE has no linear-attn layers, so this check is skipped.
+        const bool has_linear_attn =
+            (hf.model_type == "qwen3_5" || hf.model_type == "qwen3_5_text" ||
+             hf.model_type == "qwen3_5_moe" ||
+             hf.model_type == "qwen3_5_moe_text");
+        if (has_linear_attn) {
             require_divisible(hf.linear_num_key_heads, "linear_num_key_heads");
             require_divisible(hf.linear_num_value_heads, "linear_num_value_heads");
         }
         if (is_q35_moe) {
             require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
-            require_divisible(hf.shared_expert_intermediate_size,
-                              "shared_expert_intermediate_size");
+            // shared_expert_intermediate_size is 0 for Qwen3-MoE (no shared
+            // expert); only enforce divisibility when the family actually
+            // has one.
+            if (hf.shared_expert_intermediate_size > 0) {
+                require_divisible(hf.shared_expert_intermediate_size,
+                                  "shared_expert_intermediate_size");
+            }
         }
     }
 
@@ -1264,6 +1283,16 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
         }
         if (!fp8_weights.empty()) {
             std::uint64_t freed = 0, allocated = 0;
+            // Track which `_scale_inv` companions we actually consumed so
+            // we only erase those. Non-compressed-tensors FP8 ckpts
+            // (Ministral-3-Instruct-2512: quant_method="fp8" with
+            // bf16 scalar `weight_scale_inv` per projection) leave their
+            // FP8 weights without QuantMeta — the per-arch bind dequants
+            // them later using the still-resident scale tensor. Blanket-
+            // erasing every `_scale_inv` here would strip those scales
+            // before the bind runs.
+            std::vector<std::string> consumed_scales;
+            consumed_scales.reserve(fp8_weights.size());
             for (const auto& wname : fp8_weights) {
                 auto qmeta_it = e.quant_meta_.find(wname);
                 if (qmeta_it == e.quant_meta_.end() ||
@@ -1293,16 +1322,12 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
                 freed     += src.nbytes();
                 allocated += bf16.nbytes();
                 w_it->second = std::move(bf16);
+                consumed_scales.push_back(wname + "_scale_inv");
                 e.quant_meta_.erase(qmeta_it);
             }
-            // Drop the orphaned `_scale_inv` companions — no QuantMeta
-            // points at them anymore.
-            for (auto it = e.weights_.begin(); it != e.weights_.end(); ) {
-                if (ends_with_str(it->first, "_scale_inv")) {
-                    it = e.weights_.erase(it);
-                } else {
-                    ++it;
-                }
+            // Drop only the `_scale_inv` companions we actually consumed.
+            for (const auto& s : consumed_scales) {
+                e.weights_.erase(s);
             }
             CUDA_CHECK(cudaDeviceSynchronize());
             std::cerr << "[pie-driver-cuda] eager FP8 -> bf16 dequant "
@@ -1329,8 +1354,7 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
     // sharded along Im (via llama_like_shard_axis matching .gate_proj/
     // .up_proj/.down_proj.weight) so the fused result lands per-rank-
     // shaped without further slicing.
-    if (e.hf_.model_type == "qwen3_5_moe" ||
-        e.hf_.model_type == "qwen3_5_moe_text") {
+    if (is_qwen3_5_moe_arch(e.hf_.model_type)) {
         // Discover layer prefixes that have per-expert tensors.
         std::vector<std::string> layer_prefixes;
         {
@@ -1484,6 +1508,10 @@ void Engine::insert(std::string name, DeviceTensor tensor) {
     if (!inserted) {
         throw std::runtime_error("engine: weight already registered: " + it->first);
     }
+}
+
+void Engine::replace(std::string name, DeviceTensor tensor) {
+    weights_.insert_or_assign(std::move(name), std::move(tensor));
 }
 
 void Engine::set_quant_meta(const std::string& name, QuantMeta meta) {

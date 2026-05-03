@@ -25,8 +25,10 @@
 namespace pie_cuda_driver::model {
 
 enum class RopeKind {
-    Standard,  // pure theta-based, used by Qwen 2/3, Phi-3, Mistral
-    YaRN,      // Llama-3 / OLMo-3 / GPT-OSS scaling
+    Standard,      // pure theta-based, used by Qwen 2/3, Phi-3, Mistral
+    YaRN,          // Llama-3 smoothed-interpolation YaRN
+    YaRNOriginal,  // Original YaRN (OLMo-3, gpt-oss): dim-index ramp +
+                   // attention_factor mscale (Peng et al. 2023)
 };
 
 enum class NormPlacement {
@@ -41,11 +43,17 @@ struct LlamaLikeForwardCfg {
     NormPlacement norm_placement = NormPlacement::Pre;
     RopeKind rope_kind      = RopeKind::Standard;
 
-    // YaRN params (only consumed when `rope_kind == YaRN`).
+    // YaRN params (only consumed when `rope_kind == YaRN` or
+    // `YaRNOriginal`).
     float yarn_factor               = 1.0f;
     float yarn_low_freq_factor      = 1.0f;
     float yarn_high_freq_factor     = 4.0f;
     int   yarn_original_max_position = 8192;
+    // Original-YaRN extras (consumed only when `rope_kind ==
+    // YaRNOriginal`).
+    float yarn_beta_fast            = 32.0f;
+    float yarn_beta_slow            = 1.0f;
+    float yarn_attention_factor     = 1.0f;
 
     // Sliding-window attention. `sliding_window = -1` means full causal
     // for every layer; positive values switch flashinfer's

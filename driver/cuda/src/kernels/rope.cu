@@ -164,6 +164,110 @@ void launch_rope_yarn_bf16(
         static_cast<float>(original_max_position));
 }
 
+// ── Original YaRN variant (OLMo-3, gpt-oss) ───────────────────────────────
+
+namespace {
+
+// Linear ramp over dim index: 0 below low_dim, 1 above high_dim. Used
+// to blend between unscaled (high freq) and `1/factor`-scaled (low
+// freq) inv_freq, in the dim-index domain rather than the wavelen
+// domain that Llama-3 YaRN uses.
+__device__ __forceinline__ float yarn_original_freq(
+    float base_freq, float factor,
+    float low_dim, float high_dim, int dim_pair)
+{
+    const float denom = (high_dim == low_dim) ? (high_dim + 1e-3f - low_dim)
+                                              : (high_dim - low_dim);
+    float ramp = (static_cast<float>(dim_pair) - low_dim) / denom;
+    if (ramp < 0.f) ramp = 0.f;
+    if (ramp > 1.f) ramp = 1.f;
+    // Below low_dim (ramp=0): extrapolation = base. Above high_dim
+    // (ramp=1): interpolation = base / factor. Linear blend between.
+    return base_freq * ((1.f - ramp) + ramp / factor);
+}
+
+__global__ void rope_yarn_original_bf16_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const std::int32_t* __restrict__ positions,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float theta, float factor,
+    float low_dim, float high_dim,
+    float mscale)
+{
+    const int n = blockIdx.x;
+    const int total_heads = num_q_heads + num_kv_heads;
+    const int half = head_dim / 2;
+    const int pos = positions[n];
+
+    for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
+        const int head_idx = t / half;
+        const int dim_pair = t % half;
+
+        const float base_freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) / static_cast<float>(head_dim));
+        const float freq = yarn_original_freq(base_freq, factor,
+                                              low_dim, high_dim, dim_pair);
+        const float ang = static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+        cos_v *= mscale;
+        sin_v *= mscale;
+
+        if (head_idx < num_q_heads) {
+            __nv_bfloat16* qp = q + (static_cast<long long>(n) * num_q_heads +
+                                     head_idx) * head_dim;
+            rotate_pair(qp, half, dim_pair, cos_v, sin_v);
+        } else {
+            const int kv_h = head_idx - num_q_heads;
+            __nv_bfloat16* kp = k + (static_cast<long long>(n) * num_kv_heads +
+                                     kv_h) * head_dim;
+            rotate_pair(kp, half, dim_pair, cos_v, sin_v);
+        }
+    }
+}
+
+}  // namespace
+
+void launch_rope_yarn_original_bf16(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float theta, float factor,
+    float beta_fast, float beta_slow,
+    float attention_factor,
+    int original_max_position,
+    cudaStream_t stream)
+{
+    constexpr float TWO_PI = 6.2831853071795864769f;
+    // correction_dim(rot) = head_dim * ln(max_pos / (rot * 2π)) / (2 * ln(theta))
+    const float ln_theta = logf(theta);
+    auto corr_dim = [&](float rot) -> float {
+        return head_dim * logf(static_cast<float>(original_max_position) /
+                               (rot * TWO_PI)) / (2.f * ln_theta);
+    };
+    // beta_slow → "low rotation count" → larger correction_dim → upper
+    // bound on the ramp (above this, fully interpolated). beta_fast →
+    // smaller correction_dim → lower bound (below this, fully
+    // extrapolated). HF clamps to [0, head_dim/2 - 1] (we ramp over
+    // dim_pair which has range [0, head_dim/2)).
+    float low_dim  = floorf(corr_dim(beta_fast));
+    float high_dim = ceilf(corr_dim(beta_slow));
+    if (low_dim < 0.f) low_dim = 0.f;
+    const float max_pair = static_cast<float>(head_dim / 2) - 1.f;
+    if (high_dim > max_pair) high_dim = max_pair;
+    if (high_dim < low_dim)  high_dim = low_dim;
+
+    constexpr int BLOCK = 256;
+    rope_yarn_original_bf16_kernel<<<num_tokens, BLOCK, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(q),
+        static_cast<__nv_bfloat16*>(k),
+        positions,
+        num_q_heads, num_kv_heads, head_dim,
+        theta, factor, low_dim, high_dim, attention_factor);
+}
+
 // ── Partial rotary (Gemma-4 full-attention layers) ─────────────────────────
 
 namespace {

@@ -44,6 +44,17 @@ inline void apply_rope(
             fwd_cfg.yarn_high_freq_factor,
             fwd_cfg.yarn_original_max_position,
             stream);
+    } else if (fwd_cfg.rope_kind == RopeKind::YaRNOriginal) {
+        kernels::launch_rope_yarn_original_bf16(
+            q, k, positions,
+            N, num_q_heads, num_kv_heads, head_dim,
+            cfg.rope_theta,
+            fwd_cfg.yarn_factor,
+            fwd_cfg.yarn_beta_fast,
+            fwd_cfg.yarn_beta_slow,
+            fwd_cfg.yarn_attention_factor,
+            fwd_cfg.yarn_original_max_position,
+            stream);
     } else {
         kernels::launch_rope_bf16(
             q, k, positions,
@@ -191,15 +202,35 @@ void llama_like_forward_paged(
             maybe_add_bias(ws.v.data(), layer.v_bias, N, Hk, stream);
         }
 
+        // q_norm / k_norm: two conventions ship in the wild.
+        //   * Per-head (Qwen3, OLMo-2 small, Gemma-3): weight shape
+        //     `[head_dim]`. RMSNorm rolls each head's `d` channels
+        //     independently — `num_rows = N*num_heads`, `hidden = d`.
+        //   * Global (OLMo-2 7B+, OLMo-3): weight shape `[H_*]`
+        //     (per-rank in TP). HF flattens [N, num_heads, d] → [N, H_*]
+        //     and applies one RMSNorm with the full vector — `num_rows
+        //     = N`, `hidden = num_heads * d`. Pre-rope behaviour
+        //     differs from per-head by the shared scale across heads.
+        // Dispatch by inspecting the bound q/k_norm shape; bind code
+        // doesn't reshape, so the tensor's leading dim tells us.
+        auto rmsnorm_qk = [&](void* x, const DeviceTensor* w,
+                              int num_heads_local, int per_rank_H) {
+            const bool global_norm = (w->shape().size() == 1 &&
+                                      w->shape()[0] == per_rank_H);
+            if (global_norm) {
+                kernels::launch_rmsnorm_bf16(
+                    x, w->data(), x, N, per_rank_H, eps, stream);
+            } else {
+                kernels::launch_rmsnorm_bf16(
+                    x, w->data(), x,
+                    N * num_heads_local, d, eps, stream);
+            }
+        };
         if (fwd_cfg.use_qk_norm && layer.q_norm) {
-            kernels::launch_rmsnorm_bf16(
-                ws.q.data(), layer.q_norm->data(), ws.q.data(),
-                N * num_q_heads_local, d, eps, stream);
+            rmsnorm_qk(ws.q.data(), layer.q_norm, num_q_heads_local, Hq);
         }
         if (fwd_cfg.use_qk_norm && layer.k_norm) {
-            kernels::launch_rmsnorm_bf16(
-                ws.k.data(), layer.k_norm->data(), ws.k.data(),
-                N * num_kv_heads_local, d, eps, stream);
+            rmsnorm_qk(ws.k.data(), layer.k_norm, num_kv_heads_local, Hk);
         }
 
         apply_rope(fwd_cfg, cfg,

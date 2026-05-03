@@ -23,6 +23,32 @@
 
 namespace pie_cuda_driver::model {
 
+namespace {
+
+// RMSNorm dispatch: Qwen3.5 / 3.6-MoE store gamma centered at zero and
+// apply `(1 + w) * x_hat` (Gemma-style); Qwen3-MoE (Qwen3-30B-A3B) uses
+// the standard `w * x_hat`. The bind layer wires the same struct for
+// both so the forward picks the right kernel based on `cfg.model_type`.
+inline bool uses_gemma_rmsnorm(const HfConfig& cfg) {
+    return cfg.model_type != "qwen3_moe";
+}
+
+inline void rmsnorm_bf16_dispatch(
+    const HfConfig& cfg,
+    const void* x, const void* weight, void* y,
+    int num_rows, int hidden, float eps, cudaStream_t stream)
+{
+    if (uses_gemma_rmsnorm(cfg)) {
+        kernels::launch_rmsnorm_gemma_bf16(x, weight, y,
+            num_rows, hidden, eps, stream);
+    } else {
+        kernels::launch_rmsnorm_bf16(x, weight, y,
+            num_rows, hidden, eps, stream);
+    }
+}
+
+}  // namespace
+
 Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
     int max_tokens, int hidden, int num_experts, int top_k,
     int moe_intermediate, int shared_intermediate)
@@ -268,12 +294,22 @@ void full_attn_body(
     const float eps = cfg.rms_norm_eps;
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.fa_q_proj->data(),
-        la.fa_qg_packed.data(), N, 2 * Hq, H);
-    kernels::launch_split_q_gate_bf16(
-        la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
-        N, num_q_heads_local, d, stream);
+    // Qwen3.5 / 3.6-MoE fuse the per-head sigmoid output gate into
+    // q_proj as a [2*Hq, H] tensor — rows [0,Hq) are q, rows [Hq,2*Hq)
+    // are the gate logits. Qwen3-MoE (Qwen3-30B-A3B) ships plain q_proj
+    // [Hq, H] with no output gate, so the GEMM goes straight into ws.q.
+    if (cfg.attn_output_gate) {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), Lw.fa_q_proj->data(),
+            la.fa_qg_packed.data(), N, 2 * Hq, H);
+        kernels::launch_split_q_gate_bf16(
+            la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
+            N, num_q_heads_local, d, stream);
+    } else {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), Lw.fa_q_proj->data(),
+            ws.q.data(), N, Hq, H);
+    }
 
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.fa_k_proj->data(),
@@ -282,10 +318,10 @@ void full_attn_body(
         ws.norm_x.data(), Lw.fa_v_proj->data(),
         ws.v.data(), N, Hk, H);
 
-    kernels::launch_rmsnorm_gemma_bf16(
+    rmsnorm_bf16_dispatch(cfg,
         ws.q.data(), Lw.fa_q_norm->data(), ws.q.data(),
         N * num_q_heads_local, d, eps, stream);
-    kernels::launch_rmsnorm_gemma_bf16(
+    rmsnorm_bf16_dispatch(cfg,
         ws.k.data(), Lw.fa_k_norm->data(), ws.k.data(),
         N * num_kv_heads_local, d, eps, stream);
 
@@ -316,8 +352,10 @@ void full_attn_body(
             cache.page_size(), attn_ws, stream);
     }
 
-    kernels::launch_sigmoid_gate_inplace_bf16(
-        ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
+    if (cfg.attn_output_gate) {
+        kernels::launch_sigmoid_gate_inplace_bf16(
+            ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
+    }
 
     // o_proj: TP=1 fuses residual via beta=1; TP>1 row-parallel +
     // all-reduce + residual-add.
@@ -513,40 +551,44 @@ void moe_block(
         }
     }
 
-    // ── Shared expert (always-on, dense MLP + sigmoid gate) ───────
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.shared_gate_proj->data(),
-        moe_ws.shared_gate.data(), N, Is, H);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.shared_up_proj->data(),
-        moe_ws.shared_up.data(), N, Is, H);
-    kernels::launch_swiglu_bf16(
-        moe_ws.shared_gate.data(), moe_ws.shared_up.data(),
-        moe_ws.shared_act.data(),
-        N * Is, stream);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        moe_ws.shared_act.data(), Lw.shared_down_proj->data(),
-        moe_ws.shared_out.data(), N, H, Is);
+    // ── Shared expert (Qwen3.5 / 3.6-MoE: always-on dense MLP + sigmoid
+    //    gate). Qwen3-MoE has no shared expert — skip the whole block
+    //    when the bind didn't wire `shared_*` pointers (Is == 0).
+    if (Is > 0 && Lw.shared_gate_proj != nullptr) {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), Lw.shared_gate_proj->data(),
+            moe_ws.shared_gate.data(), N, Is, H);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), Lw.shared_up_proj->data(),
+            moe_ws.shared_up.data(), N, Is, H);
+        kernels::launch_swiglu_bf16(
+            moe_ws.shared_gate.data(), moe_ws.shared_up.data(),
+            moe_ws.shared_act.data(),
+            N * Is, stream);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            moe_ws.shared_act.data(), Lw.shared_down_proj->data(),
+            moe_ws.shared_out.data(), N, H, Is);
 
-    // shared_gate logit [N, 1] = norm_x @ shared_gate.weight.T
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.shared_gate->data(),
-        moe_ws.shared_gate_logit.data(), N, 1, H);
+        // shared_gate logit [N, 1] = norm_x @ shared_gate.weight.T
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_x.data(), Lw.shared_gate->data(),
+            moe_ws.shared_gate_logit.data(), N, 1, H);
 
-    // shared_out *= sigmoid(scalar_gate[n]) per token, broadcast across
-    // all H channels.
-    kernels::launch_sigmoid_scalar_gate_inplace_bf16(
-        moe_ws.shared_out.data(), moe_ws.shared_gate_logit.data(),
-        N, H, stream);
+        // shared_out *= sigmoid(scalar_gate[n]) per token, broadcast
+        // across all H channels.
+        kernels::launch_sigmoid_scalar_gate_inplace_bf16(
+            moe_ws.shared_out.data(), moe_ws.shared_gate_logit.data(),
+            N, H, stream);
 
-    // moe_out += shared_out — both terms are this rank's partial sum
-    // (routed: row-parallel down_proj; shared: row-parallel down_proj).
-    // We accumulate into ws.norm_y first and all-reduce the combined
-    // partial once, so the block fires a single collective regardless
-    // of routed/shared split.
-    kernels::launch_residual_add_bf16(
-        ws.norm_y.data(), moe_ws.shared_out.data(),
-        (std::size_t)N * H, stream);
+        // moe_out += shared_out — both terms are this rank's partial
+        // sum (routed: row-parallel down_proj; shared: row-parallel
+        // down_proj). We accumulate into ws.norm_y first and all-reduce
+        // the combined partial once, so the block fires a single
+        // collective regardless of routed/shared split.
+        kernels::launch_residual_add_bf16(
+            ws.norm_y.data(), moe_ws.shared_out.data(),
+            (std::size_t)N * H, stream);
+    }
 
     if (T > 1) {
         tp->all_reduce_bf16(ws.norm_y.data(),
@@ -604,7 +646,7 @@ void qwen3_5_moe_forward_paged(
     for (std::size_t L = 0; L < w.layers.size(); ++L) {
         const auto& Lw = w.layers[L];
 
-        kernels::launch_rmsnorm_gemma_bf16(
+        rmsnorm_bf16_dispatch(cfg,
             ws.y.data(), Lw.attn_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
 
@@ -626,7 +668,7 @@ void qwen3_5_moe_forward_paged(
         //  residual_add itself. ws.y holds the post-attention state.)
 
         // Post-attention norm + MoE block + residual.
-        kernels::launch_rmsnorm_gemma_bf16(
+        rmsnorm_bf16_dispatch(cfg,
             ws.y.data(), Lw.mlp_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
         moe_block(Lw, cfg, fwd_cfg, ws, moe_ws, N, cublas, stream);
@@ -635,7 +677,7 @@ void qwen3_5_moe_forward_paged(
             (std::size_t)N * H, stream);
     }
 
-    kernels::launch_rmsnorm_gemma_bf16(
+    rmsnorm_bf16_dispatch(cfg,
         ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
         N, H, eps, stream);
     ops::gemm_act_x_wt_bf16(cublas.handle(),

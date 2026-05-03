@@ -112,7 +112,8 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
     match arch_name {
         "qwen3" |
         "qwen3_5" | "qwen3_5_text" |
-        "qwen3_5_moe" | "qwen3_5_moe_text" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
+        "qwen3_5_moe" | "qwen3_5_moe_text" |
+        "qwen3_moe" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
             has_thinking: true,
             has_tools: true,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],

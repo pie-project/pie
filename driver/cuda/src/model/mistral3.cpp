@@ -60,12 +60,13 @@ void dequant_fp8_in_place(
     }
 
     // Allocate the bf16 destination matching the FP8 source's logical
-    // shape.
+    // shape. Use `replace` because the source FP8 tensor is registered
+    // under the same canonical `.weight` name we're materialising into.
     auto bf16 = DeviceTensor::allocate(DType::BF16, fp8.shape());
     kernels::launch_dequant_fp8_e4m3_to_bf16(
         static_cast<const std::uint8_t*>(fp8.data()),
         bf16.data(), scale, fp8.numel(), /*stream=*/nullptr);
-    engine.insert(bf16_name, std::move(bf16));
+    engine.replace(bf16_name, std::move(bf16));
 }
 
 }  // namespace

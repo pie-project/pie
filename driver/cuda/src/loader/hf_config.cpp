@@ -1,5 +1,6 @@
 #include "loader/hf_config.hpp"
 
+#include <cmath>
 #include <fstream>
 #include <stdexcept>
 
@@ -107,21 +108,55 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.hidden_act   = optional<std::string>(j, "hidden_act", "silu");
 
     cfg.rope_theta       = optional<float>(j, "rope_theta", 10000.0f);
-    cfg.has_rope_scaling = j.contains("rope_scaling") && !j["rope_scaling"].is_null();
 
-    // YaRN (Llama-3 style). Defaults match Llama-3.2-1B / 3-8B.
+    // Two YaRN variants are recognised:
+    //   * Llama-3 YaRN (`rope_type == "llama3"` or `low_freq_factor`
+    //     present) — smoothed interpolation in the wavelen domain.
+    //   * Original YaRN (`rope_type == "yarn"` with `beta_fast` /
+    //     `beta_slow` / `attention_factor`) — linear ramp in the
+    //     dim-index domain. Used by OLMo-3, gpt-oss, DeepSeek-V3.
+    // Defaults are inert (`scaling_kind = None`) so plain-RoPE
+    // ckpts (Mistral / Qwen) take the un-scaled path.
     cfg.rope_factor              = 1.0f;
     cfg.rope_low_freq_factor     = 1.0f;
     cfg.rope_high_freq_factor    = 4.0f;
+    cfg.rope_beta_fast           = 32.0f;
+    cfg.rope_beta_slow           = 1.0f;
+    cfg.rope_attention_factor    = 1.0f;
     cfg.rope_original_max_position = cfg.max_position_embeddings;
-    if (cfg.has_rope_scaling) {
+    cfg.rope_scaling_kind        = HfConfig::RopeScaling::None;
+    cfg.has_rope_scaling         = false;
+    if (j.contains("rope_scaling") && j["rope_scaling"].is_object()) {
         const auto& s = j["rope_scaling"];
-        cfg.rope_factor              = optional<float>(s, "factor", 8.0f);
-        cfg.rope_low_freq_factor     = optional<float>(s, "low_freq_factor", 1.0f);
-        cfg.rope_high_freq_factor    = optional<float>(s, "high_freq_factor", 4.0f);
-        cfg.rope_original_max_position =
-            optional<int>(s, "original_max_position_embeddings",
-                          cfg.max_position_embeddings);
+        const std::string rope_type = optional<std::string>(s, "rope_type", "");
+        const bool has_llama3_keys = s.contains("low_freq_factor") ||
+                                     s.contains("high_freq_factor");
+        if (rope_type == "llama3" || has_llama3_keys) {
+            cfg.rope_scaling_kind = HfConfig::RopeScaling::Llama3;
+            cfg.has_rope_scaling  = true;
+            cfg.rope_factor              = optional<float>(s, "factor", 8.0f);
+            cfg.rope_low_freq_factor     = optional<float>(s, "low_freq_factor", 1.0f);
+            cfg.rope_high_freq_factor    = optional<float>(s, "high_freq_factor", 4.0f);
+            cfg.rope_original_max_position =
+                optional<int>(s, "original_max_position_embeddings",
+                              cfg.max_position_embeddings);
+        } else if (rope_type == "yarn") {
+            cfg.rope_scaling_kind = HfConfig::RopeScaling::OriginalYaRN;
+            cfg.rope_factor           = optional<float>(s, "factor", 1.0f);
+            cfg.rope_beta_fast        = optional<float>(s, "beta_fast", 32.0f);
+            cfg.rope_beta_slow        = optional<float>(s, "beta_slow", 1.0f);
+            // HF's `_compute_yarn_parameters` sets the default mscale
+            // to `0.1 * ln(factor) + 1` when `attention_factor` is
+            // absent. OLMo-3 ships it explicitly (1.2079...).
+            const float default_mscale = (cfg.rope_factor > 1.f)
+                ? 0.1f * std::log(cfg.rope_factor) + 1.0f
+                : 1.0f;
+            cfg.rope_attention_factor = optional<float>(
+                s, "attention_factor", default_mscale);
+            cfg.rope_original_max_position =
+                optional<int>(s, "original_max_position_embeddings",
+                              cfg.max_position_embeddings);
+        }
     }
 
     cfg.sliding_window      = optional<int>(j, "sliding_window", -1);

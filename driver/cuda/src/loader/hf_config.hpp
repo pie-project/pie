@@ -44,13 +44,27 @@ struct HfConfig {
 
     // ── RoPE ──────────────────────────────────────────────────────────
     float rope_theta;
-    bool  has_rope_scaling;    // True when `rope_scaling.rope_type ==
-                               // "llama3"` (YaRN-style) is set.
-    // YaRN parameters. Inert when `has_rope_scaling == false`.
+    // RoPE scaling variant — `None` means plain RoPE (no scaling).
+    // `Llama3` uses the smoothed-interpolation YaRN ramp (low/high
+    // freq factors); `OriginalYaRN` uses the dim-index ramp from the
+    // YaRN paper (beta_fast/beta_slow + attention_factor mscale) and
+    // is what OLMo-3 / gpt-oss / DeepSeek-V3 ship.
+    enum class RopeScaling { None, Llama3, OriginalYaRN };
+    RopeScaling rope_scaling_kind = RopeScaling::None;
+    // Llama-3 YaRN params. Inert under `RopeScaling::OriginalYaRN`.
     float rope_factor;
     float rope_low_freq_factor;
     float rope_high_freq_factor;
     int   rope_original_max_position;
+    // Original-YaRN params. Inert under `RopeScaling::Llama3`.
+    float rope_beta_fast        = 32.f;
+    float rope_beta_slow        = 1.f;
+    float rope_attention_factor = 1.f;
+    // Backwards-compatible accessor: `has_rope_scaling` is true iff the
+    // ckpt uses Llama-3 YaRN (the only variant that took the YaRN code
+    // path before the OriginalYaRN dispatch was added). Per-arch code
+    // that branches on YaRN vs plain RoPE keeps its existing semantics.
+    bool has_rope_scaling = false;
 
     // ── Sliding-window attention ──────────────────────────────────────
     // -1 means full causal. Positive = `window_left` per request to
