@@ -312,6 +312,12 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
             case PieArch::Phi3:
                 build_phi3_();
                 break;
+            case PieArch::Phi3Small:
+                build_phi3small_();
+                break;
+            case PieArch::Phi3_5Moe:
+                build_phi3_5moe_();
+                break;
             case PieArch::Gemma2:
                 build_gemma2_();
                 break;
@@ -397,12 +403,25 @@ void Model::resolve_tensor_prefix_() {
             // under `model.language_model.`.
             tensor_prefix_ = "model.language_model.";
             break;
+        case PieArch::Gemma3:
+            // Gemma 3 4B+ multimodal (Gemma3ForConditionalGeneration) puts
+            // the text decoder under `language_model.model.`. The 270M/1B
+            // text-only checkpoints keep canonical names; detect from the
+            // archive.
+            if (archive_->find("model.embed_tokens.weight") == nullptr &&
+                archive_->find("language_model.model.embed_tokens.weight") != nullptr) {
+                tensor_prefix_ = "language_model.model.";
+            }
+            break;
         case PieArch::Mistral3:
-            // Plain Mistral / Mistral 7B v0.3 (hf_model_type "mistral")
-            // has no wrapper and keeps the canonical "model." names.
-            // Ministral 3 ships as Mistral3ForConditionalGeneration with
-            // the text decoder under `language_model.model.`.
-            if (hparams_.hf_model_type == "ministral3") {
+            // Plain Mistral / Mistral 7B v0.3 keeps canonical "model."
+            // names. Multimodal Mistral3 wrappers (Ministral 3 8B/14B Base,
+            // Mistral-Small-3.1, etc.) put the text decoder under
+            // `language_model.model.`. Detect from the archive rather than
+            // from text_config.model_type, since the inner type can be
+            // either "mistral" or "ministral3".
+            if (archive_->find("model.embed_tokens.weight") == nullptr &&
+                archive_->find("language_model.model.embed_tokens.weight") != nullptr) {
                 tensor_prefix_ = "language_model.model.";
             }
             break;
@@ -595,13 +614,36 @@ std::string Model::activation_dtype_str() const {
 // -----------------------------------------------------------------------------
 
 void Model::load_top_level_() {
-    const auto& h = hparams_;
+    auto& h = hparams_;
     weights_.tok_embd    = declare_(tname_("model.embed_tokens.weight"));
     weights_.output_norm = declare_(tname_("model.norm.weight"));
-    if (!h.tie_word_embeddings) {
-        // lm_head is typically NOT under the multimodal wrapper prefix
-        // (Ministral 3 keeps it at the top level alongside the wrapper).
-        weights_.output_head = declare_("lm_head.weight");
+    // Probe the archive for an explicit lm_head. Two layouts:
+    //   - "<wrapper>lm_head.weight" — multimodal-wrapped (Ministral 3
+    //     8B/14B, Mistral-Small-3.1: "language_model.lm_head.weight").
+    //   - "lm_head.weight" — plain causal LMs.
+    // If neither exists, use tied embeddings. The HF config flag
+    // `tie_word_embeddings` is unreliable (often null in newer Mistral
+    // configs and the HF default differs by arch), so we drive this off
+    // the actual safetensors index and override the hparam to match.
+    constexpr std::string_view kModelSuffix = "model.";
+    std::string wrapper = tensor_prefix_;
+    if (wrapper.size() >= kModelSuffix.size() &&
+        std::string_view(wrapper).substr(wrapper.size() - kModelSuffix.size()) == kModelSuffix) {
+        wrapper = wrapper.substr(0, wrapper.size() - kModelSuffix.size());
+    }
+    const std::string lm_wrapped = wrapper + "lm_head.weight";
+    const std::string lm_plain   = "lm_head.weight";
+    const std::string* found = nullptr;
+    if (archive_->find(lm_wrapped) != nullptr) {
+        found = &lm_wrapped;
+    } else if (lm_wrapped != lm_plain && archive_->find(lm_plain) != nullptr) {
+        found = &lm_plain;
+    }
+    if (found) {
+        weights_.output_head = declare_(*found);
+        h.tie_word_embeddings = false;
+    } else {
+        h.tie_word_embeddings = true;
     }
     weights_.layers.resize(h.num_hidden_layers);
 }
@@ -987,6 +1029,173 @@ void Model::build_phi3_() {
     }
 }
 
+// Phi-3-small: LayerNorm with bias, fused `query_key_value` ([Q|K|V]
+// with biases on each), `self_attn.dense` as the output projection,
+// packed `mlp.up_proj` ([gate || up] split for GeGLU). All norms +
+// projections carry a learnable bias.
+void Model::build_phi3small_() {
+    const auto& h = hparams_;
+
+    // Top-level: embed + final LayerNorm (with bias) + lm_head.
+    weights_.tok_embd      = declare_(tname_("model.embed_tokens.weight"));
+    weights_.output_norm   = declare_(tname_("model.final_layernorm.weight"));
+    weights_.output_norm_b = declare_(tname_("model.final_layernorm.bias"));
+    if (!h.tie_word_embeddings) {
+        weights_.output_head = declare_("lm_head.weight");
+    }
+    weights_.layers.resize(h.num_hidden_layers);
+
+    const std::int64_t hidden = h.hidden_size;
+    const std::int64_t n_q  = static_cast<std::int64_t>(h.num_attention_heads) * h.head_dim;
+    const std::int64_t n_kv = static_cast<std::int64_t>(h.num_key_value_heads) * h.head_dim;
+    const std::int64_t n_ff = h.intermediate_size;
+
+    auto fused_dtype = [&](const std::string& name) {
+        const auto& t = archive_->at(name);
+        return std::pair{st_to_ggml_dtype(t.dtype, name), st_dtype_size(t.dtype)};
+    };
+
+    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
+        const std::string p = tname_(layer_path(i));
+        auto& L = weights_.layers[i];
+
+        // Pre-attn / pre-FFN LayerNorm (weight + bias).
+        L.attn_norm   = declare_(p + "input_layernorm.weight");
+        L.attn_norm_b = declare_(p + "input_layernorm.bias");
+        L.ffn_norm    = declare_(p + "post_attention_layernorm.weight");
+        L.ffn_norm_b  = declare_(p + "post_attention_layernorm.bias");
+
+        // Fused query_key_value [Q | K | V] split into separate slices.
+        const std::string qkv_name = p + "self_attn.query_key_value.weight";
+        auto [qkv_type, qkv_dsz] = fused_dtype(qkv_name);
+        const std::size_t row_bytes =
+            static_cast<std::size_t>(hidden) * qkv_dsz;
+        L.q_proj = declare_slice_(qkv_name, p + "q_proj", hidden, n_q,
+                                  /*offset=*/0, qkv_type);
+        L.k_proj = declare_slice_(qkv_name, p + "k_proj", hidden, n_kv,
+                                  static_cast<std::size_t>(n_q) * row_bytes, qkv_type);
+        L.v_proj = declare_slice_(qkv_name, p + "v_proj", hidden, n_kv,
+                                  static_cast<std::size_t>(n_q + n_kv) * row_bytes,
+                                  qkv_type);
+        // Per-projection biases. The fused query_key_value.bias has
+        // shape [n_q + n_kv + n_kv]; slice into Q/K/V parts.
+        const std::string qkv_b_name = p + "self_attn.query_key_value.bias";
+        auto [qkvb_type, qkvb_dsz] = fused_dtype(qkv_b_name);
+        L.q_proj_b = declare_slice_(qkv_b_name, p + "q_proj.bias",
+                                     n_q, /*out_dim=*/1, /*offset=*/0, qkvb_type);
+        L.k_proj_b = declare_slice_(qkv_b_name, p + "k_proj.bias",
+                                     n_kv, /*out_dim=*/1,
+                                     static_cast<std::size_t>(n_q) * qkvb_dsz, qkvb_type);
+        L.v_proj_b = declare_slice_(qkv_b_name, p + "v_proj.bias",
+                                     n_kv, /*out_dim=*/1,
+                                     static_cast<std::size_t>(n_q + n_kv) * qkvb_dsz, qkvb_type);
+
+        // self_attn.dense (= o_proj) with bias.
+        L.o_proj   = declare_(p + "self_attn.dense.weight");
+        L.o_proj_b = declare_(p + "self_attn.dense.bias");
+
+        // Packed mlp.up_proj [gate || up] split. Output dim is 2 * n_ff.
+        const std::string up_name = p + "mlp.up_proj.weight";
+        auto [up_type, up_dsz] = fused_dtype(up_name);
+        const std::size_t up_row_bytes =
+            static_cast<std::size_t>(hidden) * up_dsz;
+        L.gate_proj = declare_slice_(up_name, p + "gate_proj", hidden, n_ff,
+                                      /*offset=*/0, up_type);
+        L.up_proj   = declare_slice_(up_name, p + "up_proj", hidden, n_ff,
+                                      static_cast<std::size_t>(n_ff) * up_row_bytes,
+                                      up_type);
+        // Packed up_proj.bias [2 * n_ff] split.
+        const std::string up_b_name = p + "mlp.up_proj.bias";
+        auto [upb_type, upb_dsz] = fused_dtype(up_b_name);
+        L.gate_proj_b = declare_slice_(up_b_name, p + "gate_proj.bias",
+                                        n_ff, 1, /*offset=*/0, upb_type);
+        L.up_proj_b   = declare_slice_(up_b_name, p + "up_proj.bias",
+                                        n_ff, 1,
+                                        static_cast<std::size_t>(n_ff) * upb_dsz,
+                                        upb_type);
+
+        // mlp.down_proj weight + bias.
+        L.down_proj   = declare_(p + "mlp.down_proj.weight");
+        L.down_proj_b = declare_(p + "mlp.down_proj.bias");
+    }
+}
+
+// Phi-3.5-MoE (phi3_5moe; HF model_type "phimoe"): Mixtral-style
+// per-expert w1/w2/w3 layout + block_sparse_moe.gate router, plus
+// LayerNorm-with-bias on input / post-attn / final norms, biases on
+// Q/K/V/O, and bias on lm_head.
+void Model::build_phi3_5moe_() {
+    const auto& h = hparams_;
+    if (h.num_experts <= 0 || h.num_experts_per_tok <= 0) {
+        throw std::runtime_error(
+            "model phi3_5moe: missing num_experts / num_experts_per_tok");
+    }
+
+    // Top-level: embed + final LayerNorm (with bias) + lm_head (with bias).
+    weights_.tok_embd      = declare_(tname_("model.embed_tokens.weight"));
+    weights_.output_norm   = declare_(tname_("model.norm.weight"));
+    weights_.output_norm_b = declare_(tname_("model.norm.bias"));
+    if (!h.tie_word_embeddings) {
+        weights_.output_head = declare_("lm_head.weight");
+        // Phi-3.5-MoE: lm_head also has a bias.
+        if (archive_->find("lm_head.bias") != nullptr) {
+            weights_.output_head_b = declare_("lm_head.bias");
+        }
+    }
+    weights_.layers.resize(h.num_hidden_layers);
+
+    const std::int64_t hidden = h.hidden_size;
+    const std::int64_t n_q  = static_cast<std::int64_t>(h.num_attention_heads) * h.head_dim;
+    const std::int64_t n_kv = static_cast<std::int64_t>(h.num_key_value_heads) * h.head_dim;
+    const std::int32_t n_exp = h.num_experts;
+    const std::int64_t ff   = h.moe_intermediate_size > 0
+                              ? h.moe_intermediate_size
+                              : h.intermediate_size;
+
+    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
+        const std::string p = tname_(layer_path(i));
+        auto& L = weights_.layers[i];
+
+        // LayerNorm weights + biases.
+        L.attn_norm   = declare_(p + "input_layernorm.weight");
+        L.attn_norm_b = declare_(p + "input_layernorm.bias");
+        L.ffn_norm    = declare_(p + "post_attention_layernorm.weight");
+        L.ffn_norm_b  = declare_(p + "post_attention_layernorm.bias");
+
+        // Q/K/V/O projections (split — not fused on phimoe) + biases.
+        L.q_proj   = declare_(p + "self_attn.q_proj.weight");
+        L.q_proj_b = declare_(p + "self_attn.q_proj.bias");
+        L.k_proj   = declare_(p + "self_attn.k_proj.weight");
+        L.k_proj_b = declare_(p + "self_attn.k_proj.bias");
+        L.v_proj   = declare_(p + "self_attn.v_proj.weight");
+        L.v_proj_b = declare_(p + "self_attn.v_proj.bias");
+        L.o_proj   = declare_(p + "self_attn.o_proj.weight");
+        L.o_proj_b = declare_(p + "self_attn.o_proj.bias");
+
+        // MoE: block_sparse_moe.gate router + per-expert w1/w2/w3 (mixtral
+        // naming). Stack into the standard moe_gate_exps / moe_up_exps /
+        // moe_down_exps tensors via declare_stacked_experts_.
+        L.moe_router = declare_(p + "block_sparse_moe.gate.weight");
+        std::vector<std::string> gate_names, up_names, down_names;
+        gate_names.reserve(n_exp); up_names.reserve(n_exp); down_names.reserve(n_exp);
+        for (std::int32_t e = 0; e < n_exp; ++e) {
+            const std::string ep =
+                p + "block_sparse_moe.experts." + std::to_string(e) + ".";
+            gate_names.push_back(ep + "w1.weight");
+            up_names  .push_back(ep + "w3.weight");
+            down_names.push_back(ep + "w2.weight");
+        }
+        const ggml_type w_dtype = st_to_ggml_dtype(
+            archive_->at(gate_names[0]).dtype, gate_names[0]);
+        L.moe_gate_exps = declare_stacked_experts_(
+            p + "moe_gate", hidden, ff, n_exp, gate_names, w_dtype);
+        L.moe_up_exps   = declare_stacked_experts_(
+            p + "moe_up",   hidden, ff, n_exp, up_names,   w_dtype);
+        L.moe_down_exps = declare_stacked_experts_(
+            p + "moe_down", ff, hidden, n_exp, down_names, w_dtype);
+    }
+}
+
 // Gemma2: extra norms (post_attention_layernorm + pre_feedforward_layernorm
 // + post_feedforward_layernorm), softcaps, alternating SWA layers.
 void Model::build_gemma2_() {
@@ -1190,7 +1399,12 @@ void Model::build_gemma4_() {
         // unused weights and corrupt the reused upstream KV.
         if (i < first_shared) {
             L.k_proj = declare_(p + "self_attn.k_proj.weight");
-            L.v_proj = declare_(p + "self_attn.v_proj.weight");
+            // Gemma 4 large variants (31B, 26B-A4B) omit v_proj on
+            // full_attention layers (alternative attention: V is the
+            // same projection result as K). Probe per-layer.
+            if (archive_->find(p + "self_attn.v_proj.weight") != nullptr) {
+                L.v_proj = declare_(p + "self_attn.v_proj.weight");
+            }
             L.k_norm = declare_(p + "self_attn.k_norm.weight");
         }
 
@@ -1199,6 +1413,52 @@ void Model::build_gemma4_() {
         L.gate_proj = declare_(p + "mlp.gate_proj.weight");
         L.up_proj   = declare_(p + "mlp.up_proj.weight");
         L.down_proj = declare_(p + "mlp.down_proj.weight");
+
+        // Sparse-MoE block (Gemma 4 26B-A4B only). Loaded alongside
+        // the dense MLP — at inference, both run in parallel and their
+        // post-normed outputs are summed before the layer's
+        // post_feedforward_layernorm. Mirrors HF Gemma4TextDecoderLayer
+        // and upstream driver/cuda/src/model/gemma4.cpp commit 59f45df4.
+        if (h.gemma4_enable_moe) {
+            const std::int32_t n_exp  = h.num_experts;
+            const std::int64_t hidden = h.hidden_size;
+            const std::int64_t ff     = h.gemma4_moe_intermediate_size;
+
+            L.moe_router                   = declare_(p + "router.proj.weight");
+            L.moe_router_scale             = declare_(p + "router.scale");
+            L.moe_router_per_expert_scale  = declare_(p + "router.per_expert_scale");
+            L.gemma4_moe_pre_ffn_norm_2    = declare_(p + "pre_feedforward_layernorm_2.weight");
+            L.gemma4_moe_post_ffn_norm_1   = declare_(p + "post_feedforward_layernorm_1.weight");
+            L.gemma4_moe_post_ffn_norm_2   = declare_(p + "post_feedforward_layernorm_2.weight");
+
+            // Packed experts.gate_up_proj is one 3D safetensor
+            // [n_exp, 2*ff, hidden]; split into separate stacked
+            // gate/up tensors at load so build_moe_ffn helpers apply.
+            // Mirrors load_qwen3_5_moe_layer_.
+            const std::string gate_up_name = p + "experts.gate_up_proj";
+            const std::string down_name    = p + "experts.down_proj";
+            const ggml_type w_dtype =
+                st_to_ggml_dtype(archive_->at(gate_up_name).dtype, gate_up_name);
+            const std::size_t row_bytes  =
+                static_cast<std::size_t>(hidden) * ggml_type_size(w_dtype);
+            const std::size_t per_expert_bytes =
+                static_cast<std::size_t>(2 * ff) * row_bytes;
+            const std::size_t up_intra_offset =
+                static_cast<std::size_t>(ff) * row_bytes;
+
+            L.moe_gate_exps = declare_stacked_experts_from_3d_(
+                p + "moe_gate", gate_up_name, hidden, ff, n_exp,
+                per_expert_bytes, /*intra_off=*/0, w_dtype);
+            L.moe_up_exps   = declare_stacked_experts_from_3d_(
+                p + "moe_up",   gate_up_name, hidden, ff, n_exp,
+                per_expert_bytes, /*intra_off=*/up_intra_offset, w_dtype);
+            const std::size_t down_per_expert_bytes =
+                static_cast<std::size_t>(hidden) *
+                static_cast<std::size_t>(ff) * ggml_type_size(w_dtype);
+            L.moe_down_exps = declare_stacked_experts_from_3d_(
+                p + "moe_down", down_name, ff, hidden, n_exp,
+                down_per_expert_bytes, 0, w_dtype);
+        }
 
         // PLE per-layer.
         if (h.gemma4_ple_dim > 0) {

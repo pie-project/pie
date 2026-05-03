@@ -35,6 +35,9 @@ struct LayerWeights {
     ggml_tensor* attn_norm     = nullptr;   // input_layernorm (always)
     ggml_tensor* ffn_norm      = nullptr;   // post_attention_layernorm (llama)
                                             // OR pre_feedforward_layernorm (gemma)
+    // LayerNorm biases (Phi-3-small only — RMSNorm has no bias).
+    ggml_tensor* attn_norm_b   = nullptr;
+    ggml_tensor* ffn_norm_b    = nullptr;
     // Gemma family: extra norms for the post-attn / post-FFN residual paths.
     ggml_tensor* post_attn_norm = nullptr;  // gemma2/3/4
     ggml_tensor* post_ffn_norm  = nullptr;  // gemma2/3/4
@@ -79,12 +82,28 @@ struct LayerWeights {
     ggml_tensor* gate_proj = nullptr;
     ggml_tensor* up_proj   = nullptr;
     ggml_tensor* down_proj = nullptr;
+    // MLP biases (Phi-3-small).
+    ggml_tensor* gate_proj_b = nullptr;
+    ggml_tensor* up_proj_b   = nullptr;
+    ggml_tensor* down_proj_b = nullptr;
 
     // ── MoE: per-layer router + stacked expert tensors ──
     ggml_tensor* moe_router    = nullptr;  // [hidden, n_experts]
     ggml_tensor* moe_gate_exps = nullptr;  // [hidden, ff, n_experts]
     ggml_tensor* moe_up_exps   = nullptr;  // [hidden, ff, n_experts]
     ggml_tensor* moe_down_exps = nullptr;  // [ff, hidden, n_experts]
+    // Gemma 4 26B-A4B (MoE): the router's pre-projection rmsnorm uses
+    // its own per-channel weight (router.scale, [hidden]) and a per-
+    // expert gain after top-K renorm (router.per_expert_scale,
+    // [n_experts]).
+    ggml_tensor* moe_router_scale          = nullptr;
+    ggml_tensor* moe_router_per_expert_scale = nullptr;
+    // Gemma 4 26B-A4B parallel-MoE block: dense and MoE branches each
+    // have their own post-norm; their sum is fed into the layer's
+    // existing `post_ffn_norm`. The MoE branch also has its own pre-norm.
+    ggml_tensor* gemma4_moe_pre_ffn_norm_2  = nullptr;
+    ggml_tensor* gemma4_moe_post_ffn_norm_1 = nullptr;
+    ggml_tensor* gemma4_moe_post_ffn_norm_2 = nullptr;
 
     // gpt-oss MoE biases (router + per-expert per-output-dim biases). Null
     // on Mixtral / Qwen3-MoE.
@@ -152,7 +171,11 @@ struct LayerWeights {
 struct ModelWeights {
     ggml_tensor* tok_embd     = nullptr;  // model.embed_tokens.weight
     ggml_tensor* output_norm  = nullptr;  // model.norm.weight
+    // Final-layernorm bias (Phi-3-small / Phi-3.5-MoE).
+    ggml_tensor* output_norm_b = nullptr;
     ggml_tensor* output_head  = nullptr;  // lm_head.weight (nullptr if tied)
+    // lm_head bias (Phi-3.5-MoE).
+    ggml_tensor* output_head_b = nullptr;
     // RoPE per-dim frequency factors (LLaMA-3.1+ NTK-by-parts). nullptr
     // for models that use plain θ-only RoPE.
     ggml_tensor* freq_factors = nullptr;
@@ -284,6 +307,8 @@ private:
     void build_llama3_();
     void build_mistral3_();
     void build_phi3_();
+    void build_phi3small_();
+    void build_phi3_5moe_();
     void build_gemma2_();
     void build_gemma3_();
     void build_gemma4_();

@@ -36,6 +36,54 @@ What you can run depends on the [driver](./drivers) you choose.
 `pie model list` reports `✓` for HuggingFace repos whose
 `config.json` `model_type` resolves to one of these.
 
+## Architectures supported by the portable driver
+
+The `portable` driver (`driver/portable/`) is a self-contained C++
+binary built on raw `libggml` (vendored via llama.cpp). It supports
+CPU, CUDA, Vulkan, Metal, and HIP backends selected at compile time.
+Loads HuggingFace safetensors directly — no GGUF conversion.
+
+Verified end-to-end on RTX PRO 6000 Blackwell (CUDA backend):
+
+| Family | HF `model_type` | Status | Notes |
+|---|---|---|---|
+| **Llama 3.x** | `llama` | stable | All sizes (1B–70B); base + instruct. |
+| **Qwen 2.x** | `qwen2` | stable | Qwen2 / Qwen2.5 all sizes. |
+| **Qwen 3.x** | `qwen3` | stable | Qwen3 incl. the 0.6B default. |
+| **Qwen 3 MoE** | `qwen3_moe` | preview | Qwen3-30B-A3B verified loads. |
+| **Qwen 3.5 / 3.6** | `qwen3_5` | preview | Linear-attention layers wired. |
+| **Qwen 3.5 MoE** | `qwen3_5_moe` | preview | 35B-A3B verified loads. |
+| **Phi-3** | `phi3` | stable | mini / medium (instruct + base). |
+| **Phi-3-small** | `phi3small` | preview | Loads + runs; v1 graph treats blocksparse as causal (correct for prompts ≤ 1024 tokens). End-to-end inferlet test blocked on tiktoken→tokenizer.json conversion. |
+| **Phi-3.5 / Phi-4** | `phi3` | stable | Phi-3.5-mini-instruct, Phi-4 (14B), Phi-4-mini-instruct, Phi-4-reasoning, Phi-4-mini-reasoning all work via the existing `phi3` arch (canonical pangram on RTX PRO 6000 Blackwell). |
+| **Phi-3.5-MoE** | `phimoe` | stable | 42B-A6.6B sparse MoE. Mixtral-style per-expert w1/w2/w3 + LayerNorm-with-bias + Q/K/V/O biases + lm_head bias. End-to-end canonical pangram. |
+| **Mixtral** | `mixtral` | preview | 8x7B verified end-to-end. |
+| **Gemma 2** | `gemma2` | stable | 2B / 9B / 27B. |
+| **Gemma 3** | `gemma3`, `gemma3_text` | stable | 270M / 1B text-only AND 4B / 12B / 27B multimodal-wrapped. |
+| **Gemma 3n** | `gemma3n` | stable | E2B-it / E4B-it (AltUp + PLE + Laurel + KV-share). |
+| **Gemma 4** | `gemma4`, `gemma4_text` | stable for dense | Mobile (E2B / E4B), 31B (alt-attention + per-layer KV). |
+| **Gemma 4 MoE** | `gemma4` (with experts) | — | 26B-A4B: loader-only; expert dispatch graph not yet wired. |
+| **Mistral 7B / Mistral 3** | `mistral`, `mistral3` | stable | Ministral 3 (3B / 8B / 14B), Mistral-Small 24B / 3.1-24B. |
+| **OLMo 2** | `olmo2` | — | Distinct from `olmo3`; not implemented. |
+| **OLMo 3** | `olmo3` | stable | 7B / 32B base. |
+| **GPT-OSS** | `gptoss`, `gpt_oss` | preview | 20B verified (MXFP4 dequant path). |
+
+Architectures listed as **stable** have produced canonical outputs on
+instruct-tuned variants (e.g., Phi-3-mini-instruct → "The quick brown
+fox jumps over the lazy dog. This sentence is a pangram…"). Base
+checkpoints loop on the inferlet's chat-template wrap; use the
+[`raw-completion`](#test-inferlets) inferlet for clean base-model
+output.
+
+## Test inferlets
+
+`inferlets/text-completion` wraps the prompt with `system + user +
+cue` chat template. Suitable for instruct-tuned models.
+
+`inferlets/raw-completion` tokenizes the prompt verbatim with no
+chat templating — required for clean output from base/pretrained
+checkpoints (Llama-3.2-1B, Qwen2.5-3B-Base, etc.).
+
 ## Downloading
 
 ```bash

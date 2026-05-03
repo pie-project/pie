@@ -40,6 +40,15 @@ enum class PieArch {
     Qwen3Moe,    // Qwen3-MoE family (Qwen3-30B-A3B etc.); HF model_type "qwen3_moe"
     Qwen3_5,     // Qwen 3.5 / 3.6 hybrid (gated delta + GQA);
                  // HF model_type "qwen3_5" (dense) or "qwen3_5_moe" (MoE)
+    Phi3Small,   // Phi-3-small (microsoft); HF model_type "phi3small". Uses
+                 // LayerNorm with bias, fused query_key_value, packed
+                 // mlp.up_proj (gate||up), self_attn.dense, mup parameter-
+                 // ization. v1 graph treats blocksparse as causal (correct
+                 // for prompts up to num_local_blocks * block_size = 1024
+                 // tokens).
+    Phi3_5Moe,   // Phi-3.5-MoE (microsoft); HF model_type "phimoe". Mixtral-
+                 // style sparse MoE (per-expert w1/w2/w3) with LayerNorm-
+                 // with-bias norms, Q/K/V/O biases, lm_head bias.
 };
 
 const char* pie_arch_name(PieArch a);
@@ -59,6 +68,25 @@ struct Hparams {
     std::int32_t num_hidden_layers = 0;
     std::int32_t num_attention_heads = 0;
     std::int32_t num_key_value_heads = 0;
+    // Gemma 4 alternative attention: full_attention layers use a
+    // SMALLER kv_heads count than sliding layers (e.g., 4 vs 16 on 31B).
+    // 0 = not provided / not applicable.
+    std::int32_t num_global_key_value_heads = 0;
+    // Gemma 4 26B-A4B: parallel sparse-MoE block alongside the dense MLP.
+    // When true, the loader expects per-layer experts.gate_up_proj /
+    // experts.down_proj / router.{proj,scale,per_expert_scale} plus
+    // pre_feedforward_layernorm_2 + post_feedforward_layernorm_{1,2}.
+    bool         gemma4_enable_moe          = false;
+    // Phi-3-small mup parameterization.
+    float        mup_attn_multiplier         = 0.0f;  // 0 = unused
+    float        mup_embedding_multiplier    = 0.0f;
+    float        mup_width_multiplier        = 0.0f;
+    // Phi-3-small blocksparse attention parameters.
+    std::int32_t phi3small_block_size                  = 0;
+    std::int32_t phi3small_num_local_blocks            = 0;
+    std::int32_t phi3small_vert_stride                 = 0;
+    std::int32_t phi3small_dense_attention_every_n_layers = 0;
+    std::int32_t gemma4_moe_intermediate_size = 0;
     std::int32_t hidden_size = 0;
     std::int32_t intermediate_size = 0;
     std::int32_t head_dim = 0;             // computed if missing
