@@ -64,10 +64,10 @@ fn main() {
 }
 
 fn print_usage() {
-    let build_dir = env!("PIE_DRIVER_BUILD_DIR");
+    let build_dir = option_env!("PIE_DRIVER_BUILD_DIR").unwrap_or("<in-process>");
     println!("pie-standalone (M2.4)");
     println!("  driver build dir: {build_dir}");
-    println!("  embedded driver:  pie_driver_portable_lib (statically linked)");
+    println!("  embedded driver:  {} (statically linked)", driver_ffi::FLAVOR);
     println!();
     println!("Usage:");
     println!("  pie --config <toml>   Boot the runtime + embedded driver and serve.");

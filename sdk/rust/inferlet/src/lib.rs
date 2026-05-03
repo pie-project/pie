@@ -17,8 +17,8 @@ pub use serde;
 pub use serde_json;
 pub use schemars;
 
-// Re-export the main attribute macro
-pub use inferlet_macros::main;
+// Re-export the attribute macros
+pub use inferlet_macros::{main, tool};
 
 // Generate WIT bindings directly in lib.rs
 wit_bindgen::generate!({
@@ -67,6 +67,7 @@ pub mod tools;
 
 pub use generation::{Generator, GenStep};
 pub use spec::Speculator;
+pub use tools::Tool;
 
 // =============================================================================
 // Adapter
@@ -177,8 +178,8 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 /// `use inferlet::prelude::*;` covers the common case so inferlets don't
 /// have to maintain a hand-rolled import grocery list.
 pub mod prelude {
-    pub use crate::main;
-    pub use crate::{Context, Result, Schema};
+    pub use crate::{main, tool};
+    pub use crate::{Context, Result, Schema, Tool};
     pub use crate::model::Model;
     pub use crate::runtime;
     pub use crate::messaging;

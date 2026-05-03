@@ -19,6 +19,8 @@ use serde::Serialize;
 
 use pie::device::RpcServer;
 
+use crate::driver_ffi;
+
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Spawn the cold-path dispatch loop on a dedicated OS thread and
@@ -57,21 +59,28 @@ fn dispatch(method: &str, _payload: &[u8]) -> Vec<u8> {
     match method {
         "ping" => encode(&PingResp { ok: true }),
         "query" => encode(&QueryResp {
-            driver: "portable",
+            driver: driver_ffi::FLAVOR,
             implemented: false,
         }),
-        // Aux-IPC-backed methods. Once the aux client lands these will
-        // forward to the driver's unix socket.
+        // Aux-IPC-backed methods. The dummy driver doesn't have an aux
+        // socket — it accepts these as no-ops so adapter / page-copy
+        // flows in inferlets succeed end-to-end against the dummy. The
+        // C++ drivers wait on the aux-IPC client (post-M2 work).
         "copy_d2h" | "copy_h2d" | "copy_d2d" | "copy_h2h"
         | "swap_out_pages" | "swap_in_pages" | "load_adapter" => {
-            encode_err(format!(
-                "{method:?}: not yet wired in standalone server (aux-IPC client pending)"
-            ))
+            if driver_ffi::FLAVOR == "dummy" {
+                encode(&())
+            } else {
+                encode_err(format!(
+                    "{method:?}: not yet wired in standalone server (aux-IPC client pending)"
+                ))
+            }
         }
         // Truly never-implemented, mirror Python's stubs.
         "embed_image" | "initialize_adapter" | "update_adapter" | "save_adapter" => {
             encode_err(format!(
-                "{method:?}: not implemented in portable driver (post-v1)"
+                "{method:?}: not implemented in {} driver (post-v1)",
+                driver_ffi::FLAVOR,
             ))
         }
         // fire_batch should never come down the cold path — it's served
@@ -137,7 +146,7 @@ mod tests {
     fn query_returns_driver_meta() {
         let resp = dispatch("query", &[]);
         let q: QueryDecoded = rmp_serde::from_slice(&resp).unwrap();
-        assert_eq!(q.driver, "portable");
+        assert_eq!(q.driver, driver_ffi::FLAVOR);
         assert!(!q.implemented);
     }
 
@@ -149,9 +158,16 @@ mod tests {
     }
 
     #[test]
-    fn aux_ipc_methods_have_clear_pending_error() {
+    fn aux_ipc_methods_match_flavor_capability() {
         let resp = dispatch("copy_d2h", &[]);
-        let s = decode_str(&resp);
-        assert!(s.contains("aux-IPC client pending"), "got: {s}");
+        if driver_ffi::FLAVOR == "dummy" {
+            // Dummy stubs aux-IPC methods as `()` so the runtime's
+            // `device::call::<_, ()>` deserialize succeeds.
+            let _: () = rmp_serde::from_slice(&resp)
+                .expect("dummy: copy_d2h should decode as ()");
+        } else {
+            let s = decode_str(&resp);
+            assert!(s.contains("aux-IPC client pending"), "got: {s}");
+        }
     }
 }

@@ -20,8 +20,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, ensure};
 
 use crate::bootstrap_translate::{self, ModelHandshake};
-use crate::config::{self, DriverKind, PortableDriverOptions};
-use crate::embedded_driver::EmbeddedDriver;
+use crate::config::{self, DriverKind, DummyDriverOptions, PortableDriverOptions};
+use crate::embedded_driver::{DriverOptions, EmbeddedDriver};
 use crate::rpc_loop;
 
 pub fn run(config_path: &Path) -> Result<()> {
@@ -45,20 +45,37 @@ async fn run_async(user_cfg: config::Config) -> Result<()> {
     let mut rpc_threads = Vec::with_capacity(user_cfg.models.len());
 
     for (i, m) in user_cfg.models.iter().enumerate() {
-        ensure!(
-            m.driver.kind == DriverKind::Portable,
-            "M2 only supports type = \"portable\" (got {:?} for model {:?}); \
-             cuda_native lands in M3/M4",
-            m.driver.kind,
-            m.name,
-        );
-
-        let opts: PortableDriverOptions = m
-            .driver
-            .options
-            .clone()
-            .try_into()
-            .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
+        let opts = match m.driver.kind {
+            DriverKind::Portable => {
+                let p: PortableDriverOptions = m
+                    .driver
+                    .options
+                    .clone()
+                    .try_into()
+                    .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
+                DriverOptions::Portable(p)
+            }
+            DriverKind::Dummy => {
+                let d: DummyDriverOptions = m
+                    .driver
+                    .options
+                    .clone()
+                    .try_into()
+                    .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
+                DriverOptions::Dummy {
+                    opts: d,
+                    random_seed: m.driver.random_seed,
+                    activation_dtype: m.driver.activation_dtype.clone(),
+                }
+            }
+            other => {
+                anyhow::bail!(
+                    "model {:?}: driver type {other:?} is not implemented in \
+                     server/standalone yet (cuda_native lands in M3/M4)",
+                    m.name,
+                );
+            }
+        };
 
         // v0: `hf_repo` is a local snapshot dir. HF download support is
         // a separate piece of work — for now, error clearly if it

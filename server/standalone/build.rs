@@ -15,22 +15,44 @@ use std::path::{Path, PathBuf};
 fn main() {
     let portable = cfg!(feature = "driver-portable");
     let cuda = cfg!(feature = "driver-cuda");
+    let dummy = cfg!(feature = "driver-dummy");
 
-    if portable && cuda {
+    let n = [portable, cuda, dummy].iter().filter(|x| **x).count();
+    if n > 1 {
         panic!(
-            "features `driver-portable` and `driver-cuda` are mutually exclusive — \
-             pick one (`--features driver-cuda` disables the default)"
+            "driver-* features are mutually exclusive (got portable={portable}, \
+             cuda={cuda}, dummy={dummy}) — pick exactly one"
         );
     }
-    if !portable && !cuda {
-        panic!("no driver feature enabled — build with `--features driver-portable` or `--features driver-cuda`");
+    if n == 0 {
+        panic!(
+            "no driver feature enabled — build with `--features driver-portable`, \
+             `--features driver-cuda`, or `--features driver-dummy`"
+        );
     }
 
     if portable {
         build_portable();
-    } else {
+    } else if cuda {
         build_cuda();
+    } else {
+        build_dummy();
     }
+}
+
+// -----------------------------------------------------------------------------
+// driver/dummy — Rust staticlib, no cmake step
+// -----------------------------------------------------------------------------
+
+fn build_dummy() {
+    // pie-driver-dummy is a Cargo dep with crate-type = ["staticlib", "rlib"].
+    // Cargo links the rlib automatically through the optional dependency;
+    // nothing to build here. The rlib path is enough — the C ABI symbols
+    // (`pie_driver_dummy_run` / `_request_stop`) come along.
+    //
+    // We deliberately don't set `PIE_DRIVER_BUILD_DIR` — `main.rs` reads
+    // it via `option_env!` and falls back to `<in-process>`.
+    println!("cargo:rustc-env=PIE_DRIVER_FLAVOR=dummy");
 }
 
 // -----------------------------------------------------------------------------

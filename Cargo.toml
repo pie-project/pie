@@ -11,6 +11,7 @@ members = [
     "runtime",
     "client/rust",
     "server/standalone",
+    "driver/dummy",
 ]
 exclude = [
     "inferlets",

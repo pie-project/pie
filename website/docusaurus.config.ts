@@ -166,6 +166,11 @@ const config: Config = {
           label: 'Reference',
         },
         {
+          to: 'models',
+          label: 'Models',
+          position: 'left',
+        },
+        {
           to: 'roadmap',
           label: 'Roadmap',
           position: 'left',

@@ -54,4 +54,17 @@ mod inner {
     pub use pie_driver_cuda_run as run;
 }
 
+#[cfg(feature = "driver-dummy")]
+mod inner {
+    // The dummy driver is a Rust crate (rlib) in this workspace. We
+    // call its `extern "C"` entries directly — no `unsafe extern { ... }`
+    // declaration needed, which sidesteps the link-time symbol GC that
+    // strips unreferenced `#[no_mangle]` exports out of an rlib.
+    pub use pie_driver_dummy_lib::pie_driver_dummy_request_stop as request_stop;
+    pub use pie_driver_dummy_lib::pie_driver_dummy_run as run;
+
+    pub const FLAVOR: &str = "dummy";
+    pub const ARGV0: &str = "pie_driver_dummy";
+}
+
 pub use inner::{ARGV0, FLAVOR, request_stop, run};

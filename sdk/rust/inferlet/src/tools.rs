@@ -33,6 +33,25 @@ use crate::pie::core::inference::Matcher;
 use crate::pie::instruct::tool_use;
 
 // =============================================================================
+// Tool trait — schema metadata for chat-template registration
+// =============================================================================
+
+/// Tool metadata used by [`Context::equip`](crate::Context::equip) to splice
+/// schemas into the model's chat template. Implement directly for dynamic
+/// tools, or derive via the [`#[tool]`](inferlet_macros::tool) macro for
+/// static ones.
+///
+/// `schema` returns the JSON Schema for the args **object only** —
+/// `{"type":"object","properties":{...},"required":[...]}` — without the
+/// outer `{name, description, parameters}` envelope. The SDK wraps it in
+/// whatever shape the host's `equip_prefix` expects.
+pub trait Tool {
+    fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    fn schema(&self) -> &'static str;
+}
+
+// =============================================================================
 // Templating
 // =============================================================================
 

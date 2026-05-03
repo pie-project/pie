@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 245 22" width="245" height="22">
+  <g font-family="'IBM Plex Serif', Charter, Georgia, serif" font-size="15" fill="#54473b">
+    <rect x="0" y="7" width="22" height="9" fill="#c96442" stroke="#54473b" stroke-width="0.5"/>
+    <text x="27" y="16">Pie</text>
+    <rect x="58" y="7" width="22" height="9" fill="#d4c9ad" stroke="#54473b" stroke-width="0.5"/>
+    <text x="85" y="16">vLLM</text>
+    <rect x="142" y="7" width="22" height="9" fill="#8a7c6a" stroke="#54473b" stroke-width="0.5"/>
+    <text x="169" y="16">SGLang</text>
+  </g>
+</svg>

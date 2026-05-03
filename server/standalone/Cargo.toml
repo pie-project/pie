@@ -17,6 +17,9 @@ default = ["driver-portable"]
 # Mutually exclusive — see workspace docs in Cargo.toml at repo root.
 driver-portable = []
 driver-cuda = []
+# Rust dummy driver — random tokens, no model load. Useful for plumbing
+# tests and the macOS dev loop where the C++ drivers don't build.
+driver-dummy = ["dep:pie-driver-dummy"]
 
 [dependencies]
 # `pie` is the runtime crate. We disable the default `python` feature so
@@ -31,8 +34,14 @@ toml = "0.9"
 tokio = { version = "1.38", features = ["full"] }
 tracing = "0.1"
 
+# Optional Rust drivers. The static lib is pulled in only when the matching
+# `driver-*` feature is enabled.
+pie-driver-dummy = { path = "../../driver/dummy", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+# Used by the `dummy_roundtrip` example to drive the server end-to-end.
+pie-client = { path = "../../client/rust" }
 
 [build-dependencies]
 cmake = "0.1"

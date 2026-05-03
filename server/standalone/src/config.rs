@@ -377,6 +377,9 @@ pub enum DriverKind {
     /// Native CUDA driver — embedded as a static lib in `pie-standalone`
     /// (requires `--features driver-cuda`).
     CudaNative,
+    /// Rust dummy driver — random tokens, no model load. Embedded as a
+    /// Rust staticlib in `pie-standalone` (requires `--features driver-dummy`).
+    Dummy,
     /// Torch-hosted CUDA driver. Requires Python; not supported here.
     Native,
     /// Torch-hosted vLLM driver. Requires Python; not supported here.
@@ -388,12 +391,13 @@ pub enum DriverKind {
 impl DriverKind {
     fn reject_torch_only(&self) -> Result<()> {
         match self {
-            DriverKind::Portable | DriverKind::CudaNative => Ok(()),
+            DriverKind::Portable | DriverKind::CudaNative | DriverKind::Dummy => Ok(()),
             DriverKind::Native | DriverKind::Vllm | DriverKind::Sglang => bail!(
                 "model.driver.type = {self:?} is hosted by Python (`server/torch`) \
                  and is not available in `server/standalone`. Use `pie-standalone` \
-                 with `type = \"portable\"` or `type = \"cuda_native\"`, or run \
-                 `server/torch` (Python) for the torch-based drivers."
+                 with `type = \"portable\"`, `type = \"cuda_native\"`, or \
+                 `type = \"dummy\"`, or run `server/torch` (Python) for the \
+                 torch-based drivers."
             ),
         }
     }
@@ -474,6 +478,42 @@ impl Default for PortableDriverOptions {
         }
     }
 }
+
+/// `[model.driver.options]` for `type = "dummy"`. The dummy driver
+/// fabricates everything the portable driver would otherwise read from
+/// model weights — `vocab_size` and `arch_name` are required because no
+/// safe default exists. Page geometry and timeouts have generic defaults.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DummyDriverOptions {
+    /// Vocabulary size advertised in the caps handshake. Required —
+    /// must match the tokenizer at `hf_repo/tokenizer.json`.
+    pub vocab_size: u32,
+    /// Architecture name advertised in the caps handshake (e.g.
+    /// `"qwen3"`, `"llama3"`). Required — the runtime uses it to
+    /// look up the matching chat template.
+    pub arch_name: String,
+
+    #[serde(default = "default_kv_page_size")]
+    pub kv_page_size: u32,
+    #[serde(default = "default_max_num_kv_pages")]
+    pub max_num_kv_pages: u32,
+    #[serde(default = "default_max_batch_tokens")]
+    pub max_batch_tokens: u32,
+    #[serde(default = "default_max_batch_size")]
+    pub max_batch_size: u32,
+    #[serde(default = "default_max_model_len")]
+    pub max_model_len: u32,
+    #[serde(default = "default_dummy_ready_timeout_s")]
+    pub ready_timeout_s: f64,
+}
+
+fn default_kv_page_size() -> u32 { 16 }
+fn default_max_num_kv_pages() -> u32 { 256 }
+fn default_max_batch_tokens() -> u32 { 4096 }
+fn default_max_batch_size() -> u32 { 128 }
+fn default_max_model_len() -> u32 { 4096 }
+fn default_dummy_ready_timeout_s() -> f64 { 5.0 }
 
 #[cfg(test)]
 mod tests {

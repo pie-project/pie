@@ -13,6 +13,7 @@ use crate::model::Model;
 use crate::ForwardPassExt;
 use crate::Result;
 use crate::sample::Sampler;
+use serde_json;
 
 /// The raw WIT context resource, re-exported for power users.
 pub use crate::pie::core::context::Context as RawContext;
@@ -301,6 +302,38 @@ impl Context {
     pub fn append(&mut self, tokens: &[u32]) -> &mut Self {
         self.buffer.extend_from_slice(tokens);
         self
+    }
+
+    /// Register `tools` in the chat template's tool block. Each tool's
+    /// metadata is wrapped in the `{name, description, parameters}` envelope
+    /// the host expects, then spliced into the buffer via the model's
+    /// `equip_prefix`.
+    ///
+    /// Use the [`#[tool]`](inferlet_macros::tool) macro to derive a `Tool`
+    /// impl from a Rust async fn, or implement the trait by hand for
+    /// dynamically-loaded tools.
+    ///
+    /// # Errors
+    /// Returns the underlying schema-parse or `equip_prefix` error if a
+    /// tool's `schema()` is not valid JSON, or if the model has no tool
+    /// template.
+    pub fn equip(&mut self, tools: &[&dyn crate::tools::Tool]) -> Result<&mut Self> {
+        let envelopes: Vec<String> = tools
+            .iter()
+            .map(|t| {
+                let parsed: serde_json::Value = serde_json::from_str(t.schema())
+                    .map_err(|e| format!("tool `{}`: invalid schema: {e}", t.name()))?;
+                Ok(serde_json::json!({
+                    "name": t.name(),
+                    "description": t.description(),
+                    "parameters": parsed,
+                })
+                .to_string())
+            })
+            .collect::<Result<_>>()?;
+        let prefix = crate::tools::equip_prefix(&self.model, &envelopes)?;
+        self.buffer.extend_from_slice(&prefix);
+        Ok(self)
     }
 
     /// Drop the trailing `n` tokens from the working pages and re-sync the
