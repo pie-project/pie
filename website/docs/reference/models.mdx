@@ -54,7 +54,9 @@ Verified end-to-end on RTX PRO 6000 Blackwell (CUDA backend):
 | **Qwen 3.5 / 3.6** | `qwen3_5` | preview | Linear-attention layers wired. |
 | **Qwen 3.5 MoE** | `qwen3_5_moe` | preview | 35B-A3B verified loads. |
 | **Phi-3** | `phi3` | stable | mini / medium (instruct + base). |
-| **Phi-3-small** | `phi3small` | — | Distinct architecture (blocksparse + GeGLU); not implemented. |
+| **Phi-3-small** | `phi3small` | preview | Loads + runs; v1 graph treats blocksparse as causal (correct for prompts ≤ 1024 tokens). End-to-end inferlet test blocked on tiktoken→tokenizer.json conversion. |
+| **Phi-3.5 / Phi-4** | `phi3` | stable | Phi-3.5-mini-instruct, Phi-4 (14B), Phi-4-mini-instruct, Phi-4-reasoning, Phi-4-mini-reasoning all work via the existing `phi3` arch (canonical pangram on RTX PRO 6000 Blackwell). |
+| **Phi-3.5-MoE** | `phimoe` | stable | 42B-A6.6B sparse MoE. Mixtral-style per-expert w1/w2/w3 + LayerNorm-with-bias + Q/K/V/O biases + lm_head bias. End-to-end canonical pangram. |
 | **Mixtral** | `mixtral` | preview | 8x7B verified end-to-end. |
 | **Gemma 2** | `gemma2` | stable | 2B / 9B / 27B. |
 | **Gemma 3** | `gemma3`, `gemma3_text` | stable | 270M / 1B text-only AND 4B / 12B / 27B multimodal-wrapped. |

@@ -46,6 +46,9 @@ enum class PieArch {
                  // ization. v1 graph treats blocksparse as causal (correct
                  // for prompts up to num_local_blocks * block_size = 1024
                  // tokens).
+    PhiMoe,      // Phi-3.5-MoE (microsoft); HF model_type "phimoe". Mixtral-
+                 // style sparse MoE (per-expert w1/w2/w3) with LayerNorm-
+                 // with-bias norms, Q/K/V/O biases, lm_head bias.
 };
 
 const char* pie_arch_name(PieArch a);

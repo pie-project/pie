@@ -113,6 +113,10 @@ ArchSpec arch_spec_for(PieArch a, const Hparams& h) {
             // Per-arch dispatch lives in graph_phi3small.cpp; ArchSpec
             // is unused for this arch beyond defaults.
             break;
+        case PieArch::PhiMoe:
+            // Per-arch dispatch lives in graph_phimoe.cpp.
+            apply_moe_flags_(s, h);
+            break;
         case PieArch::Mistral3:
             // SWA on every layer (when configured) plus optional YaRN
             // (Ministral 3). Mistral 7B v0.3 has no YaRN; apply_yarn_

@@ -171,9 +171,11 @@ struct LayerWeights {
 struct ModelWeights {
     ggml_tensor* tok_embd     = nullptr;  // model.embed_tokens.weight
     ggml_tensor* output_norm  = nullptr;  // model.norm.weight
-    // Final-layernorm bias (Phi-3-small only — model.final_layernorm.bias).
+    // Final-layernorm bias (Phi-3-small / Phi-3.5-MoE).
     ggml_tensor* output_norm_b = nullptr;
     ggml_tensor* output_head  = nullptr;  // lm_head.weight (nullptr if tied)
+    // lm_head bias (Phi-3.5-MoE).
+    ggml_tensor* output_head_b = nullptr;
     // RoPE per-dim frequency factors (LLaMA-3.1+ NTK-by-parts). nullptr
     // for models that use plain θ-only RoPE.
     ggml_tensor* freq_factors = nullptr;
@@ -306,6 +308,7 @@ private:
     void build_mistral3_();
     void build_phi3_();
     void build_phi3small_();
+    void build_phimoe_();
     void build_gemma2_();
     void build_gemma3_();
     void build_gemma4_();

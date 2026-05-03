@@ -315,6 +315,9 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
             case PieArch::Phi3Small:
                 build_phi3small_();
                 break;
+            case PieArch::PhiMoe:
+                build_phimoe_();
+                break;
             case PieArch::Gemma2:
                 build_gemma2_();
                 break;
@@ -1114,6 +1117,81 @@ void Model::build_phi3small_() {
         // mlp.down_proj weight + bias.
         L.down_proj   = declare_(p + "mlp.down_proj.weight");
         L.down_proj_b = declare_(p + "mlp.down_proj.bias");
+    }
+}
+
+// Phi-3.5-MoE (phimoe): Mixtral-style per-expert w1/w2/w3 layout +
+// block_sparse_moe.gate router, plus LayerNorm-with-bias on input /
+// post-attn / final norms, biases on Q/K/V/O, and bias on lm_head.
+void Model::build_phimoe_() {
+    const auto& h = hparams_;
+    if (h.num_experts <= 0 || h.num_experts_per_tok <= 0) {
+        throw std::runtime_error(
+            "model phimoe: missing num_experts / num_experts_per_tok");
+    }
+
+    // Top-level: embed + final LayerNorm (with bias) + lm_head (with bias).
+    weights_.tok_embd      = declare_(tname_("model.embed_tokens.weight"));
+    weights_.output_norm   = declare_(tname_("model.norm.weight"));
+    weights_.output_norm_b = declare_(tname_("model.norm.bias"));
+    if (!h.tie_word_embeddings) {
+        weights_.output_head = declare_("lm_head.weight");
+        // Phi-3.5-MoE: lm_head also has a bias.
+        if (archive_->find("lm_head.bias") != nullptr) {
+            weights_.output_head_b = declare_("lm_head.bias");
+        }
+    }
+    weights_.layers.resize(h.num_hidden_layers);
+
+    const std::int64_t hidden = h.hidden_size;
+    const std::int64_t n_q  = static_cast<std::int64_t>(h.num_attention_heads) * h.head_dim;
+    const std::int64_t n_kv = static_cast<std::int64_t>(h.num_key_value_heads) * h.head_dim;
+    const std::int32_t n_exp = h.num_experts;
+    const std::int64_t ff   = h.moe_intermediate_size > 0
+                              ? h.moe_intermediate_size
+                              : h.intermediate_size;
+
+    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
+        const std::string p = tname_(layer_path(i));
+        auto& L = weights_.layers[i];
+
+        // LayerNorm weights + biases.
+        L.attn_norm   = declare_(p + "input_layernorm.weight");
+        L.attn_norm_b = declare_(p + "input_layernorm.bias");
+        L.ffn_norm    = declare_(p + "post_attention_layernorm.weight");
+        L.ffn_norm_b  = declare_(p + "post_attention_layernorm.bias");
+
+        // Q/K/V/O projections (split — not fused on phimoe) + biases.
+        L.q_proj   = declare_(p + "self_attn.q_proj.weight");
+        L.q_proj_b = declare_(p + "self_attn.q_proj.bias");
+        L.k_proj   = declare_(p + "self_attn.k_proj.weight");
+        L.k_proj_b = declare_(p + "self_attn.k_proj.bias");
+        L.v_proj   = declare_(p + "self_attn.v_proj.weight");
+        L.v_proj_b = declare_(p + "self_attn.v_proj.bias");
+        L.o_proj   = declare_(p + "self_attn.o_proj.weight");
+        L.o_proj_b = declare_(p + "self_attn.o_proj.bias");
+
+        // MoE: block_sparse_moe.gate router + per-expert w1/w2/w3 (mixtral
+        // naming). Stack into the standard moe_gate_exps / moe_up_exps /
+        // moe_down_exps tensors via declare_stacked_experts_.
+        L.moe_router = declare_(p + "block_sparse_moe.gate.weight");
+        std::vector<std::string> gate_names, up_names, down_names;
+        gate_names.reserve(n_exp); up_names.reserve(n_exp); down_names.reserve(n_exp);
+        for (std::int32_t e = 0; e < n_exp; ++e) {
+            const std::string ep =
+                p + "block_sparse_moe.experts." + std::to_string(e) + ".";
+            gate_names.push_back(ep + "w1.weight");
+            up_names  .push_back(ep + "w3.weight");
+            down_names.push_back(ep + "w2.weight");
+        }
+        const ggml_type w_dtype = st_to_ggml_dtype(
+            archive_->at(gate_names[0]).dtype, gate_names[0]);
+        L.moe_gate_exps = declare_stacked_experts_(
+            p + "moe_gate", hidden, ff, n_exp, gate_names, w_dtype);
+        L.moe_up_exps   = declare_stacked_experts_(
+            p + "moe_up",   hidden, ff, n_exp, up_names,   w_dtype);
+        L.moe_down_exps = declare_stacked_experts_(
+            p + "moe_down", ff, hidden, n_exp, down_names, w_dtype);
     }
 }
 

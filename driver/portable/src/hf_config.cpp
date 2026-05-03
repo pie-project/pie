@@ -25,6 +25,7 @@ const char* pie_arch_name(PieArch a) {
         case PieArch::Qwen3Moe: return "qwen3_moe";
         case PieArch::Qwen3_5:  return "qwen3_5";
         case PieArch::Phi3Small: return "phi3small";
+        case PieArch::PhiMoe:    return "phimoe";
     }
     return "?";
 }
@@ -50,6 +51,7 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
     if (hf_model_type == "gptoss")      return PieArch::GptOss;
     if (hf_model_type == "phi3")        return PieArch::Phi3;
     if (hf_model_type == "phi3small")   return PieArch::Phi3Small;
+    if (hf_model_type == "phimoe")      return PieArch::PhiMoe;
     if (hf_model_type == "mixtral")     return PieArch::Mixtral;
     if (hf_model_type == "qwen3_moe")   return PieArch::Qwen3Moe;
     if (hf_model_type == "qwen3_5" ||
