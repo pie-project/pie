@@ -6,8 +6,10 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include <ggml-cpu.h>
+#include <omp.h>
 
 #include "gguf_archive.hpp"
 #include "gguf_hparams.hpp"
@@ -15,6 +17,47 @@
 namespace pie_portable_driver {
 
 namespace {
+
+// True if the tensor is a small parameter that we want to coerce to
+// F32 at load time. Norm scales and per-channel biases are tiny
+// (~hidden_size floats per layer each) so the bf16 → f32 promotion
+// is cheap, but it eliminates an implicit `ggml_cast` in the graph
+// per use:
+//
+//   - `norm_scale` (graph_common.cpp) casts norm weights to the
+//      activation dtype (always F32 after rms_norm).
+//   - `add_with_cast` (graph_common.cpp) casts bias weights to the
+//      activation dtype before the residual add — used for attention
+//      biases (q/k/v_proj.bias) on archs that have them: Qwen2,
+//      Phi3, GPT-OSS, etc.
+//
+// Why this matters: every `ggml_cast` is a `GGML_OP_CPY` of type
+// (bf16 → f32). ggml-vulkan (as of llama.cpp b6993) doesn't have a
+// CPY pipeline for that pair, so each cast becomes an off-primary
+// graph segment under `ggml_backend_sched`. With Qwen2's bias terms
+// the split count blew up to 145 per forward — the model still ran
+// (sched fell back to CPU per cast) but threw away the GPU's batched
+// command-buffer optimization. Promoting these tensors to f32 at load
+// makes `w->type == x->type` so the cast is skipped entirely; the
+// graph stays on a single backend (n_splits=1).
+//
+// CPU and CUDA paths handle the cast natively but also benefit from
+// the simpler graph topology (one fewer node per use).
+bool is_small_weight_for_upcast(const std::string& hf_name) {
+    // Match suffixes:
+    //   `*norm.weight` — any RMSNorm / LayerNorm gain (input_layernorm,
+    //                    q_norm, k_norm, post_*_layernorm, model.norm,
+    //                    pre_feedforward_layernorm, etc.)
+    //   `*.bias`       — any attention / projection bias
+    static constexpr std::string_view kNormSuffix = "norm.weight";
+    static constexpr std::string_view kBiasSuffix = ".bias";
+    auto ends_with = [&](std::string_view suf) {
+        return hf_name.size() >= suf.size() &&
+               hf_name.compare(hf_name.size() - suf.size(),
+                               suf.size(), suf) == 0;
+    };
+    return ends_with(kNormSuffix) || ends_with(kBiasSuffix);
+}
 
 ggml_type st_to_ggml_dtype(StDtype dt, const std::string& tensor_name) {
     switch (dt) {
@@ -170,6 +213,72 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
         throw std::runtime_error("model: backend init failed");
     }
 
+    // Pin the CPU backend to all available HW threads. ggml's default is
+    // 4 (sometimes 1 depending on backend init path), which leaves a
+    // 13900K idling. The static-lib build path in particular gets
+    // initialized from a Rust-spawned thread that may not inherit the
+    // process-level OpenMP affinity, so be explicit.
+    auto pin_cpu_threads = [](ggml_backend_t b) {
+        unsigned n = std::thread::hardware_concurrency();
+        if (n == 0) n = 4;
+        ggml_backend_cpu_set_n_threads(b, static_cast<int>(n));
+        return n;
+    };
+    if (ggml_backend_is_cpu(backend_)) {
+        const unsigned n = pin_cpu_threads(backend_);
+        std::cerr << "[model] ggml CPU backend pinned to "
+                  << n << " thread(s)\n";
+    } else {
+        // Primary is a GPU backend. Set up a CPU companion so the
+        // ForwardEngine's `ggml_backend_sched` has somewhere to route
+        // ops the GPU can't handle. Cost is minimal: the CPU backend
+        // doesn't allocate anything until sched actually splits work
+        // to it. With Part A's norm-weight upcast, the steady-state
+        // graph for Qwen3 / Llama / Gemma stays entirely on GPU and
+        // the CPU backend remains idle — but the safety net matters
+        // for arches that emit casts / ops the GPU lacks.
+        cpu_fallback_ = ggml_backend_cpu_init();
+        if (cpu_fallback_) {
+            const unsigned n = pin_cpu_threads(cpu_fallback_);
+            std::cerr << "[model] CPU fallback backend pinned to "
+                      << n << " thread(s) (sched safety net for "
+                      << ggml_backend_name(backend_) << ")\n";
+        } else {
+            // Continue without fallback: graphs that would have used
+            // it will hard-abort instead of falling back. Better than
+            // refusing to start the model entirely.
+            std::cerr << "[model] WARNING: failed to init CPU fallback "
+                         "backend; sched will run primary-only\n";
+        }
+
+        // Probe: can the primary backend run argsort on a vocab-sized
+        // input? ggml-vulkan caps at 1024 cols (max_argsort_cols), so
+        // Qwen3 (152k vocab) etc. fail. When this returns false the
+        // ForwardEngine forces the `slow_only` sampling path: download
+        // raw logits, sample host-side, no in-graph `ggml_top_k`. This
+        // keeps Vulkan steady-state decode at GPU speed instead of
+        // round-tripping each token through CPU for the argsort.
+        ggml_init_params probe_ip{
+            /*.mem_size   =*/ ggml_tensor_overhead() * 8,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        if (auto* probe_ctx = ggml_init(probe_ip)) {
+            ggml_tensor* probs =
+                ggml_new_tensor_2d(probe_ctx, GGML_TYPE_F32,
+                                   hparams_.vocab_size, 1);
+            ggml_tensor* sorted =
+                ggml_argsort(probe_ctx, probs, GGML_SORT_ORDER_DESC);
+            supports_in_graph_topk_ =
+                ggml_backend_supports_op(backend_, sorted);
+            ggml_free(probe_ctx);
+            std::cerr << "[model] in-graph top-k support on "
+                      << ggml_backend_name(backend_) << ": "
+                      << (supports_in_graph_topk_ ? "yes" : "no — using slow_only sampling path")
+                      << "\n";
+        }
+    }
+
     // Generously size the metadata context. Each tensor consumes
     // `ggml_tensor_overhead()` bytes of metadata; bump if we ever exceed.
     constexpr std::size_t MAX_TENSORS = 4096;
@@ -212,6 +321,9 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
             case PieArch::Gemma4:
                 build_gemma4_();
                 break;
+            case PieArch::Gemma3n:
+                build_gemma3n_();
+                break;
             case PieArch::Olmo3:
                 build_olmo3_();
                 break;
@@ -243,6 +355,10 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
             ggml_free(ctx_);
             ctx_ = nullptr;
         }
+        if (cpu_fallback_) {
+            ggml_backend_free(cpu_fallback_);
+            cpu_fallback_ = nullptr;
+        }
         if (backend_) {
             ggml_backend_free(backend_);
             backend_ = nullptr;
@@ -252,9 +368,10 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
 }
 
 Model::~Model() {
-    if (buf_)     ggml_backend_buffer_free(buf_);
-    if (ctx_)     ggml_free(ctx_);
-    if (backend_) ggml_backend_free(backend_);
+    if (buf_)          ggml_backend_buffer_free(buf_);
+    if (ctx_)          ggml_free(ctx_);
+    if (cpu_fallback_) ggml_backend_free(cpu_fallback_);
+    if (backend_)      ggml_backend_free(backend_);
 }
 
 std::string Model::tname_(const std::string& name) const {
@@ -273,8 +390,9 @@ void Model::resolve_tensor_prefix_() {
     // "model." prefix and substitutes `tensor_prefix_` in its place.
     switch (hparams_.arch) {
         case PieArch::Gemma4:
+        case PieArch::Gemma3n:
         case PieArch::Qwen3_5:
-            // Gemma 4 / 3n and Qwen 3.5 / 3.6 both ship as multimodal
+            // Gemma 4 / 3n and Qwen 3.5 / 3.6 all ship as multimodal
             // ForConditionalGeneration wrappers; the text decoder lives
             // under `model.language_model.`.
             tensor_prefix_ = "model.language_model.";
@@ -295,10 +413,37 @@ void Model::resolve_tensor_prefix_() {
 
 ggml_tensor* Model::declare_(const std::string& hf_name) {
     const auto& t = archive_->at(hf_name);
-    auto* tensor = new_tensor_from_st(ctx_, t, hf_name);
+
+    // Norm-style weights stored in bf16 get promoted to f32 here. The
+    // tensor we hand back to the graph builder is typed F32, so the
+    // implicit `ggml_cast` in `norm_scale` becomes a no-op. The actual
+    // bf16 → f32 byte conversion happens in load_into_backend_().
+    const bool upcast = t.dtype == StDtype::BF16
+                     && is_small_weight_for_upcast(hf_name);
+
+    ggml_tensor* tensor;
+    if (upcast) {
+        // Build the F32 tensor manually with the same shape as the
+        // safetensor (HF dim order reversed for ggml).
+        std::int64_t ne[4] = {1, 1, 1, 1};
+        for (std::size_t i = 0; i < t.shape.size(); ++i) {
+            ne[t.shape.size() - 1 - i] = t.shape[i];
+        }
+        tensor = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
+                                    ne[0], ne[1], ne[2], ne[3]);
+        if (!tensor) {
+            throw std::runtime_error(
+                "model: ggml_new_tensor_4d (upcast) failed for '" + hf_name + "'");
+        }
+        ggml_set_name(tensor, hf_name.c_str());
+    } else {
+        tensor = new_tensor_from_st(ctx_, t, hf_name);
+    }
+
     DeclaredTensor d;
-    d.hf_name = hf_name;
-    d.tensor = tensor;
+    d.hf_name            = hf_name;
+    d.tensor             = tensor;
+    d.upcast_bf16_to_f32 = upcast;
     declared_.push_back(std::move(d));
     return tensor;
 }
@@ -379,7 +524,25 @@ void Model::load_into_backend_() {
 
     for (const auto& d : declared_) {
         const auto& src = archive_->at(d.hf_name);
-        if (d.copy_bytes > 0) {
+        if (d.upcast_bf16_to_f32) {
+            // Promote bf16 source bytes to f32 in a temp buffer, then
+            // upload. ggml provides `ggml_bf16_to_fp32_row` for this.
+            // Norm weights are small enough that the temp allocation
+            // is irrelevant (a few KB per call).
+            const std::size_t n = static_cast<std::size_t>(ggml_nelements(d.tensor));
+            if (src.nbytes != n * sizeof(ggml_bf16_t)) {
+                throw std::runtime_error(
+                    "model: bf16 upcast size mismatch for '" + d.hf_name +
+                    "': expected=" + std::to_string(n * sizeof(ggml_bf16_t)) +
+                    " safetensors=" + std::to_string(src.nbytes));
+            }
+            std::vector<float> tmp(n);
+            ggml_bf16_to_fp32_row(
+                reinterpret_cast<const ggml_bf16_t*>(src.data),
+                tmp.data(), n);
+            ggml_backend_tensor_set(d.tensor, tmp.data(), 0,
+                                    n * sizeof(float));
+        } else if (d.copy_bytes > 0) {
             // Sliced load (phi3 fused QKV / gate_up) OR stacked-expert
             // load (one source written into a 3D dest at dst_offset).
             ggml_backend_tensor_set(d.tensor,
@@ -843,6 +1006,110 @@ void Model::build_gemma3_() {
         .has_qkv_bias        = false,
         .has_qk_norm         = true,
     });
+}
+
+// Gemma 3n: Gemma 3-style attention + GeGLU MLP, augmented with
+//   - AltUp: 4 parallel "alt" hidden streams updated each layer via
+//     learned prediction/correction coefs. The trained weights expect
+//     this routing — applying it correctly is what produces fluent
+//     output. See graph_gemma3n.cpp for the per-layer logic.
+//   - PLE (Per-Layer Embeddings): a secondary 262 144 × 7 680 embedding
+//     table whose per-layer slices add a token-conditioned signal to
+//     the active stream after each transformer block.
+//   - Laurel: low-rank residual through the MLP (linear_left → right →
+//     post_laurel_norm), summed with the standard MLP output.
+//
+// Tensor names mirror google/gemma-3n-E2B-it / E4B-it under the
+// `model.language_model.` prefix (set up in resolve_tensor_prefix_).
+// Activation sparsity (`activation_sparsity_pattern`) is read from the
+// config but not yet applied; the v1 graph uses standard GeGLU.
+void Model::build_gemma3n_() {
+    const auto& h = hparams_;
+
+    weights_.tok_embd    = declare_(tname_("model.embed_tokens.weight"));
+    weights_.output_norm = declare_(tname_("model.norm.weight"));
+    if (!h.tie_word_embeddings) {
+        weights_.output_head = declare_("lm_head.weight");
+    }
+
+    // PLE top-level: token-identity table + context projection + norm.
+    // Always present on Gemma 3n (gemma4_ple_dim > 0 holds for both
+    // E2B and E4B).
+    if (h.gemma4_ple_dim > 0) {
+        weights_.ple_token_embed = declare_(
+            tname_("model.embed_tokens_per_layer.weight"));
+        weights_.ple_model_proj  = declare_(
+            tname_("model.per_layer_model_projection.weight"));
+        weights_.ple_model_norm  = declare_(
+            tname_("model.per_layer_projection_norm.weight"));
+    }
+
+    // AltUp: top-level alternative-input projections (3 each direction).
+    // Used to initialize the 3 inactive streams from the embedding and
+    // to combine the 4 streams into the final output before the LM head.
+    weights_.altup_proj_0         = declare_(tname_("model.altup_projections.0.weight"));
+    weights_.altup_proj_1         = declare_(tname_("model.altup_projections.1.weight"));
+    weights_.altup_proj_2         = declare_(tname_("model.altup_projections.2.weight"));
+    weights_.altup_unembed_proj_0 = declare_(tname_("model.altup_unembed_projections.0.weight"));
+    weights_.altup_unembed_proj_1 = declare_(tname_("model.altup_unembed_projections.1.weight"));
+    weights_.altup_unembed_proj_2 = declare_(tname_("model.altup_unembed_projections.2.weight"));
+
+    weights_.layers.resize(h.num_hidden_layers);
+    // v1: declare K/V on every layer even when the config says the last
+    // `num_kv_shared_layers` should reuse upstream K/V. Pie's generic
+    // dense graph builder (build_qwen3_graph) — which Gemma 3n routes
+    // through for now — doesn't yet implement KV-sharing; calling it
+    // with null L.k_proj segfaults inside ggml_mul_mat. Wasting a
+    // little memory on the unused projections beats either forking
+    // the graph or porting Gemma 4's KV-share logic. Follow-up: skip
+    // K/V mul_mat on shared layers and feed the upstream cache slot
+    // directly, mirroring graph_gemma4.cpp.
+
+    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
+        const std::string p = tname_(layer_path(i));
+        auto& L = weights_.layers[i];
+
+        // Standard Gemma-3 four-norm layout.
+        L.attn_norm      = declare_(p + "input_layernorm.weight");
+        L.post_attn_norm = declare_(p + "post_attention_layernorm.weight");
+        L.ffn_norm       = declare_(p + "pre_feedforward_layernorm.weight");
+        L.post_ffn_norm  = declare_(p + "post_feedforward_layernorm.weight");
+
+        // Self-attention. Q/K/V/O on every layer (KV-share NYI).
+        L.q_proj = declare_(p + "self_attn.q_proj.weight");
+        L.q_norm = declare_(p + "self_attn.q_norm.weight");
+        L.o_proj = declare_(p + "self_attn.o_proj.weight");
+        L.k_proj = declare_(p + "self_attn.k_proj.weight");
+        L.v_proj = declare_(p + "self_attn.v_proj.weight");
+        L.k_norm = declare_(p + "self_attn.k_norm.weight");
+
+        // MLP — standard GeGLU.
+        L.gate_proj = declare_(p + "mlp.gate_proj.weight");
+        L.up_proj   = declare_(p + "mlp.up_proj.weight");
+        L.down_proj = declare_(p + "mlp.down_proj.weight");
+
+        // AltUp per-layer: prediction + correction coef tables, the
+        // small 4×4 router, and the active-stream output scale.
+        L.altup_predict_coefs = declare_(p + "altup.prediction_coefs.weight");
+        L.altup_correct_coefs = declare_(p + "altup.correction_coefs.weight");
+        L.altup_router        = declare_(p + "altup.modality_router.weight");
+        L.altup_router_norm   = declare_(p + "altup.router_norm.weight");
+        L.altup_correct_scale = declare_(p + "altup.correct_output_scale");
+
+        // Laurel: low-rank residual that bypasses the MLP via two thin
+        // projections + a post-norm.
+        L.laurel_left  = declare_(p + "laurel.linear_left.weight");
+        L.laurel_right = declare_(p + "laurel.linear_right.weight");
+        L.laurel_norm  = declare_(p + "laurel.post_laurel_norm.weight");
+
+        // Per-layer PLE: project the per-layer slice of the PLE table
+        // back into the hidden stream, gated by an input-derived norm.
+        if (h.gemma4_ple_dim > 0) {
+            L.gemma3n_ple_gate = declare_(p + "per_layer_input_gate.weight");
+            L.gemma3n_ple_proj = declare_(p + "per_layer_projection.weight");
+            L.gemma3n_ple_norm = declare_(p + "post_per_layer_input_norm.weight");
+        }
+    }
 }
 
 // Gemma4: per-layer head_dim (sliding vs global), partial RoPE,

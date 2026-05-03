@@ -135,6 +135,29 @@ ArchSpec arch_spec_for(PieArch a, const Hparams& h) {
             }
             apply_swa_pattern_(s, h, SwaPattern::Every6Gemma3);
             break;
+        case PieArch::Gemma3n:
+            // Gemma 3-style pre/post norm sandwich + GeGLU + per-head
+            // qk_norm + per-layer-type SWA pattern (`layer_types`). Unlike
+            // Gemma 2/3, Gemma 3n's RMSNorm stores weights centered at 1
+            // (init=ones) and applies a direct `x * w` (NOT `x * (1+w)`),
+            // so `norm_weight_plus_one` stays FALSE here even though the
+            // overall norm-sandwich layout matches Gemma 3.
+            // Attention scale is 1.0 (Q is pre-normalized via q_norm — the
+            // 1/sqrt(head_dim) factor is absorbed into the q_norm weights).
+            // Final softcap (30.0) preserved. AltUp / PLE / Laurel /
+            // activation sparsity are layered on top inside the graph builder.
+            apply_gemma_norms_(s);
+            s.has_qk_norm = true;
+            s.gemma4_unit_sm_scale = true;  // attention scale = 1.0
+            // gemma4_v_norm = true would mirror HF's V-norm wiring, but we
+            // skip it for now: enabling it produced *worse* output (looped
+            // tokens, repeated `1 is 0`) which suggests the cached V
+            // distribution drift cascades into the o_proj path more
+            // catastrophically than the missing norm. Leaving disabled
+            // until the rest of the AltUp pipeline is closer to reference.
+            apply_swa_pattern_(s, h, SwaPattern::FromLayerTypes);
+            if (h.final_logit_softcapping) s.final_softcap = *h.final_logit_softcapping;
+            break;
         case PieArch::Mixtral:
         case PieArch::GptOss:
         case PieArch::Qwen3Moe:

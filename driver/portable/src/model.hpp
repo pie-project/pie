@@ -117,6 +117,36 @@ struct LayerWeights {
     // Qwen 3.5 full-attention layer with attn_output_gate=true: q_proj
     // output is 2× expected (split [Q, gate]). Loader uses the existing
     // q_proj field; the graph builder slices it.
+
+    // ── Gemma 3n: AltUp (Alternative Updates) ──
+    // Maintains `altup_num_inputs` (=4) parallel hidden streams. Each
+    // layer predicts the streams from one "active" stream, runs the
+    // standard transformer block on the active prediction, then
+    // corrects all four predictions using the actual block output.
+    // See graph_gemma3n.cpp.
+    ggml_tensor* altup_predict_coefs = nullptr;  // [altup_num_inputs**2, altup_num_inputs] = [16, 4]
+    ggml_tensor* altup_correct_coefs = nullptr;  // [altup_num_inputs, altup_num_inputs] = [4, 4]
+    ggml_tensor* altup_router        = nullptr;  // [altup_num_inputs, hidden] = [4, hidden]
+    ggml_tensor* altup_router_norm   = nullptr;  // [hidden] RMSNorm before router
+    ggml_tensor* altup_correct_scale = nullptr;  // [hidden] scaling vector for active stream
+
+    // ── Gemma 3n: Laurel (low-rank residual through MLPs) ──
+    // y = post_laurel_norm(linear_right(linear_left(x))); the layer's
+    // MLP output is mlp(x) + laurel(active_pre_mlp).
+    ggml_tensor* laurel_left  = nullptr;  // [laurel_rank, hidden]
+    ggml_tensor* laurel_right = nullptr;  // [hidden, laurel_rank]
+    ggml_tensor* laurel_norm  = nullptr;  // [hidden] post_laurel_norm
+
+    // ── Gemma 3n: per-layer PLE gate/projection ──
+    // Each layer projects its slice of the global PLE table into hidden_size
+    // and adds (gated) into the active stream. Distinct from Gemma 4 PLE
+    // (different shapes / wiring); Gemma 3n's per-layer PLE is laid out as
+    //   per_layer_input_gate     [hidden_per_layer_input, hidden]
+    //   per_layer_projection     [hidden, hidden_per_layer_input]
+    //   post_per_layer_input_norm[hidden]
+    ggml_tensor* gemma3n_ple_gate = nullptr;
+    ggml_tensor* gemma3n_ple_proj = nullptr;
+    ggml_tensor* gemma3n_ple_norm = nullptr;
 };
 
 struct ModelWeights {
@@ -141,6 +171,17 @@ struct ModelWeights {
     ggml_tensor* ple_model_proj    = nullptr;
     // per_layer_projection_norm: RMSNorm scale [ple_dim].
     ggml_tensor* ple_model_norm    = nullptr;
+
+    // ── Gemma 3n: AltUp top-level projections ──
+    // 3 projections each (one per non-active stream, indices 0..2). Used
+    // to initialize the alt streams from the embedding and to combine the
+    // 4 streams at the end of the stack.
+    ggml_tensor* altup_proj_0 = nullptr;
+    ggml_tensor* altup_proj_1 = nullptr;
+    ggml_tensor* altup_proj_2 = nullptr;
+    ggml_tensor* altup_unembed_proj_0 = nullptr;
+    ggml_tensor* altup_unembed_proj_1 = nullptr;
+    ggml_tensor* altup_unembed_proj_2 = nullptr;
 
     std::vector<LayerWeights> layers;
 };
@@ -167,6 +208,23 @@ public:
     std::size_t          buffer_size() const noexcept;
     ggml_backend_t       backend() const noexcept { return backend_; }
     std::string          backend_name() const noexcept;
+
+    // CPU-side companion backend, used by `ForwardEngine`'s
+    // `ggml_backend_sched` as the fallback when the primary backend
+    // (e.g. ggml-vulkan, ggml-metal) doesn't implement an op the graph
+    // requires. Returns null when the primary backend already IS the
+    // CPU backend (no fallback needed). Lifetime is tied to this Model.
+    ggml_backend_t       cpu_fallback() const noexcept { return cpu_fallback_; }
+
+    // True iff the primary backend can run `ggml_argsort` on the full
+    // vocab. ggml-vulkan caps argsort at 1024 cols which is far below
+    // any modern LLM vocab (Qwen3 = 152k). When this returns false,
+    // ForwardEngine should drive the slow-only path that downloads
+    // raw logits and samples host-side, avoiding `ggml_top_k` in the
+    // graph entirely. Probed once at model load time. Returns true on
+    // CPU/CUDA/Metal (full coverage) and on Vulkan only for tiny
+    // vocabs (which we don't care about).
+    bool supports_in_graph_topk() const noexcept { return supports_in_graph_topk_; }
 
     // Friendly arch string for the READY handshake.
     std::string arch_name_pie() const { return pie_arch_name(hparams_.arch); }
@@ -229,6 +287,7 @@ private:
     void build_gemma2_();
     void build_gemma3_();
     void build_gemma4_();
+    void build_gemma3n_();
     void build_olmo3_();
     // Gemma 4 proportional-RoPE: synthesize a freq_factors tensor that
     // makes ggml's rope_ext rotate only the first `rope_angles` dim-pairs
@@ -357,9 +416,22 @@ private:
     // Underlying weight archive — either SafetensorsArchive (HF
     // snapshot dir) or GGUFArchive (single .gguf file).
     std::unique_ptr<WeightArchive> archive_;
-    ggml_backend_t        backend_ = nullptr;
-    ggml_context*         ctx_     = nullptr;
-    ggml_backend_buffer_t buf_     = nullptr;
+    ggml_backend_t        backend_     = nullptr;
+    // CPU companion for the multi-backend scheduler. Created only when
+    // `backend_` is a non-CPU backend (i.e. GPU). Null otherwise. The
+    // scheduler in `ForwardEngine` uses it to absorb ops the GPU
+    // backend can't dispatch (e.g. ggml-vulkan's missing CPY pipelines
+    // for some bf16 source types). For Qwen3 family + Part A (norm
+    // weights upcast to f32), no actual fallback fires in steady state
+    // — the CPU backend is just a safety net so new arches don't
+    // hard-abort the runtime.
+    ggml_backend_t        cpu_fallback_ = nullptr;
+    // Probed in the constructor once the primary backend exists. Drives
+    // the slow_only sampling path in ForwardEngine when false.
+    bool                  supports_in_graph_topk_ = true;
+    ggml_threadpool_t     threadpool_  = nullptr;
+    ggml_context*         ctx_         = nullptr;
+    ggml_backend_buffer_t buf_         = nullptr;
 
     // Each entry tells `load_into_backend_` where to copy data from.
     // `src_offset_bytes` and `copy_bytes` are 0 for full-tensor loads;
@@ -374,6 +446,15 @@ private:
         std::size_t  src_offset_bytes = 0;
         std::size_t  copy_bytes       = 0;
         std::size_t  dst_offset_bytes = 0;
+        // When set, `load_into_backend_` materializes the source bf16
+        // bytes into a temporary f32 buffer before uploading. Used for
+        // small parameters (norm scales, projection biases) that we
+        // promote to f32 at load time so backends that lack a bf16→f32
+        // CPY kernel (notably ggml-vulkan, b6993) don't see an implicit
+        // cast in the graph. Memory cost is trivial — norm + bias
+        // weights together are <1 MB on a 1.7 B model. See
+        // `is_small_weight_for_upcast()` in model.cpp for the predicate.
+        bool         upcast_bf16_to_f32 = false;
     };
     std::vector<DeclaredTensor> declared_;
 

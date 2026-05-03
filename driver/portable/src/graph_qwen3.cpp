@@ -10,6 +10,29 @@
 
 namespace pie_portable_driver {
 
+namespace {
+
+// Gemma 3n AltUp: compute the per-token modality vector that drives the
+// predict / correct coefficient matrices for one stream. Mirrors
+// `Gemma3nTextAltUp.compute_router_modalities`:
+//   tanh( modality_router @ ( router_norm(x) * (1 / hidden_size) ) )
+// Returns a [num_altup_inputs, n_total] tensor.
+ggml_tensor* compute_altup_modalities(ggml_context* ctx,
+                                       ggml_tensor* x,
+                                       const LayerWeights& L,
+                                       const ArchSpec& spec,
+                                       const Hparams& h) {
+    auto* normed = ggml_rms_norm(ctx, x, h.rms_norm_eps);
+    normed = norm_scale(ctx, normed, L.altup_router_norm,
+                        spec.norm_weight_plus_one);
+    normed = ggml_scale(ctx, normed,
+                        1.0f / static_cast<float>(h.hidden_size));
+    auto* routed = ggml_mul_mat(ctx, L.altup_router, normed);  // [4, n_total]
+    return ggml_tanh(ctx, routed);
+}
+
+}  // namespace
+
 GraphResult build_qwen3_graph(ggml_context* ctx,
                               const Model& model,
                               KvCachePaged& kv,
@@ -44,23 +67,153 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
     }
 
     // Default Q scaling = 1/sqrt(head_dim). Gemma2/3 override with
-    // 1/sqrt(query_pre_attn_scalar). 0 = use head_dim default.
+    // 1/sqrt(query_pre_attn_scalar). Gemma3n absorbs the dot-product
+    // scale into q_norm and uses unit attention scale (1.0).
+    // 0 = use head_dim default.
     const float kq_scale =
-        (spec.query_pre_attn_scalar > 0.0f)
-            ? 1.0f / std::sqrt(spec.query_pre_attn_scalar)
-            : 1.0f / std::sqrt(static_cast<float>(head_dim));
+        spec.gemma4_unit_sm_scale
+            ? 1.0f
+            : (spec.query_pre_attn_scalar > 0.0f
+                ? 1.0f / std::sqrt(spec.query_pre_attn_scalar)
+                : 1.0f / std::sqrt(static_cast<float>(head_dim)));
+
+    // ── Gemma 3n: AltUp init ──
+    // The model maintains 4 parallel hidden streams. Stream `altup_active_idx`
+    // (=0) is the embedding itself; the other 3 are init'd by projecting the
+    // active embedding through `altup_projections.{0..2}`. HF additionally
+    // applies a magnitude correction (target_magnitude / sqrt(mean(x^2)))
+    // after each projection; we skip that here for v1 (the AltUp coef clip
+    // bounds the per-step drift and keeps activations stable enough for
+    // first-token correctness; full magnitude correction is a follow-up).
+    const bool use_altup =
+        (h.arch == PieArch::Gemma3n)
+        && h.altup_num_inputs > 1
+        && w.altup_proj_0 && w.altup_proj_1 && w.altup_proj_2;
+    const std::int32_t altup_n      = use_altup ? h.altup_num_inputs : 1;
+    const std::int32_t altup_active = use_altup ? h.altup_active_idx : 0;
+    std::vector<ggml_tensor*> streams(altup_n, nullptr);
+    if (use_altup) {
+        // active stream stays at index `altup_active`; the rest are projections.
+        streams[altup_active] = inpL;
+        ggml_tensor* proj_w[3] = {w.altup_proj_0, w.altup_proj_1, w.altup_proj_2};
+
+        // Per HF: each projected stream is rescaled to match the active
+        // stream's per-token RMS magnitude. Without this, stream[1..3] can
+        // sit far off the active stream's scale and the per-layer predict /
+        // correct dynamics never recover (output collapses to noise).
+        auto* active_sq      = ggml_sqr(ctx, inpL);
+        auto* active_mean_sq = ggml_mean(ctx, active_sq);              // [1, n_total]
+        auto* target_mag     = ggml_sqrt(ctx, active_mean_sq);
+
+        std::int32_t pi = 0;
+        for (std::int32_t i = 0; i < altup_n; ++i) {
+            if (i == altup_active) continue;
+            auto* projected = ggml_mul_mat(ctx, proj_w[pi++], inpL);
+            auto* p_sq      = ggml_sqr(ctx, projected);
+            auto* p_mean_sq = ggml_mean(ctx, p_sq);
+            // sqrt(max(mean, 1e-5)) ≈ sqrt(mean + 1e-5) for our magnitudes.
+            auto* p_mag = ggml_sqrt(ctx,
+                ggml_scale_bias(ctx, p_mean_sq, 1.0f, 1e-5f));
+            // scale = target_mag / p_mag, broadcast over hidden
+            auto* scale = ggml_div(ctx, target_mag, p_mag);
+            streams[i] = ggml_mul(ctx, projected, scale);
+        }
+    } else {
+        streams[0] = inpL;
+    }
+
+    // ── Gemma 3n: Per-Layer Embeddings (PLE) setup ──
+    // The model maintains an auxiliary token-embedding table indexed at the
+    // input ids (`embed_tokens_per_layer`, shape [vocab_per_layer,
+    // num_layers * ple_dim]) plus a context projection
+    // (`per_layer_model_projection`, hidden → num_layers*ple_dim) of the
+    // active embedding. Their per-layer slices feed the per-layer PLE
+    // residual that the inactive AltUp streams pick up after each block.
+    // Mirrors `Gemma3nTextModel.project_per_layer_inputs`.
+    ggml_tensor* per_layer_inputs = nullptr;
+    if (use_altup && h.gemma4_ple_dim > 0
+        && w.ple_token_embed && w.ple_model_proj && w.ple_model_norm) {
+        const std::int32_t ple_dim   = h.gemma4_ple_dim;
+        const std::int32_t n_layers  = h.num_hidden_layers;
+        const float ple_token_norm = std::sqrt(static_cast<float>(ple_dim));
+        const float ple_proj_norm  = 1.0f /
+            std::sqrt(static_cast<float>(h.hidden_size));
+        const float ple_combine    = 1.0f / std::sqrt(2.0f);
+
+        // Token-identity component, scaled by sqrt(ple_dim).
+        auto* tok_emb = ggml_get_rows(ctx, w.ple_token_embed, in.tok_input);
+        tok_emb = ggml_reshape_3d(ctx, tok_emb, ple_dim, n_layers, n_total);
+        tok_emb = ggml_scale(ctx, tok_emb, ple_token_norm);
+
+        // Context component: per_layer_model_projection @ active_embedding,
+        // scaled by 1/sqrt(hidden_size), reshaped per-layer, then
+        // RMSNormed (per-layer-projection-norm, weight stored centered at
+        // 1 → plus_one path matches gemma family convention).
+        auto* ctx_proj = ggml_mul_mat(ctx, w.ple_model_proj,
+                                      streams[altup_active]);
+        ctx_proj = ggml_reshape_3d(ctx, ctx_proj, ple_dim, n_layers, n_total);
+        ctx_proj = ggml_scale(ctx, ctx_proj, ple_proj_norm);
+        ctx_proj = ggml_rms_norm(ctx, ctx_proj, h.rms_norm_eps);
+        ctx_proj = norm_scale(ctx, ctx_proj, w.ple_model_norm,
+                              spec.norm_weight_plus_one);
+
+        per_layer_inputs = ggml_add(ctx, ctx_proj, tok_emb);
+        per_layer_inputs = ggml_scale(ctx, per_layer_inputs, ple_combine);
+    }
 
     for (std::int32_t il = 0; il < h.num_hidden_layers; ++il) {
         const auto& L = w.layers[il];
+
+        // ── Gemma 3n: AltUp predict ──
+        // For each layer, derive 4 "predicted" streams from the current
+        // streams using a per-token 4×4 linear combination. The matrix is
+        // computed from a small modality vector routed off the active
+        // stream's content. Block runs on `predictions[active_idx]`; the
+        // correction step closes the loop after the block.
+        std::vector<ggml_tensor*> predictions(altup_n, nullptr);
+        if (use_altup
+            && L.altup_predict_coefs && L.altup_router && L.altup_router_norm) {
+            auto* modalities = compute_altup_modalities(
+                ctx, streams[altup_active], L, spec, h);
+            // [4, n_total] @ [4, 16] (linear weight stored [in=4, out=16])
+            // → [16, n_total]; reshape to [4, 4, n_total]. The reshape's
+            // inner-most 4 (ne[0]) iterates the input-stream index `q`,
+            // ne[1] the output-stream index `p` — matching HF's
+            // permute(0,1,3,2) on a [..., 4, 4] reshape of the linear's
+            // [..., 16] output (so a per-token entry coef[p, q, t] lives
+            // at offset p*nb1 + q*nb0 + t*nb2 in the contiguous result).
+            auto* coefs_flat = ggml_mul_mat(
+                ctx, L.altup_predict_coefs, modalities);  // [16, n_total]
+            auto* coefs_3d = ggml_reshape_3d(
+                ctx, coefs_flat,
+                /*ne0=*/altup_n, /*ne1=*/altup_n, /*ne2=*/n_total);
+            for (std::int32_t p = 0; p < altup_n; ++p) {
+                ggml_tensor* acc = streams[p];  // residual: predictions[p] += streams[p]
+                for (std::int32_t q = 0; q < altup_n; ++q) {
+                    auto* c_pq = ggml_view_2d(
+                        ctx, coefs_3d,
+                        /*ne0=*/1, /*ne1=*/n_total,
+                        /*nb1=*/coefs_3d->nb[2],
+                        /*offset=*/p * coefs_3d->nb[1] + q * coefs_3d->nb[0]);
+                    auto* term = ggml_mul(ctx, streams[q], c_pq);
+                    acc = ggml_add(ctx, acc, term);
+                }
+                predictions[p] = acc;
+            }
+            inpL = predictions[altup_active];
+        }
+
         auto* inpSA = inpL;
 
         // Pre-attention norm. Absent on post-norm-only archs (olmo3),
         // where L.attn_norm is null and we feed the residual stream
         // straight into Q/K/V projections.
         auto* cur = inpL;
+        ggml_tensor* active_normed = nullptr;  // Gemma 3n: cached for Laurel
         if (L.attn_norm) {
             cur = ggml_rms_norm(ctx, cur, h.rms_norm_eps);
             cur = norm_scale(ctx, cur, L.attn_norm, spec.norm_weight_plus_one);
+            active_normed = cur;
         }
 
         auto* Q = ggml_mul_mat(ctx, L.q_proj, cur);
@@ -106,6 +259,18 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
             Q = norm_scale(ctx, Q, L.q_norm, spec.norm_weight_plus_one);
             K = ggml_rms_norm(ctx, K, h.rms_norm_eps);
             K = norm_scale(ctx, K, L.k_norm, spec.norm_weight_plus_one);
+        }
+
+        // Gemma 3n: V-norm. Per HF Gemma3nTextAttention.v_norm with
+        // `with_scale=False`: pure RMS-norm (no learnable weight) on V
+        // BEFORE the KV-cache write, applied per-head over head_dim. Without
+        // this the cached V channels carry the un-normalized magnitudes the
+        // o_proj weights weren't trained against; attention output ends up
+        // off-distribution and the model degrades to fluent-but-incoherent
+        // text. (Mirrors graph_gemma4's v_norm path; gemma4_v_norm flag
+        // reused since the wiring is identical.)
+        if (spec.gemma4_v_norm) {
+            V = ggml_rms_norm(ctx, V, h.rms_norm_eps);
         }
 
         // freq_factors: precomputed per-dim scaling for LLaMA-3.1+ NTK
@@ -243,6 +408,29 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
 
         auto* ffn_in = ggml_add(ctx, attn_out, inpSA);
 
+        // Gemma 3n: Laurel low-rank residual through the MLP block.
+        // Per HF Gemma3nTextLaurelBlock + Gemma3nDecoderLayer: laurel takes
+        // the input-layernormed active stream `active_normed` (NOT the raw
+        // residual), runs a thin [hidden → laurel_rank → hidden] sandwich
+        // with a post_norm on the result, sums with itself
+        // (`active_normed + post_norm(LR @ LL @ active_normed)`), and the
+        // layer averages this with the standard attention residual
+        // (`active_prediction + post_attn_norm(attn)`) via 1/√2 scaling.
+        if (h.arch == PieArch::Gemma3n && L.laurel_left && L.laurel_right
+            && active_normed != nullptr) {
+            auto* lx = ggml_mul_mat(ctx, L.laurel_left,  active_normed);
+            lx       = ggml_mul_mat(ctx, L.laurel_right, lx);
+            if (L.laurel_norm) {
+                lx = ggml_rms_norm(ctx, lx, h.rms_norm_eps);
+                lx = norm_scale(ctx, lx, L.laurel_norm, spec.norm_weight_plus_one);
+            }
+            auto* laurel_output = ggml_add(ctx, active_normed, lx);
+            ffn_in = ggml_scale(
+                ctx,
+                ggml_add(ctx, ffn_in, laurel_output),
+                1.0f / std::sqrt(2.0f));
+        }
+
         // FFN — pre-FFN norm. For llama-style this is `post_attention_layernorm`;
         // for gemma it's `pre_feedforward_layernorm`. Both stored in L.ffn_norm.
         // Olmo3 has no pre-FFN norm (post-norm-only); L.ffn_norm is null and
@@ -279,6 +467,83 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
             // Dense SwiGLU / GeGLU.
             auto* gate = ggml_mul_mat(ctx, L.gate_proj, cur);
             auto* up   = ggml_mul_mat(ctx, L.up_proj,   cur);
+
+            // ── Gemma 3n: Gaussian top-k pre-activation sparsity ──
+            // Layers in the front of the stack zero out everything below
+            // `mean(gate) + std_multiplier * std(gate)` per token, then
+            // ReLU. With sparsity=0.95, std_multiplier ≈ icdf(0.95) ≈
+            // 1.6448536; only the top ~5% of gate channels survive into
+            // the activation. Required for layers 0-9 of E2B/E4B; absent
+            // (or sparsity=0) on later layers.
+            if (h.arch == PieArch::Gemma3n
+                && static_cast<std::size_t>(il) < h.activation_sparsity_pattern.size()
+                && h.activation_sparsity_pattern[il] > 0.0f) {
+                const float p = h.activation_sparsity_pattern[il];
+                // erfcinv-free inverse-CDF for the standard normal:
+                // icdf(p) = sqrt(2) * erfinv(2p - 1). std::erf is round-
+                // tripped via Newton-style series in libstdc++, but for our
+                // small set of fixed p we just compile-time approximate.
+                // Using std::sqrt(2) * erfinv(2p-1) where erfinv(x) is
+                // computed via a rational approximation (Acklam) — only
+                // called once per build_qwen3_graph call so cost is trivial.
+                auto icdf_normal = [](float p_) {
+                    // 2*p - 1, then erfinv. Acklam's approximation for
+                    // 0 < p < 1, accuracy ~1.15e-9 in the central region.
+                    const double pp = static_cast<double>(p_);
+                    const double a[6] = { -3.969683028665376e+01,
+                                           2.209460984245205e+02,
+                                          -2.759285104469687e+02,
+                                           1.383577518672690e+02,
+                                          -3.066479806614716e+01,
+                                           2.506628277459239e+00 };
+                    const double b[5] = { -5.447609879822406e+01,
+                                           1.615858368580409e+02,
+                                          -1.556989798598866e+02,
+                                           6.680131188771972e+01,
+                                          -1.328068155288572e+01 };
+                    const double c[6] = { -7.784894002430293e-03,
+                                          -3.223964580411365e-01,
+                                          -2.400758277161838e+00,
+                                          -2.549732539343734e+00,
+                                           4.374664141464968e+00,
+                                           2.938163982698783e+00 };
+                    const double d[4] = {  7.784695709041462e-03,
+                                           3.224671290700398e-01,
+                                           2.445134137142996e+00,
+                                           3.754408661907416e+00 };
+                    const double plow  = 0.02425;
+                    const double phigh = 1.0 - plow;
+                    double q, r;
+                    if (pp < plow) {
+                        q = std::sqrt(-2.0 * std::log(pp));
+                        return static_cast<float>(
+                            (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) /
+                            ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1));
+                    }
+                    if (pp <= phigh) {
+                        q = pp - 0.5;
+                        r = q * q;
+                        return static_cast<float>(
+                            (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5])*q /
+                            (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1));
+                    }
+                    q = std::sqrt(-2.0 * std::log(1.0 - pp));
+                    return static_cast<float>(
+                        -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) /
+                        ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1));
+                };
+                const float std_mult = icdf_normal(p);
+
+                // mean + std (population, unbiased=False).
+                auto* g_mean = ggml_mean(ctx, gate);                 // [1, n_total]
+                auto* dev    = ggml_sub(ctx, gate, g_mean);          // [hidden, n_total]
+                auto* var    = ggml_mean(ctx, ggml_sqr(ctx, dev));   // [1, n_total]
+                auto* g_std  = ggml_sqrt(ctx, var);                  // [1, n_total]
+                auto* cutoff = ggml_add(ctx, g_mean,
+                                        ggml_scale(ctx, g_std, std_mult));
+                gate = ggml_relu(ctx, ggml_sub(ctx, gate, cutoff));
+            }
+
             gate = spec.ffn_use_gelu ? ggml_gelu(ctx, gate)
                                      : ggml_silu(ctx, gate);
             auto* gated = ggml_mul(ctx, gate, up);
@@ -293,6 +558,135 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         }
 
         inpL = ggml_add(ctx, ffn_out, ffn_in);
+
+        // ── Gemma 3n: AltUp correct ──
+        // Given the activated active stream (the layer's output before any
+        // PLE injection) and the pre-block predictions, project the
+        // innovation `(activated - predictions[active])` across the 4
+        // streams using `correction_coefs(modalities) + 1`. The "+1" makes
+        // stream `active_idx` reproduce the activated value when its
+        // correction coef is zero (and contributes pure innovation).
+        // Then optionally rescale stream `active_idx` by
+        // `correct_output_scale` (per-channel). The corrected streams
+        // become the input to the next layer's predict step.
+        if (use_altup
+            && L.altup_correct_coefs && L.altup_router && L.altup_router_norm) {
+            auto* activated = inpL;  // [hidden, n_total]
+            auto* modalities2 = compute_altup_modalities(
+                ctx, activated, L, spec, h);
+            auto* corr = ggml_mul_mat(
+                ctx, L.altup_correct_coefs, modalities2);  // [4, n_total]
+            // corr[p, t] += 1 (folds into the per-stream coefficient).
+            corr = ggml_scale_bias(ctx, corr, 1.0f, 1.0f);
+
+            auto* innovation = ggml_sub(
+                ctx, activated, predictions[altup_active]);
+
+            std::vector<ggml_tensor*> corrected(altup_n, nullptr);
+            for (std::int32_t p = 0; p < altup_n; ++p) {
+                auto* c_p = ggml_view_2d(
+                    ctx, corr,
+                    /*ne0=*/1, /*ne1=*/n_total,
+                    /*nb1=*/corr->nb[1],
+                    /*offset=*/p * corr->nb[0]);
+                auto* term = ggml_mul(ctx, innovation, c_p);
+                corrected[p] = ggml_add(ctx, predictions[p], term);
+            }
+
+            // ── PLE per-layer residual feed ──
+            // Take a working copy of the active-stream correction, optionally
+            // rescale by `correct_output_scale` (per-channel; trained init=0
+            // so this acts as a residual gate), then run it through the
+            // per-layer input gate × PLE-input multiply × per-layer
+            // projection × post-norm. The result is added to all *non-active*
+            // streams; the active stream is left untouched (HF: only
+            // `corrected_predictions[1:] += first_prediction`).
+            ggml_tensor* first_prediction = corrected[altup_active];
+            if (h.altup_correct_scale && L.altup_correct_scale) {
+                auto* sc = (L.altup_correct_scale->type == GGML_TYPE_F32)
+                    ? L.altup_correct_scale
+                    : ggml_cast(ctx, L.altup_correct_scale, GGML_TYPE_F32);
+                first_prediction = ggml_mul(ctx, first_prediction, sc);
+            }
+            if (per_layer_inputs && L.gemma3n_ple_gate && L.gemma3n_ple_proj
+                && L.gemma3n_ple_norm) {
+                const std::int32_t ple_dim = h.gemma4_ple_dim;
+                const std::size_t  ple_off =
+                    static_cast<std::size_t>(il) * ple_dim *
+                    ggml_type_size(per_layer_inputs->type);
+                // The view straddles a stride of nb[2] in the source —
+                // strided reads land on the wrong tokens unless we
+                // materialize first. ggml_cast happens to also tolerate
+                // strided inputs but we ggml_cont before cast for
+                // belt-and-suspenders; same dance graph_gemma4.cpp does.
+                auto* ple_signal = ggml_view_2d(
+                    ctx, per_layer_inputs,
+                    /*ne0=*/ple_dim, /*ne1=*/n_total,
+                    /*nb1=*/per_layer_inputs->nb[2],
+                    /*offset=*/ple_off);
+                auto* ple_signal_f32 = ggml_cast(
+                    ctx, ggml_cont(ctx, ple_signal), GGML_TYPE_F32);
+
+                auto* gated = ggml_mul_mat(
+                    ctx, L.gemma3n_ple_gate, first_prediction);  // [ple_dim, n_total]
+                // hidden_activation = "gelu_pytorch_tanh" on E2B/E4B.
+                gated = ggml_gelu(ctx, gated);
+                gated = ggml_mul(ctx, gated, ple_signal_f32);
+                auto* ple_out = ggml_mul_mat(ctx, L.gemma3n_ple_proj, gated);
+                ple_out = ggml_rms_norm(ctx, ple_out, h.rms_norm_eps);
+                ple_out = norm_scale(ctx, ple_out, L.gemma3n_ple_norm,
+                                     spec.norm_weight_plus_one);
+
+                for (std::int32_t i = 0; i < altup_n; ++i) {
+                    if (i == altup_active) continue;
+                    corrected[i] = ggml_add(ctx, corrected[i], ple_out);
+                }
+            }
+
+            streams = std::move(corrected);
+            inpL = streams[altup_active];
+        } else if (use_altup) {
+            // Layer somehow missing the per-layer altup tensors. Keep the
+            // active stream advanced with the block output so we don't drop
+            // the residual; non-active streams stay frozen for this layer.
+            streams[altup_active] = inpL;
+        }
+    }
+
+    // ── Gemma 3n: Combine 4 streams via the unembed projections ──
+    // Mirrors HF's combine: each non-active stream is projected through
+    // `altup_unembed_projections.{0..2}`, rescaled to match the active
+    // stream's per-token RMS magnitude (so the streams contribute
+    // symmetrically to the mean), then averaged with the active stream
+    // into a single hidden state for the final norm + LM head.
+    if (use_altup
+        && w.altup_unembed_proj_0
+        && w.altup_unembed_proj_1
+        && w.altup_unembed_proj_2) {
+        ggml_tensor* unembed_w[3] = {
+            w.altup_unembed_proj_0,
+            w.altup_unembed_proj_1,
+            w.altup_unembed_proj_2,
+        };
+        auto* active = streams[altup_active];
+        auto* active_mean_sq = ggml_mean(ctx, ggml_sqr(ctx, active));
+        auto* target_mag = ggml_sqrt(ctx, active_mean_sq);
+
+        auto* combined = active;
+        std::int32_t pi = 0;
+        for (std::int32_t i = 0; i < altup_n; ++i) {
+            if (i == altup_active) continue;
+            auto* projected = ggml_mul_mat(ctx, unembed_w[pi++], streams[i]);
+            auto* p_mean_sq = ggml_mean(ctx, ggml_sqr(ctx, projected));
+            auto* p_mag = ggml_sqrt(ctx,
+                ggml_scale_bias(ctx, p_mean_sq, 1.0f, 1e-5f));
+            auto* scale = ggml_div(ctx, target_mag, p_mag);
+            projected = ggml_mul(ctx, projected, scale);
+            combined = ggml_add(ctx, combined, projected);
+        }
+        combined = ggml_scale(ctx, combined,
+                              1.0f / static_cast<float>(altup_n));
+        inpL = combined;
     }
 
     auto* cur = ggml_rms_norm(ctx, inpL, h.rms_norm_eps);

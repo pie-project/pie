@@ -25,6 +25,13 @@ enum class PieArch {
     Gemma2,
     Gemma3,
     Gemma4,
+    Gemma3n,     // Gemma 3n (E2B / E4B); HF model_type "gemma3n" /
+                 // "gemma3n_text". Dense per-layer attention with the
+                 // Gemma 3 sliding/full mix. v1 implementation skips
+                 // AltUp / PLE / Laurel (the parameter-efficient
+                 // tricks); the runtime executes a vanilla Gemma 3-
+                 // style graph and produces approximately-correct text.
+                 // Full architectural fidelity is a follow-up.
     Mistral3,
     Olmo3,
     GptOss,
@@ -112,6 +119,25 @@ struct Hparams {
     std::int32_t gemma4_ple_dim = 0;
     std::int32_t gemma4_ple_vocab = 0;
     bool         gemma4_use_double_wide_mlp = false;
+
+    // ── Gemma 3n: AltUp / Laurel ──
+    // altup_num_inputs (=4): number of parallel hidden streams.
+    // altup_active_idx (=0): which stream the transformer block actually
+    //   reads/writes; the others are predicted/corrected from the active
+    //   stream's behavior via small router + 4×4 / 4×16 coefficient
+    //   matrices learned per layer.
+    // altup_correct_scale (=true): apply correct_output_scale to the
+    //   active stream after each layer's correction step.
+    // laurel_rank: low-rank dim for the Laurel residual MLP (=64 in E2B/E4B).
+    std::int32_t altup_num_inputs    = 0;   // 0 = arch doesn't use AltUp
+    std::int32_t altup_active_idx    = 0;
+    bool         altup_correct_scale = false;
+    std::int32_t laurel_rank         = 0;
+    // Per-layer "Gaussian top-k" pre-activation sparsity. Layers where this
+    // is > 0 zero out everything below `mean + icdf(p)*std` in the gate
+    // projection (E2B/E4B: 0.95 on layers 0-9, 0.0 on the rest). Empty
+    // vector = activation sparsity disabled.
+    std::vector<float> activation_sparsity_pattern;
 
     // Logit softcap (gemma2; future gemma).
     std::optional<float> attn_logit_softcapping;
