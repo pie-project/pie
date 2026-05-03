@@ -24,6 +24,7 @@ const char* pie_arch_name(PieArch a) {
         case PieArch::Mixtral:  return "mixtral";
         case PieArch::Qwen3Moe: return "qwen3_moe";
         case PieArch::Qwen3_5:  return "qwen3_5";
+        case PieArch::Phi3Small: return "phi3small";
     }
     return "?";
 }
@@ -48,6 +49,7 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
     if (hf_model_type == "gpt_oss")     return PieArch::GptOss;
     if (hf_model_type == "gptoss")      return PieArch::GptOss;
     if (hf_model_type == "phi3")        return PieArch::Phi3;
+    if (hf_model_type == "phi3small")   return PieArch::Phi3Small;
     if (hf_model_type == "mixtral")     return PieArch::Mixtral;
     if (hf_model_type == "qwen3_moe")   return PieArch::Qwen3Moe;
     if (hf_model_type == "qwen3_5" ||
@@ -168,6 +170,15 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
         get_or<bool>(text, "enable_moe_block", false);
     h.gemma4_moe_intermediate_size =
         get_or<std::int32_t>(text, "moe_intermediate_size", 0);
+
+    // Phi-3-small mup parameterization. Default 0 means "unused";
+    // graph_phi3small consults these only when arch == Phi3Small.
+    h.mup_attn_multiplier =
+        get_or<float>(text, "mup_attn_multiplier", 0.0f);
+    h.mup_embedding_multiplier =
+        get_or<float>(text, "mup_embedding_multiplier", 0.0f);
+    h.mup_width_multiplier =
+        get_or<float>(text, "mup_width_multiplier", 0.0f);
     h.hidden_size = text.at("hidden_size").get<std::int32_t>();
     // Pure-MoE checkpoints (Qwen 3.6) omit `intermediate_size` because
     // every layer's FFN is the routed-expert path; the per-expert width
@@ -199,6 +210,22 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     h.vocab_size = text.at("vocab_size").get<std::int32_t>();
     h.max_position_embeddings =
         get_or<std::int32_t>(text, "max_position_embeddings", 4096);
+
+    if (h.arch == PieArch::Phi3Small) {
+        // Phi-3-small spells the FFN width as `ff_intermediate_size`
+        // (the standard `intermediate_size` is absent), uses
+        // `layer_norm_epsilon` (not rms_norm_eps), and `rope_embedding_base`
+        // (not rope_theta). Apply these overrides AFTER the standard
+        // parsing so they take precedence.
+        if (h.intermediate_size == 0) {
+            h.intermediate_size =
+                get_or<std::int32_t>(text, "ff_intermediate_size", 0);
+        }
+        h.rms_norm_eps =
+            get_or<float>(text, "layer_norm_epsilon", h.rms_norm_eps);
+        h.rope_theta =
+            get_or<float>(text, "rope_embedding_base", h.rope_theta);
+    }
 
     if (text.contains("head_dim") && !text["head_dim"].is_null()) {
         h.head_dim = text["head_dim"].get<std::int32_t>();

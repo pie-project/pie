@@ -21,6 +21,7 @@
 #include "graph_common.hpp"
 #include "graph_gemma4.hpp"
 #include "graph_qwen3.hpp"
+#include "graph_phi3small.hpp"
 #include "graph_qwen3_5.hpp"
 #include "plan.hpp"
 #include "response.hpp"
@@ -683,7 +684,9 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
                 cache_->result = build_gemma4_graph(
                     cache_->ctx, model_, kv_, plan);
             } else {
-                cache_->result = build_qwen3_graph(
+                cache_->result = (model_.hparams().arch == PieArch::Phi3Small)
+                    ? build_phi3small_graph(cache_->ctx, model_, kv_, plan)
+                    : build_qwen3_graph(
                     cache_->ctx, model_, kv_, plan);
             }
             take_us(timings_.graph_build_us);

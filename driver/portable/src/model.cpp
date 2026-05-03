@@ -312,6 +312,9 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
             case PieArch::Phi3:
                 build_phi3_();
                 break;
+            case PieArch::Phi3Small:
+                build_phi3small_();
+                break;
             case PieArch::Gemma2:
                 build_gemma2_();
                 break;
@@ -1020,6 +1023,97 @@ void Model::build_phi3_() {
                                      /*offset=*/ static_cast<std::size_t>(n_ff) * gu_row_bytes,
                                      gu_type);
         L.down_proj = declare_(p + "mlp.down_proj.weight");
+    }
+}
+
+// Phi-3-small: LayerNorm with bias, fused `query_key_value` ([Q|K|V]
+// with biases on each), `self_attn.dense` as the output projection,
+// packed `mlp.up_proj` ([gate || up] split for GeGLU). All norms +
+// projections carry a learnable bias.
+void Model::build_phi3small_() {
+    const auto& h = hparams_;
+
+    // Top-level: embed + final LayerNorm (with bias) + lm_head.
+    weights_.tok_embd      = declare_(tname_("model.embed_tokens.weight"));
+    weights_.output_norm   = declare_(tname_("model.final_layernorm.weight"));
+    weights_.output_norm_b = declare_(tname_("model.final_layernorm.bias"));
+    if (!h.tie_word_embeddings) {
+        weights_.output_head = declare_("lm_head.weight");
+    }
+    weights_.layers.resize(h.num_hidden_layers);
+
+    const std::int64_t hidden = h.hidden_size;
+    const std::int64_t n_q  = static_cast<std::int64_t>(h.num_attention_heads) * h.head_dim;
+    const std::int64_t n_kv = static_cast<std::int64_t>(h.num_key_value_heads) * h.head_dim;
+    const std::int64_t n_ff = h.intermediate_size;
+
+    auto fused_dtype = [&](const std::string& name) {
+        const auto& t = archive_->at(name);
+        return std::pair{st_to_ggml_dtype(t.dtype, name), st_dtype_size(t.dtype)};
+    };
+
+    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
+        const std::string p = tname_(layer_path(i));
+        auto& L = weights_.layers[i];
+
+        // Pre-attn / pre-FFN LayerNorm (weight + bias).
+        L.attn_norm   = declare_(p + "input_layernorm.weight");
+        L.attn_norm_b = declare_(p + "input_layernorm.bias");
+        L.ffn_norm    = declare_(p + "post_attention_layernorm.weight");
+        L.ffn_norm_b  = declare_(p + "post_attention_layernorm.bias");
+
+        // Fused query_key_value [Q | K | V] split into separate slices.
+        const std::string qkv_name = p + "self_attn.query_key_value.weight";
+        auto [qkv_type, qkv_dsz] = fused_dtype(qkv_name);
+        const std::size_t row_bytes =
+            static_cast<std::size_t>(hidden) * qkv_dsz;
+        L.q_proj = declare_slice_(qkv_name, p + "q_proj", hidden, n_q,
+                                  /*offset=*/0, qkv_type);
+        L.k_proj = declare_slice_(qkv_name, p + "k_proj", hidden, n_kv,
+                                  static_cast<std::size_t>(n_q) * row_bytes, qkv_type);
+        L.v_proj = declare_slice_(qkv_name, p + "v_proj", hidden, n_kv,
+                                  static_cast<std::size_t>(n_q + n_kv) * row_bytes,
+                                  qkv_type);
+        // Per-projection biases. The fused query_key_value.bias has
+        // shape [n_q + n_kv + n_kv]; slice into Q/K/V parts.
+        const std::string qkv_b_name = p + "self_attn.query_key_value.bias";
+        auto [qkvb_type, qkvb_dsz] = fused_dtype(qkv_b_name);
+        L.q_proj_b = declare_slice_(qkv_b_name, p + "q_proj.bias",
+                                     n_q, /*out_dim=*/1, /*offset=*/0, qkvb_type);
+        L.k_proj_b = declare_slice_(qkv_b_name, p + "k_proj.bias",
+                                     n_kv, /*out_dim=*/1,
+                                     static_cast<std::size_t>(n_q) * qkvb_dsz, qkvb_type);
+        L.v_proj_b = declare_slice_(qkv_b_name, p + "v_proj.bias",
+                                     n_kv, /*out_dim=*/1,
+                                     static_cast<std::size_t>(n_q + n_kv) * qkvb_dsz, qkvb_type);
+
+        // self_attn.dense (= o_proj) with bias.
+        L.o_proj   = declare_(p + "self_attn.dense.weight");
+        L.o_proj_b = declare_(p + "self_attn.dense.bias");
+
+        // Packed mlp.up_proj [gate || up] split. Output dim is 2 * n_ff.
+        const std::string up_name = p + "mlp.up_proj.weight";
+        auto [up_type, up_dsz] = fused_dtype(up_name);
+        const std::size_t up_row_bytes =
+            static_cast<std::size_t>(hidden) * up_dsz;
+        L.gate_proj = declare_slice_(up_name, p + "gate_proj", hidden, n_ff,
+                                      /*offset=*/0, up_type);
+        L.up_proj   = declare_slice_(up_name, p + "up_proj", hidden, n_ff,
+                                      static_cast<std::size_t>(n_ff) * up_row_bytes,
+                                      up_type);
+        // Packed up_proj.bias [2 * n_ff] split.
+        const std::string up_b_name = p + "mlp.up_proj.bias";
+        auto [upb_type, upb_dsz] = fused_dtype(up_b_name);
+        L.gate_proj_b = declare_slice_(up_b_name, p + "gate_proj.bias",
+                                        n_ff, 1, /*offset=*/0, upb_type);
+        L.up_proj_b   = declare_slice_(up_b_name, p + "up_proj.bias",
+                                        n_ff, 1,
+                                        static_cast<std::size_t>(n_ff) * upb_dsz,
+                                        upb_type);
+
+        // mlp.down_proj weight + bias.
+        L.down_proj   = declare_(p + "mlp.down_proj.weight");
+        L.down_proj_b = declare_(p + "mlp.down_proj.bias");
     }
 }
 

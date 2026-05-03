@@ -109,6 +109,10 @@ ArchSpec arch_spec_for(PieArch a, const Hparams& h) {
             // `weights.freq_factors` (synthesized at load time); Phi3's
             // fused QKV is handled at load time too.
             break;
+        case PieArch::Phi3Small:
+            // Per-arch dispatch lives in graph_phi3small.cpp; ArchSpec
+            // is unused for this arch beyond defaults.
+            break;
         case PieArch::Mistral3:
             // SWA on every layer (when configured) plus optional YaRN
             // (Ministral 3). Mistral 7B v0.3 has no YaRN; apply_yarn_
