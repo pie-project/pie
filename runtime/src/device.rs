@@ -196,6 +196,37 @@ pub fn copy_d2d(device_idx: DeviceId, src_phys_ids: &[u32], dst_phys_ids: &[u32]
     })
 }
 
+/// GPU → GPU page copy with explicit completion ack.
+///
+/// Awaits a request-response RPC to the worker. The Python handler
+/// `_handle_copy_d2d` is expected to call `torch.cuda.synchronize()`
+/// before responding, so by the time this future resolves the dst
+/// pages are actually populated on GPU.
+///
+/// Required to close the cross-thread race documented in
+/// `project_pie_kv_bleed_d2d_fork_race.md`: cold-path `copy_d2d`
+/// notifications can be reordered relative to shmem `fire_batch` on
+/// the Python worker, leading forward-pass kernels to read stale
+/// page contents. The Pinned + pending_d2d state machine in
+/// `snapshot::fork` uses this future to gate the new context's
+/// fire_batch admission until the d2d kernel has actually run.
+pub async fn copy_d2d_async(
+    device_idx: DeviceId,
+    src_phys_ids: &[u32],
+    dst_phys_ids: &[u32],
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct Req { src_phys_ids: Vec<u32>, dst_phys_ids: Vec<u32> }
+    // The Python handler returns msgpack-encoded `None`; deserialize
+    // through rmpv::Value to accept anything (we only care about the
+    // success of the call, not its payload).
+    let _: rmpv::Value = call(device_idx, "copy_d2d", &Req {
+        src_phys_ids: src_phys_ids.to_vec(),
+        dst_phys_ids: dst_phys_ids.to_vec(),
+    }).await?;
+    Ok(())
+}
+
 /// CPU → CPU page copy (fire-and-forget).
 /// `src_slots`: source CPU swap pool page IDs.
 /// `dst_slots`: destination CPU swap pool page IDs.
