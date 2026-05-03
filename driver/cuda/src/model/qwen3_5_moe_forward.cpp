@@ -127,7 +127,8 @@ ExpertRouting build_routing(
 
 // Linear-attn body (replica of qwen3_5_forward.cpp's logic, against
 // MoeLayerWeights). Reads `ws.norm_x`, writes contribution into
-// `ws.norm_y`.
+// `ws.norm_y`. Multi-request semantics match qwen3_5_forward's
+// linear_attn_layer_body — see the comment block there.
 void linear_attn_body(
     const Qwen3_5MoeLayerWeights& Lw,
     const HfConfig& cfg,
@@ -135,7 +136,11 @@ void linear_attn_body(
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la,
     Qwen3_5StateCache& state_cache,
-    int layer_idx, int N, bool is_pure_decode,
+    int layer_idx, int N, int R, bool is_pure_decode,
+    const std::int32_t*  slot_ids_h,
+    const std::int32_t*  slot_ids_d,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* qo_indptr_d,
     ops::CublasHandle& cublas, cudaStream_t stream)
 {
     const int T        = std::max(1, fwd_cfg.tp_size);
@@ -149,6 +154,9 @@ void linear_attn_body(
     const int conv_dim = 2 * K_dim + V_dim;
     const int conv_K   = cfg.linear_conv_kernel_dim;
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
+    auto slot_for = [&](int r) -> int {
+        return slot_ids_h ? slot_ids_h[r] : 0;
+    };
 
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.la_in_proj_qkv->data(),
@@ -163,18 +171,54 @@ void linear_attn_body(
         ws.norm_x.data(), Lw.la_in_proj_b->data(),
         la.b.data(), N, V_h, H);
 
-    if (is_pure_decode) {
-        kernels::launch_causal_conv1d_update_bf16(
-            la.mixed_qkv.data(), Lw.la_conv1d_w->data(),
-            Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
-            state_cache.conv_state(layer_idx), la.mixed_qkv_post.data(),
-            conv_dim, conv_K, stream);
-    } else {
-        kernels::launch_causal_conv1d_prefill_bf16(
-            la.mixed_qkv.data(), Lw.la_conv1d_w->data(),
-            Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
-            la.mixed_qkv_post.data(), state_cache.conv_state(layer_idx),
-            N, conv_dim, conv_K, stream);
+    {
+        auto* qkv_in_base   = la.mixed_qkv.data();
+        auto* qkv_post_base = la.mixed_qkv_post.data();
+        if (is_pure_decode) {
+            if (slot_ids_d != nullptr) {
+                kernels::launch_causal_conv1d_update_batched_bf16(
+                    qkv_in_base, Lw.la_conv1d_w->data(),
+                    Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                    state_cache.conv_state(layer_idx, /*slot=*/0),
+                    slot_ids_d,
+                    static_cast<long long>(state_cache.conv_kernel()) *
+                        state_cache.conv_dim(),
+                    qkv_post_base,
+                    R, conv_dim, conv_K, stream);
+            } else {
+                kernels::launch_causal_conv1d_update_bf16(
+                    qkv_in_base, Lw.la_conv1d_w->data(),
+                    Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                    state_cache.conv_state(layer_idx, 0),
+                    qkv_post_base,
+                    conv_dim, conv_K, stream);
+            }
+        } else {
+            if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
+                kernels::launch_causal_conv1d_prefill_batched_bf16(
+                    qkv_in_base, Lw.la_conv1d_w->data(),
+                    Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                    qkv_post_base,
+                    state_cache.conv_state(layer_idx, /*slot=*/0),
+                    slot_ids_d, qo_indptr_d,
+                    static_cast<long long>(state_cache.conv_kernel()) *
+                        state_cache.conv_dim(),
+                    R, conv_dim, conv_K, stream);
+            } else {
+                for (int r = 0; r < R; ++r) {
+                    const int t0 = static_cast<int>(qo_indptr_h[r]);
+                    const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
+                    if (Nr <= 0) continue;
+                    const std::size_t off = static_cast<std::size_t>(t0) * conv_dim;
+                    kernels::launch_causal_conv1d_prefill_bf16(
+                        qkv_in_base + off, Lw.la_conv1d_w->data(),
+                        Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                        qkv_post_base + off,
+                        state_cache.conv_state(layer_idx, slot_for(r)),
+                        Nr, conv_dim, conv_K, stream);
+                }
+            }
+        }
     }
 
     auto* qkv_base = la.mixed_qkv_post.data();
@@ -224,20 +268,69 @@ void linear_attn_body(
         la.g_log.data(), la.beta.data(),
         N, V_h, stream);
 
-    if (is_pure_decode) {
-        kernels::launch_recurrent_gated_delta_step(
-            la.q_norm.data(), la.k_norm.data(), la.v_fp32.data(),
-            la.g_log.data(), la.beta.data(),
-            state_cache.recurrent_state(layer_idx),
-            la.core_out.data(),
-            /*B=*/1, V_h, K_d, V_d, stream);
-    } else {
-        kernels::launch_chunk_gated_delta_prefill(
-            la.q_norm.data(), la.k_norm.data(), la.v_fp32.data(),
-            la.g_log.data(), la.beta.data(),
-            state_cache.recurrent_state(layer_idx),
-            la.core_out.data(),
-            N, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+    {
+        const std::size_t qk_step = static_cast<std::size_t>(V_h) * K_d;
+        const std::size_t v_step  = static_cast<std::size_t>(V_dim);
+        const std::size_t gh_step = static_cast<std::size_t>(V_h);
+        if (is_pure_decode) {
+            if (slot_ids_d != nullptr) {
+                kernels::launch_recurrent_gated_delta_step_batched(
+                    la.q_norm.data(),
+                    la.k_norm.data(),
+                    la.v_fp32.data(),
+                    la.g_log.data(),
+                    la.beta.data(),
+                    state_cache.recurrent_state(layer_idx, /*slot=*/0),
+                    slot_ids_d,
+                    static_cast<long long>(
+                        state_cache.recurrent_slot_stride_floats()),
+                    la.core_out.data(),
+                    R, V_h, K_d, V_d, stream);
+            } else {
+                kernels::launch_recurrent_gated_delta_step(
+                    la.q_norm.data(),
+                    la.k_norm.data(),
+                    la.v_fp32.data(),
+                    la.g_log.data(),
+                    la.beta.data(),
+                    state_cache.recurrent_state(layer_idx, 0),
+                    la.core_out.data(),
+                    /*B=*/1, V_h, K_d, V_d, stream);
+            }
+        } else {
+            if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
+                kernels::launch_chunk_gated_delta_prefill_batched(
+                    la.q_norm.data(),
+                    la.k_norm.data(),
+                    la.v_fp32.data(),
+                    la.g_log.data(),
+                    la.beta.data(),
+                    state_cache.recurrent_state(layer_idx, /*slot=*/0),
+                    slot_ids_d, qo_indptr_d,
+                    static_cast<long long>(
+                        state_cache.recurrent_slot_stride_floats()),
+                    la.core_out.data(),
+                    R, V_h, K_d, V_d, stream);
+            } else {
+                for (int r = 0; r < R; ++r) {
+                    const int t0 = static_cast<int>(qo_indptr_h[r]);
+                    const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
+                    if (Nr <= 0) continue;
+                    const std::size_t qk_off = static_cast<std::size_t>(t0) * qk_step;
+                    const std::size_t v_off  = static_cast<std::size_t>(t0) * v_step;
+                    const std::size_t gh_off = static_cast<std::size_t>(t0) * gh_step;
+                    kernels::launch_chunk_gated_delta_prefill(
+                        la.q_norm.data() + qk_off,
+                        la.k_norm.data() + qk_off,
+                        la.v_fp32.data() + v_off,
+                        la.g_log.data()  + gh_off,
+                        la.beta.data()   + gh_off,
+                        state_cache.recurrent_state(layer_idx, slot_for(r)),
+                        la.core_out.data() + v_off,
+                        Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                }
+            }
+        }
     }
 
     kernels::launch_fp32_to_bf16(
@@ -623,33 +716,38 @@ void qwen3_5_moe_forward_paged(
     int total_tokens, int num_requests,
     bool is_pure_decode,
     const std::uint8_t* /*mask_d*/,
-    const std::int32_t* /*mask_indptr_d*/)
+    const std::int32_t* /*mask_indptr_d*/,
+    const std::int32_t* slot_ids_h,
+    const std::uint8_t* is_fresh_h,
+    const std::int32_t* slot_ids_d)
 {
-    // Multi-request batching support depends on whether the model has
-    // a hybrid linear-attn schedule. Pure-Qwen3-MoE (Qwen3-30B-A3B,
-    // model_type == "qwen3_moe") is full-attention-only — `full_attn_body`
-    // already takes `R` and `moe_block` walks all N tokens irrespective
-    // of how they're partitioned across requests. Qwen3.5 / 3.6-MoE
-    // additionally fire `linear_attn_body`, which still hard-assumes R=1
-    // (per-request state cache); guard those archs explicitly.
+    // Pure-Qwen3-MoE (Qwen3-30B-A3B, model_type == "qwen3_moe") has no
+    // linear-attn layers; the per-slot state cache is unused. Qwen3.5 /
+    // 3.6-MoE additionally fires the linear-attn body — those layers
+    // consume slot_ids_h / is_fresh_h to drive per-request state.
     const bool has_linear_attn_layers = std::any_of(
         w.layers.begin(), w.layers.end(),
         [](const Qwen3_5MoeLayerWeights& Lw) {
             return Lw.kind == Qwen3_5MoeLayerWeights::Kind::LinearAttn;
         });
-    if (num_requests != 1 && has_linear_attn_layers) {
-        throw std::runtime_error(
-            "qwen3_5_moe_forward_paged: multi-request batching not yet "
-            "supported on the linear-attn schedule (Qwen3.5/3.6-MoE); "
-            "got R=" + std::to_string(num_requests));
-    }
     const int H  = cfg.hidden_size;
     const int V  = cfg.vocab_size;
     const int N  = total_tokens;
+    const int R  = num_requests;
     const float eps = cfg.rms_norm_eps;
     cudaStream_t stream = nullptr;
 
-    if (!is_pure_decode) state_cache.reset(stream);
+    if (has_linear_attn_layers) {
+        if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
+            for (int r = 0; r < R; ++r) {
+                if (is_fresh_h[r]) {
+                    state_cache.reset_slot(slot_ids_h[r], stream);
+                }
+            }
+        } else if (!is_pure_decode) {
+            state_cache.reset(stream);
+        }
+    }
 
     // Decode plan was refreshed by `prepare_qwen3_5_decode_plan` before
     // this body call. Avoids host work inside any cudaStream capture.
@@ -669,7 +767,9 @@ void qwen3_5_moe_forward_paged(
         if (Lw.kind == Qwen3_5MoeLayerWeights::Kind::LinearAttn) {
             linear_attn_body(
                 Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
-                static_cast<int>(L), N, is_pure_decode, cublas, stream);
+                static_cast<int>(L), N, R, is_pure_decode,
+                slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
+                cublas, stream);
         } else {
             full_attn_body(
                 Lw, cfg, fwd_cfg, ws, la_ws, cache, attn_ws, decode_plan,

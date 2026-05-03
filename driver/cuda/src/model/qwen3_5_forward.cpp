@@ -55,6 +55,18 @@ namespace {
 // Linear-attn layer body. Reads `ws.norm_x` (post-input-layernorm
 // activations) and writes the layer's contribution into `ws.norm_y`
 // (which the caller adds to `ws.y` as the residual).
+//
+// Multi-request: every state-touching kernel is the batched variant —
+// causal_conv1d_{update,prefill} and {recurrent,chunk}_gated_delta_*
+// each fire as a single grid indirected through `slot_ids_d` (and on
+// prefill `qo_indptr_d` too) to address each request's slab. One
+// launch per kernel per layer regardless of R, eliminating
+// `R × num_layers × {2,4}` per-token / per-fire launch overhead.
+//
+// `slot_ids_h` and `slot_ids_d` describe the same mapping in host and
+// device memory respectively. When both are nullptr (parity /
+// single-request callers), every kernel takes its legacy single-request
+// path against slot 0 — matches the R=1 layout exactly.
 void linear_attn_layer_body(
     const Qwen3_5LayerWeights& Lw,
     const HfConfig& cfg,
@@ -63,8 +75,12 @@ void linear_attn_layer_body(
     Qwen3_5LinearAttnWorkspace& la,
     Qwen3_5StateCache& state_cache,
     int layer_idx,
-    int N,
+    int N, int R,
     bool is_pure_decode,
+    const std::int32_t*  slot_ids_h,
+    const std::int32_t*  slot_ids_d,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* qo_indptr_d,
     ops::CublasHandle& cublas,
     cudaStream_t stream)
 {
@@ -81,6 +97,10 @@ void linear_attn_layer_body(
     const int V_dim    = V_h * V_d;
     const int conv_dim = 2 * K_dim + V_dim;
     const int conv_K   = cfg.linear_conv_kernel_dim;
+
+    auto slot_for = [&](int r) -> int {
+        return slot_ids_h ? slot_ids_h[r] : 0;
+    };
 
     // ── In-projections ────────────────────────────────────────────
     // Linear-attn projections stay bf16 (no QuantMeta companion in
@@ -103,21 +123,62 @@ void linear_attn_layer_body(
         la.b.data(), N, V_h, H);
 
     // ── Causal depthwise conv1d (kernel=K, fused silu) ────────────
-    // Per-request conv_state lives in `state_cache.conv_state(layer)`.
-    // Layout: conv_state is [conv_K, conv_dim] bf16.
+    // Per-request conv_state lives in `state_cache.conv_state(layer, slot)`.
+    // Layout: conv_state is [conv_K, conv_dim] bf16 per slot.
+    auto* qkv_in_base   = la.mixed_qkv.data();
+    auto* qkv_post_base = la.mixed_qkv_post.data();
     if (is_pure_decode) {
-        // N == 1; single-token update.
-        kernels::launch_causal_conv1d_update_bf16(
-            la.mixed_qkv.data(), Lw.la_conv1d_w->data(),
-            Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
-            state_cache.conv_state(layer_idx), la.mixed_qkv_post.data(),
-            conv_dim, conv_K, stream);
+        // N == R; one token per request. Decode hot path → batched
+        // kernel: one launch picks per-request slot via slot_ids_d.
+        if (slot_ids_d != nullptr) {
+            kernels::launch_causal_conv1d_update_batched_bf16(
+                qkv_in_base, Lw.la_conv1d_w->data(),
+                Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                state_cache.conv_state(layer_idx, /*slot=*/0),
+                slot_ids_d,
+                static_cast<long long>(state_cache.conv_kernel()) *
+                    state_cache.conv_dim(),
+                qkv_post_base,
+                R, conv_dim, conv_K, stream);
+        } else {
+            // Legacy single-request path (parity entrypoint, slot 0).
+            kernels::launch_causal_conv1d_update_bf16(
+                qkv_in_base, Lw.la_conv1d_w->data(),
+                Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                state_cache.conv_state(layer_idx, 0),
+                qkv_post_base,
+                conv_dim, conv_K, stream);
+        }
     } else {
-        kernels::launch_causal_conv1d_prefill_bf16(
-            la.mixed_qkv.data(), Lw.la_conv1d_w->data(),
-            Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
-            la.mixed_qkv_post.data(), state_cache.conv_state(layer_idx),
-            N, conv_dim, conv_K, stream);
+        // Prefill: batched kernel — one launch over (C, R) blocks; each
+        // block reads its own (t0_r, Nr_r) window from qo_indptr_d and
+        // walks tokens internally, persisting the trailing K-window
+        // into the request's slot. Falls back to host-loop for the
+        // legacy single-request parity entrypoint.
+        if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
+            kernels::launch_causal_conv1d_prefill_batched_bf16(
+                qkv_in_base, Lw.la_conv1d_w->data(),
+                Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                qkv_post_base,
+                state_cache.conv_state(layer_idx, /*slot=*/0),
+                slot_ids_d, qo_indptr_d,
+                static_cast<long long>(state_cache.conv_kernel()) *
+                    state_cache.conv_dim(),
+                R, conv_dim, conv_K, stream);
+        } else {
+            for (int r = 0; r < R; ++r) {
+                const int t0 = static_cast<int>(qo_indptr_h[r]);
+                const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
+                if (Nr <= 0) continue;
+                const std::size_t off = static_cast<std::size_t>(t0) * conv_dim;
+                kernels::launch_causal_conv1d_prefill_bf16(
+                    qkv_in_base + off, Lw.la_conv1d_w->data(),
+                    Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                    qkv_post_base + off,
+                    state_cache.conv_state(layer_idx, slot_for(r)),
+                    Nr, conv_dim, conv_K, stream);
+            }
+        }
     }
 
     // ── Split mixed_qkv_post into q_raw, k_raw, v_raw ─────────────
@@ -179,21 +240,73 @@ void linear_attn_layer_body(
         N, V_h, stream);
 
     // ── Recurrent update ───────────────────────────────────────────
-    if (is_pure_decode) {
-        kernels::launch_recurrent_gated_delta_step(
-            la.q_norm.data(), la.k_norm.data(), la.v_fp32.data(),
-            la.g_log.data(), la.beta.data(),
-            state_cache.recurrent_state(layer_idx),
-            la.core_out.data(),
-            /*B=*/1, V_h, K_d, V_d, stream);
-    } else {
-        // Sequential per-token loop (Phase-5 simplification).
-        kernels::launch_chunk_gated_delta_prefill(
-            la.q_norm.data(), la.k_norm.data(), la.v_fp32.data(),
-            la.g_log.data(), la.beta.data(),
-            state_cache.recurrent_state(layer_idx),
-            la.core_out.data(),
-            N, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+    // Both decode and prefill: one batched launch over (R, V_h) blocks
+    // with per-block slot (and on prefill, qo_indptr) indirection.
+    // Decode = one token per request; prefill = each block walks its
+    // own T_r-token window from `qo_indptr_d` along the recurrence.
+    {
+        const std::size_t qk_step = static_cast<std::size_t>(V_h) * K_d;
+        const std::size_t v_step  = static_cast<std::size_t>(V_dim);
+        const std::size_t gh_step = static_cast<std::size_t>(V_h);
+        if (is_pure_decode) {
+            if (slot_ids_d != nullptr) {
+                kernels::launch_recurrent_gated_delta_step_batched(
+                    la.q_norm.data(),
+                    la.k_norm.data(),
+                    la.v_fp32.data(),
+                    la.g_log.data(),
+                    la.beta.data(),
+                    state_cache.recurrent_state(layer_idx, /*slot=*/0),
+                    slot_ids_d,
+                    static_cast<long long>(
+                        state_cache.recurrent_slot_stride_floats()),
+                    la.core_out.data(),
+                    R, V_h, K_d, V_d, stream);
+            } else {
+                kernels::launch_recurrent_gated_delta_step(
+                    la.q_norm.data(),
+                    la.k_norm.data(),
+                    la.v_fp32.data(),
+                    la.g_log.data(),
+                    la.beta.data(),
+                    state_cache.recurrent_state(layer_idx, 0),
+                    la.core_out.data(),
+                    /*B=*/1, V_h, K_d, V_d, stream);
+            }
+        } else {
+            if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
+                kernels::launch_chunk_gated_delta_prefill_batched(
+                    la.q_norm.data(),
+                    la.k_norm.data(),
+                    la.v_fp32.data(),
+                    la.g_log.data(),
+                    la.beta.data(),
+                    state_cache.recurrent_state(layer_idx, /*slot=*/0),
+                    slot_ids_d, qo_indptr_d,
+                    static_cast<long long>(
+                        state_cache.recurrent_slot_stride_floats()),
+                    la.core_out.data(),
+                    R, V_h, K_d, V_d, stream);
+            } else {
+                for (int r = 0; r < R; ++r) {
+                    const int t0 = static_cast<int>(qo_indptr_h[r]);
+                    const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
+                    if (Nr <= 0) continue;
+                    const std::size_t qk_off = static_cast<std::size_t>(t0) * qk_step;
+                    const std::size_t v_off  = static_cast<std::size_t>(t0) * v_step;
+                    const std::size_t gh_off = static_cast<std::size_t>(t0) * gh_step;
+                    kernels::launch_chunk_gated_delta_prefill(
+                        la.q_norm.data() + qk_off,
+                        la.k_norm.data() + qk_off,
+                        la.v_fp32.data() + v_off,
+                        la.g_log.data()  + gh_off,
+                        la.beta.data()   + gh_off,
+                        state_cache.recurrent_state(layer_idx, slot_for(r)),
+                        la.core_out.data() + v_off,
+                        Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                }
+            }
+        }
     }
 
     // ── core_out → bf16, then RMSNormGated with z ──────────────────
@@ -403,22 +516,32 @@ void qwen3_5_forward_paged(
     int total_tokens, int num_requests,
     bool is_pure_decode,
     const std::uint8_t* /*mask_d*/,
-    const std::int32_t* /*mask_indptr_d*/)
+    const std::int32_t* /*mask_indptr_d*/,
+    const std::int32_t* slot_ids_h,
+    const std::uint8_t* is_fresh_h,
+    const std::int32_t* slot_ids_d)
 {
-    if (num_requests != 1) {
-        throw std::runtime_error(
-            "qwen3_5_forward_paged: multi-request batching not yet "
-            "supported on the linear-attn path; got R=" +
-            std::to_string(num_requests));
-    }
     const int H  = cfg.hidden_size;
     const int V  = cfg.vocab_size;
     const int N  = total_tokens;
+    const int R  = num_requests;
     const float eps = cfg.rms_norm_eps;
     cudaStream_t stream = nullptr;
 
-    // Prefill pulls fresh state — reset linear-attn caches.
-    if (!is_pure_decode) {
+    // Per-slot reset for any request whose slot was just (re)assigned.
+    // The runtime guarantees a slot is_fresh only on the first fire of a
+    // context (which is always a prefill), so zeroing here matches the
+    // "fresh state before consumption" semantic without disturbing
+    // continuing decodes that share the fire. Legacy path (slot_ids_h
+    // null) keeps the old "reset all on prefill" behaviour for the
+    // parity entry point; max_slots == 1 there makes the two equivalent.
+    if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
+        for (int r = 0; r < R; ++r) {
+            if (is_fresh_h[r]) {
+                state_cache.reset_slot(slot_ids_h[r], stream);
+            }
+        }
+    } else if (!is_pure_decode) {
         state_cache.reset(stream);
     }
 
@@ -446,7 +569,9 @@ void qwen3_5_forward_paged(
         if (Lw.kind == Qwen3_5LayerWeights::Kind::LinearAttn) {
             linear_attn_layer_body(
                 Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
-                static_cast<int>(L), N, is_pure_decode, cublas, stream);
+                static_cast<int>(L), N, R, is_pure_decode,
+                slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
+                cublas, stream);
         } else {
             full_attn_layer_body(
                 Lw, cfg, fwd_cfg, ws, la_ws, cache, attn_ws, decode_plan, Lw.kv_layer,

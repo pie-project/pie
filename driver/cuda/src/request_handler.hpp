@@ -18,6 +18,7 @@
 #include "forward_graph.hpp"
 #include "model/llama_like.hpp"
 #include "persistent_inputs.hpp"
+#include "slot_allocator.hpp"
 
 namespace pie_cuda_driver {
 
@@ -86,7 +87,10 @@ struct ForwardFn {
         int                  /* num_requests R */,
         bool                 /* is_pure_decode */,
         const std::uint8_t*  /* custom_mask_d  (nullable) */,
-        const std::int32_t*  /* custom_mask_indptr_d (nullable) */
+        const std::int32_t*  /* custom_mask_indptr_d (nullable) */,
+        const std::int32_t*  /* slot_ids_h     host, len R, nullable */,
+        const std::uint8_t*  /* is_fresh_h     host, len R, nullable */,
+        const std::int32_t*  /* slot_ids_d     device, len R, nullable */
     )>;
 
     using PrepareFn = std::function<void(
@@ -142,6 +146,12 @@ struct ForwardContext {
     // before invoking the forward kernels. On TP followers a parallel
     // service loop (`tp_follower_serve`) consumes those broadcasts.
     NcclComm* tp_comm = nullptr;
+
+    // Per-request linear-attention state-cache slot mapping. Rank 0
+    // owns the LRU; followers receive the pre-resolved slot_ids and
+    // is_fresh flags via NCCL broadcast (see tp_broadcast_inputs).
+    // Inert on archs that don't use a linear-attention state cache.
+    SlotAllocator slot_alloc;
 };
 
 // Decode a `fire_batch` BPIQ payload, run the forward pass + sampling

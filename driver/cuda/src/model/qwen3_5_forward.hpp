@@ -102,17 +102,24 @@ void prepare_qwen3_5_decode_plan(
     cudaStream_t stream = nullptr);
 
 // Forward pass over `total_tokens` tokens packed as a flat [N, H]
-// stream. The state caches are SINGLE-REQUEST for now — `R == 1` is
-// enforced; multi-request batching for the linear-attn path will land
-// alongside Phase 5's chunked DeltaNet.
+// stream. Multi-request batching: `slot_ids_h[r]` selects the
+// per-request slab inside the linear-attn state cache; `is_fresh_h[r]`
+// tells the body to zero that slab before consuming it (a request
+// whose slot was just (re)assigned must be fed a prefill — guaranteed
+// by the runtime's eviction → re-prefill invariant). `slot_ids_d` is
+// the same array on device, consumed by the batched kernels.
+//
+// All three are nullable. nullptr → legacy single-request mode (slot 0,
+// fresh on prefill, sticky on decode); used by the parity entry point.
+// Multi-request callers must pass all three non-null.
 //
 // Routes through:
-//   * `is_pure_decode = true`: reads state, runs the recurrent step,
-//     updates state. Conv/recurrent caches must be pre-warmed by a
-//     prior prefill call.
-//   * `is_pure_decode = false` (prefill): resets the state caches,
-//     runs the sequential per-token recurrence (Phase-5 simplification),
-//     persists final state.
+//   * `is_pure_decode = true`: batched recurrent step over (R, V_h)
+//     blocks, slot-indexed per request.
+//   * `is_pure_decode = false` (prefill): zeroes the slot for each
+//     request flagged `is_fresh`, then runs the batched chunked
+//     DeltaNet prefill — one block per (request, head) walking that
+//     request's `qo_indptr` window.
 void qwen3_5_forward_paged(
     const Qwen3_5Weights& w,
     const HfConfig& cfg,
@@ -135,6 +142,9 @@ void qwen3_5_forward_paged(
     int total_tokens, int num_requests,
     bool is_pure_decode,
     const std::uint8_t* mask_d,
-    const std::int32_t* mask_indptr_d);
+    const std::int32_t* mask_indptr_d,
+    const std::int32_t* slot_ids_h = nullptr,
+    const std::uint8_t* is_fresh_h = nullptr,
+    const std::int32_t* slot_ids_d = nullptr);
 
 }  // namespace pie_cuda_driver::model

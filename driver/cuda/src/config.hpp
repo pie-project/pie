@@ -38,6 +38,14 @@ struct BatchingConfig {
     std::uint32_t max_batch_size = 512;
     // Pinned host KV slots for swap-out. 0 = swap disabled.
     std::uint32_t swap_pool_size = 0;
+    // Cap for the linear-attention state cache slot count (Qwen3.5/3.6).
+    // 0 = "follow max_batch_size" — fine on small/medium models. Bound it
+    // explicitly on huge MoE × wide max_batch_size combos to avoid OOM:
+    //   per-slot bytes ≈ num_linear_layers
+    //                  * (V_h * K_d * V_d * 4   // recurrent_state fp32
+    //                     + conv_K * conv_dim * 2)  // conv_state bf16
+    // Qwen3.6-35B-A3B at max_batch_size=2048 → ~48 GB; 256 → ~6 GB.
+    std::uint32_t linear_attn_max_slots = 0;
 };
 
 // Tensor-parallel group geometry. Default {1, 0, ""} = single-GPU; nothing
@@ -85,6 +93,8 @@ inline Config load_config(const std::filesystem::path& path) {
         c.batching.max_batch_tokens = (*b)["max_batch_tokens"].value_or<int64_t>(c.batching.max_batch_tokens);
         c.batching.max_batch_size   = (*b)["max_batch_size"].value_or<int64_t>(c.batching.max_batch_size);
         c.batching.swap_pool_size   = (*b)["swap_pool_size"].value_or<int64_t>(c.batching.swap_pool_size);
+        c.batching.linear_attn_max_slots = (*b)["linear_attn_max_slots"]
+            .value_or<int64_t>(c.batching.linear_attn_max_slots);
     }
     if (auto d = tbl["distributed"].as_table()) {
         c.distributed.tp_size = static_cast<int>(

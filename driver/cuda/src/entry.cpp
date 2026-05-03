@@ -76,9 +76,10 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                const std::string& tokens_in,
                const std::string& logits_out,
                bool paged,
-               bool decode_after_prefill = false)
+               bool decode_after_prefill = false,
+               pie_cuda_driver::NcclComm* tp_comm = nullptr)
 {
-    auto engine = pie_cuda_driver::Engine::load(cfg);
+    auto engine = pie_cuda_driver::Engine::load(cfg, tp_comm);
     const auto& mt_for_parity = engine.hf_config().model_type;
     const bool is_gpt_oss  = (mt_for_parity == "gpt_oss");
     const bool is_gemma3n  = (mt_for_parity == "gemma3n" || mt_for_parity == "gemma3n_text");
@@ -305,8 +306,8 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             } else if (is_qwen3_5) {
                 pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
                 q35_fwd.force_prefill_path = !decode_after_prefill;
-                q35_fwd.tp_size = 1;
-                q35_fwd.tp_comm = nullptr;
+                q35_fwd.tp_size = cfg.distributed.tp_size;
+                q35_fwd.tp_comm = tp_comm;
                 pie_cuda_driver::model::Qwen3_5PlanState q35_plan;
                 pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
                     q35_plan, parity_attn_ws, cache, engine.hf_config(),
@@ -325,8 +326,8 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             } else if (is_qwen3_5_moe) {
                 pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
                 q35_fwd.force_prefill_path = !decode_after_prefill;
-                q35_fwd.tp_size = 1;
-                q35_fwd.tp_comm = nullptr;
+                q35_fwd.tp_size = cfg.distributed.tp_size;
+                q35_fwd.tp_comm = tp_comm;
                 pie_cuda_driver::model::Qwen3_5PlanState q35_plan;
                 pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
                     q35_plan, parity_attn_ws, cache, engine.hf_config(),
@@ -482,11 +483,42 @@ int run_impl(int argc,
     app.add_option("--control-fd", control_fd,
                    "Pre-opened SOCK_SEQPACKET fd for the wrapper control "
                    "channel (copy_d2h / copy_h2d / copy_d2d / copy_h2h).");
+
+    // Tensor-parallel knobs. Override [distributed] in the TOML when
+    // present so the wrapper can launch ad-hoc TP groups without
+    // rewriting the config file. Empty unique-id means "fall back to
+    // TOML".
+    int cli_tp_size = -1, cli_tp_rank = -1;
+    std::string cli_nccl_unique_id_hex;
+    app.add_option("--tp-size", cli_tp_size,
+                   "Tensor-parallel world size (overrides [distributed].tp_size).");
+    app.add_option("--tp-rank", cli_tp_rank,
+                   "This process's rank in the TP group (0..tp_size).");
+    app.add_option("--nccl-unique-id-hex", cli_nccl_unique_id_hex,
+                   "Hex-encoded ncclUniqueId shared across all ranks of "
+                   "the TP group. Only required when tp_size > 1.");
+
     CLI11_PARSE(app, argc, argv);
 
-    const auto cfg = pie_cuda_driver::load_config(config_path);
+    auto cfg = pie_cuda_driver::load_config(config_path);
+    if (cli_tp_size >= 1) cfg.distributed.tp_size = cli_tp_size;
+    if (cli_tp_rank >= 0) cfg.distributed.tp_rank = cli_tp_rank;
+    if (!cli_nccl_unique_id_hex.empty())
+        cfg.distributed.nccl_unique_id_hex = cli_nccl_unique_id_hex;
+    if (cfg.distributed.tp_size > 1 &&
+        cfg.distributed.tp_rank > 0 &&
+        cfg.distributed.nccl_unique_id_hex.empty()) {
+        std::cerr << "[pie-driver-cuda] rank " << cfg.distributed.tp_rank
+                  << " requires --nccl-unique-id-hex "
+                  << "(or [distributed].nccl_unique_id_hex)\n";
+        return 1;
+    }
 
     if (!parity_tokens.empty()) {
+        // Parity argument validation up-front so we don't go through
+        // NCCL bootstrap only to fail on bad CLI. The actual parity
+        // dispatch is deferred until after NCCL init so a TP-mode
+        // parity test can drive collectives.
         if (parity_out.empty()) {
             std::cerr << "--parity-tokens requires --parity-out\n";
             return 1;
@@ -495,8 +527,6 @@ int run_impl(int argc,
             std::cerr << "--parity-decode-after-prefill requires --parity-paged\n";
             return 1;
         }
-        return run_parity(cfg, parity_tokens, parity_out, parity_paged,
-                          parity_decode_after_prefill);
     }
 
     // Informational logs go to stderr — stdout is reserved for the READY
@@ -506,9 +536,88 @@ int run_impl(int argc,
               << "  shmem.num_slots = " << cfg.shmem.num_slots << "\n"
               << "  model.hf_repo   = " << cfg.model.hf_repo << "\n"
               << "  model.device    = " << cfg.model.device << "\n"
-              << "  model.dtype     = " << cfg.model.dtype << "\n";
+              << "  model.dtype     = " << cfg.model.dtype << "\n"
+              << "  tp_size         = " << cfg.distributed.tp_size << "\n"
+              << "  tp_rank         = " << cfg.distributed.tp_rank << "\n";
 
-    auto engine = pie_cuda_driver::Engine::load(cfg);
+    // Bind the requested CUDA device before NCCL init — ncclCommInitRank
+    // captures whatever is current on the calling thread.
+    {
+        const std::string& dev = cfg.model.device;
+        const auto colon = dev.find(':');
+        const int dev_id = (colon == std::string::npos)
+            ? 0
+            : std::atoi(dev.c_str() + colon + 1);
+        CUDA_CHECK(cudaSetDevice(dev_id));
+    }
+
+    pie_cuda_driver::NcclComm tp_comm;
+    if (cfg.distributed.tp_size > 1) {
+        // ncclGetUniqueId opens a TCP bootstrap listener inside the
+        // calling process — it must outlive the rendezvous. Rank 0
+        // generates the id (when no id was passed in), prints it on
+        // stdout for the wrapper to relay, then proceeds straight into
+        // ncclCommInitRank. Followers receive the id from the wrapper
+        // via --nccl-unique-id-hex / [distributed].nccl_unique_id_hex.
+        ncclUniqueId uid;
+        if (cfg.distributed.tp_rank == 0 &&
+            cfg.distributed.nccl_unique_id_hex.empty()) {
+            NCCL_CHECK(ncclGetUniqueId(&uid));
+            const auto hex = pie_cuda_driver::nccl_unique_id_to_hex(uid);
+            std::cout << "NCCL_UID " << hex << std::endl;
+        } else {
+            uid = pie_cuda_driver::nccl_unique_id_from_hex(
+                cfg.distributed.nccl_unique_id_hex);
+        }
+        tp_comm = pie_cuda_driver::NcclComm(
+            cfg.distributed.tp_size, cfg.distributed.tp_rank, uid);
+        std::cerr << "[pie-driver-cuda] NCCL comm initialised "
+                  << "(world=" << tp_comm.world_size()
+                  << ", rank=" << tp_comm.rank() << ")\n";
+
+        // Smoke test: every rank contributes (rank+1); sum should be
+        // world*(world+1)/2. Catches mis-numbered ranks at startup.
+        cudaStream_t s = nullptr;
+        CUDA_CHECK(cudaStreamCreate(&s));
+        int* d_v = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_v, sizeof(int)));
+        const int rank1 = cfg.distributed.tp_rank + 1;
+        CUDA_CHECK(cudaMemcpyAsync(d_v, &rank1, sizeof(int),
+                                   cudaMemcpyHostToDevice, s));
+        NCCL_CHECK(ncclAllReduce(d_v, d_v, 1, ncclInt32, ncclSum,
+                                 tp_comm.comm(), s));
+        int h_v = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&h_v, d_v, sizeof(int),
+                                   cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        CUDA_CHECK(cudaFree(d_v));
+        CUDA_CHECK(cudaStreamDestroy(s));
+        const int W = cfg.distributed.tp_size;
+        const int expected = W * (W + 1) / 2;
+        if (h_v != expected) {
+            std::cerr << "[pie-driver-cuda] NCCL smoke test FAILED: got "
+                      << h_v << ", expected " << expected << "\n";
+            return 3;
+        }
+        std::cerr << "[pie-driver-cuda] NCCL smoke test ok ("
+                  << h_v << "==" << expected << ")\n";
+    }
+    pie_cuda_driver::NcclComm* tp_comm_ptr =
+        (cfg.distributed.tp_size > 1) ? &tp_comm : nullptr;
+
+    // Parity mode: every rank participates so collectives complete;
+    // only rank 0 dumps logits to disk. The harness compares rank 0's
+    // output against a single-GPU reference run.
+    if (!parity_tokens.empty()) {
+        const std::string out_path = (cfg.distributed.tp_rank == 0)
+            ? parity_out
+            : (parity_out + ".rank" +
+               std::to_string(cfg.distributed.tp_rank));
+        return run_parity(cfg, parity_tokens, out_path, parity_paged,
+                          parity_decode_after_prefill, tp_comm_ptr);
+    }
+
+    auto engine = pie_cuda_driver::Engine::load(cfg, tp_comm_ptr);
 
     {
         const auto& mt = engine.hf_config().model_type;
@@ -700,11 +809,48 @@ int run_impl(int argc,
                    pie_cuda_driver::model::Qwen3_5MoeLayerWeights::Kind::LinearAttn);
             layer_is_linear[L] = is_linear;
         }
+        // Allocate per-slot state for the linear-attn layers.
+        //   linear_attn_max_slots = 0 → follow max_batch_size (default,
+        //                               fine for small/medium models)
+        //   linear_attn_max_slots > 0 → explicit cap to bound VRAM on
+        //                               huge MoE × wide max_batch_size
+        // Reducing max_slots below max_batch_size doesn't constrain
+        // overall serving throughput — the runtime will simply hold
+        // more contexts in cooler LRU positions and re-prefill them
+        // when their slots are reassigned.
+        const int q35_max_slots =
+            std::max<int>(1,
+                cfg.batching.linear_attn_max_slots > 0
+                    ? std::min<std::uint32_t>(
+                          cfg.batching.linear_attn_max_slots,
+                          cfg.batching.max_batch_size)
+                    : cfg.batching.max_batch_size);
         qwen3_5_state_cache = pie_cuda_driver::Qwen3_5StateCache::allocate(
             layer_is_linear, conv_dim, cfg_q.linear_conv_kernel_dim,
             cfg_q.linear_num_value_heads,
             cfg_q.linear_key_head_dim,
-            cfg_q.linear_value_head_dim);
+            cfg_q.linear_value_head_dim,
+            q35_max_slots);
+        const std::size_t per_slot_recurrent_bytes =
+            static_cast<std::size_t>(cfg_q.linear_num_value_heads) *
+            cfg_q.linear_key_head_dim *
+            cfg_q.linear_value_head_dim * sizeof(float);
+        const std::size_t per_slot_conv_bytes =
+            static_cast<std::size_t>(cfg_q.linear_conv_kernel_dim) *
+            conv_dim * sizeof(std::uint16_t);
+        const std::size_t num_linear_layers = std::count(
+            layer_is_linear.begin(), layer_is_linear.end(), true);
+        const std::size_t total_bytes = num_linear_layers *
+            static_cast<std::size_t>(q35_max_slots) *
+            (per_slot_recurrent_bytes + per_slot_conv_bytes);
+        std::cerr << "[pie-driver-cuda] qwen3.5 state cache: "
+                  << num_linear_layers << " linear layers, "
+                  << q35_max_slots << " slots, "
+                  << (per_slot_recurrent_bytes + per_slot_conv_bytes)
+                  << " B/slot (recurrent="
+                  << per_slot_recurrent_bytes << " conv="
+                  << per_slot_conv_bytes << "), total ~"
+                  << (total_bytes / (1024 * 1024)) << " MiB\n";
 
         if (is_qwen3_5_moe_arch) {
             qwen3_5_moe_ws = pie_cuda_driver::model::Qwen3_5MoeMlpWorkspace::allocate(
@@ -786,47 +932,62 @@ int run_impl(int argc,
         });
     }
 
-    pie_cuda_driver::ShmemServer server(
-        cfg.shmem.name,
-        cfg.shmem.num_slots,
-        cfg.shmem.req_buf,
-        cfg.shmem.resp_buf,
-        cfg.shmem.spin_us);
-    g_server.store(&server);
+    // Followers skip the shmem server: rank 0 owns the shmem fast path
+    // and broadcasts each fire to followers via NCCL. tp_follower_serve
+    // (entered at the end of run_impl) consumes those broadcasts and
+    // exits via `tp_send_shutdown` from rank 0 once the next broadcast
+    // completes.
+    const bool is_tp_follower =
+        cfg.distributed.tp_size > 1 && cfg.distributed.tp_rank > 0;
+    std::unique_ptr<pie_cuda_driver::ShmemServer> server_p;
+    if (!is_tp_follower) {
+        server_p = std::make_unique<pie_cuda_driver::ShmemServer>(
+            cfg.shmem.name,
+            cfg.shmem.num_slots,
+            cfg.shmem.req_buf,
+            cfg.shmem.resp_buf,
+            cfg.shmem.spin_us);
+        g_server.store(server_p.get());
+    }
 
     if (install_signal_handlers) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
     }
 
-    // Capabilities reflect both the loaded HF config and the live KV cache.
-    auto c = engine.capabilities();
-    c.total_pages = kv_cache.num_pages();
-    c.max_batch_tokens = max_workspace_tokens;
-    c.swap_pool_size = swap_pool.num_pages();
-    nlohmann::json caps = {
-        {"total_pages",      c.total_pages},
-        {"kv_page_size",     c.kv_page_size},
-        {"swap_pool_size",   c.swap_pool_size},
-        {"max_batch_tokens", c.max_batch_tokens},
-        {"max_batch_size",   c.max_batch_size},
-        {"arch_name",        c.arch_name},
-        {"vocab_size",       c.vocab_size},
-        {"max_model_len",    c.max_model_len},
-        {"activation_dtype", c.activation_dtype},
-        {"snapshot_dir",     c.snapshot_dir},
-        {"shmem_name",       cfg.shmem.name},
-    };
-    // Hand caps to the host. Standalone executable's default callback
-    // writes `READY <json>` to stdout (the Python wrapper greps for
-    // `^READY `); library callers route the JSON wherever they want.
-    const std::string caps_json = caps.dump();
-    ready_cb(caps_json.c_str(), ready_ctx);
+    if (!is_tp_follower) {
+        // Capabilities reflect both the loaded HF config and the live
+        // KV cache. Only rank 0 reports — the wrapper expects exactly
+        // one READY per TP group.
+        auto c = engine.capabilities();
+        c.total_pages = kv_cache.num_pages();
+        c.max_batch_tokens = max_workspace_tokens;
+        c.swap_pool_size = swap_pool.num_pages();
+        nlohmann::json caps = {
+            {"total_pages",      c.total_pages},
+            {"kv_page_size",     c.kv_page_size},
+            {"swap_pool_size",   c.swap_pool_size},
+            {"max_batch_tokens", c.max_batch_tokens},
+            {"max_batch_size",   c.max_batch_size},
+            {"arch_name",        c.arch_name},
+            {"vocab_size",       c.vocab_size},
+            {"max_model_len",    c.max_model_len},
+            {"activation_dtype", c.activation_dtype},
+            {"snapshot_dir",     c.snapshot_dir},
+            {"shmem_name",       cfg.shmem.name},
+        };
+        const std::string caps_json = caps.dump();
+        ready_cb(caps_json.c_str(), ready_ctx);
 
-    std::cerr << "[pie-driver-cuda] serving on shmem " << server.name()
-              << " (" << server.num_slots() << " slots, "
-              << "req_buf=" << server.req_buf_size() << ", "
-              << "resp_buf=" << server.resp_buf_size() << ")\n";
+        std::cerr << "[pie-driver-cuda] serving on shmem " << server_p->name()
+                  << " (" << server_p->num_slots() << " slots, "
+                  << "req_buf=" << server_p->req_buf_size() << ", "
+                  << "resp_buf=" << server_p->resp_buf_size() << ")\n";
+    } else {
+        std::cerr << "[pie-driver-cuda] tp follower rank "
+                  << cfg.distributed.tp_rank
+                  << " ready (waiting on rank-0 broadcasts)\n";
+    }
 
     std::uint64_t handled = 0;
 
@@ -868,6 +1029,10 @@ int run_impl(int argc,
         const bool gqa_in_decode_set = (gqa == 1 || gqa == 2 || gqa == 3
                                         || gqa == 4 || gqa == 8);
         fwd_cfg.force_prefill_path = !gqa_in_decode_set;
+        // Tensor-parallel state. tp_comm == nullptr at tp_size == 1
+        // keeps the original single-GPU branches in the forward kernels.
+        fwd_cfg.tp_size = cfg.distributed.tp_size;
+        fwd_cfg.tp_comm = tp_comm_ptr;
 
         // Gemma-2 / Gemma-3 forward knobs. `query_pre_attn_scalar` and
         // `final_logit_softcapping` come straight from the HF config —
@@ -877,6 +1042,8 @@ int run_impl(int argc,
         gemma_fwd_cfg.attn_logit_softcap    = hf.gemma_attn_logit_softcap;
         gemma_fwd_cfg.use_qk_norm           = (mt == "gemma3" || mt == "gemma3_text");
         gemma_fwd_cfg.force_prefill_path    = !gqa_in_decode_set;
+        gemma_fwd_cfg.tp_size = cfg.distributed.tp_size;
+        gemma_fwd_cfg.tp_comm = tp_comm_ptr;
 
         // Build the per-layer attention type → window_left + rope_theta
         // tables. Sliding layers get the configured window; full layers
@@ -916,6 +1083,8 @@ int run_impl(int argc,
         const bool gqa_in_decode_set = (gqa == 1 || gqa == 2 || gqa == 3
                                         || gqa == 4 || gqa == 8);
         gemma4_fwd_cfg.force_prefill_path = !gqa_in_decode_set;
+        gemma4_fwd_cfg.tp_size = cfg.distributed.tp_size;
+        gemma4_fwd_cfg.tp_comm = tp_comm_ptr;
     }
 
     // Build the type-erased forward closure once. The captures live in
@@ -950,7 +1119,9 @@ int run_impl(int argc,
             const std::uint32_t* qo_indptr_h,
             const std::uint32_t* kv_page_indptr_h,
             int N, int R, bool is_pure_decode,
-            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d) {
             pie_cuda_driver::model::gemma4_forward_paged(
                 weights_gemma4, engine.hf_config(), gemma4_fwd_cfg,
                 ws, gemma4_moe_ws, cache, attn_ws, cublas,
@@ -966,6 +1137,8 @@ int run_impl(int argc,
         // with a clear message at the first fire_batch.
         pie_cuda_driver::model::Gemma3nForwardCfg gemma3n_fwd_cfg{};
         gemma3n_fwd_cfg.final_logit_softcap = engine.hf_config().gemma_final_logit_softcap;
+        gemma3n_fwd_cfg.tp_size = cfg.distributed.tp_size;
+        gemma3n_fwd_cfg.tp_comm = tp_comm_ptr;
         forward_fn = [&engine, &weights_gemma3n, gemma3n_fwd_cfg](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
@@ -979,7 +1152,9 @@ int run_impl(int argc,
             const std::uint32_t* qo_indptr_h,
             const std::uint32_t* kv_page_indptr_h,
             int N, int R, bool is_pure_decode,
-            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d) {
             pie_cuda_driver::model::gemma3n_forward_paged(
                 weights_gemma3n, engine.hf_config(), gemma3n_fwd_cfg,
                 ws, cache, attn_ws, cublas,
@@ -1002,7 +1177,9 @@ int run_impl(int argc,
             const std::uint32_t* qo_indptr_h,
             const std::uint32_t* kv_page_indptr_h,
             int N, int R, bool is_pure_decode,
-            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d) {
             pie_cuda_driver::model::gemma2_forward_paged(
                 weights_gemma, engine.hf_config(), gemma_fwd_cfg,
                 ws, cache, attn_ws, cublas,
@@ -1030,7 +1207,9 @@ int run_impl(int argc,
             const std::uint32_t* qo_indptr_h,
             const std::uint32_t* kv_page_indptr_h,
             int N, int R, bool is_pure_decode,
-            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d) {
             pie_cuda_driver::model::mixtral_forward_paged(
                 weights_mixtral, engine.hf_config(), fwd_cfg,
                 num_experts, top_k,
@@ -1041,7 +1220,10 @@ int run_impl(int argc,
                 N, R, is_pure_decode, mask_d, mask_indptr_d);
         };
     } else if (is_qwen3_5_arch) {
-        forward_fn.prepare = [&engine, &kv_cache, &qwen3_5_plan_state](
+        const int q35_tp_size = cfg.distributed.tp_size;
+        pie_cuda_driver::NcclComm* q35_tp_comm = tp_comm_ptr;
+        forward_fn.prepare = [&engine, &kv_cache, &qwen3_5_plan_state,
+                              q35_tp_size, q35_tp_comm](
             pie_cuda_driver::AttentionWorkspace& attn_ws,
             const std::uint32_t* kv_page_indptr_h,
             int R, bool is_pure_decode) {
@@ -1052,14 +1234,15 @@ int run_impl(int argc,
             q35_fwd.force_prefill_path =
                 !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
                   gqa_q == 4 || gqa_q == 8);
-            q35_fwd.tp_size = 1;
-            q35_fwd.tp_comm = nullptr;
+            q35_fwd.tp_size = q35_tp_size;
+            q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
                 qwen3_5_plan_state, attn_ws, kv_cache, engine.hf_config(),
                 q35_fwd, kv_page_indptr_h, R, is_pure_decode);
         };
         forward_fn.body = [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
-                           &qwen3_5_state_cache, &qwen3_5_plan_state](
+                           &qwen3_5_state_cache, &qwen3_5_plan_state,
+                           q35_tp_size, q35_tp_comm](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -1072,7 +1255,9 @@ int run_impl(int argc,
             const std::uint32_t* qo_indptr_h,
             const std::uint32_t* kv_page_indptr_h,
             int N, int R, bool is_pure_decode,
-            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
             const auto& hf_q = engine.hf_config();
             const int gqa_q = hf_q.num_attention_heads /
@@ -1080,8 +1265,8 @@ int run_impl(int argc,
             q35_fwd.force_prefill_path =
                 !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
                   gqa_q == 4 || gqa_q == 8);
-            q35_fwd.tp_size = 1;
-            q35_fwd.tp_comm = nullptr;
+            q35_fwd.tp_size = q35_tp_size;
+            q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::qwen3_5_forward_paged(
                 weights_qwen3_5, engine.hf_config(), q35_fwd, qwen3_5_plan_state,
                 ws, qwen3_5_la_ws, cache, qwen3_5_state_cache,
@@ -1089,10 +1274,14 @@ int run_impl(int argc,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, is_pure_decode, mask_d, mask_indptr_d);
+                N, R, is_pure_decode, mask_d, mask_indptr_d,
+                slot_ids_h, is_fresh_h, slot_ids_d);
         };
     } else if (is_qwen3_5_moe_arch) {
-        forward_fn.prepare = [&engine, &kv_cache, &qwen3_5_plan_state](
+        const int q35moe_tp_size = cfg.distributed.tp_size;
+        pie_cuda_driver::NcclComm* q35moe_tp_comm = tp_comm_ptr;
+        forward_fn.prepare = [&engine, &kv_cache, &qwen3_5_plan_state,
+                              q35moe_tp_size, q35moe_tp_comm](
             pie_cuda_driver::AttentionWorkspace& attn_ws,
             const std::uint32_t* kv_page_indptr_h,
             int R, bool is_pure_decode) {
@@ -1103,15 +1292,16 @@ int run_impl(int argc,
             q35_fwd.force_prefill_path =
                 !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
                   gqa_q == 4 || gqa_q == 8);
-            q35_fwd.tp_size = 1;
-            q35_fwd.tp_comm = nullptr;
+            q35_fwd.tp_size = q35moe_tp_size;
+            q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
                 qwen3_5_plan_state, attn_ws, kv_cache, engine.hf_config(),
                 q35_fwd, kv_page_indptr_h, R, is_pure_decode);
         };
         forward_fn.body = [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
                            &qwen3_5_moe_ws, &qwen3_5_state_cache,
-                           &qwen3_5_plan_state](
+                           &qwen3_5_plan_state,
+                           q35moe_tp_size, q35moe_tp_comm](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -1124,7 +1314,9 @@ int run_impl(int argc,
             const std::uint32_t* qo_indptr_h,
             const std::uint32_t* kv_page_indptr_h,
             int N, int R, bool is_pure_decode,
-            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
             const auto& hf_q = engine.hf_config();
             const int gqa_q = hf_q.num_attention_heads /
@@ -1132,8 +1324,8 @@ int run_impl(int argc,
             q35_fwd.force_prefill_path =
                 !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
                   gqa_q == 4 || gqa_q == 8);
-            q35_fwd.tp_size = 1;
-            q35_fwd.tp_comm = nullptr;
+            q35_fwd.tp_size = q35moe_tp_size;
+            q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::qwen3_5_moe_forward_paged(
                 weights_qwen3_5_moe, engine.hf_config(), q35_fwd,
                 qwen3_5_plan_state,
@@ -1143,7 +1335,8 @@ int run_impl(int argc,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, is_pure_decode, mask_d, mask_indptr_d);
+                N, R, is_pure_decode, mask_d, mask_indptr_d,
+                slot_ids_h, is_fresh_h, slot_ids_d);
         };
     } else {
         static pie_cuda_driver::model::LlamaLikePlanState s_llama_plan;
@@ -1168,7 +1361,9 @@ int run_impl(int argc,
             const std::uint32_t* qo_indptr_h,
             const std::uint32_t* kv_page_indptr_h,
             int N, int R, bool is_pure_decode,
-            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d) {
             pie_cuda_driver::model::llama_like_forward_paged(
                 weights_llama, engine.hf_config(), fwd_cfg, s_llama_plan,
                 ws, cache, attn_ws, cublas,
@@ -1183,21 +1378,43 @@ int run_impl(int argc,
         engine, ws, kv_cache, attn_ws, cublas,
         max_workspace_tokens, persistent_inputs, std::move(forward_fn),
         use_cuda_graphs ? &graph_cache : nullptr,
+        /*tp_comm=*/tp_comm_ptr,
+        /*slot_alloc=*/{},
     };
+    // Size the linear-attn slot allocator only when this arch actually
+    // uses a state cache. Default-constructed (max_slots=0) on every
+    // other arch — handle_fire_batch's `use_slots` predicate stays false
+    // and the body's slot_ids/is_fresh args remain nullptr.
+    if ((is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
+        qwen3_5_state_cache.max_slots() > 0) {
+        fwd_ctx.slot_alloc.reset(qwen3_5_state_cache.max_slots());
+    }
     if (use_cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
     }
 
-    server.serve_forever([&](const pie_cuda_driver::SlotRequest& req,
-                             std::span<std::uint8_t> response) -> std::size_t {
-        ++handled;
-        if (req.method_tag != pie_cuda_driver::METHOD_TAG_FIRE_BATCH) {
-            std::cerr << "[pie-driver-cuda] unsupported method_tag="
-                      << req.method_tag << " req_id=" << req.req_id << "\n";
-            return 0;
+    if (is_tp_follower) {
+        // Followers: block on rank-0 broadcasts until shutdown.
+        std::atomic<bool> stop{false};
+        pie_cuda_driver::tp_follower_serve(fwd_ctx, stop);
+    } else {
+        server_p->serve_forever([&](const pie_cuda_driver::SlotRequest& req,
+                                    std::span<std::uint8_t> response) -> std::size_t {
+            ++handled;
+            if (req.method_tag != pie_cuda_driver::METHOD_TAG_FIRE_BATCH) {
+                std::cerr << "[pie-driver-cuda] unsupported method_tag="
+                          << req.method_tag << " req_id=" << req.req_id << "\n";
+                return 0;
+            }
+            return pie_cuda_driver::handle_fire_batch(
+                req, response, fwd_ctx, handled);
+        });
+        // Leader exited serve loop — wake followers so they can tear
+        // down cleanly.
+        if (cfg.distributed.tp_size > 1) {
+            pie_cuda_driver::tp_send_shutdown(*tp_comm_ptr);
         }
-        return pie_cuda_driver::handle_fire_batch(req, response, fwd_ctx, handled);
-    });
+    }
 
     g_server.store(nullptr);
     std::cerr << "[pie-driver-cuda] shutting down (handled " << handled

@@ -54,4 +54,54 @@ void launch_causal_conv1d_update_bf16(
     int K,
     cudaStream_t stream);
 
+// Multi-request batched decode update. Replaces the host-loop of R
+// single-request `_update_bf16` calls with one kernel launch:
+//
+//     x          : [R, C]            bf16 — one new token per request
+//     y          : [R, C]            bf16 — outputs
+//     state_base : [num_slots, K, C] bf16 — slot 0's address; the kernel
+//                  picks slot `slot_ids[r]` for each request r and reads
+//                  / writes its [K, C] slab in-place
+//     slot_ids   : [R]               int32 (device-resident)
+//     slot_stride_elems : K * C — stride between consecutive slots in
+//                  the state buffer, in bf16 elements
+//
+// Eliminates `R × num_linear_layers` per-token launch overhead on the
+// decode hot path.
+void launch_causal_conv1d_update_batched_bf16(
+    const void* x,
+    const void* weight,
+    const void* bias,
+    void*       state_base,
+    const std::int32_t* slot_ids,
+    long long   slot_stride_elems,
+    void*       y,
+    int R, int C, int K,
+    cudaStream_t stream);
+
+// Multi-request batched prefill. Replaces the host-loop of R
+// single-request `_prefill_bf16` calls with one kernel launch:
+//
+//     x              : [N_total, C]      bf16 — concatenated request tokens
+//     y              : [N_total, C]      bf16 — outputs
+//     state_out_base : [num_slots, K, C] bf16 — slot 0's address
+//     slot_ids       : [R]               int32 device — slot per request
+//     qo_indptr      : [R+1]             u32 device — token offsets per req
+//     slot_stride_elems : K * C bf16 elements
+//
+// Each (channel, request) block reads its own (t0_r, Nr_r) window from
+// qo_indptr and walks tokens internally. The trailing K-window is
+// persisted into the request's state slab for the follow-up decode.
+void launch_causal_conv1d_prefill_batched_bf16(
+    const void* x,
+    const void* weight,
+    const void* bias,
+    void*       y,
+    void*       state_out_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long   slot_stride_elems,
+    int R, int C, int K,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

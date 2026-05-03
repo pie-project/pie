@@ -50,7 +50,10 @@ struct TpFireHeader {
     std::int32_t kv_indices_count;
     std::int32_t mask_bytes;
     std::int32_t mask_indptr_count;
-    std::int32_t reserved;
+    // 1 = slot_ids[R] (int32) and is_fresh[R] (uint8) follow the
+    // existing payload broadcasts. Inert (0) for archs that don't use
+    // a state cache — followers skip those broadcasts.
+    std::int32_t has_slot_ids;
 };
 static_assert(sizeof(TpFireHeader) == 8 * sizeof(std::int32_t),
               "TpFireHeader must pack into exactly 8 ints");
@@ -76,12 +79,14 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                          int N, int R, bool is_pure_decode,
                          int kv_indices_count,
                          int mask_bytes, int mask_indptr_count,
+                         bool has_slot_ids,
                          cudaStream_t stream)
 {
     auto* d_hdr = tp_hdr_dev_buf();
     TpFireHeader hdr{
         TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
-        kv_indices_count, mask_bytes, mask_indptr_count, 0,
+        kv_indices_count, mask_bytes, mask_indptr_count,
+        has_slot_ids ? 1 : 0,
     };
     // Header goes first (synchronous from the followers' POV — they need
     // to parse sizes before posting matching payload broadcasts).
@@ -128,6 +133,14 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                                  static_cast<std::size_t>(mask_indptr_count) * 4,
                                  ncclChar, 0, comm.comm(), stream));
     }
+    if (has_slot_ids && R > 0) {
+        NCCL_CHECK(ncclBroadcast(pi.slot_ids.data(), pi.slot_ids.data(),
+                                 static_cast<std::size_t>(R) * 4, ncclChar, 0,
+                                 comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(pi.is_fresh.data(), pi.is_fresh.data(),
+                                 static_cast<std::size_t>(R), ncclChar, 0,
+                                 comm.comm(), stream));
+    }
     NCCL_CHECK(ncclGroupEnd());
 }
 
@@ -171,6 +184,9 @@ std::size_t handle_fire_batch(
         const auto kvlpl_view_orig = dec.as<std::uint32_t>(S::A_KV_LAST_PAGE_LENS);
         const auto sidx_view_orig  = dec.as<std::uint32_t>(S::A_SAMPLING_INDICES);
         const auto sptr_view_orig  = dec.as<std::uint32_t>(S::A_SAMPLING_INDPTR);
+        // Per-request stable context ids — used to drive the linear-attn
+        // state-cache slot allocator below.
+        const auto ctx_id_view     = dec.as<std::uint64_t>(S::A_CONTEXT_IDS);
 
         // Sampler params (per-sampler arrays in BPIQ wire). Decoded here
         // (rather than further down) so the spec expansion below can
@@ -344,6 +360,29 @@ std::size_t handle_fire_batch(
             }
         }
 
+        // Linear-attention slot allocation. Active only when the
+        // allocator was sized at engine init (max_slots > 0 — i.e.
+        // qwen3.5 / qwen3.6-MoE with any linear-attn layers); a
+        // zero-capacity allocator returns an empty span and the
+        // forward simply ignores the slot args.
+        std::vector<std::int32_t> slot_ids_h;
+        std::vector<std::uint8_t> is_fresh_h;
+        const bool use_slots =
+            ctx.slot_alloc.max_slots() > 0 && R > 0 &&
+            ctx_id_view.size() == static_cast<std::size_t>(R);
+        if (use_slots) {
+            slot_ids_h.resize(R);
+            is_fresh_h.resize(R);
+            for (int r = 0; r < R; ++r) {
+                const auto acq = ctx.slot_alloc.acquire(ctx_id_view[r]);
+                slot_ids_h[r]  = acq.slot;
+                is_fresh_h[r]  = acq.is_fresh ? 1u : 0u;
+            }
+            ctx.slot_alloc.end_of_fire();
+            pi.slot_ids.copy_from_host(std::span<const std::int32_t>(slot_ids_h));
+            pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
+        }
+
         // TP fan-out. Rank 0 broadcasts the per-fire payload (header +
         // refilled persistent_inputs) to every follower so they can run
         // the same forward kernels against an identical view of inputs.
@@ -354,6 +393,7 @@ std::size_t handle_fire_batch(
                                 N, R, is_pure_decode,
                                 static_cast<int>(kvpi_view.size()),
                                 mask_bytes, mask_indptr_count,
+                                /*has_slot_ids=*/use_slots,
                                 /*stream=*/nullptr);
         }
 
@@ -393,7 +433,10 @@ std::size_t handle_fire_batch(
                     pi.qo_indptr.data(), pi.kv_page_indices.data(),
                     pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
                     h_qo, h_kvpp,
-                    N, R, is_pure_decode, nullptr, nullptr);
+                    N, R, is_pure_decode, nullptr, nullptr,
+                    use_slots ? slot_ids_h.data() : nullptr,
+                    use_slots ? is_fresh_h.data() : nullptr,
+                    use_slots ? pi.slot_ids.data() : nullptr);
                 cudaGraph_t graph = nullptr;
                 CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
                 CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
@@ -419,7 +462,10 @@ std::size_t handle_fire_batch(
                 /*kv_page_indptr_h=*/h_kvpp,
                 N, R, is_pure_decode,
                 have_custom_mask ? pi.custom_mask.data()        : nullptr,
-                have_custom_mask ? pi.custom_mask_indptr.data() : nullptr);
+                have_custom_mask ? pi.custom_mask_indptr.data() : nullptr,
+                use_slots ? slot_ids_h.data() : nullptr,
+                use_slots ? is_fresh_h.data() : nullptr,
+                use_slots ? pi.slot_ids.data() : nullptr);
         }
 
         // Sampler param views (temp_view, top_k_view, …, rns_view) were
@@ -760,6 +806,15 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
                                      static_cast<std::size_t>(hdr.mask_indptr_count) * 4,
                                      ncclChar, 0, comm.comm(), stream));
         }
+        const bool have_slot_ids = (hdr.has_slot_ids != 0) && R > 0;
+        if (have_slot_ids) {
+            NCCL_CHECK(ncclBroadcast(pi.slot_ids.data(), pi.slot_ids.data(),
+                                     static_cast<std::size_t>(R) * 4,
+                                     ncclChar, 0, comm.comm(), stream));
+            NCCL_CHECK(ncclBroadcast(pi.is_fresh.data(), pi.is_fresh.data(),
+                                     static_cast<std::size_t>(R),
+                                     ncclChar, 0, comm.comm(), stream));
+        }
         NCCL_CHECK(ncclGroupEnd());
 
         // 3. Pull the host views of qo/kv_page indptrs for the per-arch
@@ -772,6 +827,18 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
         CUDA_CHECK(cudaMemcpyAsync(h_kvpp.data(), pi.kv_page_indptr.data(),
                                    static_cast<std::size_t>(R + 1) * 4,
                                    cudaMemcpyDeviceToHost, stream));
+        std::vector<std::int32_t> h_slot_ids;
+        std::vector<std::uint8_t> h_is_fresh;
+        if (have_slot_ids) {
+            h_slot_ids.resize(R);
+            h_is_fresh.resize(R);
+            CUDA_CHECK(cudaMemcpyAsync(h_slot_ids.data(), pi.slot_ids.data(),
+                                       static_cast<std::size_t>(R) * 4,
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_is_fresh.data(), pi.is_fresh.data(),
+                                       static_cast<std::size_t>(R),
+                                       cudaMemcpyDeviceToHost, stream));
+        }
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // 4. Run the same forward function as rank 0. The all-reduces
@@ -803,7 +870,10 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
                     pi.qo_indptr.data(), pi.kv_page_indices.data(),
                     pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
                     h_qo.data(), h_kvpp.data(),
-                    N, R, is_pure_decode, nullptr, nullptr);
+                    N, R, is_pure_decode, nullptr, nullptr,
+                    have_slot_ids ? h_slot_ids.data() : nullptr,
+                    have_slot_ids ? h_is_fresh.data() : nullptr,
+                    have_slot_ids ? pi.slot_ids.data() : nullptr);
                 cudaGraph_t graph = nullptr;
                 CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
                 CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
@@ -823,7 +893,10 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
                 h_qo.data(), h_kvpp.data(),
                 N, R, is_pure_decode,
                 have_custom_mask ? pi.custom_mask.data()        : nullptr,
-                have_custom_mask ? pi.custom_mask_indptr.data() : nullptr);
+                have_custom_mask ? pi.custom_mask_indptr.data() : nullptr,
+                have_slot_ids ? h_slot_ids.data() : nullptr,
+                have_slot_ids ? h_is_fresh.data() : nullptr,
+                have_slot_ids ? pi.slot_ids.data() : nullptr);
         }
     }
 }

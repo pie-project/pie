@@ -48,6 +48,33 @@ void launch_recurrent_gated_delta_step(
     int B, int V_h, int K_d, int V_d,
     cudaStream_t stream);
 
+// Multi-request batched variant. Same per-(request, head) compute as
+// `_step` above; outer R dimension picks per-request inputs/outputs and
+// per-request slot in the state pool.
+//
+//     q_norm, k_norm : [R, V_h, K_d]               fp32
+//     v              : [R, V_h, V_d]               fp32
+//     g_log, beta    : [R, V_h]                    fp32
+//     state_base     : [num_slots, V_h, K_d, V_d]  fp32 — slot 0 ptr
+//     slot_ids       : [R] int32, device-resident
+//     slot_stride_elems : V_h * K_d * V_d (per-slot fp32 stride)
+//     out            : [R, V_h, V_d]               fp32
+//
+// One launch covers all R requests on the decode path; prefer over
+// host-looping `_step` per request.
+void launch_recurrent_gated_delta_step_batched(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    float*       state_base,
+    const std::int32_t* slot_ids,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+
 // Chunked prefill (T tokens at a time, per request). Mirrors
 // `torch_chunk_gated_delta_rule` — see the HF reference for the exact
 // recurrence. Reuses the same per-request `state` buffer; final state
@@ -61,8 +88,9 @@ void launch_recurrent_gated_delta_step(
 //     out            : [T, V_h, V_d] fp32
 //     chunk_size     : 64 by default (must divide T after padding)
 //
-// Single-request only for now (no batched-prefill); when serving
-// multiple requests the caller invokes this once per request.
+// Single-request entry. Multi-request callers use
+// `launch_chunk_gated_delta_prefill_batched` below — this one is kept
+// for the legacy parity entrypoint and as a single-request fast path.
 void launch_chunk_gated_delta_prefill(
     const float* q_norm,
     const float* k_norm,
@@ -73,6 +101,44 @@ void launch_chunk_gated_delta_prefill(
     float*       out,
     int T, int V_h, int K_d, int V_d,
     int chunk_size,
+    cudaStream_t stream);
+
+// Multi-request batched chunked prefill. One block per (request, head);
+// each block walks its T_r-token window from `qo_indptr` sequentially
+// (the recurrence has a strict per-token state dependency) and updates
+// the request's state slab indexed by `slot_ids[r]`.
+//
+//     q_norm, k_norm : [N_total, V_h, K_d]          fp32
+//     v              : [N_total, V_h, V_d]          fp32
+//     g_log, beta    : [N_total, V_h]               fp32
+//     state_base     : [num_slots, V_h, K_d, V_d]   fp32 — slot 0 ptr
+//     slot_ids       : [R]   int32 device
+//     qo_indptr      : [R+1] u32   device
+//     slot_stride_elems : V_h * K_d * V_d
+//     out            : [N_total, V_h, V_d]          fp32
+//
+// TODO(perf): on Hopper, flashinfer ships a warp-specialized DeltaRule
+// prefill (`flashinfer::flat::launch_delta_rule_prefill_kernel_gbai`,
+// SM90-only — its non-Hopper branch throws) with TMA + chunk-level
+// parallelism, expected to be substantially faster on prefills > 256
+// tokens. Integration is non-trivial: flashinfer wants contiguous
+// [num_seqs, V_h, K_d, V_d] state but ours is slot-sparse, and it takes
+// bf16 inputs while we widen to fp32 for the l2norm. Either a per-fire
+// scatter/gather adapter or a templated flashinfer collective_load that
+// takes a slot_ids indirection would do; pre-SM90 hardware always falls
+// through to this kernel.
+void launch_chunk_gated_delta_prefill_batched(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    float*       state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
     cudaStream_t stream);
 
 // L2-normalise rows of `[N, hidden]` bf16, optionally scale each row

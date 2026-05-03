@@ -122,6 +122,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/causal_conv1d.cu
   src/kernels/gated_delta_net.cu
   src/qwen3_5_state_cache.cpp
+  src/slot_allocator.cpp
   src/model/qwen3_5_forward.cpp
   src/model/qwen3_5_moe.cpp
   src/model/qwen3_5_moe_forward.cpp

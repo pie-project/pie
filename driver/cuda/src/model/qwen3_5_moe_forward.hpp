@@ -84,6 +84,9 @@ void qwen3_5_moe_forward_paged(
     int total_tokens, int num_requests,
     bool is_pure_decode,
     const std::uint8_t* mask_d,
-    const std::int32_t* mask_indptr_d);
+    const std::int32_t* mask_indptr_d,
+    const std::int32_t* slot_ids_h = nullptr,
+    const std::uint8_t* is_fresh_h = nullptr,
+    const std::int32_t* slot_ids_d = nullptr);
 
 }  // namespace pie_cuda_driver::model

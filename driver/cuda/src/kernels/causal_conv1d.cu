@@ -106,6 +106,112 @@ __global__ void causal_conv1d_update_kernel(
     state[(K - 1) * C + c] = __float2bfloat16(new_x);
 }
 
+// Multi-request batched prefill. Per-(channel, request) block; threads
+// stride through that request's tokens. Same math as the single-request
+// kernel; the (t0_r, Nr_r) window is read from qo_indptr at runtime and
+// the trailing K-window is persisted to the request's state slab.
+__global__ void causal_conv1d_prefill_batched_kernel(
+    const __nv_bfloat16* __restrict__ x,           // [N_total, C]
+    const __nv_bfloat16* __restrict__ weight,      // [C, K]
+    const __nv_bfloat16* __restrict__ bias,        // [C]
+    __nv_bfloat16* __restrict__ y,                 // [N_total, C]
+    __nv_bfloat16* __restrict__ state_out_base,    // [num_slots, K, C]
+    const int*       __restrict__ slot_ids,        // [R]
+    const std::uint32_t* __restrict__ qo_indptr,   // [R+1]
+    long long slot_stride_elems,
+    int C, int K)
+{
+    const int c = blockIdx.x;
+    const int r = blockIdx.y;
+    if (c >= C) return;
+
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    const int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
+    if (Nr <= 0) return;
+
+    const int slot = slot_ids[r];
+    const __nv_bfloat16* x_r = x + (long long)t0 * C;
+    __nv_bfloat16* y_r = y + (long long)t0 * C;
+    __nv_bfloat16* state =
+        state_out_base + (long long)slot * slot_stride_elems;
+
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    const float bias_v = bias ? __bfloat162float(bias[c]) : 0.f;
+
+    for (int t = tid; t < Nr; t += block_size) {
+        float acc = bias_v;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k >= K) break;
+            const int src_t = t - (K - 1) + k;
+            if (src_t < 0) continue;
+            const float xv = __bfloat162float(x_r[src_t * C + c]);
+            const float wv = __bfloat162float(weight[c * K + k]);
+            acc += wv * xv;
+        }
+        y_r[t * C + c] = __float2bfloat16(silu_f(acc));
+    }
+
+    if (state_out_base && tid == 0) {
+        for (int s = 0; s < K; ++s) {
+            const int src_t = Nr - K + s;
+            const float v = (src_t < 0) ? 0.f
+                                        : __bfloat162float(x_r[src_t * C + c]);
+            state[s * C + c] = __float2bfloat16(v);
+        }
+    }
+}
+
+// Multi-request batched variant. Same math as the single-request
+// kernel; an outer R dimension picks the per-request input/output row
+// and the per-request slot in the state buffer. One block per
+// (request, channel-tile); threads parallelise channels in the tile.
+__global__ void causal_conv1d_update_batched_kernel(
+    const __nv_bfloat16* __restrict__ x,           // [R, C]
+    const __nv_bfloat16* __restrict__ weight,      // [C, K]
+    const __nv_bfloat16* __restrict__ bias,        // [C] nullable
+    __nv_bfloat16* __restrict__ state_base,        // [num_slots, K, C]
+    const int* __restrict__ slot_ids,              // [R]
+    long long slot_stride_elems,                   // K * C
+    __nv_bfloat16* __restrict__ y,                 // [R, C]
+    int R, int C, int K)
+{
+    const int r = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= R || c >= C) return;
+
+    const int slot = slot_ids[r];
+    __nv_bfloat16* state = state_base + (long long)slot * slot_stride_elems;
+    const __nv_bfloat16* x_r = x + (long long)r * C;
+    __nv_bfloat16* y_r = y + (long long)r * C;
+
+    const float bias_v = bias ? __bfloat162float(bias[c]) : 0.f;
+    const float new_x  = __bfloat162float(x_r[c]);
+
+    float acc = bias_v;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= K) break;
+        float xv;
+        if (k < K - 1) {
+            xv = __bfloat162float(state[(k + 1) * C + c]);
+        } else {
+            xv = new_x;
+        }
+        const float wv = __bfloat162float(weight[c * K + k]);
+        acc += wv * xv;
+    }
+    y_r[c] = __float2bfloat16(silu_f(acc));
+
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= K - 1) break;
+        state[k * C + c] = state[(k + 1) * C + c];
+    }
+    state[(K - 1) * C + c] = __float2bfloat16(new_x);
+}
+
 }  // namespace
 
 void launch_causal_conv1d_prefill_bf16(
@@ -141,6 +247,52 @@ void launch_causal_conv1d_update_bf16(
         static_cast<const __nv_bfloat16*>(bias),
         static_cast<__nv_bfloat16*>(state),
         static_cast<__nv_bfloat16*>(y),
+        C, K);
+}
+
+void launch_causal_conv1d_update_batched_bf16(
+    const void* x, const void* weight, const void* bias,
+    void* state_base,
+    const std::int32_t* slot_ids,
+    long long slot_stride_elems,
+    void* y,
+    int R, int C, int K, cudaStream_t stream)
+{
+    if (R <= 0 || C <= 0 || K <= 0) return;
+    constexpr int BLOCK = 128;
+    dim3 grid((C + BLOCK - 1) / BLOCK, R);
+    dim3 block(BLOCK);
+    causal_conv1d_update_batched_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<const __nv_bfloat16*>(bias),
+        static_cast<__nv_bfloat16*>(state_base),
+        slot_ids,
+        slot_stride_elems,
+        static_cast<__nv_bfloat16*>(y),
+        R, C, K);
+}
+
+void launch_causal_conv1d_prefill_batched_bf16(
+    const void* x, const void* weight, const void* bias,
+    void* y, void* state_out_base,
+    const std::int32_t* slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long slot_stride_elems,
+    int R, int C, int K, cudaStream_t stream)
+{
+    if (R <= 0 || C <= 0 || K <= 0) return;
+    constexpr int BLOCK = 64;
+    dim3 grid(C, R);
+    dim3 block(BLOCK);
+    causal_conv1d_prefill_batched_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<const __nv_bfloat16*>(bias),
+        static_cast<__nv_bfloat16*>(y),
+        static_cast<__nv_bfloat16*>(state_out_base),
+        slot_ids, qo_indptr,
+        slot_stride_elems,
         C, K);
 }
 

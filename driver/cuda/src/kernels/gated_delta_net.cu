@@ -243,6 +243,145 @@ __global__ void recurrent_step_kernel(
     }
 }
 
+// Multi-request batched chunked prefill. One block per (request, head);
+// the block walks its T_r tokens sequentially (per-token state
+// dependency), accumulating the recurrence into the request's state
+// slab. Same per-token math as `recurrent_step_kernel`.
+__global__ void chunk_gated_delta_prefill_batched_kernel(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    float*       __restrict__ state_base,
+    const int*       __restrict__ slot_ids,
+    const std::uint32_t* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int V_h, int K_d, int V_d)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
+    if (T <= 0) return;
+
+    const int slot = slot_ids[r];
+    float* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + K_d;
+
+    for (int t = 0; t < T; ++t) {
+        const long long bh = (long long)(t0 + t) * V_h + h;
+        const float* q_h = q_norm + bh * K_d;
+        const float* k_h = k_norm + bh * K_d;
+        const float* v_h = v      + bh * V_d;
+        const float  g_h = __expf(g_log[bh]);
+        const float  beta_h = beta[bh];
+        float* out_bh = out + bh * V_d;
+
+        for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+            sq[i] = q_h[i];
+            sk[i] = k_h[i];
+        }
+        __syncthreads();
+
+        for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+            float kv_mem = 0.f;
+            for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+                const long long off = (long long)k_idx * V_d + v_idx;
+                const float s = state[off] * g_h;
+                state[off] = s;
+                kv_mem += s * sk[k_idx];
+            }
+
+            const float v_t   = v_h[v_idx];
+            const float delta = (v_t - kv_mem) * beta_h;
+
+            float out_v = 0.f;
+            for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+                const long long off = (long long)k_idx * V_d + v_idx;
+                const float s = state[off] + sk[k_idx] * delta;
+                state[off] = s;
+                out_v += s * sq[k_idx];
+            }
+            out_bh[v_idx] = out_v;
+        }
+        // State must be globally visible before next-token's reads;
+        // __syncthreads ensures the block sees its own writes — adjacent
+        // blocks (different r or h) are independent.
+        __syncthreads();
+    }
+}
+
+// Batched variant with slot indirection. State for request r lives at
+// `state_base + slot_ids[r] * slot_stride_elems`. Otherwise the
+// per-(request, head) compute is identical to `recurrent_step_kernel`.
+__global__ void recurrent_step_batched_kernel(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    float*       __restrict__ state_base,
+    const int*   __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int V_h, int K_d, int V_d)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int slot = slot_ids[r];
+
+    const long long bh = (long long)r * V_h + h;
+    const float* q_h = q_norm + bh * K_d;
+    const float* k_h = k_norm + bh * K_d;
+    const float* v_h = v      + bh * V_d;
+    const float  g_h = __expf(g_log[bh]);
+    const float  beta_h = beta[bh];
+
+    float* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+    float* out_bh = out + bh * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + K_d;
+
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+        float kv_mem = 0.f;
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off = (long long)k_idx * V_d + v_idx;
+            const float s = state[off] * g_h;
+            state[off] = s;
+            kv_mem += s * sk[k_idx];
+        }
+
+        const float v_t   = v_h[v_idx];
+        const float delta = (v_t - kv_mem) * beta_h;
+
+        float out_v = 0.f;
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off = (long long)k_idx * V_d + v_idx;
+            const float s = state[off] + sk[k_idx] * delta;
+            state[off] = s;
+            out_v += s * sq[k_idx];
+        }
+        out_bh[v_idx] = out_v;
+    }
+}
+
 }  // namespace
 
 void launch_recurrent_gated_delta_step(
@@ -259,6 +398,27 @@ void launch_recurrent_gated_delta_step(
     const int shmem_bytes = 2 * K_d * sizeof(float);
     recurrent_step_kernel<<<grid, block, shmem_bytes, stream>>>(
         q_norm, k_norm, v, g_log, beta, state, out, V_h, K_d, V_d);
+}
+
+void launch_recurrent_gated_delta_step_batched(
+    const float* q_norm, const float* k_norm, const float* v,
+    const float* g_log, const float* beta,
+    float* state_base,
+    const std::int32_t* slot_ids,
+    long long slot_stride_elems,
+    float* out,
+    int R, int V_h, int K_d, int V_d,
+    cudaStream_t stream)
+{
+    if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
+    constexpr int BLOCK = 128;
+    dim3 grid(R, V_h);
+    dim3 block(BLOCK);
+    const int shmem_bytes = 2 * K_d * sizeof(float);
+    recurrent_step_batched_kernel<<<grid, block, shmem_bytes, stream>>>(
+        q_norm, k_norm, v, g_log, beta,
+        state_base, slot_ids, slot_stride_elems,
+        out, V_h, K_d, V_d);
 }
 
 // Chunked prefill — for now, implemented as a sequential per-token
@@ -299,6 +459,28 @@ void launch_chunk_gated_delta_prefill(
             out    + t * stride_v,
             /*B=*/1, V_h, K_d, V_d, stream);
     }
+}
+
+void launch_chunk_gated_delta_prefill_batched(
+    const float* q_norm, const float* k_norm, const float* v,
+    const float* g_log, const float* beta,
+    float* state_base,
+    const std::int32_t* slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long slot_stride_elems,
+    float* out,
+    int R, int V_h, int K_d, int V_d,
+    cudaStream_t stream)
+{
+    if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
+    constexpr int BLOCK = 128;
+    dim3 grid(R, V_h);
+    dim3 block(BLOCK);
+    const int shmem_bytes = 2 * K_d * sizeof(float);
+    chunk_gated_delta_prefill_batched_kernel<<<grid, block, shmem_bytes, stream>>>(
+        q_norm, k_norm, v, g_log, beta,
+        state_base, slot_ids, qo_indptr, slot_stride_elems,
+        out, V_h, K_d, V_d);
 }
 
 }  // namespace pie_cuda_driver::kernels
