@@ -231,10 +231,61 @@ int main(int argc, char** argv) {
     // The runtime owns page allocation; we report total_pages and page_size
     // in the READY handshake and honor the page IDs the runtime sends in
     // every BPIQ request.
-    const std::int32_t total_pages =
+    std::int32_t total_pages =
         static_cast<std::int32_t>(cfg.batching.max_num_kv_pages);
     const std::int32_t page_size =
         static_cast<std::int32_t>(cfg.batching.kv_page_size);
+
+    // Auto-cap total_pages to fit free VRAM. On tight-VRAM configs (e.g.,
+    // Mixtral-8x7B at 89 GB on a 96 GB GPU), the configured page count
+    // would OOM the cache allocation. Compute per-page bytes across all
+    // layers (handles per-layer kv_heads on Gemma 4 alt-attention and
+    // per-layer head_dim on Gemma 4 sliding/full mix), reserve 2 GB for
+    // activation + graph overhead, and clamp.
+    if (auto* dev = ggml_backend_get_device(model.backend())) {
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+        if (free_bytes > 0) {
+            const auto& h = model.hparams();
+            std::size_t bytes_per_page = 0;
+            for (std::int32_t il = 0; il < h.num_hidden_layers; ++il) {
+                const bool is_full =
+                    !h.layer_types.empty()
+                    && static_cast<std::size_t>(il) < h.layer_types.size()
+                    && h.layer_types[il] == 'g';
+                const std::int32_t kvh =
+                    (h.arch == pie_portable_driver::PieArch::Gemma4 && is_full
+                     && h.num_global_key_value_heads > 0)
+                        ? h.num_global_key_value_heads
+                        : h.num_key_value_heads;
+                const std::int32_t hd =
+                    (h.arch == pie_portable_driver::PieArch::Gemma4 && is_full
+                     && h.gemma4_head_dim_global > 0)
+                        ? h.gemma4_head_dim_global
+                        : h.head_dim;
+                // K + V, 2 bytes/element (F16 cache).
+                bytes_per_page +=
+                    2ULL * static_cast<std::size_t>(kvh) * hd * page_size * 2ULL;
+            }
+            constexpr std::size_t headroom = 2ULL * 1024 * 1024 * 1024;
+            const std::size_t safe_bytes =
+                (free_bytes > headroom) ? free_bytes - headroom : 0;
+            const std::int32_t max_safe_pages =
+                bytes_per_page > 0
+                    ? static_cast<std::int32_t>(safe_bytes / bytes_per_page)
+                    : total_pages;
+            if (max_safe_pages > 0 && max_safe_pages < total_pages) {
+                std::cerr << "[pie-driver-portable] auto-capping max_num_kv_pages "
+                          << total_pages << " -> " << max_safe_pages
+                          << " (free_vram="
+                          << (free_bytes / (1024.0 * 1024.0)) << " MiB, "
+                          << "bytes_per_page=" << bytes_per_page << ", "
+                          << "headroom=2048 MiB)\n";
+                total_pages = max_safe_pages;
+            }
+        }
+    }
+
     pie_portable_driver::ForwardEngine engine(model, total_pages, page_size);
     std::cerr << "[pie-driver-portable] forward engine ready (total_pages="
               << total_pages << ", page_size=" << page_size
