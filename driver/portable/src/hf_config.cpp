@@ -162,6 +162,12 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     // Gemma 4 alternative-attention only.
     h.num_global_key_value_heads =
         get_or<std::int32_t>(text, "num_global_key_value_heads", 0);
+    // Gemma 4 MoE (26B-A4B variant). HF accepts top_k_experts as an
+    // alias for num_experts_per_tok.
+    h.gemma4_enable_moe =
+        get_or<bool>(text, "enable_moe_block", false);
+    h.gemma4_moe_intermediate_size =
+        get_or<std::int32_t>(text, "moe_intermediate_size", 0);
     h.hidden_size = text.at("hidden_size").get<std::int32_t>();
     // Pure-MoE checkpoints (Qwen 3.6) omit `intermediate_size` because
     // every layer's FFN is the routed-expert path; the per-expert width
@@ -362,7 +368,9 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
         get_or<std::int32_t>(text, "num_experts",
             get_or<std::int32_t>(text, "num_local_experts", 0));
     h.num_experts_per_tok =
-        get_or<std::int32_t>(text, "num_experts_per_tok", 0);
+        get_or<std::int32_t>(text,
+            "num_experts_per_tok",
+            get_or<std::int32_t>(text, "top_k_experts", 0));
     h.moe_intermediate_size =
         get_or<std::int32_t>(text, "moe_intermediate_size",
             h.intermediate_size);  // fallback

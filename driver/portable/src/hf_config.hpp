@@ -63,6 +63,12 @@ struct Hparams {
     // SMALLER kv_heads count than sliding layers (e.g., 4 vs 16 on 31B).
     // 0 = not provided / not applicable.
     std::int32_t num_global_key_value_heads = 0;
+    // Gemma 4 26B-A4B: parallel sparse-MoE block alongside the dense MLP.
+    // When true, the loader expects per-layer experts.gate_up_proj /
+    // experts.down_proj / router.{proj,scale,per_expert_scale} plus
+    // pre_feedforward_layernorm_2 + post_feedforward_layernorm_{1,2}.
+    bool         gemma4_enable_moe          = false;
+    std::int32_t gemma4_moe_intermediate_size = 0;
     std::int32_t hidden_size = 0;
     std::int32_t intermediate_size = 0;
     std::int32_t head_dim = 0;             // computed if missing

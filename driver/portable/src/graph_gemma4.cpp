@@ -333,15 +333,99 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
         attn_out = norm_scale(ctx, attn_out, L.post_attn_norm, /*plus_one=*/false);
         auto* ffn_in = ggml_add(ctx, attn_out, inpSA);
 
-        // FFN — pre-norm, GeGLU, post-norm sandwich.
+        // FFN — pre-norm, GeGLU. The dense path always runs; on
+        // Gemma 4 26B-A4B (`gemma4_enable_moe`) the sparse-MoE block
+        // runs in parallel and the two post-normed branches are summed
+        // before the final post_feedforward_layernorm.
         cur = ggml_rms_norm(ctx, ffn_in, h.rms_norm_eps);
         cur = norm_scale(ctx, cur, L.ffn_norm, /*plus_one=*/false);
         auto* gate = ggml_mul_mat(ctx, L.gate_proj, cur);
         auto* up   = ggml_mul_mat(ctx, L.up_proj,   cur);
         gate = ggml_gelu(ctx, gate);
         auto* gated = ggml_mul(ctx, gate, up);
-        auto* ffn_out = ggml_mul_mat(ctx, L.down_proj, gated);
-        ffn_out = ggml_rms_norm(ctx, ffn_out, h.rms_norm_eps);
+        auto* dense_out = ggml_mul_mat(ctx, L.down_proj, gated);
+
+        ggml_tensor* combined = dense_out;
+        if (h.gemma4_enable_moe && L.moe_router != nullptr) {
+            // Branch 1: dense path's post-norm (post_feedforward_layernorm_1).
+            auto* b1 = ggml_rms_norm(ctx, dense_out, h.rms_norm_eps);
+            b1 = norm_scale(ctx, b1, L.gemma4_moe_post_ffn_norm_1,
+                            /*plus_one=*/false);
+            // Branch 2 has TWO inputs:
+            //   - router_in = rmsnorm(ffn_in) * router.scale * 1/sqrt(H),
+            //     used by the routing projection.
+            //   - moe_in    = pre_feedforward_layernorm_2(ffn_in), used
+            //     by the gate / up / down expert projections.
+            auto* router_in = ggml_rms_norm(ctx, ffn_in, h.rms_norm_eps);
+            router_in = norm_scale(ctx, router_in, L.moe_router_scale,
+                                   /*plus_one=*/false);
+            const float inv_sqrt_h =
+                1.0f / std::sqrt(static_cast<float>(h.hidden_size));
+            router_in = ggml_scale(ctx, router_in, inv_sqrt_h);
+
+            auto* moe_in = ggml_rms_norm(ctx, ffn_in, h.rms_norm_eps);
+            moe_in = norm_scale(ctx, moe_in, L.gemma4_moe_pre_ffn_norm_2,
+                                /*plus_one=*/false);
+
+            // Inline MoE block — same pattern as build_moe_ffn, but with
+            // Gemma-4's per_expert_scale gain applied to the routing
+            // weights after top-K renorm.
+            auto* logits = ggml_mul_mat(ctx, L.moe_router, router_in);
+            auto* probs  = ggml_soft_max(ctx, logits);
+            auto* selected = ggml_top_k(ctx, probs, h.num_experts_per_tok);
+
+            // Gather selected probs as [n_used, n_total] weights.
+            auto* probs_3d = ggml_reshape_3d(
+                ctx, probs, 1, h.num_experts, n_total);
+            auto* w_gather = ggml_get_rows(ctx, probs_3d, selected);
+            auto* weights = ggml_reshape_2d(
+                ctx, w_gather, h.num_experts_per_tok, n_total);
+            // Renormalise (Gemma 4 sets norm_topk_prob = true).
+            auto* w_sum = ggml_sum_rows(ctx, weights);
+            weights = ggml_div(ctx, weights, w_sum);
+
+            // Per-expert scalar gain. Cast pes to F32, broadcast across
+            // n_total so ggml_get_rows can index by `selected` (which has
+            // batch dim n_total). Then multiply into weights.
+            auto* pes_f32 = (L.moe_router_per_expert_scale->type == GGML_TYPE_F32)
+                ? L.moe_router_per_expert_scale
+                : ggml_cast(ctx, L.moe_router_per_expert_scale, GGML_TYPE_F32);
+            auto* pes_2d_orig = ggml_reshape_2d(ctx, pes_f32, h.num_experts, 1);
+            auto* pes_bc = ggml_repeat(ctx, pes_2d_orig, probs);
+            auto* pes_3d = ggml_reshape_3d(
+                ctx, pes_bc, 1, h.num_experts, n_total);
+            auto* pes_gather = ggml_get_rows(ctx, pes_3d, selected);
+            auto* pes_weights = ggml_reshape_2d(
+                ctx, pes_gather, h.num_experts_per_tok, n_total);
+            weights = ggml_mul(ctx, weights, pes_weights);
+
+            // Per-token, per-selected expert: gate / up / down.
+            auto* moe_in_3d = ggml_reshape_3d(
+                ctx, moe_in, h.hidden_size, 1, n_total);
+            auto* gate_e = ggml_mul_mat_id(ctx, L.moe_gate_exps, moe_in_3d, selected);
+            auto* up_e   = ggml_mul_mat_id(ctx, L.moe_up_exps,   moe_in_3d, selected);
+            auto* gated_e = ggml_mul(ctx, ggml_gelu(ctx, gate_e), up_e);
+            auto* expert_out = ggml_mul_mat_id(
+                ctx, L.moe_down_exps, gated_e, selected);
+            // expert_out: [hidden, n_used, n_total]
+
+            // Apply weights and sum across n_used.
+            auto* w_3d = ggml_reshape_3d(
+                ctx, weights, 1, h.num_experts_per_tok, n_total);
+            auto* weighted = ggml_mul(ctx, expert_out, w_3d);
+            // permute(1,0,2,3) puts n_used at ne[0] for sum_rows.
+            auto* perm = ggml_permute(ctx, weighted, 1, 0, 2, 3);
+            auto* perm_cont = ggml_cont(ctx, perm);
+            auto* moe_out_sum = ggml_sum_rows(ctx, perm_cont);
+            auto* moe_out = ggml_reshape_2d(
+                ctx, ggml_cont(ctx, moe_out_sum), h.hidden_size, n_total);
+            auto* b2 = ggml_rms_norm(ctx, moe_out, h.rms_norm_eps);
+            b2 = norm_scale(ctx, b2, L.gemma4_moe_post_ffn_norm_2,
+                            /*plus_one=*/false);
+            combined = ggml_add(ctx, b1, b2);
+        }
+
+        auto* ffn_out = ggml_rms_norm(ctx, combined, h.rms_norm_eps);
         ffn_out = norm_scale(ctx, ffn_out, L.post_ffn_norm, /*plus_one=*/false);
         inpL = ggml_add(ctx, ffn_out, ffn_in);
 

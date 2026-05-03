@@ -85,6 +85,18 @@ struct LayerWeights {
     ggml_tensor* moe_gate_exps = nullptr;  // [hidden, ff, n_experts]
     ggml_tensor* moe_up_exps   = nullptr;  // [hidden, ff, n_experts]
     ggml_tensor* moe_down_exps = nullptr;  // [ff, hidden, n_experts]
+    // Gemma 4 26B-A4B (MoE): the router's pre-projection rmsnorm uses
+    // its own per-channel weight (router.scale, [hidden]) and a per-
+    // expert gain after top-K renorm (router.per_expert_scale,
+    // [n_experts]).
+    ggml_tensor* moe_router_scale          = nullptr;
+    ggml_tensor* moe_router_per_expert_scale = nullptr;
+    // Gemma 4 26B-A4B parallel-MoE block: dense and MoE branches each
+    // have their own post-norm; their sum is fed into the layer's
+    // existing `post_ffn_norm`. The MoE branch also has its own pre-norm.
+    ggml_tensor* gemma4_moe_pre_ffn_norm_2  = nullptr;
+    ggml_tensor* gemma4_moe_post_ffn_norm_1 = nullptr;
+    ggml_tensor* gemma4_moe_post_ffn_norm_2 = nullptr;
 
     // gpt-oss MoE biases (router + per-expert per-output-dim biases). Null
     // on Mixtral / Qwen3-MoE.

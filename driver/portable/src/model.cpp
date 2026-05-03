@@ -1241,6 +1241,52 @@ void Model::build_gemma4_() {
         L.up_proj   = declare_(p + "mlp.up_proj.weight");
         L.down_proj = declare_(p + "mlp.down_proj.weight");
 
+        // Sparse-MoE block (Gemma 4 26B-A4B only). Loaded alongside
+        // the dense MLP — at inference, both run in parallel and their
+        // post-normed outputs are summed before the layer's
+        // post_feedforward_layernorm. Mirrors HF Gemma4TextDecoderLayer
+        // and upstream driver/cuda/src/model/gemma4.cpp commit 59f45df4.
+        if (h.gemma4_enable_moe) {
+            const std::int32_t n_exp  = h.num_experts;
+            const std::int64_t hidden = h.hidden_size;
+            const std::int64_t ff     = h.gemma4_moe_intermediate_size;
+
+            L.moe_router                   = declare_(p + "router.proj.weight");
+            L.moe_router_scale             = declare_(p + "router.scale");
+            L.moe_router_per_expert_scale  = declare_(p + "router.per_expert_scale");
+            L.gemma4_moe_pre_ffn_norm_2    = declare_(p + "pre_feedforward_layernorm_2.weight");
+            L.gemma4_moe_post_ffn_norm_1   = declare_(p + "post_feedforward_layernorm_1.weight");
+            L.gemma4_moe_post_ffn_norm_2   = declare_(p + "post_feedforward_layernorm_2.weight");
+
+            // Packed experts.gate_up_proj is one 3D safetensor
+            // [n_exp, 2*ff, hidden]; split into separate stacked
+            // gate/up tensors at load so build_moe_ffn helpers apply.
+            // Mirrors load_qwen3_5_moe_layer_.
+            const std::string gate_up_name = p + "experts.gate_up_proj";
+            const std::string down_name    = p + "experts.down_proj";
+            const ggml_type w_dtype =
+                st_to_ggml_dtype(archive_->at(gate_up_name).dtype, gate_up_name);
+            const std::size_t row_bytes  =
+                static_cast<std::size_t>(hidden) * ggml_type_size(w_dtype);
+            const std::size_t per_expert_bytes =
+                static_cast<std::size_t>(2 * ff) * row_bytes;
+            const std::size_t up_intra_offset =
+                static_cast<std::size_t>(ff) * row_bytes;
+
+            L.moe_gate_exps = declare_stacked_experts_from_3d_(
+                p + "moe_gate", gate_up_name, hidden, ff, n_exp,
+                per_expert_bytes, /*intra_off=*/0, w_dtype);
+            L.moe_up_exps   = declare_stacked_experts_from_3d_(
+                p + "moe_up",   gate_up_name, hidden, ff, n_exp,
+                per_expert_bytes, /*intra_off=*/up_intra_offset, w_dtype);
+            const std::size_t down_per_expert_bytes =
+                static_cast<std::size_t>(hidden) *
+                static_cast<std::size_t>(ff) * ggml_type_size(w_dtype);
+            L.moe_down_exps = declare_stacked_experts_from_3d_(
+                p + "moe_down", down_name, ff, hidden, n_exp,
+                down_per_expert_bytes, 0, w_dtype);
+        }
+
         // PLE per-layer.
         if (h.gemma4_ple_dim > 0) {
             L.ple_gate = declare_(p + "per_layer_input_gate.weight");
