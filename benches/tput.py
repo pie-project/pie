@@ -13,6 +13,7 @@ Usage::
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -32,16 +33,18 @@ async def run_benchmark(args):
     # -- Resolve paths --------------------------------------------------------
 
     script_dir = Path(__file__).parent.resolve()
+    # `text-completion-bench` is a sibling of `text-completion` that
+    # returns exact token counts in its Return event (no per-token
+    # streaming) so the harness can do apples-to-apples accounting
+    # against vllm/sglang. Default to it; flip back to the streaming
+    # `text-completion` with `--inferlet text-completion`.
+    inferlet_dir = args.inferlet
+    wasm_name = inferlet_dir.replace("-", "_") + ".wasm"
     wasm_path = (
-        script_dir.parent
-        / "inferlets"
-        / "text-completion"
-        / "target"
-        / "wasm32-wasip2"
-        / "release"
-        / "text_completion.wasm"
+        script_dir.parent / "inferlets" / inferlet_dir / "target"
+        / "wasm32-wasip2" / "release" / wasm_name
     )
-    manifest_path = script_dir.parent / "inferlets" / "text-completion" / "Pie.toml"
+    manifest_path = script_dir.parent / "inferlets" / inferlet_dir / "Pie.toml"
 
     if not wasm_path.exists():
         print(f"Error: WASM binary not found at {wasm_path}")
@@ -173,6 +176,8 @@ async def run_benchmark(args):
             "temperature": args.temperature,
             "system": "You are a helpful benchmarking assistant.",
         }
+        if args.ignore_eos:
+            inferlet_input["ignore_eos"] = True
 
         queue = asyncio.Queue()
         # Items are pushed inside the warmup / timed-run blocks below so the
@@ -182,12 +187,19 @@ async def run_benchmark(args):
         total_chars = 0
         total_tokens_est = 0
         output_samples = []  # Collect (req_id, text) tuples
+        per_req_latency_s = []  # Per-request wall-clock from launch to Return
+        # Authoritative output-token counts when the inferlet returns
+        # `num_output_tokens` in its Return JSON. Empty otherwise.
+        nonlocal_acc = []
         output_lock = asyncio.Lock()
 
         # -- Workers ----------------------------------------------------------
 
         async def worker(worker_id: int):
             nonlocal completed, total_chars, total_tokens_est
+            # `nonlocal_acc` is captured by closure — Python's nonlocal
+            # would only matter if we rebound it; here we mutate in
+            # place via .append.
             while not queue.empty():
                 try:
                     req_id = queue.get_nowait()
@@ -198,27 +210,50 @@ async def run_benchmark(args):
                     req_input = inferlet_input
                     if getattr(args, 'unique_prompts', False):
                         req_input = {**inferlet_input, "prompt": f"{inferlet_input['prompt']} (Request #{req_id})"}
+                    req_start = time.time()
                     process = await client.launch_process(
                         inferlet_name, input=req_input,
                     )
                     req_chars = 0
-                    req_text = []
+                    # Stdout-only text: this is what the inferlet
+                    # streams as it generates. The Return event also
+                    # ships the output (in a JSON envelope, possibly
+                    # with `num_output_tokens`); the bench inferlet
+                    # opts out of streaming so its only payload is the
+                    # Return JSON. Track the two channels separately so
+                    # downstream accounting picks the authoritative one.
+                    req_stdout_text = []
+                    final_return = ""
                     while True:
                         event, msg = await process.recv()
                         if event == Event.Stdout:
                             req_chars += len(msg)
-                            req_text.append(msg)
+                            req_stdout_text.append(msg)
                         elif event == Event.Stderr:
                             req_chars += len(msg)
                         elif event == Event.Return:
-                            req_chars += len(msg)
-                            req_text.append(msg)
+                            final_return = msg
                             total_chars += req_chars
                             total_tokens_est += req_chars / 4.0
+                            # Authoritative output token count: parse
+                            # the Return JSON's `num_output_tokens` if
+                            # the inferlet emits it. Fall back to a
+                            # tokenizer count of the streamed text
+                            # later (see report block below).
+                            try:
+                                obj = json.loads(final_return)
+                                if isinstance(obj, dict) and \
+                                   "num_output_tokens" in obj:
+                                    nonlocal_acc.append(int(obj["num_output_tokens"]))
+                                if isinstance(obj, dict) and "text" in obj:
+                                    req_stdout_text = [obj["text"]]
+                            except Exception:
+                                pass
                             completed += 1
-                            # Save output
+                            per_req_latency_s.append(time.time() - req_start)
                             async with output_lock:
-                                output_samples.append((req_id, "".join(req_text)))
+                                output_samples.append(
+                                    (req_id, "".join(req_stdout_text)))
                             print(".", end="", flush=True)
                             break
                         elif event == Event.Error:
@@ -244,6 +279,7 @@ async def run_benchmark(args):
             total_chars = 0
             total_tokens_est = 0
             output_samples.clear()
+            per_req_latency_s.clear()
             print(" done")
 
         # -- Run --------------------------------------------------------------
@@ -261,13 +297,50 @@ async def run_benchmark(args):
 
         # -- Report -----------------------------------------------------------
 
+        # Actual output-token count: tokenize each captured output via
+        # the model's tokenizer. For long-output benchmarks the
+        # `chars/4` estimate underreports — the real tokenizer is the
+        # only fair metric vs vllm/sglang's `Total Out Tokens`.
+        # Output-token count: authoritative if the inferlet emitted
+        # `num_output_tokens` in its Return JSON (text-completion-bench
+        # does this); otherwise re-tokenize the streamed text via the
+        # bare `tokenizers` library — bypasses the transformers /
+        # huggingface-hub dependency dance that the venv may have
+        # pinned for vllm/sglang interop.
+        actual_total_tokens = 0
+        token_count_source = "stdout-retokenize"
+        if nonlocal_acc and len(nonlocal_acc) == completed:
+            actual_total_tokens = sum(nonlocal_acc)
+            token_count_source = "inferlet-return"
+        else:
+            try:
+                from tokenizers import Tokenizer
+                from pie_driver.hf_utils import get_hf_snapshot_dir
+                snap = Path(get_hf_snapshot_dir(args.model))
+                _tok = Tokenizer.from_file(str(snap / "tokenizer.json"))
+                for _, text in output_samples:
+                    actual_total_tokens += len(_tok.encode(text, add_special_tokens=False).ids)
+            except Exception as _e:
+                print(f"\n[token-count] tokenizer load failed: {_e}")
+                actual_total_tokens = -1  # signal "unavailable"
         print(f"\n\n{'─' * 40}")
         print(f"{'Total Time:':<25} {duration:.2f} s")
         print(f"{'Completed:':<25} {completed}/{args.num_requests}")
         print(f"{'Total Chars:':<25} {total_chars}")
         print(f"{'Est. Total Tokens:':<25} {total_tokens_est:.0f}")
+        if actual_total_tokens >= 0:
+            print(f"{'Total Out Tokens:':<25} {actual_total_tokens}  ({token_count_source})")
         print(f"{'Requests/sec:':<25} {completed / duration:.2f}")
         print(f"{'Est. Tokens/sec:':<25} {total_tokens_est / duration:.2f}")
+        if actual_total_tokens > 0:
+            print(f"{'Tokens/sec (actual):':<25} {actual_total_tokens / duration:.2f}")
+        if per_req_latency_s:
+            sorted_lat = sorted(per_req_latency_s)
+            n = len(sorted_lat)
+            def _p(q): return sorted_lat[min(int(q * n), n - 1)]
+            mean = sum(sorted_lat) / n
+            print(f"{'Latency mean / p50:':<25} {mean*1000:.1f} / {_p(0.50)*1000:.1f} ms")
+            print(f"{'Latency p95 / p99:':<25} {_p(0.95)*1000:.1f} / {_p(0.99)*1000:.1f} ms")
         print(f"{'─' * 40}")
 
         # -- Save output samples ----------------------------------------------
@@ -288,6 +361,10 @@ def main():
     parser.add_argument("--device", default="cuda:0", help="Device(s), comma-separated (e.g. cuda:0,cuda:1)")
     parser.add_argument("--num-requests", type=int, default=64, help="Total number of concurrent requests")
     parser.add_argument("--prompt", default="Write a short story about a robot.", help="Prompt")
+    parser.add_argument("--inferlet", default="text-completion-bench",
+                        help="Inferlet directory under inferlets/ (default: text-completion-bench, which returns exact token counts)")
+    parser.add_argument("--ignore-eos", action="store_true",
+                        help="bench inferlet only: ignore stop tokens, generate exactly max_tokens")
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens per request")
     parser.add_argument("--temperature", type=float, default=0.6, help="Temperature")
     # Dummy mode is now its own driver: pass --driver dummy (no separate flag needed)
