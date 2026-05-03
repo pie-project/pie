@@ -13,9 +13,16 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 
+[features]
+default = ["python"]
+# Build the pyo3 FFI module (`ffi::pybindings`). Required by the maturin
+# build of `pie._runtime`. Disable for downstream Rust binaries (e.g.
+# `server/standalone`) that link the runtime as an rlib without Python.
+python = ["dep:pyo3"]
+
 [dependencies]
 pie-client = { path = "../client/rust" }
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 tokio = { version = "1.38", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1.0"

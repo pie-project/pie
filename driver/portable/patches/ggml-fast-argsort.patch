@@ -1,0 +1,29 @@
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -7938,16 +7938,16 @@ static void ggml_compute_forward_argsort_f32(
+             dst_data[j] = j;
+         }
+
+-        // C doesn't have a functional sort, so we do a bubble sort instead
+-        for (int64_t j = 0; j < ne0; j++) {
+-            for (int64_t k = j + 1; k < ne0; k++) {
+-                if ((order == GGML_SORT_ORDER_ASC  && src_data[dst_data[j]] > src_data[dst_data[k]]) ||
+-                    (order == GGML_SORT_ORDER_DESC && src_data[dst_data[j]] < src_data[dst_data[k]])) {
+-                    int32_t tmp = dst_data[j];
+-                    dst_data[j] = dst_data[k];
+-                    dst_data[k] = tmp;
+-                }
+-            }
++        // pie patch: replace upstream's O(n²) bubble sort with std::sort
++        // (O(n log n)). Critical for sampling fast-paths that call
++        // ggml_top_k(probs, K) over the full vocab — bubble sort makes
++        // a single forward pass take ~22 s on a 152 k-row vocab on CPU.
++        if (order == GGML_SORT_ORDER_DESC) {
++            std::sort(dst_data, dst_data + ne0,
++                      [src_data](int32_t a, int32_t b) { return src_data[a] > src_data[b]; });
++        } else {
++            std::sort(dst_data, dst_data + ne0,
++                      [src_data](int32_t a, int32_t b) { return src_data[a] < src_data[b]; });
+         }
+     }
+ }

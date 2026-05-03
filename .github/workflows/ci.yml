@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace-check:
+    name: cargo check / test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Cheap structural check: every workspace member compiles. Skips
+      # the cmake-driven C++ build by checking pie-standalone with
+      # `--no-default-features` (the default features pull in ggml).
+      - name: cargo check (runtime, client, no-driver pie-standalone)
+        run: |
+          cargo check -p pie
+          cargo check -p pie --no-default-features
+          cargo check -p pie-client
+
+      - name: cargo test (runtime, client)
+        run: |
+          cargo test -p pie --lib
+          cargo test -p pie-client --lib
+
+  pie-standalone-portable:
+    name: pie-standalone (driver-portable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + cmake build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/ccache
+            target
+          key: ${{ runner.os }}-pie-standalone-portable-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+
+      - name: cargo build (default = driver-portable)
+        run: cargo build -p pie-standalone
+
+      - name: cargo test (pie-standalone)
+        run: cargo test --bin pie
+
+      - name: Verify single-binary linkage
+        run: |
+          file target/debug/pie
+          ldd target/debug/pie
+          # No ggml shared libs should be in the dep tree.
+          ldd target/debug/pie | grep -E "libggml|libllama" \
+            && { echo "FAIL: ggml shared lib leaked into binary"; exit 1; } \
+            || echo "OK: no ggml shared deps"
+
+  # Cuda build — runs only when an opt-in label or schedule fires
+  # (no CUDA on the default GH-hosted runners). Add a self-hosted
+  # runner with a CUDA toolkit to enable this. Until then, M3's
+  # static-link spike + manual M4 verification are the canonical
+  # checkpoints.
+  pie-standalone-cuda:
+    name: pie-standalone (driver-cuda)
+    runs-on: [self-hosted, cuda]
+    if: contains(github.event.pull_request.labels.*.name, 'ci-cuda')
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo build (driver-cuda)
+        run: |
+          cargo build -p pie-standalone \
+            --no-default-features --features driver-cuda
+
+      - name: Verify no CUDA shared deps
+        run: |
+          ldd target/debug/pie
+          ldd target/debug/pie | grep -E "libcudart|libcublas|libcublasLt" \
+            && { echo "FAIL: CUDA shared lib leaked into binary"; exit 1; } \
+            || echo "OK: no CUDA shared deps"

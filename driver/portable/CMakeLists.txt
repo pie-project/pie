@@ -29,6 +29,14 @@ cpmaddpackage(
   GITHUB_REPOSITORY ggerganov/llama.cpp
   GIT_TAG b8994
   EXCLUDE_FROM_ALL YES
+  # patches/ggml-fast-argsort.patch swaps ggml-cpu's O(n²) bubble sort
+  # in `ggml_compute_forward_argsort_f32` for `std::sort`. Critical for
+  # CPU sampling fast paths: a single `ggml_top_k(probs, K)` over the
+  # full vocab (e.g. 152 k for Qwen3) otherwise takes ~22 s per token.
+  # `-N` makes the patch idempotent so re-runs don't fail; `-t` suppresses
+  # interactive prompts on hunk mismatch.
+  PATCH_COMMAND patch -p1 -N -t -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fast-argsort.patch
+                || true
   OPTIONS
     "LLAMA_BUILD_TESTS OFF"
     "LLAMA_BUILD_EXAMPLES OFF"
@@ -45,9 +53,14 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 # pie_driver_portable — portable ggml backend, sibling to ../cuda (native CUDA +
 # flashinfer) and ../../runtime (Rust). Talks to the runtime via the shmem
 # fast path; no ZMQ/protobuf needed. Loads HuggingFace safetensors directly
-# (no GGUF conversion). Consumed by the Python wrapper `pie_driver_portable`.
-add_executable(pie_driver_portable
-  src/main.cpp
+# (no GGUF conversion). Built two ways from the same translation units:
+#   - `pie_driver_portable_lib` (STATIC): linked in-process by
+#     `server/standalone` so the all-Rust binary contains the driver.
+#   - `pie_driver_portable` (executable): a thin shim around the lib's
+#     `pie_driver_portable_run` entry. Consumed by the Python wrapper
+#     `pie_driver_portable` via subprocess.
+add_library(pie_driver_portable_lib STATIC
+  src/entry.cpp
   src/shmem_ipc.cpp
   src/shmem_schema.cpp
   src/safetensors.cpp
@@ -72,20 +85,31 @@ add_executable(pie_driver_portable
   src/adapter.cpp
 )
 
-target_compile_options(pie_driver_portable PRIVATE
+target_compile_options(pie_driver_portable_lib PRIVATE
   -Wall -Wextra -Wno-unused-parameter
 )
 
-target_include_directories(pie_driver_portable
-  PRIVATE
+# We use `#pragma omp` directly in src/model.cpp (diagnostic probe of
+# the OpenMP runtime from our caller thread). Need both the compile
+# flag and runtime lib explicitly. ggml-cpu also links libgomp via its
+# own `find_package(OpenMP)` — this just makes our usage independent.
+find_package(OpenMP REQUIRED)
+target_compile_options(pie_driver_portable_lib PRIVATE ${OpenMP_CXX_FLAGS})
+target_link_libraries(pie_driver_portable_lib PUBLIC OpenMP::OpenMP_CXX)
+
+target_include_directories(pie_driver_portable_lib
+  PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-target_link_libraries(pie_driver_portable PRIVATE
+target_link_libraries(pie_driver_portable_lib PUBLIC
   CLI11::CLI11
   tomlplusplus::tomlplusplus
   nlohmann_json::nlohmann_json
   ggml
 )
 if(NOT APPLE)
-  target_link_libraries(pie_driver_portable PRIVATE rt)
+  target_link_libraries(pie_driver_portable_lib PUBLIC rt)
 endif()
+
+add_executable(pie_driver_portable src/main.cpp)
+target_link_libraries(pie_driver_portable PRIVATE pie_driver_portable_lib)

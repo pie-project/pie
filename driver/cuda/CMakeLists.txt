@@ -53,11 +53,18 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 
 
-# pie_driver_cuda — native CUDA backend, sibling to ../../runtime (Rust) and
-# ../../pie (Python driver). Talks to the runtime via the shmem fast path;
-# no ZMQ/protobuf needed. Consumed by the Python wrapper `pie_driver_cuda_native`.
-add_executable(pie_driver_cuda
-  src/main.cpp
+# pie_driver_cuda — native CUDA backend. Built two ways from the same
+# translation units:
+#   - `pie_driver_cuda_lib` (STATIC): linked in-process by server/standalone
+#     when the `driver-cuda` Cargo feature is on, so the all-Rust binary
+#     contains the driver. Per the M3 static-link spike below, this works
+#     with `cublas_static + cublasLt_static + cudart_static + culibos +
+#     pthread + rt + dl` and yields a binary with zero CUDA shared deps.
+#   - `pie_driver_cuda` (executable): a thin shim around the lib's
+#     `pie_driver_cuda_run` entry. Consumed by the Python wrapper
+#     `pie_driver_cuda_native` via subprocess.
+add_library(pie_driver_cuda_lib STATIC
+  src/entry.cpp
   src/persistent_inputs.cpp
   src/request_handler.cpp
   src/msgpack_subpass.cpp
@@ -127,7 +134,10 @@ add_executable(pie_driver_cuda
   src/ops/attention_flashinfer.cu
 )
 
-target_compile_options(pie_driver_cuda PRIVATE
+add_executable(pie_driver_cuda src/main.cpp)
+target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib)
+
+target_compile_options(pie_driver_cuda_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:
     -Xcompiler=-Wall
     -Xcompiler=-Wextra
@@ -138,8 +148,8 @@ target_compile_options(pie_driver_cuda PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
 )
 
-target_include_directories(pie_driver_cuda
-  PRIVATE
+target_include_directories(pie_driver_cuda_lib
+  PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
@@ -202,7 +212,7 @@ add_test(NAME response_writer
     ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_flat.bin
     ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_msgpack.bin)
 
-target_link_libraries(pie_driver_cuda PRIVATE
+target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
   tomlplusplus::tomlplusplus
   zstd
@@ -214,3 +224,11 @@ target_link_libraries(pie_driver_cuda PRIVATE
   CUDA::cuda_driver
   ${NCCL_LIBRARY}
 )
+
+# M3 static-link spike notes: a hello-world calling cublasCreate/Destroy
+# links cleanly with `-lcublas_static -lcublasLt_static -lcudart_static
+# -lculibos -lpthread -lrt -ldl`, runs at runtime, and yields `ldd`
+# output with zero non-system shared libs. M4 wires server/standalone's
+# `--features driver-cuda` build.rs to consume `pie_driver_cuda_lib`
+# with those static link flags (mirror the portable side's `BUILD_SHARED_LIBS=OFF`
+# trick, plus explicit `-l:libcublas_static.a` group).

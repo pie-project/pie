@@ -171,7 +171,7 @@ python-source = "src"
 python-packages = ["pie", "pie_cli", "pie_driver", "pie_driver_cuda_native", "pie_driver_portable", "pie_driver_vllm", "pie_driver_sgl", "pie_driver_dummy", "pie_kernels"]
 module-name = "pie._runtime"
 manifest-path = "../runtime/Cargo.toml"
-features = ["pyo3/extension-module"]
+features = ["python"]
 
 [tool.uv]
 cache-keys = [{file = "pyproject.toml"}, {file = "../runtime/Cargo.toml"}, {file = "../runtime/**/*.rs"}]
