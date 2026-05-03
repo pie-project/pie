@@ -147,6 +147,16 @@ target_compile_options(pie_driver_cuda_lib PRIVATE
   >
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
 )
+# Marlin sources are added to the `pie_driver_cuda` executable below
+# (see `PIE_CUDA_BUILD_MARLIN`); they need the same nvcc relaxed-
+# constexpr / extended-lambda flags the lib gets, since vendored
+# kernels mix `__host__ constexpr` helpers into `__device__` paths.
+target_compile_options(pie_driver_cuda PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:
+    --extended-lambda
+    --expt-relaxed-constexpr
+  >
+)
 
 target_include_directories(pie_driver_cuda_lib
   PUBLIC

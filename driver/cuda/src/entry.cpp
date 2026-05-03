@@ -303,8 +303,16 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                     /*total_tokens=*/total_n, /*num_requests=*/1,
                     /*is_pure_decode=*/is_decode);
             } else if (is_qwen3_5) {
+                pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
+                q35_fwd.force_prefill_path = !decode_after_prefill;
+                q35_fwd.tp_size = 1;
+                q35_fwd.tp_comm = nullptr;
+                pie_cuda_driver::model::Qwen3_5PlanState q35_plan;
+                pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
+                    q35_plan, parity_attn_ws, cache, engine.hf_config(),
+                    q35_fwd, h_pp.data(), /*num_requests=*/1, is_decode);
                 pie_cuda_driver::model::qwen3_5_forward_paged(
-                    weights_qwen3_5, engine.hf_config(),
+                    weights_qwen3_5, engine.hf_config(), q35_fwd, q35_plan,
                     ws, q35_la_ws, cache, q35_state_cache,
                     parity_attn_ws, cublas,
                     tok_d, pos_d,
@@ -315,8 +323,16 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                     /*is_pure_decode=*/is_decode,
                     /*mask_d=*/nullptr, /*mask_indptr_d=*/nullptr);
             } else if (is_qwen3_5_moe) {
+                pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
+                q35_fwd.force_prefill_path = !decode_after_prefill;
+                q35_fwd.tp_size = 1;
+                q35_fwd.tp_comm = nullptr;
+                pie_cuda_driver::model::Qwen3_5PlanState q35_plan;
+                pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
+                    q35_plan, parity_attn_ws, cache, engine.hf_config(),
+                    q35_fwd, h_pp.data(), /*num_requests=*/1, is_decode);
                 pie_cuda_driver::model::qwen3_5_moe_forward_paged(
-                    weights_qwen3_5_moe, engine.hf_config(),
+                    weights_qwen3_5_moe, engine.hf_config(), q35_fwd, q35_plan,
                     ws, q35_la_ws, q35_moe_ws,
                     cache, q35_state_cache,
                     parity_attn_ws, cublas,
@@ -648,6 +664,12 @@ int run_impl(int argc,
 
     auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate();
 
+    // Plan-state holders used by the prepare/body split for graph-friendly
+    // dispatch. Allocated unconditionally — empty on archs that don't use
+    // them. `qwen3_5_plan_state` is shared between qwen3_5 and qwen3_5_moe
+    // (they share `prepare_qwen3_5_decode_plan`).
+    pie_cuda_driver::model::Qwen3_5PlanState qwen3_5_plan_state;
+
     // Qwen3.5 / Qwen3.6-MoE linear-attention extras: per-layer state cache
     // + a per-call workspace. Inert (default-constructed) on every other
     // arch. The MoE arch additionally needs a routed-experts workspace.
@@ -899,8 +921,22 @@ int run_impl(int argc,
     // `main`'s scope (weights_*, fwd_cfg, gemma_fwd_cfg) and persist for
     // the lifetime of the server.
     pie_cuda_driver::ForwardFn forward_fn;
+    // Gemma-4 26B-A4B's MoE block needs a routed-experts workspace
+    // alongside the dense forward state. Inert (zero-byte) on dense
+    // E2B / E4B / 31B variants.
+    pie_cuda_driver::model::Gemma4MoeMlpWorkspace gemma4_moe_ws;
+    if (is_gemma4_arch && engine.hf_config().gemma4_enable_moe) {
+        const auto& hf_cfg = engine.hf_config();
+        gemma4_moe_ws = pie_cuda_driver::model::Gemma4MoeMlpWorkspace::allocate(
+            max_workspace_tokens,
+            hf_cfg.hidden_size,
+            hf_cfg.num_experts,
+            hf_cfg.num_experts_per_tok,
+            hf_cfg.moe_intermediate_size /
+                std::max(1, cfg.distributed.tp_size));
+    }
     if (is_gemma4_arch) {
-        forward_fn = [&engine, &weights_gemma4, gemma4_fwd_cfg](
+        forward_fn = [&engine, &weights_gemma4, &gemma4_moe_ws, gemma4_fwd_cfg](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -916,7 +952,7 @@ int run_impl(int argc,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
             pie_cuda_driver::model::gemma4_forward_paged(
                 weights_gemma4, engine.hf_config(), gemma4_fwd_cfg,
-                ws, cache, attn_ws, cublas,
+                ws, gemma4_moe_ws, cache, attn_ws, cublas,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
@@ -1004,7 +1040,25 @@ int run_impl(int argc,
                 N, R, is_pure_decode, mask_d, mask_indptr_d);
         };
     } else if (is_qwen3_5_arch) {
-        forward_fn = [&engine, &weights_qwen3_5, &qwen3_5_la_ws, &qwen3_5_state_cache](
+        forward_fn.prepare = [&engine, &kv_cache, &qwen3_5_plan_state](
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            const std::uint32_t* kv_page_indptr_h,
+            int R, bool is_pure_decode) {
+            pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
+            const auto& hf_q = engine.hf_config();
+            const int gqa_q = hf_q.num_attention_heads /
+                              std::max(1, hf_q.num_key_value_heads);
+            q35_fwd.force_prefill_path =
+                !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                  gqa_q == 4 || gqa_q == 8);
+            q35_fwd.tp_size = 1;
+            q35_fwd.tp_comm = nullptr;
+            pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
+                qwen3_5_plan_state, attn_ws, kv_cache, engine.hf_config(),
+                q35_fwd, kv_page_indptr_h, R, is_pure_decode);
+        };
+        forward_fn.body = [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
+                           &qwen3_5_state_cache, &qwen3_5_plan_state](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -1018,8 +1072,17 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
+            const auto& hf_q = engine.hf_config();
+            const int gqa_q = hf_q.num_attention_heads /
+                              std::max(1, hf_q.num_key_value_heads);
+            q35_fwd.force_prefill_path =
+                !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                  gqa_q == 4 || gqa_q == 8);
+            q35_fwd.tp_size = 1;
+            q35_fwd.tp_comm = nullptr;
             pie_cuda_driver::model::qwen3_5_forward_paged(
-                weights_qwen3_5, engine.hf_config(),
+                weights_qwen3_5, engine.hf_config(), q35_fwd, qwen3_5_plan_state,
                 ws, qwen3_5_la_ws, cache, qwen3_5_state_cache,
                 attn_ws, cublas,
                 tok, pos,
@@ -1028,8 +1091,26 @@ int run_impl(int argc,
                 N, R, is_pure_decode, mask_d, mask_indptr_d);
         };
     } else if (is_qwen3_5_moe_arch) {
-        forward_fn = [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
-                      &qwen3_5_moe_ws, &qwen3_5_state_cache](
+        forward_fn.prepare = [&engine, &kv_cache, &qwen3_5_plan_state](
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            const std::uint32_t* kv_page_indptr_h,
+            int R, bool is_pure_decode) {
+            pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
+            const auto& hf_q = engine.hf_config();
+            const int gqa_q = hf_q.num_attention_heads /
+                              std::max(1, hf_q.num_key_value_heads);
+            q35_fwd.force_prefill_path =
+                !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                  gqa_q == 4 || gqa_q == 8);
+            q35_fwd.tp_size = 1;
+            q35_fwd.tp_comm = nullptr;
+            pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
+                qwen3_5_plan_state, attn_ws, kv_cache, engine.hf_config(),
+                q35_fwd, kv_page_indptr_h, R, is_pure_decode);
+        };
+        forward_fn.body = [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
+                           &qwen3_5_moe_ws, &qwen3_5_state_cache,
+                           &qwen3_5_plan_state](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -1043,8 +1124,18 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
+            pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
+            const auto& hf_q = engine.hf_config();
+            const int gqa_q = hf_q.num_attention_heads /
+                              std::max(1, hf_q.num_key_value_heads);
+            q35_fwd.force_prefill_path =
+                !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                  gqa_q == 4 || gqa_q == 8);
+            q35_fwd.tp_size = 1;
+            q35_fwd.tp_comm = nullptr;
             pie_cuda_driver::model::qwen3_5_moe_forward_paged(
-                weights_qwen3_5_moe, engine.hf_config(),
+                weights_qwen3_5_moe, engine.hf_config(), q35_fwd,
+                qwen3_5_plan_state,
                 ws, qwen3_5_la_ws, qwen3_5_moe_ws,
                 cache, qwen3_5_state_cache,
                 attn_ws, cublas,
@@ -1054,7 +1145,16 @@ int run_impl(int argc,
                 N, R, is_pure_decode, mask_d, mask_indptr_d);
         };
     } else {
-        forward_fn = [&engine, &weights_llama, fwd_cfg](
+        static pie_cuda_driver::model::LlamaLikePlanState s_llama_plan;
+        forward_fn.prepare = [&engine, &kv_cache, &fwd_cfg](
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            const std::uint32_t* kv_page_indptr_h,
+            int R, bool is_pure_decode) {
+            pie_cuda_driver::model::prepare_llama_like_decode_plan(
+                s_llama_plan, attn_ws, kv_cache, engine.hf_config(),
+                fwd_cfg, kv_page_indptr_h, R, is_pure_decode);
+        };
+        forward_fn.body = [&engine, &weights_llama, fwd_cfg](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -1069,7 +1169,7 @@ int run_impl(int argc,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
             pie_cuda_driver::model::llama_like_forward_paged(
-                weights_llama, engine.hf_config(), fwd_cfg,
+                weights_llama, engine.hf_config(), fwd_cfg, s_llama_plan,
                 ws, cache, attn_ws, cublas,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
