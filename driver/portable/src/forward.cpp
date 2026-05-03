@@ -292,17 +292,24 @@ KvCachePaged build_kv_for_(Model& model,
                             std::int32_t page_size) {
     const auto& h = model.hparams();
     if (h.arch == PieArch::Gemma4) {
-        // Per-layer head_dim — sliding layers carry head_dim, full layers
-        // gemma4_head_dim_global. Each layer gets its own cache slab.
-        std::vector<std::int32_t> per_layer(h.num_hidden_layers, h.head_dim);
+        // Per-layer head_dim AND kv_heads. Sliding layers carry
+        // [num_key_value_heads, head_dim]; full layers carry
+        // [head_dim_global] and (for Gemma 4 31B / 26B-A4B alt-attention)
+        // num_global_key_value_heads instead of num_key_value_heads.
+        std::vector<std::int32_t> per_layer_dim(h.num_hidden_layers, h.head_dim);
+        std::vector<std::int32_t> per_layer_kvh(h.num_hidden_layers,
+                                                h.num_key_value_heads);
         for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
             const bool is_full = !h.layer_types.empty()
                 && h.layer_types[i] == 'g';
-            per_layer[i] = is_full ? h.gemma4_head_dim_global : h.head_dim;
+            per_layer_dim[i] = is_full ? h.gemma4_head_dim_global : h.head_dim;
+            if (is_full && h.num_global_key_value_heads > 0) {
+                per_layer_kvh[i] = h.num_global_key_value_heads;
+            }
         }
         return KvCachePaged(model.backend(),
-                             h.num_key_value_heads,
-                             std::move(per_layer),
+                             std::move(per_layer_kvh),
+                             std::move(per_layer_dim),
                              total_pages, page_size,
                              GGML_TYPE_F16);
     }

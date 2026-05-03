@@ -120,7 +120,14 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
             && spec.layer_pattern[il] == 'g';
         const std::int32_t head_dim_il =
             is_full ? spec.gemma4_head_dim_global : h.head_dim;
-        const std::int32_t n_embd_gqa_il = n_kv_heads * head_dim_il;
+        // Per-layer kv_heads. Full_attention layers on Gemma 4 31B / 26B-A4B
+        // use a smaller kv_heads count (`num_global_key_value_heads`) than
+        // sliding layers. KV cache is sized accordingly per layer.
+        const std::int32_t n_kv_heads_il =
+            (is_full && h.num_global_key_value_heads > 0)
+                ? h.num_global_key_value_heads
+                : n_kv_heads;
+        const std::int32_t n_embd_gqa_il = n_kv_heads_il * head_dim_il;
         const bool is_shared = il >= spec.gemma4_first_shared;
         const std::int32_t kv_layer = is_shared
             ? gemma4_kv_source(spec.layer_pattern, il, spec.gemma4_first_shared)
@@ -157,9 +164,15 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
 
         if (!is_shared) {
             auto* K = ggml_mul_mat(ctx, L.k_proj, cur);
-            auto* V = ggml_mul_mat(ctx, L.v_proj, cur);
-            K = ggml_reshape_3d(ctx, K, head_dim_il, n_kv_heads, n_total);
-            V = ggml_reshape_3d(ctx, V, head_dim_il, n_kv_heads, n_total);
+            // Alternative attention: when v_proj is absent (Gemma 4 large
+            // variants on full_attention layers), V is the same projection
+            // result as K. They diverge after this point — V skips K-norm
+            // and RoPE.
+            auto* V = (L.v_proj != nullptr)
+                ? ggml_mul_mat(ctx, L.v_proj, cur)
+                : K;
+            K = ggml_reshape_3d(ctx, K, head_dim_il, n_kv_heads_il, n_total);
+            V = ggml_reshape_3d(ctx, V, head_dim_il, n_kv_heads_il, n_total);
             // Per-head K-norm with [head_dim_il] weight.
             K = ggml_rms_norm(ctx, K, h.rms_norm_eps);
             K = norm_scale(ctx, K, L.k_norm, /*plus_one=*/false);
@@ -205,10 +218,10 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
             auto* K_gather = ggml_get_rows(ctx, k_cached, in.packed_gather);
             auto* V_gather = ggml_get_rows(ctx, v_cached, in.packed_gather);
             auto* K_4d = ggml_reshape_4d(ctx, K_gather,
-                                          head_dim_il, n_kv_heads,
+                                          head_dim_il, n_kv_heads_il,
                                           plan.max_n_kv, n_req);
             auto* V_4d = ggml_reshape_4d(ctx, V_gather,
-                                          head_dim_il, n_kv_heads,
+                                          head_dim_il, n_kv_heads_il,
                                           plan.max_n_kv, n_req);
 
             ggml_tensor* attn = nullptr;
@@ -223,9 +236,9 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
                 ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
             } else {
                 // Full layers (head_dim=512): manual SDPA, batched over
-                // n_req via ne[3]. GQA expands K/V from n_kv_heads to
+                // n_req via ne[3]. GQA expands K/V from n_kv_heads_il to
                 // n_q_heads via repeat_4d so mul_mat lines up per head.
-                const std::int32_t gqa_factor = n_q_heads / n_kv_heads;
+                const std::int32_t gqa_factor = n_q_heads / n_kv_heads_il;
                 ggml_tensor* K_h = K_4d;
                 ggml_tensor* V_h = V_4d;
                 if (gqa_factor > 1) {
@@ -272,7 +285,7 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
                         ctx, Q, k_cached, v_cached,
                         in.gather_idxs[r], in.masks[r],
                         R.qo_start, R.n_tokens, R.n_kv,
-                        head_dim_il, n_kv_heads, n_q_heads,
+                        head_dim_il, n_kv_heads_il, n_q_heads,
                         layer_kq_scale, spec.attn_softcap,
                         /*sinks=*/nullptr);
                 } else {
@@ -283,9 +296,9 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
                     auto* K_gather = ggml_get_rows(ctx, k_cached, in.gather_idxs[r]);
                     auto* V_gather = ggml_get_rows(ctx, v_cached, in.gather_idxs[r]);
                     auto* K_r = ggml_reshape_3d(ctx, K_gather,
-                                                head_dim_il, n_kv_heads, R.n_kv);
+                                                head_dim_il, n_kv_heads_il, R.n_kv);
                     auto* V_r = ggml_reshape_3d(ctx, V_gather,
-                                                head_dim_il, n_kv_heads, R.n_kv);
+                                                head_dim_il, n_kv_heads_il, R.n_kv);
 
                     auto* Q_perm = ggml_cont(ctx, ggml_permute(ctx, Q_r, 0, 2, 1, 3));
                     auto* K_perm = ggml_cont(ctx, ggml_permute(ctx, K_r, 0, 2, 1, 3));

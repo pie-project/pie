@@ -59,6 +59,10 @@ struct Hparams {
     std::int32_t num_hidden_layers = 0;
     std::int32_t num_attention_heads = 0;
     std::int32_t num_key_value_heads = 0;
+    // Gemma 4 alternative attention: full_attention layers use a
+    // SMALLER kv_heads count than sliding layers (e.g., 4 vs 16 on 31B).
+    // 0 = not provided / not applicable.
+    std::int32_t num_global_key_value_heads = 0;
     std::int32_t hidden_size = 0;
     std::int32_t intermediate_size = 0;
     std::int32_t head_dim = 0;             // computed if missing

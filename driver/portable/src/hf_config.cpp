@@ -133,11 +133,34 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     //     likewise unsupported. We ignore `quantization_config` here; the
     //     safetensors loader throws on the first unsupported dtype.
 
+    // Per-arch defaults for fields HF's PretrainedConfig fills implicitly.
+    // Gemma 3 4B+ multimodal checkpoints ship with a minimal text_config
+    // (only hidden_size / intermediate_size / num_hidden_layers / etc.),
+    // relying on Gemma3TextConfig class defaults. Inject those here.
+    if (h.arch == PieArch::Gemma3) {
+        auto fill = [&](const char* k, double v) {
+            if (!text.contains(k) || text[k].is_null()) text[k] = v;
+        };
+        fill("num_attention_heads", 8);
+        fill("num_key_value_heads", 4);
+        fill("head_dim", 256);
+        fill("vocab_size", 262208);
+        fill("rms_norm_eps", 1e-6);
+        fill("rope_theta", 1e6);
+        fill("max_position_embeddings", 131072);
+        fill("sliding_window", 4096);
+        fill("rope_local_base_freq", 10000.0);
+        fill("query_pre_attn_scalar", 256);
+    }
+
     h.num_hidden_layers = text.at("num_hidden_layers").get<std::int32_t>();
     h.num_attention_heads = text.at("num_attention_heads").get<std::int32_t>();
     // Some configs default num_key_value_heads to num_attention_heads.
     h.num_key_value_heads =
         get_or<std::int32_t>(text, "num_key_value_heads", h.num_attention_heads);
+    // Gemma 4 alternative-attention only.
+    h.num_global_key_value_heads =
+        get_or<std::int32_t>(text, "num_global_key_value_heads", 0);
     h.hidden_size = text.at("hidden_size").get<std::int32_t>();
     // Pure-MoE checkpoints (Qwen 3.6) omit `intermediate_size` because
     // every layer's FFN is the routed-expert path; the per-expert width

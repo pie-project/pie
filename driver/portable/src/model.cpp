@@ -397,12 +397,25 @@ void Model::resolve_tensor_prefix_() {
             // under `model.language_model.`.
             tensor_prefix_ = "model.language_model.";
             break;
+        case PieArch::Gemma3:
+            // Gemma 3 4B+ multimodal (Gemma3ForConditionalGeneration) puts
+            // the text decoder under `language_model.model.`. The 270M/1B
+            // text-only checkpoints keep canonical names; detect from the
+            // archive.
+            if (archive_->find("model.embed_tokens.weight") == nullptr &&
+                archive_->find("language_model.model.embed_tokens.weight") != nullptr) {
+                tensor_prefix_ = "language_model.model.";
+            }
+            break;
         case PieArch::Mistral3:
-            // Plain Mistral / Mistral 7B v0.3 (hf_model_type "mistral")
-            // has no wrapper and keeps the canonical "model." names.
-            // Ministral 3 ships as Mistral3ForConditionalGeneration with
-            // the text decoder under `language_model.model.`.
-            if (hparams_.hf_model_type == "ministral3") {
+            // Plain Mistral / Mistral 7B v0.3 keeps canonical "model."
+            // names. Multimodal Mistral3 wrappers (Ministral 3 8B/14B Base,
+            // Mistral-Small-3.1, etc.) put the text decoder under
+            // `language_model.model.`. Detect from the archive rather than
+            // from text_config.model_type, since the inner type can be
+            // either "mistral" or "ministral3".
+            if (archive_->find("model.embed_tokens.weight") == nullptr &&
+                archive_->find("language_model.model.embed_tokens.weight") != nullptr) {
                 tensor_prefix_ = "language_model.model.";
             }
             break;
@@ -595,13 +608,36 @@ std::string Model::activation_dtype_str() const {
 // -----------------------------------------------------------------------------
 
 void Model::load_top_level_() {
-    const auto& h = hparams_;
+    auto& h = hparams_;
     weights_.tok_embd    = declare_(tname_("model.embed_tokens.weight"));
     weights_.output_norm = declare_(tname_("model.norm.weight"));
-    if (!h.tie_word_embeddings) {
-        // lm_head is typically NOT under the multimodal wrapper prefix
-        // (Ministral 3 keeps it at the top level alongside the wrapper).
-        weights_.output_head = declare_("lm_head.weight");
+    // Probe the archive for an explicit lm_head. Two layouts:
+    //   - "<wrapper>lm_head.weight" — multimodal-wrapped (Ministral 3
+    //     8B/14B, Mistral-Small-3.1: "language_model.lm_head.weight").
+    //   - "lm_head.weight" — plain causal LMs.
+    // If neither exists, use tied embeddings. The HF config flag
+    // `tie_word_embeddings` is unreliable (often null in newer Mistral
+    // configs and the HF default differs by arch), so we drive this off
+    // the actual safetensors index and override the hparam to match.
+    constexpr std::string_view kModelSuffix = "model.";
+    std::string wrapper = tensor_prefix_;
+    if (wrapper.size() >= kModelSuffix.size() &&
+        std::string_view(wrapper).substr(wrapper.size() - kModelSuffix.size()) == kModelSuffix) {
+        wrapper = wrapper.substr(0, wrapper.size() - kModelSuffix.size());
+    }
+    const std::string lm_wrapped = wrapper + "lm_head.weight";
+    const std::string lm_plain   = "lm_head.weight";
+    const std::string* found = nullptr;
+    if (archive_->find(lm_wrapped) != nullptr) {
+        found = &lm_wrapped;
+    } else if (lm_wrapped != lm_plain && archive_->find(lm_plain) != nullptr) {
+        found = &lm_plain;
+    }
+    if (found) {
+        weights_.output_head = declare_(*found);
+        h.tie_word_embeddings = false;
+    } else {
+        h.tie_word_embeddings = true;
     }
     weights_.layers.resize(h.num_hidden_layers);
 }
@@ -1190,7 +1226,12 @@ void Model::build_gemma4_() {
         // unused weights and corrupt the reused upstream KV.
         if (i < first_shared) {
             L.k_proj = declare_(p + "self_attn.k_proj.weight");
-            L.v_proj = declare_(p + "self_attn.v_proj.weight");
+            // Gemma 4 large variants (31B, 26B-A4B) omit v_proj on
+            // full_attention layers (alternative attention: V is the
+            // same projection result as K). Probe per-layer.
+            if (archive_->find(p + "self_attn.v_proj.weight") != nullptr) {
+                L.v_proj = declare_(p + "self_attn.v_proj.weight");
+            }
             L.k_norm = declare_(p + "self_attn.k_norm.weight");
         }
 
