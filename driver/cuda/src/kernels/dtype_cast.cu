@@ -325,4 +325,75 @@ void launch_awq_dequant_to_bf16(
         size_k, size_n, group_size);
 }
 
+namespace {
+
+// GPTQ dequant: qweight packed along K (no interleave); qzeros packed
+// along N (no interleave); optional g_idx for desc_act=true.
+//
+//   nibble_w[k, n]  = (qweight[k/8, n] >> ((k%8)*4)) & 0xF
+//   nibble_zp[g, n] = (qzeros[g, n/8] >> ((n%8)*4)) & 0xF
+//   g(k)            = g_idx[k]               (desc_act=true)
+//                   = k / group_size         (desc_act=false / g_idx=null)
+//   bf16[n, k]      = (nibble_w[k, n] - (nibble_zp[g(k), n] + 1)) * scales[g(k), n]
+//
+// The `+1` on the zero-point matches autogptq's storage convention:
+// `qzeros = zp - 1` (canonical), so the dequanter must add it back.
+// For symmetric GPTQ (kU4B8 in marlin), qzeros is filled with 7 → +1
+// gives 8 (the standard bias for kU4B8), and (nibble - 8) yields the
+// signed [-8, 7] range that scales applies on top of.
+__global__ void gptq_dequant_to_bf16_kernel(
+    const std::uint32_t* __restrict__ qweight,    // [K/8, N]
+    const std::uint32_t* __restrict__ qzeros,     // [groups, N/8]
+    const __nv_bfloat16* __restrict__ scales,     // [groups, N]
+    const std::int32_t*  __restrict__ g_idx,      // [K] or nullptr
+    __nv_bfloat16*       __restrict__ out,        // [N, K]
+    int                                size_k,
+    int                                size_n,
+    int                                group_size)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = blockIdx.y * blockDim.y + threadIdx.y;
+    if (n >= size_n || k >= size_k) return;
+
+    const int n8 = size_n / 8;
+    const int g = (g_idx != nullptr)
+                      ? g_idx[k]
+                      : (k / group_size);
+
+    const std::uint32_t w_word = qweight[(k / 8) * size_n + n];
+    const std::uint32_t z_word = qzeros[g * n8 + (n / 8)];
+    const int w_int4  = static_cast<int>((w_word >> ((k % 8) * 4)) & 0xFu);
+    const int zp_int4 = static_cast<int>((z_word >> ((n % 8) * 4)) & 0xFu) + 1;
+
+    const float sc = __bfloat162float(scales[g * size_n + n]);
+    const float val = static_cast<float>(w_int4 - zp_int4) * sc;
+    out[n * size_k + k] = __float2bfloat16(val);
+}
+
+}  // namespace
+
+void launch_gptq_dequant_to_bf16(
+    const void* qweight_in,
+    const void* qzeros_in,
+    const void* scales_in,
+    const void* g_idx_in,
+    void*       bf16_out,
+    int         size_k,
+    int         size_n,
+    int         group_size,
+    cudaStream_t stream)
+{
+    if (size_k == 0 || size_n == 0 || group_size == 0) return;
+    constexpr int BX = 32, BY = 8;
+    const dim3 block(BX, BY);
+    const dim3 grid((size_n + BX - 1) / BX, (size_k + BY - 1) / BY);
+    gptq_dequant_to_bf16_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const std::uint32_t*>(qweight_in),
+        static_cast<const std::uint32_t*>(qzeros_in),
+        static_cast<const __nv_bfloat16*>(scales_in),
+        static_cast<const std::int32_t*>(g_idx_in),
+        static_cast<__nv_bfloat16*>(bf16_out),
+        size_k, size_n, group_size);
+}
+
 }  // namespace pie_cuda_driver::kernels

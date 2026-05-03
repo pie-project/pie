@@ -109,4 +109,30 @@ void launch_awq_dequant_to_bf16(
     int           group_size,
     cudaStream_t  stream);
 
+/// Direct GPTQ dequant to bf16. GPTQ packs nibbles along K axis (axis 0
+/// of qweight) sequentially (no interleave). Supports both `desc_act=
+/// false` (g_idx = nullptr → use g = k / group_size) and `desc_act=true`
+/// (g_idx[k] is the per-row scale group lookup). Symmetric (kU4B8)
+/// ckpts ship qzeros set to 8 everywhere — the kernel applies
+/// (nibble - zp) uniformly so this works for both sym and asym.
+///
+/// Inputs:
+///   * `qweight_in` — `[K/8, N]` int32 (GPTQ packing along K).
+///   * `qzeros_in`  — `[groups, N/8]` int32 (packing along N).
+///   * `scales_in`  — `[groups, N]` bf16.
+///   * `g_idx_in`   — `[K]` int32 or nullptr. When non-null, this is
+///                    desc_act=true (act-order); each row k of the
+///                    dequanted weight uses scale group g_idx[k].
+///   * `bf16_out`   — `[N, K]` bf16 (transposed for HF Linear).
+void launch_gptq_dequant_to_bf16(
+    const void*   qweight_in,
+    const void*   qzeros_in,
+    const void*   scales_in,
+    const void*   g_idx_in,        // nullable
+    void*         bf16_out,        // [N, K] bf16
+    int           size_k,
+    int           size_n,
+    int           group_size,
+    cudaStream_t  stream);
+
 }  // namespace pie_cuda_driver::kernels
