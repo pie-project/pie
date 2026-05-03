@@ -12,6 +12,21 @@ namespace pie_portable_driver {
 
 namespace {
 
+// Gemma 3n KV-share source. Mirrors graph_gemma4.cpp's gemma4_kv_source
+// helper (and the HF transformers logic): a "shared" layer reads K/V
+// from the most recent earlier non-shared layer with the same attention
+// type. `pattern[il] == 's'` for sliding, `'g'` for full.
+inline std::int32_t gemma3n_kv_source(const std::string& pattern,
+                                       std::int32_t il,
+                                       std::int32_t first_shared) {
+    if (il < first_shared) return il;
+    const char target = pattern[il];
+    for (std::int32_t i = first_shared - 1; i >= 0; --i) {
+        if (pattern[i] == target) return i;
+    }
+    return il;  // unreachable on well-formed configs
+}
+
 // Gemma 3n AltUp: compute the per-token modality vector that drives the
 // predict / correct coefficient matrices for one stream. Mirrors
 // `Gemma3nTextAltUp.compute_router_modalities`:
@@ -122,6 +137,21 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         streams[0] = inpL;
     }
 
+    // ── Gemma 3n: KV-share state ──
+    // Last `num_kv_shared_layers` layers reuse upstream non-shared layer's
+    // K/V (matched by attention type, see `gemma3n_kv_source`). Track the
+    // post-`set_rows` k/v_cached tensors per non-shared layer so shared
+    // layers can pick them up by index. Non-Gemma3n archs leave this
+    // unused.
+    const bool use_kv_share =
+        (h.arch == PieArch::Gemma3n)
+        && spec.gemma4_first_shared > 0
+        && spec.gemma4_first_shared < h.num_hidden_layers
+        && static_cast<std::int32_t>(spec.layer_pattern.size())
+               == h.num_hidden_layers;
+    std::vector<ggml_tensor*> live_k(h.num_hidden_layers, nullptr);
+    std::vector<ggml_tensor*> live_v(h.num_hidden_layers, nullptr);
+
     // ── Gemma 3n: Per-Layer Embeddings (PLE) setup ──
     // The model maintains an auxiliary token-embedding table indexed at the
     // input ids (`embed_tokens_per_layer`, shape [vocab_per_layer,
@@ -163,6 +193,13 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
 
     for (std::int32_t il = 0; il < h.num_hidden_layers; ++il) {
         const auto& L = w.layers[il];
+
+        // Gemma 3n KV-share: shared layers reuse upstream non-shared
+        // layer's K/V (matched by attention type via layer_pattern).
+        const bool is_shared = use_kv_share && il >= spec.gemma4_first_shared;
+        const std::int32_t kv_layer = is_shared
+            ? gemma3n_kv_source(spec.layer_pattern, il, spec.gemma4_first_shared)
+            : il;
 
         // ── Gemma 3n: AltUp predict ──
         // For each layer, derive 4 "predicted" streams from the current
@@ -217,8 +254,10 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         }
 
         auto* Q = ggml_mul_mat(ctx, L.q_proj, cur);
-        auto* K = ggml_mul_mat(ctx, L.k_proj, cur);
-        auto* V = ggml_mul_mat(ctx, L.v_proj, cur);
+        // Shared Gemma 3n layers skip K/V projection — they reuse upstream
+        // layer's KV cache by index. Q is still computed on every layer.
+        ggml_tensor* K = is_shared ? nullptr : ggml_mul_mat(ctx, L.k_proj, cur);
+        ggml_tensor* V = is_shared ? nullptr : ggml_mul_mat(ctx, L.v_proj, cur);
 
         // M9: optional LoRA delta for q/k/v projections (o_proj is below).
         if (plan.active_adapter
@@ -226,16 +265,20 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
             const auto& AL = plan.active_adapter->layers()[il];
             const float s = plan.active_adapter->scale();
             Q = apply_lora_delta(ctx, Q, AL.q_a, AL.q_b, cur, s);
-            K = apply_lora_delta(ctx, K, AL.k_a, AL.k_b, cur, s);
-            V = apply_lora_delta(ctx, V, AL.v_a, AL.v_b, cur, s);
+            if (!is_shared) {
+                K = apply_lora_delta(ctx, K, AL.k_a, AL.k_b, cur, s);
+                V = apply_lora_delta(ctx, V, AL.v_a, AL.v_b, cur, s);
+            }
         }
 
         // Optional QKV bias (qwen2). 1D bias vector broadcasts along ne[1]
         // (the n_total token dim) — same as flashinfer / HF.
         if (spec.has_qkv_bias) {
             if (L.q_proj_b) Q = add_with_cast(ctx, Q, L.q_proj_b);
-            if (L.k_proj_b) K = add_with_cast(ctx, K, L.k_proj_b);
-            if (L.v_proj_b) V = add_with_cast(ctx, V, L.v_proj_b);
+            if (!is_shared) {
+                if (L.k_proj_b) K = add_with_cast(ctx, K, L.k_proj_b);
+                if (L.v_proj_b) V = add_with_cast(ctx, V, L.v_proj_b);
+            }
         }
 
         // Olmo3 normalizes the flat Q/K vectors (one global RMS over
@@ -244,21 +287,27 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         if (spec.has_qk_norm && spec.qk_norm_full) {
             Q = ggml_rms_norm(ctx, Q, h.rms_norm_eps);
             Q = norm_scale(ctx, Q, L.q_norm, spec.norm_weight_plus_one);
-            K = ggml_rms_norm(ctx, K, h.rms_norm_eps);
-            K = norm_scale(ctx, K, L.k_norm, spec.norm_weight_plus_one);
+            if (!is_shared) {
+                K = ggml_rms_norm(ctx, K, h.rms_norm_eps);
+                K = norm_scale(ctx, K, L.k_norm, spec.norm_weight_plus_one);
+            }
         }
 
         Q = ggml_reshape_3d(ctx, Q, head_dim, n_q_heads,  n_total);
-        K = ggml_reshape_3d(ctx, K, head_dim, n_kv_heads, n_total);
-        V = ggml_reshape_3d(ctx, V, head_dim, n_kv_heads, n_total);
+        if (!is_shared) {
+            K = ggml_reshape_3d(ctx, K, head_dim, n_kv_heads, n_total);
+            V = ggml_reshape_3d(ctx, V, head_dim, n_kv_heads, n_total);
+        }
 
         // Per-head Q/K-norm (qwen3, gemma3). Weight is [head_dim] and
         // broadcasts over heads/tokens after the reshape above.
         if (spec.has_qk_norm && !spec.qk_norm_full) {
             Q = ggml_rms_norm(ctx, Q, h.rms_norm_eps);
             Q = norm_scale(ctx, Q, L.q_norm, spec.norm_weight_plus_one);
-            K = ggml_rms_norm(ctx, K, h.rms_norm_eps);
-            K = norm_scale(ctx, K, L.k_norm, spec.norm_weight_plus_one);
+            if (!is_shared) {
+                K = ggml_rms_norm(ctx, K, h.rms_norm_eps);
+                K = norm_scale(ctx, K, L.k_norm, spec.norm_weight_plus_one);
+            }
         }
 
         // Gemma 3n: V-norm. Per HF Gemma3nTextAttention.v_norm with
@@ -269,7 +318,7 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         // off-distribution and the model degrades to fluent-but-incoherent
         // text. (Mirrors graph_gemma4's v_norm path; gemma4_v_norm flag
         // reused since the wiring is identical.)
-        if (spec.gemma4_v_norm) {
+        if (spec.gemma4_v_norm && !is_shared) {
             V = ggml_rms_norm(ctx, V, h.rms_norm_eps);
         }
 
@@ -308,18 +357,33 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
                           layer_rope_theta, rope_freq_scale,
                           rope_ext_factor, rope_attn_factor,
                           rope_beta_fast, rope_beta_slow);
-        K = ggml_rope_ext(ctx, K, in.pos_input, c_rope,
-                          head_dim, GGML_ROPE_TYPE_NEOX, rope_n_ctx_orig,
-                          layer_rope_theta, rope_freq_scale,
-                          rope_ext_factor, rope_attn_factor,
-                          rope_beta_fast, rope_beta_slow);
+        if (!is_shared) {
+            K = ggml_rope_ext(ctx, K, in.pos_input, c_rope,
+                              head_dim, GGML_ROPE_TYPE_NEOX, rope_n_ctx_orig,
+                              layer_rope_theta, rope_freq_scale,
+                              rope_ext_factor, rope_attn_factor,
+                              rope_beta_fast, rope_beta_slow);
+        }
 
         // ---- KV pool write (set_rows scatters by physical row index) -------
-        auto* k_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, K), n_embd_gqa, n_total);
-        auto* v_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, V), n_embd_gqa, n_total);
-
-        auto* k_cached = ggml_set_rows(ctx, kv.k(il), k_2d, in.kv_idxs);
-        auto* v_cached = ggml_set_rows(ctx, kv.v(il), v_2d, in.kv_idxs);
+        // Shared layers skip the write — they read from upstream's
+        // already-written cache slot via `kv_layer`.
+        ggml_tensor* k_cached;
+        ggml_tensor* v_cached;
+        if (!is_shared) {
+            auto* k_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, K), n_embd_gqa, n_total);
+            auto* v_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, V), n_embd_gqa, n_total);
+            k_cached = ggml_set_rows(ctx, kv.k(il), k_2d, in.kv_idxs);
+            v_cached = ggml_set_rows(ctx, kv.v(il), v_2d, in.kv_idxs);
+            live_k[il] = k_cached;
+            live_v[il] = v_cached;
+        } else {
+            // Read upstream non-shared layer's post-set_rows tensor; this
+            // node carries the dependency on that layer's KV write so the
+            // graph orders correctly.
+            k_cached = live_k[kv_layer];
+            v_cached = live_v[kv_layer];
+        }
 
         // ---- Attention -----------------------------------------------------
         ggml_tensor* attn_2d = nullptr;

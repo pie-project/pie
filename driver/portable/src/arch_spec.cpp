@@ -149,12 +149,14 @@ ArchSpec arch_spec_for(PieArch a, const Hparams& h) {
             apply_gemma_norms_(s);
             s.has_qk_norm = true;
             s.gemma4_unit_sm_scale = true;  // attention scale = 1.0
-            // gemma4_v_norm = true would mirror HF's V-norm wiring, but we
-            // skip it for now: enabling it produced *worse* output (looped
-            // tokens, repeated `1 is 0`) which suggests the cached V
-            // distribution drift cascades into the o_proj path more
-            // catastrophically than the missing norm. Leaving disabled
-            // until the rest of the AltUp pipeline is closer to reference.
+            s.gemma4_v_norm        = true;  // pure RMS-norm on V (no scale)
+            // KV-share: last `num_kv_shared_layers` (=10 on E2B/E4B) reuse
+            // upstream non-shared layer's K/V matched by attention type.
+            // The graph builder reads `gemma4_first_shared` to know where
+            // the cutoff is (mirrors gemma4 wiring; same field name reused).
+            s.gemma4_first_shared = h.gemma4_num_kv_shared_layers > 0
+                ? h.num_hidden_layers - h.gemma4_num_kv_shared_layers
+                : h.num_hidden_layers;
             apply_swa_pattern_(s, h, SwaPattern::FromLayerTypes);
             if (h.final_logit_softcapping) s.final_softcap = *h.final_logit_softcapping;
             break;
