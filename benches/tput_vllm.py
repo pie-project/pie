@@ -26,6 +26,12 @@ def main():
     p.add_argument("--max-tokens", type=int, default=100,
                    help="Max generated tokens per request")
     p.add_argument("--max-num-seqs", type=int, default=512)
+    p.add_argument("--tp-size", type=int, default=1)
+    p.add_argument("--max-model-len", type=int, default=2048)
+    p.add_argument("--disable-prefix-caching", action="store_true",
+                   help="vllm v1 enables APC by default; disable for fair compare vs engines without prefix dedup")
+    p.add_argument("--ignore-eos", action="store_true",
+                   help="Generate exactly max_tokens regardless of stop tokens")
     p.add_argument("--unique-prompts", action="store_true",
                    help="Append a per-request id to the prompt to defeat KV-cache reuse")
     p.add_argument("--warmup-n", type=int, default=0,
@@ -37,6 +43,9 @@ def main():
         gpu_memory_utilization=args.gpu_mem_util,
         enforce_eager=True,
         max_num_seqs=args.max_num_seqs,
+        tensor_parallel_size=args.tp_size,
+        max_model_len=args.max_model_len,
+        enable_prefix_caching=not args.disable_prefix_caching,
     )
 
     base = "Write a short story about a robot."
@@ -60,7 +69,8 @@ def main():
 
     # Match pie's inferlet sampler: temperature=0.6 + top_p=0.95.
     sampling = SamplingParams(
-        temperature=0.6, top_p=0.95, max_tokens=args.max_tokens
+        temperature=0.6, top_p=0.95, max_tokens=args.max_tokens,
+        ignore_eos=args.ignore_eos,
     )
 
     if args.warmup_n > 0:
@@ -82,6 +92,19 @@ def main():
     print(f"Total Out Tokens:  {total_tokens}")
     print(f"Requests/sec:      {completed / duration:.2f}")
     print(f"Tokens/sec:        {total_tokens / duration:.2f}")
+    # Per-request E2E latency from vllm's RequestOutput.metrics. With
+    # all prompts submitted at once, mean/p50 ≈ duration when the
+    # batcher saturates; p95/p99 gauge tail.
+    lats = []
+    for o in outputs:
+        m = getattr(o, "metrics", None)
+        if m is not None and m.finished_time is not None and m.arrival_time is not None:
+            lats.append(m.finished_time - m.arrival_time)
+    if lats:
+        s = sorted(lats); n = len(s)
+        def _p(q): return s[min(int(q * n), n - 1)]
+        print(f"Latency mean / p50: {sum(s)/n*1000:.1f} / {_p(0.50)*1000:.1f} ms")
+        print(f"Latency p95 / p99:  {_p(0.95)*1000:.1f} / {_p(0.99)*1000:.1f} ms")
     print("─" * 40)
 
 

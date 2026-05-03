@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <type_traits>
 
 #include <atomic>
 
@@ -99,6 +100,21 @@ struct ForwardFn {
     // no graph capture" mode for this arch.
     PrepareFn prepare;
     BodyFn    body;
+
+    // Convenience: `forward_fn = [...]` assigns the lambda as the body.
+    // entry.cpp uses this terser pattern; the older `forward_fn.body =
+    // [...]` form continues to work because we leave `body` public.
+    template <class F>
+        requires(!std::is_same_v<std::decay_t<F>, ForwardFn>)
+    ForwardFn& operator=(F&& f) {
+        body = std::forward<F>(f);
+        return *this;
+    }
+    ForwardFn() = default;
+    ForwardFn(const ForwardFn&) = default;
+    ForwardFn(ForwardFn&&) noexcept = default;
+    ForwardFn& operator=(const ForwardFn&) = default;
+    ForwardFn& operator=(ForwardFn&&) noexcept = default;
 };
 
 // Stable references the request handler needs across calls. Constructed

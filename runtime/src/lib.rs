@@ -19,6 +19,7 @@ pub mod linker;
 pub mod process;
 pub mod daemon;
 pub mod telemetry;
+#[cfg(feature = "python")]
 pub mod ffi;
 pub mod shmem_ipc;
 pub mod shmem_schema;

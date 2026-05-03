@@ -38,6 +38,27 @@ KvCachePaged::KvCachePaged(ggml_backend_t backend,
     allocate_();
 }
 
+KvCachePaged::KvCachePaged(ggml_backend_t backend,
+                           std::vector<std::int32_t> per_layer_kv_heads,
+                           std::vector<std::int32_t> per_layer_head_dim,
+                           std::int32_t total_pages,
+                           std::int32_t page_size,
+                           ggml_type    dtype)
+    : backend_(backend),
+      n_layers_(static_cast<std::int32_t>(per_layer_head_dim.size())),
+      n_kv_heads_(per_layer_kv_heads.empty() ? 0 : per_layer_kv_heads[0]),
+      per_layer_head_dim_(std::move(per_layer_head_dim)),
+      per_layer_kv_heads_(std::move(per_layer_kv_heads)),
+      total_pages_(total_pages),
+      page_size_(page_size),
+      dtype_(dtype) {
+    if (per_layer_kv_heads_.size() != per_layer_head_dim_.size()) {
+        throw std::runtime_error(
+            "kv_cache: per_layer_kv_heads / per_layer_head_dim size mismatch");
+    }
+    allocate_();
+}
+
 void KvCachePaged::allocate_() {
     if (total_pages_ <= 0 || page_size_ <= 0) {
         throw std::runtime_error("kv_cache: total_pages / page_size must be > 0");
@@ -61,8 +82,11 @@ void KvCachePaged::allocate_() {
     k_layers_.reserve(n_layers_);
     v_layers_.reserve(n_layers_);
     for (std::int32_t il = 0; il < n_layers_; ++il) {
+        const std::int64_t kv_heads_il = per_layer_kv_heads_.empty()
+            ? n_kv_heads_
+            : per_layer_kv_heads_[il];
         const std::int64_t n_embd_gqa =
-            static_cast<std::int64_t>(n_kv_heads_) * per_layer_head_dim_[il];
+            kv_heads_il * per_layer_head_dim_[il];
         auto* k = ggml_new_tensor_2d(ctx_, dtype_, n_embd_gqa, n_rows);
         auto* v = ggml_new_tensor_2d(ctx_, dtype_, n_embd_gqa, n_rows);
         ggml_set_name(k, ("kv.k." + std::to_string(il)).c_str());

@@ -1,0 +1,38 @@
+[package]
+name = "pie-standalone"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Standalone Pie server (no Python). Embeds a native driver in-process."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[[bin]]
+name = "pie"
+path = "src/main.rs"
+
+[features]
+# Default to portable until cuda support lands in M3/M4.
+default = ["driver-portable"]
+# Mutually exclusive — see workspace docs in Cargo.toml at repo root.
+driver-portable = []
+driver-cuda = []
+
+[dependencies]
+# `pie` is the runtime crate. We disable the default `python` feature so
+# pyo3 stays out of our dep graph — server/standalone is meant to be
+# Python-free.
+pie = { path = "../../runtime", default-features = false }
+anyhow = "1.0"
+rmp-serde = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+tokio = { version = "1.38", features = ["full"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cmake = "0.1"

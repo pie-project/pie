@@ -73,6 +73,10 @@ public:
         std::int32_t  n_tokens_pad;   // GGML_PAD(n_tokens, 64)
         std::int32_t  n_kv;           // total KV positions to attend (= seq_len)
         std::vector<std::uint16_t> mask_f16;     // [n_kv, n_tokens_pad] F16
+        // Phi-3-small per-request blocksparse-clipped mask. Empty for
+        // other archs and for dense layers; consumed only by the
+        // blocksparse layers in graph_phi3small.cpp.
+        std::vector<std::uint16_t> mask_blocksparse_f16;
         std::vector<std::int32_t>  gather_idxs;  // [n_kv] physical KV row indices
         SamplerParams sampler;        // per-request sampler config (shared across slots)
         std::vector<std::uint32_t> logit_mask_runs;  // BRLE; empty = no mask
@@ -176,7 +180,19 @@ private:
     // Qwen 3.5 / 3.6 recurrent-state cache. Null on archs without
     // gated-delta-rule layers.
     std::unique_ptr<StateCache> state_;
-    ggml_gallocr_t galloc_ = nullptr;
+    // Multi-backend scheduler. When `model_.cpu_fallback()` is non-null,
+    // the sched is configured as `[primary, cpu_fallback]` and routes
+    // any op the primary backend can't dispatch to CPU. When the
+    // primary already IS the CPU backend, the sched is single-backend
+    // (just CPU) and behaves as a direct executor.
+    //
+    // Hot path: on graph cache HIT, we don't reset/realloc — sched
+    // still has assignments + buffers from the previous call's
+    // alloc_graph(), and we just upload inputs and call
+    // sched_graph_compute(). On cache MISS we reset, alloc, then
+    // compute. This preserves the original gallocr-style fast decode
+    // path: zero per-call sched overhead when topology repeats.
+    ggml_backend_sched_t sched_ = nullptr;
     AdapterPool*   adapters_ = nullptr;
     mutable PhaseTimings timings_;
 

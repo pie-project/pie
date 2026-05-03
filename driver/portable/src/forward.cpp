@@ -21,6 +21,8 @@
 #include "graph_common.hpp"
 #include "graph_gemma4.hpp"
 #include "graph_qwen3.hpp"
+#include "graph_phi3small.hpp"
+#include "graph_phi3_5moe.hpp"
 #include "graph_qwen3_5.hpp"
 #include "plan.hpp"
 #include "response.hpp"
@@ -292,17 +294,24 @@ KvCachePaged build_kv_for_(Model& model,
                             std::int32_t page_size) {
     const auto& h = model.hparams();
     if (h.arch == PieArch::Gemma4) {
-        // Per-layer head_dim — sliding layers carry head_dim, full layers
-        // gemma4_head_dim_global. Each layer gets its own cache slab.
-        std::vector<std::int32_t> per_layer(h.num_hidden_layers, h.head_dim);
+        // Per-layer head_dim AND kv_heads. Sliding layers carry
+        // [num_key_value_heads, head_dim]; full layers carry
+        // [head_dim_global] and (for Gemma 4 31B / 26B-A4B alt-attention)
+        // num_global_key_value_heads instead of num_key_value_heads.
+        std::vector<std::int32_t> per_layer_dim(h.num_hidden_layers, h.head_dim);
+        std::vector<std::int32_t> per_layer_kvh(h.num_hidden_layers,
+                                                h.num_key_value_heads);
         for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
             const bool is_full = !h.layer_types.empty()
                 && h.layer_types[i] == 'g';
-            per_layer[i] = is_full ? h.gemma4_head_dim_global : h.head_dim;
+            per_layer_dim[i] = is_full ? h.gemma4_head_dim_global : h.head_dim;
+            if (is_full && h.num_global_key_value_heads > 0) {
+                per_layer_kvh[i] = h.num_global_key_value_heads;
+            }
         }
         return KvCachePaged(model.backend(),
-                             h.num_key_value_heads,
-                             std::move(per_layer),
+                             std::move(per_layer_kvh),
+                             std::move(per_layer_dim),
                              total_pages, page_size,
                              GGML_TYPE_F16);
     }
@@ -352,18 +361,40 @@ ForwardEngine::ForwardEngine(Model& model,
             conv_dim,
             h.qwen35_linear_conv_kernel);
     }
-    galloc_ = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(model.backend()));
-    if (!galloc_) {
-        throw std::runtime_error("forward: ggml_gallocr_new failed");
+    // Build the backend list for the multi-backend scheduler. Order
+    // matters: sched picks the FIRST backend in the list that supports
+    // each op, so the primary GPU backend gets first dibs and CPU is
+    // the fallback only for ops the primary lacks (e.g. ggml-vulkan's
+    // missing CPY pipelines). When the primary is already CPU, the
+    // sched is single-backend and acts as a direct executor.
+    std::vector<ggml_backend_t> backends;
+    backends.push_back(model.backend());
+    if (auto* cpu_fb = model.cpu_fallback()) {
+        backends.push_back(cpu_fb);
+    }
+    // op_offload=false: sched only splits graphs when an op is genuinely
+    // unsupported by the primary backend. With op_offload=true, sched
+    // may proactively offload "small" ops to a faster backend in the
+    // list, which on Vulkan triggers extra GPU↔CPU transfers per layer
+    // and was observed to 4x decode latency on Qwen3-0.6B (3 ms → 12 ms).
+    // Since CPU is strictly the fallback here (never preferred over
+    // Vulkan/CUDA), proactive offload is the wrong default for us.
+    sched_ = ggml_backend_sched_new(
+        backends.data(), /*bufts=*/nullptr,
+        static_cast<int>(backends.size()),
+        GRAPH_MAX_NODES,
+        /*parallel=*/false,
+        /*op_offload=*/false);
+    if (!sched_) {
+        throw std::runtime_error("forward: ggml_backend_sched_new failed");
     }
 }
 
 ForwardEngine::~ForwardEngine() {
-    // Release cached graph context BEFORE the allocator: the gallocr
-    // holds the backend buffer that backs the cached graph's tensors.
+    // Release cached graph context BEFORE the scheduler: sched owns
+    // the backend buffers that back the cached graph's tensors.
     if (cache_) cache_->release();
-    if (galloc_) ggml_gallocr_free(galloc_);
+    if (sched_) ggml_backend_sched_free(sched_);
 }
 
 void ForwardEngine::log_timings(const char* label) const {
@@ -409,12 +440,25 @@ void ForwardEngine::log_timings(const char* label) const {
 ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req) {
     const auto& hpar = model_.hparams();
     const ArchSpec spec = arch_spec_for(hpar.arch, hpar);
-    // Qwen 3.5 still runs per-request (state-bearing linear layers
-    // require per-request slot views). Gemma 4 supports the M11 packed-
-    // decode path: sliding-attn layers use flash_attn_ext with the
-    // SWA-clipped mask, full-attn layers (head_dim=512, beyond
-    // flash_attn_ext) use a batched manual SDPA with the no-SWA mask.
-    const bool slow_only = hpar.arch == PieArch::Qwen3_5;
+    // Slow-only path: skip the in-graph `ggml_top_k` (which would emit
+    // `ggml_argsort` over the full vocab) and instead download raw
+    // logits to host for sampling. Triggered for arches whose graph
+    // builder demands it AND when the primary backend can't run a
+    // vocab-sized argsort.
+    //
+    //   * Qwen 3.5 still runs per-request (state-bearing linear layers
+    //     require per-request slot views) and emits only `logits`.
+    //   * Gemma 4 used to live here; the M11 packed-decode path now
+    //     lets sliding-attn layers go through flash_attn_ext (with the
+    //     SWA-clipped mask) and full-attn layers (head_dim=512, beyond
+    //     flash_attn_ext) through a batched manual SDPA, so it no
+    //     longer forces slow-only.
+    //   * `!supports_in_graph_topk()` catches ggml-vulkan, whose
+    //     argsort kernel caps at 1024 cols — without this, sched
+    //     would round-trip the sort through CPU per token (~9 ms of
+    //     wasted GPU↔CPU latency).
+    const bool slow_only = hpar.arch == PieArch::Qwen3_5 ||
+                           !model_.supports_in_graph_topk();
 
     const PlanArrays arrays = extract_plan_arrays(req);
     validate_plan_top_level(arrays);
@@ -676,13 +720,48 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
                 cache_->result = build_gemma4_graph(
                     cache_->ctx, model_, kv_, plan);
             } else {
-                cache_->result = build_qwen3_graph(
+                if (model_.hparams().arch == PieArch::Phi3Small) {
+                    cache_->result = build_phi3small_graph(cache_->ctx, model_, kv_, plan);
+                } else if (model_.hparams().arch == PieArch::Phi3_5Moe) {
+                    cache_->result = build_phi3_5moe_graph(cache_->ctx, model_, kv_, plan);
+                } else {
+                    cache_->result = build_qwen3_graph(
                     cache_->ctx, model_, kv_, plan);
+                }
             }
             take_us(timings_.graph_build_us);
 
-            if (!ggml_gallocr_alloc_graph(galloc_, cache_->result.gf)) {
-                throw std::runtime_error("compute: gallocr_alloc_graph failed");
+            // On cache miss the graph topology has changed (or this is
+            // the first call), so wipe sched's previous assignments
+            // and re-allocate buffers for the new graph. After this
+            // point `sched_` is configured for `cache_->result.gf` and
+            // subsequent cache HITs can skip both the reset and the
+            // alloc — the scheduler's split assignments and per-backend
+            // buffers remain valid for the same graph topology, which
+            // keeps the steady-state decode path at zero per-call
+            // sched overhead.
+            ggml_backend_sched_reset(sched_);
+            if (!ggml_backend_sched_alloc_graph(sched_, cache_->result.gf)) {
+                throw std::runtime_error("compute: sched_alloc_graph failed");
+            }
+            // First-call sanity diagnostic: log how the scheduler
+            // partitioned the graph. With Part A's norm upcast in
+            // place + the slow_only fallback when in-graph top-k is
+            // unsupported, this should print n_splits=1 (all on
+            // primary) on Qwen3 / Llama / Gemma. Multiple splits =
+            // some op fell to CPU, which is correct but slow; worth
+            // investigating with `ggml_backend_sched_get_tensor_backend`
+            // on each graph node to find the offender.
+            static bool _printed_assignments = false;
+            if (!_printed_assignments && std::getenv("PIE_PORTABLE_LOG_SCHED")) {
+                _printed_assignments = true;
+                std::cerr << "[sched] n_splits="
+                          << ggml_backend_sched_get_n_splits(sched_)
+                          << " n_nodes=" << ggml_graph_n_nodes(cache_->result.gf)
+                          << " backend="
+                          << ggml_backend_name(model_.backend())
+                          << (model_.cpu_fallback() ? " (+CPU fallback)" : "")
+                          << "\n";
             }
             take_us(timings_.graph_alloc_us);
         } catch (...) {
@@ -699,9 +778,9 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
     upload_graph_inputs(g, plan);
     take_us(timings_.upload_us);
 
-    const auto status = ggml_backend_graph_compute(model_.backend(), g.gf);
+    const auto status = ggml_backend_sched_graph_compute(sched_, g.gf);
     if (status != GGML_STATUS_SUCCESS) {
-        throw std::runtime_error("compute: graph_compute status=" +
+        throw std::runtime_error("compute: sched_graph_compute status=" +
                                  std::to_string(static_cast<int>(status)));
     }
     take_us(timings_.compute_us);

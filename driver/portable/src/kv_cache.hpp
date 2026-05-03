@@ -50,6 +50,15 @@ public:
                  std::int32_t total_pages,
                  std::int32_t page_size,
                  ggml_type    dtype);
+    // Per-layer kv_heads AND head_dim. Used by Gemma 4 31B / 26B-A4B
+    // alternative attention (full_attention layers carry fewer kv_heads
+    // than sliding layers). Both vectors must have size == n_layers.
+    KvCachePaged(ggml_backend_t backend,
+                 std::vector<std::int32_t> per_layer_kv_heads,
+                 std::vector<std::int32_t> per_layer_head_dim,
+                 std::int32_t total_pages,
+                 std::int32_t page_size,
+                 ggml_type    dtype);
     ~KvCachePaged();
 
     KvCachePaged(const KvCachePaged&) = delete;
@@ -61,6 +70,11 @@ public:
 
     std::int32_t n_layers()    const noexcept { return n_layers_; }
     std::int32_t n_kv_heads()  const noexcept { return n_kv_heads_; }
+    std::int32_t n_kv_heads_at(std::int32_t layer) const noexcept {
+        return per_layer_kv_heads_.empty()
+            ? n_kv_heads_
+            : per_layer_kv_heads_[layer];
+    }
     // head_dim of layer 0 — kept for backwards compatibility on uniform
     // archs. Per-layer code paths should use head_dim_at(layer).
     std::int32_t head_dim()    const noexcept { return per_layer_head_dim_[0]; }
@@ -85,6 +99,9 @@ private:
     std::int32_t          n_layers_;
     std::int32_t          n_kv_heads_;
     std::vector<std::int32_t> per_layer_head_dim_;
+    // Empty for uniform archs (use n_kv_heads_); populated for Gemma 4
+    // alternative attention.
+    std::vector<std::int32_t> per_layer_kv_heads_;
     std::int32_t          total_pages_;
     std::int32_t          page_size_;
     ggml_type             dtype_;

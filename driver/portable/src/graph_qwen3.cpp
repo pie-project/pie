@@ -371,8 +371,19 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         ggml_tensor* k_cached;
         ggml_tensor* v_cached;
         if (!is_shared) {
-            auto* k_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, K), n_embd_gqa, n_total);
-            auto* v_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, V), n_embd_gqa, n_total);
+            // K is contiguous after rope_ext (returns a freshly allocated
+            // tensor); V is contiguous after the v_proj mul_mat (and the
+            // optional v_norm preserves layout). Skip the unconditional
+            // ggml_cont — it was emitting one CPY op per layer per K/V
+            // (~48 extra nodes / 24-layer forward), each becoming an extra
+            // CUDA kernel launch under sched even though the data is
+            // already in the right shape. Fall back to ggml_cont only
+            // when actually non-contiguous (defensive — should never
+            // trigger on the standard Qwen/Llama path).
+            ggml_tensor* k_for_kv = ggml_is_contiguous(K) ? K : ggml_cont(ctx, K);
+            ggml_tensor* v_for_kv = ggml_is_contiguous(V) ? V : ggml_cont(ctx, V);
+            auto* k_2d = ggml_reshape_2d(ctx, k_for_kv, n_embd_gqa, n_total);
+            auto* v_2d = ggml_reshape_2d(ctx, v_for_kv, n_embd_gqa, n_total);
             k_cached = ggml_set_rows(ctx, kv.k(il), k_2d, in.kv_idxs);
             v_cached = ggml_set_rows(ctx, kv.v(il), v_2d, in.kv_idxs);
             live_k[il] = k_cached;
@@ -429,8 +440,13 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
                     : ggml_cast(ctx, L.attn_sinks, GGML_TYPE_F32);
                 ggml_flash_attn_ext_add_sinks(attn, sinks_f32);
             }
-            // attn shape per ggml.h: [head_dim, n_q_heads, n_batch=1, n_req]
-            attn_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, attn),
+            // attn shape per ggml.h: [head_dim, n_q_heads, n_batch=1, n_req].
+            // flash_attn_ext returns a freshly allocated contiguous tensor;
+            // skip the redundant ggml_cont (saves one CPY per layer = 24
+            // extra graph nodes on Qwen2.5).
+            ggml_tensor* attn_for_reshape =
+                ggml_is_contiguous(attn) ? attn : ggml_cont(ctx, attn);
+            attn_2d = ggml_reshape_2d(ctx, attn_for_reshape,
                                       head_dim * n_q_heads, n_req);
         } else {
             // Slow path: one flash_attn_ext per request, then concat.

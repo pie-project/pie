@@ -30,6 +30,12 @@ def main():
                    help="Run a warmup batch of this size before timing")
     p.add_argument("--cuda-graphs", action="store_true",
                    help="Enable CUDA graphs (sglang's default is enabled; this flag is for explicit-on)")
+    p.add_argument("--tp-size", type=int, default=1)
+    p.add_argument("--context-length", type=int, default=1024)
+    p.add_argument("--disable-radix-cache", action="store_true",
+                   help="Disable RadixAttention KV-prefix reuse (fair compare vs engines without prefix dedup)")
+    p.add_argument("--ignore-eos", action="store_true",
+                   help="Generate exactly max_tokens regardless of stop tokens")
     p.add_argument("--max-running-requests", type=int, default=None,
                    help="Cap concurrent in-flight requests (matches pie's max_concurrent_processes)")
     args = p.parse_args()
@@ -41,6 +47,9 @@ def main():
         mem_fraction_static=args.mem_frac,
         disable_cuda_graph=not args.cuda_graphs,
         max_running_requests=args.max_running_requests,
+        tp_size=args.tp_size,
+        context_length=args.context_length,
+        disable_radix_cache=args.disable_radix_cache,
     )
 
     base = "Write a short story about a robot."
@@ -64,7 +73,8 @@ def main():
 
     # Match pie's inferlet sampler: temperature=0.6 + top_p=0.95.
     sampling = {"temperature": 0.6, "top_p": 0.95,
-                "max_new_tokens": args.max_tokens}
+                "max_new_tokens": args.max_tokens,
+                "ignore_eos": args.ignore_eos}
 
     if args.warmup_n > 0:
         print(f"Warmup ({args.warmup_n} reqs)...", flush=True)
