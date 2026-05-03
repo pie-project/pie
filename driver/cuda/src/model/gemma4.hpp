@@ -97,8 +97,13 @@ struct Gemma4LayerWeights {
     int head_dim     = 0;
     int intermediate = 0;
     int kv_source    = 0;   // == layer index when not shared
+    int num_kv_heads = 0;   // 26B-A4B uses num_global_kv on full layers
     bool is_full     = false;
     bool is_shared   = false;
+    // 26B-A4B "k_eq_v" mode: full-attention layers omit `v_proj.weight`
+    // and derive V from the raw k_proj output (before k_norm / RoPE),
+    // then v-norm. Sliding layers always have a separate v_proj.
+    bool use_k_as_v  = false;
 };
 
 struct Gemma4Weights {
@@ -118,6 +123,7 @@ struct Gemma4Weights {
     // Cached per-layer arrays for the forward / KV-cache allocator.
     std::vector<int> per_layer_head_dim;
     std::vector<int> per_layer_intermediate;
+    std::vector<int> per_layer_num_kv_heads;
     std::vector<int> kv_source_layer;
     std::vector<int> per_layer_window_left;
     std::vector<float> per_layer_rope_theta;

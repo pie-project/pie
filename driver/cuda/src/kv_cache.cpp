@@ -33,6 +33,7 @@ KvCache KvCache::allocate_per_layer(int num_layers,
                                     int num_kv_heads,
                                     const std::vector<int>& per_layer_head_dim,
                                     const std::vector<int>& kv_source_layer,
+                                    const std::vector<int>& per_layer_num_kv_heads,
                                     DType dtype)
 {
     KvCache c;
@@ -43,6 +44,7 @@ KvCache KvCache::allocate_per_layer(int num_layers,
     c.head_dim_ = per_layer_head_dim.empty() ? 0 : per_layer_head_dim[0];
     c.per_layer_head_dim_ = per_layer_head_dim;
     c.kv_source_layer_ = kv_source_layer;
+    c.per_layer_num_kv_heads_ = per_layer_num_kv_heads;
 
     // Allocate physical storage at every slot — even shared slots get
     // an empty placeholder so the vector index matches `layer`. Slots
@@ -57,10 +59,13 @@ KvCache KvCache::allocate_per_layer(int num_layers,
         if (is_source) {
             const int hd = per_layer_head_dim.empty() ? c.head_dim_
                                                       : per_layer_head_dim[i];
+            const int kvh = per_layer_num_kv_heads.empty()
+                                ? num_kv_heads
+                                : per_layer_num_kv_heads[i];
             c.k_layers_.push_back(DeviceTensor::allocate(
-                dtype, {num_pages, page_size, num_kv_heads, hd}));
+                dtype, {num_pages, page_size, kvh, hd}));
             c.v_layers_.push_back(DeviceTensor::allocate(
-                dtype, {num_pages, page_size, num_kv_heads, hd}));
+                dtype, {num_pages, page_size, kvh, hd}));
         } else {
             c.k_layers_.emplace_back();  // empty
             c.v_layers_.emplace_back();

@@ -225,6 +225,12 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // Gemma-4 26B-A4B sets `enable_moe_block: true` to flip its layers
     // from dense-MLP-only to dense + parallel MoE.
     cfg.gemma4_enable_moe   = optional<bool>(j, "enable_moe_block", false);
+    // Gemma-4 26B-A4B's "k_eq_v" full-attention path. Defaults inert
+    // on all the dense Gemma-4 / Gemma-3n / unrelated archs.
+    cfg.gemma4_attention_k_eq_v = optional<bool>(j, "attention_k_eq_v", false);
+    cfg.gemma4_num_global_key_value_heads =
+        optional<int>(j, "num_global_key_value_heads",
+                      cfg.num_key_value_heads);
 
     // GPT-OSS knobs. The flags are inferred from `model_type` (rather
     // than from explicit fields) because HF's gpt_oss config doesn't

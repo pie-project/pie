@@ -101,6 +101,13 @@ struct HfConfig {
     // layer; the dense `intermediate_size` and `moe_intermediate_size`
     // both apply when this is true. Inert on every other arch.
     bool gemma4_enable_moe = false;
+    // Gemma-4 26B-A4B's "k_eq_v" mode: full-attention layers ship with
+    // no `v_proj.weight` (V is derived from raw k_proj output, then
+    // v-norm) and use `gemma4_num_global_key_value_heads` instead of
+    // `num_key_value_heads`. Sliding-attention layers stay on the
+    // standard `num_key_value_heads` and have their own v_proj.
+    bool gemma4_attention_k_eq_v = false;
+    int  gemma4_num_global_key_value_heads = 0;
 
     // GPT-OSS-specific knobs. Inert on every other model.
     //   * `swiglu_limit` — clipping threshold applied to gate values

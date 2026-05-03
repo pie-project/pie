@@ -163,6 +163,7 @@ Gemma4Weights bind_gemma4(const Engine& engine) {
     w.layers.resize(static_cast<std::size_t>(L));
     w.per_layer_head_dim.resize(L);
     w.per_layer_intermediate.resize(L);
+    w.per_layer_num_kv_heads.resize(L);
     w.kv_source_layer.resize(L);
     w.per_layer_window_left.resize(L);
     w.per_layer_rope_theta.resize(L);
@@ -178,6 +179,17 @@ Gemma4Weights bind_gemma4(const Engine& engine) {
         Lw.is_shared = is_shared;
         Lw.head_dim  = is_full ? global_head_dim : sliding_head_dim;
         w.per_layer_head_dim[i] = Lw.head_dim;
+        // 26B-A4B's "k_eq_v" mode flips full-attention layers onto a
+        // narrower KV head count (`num_global_key_value_heads`) and
+        // skips `v_proj.weight` entirely — V is taken from the raw
+        // k_proj output, before k_norm/RoPE, then v-norm. Sliding
+        // layers stay on the standard `num_key_value_heads` and have
+        // their own v_proj.
+        Lw.use_k_as_v = cfg.gemma4_attention_k_eq_v && is_full;
+        Lw.num_kv_heads = Lw.use_k_as_v
+                              ? cfg.gemma4_num_global_key_value_heads
+                              : cfg.num_key_value_heads;
+        w.per_layer_num_kv_heads[i] = Lw.num_kv_heads;
 
         // KV source: same layer when not shared; most recent non-shared
         // layer of the same type when shared.
@@ -228,7 +240,9 @@ Gemma4Weights bind_gemma4(const Engine& engine) {
         // Even on shared layers HF keeps k_proj/v_proj/k_norm in the
         // file (redundant). Bind them when present so the schema
         // tolerates either dump style; the forward only consults them
-        // when `is_shared == false`.
+        // when `is_shared == false`. On 26B-A4B's `use_k_as_v` full
+        // layers v_proj is genuinely absent (V is derived from raw
+        // k_proj), so a missing v_proj is expected there.
         if (engine.has(lp + "self_attn.k_proj.weight")) {
             Lw.k_proj = &engine.get(lp + "self_attn.k_proj.weight");
         }
@@ -642,15 +656,16 @@ void gemma4_forward_paged(
         const int T  = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
         const int d  = layer.head_dim;
         const int num_q_heads_local  = cfg.num_attention_heads / T;
-        const int num_kv_heads_local = cfg.num_key_value_heads / T;
+        // KV-head count is now per-layer: 26B-A4B's full-attention
+        // layers use num_global_key_value_heads; sliding layers and
+        // every other Gemma-4 family use the standard num_key_value_heads.
+        const int num_kv_heads_local = layer.num_kv_heads / T;
         const int Hq = num_q_heads_local * d;
         const int Hk = num_kv_heads_local * d;
         const int I  = layer.intermediate / T;
         NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
         // ── 3a. Attention block ─────────────────────────────────────────
-        const void* attn_residual = ws.y.data();
-
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.attn_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
@@ -662,14 +677,25 @@ void gemma4_forward_paged(
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.q_proj->data(), ws.q.data(),
             N, Hq, H);
-        // K/V projections only on non-shared layers.
+        // K/V projections only on non-shared layers. On 26B-A4B's
+        // `use_k_as_v` full layers there's no v_proj — V is the raw
+        // k_proj output (before k_norm/RoPE), then v-norm. Copy K to V
+        // here so the v-norm step below can apply in-place on V.
         if (!layer.is_shared) {
             ops::gemm_act_x_wt_bf16(cublas.handle(),
                 ws.norm_x.data(), layer.k_proj->data(), ws.k.data(),
                 N, Hk, H);
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.norm_x.data(), layer.v_proj->data(), ws.v.data(),
-                N, Hk, H);
+            if (layer.use_k_as_v) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    ws.v.data(), ws.k.data(),
+                    static_cast<std::size_t>(N) * Hk *
+                        sizeof(std::uint16_t),
+                    cudaMemcpyDeviceToDevice, stream));
+            } else {
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    ws.norm_x.data(), layer.v_proj->data(), ws.v.data(),
+                    N, Hk, H);
+            }
         }
 
         // Pre-norm dumps for parity.

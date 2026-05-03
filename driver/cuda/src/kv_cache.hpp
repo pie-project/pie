@@ -30,12 +30,20 @@ public:
     // Used by Gemma-4 (dual head_dim 256/512 + 20 shared layers).
     // `kv_source_layer` may be empty, in which case every layer is its
     // own source.
+    //
+    // `per_layer_num_kv_heads` overrides the scalar `num_kv_heads` per
+    // layer. Required by Gemma-4 26B-A4B's `attention_k_eq_v` mode,
+    // where full-attention layers use `num_global_key_value_heads`
+    // (typically 2) while sliding layers stay at the scalar
+    // `num_key_value_heads` (8). Pass an empty vector for the
+    // homogeneous case.
     static KvCache allocate_per_layer(int num_layers,
                                       int num_pages,
                                       int page_size,
                                       int num_kv_heads,
                                       const std::vector<int>& per_layer_head_dim,
                                       const std::vector<int>& kv_source_layer,
+                                      const std::vector<int>& per_layer_num_kv_heads = {},
                                       DType dtype = DType::BF16);
 
     KvCache() = default;
@@ -54,6 +62,12 @@ public:
     int head_dim_at(int layer) const noexcept {
         return per_layer_head_dim_.empty() ? head_dim_
                                            : per_layer_head_dim_[layer];
+    }
+    // Per-layer `num_kv_heads`. Falls back to the scalar when the
+    // per-layer override was not supplied at allocation time.
+    int num_kv_heads_at(int layer) const noexcept {
+        return per_layer_num_kv_heads_.empty() ? num_kv_heads_
+                                               : per_layer_num_kv_heads_[layer];
     }
 
     // Per-layer accessors. Layout: [num_pages, page_size, num_kv_heads, head_dim_at(layer)].
@@ -82,6 +96,7 @@ private:
     //     tensor backs L (typically L; smaller for shared layers).
     std::vector<int> per_layer_head_dim_;
     std::vector<int> kv_source_layer_;
+    std::vector<int> per_layer_num_kv_heads_;
 };
 
 }  // namespace pie_cuda_driver

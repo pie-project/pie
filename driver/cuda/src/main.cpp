@@ -948,7 +948,19 @@ int main(int argc, char** argv) {
                   static_cast<int>(cfg.batching.kv_page_size),
                   kv_heads_local,
                   weights_gemma4.per_layer_head_dim,
-                  weights_gemma4.kv_source_layer)
+                  weights_gemma4.kv_source_layer,
+                  // Per-layer kv_heads — only meaningful for the
+                  // 26B-A4B variant where full layers ship 2 KV heads
+                  // and sliding ones ship 8. Pass through TP-divided
+                  // values to match the forward's `Hk` calculation.
+                  [&]() {
+                      std::vector<int> r;
+                      r.reserve(weights_gemma4.per_layer_num_kv_heads.size());
+                      for (int v : weights_gemma4.per_layer_num_kv_heads) {
+                          r.push_back(v / std::max(1, cfg.distributed.tp_size));
+                      }
+                      return r;
+                  }())
             : pie_cuda_driver::KvCache::allocate(
                   engine.hf_config().num_hidden_layers,
                   static_cast<int>(cfg.batching.max_num_kv_pages),
