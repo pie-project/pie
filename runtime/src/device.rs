@@ -196,34 +196,71 @@ pub fn copy_d2d(device_idx: DeviceId, src_phys_ids: &[u32], dst_phys_ids: &[u32]
     })
 }
 
-/// GPU → GPU page copy with explicit completion ack.
+/// GPU → GPU page copy with explicit completion ack — shmem fast path.
 ///
-/// Awaits a request-response RPC to the worker. The Python handler
-/// `_handle_copy_d2d` is expected to call `torch.cuda.synchronize()`
-/// before responding, so by the time this future resolves the dst
-/// pages are actually populated on GPU.
+/// Routes through the same shmem transport as `fire_batch` so the d2d
+/// kernel and any subsequent forward-pass kernels are dispatched by
+/// the SAME Python thread. CPU launch order is preserved → CUDA
+/// stream FIFO orders the kernels on GPU. No cross-thread race
+/// surface; no cold-path RPC round-trip.
 ///
-/// Required to close the cross-thread race documented in
-/// `project_pie_kv_bleed_d2d_fork_race.md`: cold-path `copy_d2d`
-/// notifications can be reordered relative to shmem `fire_batch` on
-/// the Python worker, leading forward-pass kernels to read stale
-/// page contents. The Pinned + pending_d2d state machine in
-/// `snapshot::fork` uses this future to gate the new context's
-/// fire_batch admission until the d2d kernel has actually run.
-pub async fn copy_d2d_async(
+/// Closes both races documented in pie-project/pie#339:
+///   1. stream-ordering race (kernel launch order across threads)
+///   2. IPC-arrival race (cold-path queue lagging shmem queue)
+///
+/// Awaits the worker ack so callers can sequence fire_batch after.
+/// Per-call cost: ~10 µs busy-spin + microseconds of `index_copy_`
+/// kernel-launch CPU time on the worker. No `torch.cuda.synchronize`
+/// involved on the worker side.
+///
+/// Wire format (binary, little-endian):
+///   u32 src_count | src_count × u32 src_phys_ids
+///   u32 dst_count | dst_count × u32 dst_phys_ids
+pub async fn copy_d2d_shmem(
     device_idx: DeviceId,
     src_phys_ids: &[u32],
     dst_phys_ids: &[u32],
 ) -> Result<()> {
-    #[derive(Serialize)]
-    struct Req { src_phys_ids: Vec<u32>, dst_phys_ids: Vec<u32> }
-    // The Python handler returns msgpack-encoded `None`; deserialize
-    // through rmpv::Value to accept anything (we only care about the
-    // success of the call, not its payload).
-    let _: rmpv::Value = call(device_idx, "copy_d2d", &Req {
-        src_phys_ids: src_phys_ids.to_vec(),
-        dst_phys_ids: dst_phys_ids.to_vec(),
-    }).await?;
+    let _ = device_idx; // single-device today; SHMEM_CLIENTS keyed at 0
+    let client = get_or_init_shmem_client(0)?;
+    let req_id = SHMEM_REQ_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    let send_walltime_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+
+    let src = src_phys_ids.to_vec();
+    let dst = dst_phys_ids.to_vec();
+    let (_resp_bytes, _ts) = tokio::task::block_in_place(|| {
+        client.call_with(
+            req_id,
+            crate::shmem_ipc::METHOD_TAG_COPY_D2D,
+            send_walltime_us,
+            |buf| {
+                let needed = 4 + src.len() * 4 + 4 + dst.len() * 4;
+                if buf.len() < needed {
+                    return Err(anyhow!(
+                        "copy_d2d_shmem: req buf too small ({} < {needed})",
+                        buf.len()
+                    ));
+                }
+                let mut off = 0usize;
+                buf[off..off + 4].copy_from_slice(&(src.len() as u32).to_le_bytes());
+                off += 4;
+                for &p in &src {
+                    buf[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                    off += 4;
+                }
+                buf[off..off + 4].copy_from_slice(&(dst.len() as u32).to_le_bytes());
+                off += 4;
+                for &p in &dst {
+                    buf[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                    off += 4;
+                }
+                Ok(off)
+            },
+        )
+    })?;
     Ok(())
 }
 

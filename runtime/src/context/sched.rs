@@ -569,13 +569,6 @@ impl ContextManager {
         on_alloc: impl FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send + 'static,
     ) {
         // SUSPENSION CHECK: If the context is Suspended, store as deferred op.
-        // Pinned + pending_replay/d2d are NOT deferred here — Reserve/Commit
-        // operations are content-independent and safe to run while d2d is
-        // in flight (Reserve allocates new working pages at indices past
-        // the d2d destination range, no overlap). The narrower deferral is
-        // applied directly in `pin` (which returns page IDs that
-        // fire_batch then reads, so MUST wait for d2d completion). See
-        // `project_pie_kv_bleed_d2d_fork_race.md`.
         if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
             if ctx.is_off_gpu() {
                 let pending = PendingAlloc {

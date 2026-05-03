@@ -701,21 +701,7 @@ def _leader_loop(
         dst = torch.tensor(dst_ids, dtype=torch.long, device=gpu_kv[0].device)
         for layer_idx in range(len(gpu_kv)):
             gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
-        # NOTE: no torch.cuda.synchronize() here. On the (legacy)
-        # default stream, the index_copy_ kernels above are now
-        # enqueued in stream order. The Rust caller (`copy_d2d_async`
-        # from snapshot::fork) only clears pending_d2d after this
-        # RPC's response. Any subsequent fire_batch from the shmem
-        # busy-poll thread enqueues its forward-pass kernels onto
-        # the same default stream AFTER our index_copy_ kernels, so
-        # the GPU runs them in correct order without a CPU wait. A
-        # full sync here would block for ALL pending GPU work
-        # (forward passes for unrelated contexts), adding seconds of
-        # main-thread blocking under c≥16 sustained decode. See
-        # `project_pie_kv_bleed_d2d_fork_race.md`. If a future build
-        # ever switches to per-thread default streams, this MUST be
-        # replaced with a CUDA event recorded here + waited on
-        # before the next fire_batch.
+        #torch.cuda.synchronize() -> we don't need this
 
     def _handle_copy_h2h(**kwargs) -> None:
         """H2H: copy pinned CPU pages to other CPU pages (no GPU involved)."""
@@ -781,6 +767,44 @@ def _leader_loop(
 
     import signal as _signal
 
+    def _handle_copy_d2d_shmem(view: memoryview) -> None:
+        """Handle a METHOD_TAG_COPY_D2D shmem request.
+
+        Wire format (matches `device::copy_d2d_shmem` on the Rust
+        side, little-endian):
+            u32 src_count | src_count × u32 src_phys_ids
+            u32 dst_count | dst_count × u32 dst_phys_ids
+
+        Routing this through the same thread as `fire_batch` is what
+        closes the d2d-vs-fire_batch race documented in
+        `project_pie_kv_bleed_d2d_fork_race.md` and pie-project/
+        pie#339: CPU launch order is preserved by single-threaded
+        dispatch, and CUDA stream FIFO orders the kernels on GPU.
+        """
+        import struct
+        import torch as _torch
+        gpu_kv = engine.kv_cache_at_layer
+        b = bytes(view)  # safe: tiny payload (hundreds of bytes max)
+        off = 0
+        (src_n,) = struct.unpack_from("<I", b, off); off += 4
+        src_ids = list(struct.unpack_from(f"<{src_n}I", b, off)); off += src_n * 4
+        (dst_n,) = struct.unpack_from("<I", b, off); off += 4
+        dst_ids = list(struct.unpack_from(f"<{dst_n}I", b, off))
+        max_gpu = gpu_kv[0].shape[0]
+        for p in src_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d_shmem: src phys_id {p} out of bounds [0, {max_gpu})")
+        for p in dst_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d_shmem: dst phys_id {p} out of bounds [0, {max_gpu})")
+        src = _torch.tensor(src_ids, dtype=_torch.long, device=gpu_kv[0].device)
+        dst = _torch.tensor(dst_ids, dtype=_torch.long, device=gpu_kv[0].device)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
+        # No torch.cuda.synchronize() — we rely on stream FIFO. Any
+        # subsequent fire_batch dispatched on this same thread
+        # enqueues onto the same default stream AFTER our kernels.
+
     def _shmem_loop():
         while not stop_event.is_set():
             req = _shmem_server.busy_poll_any_slot(SHMEM_BUSY_US)
@@ -788,8 +812,20 @@ def _leader_loop(
                 continue
             req_id, method_tag, payload_len, slot, send_walltime_us = req
 
-            # Zero-copy view of the request payload bytes (flat schema).
+            # Zero-copy view of the request payload bytes.
             view = _shmem_server.request_payload_view(slot, payload_len)
+
+            if method_tag == _shm.METHOD_TAG_COPY_D2D:
+                try:
+                    _handle_copy_d2d_shmem(memoryview(view))
+                    # Empty msgpack response — caller only cares about ack.
+                    _shmem_server.respond(slot, msgpack.packb(None), 0)
+                except Exception as e:
+                    import traceback
+                    print(f"[Shmem Worker Error] copy_d2d: {e}\n{traceback.format_exc()}")
+                    _shmem_server.respond(slot, msgpack.packb(str(e)), 0)
+                continue
+
             args = _shm_schema.parse_request(memoryview(view))
 
             try:

@@ -23,6 +23,13 @@ pub const HEADER_SIZE: usize = 64;
 pub const SLOT_HEADER_SIZE: usize = 64;
 
 pub const METHOD_TAG_FIRE_BATCH: u32 = 0;
+/// Routes `copy_d2d` (working-page fork copy) through the shmem fast
+/// path so it shares a thread with `fire_batch` on the Python worker.
+/// Without this, cold-path `copy_d2d` notify can be dispatched on a
+/// different Python thread and reordered against fire_batch's
+/// forward-pass kernels — see `project_pie_kv_bleed_d2d_fork_race.md`
+/// and pie-project/pie#339.
+pub const METHOD_TAG_COPY_D2D: u32 = 1;
 
 /// Slot header offsets relative to the start of the slot.
 const OFF_REQ_SEQ: usize = 0;

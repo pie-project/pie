@@ -447,15 +447,12 @@ impl ContextManager {
     }
 
     /// Handle a completed replay forward pass: transition context out of
-    /// Pinned (only if no other pending operation holds it), then fire
-    /// deferred ops.
+    /// Pinned, then fire deferred ops.
     ///
     /// Called by the actor when a ReplayComplete message arrives.
     pub(crate) fn replay_complete(&mut self, id: ContextId) {
-        let (pending, still_pinned_for_d2d) = match self.contexts.get(&id) {
-            Some(ctx) if ctx.is_pinned() && ctx.pending_replay => {
-                (ctx.pending_suspend, ctx.pending_d2d)
-            }
+        let pending = match self.contexts.get(&id) {
+            Some(ctx) if ctx.is_pinned() && ctx.pending_replay => ctx.pending_suspend,
             _ => return,
         };
 
@@ -470,51 +467,12 @@ impl ContextManager {
             return;
         }
 
-        // Clear replay flag. If d2d is still in flight, stay Pinned;
-        // d2d_complete will perform the final transition.
+        // Normal path: Pinned → Active, fire deferred ops.
         if let Some(ctx) = self.contexts.get_mut(&id) {
+            ctx.state = State::Active;
             ctx.pending_replay = false;
-            if !still_pinned_for_d2d {
-                ctx.state = State::Active;
-            }
         }
 
-        if !still_pinned_for_d2d {
-            self.fire_deferred_ops(id);
-        }
-    }
-
-    /// Handle a completed working-page d2d copy: transition context out
-    /// of Pinned (only if replay is not also in flight), then fire any
-    /// deferred ops. Called by the actor on `Message::D2DComplete`.
-    /// Mirrors `replay_complete`. See `project_pie_kv_bleed_d2d_fork_race.md`.
-    pub(crate) fn d2d_complete(&mut self, id: ContextId) {
-        let (pending, still_pinned_for_replay) = match self.contexts.get(&id) {
-            Some(ctx) if ctx.is_pinned() && ctx.pending_d2d => {
-                (ctx.pending_suspend, ctx.pending_replay)
-            }
-            _ => return,
-        };
-
-        if pending {
-            // Re-suspension was requested while d2d was in-flight.
-            if let Some(ctx) = self.contexts.get_mut(&id) {
-                ctx.pending_d2d = false;
-            }
-            self.suspend(id);
-            self.enqueue_restore(id);
-            return;
-        }
-
-        if let Some(ctx) = self.contexts.get_mut(&id) {
-            ctx.pending_d2d = false;
-            if !still_pinned_for_replay {
-                ctx.state = State::Active;
-            }
-        }
-
-        if !still_pinned_for_replay {
-            self.fire_deferred_ops(id);
-        }
+        self.fire_deferred_ops(id);
     }
 }

@@ -15,7 +15,7 @@ use anyhow::Result;
 use tokio::sync::oneshot;
 
 use super::{
-    Context, ContextId, ContextManager, State, SERVICES,
+    Context, ContextId, ContextManager, State,
 };
 
 use crate::device::{self, DeviceId};
@@ -64,11 +64,17 @@ impl ContextManager {
         // We use the source context for contention — the fork inherits
         // the source's scheduling state.
         self.when_allocated(id, dev_idx, needed, move |mgr, gpu_pages| {
-            let result = (|| -> Result<ContextId> {
+            // Captured outside the inner closure so the post-closure
+            // d2d-spawn block can reach them.
+            let mut captured_device: DeviceId = 0;
+            let mut captured_dev_idx: usize = 0;
+            let result = (|| -> Result<(ContextId, bool, Vec<crate::context::pagestore::PhysicalPageId>, Vec<crate::context::pagestore::PhysicalPageId>)> {
                 let ctx = mgr.contexts.get(&id)
                     .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 let device = dev_idx as DeviceId;
+                captured_device = device;
+                captured_dev_idx = dev_idx;
                 let src_on_gpu = !ctx.is_off_gpu();
 
                 // Snapshot source state.
@@ -105,11 +111,8 @@ impl ContextManager {
                     mgr.gpu_stores[dev_idx].free(&surplus);
                 }
 
-                // Decide whether we will issue a d2d/h2d copy. We need
-                // to capture this BEFORE issuing it so we can pin the
-                // child context until the copy actually completes on
-                // device. See `project_pie_kv_bleed_d2d_fork_race.md`.
-                let needs_d2d_await = src_on_gpu
+                // Decide which (if any) page-copy transport we'll use.
+                let needs_d2d_shmem = src_on_gpu
                     && !src.is_empty()
                     && !working_pages.is_empty();
                 let needs_h2d = !src_on_gpu
@@ -117,11 +120,10 @@ impl ContextManager {
                     && !working_pages.is_empty();
 
                 if needs_h2d {
-                    // Suspended source path: keep the legacy fire-and-
-                    // forget for h2d. The contention model for restore
-                    // already serializes h2d against forward passes via
-                    // the existing replay/restore flow; the bleed
-                    // documented for #70 is fork-from-Active only.
+                    // Suspended source path: keep the legacy cold-path
+                    // fire-and-forget h2d. The restore flow already
+                    // serializes h2d against forward passes; the bleed
+                    // closed by #339 is fork-from-Active only.
                     let _ = device::copy_h2d(device, &working_pages, &src);
                 }
 
@@ -131,12 +133,16 @@ impl ContextManager {
                     mgr.gpu_stores[dev_idx].fork(&committed_hashes[..prefix_len]);
                 }
 
-                // Create the child context (state set below after replay/d2d checks).
+                // Create the child context. Clone working_pages once
+                // for the d2d task; the original moves into the new
+                // Context's struct field.
                 let new_id = mgr.next_id();
+                let dst_pages_for_d2d = working_pages.clone();
+                let src_pages_for_d2d = src.clone();
                 mgr.contexts.insert(new_id, Context {
                     owner: Some(owner),
                     device: Some(device),
-                    working_pages: working_pages.clone(),
+                    working_pages,
                     suspended_working_count: 0,
                     committed_hashes: committed_hashes.clone(),
                     max_committed_position: max_pos,
@@ -149,7 +155,6 @@ impl ContextManager {
                     cpu_working_pages: Vec::new(),
                     deferred_ops: Vec::new(),
                     pending_replay: false,
-                    pending_d2d: false,
                     defaulted: false,
                     cached_effective_pages: 0.0,
                 });
@@ -168,40 +173,50 @@ impl ContextManager {
                     }
                 }
 
-                // Working-page d2d (active source path): use the
-                // request-response variant so we can hold the child
-                // Pinned until the kernel actually runs on device.
-                // Without this, the cold-path copy_d2d notify may be
-                // reordered behind a shmem fire_batch, causing the new
-                // context's first forward pass to read whatever stale
-                // KV occupies the freshly-allocated pages.
-                if needs_d2d_await {
-                    if let Some(ctx) = mgr.contexts.get_mut(&new_id) {
-                        ctx.state = State::Pinned;
-                        ctx.pending_d2d = true;
-                    }
-                    let model_idx = mgr.model_idx;
-                    let src_pages = src.clone();
-                    let dst_pages = working_pages.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = device::copy_d2d_async(
-                            device, &src_pages, &dst_pages,
-                        ).await {
-                            tracing::error!(
-                                ctx = new_id, device = dev_idx,
-                                "fork: copy_d2d_async failed: {e:#}"
-                            );
-                        }
-                        let _ = SERVICES.send(model_idx, super::Message::D2DComplete { id: new_id });
-                    });
-                }
-
                 mgr.process_entry(owner).context_ids.push(new_id);
                 mgr.publish_context_counts(new_id);
 
-                Ok(new_id)
+                Ok((new_id, needs_d2d_shmem, src_pages_for_d2d, dst_pages_for_d2d))
             })();
-            let _ = response.send(result);
+
+            match result {
+                Ok((new_id, needs_d2d_shmem, src_pages, dst_pages)) => {
+                    if needs_d2d_shmem {
+                        // Working-page d2d via shmem: routes to the
+                        // SAME Python thread that handles fire_batch,
+                        // so CPU launch order is preserved (FIFO on
+                        // legacy default stream → kernels run in
+                        // launch order on GPU). We await the ack
+                        // before resolving Ok(new_id) — that ensures
+                        // any later fire_batch from the inferlet
+                        // arrives at the shmem queue *after* the d2d
+                        // has been dispatched. Closes both races in
+                        // pie-project/pie#339 without a cold-path
+                        // round-trip. See
+                        // `project_pie_kv_bleed_d2d_fork_race.md`.
+                        let device = captured_device;
+                        let dev_idx_for_log = captured_dev_idx;
+                        tokio::spawn(async move {
+                            if let Err(e) = device::copy_d2d_shmem(
+                                device, &src_pages, &dst_pages,
+                            ).await {
+                                tracing::error!(
+                                    ctx = new_id, device = dev_idx_for_log,
+                                    "fork: copy_d2d_shmem failed: {e:#}"
+                                );
+                                let _ = response.send(Err(e));
+                                return;
+                            }
+                            let _ = response.send(Ok(new_id));
+                        });
+                    } else {
+                        let _ = response.send(Ok(new_id));
+                    }
+                }
+                Err(e) => {
+                    let _ = response.send(Err(e));
+                }
+            }
         });
     }
 
@@ -269,7 +284,6 @@ impl ContextManager {
             cpu_working_pages: Vec::new(),
             deferred_ops: Vec::new(),
             pending_replay: false,
-            pending_d2d: false,
             defaulted: false,
             cached_effective_pages: 0.0,
         });
@@ -472,7 +486,6 @@ impl ContextManager {
             cpu_working_pages: Vec::new(),
             deferred_ops: Vec::new(),
             pending_replay: false,
-            pending_d2d: false,
             defaulted: false,
             cached_effective_pages: 0.0,
         });

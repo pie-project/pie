@@ -626,14 +626,6 @@ pub(crate) struct Context {
     pub deferred_ops: Vec<PendingAlloc>,
     /// True while replay forward passes are in-flight after restoration.
     pub pending_replay: bool,
-    /// True while a fork/save d2d copy is in-flight on the device.
-    /// While set, the context is held in `State::Pinned` and the
-    /// scheduler must not include it in `fire_batch` — the device
-    /// pages backing this context have not yet been written by the
-    /// async copy_d2d kernel and reading them would give stale KV.
-    /// Cleared on `Message::D2DComplete` from the spawned awaiter.
-    /// See `project_pie_kv_bleed_d2d_fork_race.md`.
-    pub pending_d2d: bool,
     /// True when the owning process couldn't afford full rent last tick.
     /// Defaulted contexts are evicted first regardless of bid.
     /// Recomputed each tick — not sticky.
@@ -662,7 +654,6 @@ impl Context {
             cpu_working_pages: Vec::new(),
             deferred_ops: Vec::new(),
             pending_replay: false,
-            pending_d2d: false,
             defaulted: false,
             cached_effective_pages: 0.0,
         }
@@ -1146,24 +1137,13 @@ impl ContextManager {
         num_input_tokens: u32,
         response: oneshot::Sender<Result<PinnedContext>>,
     ) {
-        // Defer pin if the context is Pinned with d2d/replay in flight:
-        // pin returns page IDs that fire_batch reads, so we MUST wait
-        // for the working pages to actually contain valid data. Other
-        // content-independent ops (Reserve/Commit/Append) can proceed.
-        // See `project_pie_kv_bleed_d2d_fork_race.md`.
-        if let Some(ctx) = self.contexts.get_mut(&id) {
-            if ctx.is_pinned() && (ctx.pending_replay || ctx.pending_d2d) {
-                let on_alloc = move |mgr: &mut ContextManager, _pages: Vec<pagestore::PhysicalPageId>| {
-                    mgr.pin(id, num_input_tokens, response);
-                };
-                ctx.deferred_ops.push(PendingAlloc {
-                    device: ctx.device.unwrap_or(0) as usize,
-                    num_pages: 0,
-                    on_alloc: Box::new(on_alloc),
-                });
-                return;
-            }
-        }
+        // Note: with copy_d2d routed through shmem (Option 1 from
+        // pie-project/pie#339), pin no longer needs to defer for
+        // pending_d2d — fork() awaits the d2d ack before resolving
+        // Ok(new_id), so by the time the inferlet calls Pin the d2d
+        // kernel is already enqueued on the same stream. Forward-
+        // pass kernels launched after pin go on the same stream and
+        // run after d2d via FIFO.
         self.when_active(id, move |mgr| {
             let result = (|| -> Result<PinnedContext> {
                 // Token-budget gate: refuse to pin for a forward pass when
@@ -1217,13 +1197,8 @@ impl ContextManager {
     /// If `pending_suspend` was set (and this isn't a replay context),
     /// executes the deferred suspension and enqueues for restoration.
     pub(crate) fn unpin(&mut self, id: ContextId) {
-        let (pending, replay, d2d, dev) = match self.contexts.get(&id) {
-            Some(ctx) if ctx.is_pinned() => (
-                ctx.pending_suspend,
-                ctx.pending_replay,
-                ctx.pending_d2d,
-                ctx.device.unwrap_or(0) as usize,
-            ),
+        let (pending, replay, dev) = match self.contexts.get(&id) {
+            Some(ctx) if ctx.is_pinned() => (ctx.pending_suspend, ctx.pending_replay, ctx.device.unwrap_or(0) as usize),
             _ => return,
         };
 
@@ -1232,9 +1207,8 @@ impl ContextManager {
             PINNED_COUNTS[dev].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // If this is a replay or d2d-pending context, the corresponding
-        // *_complete handler owns the Pinned → Active transition.
-        if replay || d2d {
+        // If this is a replay context, replay_complete handles the transition.
+        if replay {
             return;
         }
 
@@ -1447,11 +1421,6 @@ pub(crate) enum Message {
     Pin { id: ContextId, num_input_tokens: u32, response: oneshot::Sender<Result<PinnedContext>> },
     Unpin { id: ContextId },
     ReplayComplete { id: ContextId },
-    /// Sent by the d2d awaiter task after `device::copy_d2d_async`
-    /// resolves. Clears `pending_d2d` and, if `pending_replay` is
-    /// also clear, transitions Pinned → Active. Mirrors the
-    /// ReplayComplete pattern. See `project_pie_kv_bleed_d2d_fork_race.md`.
-    D2DComplete { id: ContextId },
     GetStats { response: oneshot::Sender<Vec<(usize, usize)>> },
 
     // Actor-routed write APIs
@@ -1549,9 +1518,6 @@ impl ServiceHandler for ContextManager {
                 self.replay_complete(id);
                 self.sched_counters.replay_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.replay_count += 1;
-            }
-            Message::D2DComplete { id } => {
-                self.d2d_complete(id);
             }
             Message::GetStats { response } => {
                 let _ = response.send(self.stats());
