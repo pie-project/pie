@@ -277,10 +277,21 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          # Persist the gcc-toolset env for subsequent steps.
-          echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}" >> "$GITHUB_ENV"
-          echo "MANPATH=/opt/rh/gcc-toolset-12/root/usr/share/man:" >> "$GITHUB_ENV"
-          echo "INFOPATH=/opt/rh/gcc-toolset-12/root/usr/share/info" >> "$GITHUB_ENV"
+          # Pin compiler explicitly. `source enable` only adjusts PATH —
+          # cmake-rs probes CC/CXX env vars and otherwise hard-codes
+          # `/usr/bin/cc` / `/usr/bin/c++`, which on rockylinux8 are
+          # gcc-8.5. gcc-8 is missing `<span>` (added in libstdc++ 10),
+          # so the portable driver's C++20 headers fail to compile.
+          {
+            echo "CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
+            echo "CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
+            echo "AR=/opt/rh/gcc-toolset-12/root/usr/bin/ar"
+            echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}"
+            echo "MANPATH=/opt/rh/gcc-toolset-12/root/usr/share/man:"
+            echo "INFOPATH=/opt/rh/gcc-toolset-12/root/usr/share/info"
+            echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/opt/rh/gcc-toolset-12/root/usr/lib"
+            echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64/pkgconfig"
+          } >> "$GITHUB_ENV"
 
       - name: Install Rust (windows)
         if: matrix.os.label == 'x86_64-windows'
