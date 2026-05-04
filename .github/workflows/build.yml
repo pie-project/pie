@@ -97,7 +97,7 @@ jobs:
           set -euxo pipefail
           dnf install -y --setopt=install_weak_deps=False \
             openssl-devel pkg-config perl \
-            gcc-toolset-14-libgomp-devel
+            gcc-toolset-14-libgomp libgomp
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
