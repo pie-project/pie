@@ -794,13 +794,24 @@ def _leader_loop(
 
             try:
                 sampling_results, batch, timings = _run_fire_batch_inner(args)
-            except Exception as e:
+            except Exception:
+                # Fail loudly and die. Catching here used to silently
+                # retry, which had two costs: the worker spun on broken
+                # state forever (the runtime treated the garbage response
+                # as success and the scheduler kept resubmitting), and
+                # the traceback only reached mp.spawn's per-worker stderr
+                # tempfile — invisible to operators. Print to sys.stderr
+                # so the launcher's inherited stderr surfaces it in the
+                # terminal, then `os._exit(1)` so the launcher's post-
+                # ready watcher sees a dead worker within 1s. The runtime
+                # in-flight shmem call is canceled by the watchdog →
+                # `ShmemClient::abort()` path on the Rust side; there's
+                # no point sending a response here.
                 import traceback
-                tb = traceback.format_exc()
-                print(f"[Shmem Worker Error] fire_batch: {e}\n{tb}")
-                response = msgpack.packb(str(e))
-                _shmem_server.respond(slot, response, 0)
-                continue
+                _sys.stderr.write(f"[shmem worker pid={_os.getpid()}] fire_batch raised; aborting:\n")
+                traceback.print_exc(file=_sys.stderr)
+                _sys.stderr.flush()
+                _os._exit(1)
             t_after_handler = _time.perf_counter()
 
             # Direct encode: bypass Batch.create_responses + dict comp on

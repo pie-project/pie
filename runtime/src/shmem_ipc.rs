@@ -21,8 +21,8 @@
 //! resize without touching the runtime.
 
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -77,6 +77,13 @@ pub struct ShmemClient {
     slot_locks: Vec<Mutex<()>>,
     /// Spin parameters.
     spin_us: u64,
+    /// Set by the supervisor when the backing driver process has exited
+    /// (or is otherwise known dead). Checked inside `call_with`'s
+    /// busy-spin so an in-flight request bails immediately instead of
+    /// waiting `hard_timeout` for a response that's never coming. The
+    /// watchdog flips this from `serve::lifecycle` via
+    /// `pie::device::abort_all_shmem_clients`.
+    aborted: AtomicBool,
 }
 
 unsafe impl Send for ShmemClient {}
@@ -194,7 +201,15 @@ impl ShmemClient {
             next_slot: AtomicUsize::new(0),
             slot_locks,
             spin_us,
+            aborted: AtomicBool::new(false),
         })
+    }
+
+    /// Mark the client as aborted so any in-flight `call_with` returns
+    /// promptly with a clear error. Idempotent. Called by the supervisor
+    /// when it observes the driver subprocess has exited.
+    pub fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
     }
 
     fn slot_addr(&self, i: usize) -> *mut u8 {
@@ -267,14 +282,28 @@ impl ShmemClient {
         let new_seq = self.req_seq_atomic(i).load(Ordering::Relaxed) + 1;
         self.req_seq_atomic(i).store(new_seq, Ordering::Release);
 
-        // Busy-spin on resp_seq with periodic yield, plus a hard deadline
-        // so a stuck/dead worker doesn't hang the caller forever.
+        // Busy-spin on resp_seq with periodic yield, an abort check
+        // (driver-death signal from the watchdog) and a hard deadline as
+        // a backstop. The supervisor's watchdog normally flips
+        // `self.aborted` within ~1s of the driver dying, so the hard
+        // timeout exists only for the no-supervisor or wedged-supervisor
+        // case — kept at 60s by default because a healthy driver's first
+        // fire_batch can spend tens of seconds JIT-compiling triton /
+        // flashinfer kernels on a cold cache. `PIE_SHMEM_TIMEOUT_S` lets
+        // CI runs override (lower for fast failure, higher if a benchmark
+        // legitimately blocks longer than 60s).
         let started = std::time::Instant::now();
         let yield_after = std::time::Duration::from_micros(self.spin_us);
-        let hard_timeout = std::time::Duration::from_secs(60);
+        let hard_timeout = *HARD_TIMEOUT;
         loop {
             if self.resp_seq_atomic(i).load(Ordering::Acquire) >= new_seq {
                 break;
+            }
+            if self.aborted.load(Ordering::Acquire) {
+                return Err(anyhow!(
+                    "shmem call aborted: driver exited (slot {}, request_id {})",
+                    i, request_id
+                ));
             }
             let elapsed = started.elapsed();
             if elapsed >= hard_timeout {
@@ -306,3 +335,20 @@ impl Drop for ShmemClient {
         unsafe { libc::munmap(self.base as *mut _, self.total_size) };
     }
 }
+
+/// Backstop timeout for `call_with`'s busy-spin. The watchdog `aborted`
+/// flag is the primary fast-detection path; this fires only when the
+/// supervisor itself is wedged (or absent — direct callers of
+/// `runtime::device::fire_batch` outside `pie-server`). Resolved once at
+/// startup from `PIE_SHMEM_TIMEOUT_S` (float seconds), defaulting to
+/// 60s so a healthy driver's first fire_batch — which can spend tens of
+/// seconds JIT-compiling triton / flashinfer kernels — doesn't trip it.
+static HARD_TIMEOUT: LazyLock<std::time::Duration> = LazyLock::new(|| {
+    const DEFAULT_SECS: f64 = 60.0;
+    let secs = std::env::var("PIE_SHMEM_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs_f64(secs)
+});

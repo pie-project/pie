@@ -155,6 +155,21 @@ fn get_or_init_shmem_client(device_idx: usize) -> Result<Arc<crate::shmem_ipc::S
     Ok(arc)
 }
 
+/// Mark every shmem client as aborted. Called by the supervisor's
+/// liveness watchdog (`pie-server`'s `serve::lifecycle::watchdog`)
+/// when it observes a driver subprocess has exited — without this,
+/// any `fire_batch` already in `call_with`'s busy-spin would wait
+/// the full `PIE_SHMEM_TIMEOUT_S` (~5s) before giving up.
+///
+/// Aborting all clients on any single driver's death is intentional:
+/// once a driver dies pie is shutting down, so leaving the surviving
+/// drivers' clients live just delays the inevitable.
+pub fn abort_all_shmem_clients() {
+    for entry in SHMEM_CLIENTS.iter() {
+        entry.value().abort();
+    }
+}
+
 /// GPU → CPU page copy (fire-and-forget).
 /// `gpu_phys_ids`: source GPU physical page IDs.
 /// `cpu_pages`: destination CPU swap pool page IDs.

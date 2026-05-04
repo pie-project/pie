@@ -271,6 +271,12 @@ def launch(*, prog: str, config_cls, worker) -> int:
     except OSError:
         pass
 
+    # Track the first dead worker's exit code so the launcher's exit
+    # status reflects the actual failure. Returning 0 here used to mask
+    # worker crashes — pie-server's watchdog would log "driver exited
+    # unexpectedly" but with rc=0, hiding which worker died and how.
+    first_failure_code = 0
+
     while not _shutdown_requested["flag"]:
         any_dead = False
         for p in ctx.processes:
@@ -279,6 +285,11 @@ def launch(*, prog: str, config_cls, worker) -> int:
                     f"[{prog}] worker pid={p.pid} exited with code {p.exitcode}",
                     file=sys.stderr,
                 )
+                if first_failure_code == 0:
+                    # exitcode is negative for signal-killed workers (-N
+                    # for SIGN); +N for `os._exit(N)`. Map both to a
+                    # non-zero positive code for the parent's view.
+                    first_failure_code = abs(p.exitcode) or 1
                 any_dead = True
         if any_dead:
             for p in ctx.processes:
@@ -292,4 +303,4 @@ def launch(*, prog: str, config_cls, worker) -> int:
         if p.is_alive():
             p.kill()
     ctx.join(timeout=1)
-    return 0
+    return first_failure_code
