@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <string>
 #include <utility>
@@ -60,10 +61,39 @@
 
 namespace {
 
-std::atomic<pie_cuda_driver::ShmemServer*> g_server{nullptr};
+std::mutex g_servers_mu;
+std::vector<pie_cuda_driver::ShmemServer*> g_servers;
+std::atomic<pie_cuda_driver::ShmemServer*> g_signal_server{nullptr};
+
+void register_server(pie_cuda_driver::ShmemServer* server) {
+    std::lock_guard<std::mutex> lk(g_servers_mu);
+    g_servers.push_back(server);
+    g_signal_server.store(server);
+}
+
+void unregister_server(pie_cuda_driver::ShmemServer* server) {
+    std::lock_guard<std::mutex> lk(g_servers_mu);
+    g_servers.erase(
+        std::remove(g_servers.begin(), g_servers.end(), server),
+        g_servers.end());
+    if (g_signal_server.load() == server) {
+        g_signal_server.store(g_servers.empty() ? nullptr : g_servers.back());
+    }
+}
+
+void stop_servers() {
+    std::vector<pie_cuda_driver::ShmemServer*> servers;
+    {
+        std::lock_guard<std::mutex> lk(g_servers_mu);
+        servers = g_servers;
+    }
+    for (auto* server : servers) {
+        if (server != nullptr) server->stop();
+    }
+}
 
 void on_signal(int) {
-    if (auto* s = g_server.load()) s->stop();
+    if (auto* server = g_signal_server.load()) server->stop();
 }
 
 void tp_startup_cpu_barrier(const pie_cuda_driver::Config& cfg) {
@@ -989,7 +1019,7 @@ int run_impl(int argc,
             cfg.shmem.req_buf,
             cfg.shmem.resp_buf,
             cfg.shmem.spin_us);
-        g_server.store(server_p.get());
+        register_server(server_p.get());
     }
 
     if (install_signal_handlers) {
@@ -1468,7 +1498,9 @@ int run_impl(int argc,
         }
     }
 
-    g_server.store(nullptr);
+    if (server_p) {
+        unregister_server(server_p.get());
+    }
     std::cerr << "[pie-driver-cuda] shutting down (handled " << handled
               << " requests)\n";
 
@@ -1500,11 +1532,9 @@ extern "C" int pie_driver_cuda_run(int argc,
     }
 }
 
-// Reaches into the same `g_server` slot the SIGINT/SIGTERM handler
-// uses. Atomic load → null check → `stop()` is the same idiom; no new
-// state needed.
+// Reaches into the same server registry the SIGINT/SIGTERM handler uses.
+// One host process can embed multiple same-flavor DP replicas, so stop every
+// live CUDA shmem server rather than only the most recently registered one.
 extern "C" void pie_driver_cuda_request_stop(void) {
-    if (auto* s = g_server.load()) {
-        s->stop();
-    }
+    stop_servers();
 }

@@ -22,8 +22,7 @@ mod shmem;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
-use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -32,11 +31,10 @@ use crate::shmem::{METHOD_TAG_FIRE_BATCH, ShmemServer};
 
 pub type ReadyCb = unsafe extern "C" fn(caps_json: *const c_char, ctx: *mut c_void);
 
-/// Process-global handle to the running server. `request_stop` reaches
-/// the server through this slot. Single instance per process —
-/// `pie_driver_dummy_run` CAS-installs a non-null pointer and refuses
-/// re-entry, mirroring the C++ drivers' `g_server` pattern.
-static SERVER: AtomicPtr<ShmemServer> = AtomicPtr::new(ptr::null_mut());
+/// Process-global handles to every running dummy shmem server. The Rust
+/// server can embed multiple same-flavor DP replicas in one process, so
+/// `request_stop` must stop all live instances.
+static SERVERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Library entry point. Mirrors the C++ `pie_driver_portable_run`.
 ///
@@ -72,12 +70,14 @@ pub unsafe extern "C" fn pie_driver_dummy_run(
 /// Stop the running serve loop. Idempotent. Safe to call from any thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pie_driver_dummy_request_stop() {
-    let p = SERVER.load(Ordering::Acquire);
-    if !p.is_null() {
-        // SAFETY: `pie_driver_dummy_run` keeps the ShmemServer live for
-        // as long as `SERVER` holds a non-null pointer (cleared on the
-        // drop guard before the local goes out of scope).
-        unsafe { (*p).stop() };
+    let servers = SERVERS.lock().map(|g| g.clone()).unwrap_or_default();
+    for addr in servers {
+        let p = addr as *mut ShmemServer;
+        if !p.is_null() {
+            // SAFETY: `pie_driver_dummy_run` keeps each registered
+            // ShmemServer live until its drop guard removes the pointer.
+            unsafe { (*p).stop() };
+        }
     }
 }
 
@@ -113,20 +113,24 @@ fn run_impl(
         cfg.shmem.spin_us,
     )?;
 
-    // Install the global pointer so `pie_driver_dummy_request_stop`
-    // can reach this instance. The CAS rejects concurrent launches.
-    let server_ptr = &server as *const _ as *mut ShmemServer;
-    SERVER
-        .compare_exchange(ptr::null_mut(), server_ptr, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| anyhow!("another pie_driver_dummy_run is already in progress"))?;
+    // Register the global pointer so `pie_driver_dummy_request_stop`
+    // can reach this instance. Multiple concurrent instances are valid
+    // for DP > 1.
+    let server_ptr = &server as *const _ as usize;
+    SERVERS
+        .lock()
+        .map_err(|_| anyhow!("dummy server registry poisoned"))?
+        .push(server_ptr);
     // RAII clear on early-return / panic so we never dangle a stale pointer.
-    struct ClearOnDrop;
+    struct ClearOnDrop(usize);
     impl Drop for ClearOnDrop {
         fn drop(&mut self) {
-            SERVER.store(ptr::null_mut(), Ordering::Release);
+            if let Ok(mut servers) = SERVERS.lock() {
+                servers.retain(|addr| *addr != self.0);
+            }
         }
     }
-    let _clear = ClearOnDrop;
+    let _clear = ClearOnDrop(server_ptr);
 
     // Capability handshake. Mirror `driver/portable/src/entry.cpp`'s
     // caps shape exactly so `embedded_driver::DriverCapabilities` parses

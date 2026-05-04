@@ -7,6 +7,7 @@
 
 #include "entry.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -34,10 +36,39 @@
 
 namespace {
 
-std::atomic<pie_portable_driver::ShmemServer*> g_server{nullptr};
+std::mutex g_servers_mu;
+std::vector<pie_portable_driver::ShmemServer*> g_servers;
+std::atomic<pie_portable_driver::ShmemServer*> g_signal_server{nullptr};
+
+void register_server(pie_portable_driver::ShmemServer* server) {
+    std::lock_guard<std::mutex> lk(g_servers_mu);
+    g_servers.push_back(server);
+    g_signal_server.store(server);
+}
+
+void unregister_server(pie_portable_driver::ShmemServer* server) {
+    std::lock_guard<std::mutex> lk(g_servers_mu);
+    g_servers.erase(
+        std::remove(g_servers.begin(), g_servers.end(), server),
+        g_servers.end());
+    if (g_signal_server.load() == server) {
+        g_signal_server.store(g_servers.empty() ? nullptr : g_servers.back());
+    }
+}
+
+void stop_servers() {
+    std::vector<pie_portable_driver::ShmemServer*> servers;
+    {
+        std::lock_guard<std::mutex> lk(g_servers_mu);
+        servers = g_servers;
+    }
+    for (auto* server : servers) {
+        if (server != nullptr) server->stop();
+    }
+}
 
 void on_signal(int) {
-    if (auto* s = g_server.load()) s->stop();
+    if (auto* server = g_signal_server.load()) server->stop();
 }
 
 // -----------------------------------------------------------------------------
@@ -318,7 +349,7 @@ int run_impl(int argc,
         cfg.shmem.req_buf,
         cfg.shmem.resp_buf,
         cfg.shmem.spin_us);
-    g_server.store(&server);
+    register_server(&server);
 
     if (install_signal_handlers) {
         std::signal(SIGINT, on_signal);
@@ -405,7 +436,7 @@ int run_impl(int argc,
         }
     });
 
-    g_server.store(nullptr);
+    unregister_server(&server);
     std::cerr << "[pie-driver-portable] shutting down (handled " << handled
               << " requests)\n";
     // Print per-stage timings on demand (e.g. e2e benchmarks). Default
@@ -434,11 +465,9 @@ extern "C" int pie_driver_portable_run(int argc,
     }
 }
 
-// Reaches into the same `g_server` slot the SIGINT/SIGTERM handler
-// uses. Atomic load → null check → `stop()` is the same idiom; no new
-// state needed.
+// Reaches into the same server registry the SIGINT/SIGTERM handler uses.
+// One host process can embed multiple same-flavor DP replicas, so stop every
+// live portable shmem server rather than only the most recently registered one.
 extern "C" void pie_driver_portable_request_stop(void) {
-    if (auto* s = g_server.load()) {
-        s->stop();
-    }
+    stop_servers();
 }

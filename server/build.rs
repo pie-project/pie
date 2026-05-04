@@ -89,8 +89,14 @@ fn build_portable() {
     cfg.build_target("pie_driver_portable_lib")
         .define("BUILD_SHARED_LIBS", "OFF");
     enable_position_independent_archives(&mut cfg);
+    // CMake caches option values under OUT_DIR. Define every backend flag
+    // explicitly so flipping PIE_PORTABLE_* between builds cannot leave stale
+    // CUDA/Vulkan/Metal sources compiled into the portable archive.
+    cfg.define("GGML_CUDA", if cuda_enabled { "ON" } else { "OFF" })
+        .define("GGML_VULKAN", if vulkan_enabled { "ON" } else { "OFF" })
+        .define("GGML_METAL", if metal_enabled { "ON" } else { "OFF" });
     if cuda_enabled {
-        cfg.define("GGML_CUDA", "ON")
+        cfg
             // ggml's CUDA-graph capture/replay is OFF by default at the ggml-
             // subproject level; llama.cpp's parent CMakeLists.txt flips it
             // ON. Embedding ggml directly (as we do here) misses that override
@@ -112,15 +118,13 @@ fn build_portable() {
         cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
     }
     if vulkan_enabled {
-        cfg.define("GGML_VULKAN", "ON")
-            .define("GGML_STATIC", "ON");
+        cfg.define("GGML_STATIC", "ON");
     }
     if metal_enabled {
         // ggml-metal links against Apple's MetalKit / Foundation. The
         // C++ side handles those via xcrun; we just need to flip the
         // ggml flag and add the framework links below.
-        cfg.define("GGML_METAL", "ON")
-            .define("GGML_STATIC", "ON");
+        cfg.define("GGML_STATIC", "ON");
     }
     // Disable ggml-cpu's OpenMP unconditionally. macOS's Apple clang
     // doesn't ship libomp; on Linux, `-Wl,--as-needed -lgomp` is
