@@ -1,23 +1,19 @@
 [package]
-name = "ingim/es-init"
-version = "0.1.0"
+name = "es-init"
+version = "0.1.5"
 description = "Initialize an Evolution Strategies adapter"
 authors = ["In Gim <in.gim@yale.edu>"]
 repository = "https://github.com/pie-project/pie"
 readme = "README.md"
-keywords = ["evolution-strategies", "initialization", "adapter"]
 
-[engine]
-min_version = "^1.0.0"
+[runtime]
+core = "^0.2.0"
 
-[interface]
-inputs = [
-    { name = "name", type = "string", description = "Name of the adapter to create/export" },
-    { name = "rank", type = "int", description = "Rank of the adapter" },
-    { name = "alpha", type = "float", description = "Scaling factor alpha" },
-    { name = "population_size", type = "int", description = "Population size for evolution" },
-    { name = "mu_fraction", type = "float", description = "Fraction of population to select" },
-    { name = "initial_sigma", type = "float", description = "Initial standard deviation" },
-    { name = "upload", type = "string", optional = true, description = "Optional filename to upload initial weights from" },
-]
-outputs = []
+[parameters]
+name = {type = "string", description = "Name of the adapter to create or open"}
+rank = {type = "int", description = "LoRA rank"}
+alpha = {type = "float", description = "LoRA scaling factor alpha"}
+population_size = {type = "int", description = "ES population size"}
+mu_fraction = {type = "float", description = "Fraction of population to select as parents"}
+initial_sigma = {type = "float", description = "Initial perturbation standard deviation"}
+upload = {type = "string", optional = true, description = "Checkpoint path to load initial weights from"}

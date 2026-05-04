@@ -1,0 +1,66 @@
+---
+title: I/O overview
+description: The I/O surfaces an inferlet has access to, and where each is supported
+sidebar_position: 1
+---
+
+# I/O overview
+
+An inferlet runs inside a WASI sandbox. From inside, it can:
+
+- Stream events to the client that launched it.
+- Exchange messages with other inferlets running in the same engine.
+- Read from a sandboxed view of the host filesystem.
+- Issue HTTP requests.
+- Connect to MCP servers the host has registered.
+
+This page lists those surfaces and where each is supported today. The pages that follow cover each surface in detail. Read this after [Generation overview](../decoder/overview).
+
+## The five surfaces
+
+| Surface | What it does | Rust | Python | JavaScript |
+|---|---|---|---|---|
+| **Session** | Stream events to the launching client. Receive client messages, files, signals. | ✓ | ✓ | ✓ |
+| **Messaging** | Pub/sub and queue between inferlets in the same engine. | ✓ | ✓ | ✓ |
+| **Filesystem** | Read/write the sandboxed file tree the host granted. | ✓ | ✓ | ✓ |
+| **HTTP** | Issue HTTP requests to external services. | ✓ | pending | pending |
+| **MCP** | Connect to host-registered MCP servers. | ✓ | ✓ | ✓ |
+
+The HTTP path is fully supported in Rust today via `wstd::http`. The Python and JavaScript SDKs do not yet bind WASI HTTP. The [Tutorial](../tutorial/build) shows the intended Python and JS API shape.
+
+## Where each runs
+
+These surfaces share one event loop. An inferlet that fetches a URL, listens for client messages, and runs a generation loop concurrently is normal: each `await` yields to the others.
+
+The model's forward passes do not stall waiting for I/O. The engine schedules forward passes from one inferlet alongside passes from every other inferlet, regardless of what each is awaiting.
+
+## What goes where
+
+A rough map of which surface fits which job:
+
+- **"Stream tokens to the user as they generate."** → [Session](./session): `session.send` from inside the chat decoder loop.
+- **"Hand off work to a worker inferlet."** → [Messaging](./messaging): pub/sub for fan-out, queues for one-to-one dispatch.
+- **"Cache reasoning state across runs."** → [Filesystem](./filesystem): write a JSON file the next run reads.
+- **"Look up a fact from Wikipedia mid-generation."** → [HTTP](./http): `wstd::http::Client::send` (Rust today).
+- **"Call an external tool over the standard MCP protocol."** → [MCP](./mcp): the engine's MCP client.
+
+Tool calls in particular often combine two surfaces: HTTP for the actual request, plus the [tool-call parser](../decoder/tool-calling) to parse the model's structured calls.
+
+## Sandbox boundaries
+
+Inferlets cannot:
+
+- Access files outside the directories the host explicitly grants.
+- Open arbitrary network sockets. HTTP goes through the engine-mediated client.
+- See processes, environment variables, or filesystems on the host.
+- Talk to other inferlets except through the messaging surface.
+
+These restrictions are by design: a Pie engine can run untrusted inferlets from many tenants concurrently without privilege escalation between them.
+
+## Next
+
+- [User and inferlet (session)](./session): the channel back to the launching client.
+- [Inferlet and inferlet (messaging)](./messaging): pub/sub and queues across inferlets.
+- [HTTP](./http): external HTTP requests (Rust today, others pending).
+- [Filesystem](./filesystem): sandboxed FS access.
+- [MCP](./mcp): structured tool servers.

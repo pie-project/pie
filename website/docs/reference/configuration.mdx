@@ -1,0 +1,205 @@
+---
+title: Configuration
+description: The pie config file schema and environment variables
+---
+
+# Configuration
+
+Pie reads its configuration from `~/.pie/config.toml` by default. The file is split into five sections — `[server]`, `[auth]`, `[telemetry]`, `[runtime]`, and one or more `[[model]]` array-of-tables entries. `pie config init` writes a working default; this page documents every key.
+
+## Schema
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 8080
+verbose = false
+registry = "https://registry.pie-project.org/"
+python_snapshot = true
+# max_concurrent_processes = 64
+
+[auth]
+enabled = false
+
+[telemetry]
+enabled = false
+endpoint = "http://localhost:4317"
+service_name = "pie"
+
+[runtime]
+worker_threads = 8
+wasm_max_instances = 1000
+wasm_max_memory_mb = 4096
+wasm_warm_memory_mb = 0
+wasm_warm_slots = 100
+allow_fs = false
+fs_scratch_dir = "/tmp/pie"
+allow_network = true
+network_allowed_hosts = ["*"]
+max_upload_mb = 256
+
+# One or more model blocks. Use `[[model]]` (array-of-tables); the first
+# entry is the implicit default for inferlets that don't specify a model.
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.scheduler]
+batch_policy = "adaptive"
+request_timeout_secs = 120
+default_endowment_pages = 64
+admission_oversubscription_factor = 4.0
+restore_pause_at_utilization = 0.85
+# default_token_limit = 100000
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+random_seed = 42
+
+[model.driver.options]
+gpu_mem_utilization = 0.85
+max_batch_tokens = 10240
+max_batch_size = 512
+```
+
+`[model.driver].type` is a discriminator. Embedded drivers (`portable`, `cuda_native`, `dummy`) run inside the `pie` process. Python drivers (`dev`, `vllm`, `sglang`) run as supervised subprocesses. Driver-specific knobs live in `[model.driver.options]`; see the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang)) for what each backend accepts.
+
+To add a second model, append another `[[model]]` block with a unique `name` and a `device` list that does not overlap any other model's.
+
+## Server keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `host` | `127.0.0.1` | Bind address for the WebSocket server. |
+| `port` | `8080` | TCP port for client connections. |
+| `verbose` | `false` | Enable verbose engine logs (also reachable via `pie serve -v`). |
+| `registry` | `https://registry.pie-project.org/` | Inferlet registry the engine fetches from when `pie run <name>` is used without `--path`. |
+| `python_snapshot` | `true` | Use the host-side Python snapshot to skip cold-start interpreter init for Python inferlets. Disable with `--no-snapshot` for debugging. |
+| `max_concurrent_processes` | unset | Cap on simultaneously running inferlets. When set, an admission semaphore gates spawn requests; new processes wait for a slot. Unset means unlimited. Must be `> 0`. |
+
+## Auth keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` (template default is `false`) | Require client public-key auth on the WebSocket. Disable with `pie serve --no-auth` for development. The keystore is managed via `pie auth add\|remove\|list`. |
+
+## Telemetry keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Emit OpenTelemetry traces and metrics. |
+| `endpoint` | `http://localhost:4317` | OTLP gRPC endpoint. |
+| `service_name` | `pie` | Service name reported in spans. |
+
+## Runtime keys
+
+The `[runtime]` block tunes the tokio worker pool, the wasmtime engine pool, the per-instance security policy (filesystem and network), and upload limits. All values have explicit defaults; pie pins them so its behavior is decoupled from upstream wasmtime / tokio version bumps.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `worker_threads` | `os.cpu_count()` | Number of tokio worker threads. On hosts with many logical cores under high request concurrency, the default can cause migration overhead; lowering to ~8 often improves throughput. Must be `> 0`. |
+| `wasm_max_instances` | `1000` | Maximum number of concurrently instantiated wasm modules in the wasmtime pooling allocator. Must be `> 0`. |
+| `wasm_max_memory_mb` | `4096` | Maximum linear memory per wasm instance, in MiB. This is a virtual reservation — only touched memory is mapped — but lower it (e.g. `64`) if you need tight RSS control and your inferlets fit. Must be `> 0`. |
+| `wasm_warm_memory_mb` | `0` | Per-slot warm memory pre-mapped at pool startup, in MiB. Trades startup time for cold-start latency. Must be `>= 0`. |
+| `wasm_warm_slots` | `100` | Number of pool slots to keep warm. Must be `>= 0`. |
+| `allow_fs` | `false` | When true, every inferlet receives a preopened scratch directory at `/scratch` mapped to a per-process subdirectory under `fs_scratch_dir`. Inferlets without this flag have no host filesystem visibility. |
+| `fs_scratch_dir` | `<tempdir>/pie` | Host root under which per-process `/scratch` directories are created when `allow_fs = true`. |
+| `allow_network` | `true` | When false, wasi:sockets is denied. Useful for tight outbound HTTP control. |
+| `network_allowed_hosts` | `["*"]` | Allowed-host filter for wasi:sockets. Supports CIDRs and host:port forms (e.g. `["10.0.0.0/8", "127.0.0.1"]`, `["10.0.0.0/8:443"]`). Filters wasi:sockets only — wasi:http bypasses the per-socket hook. |
+| `max_upload_mb` | `256` | Maximum size of a single chunked upload accepted by the server, in MiB. Must be `> 0`. |
+
+## Per-model keys
+
+Each `[[model]]` entry has only identity-level fields at the top:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `name` | required | The inferlet-side lookup key for `Model.load("<name>")`. Must be unique across `[[model]]` entries. The first `[[model]]` is the implicit default. |
+| `hf_repo` | required | HuggingFace repo id or local HuggingFace snapshot directory to load. Repo ids use the standard HuggingFace cache and download on cache miss. |
+
+Per-process admission and market policy live in `[model.scheduler]`, not at the top level.
+
+### `[model.scheduler]`
+
+Batch firing + per-process admission/market knobs:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `batch_policy` | `"adaptive"` | Batch-firing policy. One of `"adaptive"`, `"eager"`, `"greedy"`. See `runtime/src/inference/adaptive_policy.rs`. |
+| `request_timeout_secs` | `120` | Maximum wall time for a single inference request before the runtime drops it. Must be `> 0`. |
+| `default_token_limit` | unset | Per-process compute cap (tokens) when the launch request doesn't specify one. Unset means no hard cap. Must be `> 0` if set. |
+| `default_endowment_pages` | `64` | Per-process initial endowment in KV pages. Sets the process's claim weight in the bidding market — bigger values guarantee more pages held under contention. Must be `> 0`. |
+| `admission_oversubscription_factor` | `4.0` | How much logical KV memory the market overcommits relative to physical: `Σ endowment ≤ total_pages × factor`. `1.0` = no overbook; `4.0` = sell 4× capacity, betting on non-peak duty cycles. Must be a finite `> 0` number. |
+| `restore_pause_at_utilization` | `0.85` | Pause restoring suspended processes when any device exceeds this GPU page utilization (`(0.0, 1.0]`). Prevents evict→restore→re-evict thrash. |
+
+### `[model.driver]`
+
+Driver discriminator + universal driver fields:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `type` | required | Driver name. One of `portable`, `cuda_native`, `dummy`, `dev`, `vllm`, `sglang`. See the per-driver reference pages. |
+| `device` | required | Device list for this model. A single string is accepted and normalized to a one-element list. The list across all `[[model]]` entries must be disjoint. |
+| `tensor_parallel_size` | `1` | TP world size. |
+| `activation_dtype` | `"bfloat16"` | Activation dtype for forward passes. |
+| `random_seed` | `42` | Seed used by samplers and dropout-free stochastic ops. |
+
+### `[model.driver.options]`
+
+Driver-specific knobs in the driver's own vocabulary. Embedded drivers are validated by `pie` before boot. Python drivers accept `venv` or `python` as standalone-only interpreter overrides and pass the remaining options to the driver subprocess. See the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang)) for each driver's option set.
+
+## Editing the config
+
+Use `pie config` rather than hand-editing when possible:
+
+```bash
+pie config show              # pretty-print ~/.pie/config.toml
+pie config set server.port 9090
+pie config set auth.enabled true
+pie config set model.0.hf_repo meta-llama/Llama-3.2-1B
+pie config set model.0.driver.device "cuda:0,cuda:1"
+```
+
+`pie config init` regenerates the default file (and downloads the embedded Python runtime that hosts Python inferlets).
+
+`pie config set` takes a dot-path under the section the key lives in (e.g. `server.port`, not `port`). Numeric segments index into TOML arrays — `model.0.hf_repo` targets the first `[[model]]` block. Comma-separated values become lists (`"cuda:0,cuda:1"` → `["cuda:0", "cuda:1"]`).
+
+## Migration from the older schema
+
+Pie previously used a dotted `[model.<name>]` shape with admission knobs at the top level and driver options under the driver type discriminator. The current loader rejects the old shape with a migration error. The mapping:
+
+| Old key | New location |
+|---------|--------------|
+| `[model.<name>]` (table) | `[[model]]` array-of-tables with `name = "<name>"` |
+| `[server].primary_model` | Removed. The first `[[model]]` is the implicit default. |
+| `[server].allow_filesystem` | `[runtime].allow_fs` |
+| `[model.<name>].default_token_budget` | `[model.scheduler].default_token_limit` |
+| `[model.<name>].default_endowment_pages` | `[model.scheduler].default_endowment_pages` |
+| `[model.<name>].oversubscription_factor` | `[model.scheduler].admission_oversubscription_factor` |
+| `[model.<name>.scheduler].policy` | `[model.scheduler].batch_policy` |
+| `[model.<name>.driver.<type>]` | `[model.driver.options]` |
+
+Run `pie config init` to regenerate the file in the new shape.
+
+## Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `PIE_HOME` | Override the default Pie home directory (`~/.pie`). |
+| `HF_HOME` | HuggingFace cache directory (used by `pie model …`). |
+| `PIE_SDK` | Override the SDK lookup path used by `bakery` / `pie build` for editable in-tree development. Without it, bakery searches its install location and the current working directory. |
+
+## Registry authentication
+
+`pie build` does not need authentication; it produces a local `.wasm` file. Publishing to the registry is done through the `bakery` toolchain.
+
+`bakery login` walks a GitHub OAuth device-code flow and stores the resulting token under the user's bakery state directory. After login, `bakery inferlet publish` uploads a built `.wasm` plus its `Pie.toml` to the registry server configured in `[server].registry`. To revoke, delete the stored token file or revoke the token from your GitHub account settings. See `bakery <cmd> --help` for the full publish/search/info surface.
+
+## Related
+
+- [CLI reference](./pie): every `pie` command and flag.
+- Per-driver options: [CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang).
+- Supported architectures are listed on each driver page (e.g. [CUDA `#supported-architectures`](./drivers/cuda#supported-architectures)).

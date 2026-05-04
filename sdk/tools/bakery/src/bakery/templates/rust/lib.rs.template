@@ -1,33 +1,96 @@
 //! Simple text completion inferlet.
-//! This example demonstrates basic text generation with a system prompt and user message.
+//!
+//! Demonstrates chat-style generation with typed JSON input/output and the
+//! `EventStream` high-level API.
 
-use inferlet::stop_condition::{StopCondition, ends_with_any, max_len};
-use inferlet::{Args, Result, Sampler};
+use inferlet::{
+    Context, Event,
+    inference::Sampler,
+    model::Model,
+    runtime,
+    Result,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct Input {
+    /// The user prompt to complete.
+    prompt: String,
+
+    /// Maximum number of tokens to generate.
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+
+    /// System message for the assistant.
+    #[serde(default = "default_system")]
+    system: String,
+
+    /// Sampling temperature.
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+
+    /// Top-p (nucleus) sampling threshold.
+    #[serde(default = "default_top_p")]
+    top_p: f32,
+}
+
+fn default_max_tokens() -> usize { 256 }
+fn default_system() -> String { "You are a helpful, respectful and honest assistant.".into() }
+fn default_temperature() -> f32 { 0.6 }
+fn default_top_p() -> f32 { 0.95 }
+
+#[derive(Serialize)]
+struct Output {
+    /// The thinking/reasoning trace, if the model produced one.
+    thinking: String,
+    /// The generated text.
+    text: String,
+}
 
 #[inferlet::main]
-async fn main(mut args: Args) -> Result<String> {
-    // Parse arguments
-    let prompt: String = args.value_from_str(["-p", "--prompt"])?;
-    let max_tokens: usize = args.value_from_str(["-n", "--max-tokens"]).unwrap_or(256);
-    let system: String = args
-        .value_from_str(["-s", "--system"])
-        .unwrap_or_else(|_| "You are a helpful, respectful and honest assistant.".to_string());
-    let temperature: f32 = args.value_from_str(["-t", "--temperature"]).unwrap_or(0.6);
-    let top_p: f32 = args.value_from_str("--top-p").unwrap_or(0.95);
+async fn main(input: Input) -> Result<Output> {
+    // Pick the first model the engine has loaded.
+    let names = runtime::models();
+    let name = names.first().ok_or("No models available")?;
+    let model = Model::load(name)?;
 
-    // Get model and create context
-    let model = inferlet::get_auto_model();
-    let mut ctx = model.create_context();
+    // Build a chat context.
+    let mut ctx = Context::new(&model)?;
+    ctx.system(&input.system);
+    ctx.user(&input.prompt);
+    ctx.cue();
 
-    // Fill context with messages
-    ctx.fill_system(&system);
-    ctx.fill_user(&prompt);
+    // Stream the response. `decode()` turns raw tokens into chat events;
+    // `with_reasoning()` surfaces <think>…</think> chunks separately.
+    let mut events = ctx
+        .generate(Sampler::top_p(input.temperature, input.top_p))
+        .with_max_tokens(input.max_tokens)
+        .decode()
+        .with_reasoning();
 
-    // Generate response
-    let sampler = Sampler::top_p(temperature, top_p);
-    let stop_cond = max_len(max_tokens).or(ends_with_any(model.eos_tokens()));
+    let mut thinking = String::new();
+    let mut text = String::new();
 
-    let result = ctx.generate(sampler, stop_cond).await;
+    while let Some(event) = events.next().await? {
+        match event {
+            Event::Thinking(s) => {
+                eprint!("{s}");
+                thinking.push_str(&s);
+            }
+            Event::ThinkingDone(_) => {
+                eprintln!();
+            }
+            Event::Text(s) => {
+                print!("{s}");
+                text.push_str(&s);
+            }
+            Event::Done(full) => {
+                text = full;
+                break;
+            }
+            _ => {}
+        }
+    }
 
-    Ok(result)
+    Ok(Output { thinking, text })
 }

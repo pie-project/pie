@@ -1,5 +1,0 @@
-package inferlet:actor;
-
-world imports {
-    import common;
-}

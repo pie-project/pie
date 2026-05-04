@@ -1,0 +1,76 @@
+{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [
+        {
+            "id": 0,
+            "content": "<eos>",
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true
+        },
+        {
+            "id": 1,
+            "content": "<bos>",
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true
+        }
+    ],
+    "normalizer": null,
+    "pre_tokenizer": {
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true,
+        "use_regex": true
+    },
+    "post_processor": null,
+    "decoder": {
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true,
+        "use_regex": true
+    },
+    "model": {
+        "type": "BPE",
+        "dropout": null,
+        "unk_token": null,
+        "continuing_subword_prefix": null,
+        "end_of_word_suffix": null,
+        "fuse_unk": false,
+        "byte_fallback": false,
+        "vocab": {
+            "<eos>": 0,
+            "<bos>": 1,
+            "Ġ": 2,
+            "!": 3,
+            "\"": 4,
+            "#": 5,
+            "$": 6,
+            "%": 7,
+            "&": 8,
+            "'": 9,
+            "(": 10,
+            ")": 11,
+            "*": 12,
+            "h": 13,
+            "e": 14,
+            "l": 15,
+            "o": 16,
+            "he": 17,
+            "ll": 18,
+            "hello": 19
+        },
+        "merges": [
+            "h e",
+            "l l",
+            "he ll",
+            "hell o"
+        ]
+    }
+}

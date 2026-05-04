@@ -1,0 +1,376 @@
+---
+title: pie
+description: The pie engine CLI — serve, run, model, config, auth, doctor
+---
+
+# pie
+
+Complete reference for the `pie` command-line interface. Install it with the release installer on the [Installation](../guide/install) page, or build it from `server/` in a source checkout.
+
+## Overview
+
+```bash
+pie [COMMAND]
+```
+
+Top-level commands:
+
+- **`pie serve`**: start the engine and accept WebSocket clients.
+- **`pie run`**: one-shot launch of an inferlet against a temporary engine.
+- **`pie new`**: scaffold a new inferlet project (Rust or TypeScript).
+- **`pie build`**: build an inferlet directory or source file to a `.wasm` component.
+- **`pie doctor`**: environment health check.
+- **`pie config init|show|set`**: manage `~/.pie/config.toml`.
+- **`pie model list|download|remove`**: manage the HuggingFace model cache.
+- **`pie auth add|remove|list`**: manage authorized client keys.
+- **`pie driver list|...`**: inspect embedded drivers and manage Python driver venvs.
+
+---
+
+## serve
+
+Start the Pie engine.
+
+```bash
+pie serve [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-c`, `--config <PATH>` | Path to TOML configuration file (default: `~/.pie/config.toml`) |
+| `--host <HOST>` | Override `[server].host` |
+| `--port <PORT>` | Override `[server].port` |
+| `--no-auth` | Disable authentication for this run |
+| `-v`, `--verbose` | Enable verbose logging |
+| `-m`, `--monitor` | Launch the real-time TUI monitor alongside the server |
+| `--no-snapshot` | Disable the host-side Python snapshot optimization (overrides `[server].python_snapshot`) |
+
+### Examples
+
+```bash
+# Start with defaults from ~/.pie/config.toml
+pie serve
+
+# Disable auth for development
+pie serve --no-auth -v
+
+# TUI monitor on a custom port
+pie serve -m --port 9000
+
+# Use an alternate config
+pie serve -c ./dev-config.toml
+```
+
+To skip real weight loading and serve random tokens (for testing), set
+`[model.<name>.driver].type = "dummy"` in the config.
+
+---
+
+## run
+
+Launch an inferlet against a one-shot engine instance. The engine starts,
+runs the inferlet, prints its output, and exits.
+
+```bash
+pie run [OPTIONS] [INFERLET] [-- ARGS...]
+```
+
+| Argument | Description |
+|----------|-------------|
+| `INFERLET` | Inferlet name from the registry (e.g., `text-completion@0.1.0`). |
+
+| Option | Description |
+|--------|-------------|
+| `-p`, `--path <PATH>` | Run a local `.wasm` file instead of fetching from the registry. |
+| `-m`, `--manifest <PATH>` | Path to the inferlet's `Pie.toml` manifest. **Required** with `--path`. |
+| `-c`, `--config <PATH>` | Path to a TOML config file. |
+| `--port <PORT>` | Override `[server].port`. |
+| `--log <PATH>` | Write logs to this file. |
+| `ARGS...` | Inferlet input. CLI flags become JSON keys (e.g., `--prompt foo` → `{"prompt": "foo"}`). |
+
+If the inferlet name has no `@version`, the latest version is resolved from the registry.
+
+### Examples
+
+```bash
+# Run from the registry
+pie run text-completion --prompt "Hello world"
+
+# Run a local build (needs the manifest too)
+pie run --path ./target/wasm32/release/my_inferlet.wasm \
+        --manifest ./Pie.toml \
+        --prompt "Hi"
+
+# Pin a version
+pie run text-completion@0.1.0 --prompt "Hi" --max-tokens 64
+```
+
+Argument parsing rules (`pie run … --key value …`):
+
+- `--key value` becomes `{"key": value}` with int/float/bool inference.
+- `--flag` (no value) becomes `{"flag": true}`.
+- `-k value` (single-letter) becomes `{"k": value}`.
+- Bare positional values are collected under `_positional`.
+
+---
+
+## new
+
+Scaffold a fresh inferlet project. Wraps `bakery create`, which generates the
+template files locally.
+
+```bash
+pie new <NAME> [OPTIONS]
+```
+
+| Argument | Description |
+|----------|-------------|
+| `NAME` | Project name. Becomes the directory name and the package name. |
+
+| Option | Description |
+|--------|-------------|
+| `-t`, `--ts` | Generate a TypeScript project (default is Rust). |
+| `-o`, `--output <PATH>` | Parent directory for the new project. Defaults to the current directory. |
+
+The Rust template emits `src/lib.rs`, `Cargo.toml`, and `Pie.toml`. The
+TypeScript template emits `index.ts`, `package.json`, `tsconfig.json`, and
+`Pie.toml`. A Python template will follow whenever bakery adds one.
+
+```bash
+# Rust project in ./my-agent
+pie new my-agent
+
+# TypeScript project under ~/projects/my-agent
+pie new my-agent --ts -o ~/projects
+```
+
+---
+
+## build
+
+Compile an inferlet directory (or single source file) to a WebAssembly
+component. Wraps `bakery build` and auto-detects the platform.
+
+```bash
+pie build <INPUT> -o <OUTPUT> [OPTIONS]
+```
+
+| Argument | Description |
+|----------|-------------|
+| `INPUT` | Project directory or source file. Detected as Rust (`Cargo.toml`), Python (`pyproject.toml` or `main.py`), or JavaScript/TypeScript (`package.json`, `.js`, or `.ts`). |
+
+| Option | Description |
+|--------|-------------|
+| `-o`, `--output <PATH>` | Output `.wasm` path. Required. |
+| `--debug` | Debug build. For JS/Python this also embeds source maps. |
+
+Per platform:
+
+- **Rust**: runs `cargo build --release --target wasm32-wasip2`, then copies
+  the resulting `.wasm` to the output path.
+- **JavaScript / TypeScript**: bundles with esbuild, generates a WIT wrapper,
+  then runs `componentize-js`. Will prompt to run `npm install` if
+  `node_modules` is missing.
+- **Python**: generates a WIT wrapper, copies your code into a temp directory,
+  and runs `componentize-py`. The runtime is fetched on first use.
+
+```bash
+# Build a Rust project
+pie build ./my-agent -o ./my-agent.wasm
+
+# Build a single TypeScript source file
+pie build ./agent.ts -o ./agent.wasm --debug
+```
+
+Build failures (missing toolchains, manifest errors, validation failures)
+print the underlying error and exit with code 1.
+
+---
+
+## doctor
+
+```bash
+pie doctor
+```
+
+Reports platform info, GPU availability, compiled-in embedded drivers, Python
+driver venv resolution, and whether `~/.pie/config.toml` and the default model
+are present. Use it as the first stop when something fails.
+
+---
+
+## config
+
+Manage `~/.pie/config.toml`.
+
+### config init
+
+```bash
+pie config init [--path <PATH>]
+```
+
+Creates a default config at `~/.pie/config.toml` (or `--path`) and downloads
+the Python 3.14 inferlet runtime into `~/.pie/`. Safe to re-run.
+
+### config show
+
+```bash
+pie config show [--path <PATH>]
+```
+
+Prints the current config file with TOML syntax highlighting.
+
+### config set
+
+```bash
+pie config set <KEY> <VALUE> [--path <PATH>]
+```
+
+Sets a value by dot-path. Numeric segments index into TOML arrays-of-tables.
+Values are auto-typed: `true`/`false` → bool, integers and floats are parsed
+as such, comma-separated values become lists, everything else is a string.
+
+```bash
+pie config set server.host 0.0.0.0
+pie config set server.port 9090
+pie config set auth.enabled true
+pie config set model.0.hf_repo meta-llama/Llama-3.2-1B
+pie config set model.0.driver.device "cuda:0,cuda:1"
+pie config set telemetry.enabled true
+```
+
+Keys must be addressed by their full dot-path under the section they live in (e.g. `server.host`, not `host`). Numeric segments index into TOML arrays-of-tables — `model.0.hf_repo` targets the first `[[model]]` block.
+
+There is no `pie config update` command. Use `config set` for individual
+edits, or edit the file directly.
+
+---
+
+## model
+
+Manage models in the HuggingFace cache.
+
+### model list
+
+```bash
+pie model list
+```
+
+Lists every cached repo. Pie-compatible models are marked with `✓` and
+annotated with the detected architecture; incompatible repos are marked `○`.
+
+### model download
+
+```bash
+pie model download <REPO_ID>
+```
+
+Downloads a HuggingFace repo (e.g., `Qwen/Qwen3-0.6B`) and prints the local
+path plus a compatibility check.
+
+```bash
+pie model download Qwen/Qwen3-0.6B
+pie model download Qwen/Qwen2.5-7B-Instruct
+pie model download meta-llama/Llama-3.2-1B-Instruct
+```
+
+After downloading, point a config block at it:
+
+```bash
+pie config set model.0.hf_repo Qwen/Qwen2.5-7B-Instruct
+```
+
+### model remove
+
+```bash
+pie model remove <REPO_ID>
+```
+
+Prompts for confirmation, then deletes the repo from the HF cache.
+
+---
+
+## driver
+
+Inspect embedded drivers and manage subprocess-driver Python environments.
+
+```bash
+pie driver list [-c <CONFIG>]
+pie driver <dev|vllm|sglang> install [PATH] [--run]
+pie driver <dev|vllm|sglang> set venv <PATH>
+pie driver <dev|vllm|sglang> set python <PATH>
+pie driver <dev|vllm|sglang> show
+pie driver <dev|vllm|sglang> doctor
+pie driver <portable|cuda-native|dummy> doctor
+```
+
+`portable`, `cuda_native`, and `dummy` are embedded in the `pie` binary when
+compiled into that build. `dev`, `vllm`, and `sglang` run out-of-process via
+`python -m pie_driver_<type>`.
+
+Example:
+
+```bash
+pie driver dev install ~/.pie/venvs/dev --run
+pie driver dev set venv ~/.pie/venvs/dev
+pie driver dev doctor
+```
+
+---
+
+## auth
+
+Manage authorized clients. The keystore lives at the path returned by
+`pie.path.get_authorized_users_path()` and is also read by the Rust runtime.
+
+### auth add
+
+```bash
+pie auth add <USERNAME> [KEY_NAME]
+```
+
+Adds a public key for a user. The **key is read from stdin** (paste, then
+`Ctrl-D`). If `KEY_NAME` is omitted, a timestamp is used. Supported formats:
+RSA / Ed25519 / ECDSA in OpenSSH or PEM.
+
+```bash
+# Pipe a key in
+cat ~/.ssh/id_ed25519.pub | pie auth add alice laptop
+
+# Or interactively
+pie auth add alice
+# (paste key, Ctrl-D)
+```
+
+### auth remove
+
+```bash
+pie auth remove <USERNAME> [KEY_NAME]
+```
+
+With `KEY_NAME`, removes that one key. Without it, removes the entire user
+entry (after a confirmation prompt in interactive mode).
+
+### auth list
+
+```bash
+pie auth list
+```
+
+Prints every user with the names of their registered keys.
+
+---
+
+## Configuration file
+
+The config schema (every key in `~/.pie/config.toml`) lives on its own page: see [Configuration](./configuration). Edit the file with `pie config show` and `pie config set`.
+
+---
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | General error (bad config, model not found, etc.) |
+| `130` | Interrupted (Ctrl-C) |

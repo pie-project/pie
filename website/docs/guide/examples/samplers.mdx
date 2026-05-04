@@ -1,0 +1,23 @@
+---
+title: Samplers and probes
+description: Sampler outputs, scoring, watermarking
+sidebar_position: 3
+---
+
+# Samplers and probes
+
+Inferlets that exercise the forward-pass output surface — every sampler kind, every probe kind, scoring candidate strings, watermarking generated text.
+
+| Inferlet | What it shows |
+|---|---|
+| [`sampler-suite`](https://github.com/pie-project/pie/tree/main/inferlets/sampler-suite) | End-to-end correctness check for every sampler kind (token / distribution / raw-logits / logprob / logprobs / entropy) attached to the same forward-pass slot. |
+| [`raw-logits-demo`](https://github.com/pie-project/pie/tree/main/inferlets/raw-logits-demo) | Microbench for `Sampler::raw_logits()`. Measures per-call overhead vs. greedy. |
+| [`output-validation`](https://github.com/pie-project/pie/tree/main/inferlets/output-validation) | Score candidate strings by their normalized log-probability (yes/no, A/B/C/D). |
+| [`best-of-n`](https://github.com/pie-project/pie/tree/main/inferlets/best-of-n) | Best-of-N generation with diversity ranking. |
+| [`watermarking`](https://github.com/pie-project/pie/tree/main/inferlets/watermarking) | Text watermarking via green/red token partitioning. |
+
+## Related guide
+
+- [Samplers and probabilities](../forward/samplers): every `Sampler` and `Probe` kind.
+- [The forward pass](../forward/overview): the primitive these inferlets drive directly.
+- [Forking and saving](../context/sharing): the fork mechanic `best-of-n` builds on.

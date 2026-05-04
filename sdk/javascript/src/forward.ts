@@ -1,342 +1,373 @@
-// ForwardPass, KvPage, and Distribution types for neural network forward passes.
-// Mirrors the Rust forward.rs from inferlet/src/forward.rs
+// Forward — single forward-pass primitive with auto page management.
+//
+// `ctx.forward()` returns a `Forward` builder. Attach inputs, samplers,
+// probes, masks, then `await forward.execute()`.
+//
+//     const fwd = ctx.forward();
+//     fwd.input(promptTokens);
+//     const h = fwd.sample([promptTokens.length - 1], Sampler.argmax());
+//     const out = await fwd.execute();
+//     const token = out.token(h);
+//
+// For prefill / scoring / custom decode loops. The `Generator` layer is
+// built on top of this for the common token-generation case.
 
-import type { Queue } from './model.js';
-import { Brle } from './brle.js';
+import {
+  ForwardPass as _ForwardPass,
+} from 'pie:core/inference';
+import type {
+  Sampler as WitSampler,
+  Brle,
+  Output as WitOutput,
+  SlotOutput,
+} from 'pie:core/inference';
 
-// WIT bindings - these will be available at runtime through componentize-js
-import type { ForwardPass as WitForwardPass } from 'inferlet:core/forward';
-import * as forward from 'inferlet:core/forward';
-import * as apiAdapter from 'inferlet:adapter/common';
-import * as apiZo from 'inferlet:zo/evolve';
+import { awaitFuture } from './_async.js';
+import type { Adapter } from './adapter.js';
+import type { Context } from './context.js';
+import {
+  type Probe,
+  type ProbeKind,
+  type ProbeKindOf,
+  type Sampler,
+  _probeAccessorKind,
+  _probeToWit,
+} from './sample.js';
 
-/**
- * Represents a probability distribution over a set of tokens.
- */
-export interface Distribution {
-  /** Token IDs */
-  ids: number[];
-  /** Probabilities corresponding to the token IDs */
-  probs: number[];
+// =============================================================================
+// Slot handles
+// =============================================================================
+
+/** Reference to a sampler slot. Pass to `output.token()` /
+ *  `output.tokensAt()` to read the result. */
+export interface SampleHandle {
+  readonly slot: number;
+  readonly arity: number;
 }
 
-/**
- * Result of executing a forward pass.
- */
-export interface ForwardPassResult {
-  /** Optional distributions for requested output indices */
-  distributions?: Distribution[];
-  /** Optional sampled tokens for requested output indices */
-  tokens?: number[];
+/** Reference to a probe slot. The phantom `K` tag selects which
+ *  `output.*` accessor compiles. */
+export interface ProbeHandle<K extends ProbeKind = ProbeKind> {
+  readonly slot: number;
+  readonly kind: K;
 }
 
-// Enable to trace KvPage lifecycle for debugging
-const DEBUG_KVPAGE = false;
-let kvPageIdCounter = 0;
+// =============================================================================
+// Slot specs (internal)
+// =============================================================================
 
-/**
- * Represents a KV cache page with automatic resource management.
- * When the last reference is dropped, the page is deallocated.
- */
-export class KvPage {
-  private _queue: Queue;
-  private _ptr: number;
-  private _released: boolean = false;
-  private _refCount: number = 1;
-  private _debugId: number;
-
-  constructor(queue: Queue, ptr: number) {
-    this._queue = queue;
-    this._ptr = ptr;
-    this._debugId = kvPageIdCounter++;
-    if (DEBUG_KVPAGE) {
-      console.log(`[KvPage] CREATE id=${this._debugId} ptr=${this._ptr} refCount=${this._refCount}`);
-    }
-  }
-
-  /**
-   * Returns the raw pointer to this KV page.
-   */
-  get ptr(): number {
-    return this._ptr;
-  }
-
-  /**
-   * Returns the current reference count (for debugging).
-   */
-  get refCount(): number {
-    return this._refCount;
-  }
-
-  /**
-   * Returns whether this page has been released.
-   */
-  get isReleased(): boolean {
-    return this._released;
-  }
-
-  /**
-   * Increment the reference count.
-   * Call this when sharing this page with another Context.
-   */
-  ref(): void {
-    if (this._released) {
-      console.error(`[KvPage] ERROR: ref() on released page id=${this._debugId} ptr=${this._ptr}`);
-      throw new Error(`Cannot ref a released KvPage (ptr=${this._ptr})`);
-    }
-    this._refCount++;
-    if (DEBUG_KVPAGE) {
-      console.log(`[KvPage] REF id=${this._debugId} ptr=${this._ptr} refCount=${this._refCount}`);
-    }
-  }
-
-  /**
-   * Decrement the reference count and release if it reaches zero.
-   * Returns true if the page was actually deallocated.
-   */
-  unref(): boolean {
-    if (this._released) {
-      if (DEBUG_KVPAGE) {
-        console.log(`[KvPage] SKIP unref (already released) id=${this._debugId} ptr=${this._ptr}`);
-      }
-      return false;
-    }
-    this._refCount--;
-    if (DEBUG_KVPAGE) {
-      console.log(`[KvPage] UNREF id=${this._debugId} ptr=${this._ptr} refCount=${this._refCount}`);
-    }
-    if (this._refCount <= 0) {
-      if (DEBUG_KVPAGE) {
-        console.log(`[KvPage] DEALLOCATE id=${this._debugId} ptr=${this._ptr}`);
-      }
-      this._queue.deallocateKvPagePtr(this._ptr);
-      this._released = true;
-      return true;
-    }
-    return false;
-  }
-
-  /**
-   * Explicitly release this KV page (decrements ref count).
-   * Called automatically when the page is no longer needed.
-   */
-  release(): void {
-    this.unref();
-  }
+interface _SampleSlot {
+  readonly type: 'sample';
+  readonly indices: Uint32Array;
+  readonly sampler: Sampler;
 }
 
-/**
- * ForwardPass represents a batch of forward pass operations.
- * Configure inputs, outputs, attention masks, and KV cache before executing.
- */
-export class ForwardPass {
-  private inner: WitForwardPass;
+interface _ProbeSlot {
+  readonly type: 'probe';
+  readonly index: number;
+  readonly probe: Probe;
+}
 
-  constructor(inner: WitForwardPass) {
-    this.inner = inner;
+type _Slot = _SampleSlot | _ProbeSlot;
+
+// =============================================================================
+// Forward
+// =============================================================================
+
+/**
+ * Single forward pass. Construct via `ctx.forward()`.
+ *
+ * Builder methods return `this` so chains compose. `await forward.execute()`
+ * runs the host call, commits any newly-filled pages, and returns an
+ * `Output`.
+ */
+export class Forward {
+  readonly #ctx: Context;
+  #autoInputs: number[] = [];
+  #explicitInputs: Array<[Uint32Array, Uint32Array]> = [];
+  #slots: _Slot[] = [];
+  #nextSlot = 0;
+  #mask: Brle | undefined;
+  #attnMask: Brle[] | undefined;
+  #adapter: Adapter | undefined;
+  #zoSeed: number | undefined;
+
+  constructor(ctx: Context) {
+    this.#ctx = ctx;
   }
 
-  /**
-   * Execute the forward pass asynchronously.
-   */
-  async execute(): Promise<ForwardPassResult> {
-    const future = this.inner.execute();
-    if (!future) {
-      return { distributions: undefined, tokens: undefined };
+  // ── Position accessors ──────────────────────────────────────────────────
+
+  /** Position the *first* auto-input token will occupy. Equal to the
+   *  owning context's `seqLen` at the time `forward()` was called. The
+   *  sampler at index `i` (when `forward.sample([i], ...)`) lands at
+   *  `startPosition() + i`. */
+  startPosition(): number {
+    return this.#ctx._seqLen;
+  }
+
+  // ── Inputs ──────────────────────────────────────────────────────────────
+
+  /** Append `tokens` at positions starting at the context's current
+   *  sequence length. Multiple calls accumulate. After `execute()` these
+   *  tokens occupy KV slots and `seqLen` advances. */
+  input(tokens: Iterable<number>): this {
+    for (const t of tokens) this.#autoInputs.push(t);
+    return this;
+  }
+
+  /** Feed `tokens` at caller-supplied `positions`. Use for scoring at
+   *  arbitrary positions (e.g. multi-candidate evaluation). These tokens
+   *  are NOT auto-committed — caller manages page bookkeeping if positions
+   *  overlap or extend beyond `seqLen`. */
+  inputAt(tokens: Uint32Array, positions: Uint32Array): this {
+    if (tokens.length !== positions.length) {
+      throw new Error('tokens and positions must be the same length');
     }
+    this.#explicitInputs.push([tokens, positions]);
+    return this;
+  }
 
-    // Wait for the async operation to complete
-    const pollable = future.pollable();
-    // Use pollable.block() which is the WASI way to wait
-    pollable.block();
+  // ── Slot attach ─────────────────────────────────────────────────────────
 
-    // Get results
-    const distributions: Distribution[] = [];
-    const rawDistributions = future.getDistributions();
-    if (rawDistributions) {
-      for (const [ids, probs] of rawDistributions) {
-        distributions.push({ ids: [...ids], probs: [...probs] });
-      }
-    }
+  /** Attach a sampler at one or more `indices` (0-based into the auto-input
+   *  window). Returns a handle for reading the sampled token(s) on the
+   *  resulting `Output`.
+   *
+   *  A multi-arity sampler produces `indices.length` Token slots in the
+   *  output, so the next slot index advances by that count — any subsequent
+   *  `sample` / `probe` call sees the right offset. */
+  sample(indices: Iterable<number>, sampler: Sampler): SampleHandle {
+    const idxArr = indices instanceof Uint32Array
+      ? indices
+      : new Uint32Array(indices);
+    const arity = idxArr.length;
+    const h: SampleHandle = { slot: this.#nextSlot, arity };
+    this.#slots.push({ type: 'sample', indices: idxArr, sampler });
+    this.#nextSlot += arity;
+    return h;
+  }
 
-    const tokens = future.getTokens();
-
-    return {
-      distributions: distributions.length > 0 ? distributions : undefined,
-      tokens: tokens ? [...tokens] : undefined,
+  /** Attach a probe at a single `index`. Returns a typed handle whose
+   *  `kind` selects which `output.*` accessor decodes the result. */
+  probe<P extends Probe>(index: number, probe: P): ProbeHandle<ProbeKindOf<P>> {
+    const h: ProbeHandle<ProbeKindOf<P>> = {
+      slot: this.#nextSlot,
+      kind: _probeAccessorKind(probe) as ProbeKindOf<P>,
     };
+    this.#slots.push({ type: 'probe', index, probe });
+    this.#nextSlot += 1;
+    return h;
   }
 
-  /**
-   * Set embedding pointers as input.
-   */
-  inputEmbedPtrs(embedPtrs: number[], positions: number[]): void {
-    forward.inputEmbeddings(
-      this.inner,
-      new Uint32Array(embedPtrs),
-      new Uint32Array(positions)
-    );
+  // ── Decoration ──────────────────────────────────────────────────────────
+
+  /** Set a static logit mask (BRLE) applied at every sampled position. */
+  mask(brle: Brle): this {
+    this.#mask = brle;
+    return this;
   }
 
-  /**
-   * Set token IDs as input.
-   */
-  inputTokens(inputTokens: number[], positions: number[]): void {
-    forward.inputTokens(
-      this.inner,
-      new Uint32Array(inputTokens),
-      new Uint32Array(positions)
-    );
+  /** Set per-query-position attention masks. Length must match the total
+   *  number of query positions across all `input` / `inputAt` calls. */
+  attentionMask(masks: Brle[]): this {
+    this.#attnMask = masks;
+    return this;
   }
 
-  /**
-   * Set embedding pointers for output capture.
-   */
-  outputEmbedPtrs(embedPtrs: number[], indices: number[]): void {
-    forward.outputEmbeddings(
-      this.inner,
-      new Uint32Array(embedPtrs),
-      new Uint32Array(indices)
-    );
+  /** Apply an adapter (LoRA, etc.) for this forward pass. */
+  adapter(adapter: Adapter): this {
+    this.#adapter = adapter;
+    return this;
   }
 
-  /**
-   * Request probability distributions at specified indices.
-   */
-  outputDistributions(indices: number[], temperature: number, topK?: number): void {
-    forward.outputDistributions(this.inner, new Uint32Array(indices), temperature, topK);
+  /** Set a zo (Evolution Strategies) seed for this forward pass. */
+  zoSeed(seed: number): this {
+    this.#zoSeed = seed;
+    return this;
   }
 
-  /**
-   * Request sampled tokens at specified indices (multinomial sampling).
-   */
-  outputTokens(indices: number[], temperature: number): void {
-    forward.outputTokens(this.inner, new Uint32Array(indices), temperature);
-  }
+  // ── Execute ─────────────────────────────────────────────────────────────
 
   /**
-   * Request sampled tokens using top-p (nucleus) sampling.
+   * Run the forward pass. Reserves working pages for any auto-inputs,
+   * submits all attached inputs and slots, awaits the host, commits any
+   * newly-filled pages, and updates the context's cached state.
+   *
+   * Throws if no inputs and no slots are attached — a vacuous Forward
+   * almost always indicates a missed `input(...)` or `sample(...)` call.
    */
-  outputTokensTopP(indices: number[], temperature: number, topP: number): void {
-    forward.outputTokensTopP(this.inner, new Uint32Array(indices), temperature, topP);
-  }
+  async execute(): Promise<Output> {
+    const ctx = this.#ctx;
+    const nAuto = this.#autoInputs.length;
+    const nExplicit = this.#explicitInputs.reduce((a, [t]) => a + t.length, 0);
+    const nTotal = nAuto + nExplicit;
 
-  /**
-   * Request sampled tokens using top-k sampling.
-   */
-  outputTokensTopK(indices: number[], temperature: number, topK: number): void {
-    forward.outputTokensTopK(this.inner, new Uint32Array(indices), temperature, topK);
-  }
+    if (nTotal === 0 && this.#slots.length === 0) {
+      throw new Error(
+        'Forward.execute() called with no inputs and no slots. ' +
+          'Attach at least one input (`forward.input(...)`) or slot ' +
+          '(`forward.sample(...)` / `forward.probe(...)`) before executing.',
+      );
+    }
 
-  /**
-   * Request sampled tokens using min-p sampling.
-   */
-  outputTokensMinP(indices: number[], temperature: number, minP: number): void {
-    forward.outputTokensMinP(this.inner, new Uint32Array(indices), temperature, minP);
-  }
+    // Reserve pages for auto-inputs (they occupy KV and commit on the way
+    // out). Explicit inputs are scoring-only — caller manages their pages.
+    if (nAuto > 0) {
+      const totalAfter = ctx._workingTokens + nAuto;
+      const pagesNeeded = Math.ceil(totalAfter / ctx._pageSize);
+      const additional = Math.max(0, pagesNeeded - ctx._workingPages);
+      if (additional > 0) {
+        ctx._handle.reserveWorkingPages(additional);
+        ctx._workingPages = pagesNeeded;
+      }
+    }
 
-  /**
-   * Request sampled tokens using combined top-k and top-p sampling.
-   */
-  outputTokensTopKTopP(
-    indices: number[],
-    temperature: number,
-    topK: number,
-    topP: number
-  ): void {
-    forward.outputTokensTopKTopP(this.inner, new Uint32Array(indices), temperature, topK, topP);
-  }
+    // Build forward pass.
+    const fwd = new _ForwardPass(ctx._handle.model());
+    fwd.context(ctx._handle);
+    if (this.#adapter !== undefined) {
+      fwd.adapter(this.#adapter._handle);
+    }
+    if (this.#zoSeed !== undefined) {
+      const zoMod = await import('pie:zo/zo' as any);
+      zoMod.adapterSeed(fwd, this.#zoSeed);
+    }
 
-  /**
-   * Set the attention mask for the forward pass.
-   * Each element is a Brle or raw buffer representing which positions are visible.
-   */
-  attentionMask(mask: Brle[] | number[][]): void {
-    // Convert Brle array to Uint32Array[] as expected by the WIT binding
-    const rawMask = mask.map((m) => {
-      const buf = m instanceof Brle ? m.buffer : m;
-      return new Uint32Array(buf);
-    });
-    forward.attentionMask(this.inner, rawMask);
-  }
+    if (nAuto > 0) {
+      const positions = new Uint32Array(nAuto);
+      for (let i = 0; i < nAuto; i++) positions[i] = ctx._seqLen + i;
+      fwd.inputTokens(new Uint32Array(this.#autoInputs), positions);
+    }
+    for (const [tokens, positions] of this.#explicitInputs) {
+      fwd.inputTokens(tokens, positions);
+    }
 
-  /**
-   * Set the KV cache for the forward pass.
-   */
-  kvCache(kvPages: KvPage[], lastKvPageLen: number): void {
-    const ptrs = kvPages.map((kv) => kv.ptr);
-    forward.kvCache(this.inner, new Uint32Array(ptrs), lastKvPageLen);
-  }
+    // Slot attaches go in declaration order — slot indices match what we
+    // handed back via SampleHandle / ProbeHandle.
+    for (const spec of this.#slots) {
+      if (spec.type === 'sample') {
+        fwd.sampler(spec.indices, spec.sampler._variant);
+      } else {
+        fwd.sampler(new Uint32Array([spec.index]), _probeToWit(spec.probe));
+      }
+    }
 
-  /**
-   * Set the KV cache using raw pointers.
-   */
-  kvCachePtrs(kvPagePtrs: number[], lastKvPageLen: number): void {
-    forward.kvCache(this.inner, new Uint32Array(kvPagePtrs), lastKvPageLen);
-  }
+    if (this.#mask !== undefined) fwd.logitMask(this.#mask);
+    if (this.#attnMask !== undefined) fwd.attentionMask(this.#attnMask);
 
-  /**
-   * Set the adapter for this forward pass (LoRA inference).
-   * @param adapterPtr - Pointer to the adapter resource
-   */
-  setAdapter(adapterPtr: number): void {
-    apiAdapter.setAdapter(this.inner, adapterPtr);
-  }
+    const raw = await awaitFuture(fwd.execute(), 'Forward.execute failed');
 
-  /**
-   * Set the random seed for adapter perturbation (ZO optimization).
-   * @param seed - Random seed for perturbation
-   */
-  setAdapterSeed(seed: number): void {
-    apiZo.setAdapterSeed(this.inner, BigInt(seed));
+    // Commit pages that auto-input tokens fully filled.
+    if (nAuto > 0) {
+      const newWorking = ctx._workingTokens + nAuto;
+      const toCommit = Math.floor(newWorking / ctx._pageSize);
+      if (toCommit > 0) ctx._handle.commitWorkingPages(toCommit);
+      ctx._committedPages += toCommit;
+      ctx._workingPages -= toCommit;
+      ctx._workingTokens = newWorking % ctx._pageSize;
+      ctx._seqLen += nAuto;
+    }
+
+    return new Output(raw);
   }
 }
+
+// =============================================================================
+// Output
+// =============================================================================
 
 /**
- * Resource type enumeration for allocation/deallocation.
+ * Result of one forward-pass execution — produced by both
+ * `Forward.execute()` and `GenStep.execute()`.
+ *
+ * **Common path** (Generator): read `output.tokens` for the accepted
+ * tokens this step (post stop / max-tokens truncation).
+ *
+ * **Raw Forward**: read sampler slots via `token()` / `tokensAt()` using
+ * handles returned at attach time. The `tokens` field is empty.
+ *
+ * **Probes** (both paths): `distribution()` / `logits()` / `logprobs()` /
+ * `entropy()` take a typed `ProbeHandle`.
  */
-export enum Resource {
-  KvPage = 0,
-  Embed = 1,
-  Adapter = 2,
+export class Output {
+  readonly #raw: WitOutput;
+
+  /** Generator-accepted tokens this step, post stop / max-tokens
+   *  truncation. Empty for raw `Forward.execute()` (no Generator state). */
+  readonly tokens: Uint32Array;
+
+  /** Handle for the Generator's auto-attached sampler. `undefined` for raw
+   *  Forward results and for steps where `clearSampler()` was called. */
+  readonly autoSampler: SampleHandle | undefined;
+
+  constructor(
+    raw: WitOutput,
+    tokens: Uint32Array = new Uint32Array(),
+    autoSampler?: SampleHandle,
+  ) {
+    this.#raw = raw;
+    this.tokens = tokens;
+    this.autoSampler = autoSampler;
+  }
+
+  /** Underlying WIT output (slot list + speculative side channel). */
+  get raw(): WitOutput { return this.#raw; }
+
+  // ── Sampler accessors ─────────────────────────────────────────────────
+
+  /** First token from a single-index sampler slot. */
+  token(h: SampleHandle): number | undefined {
+    const slot = this.#slot(h.slot);
+    return slot?.tag === 'token' ? slot.val : undefined;
+  }
+
+  /** Tokens at the slot range a multi-index sampler covers. In speculative
+   *  mode the array may be shorter than `arity` if the verifier rejected
+   *  drafts. */
+  tokensAt(h: SampleHandle): Uint32Array {
+    const out: number[] = [];
+    for (let i = 0; i < h.arity; i++) {
+      const slot = this.#slot(h.slot + i);
+      if (slot?.tag === 'token') out.push(slot.val);
+      else break;
+    }
+    return new Uint32Array(out);
+  }
+
+  // ── Probe accessors ───────────────────────────────────────────────────
+
+  /** Distribution as `[ids, probs]` for a `Distribution` probe. */
+  distribution(h: ProbeHandle<'distribution'>): [Uint32Array, Float32Array] | undefined {
+    const slot = this.#slot(h.slot);
+    return slot?.tag === 'distribution' ? slot.val : undefined;
+  }
+
+  /** Raw logits bytes for a `Logits` probe (length `vocab_size * 4`,
+   *  native-endian f32). */
+  logits(h: ProbeHandle<'logits'>): Uint8Array | undefined {
+    const slot = this.#slot(h.slot);
+    return slot?.tag === 'logits' ? slot.val : undefined;
+  }
+
+  /** Logprob list for a `Logprob` / `Logprobs` probe. Length 1 for a
+   *  single-token query, K for a list query. */
+  logprobs(h: ProbeHandle<'logprobs'>): Float32Array | undefined {
+    const slot = this.#slot(h.slot);
+    return slot?.tag === 'logprobs' ? slot.val : undefined;
+  }
+
+  /** Entropy for an `Entropy` probe. */
+  entropy(h: ProbeHandle<'entropy'>): number | undefined {
+    const slot = this.#slot(h.slot);
+    return slot?.tag === 'entropy' ? slot.val : undefined;
+  }
+
+  #slot(idx: number): SlotOutput | undefined {
+    return idx >= 0 && idx < this.#raw.slots.length
+      ? this.#raw.slots[idx]
+      : undefined;
+  }
 }
 
-/**
- * Interface for forward pass operations.
- * Implemented by Queue.
- */
-export interface Forward {
-  // KvPage management with smart pointers
-  newKvPage(): KvPage;
-  newKvPages(count: number): KvPage[];
-
-  // KvPage raw pointer management
-  allocateKvPagePtr(): number;
-  allocateKvPagePtrs(count: number): number[];
-  deallocateKvPagePtr(ptr: number): void;
-  deallocateKvPagePtrs(ptrs: number[]): void;
-
-  // KvPage export/import
-  exportKvPages(kvPages: KvPage[], name: string): void;
-  importKvPages(name: string): KvPage[];
-  exportKvPagePtrs(ptrs: number[], name: string): void;
-  importKvPagePtrs(name: string): number[];
-  getAllExportedKvPages(): [string, number][];
-  releaseExportedKvPages(name: string): void;
-
-  // Embedding pointer management
-  allocateEmbedPtr(): number;
-  allocateEmbedPtrs(count: number): number[];
-  deallocateEmbedPtr(ptr: number): void;
-  deallocateEmbedPtrs(ptrs: number[]): void;
-  exportEmbedPtrs(ptrs: number[], name: string): void;
-  importEmbedPtrs(name: string): number[];
-  getAllExportedEmbeds(): [string, number][];
-  releaseExportedEmbeds(name: string): void;
-
-  // ForwardPass creation
-  createForwardPass(): ForwardPass;
-}
-
-// Re-export causalMask from brle
-export { causalMask } from './brle.js';
+export type { Brle };

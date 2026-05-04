@@ -1,0 +1,12 @@
+[package]
+name = "constrained-decoding"
+version = "0.1.0"
+description = "Grammar-constrained decoding using Lark grammar for structured outputs"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+num_tokens = {type = "int", optional = true, description = "Maximum number of new tokens to generate (default: 512)"}

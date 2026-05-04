@@ -1,0 +1,11 @@
+[package]
+name = "raw-logits-demo"
+version = "0.1.0"
+description = "Microbenchmark for `Sampler::raw_logits()` — measures per-call overhead vs greedy across N timed iterations. Use sampler-suite for the broader correctness-and-composability check."
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]

@@ -19,23 +19,26 @@ on:
         type: string
         default: "latest-build"
       portable:
-        description: "Build portable matrix (linux/macos/windows)"
+        description: "Build portable matrix (manylinux x86_64/aarch64 + macOS arm64)"
         type: boolean
         default: true
       cuda:
-        description: "Build CUDA matrix (linux/windows × cuda 12.6/12.8/13.0)"
+        description: "Build CUDA matrix on self-hosted GPU runner (cuda 12.6/12.8/13.0 × {cuda, portable-cuda})"
         type: boolean
         default: true
+      cuda_manylinux:
+        description: "Build CUDA matrix on GH-hosted runners with manylinux_2_28 base (broader glibc compat, slower)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write     # needed for `gh release upload`
 
 env:
-  # Same release notes refresh for every job — keeps the page in sync
-  # with the latest workflow run.
+  # Release notes body — keeps the release page in sync with the
+  # latest workflow run.
   RELEASE_NOTES: |
     Rolling build from commit ${{ github.sha }} on ${{ github.ref_name }}.
-    Triggered: ${{ github.event.workflow_run.created_at || github.event.repository.updated_at }}
     Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 jobs:
@@ -62,17 +65,27 @@ jobs:
             archive: tar.gz
             backend_env: ""
           - label: aarch64-darwin
-            runner: macos-14
+            # macos-15 gets Xcode 16 with libc++ 17, which has
+            # `std::atomic_ref` (C++20). macos-14's Xcode 15.4 ships
+            # libc++ 15, which doesn't.
+            runner: macos-15
             container: ""
             triple: aarch64-apple-darwin
             archive: tar.gz
             backend_env: "PIE_PORTABLE_METAL=1"
-          - label: x86_64-windows
-            runner: windows-latest
-            container: ""
-            triple: x86_64-pc-windows-msvc
-            archive: zip
-            backend_env: "PIE_PORTABLE_VULKAN=1"
+          # TODO(windows): re-enable once `runtime/src/shmem_ipc.rs`
+          # has a Windows backend (CreateFileMapping/MapViewOfFile).
+          # Currently it uses POSIX-only libc symbols (mmap, mode_t,
+          # PROT_READ, …) unconditionally, so the runtime crate
+          # doesn't compile on x86_64-pc-windows-msvc. Once shmem_ipc
+          # has a Windows impl, restore this entry with
+          # backend_env: "PIE_PORTABLE_VULKAN=1".
+          # - label: x86_64-windows
+          #   runner: windows-latest
+          #   container: ""
+          #   triple: x86_64-pc-windows-msvc
+          #   archive: zip
+          #   backend_env: "PIE_PORTABLE_VULKAN=1"
     runs-on: ${{ matrix.target.runner }}
     container: ${{ matrix.target.container || '' }}
     env:
@@ -81,12 +94,49 @@ jobs:
       - uses: actions/checkout@v6
 
       # manylinux containers ship gcc + cmake + ninja but no rust.
-      # Other runners have them via setup steps below.
-      - name: Install rustup (manylinux only)
+      # We dnf-install:
+      #   - `openssl-devel` + `pkg-config`: for `openssl-sys` (reqwest's
+      #     default features).
+      #   - `perl`: openssl-sys build script's vendored fallback.
+      #   - `gcc-toolset-14-gcc(-c++)`: needed for libstdc++ 14, which
+      #     ships <span> and other C++20 headers driver/portable's
+      #     source uses. The container's stock gcc-8 / libstdc++-8
+      #     is missing them.
+      #
+      # Then we pin CC/CXX explicitly to the toolset's binaries —
+      # without that, cmake-rs picks `/opt/clang/bin/cc` (also on
+      # PATH inside the manylinux image) and we lose the libstdc++ 14
+      # come link time.
+      - name: Install build deps + rustup (manylinux only)
         if: startsWith(matrix.target.container, 'quay.io/pypa/manylinux')
         shell: bash
         run: |
           set -euxo pipefail
+          dnf install -y --setopt=install_weak_deps=False \
+            openssl-devel pkg-config perl git \
+            gcc-toolset-14-gcc gcc-toolset-14-gcc-c++
+          # GitHub CLI — used by the upload step. The manylinux image
+          # doesn't ship `gh` and the upload step's --clobber flow has
+          # no clean curl equivalent. `gh` rpm depends on `git`,
+          # installed above.
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo \
+            https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y gh --repo gh-cli
+          # Pin compiler explicitly. cmake-rs (via cc-rs) reads
+          # CC/CXX, so this forces CMake to use gcc-toolset-14 even
+          # though manylinux's `/opt/clang/bin` is also on PATH and
+          # would otherwise be picked. We need libstdc++ 14 for the
+          # C++20 headers (`<span>`) the portable driver source uses.
+          {
+            echo "CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc"
+            echo "CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++"
+            echo "AR=/opt/rh/gcc-toolset-14/root/usr/bin/ar"
+            echo "PATH=/opt/rh/gcc-toolset-14/root/usr/bin:${PATH}"
+            echo "MANPATH=/opt/rh/gcc-toolset-14/root/usr/share/man:"
+            echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib"
+            echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64/pkgconfig"
+          } >> "$GITHUB_ENV"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -114,14 +164,18 @@ jobs:
           key: build-${{ matrix.target.label }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: build-${{ matrix.target.label }}-
 
-      - name: cargo build --release
+      - name: cargo build (release-min)
         shell: bash
         run: |
           set -euxo pipefail
           if [ -n "${{ matrix.target.backend_env }}" ]; then
             export ${{ matrix.target.backend_env }}
           fi
-          cargo build --release \
+          # `release-min`: thin LTO, panic=abort, strip=symbols.
+          # Defined in workspace Cargo.toml. Smaller + faster than
+          # plain `release` (no LTO at all by default), without fat
+          # LTO's many-hour link cost. Distribution profile.
+          cargo build --profile release-min \
             --target ${{ matrix.target.triple }} \
             -p pie-server \
             --features driver-portable,driver-dummy
@@ -131,7 +185,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p dist
-          BIN_DIR="target/${{ matrix.target.triple }}/release"
+          BIN_DIR="target/${{ matrix.target.triple }}/release-min"
           if [[ "${{ matrix.target.archive }}" == "zip" ]]; then
             # Windows .exe; 7z preinstalled on windows-latest.
             7z a "dist/${ARTIFACT_NAME}" "${BIN_DIR}/pie.exe"
@@ -149,77 +203,244 @@ jobs:
           gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"
 
   # =========================================================================
-  # CUDA matrix — Linux jobs run inside `nvidia/cuda` images (toolkit + nccl
-  # preinstalled, glibc 2.28 → manylinux_2_28-compatible). Windows jobs use
-  # Jimver/cuda-toolkit on `windows-latest` (no Linux-only `driver-cuda`
-  # feature; CUDA reaches portable via PIE_PORTABLE_CUDA).
+  # CUDA matrix — runs on the project's self-hosted GPU runner.
+  #
+  # The runner is bare-metal Ubuntu 24.04 (glibc 2.39) with an RTX 4090,
+  # 32 cores, and side-by-side CUDA toolkits at /usr/local/cuda-X.Y.
+  # `CARGO_HOME` and `CARGO_TARGET_DIR` are preset to persistent paths
+  # outside the workspace, so we deliberately do NOT use `actions/cache`
+  # (would shadow the runner's larger, always-warm caches).
+  #
+  # Tradeoff vs the previous nvidia/cuda manylinux containers: the
+  # resulting binary is glibc-2.39-floored — won't run on EL8 / Ubuntu
+  # 20.04. CUDA users are typically on recent distros anyway, and
+  # they need a recent NVIDIA driver to match the toolkit.
+  #
+  # Two flavors per CUDA toolkit version:
+  #   * cuda  — full bundle: `driver-portable` (ggml-CUDA) + `driver-cuda`
+  #             (native CUDA + flashinfer + NCCL). The heavyweight binary
+  #             with both drivers; what users want for production.
+  #   * portable-cuda — same `driver-portable` with PIE_PORTABLE_CUDA=1,
+  #             but without the native `driver-cuda`. Smaller binary,
+  #             no NCCL / flashinfer dependency. Useful where the ggml
+  #             CUDA backend is enough.
+  #
+  # The runner serializes jobs (one at a time), so the matrix entries
+  # below run sequentially. Total wall-time scales with cuda-version
+  # count × flavor count.
   # =========================================================================
   cuda:
     if: inputs.cuda
-    name: cuda / ${{ matrix.os.label }} / cuda${{ matrix.cuda.version }}
+    name: cuda / linux-x64 / ${{ matrix.flavor.id }}-${{ matrix.cuda.short }}
+    runs-on: [self-hosted, linux, x64, gpu, cuda]
     strategy:
       fail-fast: false
+      # Force serial execution on the self-hosted GPU runner. All matrix
+      # entries share the same `CARGO_TARGET_DIR` and write into the
+      # same `pie-server-<hash>/out/portable/build/` cmake build
+      # directory; running in parallel races on the per-object .o.d
+      # dependency files and trips EACCES the moment two jobs configure
+      # cmake at the same instant. The runner has 32 cores so each
+      # entry already fans out internally — serializing the matrix
+      # costs wall-clock but keeps the build cache coherent.
+      max-parallel: 1
       matrix:
-        os:
-          - label: x86_64-manylinux_2_28
-            runner: ubuntu-22.04
-            triple: x86_64-unknown-linux-gnu
-            cargo_features: "driver-portable,driver-cuda,driver-dummy"
-            archive: tar.gz
-          - label: x86_64-windows
-            runner: windows-latest
-            triple: x86_64-pc-windows-msvc
-            cargo_features: "driver-portable,driver-dummy"
-            archive: zip
+        # sm_75 (Turing, e.g. T4 / RTX 20-series) intentionally
+        # excluded: flashinfer's `vllm_custom_all_reduce.cuh` only
+        # specializes the bf16 cast under `__CUDA_ARCH__ >= 800`, so
+        # nvcc's sm_75 pass fails to instantiate
+        # `CustomAllreduce::allreduce<__nv_bfloat16>`. Turing has no
+        # native bf16 anyway — supporting it here would mean carrying
+        # an fp16-only fallback that the rest of the cuda driver
+        # doesn't have. The portable-cuda flavor (no driver-cuda /
+        # flashinfer) covers Turing users.
         cuda:
-          - { version: "12.6.3", short: "12.6", arch: "75;80;86;89;90" }
-          - { version: "12.8.1", short: "12.8", arch: "75;80;86;89;90;100;120" }
-          - { version: "13.0.0", short: "13.0", arch: "75;80;86;89;90;100;120" }
-    runs-on: ${{ matrix.os.runner }}
-    container: ${{ matrix.os.label == 'x86_64-manylinux_2_28' && format('nvidia/cuda:{0}-devel-rockylinux8', matrix.cuda.version) || '' }}
+          - { version: "12.6.3", short: "12.6", path: "/usr/local/cuda-12.6", arch: "80;86;89;90" }
+          - { version: "12.8.1", short: "12.8", path: "/usr/local/cuda-12.8", arch: "80;86;89;90;100;120" }
+          - { version: "13.0.0", short: "13.0", path: "/usr/local/cuda-13.0", arch: "80;86;89;90;100;120" }
+        flavor:
+          - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
+          - { id: "portable-cuda", features: "driver-portable,driver-dummy" }
     env:
-      ARTIFACT_NAME: pie-${{ matrix.os.label }}-cuda${{ matrix.cuda.short }}.${{ matrix.os.archive }}
+      ARTIFACT_NAME: pie-x86_64-linux-${{ matrix.flavor.id }}${{ matrix.cuda.short }}.tar.gz
       PIE_PORTABLE_CUDA: "1"
       PIE_PORTABLE_CUDA_ARCH: ${{ matrix.cuda.arch }}
       CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda.arch }}
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
+      # sccache is intentionally disabled here. RUSTC_WRAPPER=sccache
+      # caused enough collateral problems (CMake build dirs cached
+      # CMAKE_CUDA_COMPILER_LAUNCHER=sccache stamps; sccache 0.10's
+      # clap CLI rejected `-E` from nvcc preprocessing) that it
+      # outweighed the cache benefit. The 32-core runner builds Rust
+      # crates fast enough cold; we can revisit later.
+      CARGO_INCREMENTAL: "0"
+      # Block ggml's CMakeLists from auto-wiring sccache as the global
+      # `RULE_LAUNCH_COMPILE`. Its detection path is
+      # `if (GGML_CCACHE AND NOT CMAKE_C_COMPILER_LAUNCHER ...) find_program(... sccache)`
+      # so any non-empty value short-circuits the AND chain. `env` is
+      # the unix `env` command — when invoked as `env cc -c foo.c`, it
+      # executes the trailing args verbatim without altering anything,
+      # so it acts as a transparent launcher.
+      #
+      # Why this matters on a bare-metal runner: sccache's client
+      # connects to the daemon on the configured port (default 4226)
+      # without checking the daemon's owner. If a different user on the
+      # box (e.g. a developer's interactive session) has an sccache
+      # daemon running on 4226, every `sccache cc …` from this job
+      # routes through that foreign daemon. The daemon then forks the
+      # actual compiler under its own UID, the compiler tries to write
+      # `.o.d` / `.o` into the gh-runner-owned target tree, and EACCES
+      # kills the build with the misleading "Permission denied" trace
+      # we hit on run 25346461606.
+      CMAKE_C_COMPILER_LAUNCHER: env
+      CMAKE_CXX_COMPILER_LAUNCHER: env
+      CMAKE_CUDA_COMPILER_LAUNCHER: env
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+        with:
+          # Workspace persists between jobs on bare-metal; clean to keep
+          # builds reproducible. The big caches live outside the
+          # workspace and are unaffected.
+          clean: true
+          fetch-depth: 1
 
-      - name: Bootstrap container (linux)
-        if: matrix.os.label == 'x86_64-manylinux_2_28'
+      - name: Select CUDA toolkit
         shell: bash
         run: |
           set -euxo pipefail
-          # nvidia/cuda:rockylinux8 images have glibc 2.28 (matches
-          # manylinux_2_28) but minimal userland. Add what we need.
+          CUDA_HOME='${{ matrix.cuda.path }}'
+          test -x "${CUDA_HOME}/bin/nvcc"
+          {
+            echo "CUDA_HOME=${CUDA_HOME}"
+            echo "LD_LIBRARY_PATH=${CUDA_HOME}/lib64"
+          } >> "$GITHUB_ENV"
+          echo "${CUDA_HOME}/bin" >> "$GITHUB_PATH"
+          # NCCL is sometimes bundled inside the CUDA toolkit prefix.
+          # If we find it there, point the cuda-driver build at it via
+          # `PIE_NCCL_HOME` (`server/build.rs::build_cuda` honors this).
+          # Only matters for the `cuda` flavor; the `portable-cuda`
+          # flavor doesn't link NCCL.
+          if [ -f "${CUDA_HOME}/include/nccl.h" ] \
+              && ls "${CUDA_HOME}"/lib64/libnccl.so* >/dev/null 2>&1; then
+            echo "PIE_NCCL_HOME=${CUDA_HOME}" >> "$GITHUB_ENV"
+          fi
+          "${CUDA_HOME}/bin/nvcc" --version
+          gcc --version | head -1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: cargo build (release-min)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Force a fresh cmake configure for pie-server's build script.
+          # The persistent CARGO_TARGET_DIR keeps pie-server-<hash>/out/
+          # between matrix entries, and cmake caches per-flavor CMake
+          # variables (compile launchers, define flags, etc.) that we
+          # don't want bleeding from one flavor's job to the next.
+          # Scoped to pie-server, so other crates' deps stay cached.
+          cargo clean -p pie-server --target x86_64-unknown-linux-gnu --profile release-min
+          # `release-min`: thin LTO, panic=abort, strip=symbols.
+          # Defined in workspace Cargo.toml.
+          cargo build --profile release-min \
+            --target x86_64-unknown-linux-gnu \
+            -p pie-server \
+            --features ${{ matrix.flavor.features }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          # CARGO_TARGET_DIR is preset on the self-hosted runner to a
+          # persistent location outside the workspace; fall back to the
+          # in-tree `target/` for any other environment.
+          BIN_DIR="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-gnu/release-min"
+          tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
+          ls -la dist/
+
+      - name: Upload to release
+        # Pure-JS action — no `gh` install required on the bare-metal
+        # runner. Existing assets with the same name are replaced
+        # (same effect as `gh release upload --clobber`).
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: dist/${{ env.ARTIFACT_NAME }}
+          fail_on_unmatched_files: true
+
+  # =========================================================================
+  # CUDA matrix on GH-hosted runners with manylinux_2_28 base — produces
+  # binaries with glibc 2.28 floor (RHEL 8 / Ubuntu 20.04 / Debian 11).
+  #
+  # Built inside `nvidia/cuda:X.Y-devel-rockylinux8` containers; matrix
+  # entries run in parallel across GH-hosted ubuntu runners. Slower per
+  # job than the self-hosted matrix (no GPU, 4 vCPUs) but the
+  # parallelism evens it out — wall-clock comparable to the self-hosted
+  # serial matrix. Opt-in via the `cuda_manylinux` workflow input.
+  # =========================================================================
+  cuda-manylinux:
+    if: inputs.cuda_manylinux
+    name: cuda / x86_64-manylinux_2_28 / ${{ matrix.flavor.id }}-${{ matrix.cuda.short }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda:
+          - { version: "12.6.3", short: "12.6", arch: "80;86;89;90" }
+          - { version: "12.8.1", short: "12.8", arch: "80;86;89;90;100;120" }
+          - { version: "13.0.0", short: "13.0", arch: "80;86;89;90;100;120" }
+        flavor:
+          - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
+          - { id: "portable-cuda", features: "driver-portable,driver-dummy" }
+    container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
+    env:
+      ARTIFACT_NAME: pie-x86_64-manylinux_2_28-${{ matrix.flavor.id }}${{ matrix.cuda.short }}.tar.gz
+      PIE_PORTABLE_CUDA: "1"
+      PIE_PORTABLE_CUDA_ARCH: ${{ matrix.cuda.arch }}
+      CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda.arch }}
+      CMAKE_CUDA_RUNTIME_LIBRARY: Shared
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bootstrap container
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # `ninja-build` lives in the PowerTools repo on Rocky 8;
+          # EPEL covers extras. `patch` for the vendored llama.cpp
+          # patches; `git` for CPM's git fetches. NCCL ships in
+          # NVIDIA's cuda repo (already configured by the base image)
+          # as `libnccl-devel`; pulls `libnccl` runtime in via deps.
+          dnf install -y epel-release dnf-plugins-core
+          dnf config-manager --set-enabled powertools
           dnf install -y --setopt=install_weak_deps=False \
-            cmake ninja-build gcc-toolset-12 git \
-            openssl-devel
-          source /opt/rh/gcc-toolset-12/enable
+            openssl-devel pkg-config perl git patch \
+            cmake ninja-build \
+            gcc-toolset-12-gcc gcc-toolset-12-gcc-c++ \
+            libnccl libnccl-devel
+          # Pin compiler explicitly: `source enable` only adjusts PATH —
+          # cmake-rs probes CC/CXX env vars and otherwise picks
+          # `/usr/bin/cc` (gcc-8.5, no <span> / C++20). Same nvcc
+          # host-compiler issue applies via CUDAHOSTCXX (nvcc
+          # auto-picks gcc-8.5 and silently drops `-std=c++20`).
+          {
+            echo "CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
+            echo "CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
+            echo "AR=/opt/rh/gcc-toolset-12/root/usr/bin/ar"
+            echo "CUDAHOSTCXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
+            echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}"
+            echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/opt/rh/gcc-toolset-12/root/usr/lib"
+            echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64/pkgconfig"
+          } >> "$GITHUB_ENV"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          # Persist the gcc-toolset env for subsequent steps.
-          echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}" >> "$GITHUB_ENV"
-          echo "MANPATH=/opt/rh/gcc-toolset-12/root/usr/share/man:" >> "$GITHUB_ENV"
-          echo "INFOPATH=/opt/rh/gcc-toolset-12/root/usr/share/info" >> "$GITHUB_ENV"
-
-      - name: Install Rust (windows)
-        if: matrix.os.label == 'x86_64-windows'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.os.triple }}
-
-      - name: Install CUDA toolkit (windows)
-        if: matrix.os.label == 'x86_64-windows'
-        uses: Jimver/cuda-toolkit@v0.2.19
-        with:
-          cuda: ${{ matrix.cuda.version }}
-          method: network
-          # Headers + libs only; the runner already has a compatible MSVC.
-          sub-packages: '["nvcc", "cudart", "thrust", "cublas", "cublas_dev", "curand", "curand_dev"]'
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -228,45 +449,42 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: build-cuda-${{ matrix.os.label }}-${{ matrix.cuda.short }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: build-cuda-${{ matrix.os.label }}-${{ matrix.cuda.short }}-
+          key: build-cuda-manylinux-${{ matrix.cuda.short }}-${{ matrix.flavor.id }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: build-cuda-manylinux-${{ matrix.cuda.short }}-${{ matrix.flavor.id }}-
 
-      - name: cargo build --release
+      - name: cargo build (release-min)
         shell: bash
         run: |
           set -euxo pipefail
-          cargo build --release \
-            --target ${{ matrix.os.triple }} \
+          # `release-min`: thin LTO, panic=abort, strip=symbols.
+          # Defined in workspace Cargo.toml.
+          cargo build --profile release-min \
+            --target x86_64-unknown-linux-gnu \
             -p pie-server \
-            --features ${{ matrix.os.cargo_features }}
+            --features ${{ matrix.flavor.features }}
 
       - name: Package
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p dist
-          BIN_DIR="target/${{ matrix.os.triple }}/release"
-          if [[ "${{ matrix.os.archive }}" == "zip" ]]; then
-            7z a "dist/${ARTIFACT_NAME}" "${BIN_DIR}/pie.exe"
-          else
-            tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
-          fi
+          BIN_DIR="target/x86_64-unknown-linux-gnu/release-min"
+          tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
           ls -la dist/
 
-      - name: Upload to release (--clobber)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: dist/${{ env.ARTIFACT_NAME }}
+          fail_on_unmatched_files: true
 
   # =========================================================================
   # Refresh the release notes once after all builds finish.
   # =========================================================================
   refresh-notes:
-    if: always() && (inputs.portable || inputs.cuda)
-    needs: [portable, cuda]
+    if: always() && (inputs.portable || inputs.cuda || inputs.cuda_manylinux)
+    needs: [portable, cuda, cuda-manylinux]
     runs-on: ubuntu-latest
     permissions:
       contents: write

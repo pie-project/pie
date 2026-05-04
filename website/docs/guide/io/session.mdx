@@ -1,0 +1,286 @@
+---
+title: User and inferlet (session)
+description: Stream events to the launching client and receive its messages, files, and signals
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# User and inferlet (session)
+
+Every running inferlet has a session: a bidirectional channel to the client that launched it. The inferlet sends progress events, partial outputs, and files; the client sends messages, files, and signals. This page covers the session API. Read this after [I/O overview](./overview).
+
+## Send to the client
+
+`session.send` ships text or structured data to the client. `session.send_file` ships binary blobs.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::pie::core::session;
+
+session::send("hello");                     // text
+session::send_file(&pdf_bytes);             // binary
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import session
+
+session.send("hello")                       # text
+session.send({"event": "tick", "n": 3})     # dict / list → JSON
+session.send_file(pdf_bytes)                # binary
+```
+
+`session.send` accepts a string verbatim. Anything else is JSON-encoded.
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { session } from 'inferlet';
+
+session.send('hello');
+session.send({ event: 'tick', n: 3 });      // object → JSON
+session.sendFile(pdfBytes);                 // Uint8Array
+```
+
+</TabItem>
+</Tabs>
+
+The client receives each `send` as a `Stdout` event and each `send_file` as a `File` event. See the [client SDK reference](../../reference/client-python) for the receive side.
+
+## Receive from the client
+
+`session.receive` waits for the next message; `session.receive_file` waits for the next file. Both are async.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::pie::core::session;
+use inferlet::FutureStringExt;
+
+let next = session::receive();
+let msg: Option<String> = next.wait_async().await;   // None if the client disconnected
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+text: str = await session.receive()
+data: bytes = await session.receive_file()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const text: string = await session.receive();
+const data: Uint8Array = await session.receiveFile();
+```
+
+</TabItem>
+</Tabs>
+
+The receive futures resolve on the next inbound payload. If the client never sends, they wait forever; pair them with `select!` / `asyncio.wait_for` / `Promise.race` if you need a timeout.
+
+## Stream tokens as they decode
+
+The most common pattern: forward each chat-decoder delta to the session.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::{chat, sample::Sampler};
+use inferlet::pie::core::session;
+
+let mut g = ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+    .max_tokens(512);
+let mut dec = chat::Decoder::new(&model);
+
+while let Some(step) = g.next()? {
+    let out = step.execute().await?;
+    if let chat::Event::Delta(s) = dec.feed(&out.tokens)? {
+        session::send(&s);
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Sampler, chat, session
+
+g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=512)
+dec = chat.Decoder(model)
+
+async for step in g:
+    out = await step.execute()
+    match dec.feed(out.tokens):
+        case chat.Event.Delta(text=t):
+            session.send(t)
+        case _:
+            pass
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Sampler, chat, session } from 'inferlet';
+
+const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 512 });
+const dec = new chat.Decoder(model);
+
+for await (const step of g) {
+    const out = await step.execute();
+    const ev = dec.feed(out.tokens);
+    if (ev.type === 'delta') session.send(ev.text);
+}
+```
+
+</TabItem>
+</Tabs>
+
+The client UI updates token by token. The inferlet's final return value still arrives as the `Return` event after the loop ends.
+
+## Structured events
+
+Send a JSON object instead of a plain string when you want the client to dispatch on a tag:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::pie::core::session;
+
+let payload = serde_json::json!({
+    "channel": "progress",
+    "step": 3,
+    "of": 10,
+}).to_string();
+session::send(&payload);
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+session.send({"channel": "progress", "step": 3, "of": 10})
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+session.send({ channel: 'progress', step: 3, of: 10 });
+```
+
+</TabItem>
+</Tabs>
+
+The client receives the JSON-encoded string and parses on its end. Common channels: `progress`, `think`, `answer`, `tool-result`. The convention is yours.
+
+## Receive files
+
+For inferlets that operate on user-uploaded data, the client uploads via the client SDK's `transfer_file` and the inferlet reads with `session.receive_file`.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::pie::core::session;
+use inferlet::FutureBlobExt;
+
+let blob: Vec<u8> = session::receive_file()
+    .wait_async()
+    .await
+    .ok_or("client disconnected")?;
+process_pdf(&blob)?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+blob: bytes = await session.receive_file()
+process_pdf(blob)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const blob: Uint8Array = await session.receiveFile();
+processPdf(blob);
+```
+
+</TabItem>
+</Tabs>
+
+The client side uses `process.transfer_file(blob)` (Python) or its equivalent. See the [client SDK reference](../../reference/client-python).
+
+## Signals from the client
+
+A signal is a fire-and-forget string the client sends with `process.signal(...)`. Inside the inferlet, signals arrive on the same channel as text messages, through `session.receive`. Treat them as out-of-band hints by tagging them on the client side:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+// Client side: process.signal("stop").
+// Inferlet side: pick the message up via session::receive.
+use inferlet::pie::core::session;
+use inferlet::FutureStringExt;
+
+let next = session::receive();
+if next.wait_async().await.as_deref() == Some("stop") {
+    return Ok("stopped".into());
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+# Client side: await process.signal("stop").
+# Inferlet side: pick the message up via session.receive.
+msg = await session.receive()
+if msg == "stop":
+    return "stopped"
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+// Client side: await proc.signal('stop').
+// Inferlet side: pick the message up via session.receive.
+const msg = await session.receive();
+if (msg === 'stop') return 'stopped';
+```
+
+</TabItem>
+</Tabs>
+
+Signals are not a separate channel from the inferlet's perspective. If you need them distinguishable, encode the discriminator yourself (e.g. `"signal:stop"` or a JSON payload).
+
+## Stderr and the engine
+
+`stderr` writes from inside the inferlet (`eprintln!`, `print(file=sys.stderr)`, `console.error`) reach the client as `Stderr` events. They are separate from `session.send`, so a UI can route them differently (typically to a log panel).
+
+The `pie run` CLI mirrors `Stderr` events to the launcher's terminal. A long-running `pie serve` writes them to its own logs.
+
+## Next
+
+- [Inferlet and inferlet (messaging)](./messaging): pub/sub and queues.
+- [Filesystem](./filesystem): persistent storage that survives across runs.
+- [Client SDK](../../reference/client-python): the receive side of the session.

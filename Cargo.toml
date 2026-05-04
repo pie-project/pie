@@ -1,0 +1,36 @@
+# Top-level Cargo workspace for the host-side Rust crates.
+#
+# Members are the crates that build for the host (Linux/macOS x86_64/aarch64).
+# Wasm-target crates (`inferlets/*`, `sdk/rust/*`) are intentionally excluded —
+# they have their own Cargo.lock files and target `wasm32-wasip2`, so mixing
+# them into this workspace's resolver would pull wasm-only deps into the host
+# build graph.
+[workspace]
+resolver = "2"
+members = [
+    "runtime",
+    "client/rust",
+    "server",
+    "driver/dummy",
+    "sdk/python-rpc",
+    "sdk/python-server",
+]
+exclude = [
+    "inferlets",
+    "sdk/rust",
+]
+
+# Distribution profile for `pie-server`. Use
+# `cargo build --profile release-min -p pie-server`. The regular
+# `release` profile stays as the default dev/bench path (no LTO).
+#
+# Thin LTO over fat: ~10× faster link than fat with most of the size
+# and runtime win. Fat LTO doubled CI build time on the cuda matrix
+# (CUDA kernel compile + Rust+C++ link grew from ~1h to many hours)
+# without measurably better artifacts. Thin LTO parallelizes across
+# codegen units, so we leave codegen-units at the default (16) too.
+[profile.release-min]
+inherits = "release"
+lto = "thin"
+panic = "abort"
+strip = "symbols"

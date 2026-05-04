@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 248" width="720" height="248" role="img" aria-labelledby="fk-title fk-desc">
+  <title id="fk-title">Fork lineage: parent and child share committed pages</title>
+  <desc id="fk-desc">Pages 0, 1, and 2 are committed and shared between the parent and child contexts. The parent's working page is Page 3; the child's working page is Page 3', a copy made on fork.</desc>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#54473b"/>
+    </marker>
+  </defs>
+
+  <style>
+    text  { font-family: 'IBM Plex Serif', Charter, Georgia, serif; font-size: 13px; }
+    .ink { fill: #2c2722; }
+    .sub { fill: #54473b; }
+  </style>
+
+  <!-- Shared committed pages -->
+  <rect x="24"  y="84" width="120" height="80" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="84" y="128" text-anchor="middle">Page 0</text>
+
+  <rect x="168" y="84" width="120" height="80" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="228" y="128" text-anchor="middle">Page 1</text>
+
+  <rect x="312" y="84" width="120" height="80" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="372" y="128" text-anchor="middle">Page 2</text>
+
+  <!-- Parent's working page (top right) -->
+  <rect x="552" y="24" width="144" height="80" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="624" y="58" text-anchor="middle">Page 3</text>
+  <text class="sub" x="624" y="78" text-anchor="middle">(parent)</text>
+
+  <!-- Child's working page (bottom right) -->
+  <rect x="552" y="144" width="144" height="80" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="624" y="178" text-anchor="middle">Page 3&apos;</text>
+  <text class="sub" x="624" y="198" text-anchor="middle">(child copy)</text>
+
+  <!-- Chain links between committed pages -->
+  <line x1="144" y1="124" x2="168" y2="124"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="288" y1="124" x2="312" y2="124"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"/>
+
+  <!-- Y-fork from Page 2 to Page 3 (parent) and Page 3' (child) -->
+  <line x1="432" y1="124" x2="492" y2="124"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"/>
+  <polyline points="492,124 492,64 552,64"
+        fill="none"
+        stroke="#54473b" stroke-width="1.5"
+        stroke-linecap="round" stroke-linejoin="round"
+        marker-end="url(#ah)"/>
+  <polyline points="492,124 492,184 552,184"
+        fill="none"
+        stroke="#54473b" stroke-width="1.5"
+        stroke-linecap="round" stroke-linejoin="round"
+        marker-end="url(#ah)"/>
+</svg>

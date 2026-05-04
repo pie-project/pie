@@ -1,6 +1,6 @@
 ---
 title: Roadmap
-description: Directional view of what we’re building in Pie. Timelines and scope may change.
+description: Directional view of what we're building in Pie. Timelines and scope may change.
 ---
 
 import useBaseUrl from '@docusaurus/useBaseUrl';
@@ -12,6 +12,7 @@ import useBaseUrl from '@docusaurus/useBaseUrl';
   .r-api { background: none; }
   .r-perf { background: none; }
   .r-tooling { background: none; }
+  .r-research { background: none; font-style: italic; }
   .dim { opacity:.8 }
 `}</style>
 
@@ -27,45 +28,90 @@ This roadmap is **directional**. Priorities may evolve based on user feedback an
   <span className="r-tag r-api">api</span>
   <span className="r-tag r-perf">performance</span>
   <span className="r-tag r-tooling">tooling</span>
+  <span className="r-tag r-research">research</span>
 </div>
 
 ---
 
 ## Released in 0.2.0 (2026-01-20)
 
-- **Apple Metal support** <span className="r-tag r-runtime">runtime</span>  
+- **Apple Metal support** <span className="r-tag r-runtime">runtime</span>
   Enable GPU execution on Apple silicon via Metal for laptop development and demos.
 
-- **Multi-GPU support with mixed DP and TP** <span className="r-tag r-perf">performance</span>  
+- **Multi-GPU support with mixed DP and TP** <span className="r-tag r-perf">performance</span>
   Scale model size and throughput across devices using Data Parallelism and Tensor Parallelism.
 
-- **Quantization support (float8/int8/float4)** <span className="r-tag r-perf">performance</span>  
-  Reduce VRAM while preserving quality; per‑layer policies.
+- **Quantization (float8 / int8 / int4)** <span className="r-tag r-perf">performance</span>
+  Reduce VRAM while preserving quality; per-layer policies. Wired through `weight_dtype` on the native driver.
 
-- **New model support** <span className="r-tag r-runtime">runtime</span>  
-  Support for gpt-oss, ministral3, gemma2, gemma3, olmo3.
+- **New model support** <span className="r-tag r-runtime">runtime</span>
+  gpt-oss, Ministral 3, Gemma 2 / 3, OLMo 3, Qwen 3.
+
+---
+
+## Released in 0.3.0
+
+- **PEFT adapters API (LoRA)** <span className="r-tag r-api">api</span>
+  Hot-swap LoRA adapters at the per-pass level via `Adapter::create / open / fork / save / load / destroy`. Engine-level slot capacity and rank are configurable per driver.
+
+- **CAS-based KV cache sharing** <span className="r-tag r-perf">performance</span>
+  Committed pages are content-hashed and shared engine-wide via a Radix Trie. Forks are O(1); identical prefixes across separate contexts dedupe to one physical page.
+
+- **Suspend and restore** <span className="r-tag r-runtime">runtime</span>
+  `ctx.suspend()` returns all pages to the pool; the engine restores suspended contexts (highest-bid first) when memory frees up. Foundation for over-subscription and resumable workloads.
+
+- **Custom speculative decoding** <span className="r-tag r-api">api</span>
+  Runtime-managed n-gram drafting (`system_speculation`) plus a `Speculator` trait for caller-defined drafters (Jacobi, n-gram, draft-and-verify).
+
+- **MCP integration** <span className="r-tag r-api">api</span>
+  Full inferlet-side client (`available_servers / connect / list_tools / call_tool / list_resources / read_resource / list_prompts / get_prompt`) plus `register_mcp_server` on the client SDK. Stdio transport.
+
+- **Page-trim** <span className="r-tag r-perf">performance</span>
+  Runtime drops fully-masked leading KV pages from forward passes automatically. The mask saves work instead of zero-attending.
+
+- **Inferlet registry and CLI** <span className="r-tag r-tooling">tooling</span>
+  `bakery inferlet publish / search / info` against `registry.pie-project.org`. `bakery login` over GitHub OAuth.
 
 ---
 
 ## In progress
 
-- **PEFT adapters API (e.g., LoRA)** <span className="r-tag r-api">api</span>  
-  Hot‑swap adapters per request/session with safe isolation.
+- **Workflow API** <span className="r-tag r-api">api</span> <span className="r-tag r-runtime">runtime</span>
+  JSON DSL over `Pipe / Map / Fold / Fork / Process / Literal` with async execution and cancellation. Engine-side executor lands first; client SDK wrappers follow.
 
-- **KV‑cache quantization** <span className="r-tag r-perf">performance</span>  
-  Larger batches and longer contexts via cache compression.
+- **KV-cache quantization** <span className="r-tag r-perf">performance</span>
+  Larger batches and longer contexts via cache compression. Targeting fp8 / int8 KV with per-channel scales.
 
-- **Inferlet standard libraries (Python / JS)** <span className="r-tag r-tooling">tooling</span>  
-  Ergonomic helpers for common patterns; batteries included.
+- **HTTP from inside inferlets (Python / JS)** <span className="r-tag r-api">api</span>
+  WASI HTTP bindings beyond the Rust `wstd::http::Client`. The intended API shape (`requests` in Python, `fetch` in JS) is already used in tutorial examples.
 
+- **Per-tenant filesystem mounts** <span className="r-tag r-runtime">runtime</span> <span className="r-tag r-api">api</span>
+  Replace the single `/scratch` preopen with a configurable mount table (host path → guest path, read-only flag). Foundation for shared-engine multi-tenancy.
 
-- **Inferlet package manager** <span className="r-tag r-tooling">tooling</span>  
-  Discover, version, and share inferlets and libraries.
+- **Sliding-window attention for Gemma 2 / 3** <span className="r-tag r-runtime">runtime</span>
+  Both architectures interleave full and sliding-window attention; the native driver currently runs both as full attention. Hand-roll the sliding-window kernel path.
+
+- **Inferlet standard libraries (Python / JS)** <span className="r-tag r-tooling">tooling</span>
+  Ergonomic helpers for common patterns: typed JSON output, retry / fallback, structured tool dispatch. Rust SDK has the most surface today.
+
+- **Python `bakery create` template** <span className="r-tag r-tooling">tooling</span>
+  Bakery scaffolds Rust and TypeScript today; Python users copy `inferlets/python-example/` by hand.
+
+- **Per-user namespaces in the registry** <span className="r-tag r-tooling">tooling</span>
+  Currently a flat namespace: two publishers cannot share a name. Add `<user>/<inferlet>@<version>` resolution.
+
+- **Public-key auth for pie-client and JS client** <span className="r-tag r-tooling">tooling</span>
+  Rust client and Python `pie-client` library already support Ed25519 / RSA / ECDSA. The `pie-client` CLI and JS client currently support only token auth.
 
 ---
 
-We welcome proposals—open a GitHub issue with your use case or RFC.
+## Planned
 
+WIP
 
-**Feature ideas / RFCs:** please file a GitHub issue describing the problem, constraints, and expected API shape.  
+---
+
+We welcome proposals — open a GitHub issue with your use case or RFC.
+
+**Feature ideas / RFCs:** please file a GitHub issue describing the problem, constraints, and expected API shape.
 If something here would unblock you, let us know. Real workloads get priority.

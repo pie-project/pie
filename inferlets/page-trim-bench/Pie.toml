@@ -1,0 +1,16 @@
+[package]
+name = "page-trim-bench"
+version = "0.1.0"
+description = "Benchmark inferlet for the page-trim optimization (sink+window mask)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt_tokens = {type = "int", optional = true, description = "Length of synthetic prompt in tokens (default: 2048)"}
+decode_steps = {type = "int", optional = true, description = "Number of decode iterations to time (default: 256)"}
+sink_size = {type = "int", optional = true, description = "Attention sink size (default: 4)"}
+window_size = {type = "int", optional = true, description = "Sliding window size (default: 64)"}
+use_mask = {type = "bool", optional = true, description = "If true, attach a sink+window attention_mask each step. If false, fall back to causal — disables the page-trim optimization for the row (default: true)"}

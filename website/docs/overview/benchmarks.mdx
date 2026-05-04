@@ -1,0 +1,59 @@
+---
+title: Benchmarks
+description: End-to-end agent latency, throughput, and the cost of programmability
+sidebar_position: 5
+---
+
+# Benchmarks
+
+This page reports two questions. First, does the inferlet model give you something a black-box endpoint cannot, on a workload where the difference should show? Second, can Pie reproduce the optimizations vLLM and SGLang ship as built-in features without giving up performance? The figures below are from the [SOSP '25 paper](https://ingim.org/papers/gim2025pie.pdf).
+
+## Agent workload: end-to-end latency and throughput
+
+Agentic workflows interleave LLM inference with external I/O — tool calls, code execution, inter-agent messages. With a black-box endpoint, that orchestration runs on the client: every external interaction costs a network round trip, and changing the context can force a re-prefill. Inferlets co-locate the LLM call and the surrounding I/O in a single Wasm runtime on the server, and they keep direct control of the KV cache across interactions.
+
+We compare three representative agent patterns: ReACT (web API calls, 8 I/Os per agent), CodeACT (code execution, 8 I/Os), and Swarm (inter-agent communication, 32 I/Os).
+
+<div style={{textAlign: 'center', marginTop: '1rem', marginBottom: '-1rem'}}>
+
+![Legend: Pie, vLLM, SGLang](./benchmark_legend.svg)
+
+</div>
+
+![Latency and throughput of three agent workloads (ReACT, CodeACT, Swarm) on Pie compared to vLLM and SGLang. Bars are normalized within each workload to the worst latency and the best throughput.](./agent_latency_tput.svg)
+
+*Llama 3 1B (BF16) on an NVIDIA L4 (24 GB). vLLM v0.6.0, SGLang v0.4.4.*
+
+Pie cuts latency by up to 15% and lifts throughput by up to 30% versus vLLM and SGLang. The gain scales with the I/O-to-token ratio: with two or fewer external interactions per agent the curves converge, and the gap widens linearly as the number of interactions grows.
+
+## Replicating existing serving features
+
+The flip side of programmability: does Pie pay a performance tax on the optimizations vLLM and SGLang ship as built-in features? We re-implement eleven techniques as inferlets — basic text completion, prefix caching (Cache, PrefixTree), constrained decoding (EBNF), speculative decoding (SpecDec), beam search (Beam), attention sink (AttnSink), and four prompting strategies (ToT, RoT, GoT, SkoT) — and compare against the systems that ship them natively. The × marks unsupported techniques on a given baseline.
+
+<div style={{textAlign: 'center', marginTop: '1rem', marginBottom: '-1rem'}}>
+
+![Legend: Pie, vLLM, SGLang](./benchmark_legend.svg)
+
+</div>
+
+![Latency and throughput of eleven inference techniques implemented as Pie inferlets, compared to vLLM and SGLang where each is supported. Bars are normalized per workload to the worst latency and the best throughput.](./bench_latency_tput.svg)
+
+*Llama 3 1B (BF16) on an NVIDIA L4 (24 GB). vLLM v0.6.0, SGLang v0.4.4.*
+
+Across the board, Pie matches or beats the native implementations. The point of this plot is the absence of a programmability tax on the workloads vLLM and SGLang are tuned for.
+
+## Programmability tax
+
+The programmability tax is the overhead Pie's machinery adds on a workload where it provides no benefit. We measure it by running plain text completion as a Pie inferlet and as a direct call to vLLM with the same model.
+
+| Model | vLLM TPOT | Pie TPOT | Overhead |
+| --- | --- | --- | --- |
+| Llama 3 1B | 16.83 ms | 18.75 ms | +1.92 ms (11.4%) |
+| Llama 3 3B | 30.30 ms | 32.01 ms | +1.71 ms (5.6%) |
+| Llama 3 8B | 64.06 ms | 65.59 ms | +1.53 ms (2.4%) |
+
+The overhead is roughly constant in absolute terms — about 1.5 ms per output token — and shrinks as a fraction of TPOT as the model gets larger. The Wasm runtime itself is negligible (≈1 µs per call); the bulk comes from giving up GPU-side pipelining that vLLM does inside its monolithic decode loop (sampling and input embedding, ≈1.4 ms) plus a small amount of control-layer scheduling.
+
+## Reproducing
+
+The bench scripts live in [`benches/`](https://github.com/pie-project/pie/tree/main/benches):

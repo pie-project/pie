@@ -1,0 +1,144 @@
+---
+title: "Inputs: tokens, positions, masks"
+description: Drive the input side of a forward pass with tokens, custom positions, and BRLE attention masks
+sidebar_position: 2
+---
+
+# Inputs: tokens, positions, masks
+
+A forward pass takes a list of input positions, the token IDs at those positions, and an optional attention mask. This page covers the three input modalities. Read this after [The forward pass](./overview).
+
+The Forward builder is available in all three SDKs. The Rust examples below are canonical; the Python and JavaScript shapes mirror them with `snake_case` and `camelCase` respectively. The page-level operations at the bottom of this page reach into `ctx.inner()` and are Rust-only — the Python and JavaScript SDKs do not surface the inner handle.
+
+## Tokens with auto-positions
+
+The default form. The engine assigns positions sequentially after the context's existing tokens.
+
+```rust
+let mut fwd = ctx.forward();
+fwd.input(&token_ids);
+let h = fwd.sample(&[0], Sampler::Argmax);
+let out = fwd.execute().await?;
+```
+
+If the context has 100 tokens already and you `.input(&[a, b, c])`, the new positions are 100, 101, 102.
+
+## Tokens with explicit positions
+
+`input_at(tokens, positions)` sets position IDs explicitly. Position IDs are independent of the order tokens appear in the input list, so you can skip, repeat, or reorder them.
+
+```rust
+// Standard: sequential positions from where the context left off
+let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+fwd.input_at(&tokens, &positions);
+
+// Custom: gap in the middle
+let custom_positions = vec![0, 1, 2, 10, 11, 12];
+fwd.input_at(&tokens, &custom_positions);
+
+// Custom: same position twice (e.g. two competing draft tokens at one slot)
+let competing = vec![5, 5];
+fwd.input_at(&[draft_a, draft_b], &competing);
+```
+
+Use cases:
+
+- **Document hierarchies.** Assign different position ranges to different sections so attention sees structure.
+- **Multi-document attention.** Each document gets its own position space; the model treats them as separate streams.
+- **Positional interpolation.** Stretch position IDs to extend the effective context length (RoPE-style).
+- **Speculative decoding.** Draft tokens at the same position as their target.
+
+## Attention masks (BRLE)
+
+`attention_mask(per_token_masks)` applies a per-input-token attention mask. Each mask is BRLE-encoded.
+
+### BRLE in one paragraph
+
+Bit Run-Length Encoding. The vector is alternating runs starting with zeros. `[3, 2, 4, 1]` decodes to `0 0 0 | 1 1 | 0 0 0 0 | 1`. The convention is:
+
+- **Attention masks**: `0 = attend, 1 = mask out.`
+- **Logit masks** (`fwd.mask`): `1 = allowed, 0 = forbidden.` (Opposite polarity. Yes, it's annoying.)
+
+Each input token gets one BRLE row, and the row's length matches the number of past positions the token can see.
+
+### Sliding window
+
+Keep only the last N tokens in the attention pattern. Tokens outside the window are masked, and their working pages can be released.
+
+```rust
+let raw = ctx.inner();
+let total_len = ctx.seq_len();
+let psize = ctx.page_size();
+
+let evict_count = total_len.saturating_sub(window_size);
+let pages_to_release = evict_count / psize;
+if pages_to_release > 0 {
+    raw.release_working_pages(pages_to_release);
+}
+
+let mask = vec![evict_count, window_size];   // mask out evicted, attend to window
+fwd.attention_mask(&[mask]);
+```
+
+See the [`windowed-attention`](https://github.com/pie-project/pie/tree/main/inferlets/windowed-attention) inferlet for the full implementation.
+
+### Attention sink
+
+Keep a fixed prefix always live, plus a sliding window of recent tokens. This mirrors the [StreamingLLM](https://arxiv.org/abs/2309.17453) observation that initial tokens act as attention anchors.
+
+```rust
+let mask = vec![
+    sink_size,                  // zeros: attend to sink
+    evict_count - sink_size,    // ones: mask the evicted middle
+    window_size,                // zeros: attend to window
+];
+fwd.attention_mask(&[mask]);
+```
+
+See the [`attention-sink`](https://github.com/pie-project/pie/tree/main/inferlets/attention-sink) inferlet.
+
+## Logit masks
+
+`fwd.mask(brle)` applies a logit mask before sampling. The mask restricts which tokens the sampler can pick.
+
+```rust
+// Allow only tokens 100..150
+let mask = vec![100, 50, vocab_size - 150];   // forbid 0..100, allow 100..150, forbid rest
+fwd.mask(&mask);
+```
+
+For grammar-driven masking, prefer the `Generator` path with `constrain_with(...)`. See [Constrained generation](./constrained).
+
+## Page-trim
+
+Page-trim is a runtime optimization: when an attention mask fully masks every row of a leading KV page, the engine drops that page from the forward pass entirely. The mask saves work instead of zero-attending the masked positions.
+
+Two ground rules to make trim land:
+
+- **Mask whole pages, not individual tokens.** A row that masks positions `5..10` inside a 16-token page does not trim that page. Masking positions `0..16` does.
+- **Apply the same mask shape to every row.** Trim only fires when every row agrees that a page is dead.
+
+The high-level idioms (sliding window with whole-page eviction, attention sink, page-aligned sparse attention) all align with these rules. See the [`page-trim-bench`](https://github.com/pie-project/pie/tree/main/inferlets/page-trim-bench) inferlet for measurements.
+
+Pages receiving new K/V writes are never trimmed. The trim is per-request: two batched requests with different masks compute trim independently. Logical token positions and `position_ids` are preserved; only the physical pages on the wire shrink.
+
+## Page-level operations
+
+For custom forward-pass loops (sliding windows, speculation rollback) you sometimes manage pages by hand:
+
+```rust
+let raw = ctx.inner();
+
+raw.reserve_working_pages(n)?;          // pre-allocate n working pages
+raw.commit_working_pages(k)?;           // promote k full working pages to committed
+raw.release_working_pages(n);           // free n working pages
+raw.truncate_working_page_tokens(n);    // drop the last n tokens (rollback)
+```
+
+`commit_working_pages(k)` makes the first `k` working pages immutable. Forks of this context share committed pages. See [Pages](../context/pages) for the page model.
+
+## Next
+
+- [Samplers and probabilities](./samplers): outputs (token, distribution, logits, entropy).
+- [Constrained generation](./constrained): grammar-driven logit masking through `Generator`.
+- [Speculative decoding](./speculation): the page-rollback story for draft-and-verify.

@@ -103,7 +103,6 @@ def generate_rust_cargo_toml(project_dir: Path, name: str) -> None:
     # Use crates.io path if not in dev mode
     if pie_sdk := os.environ.get("PIE_SDK"):
         inferlet_dep = f'{{ path = "{pie_sdk}/rust/inferlet" }}'
-        macros_dep = f'{{ path = "{pie_sdk}/rust/inferlet-macros" }}'
     else:
         # Try to find relative paths
         current_dir = Path.cwd()
@@ -115,17 +114,13 @@ def generate_rust_cargo_toml(project_dir: Path, name: str) -> None:
                     else Path("..")
                 )
                 inferlet_dep = f'{{ path = "{rel_path}/sdk/rust/inferlet" }}'
-                macros_dep = f'{{ path = "{rel_path}/sdk/rust/inferlet-macros" }}'
                 break
         else:
             # Fallback to relative paths assuming standard project layout
             inferlet_dep = '{ path = "../sdk/rust/inferlet" }'
-            macros_dep = '{ path = "../sdk/rust/inferlet-macros" }'
 
     template = get_template("rust/Cargo.toml.template")
-    content = template.substitute(
-        name=name, inferlet_dep=inferlet_dep, macros_dep=macros_dep
-    )
+    content = template.substitute(name=name, inferlet_dep=inferlet_dep)
     (project_dir / "Cargo.toml").write_text(content)
 
 

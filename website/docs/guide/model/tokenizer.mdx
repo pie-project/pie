@@ -1,0 +1,199 @@
+---
+title: Tokenizers
+description: Encode and decode text, inspect the vocabulary and special tokens
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Tokenizers
+
+Most inferlets never call the tokenizer directly. `Context::user(...)` and `Context::system(...)` apply the model's chat template and tokenize on your behalf. You reach for the tokenizer when you need to inspect tokens, build prompts at the token level, or implement a custom decoder. Read this after [Loading and selecting models](./loading).
+
+## Get the tokenizer
+
+A tokenizer hangs off a `Model`:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let model = Model::load("default")?;
+let tk = model.tokenizer();
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+model = Model.load("default")
+tk = model.tokenizer()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const model = Model.load('default');
+const tk = model.tokenizer();
+```
+
+</TabItem>
+</Tabs>
+
+The tokenizer is a thin handle. Calls go through to the engine.
+
+## Encode and decode
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let ids: Vec<u32> = tk.encode("Hello, world!");
+let text: String = tk.decode(&ids)?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+ids: list[int] = tk.encode("Hello, world!")
+text: str = tk.decode(ids)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const ids: Uint32Array = tk.encode('Hello, world!');
+const text: string = tk.decode(ids);
+```
+
+</TabItem>
+</Tabs>
+
+`encode` returns the token IDs the model would see. `decode` is the inverse on a sequence of IDs. Round-tripping a string through both is not always exact: tokenizers normalize whitespace, lowercase casing in some cases, and merge unicode points into byte-pair tokens.
+
+Use `encode` to:
+
+- Inject pre-tokenized prompts via `ctx.append(&ids)`.
+- Compute prompt length in tokens (`tk.encode(text).len()`).
+- Build attention masks indexed by token position.
+
+Use `decode` to:
+
+- Render generated tokens to text yourself instead of using a decoder.
+- Pretty-print a slice of a context's token sequence.
+
+## Special tokens
+
+Models reserve token IDs for structural markers (BOS, EOS, role tags, thinking-mode markers). The tokenizer exposes them:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let (ids, bytes) = tk.special_tokens();
+for (id, b) in ids.iter().zip(bytes.iter()) {
+    println!("{id}: {}", String::from_utf8_lossy(b));
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+ids, byte_seqs = tk.special_tokens()
+for tid, b in zip(ids, byte_seqs):
+    print(tid, b.decode("utf-8", errors="replace"))
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const [ids, byteSeqs] = tk.specialTokens();
+const decoder = new TextDecoder();
+for (let i = 0; i < ids.length; i++) {
+  console.log(ids[i], decoder.decode(byteSeqs[i]));
+}
+```
+
+</TabItem>
+</Tabs>
+
+The bytes are raw token bytes, not always valid UTF-8. Decode lossily for printing. The exact set of special tokens depends on the model. Llama 3 has `<|begin_of_text|>`, `<|eot_id|>`, role markers, and tool-call markers. Qwen 3 has thinking-mode markers and a different EOT.
+
+## Vocabulary inspection
+
+`vocabs()` returns the full vocabulary as parallel `(ids, bytes)` lists.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let (ids, bytes) = tk.vocabs();
+println!("vocab size: {}", ids.len());
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+ids, byte_seqs = tk.vocabs()
+print(f"vocab size: {len(ids)}")
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const [ids, byteSeqs] = tk.vocabs();
+console.log(`vocab size: ${ids.length}`);
+```
+
+</TabItem>
+</Tabs>
+
+Useful for building token-level allowlists or denylists for [constrained generation](../forward/constrained), and for diagnostic dumps.
+
+## Split regex
+
+For BPE-style tokenizers, the split regex is the rule that pre-segments text before token merging. The tokenizer exposes it directly:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let pattern: String = tk.split_regex();
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+pattern: str = tk.split_regex()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const pattern: string = tk.splitRegex();
+```
+
+</TabItem>
+</Tabs>
+
+Useful when implementing custom drafters or aligning external tokenization (e.g. a draft model's tokenizer) to the target's behavior.
+
+## When you do not need the tokenizer
+
+Most chat inferlets reach the tokenizer indirectly. The chat template handles role tags and special tokens; the [chat parser](../decoder/chat) reads tokens off the stream and emits text. The tokenizer is the right tool for low-level work: custom samplers that score tokens by ID, watermarking, and prefix caching where you need to compute token lengths exactly.
+
+## Next
+
+- [Constrained generation](../forward/constrained): use the vocabulary to constrain logits to a grammar or schema.
+- [Chat parser](../decoder/chat): the stream parser that turns Generator output into clean chat text.
+- [Customize generation](../forward/inputs): work at the raw token / forward-pass level.

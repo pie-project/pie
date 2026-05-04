@@ -1,29 +1,54 @@
-// $name - TypeScript Inferlet
-// Simple text completion example using the inferlet library
+// $name — TypeScript inferlet.
+//
+// Demonstrates:
+// - Loading a model
+// - Using Context for chat-style prompt building
+// - Streaming generation with EventStream + callback API
 
-import { Context, getAutoModel, getArguments, send } from 'inferlet';
+import {
+    Model, Context, Sampler,
+    session, runtime,
+} from 'inferlet';
 
-// Get parsed arguments
-const args = getArguments();
-const prompt = (args.prompt as string) ?? 'What is the capital of France?';
-const maxTokens = Number(args.maxTokens ?? 256);
-const system = (args.system as string) ?? 'You are a helpful, respectful and honest assistant.';
+interface Input {
+    prompt?: string;
+    system?: string;
+    max_tokens?: number;
+    temperature?: number;
+    top_p?: number;
+}
 
-// Get the model
-const model = getAutoModel();
+export async function main(input: Input) {
+    const prompt = input.prompt ?? 'What is the capital of France?';
+    const system = input.system ?? 'You are a helpful, respectful and honest assistant.';
+    const maxTokens = input.max_tokens ?? 256;
+    const temperature = input.temperature ?? 0.6;
+    const topP = input.top_p ?? 0.95;
 
-// Create a context for generation
-const ctx = new Context(model);
+    // Load the first model the engine has loaded.
+    const model = Model.load(runtime.models()[0]);
 
-// Fill the context with messages
-ctx.fillSystem(system);
-ctx.fillUser(prompt);
+    // Build a chat context.
+    const ctx = Context.create(model);
+    ctx.system(system);
+    ctx.user(prompt);
 
-// Generate the response
-const result = await ctx.generate({
-  sampling: { topP: 0.95, temperature: 0.6 },
-  stop: { maxTokens, sequences: model.eosTokens }
-});
+    // Stream the response. `decode: { reasoning: true }` surfaces
+    // <think>...</think> chunks as separate `thinking` events.
+    let output = '';
+    const stream = await ctx.generate({
+        sampler: Sampler.topP(temperature, topP),
+        maxTokens,
+        decode: { reasoning: true },
+    });
 
-// Send the result
-send(result);
+    await stream
+        .on('thinking', text => session.send(text))
+        .on('text', text => { session.send(text); output += text; })
+        .run();
+
+    // Emit a [done] marker. The 'done' chat event doesn't fire if the
+    // model produces zero tokens, so do this unconditionally.
+    session.send('\n[done]');
+    return output;
+}

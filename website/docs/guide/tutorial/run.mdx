@@ -1,0 +1,203 @@
+---
+title: Run and iterate
+description: Build the inferlet, run it locally with pie run, and inspect intermediate state
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Run and iterate
+
+This page builds the `research-agent` inferlet you wrote on the [previous page](./build), runs it with `pie run`, and walks through the output. By the end you can edit the inferlet, rebuild, rerun, and see your changes in seconds.
+
+`pie run` boots a one-shot engine, runs the inferlet, prints its output, and exits. It is the right tool while you are iterating. The [next page](./serve) covers running the engine as a long-lived service.
+
+## Build
+
+`bakery build` compiles the source tree to a WebAssembly component.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```bash
+bakery build . -o research-agent.wasm
+```
+
+The first build pulls and compiles dependencies (`futures`, `serde_json`, `urlencoding`). Subsequent builds are incremental. Output lands at `research-agent.wasm` next to your `Pie.toml`.
+
+If you prefer raw cargo:
+
+```bash
+cargo build --target wasm32-wasip2 --release
+# output: target/wasm32-wasip2/release/research_agent.wasm
+```
+
+Both paths produce the same artifact.
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```bash
+bakery build . -o research-agent.wasm
+```
+
+`bakery build` resolves Python dependencies declared in `pyproject.toml`, packages them with the Python 3.14 inferlet runtime, and emits a single Wasm component.
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```bash
+bakery build . -o research-agent.wasm
+```
+
+`bakery build` runs the JavaScript bundler, links the inferlet runtime, and emits a single Wasm component.
+
+</TabItem>
+</Tabs>
+
+See [bakery](../../reference/bakery) for the full flag list.
+
+## Run
+
+```bash
+pie run \
+  --path ./research-agent.wasm \
+  --manifest ./Pie.toml \
+  --question "Compare the climates of Tokyo, Reykjavik, and Singapore."
+```
+
+The first run is slower because of JIT and kernel warmup. Expected output:
+
+```
+╭─ Pie Run ───────────────────────────────────────╮
+│ Inferlet     research-agent@0.1.0               │
+│ Model        default (Qwen/Qwen3-0.6B)          │
+│ Driver       cuda_native                        │
+│ Device       cuda:0                             │
+╰─────────────────────────────────────────────────╯
+
+Tokyo has a humid subtropical climate, with hot, humid summers
+and cool winters. Reykjavik has a subpolar oceanic climate,
+moderated by the Gulf Stream, with cool summers and chilly winters.
+Singapore lies near the equator and has a tropical rainforest
+climate: hot and humid year-round with no distinct seasons. The
+three differ primarily by latitude and ocean influence.
+```
+
+The CLI flags after `--manifest` fold into the inferlet's input. `--question "..."` becomes `{"question": "..."}` because that is the parameter declared in `Pie.toml`. Type inference handles `--max-tokens 64` (int) or `--temperature 0.7` (float) when you add such parameters.
+
+## Watching the steps
+
+The default output prints only the final string. To watch the four steps as they happen, stream events with `session.send` and add `eprintln!` / `print(file=sys.stderr)` / `console.error` for diagnostics. Diagnostic output goes to the engine's stderr stream, which `pie run` mirrors to your terminal.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::pie::core::session;
+
+eprintln!("[plan] {plan_text}");
+session::send(&format!("Looking up: {}\n", plan.titles.join(", ")));
+
+// after the join_all:
+let elapsed = start.elapsed().as_millis();
+eprintln!("[fetch] {} summaries in {} ms", plan.titles.len(), elapsed);
+```
+
+`eprintln!` writes to stderr; `session::send` streams a chunk back to the client (here, `pie run`) before the final result.
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+import sys
+from inferlet import session
+
+print(f"[plan] {plan_text}", file=sys.stderr)
+session.send(f"Looking up: {', '.join(titles)}\n")
+
+# after asyncio.gather:
+print(f"[fetch] {len(titles)} summaries in {elapsed_ms} ms", file=sys.stderr)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { session } from 'inferlet';
+
+console.error(`[plan] ${planText}`);
+session.send(`Looking up: ${plan.titles.join(', ')}\n`);
+
+// after Promise.all:
+console.error(`[fetch] ${plan.titles.length} summaries in ${elapsedMs} ms`);
+```
+
+</TabItem>
+</Tabs>
+
+After rebuilding and rerunning, you'll see something like:
+
+```
+[plan] {"titles": ["Tokyo", "Reykjavik", "Singapore"]}
+Looking up: Tokyo, Reykjavik, Singapore
+[fetch] 3 summaries in 412 ms
+
+Tokyo has a humid subtropical climate, ...
+```
+
+The fetch is reported as elapsed wall-clock time across all three requests, not the sum of individual request times. That is the win from running them in parallel.
+
+## The edit loop
+
+```bash
+# After editing the source:
+bakery build . -o research-agent.wasm
+pie run --path ./research-agent.wasm --manifest ./Pie.toml --question "..."
+```
+
+A Rust rebuild after a one-line change typically takes a few seconds. Python and JavaScript rebuilds are faster because they skip native compilation.
+
+To run the same inferlet against a different model without rebuilding, change the active model in your config:
+
+```bash
+pie config set model.0.hf_repo Qwen/Qwen2.5-7B-Instruct
+pie model download Qwen/Qwen2.5-7B-Instruct
+```
+
+`pie run` reads the config on every invocation, so the next run uses the new model.
+
+## When something goes wrong
+
+A few common failure modes and what to do.
+
+### The planner returned malformed JSON
+
+Symptom: the inferlet returns an error like `expected value at line 1 column 1`. The planner emitted prose around the JSON, or no JSON at all.
+
+What to do: add `eprintln!` / `print(file=sys.stderr)` around the parse to see what the planner produced. If the model is small (Qwen3-0.6B), it sometimes wraps JSON in code fences. Either strip the fences before parsing, or constrain the planner with a JSON schema. See [Structured generation](../forward/constrained).
+
+### A Wikipedia title is wrong
+
+Symptom: `[fetch failed: HTTP 404]` for one of the titles. The model invented a title that does not exist on Wikipedia, or used a non-canonical name (e.g. "Tokyo, Japan" instead of "Tokyo").
+
+What to do: include in the planner prompt a hint like "use exact Wikipedia article titles, e.g. 'Tokyo' not 'Tokyo, Japan'". For more robust handling, fall back to the Wikipedia search API when the summary endpoint 404s.
+
+### `pie run` says "no models available"
+
+Symptom: the inferlet returns `Err("no models")` immediately.
+
+What to do: run `pie model list` to see what is downloaded, and `pie config show` to see what the engine is configured to load. If the configured model is not downloaded, either download it or `pie config set model.0.hf_repo <repo>` to one you do have.
+
+### Build fails on `wasm32-wasip2`
+
+Symptom: `cargo build` errors with "target wasm32-wasip2 not installed".
+
+What to do: `rustup target add wasm32-wasip2`. The bakery toolchain installs this automatically, but a raw `cargo build` does not.
+
+## Next
+
+- [Serve and call](./serve): start a long-running engine and connect from a client SDK.
+- [Branch and share state](../context/sharing): forking the planner context for fan-out workflows.
+- [I/O and messaging](../io/overview): streaming events, the full session API, and inferlet-to-inferlet messaging.

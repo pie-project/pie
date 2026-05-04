@@ -1,0 +1,75 @@
+interface context {
+
+    use wasi:io/poll@0.2.4.{pollable};
+    use types.{error};
+    use model.{model};
+
+    type page-id = u32;
+
+    resource context {
+
+        // Creates a fresh empty context
+        create: static func(model: borrow<model>) -> result<context, error>;
+
+        // Opens a snapshot (implicit fork — snapshot stays immutable, working pages are copied)
+        open: static func(model: borrow<model>, name: string) -> result<context, error>;
+
+        // Takes ownership of a snapshot (snapshot is deleted, GPU pages transfer without copy)
+        take: static func(model: borrow<model>, name: string) -> result<context, error>;
+
+        // Deletes a saved snapshot by name
+        delete: static func(model: borrow<model>, name: string) -> result<_, error>;
+
+        // Forks into a new anonymous context (working pages are copied via GPU D2D or CPU H2D)
+        fork: func() -> result<context, error>;
+
+        // Named save — snapshots committed chain + working pages under a user-chosen name
+        save: func(name: string) -> result<_, error>;
+
+        // Anonymous save — snapshots committed chain + working pages, returns runtime-generated name
+        snapshot: func() -> result<string, error>;
+
+        // Force-destroys immediately
+        destroy: func();
+
+        // Number of tokens per page    
+        tokens-per-page: func() -> u32;
+
+        model: func() -> model;
+
+        // Number of committed KV pages in the context
+        committed-page-count: func() -> u32;
+
+        // Number of working KV pages (based on buffered tokens in the resource handle)
+        working-page-count: func() -> u32;
+
+        // Commit working KV pages to the context
+        commit-working-pages: func(num-pages: u32) -> result<_, error>;
+
+        // Reserve additional working GPU pages for the context
+        reserve-working-pages: func(num-pages: u32) -> result<_, error>;
+
+        // Release working GPU pages from the context
+        release-working-pages: func(num-pages: u32);
+
+        // Number of tokens in working pages (filled via forward pass but not yet committed)
+        working-page-token-count: func() -> u32;
+
+        // Remove the last N tokens from working pages (for rollback, e.g. speculative rejection)
+        truncate-working-page-tokens: func(num-tokens: u32);
+
+        // ── Market operations ──────────────────────────────────────
+
+        // Suspend this context (release pages, stop rent).
+        // Restoration is system-driven: highest-bid suspended contexts
+        // are restored when memory frees up.
+        suspend: func() -> result<_, error>;
+
+        // Set bid: willingness to pay per page per step.
+        // Drives suspension priority, restoration priority, and compute priority.
+        // 0.0 = use default (truthful) bidding.
+        bid: func(value: f64);
+
+    }
+
+}

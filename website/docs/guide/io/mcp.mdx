@@ -1,0 +1,442 @@
+---
+title: MCP
+description: Connect to host-registered Model Context Protocol servers
+sidebar_position: 6
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# MCP
+
+The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standard for exposing tools, resources, and prompt templates to LLM applications. Pie ships an MCP client. Inferlets discover and call MCP servers without writing transport code. Read this after [Tool-call parser](../decoder/tool-calling).
+
+There are two sides to MCP in Pie:
+
+- **The client side** registers MCP servers with the engine. The client process spawns the MCP server locally, performs the MCP `initialize` handshake, and announces it to the engine under a logical name.
+- **The inferlet side** discovers registered servers and calls into them.
+
+The pages below cover both. The client side comes first because the inferlet side has nothing to discover until something is registered.
+
+## Register an MCP server (client side)
+
+The client SDKs expose `register_mcp_server` (Python / Rust) and `registerMcpServer` (JavaScript). Today only the `stdio` transport is supported: the client spawns the MCP server as a subprocess and bridges its stdio to the engine. HTTP and SSE transports are reserved for future releases.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use pie_client::Client;
+
+let client = Client::connect("ws://127.0.0.1:8080").await?;
+client.authenticate("alice", &None).await?;
+
+client.register_mcp_server(
+    "fs",                                 // logical name inferlets see
+    "stdio",                              // only supported transport today
+    Some("npx"),                          // executable
+    Some(vec![
+        "-y".into(),
+        "@modelcontextprotocol/server-filesystem".into(),
+        "/tmp/sandbox".into(),
+    ]),
+    None,                                 // url (reserved for future transports)
+).await?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+async with PieClient("ws://127.0.0.1:8080") as client:
+    await client.authenticate("alice")
+
+    await client.register_mcp_server(
+        name="fs",
+        transport="stdio",
+        command="npx",
+        args=[
+            "-y",
+            "@modelcontextprotocol/server-filesystem",
+            "/tmp/sandbox",
+        ],
+    )
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const client = new PieClient('ws://127.0.0.1:8080');
+await client.connect();
+await client.authByToken(process.env.PIE_TOKEN!);
+
+await client.registerMcpServer('fs', {
+    transport: 'stdio',
+    command: 'npx',
+    args: [
+        '-y',
+        '@modelcontextprotocol/server-filesystem',
+        '/tmp/sandbox',
+    ],
+});
+```
+
+</TabItem>
+</Tabs>
+
+| Parameter | Meaning |
+|---|---|
+| `name` | Logical name. Inferlets refer to the server by this name. |
+| `transport` | `"stdio"` (the only supported transport today). |
+| `command` | Executable to spawn. Required for `stdio`. |
+| `args` | Arguments to `command`. |
+| `url` | Reserved for future HTTP / SSE transports. |
+
+The registration is **session-scoped**: the server stays available to inferlets launched on this client connection until the connection closes. To share servers across connections, every client registers its own.
+
+Registration spawns the subprocess locally on the client host, not on the engine host. Tool calls from the inferlet are forwarded back to the client over the WebSocket and dispatched to the local subprocess. The engine relays; it does not run the MCP server itself.
+
+A typical flow:
+
+```python
+async with PieClient(uri) as client:
+    await client.authenticate(user, key)
+
+    # 1. Register MCP servers the inferlet should see.
+    await client.register_mcp_server(
+        name="fs",
+        transport="stdio",
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp/sandbox"],
+    )
+
+    # 2. Launch the inferlet. It can now discover "fs" and call its tools.
+    process = await client.launch_process(
+        "research-agent@0.1.0",
+        input={"question": "Summarize files under /tmp/sandbox"},
+    )
+    # ... drain events ...
+```
+
+## Connect (inferlet side)
+
+The inferlet sees only the registered names. It does not know whether the underlying transport is stdio, HTTP, or which client process registered the server. `available_servers()` returns whatever has been registered on this session.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::mcp::client;
+
+let servers = client::available_servers();    // Vec<String>
+let session = client::connect(&servers[0]).map_err(|e| e.to_string())?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import mcp
+
+servers = mcp.available_servers()
+mcp_session = mcp.connect(servers[0])
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { mcp } from 'inferlet';
+
+const servers = mcp.availableServers();
+const mcpSession = mcp.connect(servers[0]);
+```
+
+</TabItem>
+</Tabs>
+
+The session resource closes when dropped (Rust) or when garbage-collected (Python / JS). Open a fresh session for each independent piece of work.
+
+## Tools
+
+`list_tools` and `call_tool` return raw MCP JSON in all three languages. Parse with your language's standard JSON library and inspect `isError`, `content`, and `structuredContent` yourself. The contract stays at the JSON level so the SDK does not lag the MCP spec.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use serde_json::{json, Value};
+
+let tools_json: String = session.list_tools().map_err(|e| e.to_string())?;
+let tools: Value = serde_json::from_str(&tools_json)
+    .map_err(|e| e.to_string())?;
+
+for tool in tools["tools"].as_array().unwrap() {
+    eprintln!("{}: {}", tool["name"], tool["description"]);
+}
+
+// Call a tool by name with JSON-encoded arguments.
+let args = json!({"query": "Rust release"}).to_string();
+let result_json = session.call_tool("search", &args).map_err(|e| e.to_string())?;
+let result: Value = serde_json::from_str(&result_json)
+    .map_err(|e| e.to_string())?;
+
+if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
+    return Err(format!("MCP error: {result}"));
+}
+
+for chunk in result["content"].as_array().unwrap() {
+    if let Some(text) = chunk["text"].as_str() {
+        print!("{text}");
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+import json
+
+tools = json.loads(mcp_session.list_tools())
+
+for tool in tools["tools"]:
+    print(f"{tool['name']}: {tool['description']}")
+
+# Call a tool by name.
+args = json.dumps({"query": "Rust release"})
+result = json.loads(mcp_session.call_tool("search", args))
+
+if result.get("isError"):
+    raise RuntimeError(result)
+
+for chunk in result["content"]:
+    if chunk["type"] == "text":
+        print(chunk["text"], end="")
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const tools = JSON.parse(mcpSession.listTools());
+
+for (const tool of tools.tools) {
+    console.error(`${tool.name}: ${tool.description}`);
+}
+
+// Call a tool by name.
+const args = JSON.stringify({ query: 'Rust release' });
+const result = JSON.parse(mcpSession.callTool('search', args));
+
+if (result.isError) throw new Error(JSON.stringify(result));
+
+for (const chunk of result.content) {
+    if (chunk.type === 'text') {
+        process.stdout.write(chunk.text);
+    }
+}
+```
+
+</TabItem>
+</Tabs>
+
+`content` chunks may also be `image`, `resource`, or other types. The MCP spec defines the full shape.
+
+## Resources
+
+`list_resources()` returns the available resources. `read_resource(uri)` fetches one.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let resources: serde_json::Value = serde_json::from_str(
+    &session.list_resources().map_err(|e| e.to_string())?
+).map_err(|e| e.to_string())?;
+let uri = resources["resources"][0]["uri"].as_str().unwrap();
+let content: serde_json::Value = serde_json::from_str(
+    &session.read_resource(uri).map_err(|e| e.to_string())?
+).map_err(|e| e.to_string())?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+resources = json.loads(mcp_session.list_resources())
+uri = resources["resources"][0]["uri"]
+content = json.loads(mcp_session.read_resource(uri))
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const resources = JSON.parse(mcpSession.listResources());
+const uri = resources.resources[0].uri;
+const content = JSON.parse(mcpSession.readResource(uri));
+```
+
+</TabItem>
+</Tabs>
+
+## Prompts
+
+`list_prompts()` returns the available prompt templates. `get_prompt(name, args)` renders one. The rendered messages live under `result.messages`.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let prompts: serde_json::Value = serde_json::from_str(
+    &session.list_prompts().map_err(|e| e.to_string())?
+).map_err(|e| e.to_string())?;
+let name = prompts["prompts"][0]["name"].as_str().unwrap();
+let args = serde_json::json!({"topic": "Rust"}).to_string();
+let rendered: serde_json::Value = serde_json::from_str(
+    &session.get_prompt(name, &args).map_err(|e| e.to_string())?
+).map_err(|e| e.to_string())?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+prompts = json.loads(mcp_session.list_prompts())
+name = prompts["prompts"][0]["name"]
+args = json.dumps({"topic": "Rust"})
+rendered = json.loads(mcp_session.get_prompt(name, args))
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const prompts = JSON.parse(mcpSession.listPrompts());
+const name = prompts.prompts[0].name;
+const args = JSON.stringify({ topic: 'Rust' });
+const rendered = JSON.parse(mcpSession.getPrompt(name, args));
+```
+
+</TabItem>
+</Tabs>
+
+## Bridging MCP to the model's tool decoder
+
+If the model has a native tool-call template, you can wire MCP tools through it. Translate the MCP tool list into the model's tool-call schemas with `tools::equip_prefix`, append the prefix to the context, generate, and feed each step through `tools::Decoder`. When a `Call` event fires, dispatch to the MCP session and append the answer with `tools::answer_prefix`.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::tools;
+
+// 1. Equip the model with the MCP tool schemas.
+let tools_json: serde_json::Value =
+    serde_json::from_str(
+        &session.list_tools().map_err(|e| e.to_string())?
+    ).map_err(|e| e.to_string())?;
+
+let schemas: Vec<String> = tools_json["tools"]
+    .as_array().unwrap()
+    .iter()
+    .map(|t| t.to_string())
+    .collect();
+let prefix = tools::equip_prefix(&model, &schemas)?;
+ctx.append(&prefix);
+
+ctx.user("Search for the latest Rust release").cue();
+
+// 2. Stream steps; dispatch Call events to MCP.
+let mut g = ctx.generate(sampler);
+let mut dec = tools::Decoder::new(&model);
+
+while let Some(step) = g.next()? {
+    let out = step.execute().await?;
+    if let tools::Event::Call(name, args) = dec.feed(&out.tokens)? {
+        let result_json = session.call_tool(&name, &args).map_err(|e| e.to_string())?;
+        let rendered = render_content(&result_json);
+        let answer = tools::answer_prefix(&model, &name, &rendered);
+        ctx.append(&answer);
+        ctx.cue();
+        dec.reset();
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import tools
+
+# 1. Equip the model with the MCP tool schemas.
+mcp_tools = json.loads(mcp_session.list_tools())
+schemas = [json.dumps(t) for t in mcp_tools["tools"]]
+prefix = tools.equip_prefix(model, schemas)
+ctx.append(prefix)
+
+ctx.user("Search for the latest Rust release").cue()
+
+# 2. Stream steps; dispatch Call events to MCP.
+g = ctx.generate(sampler)
+dec = tools.Decoder(model)
+
+async for step in g:
+    out = await step.execute()
+    match dec.feed(out.tokens):
+        case tools.Event.Call(name=n, arguments=a):
+            result_json = mcp_session.call_tool(n, a)
+            rendered = render_content(json.loads(result_json))
+            answer = tools.answer_prefix(model, n, rendered)
+            ctx.append(answer)
+            ctx.cue()
+            dec.reset()
+        case _:
+            pass
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { tools } from 'inferlet';
+
+// 1. Equip the model with the MCP tool schemas.
+const mcpTools = JSON.parse(mcpSession.listTools());
+const schemas = mcpTools.tools.map((t: unknown) => JSON.stringify(t));
+const prefix = tools.equipPrefix(model, schemas);
+ctx.append(prefix);
+
+ctx.user('Search for the latest Rust release').cue();
+
+// 2. Stream steps; dispatch tool calls to MCP.
+const g = ctx.generate(sampler);
+const dec = new tools.Decoder(model);
+
+for await (const step of g) {
+    const out = await step.execute();
+    const ev = dec.feed(out.tokens);
+    if (ev.type === 'call') {
+        const result = JSON.parse(mcpSession.callTool(ev.name, ev.arguments));
+        const rendered = renderContent(result);
+        const answer = tools.answerPrefix(model, ev.name, rendered);
+        ctx.append(answer);
+        ctx.cue();
+        dec.reset();
+    }
+}
+```
+
+</TabItem>
+</Tabs>
+
+`render_content` / `renderContent` is application-specific: parse the `tools/call` JSON, concatenate text chunks, encode images, and so on. For models without a native tool-call template, fall back to the hand-rolled loop in [Tool-call parser](../decoder/tool-calling).
+
+## Next
+
+- [Tool-call parser](../decoder/tool-calling): the chat-side surface that pairs with MCP.
+- [HTTP](./http): the lower-level alternative when MCP is overkill.
+- [I/O overview](./overview): the full surface map.

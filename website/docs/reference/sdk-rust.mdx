@@ -1,0 +1,578 @@
+---
+title: Rust SDK reference
+description: Full inferlet SDK API for Rust — Model, Context, Generator, Forward, samplers, probes, constraints, decoders, adapters
+---
+
+# Rust SDK reference
+
+The full inferlet SDK API for Rust. The [Guide](../guide/install) walks through how to use these APIs with runnable code; this page enumerates the surface.
+
+## Inferlet entry point
+
+```rust
+use inferlet::Result;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct Input { prompt: String }
+
+#[derive(Serialize)]
+struct Output { text: String }
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<Output> {
+    // ...
+}
+```
+
+The `#[inferlet::main]` macro generates the WebAssembly entry point and a JSON bridge. The function takes any `Deserialize` input type and returns any `Serialize` output type. `inferlet::Result<T>` aliases `std::result::Result<T, String>`; an `Err(s)` becomes the `Error` event the client receives.
+
+### Prelude
+
+```rust
+use inferlet::prelude::*;
+```
+
+Pulls in the common types: `main`, `Context`, `Result`, `Schema`, `Model`, `runtime`, `messaging`, `Adapter`, `Forward`, `Output`, `SampleHandle`, `ProbeHandle`, `Sampler`, `Probe`, `Generator`, `GenStep`, `chat`, `reasoning`, `tools`, `Speculator`, plus the `ForwardPassExt`, `SubscriptionExt`, and `FutureStringExt` extension traits.
+
+### Argument parsing
+
+`inferlet::Arguments` re-exports `pico_args::Arguments` for callers that want richer flag parsing than `serde_json` against the input dict.
+
+```rust
+use inferlet::{parse_args, Arguments};
+
+let mut args: Arguments = parse_args(raw_argv);
+let n: usize = args.value_from_str("--n").unwrap_or(4);
+```
+
+## Runtime
+
+```rust
+use inferlet::runtime;
+```
+
+| Function | Description |
+|---|---|
+| `runtime::models() -> Vec<String>` | Names of every model the engine has loaded. |
+| `runtime::version() -> String` | Pie runtime version string. |
+| `runtime::instance_id() -> String` | Unique identifier for this engine instance. |
+| `runtime::username() -> String` | Username of the user who launched the inferlet. |
+
+## Model
+
+```rust
+use inferlet::model::Model;
+
+let model = Model::load("default")?;
+```
+
+| Method | Description |
+|---|---|
+| `Model::load(name: &str) -> Result<Model>` | Bind to a model loaded by the engine. The name is the `[model.<name>]` key in `~/.pie/config.toml`. |
+| `model.tokenizer() -> &Tokenizer` | The model's tokenizer. |
+
+## Tokenizer
+
+| Method | Description |
+|---|---|
+| `tok.encode(text: &str) -> Vec<u32>` | Text to token IDs. |
+| `tok.decode(ids: &[u32]) -> Result<String>` | Token IDs to text. |
+| `tok.vocabs() -> (Vec<u32>, Vec<Vec<u8>>)` | All token IDs paired with their raw byte sequences. |
+| `tok.special_tokens() -> (Vec<u32>, Vec<Vec<u8>>)` | Special token IDs (BOS, EOS, etc.). |
+| `tok.split_regex() -> &str` | The split regex used during BPE pre-tokenization. |
+
+## Context
+
+### Construction and lifecycle
+
+```rust
+use inferlet::Context;
+
+let mut ctx = Context::new(&model)?;
+```
+
+| Method | Description |
+|---|---|
+| `Context::new(&model) -> Result<Context>` | Fresh anonymous context. KV pages are released on drop. |
+| `Context::open(&model, name: &str) -> Result<Context>` | Clone a saved snapshot. The snapshot stays. |
+| `Context::take(&model, name: &str) -> Result<Context>` | Move a saved snapshot into a fresh context. The snapshot is removed. |
+| `Context::delete(&model, name: &str) -> Result<()>` | Drop a saved snapshot. |
+| `ctx.save(name: &str) -> Result<()>` | Snapshot under a user-chosen name. |
+| `ctx.snapshot() -> Result<String>` | Snapshot under a runtime-generated name. Returns the name. |
+| `ctx.fork() -> Result<Context>` | Copy-on-write clone. O(1). |
+
+Saved snapshots persist across inferlet runs as long as the engine is up.
+
+### Filling
+
+| Method | Description |
+|---|---|
+| `ctx.system(text: &str) -> &mut Context` | Add a system message. |
+| `ctx.user(text: &str) -> &mut Context` | Add a user message. |
+| `ctx.assistant(text: &str) -> &mut Context` | Add a pre-filled assistant turn. |
+| `ctx.cue() -> &mut Context` | Mark the current position as the model's start. |
+| `ctx.seal() -> &mut Context` | Close the current assistant turn. |
+| `ctx.append(tokens: &[u32]) -> &mut Context` | Append raw tokens. |
+| `ctx.flush() -> impl Future<Output = Result<()>>` | Run prefill on buffered tokens; commit pages. |
+| `ctx.truncate(n: u32) -> Result<()>` | Drop the trailing `n` working-page tokens (rollback primitive). Pages already committed cannot be truncated through this API — go through `ctx.inner()` if you need to. |
+
+### Inspection
+
+| Method | Description |
+|---|---|
+| `ctx.model() -> &Model` | The bound model. |
+| `ctx.page_size() -> u32` | Tokens per KV page. |
+| `ctx.seq_len() -> u32` | Total committed + working tokens. |
+| `ctx.buffer() -> &[u32]` | SDK-side buffered tokens not yet flushed. |
+| `ctx.inner() -> &RawContext` | Underlying resource for page-level ops. |
+
+### Page operations
+
+Reach for these via `ctx.inner()` when implementing custom forward-pass loops, sliding windows, or speculation rollback.
+
+| Method | Description |
+|---|---|
+| `raw.reserve_working_pages(n: u32) -> Result<()>` | Pre-allocate `n` working pages. |
+| `raw.commit_working_pages(k: u32) -> Result<()>` | Promote `k` full working pages to committed. |
+| `raw.release_working_pages(n: u32)` | Free `n` working pages. |
+| `raw.truncate_working_page_tokens(n: u32)` | Drop the last `n` tokens (rollback). |
+| `raw.committed_page_count() -> u32` | Number of committed pages. |
+| `raw.working_page_count() -> u32` | Number of working pages. |
+| `raw.working_page_token_count() -> u32` | Tokens in the trailing working page. |
+
+## Generator
+
+```rust
+let g = ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+    .max_tokens(256);
+```
+
+`ctx.generate(sampler)` returns a `Generator`. Drive it with one of the collectors or step by step.
+
+### Collectors
+
+| Method | Returns | Notes |
+|---|---|---|
+| `g.collect_text().await` | `Result<String>` | Drives the loop; decodes via the chat template. |
+| `g.collect_tokens().await` | `Result<Vec<u32>>` | All accepted token IDs. |
+| `g.collect_json::<T>().await` | `Result<T>` | Derives schema from `T: JsonSchema + Deserialize`, applies as constraint, parses output. |
+
+### Builder methods
+
+| Method | Description |
+|---|---|
+| `.max_tokens(n)` | Stop after `n` accepted tokens. |
+| `.stop(&[...])` / `.add_stop(&[...])` | Extra stop-token IDs (added to the model's EOS). |
+| `.constrain(c)` | Apply a `Constrain` impl. |
+| `.constrain_with(Schema::JsonSchema(s))?` | Apply a declarative schema. |
+| `.speculator(s)` | Plug in a custom speculator. |
+| `.system_speculation()` | Use the runtime's draft model. |
+| `.adapter(&a)` | Apply a LoRA adapter. |
+| `.zo_seed(seed: i64)` | Set an Evolution Strategies seed for every step. |
+| `.horizon(n)` | Hint expected output length for bid planning. |
+| `.probe_each_step(idx, p)` | Attach a probe to every step (returns a handle). |
+
+### Inspection
+
+| Method | Description |
+|---|---|
+| `g.is_done() -> bool` | `true` after generation has terminated. |
+| `g.tokens_generated() -> usize` | Tokens accepted so far. |
+
+### Per-step iteration
+
+```rust
+let mut g = ctx.generate(Sampler::Argmax).max_tokens(256);
+
+while let Some(mut step) = g.next()? {
+    let out = step.execute().await?;
+    // Inspect or override; commit chosen tokens.
+    g.accept(&[chosen_token]);
+}
+```
+
+| Method | Description |
+|---|---|
+| `g.next() -> Result<Option<GenStep>>` | Yield the next step or end the loop. |
+| `step.execute().await -> Result<Output>` | Run one forward pass. |
+| `step.clear_sampler()` | Drop the auto-attached sampler so you can attach your own. |
+| `step.probe(idx, probe)` | Attach a probe to this step. |
+| `g.accept(tokens: &[u32])` | Commit chosen tokens to the generator's state. |
+
+## Forward
+
+```rust
+let mut fwd = ctx.forward();
+fwd.input(&token_ids);
+let h = fwd.sample(&[0], Sampler::Argmax);
+let out = fwd.execute().await?;
+let token = out.token(h);
+```
+
+`ctx.forward()` returns a `Forward<'ctx>`. Page reservation, position derivation, and post-execute commit happen automatically.
+
+### Builder methods
+
+| Method | Description |
+|---|---|
+| `.input(&tokens)` | Token IDs with auto-derived sequential positions. |
+| `.input_at(&tokens, &positions)` | Token IDs with explicit position IDs. |
+| `.attention_mask(&[brle, ...])` | One BRLE mask per input token. |
+| `.mask(&brle)` | Logit mask (BRLE over the vocabulary). |
+| `.sample(&indices, sampler)` | Attach a sampler at output positions. Returns `SampleHandle`. |
+| `.probe(index, probe)` | Attach a probe at one position. Returns `ProbeHandle<P>`. |
+| `.adapter(&adapter)` | Use a LoRA adapter for this pass. |
+| `.zo_seed(seed: i64)` | Set an Evolution Strategies seed for this pass. |
+| `.execute().await -> Result<Output>` | Run the pass. |
+
+### Inspection
+
+| Method | Description |
+|---|---|
+| `fwd.start_position() -> u32` | Position the first auto-input token will occupy. Equals the owning context's `seq_len()` at `pass()` time. |
+| `fwd.page_size() -> u32` | Page size of the owning context — for sizing per-position structures (masks etc.) without re-querying. |
+
+### Output access
+
+| Accessor | Returns | Use after |
+|---|---|---|
+| `out.token(h: SampleHandle)` | `Option<u32>` | A single-index sampler. |
+| `out.tokens_at(h: SampleHandle)` | `Vec<u32>` | A multi-index sampler. |
+| `out.distribution(h)` | `Option<(&[u32], &[f32])>` | `Distribution { ... }` probe. |
+| `out.logits(h)` | `Option<&[u8]>` (cast with `bytemuck`) | `Logits` probe. |
+| `out.logprobs(h)` | `Option<&[f32]>` | `Logprob(t)` or `Logprobs(ts)` probe. |
+| `out.entropy(h)` | `Option<f32>` | `Entropy` probe. |
+| `out.tokens` | `&[u32]` | Generator-accepted tokens this step (post stop / max-tokens truncation). Empty for raw `Forward::execute`. |
+| `out.auto_sampler() -> Option<SampleHandle>` | Handle for the Generator's auto-attached sampler. `None` for raw Forward and after `clear_sampler()`. |
+| `out.raw() -> &RawOutput` | Underlying slot list + speculative side channel. |
+
+Mismatched access (a sampler slot through a probe handle, or vice versa) returns `None`.
+
+## Samplers
+
+A `Sampler` chooses one token per slot.
+
+```rust
+use inferlet::sample::Sampler;
+```
+
+| Variant | Helper | Description |
+|---|---|---|
+| `Sampler::Argmax` | (use the variant directly) | Greedy. |
+| `Sampler::TopP { temperature, p }` | `Sampler::top_p(t, p)` | Nucleus sampling. |
+| `Sampler::TopK { temperature, k }` | `Sampler::top_k(t, k)` | Top-k sampling. |
+| `Sampler::MinP { temperature, p }` | `Sampler::min_p(t, p)` | Min-p sampling. |
+| `Sampler::TopKTopP { temperature, k, p }` | `Sampler::top_k_top_p(t, k, p)` | Top-k filter, then nucleus. |
+| `Sampler::Multinomial { temperature, draws }` | `Sampler::multinomial(t, draws)` | Multinomial draws. |
+
+The const fn helpers build the same variant. Either form is acceptable. There is no `Sampler::argmax()` helper; use `Sampler::Argmax` directly.
+
+## Probes
+
+A `Probe` reads the model's distribution at a position without choosing a token.
+
+```rust
+use inferlet::sample::{Distribution, Entropy, Logits, Logprob, Logprobs};
+```
+
+| Probe | Output accessor | Returns | Notes |
+|---|---|---|---|
+| `Logits` | `out.logits(h)` | packed `&[u8]` (cast with `bytemuck`) | Pre-softmax. |
+| `Distribution { temperature, k }` | `out.distribution(h)` | `(&[u32], &[f32])` | Temperature-scaled top-`k`. `k = 0` for full vocabulary. |
+| `Logprob(token_id)` | `out.logprobs(h)` | length-1 `&[f32]` | `log p(token_id | context)`. |
+| `Logprobs(ids)` | `out.logprobs(h)` | length-K `&[f32]` | Multi-candidate logprobs in input order. |
+| `Entropy` | `out.entropy(h)` | `f32` | Shannon entropy of the unscaled distribution. |
+
+A single forward pass can mix samplers and probes at different slots.
+
+## Constraints
+
+### Schema
+
+`Schema` is a trait. Five built-in implementors are re-exported at the crate root:
+
+```rust
+use inferlet::{AnyJson, JsonSchema, Regex, Ebnf, Schema};
+
+ctx.generate(sampler).constrain_with(JsonSchema(s))?;
+```
+
+| Type | Description |
+|---|---|
+| `AnyJson` | Any valid JSON. Unit struct. |
+| `JsonSchema<'a>(pub &'a str)` | JSON matching the JSON Schema string. |
+| `Regex<'a>(pub &'a str)` | Strings matching the regex. |
+| `Ebnf<'a>(pub &'a str)` | Custom EBNF grammar (Lark format). |
+| `&Grammar` | Pre-compiled grammar resource (the `Schema` impl is on `&Grammar`, so pass a borrow). |
+
+User code can implement `Schema` for custom grammar sources by providing `fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint>`.
+
+`constrain_with` returns `Result` because parsing can fail. Multiple constraints AND together.
+
+### Constrain trait
+
+```rust
+pub trait Constrain: Send {
+    /// Advance internal state with the tokens just accepted, then return the
+    /// BRLE-encoded logit mask for the next position.
+    /// Returning `&[]` means "no restriction".
+    fn step(&mut self, accepted: &[u32]) -> &[u32];
+}
+```
+
+`accepted` is `&[]` on the first call. The mask uses BRLE: `[run_of_false, run_of_true, run_of_false, ...]`, where `1 = allowed, 0 = forbidden`.
+
+### GrammarConstraint
+
+```rust
+use inferlet::GrammarConstraint;
+
+let gc = GrammarConstraint::from_ebnf(my_grammar, &model)?;
+```
+
+| Constructor | Description |
+|---|---|
+| `GrammarConstraint::json(&model)` | Free-form JSON. |
+| `GrammarConstraint::from_grammar(&grammar, &model)` | Pre-compiled grammar. |
+| `GrammarConstraint::from_json_schema(s, &model)?` | JSON Schema string. |
+| `GrammarConstraint::from_regex(p, &model)?` | Regex pattern. |
+| `GrammarConstraint::from_ebnf(g, &model)?` | EBNF grammar (Lark format). |
+
+### Matcher
+
+A stateful walker over a compiled grammar automaton. Reach for it when implementing a hand-rolled `Constrain` that wraps a grammar but adds extra logic.
+
+```rust
+use inferlet::inference::{Grammar, Matcher};
+
+let grammar = Grammar::from_ebnf(&grammar_src)?;
+let mut m = Matcher::new(&grammar, &model.tokenizer());
+
+m.accept_tokens(&prefix_tokens)?;
+let mask = m.next_token_logit_mask();
+let done = m.is_terminated();
+m.reset();
+```
+
+`Grammar` constructors mirror `GrammarConstraint`: `Grammar::from_json_schema`, `Grammar::json`, `Grammar::from_regex`, `Grammar::from_ebnf`.
+
+## Speculative decoding
+
+Speculation is **off** by default. Opt in by calling `g.system_speculation()` (runtime n-gram drafter) or `g.speculator(s)` (custom drafter) on the generator builder.
+
+### Speculator trait
+
+```rust
+use inferlet::spec::Speculator;
+
+pub trait Speculator: Send {
+    /// Produce draft tokens and their absolute positions for the next
+    /// forward pass. Empty vec = "no speculation this step."
+    fn draft(&mut self) -> (Vec<u32>, Vec<u32>);
+
+    /// Called with the verifier's accepted token sequence. The first
+    /// accepted token corresponds to the anchor's own next-token
+    /// prediction; the rest (if any) are matched drafts.
+    fn accept(&mut self, accepted: &[u32]);
+
+    /// Roll back the last `n` drafted tokens. Default impl is a no-op.
+    fn rollback(&mut self, n: u32) { let _ = n; }
+
+    /// Reset to initial state. Default impl is a no-op.
+    fn reset(&mut self) {}
+}
+```
+
+Plug in with `g.speculator(spec)` on the generator builder. Only `draft` and `accept` are required — `rollback` and `reset` have empty default impls.
+
+## Adapters and fine-tuning
+
+```rust
+use inferlet::adapter::Adapter;
+
+let adapter = Adapter::create(&model, "my-adapter")?;
+```
+
+| Method | Description |
+|---|---|
+| `Adapter::create(&model, name) -> Result<Adapter>` | Create a new LoRA overlay scoped to the model. |
+| `Adapter::open(&model, name) -> Option<Adapter>` | Open an existing adapter; `None` if absent. |
+| `adapter.fork(new_name) -> Adapter` | Copy under a new name. |
+| `adapter.save(path) -> Result<()>` | Serialize to disk. |
+| `adapter.load(path) -> Result<()>` | Load weights from disk. |
+| `adapter.destroy()` | Drop the adapter. |
+
+Apply at inference: `g.adapter(&adapter)` on a `Generator`, or `fwd.adapter(&adapter)` on a `Forward`.
+
+## Decoders
+
+Decoders translate per-step tokens into normalized events. Pie ships three with the same shape: `new(&model)`, `feed(&tokens)`, `reset()`.
+
+### chat::Decoder
+
+```rust
+use inferlet::chat;
+
+let mut dec = chat::Decoder::new(&model);
+match dec.feed(&tokens)? {
+    chat::Event::Delta(s)            => { /* visible text */ }
+    chat::Event::Done(s)             => { /* end of turn */ }
+    chat::Event::Idle                => { /* no semantic boundary */ }
+    chat::Event::Interrupt(token_id) => { /* template control token */ }
+}
+```
+
+| Variant | Payload | Meaning |
+|---|---|---|
+| `Delta(String)` | text chunk | Streaming visible text. |
+| `Done(String)` | full reply | Model reached end-of-turn. |
+| `Idle` | (none) | Batch produced no semantic boundary. |
+| `Interrupt(u32)` | control token id | Template surfaced a control token without rendering it. |
+
+### reasoning::Decoder
+
+```rust
+use inferlet::reasoning;
+```
+
+| Variant | Payload | Meaning |
+|---|---|---|
+| `Idle` | (none) | No reasoning content yet. |
+| `Start` | (none) | Entering a reasoning block. |
+| `Delta(String)` | text chunk | Reasoning text. |
+| `End(String)` | full reasoning text | Reasoning block closed. |
+
+### tools::Decoder
+
+```rust
+use inferlet::tools;
+```
+
+| Variant | Payload | Meaning |
+|---|---|---|
+| `Start` | (none) | A tool call is being assembled. |
+| `Call(String, String)` | (name, args_json) | Tool call complete. |
+
+Helpers:
+
+| Function | Description |
+|---|---|
+| `tools::equip_prefix(&model, &[schema, ...]) -> Result<Vec<u32>>` | Prefix tokens that equip the model with a tool list. |
+| `tools::answer_prefix(&model, name, result_json) -> Vec<u32>` | Prefix tokens that feed a tool result back. |
+| `tools::parse_call(&model, text) -> Option<(String, String)>` | One-shot extract of a single completed call from a finished string. |
+| `tools::native_grammar(&model, &[schema, ...]) -> Option<Grammar>` | Compiled grammar over the model's native tool-call format. `None` if the model has no native template. |
+| `tools::native_matcher(&model, &[schema, ...]) -> Option<Matcher>` | Stateful matcher over the model's native tool-call format. Pass via `GrammarConstraint::new(matcher)`. |
+
+Decoders are stateful. Call `reset()` between turns or after a terminal event so the decoder is ready for the next.
+
+## Scheduling and market hooks
+
+Every running context places a bid in the engine's KV-page market. The SDK manages this automatically. Override or read it for custom admission control.
+
+### Context-level hooks
+
+```rust
+ctx.set_bid(2.5);                // override the next-step bid
+let _g = ctx.idle();             // RAII guard: bid 0 until `_g` drops
+ctx.suspend()?;                  // return all pages to the pool; resume later
+```
+
+| Method | Description |
+|---|---|
+| `ctx.set_bid(value: f64)` | Override the auto-bid for the next forward pass. The Generator restores its auto-bid on the step after. |
+| `ctx.idle() -> Idle<'_>` | RAII guard that holds the context out of the auction (bid 0). Drop the guard to resume normal bidding. |
+| `ctx.suspend() -> Result<()>` | Return all pages to the pool. Suspended contexts are restored automatically (highest-bid first) when memory frees up. |
+
+### Reading the market
+
+```rust
+use inferlet::scheduling;
+```
+
+| Function | Returns | Use it for |
+|---|---|---|
+| `price()` | Cost in credits to allocate one new KV page. | Computing how much a planned context will cost. |
+| `rent(&ctx)` | Clearing price from the most recent knapsack auction. | Detecting contention. |
+| `dividend(&model)` | Endowment-proportional share of solver revenue. | Re-investing dividends into your own bid. |
+| `latency(&ctx)` | Per-tick wall time in seconds. | Estimating tokens/sec or backing off. |
+| `balance(&model)` | Current credit balance for this inferlet. | Deciding when to suspend or stop. |
+
+For the formula behind the default bid, see the SOSP paper.
+
+## Session (user ↔ inferlet)
+
+```rust
+use inferlet::pie::core::session;
+use inferlet::FutureStringExt;     // for `.wait_async()` on FutureString
+```
+
+The session is the bidirectional channel between the inferlet and the client that launched it. Send and receive happen on the same channel; signals from `process.signal(...)` arrive through `receive`.
+
+| Function | Description |
+|---|---|
+| `session::send(msg: &str)` | Send a text message to the client. Arrives as a `Stdout` event. |
+| `session::send_file(data: &[u8])` | Send a binary blob. Arrives as a `File` event. |
+| `session::receive() -> FutureString` | Wait for the next text message. Pair with `FutureStringExt::wait_async()`. |
+| `session::receive_file() -> FutureBlob` | Wait for the next binary blob. |
+
+A `FutureString` resolves when the next inbound payload arrives:
+
+```rust
+use inferlet::pie::core::session;
+use inferlet::FutureStringExt;
+
+let next = session::receive();
+let msg: Option<String> = next.wait_async().await;
+```
+
+## Messaging (inferlet ↔ inferlet)
+
+```rust
+use inferlet::messaging;
+use inferlet::{FutureStringExt, SubscriptionExt};
+```
+
+Pub/sub and queues across inferlets running in the same engine. The bus is engine-local; messages do not cross instances.
+
+| Function | Description |
+|---|---|
+| `messaging::broadcast(topic: &str, msg: &str)` | Publish to every subscriber of `topic`. Fire-and-forget. |
+| `messaging::subscribe(topic: &str) -> Subscription` | Open a subscription. Holds messages until consumed. |
+| `messaging::push(topic: &str, msg: &str)` | Push a message onto a queue. Each pull consumes one. |
+| `messaging::pull(topic: &str) -> FutureString` | Wait for the next queued message. |
+
+`Subscription` methods:
+
+| Method | Description |
+|---|---|
+| `sub.pollable() -> Pollable` | WASI pollable for ready-state detection. |
+| `sub.get() -> Option<String>` | Non-blocking poll for the next message. |
+| `sub.get_async().await` | Async poll that yields until a message arrives. From `SubscriptionExt`. |
+| `sub.unsubscribe()` | Drop the subscription. |
+
+## MCP (Model Context Protocol)
+
+```rust
+use inferlet::mcp;
+```
+
+The MCP client lets an inferlet call tools, read resources, and render prompts from MCP servers the host has registered. The client side of registration (telling the engine about a server) lives in the [client SDK](./client-rust); this section is the inferlet-facing surface.
+
+| Function | Description |
+|---|---|
+| `mcp::client::available_servers() -> Vec<String>` | Names of MCP servers registered by the client that launched this inferlet. |
+| `mcp::client::connect(name: &str) -> Result<Session>` | Open a session against the named server. |
+
+`Session` methods (all return JSON strings; parse with `serde_json`):
+
+| Method | Returns | Description |
+|---|---|---|
+| `s.list_tools() -> Result<String>` | JSON `{"tools": [...]}` | Tools the server exposes. |
+| `s.call_tool(name, args_json) -> Result<String>` | JSON `tools/call` result | Invoke a tool with JSON-encoded arguments. |
+| `s.list_resources() -> Result<String>` | JSON `{"resources": [...]}` | Available resources. |
+| `s.read_resource(uri) -> Result<String>` | JSON `resources/read` result | Fetch one resource by URI. |
+| `s.list_prompts() -> Result<String>` | JSON `{"prompts": [...]}` | Prompt templates. |
+| `s.get_prompt(name, args_json) -> Result<String>` | JSON `prompts/get` result | Render a prompt template. |
+
+The session resource closes when dropped.

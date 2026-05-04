@@ -1,59 +1,67 @@
-use inferlet::wstd::time::Duration;
+//! Initialize an Evolution Strategies adapter.
+//!
+//! Creates a new ES adapter (or re-uses an existing one) and optionally
+//! loads pre-trained weights from a checkpoint.
+
 use inferlet::{
-    self, Adapter, Args, Blob, Evolve, Result, get_auto_model, store_exists, store_set,
+    adapter::Adapter,
+    model::Model,
+    runtime,
+    Result,
 };
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Input {
+    /// Name of the adapter to create or open.
+    name: String,
+    /// LoRA rank.
+    rank: u32,
+    /// LoRA scaling factor.
+    alpha: f32,
+    /// ES population size.
+    population_size: u32,
+    /// Fraction of the population selected as parents.
+    mu_fraction: f32,
+    /// Initial perturbation standard deviation.
+    initial_sigma: f32,
+    /// Optional checkpoint path to load weights from.
+    #[serde(default)]
+    upload: Option<String>,
+}
 
 #[inferlet::main]
-async fn main(mut args: Args) -> Result<()> {
-    let name: String = args.value_from_str("--name")?;
-    let rank: u32 = args.value_from_str("--rank")?;
-    let alpha: f32 = args.value_from_str("--alpha")?;
-    let population_size: u32 = args.value_from_str("--population-size")?;
-    let mu_fraction: f32 = args.value_from_str("--mu-fraction")?;
-    let initial_sigma: f32 = args.value_from_str("--initial-sigma")?;
-    let upload: Option<String> = args.opt_value_from_str("--upload")?;
+async fn main(input: Input) -> Result<String> {
+    let model_name = runtime::models().into_iter().next()
+        .ok_or("No models available")?;
+    let model = Model::load(&model_name)?;
 
-    // --- 2. Initialization and Adapter Creation ---
-    let model = get_auto_model();
-    let queue = model.create_queue();
-
-    let adapter_id = if !store_exists(&name) {
-        let adapter_id = queue.allocate_adapter();
-        println!("🔧 Initializing adapter...");
-
-        // Create the Evolution Strategies adapter with the specified hyperparameters.
-        queue.initialize_adapter(
-            adapter_id,
-            rank,
-            alpha,
-            population_size,
-            mu_fraction,
-            initial_sigma,
-        );
-
-        queue.export_adapter(adapter_id, &name);
-        store_set(&name, "true");
-
-        adapter_id
+    // Reuse existing adapter or create + initialize a new one.
+    let adapter = if let Some(existing) = Adapter::open(&model, &input.name) {
+        println!("🔧 Existing adapter found: '{}'", input.name);
+        existing
     } else {
-        println!("🔧 Existing adapter found. Importing adapter...");
-
-        queue.import_adapter(&name)
+        println!("🔧 Initializing new adapter '{}'...", input.name);
+        let adapter = Adapter::create(&model, &input.name)?;
+        inferlet::zo::zo::initialize(
+            &adapter,
+            input.rank,
+            input.alpha,
+            input.population_size,
+            input.mu_fraction,
+            input.initial_sigma,
+        )?;
+        adapter
     };
 
-    // If the --upload argument was provided with a non-empty string, upload the blob.
-    if let Some(upload_file_name) = upload {
-        if !upload_file_name.is_empty() {
-            println!(
-                "🚀 Uploading to adapter '{}' with filename '{}'...",
-                name, upload_file_name
-            );
-            queue.upload_adapter(adapter_id, &upload_file_name, Blob::new(vec![]));
+    // Optionally load pre-trained weights.
+    if let Some(path) = &input.upload {
+        if !path.is_empty() {
+            println!("📥 Loading weights from '{}'...", path);
+            adapter.load(path)?;
         }
     }
 
-    inferlet::wstd::task::sleep(Duration::from_millis(100)).await;
-    println!("✅ Adapter '{}' created or imported successfully.", name);
-
-    Ok(())
+    println!("✅ Adapter '{}' ready.", input.name);
+    Ok(format!("Adapter '{}' ready", input.name))
 }

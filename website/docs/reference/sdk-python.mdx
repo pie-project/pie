@@ -1,0 +1,499 @@
+---
+title: Python SDK reference
+description: Full inferlet SDK API for Python
+---
+
+# Python SDK reference
+
+The full inferlet SDK API for Python. The [Guide](../guide/install) walks through how to use these APIs with runnable code; this page enumerates the surface.
+
+## Inferlet entry point
+
+```python
+async def main(input: dict) -> str:
+    # ...
+    return result
+```
+
+The Python inferlet runtime invokes a top-level `async def main(input)` coroutine. `input` is a parsed JSON dict whose shape matches the manifest's `[parameters]` block. The return value is JSON-serialized into the `Return` event the client receives.
+
+Raise an exception to fail the run; the message becomes the `Error` event.
+
+## Runtime
+
+```python
+from inferlet import runtime
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `runtime.models()` | `list[str]` | Names of every model the engine has loaded. |
+| `runtime.version()` | `str` | Pie runtime version string. |
+| `runtime.instance_id()` | `str` | Unique identifier for this engine instance. |
+| `runtime.username()` | `str` | Username of the user who launched the inferlet. |
+
+## Model
+
+```python
+from inferlet import Model
+```
+
+| Method | Description |
+|---|---|
+| `Model.load(name: str) -> Model` | Bind to a loaded model. `name` is the `[model.<name>]` key in `~/.pie/config.toml`. |
+| `model.tokenizer() -> Tokenizer` | The model's tokenizer. |
+
+## Tokenizer
+
+| Method | Returns | Description |
+|---|---|---|
+| `tk.encode(text)` | `list[int]` | Text to token IDs. |
+| `tk.decode(tokens)` | `str` | Token IDs to text. |
+| `tk.vocabs()` | `tuple[list[int], list[bytes]]` | Full vocabulary as parallel lists. |
+| `tk.special_tokens()` | `tuple[list[int], list[bytes]]` | Special token IDs (BOS, EOS, etc.). |
+| `tk.split_regex()` | `str` | The split regex used during BPE pre-tokenization. |
+
+## Context
+
+```python
+from inferlet import Context
+
+ctx = Context(model)
+```
+
+### Construction and lifecycle
+
+| Method | Description |
+|---|---|
+| `Context(model)` | Fresh anonymous context. KV pages release on drop. |
+| `Context.open(model, name) -> Context \| None` | Clone a saved snapshot. Returns `None` if the name is absent. |
+| `Context.take(model, name) -> Context \| None` | Take ownership of a snapshot (snapshot is removed). |
+| `Context.delete(model, name)` | Drop a saved snapshot. |
+| `ctx.fork() -> Context` | Copy-on-write clone. O(1). |
+| `ctx.save(name)` | Snapshot under a user-chosen name. |
+| `ctx.snapshot() -> str` | Snapshot under a runtime-generated name. Returns the name. |
+| `ctx.release()` | Force-destroy this context immediately. |
+
+`Context` supports the context-manager protocol (`with Context(model) as ctx:`).
+
+### Filling
+
+| Method | Description |
+|---|---|
+| `ctx.system(text) -> Context` | Add a system message. |
+| `ctx.user(text) -> Context` | Add a user message. |
+| `ctx.assistant(text) -> Context` | Add a pre-filled assistant turn. |
+| `ctx.cue() -> Context` | Mark the current position as the model's start. |
+| `ctx.seal() -> Context` | Close the current assistant turn. |
+| `ctx.append(tokens) -> Context` | Append raw token IDs. |
+| `await ctx.flush()` | Run prefill on buffered tokens; commit pages. |
+
+### Inspection
+
+| Member | Kind | Type | Description |
+|---|---|---|---|
+| `ctx.model` | property | `Model` | The bound model. |
+| `ctx.page_size` | property | `int` | Tokens per KV page. |
+| `ctx.seq_len` | property | `int` | Total committed + working tokens (excludes the SDK buffer). |
+| `ctx.buffer()` | method | `list[int]` | SDK-side buffered tokens not yet flushed. |
+
+### Truncate
+
+| Method | Description |
+|---|---|
+| `ctx.truncate(n)` | Drop the trailing `n` working-page tokens. Rollback primitive. Pages already committed cannot be truncated through this API. |
+
+The Python SDK does not expose `ctx.inner()` for raw page operations; those are Rust-only.
+
+## Generator
+
+```python
+from inferlet import Sampler
+
+g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=256)
+```
+
+`ctx.generate(sampler, **options)` returns a `Generator`. Drive it with one of the collectors, with `async for`, or by calling `__anext__` directly.
+
+### Constructor options
+
+`ctx.generate` accepts keyword-only arguments matching the Rust builder methods:
+
+| Kwarg | Type | Description |
+|---|---|---|
+| `max_tokens` | `int \| None` | Stop after `n` accepted tokens. |
+| `stop` | `Iterable[int] \| None` | Extra stop-token IDs. With `auto_flush=True`, defaults to the chat template's stop tokens. |
+| `constrain` | `Schema \| Constraint \| list[Schema \| Constraint] \| None` | Attach one or more constraints. Multiple constraints compose by AND-ing their per-step BRLE masks. |
+| `logit_mask` | `list[int] \| None` | Static BRLE mask applied every step. Composes with `constrain` like any other constraint. |
+| `speculator` | `Speculator \| None` | Custom speculator (any class implementing the protocol). |
+| `system_speculation` | `bool` | Use the runtime's built-in n-gram drafter. Default `False`. |
+| `adapter` | `Adapter \| None` | LoRA adapter to apply on every step. |
+| `zo_seed` | `int \| None` | Evolution Strategies seed for every forward pass. |
+| `horizon` | `int \| None` | Hint expected output length for credit pacing. |
+| `auto_flush` | `bool` | When `True` (default), append `cue()` to the buffer before returning the Generator and use chat-template stop tokens by default. Set `False` to inspect the buffer or call `cue()` yourself. |
+
+`speculator` and `system_speculation` are mutually exclusive.
+
+### Builder methods (returns Generator)
+
+| Method | Description |
+|---|---|
+| `g.max_tokens(n)` | Hard cap on tokens. |
+| `g.stop(tokens)` | Replace the stop set. |
+| `g.add_stop(tokens)` | Append to the stop set. |
+| `g.constrain(c)` | Add a constraint. Composes with previously attached ones. |
+| `g.horizon(n)` | Hint expected output length. |
+| `g.adapter(a)` | Apply an adapter. |
+| `g.zo_seed(seed)` | Set an Evolution Strategies seed for every step. |
+| `g.probe_each_step(idx, probe) -> ProbeHandle` | Attach a probe to every step. |
+
+### Inspection
+
+| Property / method | Description |
+|---|---|
+| `g.tokens_generated` | Total tokens accepted so far. |
+| `g.is_done` | `True` after generation has terminated. |
+
+### Collectors
+
+| Method | Returns | Description |
+|---|---|---|
+| `await g.collect_tokens()` | `list[int]` | Drain the loop; return all accepted tokens. |
+| `await g.collect_text()` | `str` | Drain, run a chat decoder internally, return the assembled string. |
+| `await g.collect_json(*, schema=None, parse=None)` | `Any` | Add a JSON-schema constraint, drain, parse the output. With `parse=cb`, run the callback on the JSON string. |
+
+### Per-step iteration
+
+```python
+async for step in g:
+    out = await step.execute()
+    # inspect; optionally call g.accept(...)
+```
+
+`step` is a `GenStep`. After `step.execute()`, the loop folds the result into the generator's state.
+
+| GenStep method | Description |
+|---|---|
+| `step.clear_sampler() -> GenStep` | Drop the auto-attached sampler. The forward pass still runs; you must read a probe and pick a token yourself. |
+| `step.probe(idx, probe) -> ProbeHandle` | Attach an extra probe for this iteration only. |
+| `await step.execute() -> Output` | Run the forward pass and fold the result into generator state. |
+
+| Generator method | Description |
+|---|---|
+| `g.accept(tokens) -> list[int]` | Register manually-sampled tokens. Returns the post-accept token list (after constraint reconciliation). |
+
+## Forward
+
+```python
+fwd = ctx.forward()
+fwd.input(token_ids)
+h = fwd.sample([0], Sampler.argmax())
+out = await fwd.execute()
+token = out.token(h)
+```
+
+`ctx.forward()` returns a `Forward` bound to the context. The builder reserves working pages, derives positions, and commits pages on execute.
+
+### Builder methods
+
+| Method | Description |
+|---|---|
+| `fwd.input(tokens) -> Forward` | Token IDs with auto-derived positions. |
+| `fwd.input_at(tokens, positions) -> Forward` | Token IDs with explicit position IDs. |
+| `fwd.attention_mask(masks) -> Forward` | Per-input-token attention masks (BRLE). |
+| `fwd.mask(brle) -> Forward` | Logit mask applied at every sampled position. |
+| `fwd.sample(indices, sampler) -> SampleHandle` | Attach a sampler at output positions. |
+| `fwd.probe(idx, probe) -> ProbeHandle` | Attach a probe at one position. |
+| `fwd.adapter(a) -> Forward` | Apply an adapter. |
+| `fwd.zo_seed(seed) -> Forward` | Set an Evolution Strategies seed for this pass. |
+| `await fwd.execute() -> Output` | Run the pass. |
+
+### Inspection
+
+| Method | Description |
+|---|---|
+| `fwd.start_position()` | Position the first auto-input token will occupy. Equal to `ctx.seq_len` at the time `forward()` was called. |
+
+### Output access
+
+| Method | Returns | Use after |
+|---|---|---|
+| `out.token(h: SampleHandle)` | `int \| None` | Single-index sampler. |
+| `out.tokens_at(h: SampleHandle)` | `list[int]` | Multi-index sampler. |
+| `out.distribution(h)` | `tuple[list[int], list[float]] \| None` | `Distribution(...)` probe. |
+| `out.logits(h)` | `bytes \| None` | `Logits()` probe. Length `vocab_size * 4`, native-endian f32. |
+| `out.logprobs(h)` | `list[float] \| None` | `Logprob(t)` or `Logprobs(ts)` probe. |
+| `out.entropy(h)` | `float \| None` | `Entropy()` probe. |
+| `out.tokens` | `list[int]` | Generator-accepted tokens this step (post stop / max-tokens truncation). Empty for raw `Forward.execute()`. |
+| `out.auto_sampler` | `SampleHandle \| None` | Handle for the Generator's auto-attached sampler. `None` for raw Forward and after `clear_sampler()`. |
+| `out.raw` | underlying WIT object | Property. The raw slot list + speculative side channel. |
+
+## Samplers
+
+```python
+from inferlet import Sampler
+```
+
+| Constructor | Description |
+|---|---|
+| `Sampler.argmax()` | Greedy. |
+| `Sampler.top_p(temperature, p)` | Nucleus sampling. |
+| `Sampler.top_k(temperature, k)` | Top-k sampling. |
+| `Sampler.min_p(temperature, p)` | Min-p sampling. |
+| `Sampler.top_k_top_p(temperature, k, p)` | Top-k filter, then nucleus. |
+| `Sampler.multinomial(temperature, draws)` | Multinomial draws. |
+
+## Probes
+
+```python
+from inferlet import Logits, Distribution, Logprob, Logprobs, Entropy
+```
+
+| Probe | Output accessor | Returns |
+|---|---|---|
+| `Logits()` | `out.logits(h)` | Native-endian f32 bytes (length `vocab_size * 4`). |
+| `Distribution(temperature, k)` | `out.distribution(h)` | Top-`k` ids and probs. `k=0` for full vocab. |
+| `Logprob(token_id)` | `out.logprobs(h)` | Length-1 list. |
+| `Logprobs(token_ids)` | `out.logprobs(h)` | Length-K list (input order). |
+| `Entropy()` | `out.entropy(h)` | Shannon entropy. |
+
+## Constraints
+
+### Schema implementors
+
+```python
+from inferlet import AnyJson, JsonSchema, Regex, Ebnf
+```
+
+| Class | Description |
+|---|---|
+| `AnyJson()` | Any valid JSON. |
+| `JsonSchema(schema=str)` | JSON conforming to a JSON Schema string. |
+| `Regex(pattern=str)` | Strings matching the regex. |
+| `Ebnf(source=str)` | Custom EBNF grammar (Lark format). |
+
+All four are dataclasses. Pass them to `ctx.generate(constrain=...)` or `g.constrain(...)`.
+
+### Custom Schema
+
+```python
+class MySchema:
+    def build_constraint(self, model: Model) -> GrammarConstraint:
+        ...
+```
+
+Any class with a `build_constraint(model)` method satisfies the `Schema` protocol.
+
+### Custom Constraint
+
+```python
+class MyConstraint:
+    def step(self, accepted: list[int]) -> list[int]:
+        # return a BRLE-encoded logit mask
+        ...
+```
+
+Any class with a `step(accepted)` method satisfies the `Constraint` protocol. Return `[]` for "no restriction this step."
+
+### Grammar / GrammarConstraint / Matcher
+
+```python
+from inferlet import Grammar, GrammarConstraint, Matcher
+```
+
+| Class / method | Description |
+|---|---|
+| `Grammar.from_json_schema(s)` | Build from JSON Schema. |
+| `Grammar.json()` | Free-form JSON. |
+| `Grammar.from_regex(p)` | Regex pattern. |
+| `Grammar.from_ebnf(g)` | EBNF (Lark) grammar. |
+| `GrammarConstraint.from_grammar(g, model)` | Pre-compiled grammar. |
+| `GrammarConstraint.from_json_schema(s, model)` | JSON Schema. |
+| `GrammarConstraint.json(model)` | Free-form JSON. |
+| `GrammarConstraint.from_regex(p, model)` | Regex. |
+| `GrammarConstraint.from_ebnf(g, model)` | EBNF. |
+| `Matcher(grammar, tokenizer)` | Stateful walker. |
+| `m.accept_tokens(ids)` | Advance the matcher state. |
+| `m.next_token_logit_mask()` | BRLE mask. |
+| `m.is_terminated` | Whether the matcher reached a terminal state. |
+| `m.reset()` | Reset to initial state. |
+
+## Speculative decoding
+
+```python
+from inferlet.spec import Speculator
+
+class MySpec:
+    def draft(self) -> tuple[list[int], list[int]]: ...
+    def accept(self, tokens: list[int]) -> None: ...
+    def rollback(self, n: int) -> None: ...
+    def reset(self) -> None: ...
+```
+
+Any class implementing the four methods satisfies the protocol. Pass to `ctx.generate(speculator=MySpec())`.
+
+`system_speculation=True` opts into the runtime's built-in n-gram drafter. Mutually exclusive with `speculator`.
+
+## Adapters
+
+```python
+from inferlet import Adapter
+```
+
+| Method | Description |
+|---|---|
+| `Adapter.create(model, name) -> Adapter` | Create a new LoRA overlay. |
+| `Adapter.open(model, name) -> Adapter \| None` | Open an existing one. |
+| `a.fork(new_name) -> Adapter` | Copy under a new name. |
+| `a.save(path)` | Serialize to disk. |
+| `a.load(path)` | Load weights from disk. |
+
+`Adapter` supports the context-manager protocol. Slot release happens on garbage collect; there is no explicit `destroy()`.
+
+Apply at inference: pass `adapter=a` to `ctx.generate(...)` or call `fwd.adapter(a)`.
+
+## Decoders (parsers)
+
+All three follow the same shape: `Decoder(model)` constructor, `feed(tokens)` returning an event, `reset()`.
+
+### chat.Decoder
+
+```python
+from inferlet import chat
+
+dec = chat.Decoder(model)
+match dec.feed(tokens):
+    case chat.Event.Delta(text=t):    ...
+    case chat.Event.Done(text=t):     ...
+    case chat.Event.Idle():           ...
+    case chat.Event.Interrupt(token=tid): ...
+```
+
+| Event | Payload | Meaning |
+|---|---|---|
+| `Idle` | (none) | Batch had no semantic boundary. |
+| `Delta(text)` | text chunk | Streaming visible text. |
+| `Done(text)` | full reply | End of turn. |
+| `Interrupt(token)` | control token id | Template surfaced a control token. |
+
+Helpers: `chat.system(model, msg)`, `chat.user(...)`, `chat.assistant(...)`, `chat.cue(model)`, `chat.seal(model)`, `chat.stop_tokens(model)` — return token-ID lists for use with `ctx.append(...)`.
+
+### reasoning.Decoder
+
+```python
+from inferlet import reasoning
+```
+
+| Event | Payload | Meaning |
+|---|---|---|
+| `Idle` | (none) | No reasoning content this batch. |
+| `Start` | (none) | Entering a reasoning block. |
+| `Delta(text)` | text chunk | Reasoning text. |
+| `End(text)` | full reasoning | Reasoning block closed. |
+
+### tools.Decoder
+
+```python
+from inferlet import tools
+```
+
+| Event | Payload | Meaning |
+|---|---|---|
+| `Start` | (none) | Tool call assembling. |
+| `Call(name, args)` | name, JSON-encoded args | Call complete. |
+
+Helpers:
+
+| Function | Description |
+|---|---|
+| `tools.equip_prefix(model, schemas)` | Tokens that register the tool schemas in the chat template. Append before your user message via `Context.append`. |
+| `tools.answer_prefix(model, name, value)` | Tokens that frame a tool result for the next turn. `value` may be a string, dict, or list (non-strings are JSON-encoded). |
+| `tools.native_matcher(model, schemas)` | Build a `Matcher` over the model's native tool-call format. Returns `None` if the model has no enforceable format — fall through to free-form generation + your own parser. Wrap with `GrammarConstraint` to pass to `Generator.constrain`. |
+
+## I/O
+
+### Session
+
+```python
+from inferlet import session
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `session.send(message)` | — | Send to the client. Strings go through verbatim; other types are JSON-encoded. |
+| `session.send_file(data: bytes)` | — | Send a binary blob. |
+| `await session.receive()` | `str` | Wait for the next inbound message. |
+| `await session.receive_file()` | `bytes` | Wait for the next inbound file. |
+
+Signals from `process.signal(...)` arrive through `session.receive`.
+
+### Messaging
+
+```python
+from inferlet import messaging
+```
+
+| Function | Description |
+|---|---|
+| `messaging.broadcast(topic, message)` | Publish to every subscriber. |
+| `messaging.subscribe(topic) -> Subscription` | Open a subscription. |
+| `messaging.push(topic, message)` | Push onto a queue. |
+| `await messaging.pull(topic) -> str` | Wait for the next queued message. |
+
+`Subscription`:
+
+| Method | Description |
+|---|---|
+| `await sub.next() -> str \| None` | Wait for the next broadcast. `None` after unsubscribe. |
+| `sub.unsubscribe()` | Drop the subscription. |
+| `async for msg in sub:` | Async-iterable shorthand. |
+
+### MCP
+
+```python
+from inferlet import mcp
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `mcp.available_servers()` | `list[str]` | Names of registered servers. |
+| `mcp.connect(name) -> McpSession` | session | Open a session. |
+
+`McpSession`:
+
+| Method | Returns | Description |
+|---|---|---|
+| `s.list_tools()` | `str` (JSON) | Raw `tools/list` result. |
+| `s.call_tool(name, args)` | `str` (JSON) | Raw `tools/call` result. |
+| `s.list_resources()` | `str` (JSON) | Raw `resources/list` result. |
+| `s.read_resource(uri)` | `str` (JSON) | Raw `resources/read` result. |
+| `s.list_prompts()` | `str` (JSON) | Raw `prompts/list` result. |
+| `s.get_prompt(name, args)` | `str` (JSON) | Raw `prompts/get` result. |
+
+`McpSession` supports the context-manager protocol.
+
+## Scheduling
+
+```python
+from inferlet import scheduling
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `scheduling.balance(model)` | `float` | Current credit balance for this inferlet. |
+| `scheduling.rent(ctx)` | `float` | Clearing price from the most recent auction. |
+| `scheduling.dividend(model)` | `float` | Endowment-proportional dividend last step. |
+| `scheduling.latency(ctx)` | `float` | Per-tick wall time in seconds. |
+| `scheduling.price()` | `float` | Cost in credits per new KV page. |
+
+To override the default bid: `ctx.set_bid(value)`. To skip bidding for a scope: `with ctx.idle():`. Both live on `Context`.
+
+## Filesystem and HTTP
+
+The Python SDK does not currently expose Pie-specific HTTP or filesystem APIs. Use the standard library (`open`, `os.makedirs`) for filesystem access (against the host-preopened `/scratch` directory). HTTP support is in progress; see [I/O / HTTP](../guide/io/http) for the intended API shape.
+
+## Related
+
+- [Rust SDK reference](./sdk-rust): the canonical SDK; some advanced primitives (custom speculators in user code, `ctx.inner()` page operations) are Rust-only.
+- [JavaScript SDK reference](./sdk-javascript): the JS counterpart.
+- [Inferlet manifest](./manifest): the `Pie.toml` schema.

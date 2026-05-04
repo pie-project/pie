@@ -1,0 +1,175 @@
+---
+title: Samplers and probabilities
+description: Pick tokens with samplers, read distributions with probes
+sidebar_position: 3
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Samplers and probabilities
+
+A forward pass produces a next-token distribution at every position you mark. You read it back two ways: a **sampler** picks a token, and a **probe** reads structured probability data without picking. Both attach to the same forward pass and compile down to the same WIT slot. This page enumerates the kinds of each. Read this after [Inputs](./inputs).
+
+## Samplers
+
+`Sampler` produces a token from a distribution. Attach one to a position via `fwd.sample(positions, sampler)` (Rust) or pass it to `ctx.generate(sampler)` (all SDKs).
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::sample::Sampler;
+
+Sampler::Argmax;
+Sampler::TopP { temperature: 0.7, p: 0.95 };
+Sampler::TopK { temperature: 0.7, k: 50 };
+Sampler::MinP { temperature: 0.7, p: 0.05 };
+Sampler::TopKTopP { temperature: 0.7, k: 50, p: 0.95 };
+Sampler::Multinomial { temperature: 1.0, draws: 1 };
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Sampler
+
+Sampler.argmax()
+Sampler.top_p(0.7, 0.95)
+Sampler.top_k(0.7, 50)
+Sampler.min_p(0.7, 0.05)
+Sampler.top_k_top_p(0.7, 50, 0.95)
+Sampler.multinomial(1.0, 1)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Sampler } from 'inferlet';
+
+Sampler.argmax();
+Sampler.topP(0.7, 0.95);
+Sampler.topK(0.7, 50);
+Sampler.minP(0.7, 0.05);
+Sampler.topKTopP(0.7, 50, 0.95);
+Sampler.multinomial(1.0, 1);
+```
+
+</TabItem>
+</Tabs>
+
+| Sampler | What it picks |
+|---|---|
+| `Argmax` | The token with maximum probability. Deterministic. |
+| `TopP { temperature, p }` | Nucleus sampling: smallest set of tokens whose cumulative probability ≥ `p`, sample within. |
+| `TopK { temperature, k }` | Sample from the top `k` tokens by probability. |
+| `MinP { temperature, p }` | Keep tokens with probability ≥ `p × max_prob`, sample within. |
+| `TopKTopP { temperature, k, p }` | Top-k first, then nucleus `p` within that. |
+| `Multinomial { temperature, draws }` | Plain multinomial sampling after temperature scaling. |
+
+`temperature = 0` collapses any of these to argmax. `Argmax` is a fast path that skips the temperature math entirely.
+
+## Probes
+
+A probe reads probability data at a position without picking a token. Attach via `fwd.probe(position, probe)`. Probes are available in all three SDKs.
+
+```rust
+use inferlet::sample::{Distribution, Logits, Logprob, Logprobs, Entropy};
+
+let logits_h = fwd.probe(0, Logits);
+let dist_h   = fwd.probe(0, Distribution { temperature: 1.0, k: 32 });
+let lp_h     = fwd.probe(0, Logprob(target_token_id));        // log p of one token
+let lps_h    = fwd.probe(0, Logprobs(vec![id_a, id_b]));      // log p of each
+let ent_h    = fwd.probe(0, Entropy);
+```
+
+| Probe | Argument | Returns | Use case |
+|---|---|---|---|
+| `Logits` | none | `Option<&[u8]>` of raw f32 LE bytes | Custom samplers, watermarking, logit shaping. |
+| `Distribution { temperature, k }` | `temperature`, `k` (0 = full vocab) | `Option<(&[u32], &[f32])>`: top-`k` token IDs and probs | Diagnose top candidates without committing. |
+| `Logprob(token_id)` | one token ID | `Option<&[f32]>` of length 1 | Score a single specified token. |
+| `Logprobs(token_ids)` | a vec of token IDs | `Option<&[f32]>` of length K | Score K specified tokens. |
+| `Entropy` | none | `Option<f32>` | Uncertainty estimate at this position. |
+
+A few sharp edges:
+
+- `Logprob` and `Logprobs` carry the token IDs you want scored. They are not zero-arg markers.
+- Both single and list logprob queries are read with `out.logprobs(handle)`. There is no `out.logprob`. The single-token form returns a length-1 slice.
+- `out.logits(...)` returns raw native-endian f32 bytes, not a `Vec<f32>`. Decode with `bytemuck::cast_slice::<u8, f32>(bytes)` or your language's equivalent.
+- `out.distribution(...)` returns slices into the output (`&[u32]`, `&[f32]`), not owned vectors.
+
+Sampler and probe handles are statically typed. `out.token(probe_handle)` does not compile; `out.distribution(sample_handle)` does not compile.
+
+## Mix samplers and probes
+
+A single forward pass can attach many handles, of either kind, at any positions. They all compute against the same forward pass.
+
+```rust
+let mut fwd = ctx.forward();
+fwd.input(&tokens);
+
+// Sample at position 0
+let h_token = fwd.sample(&[0], Sampler::TopP { temperature: 0.7, p: 0.95 });
+
+// Probe distributions at positions 0 and 1
+let h_dist0 = fwd.probe(0, Distribution { temperature: 1.0, k: 32 });
+let h_dist1 = fwd.probe(1, Distribution { temperature: 1.0, k: 32 });
+
+// Probe entropy at every position
+let h_ent: Vec<_> = (0..tokens.len() as u32)
+    .map(|i| fwd.probe(i, Entropy))
+    .collect();
+
+let out = fwd.execute().await?;
+
+let token = out.token(h_token).unwrap();
+let (ids0, probs0) = out.distribution(h_dist0).unwrap();
+let entropies: Vec<f32> = h_ent.iter().filter_map(|h| out.entropy(*h)).collect();
+```
+
+This is how you implement custom samplers, watermarking schemes, and beam-search-style scoring without giving up batching with other live processes.
+
+## Scoring candidate strings
+
+A common pattern: given a context and several candidate strings, score each by its summed log-probability under the model. Tokenize the candidate, append it as input, probe `Logprob` at each position with the next expected token, sum the resulting per-position logprobs.
+
+```rust
+async fn score_candidate(ctx: &mut Context, model: &Model, text: &str) -> Result<f32> {
+    let mut fwd = ctx.forward();
+    let tk = model.tokenizer();
+    let ids = tk.encode(text);
+    fwd.input(&ids);
+
+    // For each position i, probe log p(ids[i+1] | ctx, ids[..=i]).
+    let probes: Vec<_> = (0..ids.len().saturating_sub(1) as u32)
+        .map(|i| fwd.probe(i, Logprob(ids[(i + 1) as usize])))
+        .collect();
+
+    let out = fwd.execute().await?;
+    Ok(probes
+        .iter()
+        .filter_map(|h| out.logprobs(*h).map(|s| s[0]))
+        .sum())
+}
+```
+
+See the [`output-validation`](https://github.com/pie-project/pie/tree/main/inferlets/output-validation) inferlet for the full pattern.
+
+## Default sampler in `generate`
+
+`ctx.generate(sampler)` runs an autoregressive loop with the sampler attached at the next-token position on every step. Other sampler / probe combinations are reserved for `forward()`-level work.
+
+The two common starting points:
+
+- `Sampler::Argmax` for deterministic output and for any constrained-decoding workload.
+- `Sampler::TopP { temperature: 0.6 .. 0.8, p: 0.95 }` for natural-sounding chat.
+
+Other samplers are useful but rarely change quality enough to justify tuning past these two.
+
+## Next
+
+- [Constrained generation](./constrained): mask logits with grammars and schemas.
+- [Speculative decoding](./speculation): probes inside the verify step.
+- [Chat parser](../decoder/chat): the stream parser that turns Generator output into clean text deltas.

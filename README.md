@@ -7,62 +7,55 @@
          width="30%">
     <p></p>
   </picture>
+
+[Website] | [Guide] | [Reference] | [Paper (SOSP'25)]
 </div>
 
+[Website]: https://pie-project.org/
+[Guide]: https://pie-project.org/docs/guide/install
+[Reference]: https://pie-project.org/docs/reference/sdk-rust
+[Paper (SOSP'25)]: https://ingim.org/papers/gim2025pie.pdf
 
-**Pie** is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
+A programmable serving system for custom inference logic,
+stateful agents, and serving-side optimization.
 
-> **Note** 🧪
->
-> This software is in a **pre-release** stage and under active development. It's recommended for testing and research purposes only.
+Pie accepts *inferlets* - small programs in Rust, Python, or TypeScript that compile to WebAssembly and run inside the engine with direct access to the KV cache, token stream, and forward pass.
 
+> **Note**
+> Pie is pre-release software under active development. It is best suited
+> for testing and research right now.
+## Quick Start
 
-
-## Getting Started
-
-### Installation
-
-**Option 1: PyPI**
-
-```bash
-pip install "pie-server[cuda]"   # Linux/Windows
-pip install "pie-server[metal]"  # macOS
-```
-
-**Option 2: Build from Source (Recommended)**
+Pie is a standalone binary (~14 MB on macOS) with no Python/PyTorch dependencies.
 
 ```bash
-git clone https://github.com/pie-project/pie.git && cd pie/pie
-
-# Recommended: use uv to sync (options: cu126, cu128, metal)
-uv sync --extra cu128
+curl -fsSL https://pie-project.org/install.sh | bash
 ```
 
-### Quick Start
-
-Run a test prompt (you will be prompted for configuration and model download if this is your first time):
+Then configure and run:
 
 ```bash
-pie run text-completion -- --prompt "Hello world!"
-pie run beam-search -- --prompt "What is the capital of France?" --beam-size 2
+pie config init
+pie run text-completion --prompt "The capital of France is"
 ```
 
-> **Note:** The first run may take longer due to JIT compilation.
-> *If built from source, prefix commands with `uv run` (e.g., `uv run pie config init`).*
+## Project Layout
 
+| Directory | Description |
+|---|---|
+| `runtime/` | Inferlet runtime |
+| `server/` | CLI |
+| `inferlets/` | Example inferlets |
+| `sdk/` | Inferlet SDKs (Rust · Python · JavaScript) |
+| `client/` | Client libraries (Rust · Python · JavaScript) |
+| `driver/` | Pie drivers (portable / CUDA / vLLM / SGLang) |
+| `website/` | [pie-project.org](https://pie-project.org) docs site |
 
+## Getting Help
 
-
-Check out the [https://pie-project.org/docs](https://pie-project.org/) for more information.
-
-## Community
-
-**Issues & Bugs**: Please report bugs on [GitHub Issues](https://github.com/pie-project/pie/issues).
-
-**Discussions**: Have a question or feedback? Join us on [GitHub Discussions](https://github.com/pie-project/pie/discussions).
-
-
-
+Questions and bug reports are welcome on
+[GitHub Issues](https://github.com/pie-project/pie/issues) and
+[GitHub Discussions](https://github.com/pie-project/pie/discussions).
 
 ## License
 

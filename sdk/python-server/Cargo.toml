@@ -1,0 +1,24 @@
+[package]
+name = "pie-server-py"
+version = "0.3.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Python bindings for the pie engine — embed `pie serve` inside a Python script via `pie.server.Server`."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_engine"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# `pie-server` is the engine library — we link the same `serve::start_engine`
+# the CLI uses, so the CLI and the pyo3 wheel can never drift in their boot
+# behavior. Build every embedded driver into the Python engine so
+# `pie.server.Server` can host the same local flavors as `pie serve`.
+pie-server = { path = "../../server", default-features = false, features = ["driver-cuda", "driver-portable", "driver-dummy"] }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+tokio = { version = "1.38", features = ["rt-multi-thread"] }
+toml = "0.9"
+anyhow = "1.0"

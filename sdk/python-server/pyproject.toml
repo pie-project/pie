@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pie-server"
+version = "0.3.0"
+description = "Embed the pie engine inside a Python script via `pie.server.Server`."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "In Gim", email = "in.gim@icloud.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# `pie-client` provides `PieClient` — `Server.connect()` returns one.
+dependencies = [
+    "pie-client",
+]
+
+[tool.maturin]
+python-source = "python"
+python-packages = ["pie"]
+# `_engine.so` lands at `python/pie/_engine.so` → importable as `pie._engine`.
+module-name = "pie._engine"
+manifest-path = "Cargo.toml"
+
+[tool.uv.sources]
+pie-client = { path = "../../client/python", editable = true }
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../../server/Cargo.toml" },
+    { file = "../../server/src/**/*.rs" },
+]

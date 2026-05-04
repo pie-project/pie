@@ -61,7 +61,7 @@ def handle_list_command(
     client = engine.connect_and_authenticate(client_config)
 
     try:
-        instances = engine.list_instances(client)
+        instances = engine.list_processes(client)
 
         if not instances:
             typer.echo("✅ No running instances found.")

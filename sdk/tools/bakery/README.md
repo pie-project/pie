@@ -1,85 +1,37 @@
 # Bakery
 
-**Pie Bakery** is a CLI tool for building and publishing inferlets. It supports both JavaScript/TypeScript and Rust inferlets.
+Build tool for Pie inferlets.
 
-## Installation
-
-```bash
-pip install -e sdk/tools/bakery
-```
-
-## Commands
-
-### `bakery create`
-
-Create a new inferlet project.
+The `pie` CLI wraps the common commands:
 
 ```bash
-# Create a Rust inferlet (default)
-bakery create my-inferlet
-
-# Create a TypeScript inferlet
-bakery create my-inferlet --ts
+pie new my-inferlet
+pie new my-inferlet --ts
+pie build ./my-inferlet -o out.wasm
 ```
 
-### `bakery build`
-
-Build an inferlet to WebAssembly. The platform (Rust or JavaScript) is auto-detected based on project files.
-
-```bash
-# Build a Rust inferlet (directory with Cargo.toml)
-bakery build ./my-rust-inferlet -o output.wasm
-
-# Build a TypeScript inferlet (directory with package.json)
-bakery build ./my-ts-inferlet -o output.wasm
-
-# Build a single JS/TS file
-bakery build ./index.ts -o output.wasm
-```
-
-**Options:**
-- `-o, --output` - Output `.wasm` file path (required)
-- `--debug` - Enable debug build (JS only: includes source maps)
-
-### `bakery login`
-
-Authenticate with the Pie Registry using GitHub OAuth.
+The standalone `bakery` command is still available for registry workflows:
 
 ```bash
 bakery login
+bakery inferlet publish ./my-inferlet
+bakery inferlet search text
 ```
 
-### `bakery inferlet`
+## Supported inputs
 
-Manage inferlets in the Pie Registry.
+- Rust crates with `Cargo.toml`
+- Python projects with `pyproject.toml` or `main.py`
+- JavaScript/TypeScript projects with `package.json`, `.js`, or `.ts` input
 
-```bash
-# Search for inferlets
-bakery inferlet search <query>
+Rust builds require `wasm32-wasip2`. JavaScript/TypeScript builds require
+Node.js. Python builds use the cached Pie Python Wasm runtime.
 
-# Get inferlet info
-bakery inferlet info <name>
+## Repository development
 
-# Publish an inferlet
-bakery inferlet publish <path>
-```
-
-## Requirements
-
-### For Rust inferlets:
-- Rust toolchain with `cargo`
-- wasm32-wasip2 target: `rustup target add wasm32-wasip2`
-
-### For JavaScript/TypeScript inferlets:
-- Node.js v18+
-- npm/npx
-
-## Development
-
-When developing within the pie repository, set `PIE_SDK` to the SDK directory:
+Bakery auto-detects the SDK layout when run inside this repo. Override it
+when needed:
 
 ```bash
 export PIE_SDK=/path/to/pie/sdk
 ```
-
-This allows bakery to find the inferlet SDK libraries automatically.

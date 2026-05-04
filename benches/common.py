@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent.parent
+BENCH_SYSTEM = "You are a helpful benchmarking assistant."
+BENCH_PROMPT = "Write a short story about a robot."
+
+
+@dataclass
+class RequestResult:
+    ok: bool
+    latency_s: float
+    output_tokens: int
+    prompt_tokens: int | None = None
+    error: str | None = None
+
+
+@dataclass
+class BenchSummary:
+    mode: str
+    engine: str
+    model: str
+    requests: int
+    completed: int
+    failed: int
+    wall_s: float
+    output_tokens: int
+    prompt_tokens: int | None
+    req_per_s: float
+    output_tok_per_s: float
+    latency_mean_ms: float | None
+    latency_p50_ms: float | None
+    latency_p95_ms: float | None
+    latency_p99_ms: float | None
+    config: dict[str, Any]
+
+
+def percentile(xs: list[float], q: float) -> float | None:
+    if not xs:
+        return None
+    s = sorted(xs)
+    k = (len(s) - 1) * q
+    lo = math.floor(k)
+    hi = math.ceil(k)
+    if lo == hi:
+        return s[int(k)]
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def summarize(
+    *,
+    mode: str,
+    engine: str,
+    model: str,
+    results: list[RequestResult],
+    wall_s: float,
+    config: dict[str, Any],
+) -> BenchSummary:
+    ok = [r for r in results if r.ok]
+    lats = [r.latency_s for r in ok if r.latency_s > 0.0]
+    output_tokens = sum(r.output_tokens for r in ok)
+    prompt_known = [r.prompt_tokens for r in ok if r.prompt_tokens is not None]
+    prompt_tokens = sum(prompt_known) if len(prompt_known) == len(ok) else None
+    return BenchSummary(
+        mode=mode,
+        engine=engine,
+        model=model,
+        requests=len(results),
+        completed=len(ok),
+        failed=len(results) - len(ok),
+        wall_s=wall_s,
+        output_tokens=output_tokens,
+        prompt_tokens=prompt_tokens,
+        req_per_s=(len(ok) / wall_s) if wall_s > 0 else 0.0,
+        output_tok_per_s=(output_tokens / wall_s) if wall_s > 0 else 0.0,
+        latency_mean_ms=(statistics.fmean(lats) * 1000.0) if lats else None,
+        latency_p50_ms=(percentile(lats, 0.50) * 1000.0) if lats else None,
+        latency_p95_ms=(percentile(lats, 0.95) * 1000.0) if lats else None,
+        latency_p99_ms=(percentile(lats, 0.99) * 1000.0) if lats else None,
+        config=config,
+    )
+
+
+def print_summary(s: BenchSummary) -> None:
+    print()
+    print("-" * 52)
+    print(f"mode:              {s.mode}")
+    print(f"engine:            {s.engine}")
+    print(f"model:             {s.model}")
+    print(f"completed:         {s.completed}/{s.requests}  failed={s.failed}")
+    print(f"wall:              {s.wall_s:.3f} s")
+    print(f"requests/sec:      {s.req_per_s:.2f}")
+    print(f"output tokens:     {s.output_tokens}")
+    if s.prompt_tokens is not None:
+        print(f"prompt tokens:     {s.prompt_tokens}")
+    print(f"output tok/sec:    {s.output_tok_per_s:.2f}")
+    if s.latency_mean_ms is not None:
+        print(f"lat mean/p50:      {s.latency_mean_ms:.1f} / {s.latency_p50_ms:.1f} ms")
+        print(f"lat p95/p99:       {s.latency_p95_ms:.1f} / {s.latency_p99_ms:.1f} ms")
+    print("-" * 52)
+
+
+def write_json(path: str | None, summary: BenchSummary, results: list[RequestResult]) -> None:
+    if not path:
+        return
+    out = {"summary": asdict(summary), "requests": [asdict(r) for r in results]}
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(out, indent=2))
+
+
+def add_mode_subcommands(parser: argparse.ArgumentParser) -> None:
+    sub = parser.add_subparsers(dest="mode", required=True)
+    latency = sub.add_parser("latency", help="single-request latency")
+    add_common_args(latency)
+    latency.add_argument("--requests", type=int, default=16)
+    latency.set_defaults(num_requests=0, concurrency=1)
+
+    tput = sub.add_parser("tput", help="high-concurrency throughput")
+    add_common_args(tput)
+    tput.add_argument("--num-requests", type=int, default=512)
+    tput.add_argument("--concurrency", type=int, default=128)
+    tput.set_defaults(requests=0)
+
+
+def add_common_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--model", default="Qwen/Qwen2-0.5B")
+    p.add_argument("--prompt", default=BENCH_PROMPT)
+    p.add_argument("--system", default=BENCH_SYSTEM)
+    p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--unique-prompts", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--warmup", type=int, default=2)
+    p.add_argument("--json-out", default=None)
+    p.add_argument("--request-timeout", type=float, default=300.0)
+    p.add_argument("--tp-size", type=int, default=1)
+    p.add_argument("--gpu-mem-util", type=float, default=0.80)
+    p.add_argument("--max-model-len", type=int, default=2048)
+
+
+def make_prompts(args: argparse.Namespace, n: int) -> list[str]:
+    if args.unique_prompts:
+        return [f"{args.prompt} (Request #{i})" for i in range(n)]
+    return [args.prompt for _ in range(n)]
+
+
+def hf_chat_prompts_and_counts(
+    model: str, system: str, prompts: list[str]
+) -> tuple[list[str], list[int]]:
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model)
+    rendered = [
+        tok.apply_chat_template(
+            [{"role": "system", "content": system}, {"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for p in prompts
+    ]
+    counts = [len(tok.encode(p, add_special_tokens=False)) for p in rendered]
+    return rendered, counts
+
+
+def finish(summary: BenchSummary, results: list[RequestResult], json_out: str | None) -> None:
+    print_summary(summary)
+    write_json(json_out, summary, results)
+    if summary.failed:
+        print(f"{summary.failed} request(s) failed; inspect JSON output for details.")

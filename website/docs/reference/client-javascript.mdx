@@ -1,0 +1,184 @@
+---
+title: JavaScript Client
+description: JavaScript / TypeScript client library reference
+sidebar_position: 2
+---
+
+# JavaScript Client
+
+The JavaScript client (Node.js or modern browsers) talks to the Pie server
+over WebSocket. It mirrors the Python client surface, with `camelCase` method
+names.
+
+## Installation
+
+```bash
+npm install @pie/client
+```
+
+## Quick start
+
+```javascript
+import { PieClient } from '@pie/client';
+
+const client = new PieClient("ws://127.0.0.1:8080");
+await client.connect();
+
+// Internal-token auth (used between backend processes).
+// For public-key auth, use the Python or Rust client today.
+await client.authByToken(process.env.PIE_TOKEN);
+
+const proc = await client.launchProcess(
+  "text-completion@0.1.0",
+  { prompt: "Hello", max_tokens: 64 },
+);
+
+while (true) {
+  const { event, value } = await proc.recv();
+  if (event === "stdout")  process.stdout.write(value);
+  else if (event === "return") { console.log("\n[done]", value); break; }
+  else if (event === "error")  { console.error("\n[error]", value); break; }
+}
+
+client.close();
+```
+
+## PieClient
+
+```javascript
+const client = new PieClient(serverUri);
+await client.connect();
+// …
+client.close();
+```
+
+| Method | Description |
+|--------|-------------|
+| `connect()` | Open the WebSocket connection. Resolves once the socket is open. |
+| `close()` | Close the connection. |
+
+### Authentication
+
+| Method | Description |
+|--------|-------------|
+| `authByToken(token)` | Authenticate with an internal token. The only auth mechanism currently exposed by the JS client. |
+
+If the server has `[auth].enabled = false`, you can skip authentication
+entirely.
+
+### Programs
+
+| Method | Description |
+|--------|-------------|
+| `resolveVersion(name, registryUrl)` | Returns `name@version`; passes through if `name` already includes `@`. |
+| `checkProgram(inferlet)` | Returns `true` if the server already has this `name@version`. (`programExists` is an alias.) |
+| `installProgram(wasmPath, manifestPath, forceOverwrite=false)` | **Node.js only.** Reads the WASM and `Pie.toml` from disk and uploads them in chunks. |
+
+### Processes
+
+| Method | Description |
+|--------|-------------|
+| `launchProcess(inferlet, input={}, captureOutputs=true, { tokenBudget=null }={})` | Launch a `name@version`. `input` is JSON-stringified into the inferlet's typed input. (`launchInstance` is an alias.) |
+| `attachProcess(processId)` | Reattach to an existing process by id. |
+| `signalProcess(processId, message)` | Fire-and-forget string signal. |
+| `terminateProcess(processId)` | Stop a process. |
+| `listProcesses()` | Return active process ids. |
+| `launchDaemon(inferlet, port, input={})` | Start a long-running daemon inferlet bound to `port`. |
+| `ping()` | Round-trip a ping. |
+| `query(subject, record)` | Generic key-value query passthrough. |
+
+`launchProcess` and `attachProcess` resolve to a [`Process`](#process).
+
+### MCP
+
+| Method | Description |
+|--------|-------------|
+| `registerMcpServer(name, { transport, command, args, url })` | Spawn a local MCP server and announce it to the engine under `name`. Inferlets launched on this client see the server via `mcp.availableServers()`. Today only `transport: 'stdio'` is supported; pass `command` and `args`. |
+
+```javascript
+await client.registerMcpServer('fs', {
+  transport: 'stdio',
+  command: 'npx',
+  args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp/sandbox'],
+});
+```
+
+## Process
+
+```javascript
+class Process {
+  processId: string;
+
+  async signal(message);
+  async transferFile(fileBytes);   // Uint8Array | Buffer
+  async recv();                    // → { event, value }
+  async terminate();
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `recv()` | Await the next event. Returns `{ event, value }`. |
+| `signal(message)` | Send a string signal to the running inferlet. |
+| `transferFile(bytes)` | Send a binary file (chunked). |
+| `terminate()` | Request termination. |
+
+`Instance` is exported as a backwards-compatible alias for `Process`.
+
+### Receive loop pattern
+
+```javascript
+const proc = await client.launchProcess("my-inferlet@0.1.0", { prompt });
+
+while (true) {
+  const { event, value } = await proc.recv();
+  switch (event) {
+    case "stdout":  process.stdout.write(value); break;
+    case "stderr":  process.stderr.write(value); break;
+    case "message": handleMessage(value);        break;
+    case "file":    saveBlob(value);             break;   // Uint8Array
+    case "return":  return JSON.parse(value);              // typed Output
+    case "error":   throw new Error(value);
+  }
+}
+```
+
+## Events
+
+Events are passed as plain strings (no enum):
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `"stdout"` | `string` | Streamed stdout. |
+| `"stderr"` | `string` | Streamed stderr. |
+| `"message"` | `string` | Inferlet-emitted message. |
+| `"file"` | `Uint8Array` | Inferlet-emitted file (reassembled from chunks). |
+| `"return"` | `string` | Final JSON-encoded `Output`; the process exits cleanly after this. |
+| `"error"` | `string` | The process aborted. |
+
+The event queue for a process is cleaned up automatically once `return` or
+`error` is delivered.
+
+## Detached / reattach
+
+`launchProcess` returns a handle you can drop. Reconnect later, call
+`attachProcess(processId)`, and resume reading. While disconnected, the
+server buffers events for you.
+
+```javascript
+const c1 = new PieClient(uri); await c1.connect();
+const proc = await c1.launchProcess("long-task@0.1.0", { /* … */ });
+const pid = proc.processId;
+c1.close();
+
+// … later …
+const c2 = new PieClient(uri); await c2.connect();
+const resumed = await c2.attachProcess(pid);
+const { event, value } = await resumed.recv();
+```
+
+## Browser vs. Node.js
+
+- `installProgram` requires `fs` and is Node.js-only.
+- Everything else (`authByToken`, `launchProcess`, `recv`, file transfer with
+  in-memory `Uint8Array`) works in modern browsers.

@@ -1,0 +1,256 @@
+/**
+ * Pie — color palette (single source of truth).
+ *
+ * All color values for the site live here. Changing a value here updates
+ * the entire site. Structural CSS (typography, layout, components) lives
+ * in custom.css and consumes these tokens.
+ *
+ * IMPORTANT: Prism syntax-highlighting colors are mirrored in
+ * docusaurus.config.ts (PIE_PALETTE constant). When you change a
+ * --pie-syntax-* token here, update its twin there.
+ *
+ * Token layers:
+ *   1. PALETTE  — raw hex values, named generically (no semantic meaning)
+ *      so re-skinning is just changing values, never renaming.
+ *   2. ROLES    — semantic aliases (--pie-bg, --pie-ink, --ifm-color-primary, ...)
+ *
+ * To re-skin: edit the PALETTE block. To re-assign a swatch to a new role:
+ * edit the ROLES block.
+ */
+
+/* =====================================================================
+   1. PALETTE  — raw swatches, light mode
+   PANTONE 16-1448 TCX "Burnt Orange"    primary terracotta (Crail family)
+   PANTONE 11-0601 TCX "Bright White"    near-white background
+   PANTONE 19-0712 TCX "Black Coffee"    body ink
+   ===================================================================== */
+:root {
+  /* Accent ramp — terracotta / burnt orange */
+  --pie-accent-900: #5a2410;
+  --pie-accent-800: #722e15;
+  --pie-accent-700: #8f442d;
+  --pie-accent-600: #c96442;            /* Burnt Orange — primary */
+  --pie-accent-500: #d27559;
+  --pie-accent-400: #d77e63;
+  --pie-accent-300: #d97757;            /* lifted, dark-mode primary */
+  --pie-accent-200: #e2997f;
+  --pie-accent-100: #f0b8a3;
+  --pie-accent-rgb: 201, 100, 66;       /* base for rgba() */
+  --pie-accent-300-rgb: 217, 119, 87;
+
+  /* Paper ramp (pure white page; warm cream tints for elevation/structure) */
+  --pie-paper-50:  #ffffff;
+  --pie-paper-75:  #ffffff;             /* page background — pure white */
+  --pie-paper-100: #fbf8ec;             /* emphasis-100 (sidebar hover, table head) */
+  --pie-paper-200: #f7f2e1;             /* inline code bg */
+  --pie-paper-250: #f5efdc;             /* sunken */
+  --pie-paper-300: #ebe4ce;             /* border */
+  --pie-paper-400: #d4c9ad;             /* border-strong */
+  --pie-paper-500: #b8ab92;
+  --pie-paper-600: #948872;
+
+  /* Ink ramp (warm near-blacks to muted browns — light-mode text) */
+  --pie-ink-900:   #2c2722;             /* body text */
+  --pie-ink-800:   #54473b;
+  --pie-ink-700:   #6b5e4d;
+  --pie-ink-600:   #8a7c6a;             /* muted text */
+
+  /* Demitasse ramp (warm darks for dark-mode surfaces and text) */
+  --pie-demi-50:   #f6efde;
+  --pie-demi-100:  #ede5d2;
+  --pie-demi-200:  #c8bda6;
+  --pie-demi-300:  #a89b85;
+  --pie-demi-400:  #8a7a60;
+  --pie-demi-500:  #6e6049;
+  --pie-demi-600:  #524735;
+  --pie-demi-700:  #3d352a;
+  --pie-demi-800:  #2f2820;
+  --pie-demi-850:  #2a241d;
+  --pie-demi-900:  #1f1b16;
+  --pie-demi-950:  #181410;
+
+  /* Semantic accents — secondary colors used by admonitions and syntax
+     highlighting. Independent of the brand accent above. */
+  --pie-sage:        #5a6b25;           /* tip / strings */
+  --pie-sage-bg:     #f4f4dc;
+  --pie-sage-border: #c5cf94;
+
+  --pie-teal:        #3d6e6f;           /* info  (NB: separate from accent teal) */
+  --pie-teal-bg:     #ecf3f3;
+  --pie-teal-border: #aac4c5;
+
+  --pie-amber:        #9a5a1f;          /* warning */
+  --pie-amber-bg:     #faefd2;
+  --pie-amber-border: #d8b078;
+
+  --pie-rust:      #a83f1d;             /* danger */
+  --pie-copper:    #a06234;             /* syntax: strings */
+  --pie-gold:      #8a6020;             /* syntax: numbers */
+  --pie-rust-soft: #a04020;             /* syntax: functions */
+  --pie-plum:      #6e2f5a;             /* syntax: class names */
+
+  /* Dark-mode lifted accents */
+  --pie-sage-light:   #b8c47a;
+  --pie-teal-light:   #8ec0c1;
+  --pie-amber-light:  #d4a45c;
+  --pie-rust-light:   #e08a6f;
+  --pie-copper-light: #d4a060;
+  --pie-gold-light:   #dcb070;
+  --pie-peach-light:  #e0a47a;
+  --pie-rose-light:   #d8a8c0;
+
+  /* Dark-mode tinted admonition backgrounds */
+  --pie-sage-bg-dark:  #2a2c1a;
+  --pie-teal-bg-dark:  #1f2c2c;
+  --pie-amber-bg-dark: #2e2418;
+  --pie-amber-border-dark: #7a4a1f;
+
+  /* Foreground when on primary (e.g. .button--primary text) */
+  --pie-on-primary: #ffffff;            /* matches paper-75 */
+}
+
+/* =====================================================================
+   2. ROLES — light mode (semantic aliases for the palette)
+   ===================================================================== */
+:root {
+  /* Brand */
+  --ifm-color-primary:         var(--pie-accent-600);
+  --ifm-color-primary-dark:    var(--pie-accent-700);
+  --ifm-color-primary-darker:  var(--pie-accent-800);
+  --ifm-color-primary-darkest: var(--pie-accent-900);
+  --ifm-color-primary-light:   var(--pie-accent-500);
+  --ifm-color-primary-lighter: var(--pie-accent-400);
+  --ifm-color-primary-lightest:var(--pie-accent-300);
+
+  /* Surfaces */
+  --pie-bg:            var(--pie-paper-75);
+  --pie-bg-elev:       var(--pie-paper-50);
+  --pie-bg-sunken:     var(--pie-paper-250);
+  --pie-border:        var(--pie-paper-300);
+  --pie-border-strong: var(--pie-paper-400);
+
+  /* Text */
+  --pie-ink:       var(--pie-ink-900);
+  --pie-ink-soft:  var(--pie-ink-800);
+  --pie-ink-muted: var(--pie-ink-600);
+
+  /* Infima passthroughs */
+  --ifm-background-color:         var(--pie-bg);
+  --ifm-background-surface-color: var(--pie-bg-elev);
+  --ifm-card-background-color:    var(--pie-bg-elev);
+  --ifm-color-content:            var(--pie-ink);
+  --ifm-color-content-secondary:  var(--pie-ink-soft);
+  --ifm-heading-color:            var(--pie-ink);
+  --ifm-toc-border-color:         var(--pie-border);
+  --ifm-hr-border-color:          var(--pie-border);
+
+  --ifm-color-emphasis-100: var(--pie-paper-100);
+  --ifm-color-emphasis-200: var(--pie-border);
+  --ifm-color-emphasis-300: var(--pie-border-strong);
+  --ifm-color-emphasis-400: var(--pie-paper-500);
+  --ifm-color-emphasis-500: var(--pie-paper-600);
+  --ifm-color-emphasis-600: var(--pie-ink-muted);
+  --ifm-color-emphasis-700: var(--pie-ink-soft);
+  --ifm-color-emphasis-800: var(--pie-ink);
+  --ifm-color-emphasis-900: var(--pie-ink);
+
+  /* Universal tinted-surface beige.
+     Used wherever a surface should sit one step off pure white without
+     being a heavy shade — code blocks, search input, table panel, etc.
+     Distinct from emphasis-100 (which is darker and used for hover /
+     stacked layers on top of --pie-tint surfaces). */
+  --pie-tint: #fdfbf3;
+
+  /* Code surfaces */
+  --ifm-code-background:                   var(--pie-paper-200);
+  --ifm-pre-background:                    var(--pie-tint);
+  --docusaurus-highlighted-code-line-bg:   rgba(var(--pie-accent-rgb), 0.12);
+
+  /* Links */
+  --ifm-link-color:       var(--ifm-color-primary-darker);
+  --ifm-link-hover-color: var(--ifm-color-primary-darkest);
+
+  /* Effects */
+  --pie-selection-bg:     rgba(var(--pie-accent-rgb), 0.20);
+  --pie-shadow-primary:   0 4px 14px rgba(var(--pie-accent-rgb), 0.25);
+  --pie-navbar-bg:        rgba(255, 255, 255, 0.9);  /* matches --pie-bg @ 0.9 */
+
+  /* Global shadows */
+  --ifm-global-shadow-lw: 0 1px 0 rgba(42, 39, 34, 0.04);
+  --ifm-global-shadow-md: 0 4px 18px rgba(42, 39, 34, 0.08);
+  --ifm-global-shadow-tl: 0 12px 40px rgba(42, 39, 34, 0.12);
+
+  color-scheme: light;
+}
+
+/* =====================================================================
+   2. ROLES — dark mode (warm demitasse + lifted teal)
+   PANTONE 19-0608 TCX "Demitasse"       background
+   PANTONE 11-0608 TCX "Cloud Cream"     body text
+   ===================================================================== */
+[data-theme='dark'] {
+  /* Brand — lifted teal */
+  --ifm-color-primary:         var(--pie-accent-300);
+  --ifm-color-primary-dark:    var(--pie-accent-400);
+  --ifm-color-primary-darker:  var(--pie-accent-500);
+  --ifm-color-primary-darkest: var(--pie-accent-600);
+  --ifm-color-primary-light:   var(--pie-accent-200);
+  --ifm-color-primary-lighter: var(--pie-accent-200);
+  --ifm-color-primary-lightest:var(--pie-accent-100);
+
+  /* Surfaces */
+  --pie-bg:            var(--pie-demi-900);
+  --pie-bg-elev:       var(--pie-demi-850);
+  --pie-bg-sunken:     var(--pie-demi-950);
+  --pie-border:        var(--pie-demi-700);
+  --pie-border-strong: var(--pie-demi-600);
+
+  /* Text */
+  --pie-ink:       var(--pie-demi-100);
+  --pie-ink-soft:  var(--pie-demi-200);
+  --pie-ink-muted: var(--pie-demi-300);
+
+  /* Infima passthroughs */
+  --ifm-background-color:         var(--pie-bg);
+  --ifm-background-surface-color: var(--pie-bg-elev);
+  --ifm-card-background-color:    var(--pie-bg-elev);
+  --ifm-color-content:            var(--pie-ink);
+  --ifm-color-content-secondary:  var(--pie-ink-soft);
+  --ifm-heading-color:            var(--pie-ink);
+  --ifm-toc-border-color:         var(--pie-border);
+  --ifm-hr-border-color:          var(--pie-border);
+
+  --ifm-color-emphasis-100: var(--pie-demi-800);
+  --ifm-color-emphasis-200: var(--pie-border);
+  --ifm-color-emphasis-300: var(--pie-border-strong);
+  --ifm-color-emphasis-400: var(--pie-demi-500);
+  --ifm-color-emphasis-500: var(--pie-demi-400);
+  --ifm-color-emphasis-600: var(--pie-ink-muted);
+  --ifm-color-emphasis-700: var(--pie-ink-soft);
+  --ifm-color-emphasis-800: var(--pie-ink);
+  --ifm-color-emphasis-900: var(--pie-demi-50);
+
+  /* Universal tinted-surface (dark equivalent of light --pie-tint) */
+  --pie-tint: var(--pie-demi-850);
+
+  /* Code surfaces */
+  --ifm-code-background:                   var(--pie-demi-800);
+  --ifm-pre-background:                    var(--pie-tint);
+  --docusaurus-highlighted-code-line-bg:   rgba(var(--pie-accent-300-rgb), 0.16);
+
+  /* Links */
+  --ifm-link-color:       var(--ifm-color-primary-light);
+  --ifm-link-hover-color: var(--ifm-color-primary-lighter);
+
+  /* Effects */
+  --pie-selection-bg:   rgba(var(--pie-accent-300-rgb), 0.30);
+  --pie-shadow-primary: 0 4px 14px rgba(var(--pie-accent-300-rgb), 0.3);
+  --pie-navbar-bg:      rgba(31, 27, 22, 0.88);  /* matches dark bg @ 0.88 */
+
+  /* Global shadows */
+  --ifm-global-shadow-lw: 0 1px 0 rgba(0, 0, 0, 0.25);
+  --ifm-global-shadow-md: 0 4px 18px rgba(0, 0, 0, 0.35);
+  --ifm-global-shadow-tl: 0 12px 40px rgba(0, 0, 0, 0.5);
+
+  color-scheme: dark;
+}

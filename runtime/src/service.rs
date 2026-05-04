@@ -1,76 +1,268 @@
-//! Service Architecture
+//! Service Framework
 //!
-//! A framework for building asynchronous services that process commands via message-passing.
-//! Each service runs in a daemon task and processes commands sequentially through a channel.
+//! A lightweight actor model implementation for asynchronous message-passing services.
+//! Each service runs in a dedicated async task and processes messages sequentially.
 //!
 //! # Architecture
 //!
-//! Each service consists of:
-//! - A [`Service`] implementation that handles commands in a dedicated async task
-//! - A command enum implementing [`ServiceCommand`] with all operations
-//! - A static [`CommandDispatcher`] that routes commands to the service's task
+//! - **Handle**: Trait for implementing message handlers
+//! - **Service**: Single service address (for singletons)
+//! - **ServiceArray**: Table of service addresses indexed by usize
+//! - **ServiceMap**: Map of service addresses indexed by custom keys
 //!
-//! When [`Service::start()`] is called, it spawns a daemon task and initializes the
-//! dispatcher. Commands can then be dispatched from anywhere using `.dispatch()`.
+//! # Usage
 //!
-//! # Usage Examples
+//! ## Singleton Service
+//! ```ignore
+//! static SVC: LazyLock<Service<MyMessage>> = LazyLock::new(Service::new);
+//! SVC.spawn(|| MyHandler::new());
+//! SVC.send(msg)?;
+//! ```
 //!
-//! See `crate::kvs`, `crate::runtime`, and `crate::server` for complete implementations.
+//! ## Indexed Services
+//! ```ignore
+//! static SVCS: LazyLock<ServiceArray<MyMessage>> = LazyLock::new(ServiceArray::new);
+//! let idx = SVCS.spawn(|| MyHandler::new());
+//! SVCS.send(idx, msg)?;
+//! ```
+//!
+//! ## Keyed Services (for registries)
+//! ```ignore
+//! static REGISTRY: LazyLock<ServiceMap<ClientId, SessionMessage>> = LazyLock::new(ServiceMap::new);
+//! REGISTRY.spawn(client_id, || SessionHandler::new());
+//! REGISTRY.send(client_id, msg)?;
+//! ```
 
+use std::future::Future;
+use std::hash::Hash;
 use std::sync::OnceLock;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use anyhow::{Result, anyhow, bail, ensure};
+use dashmap::DashMap;
+use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel};
 use tokio::task;
 
-/// A service is a component that handles commands dispatched from other components.
-pub trait Service
+/// Trait for message handlers that process messages asynchronously.
+pub(crate) trait ServiceHandler: Send + 'static {
+    /// The message type this handler processes.
+    type Message: Send + 'static;
+    
+    /// Called once when the service starts, before processing any messages.
+    fn started(&mut self) -> impl Future<Output = ()> + Send { async {} }
+    
+    /// Handles a message. Called sequentially for each message.
+    fn handle(&mut self, msg: Self::Message) -> impl Future<Output = ()> + Send;
+    
+    /// Called once when the service stops, after all messages are processed.
+    fn stopped(&mut self) -> impl Future<Output = ()> + Send { async {} }
+}
+
+/// Runs a handler in a spawned task with lifecycle hooks.
+/// Returns a JoinHandle to await shutdown.
+fn run_handler<H: ServiceHandler>(mut handler: H, mut rx: UnboundedReceiver<H::Message>) -> task::JoinHandle<()> {
+    task::spawn(async move {
+        handler.started().await;
+        while let Some(msg) = rx.recv().await {
+            handler.handle(msg).await;
+        }
+        handler.stopped().await;
+    })
+}
+
+// =============================================================================
+// Singleton Service
+// =============================================================================
+
+/// A singleton service address.
+///
+/// Use when you need exactly one service instance (e.g., global services).
+/// Singletons are long-lived and don't support join.
+pub struct Service<Msg: Send + 'static> {
+    tx: OnceLock<UnboundedSender<Msg>>,
+}
+
+impl<Msg: Send + 'static> Service<Msg> {
+    /// Creates a new empty service.
+    pub const fn new() -> Self {
+        Self { tx: OnceLock::new() }
+    }
+    
+    /// Spawns the service using a factory function for custom initialization.
+    pub fn spawn<H, F>(&self, factory: F) -> Result<()>
+    where
+        H: ServiceHandler<Message = Msg>,
+        F: FnOnce() -> H,
+    {
+        let handler = factory();
+        let (tx, rx) = unbounded_channel();
+
+        self.tx
+            .set(tx)
+            .map_err(|_| anyhow!("Service already spawned"))?;
+
+        let _ = run_handler(handler, rx);
+        Ok(())
+    }
+    
+    /// Sends a message to the service.
+    pub fn send(&self, msg: Msg) -> Result<()> {
+        let tx = self.tx.get().ok_or_else(|| anyhow!("Service not spawned"))?;
+        tx.send(msg).map_err(|_| anyhow!("Service channel closed"))
+    }
+    
+    /// Returns true if the service has been spawned.
+    pub fn is_spawned(&self) -> bool {
+        self.tx.get().is_some()
+    }
+}
+
+// =============================================================================
+// Indexed Services
+// =============================================================================
+
+/// A table of service addresses indexed by ID.
+///
+/// Use when you need one service per model/context/etc.
+#[derive(Debug)]
+pub struct ServiceArray<Msg: Send + 'static> {
+    table: boxcar::Vec<UnboundedSender<Msg>>,
+}
+
+impl<Msg: Send + 'static> ServiceArray<Msg> {
+    /// Creates a new empty table.
+    pub const fn new() -> Self {
+        Self {
+            table: boxcar::Vec::new(),
+        }
+    }
+    
+    /// Spawns a new service and returns its index.
+    pub fn spawn<H, F>(&self, factory: F) -> Result<usize>
+    where
+        H: ServiceHandler<Message = Msg>,
+        F: FnOnce() -> H,
+    {
+        let handler = factory();
+        let (tx, rx) = unbounded_channel();
+        let idx = self.table.push(tx);
+
+        let _ = run_handler(handler, rx);
+
+        Ok(idx)
+    }
+    
+    /// Sends a message to a service by index.
+    pub fn send(&self, idx: usize, msg: Msg) -> Result<()> {
+        let tx = self.table.get(idx).ok_or_else(|| anyhow!("Invalid service index: {}", idx))?;
+        tx.send(msg).map_err(|_| anyhow!("Service channel closed"))
+    }
+    
+    /// Returns the number of services.
+    pub fn len(&self) -> usize {
+        self.table.count()
+    }
+    
+    /// Returns true if no services exist.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// =============================================================================
+// Keyed Services (for registries)
+// =============================================================================
+
+/// A map of service addresses indexed by custom keys.
+///
+/// Use for registries where services are dynamically spawned and removed
+/// (e.g., client sessions, instance actors). Supports joining on shutdown.
+pub struct ServiceMap<K, Msg>
 where
-    Self: Sized + Send + 'static,
+    K: Eq + Hash + Send + Sync + 'static,
+    Msg: Send + 'static,
 {
-    /// The command type that this service handles.
-    type Command: ServiceCommand;
-
-    /// Handles a command.
-    fn handle(&mut self, cmd: Self::Command) -> impl Future<Output = ()> + Send;
-
-    /// Starts the service. Internally, it creates a channel and spawns a task that handles
-    /// the commands. The `dispatcher` will be initialized with the sender of the channel that
-    /// carries the dispatched commands.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the service has already been started (i.e., the dispatcher is already initialized).
-    fn start(mut self, dispatcher: &OnceLock<CommandDispatcher<Self::Command>>) {
-        let (tx, mut rx) = unbounded_channel();
-
-        task::spawn(async move {
-            while let Some(cmd) = rx.recv().await {
-                self.handle(cmd).await;
-            }
-        });
-
-        dispatcher
-            .set(CommandDispatcher { tx })
-            .map_err(|_| format!("Service {} already started", std::any::type_name::<Self>()))
-            .unwrap();
-    }
+    map: DashMap<K, UnboundedSender<Msg>>,
+    handles: DashMap<K, task::JoinHandle<()>>,
 }
 
-/// A command that can be dispatched to a service.
-pub trait ServiceCommand: Send + 'static + Sized {
-    /// The dispatcher that this command is sent through, which is essentially a sender
-    /// of a channel.
-    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>>;
-
-    /// Sends this command to the service.
-    fn dispatch(self) {
-        // The dispatcher must be initialized before sending the command through
-        // `Service::start()`. Sending through the internal channel must also
-        // succeed. We unwrap to make sure these conditions are met.
-        Self::DISPATCHER.get().unwrap().tx.send(self).unwrap();
+impl<K, Msg> ServiceMap<K, Msg>
+where
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    Msg: Send + 'static,
+{
+    /// Creates a new empty service map.
+    pub fn new() -> Self {
+        Self {
+            map: DashMap::new(),
+            handles: DashMap::new(),
+        }
     }
-}
 
-/// A dispatcher for commands, which is essentially a sender of a channel.
-pub struct CommandDispatcher<T> {
-    tx: UnboundedSender<T>,
+    /// Spawns a new service with the given key.
+    pub fn spawn<H, F>(&self, key: K, factory: F) -> Result<()>
+    where
+        H: ServiceHandler<Message = Msg>,
+        F: FnOnce() -> H,
+    {
+        let handler = factory();
+        let (tx, rx) = unbounded_channel();
+
+        ensure!(
+            self.map.insert(key.clone(), tx).is_none(),
+            "Service with this key already exists"
+        );
+
+        let handle = run_handler(handler, rx);
+        self.handles.insert(key, handle);
+        Ok(())
+    }
+
+    /// Sends a message to a service by key.
+    /// 
+    /// If the service has stopped (channel closed), it is automatically removed.
+    pub fn send(&self, key: &K, msg: Msg) -> Result<()> {
+        let tx = self.map.get(key).ok_or_else(|| anyhow!("Service not found"))?;
+        if tx.send(msg).is_err() {
+            let closed_tx = tx.clone();
+            drop(tx);
+            // Atomically remove only if the sender hasn't been replaced
+            self.map.remove_if(key, |_, v| v.same_channel(&closed_tx));
+            self.handles.remove(key);
+            bail!("Service channel closed");
+        }
+        Ok(())
+    }
+
+    /// Removes a service by key. Returns true if a service was removed.
+    pub fn remove(&self, key: &K) -> bool {
+        self.handles.remove(key);
+        self.map.remove(key).is_some()
+    }
+
+    /// Removes a service and awaits its shutdown.
+    pub async fn join(&self, key: &K) -> Result<()> {
+        self.map.remove(key);
+        let (_, handle) = self.handles.remove(key)
+            .ok_or_else(|| anyhow!("Service not found"))?;
+        handle.await.map_err(|e| anyhow!("Service task panicked: {}", e))
+    }
+
+    /// Returns true if a service with the given key exists.
+    pub fn contains(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+
+    /// Returns all keys in the map.
+    pub fn keys(&self) -> Vec<K> {
+        self.map.iter().map(|r| r.key().clone()).collect()
+    }
+
+    /// Returns the number of services.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Returns true if no services exist.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 }

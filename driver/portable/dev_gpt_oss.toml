@@ -1,0 +1,18 @@
+# gpt-oss-20b smoke-test config (MXFP4 dequanted to BF16 → ~80 GB on GPU).
+[shmem]
+name = "/pie_shmem"
+num_slots = 8
+req_buf = 4194304
+resp_buf = 1048576
+spin_us = 0
+
+[model]
+hf_path = "/root/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee"
+n_gpu_layers = -1
+n_ctx = 4096
+
+[batching]
+kv_page_size = 32
+max_num_kv_pages = 64
+max_batch_tokens = 2048
+max_batch_size = 16

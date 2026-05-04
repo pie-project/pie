@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 240" width="720" height="240" role="img" aria-labelledby="hpf-title hpf-desc">
+  <title id="hpf-title">Pie engine architecture</title>
+  <desc id="hpf-desc">A client connects to the Pie engine over a WebSocket. Inside the engine, an inferlet running in a WebAssembly sandbox communicates bidirectionally with the model loaded on the GPU. Tokens and events stream back to the client.</desc>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#54473b"/>
+    </marker>
+  </defs>
+
+  <style>
+    text  { font-family: 'IBM Plex Serif', Charter, Georgia, serif; font-size: 13px; }
+    .ink   { fill: #2c2722; }
+    .sub   { fill: #54473b; }
+    .muted { fill: #7a6a55; font-style: italic; }
+  </style>
+
+  <!-- Pie engine: dashed enclosing container -->
+  <rect x="240" y="40" width="456" height="160" rx="10" ry="10"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="ink" x="264" y="64">Pie</text>
+
+  <!-- Client box -->
+  <rect x="24" y="88" width="144" height="90" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="96" y="137" text-anchor="middle">Client</text>
+
+  <!-- Inferlet box -->
+  <rect x="264" y="88" width="180" height="90" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="354" y="128" text-anchor="middle">Inferlet</text>
+  <text class="sub" x="354" y="148" text-anchor="middle">(Wasm)</text>
+
+  <!-- Model box -->
+  <rect x="492" y="88" width="180" height="90" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="582" y="128" text-anchor="middle">Model</text>
+  <text class="sub" x="582" y="148" text-anchor="middle">(on GPU)</text>
+
+  <!-- WebSocket: Client → Pie -->
+  <line x1="172" y1="118" x2="234" y2="118"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-end="url(#ah)"/>
+  <text class="muted" x="203" y="108" text-anchor="middle">WebSocket</text>
+
+  <!-- events: Pie → Client -->
+  <line x1="234" y1="148" x2="172" y2="148"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-end="url(#ah)"/>
+  <text class="muted" x="203" y="164" text-anchor="middle">events</text>
+
+  <!-- Inferlet ↔ Model -->
+  <line x1="452" y1="133" x2="484" y2="133"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-start="url(#ah)" marker-end="url(#ah)"/>
+</svg>

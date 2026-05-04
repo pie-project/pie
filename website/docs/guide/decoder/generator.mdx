@@ -1,0 +1,262 @@
+---
+title: Generator
+description: The multi-step state machine — sampler, collectors, per-step control
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Generator
+
+`Generator` is the multi-step loop on top of `Forward`. You configure it once with a sampler and stop conditions, then either drain it with a collector or step it yourself.
+
+Each step does the same thing: submit one forward pass, sample a token, fold the result into the loop's state, and decide whether to stop. The Generator handles the bookkeeping — advancing constraint matchers, accepting or rejecting speculative drafts, counting tokens against `max_tokens`, re-bidding credits — so you don't write any of that yourself.
+
+Read this after [Generation overview](./overview).
+
+## Construct one
+
+`ctx.generate(sampler)` returns a `Generator<'ctx>` (Rust) or a Generator-shaped object (Python / JS).
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::sample::Sampler;
+
+let g = ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+    .max_tokens(256);
+```
+
+The Rust API is a builder. Methods take `self` and return `Self`, so calls chain. A `collect_*` call consumes the Generator; `next()` borrows it, so you can call `next()` repeatedly to step through.
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Sampler
+
+g = ctx.generate(
+    Sampler.top_p(0.6, 0.95),
+    max_tokens=256,
+)
+```
+
+The Python API takes options as keyword arguments to `generate`. Every Rust builder method has an equivalent kwarg.
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Sampler } from 'inferlet';
+
+const g = ctx.generate(
+    Sampler.topP(0.6, 0.95),
+    { maxTokens: 256 },
+);
+```
+
+The JS API takes an options object. Every Rust builder method has an equivalent option key.
+
+</TabItem>
+</Tabs>
+
+## Builder surface
+
+Every option below has the same shape across SDKs: a Rust builder method, a Python keyword argument, a JS option key. The behavior is the same.
+
+| Rust builder | Python kwarg | JS option | Effect |
+|---|---|---|---|
+| `.max_tokens(n)` | `max_tokens=n` | `maxTokens: n` | Stop after `n` tokens have been generated. |
+| `.stop(&[id, ...])` | `stop=[id, ...]` | `stop: [id, ...]` | Stop when the model emits any of these token IDs. |
+| `.constrain(c)` | `constrain=c` | `constrain: c` | Attach a `Constrain` / `Constraint` instance. |
+| `.constrain_with(schema)` | `constrain=schema` | `constrain: schema` | Attach a `Schema` (the SDK compiles it into a constraint). |
+| `.speculator(s)` | `speculator=s` | `speculator: s` | Use a custom speculator for drafting. |
+| `.system_speculation()` | `system_speculation=True` | `systemSpeculation: true` | Use the runtime's built-in n-gram drafter. |
+| `.adapter(&a)` | `adapter=a` | `adapter: a` | Apply a LoRA adapter on every step. |
+| `.zo_seed(seed)` | `zo_seed=seed` | `zoSeed: seed` | Set an Evolution Strategies seed for every step. |
+| `.horizon(n)` | `horizon=n` | `horizon: n` | Tell the credit bidder you expect about `n` more steps. |
+| `.probe_each_step(idx, probe)` | `g.probe_each_step(idx, probe)` | `g.probeEachStep(idx, probe)` | Attach a probe at `idx` on every step. Returns a typed handle. Builder method on the Generator (no constructor-option equivalent). |
+
+Two compatibility notes:
+
+- `speculator` and `system_speculation` are mutually exclusive. Setting both is a runtime error. See [Speculative decoding](../forward/speculation).
+- `constrain` and `constrain_with` compose. Every constraint contributes a logit mask; the masks AND together before each forward pass. See [Constrained generation](../forward/constrained).
+
+## Drain with a collector
+
+A collector runs the loop to completion and returns the result in a particular shape. Three are built in. None of them is chat-specific.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let tokens: Vec<u32> = g.collect_tokens().await?;             // raw IDs
+let text:   String   = g.collect_text().await?;               // string
+let plan:   Plan     = g.collect_json::<Plan>().await?;       // typed JSON
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+tokens = await g.collect_tokens()                              # list[int]
+text   = await g.collect_text()                                # str
+data   = await g.collect_json(schema=PLAN_SCHEMA)              # parsed JSON
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const tokens = await g.collectTokens();                        // Uint32Array
+const text   = await g.collectText();                          // string
+const plan   = await g.collectJson<Plan>({ schema, parse });   // typed JSON
+```
+
+</TabItem>
+</Tabs>
+
+| Collector | Returns | What it does |
+|---|---|---|
+| `collect_tokens` | All accepted token IDs. | Loops until done; accumulates `out.tokens` from each step. |
+| `collect_text` | The assembled string. | Loops until done; runs a `chat::Decoder` internally to strip control tokens and assemble visible text. The chat parser is an implementation detail; the collector itself is not chat-specific. |
+| `collect_json` | Parsed JSON, optionally typed. | Attaches a JSON-schema constraint (derived from `T` in Rust, supplied as a string in Python / JS), loops until done, parses the result. |
+
+`collect_text` is the right call when you want a string and don't need streaming. For streaming deltas, step the Generator yourself and feed tokens through a parser. See [Chat parser](./chat).
+
+## Step manually
+
+For watermarking, custom sampling, mid-generation tool calls, or anything that needs to see (or replace) what the Generator does each step, drive it explicitly.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::sample::{Sampler, Logits};
+
+let mut g = ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+    .max_tokens(256);
+
+while let Some(mut step) = g.next()? {
+    // Optional: drop the auto-sampler and pick the token yourself.
+    step.clear_sampler();
+    let h = step.probe(0, Logits);
+
+    let out = step.execute().await?;
+    let logits_bytes = out.logits(h).unwrap();
+    let chosen: u32 = pick_with_watermark(logits_bytes);
+
+    // Register the chosen token so the Generator advances state.
+    g.accept(&[chosen]);
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Sampler, Logits
+
+g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=256)
+
+async for step in g:
+    step.clear_sampler()
+    h = step.probe(0, Logits())
+    out = await step.execute()
+    chosen = pick_with_watermark(out.logits(h))
+    g.accept([chosen])
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Sampler, Logits } from 'inferlet';
+
+const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
+
+for await (const step of g) {
+    step.clearSampler();
+    const h = step.probe(0, Logits());
+    const out = await step.execute();
+    const chosen = pickWithWatermark(out.logits(h));
+    g.accept(new Uint32Array([chosen]));
+}
+```
+
+</TabItem>
+</Tabs>
+
+Two pieces matter:
+
+- **`step.clear_sampler()`** drops the Generator's auto-attached sampler. The forward pass still runs; what changes is that no token is sampled automatically. You read the distribution off a probe (`Logits` or `Distribution`) and pick a token yourself.
+- **`g.accept(&[token])`** registers a manually-sampled token with the Generator. Without it, the loop has no way to know what was chosen — `max_tokens`, `stop`, and constraint state never advance. Pass a slice with one token in the common case. (Speculative decoding accepts a run of tokens at once; same call shape.)
+
+`step.probe(idx, probe)` adds a one-off probe for the current step. The handle works exactly like a probe attached to a `Forward` builder — see [Samplers and probabilities](../forward/samplers).
+
+## Stop conditions
+
+A Generator stops on the first of these:
+
+- `max_tokens` reached.
+- The model emits a token in the `stop` set.
+- The model emits an end-of-turn marker the runtime recognizes (the engine's default stop list — your `stop` adds to this list, it does not replace it).
+- An attached constraint reaches a terminal state.
+
+Once stopped, `g.next()` returns `Ok(None)` (Rust) or the async iterator ends (Python / JS). Collectors return at that point.
+
+## Stop on a custom token
+
+Pass a list of token IDs to `stop`. The chat-template stop set (EOS, role-end markers) is added on top automatically; you don't need to repeat it.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::chat;
+
+// Stop on EOS / role-end markers AND on whatever your custom marker is.
+let mut stops = chat::stop_tokens(&model);
+stops.extend(my_extra_stop_ids);
+
+let g = ctx.generate(sampler).max_tokens(512).stop(&stops);
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import chat
+
+stops = chat.stop_tokens(model) + my_extra_stop_ids
+g = ctx.generate(sampler, max_tokens=512, stop=stops)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { chat } from 'inferlet';
+
+const stops = [...chat.stopTokens(model), ...myExtraStopIds];
+const g = ctx.generate(sampler, { maxTokens: 512, stop: stops });
+```
+
+</TabItem>
+</Tabs>
+
+## Inspect
+
+`g.is_done()` (Rust) / `g.is_done` (Python) / `g.isDone()` (JavaScript) reports whether the Generator has terminated. Useful when you split the loop across functions.
+
+`g.tokens_generated()` (Rust) / `g.tokens_generated` (Python) / `g.tokensGenerated` (JavaScript) is the running count of tokens accepted so far. Useful for progress reporting or for budget checks inside a custom loop.
+
+## Next
+
+- [Chat parser](./chat). Stream visible chat text as deltas.
+- [Reasoning parser](./reasoning). Stream thinking-block events.
+- [Tool-call parser](./tool-calling). Detect tool calls in the stream.
+- [Constrained generation](../forward/constrained). The `Schema` and `Constrain` API the Generator's `constrain` knob takes.
+- [Speculative decoding](../forward/speculation). The Speculator API the Generator's `speculator` knob takes.

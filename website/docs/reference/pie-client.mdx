@@ -1,0 +1,156 @@
+---
+title: pie-client
+description: The pie-client CLI — submit, install, list, attach, abort, ping, config
+---
+
+# pie-client
+
+`pie-client` is the command-line client for talking to a running Pie engine over WebSocket. Use it to submit inferlets, install local builds, attach to processes, and inspect what's running. It ships with the `pie-client` Python package.
+
+```bash
+pip install pie-client
+pie-client --help
+```
+
+## Configuration file
+
+Most commands accept the same connection / auth options. To avoid repeating them, write them once into a config file at `~/.pie-client/config.toml`:
+
+```toml
+host = "127.0.0.1"
+port = 8080
+username = "alice"
+private_key_path = "~/.ssh/id_ed25519"
+enable_auth = true
+```
+
+`pie-client config init` walks an interactive prompt to write this file. `pie-client config show` prints the current config. `pie-client config update` patches individual fields by passing the matching `--host` / `--port` / `--username` / `--private-key-path` / `--enable-auth` option.
+
+Every command also accepts `--host`, `--port`, `--username`, `--private-key-path`, and `--config <PATH>` to override or supplement the file.
+
+## Commands
+
+```
+pie-client [COMMAND]
+  submit      Submit an inferlet to a running engine
+  install     Upload a local build to the engine
+  list        List running inferlet instances
+  attach      Attach to a running instance and stream output
+  abort       Terminate a running instance
+  ping        Check whether the engine is alive
+  config      Manage the client config file
+```
+
+## pie-client submit
+
+Submit an inferlet to the engine, stream its events, and exit when it returns.
+
+```bash
+# By registry name
+pie-client submit text-completion@0.1.0 --prompt "hello"
+
+# By local build
+pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml --prompt "hello"
+```
+
+| Argument / flag | Description |
+|---|---|
+| `<inferlet>` (positional) | `name@version` from the registry. Mutually exclusive with `--path`. |
+| `--path / -p <FILE>` | Path to a local `.wasm` build. Requires `--manifest`. |
+| `--manifest / -m <FILE>` | Path to the `Pie.toml` manifest for the local build. |
+| `--no-output / -d` | Don't capture the inferlet's stdout/stderr. |
+| `--link / -l <FILE>` | Path to a `.wasm` library file to link. May be repeated. |
+| `<arguments...>` (trailing positional) | Extra arguments forwarded to the inferlet's input dict. |
+| `--config <FILE>` | Override config file path. |
+| `--host`, `--port` | Override engine host / port. |
+| `--username`, `--private-key-path` | Override auth credentials. |
+
+## pie-client install
+
+Upload a local `.wasm` and its manifest to the engine. The build stays loaded for the engine's lifetime; subsequent `submit` calls can reference it by `name@version`.
+
+```bash
+pie-client install --path ./my_inferlet.wasm --manifest ./Pie.toml
+```
+
+| Flag | Description |
+|---|---|
+| `--path / -p <FILE>` (required) | The `.wasm` file. |
+| `--manifest / -m <FILE>` (required) | The `Pie.toml` manifest. |
+| `--force / -f` | Overwrite an existing program with the same `name@version`. |
+| `--config`, `--host`, `--port`, `--username`, `--private-key-path` | Connection / auth overrides. |
+
+## pie-client list
+
+List running inferlet instances on the engine.
+
+```bash
+pie-client list
+pie-client list --long      # show 8-character UUID prefixes
+pie-client list --full      # show full UUIDs
+```
+
+| Flag | Description |
+|---|---|
+| `--full` | Show full UUIDs (otherwise the table abbreviates). |
+| `--long` | Show 8-character UUID prefixes. |
+| `--config`, `--host`, `--port`, `--username`, `--private-key-path` | Connection / auth overrides. |
+
+## pie-client attach
+
+Attach to a running instance and stream its output until it returns. The instance keeps running across attach / detach cycles.
+
+```bash
+pie-client attach <instance-id-prefix>
+```
+
+The argument can be a UUID prefix (any unique substring works) or a full UUID.
+
+| Flag | Description |
+|---|---|
+| `<instance-id-prefix>` (required) | Prefix or full UUID of the target instance. |
+| `--config`, `--host`, `--port`, `--username`, `--private-key-path` | Connection / auth overrides. |
+
+## pie-client abort
+
+Request termination of a running instance.
+
+```bash
+pie-client abort <instance-id-prefix>
+```
+
+| Flag | Description |
+|---|---|
+| `<instance-id-prefix>` (required) | Prefix or full UUID of the target instance. |
+| `--config`, `--host`, `--port`, `--username`, `--private-key-path` | Connection / auth overrides. |
+
+## pie-client ping
+
+Health check. Round-trips a ping through the engine and prints the result.
+
+```bash
+pie-client ping
+```
+
+## pie-client config
+
+Manage the per-user config file.
+
+| Subcommand | Description |
+|---|---|
+| `pie-client config init [--no-enable-auth] [--path FILE]` | Writes `~/.pie-client/config.toml` (or `--path FILE`). Picks up an existing `~/.ssh/id_ed25519` / `id_rsa` / `id_ecdsa` key if found; otherwise points at the default `~/.ssh/id_ed25519` path. |
+| `pie-client config show [--path FILE]` | Pretty-print the current config. |
+| `pie-client config update [--host HOST] [--port PORT] [--username NAME] [--private-key-path PATH] [--enable-auth BOOL] [--path FILE]` | Patch one or more fields. Pass any subset; only provided fields are updated. |
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Command succeeded. |
+| `1` | Command failed; stderr contains the reason. |
+
+## Related
+
+- [Python client SDK](./client-python): the library `pie-client` is built on. Use this when you need programmatic access from your own Python application.
+- [pie](./pie): the engine CLI. The client connects to a `pie serve` instance.
+- [Inferlet manifest](./manifest): the `Pie.toml` file `--manifest` points at.

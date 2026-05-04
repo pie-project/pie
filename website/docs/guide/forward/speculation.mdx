@@ -1,0 +1,183 @@
+---
+title: Speculative decoding
+description: System speculation, the Speculator trait, and grammar-aware drafting
+sidebar_position: 6
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Speculative decoding
+
+Speculative decoding accelerates autoregressive generation by drafting multiple tokens cheaply and verifying them in a single forward pass. Pie supports two paths: a runtime-driven n-gram drafter (system speculation) and an arbitrary `Speculator` you write yourself. Both are off by default; you opt in per `Generator`. Read this after [Constrained generation](./constrained).
+
+:::note[Running on the dummy driver?]
+The dummy driver samples a fresh random token for every slot, including the verifier's, so every draft is rejected and the loop runs in 1-token-per-step fallback — no speedup is observable.
+:::
+
+## System speculation
+
+Off by default. Opt in with `system_speculation()` (Rust) or the `system_speculation` / `systemSpeculation` flag on `generate(...)`. The runtime then drives drafts using its built-in n-gram drafter. Each `g.next()?` step (Rust) or async-for iteration (Python / JS) may return multiple accepted tokens.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let text = ctx
+    .generate(sampler)
+    .system_speculation()
+    .max_tokens(256)
+    .collect_text()
+    .await?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+text = await ctx.generate(
+    sampler,
+    max_tokens=256,
+    system_speculation=True,
+).collect_text()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const text = await ctx.generate(
+    sampler,
+    { maxTokens: 256, systemSpeculation: true },
+).collectText();
+```
+
+</TabItem>
+</Tabs>
+
+The system speculator is a runtime-managed n-gram drafter. It looks at the recent context, finds repeated patterns, and proposes the next few tokens from those patterns. Acceptance is high on workloads with repeated structure (code, tables, structured output) and lower on free-form prose.
+
+To run the non-speculative path (the default), simply omit the flag.
+
+`system_speculation` and a custom `speculator` (below) are mutually exclusive — passing both is an error.
+
+## Custom speculators (Rust)
+
+Implement the `Speculator` trait for custom draft strategies. The trait has four methods. `rollback` and `reset` have default implementations, so a minimal speculator only needs `draft` and `accept`.
+
+```rust
+pub trait Speculator: Send {
+    /// Produce draft tokens and their absolute positions for the next
+    /// forward pass. Empty vec means "no speculation this step."
+    fn draft(&mut self) -> (Vec<u32>, Vec<u32>);
+
+    /// Called with the verifier's accepted token sequence. The first
+    /// accepted token corresponds to the anchor's own next-token
+    /// prediction; the rest (if any) are matched drafts.
+    fn accept(&mut self, accepted: &[u32]);
+
+    /// Roll back the last `n` drafted tokens on partial rejection.
+    fn rollback(&mut self, n: u32) { let _ = n; }
+
+    /// Reset to initial state.
+    fn reset(&mut self) {}
+}
+```
+
+The custom Speculator API is Rust-only.
+
+### Example: n-gram drafter
+
+```rust
+use inferlet::Speculator;
+
+struct NgramSpeculator { history: Vec<u32>, n: usize }
+
+impl Speculator for NgramSpeculator {
+    fn draft(&mut self) -> (Vec<u32>, Vec<u32>) {
+        if self.history.len() < self.n {
+            return (vec![], vec![]);
+        }
+        let pattern = &self.history[self.history.len() - (self.n - 1)..];
+        for window in self.history.windows(self.n) {
+            if &window[..self.n - 1] == pattern {
+                return (
+                    vec![window[self.n - 1]],
+                    vec![self.history.len() as u32],
+                );
+            }
+        }
+        (vec![], vec![])
+    }
+
+    fn accept(&mut self, accepted: &[u32]) {
+        self.history.extend_from_slice(accepted);
+    }
+    fn reset(&mut self) {
+        self.history.clear();
+    }
+    fn rollback(&mut self, n: u32) {
+        let new_len = self.history.len().saturating_sub(n as usize);
+        self.history.truncate(new_len);
+    }
+}
+```
+
+Plug it in:
+
+```rust
+let speculator = NgramSpeculator { history: vec![], n: 4 };
+
+let text = ctx
+    .generate(sampler)
+    .speculator(speculator)
+    .max_tokens(256)
+    .collect_text()
+    .await?;
+```
+
+The [`cacheback-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/cacheback-decoding) and [`jacobi-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/jacobi-decoding) inferlets show two more drafting strategies in full.
+
+## How verification works
+
+Each step runs the model on `prefix + draft_tokens`. The forward pass produces a distribution at every drafted position. Verification compares each draft token against the distribution:
+
+- For greedy (`Argmax`), the draft is accepted if it matches the argmax.
+- For stochastic samplers, an accept/reject test against the draft probability decides per token.
+
+Accepted tokens commit to the context. The first rejected token is replaced by a freshly sampled token, and any further drafted tokens are discarded. The `Speculator::rollback` method is called with the count of rejected tokens.
+
+The result: when the drafter is right, you get N tokens for the cost of one forward pass. When it is wrong, you pay one forward pass and roll back.
+
+## Speculation with constraints
+
+Speculative decoding works alongside grammar constraints. When a draft is partially rejected, the constraint matcher rolls back to the accepted prefix and continues from there.
+
+```rust
+use inferlet::JsonSchema;
+
+let text = ctx
+    .generate(sampler)
+    .system_speculation()
+    .constrain_with(JsonSchema(schema))?
+    .max_tokens(256)
+    .collect_text()
+    .await?;
+```
+
+Acceptance rates drop in heavily-constrained generation because the masked distribution is narrow and the drafter sees fewer matches. The system speculator usually still nets out positive; with custom drafters the trade-off is workload-specific.
+
+## When to write a custom speculator
+
+The system n-gram drafter is right most of the time. Reach for a custom one when:
+
+- **You have a small draft model.** Use it as the drafter for a larger target.
+- **The output has a known structure.** A grammar-aware drafter that follows the same grammar accepts at much higher rates than n-gram on long structured outputs.
+- **You are doing parallel decoding.** Jacobi-style decoders fall under the speculator interface even though no "draft" is involved in the usual sense.
+- **You are doing research on draft strategies.** The trait is the right place to implement new ideas without modifying the engine.
+
+## Next
+
+- [Adapters](./adapters): drafter adapters versus full draft models.
+- [Constrained generation](./constrained): grammar interaction with speculation.
+- [The forward pass](./overview): the primitive that verification runs against.

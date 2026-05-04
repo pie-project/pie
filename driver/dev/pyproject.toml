@@ -1,0 +1,131 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pie-driver-dev"
+version = "0.3.0"
+description = "Pie reference Python driver — flashinfer-based PyTorch backend, the readable implementation drivers iterate against before being ported to C++."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = "Apache-2.0"
+authors = [{ name = "In Gim", email = "in.gim@icloud.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# `pie-rpc` ships the `RpcServer` IPC primitive (cold-path channel back
+# to the Rust runtime). `DriverCapabilities` lives in
+# `pie_driver_dev.capabilities` (Phase 8 — the legacy `pie.capabilities`
+# / `pie.drivers` registry is gone, replaced by `python -m pie_driver_<type>`
+# discovery in the standalone).
+dependencies = [
+    "pie-rpc",
+    "einops>=0.8.1",
+    "huggingface_hub>=0.34.0",
+    "msgpack>=0.5",
+    # `msgspec` is the worker batch wire format (pie_driver_dev.message); the
+    # leader loop lazy-imports it on the first batch, so a missing install
+    # only trips after model load.
+    "msgspec>=0.18",
+    # vllm 0.16.0 pins numba==0.61.2 and the dev driver only uses `@njit`
+    # in batching / attention-metadata helpers (works on 0.61.x). Keeping
+    # the floor at 0.61 lets pie-driver-{vllm,sglang} co-resolve through
+    # `uv pip install` without needing the override-dependencies workaround.
+    "numba>=0.61",
+    # `psutil` is imported by `pie_driver_dev.utils` (RAM probe via
+    # `get_available_memory`) at module top — engine.py picks it up on
+    # boot, so a missing install crashes every worker before ready.
+    "psutil>=5.9",
+    "safetensors>=0.6.2",
+    "tqdm>=4.67",
+    "ztensor>=0.1.4",
+    # OpenTelemetry — `pie_driver_dev.telemetry` imports `opentelemetry.trace`
+    # at module top, which engine.py pulls in unconditionally. The runtime
+    # use is opt-in via `[telemetry] enabled = true`, but the imports run
+    # either way.
+    "opentelemetry-api>=1.30",
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp>=1.30",
+]
+
+[project.optional-dependencies]
+
+cu126 = [
+    "torch>=2.7.1",
+    "torchao>=0.14.1",
+    "flashinfer-python>=0.6.1",
+    "flashinfer-cubin>=0.6.1",
+]
+
+cu128 = [
+    "torch>=2.7.1",
+    "torchao>=0.14.1",
+    # All three flashinfer packages must agree on the patch version — the
+    # Python wrapper, the cubin loader, and the precompiled C ops have
+    # ABI-coupled signatures.
+    "flashinfer-python==0.6.8.post1",
+    "flashinfer-cubin==0.6.8.post1",
+    "flashinfer-jit-cache==0.6.8.post1",
+]
+
+metal = [
+    "torch>=2.7.1",
+    "torchao>=0.14.1",
+    "pyobjc-core>=10.0,<11.0",
+    "pyobjc-framework-Metal>=10.0,<11.0",
+    "pyobjc-framework-MetalKit>=10.0,<11.0",
+    "pyobjc-framework-Cocoa>=10.0,<11.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu128"
+url = "https://flashinfer.ai/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+pie-rpc = { path = "../../sdk/python-rpc", editable = true }
+torch = [
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu128", extra = "cu128" },
+]
+torchao = [
+    { index = "pytorch-cu128", extra = "cu128" },
+]
+flashinfer-jit-cache = [
+    { index = "flashinfer-cu128", extra = "cu128" },
+]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cu126" },
+        { extra = "cu128" },
+        { extra = "metal" },
+    ],
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+# `pie_kernels` (was `pie/src/pie_kernels`) ships from this wheel after
+# Phase 8 — the dev driver is its only consumer, and shipping it from
+# pie-driver-dev keeps the import path (`from pie_kernels import …`)
+# unchanged inside the dev driver's source.
+packages = [
+    "pie_driver_dev",
+    "pie_driver_dev.model",
+    "pie_kernels",
+    "pie_kernels.cuda",
+    "pie_kernels.metal",
+]

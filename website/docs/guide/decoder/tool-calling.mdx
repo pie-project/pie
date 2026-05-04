@@ -1,0 +1,507 @@
+---
+title: Tool-call parser
+description: Hand-rolled ReAct, native tool-call templates, and parallel tool calls
+sidebar_position: 5
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Tool-call parser
+
+Pie has two paths for tool use:
+
+1. **Hand-rolled agent loops.** Prompt the model to emit a structured action, parse the response in code, run the tool, feed the observation back. Works with any model.
+2. **Native tool-call templates.** Some models build a tool-call format into their chat template (Llama 3.1+, Qwen 2.5+ instruct, others). The `tools` module wraps the equip / answer / decode flow, and `tools::Decoder` is the stream parser that detects calls in the model's output.
+
+Read this after [Chat parser](./chat). For external tool servers, see [MCP](../io/mcp).
+
+:::note[Running on the dummy driver?]
+The dummy driver returns uniform random tokens, so native tool-call marker sequences (Llama 3.1 / Qwen 2.5 format) almost never appear in the stream — `tools::Decoder` will run to `max_tokens` without firing a `Call` event, and the hand-rolled ReAct parser will fail to match its action format. The "forcing valid tool calls with grammar" pattern further down *does* produce parseable tool-call JSON on the dummy because constraint masks are honored; only the field values are random.
+:::
+
+## Hand-rolled ReAct
+
+Prompt-engineer the action format and parse the response yourself.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::{Context, sample::Sampler};
+
+const SYSTEM_PROMPT: &str = "\
+You have these tools:
+- Calculator[expr]: evaluate a math expression
+- FinalAnswer[answer]: report the final answer
+
+Respond in this format:
+Thought: <your reasoning>
+Action: ToolName[input]";
+
+ctx.system(SYSTEM_PROMPT)
+   .user("What is 15 * 37?")
+   .cue();
+
+for _ in 0..max_iterations {
+    let response = ctx
+        .generate(Sampler::Argmax)
+        .max_tokens(512)
+        .collect_text()
+        .await?;
+
+    match parse_action(&response) {
+        Action::Tool(name, input) => {
+            let result = run_tool(&name, &input);
+            ctx.user(&format!("Observation: {result}")).cue();
+        }
+        Action::FinalAnswer(answer) => return Ok(answer),
+        Action::None => break,
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Sampler
+
+SYSTEM_PROMPT = """\
+You have these tools:
+- Calculator[expr]: evaluate a math expression
+- FinalAnswer[answer]: report the final answer
+
+Respond in this format:
+Thought: <your reasoning>
+Action: ToolName[input]"""
+
+ctx.system(SYSTEM_PROMPT)
+ctx.user("What is 15 * 37?")
+ctx.cue()
+
+for _ in range(max_iterations):
+    response = await ctx.generate(
+        Sampler.argmax(), max_tokens=512,
+    ).collect_text()
+
+    action = parse_action(response)
+    if action.kind == "tool":
+        result = run_tool(action.name, action.input)
+        ctx.user(f"Observation: {result}").cue()
+    elif action.kind == "final":
+        return action.answer
+    else:
+        break
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Sampler } from 'inferlet';
+
+const SYSTEM_PROMPT = `\
+You have these tools:
+- Calculator[expr]: evaluate a math expression
+- FinalAnswer[answer]: report the final answer
+
+Respond in this format:
+Thought: <your reasoning>
+Action: ToolName[input]`;
+
+ctx.system(SYSTEM_PROMPT)
+   .user('What is 15 * 37?')
+   .cue();
+
+for (let i = 0; i < maxIterations; i++) {
+    const response = await ctx
+        .generate(Sampler.argmax(), { maxTokens: 512 })
+        .collectText();
+
+    const action = parseAction(response);
+    if (action.kind === 'tool') {
+        const result = runTool(action.name, action.input);
+        ctx.user(`Observation: ${result}`).cue();
+    } else if (action.kind === 'final') {
+        return action.answer;
+    } else {
+        break;
+    }
+}
+```
+
+</TabItem>
+</Tabs>
+
+The [`agent-react`](https://github.com/pie-project/pie/tree/main/inferlets/agent-react) and [`agent-codeact`](https://github.com/pie-project/pie/tree/main/inferlets/agent-codeact) inferlets are full implementations.
+
+## Native tool-call template
+
+For models with a built-in tool-call format, the `tools` module wraps the equip / answer / decode flow. You hand it a JSON schema of available tools; the model's chat template emits structured calls; the decoder parses them.
+
+### Equip and answer
+
+Get the prefix tokens from `tools::equip_prefix`, append them to the context, and start generating. When the model emits a call, run it and feed the result back with `tools::answer_prefix`.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::tools;
+
+let calculator_schema = serde_json::json!({
+    "name": "calculator",
+    "description": "Evaluate a mathematical expression",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "expression": { "type": "string" }
+        },
+        "required": ["expression"]
+    }
+}).to_string();
+
+let prefix = tools::equip_prefix(&model, &[calculator_schema])?;
+ctx.append(&prefix);
+
+ctx.user("What is 15 * 37?").cue();
+
+// After running the tool:
+let answer = tools::answer_prefix(&model, "calculator", &result_json);
+ctx.append(&answer);
+ctx.cue();
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import tools
+import json
+
+calculator_schema = {
+    "name": "calculator",
+    "description": "Evaluate a mathematical expression",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "expression": {"type": "string"},
+        },
+        "required": ["expression"],
+    },
+}
+
+prefix = tools.equip_prefix(model, [json.dumps(calculator_schema)])
+ctx.append(prefix)
+
+ctx.user("What is 15 * 37?").cue()
+
+# After running the tool:
+answer = tools.answer_prefix(model, "calculator", result_json)
+ctx.append(answer)
+ctx.cue()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { tools } from 'inferlet';
+
+const calculatorSchema = {
+    name: 'calculator',
+    description: 'Evaluate a mathematical expression',
+    parameters: {
+        type: 'object',
+        properties: { expression: { type: 'string' } },
+        required: ['expression'],
+    },
+};
+
+const prefix = tools.equipPrefix(model, [JSON.stringify(calculatorSchema)]);
+ctx.append(prefix);
+
+ctx.user('What is 15 * 37?').cue();
+
+// After running the tool:
+const answer = tools.answerPrefix(model, 'calculator', JSON.stringify(result));
+ctx.append(answer);
+ctx.cue();
+```
+
+</TabItem>
+</Tabs>
+
+### Streaming detection
+
+Feed each step's tokens to a `tools::Decoder`. It emits `Start` while a call is being assembled and `Call(name, args_json)` when the arguments close.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::{tools, sample::Sampler};
+
+let mut g = ctx.generate(Sampler::Argmax).max_tokens(512);
+let mut dec = tools::Decoder::new(&model);
+
+while let Some(step) = g.next()? {
+    let out = step.execute().await?;
+    match dec.feed(&out.tokens)? {
+        tools::Event::Call(name, args_json) => {
+            let result = run_tool(&name, &args_json);
+            let answer = tools::answer_prefix(&model, &name, &result);
+            ctx.append(&answer);
+            ctx.cue();
+            dec.reset();
+        }
+        tools::Event::Start => {} // call still being assembled
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Sampler, tools
+
+g = ctx.generate(Sampler.argmax(), max_tokens=512)
+dec = tools.Decoder(model)
+
+async for step in g:
+    out = await step.execute()
+    match dec.feed(out.tokens):
+        case tools.Event.Call(name=n, args=a):
+            result = run_tool(n, a)
+            answer = tools.answer_prefix(model, n, result)
+            ctx.append(answer)
+            ctx.cue()
+            dec.reset()
+        case tools.Event.Start():
+            pass
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Sampler, tools } from 'inferlet';
+
+const g = ctx.generate(Sampler.argmax(), { maxTokens: 512 });
+const dec = new tools.Decoder(model);
+
+for await (const step of g) {
+    const out = await step.execute();
+    const ev = dec.feed(out.tokens);
+    if (ev.type === 'call') {
+        const result = runTool(ev.name, ev.args);
+        const answer = tools.answerPrefix(model, ev.name, JSON.stringify(result));
+        ctx.append(answer);
+        ctx.cue();
+        dec.reset();
+    }
+    // ev.type === 'start': call still being assembled
+}
+```
+
+</TabItem>
+</Tabs>
+
+`dec.reset()` after each `Call` so the decoder is ready for the next call in the same context.
+
+## Parallel tool calls
+
+When a turn produces multiple tool calls, run them concurrently with the language's standard async primitive instead of one at a time. The pattern: collect all `Call` events from one assistant turn, dispatch them as a fan-out, await all results, append all answers, resume generation.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use futures::future;
+
+let mut pending: Vec<(String, String)> = Vec::new();
+
+while let Some(step) = g.next()? {
+    let out = step.execute().await?;
+    match dec.feed(&out.tokens)? {
+        tools::Event::Call(name, args) => pending.push((name, args)),
+        tools::Event::Start => {}
+    }
+
+    if turn_just_ended(&out) {
+        let results: Vec<String> = future::join_all(
+            pending.iter().map(|(n, a)| run_tool_async(n, a))
+        ).await;
+
+        for ((name, _), result) in pending.iter().zip(results.iter()) {
+            let answer = tools::answer_prefix(&model, name, result);
+            ctx.append(&answer);
+        }
+        ctx.cue();
+        pending.clear();
+        dec.reset();
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+import asyncio
+
+pending: list[tuple[str, str]] = []
+
+async for step in g:
+    out = await step.execute()
+    match dec.feed(out.tokens):
+        case tools.Event.Call(name=n, args=a):
+            pending.append((n, a))
+        case tools.Event.Start():
+            pass
+
+    if turn_just_ended(out):
+        results = await asyncio.gather(
+            *(run_tool_async(n, a) for n, a in pending)
+        )
+        for (n, _), r in zip(pending, results):
+            ctx.append(tools.answer_prefix(model, n, r))
+        ctx.cue()
+        pending.clear()
+        dec.reset()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const pending: { name: string; args: string }[] = [];
+
+for await (const step of g) {
+    const out = await step.execute();
+    const ev = dec.feed(out.tokens);
+    if (ev.type === 'call') pending.push({ name: ev.name, args: ev.args });
+
+    if (turnJustEnded(out)) {
+        const results = await Promise.all(
+            pending.map(p => runToolAsync(p.name, p.args)),
+        );
+        pending.forEach((p, i) => {
+            ctx.append(tools.answerPrefix(model, p.name, JSON.stringify(results[i])));
+        });
+        ctx.cue();
+        pending.length = 0;
+        dec.reset();
+    }
+}
+```
+
+</TabItem>
+</Tabs>
+
+`turn_just_ended` is workload-specific: in the simplest form, the chat parser's `Done` event for the same step indicates the turn closed. With native tool-call templates, the template's end-of-turn marker is the signal.
+
+## One-shot parsing (Rust only)
+
+If you don't need streaming, the Rust SDK exposes `tools::parse_call` to extract a single completed call from a finished string. The Python and JavaScript SDKs do not ship a one-shot helper — feed the full token output through `tools.Decoder` and read the first `Call` event.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let response = ctx.generate(Sampler::Argmax).max_tokens(512).collect_text().await?;
+if let Some((name, args_json)) = tools::parse_call(&model, &response) {
+    let result = run_tool(&name, &args_json);
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+tokens = await ctx.generate(Sampler.argmax(), max_tokens=512).collect_tokens()
+dec = tools.Decoder(model)
+match dec.feed(tokens):
+    case tools.Event.Call(name=n, args=a):
+        result = run_tool(n, a)
+    case _:
+        pass
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const tokens = await ctx.generate(Sampler.argmax(), { maxTokens: 512 }).collectTokens();
+const dec = new tools.Decoder(model);
+const ev = dec.feed(tokens);
+if (ev.type === 'call') {
+    const result = runTool(ev.name, ev.args);
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Forcing valid tool calls
+
+To force the model to produce a syntactically valid call, attach the model's native grammar to the generator. `tools::native_grammar` returns a compiled grammar over the tool-call format; pass it through a [schema constraint](../forward/constrained).
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::{tools, sample::Sampler};
+
+if let Some(grammar) = tools::native_grammar(&model, &[calculator_schema]) {
+    let response = ctx
+        .generate(Sampler::Argmax)
+        .max_tokens(512)
+        .constrain_with(&grammar)?        // &Grammar implements Schema
+        .collect_text()
+        .await?;
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Sampler, GrammarConstraint, tools
+
+matcher = tools.native_matcher(model, [json.dumps(calculator_schema)])
+if matcher:
+    response = await ctx.generate(
+        Sampler.argmax(),
+        max_tokens=512,
+        constrain=GrammarConstraint(matcher),
+    ).collect_text()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Sampler, GrammarConstraint, tools } from 'inferlet';
+
+const matcher = tools.nativeMatcher(model, [JSON.stringify(calculatorSchema)]);
+if (matcher) {
+    const response = await ctx.generate(Sampler.argmax(), {
+        maxTokens: 512,
+        constrain: new GrammarConstraint(matcher),
+    }).collectText();
+}
+```
+
+</TabItem>
+</Tabs>
+
+The Rust `tools::native_grammar` returns a compiled `Grammar`; the Python `tools.native_matcher` and JavaScript `tools.nativeMatcher` return a stateful `Matcher` (wrap with `GrammarConstraint`). All three return `None` / `undefined` for models without a native tool-call template — fall back to the hand-rolled approach in that case.
+
+## Next
+
+- [MCP](../io/mcp): connect to external tool servers.
+- [Constrained generation](../forward/constrained): grammar and schema constraints in detail.
+- [Tutorial: build a parallel research agent](../tutorial/build): parallel HTTP fetches as tool calls.

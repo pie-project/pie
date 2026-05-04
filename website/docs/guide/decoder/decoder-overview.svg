@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 336" width="720" height="336" role="img" aria-labelledby="dec-title dec-desc">
+  <title id="dec-title">Three-layer generation API: Parsers, Generator, Forward</title>
+  <desc id="dec-desc">The SDK exposes three layers over the model. Parsers turn raw tokens into typed events. Generator drives a multi-step loop and produces tokens. Forward runs a single pass and produces output slots.</desc>
+
+  <style>
+    text  { font-family: 'IBM Plex Serif', Charter, Georgia, serif; font-size: 13px; }
+    .ink   { fill: #2c2722; }
+    .sub   { fill: #54473b; }
+    .muted { fill: #7a6a55; font-style: italic; }
+  </style>
+
+  <!-- Parsers (top) -->
+  <rect x="24" y="24" width="672" height="80" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink"   x="48"  y="54">Parsers</text>
+  <text class="sub"   x="48"  y="80">Chat · Reasoning · Tool-call</text>
+  <text class="muted" x="672" y="68" text-anchor="end">tokens → events</text>
+
+  <!-- Generator (middle) -->
+  <rect x="24" y="128" width="672" height="80" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink"   x="48"  y="158">Generator</text>
+  <text class="sub"   x="48"  y="184">Multi-step loop</text>
+  <text class="muted" x="672" y="172" text-anchor="end">sampler, stop, constraints → tokens</text>
+
+  <!-- Forward (bottom) -->
+  <rect x="24" y="232" width="672" height="80" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink"   x="48"  y="262">Forward</text>
+  <text class="sub"   x="48"  y="288">Single forward pass</text>
+  <text class="muted" x="672" y="276" text-anchor="end">tokens, masks → output slots</text>
+</svg>

@@ -1,887 +1,316 @@
-// Context class for managing conversation state and generation.
-// Mirrors the Rust Context from inferlet/src/context.rs
+// Context — host-managed conversation state.
+//
+// Wraps `pie:core/context`. Buffers tokens via `system / user / assistant /
+// cue / seal / append`, drains via `flush()` or by handing the buffer to a
+// `Forward` / `Generator`.
+//
+//     const ctx = new Context(model);
+//     ctx.system("You are helpful.").user("Tell me a joke.");
+//
+//     // Auto-flushed by `generate(...)` — no explicit cue/flush needed.
+//     const text = await ctx
+//       .generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 })
+//       .collectText();
+//
+// `forward()` / `generate()` read from the same `_pendingTokens` buffer the
+// fillers append to, so a single call sequence — `ctx.system(...).user(...)
+// .generate(...)` — flows from text to tokens to KV without an intermediate
+// step the user has to remember.
 
-import { Model, Queue, _bindContextClass } from './model.js';
-import { Tokenizer } from './tokenizer.js';
-import { ChatFormatter } from './chat.js';
-import { Brle } from './brle.js';
-import { KvPage, ForwardPass, type Distribution } from './forward.js';
-import { toSamplerType, type SamplerType, type SamplingConfig } from './sampler.js';
-import { KvPageManager } from './kv-page-manager.js';
-import type { Drafter } from './drafter.js';
+import { Context as _Context } from 'pie:core/context';
+import * as _scheduling from 'pie:core/scheduling';
 
+import * as _chat from './chat.js';
+import { Forward } from './forward.js';
+import { Generator, type GenerateOptions } from './generation.js';
+import { Model } from './model.js';
 
+import type { Sampler } from './sample.js';
 
-/**
- * Message role for chat messages
- */
-export type MessageRole = 'system' | 'user' | 'assistant';
+// =============================================================================
+// Bid math (internal — matches Rust SDK)
+// =============================================================================
 
-/**
- * Chat message format
- */
-export interface ChatMessage {
-  role: MessageRole;
-  content: string;
+function _computeBid(
+  balance: number,
+  pages: number,
+  mu: number,
+  cv2: number,
+  pageSize: number,
+  dividend: number,
+): number {
+  mu = Math.max(mu, 1.0);
+  const numerator = balance / mu + dividend;
+  const denominator = pages + (mu * (1.0 + cv2)) / (2.0 * pageSize);
+  return denominator > 0 ? numerator / denominator : numerator;
 }
 
-/**
- * Stop condition configuration
- */
-export interface StopConfig {
-  /** Maximum number of tokens to generate */
-  maxTokens?: number;
-  /** Stop sequences as tokenized arrays */
-  sequences?: number[][];
-}
+// =============================================================================
+// Context
+// =============================================================================
 
-/**
- * Options for the generate() method
- */
-export interface GenerateOptions {
-  /** Sampling configuration */
-  sampling: SamplingConfig;
-  /** Stop conditions */
-  stop: StopConfig;
-}
+/** Host-managed conversation context.
+ *
+ *  Construct with a model, fill via chat methods (or `append`), then either
+ *  drain explicitly with `flush` or let `generate` / `forward` drain on
+ *  demand. */
+export class Context implements Disposable {
+  /** @internal */ _handle: _Context;
+  /** @internal */ _model: Model;
+  /** @internal Pending tokens buffered by fillers, drained by Forward / Generator. */
+  _pendingTokens: Uint32Array = new Uint32Array();
+  /** @internal Cached page-bookkeeping state — synced from host on construction
+   *  and after `truncate()` / failed-spec re-syncs; mutated in lockstep by
+   *  Forward / Generator after each successful `execute()`. */
+  _pageSize = 0;
+  /** @internal */ _seqLen = 0;
+  /** @internal */ _committedPages = 0;
+  /** @internal */ _workingPages = 0;
+  /** @internal */ _workingTokens = 0;
 
-/**
- * Options for the generateWithBeam() method
- */
-export interface GenerateBeamOptions {
-  /** Number of beams to use */
-  beamSize: number;
-  /** Stop conditions */
-  stop: StopConfig;
-}
+  // ── Construction / lifecycle ─────────────────────────────────────────
+  //
+  // Public form: `new Context(model)` opens a fresh empty context.
+  // Internal form: `new Context(rawHandle, model)` adopts an existing
+  // handle (used by `open` / `take` / `fork`). The two-arg overload is
+  // marked @internal — caller must own the handle.
 
-/**
- * Context manages the state for text generation, including:
- * - Token history and pending tokens
- * - Attention masks
- * - KV cache pages
- * - Chat formatting
- */
-export class Context {
-  queue: Queue;
-  model: Model;
-  tokenizer: Tokenizer;
-  formatter: ChatFormatter;
-
-  private _tokenIds: number[] = [];
-  tokenIdsPending: number[] = [];
-
-  tokenMaskPending: Brle[] = [];
-  tokenMaskCurrent: Brle;
-
-  private _positionIds: number[] = [];
-
-  private kvPageManager: KvPageManager;
-  kvPageSize: number;
-
-  adapterPtr?: number;
-  adapterRandomSeed?: number;
-
-  beginOfSequence: boolean = true;
-
-  constructor(model: Model) {
-    this.queue = model.createQueue();
-    this.kvPageSize = model.kvPageSize;
-    this.kvPageManager = new KvPageManager(this.queue, this.kvPageSize);
-    this.tokenizer = model.tokenizer;
-    this.model = model;
-    this.formatter = new ChatFormatter();
-    this.tokenMaskCurrent = Brle.new(0);
-  }
-
-  /**
-   * The committed token IDs (as regular array for backward compatibility)
-   */
-  get tokenIds(): number[] {
-    return this._tokenIds;
-  }
-
-  set tokenIds(value: number[]) {
-    this._tokenIds = [...value];
-  }
-
-  /**
-   * The position IDs (as regular array for backward compatibility)
-   */
-  get positionIds(): number[] {
-    return this._positionIds;
-  }
-
-  set positionIds(value: number[]) {
-    this._positionIds = [...value];
-  }
-
-  /**
-   * The KV pages array (for backward compatibility)
-   */
-  get kvPages(): KvPage[] {
-    return this.kvPageManager.allPages;
-  }
-
-  /**
-   * The last page length
-   */
-  get kvPageLastLen(): number {
-    return this.kvPageManager.lastPageLen;
-  }
-
-  /**
-   * The unique IDs of the KV cache pages currently in use
-   */
-  get kvPagePtrs(): number[] {
-    return this.kvPageManager.ptrs;
-  }
-
-  /**
-   * Creates a new Context from previously exported and now imported KV pages.
-   * This is used to restore a context's state from a cache.
-   */
-  static fromImportedState(
-    model: Model,
-    kvPages: KvPage[],
-    prefixTokens: number[],
-    kvPageLastLen: number
-  ): Context {
-    const ctx = new Context(model);
-    const kvPageSize = model.kvPageSize;
-
-    // Validate kvPageLastLen is within valid range
-    if (kvPageLastLen < 0 || kvPageLastLen > kvPageSize) {
-      throw new Error(
-        `kvPageLastLen out of range: expected 0..${kvPageSize}, got ${kvPageLastLen}`
-      );
-    }
-
-    // Handle empty state and validate kvPages/kvPageLastLen consistency
-    let expectedTokens: number;
-    if (kvPages.length === 0) {
-      if (kvPageLastLen !== 0) {
-        throw new Error(
-          `Invalid state: kvPages is empty but kvPageLastLen is ${kvPageLastLen} (must be 0 when kvPages is empty)`
-        );
-      }
-      expectedTokens = 0;
+  constructor(model: Model);
+  /** @internal */
+  constructor(handle: _Context, model: Model);
+  constructor(modelOrHandle: Model | _Context, model?: Model) {
+    if (model === undefined) {
+      // Public form.
+      this._model = modelOrHandle as Model;
+      this._handle = _Context.create(this._model._handle);
     } else {
-      expectedTokens = (kvPages.length - 1) * kvPageSize + kvPageLastLen;
+      // Internal form — adopt the handle.
+      this._handle = modelOrHandle as _Context;
+      this._model = model;
     }
-
-    // Verify the token count matches the KV page state
-    if (prefixTokens.length !== expectedTokens) {
-      throw new Error(
-        `Token count mismatch: expected ${expectedTokens}, got ${prefixTokens.length} (kvPages.length=${kvPages.length}, kvPageLastLen=${kvPageLastLen}, kvPageSize=${kvPageSize})`
-      );
-    }
-
-    ctx._tokenIds = [...prefixTokens];
-    ctx._positionIds = Array.from({ length: prefixTokens.length }, (_, i) => i);
-
-    // Import pages into manager
-    ctx.kvPageManager.importPages(kvPages, kvPageLastLen);
-
-    ctx.tokenMaskCurrent = Brle.new(prefixTokens.length);
-    ctx.beginOfSequence = false;
-
-    return ctx;
+    this._syncFromHost();
   }
 
-  /**
-   * The text representation of all tokens (computed on access)
-   */
-  get text(): string {
-    return this.tokenizer.detokenize(new Uint32Array(this._tokenIds));
+  /** @internal */
+  _syncFromHost(): void {
+    this._pageSize = this._handle.tokensPerPage();
+    this._committedPages = this._handle.committedPageCount();
+    this._workingPages = this._handle.workingPageCount();
+    this._workingTokens = this._handle.workingPageTokenCount();
+    this._seqLen = this._committedPages * this._pageSize + this._workingTokens;
   }
 
-  /**
-   * Set the adapter pointer for LoRA inference
-   */
-  setAdapter(adapterPtr: number): void {
-    this.adapterPtr = adapterPtr;
+  /** Open a saved snapshot (implicit fork — snapshot stays immutable). */
+  static open(model: Model, name: string): Context | undefined {
+    const raw = _Context.open(model._handle, name);
+    return raw === undefined ? undefined : new Context(raw, model);
   }
 
-  /**
-   * Remove the adapter
-   */
-  removeAdapter(): void {
-    this.adapterPtr = undefined;
+  /** Take ownership of a snapshot (snapshot is deleted). */
+  static take(model: Model, name: string): Context | undefined {
+    const raw = _Context.take(model._handle, name);
+    return raw === undefined ? undefined : new Context(raw, model);
   }
 
-  /**
-   * Set the random seed for adapter
-   */
-  setAdapterRandomSeed(seed: number): void {
-    this.adapterRandomSeed = seed;
+  /** Delete a saved snapshot by name. */
+  static delete(model: Model, name: string): void {
+    _Context.delete(model._handle, name);
   }
 
-  /**
-   * Creates a safe, copy-on-write fork of the context.
-   *
-   * This method creates a new context that shares only FULL KV cache pages.
-   * Partial pages are dropped and their tokens moved to pending buffer for
-   * recomputation. This ensures state isolation - shared pages are read-only
-   * (full pages won't be written to), and writable pages are unique per context.
-   */
+  /** Fork into a new anonymous context (working pages copied). */
   fork(): Context {
-    const forked = new Context(this.model);
-
-    // Always use forkPartial behavior to ensure no writable pages are shared.
-    // This drops partial pages and moves their tokens to pending for recomputation.
-    const { manager: forkedKvManager, droppedTokenCount } = this.kvPageManager.fork();
-    forked.kvPageManager = forkedKvManager;
-
-    const keptTokensLen = forkedKvManager.totalTokens;
-
-    forked._tokenIds = this._tokenIds.slice(0, keptTokensLen);
-    forked._positionIds = this._positionIds.slice(0, keptTokensLen);
-
-    // Combine uncommitted tokens from last page with pending tokens
-    forked.tokenIdsPending = [
-      ...this._tokenIds.slice(keptTokensLen),
-      ...this.tokenIdsPending,
-    ];
-
-    // Rebuild the mask for pending tokens
-    // Optimization: Build final mask first, then truncate (avoids O(n²) clone+append)
-    let maskBuilder = this.tokenMaskCurrent.clone();
-    const parentTotalMaskLen = this.tokenIds.length + this.tokenIdsPending.length;
-    maskBuilder.removeRange(keptTokensLen, parentTotalMaskLen);
-
-    const pendingCount = forked.tokenIdsPending.length;
-    const baseLen = maskBuilder.len();
-
-    // Append all positions at once
-    for (let i = 0; i < pendingCount; i++) {
-      maskBuilder.append(false);
-    }
-
-    // Build masks by truncating from final (cheaper than repeated clone+append)
-    forked.tokenMaskPending = [];
-    for (let i = 0; i < pendingCount; i++) {
-      forked.tokenMaskPending.push(maskBuilder.truncate(baseLen + i + 1));
-    }
-
-    // tokenMaskCurrent includes both committed and pending tokens
-    forked.tokenMaskCurrent = maskBuilder;
-
-    forked.adapterPtr = this.adapterPtr;
-    forked.adapterRandomSeed = this.adapterRandomSeed;
-    forked.beginOfSequence = this.beginOfSequence;
-
-    return forked;
+    const obj = new Context(this._handle.fork(), this._model);
+    // Carry pending tokens forward.
+    obj._pendingTokens = new Uint32Array(this._pendingTokens);
+    return obj;
   }
 
-  /**
-   * Release all KV pages held by this context.
-   * Call this when the context is no longer needed to free resources.
-   * Safe to call multiple times.
-   */
+  /** Save this context with a name. */
+  save(name: string): void {
+    this._handle.save(name);
+  }
+
+  /** Anonymous save — returns a runtime-generated name. */
+  snapshot(): string {
+    return this._handle.snapshot();
+  }
+
+  /** Force-destroy this context immediately, releasing its KV resources. */
   release(): void {
-    this.kvPageManager.release();
+    this._handle.destroy();
   }
 
-  /**
-   * Fill with raw text, tokenizing it first
-   */
-  fill(text: string): void {
-    const newTokenIds = this.tokenizer.tokenize(text);
-    this.fillTokens([...newTokenIds]);
+  /** Disposable protocol — calls `release()`. */
+  [Symbol.dispose](): void {
+    this.release();
   }
 
-  /**
-   * Fill with an array of token IDs
-   */
-  fillTokens(newTokenIds: number[]): void {
-    const n = newTokenIds.length;
-    this.tokenIdsPending.push(...newTokenIds);
+  // ── Accessors ────────────────────────────────────────────────────────
 
-    for (let i = 0; i < n; i++) {
-      this.tokenMaskCurrent.append(false);
-      this.tokenMaskPending.push(this.tokenMaskCurrent.clone());
-    }
-    this.beginOfSequence = false;
+  /** The model this context is tied to. */
+  get model(): Model { return this._model; }
+
+  /** Tokens per KV page. */
+  get pageSize(): number { return this._pageSize; }
+
+  /** Total committed + working tokens (excludes the pending buffer). */
+  get seqLen(): number { return this._seqLen; }
+
+  /** Pending (buffered but not yet flushed) tokens. */
+  buffer(): Uint32Array {
+    return new Uint32Array(this._pendingTokens);
   }
 
-  /**
-   * Fill with a single token ID
-   */
-  fillToken(newTokenId: number): void {
-    this.tokenIdsPending.push(newTokenId);
-    this.tokenMaskCurrent.append(false);
-    this.tokenMaskPending.push(this.tokenMaskCurrent.clone());
-    this.beginOfSequence = false;
+  // ── Chat fillers ─────────────────────────────────────────────────────
+  //
+  // All return `this` for chaining: ctx.system("...").user("...").
+
+  /** Fill a system-role message. */
+  system(message: string): this {
+    this._appendPending(_chat.system(this._model, message));
+    return this;
   }
 
-  /**
-   * Fill a system message using the chat formatter
-   */
-  fillSystem(text: string): void {
-    this.formatter.system(text);
-    this.flushChatMessages(false);
+  /** Fill a user-role message. */
+  user(message: string): this {
+    this._appendPending(_chat.user(this._model, message));
+    return this;
   }
 
-  /**
-   * Fill a user message using the chat formatter (with generation prompt)
-   */
-  fillUser(text: string): void {
-    this.formatter.user(text);
-    this.flushChatMessages(true);
+  /** Fill an assistant-role message (history replay). */
+  assistant(message: string): this {
+    this._appendPending(_chat.assistant(this._model, message));
+    return this;
   }
 
-  /**
-   * Fill a user message without generation prompt
-   */
-  fillUserOnly(text: string): void {
-    this.formatter.user(text);
-    this.flushChatMessages(false);
+  /** Cue the model to generate (fills the generation header). */
+  cue(): this {
+    this._appendPending(_chat.cue(this._model));
+    return this;
   }
 
-  /**
-   * Fill an assistant message using the chat formatter
-   */
-  fillAssistant(text: string): void {
-    this.formatter.assistant(text);
-    this.flushChatMessages(false);
+  /** Seal the current turn (insert stop token). */
+  seal(): this {
+    this._appendPending(_chat.seal(this._model));
+    return this;
   }
 
-  /**
-   * Mask specific token indices
-   */
-  maskTokens(indices: number[], mask: boolean): void {
-    this.tokenMaskCurrent.mask(indices, mask);
+  /** Append raw tokens to the buffer directly. */
+  append(tokens: Iterable<number>): this {
+    this._appendPending(
+      tokens instanceof Uint32Array ? tokens : new Uint32Array(tokens),
+    );
+    return this;
   }
 
-  /**
-   * Mask a range of tokens
-   */
-  maskTokenRange(start: number, end: number, mask: boolean): void {
-    this.tokenMaskCurrent.maskRange(start, end, mask);
+  /** Append text — encodes via the model's tokenizer. */
+  appendText(text: string): this {
+    this._appendPending(this._model.tokenizer().encode(text));
+    return this;
   }
 
-  /**
-   * Mask a single token
-   */
-  maskToken(index: number, mask: boolean): void {
-    this.tokenMaskCurrent.mask([index], mask);
-  }
+  // ── Flush / truncate ─────────────────────────────────────────────────
 
-  /**
-   * Grow the KV cache by the specified number of tokens
-   */
-  growKvPages(numTokens: number): void {
-    this.kvPageManager.grow(numTokens);
-  }
-
-  /**
-   * Shrink the KV cache by the specified number of tokens
-   */
-  shrinkKvPages(numTokens: number): void {
-    this.kvPageManager.shrink(numTokens);
-  }
-
-  /**
-   * Drops fully masked KV pages to save memory, supporting non-contiguous
-   * dropping for optimizations like attention sink.
-   *
-   * The function iterates through all committed pages and checks if the tokens
-   * corresponding to a page are all masked as `true`. If so, it deallocates
-   * the page and removes the corresponding token ranges from the context's state.
-   *
-   * # Warning
-   *
-   * This operation modifies the token history non-contiguously, which can
-   * break the assumptions of a standard causal attention model. It should
-   * only be used with models and systems (like StreamingLLM) designed to
-   * handle a KV cache with logical gaps.
-   */
-  dropMaskedKvPages(): void {
-    const numCommittedPages = Math.floor(this._tokenIds.length / this.kvPageSize);
-
-    // Iterate backwards to safely remove elements from arrays by index.
-    // We only consider dropping full pages, not the last (potentially partial) page.
-    for (let i = numCommittedPages - 1; i >= 0; i--) {
-      const pageStartTokenIdx = i * this.kvPageSize;
-      const pageEndTokenIdx = (i + 1) * this.kvPageSize;
-
-      if (
-        this.tokenMaskCurrent.isRangeAllValue(
-          pageStartTokenIdx,
-          pageEndTokenIdx,
-          true
-        )
-      ) {
-        // This page is fully masked and can be dropped.
-
-        // 1. Remove the page ID and deallocate the physical page.
-        this.kvPageManager.removePageAt(i);
-
-        // 2. Remove the corresponding token range from the main token list.
-        this._tokenIds.splice(pageStartTokenIdx, this.kvPageSize);
-
-        // 3. Remove the corresponding position IDs.
-        this._positionIds.splice(pageStartTokenIdx, this.kvPageSize);
-
-        // 4. Remove the same range from the current mask.
-        this.tokenMaskCurrent.removeRange(pageStartTokenIdx, pageEndTokenIdx);
-
-        // 5. Remove the range from all historical pending masks.
-        for (const mask of this.tokenMaskPending) {
-          mask.removeRange(pageStartTokenIdx, pageEndTokenIdx);
-        }
-      }
-    }
-
-    // Recalculate the last page length after dropping pages.
-    this.kvPageManager.recalculateLastPageLen(this._tokenIds.length);
-  }
-
-  /**
-   * Flush chat messages to tokens
-   */
-  private flushChatMessages(addGenerationPrompt: boolean): void {
-    if (this.formatter.hasMessages()) {
-      const prompt = this.formatter.render(
-        this.model.promptTemplate,
-        addGenerationPrompt,
-        this.beginOfSequence
-      );
-      this.beginOfSequence = false;
-      this.formatter.clear();
-      this.fill(prompt);
-    }
-  }
-
-  /**
-   * Processes a batch of pending tokens to update the model's internal state.
-   */
+  /** Drain buffered tokens through a forward pass and commit pages.
+   *  After flush, the buffer is empty and `seqLen` reflects all consumed
+   *  tokens. */
   async flush(): Promise<void> {
-    if (this.tokenIdsPending.length === 0) {
-      return;
-    }
-
-    const processCount = this.tokenIdsPending.length;
-
-    // Process all pending tokens
-    const pendingTokenIds = this.tokenIdsPending.splice(0, processCount);
-    const mask = this.tokenMaskPending
-      .splice(0, processCount)
-      .map((b) => b.buffer);
-
-    const lastPos =
-      this.positionIds.length > 0
-        ? this.positionIds[this.positionIds.length - 1] + 1
-        : 0;
-
-    const positionIds = Array.from(
-      { length: pendingTokenIds.length },
-      (_, i) => lastPos + i
-    );
-
-    this.growKvPages(pendingTokenIds.length);
-
-    const p = this.queue.createForwardPass();
-    p.inputTokens(pendingTokenIds, positionIds);
-    p.kvCachePtrs(this.kvPagePtrs, this.kvPageLastLen);
-    p.attentionMask(mask);
-
-    await p.execute();
-
-    this._tokenIds.push(...pendingTokenIds);
-    this._positionIds.push(...positionIds);
+    if (this._pendingTokens.length === 0) return;
+    const fwd = new Forward(this);
+    fwd.input(this._pendingTokens);
+    this._pendingTokens = new Uint32Array();
+    await fwd.execute();
   }
 
-  /**
-   * Performs a single autoregressive decoding step.
-   * Returns the sampled token ID.
-   */
-  private async decodeStep(samplerType: SamplerType): Promise<number> {
-    if (this.tokenIdsPending.length === 0) {
-      throw new Error('Must have at least one seed token');
-    }
-
-    const pendingTokenIds = this.tokenIdsPending.splice(0);
-    const lastPosId =
-      this.positionIds.length > 0
-        ? this.positionIds[this.positionIds.length - 1] + 1
-        : 0;
-
-    const positionIds = Array.from(
-      { length: pendingTokenIds.length },
-      (_, i) => lastPosId + i
-    );
-
-    this.growKvPages(pendingTokenIds.length);
-
-    const mask = this.tokenMaskPending.splice(0).map((b) => b.buffer);
-
-    const p = this.queue.createForwardPass();
-    p.inputTokens(pendingTokenIds, positionIds);
-    p.kvCachePtrs(this.kvPagePtrs, this.kvPageLastLen);
-    p.attentionMask(mask);
-
-    const outputIdx = pendingTokenIds.length - 1;
-
-    // Configure output based on sampler type
-    switch (samplerType.type) {
-      case 'Multinomial':
-        p.outputTokens([outputIdx], samplerType.temperature);
-        break;
-      case 'TopP':
-        p.outputTokensTopP([outputIdx], samplerType.temperature, samplerType.top_p);
-        break;
-      case 'TopK':
-        p.outputTokensTopK([outputIdx], samplerType.temperature, samplerType.top_k);
-        break;
-      case 'MinP':
-        p.outputTokensMinP([outputIdx], samplerType.temperature, samplerType.min_p);
-        break;
-      case 'TopKTopP':
-        p.outputTokensTopKTopP(
-          [outputIdx],
-          samplerType.temperature,
-          samplerType.top_k,
-          samplerType.top_p
-        );
-        break;
-      case 'Custom':
-        p.outputDistributions([outputIdx], samplerType.temperature, undefined);
-        break;
-    }
-
-    const res = await p.execute();
-
-    let sampled: number;
-    if (samplerType.type === 'Custom' && res.distributions) {
-      // Custom sampler needs to sample from distribution
-      const dist = res.distributions[0];
-      // For now, just take the highest probability token
-      sampled = dist.ids[0];
-    } else if (res.tokens) {
-      sampled = res.tokens[0];
-    } else {
-      throw new Error('No token generated');
-    }
-
-    this._tokenIds.push(...pendingTokenIds);
-    this._positionIds.push(...positionIds);
-
-    return sampled;
+  /** Drop the trailing `n` working-page tokens. Use after a speculative
+   *  pass to roll back the rejected suffix. `n` counts only working-page
+   *  tokens — pages already committed cannot be truncated through this
+   *  API. */
+  truncate(n: number): void {
+    if (n === 0) return;
+    this._handle.truncateWorkingPageTokens(n);
+    this._syncFromHost();
   }
 
-  /**
-   * Performs a single decoding step and returns the distribution.
-   */
-  async decodeStepDist(): Promise<Distribution> {
-    if (this.tokenIdsPending.length === 0) {
-      throw new Error('Must have at least one seed token');
-    }
+  // ── Forward (single forward-pass primitive) ──────────────────────────
 
-    const pendingTokenIds = this.tokenIdsPending.splice(0);
-    const lastPosId =
-      this.positionIds.length > 0
-        ? this.positionIds[this.positionIds.length - 1] + 1
-        : 0;
-
-    const positionIds = Array.from(
-      { length: pendingTokenIds.length },
-      (_, i) => lastPosId + i
-    );
-
-    this.growKvPages(pendingTokenIds.length);
-
-    const mask = this.tokenMaskPending.splice(0).map((b) => b.buffer);
-
-    const p = this.queue.createForwardPass();
-    p.inputTokens(pendingTokenIds, positionIds);
-    p.kvCachePtrs(this.kvPagePtrs, this.kvPageLastLen);
-    p.attentionMask(mask);
-
-    const outputIdx = pendingTokenIds.length - 1;
-    p.outputDistributions([outputIdx], 1.0, undefined);
-
-    const res = await p.execute();
-
-    if (!res.distributions || res.distributions.length === 0) {
-      throw new Error('No distribution returned');
-    }
-
-    const dist = res.distributions[0];
-
-    this._tokenIds.push(...pendingTokenIds);
-    this._positionIds.push(...positionIds);
-
-    return dist;
+  /** Build a single `Forward` — a forward pass with auto page reservation,
+   *  position derivation, and post-execute commit. Use for prefill,
+   *  scoring, custom decode loops, and anywhere `generate()` is too
+   *  high-level. */
+  forward(): Forward {
+    return new Forward(this);
   }
 
-  /**
-   * Generates text autoregressively until a stop condition is met.
+  // ── Generate (multi-step loop) ───────────────────────────────────────
+
+  /** Build a `Generator` for token generation.
    *
-   * Fill context with messages using fillSystem(), fillUser(), fillAssistant()
-   * before calling generate().
-   *
-   * @example
-   * ```ts
-   * ctx.fillSystem('You are helpful.');
-   * ctx.fillUser('Hello!');
-   *
-   * const result = await ctx.generate({
-   *   sampling: { topP: 0.95, temperature: 0.6 },
-   *   stop: { maxTokens: 256, sequences: model.eosTokens }
-   * });
-   * ```
-   */
-  async generate(options: GenerateOptions): Promise<string> {
-    const samplerType = toSamplerType(options.sampling);
-    const { maxTokens, sequences } = options.stop;
-
-    if (maxTokens === undefined && (sequences === undefined || sequences.length === 0)) {
-      throw new Error('At least one stop condition (maxTokens or sequences) must be specified');
-    }
-
-    const generatedTokenIds: number[] = [];
-
-    // The autoregressive generation loop
-    while (true) {
-      const nextTokenId = await this.decodeStep(samplerType);
-      this.fillToken(nextTokenId);
-      generatedTokenIds.push(nextTokenId);
-
-      // Check stop conditions
-      if (maxTokens !== undefined && generatedTokenIds.length >= maxTokens) {
-        break;
-      }
-      if (sequences !== undefined && this.endsWithAny(generatedTokenIds, sequences)) {
-        break;
+   *  **Auto-flush**: when `autoFlush` is `true` (default), this method
+   *  appends `cue()` tokens to the buffer before returning the Generator
+   *  and defaults `stop` to the model's chat stop tokens. The first
+   *  `execute()` call drains the buffer through a forward pass — no
+   *  separate flush call needed. Pass `autoFlush: false` to inspect the
+   *  buffer before generation starts (or call `cue()` yourself). */
+  generate(
+    sampler: Sampler,
+    options: GenerateOptions & { autoFlush?: boolean } = {},
+  ): Generator {
+    const { autoFlush = true, ...rest } = options;
+    if (autoFlush) {
+      this.cue();
+      if (rest.stop === undefined) {
+        rest.stop = _chat.stopTokens(this._model);
       }
     }
-
-    return this.tokenizer.detokenize(new Uint32Array(generatedTokenIds));
+    return new Generator(this, sampler, rest);
   }
 
-  /**
-   * Check if tokenIds ends with any of the given sequences
-   */
-  private endsWithAny(tokenIds: number[], sequences: number[][]): boolean {
-    for (const seq of sequences) {
-      if (seq.length === 0) continue;
-      if (tokenIds.length < seq.length) continue;
+  // ── Bidding / scheduling ─────────────────────────────────────────────
 
-      let matches = true;
-      const start = tokenIds.length - seq.length;
-      for (let i = 0; i < seq.length; i++) {
-        if (tokenIds[start + i] !== seq[i]) {
-          matches = false;
-          break;
-        }
-      }
-      if (matches) return true;
-    }
-    return false;
+  /** Override the auto-computed bid (willingness to pay per page per step).
+   *  Most callers should NOT use this — the `Generator` auto-bids each
+   *  step. */
+  setBid(value: number): void {
+    this._handle.bid(value);
   }
 
-  /**
-   * Generates text using beam search decoding until a stop condition is met.
+  /** Mark this context as idle: drop the bid to zero so other contexts
+   *  can take its pages under contention. Returns a `Disposable` that
+   *  restores the truthful generation bid on `[Symbol.dispose]`:
    *
-   * @example
-   * ```ts
-   * const result = await ctx.generateWithBeam({
-   *   beamSize: 4,
-   *   stop: { maxTokens: 128, sequences: model.eosTokens }
-   * });
-   * ```
-   */
-  async generateWithBeam(options: GenerateBeamOptions): Promise<string> {
-    const { beamSize, stop } = options;
-    const { maxTokens, sequences } = stop;
-
-    if (maxTokens === undefined && (sequences === undefined || sequences.length === 0)) {
-      throw new Error('At least one stop condition (maxTokens or sequences) must be specified');
+   *      using _ = ctx.idle();
+   *      const result = await fetch(url);
+   *      // bid restored when `_` goes out of scope
+   *
+   *  On an uncontended device the runtime charges zero rent anyway —
+   *  `idle()` is a no-op cost-wise but still safe to call. Under load,
+   *  it yields priority to other workloads for the duration. */
+  idle(): Disposable {
+    const pages = this._committedPages + this._workingPages;
+    let saved = 0.0;
+    if (pages > 0) {
+      const balance = _scheduling.balance(this._model._handle);
+      const dividend = _scheduling.dividend(this._model._handle);
+      saved = _computeBid(balance, pages, 4096.0, 1.0, this._pageSize, dividend);
     }
-
-    type BeamState = [Context, number[], number]; // [context, generated_tokens, score]
-
-    let beams: BeamState[] = [[this.fork(), [], 0.0]];
-
-    const checkStop = (generated: number[]): boolean => {
-      if (maxTokens !== undefined && generated.length >= maxTokens) {
-        return true;
-      }
-      if (sequences !== undefined && this.endsWithAny(generated, sequences)) {
-        return true;
-      }
-      return false;
+    this._handle.bid(0.0);
+    const handle = this._handle;
+    return {
+      [Symbol.dispose]() {
+        handle.bid(saved);
+      },
     };
-
-    while (true) {
-      // Check if any beam satisfies the stop condition
-      const completedBeam = beams.find(([, generated]) => checkStop(generated));
-
-      if (completedBeam) {
-        const [winningBeam, generatedTokens] = completedBeam;
-
-        // Adopt the state from the winning beam
-        this.kvPageManager.adopt(winningBeam.kvPageManager);
-        this._tokenIds = [...winningBeam._tokenIds];
-        this._positionIds = [...winningBeam._positionIds];
-        this.tokenIdsPending = [...winningBeam.tokenIdsPending];
-
-        // Release all beams
-        for (const [beam] of beams) {
-          beam.release();
-        }
-
-        return this.tokenizer.detokenize(new Uint32Array(generatedTokens));
-      }
-
-      // Progress all beams in parallel
-      const nextDists = await Promise.all(
-        beams.map(([beam]) => beam.decodeStepDist())
-      );
-
-      // Expand beams
-      const nextBeams: BeamState[] = [];
-      for (let i = 0; i < beams.length; i++) {
-        const [beam, generated, score] = beams[i];
-        const nextDist = nextDists[i];
-
-        // Expand with top candidates
-        const expandCount = Math.min(beamSize, nextDist.ids.length);
-        for (let j = 0; j < expandCount; j++) {
-          const nextBeam = beam.fork();
-          const tokenId = nextDist.ids[j];
-          nextBeam.fillToken(tokenId);
-
-          const nextGenerated = [...generated, tokenId];
-          const nextScore = score + Math.log(nextDist.probs[j]);
-
-          nextBeams.push([nextBeam, nextGenerated, nextScore]);
-        }
-
-        // Release the old beam after forking
-        beam.release();
-      }
-
-      // Prune: Sort by score (descending) and keep top beamSize
-      nextBeams.sort((a, b) => b[2] - a[2]);
-
-      // Release pruned beams
-      const prunedBeams = nextBeams.slice(beamSize);
-      for (const [prunedCtx] of prunedBeams) {
-        prunedCtx.release();
-      }
-
-      beams = nextBeams.slice(0, beamSize);
-    }
   }
 
-  /**
-   * Generates text using speculative decoding with a drafter model.
-   *
-   * Speculative decoding accelerates generation by using a small, fast drafter
-   * to propose candidate tokens that are then verified by the main model.
-   *
-   * @param drafter - The drafter that proposes candidate tokens
-   * @param options - Generation options
-   * @returns The generated text
-   *
-   * @example
-   * ```ts
-   * const drafter = new MyDrafter(smallModel);
-   * const result = await ctx.generateWithDrafter(drafter, {
-   *   sampling: { topP: 0.95, temperature: 0.6 },
-   *   stop: { maxTokens: 256, sequences: model.eosTokens }
-   * });
-   * ```
-   */
-  async generateWithDrafter(
-    drafter: Drafter,
-    options: GenerateOptions
-  ): Promise<string> {
-    // Initialize drafter with current context
-    drafter.update([...this._tokenIds, ...this.tokenIdsPending]);
+  // ── Internal ─────────────────────────────────────────────────────────
 
-    const samplerType = toSamplerType(options.sampling);
-    const { maxTokens, sequences } = options.stop;
-
-    if (maxTokens === undefined && (sequences === undefined || sequences.length === 0)) {
-      throw new Error('At least one stop condition (maxTokens or sequences) must be specified');
-    }
-
-    const generatedTokenIds: number[] = [];
-
-    while (true) {
-      // Get draft tokens
-      const [draftTokens, draftPosIds] = drafter.draft();
-
-      if (draftTokens.length === 0) {
-        // No drafts - fall back to regular decode
-        const nextTokenId = await this.decodeStep(samplerType);
-        this.fillToken(nextTokenId);
-        generatedTokenIds.push(nextTokenId);
-        drafter.update([nextTokenId]);
-      } else {
-        // Verify drafts with main model
-        const acceptedTokens = await this.verifyDrafts(
-          draftTokens,
-          draftPosIds,
-          samplerType
-        );
-
-        for (const token of acceptedTokens) {
-          this.fillToken(token);
-          generatedTokenIds.push(token);
-        }
-        drafter.update(acceptedTokens);
-      }
-
-      // Check stop conditions
-      if (maxTokens !== undefined && generatedTokenIds.length >= maxTokens) {
-        break;
-      }
-      if (sequences !== undefined && this.endsWithAny(generatedTokenIds, sequences)) {
-        break;
-      }
-    }
-
-    return this.tokenizer.detokenize(new Uint32Array(generatedTokenIds));
-  }
-
-  /**
-   * Verify draft tokens with the main model.
-   * Returns the tokens that were accepted.
-   *
-   * This uses a simple sequential verification strategy where drafts are
-   * verified one by one until a rejection occurs.
-   */
-  private async verifyDrafts(
-    draftTokens: number[],
-    _draftPosIds: number[],
-    _samplerType: SamplerType
-  ): Promise<number[]> {
-    const accepted: number[] = [];
-
-    for (let i = 0; i < draftTokens.length; i++) {
-      const dist = await this.decodeStepDist();
-      const predictedToken = dist.ids[0]; // Most likely token
-
-      if (predictedToken === draftTokens[i]) {
-        // Draft accepted
-        accepted.push(predictedToken);
-        this.fillToken(predictedToken);
-      } else {
-        // Draft rejected - use model's prediction instead
-        accepted.push(predictedToken);
-        this.fillToken(predictedToken);
-        break;
-      }
-    }
-
-    return accepted;
+  /** @internal Append tokens to the pending buffer. */
+  _appendPending(tokens: Uint32Array): void {
+    if (tokens.length === 0) return;
+    const merged = new Uint32Array(this._pendingTokens.length + tokens.length);
+    merged.set(this._pendingTokens);
+    merged.set(tokens, this._pendingTokens.length);
+    this._pendingTokens = merged;
   }
 }
-
-// Bind Context class to model.js to enable Model.createContext()
-_bindContextClass(Context);

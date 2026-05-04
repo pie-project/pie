@@ -1,0 +1,72 @@
+---
+title: Key features
+description: "The three primitives an inferlet has access to: forward pass, KV cache, I/O"
+sidebar_position: 3
+---
+
+# Key features
+
+An inferlet exposes three things to your code: the forward pass at token granularity, the KV cache as named pages you can fork and share, and an I/O surface that reaches HTTP, MCP, the filesystem, plus embedded language runtimes (for JavaScript and Python). Most of what looks like a separate "feature" of Pie is one of these three primitives applied to a problem. This page lists those primitives and points to the guide pages that go deep.
+
+
+## Token-level forward pass control
+
+`ctx.forward()` runs one forward pass. You decide what tokens go in, where to read logits, and how to sample. Higher-level helpers like `ctx.generate(...)` are written on top of the same primitive.
+
+```rust
+let mut fwd = ctx.forward();
+fwd.input(&token_ids);
+let h = fwd.sample(&[0], Sampler::Argmax);
+let out = fwd.execute().await?;
+```
+
+A primitive at this level is enough to express decoding strategies that other serving systems either hardcode or do not support at all. Each of the following is a library on top of `forward()`, not an engine feature:
+
+- **Constrained decoding.** Mask logits against a grammar or JSON schema before sampling. See [Structured generation](../guide/forward/constrained).
+- **Speculative decoding.** Run a drafter, verify with the target model, accept or reject. Pie ships an n-gram speculator and a Jacobi decoder, and you can write your own. See the `text-completion-spec`, `cacheback-decoding`, and `jacobi-decoding` inferlets.
+- **Custom samplers and raw logits.** Score candidate strings, compute entropy, or pull the full distribution back into your inferlet. See the `sampler-suite` and `output-validation` inferlets.
+- **Custom attention masks.** Sliding window, attention sink, hierarchical masks, anything that can be expressed as a per-token mask. See [Customize generation](../guide/forward/overview).
+- **LoRA adapters.** Attach an adapter for a single forward pass or for every step of a generation loop.
+
+The engine batches forward passes across all live processes. Your custom decoder does not give up batching to gain control.
+
+## Fine-grained KV cache control
+
+A `Context` holds a token sequence and its KV cache as a chain of fixed-size pages. Two operations let you reuse that state: `fork()` clones a context in O(1) (committed pages are shared, divergent pages are copy-on-write), and `save()` snapshots one under a name so it survives past the inferlet's exit.
+
+```rust
+let mut prefix = Context::new(&model)?;
+prefix.system("You are a helpful assistant. <long preamble...>");
+prefix.flush().await?;
+prefix.save("system-prompt-v1")?;
+
+let prefix = Context::open(&model, "system-prompt-v1")?;
+let mut ctx = prefix.fork()?;
+ctx.user("New user question").cue();
+let resp = ctx.generate(sampler).collect_text().await?;
+```
+
+Patterns this supports:
+
+- **Prompt prefix caching.** Compute a long system prompt once, save it, fork from the snapshot for every request. The prefill cost is paid once for the lifetime of the snapshot.
+- **Best-of-N and tree of thought.** Branch from a shared prefix N times. Each branch's compute and memory scales with its divergent tokens, not with the prompt length. See the `best-of-n`, `tree-of-thought`, and `graph-of-thought` inferlets.
+- **Sliding window and attention sink.** Drop pages that fall out of the window, keep the sink pages pinned. See the `windowed-attention` and `attention-sink` inferlets.
+- **Resumable sessions.** A named context outlives the inferlet that created it. The next request reattaches by name.
+
+## Integrated I/O
+
+An inferlet runs inside a WASI sandbox with three I/O surfaces:
+
+- **Session.** `session::send` and `session::receive` exchange text and binary payloads with the client that launched the inferlet. The engine streams tokens back through this channel.
+- **WASI HTTP and filesystem.** Inferlets can issue HTTP requests and read files from a sandboxed view. The `wstd` crate exposes `http::Client`, useful for fetching tool outputs, images, or documents inline. See the `image-fetch` and `http-server` inferlets.
+- **Messaging.** `messaging::broadcast` and `messaging::subscribe` exchange messages between inferlets running in the same engine. Useful for coordinating swarms.
+
+These surfaces enable patterns that are awkward when application logic runs outside the engine:
+
+- **Function calling.** Format the call, run the tool inline, append the result to the context, continue generating. The KV cache from before the call is still warm.
+- **MCP.** A first-class MCP client. Connect to a registered MCP server, list tools, call them. See the `mcp-example` family.
+- **Virtual filesystem.** Inferlets can read from a sandboxed file tree exposed by the engine. Useful for episodic memory and checkpoint/resume.
+- **Embedded language runtimes.** Run JavaScript or Python from inside an inferlet (CodeACT-style). The model emits code; the inferlet executes it. See the `agent-codeact` inferlet.
+- **HTTP servers as inferlets.** An inferlet can implement `wasi:http/incoming-handler` and serve requests directly. See the `openresponses` inferlet, which exposes the OpenAI Responses API.
+
+I/O happens on the inferlet's own time, on a worker thread the engine manages. The model's forward passes do not stall waiting for HTTP.

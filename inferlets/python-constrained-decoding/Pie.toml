@@ -1,0 +1,14 @@
+[package]
+name = "python-constrained-decoding"
+version = "0.1.0"
+description = "Grammar-constrained JSON generation in Python via Schema.json_schema"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+python-runtime = "^0.4.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Description of what to generate"}
+max_tokens = {type = "int", optional = true, description = "Max generation tokens (default: 512)"}

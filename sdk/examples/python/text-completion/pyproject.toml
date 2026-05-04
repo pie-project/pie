@@ -1,5 +1,0 @@
-[project]
-name = "text-completion"
-version = "0.1.0"
-description = "Text completion example using inferlet"
-requires-python = ">=3.10"

@@ -1,0 +1,113 @@
+---
+title: Installation
+description: Install the Pie CLI and optional Python-backed drivers
+sidebar_position: 1
+---
+
+# Installation
+
+This page gets the `pie` CLI onto your machine. After this, see [Initial setup](./setup) to create `~/.pie/config.toml` and run a prompt.
+
+## Supported platforms
+
+| Platform | Builds |
+|---|---|
+| Linux x86_64 | `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, and `portable-cuda*` |
+| Linux aarch64 | `portable` |
+| macOS Apple Silicon | `portable` |
+
+Windows native and Intel Macs are not supported. On Windows, use WSL and the Linux build.
+
+`portable` includes the ggml-backed embedded driver and is the fallback everywhere. The CUDA flavors are Linux x86_64 only and include the embedded `cuda_native` driver.
+
+## Install the CLI
+
+```bash
+curl -fsSL https://pie-project.org/install.sh | bash
+```
+
+The installer downloads a release tarball, installs `pie` into `~/.local/bin` by default, and auto-picks a flavor:
+
+- NVIDIA driver `>= 580`: `cuda13.0`
+- NVIDIA driver `>= 525`: `cuda12.8`
+- otherwise: `portable`
+
+Override the flavor or install directory with environment variables:
+
+```bash
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=portable bash
+curl -fsSL https://pie-project.org/install.sh | PIE_INSTALL_DIR=/usr/local/bin bash
+```
+
+Valid `PIE_FLAVOR` values are `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, `portable-cuda12.6`, `portable-cuda12.8`, and `portable-cuda13.0`.
+
+To install a specific release tag:
+
+```bash
+curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=v0.1.2 bash
+```
+
+If `pie` is not on your `PATH`, add the install directory:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+```
+
+## Verify
+
+```bash
+pie --version
+pie doctor
+pie driver list
+```
+
+`pie doctor` reports platform readiness, compiled-in embedded drivers, GPU visibility, config status, and subprocess-driver venv resolution.
+
+## Optional Python drivers
+
+The `pie` binary can run embedded drivers without Python. Python is only needed for subprocess drivers: `dev`, `vllm`, and `sglang`.
+
+Install `uv`, then let `pie driver` print or run the matching venv recipe:
+
+```bash
+pie driver dev install ~/.pie/venvs/dev --run
+pie driver dev set venv ~/.pie/venvs/dev
+pie driver dev doctor
+```
+
+Use the same flow for vLLM or SGLang:
+
+```bash
+pie driver vllm install ~/.pie/venvs/vllm --run
+pie driver vllm set venv ~/.pie/venvs/vllm
+
+pie driver sglang install ~/.pie/venvs/sglang --run
+pie driver sglang set venv ~/.pie/venvs/sglang
+```
+
+The CLI creates Python 3.12 virtual environments and installs the matching wheels (`pie-driver-dev[cu128]`, `pie-driver-vllm`, or `pie-driver-sglang`). A model can also override the interpreter with `venv` or `python` under `[model.driver.options]`.
+
+## Install from source
+
+For development:
+
+```bash
+git clone https://github.com/pie-project/pie.git
+cd pie
+
+# Default features: embedded portable driver plus always-linked dummy.
+cargo install --path server
+
+# Include the embedded CUDA driver too.
+CUDACXX=/usr/local/cuda/bin/nvcc \
+  cargo install --path server --features driver-portable,driver-cuda
+```
+
+The installed CLI is still `pie`. Re-run `pie doctor` after building to confirm which embedded drivers are compiled in.
+
+## Next
+
+- [Initial setup](./setup): create config, download a model, run a prompt.
+- [Development environment](./dev-env): install tools for writing inferlets.
+- [Configuration](../reference/configuration): the full `~/.pie/config.toml` schema.

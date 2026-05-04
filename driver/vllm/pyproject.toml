@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pie-driver-vllm"
+version = "0.3.0"
+description = "Pie driver — vLLM backend. Uses vllm's model definitions and kernels under pie's RPC surface."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = "Apache-2.0"
+authors = [{ name = "In Gim", email = "in.gim@icloud.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# vLLM 0.16.0 is the newest release that pins torch==2.9.1 and ships a
+# CUDA 12.x wheel; vLLM 0.20.x requires torch 2.11 + CUDA 13. Co-resolves
+# with `pie-driver-sglang` (sglang 0.5.9 carries a matching flashinfer
+# 0.6.3 pin). The two drivers are independent wheels — installing them
+# into separate venvs is the supported path; coexisting in the same venv
+# requires the override-dependencies block at the bottom of this file.
+dependencies = [
+    # vllm + sglang reuse the shared worker scaffolding (run_worker,
+    # calculate_topology, telemetry, batching) from pie-driver-dev. They
+    # ship as separate wheels but compose against dev's surface rather
+    # than re-implementing it. `DriverCapabilities` and the `pie-rpc`
+    # dep flow transitively through `pie-driver-dev`.
+    "pie-driver-dev",
+    "msgpack>=0.5",
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "torchaudio==2.9.1",
+    "torchao==0.9.0",
+    "vllm==0.16.0",
+    "flashinfer-python==0.6.3",
+    "flashinfer-cubin==0.6.3",
+    "flashinfer-jit-cache==0.6.3",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu128"
+url = "https://flashinfer.ai/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+pie-driver-dev = { path = "../dev", editable = true }
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]
+flashinfer-jit-cache = [{ index = "flashinfer-cu128" }]
+
+[tool.uv]
+# Resolve the structured-decoding pins where vLLM 0.16.0 and SGLang 0.5.9
+# disagree. Taking vLLM's (newer) side: SGLang's grammar-constrained
+# decoding paths will likely fail at runtime, but plain generation is
+# unaffected. Only matters when both wheels share a venv (separate venvs
+# is the supported deployment, in which case this block is inert).
+# Note: `uv pip install` does not honor this block; only `uv lock` /
+# `uv sync` do. Shared-venv users should drive install via uv sync, or
+# pass these as `--override` to uv pip install.
+override-dependencies = [
+    "llguidance>=1.3.0,<1.4.0",
+    "xgrammar==0.1.29",
+    "outlines-core==0.2.11",
+    "outlines>=1.2.0,<1.3.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["pie_driver_vllm"]
