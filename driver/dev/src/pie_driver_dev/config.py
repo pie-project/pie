@@ -305,13 +305,13 @@ class NativeRuntimeConfig(RuntimeConfig):
 
 
 # ---------------------------------------------------------------------------
-# TOML-shaped driver config (`[model.driver.options]` with type = "native")
+# TOML-shaped driver config (`[model.driver.options]` with type = "dev")
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class NativeDriverConfig:
-    """User-facing knobs for the `native` driver. Splatted into
+    """User-facing knobs for the `dev` driver. Splatted into
     `NativeRuntimeConfig.from_args` by the worker.
     """
 

@@ -8,13 +8,17 @@ sidebar_position: 5
 
 `type = "sglang"`. Mirrors SGLang's `ServerArgs`; field names mirror SGLang verbatim so values flow through.
 
-Pick SGLang when you want strong custom-mask support or its n-gram speculative decoding. Like vLLM, some inferlet features that depend on raw forward-pass control are not available through SGLang; those require the [CUDA `native` driver](./cuda).
+Pick SGLang when you want strong custom-mask support or its n-gram speculative decoding. Like vLLM, some inferlet features that depend on raw forward-pass control are not available through SGLang; those require a Pie-controlled driver such as [`cuda_native` or `dev`](./cuda).
 
 ## Install
 
 ```bash
-pip install 'pie-server[sglang]'
+pie driver sglang install ~/.pie/venvs/sglang --run
+pie driver sglang set venv ~/.pie/venvs/sglang
+pie driver sglang doctor
 ```
+
+This installs `pie-driver-sglang` into a Python 3.12 virtual environment. SGLang, Torch, and FlashInfer pins are co-resolved; expect a large install.
 
 ## Configuration
 
@@ -25,6 +29,7 @@ device = ["cuda:0"]
 activation_dtype = "bfloat16"
 
 [model.driver.options]
+venv = "/home/me/.pie/venvs/sglang"
 attention_backend       = "triton"       # triton / flashinfer / fa3 / fa4 / …
 mem_fraction_static     = 0.65
 page_size               = 16

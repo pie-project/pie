@@ -15,7 +15,7 @@ Every inferlet starts by binding to a model. The engine has already loaded weigh
 
 `Model::load(name)` returns a handle to a model the engine has already loaded. It does not read weights from disk, copy parameters, or allocate GPU memory. Multiple inferlets can hold handles to the same model concurrently.
 
-The `name` is the key under `[model.<name>]` in `~/.pie/config.toml`. The default config has one model, named `default`.
+The `name` is the `name` field in a `[[model]]` block in `~/.pie/config.toml`. The default config has one model, named `default`.
 
 <Tabs groupId="lang" queryString>
 <TabItem value="rust" label="Rust" default>
@@ -62,7 +62,7 @@ name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.driver]
-type = "native"
+type = "cuda_native"
 device = ["cuda:0"]
 
 [[model]]
@@ -70,7 +70,7 @@ name = "large"
 hf_repo = "Qwen/Qwen2.5-7B-Instruct"
 
 [model.driver]
-type = "native"
+type = "cuda_native"
 device = ["cuda:1"]
 ```
 
@@ -132,15 +132,15 @@ A single model can span multiple devices:
 
 ```toml
 [model.driver]
-type = "native"
+type = "cuda_native"
 device = ["cuda:0", "cuda:1"]
 tensor_parallel_size = 2
 ```
 
-The native driver handles tensor parallelism. From the inferlet's side, the model handle is the same; the engine schedules forward passes across the listed devices. See the [CUDA driver](../../reference/drivers/cuda) page for the per-driver behavior.
+CUDA-capable drivers handle tensor parallelism. From the inferlet's side, the model handle is the same; the engine schedules forward passes across the listed devices. See the [CUDA driver](../../reference/drivers/cuda) page for the per-driver behavior.
 
 ## Next
 
 - [Tokenizers](./tokenizer): encode and decode text, inspect special tokens.
 - [Context overview](../context/overview): allocate a KV context against a loaded model.
-- [CUDA driver](../../reference/drivers/cuda#supported-architectures): which architectures the native driver handles.
+- [CUDA driver](../../reference/drivers/cuda#supported-architectures): which architectures the CUDA drivers handle.

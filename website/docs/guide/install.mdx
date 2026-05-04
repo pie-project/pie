@@ -1,85 +1,113 @@
 ---
 title: Installation
-description: Install Pie on Linux or macOS, optionally with vLLM or SGLang drivers
+description: Install the Pie CLI and optional Python-backed drivers
 sidebar_position: 1
 ---
 
 # Installation
 
-This page covers getting `pie-server` onto your machine. After this, see [Initial setup](./setup) to configure it and run your first prompt.
+This page gets the `pie` CLI onto your machine. After this, see [Initial setup](./setup) to create `~/.pie/config.toml` and run a prompt.
 
 ## Supported platforms
 
-| Platform | Hardware | Backend |
-|---|---|---|
-| Linux x86_64 | NVIDIA GPU (Ampere or newer) | CUDA 12.6 or 12.8 + FlashInfer kernels |
-| macOS (Apple Silicon) | M-series | Metal kernels |
-| Linux x86_64 | CPU only | Supported for development; throughput is low |
+| Platform | Builds |
+|---|---|
+| Linux x86_64 | `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, and `portable-cuda*` |
+| Linux aarch64 | `portable` |
+| macOS Apple Silicon | `portable` |
 
-Other combinations (Windows native, AMD GPUs, Intel GPUs) are not supported in this release.
+Windows native and Intel Macs are not supported. On Windows, use WSL and the Linux build.
 
-## Install from PyPI
+`portable` includes the ggml-backed embedded driver and is the fallback everywhere. The CUDA flavors are Linux x86_64 only and include the embedded `cuda_native` driver.
 
-The fastest path. Pick the extra that matches your platform:
-
-```bash
-# Linux + NVIDIA GPU (CUDA 12.6 toolchain)
-pip install "pie-server[cu126]"
-
-# Linux + NVIDIA GPU (CUDA 12.8 toolchain)
-pip install "pie-server[cu128]"
-
-# macOS (Apple Silicon)
-pip install "pie-server[metal]"
-```
-
-The extra determines which Torch wheel index and which kernel backend get pulled in. Picking the wrong extra for your hardware produces an install that boots but cannot load models.
-
-## Optional driver backends
-
-Pie ships with a built-in driver (`type = "native"`). It also wires up vLLM and SGLang as alternative drivers when those packages are available. The vLLM and SGLang drivers do not have their own `pie-server` extras today — install Pie with one of the platform extras above, then `pip install vllm` or `pip install sglang` separately when you want to route a model block to one of them.
+## Install the CLI
 
 ```bash
-pip install "pie-server[cu128]"
-pip install vllm                    # for the vLLM driver
-pip install sglang                  # for the SGLang driver
+curl -fsSL https://pie-project.org/install.sh | bash
 ```
 
-See [Configuration](../reference/configuration) and the per-driver pages ([CUDA](../reference/drivers/cuda), [Portable](../reference/drivers/portable), [vLLM](../reference/drivers/vllm), [SGLang](../reference/drivers/sglang)) for how to point a model block at a specific driver.
+The installer downloads a release tarball, installs `pie` into `~/.local/bin` by default, and auto-picks a flavor:
 
-## Install from source
+- NVIDIA driver `>= 580`: `cuda13.0`
+- NVIDIA driver `>= 525`: `cuda12.8`
+- otherwise: `portable`
 
-For development or to track the tip:
+Override the flavor or install directory with environment variables:
 
 ```bash
-git clone https://github.com/pie-project/pie.git
-cd pie/pie
-
-# uv resolves the right Torch / FlashInfer / kernel set per extra.
-uv sync --extra cu128            # or cu126 / metal
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=portable bash
+curl -fsSL https://pie-project.org/install.sh | PIE_INSTALL_DIR=/usr/local/bin bash
 ```
 
-When working from a source checkout, prefix commands with `uv run`:
+Valid `PIE_FLAVOR` values are `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, `portable-cuda12.6`, `portable-cuda12.8`, and `portable-cuda13.0`.
+
+To install a specific release tag:
 
 ```bash
-uv run pie config init
-uv run pie serve
+curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=v0.1.2 bash
 ```
 
-`uv run` selects the correct virtual environment without you having to activate it.
+If `pie` is not on your `PATH`, add the install directory:
 
-## Verify the install
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+```
+
+## Verify
 
 ```bash
 pie --version
+pie doctor
+pie driver list
 ```
 
-If the command resolves and prints a version string, the install worked. Move on to [Initial setup](./setup) to configure Pie and run your first prompt.
+`pie doctor` reports platform readiness, compiled-in embedded drivers, GPU visibility, config status, and subprocess-driver venv resolution.
 
-If `pie` is not on your PATH after `pip install`, the issue is almost always that Python's user-level scripts directory is not in PATH. Either activate a venv before installing, or add `python -m site --user-base`'s `bin` directory to PATH.
+## Optional Python drivers
+
+The `pie` binary can run embedded drivers without Python. Python is only needed for subprocess drivers: `dev`, `vllm`, and `sglang`.
+
+Install `uv`, then let `pie driver` print or run the matching venv recipe:
+
+```bash
+pie driver dev install ~/.pie/venvs/dev --run
+pie driver dev set venv ~/.pie/venvs/dev
+pie driver dev doctor
+```
+
+Use the same flow for vLLM or SGLang:
+
+```bash
+pie driver vllm install ~/.pie/venvs/vllm --run
+pie driver vllm set venv ~/.pie/venvs/vllm
+
+pie driver sglang install ~/.pie/venvs/sglang --run
+pie driver sglang set venv ~/.pie/venvs/sglang
+```
+
+The CLI creates Python 3.12 virtual environments and installs the matching wheels (`pie-driver-dev[cu128]`, `pie-driver-vllm`, or `pie-driver-sglang`). A model can also override the interpreter with `venv` or `python` under `[model.driver.options]`.
+
+## Install from source
+
+For development:
+
+```bash
+git clone https://github.com/pie-project/pie.git
+cd pie
+
+# Default features: embedded portable driver plus always-linked dummy.
+cargo install --path server
+
+# Include the embedded CUDA driver too.
+CUDACXX=/usr/local/cuda/bin/nvcc \
+  cargo install --path server --features driver-portable,driver-cuda
+```
+
+The installed CLI is still `pie`. Re-run `pie doctor` after building to confirm which embedded drivers are compiled in.
 
 ## Next
 
-- [Initial setup](./setup): configure Pie, download a model, run a prompt.
-- [Development environment](./dev-env): install the toolchain for writing your own inferlets.
+- [Initial setup](./setup): create config, download a model, run a prompt.
+- [Development environment](./dev-env): install tools for writing inferlets.
 - [Configuration](../reference/configuration): the full `~/.pie/config.toml` schema.

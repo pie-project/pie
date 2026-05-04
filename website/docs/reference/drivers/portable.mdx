@@ -6,20 +6,25 @@ sidebar_position: 3
 
 # Portable
 
-`type = "portable"`. A standalone C++ binary (`pie_driver_portable`) built from `driver/portable/` on top of libggml (vendored via llama.cpp). Loads HuggingFace safetensors directly, no GGUF conversion. CPU is the default backend; CUDA, Vulkan, Metal, HIP, and SYCL backends are selected at C++ build time via `GGML_*=ON` CMake flags.
+`type = "portable"`. An embedded ggml-backed driver built from `driver/portable/` on top of vendored llama.cpp/ggml. Loads HuggingFace safetensors directly, no GGUF conversion. CPU is the default backend; CUDA, Vulkan, Metal, HIP, and SYCL backends are selected at C++ build time via `GGML_*=ON` CMake flags.
 
 Pick `portable` for CPU-only inference, non-NVIDIA GPUs (Vulkan / Metal / HIP / SYCL), or any host where you want a self-contained binary without a Python runtime.
 
 ## Install
 
-The `portable` driver has no Python extras; the binary is built from `driver/portable/` against vendored libggml. CPU is the default backend; CUDA / Vulkan / Metal / HIP / SYCL are selected at C++ build time via `GGML_*=ON` CMake flags.
+The default installer uses `portable` when no supported CUDA build is detected:
 
 ```bash
-cmake -S driver/portable -B driver/portable/build -DGGML_CUDA=ON   # or GGML_METAL, GGML_VULKAN, …
-cmake --build driver/portable/build
+curl -fsSL https://pie-project.org/install.sh | bash
 ```
 
-The resulting `pie_driver_portable` binary is what Pie spawns when `type = "portable"`.
+To force the portable build:
+
+```bash
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=portable bash
+```
+
+From source, `cargo install --path server` builds `pie` with `driver-portable` enabled by default. CUDA-capable portable release artifacts are named `portable-cuda12.6`, `portable-cuda12.8`, and `portable-cuda13.0`.
 
 ## Configuration
 
@@ -30,7 +35,6 @@ device = ["cpu"]                  # or ["cuda:0"] / ["metal"] / ["vulkan"] depen
 activation_dtype = "bfloat16"
 
 [model.driver.options]
-binary_path          = ""
 kv_page_size         = 32
 max_num_kv_pages     = 1024
 max_batch_tokens     = 10240
@@ -44,7 +48,7 @@ shutdown_timeout_s   = 5.0
 
 | Key | Default | Description |
 |---|---|---|
-| `binary_path` | `""` | Override path to `pie_driver_portable`. Empty resolves via `$PIE_PORTABLE_DRIVER_BIN`, then `which pie_driver_portable`, then `<repo>/driver/portable/build/bin/`. |
+| `binary_path` | `""` | Accepted for older config compatibility, ignored by standalone `pie`; the driver is embedded. |
 | `kv_page_size` | `32` | KV cache page size in tokens. |
 | `max_num_kv_pages` | `1024` | KV pool size. KV memory scales linearly. |
 | `max_batch_tokens` | `10240` | Cap on tokens per fire_batch. |

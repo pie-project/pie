@@ -183,7 +183,7 @@ def run_case(args: argparse.Namespace, model: dict[str, Any], topo: dict[str, An
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Sweep Pie cuda_native benches smoke over local HF models.")
-    p.add_argument("--model-root", default="/root/Workspace/models/hf")
+    p.add_argument("--model-root", default=str(ROOT / "models" / "hf"))
     p.add_argument("--out-dir", default="/tmp/benches-pie-cuda-native-sweep")
     p.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
     p.add_argument("--requests", type=int, default=1)

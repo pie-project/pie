@@ -1,38 +1,85 @@
 ---
 title: CUDA
-description: Configuration and supported architectures for Pie's NVIDIA-CUDA drivers (`native` and `cuda_native`)
+description: Configuration and supported architectures for Pie's NVIDIA-CUDA drivers
 sidebar_position: 2
 ---
 
 # CUDA
 
-Pie ships two NVIDIA-targeted drivers. Both implement the full inferlet feature set (custom attention masks, page-trim, raw-logits samplers, LoRA adapters), and both target CUDA. They differ in the executor:
+Pie has two CUDA-oriented paths:
 
-- **`native`** is Pie's first-party PyTorch path. Uses FlashInfer kernels on CUDA. Also runs on Apple Metal via PyTorch MPS, so it's the default driver across platforms.
-- **`cuda_native`** is a standalone C++/CUDA binary built from `driver/cuda/`. Lower per-step Python overhead than `native`, narrower model coverage.
+- **`cuda_native`**: embedded C++/CUDA driver linked into the `pie` binary when the installed flavor includes CUDA.
+- **`dev`**: subprocess Python driver backed by PyTorch and FlashInfer, useful for development and model/kernel prototyping.
+
+Use `cuda_native` for the standalone binary path. Use `dev` when you need the readable Python implementation or its platform extras.
 
 ## Install
 
+Install a CUDA-flavored `pie` binary:
+
 ```bash
-pip install 'pie-server[cu126]'   # CUDA 12.6
-pip install 'pie-server[cu128]'   # CUDA 12.8
-pip install 'pie-server[metal]'   # macOS / Apple Silicon (native only)
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
 ```
 
-The `cu126` / `cu128` extras provide the PyTorch CUDA build the `native` driver needs and that the `cuda_native` binary's Python wrapper bridges through. `metal` is `native`-only.
+Auto-detection chooses `cuda13.0` for NVIDIA driver `>= 580`, `cuda12.8` for driver `>= 525`, and `portable` otherwise. Valid CUDA flavors are `cuda12.6`, `cuda12.8`, `cuda13.0`, and the matching `portable-cuda*` variants.
 
-## Configuration
+For the Python `dev` driver:
 
-### `native`
+```bash
+pie driver dev install ~/.pie/venvs/dev --run
+pie driver dev set venv ~/.pie/venvs/dev
+pie driver dev doctor
+```
+
+The install recipe uses `pie-driver-dev[cu128]` by default. For source or manual installs, the driver wheel also exposes `cu126`, `cu128`, and `metal` extras.
+
+## `cuda_native` configuration
 
 ```toml
 [model.driver]
-type = "native"
+type = "cuda_native"
 device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 
 [model.driver.options]
+gpu_mem_utilization  = 0.85
+kv_page_size         = 32
+max_batch_tokens     = 10240
+max_batch_size       = 512
+max_num_kv_pages     = 1024
+swap_pool_size       = 0
+weight_dtype         = "bfloat16"
+runtime_quant        = ""
+ready_timeout_s      = 600.0
+shutdown_timeout_s   = 5.0
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `binary_path` | `""` | Accepted for older config compatibility, ignored by standalone `pie`; the driver is embedded. |
+| `gpu_mem_utilization` | `0.85` | Fraction of free GPU memory the driver claims. |
+| `kv_page_size` | `32` | KV cache page size in tokens. |
+| `max_batch_tokens` | `10240` | Cap on tokens per batch. |
+| `max_batch_size` | `512` | Cap on sequences per batch. |
+| `max_num_kv_pages` | `1024` | KV cache page count. KV memory scales linearly. |
+| `swap_pool_size` | `0` | Pinned host KV-page count for swap-out. `0` disables swap. |
+| `weight_dtype` | `"bfloat16"` | Weight precision. |
+| `runtime_quant` | `""` | Empty disables runtime quantization; `"fp8"` enables the current FP8 path where supported. |
+| `ready_timeout_s` | `600.0` | Seconds to wait for driver readiness. |
+| `shutdown_timeout_s` | `5.0` | Seconds to wait for graceful shutdown. |
+
+## `dev` configuration
+
+```toml
+[model.driver]
+type = "dev"
+device = ["cuda:0"]
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+
+[model.driver.options]
+venv = "/home/me/.pie/venvs/dev"
 gpu_mem_utilization  = 0.8
 max_batch_tokens     = 10240
 max_batch_size       = 512
@@ -47,89 +94,44 @@ cpu_mem_budget_in_gb = 0
 
 | Key | Default | Description |
 |---|---|---|
-| `gpu_mem_utilization` | `0.8` | Fraction of free GPU memory the driver claims. |
-| `max_batch_tokens` | `10240` | Maximum tokens summed across all sequences in a single batch. |
+| `venv` / `python` | unset | Optional per-model interpreter override. Otherwise `pie driver dev set ...`, `PIE_PYTHON`, the active venv, and `python3` are checked in order. |
+| `gpu_mem_utilization` | `0.8` | Fraction of free GPU memory used as the KV budget. |
+| `max_batch_tokens` | `10240` | Maximum tokens summed across all sequences in a batch. |
 | `max_batch_size` | `512` | Maximum sequences per batch. |
 | `max_dist_size` | `32` | Cap on `Distribution { k }` probe size. |
 | `max_num_embeds` | `128` | Cap on embedding lookups per batch. |
 | `max_num_adapters` | `32` | Adapter slot capacity. |
 | `max_adapter_rank` | `8` | Maximum LoRA rank. |
 | `kv_page_size` | `16` | KV cache page size in tokens. |
-| `weight_dtype` | `"auto"` | `auto`, `float32`, `float16`, `bfloat16`, `int4`, `int8`, or `float8`. See [Quantization](#quantization). |
+| `weight_dtype` | `"auto"` | `auto`, `float32`, `float16`, `bfloat16`, `int4`, `int8`, or `float8`. |
 | `cpu_mem_budget_in_gb` | `0` | Pinned host pool for KV swap, in GiB. `0` disables swap. |
-
-### `cuda_native`
-
-Pie spawns the binary, hands it a TOML fragment, and talks to it over the shared-memory IPC ring.
-
-```toml
-[model.driver]
-type = "cuda_native"
-device = ["cuda:0"]
-activation_dtype = "bfloat16"
-
-[model.driver.options]
-binary_path          = ""
-gpu_mem_utilization  = 0.85
-kv_page_size         = 32
-max_batch_tokens     = 10240
-max_batch_size       = 512
-max_num_kv_pages     = 1024
-swap_pool_size       = 0
-weight_dtype         = "bfloat16"
-ready_timeout_s      = 120.0
-shutdown_timeout_s   = 5.0
-```
-
-| Key | Default | Description |
-|---|---|---|
-| `binary_path` | `""` | Override path to `pie_driver_cuda`. Empty resolves via `$PIE_CUDA_DRIVER_BIN`, then `which pie_driver_cuda`, then `<repo>/driver/cuda/build/bin/`. |
-| `gpu_mem_utilization` | `0.85` | Fraction of free GPU memory the binary claims. |
-| `kv_page_size` | `32` | KV cache page size in tokens. |
-| `max_batch_tokens` | `10240` | Cap on tokens per fire_batch. |
-| `max_batch_size` | `512` | Cap on sequences per fire_batch. |
-| `max_num_kv_pages` | `1024` | KV cache page count. KV memory scales linearly. |
-| `swap_pool_size` | `0` | Pinned host KV-page count for swap-out. `0` disables swap. |
-| `weight_dtype` | `"bfloat16"` | Weight precision. |
-| `ready_timeout_s` | `120.0` | Seconds to wait for the binary's `READY` line on stdout. |
-| `shutdown_timeout_s` | `5.0` | Seconds to wait for graceful shutdown after SIGTERM before SIGKILL. |
 
 ## Supported architectures
 
-The `native` driver has explicit per-architecture implementations under `pie/src/pie_driver/model/`. `cuda_native` covers a narrower subset (the architectures ported to `driver/cuda/src/`).
+`cuda_native` covers the architectures ported to `driver/cuda/src/`. The `dev` driver has the broader Python model roster under `driver/dev/src/pie_driver_dev/model/`.
 
-| Family | Pie module | HF `model_type` | Examples |
-|---|---|---|---|
-| **Llama 3.x** | `llama3.py` | `llama` (also `l4ma`) | Llama 3, 3.1, 3.2 (instruct + base); Mistral 7B (Llama-compatible). |
-| **Qwen 2.x** | `qwen2.py` | `qwen2` | Qwen2, Qwen2.5 (all sizes, instruct + base). |
-| **Qwen 3.x** | `qwen3.py` | `qwen3` | Qwen3 (incl. the 0.6B default). |
-| **Qwen 3.5** | `qwen3_5.py` | `qwen3_5` | Qwen3.5 family. |
-| **Phi-3** | `phi3.py` | `phi3` | Microsoft Phi-3. |
-| **Mixtral** | `mixtral.py` | `mixtral` | Mistral Mixtral (MoE). |
-| **Gemma 2** | `gemma2.py` | `gemma2` | Gemma 2 (Google open weights). |
-| **Gemma 3** | `gemma3.py` | `gemma3_text` | Gemma 3 text-only checkpoints. |
-| **Gemma 4** | `gemma4.py` | `gemma4_text`, `gemma4` | Gemma 4 (text). |
-| **Mistral 3** | `mistral3.py` | `mistral3` | Ministral-class checkpoints. |
-| **OLMo 3** | `olmo3.py` | `olmo3` | AI2 OLMo 3. |
-| **GPT-OSS** | `gpt_oss.py` | `gptoss`, `gpt_oss` | Community GPT-OSS variants. |
+| Family | HF `model_type` | Notes |
+|---|---|---|
+| Llama 3.x / Mistral-compatible | `llama` | Instruct and base checkpoints. |
+| Qwen 2.x | `qwen2` | Qwen2 and Qwen2.5. |
+| Qwen 3.x | `qwen3` | Includes the default `Qwen/Qwen3-0.6B`. |
+| Qwen 3.5 | `qwen3_5` | Supported where the selected CUDA path has the graph implemented. |
+| Phi-3 | `phi3` | Microsoft Phi-3 family. |
+| Mixtral | `mixtral` | MoE path. |
+| Gemma 2 / 3 / 4 | `gemma2`, `gemma3_text`, `gemma4_text`, `gemma4` | Text checkpoints. |
+| Mistral 3 | `mistral3` | Ministral-class checkpoints. |
+| OLMo 3 | `olmo3` | AI2 OLMo 3. |
+| GPT-OSS | `gptoss`, `gpt_oss` | Community GPT-OSS variants. |
 
-`pie model list` reports `✓` for HuggingFace repos whose `config.json` `model_type` resolves to one of these.
+Run `pie model list` to see whether cached HuggingFace repos are compatible with your installed drivers.
 
 ## Quantization
 
-The `native` driver supports float and quantized weight dtypes; the choice maps to a torchao config under the hood (`pie_driver/quantization.py`).
+For `dev`, set `weight_dtype` under `[model.driver.options]`:
 
 ```toml
-[model.driver.options]            # type = "native"
+[model.driver.options]            # type = "dev"
 weight_dtype = "float8"           # auto / float32 / float16 / bfloat16 / int4 / int8 / float8
 ```
 
-| Value | Notes |
-|---|---|
-| `"auto"` | Inherit `activation_dtype`. |
-| `"float16"` / `"bfloat16"` / `"float32"` | Plain floating-point weights. |
-| `"int8"` | int8 weight-only quantization (torchao). |
-| `"int4"` | int4 weight-only quantization (torchao). |
-| `"float8"` | float8 weights (torchao). |
-
-`activation_dtype` (one level up under `[model.driver]`) is independent.
+For `cuda_native`, `weight_dtype = "bfloat16"` is the default and `runtime_quant = "fp8"` enables the current runtime quantization path where supported.

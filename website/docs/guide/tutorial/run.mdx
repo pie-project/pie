@@ -73,7 +73,7 @@ The first run is slower because of JIT and kernel warmup. Expected output:
 ╭─ Pie Run ───────────────────────────────────────╮
 │ Inferlet     research-agent@0.1.0               │
 │ Model        default (Qwen/Qwen3-0.6B)          │
-│ Driver       native                             │
+│ Driver       cuda_native                        │
 │ Device       cuda:0                             │
 ╰─────────────────────────────────────────────────╯
 
@@ -162,7 +162,7 @@ A Rust rebuild after a one-line change typically takes a few seconds. Python and
 To run the same inferlet against a different model without rebuilding, change the active model in your config:
 
 ```bash
-pie config set model.default.hf_repo Qwen/Qwen2.5-7B-Instruct
+pie config set model.0.hf_repo Qwen/Qwen2.5-7B-Instruct
 pie model download Qwen/Qwen2.5-7B-Instruct
 ```
 
@@ -188,7 +188,7 @@ What to do: include in the planner prompt a hint like "use exact Wikipedia artic
 
 Symptom: the inferlet returns `Err("no models")` immediately.
 
-What to do: run `pie model list` to see what is downloaded, and `pie config show` to see what the engine is configured to load. If the configured model is not downloaded, either download it or `pie config set model.default.hf_repo <repo>` to one you do have.
+What to do: run `pie model list` to see what is downloaded, and `pie config show` to see what the engine is configured to load. If the configured model is not downloaded, either download it or `pie config set model.0.hf_repo <repo>` to one you do have.
 
 ### Build fails on `wasm32-wasip2`
 

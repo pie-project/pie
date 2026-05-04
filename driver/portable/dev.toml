@@ -1,4 +1,4 @@
-# Sample driver/ggml config. Pass via `pie_driver_portable --config dev.toml`.
+# Sample portable-driver config. Pass via `pie_driver_portable --config dev.toml`.
 
 # Shmem IPC channel — must match the runtime's `[model.<name>.driver]` config.
 [shmem]
@@ -13,9 +13,8 @@ spin_us = 0         # 0 = pure busy spin
 # Path to a HuggingFace snapshot directory. The Python wrapper (pie_driver_portable)
 # resolves `hf_repo` to a local snapshot via the standard hub cache before
 # spawning this binary; for local dev, point directly at the snapshot.
-hf_path = "/root/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
+hf_path = "/path/to/huggingface/snapshot"
 # 0 = CPU only, -1 = offload all layers to GPU, N = first N layers on GPU.
-# Backend is CPU-only in v1; this knob takes effect once CUDA/Metal land in M11.
 n_gpu_layers = -1   # -1 = all layers on GPU; 0 = CPU only
 # Informational max position. Real KV capacity is total_pages × kv_page_size.
 n_ctx = 4096

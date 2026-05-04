@@ -18,7 +18,7 @@ pie serve
 ╭─ Pie Engine ─────────────────────────────────╮
 │ Host         127.0.0.1:8080                  │
 │ Model        default (Qwen/Qwen3-0.6B)       │
-│ Driver       native                          │
+│ Driver       cuda_native                     │
 │ Device       cuda:0                          │
 ╰──────────────────────────────────────────────╯
 
@@ -100,9 +100,9 @@ The engine stops accepting new connections, lets running processes finish, tears
 
 For a hard kill (no grace period), send `SIGKILL`. Saved contexts and adapters survive a graceful shutdown but not a hard kill.
 
-## Tuning forward-pass parallelism
+## Tuning runtime parallelism
 
-The native driver runs forward passes on a Tokio worker pool. The default is fine for most deployments. To override:
+The runtime schedules engine work on a Tokio worker pool. The default is fine for most deployments. To override:
 
 ```toml
 [runtime]
@@ -113,11 +113,11 @@ Set `worker_threads` to the number of CPU cores you want to dedicate to the runt
 
 ## Multi-GPU on one host
 
-The native driver runs tensor-parallel inference across multiple GPUs:
+CUDA-capable drivers run tensor-parallel inference across multiple GPUs:
 
 ```toml
 [model.driver]
-type = "native"
+type = "cuda_native"
 device = ["cuda:0", "cuda:1"]
 tensor_parallel_size = 2
 ```
@@ -132,7 +132,7 @@ name = "small"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.driver]
-type = "native"
+type = "cuda_native"
 device = ["cuda:0"]
 
 [[model]]
@@ -140,7 +140,7 @@ name = "large"
 hf_repo = "Qwen/Qwen2.5-7B-Instruct"
 
 [model.driver]
-type = "native"
+type = "cuda_native"
 device = ["cuda:1"]
 ```
 
