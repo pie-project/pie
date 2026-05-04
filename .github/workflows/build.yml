@@ -70,12 +70,19 @@ jobs:
             triple: aarch64-apple-darwin
             archive: tar.gz
             backend_env: "PIE_PORTABLE_METAL=1"
-          - label: x86_64-windows
-            runner: windows-latest
-            container: ""
-            triple: x86_64-pc-windows-msvc
-            archive: zip
-            backend_env: "PIE_PORTABLE_VULKAN=1"
+          # TODO(windows): re-enable once `runtime/src/shmem_ipc.rs`
+          # has a Windows backend (CreateFileMapping/MapViewOfFile).
+          # Currently it uses POSIX-only libc symbols (mmap, mode_t,
+          # PROT_READ, …) unconditionally, so the runtime crate
+          # doesn't compile on x86_64-pc-windows-msvc. Once shmem_ipc
+          # has a Windows impl, restore this entry with
+          # backend_env: "PIE_PORTABLE_VULKAN=1".
+          # - label: x86_64-windows
+          #   runner: windows-latest
+          #   container: ""
+          #   triple: x86_64-pc-windows-msvc
+          #   archive: zip
+          #   backend_env: "PIE_PORTABLE_VULKAN=1"
     runs-on: ${{ matrix.target.runner }}
     container: ${{ matrix.target.container || '' }}
     env:
@@ -196,11 +203,14 @@ jobs:
             triple: x86_64-unknown-linux-gnu
             cargo_features: "driver-portable,driver-cuda,driver-dummy"
             archive: tar.gz
-          - label: x86_64-windows
-            runner: windows-latest
-            triple: x86_64-pc-windows-msvc
-            cargo_features: "driver-portable,driver-dummy"
-            archive: zip
+          # TODO(windows): same `runtime/src/shmem_ipc.rs` POSIX-only
+          # blocker as the portable matrix. Re-enable once shmem_ipc
+          # has a Windows backend.
+          # - label: x86_64-windows
+          #   runner: windows-latest
+          #   triple: x86_64-pc-windows-msvc
+          #   cargo_features: "driver-portable,driver-dummy"
+          #   archive: zip
         cuda:
           - { version: "12.6.3", short: "12.6", arch: "75;80;86;89;90" }
           - { version: "12.8.1", short: "12.8", arch: "75;80;86;89;90;100;120" }
