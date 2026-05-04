@@ -4,8 +4,13 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <condition_variable>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -32,6 +37,44 @@
 namespace pie_cuda_driver {
 
 namespace {
+
+struct TpCpuGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::uint64_t seq = 0;
+};
+
+std::mutex g_tp_cpu_gates_mu;
+std::unordered_map<std::string, std::shared_ptr<TpCpuGate>> g_tp_cpu_gates;
+
+std::shared_ptr<TpCpuGate> tp_cpu_gate_for(const std::string& key) {
+    std::lock_guard<std::mutex> lk(g_tp_cpu_gates_mu);
+    auto& gate = g_tp_cpu_gates[key];
+    if (!gate) gate = std::make_shared<TpCpuGate>();
+    return gate;
+}
+
+void tp_cpu_gate_notify(const std::string& key) {
+    if (key.empty()) return;
+    auto gate = tp_cpu_gate_for(key);
+    {
+        std::lock_guard<std::mutex> lk(gate->mu);
+        ++gate->seq;
+    }
+    gate->cv.notify_all();
+}
+
+void tp_cpu_gate_wait(const std::string& key,
+                      std::uint64_t& seen,
+                      std::atomic<bool>& stop) {
+    if (key.empty()) return;
+    auto gate = tp_cpu_gate_for(key);
+    std::unique_lock<std::mutex> lk(gate->mu);
+    gate->cv.wait(lk, [&] {
+        return stop.load() || gate->seq != seen;
+    });
+    seen = gate->seq;
+}
 
 // Broadcast header sent from rank 0 → followers before each fire's
 // per-fire payload. Followers parse it to size the subsequent broadcasts
@@ -64,7 +107,7 @@ constexpr std::int32_t TP_STOP_MAGIC = 0x504F5453;  // 'STOP' tag
 // Both rank 0 and followers reuse it across fires; no need to plumb it
 // through ForwardContext.
 std::int32_t* tp_hdr_dev_buf() {
-    static std::int32_t* buf = nullptr;
+    thread_local std::int32_t* buf = nullptr;
     if (buf == nullptr) {
         CUDA_CHECK(cudaMalloc(&buf, sizeof(TpFireHeader)));
     }
@@ -389,6 +432,7 @@ std::size_t handle_fire_batch(
         // The all-reduces inside `forward_fn.body` then synchronise the
         // ranks layer-by-layer.
         if (ctx.tp_comm != nullptr) {
+            tp_cpu_gate_notify(ctx.tp_cpu_gate_key);
             tp_broadcast_inputs(*ctx.tp_comm, pi,
                                 N, R, is_pure_decode,
                                 static_cast<int>(kvpi_view.size()),
@@ -742,11 +786,13 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
     auto& comm    = *ctx.tp_comm;
     auto* d_hdr   = tp_hdr_dev_buf();
     cudaStream_t stream = nullptr;
+    std::uint64_t cpu_gate_seq = 0;
 
     // Sized lazily; R is at most max_workspace_tokens (one request per token).
     std::vector<std::uint32_t> h_qo, h_kvpp;
 
     while (!stop.load()) {
+        tp_cpu_gate_wait(ctx.tp_cpu_gate_key, cpu_gate_seq, stop);
         // 1. Receive header.
         NCCL_CHECK(ncclBroadcast(d_hdr, d_hdr, sizeof(TpFireHeader),
                                  ncclChar, 0, comm.comm(), stream));
@@ -901,7 +947,8 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
     }
 }
 
-void tp_send_shutdown(NcclComm& comm) {
+void tp_send_shutdown(NcclComm& comm, const std::string& cpu_gate_key) {
+    tp_cpu_gate_notify(cpu_gate_key);
     auto* d_hdr = tp_hdr_dev_buf();
     cudaStream_t stream = nullptr;
     TpFireHeader hdr{TP_STOP_MAGIC, 0, 0, 0, 0, 0, 0, 0};

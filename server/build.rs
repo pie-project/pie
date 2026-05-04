@@ -88,6 +88,7 @@ fn build_portable() {
         .join("portable"));
     cfg.build_target("pie_driver_portable_lib")
         .define("BUILD_SHARED_LIBS", "OFF");
+    enable_position_independent_archives(&mut cfg);
     if cuda_enabled {
         cfg.define("GGML_CUDA", "ON")
             // ggml's CUDA-graph capture/replay is OFF by default at the ggml-
@@ -106,9 +107,9 @@ fn build_portable() {
             // is unused either way — disable to keep the libggml-cuda.a
             // self-contained.
             .define("GGML_CUDA_NCCL", "OFF");
-        if let Ok(arch) = std::env::var("PIE_PORTABLE_CUDA_ARCH") {
-            cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
-        }
+        let arch = std::env::var("PIE_PORTABLE_CUDA_ARCH")
+            .unwrap_or_else(|_| "native".to_string());
+        cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
     }
     if vulkan_enabled {
         cfg.define("GGML_VULKAN", "ON")
@@ -137,57 +138,37 @@ fn build_portable() {
     add_link_search_paths(&build_dir);
 
     println!("cargo:rustc-link-lib=static=pie_driver_portable_lib");
-    // GNU ld's `--start-group`/`--end-group` + `-l:libfoo.a` syntax
-    // are Linux-only. Apple ld64 has no equivalent for either
-    // (`-l:` is rejected outright; group resolution is automatic).
-    // For non-Linux, use the portable `cargo:rustc-link-lib=static=NAME`
-    // form which lets rustc pick the static archive via lib-search.
-    let is_linux = target_os == "linux";
-    if is_linux {
-        println!("cargo:rustc-link-arg=-Wl,--start-group");
-        println!("cargo:rustc-link-arg=-l:libggml.a");
-        println!("cargo:rustc-link-arg=-l:libggml-cpu.a");
-        if cuda_enabled {
-            println!("cargo:rustc-link-arg=-l:libggml-cuda.a");
-        }
-        if vulkan_enabled {
-            println!("cargo:rustc-link-arg=-l:libggml-vulkan.a");
-        }
-        println!("cargo:rustc-link-arg=-l:libggml-base.a");
-        println!("cargo:rustc-link-arg=-Wl,--end-group");
-    } else {
-        println!("cargo:rustc-link-lib=static=ggml");
-        println!("cargo:rustc-link-lib=static=ggml-cpu");
-        if cuda_enabled {
-            println!("cargo:rustc-link-lib=static=ggml-cuda");
-        }
-        if vulkan_enabled {
-            println!("cargo:rustc-link-lib=static=ggml-vulkan");
-        }
+    println!("cargo:rustc-link-lib=static=ggml");
+    println!("cargo:rustc-link-lib=static=ggml-cpu");
+    if cuda_enabled {
+        println!("cargo:rustc-link-lib=static=ggml-cuda");
+    }
+    if vulkan_enabled {
+        println!("cargo:rustc-link-lib=static=ggml-vulkan");
+    }
+    if metal_enabled {
+        println!("cargo:rustc-link-lib=static=ggml-metal");
+    }
+    // ggml-cpu's macOS build pulls in the BLAS backend (calls
+    // `_ggml_backend_blas_reg`); ggml-cpu uses Apple's Accelerate
+    // framework for vDSP. Both need explicit links on macOS.
+    if target_os == "macos" {
+        println!("cargo:rustc-link-lib=static=ggml-blas");
+        println!("cargo:rustc-link-arg=-framework");
+        println!("cargo:rustc-link-arg=Accelerate");
         if metal_enabled {
-            println!("cargo:rustc-link-lib=static=ggml-metal");
-        }
-        // ggml-cpu's macOS build pulls in the BLAS backend (calls
-        // `_ggml_backend_blas_reg`); ggml-cpu uses Apple's Accelerate
-        // framework for vDSP. Both need explicit links on macOS.
-        if target_os == "macos" {
-            println!("cargo:rustc-link-lib=static=ggml-blas");
-            println!("cargo:rustc-link-arg=-framework");
-            println!("cargo:rustc-link-arg=Accelerate");
-            if metal_enabled {
-                for fw in [
-                    "Foundation",
-                    "Metal",
-                    "MetalKit",
-                    "MetalPerformanceShaders",
-                ] {
-                    println!("cargo:rustc-link-arg=-framework");
-                    println!("cargo:rustc-link-arg={fw}");
-                }
+            for fw in [
+                "Foundation",
+                "Metal",
+                "MetalKit",
+                "MetalPerformanceShaders",
+            ] {
+                println!("cargo:rustc-link-arg=-framework");
+                println!("cargo:rustc-link-arg={fw}");
             }
         }
-        println!("cargo:rustc-link-lib=static=ggml-base");
     }
+    println!("cargo:rustc-link-lib=static=ggml-base");
 
     if cuda_enabled {
         // ggml-cuda calls `cublasGemmEx` (libcublas), nothing in
@@ -243,6 +224,7 @@ fn build_cuda() {
         .join("cuda"));
     cfg.build_target("pie_driver_cuda_lib")
         .define("BUILD_SHARED_LIBS", "OFF");
+    enable_position_independent_archives(&mut cfg);
 
     // CUDA architecture. driver/cuda's `DetectCudaArchitecture.cmake`
     // shells out to `nvidia-smi` if `CMAKE_CUDA_ARCHITECTURES` isn't
@@ -297,10 +279,7 @@ fn build_cuda() {
     // archives — those two are header-only at the time of writing but
     // we still walk the tree in case that changes).
     println!("cargo:rustc-link-lib=static=pie_driver_cuda_lib");
-    println!("cargo:rustc-link-arg=-Wl,--start-group");
-    println!("cargo:rustc-link-arg=-l:libpie_driver_cuda_lib.a");
-    println!("cargo:rustc-link-arg=-l:libzstd.a");
-    println!("cargo:rustc-link-arg=-Wl,--end-group");
+    println!("cargo:rustc-link-lib=static=zstd");
 
     // CUDA toolkit: dynamic-link cudart + cublas + cublasLt.
     // The cuda driver's `src/ops/gemm.cpp` directly references
@@ -310,9 +289,6 @@ fn build_cuda() {
     // together with the toolkit.
     link_cuda_toolkit_dynamic(&["cudart", "cublas", "cublasLt"]);
     link_cuda_driver_stub();
-
-    let cuda_home = std::env::var("CUDA_HOME")
-        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
 
     // NCCL: dynamic-linked. Two install shapes in the wild:
     //   * System `libnccl-dev`: `libnccl.so` -> `libnccl.so.2.X` symlink,
@@ -356,6 +332,14 @@ fn build_cuda() {
 // -----------------------------------------------------------------------------
 // Shared helpers
 // -----------------------------------------------------------------------------
+
+/// The embedded drivers are static CMake archives, but downstream crates may
+/// link them into a shared object (notably the pyo3 `pie-server` wheel). Keep
+/// the archives PIC-compatible so the same embedded driver build works for both
+/// the standalone CLI binary and Python extension module.
+fn enable_position_independent_archives(cfg: &mut cmake::Config) {
+    cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
+}
 
 /// Dynamic-link CUDA toolkit `.so`s (`-lcudart -lcublas` etc.) from
 /// `$CUDA_HOME/lib64`. We deliberately do NOT static-link: NVIDIA's

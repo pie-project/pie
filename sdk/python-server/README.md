@@ -69,3 +69,23 @@ uv pip install pie-server
 
 (or, from this checkout, `uv pip install --python <venv>/bin/python -e
 sdk/python-server/`)
+
+## Local embedded-driver build
+
+From this checkout, the wheel links the embedded `cuda_native`,
+`portable`, and `dummy` drivers into `pie._engine`, so
+`pie.server.Server` can host the same local driver flavors as
+`pie serve`.
+
+```sh
+CUDACXX=/usr/local/cuda-12.8/bin/nvcc \
+  uv --project sdk/python-server sync --reinstall-package pie-server
+```
+
+To include the portable driver's ggml CUDA backend in the same Python
+extension, enable it at build time:
+
+```sh
+PIE_PORTABLE_CUDA=1 CUDACXX=/usr/local/cuda-12.8/bin/nvcc \
+  uv --project sdk/python-server sync --reinstall-package pie-server
+```

@@ -40,13 +40,10 @@
 
 namespace {
 
-// Pie's KV cache is F16; Pie casts Q to BF16 in the graph builder
-// before the paged op. FlashInfer's mixed-precision support requires
-// the K/V types to match each other. We use F16 for both K and V to
-// match Pie's pool dtype, and BF16 for Q (matching driver/cuda's
-// production setup).
+// Pie casts Q to BF16 in the graph builder before the paged op. K/V
+// pools follow the model dtype in the portable driver, so support both
+// F16 and BF16 K/V while requiring K and V to match each other.
 using DTypeQ  = __nv_bfloat16;
-using DTypeKV = half;
 using DTypeO  = __nv_bfloat16;
 using IdType  = int32_t;
 
@@ -68,7 +65,9 @@ using AttnVariantSoftcap = ::flashinfer::DefaultAttention<
     /*use_logits_soft_cap=*/true,
     /*use_alibi=*/false>;
 
-using DecodeParams = ::flashinfer::BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+template <typename DTypeKV>
+using DecodeParamsT =
+    ::flashinfer::BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
 // Workspace for FlashInfer's planner + kernel. Allocated lazily on
 // first call, sized for the largest realistic batch (n_req=512,
@@ -187,13 +186,14 @@ std::size_t hash_indptr(const IdType* p, std::size_t n) {
 // that has been observed to hang at 256+ tokens. Single-stage trades
 // some perf at very long contexts (>~4K KV/req) for deterministic
 // launches and stable graph capture across all decode steps.
-template <uint32_t HEAD_DIM, uint32_t GROUP_SIZE>
+template <uint32_t HEAD_DIM, uint32_t GROUP_SIZE, typename DTypeKV>
 struct DecodeWorkEstimator {
     cudaError_t operator()(bool& split_kv, uint32_t& max_grid_size,
                            uint32_t& max_num_pages_per_batch, uint32_t& new_batch_size,
                            uint32_t& gdy, uint32_t batch_size, IdType* kv_indptr_h,
                            uint32_t num_qo_heads, uint32_t page_size, bool enable_cuda_graph,
                            cudaStream_t stream) {
+        using DecodeParams = DecodeParamsT<DTypeKV>;
         cudaError_t rc = ::flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
             GROUP_SIZE, HEAD_DIM, POS_ENC, AttnVariant, DecodeParams>(
             split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
@@ -205,7 +205,7 @@ struct DecodeWorkEstimator {
 };
 
 // Plan + dispatch for a single (HEAD_DIM, gqa_group_size, Variant) tuple.
-template <uint32_t HEAD_DIM, uint32_t GROUP_SIZE, class Variant>
+template <uint32_t HEAD_DIM, uint32_t GROUP_SIZE, class Variant, typename DTypeKV>
 cudaError_t plan_and_dispatch(
         cudaStream_t stream,
         uint32_t num_requests,
@@ -236,7 +236,8 @@ cudaError_t plan_and_dispatch(
         g_host_indptr.data(), static_cast<std::size_t>(num_requests + 1));
 
     if (!g_plan_cache.valid || !(g_plan_cache.key == key)) {
-        DecodeWorkEstimator<HEAD_DIM, GROUP_SIZE> estimator;
+        using DecodeParams = DecodeParamsT<DTypeKV>;
+        DecodeWorkEstimator<HEAD_DIM, GROUP_SIZE, DTypeKV> estimator;
         cudaError_t st = ::flashinfer::DecodePlan<HEAD_DIM, POS_ENC, AttnVariant, DecodeParams>(
             ws.float_buf(), ws.float_bytes(),
             ws.int_buf(),   ws.page_locked_int(), ws.int_bytes(),
@@ -250,6 +251,8 @@ cudaError_t plan_and_dispatch(
         g_plan_cache.valid = true;
     }
     const ::flashinfer::DecodePlanInfo& plan_info = g_plan_cache.plan_info;
+
+    using DecodeParams = DecodeParamsT<DTypeKV>;
 
     ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
         num_kv_heads, page_size, HEAD_DIM, num_requests,
@@ -298,7 +301,7 @@ cudaError_t plan_and_dispatch(
         params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
 }
 
-template <uint32_t HEAD_DIM, class Variant>
+template <uint32_t HEAD_DIM, class Variant, typename DTypeKV>
 cudaError_t dispatch_for_gqa(
         cudaStream_t stream,
         uint32_t num_requests,
@@ -310,23 +313,23 @@ cudaError_t dispatch_for_gqa(
 {
     const uint32_t group = num_q_heads / num_kv_heads;
     switch (group) {
-        case 1: return plan_and_dispatch<HEAD_DIM, 1, Variant>(
+        case 1: return plan_and_dispatch<HEAD_DIM, 1, Variant, DTypeKV>(
             stream, num_requests, num_q_heads, num_kv_heads, page_size,
             q, k, v, pi, pip, lpl, o, window_left, scale, softcap);
-        case 2: return plan_and_dispatch<HEAD_DIM, 2, Variant>(
+        case 2: return plan_and_dispatch<HEAD_DIM, 2, Variant, DTypeKV>(
             stream, num_requests, num_q_heads, num_kv_heads, page_size,
             q, k, v, pi, pip, lpl, o, window_left, scale, softcap);
-        case 4: return plan_and_dispatch<HEAD_DIM, 4, Variant>(
+        case 4: return plan_and_dispatch<HEAD_DIM, 4, Variant, DTypeKV>(
             stream, num_requests, num_q_heads, num_kv_heads, page_size,
             q, k, v, pi, pip, lpl, o, window_left, scale, softcap);
-        case 8: return plan_and_dispatch<HEAD_DIM, 8, Variant>(
+        case 8: return plan_and_dispatch<HEAD_DIM, 8, Variant, DTypeKV>(
             stream, num_requests, num_q_heads, num_kv_heads, page_size,
             q, k, v, pi, pip, lpl, o, window_left, scale, softcap);
     }
     return cudaErrorInvalidValue;
 }
 
-template <class Variant>
+template <class Variant, typename DTypeKV>
 cudaError_t dispatch_for_head_dim(
         uint32_t head_dim,
         cudaStream_t stream,
@@ -338,13 +341,13 @@ cudaError_t dispatch_for_head_dim(
         int window_left, float scale, float softcap)
 {
     switch (head_dim) {
-        case 64:  return dispatch_for_gqa< 64, Variant>(
+        case 64:  return dispatch_for_gqa< 64, Variant, DTypeKV>(
             stream, num_requests, num_q_heads, num_kv_heads, page_size,
             q, k, v, pi, pip, lpl, o, window_left, scale, softcap);
-        case 128: return dispatch_for_gqa<128, Variant>(
+        case 128: return dispatch_for_gqa<128, Variant, DTypeKV>(
             stream, num_requests, num_q_heads, num_kv_heads, page_size,
             q, k, v, pi, pip, lpl, o, window_left, scale, softcap);
-        case 256: return dispatch_for_gqa<256, Variant>(
+        case 256: return dispatch_for_gqa<256, Variant, DTypeKV>(
             stream, num_requests, num_q_heads, num_kv_heads, page_size,
             q, k, v, pi, pip, lpl, o, window_left, scale, softcap);
     }
@@ -389,26 +392,49 @@ void pie_cuda_paged_attn_dispatch(cudaStream_t stream, ggml_tensor* dst) {
     }
 
     auto* q_ptr   = (DTypeQ*)  Q->data;
-    auto* k_ptr   = (DTypeKV*) K_pool->data;
-    auto* v_ptr   = (DTypeKV*) V_pool->data;
     auto* pi_ptr  = (IdType*)  page_indices->data;
     auto* pip_ptr = (IdType*)  page_indptr->data;
     auto* lpl_ptr = (IdType*)  last_page_lens->data;
     auto* o_ptr   = (DTypeO*)  dst->data;
 
     cudaError_t st;
-    if (softcap > 0.0f) {
-        st = dispatch_for_head_dim<AttnVariantSoftcap>(
-            head_dim, stream, (uint32_t) n_req,
-            (uint32_t) n_q_heads, (uint32_t) n_kv_heads, (uint32_t) page_size,
-            q_ptr, k_ptr, v_ptr, pi_ptr, pip_ptr, lpl_ptr, o_ptr,
-            sliding_window, scale, softcap);
+    if (K_pool->type == GGML_TYPE_F16) {
+        auto* k_ptr = (half*) K_pool->data;
+        auto* v_ptr = (half*) V_pool->data;
+        if (softcap > 0.0f) {
+            st = dispatch_for_head_dim<AttnVariantSoftcap, half>(
+                head_dim, stream, (uint32_t) n_req,
+                (uint32_t) n_q_heads, (uint32_t) n_kv_heads, (uint32_t) page_size,
+                q_ptr, k_ptr, v_ptr, pi_ptr, pip_ptr, lpl_ptr, o_ptr,
+                sliding_window, scale, softcap);
+        } else {
+            st = dispatch_for_head_dim<AttnVariant, half>(
+                head_dim, stream, (uint32_t) n_req,
+                (uint32_t) n_q_heads, (uint32_t) n_kv_heads, (uint32_t) page_size,
+                q_ptr, k_ptr, v_ptr, pi_ptr, pip_ptr, lpl_ptr, o_ptr,
+                sliding_window, scale, softcap);
+        }
+    } else if (K_pool->type == GGML_TYPE_BF16) {
+        auto* k_ptr = (__nv_bfloat16*) K_pool->data;
+        auto* v_ptr = (__nv_bfloat16*) V_pool->data;
+        if (softcap > 0.0f) {
+            st = dispatch_for_head_dim<AttnVariantSoftcap, __nv_bfloat16>(
+                head_dim, stream, (uint32_t) n_req,
+                (uint32_t) n_q_heads, (uint32_t) n_kv_heads, (uint32_t) page_size,
+                q_ptr, k_ptr, v_ptr, pi_ptr, pip_ptr, lpl_ptr, o_ptr,
+                sliding_window, scale, softcap);
+        } else {
+            st = dispatch_for_head_dim<AttnVariant, __nv_bfloat16>(
+                head_dim, stream, (uint32_t) n_req,
+                (uint32_t) n_q_heads, (uint32_t) n_kv_heads, (uint32_t) page_size,
+                q_ptr, k_ptr, v_ptr, pi_ptr, pip_ptr, lpl_ptr, o_ptr,
+                sliding_window, scale, softcap);
+        }
     } else {
-        st = dispatch_for_head_dim<AttnVariant>(
-            head_dim, stream, (uint32_t) n_req,
-            (uint32_t) n_q_heads, (uint32_t) n_kv_heads, (uint32_t) page_size,
-            q_ptr, k_ptr, v_ptr, pi_ptr, pip_ptr, lpl_ptr, o_ptr,
-            sliding_window, scale, softcap);
+        std::fprintf(stderr,
+            "[paged_attn_cuda] unsupported KV dtype: K=%s V=%s\n",
+            ggml_type_name(K_pool->type), ggml_type_name(V_pool->type));
+        std::abort();
     }
 
     if (st != cudaSuccess) {
@@ -424,8 +450,10 @@ bool pie_cuda_paged_attn_supported(int /*device*/, const ggml_tensor* dst) {
     const ggml_tensor* V_pool = dst->src[2];
 
     if (Q->type != GGML_TYPE_BF16) return false;
-    if (K_pool->type != GGML_TYPE_F16) return false;
-    if (V_pool->type != GGML_TYPE_F16) return false;
+    if (K_pool->type != V_pool->type) return false;
+    if (K_pool->type != GGML_TYPE_F16 && K_pool->type != GGML_TYPE_BF16) {
+        return false;
+    }
     if (dst->type   != GGML_TYPE_BF16) return false;
 
     const int* params_i32 = (const int*) dst->op_params;
@@ -435,7 +463,8 @@ bool pie_cuda_paged_attn_supported(int /*device*/, const ggml_tensor* dst) {
 
     const int n_q_heads = Q->ne[2];
     const int gqa_ratio = n_q_heads / n_kv_heads;
-    if (gqa_ratio != 1 && gqa_ratio != 2 && gqa_ratio != 4 && gqa_ratio != 8) {
+    if (gqa_ratio != 1 && gqa_ratio != 2 &&
+        gqa_ratio != 4 && gqa_ratio != 8) {
         return false;
     }
     if (Q->ne[1] != 1) return false;   // decode-only

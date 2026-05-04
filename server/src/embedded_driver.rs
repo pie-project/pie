@@ -29,6 +29,37 @@ use serde::Deserialize;
 use crate::config::{CudaNativeDriverOptions, DummyDriverOptions, PortableDriverOptions};
 use crate::driver_ffi::{self, Flavor};
 
+#[cfg(feature = "driver-cuda")]
+#[repr(C)]
+struct NcclUniqueId {
+    internal: [u8; 128],
+}
+
+#[cfg(feature = "driver-cuda")]
+unsafe extern "C" {
+    fn ncclGetUniqueId(unique_id: *mut NcclUniqueId) -> c_int;
+    fn ncclGetErrorString(result: c_int) -> *const c_char;
+}
+
+#[cfg(feature = "driver-cuda")]
+fn nccl_unique_id_hex() -> Result<String> {
+    let mut id = NcclUniqueId { internal: [0; 128] };
+    let rc = unsafe { ncclGetUniqueId(&mut id as *mut NcclUniqueId) };
+    if rc != 0 {
+        let msg = unsafe { CStr::from_ptr(ncclGetErrorString(rc)) }
+            .to_string_lossy()
+            .into_owned();
+        return Err(anyhow!("ncclGetUniqueId: {msg}"));
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(id.internal.len() * 2);
+    for b in id.internal {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    Ok(out)
+}
+
 /// Per-flavor driver options, passed to [`EmbeddedDriver::start`] so the
 /// caller doesn't have to discriminate on `DriverKind` in two places.
 ///
@@ -73,6 +104,91 @@ impl DriverOptions {
             #[cfg(feature = "driver-dummy")]
             DriverOptions::Dummy { .. } => Flavor::Dummy,
         }
+    }
+}
+
+fn ready_timeout(options: &DriverOptions) -> Duration {
+    let ready_timeout_s = match options {
+        #[cfg(feature = "driver-portable")]
+        DriverOptions::Portable(p) => p.ready_timeout_s,
+        #[cfg(feature = "driver-cuda")]
+        DriverOptions::CudaNative { opts, .. } => opts.ready_timeout_s,
+        #[cfg(feature = "driver-dummy")]
+        DriverOptions::Dummy { opts, .. } => opts.ready_timeout_s,
+    };
+    Duration::from_secs_f64(ready_timeout_s.max(1.0))
+}
+
+#[derive(Clone)]
+pub(crate) struct TpLaunch {
+    size: usize,
+    rank: usize,
+    nccl_unique_id_hex: String,
+    startup_barrier_path: String,
+}
+
+struct PendingEmbeddedDriver {
+    flavor: Flavor,
+    shmem_name: String,
+    aux_socket_path: PathBuf,
+    thread: Option<JoinHandle<i32>>,
+    caps_ctx: *mut CapsCtx,
+    caps_rx: Option<mpsc::Receiver<String>>,
+    state_dir: PathBuf,
+}
+
+impl PendingEmbeddedDriver {
+    fn wait_for_caps(&mut self, timeout: Duration) -> Result<DriverCapabilities> {
+        let caps_rx = self
+            .caps_rx
+            .take()
+            .ok_or_else(|| anyhow!("internal error: caps receiver missing"))?;
+        let json = match caps_rx.recv_timeout(timeout) {
+            Ok(j) => j,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let thread = self.thread.take();
+                let rc = thread.map(|h| h.join().unwrap_or(-1)).unwrap_or(-1);
+                if !self.caps_ctx.is_null() {
+                    unsafe { drop(Box::from_raw(self.caps_ctx)) };
+                    self.caps_ctx = std::ptr::null_mut();
+                }
+                return Err(anyhow!(
+                    "driver thread exited (rc={rc}) before emitting capabilities; \
+                     check stderr for the [pie-driver-{}] error message",
+                    self.flavor.as_str(),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(anyhow!(
+                    "driver did not emit capabilities within {:.1}s",
+                    timeout.as_secs_f64()
+                ));
+            }
+        };
+        DriverCapabilities::from_json(&json)
+    }
+
+    fn into_driver(mut self, caps: DriverCapabilities) -> EmbeddedDriver {
+        EmbeddedDriver {
+            shmem_name: self.shmem_name.clone(),
+            flavor: self.flavor,
+            aux_socket_path: self.aux_socket_path.clone(),
+            caps,
+            thread: self.thread.take(),
+            caps_ctx: self.caps_ctx,
+            _state_dir: self.state_dir.clone(),
+        }
+    }
+}
+
+impl Drop for PendingEmbeddedDriver {
+    fn drop(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
+        let _ = self.thread.take();
+        // Same safety tradeoff as EmbeddedDriver::drop: the detached
+        // C thread may still call ready_cb, so leave caps_ctx alive.
     }
 }
 
@@ -317,28 +433,41 @@ snapshot_dir = \"{snapshot}\"\n",
 /// with `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional `runtime_quant`,
 /// and `[batching]` with KV-page geometry plus `swap_pool_size`.
 ///
-/// `[distributed]` is omitted: single-rank is the default
-/// (`tp_size=1, tp_rank=0`), and the cuda driver entry expects TP > 1
-/// flags (`--tp-size`, `--tp-rank`, `--nccl-unique-id-hex`) on the
-/// command line — those are wired in M4.
+/// `[distributed]` is emitted only for TP launches; single-rank uses the
+/// cuda driver's default (`tp_size=1, tp_rank=0`).
 ///
 /// `[aux_ipc]` is also omitted: the cuda driver currently uses a
 /// `--control-fd` inherited from a subprocess, which has no in-process
 /// analogue. M3 patches the cuda driver to accept `[aux_ipc].socket_path`
 /// so it becomes symmetric with portable.
-pub fn write_cuda_startup_toml(
+pub(crate) fn write_cuda_startup_toml(
     out_path: &Path,
     opts: &CudaNativeDriverOptions,
     hf_repo: &str,
     snapshot_dir: &Path,
     device: &str,
     group_id: usize,
+    tp: Option<&TpLaunch>,
 ) -> Result<()> {
     let runtime_quant_line = if opts.runtime_quant.is_empty() {
         String::new()
     } else {
         format!("runtime_quant = \"{}\"\n", opts.runtime_quant)
     };
+
+    let distributed_block = tp.map(|tp| {
+        format!(
+            "\n[distributed]\n\
+tp_size = {tp_size}\n\
+tp_rank = {tp_rank}\n\
+nccl_unique_id_hex = \"{uid}\"\n\
+startup_barrier_path = \"{barrier}\"\n",
+            tp_size = tp.size,
+            tp_rank = tp.rank,
+            uid = tp.nccl_unique_id_hex,
+            barrier = tp.startup_barrier_path,
+        )
+    }).unwrap_or_default();
 
     let toml = format!(
         "# Auto-generated by pie-server; do not edit.\n\
@@ -356,7 +485,8 @@ kv_page_size = {kv_page_size}\n\
 max_num_kv_pages = {max_num_kv_pages}\n\
 max_batch_tokens = {max_batch_tokens}\n\
 max_batch_size = {max_batch_size}\n\
-swap_pool_size = {swap_pool_size}\n",
+swap_pool_size = {swap_pool_size}\n\
+{distributed_block}",
         shmem_block = render_shmem_block(group_id, SHMEM_RESP_BUF_CUDA),
         snapshot = snapshot_dir.display(),
         dtype = opts.weight_dtype,
@@ -365,6 +495,7 @@ swap_pool_size = {swap_pool_size}\n",
         max_batch_tokens = opts.max_batch_tokens,
         max_batch_size = opts.max_batch_size,
         swap_pool_size = opts.swap_pool_size,
+        distributed_block = distributed_block,
     );
 
     if let Some(parent) = out_path.parent() {
@@ -455,13 +586,85 @@ impl EmbeddedDriver {
         snapshot_dir: &Path,
         group_id: usize,
     ) -> Result<Self> {
+        let mut pending = Self::spawn_rank(options, snapshot_dir, group_id, None)?;
+        let timeout = ready_timeout(options);
+        let caps = pending.wait_for_caps(timeout)?;
+        Ok(pending.into_driver(caps))
+    }
+
+    /// Spawn one embedded cuda TP group. Rank 0 owns the shmem server and
+    /// emits capabilities; followers only participate in NCCL collectives.
+    #[cfg(feature = "driver-cuda")]
+    pub fn start_cuda_tp_group(
+        options_by_rank: &[DriverOptions],
+        snapshot_dir: &Path,
+        group_id: usize,
+    ) -> Result<Vec<Self>> {
+        if options_by_rank.is_empty() {
+            return Err(anyhow!("cuda TP group must contain at least one rank"));
+        }
+        if options_by_rank.len() == 1 {
+            return Ok(vec![Self::start(&options_by_rank[0], snapshot_dir, group_id)?]);
+        }
+        for opt in options_by_rank {
+            if !matches!(opt, DriverOptions::CudaNative { .. }) {
+                return Err(anyhow!("start_cuda_tp_group only accepts cuda_native options"));
+            }
+        }
+
+        let uid = nccl_unique_id_hex()?;
+        let startup_barrier_path = launch_state_dir()
+            .join(format!("g{group_id}-tp-startup-{}", &uid[..16]))
+            .to_string_lossy()
+            .into_owned();
+        let tp_size = options_by_rank.len();
+        let mut pending = Vec::with_capacity(tp_size);
+        for (rank, opt) in options_by_rank.iter().enumerate() {
+            pending.push(Self::spawn_rank(
+                opt,
+                snapshot_dir,
+                group_id,
+                Some(TpLaunch {
+                    size: tp_size,
+                    rank,
+                    nccl_unique_id_hex: uid.clone(),
+                    startup_barrier_path: startup_barrier_path.clone(),
+                }),
+            )?);
+        }
+
+        let timeout = ready_timeout(&options_by_rank[0]);
+        let leader_caps = pending[0].wait_for_caps(timeout)?;
+        let mut drivers = Vec::with_capacity(tp_size);
+        for (rank, p) in pending.into_iter().enumerate() {
+            let mut caps = leader_caps.clone();
+            if rank > 0 {
+                // Followers do not own runtime-visible shmem/RPC, but
+                // DriverHandle requires caps for lifecycle diagnostics.
+                caps.shmem_name = shmem_name(group_id);
+            }
+            drivers.push(p.into_driver(caps));
+        }
+        Ok(drivers)
+    }
+
+    fn spawn_rank(
+        options: &DriverOptions,
+        snapshot_dir: &Path,
+        group_id: usize,
+        tp: Option<TpLaunch>,
+    ) -> Result<PendingEmbeddedDriver> {
         if !snapshot_dir.is_dir() {
             return Err(anyhow!(
                 "snapshot_dir {snapshot_dir:?} does not exist or is not a directory"
             ));
         }
 
-        let state_dir = launch_state_dir().join(format!("g{group_id}"));
+        let rank_suffix = tp
+            .as_ref()
+            .map(|tp| format!("-r{}", tp.rank))
+            .unwrap_or_default();
+        let state_dir = launch_state_dir().join(format!("g{group_id}{rank_suffix}"));
         std::fs::create_dir_all(&state_dir)
             .map_err(|e| anyhow!("create state dir {state_dir:?}: {e}"))?;
 
@@ -482,6 +685,7 @@ impl EmbeddedDriver {
                     snapshot_dir,
                     device,
                     group_id,
+                    tp.as_ref(),
                 )?;
             }
             #[cfg(feature = "driver-dummy")]
@@ -521,8 +725,12 @@ impl EmbeddedDriver {
         // Send for EmbeddedDriver`) that nobody else writes through
         // until the thread is joined.
         let caps_ctx_addr = caps_ctx as usize;
+        let thread_name = tp
+            .as_ref()
+            .map(|tp| format!("pie-driver-{}-g{group_id}-r{}", flavor.as_str(), tp.rank))
+            .unwrap_or_else(|| format!("pie-driver-{}-g{group_id}", flavor.as_str()));
         let thread = std::thread::Builder::new()
-            .name(format!("pie-driver-{}-g{group_id}", flavor.as_str()))
+            .name(thread_name)
             .spawn(move || -> i32 {
                 // Argv storage lives on the thread's stack for the
                 // entire run — safe to hand its raw pointers to the
@@ -554,52 +762,14 @@ impl EmbeddedDriver {
                 anyhow!("spawn pie-driver thread: {e}")
             })?;
 
-        let ready_timeout_s = match options {
-            #[cfg(feature = "driver-portable")]
-            DriverOptions::Portable(p) => p.ready_timeout_s,
-            #[cfg(feature = "driver-cuda")]
-            DriverOptions::CudaNative { opts, .. } => opts.ready_timeout_s,
-            #[cfg(feature = "driver-dummy")]
-            DriverOptions::Dummy { opts, .. } => opts.ready_timeout_s,
-        };
-        let timeout = Duration::from_secs_f64(ready_timeout_s.max(1.0));
-        let json = match caps_rx.recv_timeout(timeout) {
-            Ok(j) => j,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Sender hung up before sending → driver thread exited
-                // without firing the callback. Join, free the ctx, bail.
-                let rc = thread.join().unwrap_or(-1);
-                unsafe { drop(Box::from_raw(caps_ctx)) };
-                return Err(anyhow!(
-                    "driver thread exited (rc={rc}) before emitting capabilities; \
-                     check stderr for the [pie-driver-{}] error message",
-                    flavor.as_str(),
-                ));
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Driver is still running (probably still loading
-                // weights past the deadline). We can't safely free the
-                // ctx — the thread might still fire the callback. Best
-                // we can do: leak it. The OS will reclaim on process
-                // exit; the `request_stop` path in shutdown should let
-                // the thread clean up first under normal teardown.
-                std::mem::forget(unsafe { Box::from_raw(caps_ctx) });
-                return Err(anyhow!(
-                    "driver did not emit capabilities within {:.1}s",
-                    timeout.as_secs_f64()
-                ));
-            }
-        };
-
-        let caps = DriverCapabilities::from_json(&json)?;
-        Ok(EmbeddedDriver {
-            shmem_name: caps.shmem_name.clone(),
+        Ok(PendingEmbeddedDriver {
+            shmem_name: shmem_name(group_id),
             flavor,
             aux_socket_path,
-            caps,
             thread: Some(thread),
             caps_ctx,
-            _state_dir: state_dir,
+            caps_rx: Some(caps_rx),
+            state_dir,
         })
     }
 
@@ -723,7 +893,7 @@ mod tests {
         let snap = tmp.path().join("snap");
         let opts = CudaNativeDriverOptions::default();
 
-        write_cuda_startup_toml(&out, &opts, "Qwen/Qwen3-0.6B", &snap, "cuda:0", 0)
+        write_cuda_startup_toml(&out, &opts, "Qwen/Qwen3-0.6B", &snap, "cuda:0", 0, None)
             .unwrap();
 
         // Re-parse the emitted TOML to confirm the schema the cuda
@@ -754,12 +924,41 @@ mod tests {
         let mut opts = CudaNativeDriverOptions::default();
         opts.runtime_quant = "fp8".to_string();
 
-        write_cuda_startup_toml(&out, &opts, "Q/q", &snap, "cuda:1", 3).unwrap();
+        write_cuda_startup_toml(&out, &opts, "Q/q", &snap, "cuda:1", 3, None).unwrap();
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(val["model"]["runtime_quant"].as_str().unwrap(), "fp8");
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:1");
         assert_eq!(val["shmem"]["name"].as_str().unwrap(), "/pie_shmem_g3");
+    }
+
+    #[test]
+    fn cuda_startup_toml_emits_distributed_block_for_tp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let opts = CudaNativeDriverOptions::default();
+        let tp = TpLaunch {
+            size: 2,
+            rank: 1,
+            nccl_unique_id_hex: "abcd".to_string(),
+            startup_barrier_path: "/tmp/pie-tp-test".to_string(),
+        };
+
+        write_cuda_startup_toml(&out, &opts, "Q/q", &snap, "cuda:1", 4, Some(&tp)).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(val["distributed"]["tp_size"].as_integer().unwrap(), 2);
+        assert_eq!(val["distributed"]["tp_rank"].as_integer().unwrap(), 1);
+        assert_eq!(
+            val["distributed"]["nccl_unique_id_hex"].as_str().unwrap(),
+            "abcd",
+        );
+        assert_eq!(
+            val["distributed"]["startup_barrier_path"].as_str().unwrap(),
+            "/tmp/pie-tp-test",
+        );
     }
 }

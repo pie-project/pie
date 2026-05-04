@@ -15,17 +15,9 @@ path = "src/lib.rs"
 [dependencies]
 # `pie-server` is the engine library — we link the same `serve::start_engine`
 # the CLI uses, so the CLI and the pyo3 wheel can never drift in their boot
-# behavior. We don't enable `driver-cuda` here; the dummy + portable embedded
-# drivers cover smoke testing and Python users typically pick a subprocess
-# flavor (dev / vllm / sglang) anyway.
-# Embedded-driver feature picks: only `driver-dummy` (Rust crate, no
-# native build dependencies). The C++ embedded drivers (`driver-portable`,
-# `driver-cuda`) need ggml/CUDA dynamic libs that the cdylib doesn't
-# link by default — users who want those should use the `pie` CLI
-# binary, which has a real `bin` build pulling the static archives in.
-# For the Python wheel, the subprocess drivers (`dev` / `vllm` /
-# `sglang`) are the realistic deployment anyway.
-pie-server = { path = "../../server", default-features = false, features = ["driver-dummy"] }
+# behavior. Build every embedded driver into the Python engine so
+# `pie.server.Server` can host the same local flavors as `pie serve`.
+pie-server = { path = "../../server", default-features = false, features = ["driver-cuda", "driver-portable", "driver-dummy"] }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 tokio = { version = "1.38", features = ["rt-multi-thread"] }
 toml = "0.9"

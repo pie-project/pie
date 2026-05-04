@@ -8,7 +8,8 @@
 //! falls back to the runtime's synthesized causal mask — every page stays in
 //! play, giving an apples-to-apples comparison for the optimization's effect.
 //!
-//! Output is a key=value summary parsed by `benches/page_trim.py`. Token IDs
+//! Output is a key=value summary consumed by tests and ad hoc benchmark
+//! harnesses. Token IDs
 //! produced by the model are discarded; we only care about timing.
 
 use inferlet::{

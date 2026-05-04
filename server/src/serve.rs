@@ -223,14 +223,18 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
         let topology = calculate_topology(world_size, tp_degree)
             .with_context(|| format!("model {:?} topology", m.name))?;
 
+        #[allow(unreachable_patterns)]
         if tp_degree > 1 {
-            anyhow::bail!(
-                "model {:?}: tensor_parallel_size={tp_degree} is not yet \
-                 supported in server — only DP > 1 (one driver \
-                 per replica, tp=1) works today. NCCL rendezvous for \
-                 in-process TP lands in M4.5.",
-                m.name,
-            );
+            match resolved {
+                #[cfg(feature = "driver-cuda")]
+                ResolvedFlavor::Embedded(Flavor::Cuda) => {}
+                ResolvedFlavor::Subprocess(_) => {}
+                _ => anyhow::bail!(
+                    "model {:?}: tensor_parallel_size={tp_degree} is only \
+                     supported for cuda_native and Python subprocess drivers",
+                    m.name,
+                ),
+            }
         }
 
         // Embedded options are typed; subprocess uses raw passthrough,
@@ -251,8 +255,8 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
         let model_master_port = base_master_port.saturating_add((model_idx as u16) * 100);
 
         for (group_idx, group) in topology.iter().enumerate() {
-            // For tp=1 the per-group device is just `device[group_idx]`.
-            // For tp>1 (gated above), it would be `device[group[0]]`.
+            // Rank 0 owns the runtime-visible shmem/RPC endpoint for
+            // each TP group. For tp=1 this is just one DP replica.
             let _device_for_group = m
                 .driver
                 .device
@@ -276,6 +280,7 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
                     // Cuda needs the device pinned per group (`model.device`
                     // in its TOML); other flavors derive everything else from
                     // the snapshot dir alone.
+                    #[allow(unreachable_patterns)]
                     let opts = match embedded_base_opts.as_ref().expect("embedded => Some") {
                         #[cfg(feature = "driver-cuda")]
                         DriverOptions::CudaNative { opts, hf_repo, .. } => {
@@ -305,11 +310,68 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
                     // returns the aux socket is accepting. Spawning the
                     // cold-path dispatcher before the driver would race
                     // the runtime's first call against an absent client.
-                    let driver = EmbeddedDriver::start(&opts, &snapshot_dir, device_idx)
-                        .with_context(|| format!(
-                            "starting driver for model {:?} group {group_idx}",
-                            m.name,
-                        ))?;
+                    let group_drivers: Vec<EmbeddedDriver>;
+                    #[cfg(feature = "driver-cuda")]
+                    {
+                        if flavor == Flavor::Cuda && tp_degree > 1 {
+                            let base = embedded_base_opts.as_ref().expect("embedded => Some");
+                            let mut rank_opts = Vec::with_capacity(group.len());
+                            for &rank_device_idx in group {
+                                let rank_device = m
+                                    .driver
+                                    .device
+                                    .get(rank_device_idx)
+                                    .ok_or_else(|| {
+                                        anyhow!(
+                                            "model {:?}: TP group {group_idx} references \
+                                             device index {} but only {} devices configured",
+                                            m.name,
+                                            rank_device_idx,
+                                            m.driver.device.len(),
+                                        )
+                                    })?
+                                    .clone();
+                                #[allow(unreachable_patterns)]
+                                match base {
+                                    DriverOptions::CudaNative { opts, hf_repo, .. } => {
+                                        rank_opts.push(DriverOptions::CudaNative {
+                                            opts: opts.clone(),
+                                            device: rank_device,
+                                            hf_repo: hf_repo.clone(),
+                                        });
+                                    }
+                                    _ => unreachable!("flavor checked above"),
+                                }
+                            }
+                            group_drivers = EmbeddedDriver::start_cuda_tp_group(
+                                &rank_opts,
+                                &snapshot_dir,
+                                device_idx,
+                            )
+                            .with_context(|| format!(
+                                "starting cuda TP driver group for model {:?} group {group_idx}",
+                                m.name,
+                            ))?;
+                        } else {
+                            group_drivers = vec![
+                                EmbeddedDriver::start(&opts, &snapshot_dir, device_idx)
+                                    .with_context(|| format!(
+                                        "starting driver for model {:?} group {group_idx}",
+                                        m.name,
+                                    ))?,
+                            ];
+                        }
+                    }
+                    #[cfg(not(feature = "driver-cuda"))]
+                    {
+                        group_drivers = vec![
+                            EmbeddedDriver::start(&opts, &snapshot_dir, device_idx)
+                                .with_context(|| format!(
+                                    "starting driver for model {:?} group {group_idx}",
+                                    m.name,
+                                ))?,
+                        ];
+                    }
 
                     // Connect the aux-IPC client only for drivers that listen
                     // (portable today). Cuda's `[aux_ipc]` listener and
@@ -319,7 +381,7 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
                     let aux_client: Option<Arc<AuxIpcClient>> = match flavor {
                         #[cfg(feature = "driver-portable")]
                         Flavor::Portable => Some(Arc::new(
-                            AuxIpcClient::connect(driver.aux_socket_path.clone())
+                            AuxIpcClient::connect(group_drivers[0].aux_socket_path.clone())
                                 .with_context(|| format!(
                                     "connecting aux-ipc socket for model {:?} group {group_idx}",
                                     m.name,
@@ -333,9 +395,11 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
 
                     group_handshakes.push(GroupHandshake {
                         rpc_server_name,
-                        caps: driver.caps.clone(),
+                        caps: group_drivers[0].caps.clone(),
                     });
-                    drivers.push(DriverHandle::Embedded(driver));
+                    for driver in group_drivers {
+                        drivers.push(DriverHandle::Embedded(driver));
+                    }
                     rpc_servers.push(rpc_server);
                     rpc_threads.push(rpc_thread);
                 }

@@ -3,7 +3,8 @@
 Verifies the inferlet runs to completion under both modes (mask on / off) and
 that the timing summary it prints contains the expected key=value lines. We
 keep the workload small here (short prompt, few decode steps) so the test is
-fast — the real numbers are gathered by ``benches/page_trim.py``.
+fast. Use the canonical scripts in ``benches/`` for engine-level benchmark
+numbers.
 """
 import re
 

@@ -43,7 +43,14 @@ ncclUniqueId nccl_unique_id_from_hex(const std::string& hex) {
 
 NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
     : world_size_(world_size), rank_(rank) {
-    NCCL_CHECK(ncclCommInitRank(&comm_, world_size, uid, rank));
+    ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+    // Followers often wait for rank 0's next fire-batch broadcast. The
+    // default non-blocking communicator can surface that idle wait as a
+    // persistent 100% GPU-utilization spin. Use NCCL's blocking mode so idle
+    // collectives sleep instead of burning a device while rank 0 is between
+    // requests or still publishing readiness.
+    config.blocking = 1;
+    NCCL_CHECK(ncclCommInitRankConfig(&comm_, world_size, uid, rank, &config));
 }
 
 NcclComm::~NcclComm() {

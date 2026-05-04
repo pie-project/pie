@@ -221,3 +221,12 @@
          case GGML_OP_CROSS_ENTROPY_LOSS:
          case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
          case GGML_OP_OPT_STEP_ADAMW:
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -449,6 +449,8 @@
+                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
++        case GGML_OP_PAGED_ATTN_EXT:
++            return false;
+         default:
+             return true;
+     }

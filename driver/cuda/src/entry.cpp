@@ -15,6 +15,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <span>
 #include <string>
@@ -63,6 +64,40 @@ std::atomic<pie_cuda_driver::ShmemServer*> g_server{nullptr};
 
 void on_signal(int) {
     if (auto* s = g_server.load()) s->stop();
+}
+
+void tp_startup_cpu_barrier(const pie_cuda_driver::Config& cfg) {
+    if (cfg.distributed.tp_size <= 1 ||
+        cfg.distributed.startup_barrier_path.empty()) {
+        return;
+    }
+
+    const std::filesystem::path base(cfg.distributed.startup_barrier_path);
+    if (base.has_parent_path()) {
+        std::filesystem::create_directories(base.parent_path());
+    }
+    const auto rank_path =
+        base.string() + ".rank" + std::to_string(cfg.distributed.tp_rank);
+    {
+        std::ofstream f(rank_path, std::ios::out | std::ios::trunc);
+        f << "ready\n";
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(600);
+    while (std::chrono::steady_clock::now() < deadline) {
+        bool all_ready = true;
+        for (int r = 0; r < cfg.distributed.tp_size; ++r) {
+            const auto p = base.string() + ".rank" + std::to_string(r);
+            if (!std::filesystem::exists(p)) {
+                all_ready = false;
+                break;
+            }
+        }
+        if (all_ready) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    throw std::runtime_error("timed out waiting for TP startup CPU barrier");
 }
 
 }  // namespace
@@ -962,40 +997,6 @@ int run_impl(int argc,
         std::signal(SIGTERM, on_signal);
     }
 
-    if (!is_tp_follower) {
-        // Capabilities reflect both the loaded HF config and the live
-        // KV cache. Only rank 0 reports — the wrapper expects exactly
-        // one READY per TP group.
-        auto c = engine.capabilities();
-        c.total_pages = kv_cache.num_pages();
-        c.max_batch_tokens = max_workspace_tokens;
-        c.swap_pool_size = swap_pool.num_pages();
-        nlohmann::json caps = {
-            {"total_pages",      c.total_pages},
-            {"kv_page_size",     c.kv_page_size},
-            {"swap_pool_size",   c.swap_pool_size},
-            {"max_batch_tokens", c.max_batch_tokens},
-            {"max_batch_size",   c.max_batch_size},
-            {"arch_name",        c.arch_name},
-            {"vocab_size",       c.vocab_size},
-            {"max_model_len",    c.max_model_len},
-            {"activation_dtype", c.activation_dtype},
-            {"snapshot_dir",     c.snapshot_dir},
-            {"shmem_name",       cfg.shmem.name},
-        };
-        const std::string caps_json = caps.dump();
-        ready_cb(caps_json.c_str(), ready_ctx);
-
-        std::cerr << "[pie-driver-cuda] serving on shmem " << server_p->name()
-                  << " (" << server_p->num_slots() << " slots, "
-                  << "req_buf=" << server_p->req_buf_size() << ", "
-                  << "resp_buf=" << server_p->resp_buf_size() << ")\n";
-    } else {
-        std::cerr << "[pie-driver-cuda] tp follower rank "
-                  << cfg.distributed.tp_rank
-                  << " ready (waiting on rank-0 broadcasts)\n";
-    }
-
     std::uint64_t handled = 0;
 
     pie_cuda_driver::ForwardGraphCache graph_cache;
@@ -1098,6 +1099,7 @@ int run_impl(int argc,
     // `main`'s scope (weights_*, fwd_cfg, gemma_fwd_cfg) and persist for
     // the lifetime of the server.
     pie_cuda_driver::ForwardFn forward_fn;
+    pie_cuda_driver::model::LlamaLikePlanState llama_plan;
     // Gemma-4 26B-A4B's MoE block needs a routed-experts workspace
     // alongside the dense forward state. Inert (zero-byte) on dense
     // E2B / E4B / 31B variants.
@@ -1346,16 +1348,15 @@ int run_impl(int argc,
                 slot_ids_h, is_fresh_h, slot_ids_d);
         };
     } else {
-        static pie_cuda_driver::model::LlamaLikePlanState s_llama_plan;
-        forward_fn.prepare = [&engine, &kv_cache, &fwd_cfg](
+        forward_fn.prepare = [&engine, &kv_cache, &fwd_cfg, &llama_plan](
             pie_cuda_driver::AttentionWorkspace& attn_ws,
             const std::uint32_t* kv_page_indptr_h,
             int R, bool is_pure_decode) {
             pie_cuda_driver::model::prepare_llama_like_decode_plan(
-                s_llama_plan, attn_ws, kv_cache, engine.hf_config(),
+                llama_plan, attn_ws, kv_cache, engine.hf_config(),
                 fwd_cfg, kv_page_indptr_h, R, is_pure_decode);
         };
-        forward_fn.body = [&engine, &weights_llama, fwd_cfg](
+        forward_fn.body = [&engine, &weights_llama, fwd_cfg, &llama_plan](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -1372,7 +1373,7 @@ int run_impl(int argc,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
             const std::int32_t* slot_ids_d) {
             pie_cuda_driver::model::llama_like_forward_paged(
-                weights_llama, engine.hf_config(), fwd_cfg, s_llama_plan,
+                weights_llama, engine.hf_config(), fwd_cfg, llama_plan,
                 ws, cache, attn_ws, cublas,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
@@ -1388,6 +1389,7 @@ int run_impl(int argc,
         /*tp_comm=*/tp_comm_ptr,
         /*slot_alloc=*/{},
     };
+    fwd_ctx.tp_cpu_gate_key = cfg.distributed.startup_barrier_path;
     // Size the linear-attn slot allocator only when this arch actually
     // uses a state cache. Default-constructed (max_slots=0) on every
     // other arch — handle_fire_batch's `use_slots` predicate stays false
@@ -1400,11 +1402,53 @@ int run_impl(int argc,
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
     }
 
+    // TP ranks run as independent driver instances. Followers can reach the
+    // first NCCL receive before rank 0 has finished building its CUDA serving
+    // state; posting that idle receive while the leader is still allocating can
+    // show as a persistent 100% GPU-util spin and has reproduced startup
+    // wedges. Rendezvous on CPU after all persistent allocations are complete,
+    // then publish rank-0 readiness and let followers enter the NCCL loop.
+    tp_startup_cpu_barrier(cfg);
+
     if (is_tp_follower) {
+        std::cerr << "[pie-driver-cuda] tp follower rank "
+                  << cfg.distributed.tp_rank
+                  << " ready (waiting on rank-0 broadcasts"
+                  << (fwd_ctx.tp_cpu_gate_key.empty()
+                          ? ", cpu_gate=off"
+                          : ", cpu_gate=on")
+                  << ")\n";
         // Followers: block on rank-0 broadcasts until shutdown.
         std::atomic<bool> stop{false};
         pie_cuda_driver::tp_follower_serve(fwd_ctx, stop);
     } else {
+        // Capabilities reflect both the loaded HF config and the live
+        // KV cache. Only rank 0 reports — the wrapper expects exactly
+        // one READY per TP group.
+        auto c = engine.capabilities();
+        c.total_pages = kv_cache.num_pages();
+        c.max_batch_tokens = max_workspace_tokens;
+        c.swap_pool_size = swap_pool.num_pages();
+        nlohmann::json caps = {
+            {"total_pages",      c.total_pages},
+            {"kv_page_size",     c.kv_page_size},
+            {"swap_pool_size",   c.swap_pool_size},
+            {"max_batch_tokens", c.max_batch_tokens},
+            {"max_batch_size",   c.max_batch_size},
+            {"arch_name",        c.arch_name},
+            {"vocab_size",       c.vocab_size},
+            {"max_model_len",    c.max_model_len},
+            {"activation_dtype", c.activation_dtype},
+            {"snapshot_dir",     c.snapshot_dir},
+            {"shmem_name",       cfg.shmem.name},
+        };
+        const std::string caps_json = caps.dump();
+        ready_cb(caps_json.c_str(), ready_ctx);
+
+        std::cerr << "[pie-driver-cuda] serving on shmem " << server_p->name()
+                  << " (" << server_p->num_slots() << " slots, "
+                  << "req_buf=" << server_p->req_buf_size() << ", "
+                  << "resp_buf=" << server_p->resp_buf_size() << ")\n";
         server_p->serve_forever([&](const pie_cuda_driver::SlotRequest& req,
                                     std::span<std::uint8_t> response) -> std::size_t {
             ++handled;
@@ -1419,7 +1463,8 @@ int run_impl(int argc,
         // Leader exited serve loop — wake followers so they can tear
         // down cleanly.
         if (cfg.distributed.tp_size > 1) {
-            pie_cuda_driver::tp_send_shutdown(*tp_comm_ptr);
+            pie_cuda_driver::tp_send_shutdown(
+                *tp_comm_ptr, fwd_ctx.tp_cpu_gate_key);
         }
     }
 

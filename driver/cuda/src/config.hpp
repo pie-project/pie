@@ -56,6 +56,10 @@ struct DistributedConfig {
     int tp_rank = 0;
     // Hex-encoded ncclUniqueId (256 chars). Empty when tp_size == 1.
     std::string nccl_unique_id_hex;
+    // Optional CPU-side rendezvous file prefix. Embedded TP launches use this
+    // to keep follower ranks from posting their idle NCCL receive before the
+    // leader has finished all startup allocations.
+    std::string startup_barrier_path;
 };
 
 struct Config {
@@ -103,6 +107,8 @@ inline Config load_config(const std::filesystem::path& path) {
             (*d)["tp_rank"].value_or<int64_t>(c.distributed.tp_rank));
         c.distributed.nccl_unique_id_hex =
             (*d)["nccl_unique_id_hex"].value_or(std::string{});
+        c.distributed.startup_barrier_path =
+            (*d)["startup_barrier_path"].value_or(std::string{});
     }
 
     if (c.model.hf_repo.empty()) {

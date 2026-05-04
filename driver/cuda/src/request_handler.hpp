@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <string>
 #include <type_traits>
 
 #include <atomic>
@@ -146,6 +147,11 @@ struct ForwardContext {
     // before invoking the forward kernels. On TP followers a parallel
     // service loop (`tp_follower_serve`) consumes those broadcasts.
     NcclComm* tp_comm = nullptr;
+    // Optional in-process CPU gate keyed by the embedded launch barrier path.
+    // Rank 0 notifies before posting NCCL broadcasts; followers wait here
+    // before entering their NCCL receive. This prevents idle followers from
+    // burning GPU cycles while rank 0 is between requests.
+    std::string tp_cpu_gate_key;
 
     // Per-request linear-attention state-cache slot mapping. Rank 0
     // owns the LRU; followers receive the pre-resolved slot_ids and
@@ -176,6 +182,6 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop);
 
 // Send the shutdown sentinel header from rank 0 so followers exit their
 // `tp_follower_serve` loop on the next broadcast.
-void tp_send_shutdown(NcclComm& comm);
+void tp_send_shutdown(NcclComm& comm, const std::string& cpu_gate_key = {});
 
 }  // namespace pie_cuda_driver

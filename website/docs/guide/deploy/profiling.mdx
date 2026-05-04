@@ -13,10 +13,10 @@ The right tool depends on the question you are asking.
 | Question | Tool |
 |---|---|
 | Is the engine doing work? | `pie serve --monitor` (TUI). |
-| Is throughput in the expected range? | `benches/tput.py` and friends. |
+| Is throughput in the expected range? | `benches/pie_bench.py tput`. |
 | Is one inferlet hot-spotting? | Per-process view in the monitor. |
 | Where in the inferlet is the time going? | Manual timing from inside the inferlet. |
-| How does Pie compare to vLLM / SGLang? | `benches/all_drivers.py`. |
+| How does Pie compare to vLLM / SGLang? | `benches/vllm_bench.py` and `benches/sglang_bench.py`. |
 
 ## The monitor TUI
 
@@ -41,29 +41,27 @@ The monitor is the right first stop when something feels slow. Three quick reads
 
 ## The bench scripts
 
-The repo's [`benches/`](https://github.com/pie-project/pie/tree/main/benches) directory has scripts that drive the engine through known workloads and report tokens per second, latency, and per-step timing.
+The repo's [`benches/`](https://github.com/pie-project/pie/tree/main/benches) directory has scripts that drive Pie and baseline engines through known workloads and report exact output-token counts, latency, and throughput.
 
 ```bash
-# Pie native driver, throughput sweep
-uv run python benches/tput.py
+# Pie cuda_native latency
+uv --project sdk/python-server run python benches/pie_bench.py latency \
+  --driver cuda_native --model Qwen/Qwen2-0.5B --device cuda:0
 
-# vLLM driver, same workload shape
-uv run python benches/tput_vllm.py
+# Pie cuda_native throughput
+uv --project sdk/python-server run python benches/pie_bench.py tput \
+  --driver cuda_native --model Qwen/Qwen2-0.5B --device cuda:0
 
-# SGLang driver, same workload shape
-uv run python benches/tput_sglang.py
+# vLLM, same workload shape
+/root/Workspace/.venvs/vllm/bin/python benches/vllm_bench.py tput \
+  --model Qwen/Qwen2-0.5B
 
-# All three drivers on the same workload
-uv run python benches/all_drivers.py
-
-# Phase breakdown (prefill vs decode)
-uv run python benches/tput_phase.py
-
-# Per-RPS sweep
-uv run python benches/tput_rps.py
+# SGLang, same workload shape
+/root/Workspace/.venvs/sglang/bin/python benches/sglang_bench.py tput \
+  --model Qwen/Qwen2-0.5B
 ```
 
-Each script writes a CSV next to itself. Hardware and model live at the top of the file. Edit them in place to match your environment.
+Each script prints a summary and writes JSON when `--json-out` is set. See `benches/README.md` for environment setup and fairness defaults.
 
 ## Manual timing inside an inferlet
 
