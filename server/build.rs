@@ -238,6 +238,16 @@ fn build_cuda() {
     cfg.build_target("pie_driver_cuda_lib")
         .define("BUILD_SHARED_LIBS", "OFF");
 
+    // CUDA architecture. driver/cuda's `DetectCudaArchitecture.cmake`
+    // shells out to `nvidia-smi` if `CMAKE_CUDA_ARCHITECTURES` isn't
+    // pre-set, which fails on CI runners with no GPU. cmake-rs does
+    // not auto-forward env vars, so honor the standard
+    // `CMAKE_CUDA_ARCHITECTURES` env var explicitly.
+    println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
+    if let Ok(arch) = std::env::var("CMAKE_CUDA_ARCHITECTURES") {
+        cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
+    }
+
     // NCCL discovery hint. The cuda driver's CMakeLists.txt does
     // `find_path(NCCL_INCLUDE_DIR nccl.h ...)` against `/usr/include`
     // and `/usr/local/include` by default. Sites that install NCCL
