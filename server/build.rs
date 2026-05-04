@@ -112,6 +112,15 @@ fn build_portable() {
         cfg.define("GGML_METAL", "ON")
             .define("GGML_STATIC", "ON");
     }
+    // Apple clang (`/usr/bin/cc` on macOS) doesn't ship with OpenMP
+    // and the ggml-cpu CMake hard-errors when `find_package(OpenMP)`
+    // misses. Metal is the relevant backend on this OS anyway, so
+    // turn ggml's OpenMP requirement off rather than dragging in
+    // libomp from Homebrew. Linux + Windows have OpenMP via gcc/MSVC
+    // out of the box, so leave the default on there.
+    if target_os == "macos" {
+        cfg.define("GGML_OPENMP", "OFF");
+    }
     let dst = cfg.build();
     let build_dir = dst.join("build");
 
