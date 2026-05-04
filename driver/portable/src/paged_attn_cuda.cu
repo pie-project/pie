@@ -178,6 +178,15 @@ std::size_t hash_indptr(const IdType* p, std::size_t n) {
 }
 
 // Per-(head_dim, group_size) work estimator for the planner.
+//
+// We force `split_kv = false` after FlashInfer's estimator runs. The
+// adaptive choice would flip to two-stage (split-K + reduction) at long
+// contexts, which changes the actual kernel launches FlashInfer makes.
+// ggml-cuda's CUDA graph capture keys on observed launches; a mid-bench
+// flip invalidates the captured graph and triggers a recapture stall
+// that has been observed to hang at 256+ tokens. Single-stage trades
+// some perf at very long contexts (>~4K KV/req) for deterministic
+// launches and stable graph capture across all decode steps.
 template <uint32_t HEAD_DIM, uint32_t GROUP_SIZE>
 struct DecodeWorkEstimator {
     cudaError_t operator()(bool& split_kv, uint32_t& max_grid_size,
@@ -185,10 +194,13 @@ struct DecodeWorkEstimator {
                            uint32_t& gdy, uint32_t batch_size, IdType* kv_indptr_h,
                            uint32_t num_qo_heads, uint32_t page_size, bool enable_cuda_graph,
                            cudaStream_t stream) {
-        return ::flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
+        cudaError_t rc = ::flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
             GROUP_SIZE, HEAD_DIM, POS_ENC, AttnVariant, DecodeParams>(
             split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
             batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
+        split_kv       = false;
+        new_batch_size = batch_size;
+        return rc;
     }
 };
 
