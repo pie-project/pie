@@ -96,7 +96,16 @@ fn build_portable() {
             // and ends up issuing ~30 kernel launches per decode step, which
             // costs ~1 ms vs ~0.3 ms with capture. Enable explicitly.
             .define("GGML_CUDA_GRAPHS", "ON")
-            .define("GGML_STATIC", "ON");
+            .define("GGML_STATIC", "ON")
+            // llama.cpp b8994 added a multi-GPU NCCL allreduce path inside
+            // ggml-cuda (`GGML_CUDA_NCCL`, default ON when NCCL is present
+            // on the host). When set, libggml-cuda.a references nccl
+            // symbols that the portable-cuda flavor (no driver-cuda) can't
+            // satisfy at link time. We have our own NCCL-backed
+            // tensor-parallel path in driver-cuda, so the ggml-cuda one
+            // is unused either way — disable to keep the libggml-cuda.a
+            // self-contained.
+            .define("GGML_CUDA_NCCL", "OFF");
         if let Ok(arch) = std::env::var("PIE_PORTABLE_CUDA_ARCH") {
             cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
         }
