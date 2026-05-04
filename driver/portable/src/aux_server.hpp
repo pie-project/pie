@@ -79,7 +79,14 @@ private:
     ggml_backend_t    adapter_backend_ = nullptr;
     const Hparams*    hparams_         = nullptr;
     std::string       socket_path_;
-    int               listen_fd_ = -1;
+    int               listen_fd_     = -1;
+    // Self-pipe used to break the listener thread out of `accept()` on
+    // shutdown. `shutdown(SHUT_RDWR)` on a listening AF_UNIX socket
+    // doesn't unblock pending `accept()` on macOS/BSD (works on Linux),
+    // so we register both fds with `poll()` and `stop()` writes one byte
+    // to the write end to wake the loop.
+    int               wakeup_read_   = -1;
+    int               wakeup_write_  = -1;
     std::thread       thread_;
     std::atomic<bool> stop_{false};
 };

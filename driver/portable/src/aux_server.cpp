@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -119,29 +120,62 @@ AuxServer::AuxServer(const std::string& socket_path,
                                  std::string(std::strerror(errno)));
     }
 
+    int p[2];
+    if (::pipe(p) != 0) {
+        ::close(listen_fd_);
+        ::unlink(socket_path_.c_str());
+        throw std::runtime_error("aux_server: pipe() failed: " +
+                                 std::string(std::strerror(errno)));
+    }
+    ::fcntl(p[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(p[1], F_SETFD, FD_CLOEXEC);
+    ::fcntl(p[0], F_SETFL, O_NONBLOCK);
+    wakeup_read_  = p[0];
+    wakeup_write_ = p[1];
+
     thread_ = std::thread([this] { run_(); });
 }
 
 AuxServer::~AuxServer() {
     stop();
     if (thread_.joinable()) thread_.join();
+    if (wakeup_read_  >= 0) ::close(wakeup_read_);
+    if (wakeup_write_ >= 0) ::close(wakeup_write_);
     if (listen_fd_ >= 0) ::close(listen_fd_);
     if (!socket_path_.empty()) ::unlink(socket_path_.c_str());
 }
 
 void AuxServer::stop() {
     stop_.store(true, std::memory_order_relaxed);
-    // Closing the listening socket unblocks any pending accept().
-    if (listen_fd_ >= 0) {
-        ::shutdown(listen_fd_, SHUT_RDWR);
+    // Wake the listener thread out of `poll()` (or `accept()` if it
+    // somehow bypassed the poll). Best-effort: a full pipe means a
+    // wakeup is already pending, which is fine.
+    if (wakeup_write_ >= 0) {
+        const std::uint8_t b = 1;
+        ssize_t r = ::write(wakeup_write_, &b, 1);
+        (void)r;
     }
 }
 
 void AuxServer::run_() {
     while (!stop_.load(std::memory_order_relaxed)) {
+        struct pollfd pfds[2] = {
+            { listen_fd_,    POLLIN, 0 },
+            { wakeup_read_,  POLLIN, 0 },
+        };
+        const int prc = ::poll(pfds, 2, /*timeout=*/-1);
+        if (prc < 0) {
+            if (errno == EINTR) continue;
+            std::cerr << "[pie-driver-portable] aux poll() failed: "
+                      << std::strerror(errno) << "\n";
+            break;
+        }
+        if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) break;
+        if (!(pfds[0].revents & POLLIN)) continue;
+
         const int conn = ::accept(listen_fd_, nullptr, nullptr);
         if (conn < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN) continue;
             if (stop_.load(std::memory_order_relaxed)) break;
             std::cerr << "[pie-driver-portable] aux accept() failed: "
                       << std::strerror(errno) << "\n";
