@@ -30,9 +30,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       # Cheap structural check: every workspace member compiles. Skips
-      # the cmake-driven C++ build by checking pie-standalone with
+      # the cmake-driven C++ build by checking pie-server with
       # `--no-default-features` (the default features pull in ggml).
-      - name: cargo check (runtime, client, no-driver pie-standalone)
+      - name: cargo check (runtime, client, no-driver pie-server)
         run: |
           cargo check -p pie
           cargo check -p pie --no-default-features
@@ -43,8 +43,8 @@ jobs:
           cargo test -p pie --lib
           cargo test -p pie-client --lib
 
-  pie-standalone-portable:
-    name: pie-standalone (driver-portable)
+  pie-server-portable:
+    name: pie-server (driver-portable)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -66,12 +66,12 @@ jobs:
             ~/.cargo/git
             ~/.cache/ccache
             target
-          key: ${{ runner.os }}-pie-standalone-portable-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+          key: ${{ runner.os }}-pie-server-portable-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
 
       - name: cargo build (default = driver-portable)
-        run: cargo build -p pie-standalone
+        run: cargo build -p pie-server
 
-      - name: cargo test (pie-standalone)
+      - name: cargo test (pie-server)
         run: cargo test --bin pie
 
       - name: Verify single-binary linkage
@@ -86,8 +86,8 @@ jobs:
   # Dummy driver — pure Rust, builds on every OS we support. Cheapest
   # gate for "did the standalone wiring break end to end". Runs the
   # full unit-test suite too since dummy doesn't pull in cmake.
-  pie-standalone-dummy:
-    name: pie-standalone (driver-dummy)
+  pie-server-dummy:
+    name: pie-server (driver-dummy)
     strategy:
       fail-fast: false
       matrix:
@@ -106,14 +106,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-pie-standalone-dummy-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pie-server-dummy-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo build (driver-dummy)
         run: |
-          cargo build -p pie-standalone \
+          cargo build -p pie-server \
             --no-default-features --features driver-dummy
 
-      - name: cargo test (pie-standalone, dummy)
+      - name: cargo test (pie-server, dummy)
         run: |
           cargo test --bin pie \
             --no-default-features --features driver-dummy
@@ -122,8 +122,8 @@ jobs:
   # macOS branch + libomp link path. Doesn't run tests against a
   # real model — just exercises the cmake + link path so PRs that
   # touch driver/portable or build.rs fail fast on macOS.
-  pie-standalone-portable-metal:
-    name: pie-standalone (driver-portable + metal)
+  pie-server-portable-metal:
+    name: pie-server (driver-portable + metal)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -144,14 +144,14 @@ jobs:
             ~/.cargo/git
             ~/Library/Caches/ccache
             target
-          key: ${{ runner.os }}-pie-standalone-portable-metal-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+          key: ${{ runner.os }}-pie-server-portable-metal-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
 
       - name: cargo build (driver-portable + metal)
         env:
           PIE_PORTABLE_METAL: "1"
-        run: cargo build -p pie-standalone
+        run: cargo build -p pie-server
 
-      - name: cargo test (pie-standalone)
+      - name: cargo test (pie-server)
         env:
           PIE_PORTABLE_METAL: "1"
         run: cargo test --bin pie
@@ -161,8 +161,8 @@ jobs:
   # runner with a CUDA toolkit to enable this. Until then, M3's
   # static-link spike + manual M4 verification are the canonical
   # checkpoints.
-  pie-standalone-cuda:
-    name: pie-standalone (driver-cuda)
+  pie-server-cuda:
+    name: pie-server (driver-cuda)
     runs-on: [self-hosted, cuda]
     if: contains(github.event.pull_request.labels.*.name, 'ci-cuda')
     steps:
@@ -173,7 +173,7 @@ jobs:
 
       - name: cargo build (driver-cuda)
         run: |
-          cargo build -p pie-standalone \
+          cargo build -p pie-server \
             --no-default-features --features driver-cuda
 
       - name: Verify no CUDA shared deps
