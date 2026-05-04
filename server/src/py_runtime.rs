@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow, bail};
 
 const RUNTIME_URL: &str =
-    "https://registry.pie-project.org/api/v1/runtimes/python3.14/0.3.0/download";
+    "https://registry.pie-project.org/api/v1/runtimes/python3.14/0.4.0/download";
 
 /// Where the host loader expects to find the runtime tree.
 pub fn runtime_dir() -> PathBuf {

@@ -26,7 +26,7 @@ import httpx
 # Pinned to the version pie-server expects. Bumping this is a coordinated
 # change with the runtime/program/python module on the Rust side.
 RUNTIME_URL = (
-    "https://registry.pie-project.org/api/v1/runtimes/python3.14/0.3.0/download"
+    "https://registry.pie-project.org/api/v1/runtimes/python3.14/0.4.0/download"
 )
 
 
