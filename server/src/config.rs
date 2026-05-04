@@ -370,6 +370,39 @@ impl DriverConfig {
         // (dev / vllm / sglang) → handled by `crate::subprocess_driver`. The
         // earlier `reject_torch_only()` gate is gone — subprocess support
         // landed in Phase 3.
+        match self.kind {
+            DriverKind::Portable => {
+                let _: PortableDriverOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [model.driver.options] for driver type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+            }
+            DriverKind::CudaNative => {
+                let _: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [model.driver.options] for driver type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+            }
+            DriverKind::Dummy => {
+                let _: DummyDriverOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [model.driver.options] for driver type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+            }
+            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang => {}
+        }
         Ok(())
     }
 }
@@ -700,5 +733,27 @@ device = ["cuda:0"]
         assert_eq!(opts.swap_pool_size, 0);
         assert_eq!(opts.gpu_mem_utilization, 0.85);
         assert_eq!(opts.ready_timeout_s, 600.0);
+    }
+
+    #[test]
+    fn rejects_options_for_wrong_embedded_driver_type() {
+        let stale = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "dummy"
+device = ["cpu"]
+
+[model.driver.options]
+gpu_mem_utilization = 0.50
+vocab_size = 151936
+arch_name = "qwen3"
+"#;
+        let cfg: Config = toml::from_str(stale).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("gpu_mem_utilization"), "got: {err}");
+        assert!(err.contains("Dummy"), "got: {err}");
     }
 }
