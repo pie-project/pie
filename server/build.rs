@@ -112,39 +112,53 @@ fn build_portable() {
         cfg.define("GGML_METAL", "ON")
             .define("GGML_STATIC", "ON");
     }
-    // Apple clang (`/usr/bin/cc` on macOS) doesn't ship with OpenMP
-    // and the ggml-cpu CMake hard-errors when `find_package(OpenMP)`
-    // misses. Metal is the relevant backend on this OS anyway, so
-    // turn ggml's OpenMP requirement off rather than dragging in
-    // libomp from Homebrew. Linux + Windows have OpenMP via gcc/MSVC
-    // out of the box, so leave the default on there.
-    if target_os == "macos" {
-        cfg.define("GGML_OPENMP", "OFF");
-    }
+    // Disable ggml-cpu's OpenMP unconditionally. macOS's Apple clang
+    // doesn't ship libomp; on Linux, `-Wl,--as-needed -lgomp` is
+    // ordered before `-Wl,--start-group … libggml-cpu.a` and the
+    // linker discards libgomp before ggml-cpu.a's GOMP_* symbols
+    // are seen, leading to `undefined reference to GOMP_barrier`.
+    // The portable driver's own `#pragma omp` probe in src/model.cpp
+    // still goes through `find_package(OpenMP REQUIRED)` and links
+    // libomp/libgomp via the OpenMP::OpenMP_CXX target — that one
+    // works because cmake places it correctly. Disabling ggml-cpu's
+    // OpenMP costs us multi-thread CPU inference on the portable
+    // backend; not relevant for CI artifacts where the GPU backends
+    // (Metal / CUDA / Vulkan) are the hot path.
+    cfg.define("GGML_OPENMP", "OFF");
     let dst = cfg.build();
     let build_dir = dst.join("build");
 
     add_link_search_paths(&build_dir);
 
     println!("cargo:rustc-link-lib=static=pie_driver_portable_lib");
-    // GNU ld's `--start-group`/`--end-group` resolve circular static
-    // archive deps. Apple `ld64` doesn't have them (and doesn't need
-    // them — it auto-resolves). Gate on Linux only.
+    // GNU ld's `--start-group`/`--end-group` + `-l:libfoo.a` syntax
+    // are Linux-only. Apple ld64 has no equivalent for either
+    // (`-l:` is rejected outright; group resolution is automatic).
+    // For non-Linux, use the portable `cargo:rustc-link-lib=static=NAME`
+    // form which lets rustc pick the static archive via lib-search.
     let is_linux = target_os == "linux";
     if is_linux {
         println!("cargo:rustc-link-arg=-Wl,--start-group");
-    }
-    println!("cargo:rustc-link-arg=-l:libggml.a");
-    println!("cargo:rustc-link-arg=-l:libggml-cpu.a");
-    if cuda_enabled {
-        println!("cargo:rustc-link-arg=-l:libggml-cuda.a");
-    }
-    if vulkan_enabled {
-        println!("cargo:rustc-link-arg=-l:libggml-vulkan.a");
-    }
-    println!("cargo:rustc-link-arg=-l:libggml-base.a");
-    if is_linux {
+        println!("cargo:rustc-link-arg=-l:libggml.a");
+        println!("cargo:rustc-link-arg=-l:libggml-cpu.a");
+        if cuda_enabled {
+            println!("cargo:rustc-link-arg=-l:libggml-cuda.a");
+        }
+        if vulkan_enabled {
+            println!("cargo:rustc-link-arg=-l:libggml-vulkan.a");
+        }
+        println!("cargo:rustc-link-arg=-l:libggml-base.a");
         println!("cargo:rustc-link-arg=-Wl,--end-group");
+    } else {
+        println!("cargo:rustc-link-lib=static=ggml");
+        println!("cargo:rustc-link-lib=static=ggml-cpu");
+        if cuda_enabled {
+            println!("cargo:rustc-link-lib=static=ggml-cuda");
+        }
+        if vulkan_enabled {
+            println!("cargo:rustc-link-lib=static=ggml-vulkan");
+        }
+        println!("cargo:rustc-link-lib=static=ggml-base");
     }
 
     if cuda_enabled {
