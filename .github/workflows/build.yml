@@ -214,146 +214,113 @@ jobs:
           gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"
 
   # =========================================================================
-  # CUDA matrix — Linux jobs run inside `nvidia/cuda` images (toolkit + nccl
-  # preinstalled, glibc 2.28 → manylinux_2_28-compatible). Windows jobs use
-  # Jimver/cuda-toolkit on `windows-latest` (no Linux-only `driver-cuda`
-  # feature; CUDA reaches portable via PIE_PORTABLE_CUDA).
+  # CUDA matrix — runs on the project's self-hosted GPU runner.
+  #
+  # The runner is bare-metal Ubuntu 24.04 (glibc 2.39) with an RTX 4090,
+  # 32 cores, side-by-side CUDA toolkits (12.6 / 12.8 / 13.0 / 13.2),
+  # sccache pre-installed, and persistent `CARGO_HOME` /
+  # `CARGO_TARGET_DIR` outside the workspace — so we deliberately do NOT
+  # use `actions/cache` (would just shadow the runner's larger,
+  # always-warm caches).
+  #
+  # Tradeoff vs the previous nvidia/cuda manylinux containers: the
+  # resulting binary is glibc-2.39-floored — won't run on EL8 / Ubuntu
+  # 20.04. CUDA users are typically on recent distros anyway, and
+  # they need a recent NVIDIA driver to match the toolkit.
+  #
+  # The runner serializes jobs (one at a time), so the matrix entries
+  # below run sequentially. With sccache, kernels common across CUDA
+  # versions reuse cached object files between matrix entries.
   # =========================================================================
   cuda:
     if: inputs.cuda
-    name: cuda / ${{ matrix.os.label }} / cuda${{ matrix.cuda.version }}
+    name: cuda / linux-x64 / cuda${{ matrix.cuda.version }}
+    runs-on: [self-hosted, linux, x64, gpu, cuda]
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - label: x86_64-manylinux_2_28
-            runner: ubuntu-22.04
-            triple: x86_64-unknown-linux-gnu
-            cargo_features: "driver-portable,driver-cuda,driver-dummy"
-            archive: tar.gz
-          # TODO(windows): same `runtime/src/shmem_ipc.rs` POSIX-only
-          # blocker as the portable matrix. Re-enable once shmem_ipc
-          # has a Windows backend.
-          # - label: x86_64-windows
-          #   runner: windows-latest
-          #   triple: x86_64-pc-windows-msvc
-          #   cargo_features: "driver-portable,driver-dummy"
-          #   archive: zip
         cuda:
-          - { version: "12.6.3", short: "12.6", arch: "75;80;86;89;90" }
-          - { version: "12.8.1", short: "12.8", arch: "75;80;86;89;90;100;120" }
-          - { version: "13.0.0", short: "13.0", arch: "75;80;86;89;90;100;120" }
-    runs-on: ${{ matrix.os.runner }}
-    container: ${{ matrix.os.label == 'x86_64-manylinux_2_28' && format('nvidia/cuda:{0}-devel-rockylinux8', matrix.cuda.version) || '' }}
+          - { version: "12.6.3", short: "12.6", path: "/usr/local/cuda-12.6", arch: "75;80;86;89;90" }
+          - { version: "12.8.1", short: "12.8", path: "/usr/local/cuda-12.8", arch: "75;80;86;89;90;100;120" }
+          - { version: "13.0.0", short: "13.0", path: "/usr/local/cuda-13.0", arch: "75;80;86;89;90;100;120" }
     env:
-      ARTIFACT_NAME: pie-${{ matrix.os.label }}-cuda${{ matrix.cuda.short }}.${{ matrix.os.archive }}
+      ARTIFACT_NAME: pie-x86_64-linux-cuda${{ matrix.cuda.short }}.tar.gz
       PIE_PORTABLE_CUDA: "1"
       PIE_PORTABLE_CUDA_ARCH: ${{ matrix.cuda.arch }}
       CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda.arch }}
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
+      # Compile cache for both Rust (RUSTC_WRAPPER) and nvcc
+      # (CMAKE_CUDA_COMPILER_LAUNCHER). The runner's $SCCACHE_DIR is
+      # 200 GB and persists across jobs.
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+      CMAKE_CUDA_COMPILER_LAUNCHER: sccache
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+        with:
+          # Workspace persists between jobs on bare-metal; clean to keep
+          # builds reproducible. The big caches live outside the
+          # workspace and are unaffected.
+          clean: true
+          fetch-depth: 1
 
-      - name: Bootstrap container (linux)
-        if: matrix.os.label == 'x86_64-manylinux_2_28'
+      - name: Select CUDA toolkit
         shell: bash
         run: |
           set -euxo pipefail
-          # nvidia/cuda:rockylinux8 images have glibc 2.28 (matches
-          # manylinux_2_28) but minimal userland. `ninja-build` lives in
-          # the PowerTools repo on Rocky 8, EPEL provides extras.
-          dnf install -y epel-release dnf-plugins-core
-          dnf config-manager --set-enabled powertools
-          dnf install -y --setopt=install_weak_deps=False \
-            cmake ninja-build gcc-toolset-12 git \
-            openssl-devel patch
-          # GitHub CLI — used by the upload step.
-          dnf install -y 'dnf-command(config-manager)'
-          dnf config-manager --add-repo \
-            https://cli.github.com/packages/rpm/gh-cli.repo
-          dnf install -y gh --repo gh-cli
-          source /opt/rh/gcc-toolset-12/enable
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-            sh -s -- -y --profile minimal --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          # Pin compiler explicitly. `source enable` only adjusts PATH —
-          # cmake-rs probes CC/CXX env vars and otherwise hard-codes
-          # `/usr/bin/cc` / `/usr/bin/c++`, which on rockylinux8 are
-          # gcc-8.5. gcc-8 is missing `<span>` (added in libstdc++ 10),
-          # so the portable driver's C++20 headers fail to compile.
+          CUDA_HOME='${{ matrix.cuda.path }}'
+          test -x "${CUDA_HOME}/bin/nvcc"
           {
-            echo "CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
-            echo "CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
-            echo "AR=/opt/rh/gcc-toolset-12/root/usr/bin/ar"
-            # nvcc auto-detects the host compiler via PATH, but the
-            # cuda image's `/usr/bin/g++` (gcc-8.5) shadows ours and
-            # nvcc silently drops `-std=c++20` against it
-            # ("flag is not supported with the configured host compiler"),
-            # which then breaks flashinfer's C++17 `std::is_same_v`.
-            # CUDAHOSTCXX forces nvcc to invoke the gcc-12 host compiler.
-            echo "CUDAHOSTCXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
-            echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}"
-            echo "MANPATH=/opt/rh/gcc-toolset-12/root/usr/share/man:"
-            echo "INFOPATH=/opt/rh/gcc-toolset-12/root/usr/share/info"
-            echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/opt/rh/gcc-toolset-12/root/usr/lib"
-            echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64/pkgconfig"
+            echo "CUDA_HOME=${CUDA_HOME}"
+            echo "LD_LIBRARY_PATH=${CUDA_HOME}/lib64"
           } >> "$GITHUB_ENV"
+          echo "${CUDA_HOME}/bin" >> "$GITHUB_PATH"
+          # NCCL is sometimes bundled inside the CUDA toolkit prefix.
+          # If we find it there, point the cuda-driver build at it via
+          # `PIE_NCCL_HOME` (`server/build.rs::build_cuda` honors this).
+          if [ -f "${CUDA_HOME}/include/nccl.h" ] \
+              && ls "${CUDA_HOME}"/lib64/libnccl.so* >/dev/null 2>&1; then
+            echo "PIE_NCCL_HOME=${CUDA_HOME}" >> "$GITHUB_ENV"
+          fi
+          "${CUDA_HOME}/bin/nvcc" --version
+          gcc --version | head -1
 
-      - name: Install Rust (windows)
-        if: matrix.os.label == 'x86_64-windows'
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.os.triple }}
-
-      - name: Install CUDA toolkit (windows)
-        if: matrix.os.label == 'x86_64-windows'
-        uses: Jimver/cuda-toolkit@v0.2.19
-        with:
-          cuda: ${{ matrix.cuda.version }}
-          method: network
-          # Headers + libs only; the runner already has a compatible MSVC.
-          sub-packages: '["nvcc", "cudart", "thrust", "cublas", "cublas_dev", "curand", "curand_dev"]'
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: build-cuda-${{ matrix.os.label }}-${{ matrix.cuda.short }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: build-cuda-${{ matrix.os.label }}-${{ matrix.cuda.short }}-
+          targets: x86_64-unknown-linux-gnu
 
       - name: cargo build --release
         shell: bash
         run: |
           set -euxo pipefail
           cargo build --release \
-            --target ${{ matrix.os.triple }} \
+            --target x86_64-unknown-linux-gnu \
             -p pie-server \
-            --features ${{ matrix.os.cargo_features }}
+            --features driver-portable,driver-cuda,driver-dummy
+          sccache --show-stats || true
 
       - name: Package
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p dist
-          BIN_DIR="target/${{ matrix.os.triple }}/release"
-          if [[ "${{ matrix.os.archive }}" == "zip" ]]; then
-            7z a "dist/${ARTIFACT_NAME}" "${BIN_DIR}/pie.exe"
-          else
-            tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
-          fi
+          # CARGO_TARGET_DIR is preset on the self-hosted runner to a
+          # persistent location outside the workspace; fall back to the
+          # in-tree `target/` for any other environment.
+          BIN_DIR="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-gnu/release"
+          tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
           ls -la dist/
 
-      - name: Upload to release (--clobber)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"
+      - name: Upload to release
+        # Pure-JS action — no `gh` install required on the bare-metal
+        # runner. Existing assets with the same name are replaced
+        # (same effect as `gh release upload --clobber`).
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: dist/${{ env.ARTIFACT_NAME }}
+          fail_on_unmatched_files: true
 
   # =========================================================================
   # Refresh the release notes once after all builds finish.
