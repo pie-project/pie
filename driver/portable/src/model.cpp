@@ -9,7 +9,6 @@
 #include <thread>
 
 #include <ggml-cpu.h>
-#include <omp.h>
 
 #include "gguf_archive.hpp"
 #include "gguf_hparams.hpp"
