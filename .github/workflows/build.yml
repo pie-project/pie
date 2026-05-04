@@ -62,7 +62,10 @@ jobs:
             archive: tar.gz
             backend_env: ""
           - label: aarch64-darwin
-            runner: macos-14
+            # macos-15 gets Xcode 16 with libc++ 17, which has
+            # `std::atomic_ref` (C++20). macos-14's Xcode 15.4 ships
+            # libc++ 15, which doesn't.
+            runner: macos-15
             container: ""
             triple: aarch64-apple-darwin
             archive: tar.gz
