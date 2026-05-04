@@ -381,7 +381,7 @@ fn add_system_libs(extra: &[&str], metal: bool) {
             }
         }
         other => {
-            panic!("pie-standalone: unsupported target OS {other:?}");
+            panic!("pie-server: unsupported target OS {other:?}");
         }
     }
 }

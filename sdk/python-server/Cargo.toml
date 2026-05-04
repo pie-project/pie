@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-# `pie-standalone` is the engine library — we link the same `serve::start_engine`
+# `pie-server` is the engine library — we link the same `serve::start_engine`
 # the CLI uses, so the CLI and the pyo3 wheel can never drift in their boot
 # behavior. We don't enable `driver-cuda` here; the dummy + portable embedded
 # drivers cover smoke testing and Python users typically pick a subprocess
@@ -25,7 +25,7 @@ path = "src/lib.rs"
 # binary, which has a real `bin` build pulling the static archives in.
 # For the Python wheel, the subprocess drivers (`dev` / `vllm` /
 # `sglang`) are the realistic deployment anyway.
-pie-standalone = { path = "../../server", default-features = false, features = ["driver-dummy"] }
+pie-server = { path = "../../server", default-features = false, features = ["driver-dummy"] }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 tokio = { version = "1.38", features = ["rt-multi-thread"] }
 toml = "0.9"

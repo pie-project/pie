@@ -42,11 +42,11 @@ subprocess or a thread.
 
 ```bash
 # Default: portable driver (CPU + ggml's optional GPU backends).
-cargo build -p pie-standalone --release
+cargo build -p pie-server --release
 
 # CUDA driver (statically linked cudart/cublas/cublasLt; GPU at runtime
 # only — no CUDA toolkit required at runtime).
-cargo build -p pie-standalone --release \
+cargo build -p pie-server --release \
     --no-default-features --features driver-cuda
 ```
 
@@ -157,14 +157,14 @@ they were intentionally deferred to land the architecture first.
   no-op stub.
 - **CI matrix.** The repo's existing `.github/workflows` covers
   releases (cargo / npm / pypi). Build verification for both
-  `pie-standalone` flavors should be added once a CI runner with a
+  `pie-server` flavors should be added once a CI runner with a
   CUDA toolkit is available.
 
 ## Layout
 
 ```
 server/
-├── Cargo.toml          # `pie-standalone` crate metadata, feature flags
+├── Cargo.toml          # `pie-server` crate metadata, feature flags
 ├── build.rs            # cmake-rs invocation per driver flavor + link flags
 ├── src/
 │   ├── main.rs         # CLI dispatch (--config / --check / --smoke[-rpc])

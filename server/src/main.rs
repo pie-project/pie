@@ -1,4 +1,4 @@
-//! `pie` CLI binary — thin wrapper over [`pie_standalone::cli::dispatch`].
+//! `pie` CLI binary — thin wrapper over [`pie_server::cli::dispatch`].
 //!
 //! Subcommand layout (mirrors the legacy `pie_cli`):
 //!
@@ -16,10 +16,10 @@
 //! pie smoke   [--rpc]
 //! ```
 //!
-//! All of the work happens in `pie_standalone::cli::dispatch`.
+//! All of the work happens in `pie_server::cli::dispatch`.
 
 fn main() {
-    if let Err(e) = pie_standalone::cli::dispatch() {
+    if let Err(e) = pie_server::cli::dispatch() {
         eprintln!("pie: {e:#}");
         std::process::exit(1);
     }

@@ -1,15 +1,15 @@
 //! End-to-end round-trip test: launch the three marketing-tab inferlets
-//! against the live `pie-standalone` + `driver-dummy` stack.
+//! against the live `pie-server` + `driver-dummy` stack.
 //!
 //! Run with:
 //!
 //! ```bash
-//! cargo build -p pie-standalone --no-default-features \
+//! cargo build -p pie-server --no-default-features \
 //!     --features driver-dummy --release
 //! cd inferlets/marketing-tab1-agent && cargo build --target wasm32-wasip2 --release
 //! cd inferlets/marketing-tab2-watermark && cargo build --target wasm32-wasip2 --release
 //! cd inferlets/marketing-tab3-lora-spec && cargo build --target wasm32-wasip2 --release
-//! cargo run --example dummy_roundtrip -p pie-standalone \
+//! cargo run --example dummy_roundtrip -p pie-server \
 //!     --no-default-features --features driver-dummy --release \
 //!     -- /path/to/dir/with/tokenizer.json
 //! ```
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     if !pie_bin.is_file() {
         anyhow::bail!(
             "pie binary not found at {pie_bin:?}; build it first with \
-             `cargo build -p pie-standalone --no-default-features \
+             `cargo build -p pie-server --no-default-features \
              --features driver-dummy --release`"
         );
     }
@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
     let stdout = child.stdout.take().expect("piped stdout");
 
     // The child writes:
-    //   pie-standalone serving on 127.0.0.1:8093 (...)
+    //   pie-server serving on 127.0.0.1:8093 (...)
     //   internal token: <TOKEN>
     //   press Ctrl-C to shut down
     let (tx, rx) = mpsc::channel::<StartupSignal>();
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
         let mut token: Option<String> = None;
         while reader.read_line(&mut line).map_or(false, |n| n > 0) {
             print!("[pie] {line}");
-            if line.contains("pie-standalone serving on") {
+            if line.contains("pie-server serving on") {
                 serving = true;
             } else if let Some(rest) = line.strip_prefix("internal token: ") {
                 token = Some(rest.trim().to_string());

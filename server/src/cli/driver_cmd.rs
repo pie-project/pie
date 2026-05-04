@@ -444,7 +444,7 @@ fn doctor_embedded(name: &str) -> Result<()> {
     );
     if !compiled {
         println!(
-            "  rebuild with `cargo install pie-standalone --features driver-{}` \
+            "  rebuild with `cargo install pie-server --features driver-{}` \
              (or `--features driver-portable,driver-cuda` to keep both).",
             name.replace('_', "-"),
         );

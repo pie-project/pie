@@ -1,6 +1,6 @@
 # driver/dummy
 
-Rust dummy driver for `pie-standalone`. Same C ABI as
+Rust dummy driver for `pie-server`. Same C ABI as
 `driver/portable` and `driver/cuda` (`pie_driver_dummy_run` /
 `pie_driver_dummy_request_stop`), same shmem wire protocol, no model
 load and no real compute. Each `fire_batch` request returns a vector of
@@ -9,7 +9,7 @@ random token ids, one per sampler slot.
 The Python `pie_driver_dummy` worker (under `pie/src/pie_driver_dummy/`)
 shells through `pie_driver_dev.worker.run_worker` whose shmem fast path
 hard-imports `librt.so.1` at module load — Linux-only. This Rust dummy
-links into `pie-standalone` directly, calls POSIX `shm_open` /
+links into `pie-server` directly, calls POSIX `shm_open` /
 `mmap` via `libc`, and works on Linux **and** macOS.
 
 ## Build
@@ -20,10 +20,10 @@ Standalone smoke (just compile the crate):
 cargo build -p pie-driver-dummy
 ```
 
-End-to-end with `pie-standalone`:
+End-to-end with `pie-server`:
 
 ```bash
-cargo build -p pie-standalone --no-default-features --features driver-dummy --release
+cargo build -p pie-server --no-default-features --features driver-dummy --release
 ./target/release/pie --config /path/to/dummy.toml
 ```
 

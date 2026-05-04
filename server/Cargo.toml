@@ -1,5 +1,5 @@
 [package]
-name = "pie-standalone"
+name = "pie-server"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
@@ -11,7 +11,7 @@ repository = "https://github.com/pie-project/pie"
 # the supervisors). The `pie` CLI binary below is one consumer; the
 # `pie-server` Python wheel under `sdk/python-server/` is another.
 [lib]
-name = "pie_standalone"
+name = "pie_server"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 

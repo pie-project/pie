@@ -394,7 +394,7 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
         .map_err(|e| anyhow!("pie::bootstrap::bootstrap: {e}"))?;
 
     println!(
-        "pie-standalone serving on {}:{} ({} model(s))",
+        "pie-server serving on {}:{} ({} model(s))",
         user_cfg.server.host,
         user_cfg.server.port,
         user_cfg.models.len(),

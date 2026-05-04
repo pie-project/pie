@@ -377,13 +377,13 @@ impl DriverConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
-    /// Portable ggml driver — embedded as a static lib in `pie-standalone`.
+    /// Portable ggml driver — embedded as a static lib in `pie-server`.
     Portable,
-    /// Native CUDA driver — embedded as a static lib in `pie-standalone`
+    /// Native CUDA driver — embedded as a static lib in `pie-server`
     /// (requires `--features driver-cuda`).
     CudaNative,
     /// Rust dummy driver — random tokens, no model load. Embedded as a
-    /// Rust staticlib in `pie-standalone` (requires `--features driver-dummy`).
+    /// Rust staticlib in `pie-server` (requires `--features driver-dummy`).
     Dummy,
     /// Torch-backed reference Python driver (`pie_driver_dev`). Hosted
     /// out-of-process by [`crate::subprocess_driver::SubprocessDriver`].

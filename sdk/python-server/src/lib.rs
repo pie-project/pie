@@ -1,9 +1,9 @@
 //! `pie-server` Python bindings — the embeddable counterpart to the
 //! `pie` CLI binary.
 //!
-//! Both surfaces drive the same library (`pie-standalone`); this crate
-//! is just a pyo3 wrapper around [`pie_standalone::serve::start_engine`]
-//! plus a [`pie_standalone::serve::EngineHandle`] handle. Lifecycle:
+//! Both surfaces drive the same library (`pie-server`); this crate
+//! is just a pyo3 wrapper around [`pie_server::serve::start_engine`]
+//! plus a [`pie_server::serve::EngineHandle`] handle. Lifecycle:
 //! when the Python `EngineHandle` is dropped (or the user's interpreter
 //! exits), the embedded tokio runtime + every subprocess driver are
 //! torn down — combined with the `PR_SET_PDEATHSIG` hook in
@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use pie_standalone::config::Config as ServeConfig;
-use pie_standalone::serve::{self, EngineHandle as ServeHandle};
+use pie_server::config::Config as ServeConfig;
+use pie_server::serve::{self, EngineHandle as ServeHandle};
 
 /// Live engine returned by `bootstrap`. Holds the tokio runtime that
 /// keeps the WS scheduler + driver supervisors alive.
@@ -104,7 +104,7 @@ fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
         // Best-effort: install the Python WASM runtime tarball if missing,
         // mirroring `pie serve`'s startup. Failures (offline / no registry)
         // log + continue; only matters for Python inferlets.
-        pie_standalone::py_runtime::ensure_installed_best_effort();
+        pie_server::py_runtime::ensure_installed_best_effort();
 
         let handle = runtime
             .block_on(serve::start_engine(cfg))

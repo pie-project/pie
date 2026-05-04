@@ -1,4 +1,4 @@
-//! `pie-standalone` library — engine boot path + supporting modules.
+//! `pie-server` library — engine boot path + supporting modules.
 //!
 //! The `pie` CLI binary (`src/main.rs`) is one consumer; the upcoming
 //! `pie-server` pyo3 wheel under `sdk/python-server/` is another.
