@@ -105,9 +105,17 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          # Probe: list available gcc-toolset-14 packages so we know
+          # the actual libgomp package name. Then install it together
+          # with the base build deps. This noisy probe is cheap and
+          # helps when the package layout drifts across manylinux
+          # image revisions.
+          dnf list --available "gcc-toolset-14*libgomp*" "gcc-toolset-14*gcc*" 2>&1 | head -30 || true
+          dnf provides "/opt/rh/gcc-toolset-14/root/usr/lib*/libgomp.so*" 2>&1 | head -20 || true
           dnf install -y --setopt=install_weak_deps=False \
             openssl-devel pkg-config perl \
-            gcc-toolset-14-libgomp libgomp
+            gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ \
+            libgomp
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
