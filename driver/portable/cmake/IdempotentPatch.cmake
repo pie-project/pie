@@ -10,9 +10,9 @@
 # tree + closed stdin makes `patch` silently reverse-apply the patch and
 # return rc=0, masking real drift. With `-N`:
 #
-#   * rc=0                                                → unpatched,
+#   * forward dry-run rc=0                                → unpatched,
 #                                                           apply for real.
-#   * rc!=0 and output ~ "Ignoring previously applied"    → already
+#   * forward fails, reverse dry-run rc=0                  → already
 #                                                           patched, skip.
 #   * else                                                → real failure
 #                                                           (hunk drift
@@ -55,13 +55,23 @@ if(probe_rc EQUAL 0)
   if(NOT apply_rc EQUAL 0)
     message(FATAL_ERROR "${PATCH_NAME}: patch failed with exit ${apply_rc}")
   endif()
-elseif("${probe_out}${probe_err}" MATCHES "Ignoring previously applied")
-  message(STATUS "${PATCH_NAME} already applied (skipped)")
 else()
-  message(FATAL_ERROR
-    "${PATCH_NAME}: hunks no longer apply forward and tree is not in "
-    "patched state — patch needs to be refreshed against the current "
-    "upstream source.\n"
-    "----- patch -N --dry-run output (rc=${probe_rc}) -----\n"
-    "${probe_out}${probe_err}")
+  execute_process(
+    COMMAND patch -p1 -R --dry-run -i ${PATCH_FILE}
+    RESULT_VARIABLE reverse_rc
+    OUTPUT_VARIABLE reverse_out
+    ERROR_VARIABLE  reverse_err
+    INPUT_FILE      /dev/null)
+  if(reverse_rc EQUAL 0)
+    message(STATUS "${PATCH_NAME} already applied (skipped)")
+  else()
+    message(FATAL_ERROR
+      "${PATCH_NAME}: hunks no longer apply forward and tree is not in "
+      "patched state — patch needs to be refreshed against the current "
+      "upstream source.\n"
+      "----- patch -N --dry-run output (rc=${probe_rc}) -----\n"
+      "${probe_out}${probe_err}\n"
+      "----- patch -R --dry-run output (rc=${reverse_rc}) -----\n"
+      "${reverse_out}${reverse_err}")
+  endif()
 endif()
