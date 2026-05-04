@@ -127,7 +127,13 @@ fn build_portable() {
     add_link_search_paths(&build_dir);
 
     println!("cargo:rustc-link-lib=static=pie_driver_portable_lib");
-    println!("cargo:rustc-link-arg=-Wl,--start-group");
+    // GNU ld's `--start-group`/`--end-group` resolve circular static
+    // archive deps. Apple `ld64` doesn't have them (and doesn't need
+    // them — it auto-resolves). Gate on Linux only.
+    let is_linux = target_os == "linux";
+    if is_linux {
+        println!("cargo:rustc-link-arg=-Wl,--start-group");
+    }
     println!("cargo:rustc-link-arg=-l:libggml.a");
     println!("cargo:rustc-link-arg=-l:libggml-cpu.a");
     if cuda_enabled {
@@ -137,7 +143,9 @@ fn build_portable() {
         println!("cargo:rustc-link-arg=-l:libggml-vulkan.a");
     }
     println!("cargo:rustc-link-arg=-l:libggml-base.a");
-    println!("cargo:rustc-link-arg=-Wl,--end-group");
+    if is_linux {
+        println!("cargo:rustc-link-arg=-Wl,--end-group");
+    }
 
     if cuda_enabled {
         // ggml-cuda calls `cublasGemmEx` (libcublas), nothing in

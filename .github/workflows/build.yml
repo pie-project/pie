@@ -112,9 +112,17 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False \
             openssl-devel pkg-config perl \
             gcc-toolset-14-gcc gcc-toolset-14-gcc-c++
-          # Enable gcc-toolset-14 in subsequent steps (compile + link
-          # both go through it, so libgomp matches symbol-version).
+          # Pin compiler + linker to gcc-toolset-14 for subsequent
+          # steps. cmake-rs (via cc-rs) reads CC/CXX, so this forces
+          # CMake to use gcc-14 even though manylinux's `/opt/clang/bin`
+          # is also on PATH. Without explicit pinning, `which cc` may
+          # resolve to clang and produce a libggml-cpu.a that the
+          # gcc-14 linker can't link (missing GOMP_* symbols because
+          # libgomp's symbol versioning doesn't match).
           {
+            echo "CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc"
+            echo "CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++"
+            echo "AR=/opt/rh/gcc-toolset-14/root/usr/bin/ar"
             echo "PATH=/opt/rh/gcc-toolset-14/root/usr/bin:${PATH}"
             echo "MANPATH=/opt/rh/gcc-toolset-14/root/usr/share/man:"
             echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib"
