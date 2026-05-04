@@ -158,6 +158,28 @@ fn build_portable() {
         if vulkan_enabled {
             println!("cargo:rustc-link-lib=static=ggml-vulkan");
         }
+        if metal_enabled {
+            println!("cargo:rustc-link-lib=static=ggml-metal");
+        }
+        // ggml-cpu's macOS build pulls in the BLAS backend (calls
+        // `_ggml_backend_blas_reg`); ggml-cpu uses Apple's Accelerate
+        // framework for vDSP. Both need explicit links on macOS.
+        if target_os == "macos" {
+            println!("cargo:rustc-link-lib=static=ggml-blas");
+            println!("cargo:rustc-link-arg=-framework");
+            println!("cargo:rustc-link-arg=Accelerate");
+            if metal_enabled {
+                for fw in [
+                    "Foundation",
+                    "Metal",
+                    "MetalKit",
+                    "MetalPerformanceShaders",
+                ] {
+                    println!("cargo:rustc-link-arg=-framework");
+                    println!("cargo:rustc-link-arg={fw}");
+                }
+            }
+        }
         println!("cargo:rustc-link-lib=static=ggml-base");
     }
 
