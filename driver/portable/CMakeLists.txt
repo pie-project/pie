@@ -39,10 +39,17 @@ cpmaddpackage(
   # land in follow-up patches; with no backend advertising support, the
   # Pie graph builders take the materialize+flash_attn_ext fallback path.
   #
-  # `-N` makes the patch idempotent so re-runs don't fail; `-t` suppresses
-  # interactive prompts on hunk mismatch.
-  PATCH_COMMAND patch -p1 -N -t -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fast-argsort.patch          || true
-        COMMAND patch -p1 -N -t -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-pie-paged-attn-ext.patch    || true
+  # ExternalProject (which CPM uses under the hood) only runs PATCH_COMMAND
+  # once, after the initial populate step. Re-configures don't re-run the
+  # patch step, so we don't need to make `patch` idempotent. We also do
+  # NOT swallow patch's exit code with `|| true`: a failing patch on a
+  # fresh download silently leaves ggml.h without `ggml_paged_attn_ext`,
+  # which only surfaces ~60 minutes later as a model.cpp compile error.
+  # `-N` is kept as belt-and-suspenders for the rare manual re-populate.
+  PATCH_COMMAND ${CMAKE_COMMAND} -E echo "applying ggml-fast-argsort.patch"
+        COMMAND patch -p1 -N -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fast-argsort.patch
+        COMMAND ${CMAKE_COMMAND} -E echo "applying ggml-pie-paged-attn-ext.patch"
+        COMMAND patch -p1 -N -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-pie-paged-attn-ext.patch
   OPTIONS
     "LLAMA_BUILD_TESTS OFF"
     "LLAMA_BUILD_EXAMPLES OFF"
