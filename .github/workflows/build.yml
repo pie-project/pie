@@ -327,7 +327,7 @@ jobs:
           # CARGO_TARGET_DIR is preset on the self-hosted runner to a
           # persistent location outside the workspace; fall back to the
           # in-tree `target/` for any other environment.
-          BIN_DIR="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-gnu/release"
+          BIN_DIR="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-gnu/release-min"
           tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
           ls -la dist/
 
