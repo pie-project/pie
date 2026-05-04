@@ -40,7 +40,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub port: Option<u16>,
 
-    /// Inferlet input as a JSON string. Defaults to `{}`.
+    /// Inferlet input as a JSON string. Defaults to `{}`. Mutually
+    /// exclusive with trailing `-- --key value` args.
     #[arg(long, default_value = "{}")]
     pub input: String,
 
@@ -52,14 +53,28 @@ pub struct RunArgs {
     /// Suppress `pie run` progress chatter on stderr.
     #[arg(short = 'q', long)]
     pub quiet: bool,
+
+    /// Trailing `--key value` args become the inferlet input JSON.
+    /// `--max-tokens 64` → `{"max_tokens": 64}` (kebab → snake, with
+    /// int/float/bool inference). Bare `--flag` is `true`. Use `--`
+    /// to separate from `pie run` flags.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub extra: Vec<String>,
 }
 
-pub fn run(args: RunArgs) -> Result<()> {
+pub fn run(mut args: RunArgs) -> Result<()> {
     if args.inferlet.is_none() && args.path.is_none() {
         bail!("specify an inferlet name or --path");
     }
     if args.path.is_some() && args.manifest.is_none() {
         bail!("--manifest is required when --path is used");
+    }
+    if !args.extra.is_empty() {
+        if args.input != "{}" {
+            bail!("--input and trailing `-- --key value` args are mutually exclusive");
+        }
+        args.input = serde_json::to_string(&cli_args_to_json(&args.extra))
+            .expect("Map<String, Value> is always serializable");
     }
 
     let cfg_path = args
@@ -196,6 +211,61 @@ fn manifest_id(manifest: &std::path::Path) -> Result<String> {
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow!("manifest missing [package].version"))?;
     Ok(format!("{name}@{version}"))
+}
+
+/// Convert trailing CLI tokens like `--key value -k v --flag positional` to a
+/// JSON object. Mirrors `_cli_args_to_dict` from the legacy Python CLI.
+fn cli_args_to_json(args: &[String]) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let mut obj: Map<String, Value> = Map::new();
+    let mut positional: Vec<Value> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(rest) = a.strip_prefix("--") {
+            let key = rest.replace('-', "_");
+            let next_is_value = matches!(args.get(i + 1), Some(n) if !n.starts_with('-'));
+            if next_is_value {
+                obj.insert(key, parse_cli_value(&args[i + 1]));
+                i += 2;
+            } else {
+                obj.insert(key, Value::Bool(true));
+                i += 1;
+            }
+        } else if a.starts_with('-') && a.chars().count() == 2 {
+            let key = a[1..].to_string();
+            if let Some(next) = args.get(i + 1) {
+                obj.insert(key, parse_cli_value(next));
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            positional.push(parse_cli_value(a));
+            i += 1;
+        }
+    }
+    if !positional.is_empty() {
+        obj.insert("_positional".into(), Value::Array(positional));
+    }
+    Value::Object(obj)
+}
+
+/// Infer an int → float → bool → string for a single CLI value.
+fn parse_cli_value(s: &str) -> serde_json::Value {
+    if let Ok(n) = s.parse::<i64>() {
+        return serde_json::Value::Number(n.into());
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        if let Some(num) = serde_json::Number::from_f64(f) {
+            return serde_json::Value::Number(num);
+        }
+    }
+    match s {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        _ => serde_json::Value::String(s.to_string()),
+    }
 }
 
 fn shutdown_engine_bounded(engine: serve::EngineHandle, quiet: bool) {
