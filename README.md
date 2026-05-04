@@ -22,7 +22,6 @@ stateful agents, and serving-side optimization.
 Pie accepts *inferlets* - small programs in Rust, Python, or TypeScript that compile to WebAssembly and run inside the engine with direct access to the KV cache, token stream, and forward pass.
 
 > **Note**
->
 > Pie is pre-release software under active development. It is best suited
 > for testing and research right now.
 ## Quick Start
