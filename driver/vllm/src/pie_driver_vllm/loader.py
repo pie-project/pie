@@ -32,6 +32,12 @@ def _resolve_hf_snapshot_dir(hf_repo: str) -> str | None:
     if vllm has already loaded weights we know the snapshot is on disk. If
     nothing is cached, fall back to scanning HF_HUB_CACHE for the repo's dir.
     """
+    from pathlib import Path
+
+    local = Path(hf_repo)
+    if local.is_dir():
+        return str(local)
+
     try:
         from huggingface_hub import snapshot_download
         return snapshot_download(hf_repo, local_files_only=True)
@@ -39,7 +45,6 @@ def _resolve_hf_snapshot_dir(hf_repo: str) -> str | None:
         pass
 
     try:
-        from pathlib import Path
         from huggingface_hub.constants import HF_HUB_CACHE
         repo_dir = Path(HF_HUB_CACHE) / f"models--{hf_repo.replace('/', '--')}" / "snapshots"
         if repo_dir.is_dir():
@@ -128,7 +133,25 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
             engine_kwargs["max_num_batched_tokens"] = mml
 
     args = EngineArgs(**engine_kwargs)
-    return args.create_engine_config()
+    vllm_config = args.create_engine_config()
+
+    # Pie launches each DP replica as an independent single-rank subprocess.
+    # vLLM names those compile-cache leaves `rank_0_0` in every replica, so
+    # two DP replicas on different CUDA devices can otherwise reuse the same
+    # TorchInductor/static-launcher artifacts. Keep compile + CUDA graphs on,
+    # but isolate the cache per process/device.
+    if (
+        not engine_kwargs.get("enforce_eager", False)
+        and not vllm_config.compilation_config.cache_dir
+    ):
+        import os
+
+        safe_device = str(config.device).replace(":", "_")
+        vllm_config.compilation_config.cache_dir = (
+            f"/tmp/pie_vllm_compile_cache/pid_{os.getpid()}_{safe_device}"
+        )
+
+    return vllm_config
 
 
 def _ensure_vllm_distributed(vllm_config: Any, rank: int, local_rank: int) -> None:

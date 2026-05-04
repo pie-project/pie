@@ -20,6 +20,7 @@ def worker_main(
     model_config: dict,
     driver_config: dict,
     group_topology: list[list[int]],
+    group_id_base: int,
     ready_queue,
 ):
     """Worker entry point — `sglang` driver.
@@ -40,6 +41,7 @@ def worker_main(
         master_port=master_port,
         model_config=model_config,
         group_topology=group_topology,
+        group_id_base=group_id_base,
         ready_queue=ready_queue,
         build_engine=lambda cfg: SGLangEngine.load(cfg, sgl_cfg),
         # `cpu_mem_budget_in_gb` is the only universal pie knob carried on

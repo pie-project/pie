@@ -38,6 +38,10 @@ def _resolve_hf_snapshot_dir(hf_repo: str) -> str | None:
 
     Pie's Rust runtime needs a local filesystem path containing tokenizer.json.
     """
+    local = Path(hf_repo)
+    if local.is_dir():
+        return str(local)
+
     try:
         from huggingface_hub import snapshot_download
         return snapshot_download(hf_repo, local_files_only=True)
@@ -134,10 +138,6 @@ def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriver
         k: v for k, v in asdict(driver_config).items()
         if v is not None and k not in _NON_SGLANG_FIELDS
     })
-    # Pie owns prefix sharing via its own scheduler; sglang's radix cache
-    # on top would just be wasted work. Hardcoded rather than configurable
-    # because there's no scenario where False is correct under pie.
-    server_kwargs["disable_radix_cache"] = True
     return ServerArgs(**server_kwargs)
 
 

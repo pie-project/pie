@@ -119,6 +119,7 @@ def run_worker(
     model_config: dict,
     group_topology: list[list[int]],
     ready_queue,
+    group_id_base: int,
     build_engine,
     runtime_config_extras: dict | None = None,
     config_cls=None,
@@ -179,6 +180,7 @@ def run_worker(
                 my_group_id = i
                 tp_rank = group.index(rank)
                 break
+        global_group_id = group_id_base + my_group_id
         tp_degree = len(group_topology[my_group_id])
 
         # Per-replica MASTER_PORT so DP replicas on the same host don't
@@ -236,7 +238,7 @@ def run_worker(
                     engine=engine,
                     server=server,
                     stop_event=stop_event,
-                    group_id=my_group_id,
+                    group_id=global_group_id,
                 )
             else:
                 ready_queue.put((rank, None, None))
@@ -269,6 +271,7 @@ def worker_main(
     model_config: dict,
     driver_config: dict,
     group_topology: list[list[int]],
+    group_id_base: int,
     ready_queue,
 ):
     """Worker entry point — `native` driver.
@@ -287,6 +290,7 @@ def worker_main(
         master_port=master_port,
         model_config=model_config,
         group_topology=group_topology,
+        group_id_base=group_id_base,
         ready_queue=ready_queue,
         build_engine=lambda cfg: Engine.load(cfg),
         runtime_config_extras=driver_config,

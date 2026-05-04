@@ -117,7 +117,8 @@ def launch(*, prog: str, config_cls, worker) -> int:
         worker: the driver's `worker` module. Must export
             `calculate_topology(world_size, tp_degree)` and
             `worker_main(local_rank, world_size, devices, master_port,
-            model_config, driver_config, group_topology, ready_queue)`.
+            model_config, driver_config, group_topology, group_id_base,
+            ready_queue)`.
 
     Returns:
         Exit code (0 on graceful shutdown). Raises SystemExit for hard
@@ -159,6 +160,7 @@ def launch(*, prog: str, config_cls, worker) -> int:
     world_size = len(devices)
 
     tp_degree = int(driver_section.get("tensor_parallel_size", 0)) or world_size
+    group_id_base = int(driver_section.get("group_id", 0))
     master_port = int(driver_section.get("master_port", 29500))
     activation_dtype = driver_section.get("activation_dtype", "bfloat16")
     random_seed = int(driver_section.get("random_seed", 42))
@@ -194,6 +196,7 @@ def launch(*, prog: str, config_cls, worker) -> int:
             model_config_dict,
             driver_options_dict,
             group_topology,
+            group_id_base,
             ready_queue,
         ),
         nprocs=world_size,
@@ -257,12 +260,13 @@ def launch(*, prog: str, config_cls, worker) -> int:
     # it, and `embedded_driver::DriverCapabilities` accepts the field
     # missing via `#[serde(default)]`.
     for gid in range(num_groups):
+        global_gid = group_id_base + gid
         caps = caps_by_group[gid]
         caps_dict = asdict(caps) if dataclasses.is_dataclass(caps) else dict(caps)
         _write_handshake(args.handshake_fd, {
-            "group_id": gid,
+            "group_id": global_gid,
             "server_name": server_names_by_group[gid],
-            "shmem_name": f"/pie_shmem_g{gid}",
+            "shmem_name": f"/pie_shmem_g{global_gid}",
             "caps": caps_dict,
         })
     _write_handshake(args.handshake_fd, {"ready": True, "num_groups": num_groups})

@@ -129,6 +129,9 @@ pub fn write_subprocess_startup_toml(
     out_path: &Path,
     model: &ModelConfig,
     snapshot_dir: &Path,
+    group_id: usize,
+    devices: &[String],
+    tensor_parallel_size: usize,
     master_port: u16,
     ready_timeout_s: f64,
 ) -> Result<()> {
@@ -146,12 +149,11 @@ pub fn write_subprocess_startup_toml(
 
     // [driver]
     let mut driver_section = toml::Table::new();
+    driver_section.insert("group_id".into(), toml::Value::Integer(group_id as i64));
     driver_section.insert(
         "device".into(),
         toml::Value::Array(
-            model
-                .driver
-                .device
+            devices
                 .iter()
                 .map(|d| toml::Value::String(d.clone()))
                 .collect(),
@@ -159,7 +161,7 @@ pub fn write_subprocess_startup_toml(
     );
     driver_section.insert(
         "tensor_parallel_size".into(),
-        toml::Value::Integer(model.driver.tensor_parallel_size as i64),
+        toml::Value::Integer(tensor_parallel_size as i64),
     );
     driver_section.insert(
         "activation_dtype".into(),
@@ -226,19 +228,17 @@ impl SubprocessDriver {
     /// the legacy Python server, except each model now gets its own
     /// process tree (one `python -m pie_driver_<flavor>` per group).
     ///
-    /// **Note:** the current launcher TOML doesn't carry per-group
-    /// info — `mp.spawn(world_size=N)` is invoked once per group with
-    /// the same `[driver]` section. With DP > 1, the standalone calls
-    /// `start` per group, so each call gets its own subprocess that
-    /// thinks it's alone. A future launcher can collapse this to one
-    /// Python subprocess for all groups without changing the runtime
-    /// handshake shape.
+    /// The launcher TOML is already narrowed to this group's device slice;
+    /// `group_id` stays global so the launcher reports `/pie_shmem_g{group_id}`
+    /// matching the runtime's device index.
     pub fn start(
         flavor: SubprocessFlavor,
         python_exe: &Path,
         model: &ModelConfig,
         snapshot_dir: &Path,
         group_id: usize,
+        devices: &[String],
+        tensor_parallel_size: usize,
         master_port: u16,
     ) -> Result<Self> {
         if !snapshot_dir.is_dir() {
@@ -259,6 +259,9 @@ impl SubprocessDriver {
             &toml_path,
             model,
             snapshot_dir,
+            group_id,
+            devices,
+            tensor_parallel_size,
             master_port,
             ready_timeout_s,
         )?;
@@ -624,6 +627,7 @@ fn try_wait_code(child: &mut Child) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DriverConfig, DriverKind, ModelConfig, SchedulerConfig};
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -694,6 +698,64 @@ mod tests {
             err.to_string().contains("without a handshake line"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn startup_toml_uses_group_device_slice() {
+        let path = std::env::temp_dir().join(format!(
+            "pie-subprocess-startup-{}-{}.toml",
+            std::process::id(),
+            "group-device-slice",
+        ));
+        let model = ModelConfig {
+            name: "default".to_string(),
+            hf_repo: "Qwen/Qwen3-0.6B-Base".to_string(),
+            driver: DriverConfig {
+                kind: DriverKind::Vllm,
+                device: vec!["cuda:0".to_string(), "cuda:1".to_string()],
+                tensor_parallel_size: 1,
+                activation_dtype: "bfloat16".to_string(),
+                random_seed: 42,
+                options: toml::Table::new(),
+            },
+            scheduler: SchedulerConfig::default(),
+        };
+
+        write_subprocess_startup_toml(
+            &path,
+            &model,
+            Path::new("/tmp/snapshot"),
+            1,
+            &["cuda:1".to_string()],
+            1,
+            29610,
+            1200.0,
+        )
+        .unwrap();
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let driver = doc.get("driver").unwrap();
+
+        assert_eq!(
+            driver.get("group_id").and_then(toml::Value::as_integer),
+            Some(1)
+        );
+        assert_eq!(
+            driver
+                .get("device")
+                .and_then(toml::Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["cuda:1"],
+        );
+        assert_eq!(
+            driver
+                .get("tensor_parallel_size")
+                .and_then(toml::Value::as_integer),
+            Some(1),
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

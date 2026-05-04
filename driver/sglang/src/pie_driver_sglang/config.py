@@ -42,6 +42,11 @@ class SGLangDriverConfig:
     # Mirrors sglang's `disable_cuda_graph`.
     disable_cuda_graph: bool = False
 
+    # Disable SGLang's radix cache. Pie owns prefix sharing through its
+    # scheduler, so the default avoids duplicated caching work while still
+    # allowing explicit experiments.
+    disable_radix_cache: bool = True
+
     # Override the largest CUDA-graph batch-size bin sglang captures. None
     # = sglang's auto-pick, which on a 4090 caps around 24. Bumping this
     # to match `max_batch_size` lets the scheduler use captured graphs at

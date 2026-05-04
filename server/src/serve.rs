@@ -273,6 +273,21 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
                     rpc_threads.push(started.rpc_thread);
                 }
                 ResolvedFlavor::Subprocess(sub_flavor) => {
+                    let group_devices = group
+                        .iter()
+                        .map(|&idx| {
+                            m.driver.device.get(idx).cloned().ok_or_else(|| {
+                                anyhow!(
+                                    "model {:?}: group {group_idx} references device index {} but only {} devices configured",
+                                    m.name,
+                                    idx,
+                                    m.driver.device.len(),
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let group_master_port =
+                        model_master_port.saturating_add((group_idx as u16) * 10);
                     let started = start_subprocess_group(
                         m,
                         group_idx,
@@ -280,7 +295,9 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
                         &drivers_config,
                         &snapshot_dir,
                         device_idx,
-                        model_master_port,
+                        &group_devices,
+                        tp_degree,
+                        group_master_port,
                         user_cfg.server.verbose,
                     )?;
                     group_handshakes.push(started.handshake);
@@ -513,7 +530,9 @@ fn start_subprocess_group(
     drivers_config: &DriversConfig,
     snapshot_dir: &Path,
     device_idx: usize,
-    model_master_port: u16,
+    devices: &[String],
+    tp_degree: usize,
+    master_port: u16,
     verbose: bool,
 ) -> Result<StartedSubprocessGroup> {
     let resolved =
@@ -534,7 +553,9 @@ fn start_subprocess_group(
         m,
         snapshot_dir,
         device_idx,
-        model_master_port,
+        devices,
+        tp_degree,
+        master_port,
     )
     .with_context(|| {
         format!(
