@@ -80,13 +80,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # manylinux containers ship gcc + cmake + ninja but no rust.
-      # Other runners have them via setup steps below.
-      - name: Install rustup (manylinux only)
+      # manylinux containers ship gcc + cmake + ninja but no rust and
+      # not every devel header. We dnf-install just the deps the build
+      # needs (`openssl-devel` + `pkg-config` for the `openssl-sys`
+      # crate that `reqwest` pulls in by default; `perl` for the
+      # openssl-sys build script's vendored fallback).
+      - name: Install build deps + rustup (manylinux only)
         if: startsWith(matrix.target.container, 'quay.io/pypa/manylinux')
         shell: bash
         run: |
           set -euxo pipefail
+          dnf install -y --setopt=install_weak_deps=False \
+            openssl-devel pkg-config perl
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
