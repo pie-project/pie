@@ -28,8 +28,8 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    from pie_driver.config import NativeRuntimeConfig
-    from pie_driver.engine import Engine
+    from pie_driver_dev.config import NativeRuntimeConfig
+    from pie_driver_dev.engine import Engine
 
     cfg = NativeRuntimeConfig.from_args(
         hf_repo=args.model,

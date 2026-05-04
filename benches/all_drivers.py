@@ -112,7 +112,7 @@ class RunResult:
 # ---------------------------------------------------------------------------
 
 def build_driver_options(driver: str, args) -> dict:
-    if driver == "native":
+    if driver == "dev":
         return {
             "gpu_mem_utilization": args.gpu_mem_util,
             "max_batch_size": args.max_batch_size,

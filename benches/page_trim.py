@@ -54,7 +54,7 @@ def build_driver_config(args, device: list[str]) -> dict:
         }
         if args.vllm_attention_backend is not None:
             opts["attention_backend"] = args.vllm_attention_backend
-    elif args.driver == "native":
+    elif args.driver == "dev":
         opts = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "max_batch_size": args.max_batch_size,
@@ -282,8 +282,8 @@ def main():
     parser.add_argument("--window-size", type=int, default=64)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument(
-        "--driver", default="native",
-        choices=["native", "vllm", "sglang", "dummy"],
+        "--driver", default="dev",
+        choices=["dev", "vllm", "sglang", "dummy"],
     )
     parser.add_argument("--gpu-mem-util", type=float, default=0.8)
     parser.add_argument("--max-batch-size", type=int, default=64)

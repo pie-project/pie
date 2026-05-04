@@ -45,7 +45,7 @@ def package_id(name: str) -> str | None:
 
 
 def driver_options(driver: str, args) -> dict:
-    if driver == "native":
+    if driver == "dev":
         return {
             "gpu_mem_utilization": args.gpu_mem_util,
             "max_batch_size": args.max_batch_size,
@@ -168,7 +168,7 @@ def main():
     parser = argparse.ArgumentParser(description="High-concurrency overload sweep")
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--driver", default="native")
+    parser.add_argument("--driver", default="dev")
     parser.add_argument("--inferlet", default="text-completion")
     parser.add_argument("--prompt", default="Write a haiku about distributed systems.")
     parser.add_argument("--max-tokens", type=int, default=64)

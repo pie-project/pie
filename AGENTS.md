@@ -3,32 +3,33 @@
 This document provides a concise overview of the key directories and components in the Pie project for Agents to understand the architecture.
 
 ## `runtime`
-**The Rust-based Main Runtime.**
+**The Rust runtime.**
 *   **Path**: `runtime/`
 *   **Language**: Rust
-*   **Description**: This is the core "Engine" of Pie. It implements the high-performance logic including the WASM runtime (based on Wasmtime), request scheduling, and networking (ZeroMQ).
-*   **Integration**: It exposes a Python interface via PyO3, allowing it to be controlled by the `server` layer.
-*   **Key Dependencies**: `wasmtime`, `tokio`, `zeromq`, `pyo3`.
+*   **Description**: Core engine — WASM (Wasmtime) + scheduler + networking. Consumed as an `rlib` by `server` and `sdk/python-rpc/`.
+*   **Key Dependencies**: `wasmtime`, `tokio`, `ipc-channel`. After Phase 8, runtime no longer ships pyo3 bindings — the legacy `pie._runtime` maturin module is gone; pyo3 lives only in `sdk/python-rpc/`.
 
-## `pie`
-**Main Entrypoint and CLI (`pie`) + Inference Drivers.**
-*   **Path**: `pie/`
-*   **Language**: Python (`pie-server`) + Rust (PyO3 extension)
-*   **Description**: The primary interface for the user. It wraps the `runtime` (Rust), includes the inference drivers, and provides the `pie` CLI.
-*   **Subdirectories**:
-    *   `src/pie/`: Server, config schema, driver registry (`drivers.py`), runtime façade
-    *   `src/pie_cli/`: CLI commands (`pie serve`, `pie run`, `pie model`, `pie config`, `pie auth`, `pie doctor`)
-    *   `src/pie_driver/`: Native driver — pie's own batched scheduler + model implementations under `model/` (llama3, qwen2/3, gemma2/3/4, mistral3, olmo3, gpt_oss)
-    *   `src/pie_driver_vllm/`, `src/pie_driver_sgl/`, `src/pie_driver_dummy/`: Alternate drivers (delegate inference to vLLM / SGLang, or skip real compute)
-    *   `src/pie_backend/`: Backend host glue (model registry imported by drivers)
-    *   `src/pie_kernels/`: Unified kernel dispatch — routes to `pie_kernels.metal` on Apple Silicon and upstream `flashinfer` on CUDA; `pie_kernels.cuda/` hosts pie-owned CUDA/Triton kernels
-*   **CLI**: Provides the `pie` command.
-    *   `pie serve`: Starts the engine.
-    *   `pie run`: Executes a one-shot inferlet.
-    *   `pie model {list,download,remove}`: Manage HuggingFace cache.
-    *   `pie config {init,show,set}`: Manage `~/.pie/config.toml`.
-    *   `pie auth {add,remove,list}`: Manage authorized clients.
-    *   `pie doctor`: Checks system health.
+## `server`
+**`pie` CLI — the Rust-only standalone server.**
+*   **Path**: `server/`
+*   **Language**: Rust
+*   **Description**: Single-binary entrypoint. Boots embedded drivers (portable / cuda_native / dummy) as static libs and Python drivers (dev / vllm / sglang) as subprocesses; mirrors the legacy `pie-server` Python CLI surface.
+*   **Subcommands**: `serve`, `run`, `model`, `config`, `auth`, `new`, `build`, `doctor`, `check`, `smoke`, `driver`.
+*   `pie driver <type> {install|doctor|set|unset|show|exec}` — manages per-driver venvs in `~/.pie/drivers.toml` (BYO-venv; standalone never installs wheels itself, just prints the `uv venv` + `uv pip install` recipe).
+
+## `driver/`
+**Inference drivers — embedded (Rust/C++) + subprocess (Python).**
+*   `driver/portable/` — C++ ggml driver (CMake static lib, linked into pie-standalone).
+*   `driver/cuda/` — C++ CUDA driver (CMake static lib).
+*   `driver/dummy/` — Rust dummy driver (rlib).
+*   `driver/dev/` (wheel `pie-driver-dev`) — reference Python driver. Houses model implementations under `pie_driver_dev/model/` (llama3, qwen2/3, gemma2/3/4, mistral3, olmo3, gpt_oss) and ships `pie_kernels` (Metal + CUDA kernel dispatch) since dev is its only consumer.
+*   `driver/vllm/` (wheel `pie-driver-vllm`), `driver/sglang/` (wheel `pie-driver-sglang`) — Python driver wheels delegating to vLLM / SGLang. Reuse `pie_driver_dev`'s worker scaffolding (`run_worker`, `calculate_topology`, `batching`, `telemetry`).
+*   Each Python driver has a `__main__.py` launcher that the standalone's `SubprocessDriver` invokes via `python -m pie_driver_<flavor>`.
+
+## `sdk/python-rpc`
+**`pie-rpc` wheel — Python bindings for `pie::device::RpcServer`.**
+*   **Path**: `sdk/python-rpc/`
+*   **Description**: Tiny pyo3 wheel exposing `RpcServer` to Python drivers (cold-path channel back to the Rust runtime). Pairs with the shmem fast path each driver mounts at `/pie_shmem_g{group_id}` for `fire_batch`.
 
 ## `sdk`
 **SDK for Writing Inferlets.**

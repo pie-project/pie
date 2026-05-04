@@ -111,7 +111,7 @@ async def run(args):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    p.add_argument("--driver", default="dummy", choices=["native", "vllm", "sglang", "dummy"])
+    p.add_argument("--driver", default="dummy", choices=["dev", "vllm", "sglang", "dummy"])
     p.add_argument("--num-requests", type=int, default=128)
     p.add_argument("--prompt", default="Write a short story about a robot.")
     p.add_argument("--max-tokens", type=int, default=100)

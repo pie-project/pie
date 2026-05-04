@@ -5,7 +5,7 @@ Plain text completion that exercises the speculative-decoding interface.
 The SDK's `ctx.generate(sampler).next()` defaults to `Speculation::system()`
 (== `Speculation::Default`), which sets `output_speculative_tokens(true)` on
 every forward pass and feeds back any drafts the driver returns. With the
-`pie_driver_sgl` driver and `spec_ngram_enabled = true`, the driver
+`pie_driver_sglang` driver and `spec_ngram_enabled = true`, the driver
 maintains an n-gram trie and proposes linear continuations after the trie
 warms up; this inferlet's runtime drops as the acceptance rate climbs.
 

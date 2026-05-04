@@ -49,7 +49,7 @@ async def _get_client(args, cfg):
 async def run_benchmark(args):
     from pie.config import Config, ModelConfig, AuthConfig, RuntimeConfig, SchedulerConfig
 
-    if args.driver == "native" and args.use_cuda_graphs:
+    if args.driver == "dev" and args.use_cuda_graphs:
         print("ERROR: --use-cuda-graphs is not supported on the native driver.",
               file=sys.stderr)
         sys.exit(1)
@@ -113,7 +113,7 @@ async def run_benchmark(args):
         }
         if args.vllm_attention_backend is not None:
             driver_subsection["attention_backend"] = args.vllm_attention_backend
-    elif args.driver == "native":
+    elif args.driver == "dev":
         driver_subsection = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "max_batch_size": args.max_batch_size,
@@ -345,7 +345,7 @@ async def run_benchmark(args):
         else:
             try:
                 from tokenizers import Tokenizer
-                from pie_driver.hf_utils import get_hf_snapshot_dir
+                from pie_driver_dev.hf_utils import get_hf_snapshot_dir
                 snap = Path(get_hf_snapshot_dir(args.model))
                 _tok = Tokenizer.from_file(str(snap / "tokenizer.json"))
                 for _, text in output_samples:
@@ -408,8 +408,8 @@ def main():
                         help="Maximum number of concurrent processes (default: None — uncapped, saturate the GPU)")
     parser.add_argument("--max-batch-size", type=int, default=2048,
                         help="Maximum batch size for inference (default: 2048 — let the GPU dictate).")
-    parser.add_argument("--driver", default="native",
-                        choices=["native", "vllm", "sglang", "dummy", "cuda_native", "portable"],
+    parser.add_argument("--driver", default="dev",
+                        choices=["dev", "vllm", "sglang", "dummy", "cuda_native", "portable"],
                         help="Inference driver: 'native', 'vllm', 'sglang', 'dummy', 'cuda_native', or 'portable'")
     parser.add_argument("--tp-size", type=int, default=1,
                         help="Tensor-parallel size; DP = len(--device) // --tp-size")

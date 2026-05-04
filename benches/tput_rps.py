@@ -287,7 +287,7 @@ async def run_benchmark(args):
         }
         if args.vllm_attention_backend is not None:
             driver_subsection["attention_backend"] = args.vllm_attention_backend
-    elif args.driver == "native":
+    elif args.driver == "dev":
         driver_subsection = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "max_batch_size": args.max_batch_size,
@@ -413,7 +413,7 @@ def main():
     parser.add_argument("--default-token-limit", type=int, required=True)
     parser.add_argument("--max-concurrent-processes", type=int, default=None)
     parser.add_argument("--max-batch-size", type=int, default=512)
-    parser.add_argument("--driver", default="native", choices=["native", "vllm", "sglang", "dummy"])
+    parser.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "dummy"])
     parser.add_argument("--vllm-attention-backend", default=None)
     parser.add_argument("--sglang-attention-backend", default=None)
     parser.add_argument("--use-cuda-graphs", action="store_true")

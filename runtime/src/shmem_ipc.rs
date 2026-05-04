@@ -1,6 +1,6 @@
 //! Shared-memory IPC fast path for `fire_batch`.
 //!
-//! Layout matches `pie_driver/shmem_ipc.py` and the C++ servers under
+//! Layout matches `pie_driver_dev/shmem_ipc.py` and the C++ servers under
 //! `driver/{cuda,portable}/src/shmem_ipc.{cpp,hpp}`. Both sides agree on:
 //!
 //! - 64-byte global header (magic, schema, num_slots, slot_stride,
@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, Context, Result};
 
 pub const MAGIC: u32 = 0x50494533; // 'PIE3'
-/// Bump in lockstep with `pie_driver/shmem_ipc.py::SCHEMA_VERSION` and the
+/// Bump in lockstep with `pie_driver_dev/shmem_ipc.py::SCHEMA_VERSION` and the
 /// `SCHEMA_VERSION` constant in `driver/{cuda,portable}/src/shmem_ipc.hpp`.
 /// v2 added `req_buf_size` / `resp_buf_size` to the global header so the
 /// client no longer hardcodes geometry.

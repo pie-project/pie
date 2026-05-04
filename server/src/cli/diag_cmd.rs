@@ -1,0 +1,119 @@
+//! `pie check` / `pie smoke` — diagnostics that run without booting
+//! the full engine. Used during driver/standalone development; not
+//! part of the Python `pie_cli` surface.
+
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_void};
+use std::path::Path;
+
+use anyhow::{Result, anyhow};
+
+use crate::config::{self, DriverKind};
+use crate::driver_ffi::{self, Flavor};
+
+/// `pie check <toml>` — parse + validate a config TOML and pretty-
+/// print the resulting struct. Exits non-zero on parse / validation
+/// failure.
+pub fn check(path: &Path) -> Result<()> {
+    match config::Config::from_toml_file(path) {
+        Ok(cfg) => {
+            println!("[ok] {path:?}");
+            println!("{cfg:#?}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[err] {path:?}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `pie smoke [--rpc] [--flavor <name>]` — exercise the FFI / RPC
+/// plumbing without a real model load. `rpc=false` invokes the
+/// requested driver's entry with `--help` and reports its rc;
+/// `rpc=true` constructs an `RpcServer` and confirms it can be opened
+/// + closed.
+pub fn smoke(rpc: bool, flavor_name: Option<&str>) -> Result<()> {
+    if rpc {
+        smoke_rpc()
+    } else {
+        let flavor = pick_smoke_flavor(flavor_name)?;
+        smoke_ffi(flavor)
+    }
+}
+
+fn pick_smoke_flavor(name: Option<&str>) -> Result<Flavor> {
+    if let Some(n) = name {
+        // Reuse the TOML kind parser for symmetry: same string set.
+        let kind: DriverKind = match n {
+            "portable" => DriverKind::Portable,
+            "cuda" | "cuda_native" => DriverKind::CudaNative,
+            "dummy" => DriverKind::Dummy,
+            other => {
+                return Err(anyhow!(
+                    "--flavor must be one of \"portable\" | \"cuda\" | \"dummy\" \
+                     (got {other:?}). Compiled flavors: {compiled}.",
+                    compiled = driver_ffi::compiled_summary(),
+                ));
+            }
+        };
+        Flavor::from_kind(kind).map_err(|m| anyhow!("{m}"))
+    } else {
+        driver_ffi::default_flavor().ok_or_else(|| {
+            anyhow!("no driver flavor compiled into this binary")
+        })
+    }
+}
+
+unsafe extern "C" fn smoke_ready_cb(caps_json: *const c_char, _ctx: *mut c_void) {
+    let json = unsafe { CStr::from_ptr(caps_json) }
+        .to_string_lossy()
+        .into_owned();
+    println!("[smoke] ready_cb fired with {json}");
+}
+
+fn smoke_ffi(flavor: Flavor) -> Result<()> {
+    println!(
+        "[smoke] invoking pie_driver_{}_run(--help)…\n",
+        flavor.as_str()
+    );
+    let argv_strs = vec![
+        CString::new(flavor.argv0()).unwrap(),
+        CString::new("--help").unwrap(),
+    ];
+    let mut argv_ptrs: Vec<*mut c_char> = argv_strs
+        .iter()
+        .map(|s| s.as_ptr() as *mut c_char)
+        .collect();
+    let rc = unsafe {
+        driver_ffi::run(
+            flavor,
+            argv_ptrs.len() as c_int,
+            argv_ptrs.as_mut_ptr(),
+            0,
+            smoke_ready_cb,
+            std::ptr::null_mut(),
+        )
+    };
+    println!("\n[smoke] driver entry returned rc={rc}");
+    Ok(())
+}
+
+fn smoke_rpc() -> Result<()> {
+    use pie::device::RpcServer;
+    match RpcServer::create() {
+        Ok(server) => {
+            println!(
+                "[smoke-rpc] RpcServer ready, server_name={}",
+                server.server_name()
+            );
+            server.close();
+            println!("[smoke-rpc] closed cleanly");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[smoke-rpc] RpcServer::create failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}

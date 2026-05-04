@@ -9,20 +9,14 @@ repository = "https://github.com/pie-project/pie"
 
 [lib]
 name = "pie"
-crate-type = ["cdylib", "rlib"]
+# After Phase 8 the runtime is consumed only as an `rlib` by Rust
+# binaries (`server`, `pie-rpc`); the maturin `cdylib` for
+# `pie._runtime` is gone with the rest of the legacy Python server.
+crate-type = ["rlib"]
 path = "src/lib.rs"
-
-
-[features]
-default = ["python"]
-# Build the pyo3 FFI module (`ffi::pybindings`). Required by the maturin
-# build of `pie._runtime`. Disable for downstream Rust binaries (e.g.
-# `server/standalone`) that link the runtime as an rlib without Python.
-python = ["dep:pyo3"]
 
 [dependencies]
 pie-client = { path = "../client/rust" }
-pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 tokio = { version = "1.38", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1.0"

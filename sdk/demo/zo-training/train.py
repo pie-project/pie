@@ -61,10 +61,10 @@ class TrainingConfig:
     local: bool = False
     model: str = "meta-llama/Llama-3.2-1B-Instruct"
     device: str = "cuda:0"
-    # `native` = pie_driver (flashinfer); `sglang` = pie_driver_sgl.
+    # `dev` = pie_driver_dev (flashinfer); `sglang` = pie_driver_sglang.
     # When `sglang`, the driver is configured with `enable_adapter=True`
     # so the QKV adapter wrappers get installed at engine load.
-    driver: str = "native"
+    driver: str = "dev"
     gpu_mem_util: float = 0.8
     cpu_mem_budget: int = 12
     max_concurrent_processes: int = 256

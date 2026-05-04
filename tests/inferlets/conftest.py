@@ -46,8 +46,8 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser.add_argument("--device", default="cuda:0", help="Device(s), comma-separated")
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per inferlet (seconds)")
     parser.add_argument("--verbose", action="store_true", help="Show stdout on failure")
-    parser.add_argument("--driver", default="native", choices=["native", "vllm", "sglang", "dummy", "cuda_native", "portable"],
-                        help="Inference driver: 'native' (pie_driver), 'vllm' (pie_driver_vllm), 'sglang' (pie_driver_sgl), 'dummy' (pie_driver_dummy), 'cuda_native' (pie_driver_cuda_native), 'portable' (pie_driver_portable)")
+    parser.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "dummy", "cuda_native", "portable"],
+                        help="Inference driver: 'dev' (pie_driver_dev), 'vllm' (pie_driver_vllm), 'sglang' (pie_driver_sglang), 'dummy' (pie_driver_dummy), 'cuda_native' (pie_driver_cuda_native), 'portable' (pie_driver_portable)")
     parser.add_argument("--vllm-attention-backend", default=None,
                         help="vLLM attention backend (FLASH_ATTN / FLASHINFER / TRITON_ATTN / FLEX_ATTENTION). Default: vllm auto-picks")
     parser.add_argument("--sglang-attention-backend", default="triton",
@@ -203,7 +203,7 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         driver_subsection["attention_backend"] = args.vllm_attention_backend
     if args.driver == "sglang":
         driver_subsection["attention_backend"] = args.sglang_attention_backend
-    if args.cpu_mem_gb > 0 and args.driver in ("native", "sglang", "dummy"):
+    if args.cpu_mem_gb > 0 and args.driver in ("dev", "sglang", "dummy"):
         driver_subsection["cpu_mem_budget_in_gb"] = args.cpu_mem_gb
     if args.driver in ("sglang", "vllm") and args.spec_ngram:
         driver_subsection["spec_ngram_enabled"] = True

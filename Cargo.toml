@@ -10,8 +10,10 @@ resolver = "2"
 members = [
     "runtime",
     "client/rust",
-    "server/standalone",
+    "server",
     "driver/dummy",
+    "sdk/python-rpc",
+    "sdk/python-server",
 ]
 exclude = [
     "inferlets",

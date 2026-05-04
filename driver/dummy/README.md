@@ -7,7 +7,7 @@ load and no real compute. Each `fire_batch` request returns a vector of
 random token ids, one per sampler slot.
 
 The Python `pie_driver_dummy` worker (under `pie/src/pie_driver_dummy/`)
-shells through `pie_driver/worker.run_worker` whose shmem fast path
+shells through `pie_driver_dev.worker.run_worker` whose shmem fast path
 hard-imports `librt.so.1` at module load — Linux-only. This Rust dummy
 links into `pie-standalone` directly, calls POSIX `shm_open` /
 `mmap` via `libc`, and works on Linux **and** macOS.
