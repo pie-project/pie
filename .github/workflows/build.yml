@@ -110,11 +110,12 @@ jobs:
         run: |
           set -euxo pipefail
           dnf install -y --setopt=install_weak_deps=False \
-            openssl-devel pkg-config perl \
+            openssl-devel pkg-config perl git \
             gcc-toolset-14-gcc gcc-toolset-14-gcc-c++
           # GitHub CLI — used by the upload step. The manylinux image
           # doesn't ship `gh` and the upload step's --clobber flow has
-          # no clean curl equivalent.
+          # no clean curl equivalent. `gh` rpm depends on `git`,
+          # installed above.
           dnf install -y 'dnf-command(config-manager)'
           dnf config-manager --add-repo \
             https://cli.github.com/packages/rpm/gh-cli.repo
