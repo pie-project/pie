@@ -60,16 +60,16 @@ flashinfer-jit-cache = [{ index = "flashinfer-cu128" }]
 # Resolve the structured-decoding pins where vLLM 0.16.0 and SGLang 0.5.9
 # disagree. Taking vLLM's (newer) side: SGLang's grammar-constrained
 # decoding paths will likely fail at runtime, but plain generation is
-# unaffected. Only matters when both wheels share a venv.
+# unaffected. Only matters when both wheels share a venv (separate venvs
+# is the supported deployment, in which case this block is inert).
+# Note: `uv pip install` does not honor this block; only `uv lock` /
+# `uv sync` do. Shared-venv users should drive install via uv sync, or
+# pass these as `--override` to uv pip install.
 override-dependencies = [
     "llguidance>=1.3.0,<1.4.0",
     "xgrammar==0.1.29",
     "outlines-core==0.2.11",
     "outlines>=1.2.0,<1.3.0",
-    # vLLM 0.16.0 pins numba==0.61.2; pie-server's base requires >=0.63.
-    # Take vllm's pin — pie's numba use (`@njit` in batching/attn metadata)
-    # works on 0.61.x.
-    "numba==0.61.2",
 ]
 
 [tool.setuptools]

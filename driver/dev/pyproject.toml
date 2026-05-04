@@ -25,10 +25,29 @@ dependencies = [
     "einops>=0.8.1",
     "huggingface_hub>=0.34.0",
     "msgpack>=0.5",
-    "numba>=0.63",
+    # `msgspec` is the worker batch wire format (pie_driver_dev.message); the
+    # leader loop lazy-imports it on the first batch, so a missing install
+    # only trips after model load.
+    "msgspec>=0.18",
+    # vllm 0.16.0 pins numba==0.61.2 and the dev driver only uses `@njit`
+    # in batching / attention-metadata helpers (works on 0.61.x). Keeping
+    # the floor at 0.61 lets pie-driver-{vllm,sglang} co-resolve through
+    # `uv pip install` without needing the override-dependencies workaround.
+    "numba>=0.61",
+    # `psutil` is imported by `pie_driver_dev.utils` (RAM probe via
+    # `get_available_memory`) at module top — engine.py picks it up on
+    # boot, so a missing install crashes every worker before ready.
+    "psutil>=5.9",
     "safetensors>=0.6.2",
     "tqdm>=4.67",
     "ztensor>=0.1.4",
+    # OpenTelemetry — `pie_driver_dev.telemetry` imports `opentelemetry.trace`
+    # at module top, which engine.py pulls in unconditionally. The runtime
+    # use is opt-in via `[telemetry] enabled = true`, but the imports run
+    # either way.
+    "opentelemetry-api>=1.30",
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp>=1.30",
 ]
 
 [project.optional-dependencies]
