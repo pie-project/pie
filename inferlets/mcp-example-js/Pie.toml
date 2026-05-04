@@ -1,0 +1,14 @@
+[package]
+name = "mcp-example-js"
+version = "0.1.0"
+description = "Connect to an MCP server registered on the client session, list tools, and call one (JavaScript)."
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+server = { type = "string", optional = true, description = "MCP server name (default: 'demo')" }
+tool   = { type = "string", optional = true, description = "Tool to call (default: 'echo')" }
+text   = { type = "string", optional = true, description = "Text argument for the echo tool (default: 'hello')" }

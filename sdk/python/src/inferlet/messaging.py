@@ -1,133 +1,78 @@
 """
-Messaging functions for communicating with the remote user client.
+Messaging — ``pie:core/messaging``.
+
+Push/pull and broadcast/subscribe for inter-inferlet communication.
 """
 
-from wit_world.imports import message as _message
-from wit_world.imports import inferlet_core_common as _common
-from .async_utils import await_future
+from __future__ import annotations
+
+import asyncio
+
+from wit_world.imports import messaging as _msg
+
+from ._async import await_future
 
 
-class Blob:
-    """Represents a binary blob that can be sent/received."""
-
-    def __init__(self, inner: _common.Blob) -> None:
-        self._inner = inner
-
-    @classmethod
-    def new(cls, data: bytes) -> "Blob":
-        """Create a new Blob from binary data."""
-        return cls(_common.Blob(data))
-
-    @classmethod
-    def _from_inner(cls, inner: _common.Blob) -> "Blob":
-        """
-        Internal factory to create Blob from WIT binding.
-
-        This is used when receiving blobs from WIT functions that return
-        blob resources directly (e.g., download_adapter).
-        """
-        blob = cls.__new__(cls)
-        blob._inner = inner
-        return blob
-
-    @property
-    def size(self) -> int:
-        """Get the size of the blob."""
-        return self._inner.size()
-
-    def read(self, offset: int, n: int) -> bytes:
-        """Read n bytes from the blob starting at offset."""
-        return self._inner.read(offset, n)
-
-    def __bytes__(self) -> bytes:
-        """Convert entire blob to bytes."""
-        return self.read(0, self.size)
+def push(topic: str, message: str) -> None:
+    """Push a message to a topic (point-to-point)."""
+    _msg.push(topic, message)
 
 
-def send(message: str, *, streaming: bool = False) -> None:
-    """
-    Sends a message to the remote user client.
-
-    Args:
-        message: The message to send
-        streaming: If True, indicates this is a partial/streaming update
-                   (Note: streaming flag is for semantic clarity, actual behavior
-                   is the same - messages are sent immediately)
-    """
-    _message.send(message)
-
-
-def receive(*, timeout: float | None = None) -> str:
-    """
-    Receives an incoming message from the remote user client.
-    Blocks until a message arrives.
-
-    Args:
-        timeout: Optional timeout in seconds (not yet implemented)
-
-    Returns:
-        The received message
-    """
-    # Note: timeout not yet implemented in WIT interface
-    result = _message.receive()
-    return await_future(result, "receive() returned None")
-
-
-def send_blob(blob: Blob) -> None:
-    """Sends a blob to the remote user client."""
-    _message.send_blob(blob._inner)
-
-
-def receive_blob() -> Blob:
-    """
-    Receives an incoming blob from the remote user client.
-    Blocks until a blob arrives.
-    """
-    result = _message.receive_blob()
-    inner = await_future(result, "receive_blob() returned None")
-    return Blob(inner)
+async def pull(topic: str) -> str:
+    """Pull the next message from a topic."""
+    future = _msg.pull(topic)
+    return await await_future(future, f"Pull from '{topic}' failed")
 
 
 def broadcast(topic: str, message: str) -> None:
-    """
-    Publishes a message to a topic (broadcast to all subscribers).
-
-    Args:
-        topic: The topic to broadcast to
-        message: The message to broadcast
-    """
-    _message.broadcast(topic, message)
-
-
-class Subscription:
-    """Subscription to a broadcast topic."""
-
-    def __init__(self, inner: _message.Subscription) -> None:
-        self._inner = inner
-
-    def get(self) -> str | None:
-        """Get next message if available, returns None if no message ready."""
-        return self._inner.get()
-
-    def unsubscribe(self) -> None:
-        """Cancel the subscription."""
-        self._inner.unsubscribe()
-
-    def __enter__(self) -> "Subscription":
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self.unsubscribe()
+    """Broadcast a message to all subscribers of a topic."""
+    _msg.broadcast(topic, message)
 
 
 def subscribe(topic: str) -> Subscription:
-    """
-    Subscribes to a topic and returns a subscription handle.
+    """Subscribe to a topic. Returns an async iterable subscription."""
+    return Subscription(_msg.subscribe(topic))
 
-    Args:
-        topic: The topic to subscribe to
 
-    Returns:
-        A Subscription that can be used to receive messages
+class Subscription:
+    """Async iterable subscription to a messaging topic.
+
+    Usage::
+
+        with messaging.subscribe("events") as sub:
+            async for message in sub:
+                print(message)
     """
-    return Subscription(_message.subscribe(topic))
+
+    __slots__ = ("_handle",)
+
+    def __init__(self, handle: _msg.Subscription) -> None:
+        self._handle = handle
+
+    async def next(self) -> str | None:
+        """Get the next message, or ``None`` if no more messages."""
+        pollable = self._handle.pollable()
+        loop = asyncio.get_event_loop()
+        waker: asyncio.Future[None] = loop.create_future()
+        loop.wakers.append((pollable, waker))  # type: ignore[attr-defined]
+        await waker
+        return self._handle.get()
+
+    def unsubscribe(self) -> None:
+        """Unsubscribe from the topic."""
+        self._handle.unsubscribe()
+
+    def __enter__(self) -> Subscription:
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.unsubscribe()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        result = await self.next()
+        if result is None:
+            raise StopAsyncIteration
+        return result

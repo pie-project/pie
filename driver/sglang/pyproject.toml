@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pie-driver-sglang"
+version = "0.3.0"
+description = "Pie driver — SGLang backend. Uses sglang's model definitions, attention kernels, and KV cache plumbing under pie's RPC surface."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = "Apache-2.0"
+authors = [{ name = "In Gim", email = "in.gim@icloud.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# SGLang 0.5.9 is the newest release that pins flashinfer 0.6.3, which
+# matches pie-driver-vllm's pin so the two wheels are jointly resolvable
+# (separate venvs is still the supported deployment).
+dependencies = [
+    # vllm + sglang reuse the shared worker scaffolding (run_worker,
+    # calculate_topology, telemetry, batching) from pie-driver-dev. They
+    # ship as separate wheels but compose against dev's surface rather
+    # than re-implementing it. `DriverCapabilities` and the `pie-rpc`
+    # dep flow transitively through `pie-driver-dev`.
+    "pie-driver-dev",
+    "msgpack>=0.5",
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "torchaudio==2.9.1",
+    "torchao==0.9.0",
+    "sglang==0.5.9",
+    "flashinfer-python==0.6.3",
+    "flashinfer-cubin==0.6.3",
+    "flashinfer-jit-cache==0.6.3",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu128"
+url = "https://flashinfer.ai/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+pie-driver-dev = { path = "../dev", editable = true }
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]
+flashinfer-jit-cache = [{ index = "flashinfer-cu128" }]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["pie_driver_sglang"]

@@ -1,0 +1,76 @@
+---
+title: FAQ
+description: Common questions about Pie's status, scope, and design choices
+sidebar_position: 5
+---
+
+# FAQ
+
+Common questions about Pie's status, scope, and design choices. If you cannot find an answer here, open a [GitHub Discussion](https://github.com/pie-project/pie/discussions) or file an [issue](https://github.com/pie-project/pie/issues).
+
+## Is Pie production ready?
+
+No. Pie is a research prototype under active development. APIs change between releases without deprecation cycles. The supported model families and drivers are listed on each driver's reference page ([CUDA](../reference/drivers/cuda#supported-architectures), [Portable](../reference/drivers/portable#supported-architectures), [vLLM](../reference/drivers/vllm), [SGLang](../reference/drivers/sglang)). Anything outside those lists is not guaranteed to work. Use Pie for research, prototyping, and internal deployments where you can update with the project.
+
+## Do I have to write Rust?
+
+No. Inferlets can be written in Rust, Python, or TypeScript. Rust is the canonical SDK, and a few advanced primitives (the raw `forward()` API, custom speculators, custom adapters) are Rust-only today. The Python and TypeScript SDKs cover generation, KV cache control, structured output, MCP, and tool calling. See [Your first inferlet](../guide/first-inferlet) for the Rust path and the `python-example` and `js-example` inferlets for the other two.
+
+## Does this architecture introduce too much overhead?
+
+The accumulated per-request runtime overhead (Wasm instantiation, the tokio per-inferlet executor, Wasm/host boundary crossings, and the runtime-to-driver IPC) sits in the 100-500 microsecond range even under load. That's small relative to a forward pass. The main "programmability tax" per-step comes from two places:
+
+1. **Optimizations the driver can no longer apply.** The driver doesn't know which API calls the inferlet will issue next, so it can't pipeline CPU-side batch preparation with GPU execution, and it can't do in-place batch updates that only edit newly added tokens.
+
+2. **Sampling has to be composable.** A black-box endpoint can fuse the entire sampler into one kernel. Pie splits sampling into composable steps so inferlets can mix and match, which costs extra kernel launches.
+
+
+## Does Pie support multi-GPU and multi-node?
+
+Pie supports tensor-parallel and data-parallel inference across multiple GPUs on one host. Multi-node inference is not supported today.
+
+## How do I bring my own model?
+
+Pie is compatible with HuggingFace models.
+If your model is one of the supported architectures, point the model block at its HuggingFace repo. `pie model download <repo>` pulls the weights; `pie model list` reports compatibility.
+If you use vLLM/SGLang as driver, then you can use any model supported by those frameworks.
+
+## Why WebAssembly?
+
+Three reasons:
+
+1. **Sandboxing.** Inferlets run inside the engine process. WebAssembly gives memory safety and a deny-by-default capability model. An untrusted inferlet cannot read another's memory or escape to the host.
+2. **Language agnostic.** Rust, Python, and TypeScript all compile to the same Wasm component target. The engine speaks one ABI.
+3. **Fast cold start.** Wasm modules instantiate within milliseconds. A new inferlet process per request is feasible.
+
+The cost is a per-call boundary between Wasm and the host. The [benchmarks](./benchmarks) page reports the size of that overhead.
+
+## How does Pie relate to LangChain, LlamaIndex, or DSPy?
+
+Those are application frameworks that run on top of a serving system. They orchestrate prompts, manage memory, and call tools, but they call the model through a black-box endpoint. Pie is the serving system underneath. You could in principle run a LangChain agent against a Pie endpoint and get nothing extra; the value of Pie is moving the orchestration logic *into* the engine, where it can share the KV cache and avoid client round trips. An inferlet is an alternative to that orchestration layer, not a replacement for prompt templates or document loaders.
+
+## Can I use Pie as a drop-in OpenAI-compatible endpoint?
+
+Yes, through the `openresponses` inferlet. It exposes an OpenAI Responses-compatible HTTP API on top of the engine. For OpenAI Chat Completions specifically, you write a small inferlet that translates the schema; the [examples](../guide/examples/overview) page lists relevant building blocks.
+
+## Is Pie open source?
+
+Yes, Apache 2.0. Source on [GitHub](https://github.com/pie-project/pie). Issues and discussions are public.
+
+## How do I cite Pie?
+
+```
+@inproceedings{gim2025pie,
+  title={Pie: A programmable serving system for emerging llm applications},
+  author={Gim, In and Ma, Zhiyao and Lee, Seung-seob and Zhong, Lin},
+  booktitle={Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles},
+  pages={415--430},
+  year={2025}
+}
+```
+
+## Where do I get help?
+
+- [GitHub Discussions](https://github.com/pie-project/pie/discussions) for questions and design feedback.
+- [GitHub Issues](https://github.com/pie-project/pie/issues) for bugs and feature requests.
+- The [Examples](../guide/examples/overview) page for working code on most common patterns.

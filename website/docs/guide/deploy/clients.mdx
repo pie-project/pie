@@ -1,0 +1,413 @@
+---
+title: Connecting clients
+description: Open a WebSocket, launch a process, and stream events from an inferlet
+sidebar_position: 4
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Connecting clients
+
+A client is the application that calls your inferlet. Three official client libraries cover the common cases: Python (`pie-client`), JavaScript (`@pie/client`), and Rust (`pie-client` crate). This page is task-shaped: how to connect, launch, stream, and close. The full API surface is in the per-language reference. Read this after [Run a server](./serve).
+
+## Install
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```toml
+[dependencies]
+pie-client = "*"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+anyhow = "1"
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```bash
+pip install pie-client
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```bash
+npm install @pie/client
+```
+
+</TabItem>
+</Tabs>
+
+## Connect and authenticate
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use pie_client::{Client, ParsedPrivateKey};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = Client::connect("ws://127.0.0.1:8080").await?;
+
+    // Public-key auth (Ed25519 / RSA / ECDSA).
+    let key = ParsedPrivateKey::from_file("~/.ssh/id_ed25519")?;
+    client.authenticate("alice", &Some(key)).await?;
+
+    // ... use the client ...
+
+    client.close().await?;
+    Ok(())
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+import asyncio
+from pie_client import PieClient, ParsedPrivateKey
+
+async def main():
+    async with PieClient("ws://127.0.0.1:8080") as client:
+        key = ParsedPrivateKey.from_file("~/.ssh/id_ed25519")
+        await client.authenticate("alice", key)
+        # ... use the client ...
+
+asyncio.run(main())
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { PieClient } from '@pie/client';
+
+const client = new PieClient('ws://127.0.0.1:8080');
+await client.connect();
+
+// JS client today only supports token auth.
+await client.authByToken(process.env.PIE_TOKEN!);
+
+// ... use the client ...
+
+client.close();
+```
+
+</TabItem>
+</Tabs>
+
+If the engine is running with `--no-auth`, the `authenticate` call is a no-op (Python and Rust) and you skip it entirely (JavaScript).
+
+## Launch a process
+
+`launch_process(name@version, input)` starts an inferlet. The returned handle streams events.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let input = serde_json::json!({"question": "What is 2+2?"}).to_string();
+let mut process = client
+    .launch_process(
+        "research-agent@0.1.0".into(),
+        input,
+        true,           // capture stdout/stderr
+        None,           // token budget (None = unlimited)
+    )
+    .await?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+process = await client.launch_process(
+    "research-agent@0.1.0",
+    input={"question": "What is 2+2?"},
+)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const proc = await client.launchProcess('research-agent@0.1.0', {
+    question: 'What is 2+2?',
+});
+```
+
+</TabItem>
+</Tabs>
+
+`input` becomes the inferlet's typed `Input` struct. The launch resolves once the engine has confirmed the inferlet started; events stream after.
+
+## Stream events
+
+The handle yields events one by one. Loop until `Return` (success) or `Error` (failure).
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use pie_client::ProcessEvent;
+
+loop {
+    match process.recv().await? {
+        ProcessEvent::Stdout(s) => print!("{s}"),
+        ProcessEvent::Stderr(s) => eprint!("{s}"),
+        ProcessEvent::Message(m) => println!("[message] {m}"),
+        ProcessEvent::File(b) => save_blob(&b),
+        ProcessEvent::Return(v) => {
+            let answer: String = serde_json::from_str(&v)?;
+            println!("{answer}");
+            break;
+        }
+        ProcessEvent::Error(e) => anyhow::bail!("{e}"),
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from pie_client import Event
+import json
+
+while True:
+    event, value = await process.recv()
+    if event == Event.Stdout:
+        print(value, end="", flush=True)
+    elif event == Event.Stderr:
+        print(value, end="", flush=True, file=sys.stderr)
+    elif event == Event.Message:
+        handle_message(value)
+    elif event == Event.File:
+        save_blob(value)
+    elif event == Event.Return:
+        answer = json.loads(value)
+        print(answer)
+        break
+    elif event == Event.Error:
+        raise RuntimeError(value)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+while (true) {
+    const { event, value } = await proc.recv();
+    if (event === 'stdout') process.stdout.write(value);
+    else if (event === 'stderr') process.stderr.write(value);
+    else if (event === 'message') handleMessage(value);
+    else if (event === 'file') saveBlob(value);
+    else if (event === 'return') {
+        const answer = JSON.parse(value);
+        console.log(answer);
+        break;
+    } else if (event === 'error') {
+        throw new Error(value);
+    }
+}
+```
+
+</TabItem>
+</Tabs>
+
+`Stdout` events arrive in the order the inferlet emitted them. Per-event ordering is preserved across stdout / stderr / messages.
+
+## Send signals and files
+
+The client side mirrors the inferlet's [session](../io/session) surface.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+process.signal("stop").await?;
+process.transfer_file(&pdf_bytes).await?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+await process.signal("stop")
+await process.transfer_file(pdf_bytes)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+await proc.signal('stop');
+await proc.transferFile(pdfBytes);
+```
+
+</TabItem>
+</Tabs>
+
+The inferlet receives signals via `session.receive_signal()` and files via `session.receive_file()`.
+
+## Concurrent calls on one connection
+
+A single connection multiplexes many processes. Launch several without awaiting, drain them in parallel.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let mut handles = Vec::new();
+for q in questions {
+    let input = serde_json::json!({"question": q}).to_string();
+    let p = client.launch_process(
+        "research-agent@0.1.0".into(), input, true, None,
+    ).await?;
+    handles.push(p);
+}
+
+// Drain in parallel via tokio tasks.
+let answers = futures::future::join_all(
+    handles.into_iter().map(|mut p| async move {
+        loop {
+            match p.recv().await? {
+                ProcessEvent::Return(v) => return Ok::<_, anyhow::Error>(v),
+                ProcessEvent::Error(e) => anyhow::bail!("{e}"),
+                _ => {}
+            }
+        }
+    })
+).await;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+async def run_one(q):
+    proc = await client.launch_process(
+        "research-agent@0.1.0", input={"question": q},
+    )
+    while True:
+        event, value = await proc.recv()
+        if event == Event.Return:
+            return json.loads(value)
+        if event == Event.Error:
+            raise RuntimeError(value)
+
+answers = await asyncio.gather(*(run_one(q) for q in questions))
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+async function runOne(q: string) {
+    const proc = await client.launchProcess('research-agent@0.1.0', { question: q });
+    while (true) {
+        const { event, value } = await proc.recv();
+        if (event === 'return') return JSON.parse(value);
+        if (event === 'error') throw new Error(value);
+    }
+}
+
+const answers = await Promise.all(questions.map(runOne));
+```
+
+</TabItem>
+</Tabs>
+
+The engine batches forward passes from concurrent processes. Three runs in parallel against the same engine take roughly the same wall-clock time as one run, plus per-step overhead.
+
+## Upload a local build
+
+For client-uploaded builds (no registry):
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use std::path::Path;
+
+if !client.check_program("research-agent@0.1.0", None, None).await? {
+    client.add_program(
+        Path::new("./research-agent.wasm"),
+        Path::new("./Pie.toml"),
+        false,
+    ).await?;
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+if not await client.check_program("research-agent@0.1.0"):
+    await client.install_program("./research-agent.wasm", "./Pie.toml")
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+if (!(await client.checkProgram('research-agent@0.1.0'))) {
+    await client.installProgram('./research-agent.wasm', './Pie.toml');
+}
+```
+
+</TabItem>
+</Tabs>
+
+The upload chunks at 256 KiB. The build stays loaded as long as the engine runs.
+
+## Detach and reattach
+
+Long-running processes can be detached and reattached later by ID.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let id = process.id().to_string();
+drop(process);  // detach
+
+// later, on a new client connection:
+let mut process = client.attach_process(&id).await?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+pid = process.process_id
+del process
+
+# later, on a new client connection:
+process = await client.attach_process(pid)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const pid = proc.id;
+// later:
+const proc = await client.attachProcess(pid);
+```
+
+</TabItem>
+</Tabs>
+
+The process keeps running on the engine while detached. Reattachment resumes the event stream from where it left off (with the buffered events the engine has held).
+
+## Next
+
+- [Profiling](./profiling): measure end-to-end performance from the client side.
+- [Python client reference](../../reference/client-python): full API surface.
+- [Rust client reference](../../reference/client-rust): full API surface.
+- [JavaScript client reference](../../reference/client-javascript): full API surface.

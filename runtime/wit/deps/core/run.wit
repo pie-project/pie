@@ -1,0 +1,6 @@
+interface run {
+
+    use types.{error};
+
+    run: func(input: string) -> result<string, error>;
+}

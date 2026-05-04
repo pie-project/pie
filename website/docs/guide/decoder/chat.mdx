@@ -1,0 +1,239 @@
+---
+title: Chat parser
+description: Stream visible chat text from a Generator's token output
+sidebar_position: 3
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Chat parser
+
+`chat::Decoder` is a stateful parser that turns the model's raw token stream into clean text deltas. It strips role tags, suppresses special tokens, and emits a terminal `Done` event when the model ends its turn. The SDK names the type `Decoder`; functionally it is a tokenizer-aware parser. Read this after [Generator](./generator).
+
+The parser does not generate. Pair it with a [Generator](./generator) (or any other source of token IDs) and feed the tokens in.
+
+## Stream tokens through the parser
+
+The standard pattern: drive the Generator step by step and feed each step's tokens into the parser.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::{chat, sample::Sampler};
+
+let mut g = ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+    .max_tokens(256);
+let mut parser = chat::Decoder::new(&model);
+
+while let Some(step) = g.next()? {
+    let out = step.execute().await?;
+    match parser.feed(&out.tokens)? {
+        chat::Event::Delta(s) => print!("{s}"),
+        chat::Event::Done(_)  => break,
+        _                      => {}
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Sampler, chat
+
+g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=256)
+parser = chat.Decoder(model)
+
+async for step in g:
+    out = await step.execute()
+    match parser.feed(out.tokens):
+        case chat.Event.Delta(text=t):
+            print(t, end="")
+        case chat.Event.Done(text=_):
+            break
+        case _:
+            pass
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Sampler, chat } from 'inferlet';
+
+const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
+const parser = new chat.Decoder(model);
+
+for await (const step of g) {
+    const out = await step.execute();
+    const ev = parser.feed(out.tokens);
+    if (ev.type === 'delta') process.stdout.write(ev.text);
+    else if (ev.type === 'done') break;
+}
+```
+
+</TabItem>
+</Tabs>
+
+Each `step.execute()` runs one forward pass and returns the tokens accepted in that step (one without speculative decoding, several with it). The parser is stateful; reset it between turns with `parser.reset()`.
+
+If you only want the assembled string and don't care about streaming, the Generator's `collect_text` collector runs the same parser internally — see [Generator](./generator#drain-with-a-collector).
+
+## Events
+
+| Event | When |
+|---|---|
+| `Idle` | The token batch produced no visible text (e.g. an opening role tag). |
+| `Delta(text)` | New visible text. Append it to the UI. |
+| `Done(text)` | The assistant turn ended. `text` is the full assembled reply. |
+| `Interrupt(token_id)` | A control token the template did not render as visible text. Most callers ignore this. |
+
+The parser yields one event per `feed(...)` call. For multi-token batches (with speculative decoding accepted), the parser still emits one event with the consolidated delta.
+
+## Streaming back to the client
+
+Inside an inferlet, stream each delta to the launching client with `session::send`:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::pie::core::session;
+
+while let Some(step) = g.next()? {
+    let out = step.execute().await?;
+    if let chat::Event::Delta(s) = parser.feed(&out.tokens)? {
+        session::send(&s);
+    }
+}
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import session
+
+async for step in g:
+    out = await step.execute()
+    if isinstance((ev := parser.feed(out.tokens)), chat.Event.Delta):
+        session.send(ev.text)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { session } from 'inferlet';
+
+for await (const step of g) {
+    const out = await step.execute();
+    const ev = parser.feed(out.tokens);
+    if (ev.type === 'delta') session.send(ev.text);
+}
+```
+
+</TabItem>
+</Tabs>
+
+The client receives each delta as a `Stdout` event. See [User and inferlet](../io/session) for the full session API.
+
+## Multi-turn
+
+After a turn finishes, `seal()` closes the assistant block. The next `user()` opens a new turn. The KV cache from earlier turns stays live, so nothing re-prefills.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+ctx.system("You are a math tutor.");
+
+ctx.user("What is 2+2?").cue();
+let answer = ctx.generate(sampler.clone()).max_tokens(64).collect_text().await?;
+ctx.seal();
+
+ctx.user("Why?").cue();
+let explain = ctx.generate(sampler).max_tokens(256).collect_text().await?;
+ctx.seal();
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+ctx.system("You are a math tutor.")
+
+ctx.user("What is 2+2?").cue()
+answer = await ctx.generate(sampler, max_tokens=64).collect_text()
+ctx.seal()
+
+ctx.user("Why?").cue()
+explain = await ctx.generate(sampler, max_tokens=256).collect_text()
+ctx.seal()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+ctx.system('You are a math tutor.');
+
+ctx.user('What is 2+2?').cue();
+const answer = await ctx.generate(sampler, { maxTokens: 64 }).collectText();
+ctx.seal();
+
+ctx.user('Why?').cue();
+const explain = await ctx.generate(sampler, { maxTokens: 256 }).collectText();
+ctx.seal();
+```
+
+</TabItem>
+</Tabs>
+
+The text the model produced is written back into the context (every accepted token commits to the KV cache), so the next turn already sees it.
+
+## Custom stop tokens
+
+Some workloads want to stop on a marker the chat template doesn't recognize as end-of-turn (e.g. a tool-call boundary). `chat::stop_tokens(model)` returns the model's standard stop list (EOS plus any role-end markers); add your own and pass to the Generator:
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+let mut stops = chat::stop_tokens(&model);
+stops.extend(my_extra_stop_ids);
+
+let g = ctx.generate(sampler).max_tokens(512).stop(&stops);
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+stops = chat.stop_tokens(model) + my_extra_stop_ids
+
+g = ctx.generate(sampler, max_tokens=512, stop=stops)
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const stops = [...chat.stopTokens(model), ...myExtraStopIds];
+
+const g = ctx.generate(sampler, { maxTokens: 512, stop: stops });
+```
+
+</TabItem>
+</Tabs>
+
+This stops the Generator. The parser sees the same token stream the Generator emitted — it doesn't need to know about your custom stop.
+
+## Next
+
+- [Reasoning parser](./reasoning): the parser for thinking-block events.
+- [Tool-call parser](./tool-calling): the parser for tool calls.
+- [Generator](./generator): the multi-step source the parser composes with.
+- [Constrained generation](../forward/constrained): pair the chat parser with a JSON or regex constraint upstream.

@@ -1,0 +1,415 @@
+---
+title: Build the agent
+description: Write a parallel research agent inferlet from scratch
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Build the agent
+
+This tutorial walks you through writing an inferlet that answers comparative questions by fetching Wikipedia summaries in parallel. It is the first of three pages: this one writes the program, the [next page](./run) builds and runs it locally, and the [last page](./serve) calls it from a separate client process. Read this after [Your first inferlet](../first-inferlet).
+
+By the end of this page you will have a `research-agent` inferlet that takes a question, asks the model what to look up, fetches Wikipedia summaries concurrently, and writes a synthesized answer.
+
+:::note[Pie SDK status]
+HTTP from inside an inferlet is fully supported in the Rust SDK today. The Python and JavaScript HTTP paths shown below are the API shape; the runtime bindings are in progress. The Rust tab runs end-to-end as written; the other tabs run end-to-end *except* for the HTTP fetch step.
+:::
+
+## What you'll build
+
+Sample interaction:
+
+```
+Question: Compare the climates of Tokyo, Reykjavik, and Singapore.
+
+[plan]      titles: ["Tokyo", "Reykjavik", "Singapore"]
+[fetch]     3 summaries in parallel (~400 ms total)
+[synthesize] Tokyo has a humid subtropical climate with hot, humid summers...
+            Reykjavik has a subpolar oceanic climate, cool year-round...
+            Singapore lies on the equator and has a tropical rainforest climate...
+            All three differ primarily in latitude and ocean influence...
+```
+
+The inferlet runs four steps:
+
+1. **Plan.** Ask the model to emit a JSON list of Wikipedia titles to look up.
+2. **Fetch in parallel.** Issue all HTTP requests concurrently.
+3. **Append observations.** Hand the summaries back to the model as a user turn.
+4. **Synthesize.** Generate the final answer from the augmented context.
+
+The interesting part is step 2. Inside the inferlet, parallel HTTP is the same primitive your language already provides (`futures::future::join_all`, `asyncio.gather`, `Promise.all`). The KV cache from step 1 stays warm across the whole run, so step 4 does not re-prefill the conversation.
+
+## Prerequisites
+
+- Pie installed and a model downloaded. See [Install and first run](../install).
+- A working scaffold from [Your first inferlet](../first-inferlet).
+- For the Python and JavaScript tabs, the `pie` toolchain (Python 3.14 runtime and the JS runtime) is downloaded by `pie config init`.
+
+## Scaffold
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```bash
+bakery create research-agent
+cd research-agent
+```
+
+Edit `Cargo.toml` to add the dependencies you need:
+
+```toml
+[package]
+name = "research-agent"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet = { path = "../../sdk/rust/inferlet" }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = true
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+`bakery create` does not ship a Python template today. Copy [`inferlets/python-example`](https://github.com/pie-project/pie/tree/main/inferlets/python-example) as a starting point and rename:
+
+```bash
+cp -r inferlets/python-example research-agent
+cd research-agent
+```
+
+Edit `pyproject.toml` to declare `requests` as a dependency:
+
+```toml
+[project]
+name = "research-agent"
+version = "0.1.0"
+description = "Parallel research agent"
+requires-python = ">=3.10"
+dependencies = ["requests"]
+```
+
+The Python template's `Pie.toml` already declares the `[runtime]` block (including `python-runtime`).
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```bash
+bakery create research-agent --ts
+cd research-agent
+```
+
+`bakery create --ts` lays down `index.ts`, `package.json`, and `Pie.toml`. The global `fetch` is built in, so no extra deps are needed for HTTP.
+
+</TabItem>
+</Tabs>
+
+## Manifest
+
+`Pie.toml` declares the parameters the inferlet expects. The same shape works in all three languages:
+
+```toml
+[package]
+name = "research-agent"
+version = "0.1.0"
+description = "Parallel research agent"
+authors = ["You <you@example.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+question = { type = "string", description = "The question to research" }
+```
+
+The Python tab adds `python-runtime = "^0.3.0"` to `[runtime]`. `bakery create --lang python` writes that automatically.
+
+## The program
+
+Here is the full inferlet. Read past it for the walkthrough.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+`src/lib.rs`:
+
+```rust
+use futures::future;
+use inferlet::wstd::http::{Client, Method, Request};
+use inferlet::wstd::io::{empty, AsyncRead};
+use inferlet::{model::Model, runtime, sample::Sampler, Context, Result};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Input {
+    question: String,
+}
+
+#[derive(Deserialize)]
+struct Plan {
+    titles: Vec<String>,
+}
+
+const PLANNER_PROMPT: &str = "\
+You are a research assistant. Given a question, return a JSON object \
+with one key \"titles\": an array of 2 to 4 Wikipedia article titles \
+that would help answer the question. Return JSON only, no prose.";
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<String> {
+    let model = Model::load(runtime::models().first().ok_or("no models")?)?;
+    let mut ctx = Context::new(&model)?;
+
+    // 1. Plan: ask the model what to look up.
+    ctx.system(PLANNER_PROMPT)
+        .user(&input.question)
+        .cue();
+    let plan_text = ctx
+        .generate(Sampler::Argmax)
+        .max_tokens(256)
+        .collect_text()
+        .await?;
+    let plan: Plan = serde_json::from_str(&plan_text).map_err(|e| e.to_string())?;
+
+    // 2. Fetch summaries in parallel.
+    let summaries =
+        future::join_all(plan.titles.iter().map(|t| fetch_summary(t))).await;
+
+    // 3. Hand observations back to the model.
+    let mut observation = String::from("Wikipedia summaries:\n\n");
+    for (title, result) in plan.titles.iter().zip(summaries.iter()) {
+        match result {
+            Ok(text) => observation.push_str(&format!("## {title}\n\n{text}\n\n")),
+            Err(e) => observation.push_str(&format!("## {title}\n\n[fetch failed: {e}]\n\n")),
+        }
+    }
+    ctx.user(&observation).cue();
+
+    // 4. Synthesize the final answer.
+    ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+        .max_tokens(512)
+        .collect_text()
+        .await
+}
+
+async fn fetch_summary(title: &str) -> Result<String> {
+    let url = format!(
+        "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
+        urlencoding::encode(title)
+    );
+    let req = Request::builder()
+        .uri(&url)
+        .method(Method::GET)
+        .body(empty())
+        .map_err(|e| e.to_string())?;
+    let resp = Client::new().send(req).await.map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    resp.into_body()
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| e.to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
+    value
+        .get("extract")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| "no extract field".to_string())
+}
+```
+
+Add `urlencoding = "2"` to `Cargo.toml` for the URL escape helper.
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+`main.py`:
+
+```python
+import asyncio
+import json
+import urllib.parse
+
+import requests
+from inferlet import Context, Model, Sampler, runtime
+
+PLANNER_PROMPT = (
+    "You are a research assistant. Given a question, return a JSON object "
+    'with one key "titles": an array of 2 to 4 Wikipedia article titles '
+    "that would help answer the question. Return JSON only, no prose."
+)
+
+
+async def fetch_summary(title: str) -> str:
+    url = (
+        "https://en.wikipedia.org/api/rest_v1/page/summary/"
+        + urllib.parse.quote(title)
+    )
+    # `requests` is synchronous; `asyncio.to_thread` lets us run it
+    # off the event loop so other fetches make progress concurrently.
+    r = await asyncio.to_thread(requests.get, url, timeout=10)
+    r.raise_for_status()
+    return r.json()["extract"]
+
+
+async def main(input: dict) -> str:
+    model = Model.load(runtime.models()[0])
+    ctx = Context(model)
+
+    # 1. Plan: ask the model what to look up.
+    ctx.system(PLANNER_PROMPT)
+    ctx.user(input["question"])
+    ctx.cue()
+    plan_text = await ctx.generate(
+        Sampler.argmax(), max_tokens=256
+    ).collect_text()
+    titles = json.loads(plan_text)["titles"]
+
+    # 2. Fetch summaries in parallel.
+    results = await asyncio.gather(
+        *(fetch_summary(t) for t in titles),
+        return_exceptions=True,
+    )
+
+    # 3. Hand observations back to the model.
+    parts = ["Wikipedia summaries:\n"]
+    for title, result in zip(titles, results):
+        if isinstance(result, Exception):
+            parts.append(f"## {title}\n\n[fetch failed: {result}]\n")
+        else:
+            parts.append(f"## {title}\n\n{result}\n")
+    ctx.user("\n".join(parts))
+    ctx.cue()
+
+    # 4. Synthesize the final answer.
+    return await ctx.generate(
+        Sampler.top_p(0.6, 0.95), max_tokens=512
+    ).collect_text()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+`index.ts`:
+
+```typescript
+import { Context, Model, Sampler, runtime } from 'inferlet';
+
+interface Input {
+    question: string;
+}
+
+interface Plan {
+    titles: string[];
+}
+
+const PLANNER_PROMPT =
+    'You are a research assistant. Given a question, return a JSON ' +
+    'object with one key "titles": an array of 2 to 4 Wikipedia ' +
+    'article titles that would help answer the question. ' +
+    'Return JSON only, no prose.';
+
+async function fetchSummary(title: string): Promise<string> {
+    const url =
+        'https://en.wikipedia.org/api/rest_v1/page/summary/' +
+        encodeURIComponent(title);
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = (await r.json()) as { extract?: string };
+    if (!data.extract) throw new Error('no extract field');
+    return data.extract;
+}
+
+export async function main(input: Input): Promise<string> {
+    const model = Model.load(runtime.models()[0]);
+    using ctx = new Context(model);
+
+    // 1. Plan: ask the model what to look up.
+    ctx.system(PLANNER_PROMPT).user(input.question).cue();
+    const planText = await ctx
+        .generate(Sampler.argmax(), { maxTokens: 256 })
+        .collectText();
+    const plan = JSON.parse(planText) as Plan;
+
+    // 2. Fetch summaries in parallel.
+    const results = await Promise.all(
+        plan.titles.map(t =>
+            fetchSummary(t).catch(e => `[fetch failed: ${e.message}]`),
+        ),
+    );
+
+    // 3. Hand observations back to the model.
+    const parts = ['Wikipedia summaries:'];
+    plan.titles.forEach((t, i) => parts.push(`## ${t}\n\n${results[i]}`));
+    ctx.user(parts.join('\n\n')).cue();
+
+    // 4. Synthesize the final answer.
+    return await ctx
+        .generate(Sampler.topP(0.6, 0.95), { maxTokens: 512 })
+        .collectText();
+}
+```
+
+</TabItem>
+</Tabs>
+
+The four steps are walked through below.
+
+## Step 1: Plan
+
+You hand the model a system prompt that asks for a JSON list of Wikipedia titles, then sample with `Sampler::Argmax` to make the planning step deterministic. `collect_text()` runs the autoregressive loop and returns the assistant's full reply as a string.
+
+The planner uses the same `Context` you'll reuse for the synthesis step. That matters: the system prompt and the user's question stay in the KV cache across both calls. When step 4 runs, the model sees the full conversation history without re-prefilling.
+
+You parse the JSON yourself with `serde_json` / `json.loads` / `JSON.parse`. If the model returns malformed JSON, the parse error propagates out as the inferlet's error result. The next page covers how to harden this with a schema constraint.
+
+## Step 2: Fetch in parallel
+
+Each language has its own primitive for awaiting a set of futures concurrently:
+
+- **Rust**: `futures::future::join_all(iter)` returns a `Vec<Result<T, E>>`.
+- **Python**: `asyncio.gather(*coros, return_exceptions=True)` returns a list mixing values and exceptions.
+- **JavaScript**: `Promise.all(promises)` resolves to an array, or rejects on the first failure. The example uses `.catch(...)` per request so one failure does not abort the rest.
+
+The HTTP request itself uses each language's standard client. Inside an inferlet, those clients run on the same event loop as the rest of your code, so dozens of fetches in flight at once is normal. The model's forward passes do not stall waiting for HTTP; the engine schedules them alongside passes from other live processes.
+
+The Wikipedia summary endpoint is `https://en.wikipedia.org/api/rest_v1/page/summary/{title}`. It returns a small JSON document with an `extract` field. No auth, no rate-limit headaches at low volume.
+
+## Step 3: Append observations
+
+You build a single user turn out of the fetched summaries and append it to the same `Context`. `ctx.user(...)` adds the message; `ctx.cue()` marks the position where the model's next turn starts.
+
+The shape (one user turn per round of fetching) is intentional. The model sees a clean conversation: system prompt, user question, assistant plan, user observations, assistant answer. You are not re-prompting from scratch.
+
+If a fetch failed, the observation includes the error text. The model is good at noticing that and qualifying its answer. For workloads where missing data should abort the run, return an `Err` from this step instead.
+
+## Step 4: Synthesize
+
+The final `generate` call runs against the same context with a higher temperature. The model sees the original question and all the summaries, and writes the comparison.
+
+This generation reuses every page of KV cache built up in steps 1 and 3. On a black-box endpoint, this same workflow re-prefills the entire conversation on every step. Inside an inferlet, the cache is the natural state.
+
+## Hardening the plan
+
+The minimal version parses the planner's output with `serde_json` / `json.loads` / `JSON.parse` and trusts the model to produce well-formed JSON. Two ways to tighten this up:
+
+- **Constrain the planner with a schema.** Pie supports JSON-schema-constrained decoding through `Schema::Json` (Rust), `Schema.json(...)` (Python), and `jsonSchema(...)` (JavaScript). Attach the schema to the planner's `generate` call and the model cannot emit invalid JSON. See [Structured generation](../forward/constrained).
+- **Cap the fan-out.** Reject plans with more than four titles, or fewer than two. Use a Rust `if plan.titles.len() > 4 { ... }` guard or the Python/JS equivalent.
+
+For the tutorial, the unguarded version keeps the code small. The next page shows how to inspect what the planner emits when something goes wrong.
+
+## Next
+
+- [Run and iterate](./run): build the inferlet, run it with `pie run`, and inspect intermediate state.
+- [Serve and call](./serve): start a long-running engine and call the inferlet from a client process.
+- [Structured generation](../forward/constrained): JSON-schema constraints for the planner.

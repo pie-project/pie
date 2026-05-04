@@ -1,5 +1,5 @@
-package inferlet:zo;
+package pie:zo;
 
 world imports {
-    import evolve;
+    import zo;
 }

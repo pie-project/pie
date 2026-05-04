@@ -1,131 +1,150 @@
 """
-inferlet-py - Python SDK for writing Pie inferlets
+Pie Inferlet SDK — Python bindings for the Pie runtime.
 
-This mirrors the inferlet-js library API with Pythonic idioms.
+Quickstart::
+
+    from inferlet import Context, Model, Sampler, runtime
+
+    model = Model.load(runtime.models()[0])
+    ctx = Context(model)
+
+    ctx.system("You are helpful.").user("What is 2 + 2?")
+    text = await ctx.generate(Sampler.argmax(), max_tokens=64).collect_text()
+
+Three-layer surface:
+
+* :class:`Context` — KV cache + chat fillers + ``forward()`` / ``generate()``.
+* :class:`Forward` (``ctx.forward()``) — single forward-pass primitive
+  with auto page management. For prefill / scoring / custom loops.
+* :class:`Generator` (``ctx.generate()``) — multi-step state machine
+  over Forward. Iterate with ``async for step in gen``, or use
+  ``await gen.collect_text() / .collect_tokens() / .collect_json()``.
+
+Streaming decoders for chat / reasoning / tools live as independent
+modules — compose by hand, no implicit suppression::
+
+    from inferlet import chat, reasoning, tools
+
+    chat_dec = chat.Decoder(model)
+    async for step in gen:
+        out = await step.execute()
+        match chat_dec.feed(out.tokens):
+            case chat.Event.Delta(text=t): print(t, end="")
+            case chat.Event.Done(text=full): break
+            case _: pass
+
+Constraint specs (:class:`JsonSchema`, :class:`AnyJson`, :class:`Regex`,
+:class:`Ebnf`) implement the :class:`Schema` protocol — duck-typed, so
+your own grammar source class plugs in by adding a ``build_constraint``
+method. No inheritance required.
 """
 
-__version__ = "0.1.0"
+from __future__ import annotations
 
-# Runtime functions
-from .runtime import (
-    get_version,
-    get_instance_id,
-    get_arguments,
-    set_return,
-    was_return_set,
-    debug_query,
+# --- Core ---
+from .model import Model, Tokenizer
+from .sample import (
+    Distribution,
+    Entropy,
+    Logits,
+    Logprob,
+    Logprobs,
+    Sampler,
+)
+from .forward import Forward, Output, ProbeHandle, SampleHandle
+from .generation import GenStep, Generator
+from .context import Context
+
+# --- Decoders + tools (sub-modules; users import as `inferlet.chat`, etc.) ---
+from . import chat
+from . import reasoning
+from . import tools
+
+# --- Constraint surface ---
+from .grammar import (
+    AnyJson,
+    Constraint,
+    Ebnf,
+    Grammar,
+    GrammarConstraint,
+    JsonSchema,
+    Matcher,
+    Regex,
+    Schema,
 )
 
-# KVS functions
-from .kvs import (
-    store_get,
-    store_set,
-    store_delete,
-    store_exists,
-    store_list_keys,
-)
+# --- Speculation ---
+from .spec import Speculator
 
-# Messaging functions
-from .messaging import (
-    send,
-    receive,
-    send_blob,
-    receive_blob,
-    broadcast,
-    subscribe,
-    Blob,
-    Subscription,
-)
+# --- Runtime / IO ---
+from . import runtime
+from . import scheduling
+from . import messaging
+from . import session
+from . import mcp
+from . import zo
 
-# Model and Queue
-from .model import (
-    Model,
-    Queue,
-    get_model,
-    get_all_models,
-    get_auto_model,
-    get_all_models_with_traits,
-)
+# --- Adapter ---
+from .adapter import Adapter
 
-# Tokenizer
-from .tokenizer import Tokenizer
-
-# Sampler
-from .sampler import Sampler
-
-# ForwardPass
-from .forward import ForwardPass, ForwardPassResult
-
-# KV Page management
-from .kv_page import KvPage, KvPageManager
-
-# Chat formatting
-from .chat import ChatFormatter, format_messages, ToolCall, Message
-
-# BRLE (attention mask encoding)
-from .brle import Brle, causal_mask, causal_mask_raw
-
-# Context (main high-level API)
-from .context import Context, GenerateResult
-
-# Drafter (speculative decoding)
-from .drafter import Drafter, EmptyDrafter
 
 __all__ = [
-    # Version
-    "__version__",
-    # Runtime
-    "get_version",
-    "get_instance_id",
-    "get_arguments",
-    "set_return",
-    "was_return_set",
-    "debug_query",
-    # KVS
-    "store_get",
-    "store_set",
-    "store_delete",
-    "store_exists",
-    "store_list_keys",
-    # Messaging
-    "send",
-    "receive",
-    "send_blob",
-    "receive_blob",
-    "broadcast",
-    "subscribe",
-    "Blob",
-    "Subscription",
-    # Model
-    "Model",
-    "Queue",
-    "get_model",
-    "get_all_models",
-    "get_auto_model",
-    "get_all_models_with_traits",
-    # Tokenizer
-    "Tokenizer",
-    # Sampler
-    "Sampler",
-    # ForwardPass
-    "ForwardPass",
-    "ForwardPassResult",
-    # KV Page
-    "KvPage",
-    "KvPageManager",
-    # Chat
-    "ChatFormatter",
-    "format_messages",
-    "ToolCall",
-    "Message",
-    # BRLE
-    "Brle",
-    "causal_mask",
-    "causal_mask_raw",
-    # Context
+    # Core
     "Context",
-    "GenerateResult",
-    # Drafter
-    "Drafter",
-    "EmptyDrafter",
+    "Model",
+    "Tokenizer",
+    "Adapter",
+    # Forward primitive
+    "Forward",
+    "Output",
+    "SampleHandle",
+    "ProbeHandle",
+    # Generator
+    "Generator",
+    "GenStep",
+    # Sampler / Probe
+    "Sampler",
+    "Logits",
+    "Distribution",
+    "Logprob",
+    "Logprobs",
+    "Entropy",
+    # Decoders + tools
+    "chat",
+    "reasoning",
+    "tools",
+    # Constraints
+    "Schema",
+    "JsonSchema",
+    "AnyJson",
+    "Regex",
+    "Ebnf",
+    "Constraint",
+    "GrammarConstraint",
+    "Grammar",
+    "Matcher",
+    # Speculation
+    "Speculator",
+    # Runtime / IO
+    "runtime",
+    "scheduling",
+    "messaging",
+    "session",
+    "mcp",
+    "zo",
 ]
+
+
+# --- Internal: return value plumbing for bakery wrapper ---
+_return_value: str | None = None
+
+
+def set_return(value: str) -> None:
+    """Set the return value for the inferlet (internal use by bakery wrapper)."""
+    global _return_value
+    _return_value = value
+
+
+def get_return_value() -> str | None:
+    """Get the return value for the inferlet (internal use by bakery wrapper)."""
+    return _return_value

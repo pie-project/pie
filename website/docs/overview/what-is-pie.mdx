@@ -1,0 +1,254 @@
+---
+title: What is Pie?
+description: Pie is an LLM serving system that lets application logic run inside the engine
+sidebar_position: 1
+---
+
+import { CodeTabs, CodeTabItem } from '@site/src/components/CodeTabs';
+
+# What is Pie?
+
+Pie is an LLM serving system. A serving system is the software that sits between your inference requests and the model's parameters on a GPU: it loads weights, batches forward passes, manages the KV cache, and exposes an interface to clients. Pie does the same, with one difference. Instead of accepting prompts and returning tokens through a fixed endpoint, Pie accepts *programs* that the engine runs next to the model. This page explains why that matters.
+
+:::warning[Research prototype]
+Pie is a research prototype under active development. APIs and features change without notice.
+:::
+
+## Why a new serving system?
+
+Many serving systems exist, e.g., [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang), and [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM). These systems treat the model as a black box: the client sends a prompt, the engine returns tokens, and anything richer than that lives in a separate process on the client side.
+
+However, three problems show up in practice:
+
+1. **KV cache is invisible to the application.** A multi-turn agent can re-prefill between tool calls. In multi-agent systems with shared context, KV cache thrashing can occur, because the engine is oblivious to KV cache dependencies. The engine alone cannot make optimal KV cache decisions.
+2. **Tool calls are network round trips.** Agentic systems generate tool requests, send them back to the client, wait for results, then resume inference. Every iteration of the agent loop pays for a round trip.
+3. **Custom decoding requires modifying the engine.** Speculative decoding, constrained decoding, and custom samplers cannot be expressed through the API. To add one, you patch the serving system itself.
+
+These problems are well-known. They have been addressed in piecemeal ways, such as explicit prompt-caching APIs and tool-call APIs that allow limited in-engine execution. In Pie, the engine exposes its internal state through a small set of primitives, and the application uses those primitives to implement whatever logic it needs.
+
+For interested readers, the motivation is described in depth in [Pie: a programmable serving system for emerging LLM applications](https://ingim.org/papers/gim2025pie.pdf) (SOSP '25) and [Serve programs, not prompts](https://ingim.org/papers/gim2025serve.pdf) (HotOS '25).
+
+
+## Pie serves programs, not prompts
+
+Pie's primitive is the *inferlet*: a small program you write in Rust, Python, or TypeScript that compiles to WebAssembly and runs inside the engine. The inferlet has direct access to the KV cache, the token stream, and the forward pass. The client launches an inferlet by name; the inferlet runs to completion; tokens and events stream back through it.
+
+Below are three short inferlets. The [Examples](../guide/examples/overview) page lists more inferlets.
+
+<CodeTabs>
+<CodeTabItem value="agent" label="Agent loop with in-engine tool calls">
+
+```rust
+use inferlet::{Context, Result, model::Model, runtime, sample::Sampler, tool, tools};
+
+/// Search the web for current information.
+#[tool]
+async fn web_search(query: String) -> Result<String> {
+    // Real implementations hit MCP, HTTP, or the inferlet's own state.
+    Ok(format!("(stub result for: {query})"))
+}
+
+#[inferlet::main]
+async fn main(prompt: String) -> Result<String> {
+    let model = Model::load(runtime::models().first().unwrap())?;
+    let mut ctx = Context::new(&model)?;
+    ctx.system("Use web_search if you need fresh facts, then answer.")
+        .equip(&[&web_search])?
+        .user(&prompt);
+
+    loop {
+        // Stream tokens through tools::Decoder so the loop aborts the
+        // moment the model emits a tool-call structure. No wasted
+        // tokens past it.
+        let mut tdec = tools::Decoder::new(&model);
+        let mut full = Vec::new();
+        let call = {
+            let mut g = ctx.generate(Sampler::Argmax).max_tokens(512);
+            loop {
+                let Some(step) = g.next()? else { break None };
+                let out = step.execute().await?;
+                full.extend_from_slice(&out.tokens);
+                if let tools::Event::Call(name, args) = tdec.feed(&out.tokens)? {
+                    break Some((name, args));
+                }
+            }
+        };
+
+        let Some((name, args)) = call else {
+            return Ok(model.tokenizer().decode(&full)?);
+        };
+
+        // Hint to the engine that this inferlet is not using the KV
+        // cache. Under contention, the engine evicts our pages for a
+        // peer and restores them when the idle scope ends.
+        let result = {
+            let _idle = ctx.idle();
+            match name.as_str() {
+                "web_search" => web_search::call(&args).await?,
+                _ => return Err(format!("unknown tool: {name}")),
+            }
+        };
+        ctx.append(&tools::answer_prefix(&model, &name, &result));
+    }
+}
+```
+
+</CodeTabItem>
+<CodeTabItem value="watermark" label="Watermarked decoding">
+
+```rust
+use inferlet::{Context, Result, model::Model, runtime, sample::Logits};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Input {
+    prompt: String,
+    #[serde(default = "default_max_tokens")] max_tokens: usize,
+    /// Logit bias added to green-list ids.
+    #[serde(default = "default_delta")] delta: f32,
+    /// Fraction of the vocab marked green per step.
+    #[serde(default = "default_gamma")] gamma: f32,
+}
+fn default_max_tokens() -> usize { 256 }
+fn default_delta() -> f32 { 4.0 }
+fn default_gamma() -> f32 { 0.5 }
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<String> {
+    let model = Model::load(runtime::models().first().unwrap())?;
+    let mut ctx = Context::new(&model)?;
+    let cue = inferlet::chat::cue(&model);
+    ctx.user(&input.prompt).append(&cue);
+    ctx.flush().await?;
+
+    // Kirchenbauer-style watermark: hash the previous token to seed a
+    // pseudorandom green list covering γ of the vocab, then add a fixed
+    // bias δ to those logits before argmax. Invisible to readers; a
+    // verifier counts green-list hits above γ to detect the watermark.
+    let mut tokens = Vec::new();
+    let mut last = *cue.last().unwrap();
+
+    for _ in 0..input.max_tokens {
+        let mut pass = ctx.forward();
+        pass.input(&[last]);
+        let p = pass.probe(0, Logits);
+        let out = pass.execute().await?;
+
+        let mut logits: Vec<f32> = out.logits(p).unwrap()
+            .chunks_exact(4).map(|c| f32::from_ne_bytes(c.try_into().unwrap())).collect();
+        let vocab = logits.len() as u32;
+        for t in green_list(last, vocab, input.gamma) { logits[t as usize] += input.delta; }
+        last = argmax(&logits);
+        tokens.push(last);
+    }
+    Ok(model.tokenizer().decode(&tokens)?)
+}
+
+fn green_list(seed: u32, vocab: u32, gamma: f32) -> impl Iterator<Item = u32> {
+    let mut s = seed.wrapping_mul(0x9E3779B1).wrapping_add(1);
+    let n = (vocab as f32 * gamma) as u32;
+    (0..n).map(move |_| {
+        s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        s % vocab
+    })
+}
+fn argmax(xs: &[f32]) -> u32 {
+    xs.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32
+}
+```
+
+</CodeTabItem>
+<CodeTabItem value="lora" label="LoRA + n-gram speculative decoding">
+
+```rust
+use inferlet::{
+    Context, Result, Speculator,
+    adapter::Adapter,
+    model::Model,
+    runtime,
+    sample::Sampler,
+    wstd::http::{Client, Method, Request},
+    wstd::io::{AsyncRead, empty},
+};
+use std::collections::HashMap;
+
+#[inferlet::main]
+async fn main(prompt: String) -> Result<String> {
+    let model = Model::load(runtime::models().first().unwrap())?;
+
+    // Materialize the LoRA: download the safetensors blob, drop it in
+    // /scratch (the inferlet's private virtual preopen), then point
+    // the adapter at the path. The host loads the bytes into GPU
+    // memory; the inferlet keeps no copy.
+    let bytes = http_get("https://example.com/loras/math-tutor.safetensors").await?;
+    std::fs::write("/scratch/lora.safetensors", &bytes).map_err(|e| e.to_string())?;
+    let lora = Adapter::create(&model, "math-tutor")?;
+    lora.load("/scratch/lora.safetensors")?;
+
+    let mut ctx = Context::new(&model)?;
+    ctx.system("Solve the problem step by step.").user(&prompt).cue();
+    ctx.flush().await?;
+
+    // 2-gram speculator drafts up to 4 tokens per step from a bigram
+    // table built on the fly. The verifier accepts in batch; every
+    // matched draft is a forward pass we skip. LoRA and speculation
+    // are independent calls on the generator and ride the same
+    // forward-pass primitive.
+    let speculator = NGram::new(ctx.seq_len());
+    Ok(ctx.generate(Sampler::Argmax)
+        .adapter(&lora)
+        .speculator(speculator)
+        .max_tokens(512)
+        .collect_text().await?)
+}
+
+async fn http_get(url: &str) -> Result<Vec<u8>> {
+    let req = Request::builder().uri(url).method(Method::GET).body(empty())
+        .map_err(|e| e.to_string())?;
+    let mut body = Client::new().send(req).await.map_err(|e| e.to_string())?.into_body();
+    let mut buf = Vec::new();
+    body.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
+    Ok(buf)
+}
+
+struct NGram { cursor: u32, history: Vec<u32>, table: HashMap<u32, u32> }
+impl NGram {
+    fn new(start: u32) -> Self { Self { cursor: start, history: Vec::new(), table: HashMap::new() } }
+}
+impl Speculator for NGram {
+    fn draft(&mut self) -> (Vec<u32>, Vec<u32>) {
+        let Some(&last) = self.history.last() else { return (Vec::new(), Vec::new()) };
+        let mut drafts = Vec::new();
+        let mut probe = last;
+        for _ in 0..4 {
+            let Some(&t) = self.table.get(&probe) else { break };
+            drafts.push(t);
+            probe = t;
+        }
+        let positions = (self.cursor..self.cursor + drafts.len() as u32).collect();
+        (drafts, positions)
+    }
+    fn accept(&mut self, accepted: &[u32]) {
+        for &t in accepted {
+            if let Some(&prev) = self.history.last() { self.table.insert(prev, t); }
+            self.history.push(t);
+        }
+        self.cursor += accepted.len() as u32;
+    }
+}
+```
+
+</CodeTabItem>
+</CodeTabs>
+
+## What Pie brings us
+
+The examples above run end-to-end inside the engine, without client round trips or engine patches. Three things follow from that:
+
+- **Application-specific optimization.** The engine sees a stream of forward passes and doesn't know which KV pages will be reused. The inferlet does. A multi-turn agent pins a shared prefix across turns; a planner with cheap-to-recompute branches releases its pages under contention. Placement, prefetching, and eviction are policy decisions, and the right policy depends on what the application is doing.
+
+- **Programmatic model control.** Speculative decoding, watermarking, constrained decoding, custom samplers, and adapter composition are loops over the forward pass and the token stream. You write them as inferlets. Tool calls run in the same process as decoding, so an agent loop completes without round-tripping to a client.
+
+- **Less engineering.** The engine and the application logic evolve independently. The engine exposes a fixed set of primitives, and new behavior is extended on top of them rather than patched into the engine. Agent loops, KV cache policy, decoding strategy, and tool execution live in one inferlet instead of separate processes.
+
+The next page, [Components](./components), describes the engine, SDKs, and Bakery toolchain that make up the distribution.

@@ -1,118 +1,131 @@
-use serde::Serialize;
-use serde_json::Value;
+//! Chat-template templating + parsing.
+//!
+//! Two halves:
+//!
+//! 1. **Fillers** ([`system`], [`user`], [`assistant`], [`cue`], [`seal`])
+//!    produce token sequences for the model's chat template. The
+//!    [`Context`](crate::Context) calls them through its `system` /
+//!    `user` / `cue` / `seal` methods; for inferlets that build prompts
+//!    by hand (no Context buffering), these are the public entry points.
+//!
+//! 2. **Decoder** ([`Decoder`], [`Event`]) parses the model's generated
+//!    tokens back into visible text + structural events.
+//!
+//! Both halves wrap the host's `pie:instruct/chat` interface — chat
+//! template knowledge lives in the Pie runtime, not in the SDK.
 
-// --- Simplified Data Structures ---
+use crate::Result;
+use crate::model::Model;
+use crate::pie::instruct::chat::{
+    Decoder as RawDecoder,
+    Event as RawEvent,
+};
 
-/// Represents a single tool call.
-#[derive(Serialize, Clone, Debug)]
-pub struct ToolCall {
-    pub name: String,
-    pub arguments: Value,
+// =============================================================================
+// Template fillers
+// =============================================================================
+
+/// Token sequence for a system-role message.
+pub fn system(model: &Model, message: &str) -> Vec<u32> {
+    crate::pie::instruct::chat::system(model, message)
 }
 
-/// Represents a single message in the conversation history.
-/// This struct is no longer generic over a lifetime. All string data is owned.
-#[derive(Serialize, Clone, Debug)]
-struct Message {
-    role: String,
-    content: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ToolCall>>,
+/// Token sequence for a user-role message.
+pub fn user(model: &Model, message: &str) -> Vec<u32> {
+    crate::pie::instruct::chat::user(model, message)
 }
 
-// --- API Implementation ---
-
-#[derive(Debug, Clone)]
-pub struct ChatFormatter {
-    messages: Vec<Message>,
+/// Token sequence for an assistant-role message (history replay).
+pub fn assistant(model: &Model, message: &str) -> Vec<u32> {
+    crate::pie::instruct::chat::assistant(model, message)
 }
 
-impl ChatFormatter {
-    /// Creates a new Conversation instance with a given chat template.
-    pub fn new() -> Self {
-        ChatFormatter {
-            messages: Vec::new(),
+/// Token sequence for the generation cue (tells the model "your turn").
+pub fn cue(model: &Model) -> Vec<u32> {
+    crate::pie::instruct::chat::cue(model)
+}
+
+/// Token sequence that seals the current turn (inserts a stop token).
+pub fn seal(model: &Model) -> Vec<u32> {
+    crate::pie::instruct::chat::seal(model)
+}
+
+/// Stop-token IDs for `model`'s chat template — pass to
+/// [`Generator::stop`](crate::generation::Generator::stop) for explicit
+/// termination control.
+pub fn stop_tokens(model: &Model) -> Vec<u32> {
+    crate::pie::instruct::chat::stop_tokens(model)
+}
+
+// =============================================================================
+// Decoder
+// =============================================================================
+
+/// One unit of chat-decoded output.
+///
+/// Per `feed`, exactly one event fires. `Idle` is the no-op signal —
+/// the batch was consumed but didn't cross a semantic boundary worth
+/// surfacing (e.g. the chunk landed on a token whose visible text is
+/// empty, or inside a region this decoder doesn't report on like a
+/// reasoning block).
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// No semantic boundary crossed in this batch.
+    Idle,
+    /// Streamed text chunk (post-detokenization, post-template-strip).
+    /// Always non-empty.
+    Delta(String),
+    /// End-of-turn reached — the string is the full accumulated text
+    /// since the last `reset()`.
+    Done(String),
+    /// The model emitted a special / control token that the chat
+    /// template recognized but didn't lower to visible text. The id is
+    /// surfaced raw so the caller can decide what to do.
+    ///
+    /// Common cases this fires for:
+    /// - Tool-call boundary markers (e.g. `<|tool_call|>` in some
+    ///   templates) — useful as an early-stop hint when you don't have
+    ///   `tools::Decoder` attached.
+    /// - Custom control tokens injected by fine-tuned models.
+    /// - Format markers (turn boundaries, role separators) the host
+    ///   template chose to expose rather than swallow.
+    ///
+    /// Most callers ignore this branch. If you need fine-grained control
+    /// over a specific marker, match on the token id.
+    Interrupt(u32),
+}
+
+/// Stateful chat decoder. Feed token batches in order; events come back
+/// per call. `reset()` returns the decoder to its initial state.
+pub struct Decoder {
+    inner: RawDecoder,
+}
+
+impl Decoder {
+    /// Construct a decoder for `model`'s chat template.
+    pub fn new(model: &Model) -> Self {
+        Self {
+            inner: crate::pie::instruct::chat::create_decoder(model),
         }
     }
 
-    /// Adds a system message to the conversation.
-    /// The `content` parameter now accepts any type that implements `ToString`.
-    pub fn system<T: ToString>(&mut self, content: T) {
-        self.messages.push(Message {
-            role: "system".to_string(),
-            content: content.to_string(),
-            reasoning_content: None,
-            tool_calls: None,
-        });
+    /// Feed a token batch and get back the event that fired (one per
+    /// call). Returns [`Event::Idle`] when nothing semantically happened
+    /// — e.g. the batch landed on a token whose visible text is empty,
+    /// or inside a region this decoder doesn't report on.
+    pub fn feed(&mut self, tokens: &[u32]) -> Result<Event> {
+        match self.inner.feed(tokens)? {
+            // Empty delta means the batch consumed tokens that produced
+            // no visible character — surface as Idle, not Delta("").
+            RawEvent::Delta(s) if s.is_empty() => Ok(Event::Idle),
+            RawEvent::Delta(s) => Ok(Event::Delta(s)),
+            RawEvent::Done(s) => Ok(Event::Done(s)),
+            RawEvent::Interrupt(t) => Ok(Event::Interrupt(t)),
+        }
     }
 
-    /// Adds a user message to the conversation.
-    pub fn user<T: ToString>(&mut self, content: T) {
-        self.messages.push(Message {
-            role: "user".to_string(),
-            content: content.to_string(),
-            reasoning_content: None,
-            tool_calls: None,
-        });
-    }
-
-    /// Adds a simple assistant message with only text content.
-    pub fn assistant<T: ToString>(&mut self, content: T) {
-        // We specify a type for `None` to help the compiler infer the generic `R`
-        // in `assistant_response`. `&str` is a good, lightweight choice.
-        self.assistant_response(content, None::<&str>, None);
-    }
-
-    /// Adds a comprehensive assistant response, optionally including reasoning and tool calls.
-    /// Both `content` and `reasoning` are now generic over `ToString`.
-    pub fn assistant_response<T: ToString, R: ToString>(
-        &mut self,
-        content: T,
-        reasoning: Option<R>,
-        tool_calls: Option<Vec<ToolCall>>,
-    ) {
-        self.messages.push(Message {
-            role: "assistant".to_string(),
-            content: content.to_string(),
-            reasoning_content: reasoning.map(|s| s.to_string()),
-            tool_calls,
-        });
-    }
-
-    /// Adds a tool response message to the conversation.
-    pub fn tool<T: ToString>(&mut self, content: T) {
-        self.messages.push(Message {
-            role: "tool".to_string(),
-            content: content.to_string(),
-            reasoning_content: None,
-            tool_calls: None,
-        });
-    }
-
-    pub fn has_messages(&self) -> bool {
-        !self.messages.is_empty()
-    }
-
-    pub fn clear(&mut self) {
-        self.messages.clear();
-    }
-
-    /// Renders the entire conversation into a single formatted string prompt.
-    pub fn render(
-        &self,
-        template: &str,
-        add_generation_prompt: bool,
-        begin_of_sequence: bool,
-    ) -> String {
-        minijinja::render!(
-            template,
-            messages => self.messages,
-            add_generation_prompt => add_generation_prompt,
-            begin_of_sequence => begin_of_sequence,
-        )
+    /// Reset to initial state.
+    pub fn reset(&mut self) {
+        self.inner.reset();
     }
 }

@@ -1,0 +1,6 @@
+{
+    "name": "js-constrained-decoding",
+    "version": "0.1.0",
+    "type": "module",
+    "main": "index.ts"
+}

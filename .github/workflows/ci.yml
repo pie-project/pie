@@ -1,0 +1,184 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace-check:
+    name: cargo check / test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Cheap structural check: every workspace member compiles. Skips
+      # the cmake-driven C++ build by checking pie-server with
+      # `--no-default-features` (the default features pull in ggml).
+      - name: cargo check (runtime, client, no-driver pie-server)
+        run: |
+          cargo check -p pie
+          cargo check -p pie --no-default-features
+          cargo check -p pie-client
+
+      - name: cargo test (runtime, client)
+        run: |
+          cargo test -p pie --lib
+          cargo test -p pie-client --lib
+
+  pie-server-portable:
+    name: pie-server (driver-portable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + cmake build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/ccache
+            target
+          key: ${{ runner.os }}-pie-server-portable-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+
+      - name: cargo build (default = driver-portable)
+        run: cargo build -p pie-server
+
+      - name: cargo test (pie-server)
+        run: cargo test --bin pie
+
+      - name: Verify single-binary linkage
+        run: |
+          file target/debug/pie
+          ldd target/debug/pie
+          # No ggml shared libs should be in the dep tree.
+          ldd target/debug/pie | grep -E "libggml|libllama" \
+            && { echo "FAIL: ggml shared lib leaked into binary"; exit 1; } \
+            || echo "OK: no ggml shared deps"
+
+  # Dummy driver — pure Rust, builds on every OS we support. Cheapest
+  # gate for "did the standalone wiring break end to end". Runs the
+  # full unit-test suite too since dummy doesn't pull in cmake.
+  pie-server-dummy:
+    name: pie-server (driver-dummy)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-pie-server-dummy-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo build (driver-dummy)
+        run: |
+          cargo build -p pie-server \
+            --no-default-features --features driver-dummy
+
+      - name: cargo test (pie-server, dummy)
+        run: |
+          cargo test --bin pie \
+            --no-default-features --features driver-dummy
+
+  # macOS portable build with Metal backend. Verifies build.rs's
+  # macOS branch + libomp link path. Doesn't run tests against a
+  # real model — just exercises the cmake + link path so PRs that
+  # touch driver/portable or build.rs fail fast on macOS.
+  pie-server-portable-metal:
+    name: pie-server (driver-portable + metal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install cmake ninja ccache libomp
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + cmake build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/Library/Caches/ccache
+            target
+          key: ${{ runner.os }}-pie-server-portable-metal-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+
+      - name: cargo build (driver-portable + metal)
+        env:
+          PIE_PORTABLE_METAL: "1"
+        run: cargo build -p pie-server
+
+      - name: cargo test (pie-server)
+        env:
+          PIE_PORTABLE_METAL: "1"
+        run: cargo test --bin pie
+
+  # Cuda build — runs only when an opt-in label or schedule fires
+  # (no CUDA on the default GH-hosted runners). Add a self-hosted
+  # runner with a CUDA toolkit to enable this. Until then, M3's
+  # static-link spike + manual M4 verification are the canonical
+  # checkpoints.
+  pie-server-cuda:
+    name: pie-server (driver-cuda)
+    runs-on: [self-hosted, cuda]
+    if: contains(github.event.pull_request.labels.*.name, 'ci-cuda')
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo build (driver-cuda)
+        run: |
+          cargo build -p pie-server \
+            --no-default-features --features driver-cuda
+
+      - name: Verify no CUDA shared deps
+        run: |
+          ldd target/debug/pie
+          ldd target/debug/pie | grep -E "libcudart|libcublas|libcublasLt" \
+            && { echo "FAIL: CUDA shared lib leaked into binary"; exit 1; } \
+            || echo "OK: no CUDA shared deps"

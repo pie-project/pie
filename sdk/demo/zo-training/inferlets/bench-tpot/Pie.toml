@@ -1,0 +1,17 @@
+[package]
+name = "bench-tpot"
+version = "0.1.0"
+description = "Single-decode TPOT/TTFT benchmark, with optional adapter"
+authors = ["In Gim <in.gim@yale.edu>"]
+readme = "README.md"
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", description = "User prompt"}
+system_prompt = {type = "string", description = "System prompt"}
+max_tokens = {type = "int", description = "Number of tokens to decode"}
+warmup_tokens = {type = "int", description = "Tokens to drop from TPOT stats (warm caches)"}
+adapter_name = {type = "string", description = "Adapter to use; empty string = no adapter"}
+zo_seed = {type = "int", description = "ZO seed (only used when adapter_name is set)"}

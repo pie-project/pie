@@ -1,0 +1,23 @@
+interface types {
+
+    use wasi:io/poll@0.2.4.{pollable};
+
+    type error = string;
+
+    type blob = list<u8>;
+
+    // Result of an async receive operation
+    resource future-string {
+        // Pollable to check readiness
+        pollable: func() -> pollable;
+
+        // Retrieves the message if available; None if not ready
+        get: func() -> option<string>;
+    }
+
+    resource future-blob {
+        pollable: func() -> pollable;
+        get: func() -> option<blob>;
+    }
+
+}

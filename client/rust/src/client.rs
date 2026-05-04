@@ -1,8 +1,6 @@
 use crate::crypto::ParsedPrivateKey;
-use crate::message::{
-    CHUNK_SIZE_BYTES, ClientMessage, EventCode, InstanceInfo, QUERY_PROGRAM_EXISTS, ServerMessage,
-    StreamingOutput,
-};
+use crate::mcp_bridge::BridgeRegistry;
+use crate::message::{CHUNK_SIZE_BYTES, ClientMessage, ServerMessage};
 use crate::utils::IdPool;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -19,64 +17,60 @@ use tokio::task;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use uuid::Uuid;
 
-type InstanceId = Uuid;
 type CorrId = u32;
 
-/// A binary blob or a text-based event from an instance.
+/// Events received from a running process.
 #[derive(Debug)]
-pub enum InstanceEvent {
-    /// An event from the server, like program completion or an error.
-    Event { code: EventCode, message: String },
-    /// A binary blob of data sent from the instance.
-    Blob(Vec<u8>),
-    /// Streaming output to stdout from the instance.
+pub enum ProcessEvent {
+    /// Stdout output from the process.
     Stdout(String),
-    /// Streaming output to stderr from the instance.
+    /// Stderr output from the process.
     Stderr(String),
+    /// An inferlet text message (via messaging::send).
+    Message(String),
+    /// A binary file sent from the inferlet.
+    File(Vec<u8>),
+    /// Process completed successfully with a return value.
+    Return(String),
+    /// Process terminated with an error.
+    Error(String),
 }
 
-/// Holds the state for a blob being downloaded from the server.
+/// Holds the state for a file being downloaded from the server.
 #[derive(Debug)]
 struct DownloadState {
-    instance_id: InstanceId,
+    process_id: String,
     buffer: Vec<u8>,
 }
 
 /// A client that interacts with the server.
 pub struct Client {
     inner: Arc<ClientInner>,
-    _server_event_rx: mpsc::Receiver<String>, // Keep the channel endpoint
     reader_handle: task::JoinHandle<()>,
     writer_handle: task::JoinHandle<()>,
 }
 
-/// State shared between the Client and its Instances.
+/// State shared between the Client and its Processes.
 #[derive(Debug)]
 struct ClientInner {
     ws_writer_tx: UnboundedSender<Message>,
     corr_id_pool: IdPool<CorrId>,
+    /// Single pending-request map: all request/reply commands use this.
     pending_requests: DashMap<CorrId, oneshot::Sender<(bool, String)>>,
-    pending_list_requests: DashMap<CorrId, oneshot::Sender<Vec<InstanceInfo>>>,
-    pending_launch_requests:
-        DashMap<CorrId, oneshot::Sender<Result<(InstanceId, mpsc::Receiver<InstanceEvent>)>>>,
-    pending_attach_requests: DashMap<
-        CorrId,
-        (
-            InstanceId,
-            oneshot::Sender<Result<mpsc::Receiver<InstanceEvent>>>,
-        ),
-    >,
-    inst_event_tx: DashMap<InstanceId, mpsc::Sender<InstanceEvent>>,
-    // Use a Mutex per entry to avoid deadlocking the DashMap shard
-    pending_downloads: DashMap<String, Mutex<DownloadState>>, // Key: blob_hash
+    /// Per-process event channels.
+    process_event_tx: DashMap<String, mpsc::Sender<ProcessEvent>>,
+    /// In-flight file downloads (key: file_hash).
+    pending_downloads: DashMap<String, Mutex<DownloadState>>,
+    /// Locally-spawned MCP servers, keyed by registered name.
+    mcp_bridge: BridgeRegistry,
 }
 
-/// Represents a running program instance on the server.
+/// Represents a running process on the server.
 #[derive(Debug)]
-pub struct Instance {
-    id: InstanceId,
+pub struct Process {
+    id: String,
     inner: Arc<ClientInner>,
-    event_rx: mpsc::Receiver<InstanceEvent>,
+    event_rx: mpsc::Receiver<ProcessEvent>,
 }
 
 /// Computes the blake3 hash for a slice of bytes.
@@ -84,15 +78,16 @@ pub fn hash_blob(blob: &[u8]) -> String {
     blake3::hash(blob).to_hex().to_string()
 }
 
-impl Instance {
-    pub fn id(&self) -> InstanceId {
-        self.id
+impl Process {
+    /// Returns the process UUID string.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
-    /// Sends a string message to the instance (fire-and-forget).
-    pub async fn send<T: ToString>(&self, message: T) -> Result<()> {
-        let msg = ClientMessage::SignalInstance {
-            instance_id: self.id.to_string(),
+    /// Sends a string message to the process (fire-and-forget).
+    pub async fn signal<T: ToString>(&self, message: T) -> Result<()> {
+        let msg = ClientMessage::SignalProcess {
+            process_id: self.id.clone(),
             message: message.to_string(),
         };
         self.inner
@@ -101,28 +96,18 @@ impl Instance {
         Ok(())
     }
 
-    /// Uploads a binary blob to the instance, handling chunking and awaiting confirmation.
-    pub async fn upload_blob(&self, blob: &[u8]) -> Result<()> {
-        let blob_hash = hash_blob(blob);
-        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending_requests.insert(*corr_id_guard, tx);
-
+    /// Uploads a binary file to the process (fire-and-forget, chunked).
+    pub async fn transfer_file(&self, blob: &[u8]) -> Result<()> {
+        let file_hash = hash_blob(blob);
         let total_size = blob.len();
-        // An empty blob is sent as one empty chunk.
-        let total_chunks = if total_size == 0 {
-            1
-        } else {
-            total_size.div_ceil(CHUNK_SIZE_BYTES)
-        };
+        let total_chunks = if total_size == 0 { 1 } else { total_size.div_ceil(CHUNK_SIZE_BYTES) };
 
         for chunk_index in 0..total_chunks {
             let start = chunk_index * CHUNK_SIZE_BYTES;
             let end = (start + CHUNK_SIZE_BYTES).min(total_size);
-            let msg = ClientMessage::UploadBlob {
-                corr_id: *corr_id_guard,
-                instance_id: self.id.to_string(),
-                blob_hash: blob_hash.clone(),
+            let msg = ClientMessage::TransferFile {
+                process_id: self.id.clone(),
+                file_hash: file_hash.clone(),
                 chunk_index,
                 total_chunks,
                 chunk_data: blob[start..end].to_vec(),
@@ -131,22 +116,24 @@ impl Instance {
                 .ws_writer_tx
                 .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
         }
-
-        let (successful, result) = rx.await?;
-
-        if successful {
-            Ok(())
-        } else {
-            anyhow::bail!("Blob upload failed: {}", result)
-        }
+        Ok(())
     }
 
-    /// Receives the next event or blob from the instance.
-    pub async fn recv(&mut self) -> Result<InstanceEvent> {
+    /// Receives the next event from the process. Blocks until one is available.
+    pub async fn recv(&mut self) -> Result<ProcessEvent> {
         self.event_rx
             .recv()
             .await
             .ok_or(anyhow!("Event channel closed"))
+    }
+
+    /// Non-blocking receive. Returns None if no event is available.
+    pub fn try_recv(&mut self) -> Result<Option<ProcessEvent>> {
+        match self.event_rx.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(anyhow!("Event channel closed")),
+        }
     }
 }
 
@@ -155,17 +142,14 @@ impl Client {
         let (ws_stream, _) = connect_async(ws_host).await?;
         let (mut ws_write, mut ws_read) = ws_stream.split();
         let (ws_writer_tx, mut ws_writer_rx) = unbounded_channel();
-        let (server_event_tx, server_event_rx) = mpsc::channel(64);
 
         let inner = Arc::new(ClientInner {
             ws_writer_tx: ws_writer_tx.clone(),
             corr_id_pool: IdPool::new(CorrId::MAX),
             pending_requests: DashMap::new(),
-            pending_list_requests: DashMap::new(),
-            pending_launch_requests: DashMap::new(),
-            pending_attach_requests: DashMap::new(),
-            inst_event_tx: DashMap::new(),
+            process_event_tx: DashMap::new(),
             pending_downloads: DashMap::new(),
+            mcp_bridge: BridgeRegistry::new(),
         });
 
         let writer_handle = task::spawn(async move {
@@ -183,8 +167,7 @@ impl Client {
                 match msg {
                     Message::Binary(bin) => {
                         if let Ok(server_msg) = decode::from_slice::<ServerMessage>(&bin) {
-                            handle_server_message(server_msg, &reader_inner, &server_event_tx)
-                                .await;
+                            handle_server_message(server_msg, &reader_inner).await;
                         }
                     }
                     Message::Close(_) => break,
@@ -196,7 +179,6 @@ impl Client {
 
         Ok(Client {
             inner,
-            _server_event_rx: server_event_rx,
             reader_handle,
             writer_handle,
         })
@@ -209,14 +191,21 @@ impl Client {
         Ok(())
     }
 
+    /// Send a command and wait for a Response { corr_id, ok, result }.
     async fn send_msg_and_wait(&self, mut msg: ClientMessage) -> Result<(bool, String)> {
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let corr_id_ref = match &mut msg {
-            ClientMessage::Identification { corr_id, .. }
-            | ClientMessage::Signature { corr_id, .. }
-            | ClientMessage::InternalAuthenticate { corr_id, .. }
-            | ClientMessage::TerminateInstance { corr_id, .. }
+            ClientMessage::AuthIdentify { corr_id, .. }
+            | ClientMessage::AuthProve { corr_id, .. }
+            | ClientMessage::AuthByToken { corr_id, .. }
+            | ClientMessage::CheckProgram { corr_id, .. }
+            | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
+            | ClientMessage::AddProgram { corr_id, .. }
+            | ClientMessage::LaunchProcess { corr_id, .. }
+            | ClientMessage::LaunchDaemon { corr_id, .. }
+            | ClientMessage::ListProcesses { corr_id }
+            | ClientMessage::RegisterMcpServer { corr_id, .. }
             | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
@@ -228,26 +217,8 @@ impl Client {
             .ws_writer_tx
             .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
 
-        let (successful, result) = rx.await?;
-        Ok((successful, result))
-    }
-
-    async fn send_list_msg_and_wait(&self, mut msg: ClientMessage) -> Result<Vec<InstanceInfo>> {
-        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
-        let corr_id_ref = match &mut msg {
-            ClientMessage::ListInstances { corr_id } => corr_id,
-            _ => anyhow::bail!("Invalid message type for list helper"),
-        };
-        *corr_id_ref = *corr_id_guard;
-
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending_list_requests.insert(*corr_id_guard, tx);
-        self.inner
-            .ws_writer_tx
-            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
-
-        let instances = rx.await?;
-        Ok(instances)
+        let (ok, result) = rx.await?;
+        Ok((ok, result))
     }
 
     /// Authenticates the client with the server using a username and private key.
@@ -256,17 +227,16 @@ impl Client {
         username: &str,
         private_key: &Option<ParsedPrivateKey>,
     ) -> Result<()> {
-        // Send the authentication request to the engine to get a challenge
-        let msg = ClientMessage::Identification {
+        let msg = ClientMessage::AuthIdentify {
             corr_id: 0,
             username: username.to_string(),
         };
-        let (successful, result) = self
+        let (ok, result) = self
             .send_msg_and_wait(msg)
             .await
             .context("Failed to send identification message to engine")?;
 
-        if !successful {
+        if !ok {
             anyhow::bail!("Username '{}' rejected by engine: {}", username, result)
         }
 
@@ -279,29 +249,23 @@ impl Client {
             .as_ref()
             .context("Client private key is required when engine uses public key authentication")?;
 
-        // Otherwise, the engine has enabled public key authentication and we need to sign
-        // the challenge encoded in base64 with the private key.
         let challenge = base64::engine::general_purpose::STANDARD
             .decode(result.as_bytes())
             .context("Failed to decode challenge from base64")?;
 
-        // Sign the challenge with the private key
         let signature_bytes = private_key.sign(&challenge)?;
-
-        // Encode the signature to base64
         let signature = base64::engine::general_purpose::STANDARD.encode(&signature_bytes);
 
-        // Send the signature to the server to verify the authentication
-        let msg = ClientMessage::Signature {
+        let msg = ClientMessage::AuthProve {
             corr_id: 0,
             signature,
         };
 
-        let (successful, result) = self
+        let (ok, result) = self
             .send_msg_and_wait(msg)
             .await
             .context("Failed to send signature message to engine")?;
-        if successful {
+        if ok {
             Ok(())
         } else {
             anyhow::bail!(
@@ -313,15 +277,13 @@ impl Client {
     }
 
     /// Authenticates the client with the server using an internal token.
-    /// This method is used for internal communication between the backend and the engine
-    /// as well as between the Pie shell and the engine. This is not used for user authentication.
-    pub async fn internal_authenticate(&self, token: &str) -> Result<()> {
-        let msg = ClientMessage::InternalAuthenticate {
+    pub async fn auth_by_token(&self, token: &str) -> Result<()> {
+        let msg = ClientMessage::AuthByToken {
             corr_id: 0,
             token: token.to_string(),
         };
-        let (successful, result) = self.send_msg_and_wait(msg).await?;
-        if successful {
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if ok {
             Ok(())
         } else {
             anyhow::bail!("Internal authentication failed: {}", result)
@@ -334,53 +296,76 @@ impl Client {
             subject: subject.to_string(),
             record,
         };
-        let (successful, result) = self.send_msg_and_wait(msg).await?;
-        if successful {
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if ok {
             Ok(result)
         } else {
             anyhow::bail!("Query failed: {}", result)
         }
     }
 
-    /// Check if a program exists by its inferlet name.
-    /// Optionally verifies that the stored hashes match the provided file contents.
+    /// Check if a program exists on the server.
     ///
-    /// The `inferlet` parameter can be:
-    /// - Full name with version: `text-completion@0.1.0`
-    /// - Without version (defaults to `latest`): `text-completion`
-    ///
-    /// If paths are provided, both `wasm_path` and `manifest_path` must be specified together.
-    /// The function will read the files and compute blake3 hashes for verification.
+    /// The `inferlet` must be in `name@version` format (e.g., "text-completion@0.1.0").
+    pub async fn check_program(
+        &self,
+        inferlet: &str,
+        wasm_path: Option<&Path>,
+        manifest_path: Option<&Path>,
+    ) -> Result<bool> {
+        use std::sync::LazyLock;
+        use regex::Regex;
+
+        static RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"^([a-zA-Z0-9][a-zA-Z0-9_-]*)@(\d+\.\d+\.\d+)$").unwrap()
+        });
+
+        let caps = RE.captures(inferlet)
+            .ok_or_else(|| anyhow!(
+                "Invalid program identifier '{}': expected 'name@major.minor.patch'", inferlet
+            ))?;
+        let name = caps[1].to_string();
+        let version = caps[2].to_string();
+
+        let (wasm_hash, manifest_hash) = match (wasm_path, manifest_path) {
+            (Some(wasm_p), Some(manifest_p)) => {
+                let wasm_bytes = fs::read(wasm_p)
+                    .with_context(|| format!("Failed to read WASM file: {:?}", wasm_p))?;
+                let manifest_content = fs::read_to_string(manifest_p)
+                    .with_context(|| format!("Failed to read manifest file: {:?}", manifest_p))?;
+                (Some(hash_blob(&wasm_bytes)), Some(hash_blob(manifest_content.as_bytes())))
+            }
+            (None, None) => (None, None),
+            _ => anyhow::bail!("wasm_path and manifest_path must both be provided or both be None"),
+        };
+
+        let msg = ClientMessage::CheckProgram {
+            corr_id: 0,
+            name,
+            version,
+            wasm_hash,
+            manifest_hash,
+        };
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if ok {
+            Ok(result == "true")
+        } else {
+            anyhow::bail!("CheckProgram failed: {}", result)
+        }
+    }
+
+    /// For backward compatibility. Delegates to `check_program`.
     pub async fn program_exists(
         &self,
         inferlet: &str,
         wasm_path: Option<&Path>,
         manifest_path: Option<&Path>,
     ) -> Result<bool> {
-        let query = match (wasm_path, manifest_path) {
-            (Some(wasm_p), Some(manifest_p)) => {
-                let wasm_bytes = fs::read(wasm_p)
-                    .with_context(|| format!("Failed to read WASM file: {:?}", wasm_p))?;
-                let manifest_content = fs::read_to_string(manifest_p)
-                    .with_context(|| format!("Failed to read manifest file: {:?}", manifest_p))?;
-                let wasm_hash = hash_blob(&wasm_bytes);
-                let manifest_hash = hash_blob(manifest_content.as_bytes());
-                format!("{}#{}+{}", inferlet, wasm_hash, manifest_hash)
-            }
-            (None, None) => inferlet.to_string(),
-            _ => anyhow::bail!("wasm_path and manifest_path must both be provided or both be None"),
-        };
-        self.query(QUERY_PROGRAM_EXISTS, query)
-            .await
-            .map(|r| r == "true")
+        self.check_program(inferlet, wasm_path, manifest_path).await
     }
 
     /// Upload a program to the server.
-    ///
-    /// Args:
-    ///     wasm_path: Path to the WASM binary file.
-    ///     manifest_path: Path to the manifest TOML file.
-    pub async fn install_program(&self, wasm_path: &Path, manifest_path: &Path) -> Result<()> {
+    pub async fn add_program(&self, wasm_path: &Path, manifest_path: &Path, force_overwrite: bool) -> Result<()> {
         let blob = fs::read(wasm_path)
             .with_context(|| format!("Failed to read WASM file: {:?}", wasm_path))?;
         let manifest = fs::read_to_string(manifest_path)
@@ -392,19 +377,16 @@ impl Client {
         self.inner.pending_requests.insert(*corr_id_guard, tx);
 
         let total_size = blob.len();
-        let total_chunks = if total_size == 0 {
-            1
-        } else {
-            total_size.div_ceil(CHUNK_SIZE_BYTES)
-        };
+        let total_chunks = if total_size == 0 { 1 } else { total_size.div_ceil(CHUNK_SIZE_BYTES) };
 
         for chunk_index in 0..total_chunks {
             let start = chunk_index * CHUNK_SIZE_BYTES;
             let end = (start + CHUNK_SIZE_BYTES).min(total_size);
-            let msg = ClientMessage::InstallProgram {
+            let msg = ClientMessage::AddProgram {
                 corr_id: *corr_id_guard,
                 program_hash: program_hash.clone(),
                 manifest: manifest.to_string(),
+                force_overwrite,
                 chunk_index,
                 total_chunks,
                 chunk_data: blob[start..end].to_vec(),
@@ -414,315 +396,316 @@ impl Client {
                 .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
         }
 
-        let (successful, result) = rx.await?;
-
-        if successful {
+        let (ok, result) = rx.await?;
+        if ok {
             Ok(())
         } else {
             anyhow::bail!("Program install failed: {}", result)
         }
     }
 
-    /// Launches an instance of a program.
-    ///
-    /// This method performs a two-level search for the inferlet:
-    /// 1. First, it searches for the program among client-uploaded programs.
-    /// 2. If not found, it falls back to searching the registry.
-    ///
-    /// The `inferlet` parameter can be:
-    /// - Full name with version: `text-completion@0.1.0`
-    /// - Without version (defaults to `latest`): `text-completion`
-    pub async fn launch_instance(
+    /// Launches an instance of a program. Returns a `Process` for interaction.
+    pub async fn launch_process(
         &self,
         inferlet: String,
-        arguments: Vec<String>,
-        detached: bool,
-    ) -> Result<Instance> {
-        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
-        let msg = ClientMessage::LaunchInstance {
-            corr_id: *corr_id_guard,
+        input: String,
+        capture_outputs: bool,
+        token_budget: Option<usize>,
+    ) -> Result<Process> {
+        let msg = ClientMessage::LaunchProcess {
+            corr_id: 0,
             inferlet,
-            arguments,
-            detached,
+            input,
+            capture_outputs,
+            token_budget,
         };
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
 
-        let (tx, rx) = oneshot::channel();
-        self.inner
-            .pending_launch_requests
-            .insert(*corr_id_guard, tx);
-        self.inner
-            .ws_writer_tx
-            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+        if !ok {
+            anyhow::bail!("Launch process failed: {}", result);
+        }
 
-        let (inst_id, event_rx) = rx.await??;
+        // result is the UUID string
+        let process_id = result;
+        let (tx, rx) = mpsc::channel(64);
+        self.inner.process_event_tx.insert(process_id.clone(), tx);
 
-        Ok(Instance {
-            id: inst_id,
+        Ok(Process {
+            id: process_id,
             inner: Arc::clone(&self.inner),
-            event_rx,
+            event_rx: rx,
         })
     }
 
-    /// Launches an instance from an inferlet in the registry only.
-    ///
-    /// Unlike [`launch_instance`](Self::launch_instance), this method searches only
-    /// the registry and does not check client-uploaded programs. Use this when you
-    /// explicitly want to launch an inferlet from the registry.
-    ///
-    /// The `inferlet` parameter can be:
-    /// - Full name with version: `text-completion@0.1.0`
-    /// - Without version (defaults to `latest`): `text-completion`
-    pub async fn launch_instance_from_registry(
-        &self,
-        inferlet: String,
-        arguments: Vec<String>,
-        detached: bool,
-    ) -> Result<Instance> {
-        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
-        let msg = ClientMessage::LaunchInstanceFromRegistry {
-            corr_id: *corr_id_guard,
-            inferlet,
-            arguments,
-            detached,
+    pub async fn attach_process(&self, process_id: &str) -> Result<Process> {
+        // Validate UUID format
+        let _uuid = Uuid::parse_str(process_id)?;
+        let msg = ClientMessage::AttachProcess {
+            corr_id: 0,
+            process_id: process_id.to_string(),
         };
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
 
-        let (tx, rx) = oneshot::channel();
-        self.inner
-            .pending_launch_requests
-            .insert(*corr_id_guard, tx);
-        self.inner
-            .ws_writer_tx
-            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+        if !ok {
+            anyhow::bail!("Attach process failed: {}", result);
+        }
 
-        let (inst_id, event_rx) = rx.await??;
+        let (tx, rx) = mpsc::channel(64);
+        self.inner.process_event_tx.insert(process_id.to_string(), tx);
 
-        Ok(Instance {
-            id: inst_id,
+        Ok(Process {
+            id: process_id.to_string(),
             inner: Arc::clone(&self.inner),
-            event_rx,
-        })
-    }
-
-    pub async fn attach_instance(&self, instance_id: &str) -> Result<Instance> {
-        let instance_id = Uuid::parse_str(instance_id)?;
-        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
-        let msg = ClientMessage::AttachInstance {
-            corr_id: *corr_id_guard,
-            instance_id: instance_id.to_string(),
-        };
-
-        let (tx, rx) = oneshot::channel();
-        self.inner
-            .pending_attach_requests
-            .insert(*corr_id_guard, (instance_id, tx));
-        self.inner
-            .ws_writer_tx
-            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
-
-        let event_rx = rx.await??;
-
-        Ok(Instance {
-            id: instance_id,
-            inner: Arc::clone(&self.inner),
-            event_rx,
+            event_rx: rx,
         })
     }
 
     pub async fn ping(&self) -> Result<()> {
         let msg = ClientMessage::Ping { corr_id: 0 };
-        let (successful, result) = self.send_msg_and_wait(msg).await?;
-        if successful {
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if ok {
             Ok(())
         } else {
             anyhow::bail!("Ping failed: {}", result)
         }
     }
 
-    pub async fn list_instances(&self) -> Result<Vec<InstanceInfo>> {
-        let msg = ClientMessage::ListInstances { corr_id: 0 };
-        self.send_list_msg_and_wait(msg).await
+    /// List running processes. Returns a list of process UUID strings.
+    pub async fn list_processes(&self) -> Result<Vec<String>> {
+        let msg = ClientMessage::ListProcesses { corr_id: 0 };
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if ok {
+            let ids: Vec<String> = result.split(',')
+                .map(|s| s.trim().trim_matches('"').trim_matches('[').trim_matches(']').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            Ok(ids)
+        } else {
+            anyhow::bail!("List processes failed: {}", result)
+        }
     }
 
-    /// Terminates an instance by its ID (fire-and-forget).
-    pub async fn terminate_instance(&self, instance_id: &str) -> Result<()> {
-        let msg = ClientMessage::TerminateInstance {
+    /// Terminates a process by its UUID string.
+    pub async fn terminate_process(&self, process_id: &str) -> Result<()> {
+        let msg = ClientMessage::TerminateProcess {
             corr_id: 0,
-            instance_id: instance_id.to_string(),
+            process_id: process_id.to_string(),
         };
-        let (successful, result) = self.send_msg_and_wait(msg).await?;
-        if successful {
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if ok {
             Ok(())
         } else {
-            anyhow::bail!("Terminate instance failed: {}", result)
+            anyhow::bail!("Terminate process failed: {}", result)
+        }
+    }
+
+    /// Registers an MCP server for this session.
+    /// All inferlets launched in this session can discover and connect to it.
+    ///
+    /// For `transport = "stdio"`, this spawns the server process locally and
+    /// performs the MCP `initialize` handshake before announcing the server
+    /// to the engine. Other transports are not yet implemented.
+    pub async fn register_mcp_server(
+        &self,
+        name: &str,
+        transport: &str,
+        command: Option<&str>,
+        args: Option<Vec<String>>,
+        url: Option<&str>,
+    ) -> Result<()> {
+        // Spawn locally first so engine-side registration only succeeds if
+        // the server actually came up.
+        match transport {
+            "stdio" => {
+                let cmd = command.context(
+                    "register_mcp_server(stdio): `command` is required",
+                )?;
+                let args_vec = args.clone().unwrap_or_default();
+                self.inner
+                    .mcp_bridge
+                    .register_stdio(name, cmd, &args_vec)
+                    .await
+                    .with_context(|| format!("Local registration of MCP server '{}' failed", name))?;
+            }
+            other => {
+                anyhow::bail!(
+                    "register_mcp_server: transport '{}' is not yet supported (only 'stdio')",
+                    other
+                );
+            }
+        }
+
+        let msg = ClientMessage::RegisterMcpServer {
+            corr_id: 0,
+            name: name.to_string(),
+            transport: transport.to_string(),
+            command: command.map(|s| s.to_string()),
+            args,
+            url: url.map(|s| s.to_string()),
+        };
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if ok {
+            Ok(())
+        } else {
+            anyhow::bail!("Register MCP server failed: {}", result)
         }
     }
 }
 
-/// Main message handler function called by the reader task.
+// =============================================================================
+// Server Message Handler
+// =============================================================================
+
+/// Routes incoming server messages to the appropriate handler.
 async fn handle_server_message(
     msg: ServerMessage,
     inner: &Arc<ClientInner>,
-    server_event_tx: &mpsc::Sender<String>,
 ) {
     match msg {
-        ServerMessage::Response {
-            corr_id,
-            successful,
-            result,
-        } => {
+        ServerMessage::Response { corr_id, ok, result } => {
             if let Some((_, sender)) = inner.pending_requests.remove(&corr_id) {
-                sender.send((successful, result)).ok();
+                sender.send((ok, result)).ok();
             }
         }
-        ServerMessage::InstanceLaunchResult {
-            corr_id,
-            successful,
-            message: instance_id,
-        } => {
-            if let Some((_, sender)) = inner.pending_launch_requests.remove(&corr_id) {
-                if successful {
-                    // Insert the channel here in the message handler rather than in
-                    // `launch_instance` to avoid a race condition. Instance events may arrive
-                    // immediately after the launch result, so the channel must exist before we
-                    // process any events. If `launch_instance` (running in a different task) were
-                    // to insert the channel, it might not be ready in time, causing events to be
-                    // dropped.
-                    if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-                        let (tx, rx) = mpsc::channel(64);
-                        inner.inst_event_tx.insert(inst_id, tx);
-                        sender.send(Ok((inst_id, rx))).ok();
-                    } else {
-                        sender
-                            .send(Err(anyhow!(
-                                "Received invalid instance ID: {}",
-                                instance_id
-                            )))
-                            .ok();
+        ServerMessage::ProcessEvent { process_id, event, value } => {
+            if let Some(sender) = inner.process_event_tx.get(&process_id) {
+                let process_event = match event.as_str() {
+                    "stdout" => ProcessEvent::Stdout(value),
+                    "stderr" => ProcessEvent::Stderr(value),
+                    "message" => ProcessEvent::Message(value),
+                    "return" => ProcessEvent::Return(value),
+                    "error" => ProcessEvent::Error(value),
+                    _ => {
+                        eprintln!("Unknown event type: {}", event);
+                        return;
                     }
-                } else {
-                    sender
-                        .send(Err(anyhow!("Launch instance failed: {}", instance_id)))
-                        .ok();
+                };
+                sender.send(process_event).await.ok();
+
+                // Clean up event channel on terminal events
+                if event == "return" || event == "error" {
+                    drop(sender);
+                    inner.process_event_tx.remove(&process_id);
                 }
             }
         }
-        ServerMessage::InstanceAttachResult {
-            corr_id,
-            successful,
-            message,
-        } => {
-            if let Some((_, (instance_id, sender))) = inner.pending_attach_requests.remove(&corr_id)
-            {
-                if successful {
-                    // Insert the channel here in the message handler rather than in
-                    // `attach_instance` to avoid a race condition. Instance events may arrive
-                    // immediately after the attach result, so the channel must exist before we
-                    // process any events. If `attach_instance` (running in a different task) were
-                    // to insert the channel, it might not be ready in time, causing events to be
-                    //dropped.
-                    let (tx, rx) = mpsc::channel(64);
-                    inner.inst_event_tx.insert(instance_id, tx);
-                    sender.send(Ok(rx)).ok();
-                } else {
-                    sender
-                        .send(Err(anyhow!("Attach instance failed: {}", message)))
-                        .ok();
-                }
-            }
-        }
-        ServerMessage::InstanceEvent {
-            instance_id,
-            event,
-            message,
-        } => {
-            if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-                if let Some(sender) = inner.inst_event_tx.get(&inst_id) {
-                    sender
-                        .send(InstanceEvent::Event {
-                            code: EventCode::from_u32(event).unwrap(),
-                            message,
-                        })
-                        .await
-                        .ok();
-                }
-            }
-        }
-        ServerMessage::DownloadBlob {
-            instance_id,
-            blob_hash,
+        ServerMessage::File {
+            process_id,
+            file_hash,
             chunk_index,
             total_chunks,
             chunk_data,
-            ..
         } => {
-            if !inner.pending_downloads.contains_key(&blob_hash) {
-                if let Ok(id) = Uuid::parse_str(&instance_id) {
-                    let state = DownloadState {
-                        instance_id: id,
-                        buffer: Vec::with_capacity(total_chunks * CHUNK_SIZE_BYTES),
-                    };
-                    inner
-                        .pending_downloads
-                        .insert(blob_hash.clone(), Mutex::new(state));
-                }
+            // Initialize download state on first chunk
+            if !inner.pending_downloads.contains_key(&file_hash) {
+                let state = DownloadState {
+                    process_id: process_id.clone(),
+                    buffer: Vec::with_capacity(total_chunks * CHUNK_SIZE_BYTES),
+                };
+                inner
+                    .pending_downloads
+                    .insert(file_hash.clone(), Mutex::new(state));
             }
-            if let Some(state_mutex) = inner.pending_downloads.get(&blob_hash) {
+
+            // Accumulate chunk data, then drop all guards before any remove().
+            // SAFETY: We must drop the DashMap Ref guard before calling .remove(),
+            // because .get() holds a shard read-lock and .remove() needs a write-lock
+            // on the same shard — holding both would deadlock.
+            let is_last = chunk_index == total_chunks - 1;
+            if let Some(state_mutex) = inner.pending_downloads.get(&file_hash) {
                 let mut state = state_mutex.lock().await;
                 state.buffer.extend_from_slice(&chunk_data);
+                drop(state);        // release Mutex guard
+            }
+            // DashMap Ref dropped here (end of `if let` scope)
 
-                if chunk_index == total_chunks - 1 {
-                    if let Some((_, state_mutex)) = inner.pending_downloads.remove(&blob_hash) {
-                        let final_state = state_mutex.into_inner();
-                        if hash_blob(&final_state.buffer) == blob_hash {
-                            if let Some(sender) = inner.inst_event_tx.get(&final_state.instance_id)
-                            {
-                                sender
-                                    .send(InstanceEvent::Blob(final_state.buffer))
-                                    .await
-                                    .ok();
-                            }
+            // Finalize on last chunk — no guards held
+            if is_last {
+                if let Some((_, state_mutex)) = inner.pending_downloads.remove(&file_hash) {
+                    let final_state = state_mutex.into_inner();
+                    if hash_blob(&final_state.buffer) == file_hash {
+                        if let Some(sender) = inner.process_event_tx.get(&final_state.process_id) {
+                            sender
+                                .send(ProcessEvent::File(final_state.buffer))
+                                .await
+                                .ok();
                         }
                     }
                 }
             }
         }
-        ServerMessage::ServerEvent { message } => {
-            server_event_tx.send(message).await.ok();
-        }
-        ServerMessage::Challenge { corr_id, challenge } => {
-            if let Some((_, sender)) = inner.pending_requests.remove(&corr_id) {
-                sender.send((true, challenge)).ok();
-            }
-        }
-        ServerMessage::LiveInstances { corr_id, instances } => {
-            if let Some((_, sender)) = inner.pending_list_requests.remove(&corr_id) {
-                sender.send(instances).ok();
-            }
-        }
-        ServerMessage::StreamingOutput {
-            instance_id,
-            output,
+        ServerMessage::McpRequest {
+            corr_id,
+            process_id: _,
+            server_name,
+            method,
+            params,
         } => {
-            if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-                if let Some(sender) = inner.inst_event_tx.get(&inst_id) {
-                    let event = match output {
-                        StreamingOutput::Stdout(output) => InstanceEvent::Stdout(output),
-                        StreamingOutput::Stderr(output) => InstanceEvent::Stderr(output),
-                    };
-                    sender.send(event).await.ok();
+            let inner_for_task = Arc::clone(inner);
+            // Run the relay off the reader task so a slow MCP server can't
+            // block other server messages.
+            tokio::spawn(async move {
+                let (ok, result) = relay_mcp_request(
+                    &inner_for_task,
+                    server_name,
+                    method,
+                    params,
+                )
+                .await;
+                let response = ClientMessage::McpResponse { corr_id, ok, result };
+                if let Ok(encoded) = rmp_serde::encode::to_vec_named(&response) {
+                    inner_for_task
+                        .ws_writer_tx
+                        .send(Message::Binary(Bytes::from(encoded)))
+                        .ok();
                 }
-            }
+            });
         }
     }
 }
 
-/// When the server teminates, clear all pending requests, instance events, and downloads
-/// to avoid locking up the client indefinitely.
+/// Forward a JSON-RPC method to the named local MCP server and return
+/// `(ok, payload)` for an `McpResponse`. On success, `payload` is the
+/// JSON-encoded `result` field of the JSON-RPC response. On failure,
+/// `payload` is a human-readable error string.
+async fn relay_mcp_request(
+    inner: &Arc<ClientInner>,
+    server_name: String,
+    method: String,
+    params: String,
+) -> (bool, String) {
+    let server = match inner.mcp_bridge.get(&server_name) {
+        Some(s) => s,
+        None => return (false, format!("MCP server '{}' is not registered locally", server_name)),
+    };
+    // The runtime sends params as a JSON-encoded string. Parse it back so we
+    // can embed a real JSON value in the JSON-RPC envelope.
+    let params_value: serde_json::Value = serde_json::from_str(&params)
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    match server.call(&method, params_value).await {
+        Ok(result_value) => match serde_json::to_string(&result_value) {
+            Ok(s) => (true, s),
+            Err(e) => (false, encode_error(-32603, &format!("Result serialize: {}", e), None)),
+        },
+        Err(e) => (false, encode_error(e.code, &e.message, e.data)),
+    }
+}
+
+/// Encode a JSON-RPC-style error as the JSON payload that the runtime side
+/// expects to parse on `ok=false`.
+fn encode_error(code: i64, message: &str, data: Option<serde_json::Value>) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("code".into(), serde_json::Value::Number(code.into()));
+    obj.insert("message".into(), serde_json::Value::String(message.to_string()));
+    if let Some(d) = data {
+        obj.insert("data".into(), d);
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// When the server terminates, clear all pending state.
 async fn handle_server_termination(inner: &Arc<ClientInner>) {
     inner.pending_requests.clear();
-    inner.pending_list_requests.clear();
-    inner.pending_launch_requests.clear();
-    inner.pending_attach_requests.clear();
-    inner.inst_event_tx.clear();
+    inner.process_event_tx.clear();
     inner.pending_downloads.clear();
 }

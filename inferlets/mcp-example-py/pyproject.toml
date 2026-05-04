@@ -1,0 +1,5 @@
+[project]
+name = "mcp-example-py"
+version = "0.1.0"
+description = "Connect to an MCP server registered on the client session, list tools, and call one (Python)."
+requires-python = ">=3.10"

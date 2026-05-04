@@ -1,0 +1,179 @@
+---
+title: Scheduling and budgets
+description: How forward passes are priced and how to override the default bidding
+sidebar_position: 4
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Scheduling and budgets
+
+Pie's engine schedules forward passes across all live processes via a per-step credit auction. Each context bids for compute on every tick, and the engine fills its batch by clearing the highest bids first. This page covers the bidding API. **Most inferlets do not need to touch it.** The default `Generator` auto-bids using a budget-exhausting strategy that spreads the wallet over the horizon. Read on if you want to write a custom bid strategy or understand what the default is doing. Read this after [Pages](./pages).
+
+## Why credits
+
+When many inferlets share an engine, the engine has to decide which context's next forward pass runs in this batch. Per-process priority would let one inferlet starve others. Round-robin would underuse the GPU when some processes have more useful work to do. Pie uses a market: each process gets a credit endowment, bids for batch slots, and the engine auctions them off.
+
+The mechanism is a per-tick second-price auction over GPU page slots, with rent revenue redistributed as endowment-weighted dividends, and shared KV prefixes split via Shapley values across the contexts that share them. The summary you need:
+
+- Every context has a **balance** (current credit holdings).
+- Every step pays a **rent** (the clearing price for one slot on the device this tick — the highest excluded bid).
+- Every step pays a **dividend** back to participating processes proportional to endowment, so rent revenue is conserved across participants.
+- The price of producing one new KV page is a constant 1 credit.
+- The conservation invariant is `Σ balance = Σ endowment − cumulative make cost`.
+
+You usually only see this through `Generator`'s auto-bidding, which keeps your context running until either the model emits a stop token or you hit `max_tokens`.
+
+## Read the market
+
+The `scheduling` module exposes the inputs to the bidding decision.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::scheduling;
+
+let bal = scheduling::balance(&model);
+let rnt = scheduling::rent(ctx.inner());
+let div = scheduling::dividend(&model);
+let lat = scheduling::latency(ctx.inner());
+let p = scheduling::price();
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import scheduling
+
+bal = scheduling.balance(model)
+rnt = scheduling.rent(ctx)
+div = scheduling.dividend(model)
+lat = scheduling.latency(ctx)
+p = scheduling.price()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { scheduling } from 'inferlet';
+
+const bal = scheduling.balance(model);
+const rnt = scheduling.rent(ctx);
+const div = scheduling.dividend(model);
+const lat = scheduling.latency(ctx);
+const p = scheduling.price();
+```
+
+</TabItem>
+</Tabs>
+
+| Quantity | Meaning |
+|---|---|
+| `balance(model)` | The process's current credit holdings on this model. Spent on rent, replenished by dividends. |
+| `rent(ctx)` | The clearing price from the last knapsack auction on this context's device. The rent you pay per page next tick. |
+| `dividend(model)` | The credit dividend paid out to participating processes last step. Endowment-proportional share of revenue. |
+| `latency(ctx)` | Per-tick latency of this context's device, in seconds. |
+| `price()` | The cost (in credits) to produce one new KV page. Constant: 1. |
+
+These are read-only. The engine sets them; your inferlet observes.
+
+## How the default bid works
+
+`Generator` sets a bid on every step that exhausts the budget over the remaining horizon. Concretely (matching the SDK's `_compute_bid`):
+
+```
+bid = (balance / mu + dividend) / (pages + mu * (1 + cv2) / (2 * page_size))
+```
+
+Where `mu` is the expected steps to finish, `cv2` is the squared coefficient of variation in step count, `pages` is the pages this context will consume next, and `page_size` is the tokens per page.
+
+You do not need to read this formula to use Pie. It says: bid more when you have more credit, when more dividend is coming, and when fewer pages are at stake; bid less when many pages are at stake or when the horizon is long.
+
+## Override the bid
+
+Two ways to influence the bid.
+
+### Set a bid directly
+
+`ctx.set_bid(value)` overrides the auto-bid for the next step.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+ctx.set_bid(2.5);     // bid 2.5 credits on the next forward pass
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+ctx.set_bid(2.5)      # bid 2.5 credits on the next forward pass
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+ctx.setBid(2.5);      // bid 2.5 credits on the next forward pass
+```
+
+</TabItem>
+</Tabs>
+
+The override applies to the next forward pass on this context. After that, the auto-bid resumes. Use this to bid extra on a single step (e.g. the final synthesis pass of an agent loop) or to throttle a low-priority background context (bid 0).
+
+### Skip bidding
+
+`ctx.idle()` is a convenience for "do not run on the next tick": the context yields its slot to other processes.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+ctx.idle();
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+with ctx.idle():
+    # this context does not bid while we await something else
+    await some_long_running_io()
+```
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+{
+    using _ = ctx.idle();
+    // this context does not bid while we await something else
+    await someLongRunningIo();
+}
+```
+
+</TabItem>
+</Tabs>
+
+Useful when an inferlet is waiting on I/O or on another inferlet and does not want to hold its slot. The Python and JS forms return a context manager / `Disposable`; the bid is restored when the scope exits. The Rust form is a method call that takes effect for the next forward pass.
+
+## When to override
+
+The default is fine for most workloads. Override when you have a reason:
+
+- **A latency-sensitive final step.** An interactive agent might want to bid extra on the synthesis pass after a long fetch, so the user does not wait an extra tick.
+- **Background work.** A pre-computation inferlet (e.g. building a prefix snapshot) that should run only when no foreground process needs the GPU. Bid 0 or call `idle()`.
+- **Custom fairness.** A multi-tenant deployment that wants to cap the bid one tenant can place. Wrap `set_bid` in your own policy.
+
+The implementation lives in `runtime/src/context/sched.rs` (auction tick, rent, dividends, Shapley cost-sharing) and `pie/src/pie_driver/` (per-driver hooks). Read the module headers there for the conservation invariants and the eviction tiebreakers.
+
+## Next
+
+- [The forward pass](../forward/overview): the primitive a bid pays for.
+- [I/O and messaging](../io/overview): coordination across inferlets, where `idle()` is most useful.

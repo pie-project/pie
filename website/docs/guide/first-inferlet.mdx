@@ -1,0 +1,181 @@
+---
+title: Your first inferlet
+description: Scaffold, write, build, and run a custom inferlet in Rust
+---
+
+# Your first inferlet
+
+This page walks you from a fresh shell to a custom inferlet that loads a model, generates text, and returns a string. It uses Rust, the canonical SDK. After you have this working, the rest of the Guide shows what else inferlets can do.
+
+## Prerequisites
+
+- Pie installed and a model downloaded. See [Install & first run](./install).
+- Rust 1.85+ with the WebAssembly target:
+
+  ```bash
+  rustup target add wasm32-wasip2
+  ```
+
+- The bakery CLI. It ships with Pie:
+
+  ```bash
+  bakery --version
+  ```
+
+## Scaffold
+
+```bash
+bakery create my-inferlet
+cd my-inferlet
+```
+
+`bakery create` lays down a Rust crate with two manifests and one source file:
+
+```
+my-inferlet/
+├── Cargo.toml
+├── Pie.toml
+└── src/
+    └── lib.rs
+```
+
+`Cargo.toml` declares the crate as a WebAssembly component (`crate-type = ["cdylib"]`) and depends on the `inferlet` crate.
+
+`Pie.toml` is the inferlet manifest. The `inferlet::main` macro reads it at compile time, and `pie run` reads it at launch.
+
+```toml
+[package]
+name = "my-inferlet"
+version = "0.1.0"
+description = "My first inferlet"
+authors = ["You <you@example.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt     = { type = "string", description = "User prompt" }
+max_tokens = { type = "int", optional = true }
+```
+
+The `[parameters]` block declares the JSON input the inferlet expects. `pie run --prompt "..."` uses these declarations to fold CLI flags into the input dict.
+
+## The code
+
+`src/lib.rs`:
+
+```rust
+use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Input {
+    prompt: String,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+}
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<String> {
+    let model = Model::load(runtime::models().first().ok_or("no models")?)?;
+    let mut ctx = Context::new(&model)?;
+
+    ctx.system("You are a helpful assistant.")
+       .user(&input.prompt)
+       .cue();
+
+    ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
+        .max_tokens(input.max_tokens.unwrap_or(256))
+        .collect_text()
+        .await
+}
+```
+
+What each piece does:
+
+1. `#[inferlet::main]` generates the WebAssembly entry point and a JSON bridge. Because `Input` is not `String`, the macro wires up `serde_json::from_str` for you.
+2. `Model::load` binds to a model the engine has loaded. `runtime::models()` lists the names from `~/.pie/config.toml`.
+3. `Context::new` allocates a fresh KV cache context.
+4. `ctx.system(...).user(...).cue()` formats a chat conversation. `cue()` marks the position where the model takes over.
+5. `ctx.generate(sampler).max_tokens(n).collect_text().await` runs the autoregressive loop and returns the decoded reply.
+6. `Result<String>` aliases `Result<String, String>`. Returning `Err(s)` becomes the `Error` event the client receives.
+
+## Build
+
+```bash
+bakery build . -o my-inferlet.wasm
+```
+
+You get a `my-inferlet.wasm` next to your `Pie.toml`.
+
+If you prefer raw cargo:
+
+```bash
+cargo build --target wasm32-wasip2 --release
+# output: target/wasm32-wasip2/release/my_inferlet.wasm
+```
+
+Both paths produce the same artifact.
+
+## Run
+
+```bash
+pie run \
+  --path ./my-inferlet.wasm \
+  --manifest ./Pie.toml \
+  --prompt "What is the capital of France?" \
+  --max-tokens 64
+```
+
+You see something like:
+
+```
+╭─ Pie Run ───────────────────────────────────────╮
+│ Inferlet     my-inferlet@0.1.0                  │
+│ Model        default (Qwen/Qwen3-0.6B)          │
+│ Driver       cuda_native                        │
+│ Device       cuda:0                             │
+╰─────────────────────────────────────────────────╯
+
+The capital of France is Paris.
+```
+
+CLI flags after `--manifest` are folded into `Input` (with int / float / bool inference). `--prompt "..."` becomes `{"prompt": "..."}`. `--max-tokens 64` becomes `{"max_tokens": 64}`.
+
+## Iterate
+
+The dev loop is edit, build, run.
+
+```bash
+# After editing src/lib.rs:
+bakery build . -o my-inferlet.wasm
+pie run --path ./my-inferlet.wasm --manifest ./Pie.toml --prompt "..."
+```
+
+The first build is slow because the toolchain pulls dependencies. Subsequent rebuilds are incremental.
+
+## Notes
+
+### Error handling
+
+`Result<T>` aliases `Result<T, String>`. Any `Err(s)` you return becomes the `Error` event the client receives.
+
+```rust
+let model = Model::load("default")?;   // propagates Err("...") on failure
+```
+
+### Debugging
+
+`eprintln!` writes to stderr, which `pie run` and clients receive as `Stderr` events.
+
+```rust
+eprintln!("[debug] loaded model {name}");
+```
+
+`pie run` prints stderr alongside stdout in the terminal.
+
+## Next steps
+
+- [Generator](./decoder/generator): samplers, collectors, per-step control, multi-turn.
+- [Forking and saving](./context/sharing): branching and prefix caching for fan-out workflows.
+- [Build and publish](./deploy/build-publish): publish your inferlet to the registry.

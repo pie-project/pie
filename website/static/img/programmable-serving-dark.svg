@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600">
+  <defs>
+    <style>
+      .cls-1, .cls-2, .cls-3 {
+        font-family: 'IBM Plex Serif', Charter, Georgia, serif;
+      }
+
+      .cls-1, .cls-2, .cls-4 {
+        font-size: 26px;
+      }
+
+      .cls-1, .cls-5 {
+        fill: #2a241d;
+      }
+
+      .cls-2 {
+        fill: #ede5d2;
+      }
+
+      .cls-6 {
+        stroke: #c8bda6;
+        stroke-width: 1.5px;
+      }
+
+      .cls-6, .cls-7, .cls-8 {
+        fill: none;
+        stroke-linecap: round;
+        stroke-miterlimit: 10;
+      }
+
+      .cls-9 {
+        fill: #c8bda6;
+      }
+
+      .cls-orange {
+        fill: #e08a6f;
+      }
+
+      .cls-10 {
+        fill: #c8bda6;
+      }
+
+      .cls-11 {
+        fill: #2a241d;
+        stroke: #c8bda6;
+        stroke-width: 1.5px;
+      }
+
+      .cls-3 {
+        fill: #ede5d2;
+        font-size: 25.61px;
+      }
+
+      .cls-7 {
+        stroke-dasharray: 4;
+      }
+
+      .cls-7, .cls-8 {
+        stroke: #c8bda6;
+        stroke-width: 1.4px;
+      }
+
+      .cls-12 {
+        fill: #ede5d2;
+        font-family: 'IBM Plex Serif', Charter, Georgia, serif;
+        font-size: 17px;
+        font-weight: 700;
+      }
+
+      .cls-13 {
+        letter-spacing: 0em;
+      }
+
+      .cls-4, .cls-5 {
+        font-family: 'IBM Plex Serif', Charter, Georgia, serif;
+        font-style: italic;
+        font-weight: 400;
+      }
+
+      .cls-4 {
+        fill: #ede5d2;
+      }
+
+      .cls-14 {
+        fill: #2a241d;
+        stroke: #c8bda6;
+        stroke-width: 1.5px;
+      }
+
+      .cls-15 {
+        letter-spacing: -.02em;
+      }
+
+      .cls-16 {
+        letter-spacing: -.02em;
+      }
+
+      .cls-5 {
+        font-size: 22px;
+      }
+    </style>
+  </defs>
+  <rect class="cls-11" x="450.28" y="77.1" width="139.72" height="50.94" rx="7.5" ry="7.5"/>
+  <rect class="cls-11" x="640.23" y="77.1" width="139.72" height="50.94" rx="7.5" ry="7.5"/>
+  <text class="cls-2" transform="translate(344.62 226.96)"><tspan x="0" y="0">program</tspan></text>
+  <path class="cls-10" d="M771.33,257.8c7.51,0,13.62,6.11,13.62,13.62v304.17c0,7.51-6.11,13.62-13.62,13.62H46.01c-7.51,0-13.62-6.11-13.62-13.62v-304.17c0-7.51,6.11-13.62,13.62-13.62h725.33M771.33,256.4H46.01c-8.3,0-15.02,6.72-15.02,15.02v304.17c0,8.3,6.72,15.02,15.02,15.02h725.33c8.3,0,15.02-6.72,15.02-15.02v-304.17c0-8.3-6.72-15.02-15.02-15.02h0Z"/>
+  <line class="cls-7" x1="30.99" y1="180.92" x2="794.07" y2="180.92"/>
+  <rect class="cls-orange" x="60.32" y="278.37" width="386.87" height="50" rx="7.5" ry="7.5"/>
+  <text class="cls-1" transform="translate(74.78 310.82)"><tspan x="0" y="0">Inferlet</tspan></text>
+  <rect class="cls-14" x="60.32" y="386.97" width="702.36" height="50" rx="7.5" ry="7.5"/>
+  <text class="cls-2" transform="translate(315.7 418.81)"><tspan x="0" y="0">Control layer</tspan></text>
+  <rect class="cls-14" x="59.47" y="498.08" width="170.39" height="70.63" rx="7.5" ry="7.5"/>
+  <text class="cls-3" transform="translate(68.58 525.2) scale(1.02 1)"><tspan x="0" y="0">alloc_kvpage</tspan><tspan x="32.24" y="30.73">handler</tspan></text>
+  <rect class="cls-14" x="246.84" y="498.68" width="136.65" height="70.03" rx="7.5" ry="7.5"/>
+  <rect class="cls-14" x="621.12" y="492.31" width="141.56" height="70" rx="7.5" ry="7.5"/>
+  <text class="cls-3" transform="translate(271.2 525.2) scale(1.02 1)"><tspan x="0" y="0">forward</tspan><tspan x="4.49" y="30.73">handler</tspan></text>
+  <rect class="cls-orange" x="471.89" y="278.37" width="130" height="50" rx="7.5" ry="7.5"/>
+  <text class="cls-1" transform="translate(497.17 311.11)"><tspan x="0" y="0">Inferlet</tspan></text>
+  <rect class="cls-orange" x="633.15" y="278.27" width="130" height="50" rx="7.5" ry="7.5"/>
+  <text class="cls-1" transform="translate(662.4 310.34)"><tspan x="0" y="0">Inferlet</tspan></text>
+  <text class="cls-2" transform="translate(146.26 363.34)"><tspan x="0" y="0">Stream of API calls</tspan></text>
+  <text class="cls-2" transform="translate(327.74 469.68)"><tspan x="0" y="0">Batched API calls</tspan></text>
+  <text class="cls-5" transform="translate(198.03 310.82)"><tspan x="0" y="0">Custom generation logic</tspan></text>
+  <text class="cls-2" transform="translate(645.67 522.87)"><tspan x="0" y="0">get_dist</tspan><tspan x="2.89" y="31.2">handler</tspan></text>
+  <text class="cls-12" transform="translate(484.28 527.59)"><tspan x="0" y="0">. . .</tspan></text>
+  <g>
+    <line class="cls-6" x1="694.38" y1="345.64" x2="694.38" y2="363.72"/>
+    <polygon class="cls-9" points="694.38 337.16 689.5 349.1 694.38 346.27 699.25 349.1 694.38 337.16"/>
+    <path class="cls-9" d="M694.38,370.96c-1.26-3.41-3.42-7.64-5.71-10.26l5.71,2.06,5.71-2.06c-2.29,2.62-4.44,6.85-5.71,10.26Z"/>
+  </g>
+  <g>
+    <line class="cls-6" x1="539.46" y1="345.74" x2="539.46" y2="363.82"/>
+    <polygon class="cls-9" points="539.46 337.27 534.58 349.21 539.46 346.37 544.33 349.21 539.46 337.27"/>
+    <path class="cls-9" d="M539.46,371.07c-1.26-3.41-3.42-7.64-5.71-10.26l5.71,2.06,5.71-2.06c-2.29,2.62-4.44,6.85-5.71,10.26Z"/>
+  </g>
+  <g>
+    <line class="cls-6" x1="124.47" y1="345.74" x2="124.47" y2="363.82"/>
+    <polygon class="cls-9" points="124.47 337.27 119.59 349.21 124.47 346.37 129.35 349.21 124.47 337.27"/>
+    <path class="cls-9" d="M124.47,371.07c-1.26-3.41-3.42-7.64-5.71-10.26l5.71,2.06,5.71-2.06c-2.29,2.62-4.44,6.85-5.71,10.26Z"/>
+  </g>
+  <g>
+    <line class="cls-6" x1="127.41" y1="449.56" x2="127.41" y2="467.84"/>
+    <polygon class="cls-9" points="127.41 441.08 122.53 453.02 127.41 450.19 132.29 453.02 127.41 441.08"/>
+    <path class="cls-9" d="M127.41,475.08c-1.26-3.41-3.42-7.64-5.71-10.26l5.71,2.06,5.71-2.06c-2.29,2.62-4.44,6.85-5.71,10.26Z"/>
+  </g>
+  <g>
+    <line class="cls-6" x1="306.65" y1="456.27" x2="306.65" y2="474.55"/>
+    <polygon class="cls-9" points="306.65 447.8 301.77 459.74 306.65 456.9 311.52 459.74 306.65 447.8"/>
+    <path class="cls-9" d="M306.65,481.8c-1.26-3.41-3.42-7.64-5.71-10.26l5.71,2.06,5.71-2.06c-2.29,2.62-4.44,6.85-5.71,10.26Z"/>
+  </g>
+  <g>
+    <line class="cls-6" x1="675.06" y1="449.56" x2="675.06" y2="467.84"/>
+    <polygon class="cls-9" points="675.06 441.08 670.18 453.02 675.06 450.19 679.94 453.02 675.06 441.08"/>
+    <path class="cls-9" d="M675.06,475.08c-1.26-3.41-3.42-7.64-5.71-10.26l5.71,2.06,5.71-2.06c-2.29,2.62-4.44,6.85-5.71,10.26Z"/>
+  </g>
+  <text class="cls-4" transform="translate(397.15 559.47)"><tspan x="0" y="0">Fine-grained APIs</tspan></text>
+  <rect class="cls-11" x="260.33" y="77.1" width="139.72" height="50.94" rx="7.5" ry="7.5"/>
+  <text class="cls-2" transform="translate(278.39 111.19)"><tspan x="0" y="0">LLM app</tspan></text>
+  <text class="cls-2" transform="translate(469.21 111.19)"><tspan x="0" y="0">LLM app</tspan></text>
+  <text class="cls-2" transform="translate(660.03 111.19)"><tspan x="0" y="0">LLM app</tspan></text>
+  <g>
+    <line class="cls-8" x1="327.75" y1="129.52" x2="327.75" y2="233.81"/>
+    <path class="cls-10" d="M327.75,242.26c-1.48-3.98-3.99-8.91-6.66-11.97l6.66,2.41,6.66-2.41c-2.67,3.06-5.18,7.99-6.66,11.97Z"/>
+  </g>
+  <g>
+    <line class="cls-8" x1="520.14" y1="128.74" x2="520.14" y2="233.02"/>
+    <path class="cls-10" d="M520.14,241.47c-1.48-3.98-3.99-8.91-6.66-11.97l6.66,2.41,6.66-2.41c-2.67,3.06-5.18,7.99-6.66,11.97Z"/>
+  </g>
+  <g>
+    <line class="cls-8" x1="710.09" y1="128.04" x2="710.09" y2="232.32"/>
+    <path class="cls-10" d="M710.09,240.77c-1.48-3.98-3.99-8.91-6.66-11.97l6.66,2.41,6.66-2.41c-2.67,3.06-5.18,7.99-6.66,11.97Z"/>
+  </g>
+  <text class="cls-2" transform="translate(30.5 222.71)"><tspan x="0" y="0">LLM serving system</tspan></text>
+  <text class="cls-2" transform="translate(26.58 148.71)"><tspan x="0" y="0">Users</tspan></text>
+</svg>

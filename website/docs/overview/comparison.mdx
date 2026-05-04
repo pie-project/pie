@@ -1,0 +1,35 @@
+---
+title: Comparison with other systems
+description: How Pie relates to vLLM, SGLang, TensorRT-LLM, llama.cpp, and HF Transformers
+sidebar_position: 4
+---
+
+# Comparison with other systems
+
+Pie sits in a different place from existing inference stacks. It does not replace vLLM or llama.cpp at what they do best. It exists because some workloads (agents, reasoning chains, tool-driven pipelines) need a different abstraction than "prompt in, tokens out."
+
+## vLLM, SGLang, TensorRT-LLM
+
+These are high-throughput batched inference engines. They serve a fixed request shape (a prompt, optional sampling parameters, an output stream) at high tokens-per-second.
+
+Pie targets a different workload. The engine's primitive is a running program. The program can control its KV cache, call tools inline, and coordinate with other programs.
+
+For workloads that are a sequence of stateless prompts, Pie is not a good choice, since its per-token overhead ([1% to 15% depending on the model size](benchmarks)) outweighs the benefit of custom optimizations.
+
+For infrastructures that already use vLLM or SGLang, Pie has experimental support for running them as *drivers* (backend engines), so Pie piggybacks on their kernel implementations. This can give better performance in some environments than the default driver, at the cost of a few missing features (e.g., custom attention masks). See the [vLLM](../reference/drivers/vllm) and [SGLang](../reference/drivers/sglang) reference pages for the configuration details.
+
+
+## llama.cpp
+
+llama.cpp is a popular local inference runtime. It runs quantized models well on consumer hardware, including Apple Silicon.
+Pie also supports local inference through its portable driver, built on top of ggml, the same foundation that llama.cpp uses.
+
+
+## HF Transformers
+
+Hugging Face Transformers provides a canonical model implementation and a great foundation for research. You write Python that reaches into the model, modifies attention, samples with custom logic, and prototypes ideas quickly.
+
+The problem with Transformers is that it is not a serving system. Deploying it for high throughput in production takes significant engineering effort.
+
+Pie tries to bridge that gap by providing serving infrastructure around a flexible execution model.
+The trade is that the inferlet model is more constrained than "do anything in PyTorch." You operate at the level of forward passes and tokens, not arbitrary tensor ops.

@@ -55,8 +55,8 @@ def handle_install_command(
     client = engine.connect_and_authenticate(client_config)
 
     try:
-        if force or not engine.program_exists(client, inferlet_name, path, manifest):
-            engine.install_program(client, path, manifest)
+        if force or not engine.check_program(client, inferlet_name, str(path), str(manifest)):
+            engine.install_program(client, str(path), str(manifest), force_overwrite=force)
             typer.echo("✅ Inferlet installed successfully.")
         else:
             typer.echo("Inferlet already exists on server.")

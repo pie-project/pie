@@ -1,276 +1,452 @@
-use crate::api;
-use crate::brle::Brle;
-use crate::{Queue, Resource};
-use std::rc::Rc;
-use wstd::io::AsyncPollable;
+//! `Forward` — a single forward-pass primitive with automatic page management.
+//!
+//! `Forward` wraps the WIT `forward-pass` resource and folds in the page math
+//! that every consumer would otherwise repeat: working-page reservation
+//! before submission, position derivation, page commit after execution.
+//! Slots are attached via [`Forward::sample`] / [`Forward::probe`] and read back
+//! through typed handles on the returned [`Output`].
+//!
+//! For the rare case where the caller needs full WIT control (custom
+//! attention masks, manual page management for speculation rollback, etc.),
+//! the underlying `forward-pass` resource is still available via
+//! `inferlet::inference::ForwardPass`.
 
-#[derive(Debug, Clone)]
-pub struct ForwardPass {
-    pub(crate) inner: Rc<api::forward::ForwardPass>,
+use std::marker::PhantomData;
+
+use crate::ForwardPassExt;
+use crate::Result;
+use crate::adapter::Adapter;
+use crate::context::Context;
+use crate::pie::core::inference::{ForwardPass, SlotOutput};
+use crate::pie::core::inference::Output as RawOutput;
+use crate::sample::{self, Probe, Sampler};
+
+// =============================================================================
+// Slot handles
+// =============================================================================
+
+/// Opaque handle to a sampler slot, returned by [`Forward::sample`]. Pass to
+/// [`Output::token`] / [`Output::tokens`] to read the result.
+#[derive(Copy, Clone, Debug)]
+pub struct SampleHandle {
+    slot: u32,
+    /// Number of positions the sampler was attached to. Lets `Output::tokens`
+    /// read back the right window without separate bookkeeping.
+    arity: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct ForwardPassResult {
-    pub distributions: Option<Vec<Distribution>>,
-    pub tokens: Option<Vec<u32>>,
+impl SampleHandle {
+    pub(crate) fn new(slot: u32, arity: u32) -> Self {
+        Self { slot, arity }
+    }
+    pub(crate) fn slot(&self) -> u32 {
+        self.slot
+    }
+    pub(crate) fn arity(&self) -> u32 {
+        self.arity
+    }
 }
 
-/// Represents a probability distribution over a set of tokens.
-#[derive(Clone, Debug)]
-pub struct Distribution {
-    /// A vector of token IDs.
-    pub ids: Vec<u32>,
-    /// A vector of probabilities corresponding to the token IDs.
-    pub probs: Vec<f32>,
+/// Phantom-typed handle to a probe slot, returned by [`Forward::probe`]. The
+/// type parameter selects which `Output::*` accessor compiles.
+#[derive(Debug)]
+pub struct ProbeHandle<P> {
+    slot: u32,
+    _kind: PhantomData<fn() -> P>,
 }
 
-// "Smart" kv page
-#[derive(Debug, Clone)]
-pub struct KvPage {
-    queue: Queue,
-    rc: Rc<()>,
-    ptr: u32,
+// `PhantomData<fn() -> P>` is `Copy + Clone` regardless of `P`, but the
+// auto-derive generates `where P: Copy/Clone` bounds which surprise
+// callers using probe markers like `Logprobs(Vec<u32>)`. Hand-roll the
+// impls so handles are always `Copy`.
+impl<P> Copy for ProbeHandle<P> {}
+impl<P> Clone for ProbeHandle<P> {
+    fn clone(&self) -> Self { *self }
 }
 
-impl KvPage {
-    pub fn new(queue: &Queue, ptr: u32) -> Self {
-        KvPage {
-            queue: queue.clone(),
-            rc: Rc::new(()),
-            ptr,
+impl<P> ProbeHandle<P> {
+    pub(crate) fn new(slot: u32) -> Self {
+        Self { slot, _kind: PhantomData }
+    }
+    pub(crate) fn slot(&self) -> u32 {
+        self.slot
+    }
+}
+
+// =============================================================================
+// Pass
+// =============================================================================
+
+/// One slot attach, kept until `execute` so the WIT calls land in the same
+/// order the handles were handed out. Probes go through `into_wit()` at
+/// construction time and stash the resulting variant here.
+enum SlotSpec {
+    Sample {
+        indices: Vec<u32>,
+        sampler: Sampler,
+    },
+    Probe {
+        index: u32,
+        wit: crate::pie::core::inference::Sampler,
+    },
+}
+
+/// Builder for a single forward pass. Construct via
+/// [`Context::pass`](crate::Context::pass).
+///
+/// Builder methods return `&mut Self` so chains compose. `execute(self)` runs
+/// the host call, commits pages, and returns an [`Output`].
+pub struct Forward<'ctx> {
+    ctx: &'ctx mut Context,
+    /// Tokens fed at auto-derived positions (appended at the next free slot).
+    auto_inputs: Vec<u32>,
+    /// Tokens fed at caller-supplied positions. Used for non-contiguous
+    /// scoring (e.g. validation) where positions don't extend `seq_len`.
+    explicit_inputs: Vec<(Vec<u32>, Vec<u32>)>,
+    /// Slot attachments in declaration order.
+    slots: Vec<SlotSpec>,
+    next_slot: u32,
+    mask: Option<Vec<u32>>,
+    attn_mask: Option<Vec<Vec<u32>>>,
+    adapter: Option<&'ctx Adapter>,
+    zo_seed: Option<i64>,
+}
+
+impl<'ctx> Forward<'ctx> {
+    /// Position the *first* auto-input token will occupy. Equals the
+    /// owning context's `seq_len` at the time `pass()` was called. Useful
+    /// for callers that need to derive an attention mask or condition on
+    /// the upcoming position before `execute`. The sampler at index `i`
+    /// (when `pass.sample(&[i], …)`) lands at `start_position() + i`.
+    pub fn start_position(&self) -> u32 {
+        self.ctx.seq_len()
+    }
+
+    /// Page size of the owning context — for callers that need to size
+    /// per-position structures (masks, etc.) without re-querying.
+    pub fn page_size(&self) -> u32 {
+        self.ctx.page_size()
+    }
+
+    /// Construct a `Forward` against a context. Prefer [`Context::pass`].
+    pub(crate) fn new(ctx: &'ctx mut Context) -> Self {
+        Self {
+            ctx,
+            auto_inputs: Vec::new(),
+            explicit_inputs: Vec::new(),
+            slots: Vec::new(),
+            next_slot: 0,
+            mask: None,
+            attn_mask: None,
+            adapter: None,
+            zo_seed: None,
         }
     }
 
-    pub fn ptr(&self) -> u32 {
-        self.ptr
-    }
-}
+    // ── Inputs ─────────────────────────────────────────────────────────
 
-impl Drop for KvPage {
-    fn drop(&mut self) {
-        if Rc::strong_count(&self.rc) == 1 {
-            self.queue.deallocate_kv_page_ptr(self.ptr);
+    /// Append `tokens` at positions starting at the context's current
+    /// sequence length. Multiple calls accumulate. After `execute()`, these
+    /// tokens occupy KV slots and the context's `seq_len` advances.
+    pub fn input(&mut self, tokens: &[u32]) -> &mut Self {
+        self.auto_inputs.extend_from_slice(tokens);
+        self
+    }
+
+    /// Feed `tokens` at caller-supplied `positions`. Use for scoring at
+    /// arbitrary positions (e.g. log-probability evaluation across a
+    /// candidate window). These tokens are NOT auto-committed — the caller
+    /// is responsible for any page bookkeeping if positions overlap or
+    /// extend beyond `seq_len`.
+    ///
+    /// Panics if `tokens.len() != positions.len()`.
+    pub fn input_at(&mut self, tokens: &[u32], positions: &[u32]) -> &mut Self {
+        assert_eq!(
+            tokens.len(),
+            positions.len(),
+            "input_at: tokens and positions must be the same length"
+        );
+        self.explicit_inputs
+            .push((tokens.to_vec(), positions.to_vec()));
+        self
+    }
+
+    // ── Slot attach ────────────────────────────────────────────────────
+
+    /// Attach a sampler at one or more `indices`. Indices are 0-based into
+    /// the auto-input window: `0` is the first auto-input token, `n-1` the
+    /// last. Returns a handle for reading the sampled token(s) on the
+    /// resulting [`Output`].
+    pub fn sample(&mut self, indices: &[u32], sampler: Sampler) -> SampleHandle {
+        let arity = indices.len() as u32;
+        let h = SampleHandle::new(self.next_slot, arity);
+        self.slots.push(SlotSpec::Sample {
+            indices: indices.to_vec(),
+            sampler,
+        });
+        // Multi-arity samplers produce `arity` Token slots in the output
+        // (one per index); advance the slot index by that count so any
+        // subsequent `sample` / `probe` call sees the right offset.
+        self.next_slot += arity;
+        h
+    }
+
+    /// Attach a probe at a single `index`. Returns a typed handle whose
+    /// type parameter selects which `Output::*` accessor compiles.
+    pub fn probe<P: Probe>(&mut self, index: u32, probe: P) -> ProbeHandle<P::Out> {
+        let h = ProbeHandle::new(self.next_slot);
+        self.slots.push(SlotSpec::Probe {
+            index,
+            wit: probe.into_wit(),
+        });
+        self.next_slot += 1;
+        h
+    }
+
+    // ── Decoration ─────────────────────────────────────────────────────
+
+    /// Set a static logit mask (BRLE) applied at every sampled position.
+    pub fn mask(&mut self, brle: &[u32]) -> &mut Self {
+        self.mask = Some(brle.to_vec());
+        self
+    }
+
+    /// Set per-query-position attention masks. Length must match the total
+    /// number of query positions across all `input` / `input_at` calls.
+    /// If unset, the runtime synthesizes a causal mask.
+    pub fn attention_mask(&mut self, masks: &[Vec<u32>]) -> &mut Self {
+        self.attn_mask = Some(masks.to_vec());
+        self
+    }
+
+    /// Apply an adapter (LoRA, etc.) for this forward pass.
+    pub fn adapter(&mut self, adapter: &'ctx Adapter) -> &mut Self {
+        self.adapter = Some(adapter);
+        self
+    }
+
+    /// Set a `zo` (Evolution Strategies) seed for this forward pass.
+    pub fn zo_seed(&mut self, seed: i64) -> &mut Self {
+        self.zo_seed = Some(seed);
+        self
+    }
+
+    // ── Execute ────────────────────────────────────────────────────────
+
+    /// Run the forward pass. Reserves working pages for any auto-inputs,
+    /// submits all attached inputs and slots, awaits the host, commits any
+    /// newly-filled pages, and updates the context's cached state.
+    pub async fn execute(self) -> Result<Output> {
+        let Forward {
+            ctx,
+            auto_inputs,
+            explicit_inputs,
+            slots,
+            next_slot: _,
+            mask,
+            attn_mask,
+            adapter,
+            zo_seed,
+        } = self;
+
+        let n_auto = auto_inputs.len() as u32;
+
+        // Reserve working pages for auto-inputs (those occupy KV slots and
+        // commit on the way out). Explicit inputs are scoring-only — the
+        // caller manages their pages.
+        if n_auto > 0 {
+            let total_after = ctx.working_tokens + n_auto;
+            let pages_needed = (total_after + ctx.page_size - 1) / ctx.page_size;
+            let additional = pages_needed.saturating_sub(ctx.working_pages);
+            if additional > 0 {
+                ctx.inner
+                    .reserve_working_pages(additional)
+                    .map_err(|e| format!("Forward::execute: reserve_working_pages: {e}"))?;
+                ctx.working_pages = pages_needed;
+            }
         }
-    }
-}
 
-pub fn causal_mask(num_total_tokens: u32, num_input_tokens: u32) -> Vec<Brle> {
-    let mut mask = Vec::new();
-    let offset = num_total_tokens - num_input_tokens;
-    for i in 0..num_input_tokens {
-        mask.push(Brle::new((offset + i + 1) as usize));
-    }
-    mask
-}
+        let pass = ForwardPass::new(&ctx.model);
+        pass.context(&ctx.inner);
 
-/// Defines the interface for executing forward passes in a neural network model,
-/// including support for PEFT adapters and KV cache manipulation.
-pub trait Forward {
-    fn new_kv_page(&self) -> KvPage;
-    fn new_kv_pages(&self, count: usize) -> Vec<KvPage>;
-
-    fn export_kv_pages(&self, ptrs: &[KvPage], name: &str);
-    fn import_kv_pages(&self, name: &str) -> Vec<KvPage>;
-    fn allocate_kv_page_ptr(&self) -> u32;
-    fn allocate_kv_page_ptrs(&self, count: usize) -> Vec<u32>;
-    fn deallocate_kv_page_ptr(&self, ptr: u32);
-    fn deallocate_kv_page_ptrs(&self, ptrs: &[u32]);
-    fn export_kv_page_ptrs(&self, ptrs: &[u32], name: &str);
-    fn import_kv_page_ptrs(&self, name: &str) -> Vec<u32>;
-
-    fn get_all_exported_kv_pages(&self) -> Vec<(String, u32)>;
-    fn release_exported_kv_pages(&self, name: &str);
-
-    fn allocate_embed_ptr(&self) -> u32;
-    fn allocate_embed_ptrs(&self, count: usize) -> Vec<u32>;
-    fn deallocate_embed_ptr(&self, ptr: u32);
-    fn deallocate_embed_ptrs(&self, ptrs: &[u32]);
-    fn export_embed_ptrs(&self, ptrs: &[u32], name: &str);
-    fn import_embed_ptrs(&self, name: &str) -> Vec<u32>;
-    fn get_all_exported_embeds(&self) -> Vec<(String, u32)>;
-    fn release_exported_embeds(&self, name: &str);
-
-    fn create_forward_pass(&self) -> ForwardPass;
-}
-
-impl Forward for Queue {
-    fn new_kv_page(&self) -> KvPage {
-        let ptr = self.allocate_kv_page_ptr();
-        KvPage::new(self, ptr)
-    }
-
-    fn new_kv_pages(&self, count: usize) -> Vec<KvPage> {
-        self.allocate_kv_page_ptrs(count)
-            .into_iter()
-            .map(|ptr| KvPage::new(self, ptr))
-            .collect()
-    }
-
-    fn export_kv_pages(&self, kv_pages: &[KvPage], name: &str) {
-        let ptrs = kv_pages.iter().map(|kv| kv.ptr()).collect::<Vec<_>>();
-        self.export_resource(Resource::KvPage, &ptrs, name)
-    }
-
-    fn import_kv_pages(&self, name: &str) -> Vec<KvPage> {
-        let ptrs = self.import_resource(Resource::KvPage, name);
-        ptrs.into_iter().map(|ptr| KvPage::new(self, ptr)).collect()
-    }
-
-    fn allocate_kv_page_ptr(&self) -> u32 {
-        self.allocate_resources(Resource::KvPage, 1)
-            .into_iter()
-            .next()
-            .unwrap()
-    }
-
-    fn allocate_kv_page_ptrs(&self, count: usize) -> Vec<u32> {
-        self.allocate_resources(Resource::KvPage, count as u32)
-    }
-
-    fn deallocate_kv_page_ptr(&self, ptr: u32) {
-        self.deallocate_resources(Resource::KvPage, &[ptr])
-    }
-
-    fn deallocate_kv_page_ptrs(&self, ptrs: &[u32]) {
-        self.deallocate_resources(Resource::KvPage, ptrs)
-    }
-
-    fn export_kv_page_ptrs(&self, ptrs: &[u32], name: &str) {
-        self.export_resource(Resource::KvPage, ptrs, name)
-    }
-
-    fn import_kv_page_ptrs(&self, name: &str) -> Vec<u32> {
-        self.import_resource(Resource::KvPage, name)
-    }
-
-    fn get_all_exported_kv_pages(&self) -> Vec<(String, u32)> {
-        self.get_all_exported_resources(Resource::KvPage)
-    }
-
-    fn release_exported_kv_pages(&self, name: &str) {
-        self.release_exported_resources(Resource::KvPage, name)
-    }
-
-    fn allocate_embed_ptr(&self) -> u32 {
-        self.allocate_resources(Resource::Embed, 1)
-            .into_iter()
-            .next()
-            .unwrap()
-    }
-
-    fn allocate_embed_ptrs(&self, count: usize) -> Vec<u32> {
-        self.allocate_resources(Resource::Embed, count as u32)
-    }
-
-    fn deallocate_embed_ptr(&self, ptr: u32) {
-        self.deallocate_resources(Resource::Embed, &[ptr])
-    }
-
-    fn deallocate_embed_ptrs(&self, ptrs: &[u32]) {
-        self.deallocate_resources(Resource::Embed, ptrs)
-    }
-
-    fn export_embed_ptrs(&self, ptrs: &[u32], name: &str) {
-        self.export_resource(Resource::Embed, ptrs, name)
-    }
-
-    fn import_embed_ptrs(&self, name: &str) -> Vec<u32> {
-        self.import_resource(Resource::Embed, name)
-    }
-
-    fn get_all_exported_embeds(&self) -> Vec<(String, u32)> {
-        self.get_all_exported_resources(Resource::Embed)
-    }
-
-    fn release_exported_embeds(&self, name: &str) {
-        self.release_exported_resources(Resource::Embed, name)
-    }
-
-    fn create_forward_pass(&self) -> ForwardPass {
-        ForwardPass {
-            inner: Rc::new(api::forward::create_forward_pass(&self.inner)),
+        if let Some(a) = adapter {
+            pass.adapter(a);
         }
-    }
-}
+        if let Some(seed) = zo_seed {
+            crate::pie::zo::zo::adapter_seed(&pass, seed);
+        }
 
-impl ForwardPass {
-    pub async fn execute(&self) -> ForwardPassResult {
-        if let Some(future) = self.inner.execute() {
-            let pollable = future.pollable();
-            AsyncPollable::new(pollable).wait_for().await;
+        if n_auto > 0 {
+            let positions: Vec<u32> = (ctx.seq_len..ctx.seq_len + n_auto).collect();
+            pass.input_tokens(&auto_inputs, &positions);
+        }
+        for (toks, pos) in &explicit_inputs {
+            pass.input_tokens(toks, pos);
+        }
 
-            let mut dists = Vec::new();
-            if let Some(distributions) = future.get_distributions() {
-                for (ids, probs) in distributions {
-                    dists.push(Distribution { ids, probs });
+        for spec in slots {
+            match spec {
+                SlotSpec::Sample { indices, sampler } => {
+                    let wit: crate::pie::core::inference::Sampler = sampler.into();
+                    pass.sampler(&indices, &wit);
+                }
+                SlotSpec::Probe { index, wit } => {
+                    pass.sampler(&[index], &wit);
                 }
             }
-            let distributions = if dists.is_empty() { None } else { Some(dists) };
+        }
 
-            ForwardPassResult {
-                distributions,
-                tokens: future.get_tokens(),
+        if let Some(m) = mask {
+            pass.logit_mask(&m);
+        }
+        if let Some(m) = attn_mask {
+            pass.attention_mask(&m);
+        }
+
+        let raw = pass
+            .execute_async()
+            .await
+            .map_err(|e| format!("Forward::execute: forward pass failed: {e}"))?;
+
+        // Commit any pages that auto-input tokens fully filled.
+        if n_auto > 0 {
+            let new_working = ctx.working_tokens + n_auto;
+            let to_commit = new_working / ctx.page_size;
+            if to_commit > 0 {
+                ctx.inner
+                    .commit_working_pages(to_commit)
+                    .map_err(|e| format!("Forward::execute: commit_working_pages: {e}"))?;
             }
-        } else {
-            ForwardPassResult {
-                distributions: None,
-                tokens: None,
-            }
+            ctx.committed_pages += to_commit;
+            ctx.working_pages -= to_commit;
+            ctx.working_tokens = new_working % ctx.page_size;
+            ctx.seq_len += n_auto;
+        }
+
+        Ok(Output::new(raw))
+    }
+}
+
+// =============================================================================
+// Output
+// =============================================================================
+
+/// Result of one forward-pass execution — produced by both
+/// [`Forward::execute`] and [`GenStep::execute`](crate::generation::GenStep::execute).
+///
+/// **Common path** ([`Generator`](crate::generation::Generator)): read
+/// the [`tokens`](Self::tokens) field for the accepted tokens this step
+/// (post stop / max-tokens truncation). The auto-attached sampler's
+/// [`SampleHandle`] is also exposed via [`auto_sampler`](Self::auto_sampler)
+/// for callers that want the pre-truncation verifier output.
+///
+/// **Raw `Forward`**: read sampler slots via [`token`](Self::token) /
+/// [`tokens_at`](Self::tokens_at) using the handles returned at attach
+/// time. The [`tokens`](Self::tokens) field is empty.
+///
+/// **Probes** (both paths): [`distribution`](Self::distribution) /
+/// [`logits`](Self::logits) / [`logprobs`](Self::logprobs) /
+/// [`entropy`](Self::entropy) take a typed [`ProbeHandle`].
+///
+/// Mismatched access (reading a sampler slot through a probe handle, or
+/// vice versa) returns `None`.
+pub struct Output {
+    raw: RawOutput,
+    /// Generator-accepted tokens this step, post stop / max-tokens
+    /// truncation. Empty for raw `Forward::execute` (no Generator state).
+    pub tokens: Vec<u32>,
+    auto_sampler: Option<SampleHandle>,
+}
+
+impl Output {
+    pub(crate) fn new(raw: RawOutput) -> Self {
+        Self {
+            raw,
+            tokens: Vec::new(),
+            auto_sampler: None,
         }
     }
 
-    pub fn input_embed_ptrs(&self, embed_ptrs: &[u32], positions: &[u32]) {
-        api::forward::input_embeddings(&self.inner, embed_ptrs, positions);
+    pub(crate) fn from_generator(
+        raw: RawOutput,
+        tokens: Vec<u32>,
+        auto_sampler: Option<SampleHandle>,
+    ) -> Self {
+        Self { raw, tokens, auto_sampler }
     }
 
-    pub fn input_tokens(&self, input_tokens: &[u32], positions: &[u32]) {
-        api::forward::input_tokens(&self.inner, input_tokens, positions);
+    /// Underlying WIT output, for callers who need the raw slot list or the
+    /// speculative side channel (`raw.spec_tokens`, `raw.spec_positions`).
+    pub fn raw(&self) -> &RawOutput {
+        &self.raw
     }
 
-    pub fn output_embed_ptrs(&self, embed_ptrs: &[u32], indices: &[u32]) {
-        api::forward::output_embeddings(&self.inner, embed_ptrs, indices);
+    /// Handle for the generator's auto-attached sampler. `None` for raw
+    /// `Forward` results and for steps where
+    /// [`GenStep::clear_sampler`](crate::generation::GenStep::clear_sampler)
+    /// was called.
+    pub fn auto_sampler(&self) -> Option<SampleHandle> {
+        self.auto_sampler
     }
 
-    pub fn output_distributions(&self, indices: &[u32], temperature: f32, top_k: Option<u32>) {
-        api::forward::output_distributions(&self.inner, indices, temperature, top_k);
+    /// First token from a single-index sampler slot.
+    pub fn token(&self, h: SampleHandle) -> Option<u32> {
+        match self.raw.slots.get(h.slot() as usize)? {
+            SlotOutput::Token(t) => Some(*t),
+            _ => None,
+        }
     }
 
-    pub fn output_tokens(&self, indices: &[u32], temperature: f32) {
-        api::forward::output_tokens(&self.inner, indices, temperature);
+    /// Tokens at the slot range a multi-index sampler covers. Returns one
+    /// token per index the sampler was attached to. In speculative mode
+    /// the slice may be shorter than `arity` if the verifier rejected
+    /// drafts.
+    pub fn tokens_at(&self, h: SampleHandle) -> Vec<u32> {
+        let mut out = Vec::with_capacity(h.arity() as usize);
+        let start = h.slot() as usize;
+        for i in 0..(h.arity() as usize) {
+            match self.raw.slots.get(start + i) {
+                Some(SlotOutput::Token(t)) => out.push(*t),
+                _ => break,
+            }
+        }
+        out
     }
 
-    pub fn output_tokens_top_p(&self, indices: &[u32], temperature: f32, top_p: f32) {
-        api::forward::output_tokens_top_p(&self.inner, indices, temperature, top_p);
-    }
-
-    pub fn output_tokens_top_k(&self, indices: &[u32], temperature: f32, top_k: u32) {
-        api::forward::output_tokens_top_k(&self.inner, indices, temperature, top_k);
-    }
-
-    pub fn output_tokens_min_p(&self, indices: &[u32], temperature: f32, min_p: f32) {
-        api::forward::output_tokens_min_p(&self.inner, indices, temperature, min_p);
-    }
-
-    pub fn output_tokens_top_k_top_p(
+    /// Distribution as `(ids, probs)` for a [`Distribution`](sample::Distribution) probe.
+    pub fn distribution(
         &self,
-        indices: &[u32],
-        temperature: f32,
-        top_k: u32,
-        top_p: f32,
-    ) {
-        api::forward::output_tokens_top_k_top_p(&self.inner, indices, temperature, top_k, top_p);
+        h: ProbeHandle<sample::Distribution>,
+    ) -> Option<(&[u32], &[f32])> {
+        match self.raw.slots.get(h.slot() as usize)? {
+            SlotOutput::Distribution((ids, ps)) => Some((ids.as_slice(), ps.as_slice())),
+            _ => None,
+        }
     }
 
-    pub fn attention_mask(&self, mask: &[Vec<u32>]) {
-        api::forward::attention_mask(&self.inner, mask);
+    /// Raw logits bytes for a [`Logits`](sample::Logits) probe.
+    pub fn logits(&self, h: ProbeHandle<sample::Logits>) -> Option<&[u8]> {
+        match self.raw.slots.get(h.slot() as usize)? {
+            SlotOutput::Logits(b) => Some(b.as_slice()),
+            _ => None,
+        }
     }
 
-    pub fn kv_cache(&self, kv_pages: &[KvPage], last_kv_page_len: usize) {
-        let ptrs = kv_pages.iter().map(|kv| kv.ptr()).collect::<Vec<_>>();
-        api::forward::kv_cache(&self.inner, &ptrs, last_kv_page_len as u32);
+    /// Logprob list for a [`Logprob`](sample::Logprob) or
+    /// [`Logprobs`](sample::Logprobs) probe. Length is 1 for a single-token
+    /// query, K for a list query.
+    pub fn logprobs(&self, h: ProbeHandle<sample::Logprobs>) -> Option<&[f32]> {
+        match self.raw.slots.get(h.slot() as usize)? {
+            SlotOutput::Logprobs(v) => Some(v.as_slice()),
+            _ => None,
+        }
     }
 
-    pub fn kv_cache_ptrs(&self, kv_page_ptrs: &[u32], last_kv_page_len: usize) {
-        api::forward::kv_cache(&self.inner, kv_page_ptrs, last_kv_page_len as u32);
+    /// Entropy for an [`Entropy`](sample::Entropy) probe.
+    pub fn entropy(&self, h: ProbeHandle<sample::Entropy>) -> Option<f32> {
+        match self.raw.slots.get(h.slot() as usize)? {
+            SlotOutput::Entropy(v) => Some(*v),
+            _ => None,
+        }
     }
 }

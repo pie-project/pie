@@ -1,42 +1,976 @@
 /**
- * Any CSS included here will be global. The classic template
- * bundles Infima by default. Infima is a CSS framework designed to
- * work well for content-centric websites.
+ * Pie — global structural styles.
+ *
+ * Color palette lives in theme.css (single source of truth).
+ * This file holds typography, layout, and component styles —
+ * everything color-related references tokens from theme.css.
+ *
+ * Type: IBM Plex Serif (low-contrast slab — reads almost like a sans).
+ * Code: JetBrains Mono.
  */
 
-/* You can override the default Infima variables here. */
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* =====================================================================
+   Typography tokens, size scale, geometry, link defaults.
+   (Color tokens live in theme.css.)
+   ===================================================================== */
 :root {
-    /* Inspired by PANTONE 15-1335 TCX "Flame" */
-  --ifm-color-primary: #ec5825;
-  --ifm-color-primary-dark: #e9460e;
-  --ifm-color-primary-darker: #dd430d;
-  --ifm-color-primary-darkest: #b8380b;
-  --ifm-color-primary-light: #ef6a3c;
-  --ifm-color-primary-lighter: #f17349;
-  --ifm-color-primary-lightest: #f48b69;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+  /* Typography — IBM Plex Serif throughout: low-contrast, slab-ish, almost sans */
+  --pie-font-serif: 'IBM Plex Serif', 'Charter', 'Iowan Old Style', 'Palatino', Georgia, serif;
+  --pie-font-display: var(--pie-font-serif);
+  --pie-font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, system-ui, sans-serif;
+  --pie-font-mono: 'JetBrains Mono', 'SFMono-Regular', 'Menlo', 'Consolas', 'Liberation Mono', monospace;
+
+  --ifm-font-family-base: var(--pie-font-serif);
+  --ifm-heading-font-family: var(--pie-font-serif);
+  --ifm-font-family-monospace: var(--pie-font-mono);
+  --ifm-font-size-base: 15px;
+  --ifm-line-height-base: 1.65;
+  --ifm-heading-line-height: 1.25;
+  --ifm-heading-font-weight: 600;
+
+  /* Type scale — single system, 16px root.
+     Use these tokens everywhere for size consistency. */
+  --pie-text-micro: 0.75rem;     /* 12 — eyebrow, TOC, captions */
+  --pie-text-xs:    0.8125rem;   /* 13 — nav links, sidebar items, dropdowns */
+  --pie-text-sm:    0.875rem;    /* 14 — small UI, hero buttons */
+  --pie-text-base:  0.9375rem;   /* 15 — body, doc body, card body */
+  --pie-text-md:    1rem;        /* 16 — sidebar group headings */
+  --pie-text-lg:    1.125rem;    /* 18 — navbar title, card titles, top groups */
+  --pie-text-xl:    1.25rem;     /* 20 — h3 */
+  --pie-text-2xl:   1.625rem;    /* 26 — h2, section titles */
+  --pie-text-3xl:   2rem;        /* 32 — h1, doc page title */
+
+  --ifm-h1-font-size: var(--pie-text-3xl);   /* 32 */
+  --ifm-h2-font-size: 1.375rem;              /* 22 — sits between xl and 2xl for clearer h1/h2 hierarchy */
+  --ifm-h3-font-size: var(--pie-text-xl);    /* 20 */
+  --ifm-h4-font-size: var(--pie-text-lg);    /* 18 */
+  --ifm-h5-font-size: var(--pie-text-md);    /* 16 */
+
+  /* Code metrics (color tokens defined in theme.css) */
+  --ifm-code-font-size: 88%;
+  --ifm-code-padding-horizontal: 0.35rem;
+  --ifm-code-padding-vertical: 0.1rem;
+
+  /* Geometry */
+  --ifm-card-border-radius: 12px;
+  --ifm-global-radius: 8px;
+  --ifm-navbar-height: 4rem;
+
+  /* Link defaults (colors come from theme.css) */
+  --ifm-link-decoration: none;
+  --ifm-link-hover-decoration: underline;
 }
 
-/* For readability concerns, you should choose a lighter palette in dark mode. */
+::selection {
+  background: var(--pie-selection-bg);
+  color: var(--pie-ink);
+}
+
+[data-theme='dark'] ::selection {
+  background: var(--pie-selection-bg);
+  color: var(--pie-demi-50);
+}
+
+/* =====================================================================
+   Base typography
+   ===================================================================== */
+html,
+body {
+  background: var(--pie-bg);
+  color: var(--pie-ink);
+  font-family: var(--pie-font-serif);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--pie-font-serif);
+  letter-spacing: -0.015em;
+}
+
+h1 { font-weight: 600; letter-spacing: -0.02em; }
+h2 { font-weight: 600; letter-spacing: -0.018em; }
+h3 { font-weight: 600; }
+h4, h5, h6 { font-weight: 600; }
+
+article header h1,
+.markdown > h1:first-child {
+  font-size: var(--pie-text-3xl);
+  margin-bottom: 1rem;
+}
+
+/* Infima ships .markdown > h2 / .markdown > h3 with their own size overrides
+   that beat our :root values. Override them here so the h1/h2/h3 hierarchy
+   in doc content matches the global scale. */
+.markdown > h2 {
+  --ifm-h2-font-size: 1.375rem;            /* 22 */
+}
+
+.markdown > h3 {
+  --ifm-h3-font-size: var(--pie-text-xl);  /* 20 */
+}
+
+p {
+  font-feature-settings: 'kern', 'liga', 'onum';
+}
+
+code, kbd, pre, samp {
+  font-family: var(--pie-font-mono);
+  font-feature-settings: 'liga' 0;
+}
+
+/* Inline code only — bare text, no box. The :not(pre) > code selector
+   makes sure we never touch <code> inside <pre>, which would clobber
+   Prism's syntax highlighting. */
+:not(pre) > code {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  color: var(--ifm-color-primary-darker);
+  font-size: 0.92em;
+}
+
+[data-theme='dark'] :not(pre) > code {
+  color: var(--ifm-color-primary-light);
+}
+
+a > code,
+:not(pre) > a code {
+  color: inherit;
+}
+
+/* Quote blocks read like editorial pull-quotes */
+blockquote {
+  border-left: 3px solid var(--ifm-color-primary);
+  background: transparent;
+  color: var(--pie-ink-soft);
+  font-style: italic;
+  padding: 0.25rem 0 0.25rem 1.25rem;
+  margin: 1.5rem 0;
+}
+
+[data-theme='dark'] blockquote {
+  color: var(--pie-ink-soft);
+}
+
+/* =====================================================================
+   Tables — full width, rounded corners, tight rows.
+   border-collapse: separate keeps the outer border-radius intact;
+   internal lines come from per-cell border-bottom only.
+   ===================================================================== */
+table {
+  display: table;
+  width: 100%;
+  margin-block: 1.25rem;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--pie-border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--pie-tint);
+  font-size: var(--pie-text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+table th,
+table td {
+  padding: 0.45rem 0.75rem;
+  border: 0 !important;
+  border-bottom: 1px solid var(--pie-border) !important;
+  text-align: left;
+  vertical-align: top;
+  line-height: 1.5;
+}
+
+table tbody tr:last-child td {
+  border-bottom: 0 !important;
+}
+
+table thead {
+  background: var(--ifm-color-emphasis-100);
+}
+
+table thead th {
+  font-family: var(--pie-font-serif);
+  font-weight: 600;
+  color: var(--pie-ink);
+  font-size: var(--pie-text-xs);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding-block: 0.55rem;
+  border-bottom: 1px solid var(--pie-border-strong) !important;
+}
+
+table tbody tr {
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+table tbody tr:hover {
+  background: var(--ifm-color-emphasis-100);
+}
+
+/* =====================================================================
+   Navbar — typesense-inspired: serif, tight, colored-text active state
+   ===================================================================== */
+.navbar {
+  background: var(--pie-navbar-bg);
+  backdrop-filter: saturate(180%) blur(14px);
+  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  border-bottom: 1px solid var(--pie-border);
+  box-shadow: none;
+  font-family: var(--pie-font-serif);
+  padding: 0.5rem 1.5rem;
+}
+
+[data-theme='dark'] .navbar {
+  border-bottom: 1px solid var(--pie-border);
+}
+
+.navbar__title {
+  font-family: var(--pie-font-sans);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  font-size: var(--pie-text-lg);
+  margin-right: 0.25rem;
+}
+
+.navbar__inner {
+  align-items: center;
+}
+
+.navbar__items {
+  align-items: center;
+}
+
+.navbar__link {
+  font-family: var(--pie-font-serif);
+  font-weight: 500;
+  font-size: var(--pie-text-sm);
+  color: var(--pie-ink);
+  transition: color 140ms ease;
+  margin-inline: 0.2rem;
+  padding: 0.3rem 0.55rem;
+  letter-spacing: 0.005em;
+}
+
+.navbar__link:hover,
+.navbar__link--active {
+  color: var(--ifm-color-primary);
+  background: transparent;
+}
+
+.navbar__brand:hover {
+  color: var(--pie-ink);
+}
+
+.navbar__logo {
+  height: 1.4rem;
+  margin-right: 0.25rem;
+}
+
+/* Dropdown menu */
+.dropdown__menu {
+  font-family: var(--pie-font-serif);
+  background: var(--pie-bg-elev);
+  border: 1px solid var(--pie-border);
+  border-radius: 10px;
+  box-shadow: var(--ifm-global-shadow-md);
+  padding: 0.4rem;
+}
+
+.dropdown__link {
+  font-size: var(--pie-text-sm);
+  color: var(--pie-ink);
+  border-radius: 6px;
+  padding: 0.35rem 0.65rem;
+}
+
+.dropdown__link:hover,
+.dropdown__link--active {
+  background: var(--ifm-color-emphasis-100);
+  color: var(--ifm-color-primary);
+}
+
+/* =====================================================================
+   Search bar (@easyops-cn/docusaurus-search-local)
+   ===================================================================== */
+.navbar__search {
+  margin-left: 0.5rem;
+}
+
+.navbar__search-input {
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-sm);
+  background: var(--pie-tint);
+  border: 1px solid var(--pie-border);
+  border-radius: 8px;
+  color: var(--pie-ink);
+  padding: 0.4rem 0.75rem 0.4rem 2.1rem;
+  width: 13rem;
+  transition: border-color 140ms ease, background 140ms ease, width 140ms ease;
+  /* Replace the default magnifier icon with a tinted, smaller version */
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238a7c6a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 0.65rem center;
+  background-size: 14px 14px;
+}
+
+.navbar__search-input::placeholder {
+  color: var(--pie-ink-muted);
+  font-style: italic;
+}
+
+.navbar__search-input:hover {
+  border-color: var(--pie-border-strong);
+}
+
+.navbar__search-input:focus {
+  outline: none;
+  border-color: var(--ifm-color-primary);
+  background: var(--pie-bg-elev);
+  width: 16rem;
+}
+
+[data-theme='dark'] .navbar__search-input {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a89b85' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E");
+}
+
+/* Keyboard shortcut hint (⌘K) */
+.search-bar-shortcut-hint {
+  font-family: var(--pie-font-mono);
+  font-size: 0.7rem;
+  color: var(--pie-ink-muted);
+  background: var(--pie-bg-elev);
+  border: 1px solid var(--pie-border);
+  border-radius: 4px;
+  padding: 0.05rem 0.35rem;
+  margin-left: 0.4rem;
+}
+
+/* Search results dropdown */
+.search-result-match {
+  color: var(--ifm-color-primary);
+  font-weight: 600;
+  background: transparent;
+}
+
+.suggestion {
+  font-family: var(--pie-font-serif);
+}
+
+@media (max-width: 996px) {
+  .navbar__search-input {
+    width: 9rem;
+    padding-left: 1.9rem;
+  }
+  .navbar__search-input:focus {
+    width: 11rem;
+  }
+}
+
+/* =====================================================================
+   Buttons
+   ===================================================================== */
+.button {
+  font-family: var(--pie-font-serif);
+  font-weight: 500;
+  font-size: var(--pie-text-sm);
+  border-radius: 999px;
+  letter-spacing: 0.005em;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+
+.button--primary {
+  background: var(--ifm-color-primary);
+  border-color: var(--ifm-color-primary);
+  color: var(--pie-on-primary);
+}
+
+.button--primary:hover {
+  background: var(--ifm-color-primary-dark);
+  border-color: var(--ifm-color-primary-dark);
+  color: var(--pie-on-primary);
+}
+
+.button--secondary {
+  background: transparent;
+  color: var(--pie-ink);
+  border-color: var(--pie-border-strong);
+}
+
+.button--secondary:hover {
+  background: var(--ifm-color-emphasis-100);
+  color: var(--pie-ink);
+  border-color: var(--pie-ink-muted);
+}
+
+[data-theme='dark'] .button--secondary {
+  color: var(--pie-ink);
+  border-color: var(--pie-border-strong);
+}
+
+[data-theme='dark'] .button--secondary:hover {
+  background: var(--ifm-color-emphasis-100);
+}
+
+/* =====================================================================
+   Sidebar / TOC — typesense-inspired
+   - Active = colored text + 3px left rule, no background fill
+   - Tight padding, serif throughout
+   ===================================================================== */
+.theme-doc-sidebar-container {
+  border-right: 1px solid var(--pie-border) !important;
+  background: var(--pie-bg);
+}
+
+.menu {
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-sm);
+  padding: 0.75rem 0.5rem !important;
+}
+
+.menu__list .menu__list {
+  margin-left: 0;
+  padding-left: 0.5rem;
+}
+
+.menu__link {
+  border-radius: 0;
+  color: var(--pie-ink);
+  font-weight: 400;
+  font-size: var(--pie-text-sm);
+  line-height: 1.4;
+  padding: 0.3rem 0.75rem 0.3rem 1rem;
+  border-left: 2px solid transparent;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.menu__link:hover {
+  background: transparent;
+  color: var(--ifm-color-primary);
+}
+
+.menu__link--active,
+.menu__link--active:hover {
+  background: transparent;
+  color: var(--ifm-color-primary);
+  font-weight: 600;
+  border-left-color: var(--ifm-color-primary);
+}
+
+.menu__list-item-collapsible {
+  border-radius: 0;
+}
+
+.menu__list-item-collapsible:hover {
+  background: transparent;
+}
+
+.menu__list-item-collapsible:hover .menu__link {
+  color: var(--ifm-color-primary);
+}
+
+.menu__list-item-collapsible .menu__link--sublist {
+  font-family: var(--pie-font-serif);
+  font-weight: 600;
+  font-size: var(--pie-text-base);
+  color: var(--pie-ink);
+  letter-spacing: -0.005em;
+}
+
+.menu__caret {
+  padding: 0.4rem;
+  border-radius: 4px;
+}
+
+.menu__caret:hover {
+  background: var(--ifm-color-emphasis-100);
+}
+
+/* Replace Infima's chunky filled triangle with a thin stroked chevron.
+   stroke-width 1.25 reads as a hairline at the icon's size.
+   Expanded: chevron-down (▾). Collapsed: chevron-right (▸). */
+.menu__caret:before,
+.menu__link--sublist-caret:after {
+  background: var(--pie-caret-icon) center / 0.85rem 0.85rem no-repeat !important;
+  opacity: 0.7;
+  height: 1.25rem;
+  width: 1.25rem;
+  transform: rotate(0deg);
+  filter: none;
+  transition: transform 180ms ease;
+}
+
+.menu__list-item--collapsed .menu__caret:before,
+.menu__list-item--collapsed .menu__link--sublist-caret:after {
+  transform: rotate(-90deg);
+}
+
+:root {
+  --pie-caret-icon: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237a6e60' stroke-width='1.25' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+}
+
 [data-theme='dark'] {
-  /* Inspired by PANTONE 16-1359 TCX "Orangeade" for a stronger feel */
-  --ifm-color-primary: #f06524;
-  --ifm-color-primary-dark: #d85a20;
-  --ifm-color-primary-darker: #cc551e;
-  --ifm-color-primary-darkest: #a84618;
-  --ifm-color-primary-light: #f2753a;
-  --ifm-color-primary-lighter: #f37d47;
-  --ifm-color-primary-lightest: #f69366;
-  --ifm-code-font-size: 95%;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
-
+  --pie-caret-icon: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a89b85' stroke-width='1.25' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
 }
 
-/* src/css/custom.css */
+/* Full-sidebar collapse and expand buttons — replace filled icons with
+   thin stroked versions, scaled down. */
+button[class*='collapseSidebarButton'],
+div[class*='expandButton'] {
+  background: transparent !important;
+  border-color: var(--pie-border) !important;
+  color: var(--pie-ink-muted) !important;
+}
 
-/* === /whypieagent dark theme: re-skin navbar + footer to match page ===
+button[class*='collapseSidebarButton']:hover,
+div[class*='expandButton']:hover {
+  background: var(--ifm-color-emphasis-100) !important;
+  color: var(--ifm-color-primary) !important;
+}
+
+button[class*='collapseSidebarButton'] svg,
+div[class*='expandButton'] svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.25;
+}
+
+/* Top-level group headings get more presence */
+.theme-doc-sidebar-menu > .menu__list-item > .menu__list-item-collapsible > .menu__link--sublist {
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-md);
+  font-weight: 600;
+  color: var(--pie-ink);
+  text-transform: none;
+  letter-spacing: -0.01em;
+  margin-top: 0.5rem;
+}
+
+/* Table of contents (right rail) — match left sidebar item size */
+.table-of-contents {
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-xs);
+  border-left: 1px solid var(--pie-border);
+}
+
+.table-of-contents__link {
+  color: var(--pie-ink-muted);
+  font-weight: 400;
+  transition: color 120ms ease;
+}
+
+.table-of-contents__link:hover,
+.table-of-contents__link--active {
+  color: var(--ifm-color-primary);
+  font-weight: 500;
+}
+
+/* =====================================================================
+   Pagination — editorial prev/next with sliding arrows
+   Cream surface, primary-tinted arrows that travel on hover.
+   Next gets a slightly warmer tint to suggest forward motion.
+   ===================================================================== */
+.pagination-nav {
+  margin-top: 3rem;
+  gap: 1rem;
+}
+
+.pagination-nav__link {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--pie-border);
+  border-radius: 12px;
+  background: var(--pie-bg-elev);
+  padding: 0.9rem 1.1rem;
+  overflow: hidden;
+  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease, box-shadow 160ms ease;
+}
+
+/* A diagonal warm wash that swells on hover */
+.pagination-nav__link::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(120deg,
+    color-mix(in oklab, var(--ifm-color-primary) 6%, transparent),
+    transparent 65%);
+  opacity: 0;
+  transition: opacity 160ms ease;
+  pointer-events: none;
+}
+
+.pagination-nav__link--next::before {
+  background: linear-gradient(-120deg,
+    color-mix(in oklab, var(--ifm-color-primary) 6%, transparent),
+    transparent 65%);
+}
+
+.pagination-nav__link:hover {
+  border-color: var(--ifm-color-primary);
+  transform: translateY(-2px);
+  box-shadow: var(--ifm-global-shadow-md);
+  background: var(--pie-bg-elev);
+}
+
+.pagination-nav__link:hover::before {
+  opacity: 1;
+}
+
+/* Sublabel row holds the arrow + "Previous" / "Next" word */
+.pagination-nav__sublabel {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--pie-ink-muted);
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-micro);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+  position: relative;
+}
+
+.pagination-nav__link--next .pagination-nav__sublabel {
+  justify-content: flex-end;
+}
+
+/* Arrows — Unicode glyphs in primary, slide on hover */
+.pagination-nav__link--prev .pagination-nav__sublabel::before {
+  content: "←";
+  color: var(--ifm-color-primary);
+  font-size: 1.15em;
+  font-weight: 400;
+  display: inline-block;
+  transition: transform 180ms ease;
+}
+
+.pagination-nav__link--next .pagination-nav__sublabel::after {
+  content: "→";
+  color: var(--ifm-color-primary);
+  font-size: 1.15em;
+  font-weight: 400;
+  display: inline-block;
+  transition: transform 180ms ease;
+}
+
+.pagination-nav__link--prev:hover .pagination-nav__sublabel::before {
+  transform: translateX(-3px);
+}
+
+.pagination-nav__link--next:hover .pagination-nav__sublabel::after {
+  transform: translateX(3px);
+}
+
+/* Page title */
+.pagination-nav__label {
+  font-family: var(--pie-font-serif);
+  color: var(--pie-ink);
+  font-weight: 600;
+  font-size: var(--pie-text-base);
+  line-height: 1.35;
+  letter-spacing: -0.005em;
+  position: relative;
+  transition: color 140ms ease;
+}
+
+.pagination-nav__link--next .pagination-nav__label {
+  text-align: right;
+}
+
+.pagination-nav__link:hover .pagination-nav__label {
+  color: var(--ifm-color-primary);
+}
+
+/* =====================================================================
+   Code blocks
+   ===================================================================== */
+.theme-code-block {
+  border-radius: 12px;
+  border: 1px solid var(--pie-border);
+  box-shadow: var(--ifm-global-shadow-lw);
+}
+
+[data-theme='dark'] .theme-code-block {
+  border-color: var(--pie-border);
+}
+
+div[class*='codeBlockTitle'] {
+  background: var(--ifm-color-emphasis-100);
+  border-bottom: 1px solid var(--pie-border);
+  font-family: var(--pie-font-mono);
+  font-size: var(--pie-text-micro);
+  color: var(--pie-ink-muted);
+}
+
+/* =====================================================================
+   Tabs
+   ===================================================================== */
+.tabs {
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-sm);
+}
+
+.tabs__item {
+  font-weight: 500;
+  color: var(--pie-ink-muted);
+  border-bottom-width: 2px;
+}
+
+.tabs__item--active {
+  color: var(--ifm-color-primary);
+  border-bottom-color: var(--ifm-color-primary);
+}
+
+
+/* =====================================================================
+   Admonitions (:::note, :::tip, :::info, :::warning, :::danger)
+   Warm, low-saturation variants with serif headings, semantic left rule,
+   subtle tinted background, and a recolored inline icon. Each type sets
+   --admon-color / --admon-border / --admon-bg via custom properties so
+   the rest of the styling stays generic.
+   ===================================================================== */
+.alert,
+.theme-admonition {
+  --admon-color: var(--pie-ink-soft);
+  --admon-border: var(--pie-border-strong);
+  --admon-bg: var(--ifm-color-emphasis-100);
+
+  border: 0;
+  border-left: 3px solid var(--admon-color);
+  border-radius: 8px;
+  background: var(--admon-bg);
+  color: var(--pie-ink);
+  padding: 0.75rem 1rem;
+  margin-block: 1.25rem;
+  box-shadow: none !important;
+  filter: none;
+  font-size: var(--pie-text-base);
+  line-height: 1.55;
+}
+
+.alert > *:first-child,
+.theme-admonition > *:first-child {
+  margin-top: 0;
+}
+
+.alert > *:last-child,
+.theme-admonition > *:last-child {
+  margin-bottom: 0;
+}
+
+/* Heading row — mixed-case serif, semantic color, icon inline.
+   No tracking, no caps — reads as a quiet inline label. */
+.alert h5,
+[class*='admonitionHeading'] {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: var(--pie-font-serif);
+  font-weight: 600;
+  font-size: var(--pie-text-sm);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--admon-color);
+  margin: 0 0 0.3rem;
+  line-height: 1.2;
+}
+
+/* Recolor the SVG icon to the semantic color */
+[class*='admonitionIcon'] {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 0;
+}
+
+[class*='admonitionIcon'] svg {
+  fill: var(--admon-color);
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+/* Body content uses warm ink and slightly tighter spacing */
+[class*='admonitionContent'] {
+  color: var(--pie-ink);
+}
+
+[class*='admonitionContent'] p:last-child {
+  margin-bottom: 0;
+}
+
+[class*='admonitionContent'] code {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+/* Links inside admonitions take the semantic color so they feel anchored */
+.alert a,
+.theme-admonition a {
+  color: var(--admon-color);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.alert a:hover,
+.theme-admonition a:hover {
+  color: var(--admon-color);
+  filter: brightness(0.85);
+}
+
+/* ---------- Per-type palette ---------- */
+
+/* Per-type palette — all colors come from theme.css tokens */
+
+.alert--secondary,
+.theme-admonition-note {
+  --admon-color: var(--pie-ink-700);
+  --admon-border: var(--pie-border-strong);
+  --admon-bg: var(--ifm-color-emphasis-100);
+}
+
+.alert--success,
+.theme-admonition-tip {
+  --admon-color: var(--pie-sage);
+  --admon-border: var(--pie-sage-border);
+  --admon-bg: var(--pie-sage-bg);
+}
+
+.alert--info,
+.theme-admonition-info {
+  --admon-color: var(--pie-teal);
+  --admon-border: var(--pie-teal-border);
+  --admon-bg: var(--pie-teal-bg);
+}
+
+.alert--warning,
+.theme-admonition-warning,
+.theme-admonition-caution {
+  --admon-color: var(--pie-amber);
+  --admon-border: var(--pie-amber-border);
+  --admon-bg: var(--pie-amber-bg);
+}
+
+.alert--danger,
+.theme-admonition-danger {
+  --admon-color: var(--pie-rust);
+  --admon-border: color-mix(in oklab, var(--ifm-color-primary) 45%, var(--pie-bg-elev));
+  --admon-bg: color-mix(in oklab, var(--ifm-color-primary) 8%, var(--pie-bg-elev));
+}
+
+/* Dark mode lifts */
+
+[data-theme='dark'] .alert--secondary,
+[data-theme='dark'] .theme-admonition-note {
+  --admon-color: var(--pie-demi-200);
+  --admon-border: var(--pie-border-strong);
+  --admon-bg: var(--pie-bg-elev);
+}
+
+[data-theme='dark'] .alert--success,
+[data-theme='dark'] .theme-admonition-tip {
+  --admon-color: var(--pie-sage-light);
+  --admon-border: var(--pie-sage);
+  --admon-bg: var(--pie-sage-bg-dark);
+}
+
+[data-theme='dark'] .alert--info,
+[data-theme='dark'] .theme-admonition-info {
+  --admon-color: var(--pie-teal-light);
+  --admon-border: var(--pie-teal);
+  --admon-bg: var(--pie-teal-bg-dark);
+}
+
+[data-theme='dark'] .alert--warning,
+[data-theme='dark'] .theme-admonition-warning,
+[data-theme='dark'] .theme-admonition-caution {
+  --admon-color: var(--pie-amber-light);
+  --admon-border: var(--pie-amber-border-dark);
+  --admon-bg: var(--pie-amber-bg-dark);
+}
+
+[data-theme='dark'] .alert--danger,
+[data-theme='dark'] .theme-admonition-danger {
+  --admon-color: var(--pie-rust-light);
+  --admon-border: color-mix(in oklab, var(--ifm-color-primary) 50%, transparent);
+  --admon-bg: color-mix(in oklab, var(--ifm-color-primary) 10%, var(--pie-bg-elev));
+}
+
+[data-theme='dark'] [class*='admonitionContent'] code {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* =====================================================================
+   Footer
+   ===================================================================== */
+.footer {
+  background: var(--pie-bg-sunken);
+  color: var(--pie-ink-soft);
+  border-top: 1px solid var(--pie-border);
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-sm);
+}
+
+.footer--dark {
+  background: var(--pie-bg-sunken);
+  color: var(--pie-ink-soft);
+}
+
+.footer__title {
+  color: var(--pie-ink);
+  font-family: var(--pie-font-serif);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+.footer__link-item {
+  color: var(--pie-ink-soft);
+}
+
+.footer__link-item:hover {
+  color: var(--ifm-color-primary);
+  text-decoration: none;
+}
+
+.footer__copyright {
+  color: var(--pie-ink-muted);
+  font-size: var(--pie-text-micro);
+}
+
+/* =====================================================================
+   Doc page polish — generous reading column
+   ===================================================================== */
+.theme-doc-markdown {
+  font-size: var(--pie-text-base);
+}
+
+.theme-doc-markdown h2 {
+  margin-top: 2.5rem;
+  padding-top: 0;
+}
+
+.theme-doc-markdown h3 {
+  margin-top: 2rem;
+}
+
+.theme-doc-markdown hr {
+  border: 0;
+  border-top: 1px solid var(--pie-border);
+  margin: 2.5rem 0;
+}
+
+/* =====================================================================
+   /whypieagent dark theme override
    Scoped to body.whypieagent-dark because Docusaurus actively manages the
-   <html> className on route changes and clobbers any class added there. */
+   <html> className on route changes and clobbers any class added there.
+   ===================================================================== */
 body.whypieagent-dark,
 body.whypieagent-dark html {
   background: #0a0a0f;
@@ -45,6 +979,8 @@ body.whypieagent-dark .navbar {
   background: #0a0a0f;
   border-bottom: 1px solid #2a2a3a;
   box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 body.whypieagent-dark .navbar__title,
 body.whypieagent-dark .navbar__link,
@@ -74,3 +1010,4 @@ body.whypieagent-dark .footer__title {
 body.whypieagent-dark .footer__copyright {
   color: #808090;
 }
+

@@ -1,0 +1,11 @@
+[package]
+name = "sampler-suite"
+version = "0.1.0"
+description = "End-to-end correctness check for the programming-model samplers (token / distribution / raw_logits / logprob / logprobs / entropy). Attaches all six to the same forward-pass slot and cross-checks the values."
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]

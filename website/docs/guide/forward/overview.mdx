@@ -1,0 +1,126 @@
+---
+title: The forward pass
+description: The forward-pass primitive and when to drop down from generate()
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# The forward pass
+
+A **forward pass** runs the model once on a sequence of input positions and reads results back. The SDK exposes two layers over this primitive: `Forward` (the per-pass builder) and `Generator` (the multi-step loop that runs many `Forward` passes). This page is about `Forward`. The [Generator page](../decoder/generator) covers the loop.
+
+`Forward` is the per-pass builder. The bookkeeping it hides:
+
+- Working-page reservation before the call.
+- Position derivation for input tokens.
+- Draining the context's pending token buffer.
+- Committing pages after the call returns.
+
+You decide what tokens go in, what slots to read off, and what mask shape to use; the builder handles the rest. The underlying WIT resource (`inference::ForwardPass`) is still reachable for cases where you need control the builder does not expose — custom commit timing, manual draft rollback.
+
+Read this after [Context overview](../context/overview).
+
+The Forward builder, samplers, and probes are available in all three SDKs. A handful of low-level page operations on the raw context handle (`ctx.inner()`) are Rust-only; pages that show those are noted.
+
+## What `ctx.forward()` does
+
+`ctx.forward()` returns a `Forward<'ctx>` bound to the context. You configure it with builder methods, call `execute().await`, and read outputs through typed handles.
+
+```rust
+use inferlet::sample::{Sampler, Distribution};
+
+let mut fwd = ctx.forward();
+fwd.input(&token_ids);                        // auto-derived positions
+let h = fwd.sample(&[0], Sampler::Argmax);    // SampleHandle for position 0
+let d = fwd.probe(0, Distribution { temperature: 1.0, k: 32 });
+
+let out = fwd.execute().await?;
+
+let token: Option<u32> = out.token(h);
+let (ids, probs) = out.distribution(d).unwrap();
+```
+
+What the engine does on `execute()`:
+
+1. Runs prefill on any pending tokens in the context.
+2. Reserves working pages for the new input.
+3. Submits the forward pass to the scheduler.
+4. The scheduler batches this pass with passes from other live processes.
+5. Returns the typed outputs.
+
+Page reservation, position derivation, and post-execute commits happen automatically.
+
+## Why drop down from `generate()`
+
+`ctx.generate(...)` is a state machine over `forward()`. It runs the autoregressive loop, applies samplers and constraints, manages stop conditions, and bids credits. It is the right answer for most generation. Reach for `forward()` when:
+
+- **You want to run a single pass without sampling.** Score candidate strings, build a custom drafter, or implement beam search where the picking logic lives in your code.
+- **The output is a probability distribution, not a token.** `Probe` reads logits, distributions, log-probabilities, or entropy at a position without choosing a token.
+- **You need a custom attention mask.** Sliding window, attention sink, hierarchical attention, anything that is not a plain causal mask.
+- **You are building a custom decoder.** Speculative decoding, parallel decoding, draft-and-verify schemes that want explicit control over what each pass does.
+
+If your work fits inside the standard autoregressive loop, prefer `generate()`.
+
+## The Forward builder
+
+Every method below returns `&mut self`, so calls chain naturally.
+
+| Method | What it does |
+|---|---|
+| `.input(tokens)` | Append tokens with auto-derived (sequential) positions. |
+| `.input_at(tokens, positions)` | Append tokens at explicit position IDs. |
+| `.attention_mask(masks)` | Apply per-input-token attention masks (BRLE). |
+| `.mask(logit_brle)` | Apply a logit mask (BRLE) before sampling. |
+| `.sample(positions, sampler)` | Attach a sampler. Returns a `SampleHandle`. |
+| `.probe(position, probe)` | Attach a probe. Returns a `ProbeHandle`. |
+| `.adapter(&adapter)` | Apply a LoRA adapter for this pass. |
+| `.execute()` | Submit the pass and await its result. |
+
+`.input(...)` and `.input_at(...)` are the input setters. The rest are modifiers. Call `.execute()` once.
+
+## Outputs
+
+`out.token(h)` reads a token by `SampleHandle`. Probe handles read structured outputs:
+
+```rust
+use inferlet::sample::{Distribution, Logits, Logprob, Logprobs, Entropy};
+
+let logits_h = fwd.probe(0, Logits);
+let dist_h   = fwd.probe(0, Distribution { temperature: 1.0, k: 32 });
+let lp_h     = fwd.probe(0, Logprob(target_token_id));   // log p(target_token_id)
+let lps_h    = fwd.probe(0, Logprobs(vec![id_a, id_b])); // log p of each
+let ent_h    = fwd.probe(0, Entropy);
+
+let out = fwd.execute().await?;
+
+let logits: Option<&[u8]>            = out.logits(logits_h);     // raw f32 LE bytes
+let dist:   Option<(&[u32], &[f32])> = out.distribution(dist_h); // ids + probs
+let logp:   Option<&[f32]>           = out.logprobs(lp_h);       // length 1
+let logps:  Option<&[f32]>           = out.logprobs(lps_h);      // length K
+let ent:    Option<f32>              = out.entropy(ent_h);
+```
+
+A few details that bite the first time:
+
+- `Logprob(token_id)` and `Logprobs(token_ids)` carry the token IDs you want scored. They are not zero-arg markers.
+- Both single and list logprob queries are read with `out.logprobs(...)`. There is no `out.logprob`.
+- `out.logits(...)` returns raw native-endian f32 bytes. Decode with `bytemuck::cast_slice::<u8, f32>(bytes)` (or your language's equivalent).
+- `out.distribution(...)` returns slices into the output, not owned vectors.
+
+The handles are typed: `out.token(probe_handle)` does not compile. Mismatched access at runtime returns `None`.
+
+## What this section covers
+
+- [Inputs: tokens, positions, masks](./inputs). Building the input side of a forward pass.
+- [Samplers and probabilities](./samplers). Every `Sampler` kind and every `Probe` kind.
+- [Constrained generation](./constrained). Logit masks driven by JSON Schema, regex, EBNF, and custom grammars.
+- [Adapters](./adapters). LoRA adapters scoped to a model.
+- [Speculative decoding](./speculation). System speculation and the `Speculator` trait.
+
+## Next
+
+- [Inputs: tokens, positions, masks](./inputs).
+- [Samplers and probabilities](./samplers).
+- [Generation overview](../decoder/overview): the layer that runs `forward()` in a loop for you.

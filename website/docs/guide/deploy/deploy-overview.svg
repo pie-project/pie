@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 264" width="720" height="264" role="img" aria-labelledby="dep-title dep-desc">
+  <title id="dep-title">Pie deployment topology</title>
+  <desc id="dep-desc">Clients connect to a Pie engine over WebSocket. The engine pulls inferlets from the Pie registry on first launch.</desc>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#54473b"/>
+    </marker>
+  </defs>
+
+  <style>
+    text  { font-family: 'IBM Plex Serif', Charter, Georgia, serif; font-size: 13px; }
+    .ink   { fill: #2c2722; }
+    .muted { fill: #7a6a55; font-style: italic; }
+  </style>
+
+  <!-- Registry: top, centered above engine -->
+  <rect x="348" y="24" width="240" height="60" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="468" y="59" text-anchor="middle">Registry</text>
+
+  <!-- Clients: left -->
+  <rect x="48" y="156" width="144" height="84" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="120" y="201" text-anchor="middle">Clients</text>
+
+  <!-- Pie engine: right -->
+  <rect x="264" y="156" width="408" height="84" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="468" y="201" text-anchor="middle">Pie</text>
+
+  <!-- Registry → Pie (vertical) -->
+  <line x1="468" y1="88" x2="468" y2="152"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-end="url(#ah)"/>
+  <text class="muted" x="480" y="124">pull on first launch</text>
+
+  <!-- Clients ↔ Pie (bidirectional) -->
+  <line x1="196" y1="198" x2="260" y2="198"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-start="url(#ah)" marker-end="url(#ah)"/>
+</svg>

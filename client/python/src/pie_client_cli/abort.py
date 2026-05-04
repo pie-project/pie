@@ -41,11 +41,11 @@ def handle_abort_command(
 
     try:
         # Query all running instances
-        instances = engine.list_instances(client)
+        instances = engine.list_processes(client)
 
         # Find matching instances
         matching = [
-            inst for inst in instances if inst.id.startswith(instance_id_prefix)
+            inst for inst in instances if inst.startswith(instance_id_prefix)
         ]
 
         if len(matching) == 0:
@@ -60,7 +60,7 @@ def handle_abort_command(
             )
             typer.echo()
             for inst in matching:
-                typer.echo(f"  {inst.id}")
+                typer.echo(f"  {inst}")
             typer.echo()
             typer.echo(
                 "Please provide a more specific prefix to uniquely identify the instance."
@@ -68,11 +68,10 @@ def handle_abort_command(
             raise ValueError("Ambiguous instance ID prefix")
 
         # Found exactly one match
-        instance_info = matching[0]
-        instance_id = instance_info.id
+        instance_id = matching[0]
 
         # Terminate the instance
-        engine.terminate_instance(client, instance_id)
+        engine.terminate_process(client, instance_id)
 
         typer.echo(f"✅ Sent termination request for instance {instance_id}")
 

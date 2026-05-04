@@ -1,0 +1,363 @@
+---
+title: Constrained generation
+description: Force valid output with JSON Schema, regex, EBNF, or compiled grammars
+sidebar_position: 4
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Constrained generation
+
+Constrained decoding masks the model's logits each step so only tokens that keep the output valid against a grammar can be sampled. Pie supports JSON Schema, regex, EBNF, and reusable compiled grammars. Read this after [Samplers and probabilities](./samplers).
+
+The high-level entry point is `Schema`. Pass any `Schema` value to `constrain_with` (Rust) or as the `constrain` argument (Python and JavaScript) on a `generate` call. The SDK compiles it into a stateful matcher and drives the matcher per generated token.
+
+:::note[Running on the dummy driver?]
+Constraint masks are honored by the dummy driver, so output structure is in-grammar — but the *content* inside the grammar (string field values, numbers, tool arguments) is uniform random. Use a real driver if you need meaningful values.
+:::
+
+## Schemas
+
+Each language exposes the same five built-in schema variants. Their constructors differ.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::{AnyJson, JsonSchema, Regex, Ebnf, sample::Sampler};
+
+// Force any valid JSON
+let json: serde_json::Value = ctx
+    .generate(Sampler::Argmax)
+    .constrain_with(AnyJson)?
+    .max_tokens(256)
+    .collect_json::<serde_json::Value>()
+    .await?;
+
+// JSON Schema
+let schema = r#"{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}"#;
+let text = ctx
+    .generate(Sampler::Argmax)
+    .constrain_with(JsonSchema(schema))?
+    .max_tokens(128)
+    .collect_text()
+    .await?;
+
+// Regex
+ctx.generate(Sampler::Argmax)
+   .constrain_with(Regex(r"\d{4}-\d{2}-\d{2}"))?;
+
+// EBNF (Lark format)
+ctx.generate(Sampler::Argmax)
+   .constrain_with(Ebnf(&my_grammar))?;
+```
+
+`Schema` is a trait. The built-in implementors `JsonSchema`, `AnyJson`, `Regex`, and `Ebnf` are tuple/unit structs. A pre-compiled `&Grammar` also implements `Schema`.
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Sampler, AnyJson, JsonSchema, Regex, Ebnf
+
+# Force any valid JSON
+result = await ctx.generate(
+    Sampler.argmax(),
+    max_tokens=256,
+    constrain=AnyJson(),
+).collect_json()
+
+# JSON Schema (string)
+schema = '{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}'
+text = await ctx.generate(
+    Sampler.argmax(),
+    max_tokens=128,
+    constrain=JsonSchema(schema=schema),
+).collect_text()
+
+# Regex
+await ctx.generate(
+    Sampler.argmax(),
+    constrain=Regex(pattern=r"\d{4}-\d{2}-\d{2}"),
+).collect_text()
+
+# EBNF (Lark format)
+await ctx.generate(
+    Sampler.argmax(),
+    constrain=Ebnf(source=my_grammar),
+).collect_text()
+```
+
+`Schema` is a `Protocol`. The built-in implementors `JsonSchema`, `AnyJson`, `Regex`, and `Ebnf` are dataclasses. A `Grammar` (compiled once) does not directly implement `Schema`; wrap it in a `GrammarConstraint` and pass via `constrain` (see "Reuse a compiled grammar" below).
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Sampler, jsonSchema, anyJson, regex, ebnf } from 'inferlet';
+
+// Force any valid JSON
+const result = await ctx.generate(
+    Sampler.argmax(),
+    { maxTokens: 256, constrain: anyJson() },
+).collectJson();
+
+// JSON Schema (string)
+const schema = '{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}';
+const text = await ctx.generate(
+    Sampler.argmax(),
+    { maxTokens: 128, constrain: jsonSchema(schema) },
+).collectText();
+
+// Regex
+await ctx.generate(
+    Sampler.argmax(),
+    { constrain: regex(/\d{4}-\d{2}-\d{2}/.source) },
+).collectText();
+
+// EBNF (Lark format)
+await ctx.generate(
+    Sampler.argmax(),
+    { constrain: ebnf(myGrammar) },
+).collectText();
+```
+
+`Schema` is a duck-typed interface (any object with a `buildConstraint(model)` method). The built-in implementors `jsonSchema`, `anyJson`, `regex`, and `ebnf` are top-level functions returning `Schema` values. `grammar(g)` wraps a pre-compiled `Grammar` (see below).
+
+</TabItem>
+</Tabs>
+
+| Concept | Rust | Python | JavaScript |
+|---|---|---|---|
+| Any valid JSON | `AnyJson` | `AnyJson()` | `anyJson()` |
+| JSON conforming to a schema string | `JsonSchema(s)` | `JsonSchema(schema=s)` | `jsonSchema(s)` |
+| Strings matching a regex | `Regex(p)` | `Regex(pattern=p)` | `regex(p)` |
+| Custom EBNF grammar | `Ebnf(g)` | `Ebnf(source=g)` | `ebnf(g)` |
+| Pre-compiled grammar | `&Grammar` | `GrammarConstraint.from_grammar(g, model)` | `grammar(g)` |
+
+In Rust, `constrain_with` returns `Result` because schema parsing can fail at compile time. Multiple constraints AND together: every constraint contributes a mask, and the masks combine before each forward pass.
+
+:::tip[Pair grammars with greedy or low-temperature sampling]
+Once the mask narrows the distribution to a handful of valid tokens, stochastic sampling rarely improves quality and can lower speculative-decoding acceptance.
+:::
+
+## Typed JSON output
+
+If you have a type for the result, the SDK can derive the schema and parse the output for you.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchema)]
+struct Plan { steps: Vec<String> }
+
+let plan: Plan = ctx
+    .generate(Sampler::Argmax)
+    .max_tokens(256)
+    .collect_json::<Plan>()
+    .await?;
+```
+
+`collect_json::<T>` derives the JSON schema for `T`, applies it as a constraint, samples, and parses. It errors if you also pass `constrain_with`, since it owns the schema.
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+schema = {
+    "type": "object",
+    "properties": {"steps": {"type": "array", "items": {"type": "string"}}},
+    "required": ["steps"],
+}
+
+plan = await ctx.generate(
+    Sampler.argmax(),
+    max_tokens=256,
+).collect_json(schema=json.dumps(schema))
+
+# `plan` is a parsed dict / list / primitive.
+```
+
+`collect_json(schema=schema_str)` applies the schema as a constraint and parses. To run a custom parser on the JSON string, pass `parse=callable`. With no `schema=`, the constraint falls back to any-JSON.
+
+Pydantic does not load inside the WASM Python runtime today, so a typed parser pattern is on you to wire up against the parsed dict.
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+const schema = JSON.stringify({
+    type: 'object',
+    properties: { steps: { type: 'array', items: { type: 'string' } } },
+    required: ['steps'],
+});
+
+const plan = await ctx.generate(
+    Sampler.argmax(),
+    { maxTokens: 256 },
+).collectJson<{ steps: string[] }>({
+    schema,
+    parse: (val) => val as { steps: string[] },   // optional Zod / runtime validator
+});
+```
+
+`collectJson({ schema })` applies the schema and returns parsed `unknown`. `collectJson({ schema, parse })` runs your parser and returns its result type. With no options, the constraint falls back to any-JSON.
+
+</TabItem>
+</Tabs>
+
+## Reuse a compiled grammar
+
+If the same grammar applies across many turns or streams, compile it once and reuse the constraint object. This amortizes the parser cost across calls. The compiled object is safe to reuse across forks of the same context.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::inference::Grammar;
+
+let grammar = Grammar::from_ebnf(&my_grammar)?;
+
+let out = ctx
+    .generate(Sampler::Argmax)
+    .constrain_with(&grammar)?             // &Grammar implements Schema
+    .max_tokens(256)
+    .collect_text()
+    .await?;
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+from inferlet import Grammar, GrammarConstraint
+
+grammar = Grammar.from_ebnf(my_grammar)
+gc = GrammarConstraint.from_grammar(grammar, model)
+
+out = await ctx.generate(
+    Sampler.argmax(),
+    max_tokens=256,
+    constrain=gc,
+).collect_text()
+```
+
+`GrammarConstraint` implements the `Constraint` protocol directly, so you pass it as `constrain=` without going through `Schema`.
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import { Grammar, grammar as gschema } from 'inferlet';
+
+const g = Grammar.fromEbnf(myGrammar);
+
+const out = await ctx.generate(
+    Sampler.argmax(),
+    { maxTokens: 256, constrain: gschema(g) },
+).collectText();
+```
+
+`grammar(g)` is the JS function that wraps a `Grammar` as a `Schema`. (It is renamed to `gschema` in the import here only to avoid shadowing the variable.)
+
+</TabItem>
+</Tabs>
+
+## Why constrain at the decoder
+
+A common pattern wraps an LLM with a parser, a retry loop, and a prompt asking for JSON output. The model occasionally drifts. The parser breaks. The retry costs tokens.
+
+Constrained decoding turns format compliance into a property of the decoder, not of the prompt:
+
+- **Every token is valid.** The mask intersects with the sampler before it picks, so an invalid token cannot be sampled.
+- **No retries.** A bad output is impossible by construction.
+- **Cheap.** The mask is BRLE-encoded and ANDed once per step. There is no rejection sampling and no extra forward pass.
+
+This makes structured output appropriate for any task where the format is part of the contract: API responses, form filling, function arguments, downstream parsers.
+
+## Custom constraints
+
+For non-grammar logic, implement the `Constrain` trait (Rust) / `Constraint` protocol (Python) / `Constraint` interface (JS). Each step the generator passes any newly accepted tokens (or empty on the first step) and gets back the BRLE-encoded logit mask for the next position. Returning an empty mask means "no restriction" and is treated as transparent during composition.
+
+<Tabs groupId="lang" queryString>
+<TabItem value="rust" label="Rust" default>
+
+```rust
+use inferlet::Constrain;
+
+struct MyConstraint {
+    cached: Vec<u32>,
+    /* …state… */
+}
+
+impl Constrain for MyConstraint {
+    fn step(&mut self, accepted: &[u32]) -> &[u32] {
+        // Update internal state from `accepted`.
+        self.cached.clear();
+        self.cached.extend_from_slice(&recompute_brle_for_state(self));
+        &self.cached
+    }
+}
+
+let out = ctx
+    .generate(Sampler::Argmax)
+    .constrain(MyConstraint { cached: Vec::new() /* … */ })
+    .max_tokens(256)
+    .collect_text()
+    .await?;
+```
+
+The trait has one method. There is no `reset`, no `Result`. Return `&[]` to indicate "no restriction this step." The returned slice can borrow from `self`.
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+class MyConstraint:
+    def step(self, accepted: list[int]) -> list[int]:
+        # Update internal state from `accepted`, return BRLE mask.
+        return recompute_brle_for_state(self)
+
+out = await ctx.generate(
+    Sampler.argmax(),
+    max_tokens=256,
+    constrain=MyConstraint(),
+).collect_text()
+```
+
+`Constraint` is a runtime-checkable `Protocol`: any class with a `step(accepted)` method satisfies it.
+
+</TabItem>
+<TabItem value="js" label="JavaScript">
+
+```typescript
+import type { Constraint } from 'inferlet';
+
+class MyConstraint implements Constraint {
+    step(accepted: Uint32Array): Uint32Array {
+        // Update internal state from `accepted`, return BRLE mask.
+        return recomputeBrleForState(this);
+    }
+}
+
+const out = await ctx.generate(
+    Sampler.argmax(),
+    { maxTokens: 256, constrain: new MyConstraint() },
+).collectText();
+```
+
+</TabItem>
+</Tabs>
+
+The custom constraint composes with `Schema` constraints: each adds its own mask and the masks AND together.
+
+## Next
+
+- [Speculative decoding](./speculation): how constraints interact with draft-and-verify.
+- [Tool-call parser](../decoder/tool-calling): tool-call schemas backed by the model's native grammar.
+- [Inputs](./inputs): apply masks at the forward-pass level instead of through `Generator`.

@@ -1,6 +1,6 @@
 [package]
 name = "inferlet"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Inferlet support library for Pie"
@@ -8,17 +8,15 @@ license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 keywords = ["wasi", "wasm", "pie", "inferlet"]
 categories = ["wasm"]
-include = ["src", "Cargo.toml", "wit"]
 
 [dependencies]
-wit-bindgen = "0.46.0"
+wit-bindgen = "0.51.0"
 wstd = "0.5.6"
 trait-variant = "0.1.2"
 wasi = "0.14.7"
-inferlet-macros = { version = "0.1.0", path = "../inferlet-macros" } # Adjust the path as needed
-anyhow = "1.0.95"
+inferlet-macros = { version = "0.1.0", path = "../inferlet-macros" }
 futures = "0.3.31"
-minijinja = { version = "2.12.0", features = ["loader"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-pico-args = "0.5.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+schemars = "0.8"
+pico-args = "0.5"

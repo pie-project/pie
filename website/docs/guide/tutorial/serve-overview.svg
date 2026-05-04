@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 280" width="720" height="280" role="img" aria-labelledby="srv-title srv-desc">
+  <title id="srv-title">Tutorial: serving the research agent</title>
+  <desc id="srv-desc">A client application sends a launch request to the Pie engine over WebSocket and receives streamed events. Inside the engine, the research-agent inferlet runs in a WebAssembly sandbox, communicates with the model on the GPU, and issues parallel HTTP requests to en.wikipedia.org.</desc>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#54473b"/>
+    </marker>
+  </defs>
+
+  <style>
+    text  { font-family: 'IBM Plex Serif', Charter, Georgia, serif; font-size: 13px; }
+    .ink   { fill: #2c2722; }
+    .sub   { fill: #54473b; }
+    .muted { fill: #7a6a55; font-style: italic; }
+  </style>
+
+  <!-- Pie engine: dashed enclosing container -->
+  <rect x="240" y="40" width="456" height="192" rx="10" ry="10"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text class="ink" x="264" y="64">Pie</text>
+
+  <!-- Client box -->
+  <rect x="24" y="88" width="144" height="90" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="96" y="137" text-anchor="middle">Client</text>
+
+  <!-- Inferlet box (Research agent) -->
+  <rect x="264" y="88" width="180" height="90" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="354" y="128" text-anchor="middle">Research agent</text>
+  <text class="sub" x="354" y="148" text-anchor="middle">(Wasm)</text>
+
+  <!-- Model box -->
+  <rect x="492" y="88" width="180" height="90" rx="8" ry="8"
+        fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="ink" x="582" y="137" text-anchor="middle">Model</text>
+
+  <!-- launch: Client → Pie -->
+  <line x1="172" y1="118" x2="234" y2="118"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-end="url(#ah)"/>
+  <text class="muted" x="203" y="108" text-anchor="middle">launch</text>
+
+  <!-- events: Pie → Client -->
+  <line x1="234" y1="148" x2="172" y2="148"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-end="url(#ah)"/>
+  <text class="muted" x="203" y="164" text-anchor="middle">events</text>
+
+  <!-- Inferlet ↔ Model -->
+  <line x1="452" y1="133" x2="484" y2="133"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-start="url(#ah)" marker-end="url(#ah)"/>
+
+  <!-- Outbound: Research agent → external HTTP -->
+  <line x1="354" y1="180" x2="354" y2="208"
+        stroke="#54473b" stroke-width="1.5" stroke-linecap="round"
+        marker-end="url(#ah)"/>
+  <text class="muted" x="354" y="222" text-anchor="middle">parallel HTTP to en.wikipedia.org</text>
+</svg>

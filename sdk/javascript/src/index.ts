@@ -1,48 +1,96 @@
-// inferlet - JavaScript library for writing Pie inferlets
-// This mirrors the Rust inferlet crate API
+// Public API for the Pie inferlet JavaScript SDK.
+//
+// Quickstart:
+//
+//     import { Context, Model, Sampler, runtime } from 'inferlet';
+//
+//     const model = Model.load(runtime.models()[0]);
+//     const ctx = new Context(model);
+//
+//     ctx.system('You are helpful.').user('What is 2 + 2?');
+//     const text = await ctx
+//       .generate(Sampler.argmax(), { maxTokens: 64 })
+//       .collectText();
+//
+// Three-layer surface:
+//
+// * `Context` — KV cache + chat fillers + `forward()` / `generate()`.
+// * `Forward` (`ctx.forward()`) — single forward-pass primitive with auto
+//   page management. For prefill / scoring / custom loops.
+// * `Generator` (`ctx.generate()`) — multi-step state machine over
+//   Forward. Iterate with `for await (const step of gen)`, or use
+//   `await gen.collectText() / .collectTokens() / .collectJson()`.
+//
+// Streaming decoders for chat / reasoning / tools live as independent
+// modules — compose by hand, no implicit suppression:
+//
+//     import { chat, reasoning, tools } from 'inferlet';
+//
+//     const chatDec = new chat.Decoder(model);
+//     for await (const step of gen) {
+//       const out = await step.execute();
+//       const ev = chatDec.feed(out.tokens);
+//       if (ev.type === 'delta') process.stdout.write(ev.text);
+//       else if (ev.type === 'done') break;
+//     }
+//
+// Constraint specs (`jsonSchema`, `anyJson`, `regex`, `ebnf`) implement
+// the `Schema` interface — duck-typed, so your own grammar source class
+// plugs in by adding a `buildConstraint(model)` method.
 
-export const VERSION = '0.1.0';
-
-// Re-export runtime functions
-export {
-  getVersion,
-  getInstanceId,
-  getArguments,
-  setReturn,
-  debugQuery,
-} from './runtime.js';
-
-// Re-export Sampler presets and types
-export { Sampler, toSamplerType } from './sampler.js';
-export type { SamplerType, SamplingConfig } from './sampler.js';
-
-// Re-export Drafter
-export { Drafter, EmptyDrafter } from './drafter.js';
-
-// Re-export Tokenizer
-export { Tokenizer } from './tokenizer.js';
-
-// Re-export Model and Queue
-export { Model, Queue, getModel, getAllModels, getAutoModel, getAllModelsWithTraits } from './model.js';
-
-// Re-export ChatFormatter
-export { ChatFormatter } from './chat.js';
-export type { ToolCall } from './chat.js';
-
-// Re-export Brle
-export { Brle, causalMask } from './brle.js';
-
-// Re-export ForwardPass and related types
-export { ForwardPass, KvPage, Resource, causalMask as forwardCausalMask } from './forward.js';
-export type { Distribution, ForwardPassResult, Forward } from './forward.js';
-
-// Re-export Context and generation types
+// ── Core ─────────────────────────────────────────────────────────────
+export { Model, Tokenizer } from './model.js';
+export { Adapter } from './adapter.js';
 export { Context } from './context.js';
-export type { MessageRole, ChatMessage, StopConfig, GenerateOptions, GenerateBeamOptions } from './context.js';
 
-// Re-export messaging functions
-export { send, receive, sendBlob, receiveBlob, broadcast, subscribe, Blob } from './messaging.js';
+// ── Forward primitive ────────────────────────────────────────────────
+export { Forward, Output } from './forward.js';
+export type { SampleHandle, ProbeHandle, Brle } from './forward.js';
 
-// Re-export KVS functions
-export { storeGet, storeSet, storeDelete, storeExists, storeListKeys } from './kvs.js';
+// ── Generator ────────────────────────────────────────────────────────
+export { Generator, GenStep } from './generation.js';
+export type { GenerateOptions } from './generation.js';
 
+// ── Sampler / Probe ──────────────────────────────────────────────────
+export {
+  Sampler,
+  Logits,
+  Distribution,
+  Logprob,
+  Logprobs,
+  Entropy,
+} from './sample.js';
+export type { Probe, ProbeKind } from './sample.js';
+
+// ── Decoders + tools (sub-modules) ───────────────────────────────────
+export * as chat from './chat.js';
+export * as reasoning from './reasoning.js';
+export * as tools from './tools.js';
+
+// ── Constraints ──────────────────────────────────────────────────────
+export {
+  Grammar,
+  Matcher,
+  GrammarConstraint,
+  jsonSchema,
+  anyJson,
+  regex,
+  ebnf,
+  grammar,
+} from './grammar.js';
+export type { Schema, Constraint } from './grammar.js';
+
+// ── Speculation ──────────────────────────────────────────────────────
+export type { Speculator } from './spec.js';
+
+// ── Runtime / IO sub-modules ─────────────────────────────────────────
+export * as runtime from './runtime.js';
+export * as scheduling from './scheduling.js';
+export * as session from './session.js';
+export * as messaging from './messaging.js';
+export * as mcp from './mcp.js';
+export * as zo from './zo.js';
+
+// Convenience re-exports for the most commonly subscribed-to types.
+export { Subscription } from './messaging.js';
+export { McpSession } from './mcp.js';

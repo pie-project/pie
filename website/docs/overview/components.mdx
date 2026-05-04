@@ -1,0 +1,27 @@
+---
+title: Components
+description: The three pieces of the Pie distribution — engine, SDKs, and Bakery toolchain
+sidebar_position: 2
+---
+
+# Components
+
+Pie has three parts: the **engine** that runs inferlets, the **SDKs** for writing them and talking to a running engine, and **Bakery**, the toolchain for building and publishing them.
+
+## Engine
+
+The engine is the "operating system" for inferlets, made of three pieces:
+- **Runtime** (`runtime/`). The Rust core. Hosts the Wasmtime-based WebAssembly runtime, the inferlet scheduler, KV cache mapping, contention management, and the WebSocket protocol clients connect to.
+- **Driver** (`driver/`). The hardware layer. Pie ships a CUDA driver, and a local driver for CPU and Apple Silicon. Pie also has experimental support for vLLM and SGLang as drivers.
+- **Server**. Glues the runtime and driver together, and provide CLI to configure and start them.
+
+## SDKs
+
+Each available in Rust, Python, and JavaScript / TypeScript.
+
+- **Inferlet SDK** (`sdk/`). A library for writing inferlets. Comes with helpful utilities and macros to reduce boilerplate.
+- **Client SDK** (`client/`). A programmatic client for controlling a running Pie engine, for example install, run, and manage inferlets.
+
+## Bakery
+
+`bakery` (in `sdk/tools/bakery/`) is the inferlet toolchain, that provides CLI commands to scaffold and build inferlets. It also provides an experimental package manager to share the inferlets.

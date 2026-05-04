@@ -1,0 +1,36 @@
+# Sample portable-driver config. Pass via `pie_driver_portable --config dev.toml`.
+
+# Shmem IPC channel — must match the runtime's `[model.<name>.driver]` config.
+[shmem]
+# Hardcoded across the stack (runtime/src/device.rs, pie_driver_dev/worker.py).
+name = "/pie_shmem"
+num_slots = 8
+req_buf = 4194304   # 4 MiB
+resp_buf = 1048576  # 1 MiB
+spin_us = 0         # 0 = pure busy spin
+
+[model]
+# Path to a HuggingFace snapshot directory. The Python wrapper (pie_driver_portable)
+# resolves `hf_repo` to a local snapshot via the standard hub cache before
+# spawning this binary; for local dev, point directly at the snapshot.
+hf_path = "/path/to/huggingface/snapshot"
+# 0 = CPU only, -1 = offload all layers to GPU, N = first N layers on GPU.
+n_gpu_layers = -1   # -1 = all layers on GPU; 0 = CPU only
+# Informational max position. Real KV capacity is total_pages × kv_page_size.
+n_ctx = 4096
+
+# KV cache / batching — Pie's runtime owns page allocation. We allocate a
+# global pool of `max_num_kv_pages` pages of `kv_page_size` token slots each
+# and report those values in the READY capabilities. The runtime then hands
+# us `kv_page_indices` per request in every BPIQ payload; we honor them.
+#
+# Total KV memory per layer = max_num_kv_pages × kv_page_size × n_kv_heads
+#                             × head_dim × 2 (K+V) × dtype_size.
+# For Qwen3-0.6B with 1024 pages × 32 / F16 KV that's ~3.5 GiB across
+# 28 layers — ~32k token slots flexibly shared across all in-flight
+# contexts.
+[batching]
+kv_page_size = 32
+max_num_kv_pages = 4096
+max_batch_tokens = 10240
+max_batch_size = 512

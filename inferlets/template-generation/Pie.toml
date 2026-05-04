@@ -1,0 +1,13 @@
+[package]
+name = "template-generation"
+version = "0.1.1"
+description = "Grammar-constrained JSON + Jinja2 template rendering"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "The product/topic to generate content for"}
+max_tokens = {type = "int", optional = true, description = "Max generation tokens (default: 1024)"}

@@ -1,0 +1,18 @@
+[package]
+name = "text-completion-spec"
+version = "0.1.0"
+description = "Text completion exercising the speculative-decoding path (Speculation::Default → backend NGRAM)"
+authors = ["pie"]
+repository = "https://github.com/pie-project/pie"
+readme = "README.md"
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", description = "The user message to complete"}
+system = {type = "string", optional = true, description = "System prompt (default: helpful assistant)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens to generate (default: 128)"}
+temperature = {type = "float", optional = true, description = "Sampling temperature (default: 0.0 — greedy, best for spec acceptance)"}
+top_p = {type = "float", optional = true, description = "Top-p (default: 1.0)"}

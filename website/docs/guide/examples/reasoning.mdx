@@ -1,0 +1,23 @@
+---
+title: Reasoning patterns
+description: Tree, graph, and recursion of thought
+sidebar_position: 7
+---
+
+# Reasoning patterns
+
+Inferlets that fan out reasoning across multiple branches and aggregate the results. All of them lean on the KV cache's copy-on-write fork to keep memory and compute proportional to the divergent tokens.
+
+| Inferlet | What it shows |
+|---|---|
+| [`tree-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/tree-of-thought) | Multi-branch reasoning (Propose, Execute, Reflect). |
+| [`graph-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/graph-of-thought) | Hierarchical aggregation of multiple proposals. |
+| [`skeleton-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/skeleton-of-thought) | Parallel elaboration of key points. |
+| [`recursion-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/recursion-of-thought) | Divide-and-conquer problem solving. |
+| [`knowledge-graph`](https://github.com/pie-project/pie/tree/main/inferlets/knowledge-graph) | Knowledge-graph extraction and traversal with `petgraph`. |
+
+## Related guide
+
+- [Forking and saving](../context/sharing): the `fork()` primitive every branching pattern starts from.
+- [Generator](../decoder/generator): per-step control for evaluator/scorer steps.
+- [Constrained generation](../forward/constrained): structured planning output (lists of subgoals, JSON proposals).

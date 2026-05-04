@@ -1,0 +1,47 @@
+/* Verbatim port of the homepage `.codeTabs` / `.codeTab` /
+   `.codeTabActive` rules in `src/pages/index.module.css`. The tabs
+   overlap the code panel by 1px (`margin-bottom: -1px` + `z-index`) so
+   the active button reads as a labelled extrusion of the panel. */
+
+.codeContainer {
+    margin-block: 1.5rem;
+}
+
+.codeTabs {
+    display: flex;
+    gap: 0.25rem;
+    margin-bottom: -1px;
+    position: relative;
+    z-index: 1;
+    flex-wrap: wrap;
+}
+
+.codeTab {
+    padding: 0.45rem 1.1rem;
+    border: 1px solid var(--pie-border);
+    border-bottom: none;
+    border-radius: 8px 8px 0 0;
+    background: transparent;
+    color: var(--pie-ink-muted);
+    font-size: var(--pie-text-xs);
+    font-family: var(--pie-font-serif);
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 150ms ease, background 150ms ease;
+}
+
+.codeTab:hover {
+    color: var(--ifm-color-primary);
+}
+
+.codeTabActive {
+    background: var(--pie-bg-sunken);
+    color: var(--ifm-color-primary);
+    border-color: var(--pie-border-strong);
+    font-weight: 600;
+}
+
+.codeContainer :global(.theme-code-block) {
+    border-radius: 0 12px 12px 12px;
+    margin: 0;
+}

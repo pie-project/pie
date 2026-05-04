@@ -1,22 +1,16 @@
 [package]
-name = "ingim/es-rollout"
-version = "0.1.0"
-description = "Perform parallel rollouts for evaluation"
+name = "es-rollout"
+version = "0.1.6"
+description = "Perform ES rollouts — generate text with perturbed adapter"
 authors = ["In Gim <in.gim@yale.edu>"]
 repository = "https://github.com/pie-project/pie"
 readme = "README.md"
-keywords = ["evolution-strategies", "rollout", "inference"]
 
-[engine]
-min_version = "^1.0.0"
+[runtime]
+core = "^0.2.0"
 
-[interface]
-inputs = [
-    { name = "name", type = "string", description = "Name of the adapter to use" },
-    { name = "system_prompt", type = "string", description = "System prompt for generation" },
-    { name = "max_num_outputs", type = "int", description = "Maximum number of tokens to generate per rollout" },
-    { name = "rollouts", type = "string", description = "JSON string containing rollout tasks" },
-]
-outputs = [
-    { name = "results", type = "string", description = "JSON string containing rollout results" }
-]
+[parameters]
+name = {type = "string", description = "Adapter name"}
+system_prompt = {type = "string", description = "System prompt for generation"}
+max_num_outputs = {type = "int", description = "Maximum tokens to generate per rollout"}
+rollouts = {type = "string", description = "List of rollout tasks (each with uid, task, seed), as JSON"}

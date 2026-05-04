@@ -1,134 +1,50 @@
-use super::api::core::Queue;
-use super::utils;
-use crate::model::resource::{ResourceId, ResourceTypeId};
-use crate::server::InstanceEvent;
-use anyhow::{Result, format_err};
-use bytes::Bytes;
-use ringbuffer::{AllocRingBuffer, RingBuffer};
+//! Instance state for WASM component execution.
+//!
+//! Per-instance runtime state attached to every wasmtime `Store`: WASI
+//! context, filesystem/Python preopens, and dynamic-linking resource maps.
+
+mod output;
+
 use std::collections::HashMap;
-use std::io;
-use std::path::Path;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
-use tokio::io::AsyncWrite;
-use tokio::sync::Notify;
-use uuid::Uuid;
-use wasmtime::component::{Resource, ResourceAny, ResourceTable};
-use wasmtime_wasi::async_trait;
-use wasmtime_wasi::cli::IsTerminal;
-use wasmtime_wasi::cli::StdoutStream;
-use wasmtime_wasi::p2::{OutputStream, Pollable, StreamResult};
+use std::path::{Path, PathBuf};
+use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
-pub type InstanceId = Uuid;
+use self::output::LogStream;
 
-/// Controller for controlling the output delivery mode of a running instance
-#[derive(Clone)]
-pub struct OutputDeliveryCtrl {
-    stdout_stream: LogStream,
-    stderr_stream: LogStream,
-}
-
-impl OutputDeliveryCtrl {
-    /// Set output mode
-    pub fn set_output_delivery(&self, output_delivery: OutputDelivery) {
-        match output_delivery {
-            OutputDelivery::Buffered => {
-                self.stdout_stream.set_deliver_to_buffer();
-                self.stderr_stream.set_deliver_to_buffer();
-            }
-            OutputDelivery::Streamed => {
-                self.stdout_stream.set_deliver_to_stream();
-                self.stderr_stream.set_deliver_to_stream();
-            }
-        }
-    }
-
-    /// Allow output to be written to the streams.
-    /// This should be called after the instance ID has been communicated to the client
-    /// to prevent a race condition where output arrives before the instance ID.
-    pub fn allow_output(&self) {
-        self.stdout_stream.allow_output();
-        self.stderr_stream.allow_output();
-    }
-}
-
-/// Manages the mapping between virtual and physical resource identifiers.
-#[derive(Debug)]
-struct ResourceIdMapper {
-    /// A pool for acquiring and releasing unique virtual IDs.
-    virtual_id_pool: utils::IdPool<u32>,
-    /// The map from a virtual ID to its corresponding physical ID.
-    virtual_to_physical: HashMap<ResourceId, ResourceId>,
-}
-
-impl Default for ResourceIdMapper {
-    fn default() -> Self {
-        ResourceIdMapper {
-            virtual_id_pool: utils::IdPool::new(u32::MAX),
-            virtual_to_physical: HashMap::new(),
-        }
-    }
-}
-
-impl ResourceIdMapper {
-    /// Creates new virtual IDs and maps them to the provided physical IDs.
-    ///
-    /// Returns the newly created virtual IDs in the same order as the provided physical IDs.
-    fn map_resources(&mut self, physical_ids: &[ResourceId]) -> Vec<ResourceId> {
-        let virtual_ids = self
-            .virtual_id_pool
-            .acquire_many(physical_ids.len())
-            .unwrap();
-
-        // Pre-allocate to prevent multiple rehashes when inserting new entries.
-        self.virtual_to_physical.reserve(physical_ids.len());
-
-        for (&virtual_id, &physical_id) in virtual_ids.iter().zip(physical_ids.iter()) {
-            self.virtual_to_physical.insert(virtual_id, physical_id);
-        }
-
-        virtual_ids
-    }
-
-    /// Removes the mappings for the given virtual IDs and releases them back to the pool.
-    fn unmap_resources(&mut self, virtual_ids: &[ResourceId]) {
-        for &virtual_id in virtual_ids {
-            self.virtual_to_physical.remove(&virtual_id);
-        }
-        self.virtual_id_pool.release_many(virtual_ids).unwrap();
-    }
-
-    /// Translates a single virtual ID to its corresponding physical ID.
-    fn translate(&self, virtual_id: ResourceId) -> Option<ResourceId> {
-        self.virtual_to_physical.get(&virtual_id).copied()
-    }
-}
+use crate::context;
+use crate::linker::InstancePolicy;
+use crate::process::ProcessId;
 
 pub struct InstanceState {
     // Wasm states
-    id: InstanceId,
+    id: ProcessId,
     username: String,
-    arguments: Vec<String>,
-    pub return_value: Option<String>,
 
     // WASI states
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
-    // virtual resources
-    resources: HashMap<(usize, ResourceTypeId), ResourceIdMapper>,
 
-    // Dynamic linking state: maps host rep -> guest's ResourceAny
+    /// Per-instance scratch directory, deleted on Drop.
+    scratch_dir: PathBuf,
+
+    // Dynamic linking support for proxy resources
+    /// Maps host rep → guest ResourceAny for dynamic linking
     dynamic_resource_map: HashMap<u32, ResourceAny>,
-    // Reverse map: guest ResourceAny -> host rep (for identity preservation)
-    // ResourceAny doesn't implement Hash, so we use a Vec for linear scan
+    /// Maps guest ResourceAny → host rep (for identity preservation)
     guest_resource_map: Vec<(ResourceAny, u32)>,
-    // Counter for generating unique dynamic resource reps
+    /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
+}
+
+impl Drop for InstanceState {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.scratch_dir);
+        // Unregister the process: destroy all contexts and remove process entries.
+        context::unregister_process(self.id);
+    }
 }
 
 impl WasiView for InstanceState {
@@ -152,21 +68,53 @@ impl WasiHttpView for InstanceState {
 
 impl InstanceState {
     pub async fn new(
-        id: InstanceId,
+        id: ProcessId,
         username: String,
-        arguments: Vec<String>,
+        capture_outputs: bool,
+        policy: &InstancePolicy,
+        token_budget: Option<usize>,
         py_runtime_dir: Option<&Path>,
-    ) -> (Self, OutputDeliveryCtrl) {
+    ) -> anyhow::Result<Self> {
+        // Register the process with all model context managers. Fails if the
+        // admission gate (Σ endowment ≤ capacity × overbook) refuses.
+        // Partial failures are rolled back inside register_process, so Drop
+        // does not need to care about double-unregistration.
+        context::register_process(id, token_budget).await?;
+
         let mut builder = WasiCtx::builder();
-        builder.inherit_network(); // TODO: Replace with socket_addr_check later.
 
-        // Create LogStream instances and keep handles for delivery mode control
-        let stdout_stream = LogStream::new(OutputChannel::Stdout, id);
-        let stderr_stream = LogStream::new(OutputChannel::Stderr, id);
+        // Network capability. `inherit_network` exposes the host network;
+        // `socket_addr_check` filters per-connect/per-bind. Skipping
+        // `inherit_network` denies all socket operations entirely.
+        if policy.network.allow {
+            builder.inherit_network();
+            if !policy.network.is_unrestricted() {
+                let net = policy.network.clone();
+                builder.socket_addr_check(move |addr, _use| {
+                    let ok = net.check(&addr);
+                    Box::pin(async move { ok })
+                });
+            }
+        }
 
-        // Clone the streams for the WASI context (LogStream is cheap to clone due to Arc)
-        builder.stdout(stdout_stream.clone());
-        builder.stderr(stderr_stream.clone());
+        if capture_outputs {
+            builder.stdout(LogStream::new_stdout(id));
+            builder.stderr(LogStream::new_stderr(id));
+        }
+
+        let scratch_dir = policy.fs.base_dir.join(id.to_string());
+
+        if policy.fs.allow {
+            std::fs::create_dir_all(&scratch_dir)
+                .expect("failed to create scratch dir");
+
+            builder.preopened_dir(
+                &scratch_dir,
+                "/scratch",
+                DirPerms::all(),
+                FilePerms::all(),
+            ).expect("failed to preopen scratch dir");
+        }
 
         // Set up Python runtime environment if py-runtime directory is available.
         // Layout: py-runtime/runtime/{python,bundled}, py-runtime/site-packages
@@ -204,41 +152,45 @@ impl InstanceState {
                 .expect("failed to preopen site-packages dir");
         }
 
-        let streaming_ctrl = OutputDeliveryCtrl {
-            stdout_stream,
-            stderr_stream,
-        };
-
-        let state = InstanceState {
+        Ok(InstanceState {
             id,
             username,
-            arguments,
-            return_value: None,
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
-            resources: HashMap::new(),
+            scratch_dir,
+            // Dynamic linking support
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
-        };
-
-        (state, streaming_ctrl)
+        })
     }
 
-    /// Allocate a unique rep for dynamic resource mapping
+    pub fn id(&self) -> ProcessId {
+        self.id
+    }
+
+    pub fn get_username(&self) -> String {
+        self.username.clone()
+    }
+
+    // ========================================================================
+    // Dynamic Linking Support Methods
+    // ========================================================================
+
+    /// Allocates a new host rep for dynamic resource mapping.
     pub fn alloc_dynamic_rep(&mut self) -> u32 {
         let rep = self.next_dynamic_rep;
         self.next_dynamic_rep = self.next_dynamic_rep.checked_add(1).unwrap();
         rep
     }
 
-    /// Get the guest resource for a given host rep
+    /// Gets the guest ResourceAny for a given host rep.
     pub fn get_dynamic_resource(&self, rep: u32) -> Option<ResourceAny> {
         self.dynamic_resource_map.get(&rep).copied()
     }
 
-    /// Look up host rep for an existing guest resource (for identity preservation)
+    /// Gets the host rep for a given guest ResourceAny (for identity preservation).
     pub fn rep_for_guest_resource(&self, resource: ResourceAny) -> Option<u32> {
         self.guest_resource_map
             .iter()
@@ -246,299 +198,22 @@ impl InstanceState {
             .map(|(_, rep)| *rep)
     }
 
-    /// Insert a bidirectional mapping between host rep and guest resource
+    /// Inserts a mapping between host rep and guest ResourceAny.
     pub fn insert_dynamic_resource_mapping(&mut self, rep: u32, resource: ResourceAny) {
         self.dynamic_resource_map.insert(rep, resource);
-        // Only add to reverse map if not already present
+        // Only insert the reverse mapping if not already present
         if self.rep_for_guest_resource(resource).is_none() {
             self.guest_resource_map.push((resource, rep));
         }
     }
 
-    /// Remove a resource mapping by host rep (returns the guest resource if found)
+    /// Removes the mapping for a host rep and returns the guest ResourceAny.
     pub fn remove_dynamic_resource_mapping(&mut self, rep: u32) -> Option<ResourceAny> {
-        let resource = self.dynamic_resource_map.remove(&rep);
-        if let Some(resource) = resource {
+        if let Some(resource) = self.dynamic_resource_map.remove(&rep) {
             self.guest_resource_map.retain(|(r, _)| *r != resource);
             Some(resource)
         } else {
             None
         }
-    }
-
-    pub fn id(&self) -> InstanceId {
-        self.id
-    }
-
-    pub fn arguments(&self) -> &[String] {
-        &self.arguments
-    }
-
-    pub fn return_value(&self) -> Option<String> {
-        self.return_value.clone()
-    }
-
-    pub fn read_queue(&self, queue: &Resource<Queue>) -> Result<(usize, u32, u32)> {
-        let q = self.resource_table.get(&queue)?;
-        Ok((q.service_id, q.uid, q.priority))
-    }
-    pub fn map_resources(
-        &mut self,
-        service_id: usize,
-        resource_type: ResourceTypeId,
-        phys_ids: &[ResourceId],
-    ) -> Vec<ResourceId> {
-        self.resources
-            .entry((service_id, resource_type))
-            .or_default()
-            .map_resources(phys_ids)
-    }
-
-    pub fn unmap_resources(
-        &mut self,
-        service_id: usize,
-        resource_type: ResourceTypeId,
-        virt_ids: &[ResourceId],
-    ) {
-        let m = self.resources.get_mut(&(service_id, resource_type));
-        if let Some(m) = m {
-            m.unmap_resources(virt_ids);
-        }
-    }
-
-    pub fn translate_resource_ptr(
-        &self,
-        service_id: usize,
-        resource_type: ResourceTypeId,
-        virt_id: ResourceId,
-    ) -> Result<ResourceId> {
-        let m = self
-            .resources
-            .get(&(service_id, resource_type))
-            .ok_or(format_err!(
-                "Failed to find resource mapper for service_id: {:?}, resource_type: {:?}",
-                service_id,
-                resource_type
-            ))?;
-        let phys_id = m.translate(virt_id).ok_or(format_err!(
-            "Failed to translate resource pointer: {:?} -> {:?}",
-            virt_id,
-            m.virtual_to_physical
-        ))?;
-        Ok(phys_id)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum OutputChannel {
-    Stdout,
-    Stderr,
-}
-
-impl OutputChannel {
-    /// Send the output to the server so that it can be delivered to the client
-    fn dispatch_output(&self, content: String, instance_id: InstanceId) {
-        match self {
-            OutputChannel::Stdout => InstanceEvent::StreamingOutput {
-                inst_id: instance_id,
-                output_type: OutputChannel::Stdout,
-                content,
-            }
-            .dispatch(),
-            OutputChannel::Stderr => InstanceEvent::StreamingOutput {
-                inst_id: instance_id,
-                output_type: OutputChannel::Stderr,
-                content,
-            }
-            .dispatch(),
-        }
-    }
-}
-
-/// Output mode for LogStream
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(u8)]
-pub enum OutputDelivery {
-    /// Buffer output in a circular buffer, discarding old content when full
-    Buffered = 0,
-    /// Stream buffered content via instance events
-    Streamed = 1,
-}
-
-impl OutputDelivery {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => OutputDelivery::Buffered,
-            1 => OutputDelivery::Streamed,
-            _ => OutputDelivery::Buffered, // Default to buffering for invalid values
-        }
-    }
-
-    fn to_u8(self) -> u8 {
-        self as u8
-    }
-}
-
-#[derive(Clone)]
-struct LogStream {
-    channel: OutputChannel,
-    state: Arc<LogStreamState>,
-}
-
-struct LogStreamState {
-    instance_id: InstanceId,
-    mode: AtomicU8,
-    buffer: Mutex<AllocRingBuffer<u8>>,
-    /// Tracks whether output is allowed to be written.
-    /// Starts as false to prevent output before the instance ID is sent to the client.
-    output_allowed: AtomicBool,
-    /// Notifies async waiters when output becomes allowed.
-    output_allowed_notify: Notify,
-}
-
-impl LogStream {
-    /// Default buffer capacity: 1MB
-    const DEFAULT_BUFFER_CAPACITY: usize = 1024 * 1024;
-
-    fn new(channel: OutputChannel, instance_id: InstanceId) -> LogStream {
-        LogStream {
-            channel,
-            state: Arc::new(LogStreamState {
-                instance_id,
-                mode: AtomicU8::new(OutputDelivery::Buffered.to_u8()),
-                buffer: Mutex::new(AllocRingBuffer::new(Self::DEFAULT_BUFFER_CAPACITY)),
-                output_allowed: AtomicBool::new(false),
-                output_allowed_notify: Notify::new(),
-            }),
-        }
-    }
-
-    /// Allow output to be written to this stream.
-    /// This should be called after the instance ID has been communicated to the client.
-    fn allow_output(&self) {
-        self.state.output_allowed.store(true, Ordering::Release);
-        self.state.output_allowed_notify.notify_waiters();
-    }
-
-    /// Set the delivery mode to buffering
-    pub fn set_deliver_to_buffer(&self) {
-        self.state
-            .mode
-            .store(OutputDelivery::Buffered.to_u8(), Ordering::Release);
-    }
-
-    /// Set the delivery mode to streaming
-    ///
-    /// When transitioning from buffering to streaming, any buffered content
-    /// will be immediately flushed.
-    pub fn set_deliver_to_stream(&self) {
-        self.state
-            .mode
-            .store(OutputDelivery::Streamed.to_u8(), Ordering::Release);
-        self.flush_buffer();
-    }
-
-    /// Flush any buffered content to output
-    fn flush_buffer(&self) {
-        let mut buffer = self.state.buffer.lock().unwrap();
-        if !buffer.is_empty() {
-            let content = String::from_utf8_lossy(&buffer.drain().collect::<Vec<u8>>()).to_string();
-            self.channel
-                .dispatch_output(content, self.state.instance_id);
-        }
-    }
-
-    /// Write bytes according to the current mode
-    fn write_bytes(&self, bytes: &[u8]) {
-        let mode = OutputDelivery::from_u8(self.state.mode.load(Ordering::Acquire));
-
-        match mode {
-            // In buffering mode, append to the circular buffer
-            OutputDelivery::Buffered => {
-                let mut buffer = self.state.buffer.lock().unwrap();
-                buffer.extend(bytes.iter().copied());
-            }
-            // In streaming mode, dispatch the new content immediately
-            OutputDelivery::Streamed => {
-                self.channel.dispatch_output(
-                    String::from_utf8_lossy(&bytes).to_string(),
-                    self.state.instance_id,
-                );
-            }
-        }
-    }
-}
-
-impl StdoutStream for LogStream {
-    fn p2_stream(&self) -> Box<dyn OutputStream> {
-        Box::new(self.clone())
-    }
-    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
-        Box::new(self.clone())
-    }
-}
-
-impl IsTerminal for LogStream {
-    fn is_terminal(&self) -> bool {
-        match &self.channel {
-            OutputChannel::Stdout => false,
-            OutputChannel::Stderr => false,
-        }
-    }
-}
-
-impl OutputStream for LogStream {
-    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
-        self.write_bytes(&bytes);
-        Ok(())
-    }
-
-    fn flush(&mut self) -> StreamResult<()> {
-        Ok(())
-    }
-
-    fn check_write(&mut self) -> StreamResult<usize> {
-        // If output is not allowed yet, return 0 to signal backpressure.
-        // This prevents writes until the instance ID has been sent to the client.
-        if !self.state.output_allowed.load(Ordering::Acquire) {
-            Ok(0)
-        } else {
-            Ok(1024 * 1024)
-        }
-    }
-}
-
-#[async_trait]
-impl Pollable for LogStream {
-    async fn ready(&mut self) {
-        // IMPORTANT: Call notified() BEFORE checking the condition to avoid
-        // missing the notification (lost wakeup problem).
-        let notified = self.state.output_allowed_notify.notified();
-
-        // Wait until output is allowed before becoming ready.
-        // This prevents a race condition where output is sent before
-        // the client receives the instance ID.
-        if !self.state.output_allowed.load(Ordering::Acquire) {
-            notified.await;
-        }
-    }
-}
-
-impl AsyncWrite for LogStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.write_bytes(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
     }
 }

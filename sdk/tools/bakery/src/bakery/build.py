@@ -8,14 +8,15 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 from pathlib import Path
-from typing import Optional
 
 from rich.panel import Panel
 from .console import console
 from . import path as path_utils
+from . import py_runtime
 import typer
 
 
@@ -75,9 +76,29 @@ def to_python_ident(name: str) -> str:
     return name.replace("-", "_")
 
 
+def find_command(cmd: str) -> str | None:
+    """Locate ``cmd`` on PATH or alongside the running interpreter.
+
+    The interpreter-bin fallback matters when bakery is invoked through
+    ``pie build`` via the venv's absolute path from outside the venv's
+    activation: PATH won't include the venv's bin/, but tools like
+    ``componentize-py`` (installed by ``factored-componentize-py``) live
+    there.
+    """
+    if found := shutil.which(cmd):
+        return found
+    candidate = Path(sys.executable).parent / cmd
+    return str(candidate) if candidate.exists() else None
+
+
 def command_exists(cmd: str) -> bool:
-    """Check if a command is available in PATH."""
-    return shutil.which(cmd) is not None
+    return find_command(cmd) is not None
+
+
+def resolve_command(cmd: str) -> str:
+    """Resolved path for ``cmd``, or the bare name as a fallback so the
+    OS surfaces the usual "command not found" error."""
+    return find_command(cmd) or cmd
 
 
 def detect_platform(input_path: Path) -> str:
@@ -207,8 +228,17 @@ def generate_py_wrapper(
 # This wrapper provides the WIT interface for the inferlet
 # Package: {package_name}
 
+import asyncio
+
 # Import WIT bindings for the run export
 from wit_world import exports
+from wit_world.imports.poll import poll as _wasi_poll
+
+# `componentize_py_types.Err` is the exception class that componentize-py
+# uses to encode the Err arm of a `result<T, E>` return. We catch any
+# uncaught Python exception from the user's main() and re-raise it as
+# this so the host receives a clean WIT Err instead of a wasm trap.
+from componentize_py_types import Err as _WitErr
 
 # Import inferlet at top level so componentize-py bundles it
 import inferlet as _inferlet
@@ -216,17 +246,145 @@ import inferlet as _inferlet
 # Import user module at top level so componentize-py bundles it
 import {module_name} as _user_module
 
+
+# Minimal PollLoop — custom asyncio event loop backed by wasi:io/poll.
+class _PollLoop(asyncio.AbstractEventLoop):
+    def __init__(self):
+        self.wakers = []
+        self.running = False
+        self.handles = []
+        self.exception = None
+
+    def get_debug(self):
+        return False
+
+    def run_until_complete(self, future):
+        future = asyncio.ensure_future(future, loop=self)
+        self.running = True
+        asyncio.events._set_running_loop(self)
+        while self.running and not future.done():
+            handles = self.handles
+            self.handles = []
+            for handle in handles:
+                if not handle._cancelled:
+                    handle._run()
+            if self.wakers:
+                [pollables, wakers] = list(map(list, zip(*self.wakers)))
+                new_wakers = []
+                ready = [False] * len(pollables)
+                for index in _wasi_poll(pollables):
+                    ready[index] = True
+                for (r, p), w in zip(zip(ready, pollables), wakers):
+                    if r:
+                        p.__exit__(None, None, None)
+                        w.set_result(None)
+                    else:
+                        new_wakers.append((p, w))
+                self.wakers = new_wakers
+            if self.exception is not None:
+                raise self.exception
+        return future.result()
+
+    def is_running(self):
+        return self.running
+
+    def is_closed(self):
+        return not self.running
+
+    def stop(self):
+        self.running = False
+
+    def close(self):
+        self.running = False
+
+    def shutdown_asyncgens(self):
+        pass
+
+    def call_exception_handler(self, context):
+        self.exception = context.get("exception", None)
+
+    def call_soon(self, callback, *args, context=None):
+        handle = asyncio.Handle(callback, args, self, context)
+        self.handles.append(handle)
+        return handle
+
+    def create_task(self, coroutine):
+        return asyncio.Task(coroutine, loop=self)
+
+    def create_future(self):
+        return asyncio.Future(loop=self)
+
+    def run_forever(self):
+        raise NotImplementedError
+
+    async def shutdown_default_executor(self):
+        raise NotImplementedError
+
+    def _timer_handle_cancelled(self, handle):
+        raise NotImplementedError
+
+    def call_later(self, delay, callback, *args, context=None):
+        raise NotImplementedError
+
+    def call_at(self, when, callback, *args, context=None):
+        raise NotImplementedError
+
+    def time(self):
+        raise NotImplementedError
+
+    def call_soon_threadsafe(self, callback, *args, context=None):
+        raise NotImplementedError
+
+    def run_in_executor(self, executor, func, *args):
+        raise NotImplementedError
+
+    def set_default_executor(self, executor):
+        raise NotImplementedError
+
+
 class Run(exports.Run):
-    def run(self) -> None:
-        # Call the user's main function if it exists
-        if hasattr(_user_module, 'main'):
-            _user_module.main()
-        else:
-            # Module execution happens at import time for scripts without main()
-            pass
-        # Signal completion if user code didn't call set_return()
-        if not _inferlet.was_return_set():
-            _inferlet.set_return("")
+    def run(self, input: str) -> str:
+        # Install PollLoop as the asyncio event loop (drives wasi:io/poll)
+        loop = _PollLoop()
+        asyncio.set_event_loop(loop)
+
+        import json
+        # Parse JSON input into a dict for the user's main()
+        try:
+            input_data = json.loads(input) if input else {{}}
+        except json.JSONDecodeError:
+            input_data = {{"input": input}}
+
+        # Call the user's main function, passing parsed input. Translate
+        # any Python exception into the WIT Err variant so the host sees
+        # a clean error string rather than a wasm trap.
+        try:
+            if hasattr(_user_module, 'main'):
+                result = _user_module.main(input_data)
+                # Support both sync and async main()
+                if asyncio.iscoroutine(result):
+                    result = loop.run_until_complete(result)
+                # Pass through strings; JSON-stringify everything else
+                # (dict, list, primitives, dataclasses). Objects with a
+                # `model_dump_json` method are handed off to it — useful
+                # for any future WASM-compatible pydantic-shaped class
+                # (pydantic v2 itself does not load in WASM today).
+                if result is None:
+                    return _inferlet.get_return_value() or ""
+                if isinstance(result, str):
+                    return result
+                if hasattr(result, "model_dump_json") and callable(result.model_dump_json):
+                    return result.model_dump_json()
+                return json.dumps(result, default=str)
+            else:
+                # Module execution happens at import time for scripts without main()
+                pass
+
+            return _inferlet.get_return_value() or ""
+        except _WitErr:
+            raise  # already shaped for componentize-py
+        except BaseException as e:
+            raise _WitErr(str(e))
 """
 
     output_path.write_text(wrapper_content)
@@ -289,7 +447,7 @@ def generate_dynamic_wit(
 
 // Dynamic run interface for this inferlet
 interface run {{
-    run: func() -> result<_, string>;
+    run: func(input: string) -> result<string, string>;
 }}
 
 // Exec world with imports and dynamic export
@@ -335,7 +493,7 @@ def run_componentize_py(
     )
 
     cmd = [
-        "componentize-py",
+        resolve_command("componentize-py"),
         "-d",
         str(temp_wit_dir),
         "-w",
@@ -365,28 +523,13 @@ def run_componentize_py(
 
 
 def get_inferlet_wit_path() -> Path:
-    """Get the path to the inferlet WIT directory.
+    """Get the path to the inferlet WIT directory (sdk/rust/inferlet/wit).
 
-    This is sdk/rust/inferlet/wit/ which contains all WIT definitions
-    with properly structured deps/.
-
-    Raises:
-        FileNotFoundError: If the WIT directory cannot be found.
+    Delegates to ``path.get_wit_path`` so the resolution order (env
+    override → cwd walk → bakery install location walk) stays consistent
+    across modules.
     """
-    if pie_sdk := os.environ.get("PIE_SDK"):
-        path = Path(pie_sdk) / "rust" / "inferlet" / "wit"
-        if path.exists():
-            return path
-
-    current_dir = Path.cwd()
-    for parent in [current_dir] + list(current_dir.parents):
-        wit_path = parent / "sdk" / "rust" / "inferlet" / "wit"
-        if wit_path.exists():
-            return wit_path
-
-    raise FileNotFoundError(
-        "Could not find sdk/rust/inferlet/wit directory. Please set PIE_SDK environment variable."
-    )
+    return path_utils.get_wit_path()
 
 
 def handle_python_build(input_path: Path, output: Path, debug: bool = False) -> None:
@@ -413,6 +556,24 @@ def handle_python_build(input_path: Path, output: Path, debug: bool = False) -> 
     # Read package name from Pie.toml
     project_dir = input_path if input_path.is_dir() else input_path.parent
     package_name = read_package_name(project_dir)
+
+    # The built WASM imports `componentize-py-runtime` from the host at
+    # run time — fetch that runtime now if it's missing so the user
+    # doesn't get a cryptic linker error later. Best-effort: a network
+    # failure here doesn't block the build, it just means `pie run`
+    # will need to retry.
+    if not py_runtime.is_installed():
+        console.print(
+            "[dim]Python WASM runtime not installed; fetching for first use…[/dim]"
+        )
+        try:
+            py_runtime.ensure_installed()
+        except Exception as exc:
+            console.print(
+                f"[yellow]⚠[/yellow]  Could not fetch Python WASM runtime ({exc}). "
+                "The build will continue but `pie run` will need it before "
+                "the inferlet can execute."
+            )
 
     # Resolve paths
     with console.status("[bold green]Resolving paths...[/bold green]"):
@@ -517,6 +678,7 @@ def run_esbuild_user_code(entry_point: Path, output_file: Path) -> None:
     """Bundle user code with esbuild (keeps inferlet imports external)."""
     cmd = [
         "npx",
+        "-y",
         "esbuild",
         str(entry_point),
         "--bundle",
@@ -578,6 +740,7 @@ def run_esbuild(
 
     cmd = [
         "npx",
+        "-y",
         "esbuild",
         str(entry_point),
         "--bundle",
@@ -595,7 +758,7 @@ def run_esbuild(
         cmd.append("--minify")
 
     # External WIT imports
-    cmd.extend(["--external:wasi:*", "--external:inferlet:*"])
+    cmd.extend(["--external:wasi:*", "--external:inferlet:*", "--external:pie:*"])
 
     # External Node.js built-ins
     nodejs_builtins = [
@@ -634,6 +797,7 @@ def run_componentize_js(
 
     cmd = [
         "npx",
+        "-y",
         "@bytecodealliance/componentize-js",
         str(input_js),
         "-o",
@@ -788,10 +952,6 @@ for (const node of ast.body) {
             console.error("FORBIDDEN:run");
             process.exit(1);
         }
-        if (name === "main") {
-            console.error("FORBIDDEN:main");
-            process.exit(1);
-        }
     }
 }
 console.log("OK");
@@ -827,11 +987,7 @@ console.log("OK");
                     "To fix: Remove the 'export const run = { ... }' block from your code.\n"
                     "The WIT interface is now automatically created by bakery build."
                 )
-            elif stderr.startswith("FORBIDDEN:main"):
-                raise RuntimeError(
-                    "User code must not export 'main' - use top-level code instead.\n\n"
-                    "To fix: Move your code from inside main() to the top level."
-                )
+
             else:
                 raise RuntimeError(f"Validation failed: {stderr}")
     finally:
@@ -871,17 +1027,41 @@ if (typeof globalThis.Intl === 'undefined') {
     wrapper_content = f"""// Auto-generated by bakery build
 // This wrapper provides the WIT interface for the inferlet
 {intl_polyfill}
+// Import user's main function
+import {{ main as userMain }} from './{user_bundle_name}';
+
 // WIT interface export (inferlet:core/run)
 export const run = {{
-  run: async () => {{
-    try {{
-      await import('./{user_bundle_name}');
-      return {{ tag: 'ok' }};
-    }} catch (e) {{
-      const msg = e instanceof Error ? `${{e.message}}\\n${{e.stack}}` : String(e);
-      console.log(`\\nERROR: ${{msg}}\\n`);
-      return {{ tag: 'err', val: msg }};
+  async run(input) {{
+    if (typeof userMain === 'function') {{
+      // Parse JSON input into an object for the user's main(), mirroring
+      // the Python wrapper. If input isn't valid JSON, fall back to
+      // {{ input: <raw> }}.
+      let inputData = {{}};
+      if (input) {{
+        try {{
+          inputData = JSON.parse(input);
+        }} catch {{
+          inputData = {{ input }};
+        }}
+      }}
+      let result;
+      try {{
+        result = await userMain(inputData);
+      }} catch (e) {{
+        // componentize-js maps a thrown *string* to the WIT
+        // `result<_, string>::Err` variant; throwing an Error object
+        // would trap. Coerce so users can `throw new Error(...)` idiomatically.
+        if (typeof e === 'string') throw e;
+        throw String(e?.message ?? e);
+      }}
+      // Pass strings through; JSON-stringify everything else (objects,
+      // arrays, primitives). null/undefined become empty string.
+      if (result == null) return '';
+      if (typeof result === 'string') return result;
+      return JSON.stringify(result);
     }}
+    return '';
   }},
 }};
 """
@@ -972,17 +1152,15 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
 
     Build process:
     1. Check prerequisites (Node.js, npx)
-    2. Read package name from Pie.toml
-    3. Find inferlet-js and WIT paths
-    4. Ensure npm dependencies installed
-    5. Detect input type (file or package)
-    6. Bundle user code with esbuild
-    7. Check for Node.js imports (warnings)
-    8. Validate user code (no export run/main)
-    9. Generate WIT wrapper
-    10. Generate dynamic WIT with package-specific export
-    11. Bundle wrapper with esbuild
-    12. Compile to WASM with componentize-js
+    2. Find inferlet-js and WIT paths
+    3. Ensure npm dependencies installed
+    4. Detect input type (file or package)
+    5. Bundle user code with esbuild
+    6. Check for Node.js imports (warnings)
+    7. Validate user code (no export run/main)
+    8. Generate WIT wrapper
+    9. Bundle wrapper with esbuild
+    10. Compile to WASM with componentize-js
     """
     # Check prerequisites
     if not command_exists("node"):
@@ -1010,7 +1188,6 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
     console.print("[bold]🏗️  Building JS inferlet...[/bold]")
     console.print(f"   Input: [blue]{input_path}[/blue]")
     console.print(f"   Output: [blue]{output}[/blue]")
-    console.print(f"   Package: [dim]{package_name}[/dim]")
 
     # Detect input type
     input_type, entry_point = detect_js_input_type(input_path)
@@ -1047,8 +1224,10 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
             status.update("[bold green]📦 Bundling final output...[/bold green]")
             run_esbuild(wrapper_js, final_bundle, inferlet_js_path, debug)
 
-            # Step 6: Generate dynamic WIT with package-specific export
-            status.update("[bold green]🔧 Generating dynamic WIT...[/bold green]")
+            # Step 6: Generate dynamic WIT directory with exec world
+            status.update(
+                "[bold green]🔧 Generating dynamic WIT...[/bold green]"
+            )
             temp_wit_dir = temp_path / "wit"
             generate_dynamic_wit(wit_path, temp_wit_dir, package_name)
 

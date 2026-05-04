@@ -1,0 +1,93 @@
+---
+title: Portable
+description: Configuration and supported architectures for the standalone ggml-based driver
+sidebar_position: 3
+---
+
+# Portable
+
+`type = "portable"`. An embedded ggml-backed driver built from `driver/portable/` on top of vendored llama.cpp/ggml. Loads HuggingFace safetensors directly, no GGUF conversion. CPU is the default backend; CUDA, Vulkan, Metal, HIP, and SYCL backends are selected at C++ build time via `GGML_*=ON` CMake flags.
+
+Pick `portable` for CPU-only inference, non-NVIDIA GPUs (Vulkan / Metal / HIP / SYCL), or any host where you want a self-contained binary without a Python runtime.
+
+## Install
+
+The default installer uses `portable` when no supported CUDA build is detected:
+
+```bash
+curl -fsSL https://pie-project.org/install.sh | bash
+```
+
+To force the portable build:
+
+```bash
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=portable bash
+```
+
+From source, `cargo install --path server` builds `pie` with `driver-portable` enabled by default. CUDA-capable portable release artifacts are named `portable-cuda12.6`, `portable-cuda12.8`, and `portable-cuda13.0`.
+
+## Configuration
+
+```toml
+[model.driver]
+type = "portable"
+device = ["cpu"]                  # or ["cuda:0"] / ["metal"] / ["vulkan"] depending on the build
+activation_dtype = "bfloat16"
+
+[model.driver.options]
+kv_page_size         = 32
+max_num_kv_pages     = 1024
+max_batch_tokens     = 10240
+max_batch_size       = 512
+cpu_pages            = 0
+n_ctx                = 4096
+n_gpu_layers         = 0
+ready_timeout_s      = 120.0
+shutdown_timeout_s   = 5.0
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `binary_path` | `""` | Accepted for older config compatibility, ignored by standalone `pie`; the driver is embedded. |
+| `kv_page_size` | `32` | KV cache page size in tokens. |
+| `max_num_kv_pages` | `1024` | KV pool size. KV memory scales linearly. |
+| `max_batch_tokens` | `10240` | Cap on tokens per fire_batch. |
+| `max_batch_size` | `512` | Cap on sequences per fire_batch. |
+| `cpu_pages` | `0` | Host-side swap pool capacity. `0` = no swap. |
+| `n_ctx` | `4096` | Informational max position the binary will accept. Real KV capacity is `max_num_kv_pages * kv_page_size` slots flexibly shared across contexts. |
+| `n_gpu_layers` | `0` | `0` = CPU only, `-1` = offload all layers to a GPU backend, `N` = first `N` layers. Takes effect only when GPU backends are linked into the binary. |
+| `ready_timeout_s` | `120.0` | Seconds to wait for `READY` on stdout. |
+| `shutdown_timeout_s` | `5.0` | Seconds to wait for graceful shutdown after SIGTERM. |
+
+## Supported architectures
+
+Verified end-to-end on RTX PRO 6000 Blackwell (CUDA backend):
+
+| Family | HF `model_type` | Status | Notes |
+|---|---|---|---|
+| **Llama 3.x** | `llama` | stable | All sizes (1B-70B); base + instruct. |
+| **Qwen 2.x** | `qwen2` | stable | Qwen2 / Qwen2.5 all sizes. |
+| **Qwen 3.x** | `qwen3` | stable | Qwen3 incl. the 0.6B default. |
+| **Qwen 3 MoE** | `qwen3_moe` | preview | Qwen3-30B-A3B verified loads. |
+| **Qwen 3.5 / 3.6** | `qwen3_5` | preview | Linear-attention layers wired. |
+| **Qwen 3.5 MoE** | `qwen3_5_moe` | preview | 35B-A3B verified loads. |
+| **Phi-3** | `phi3` | stable | mini / medium (instruct + base). |
+| **Phi-3-small** | `phi3small` | preview | Loads + runs; v1 graph treats blocksparse as causal (correct for prompts ≤ 1024 tokens). End-to-end inferlet test blocked on tiktoken→tokenizer.json conversion. |
+| **Phi-3.5 / Phi-4** | `phi3` | stable | Phi-3.5-mini-instruct, Phi-4 (14B), Phi-4-mini-instruct, Phi-4-reasoning, Phi-4-mini-reasoning all work via the existing `phi3` arch (canonical pangram on RTX PRO 6000 Blackwell). |
+| **Phi-3.5-MoE** | `phimoe` | stable | 42B-A6.6B sparse MoE. Mixtral-style per-expert w1/w2/w3 + LayerNorm-with-bias + Q/K/V/O biases + lm_head bias. End-to-end canonical pangram. |
+| **Mixtral** | `mixtral` | preview | 8x7B verified end-to-end. |
+| **Gemma 2** | `gemma2` | stable | 2B / 9B / 27B. |
+| **Gemma 3** | `gemma3`, `gemma3_text` | stable | 270M / 1B text-only AND 4B / 12B / 27B multimodal-wrapped. |
+| **Gemma 3n** | `gemma3n` | stable | E2B-it / E4B-it (AltUp + PLE + Laurel + KV-share). |
+| **Gemma 4** | `gemma4`, `gemma4_text` | stable for dense | Mobile (E2B / E4B), 31B (alt-attention + per-layer KV). |
+| **Gemma 4 MoE** | `gemma4` (with experts) | — | 26B-A4B: loader-only; expert dispatch graph not yet wired. |
+| **Mistral 7B / Mistral 3** | `mistral`, `mistral3` | stable | Ministral 3 (3B / 8B / 14B), Mistral-Small 24B / 3.1-24B. |
+| **OLMo 2** | `olmo2` | stable | Mapped to the `olmo3` arch via dispatch alias (`hf_config.cpp`). |
+| **OLMo 3** | `olmo3` | stable | 7B / 32B base. |
+| **GPT-OSS** | `gptoss`, `gpt_oss` | preview | 20B verified (MXFP4 dequant path). |
+
+Architectures listed as **stable** have produced canonical outputs on instruct-tuned variants (e.g., Phi-3-mini-instruct → "The quick brown fox jumps over the lazy dog. This sentence is a pangram…"). Base checkpoints loop on the inferlet's chat-template wrap; use the `raw-completion` inferlet for clean base-model output.
+
+## Quantization
+
+Not configurable via Pie. The portable driver loads weights at their stored dtype directly from safetensors; only `activation_dtype` (one level up under `[model.driver]`) is configurable. For weight-side quantization, use the [CUDA driver](./cuda#quantization).

@@ -1,0 +1,23 @@
+---
+title: Chat and generation
+description: Minimal text generation in Rust, Python, and JavaScript
+sidebar_position: 2
+---
+
+# Chat and generation
+
+The starting point. Each of these is a small inferlet that loads a model, builds a chat prompt, and streams a reply.
+
+| Inferlet | What it shows |
+|---|---|
+| [`helloworld`](https://github.com/pie-project/pie/tree/main/inferlets/helloworld) | Minimal `#[inferlet::main]` with typed JSON input/output. |
+| [`text-completion`](https://github.com/pie-project/pie/tree/main/inferlets/text-completion) | Chat-style generation via `Context::system / user / cue`, the per-step `Generator`, and independent `chat::Decoder` and `reasoning::Decoder`. |
+| [`text-completion-spec`](https://github.com/pie-project/pie/tree/main/inferlets/text-completion-spec) | Same shape, but exercises the speculative-decoding path (`Speculation::Default` → backend NGRAM). |
+| [`python-example`](https://github.com/pie-project/pie/tree/main/inferlets/python-example) | Text completion in Python. |
+| [`js-example`](https://github.com/pie-project/pie/tree/main/inferlets/js-example) | Text completion in JavaScript. |
+
+## Related guide
+
+- [Generation overview](../decoder/overview): the three-layer model that these inferlets drive.
+- [Generator](../decoder/generator): the multi-step loop they all use.
+- [Chat parser](../decoder/chat): the streaming text parser the chat-style examples feed.

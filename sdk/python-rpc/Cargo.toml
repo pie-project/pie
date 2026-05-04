@@ -1,0 +1,21 @@
+[package]
+name = "pie-rpc"
+version = "0.3.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Python bindings for pie's RPC primitive (RpcServer). Drivers running as Python subprocesses use this to receive cold-path requests from the pie runtime and respond — pairs with the shmem fast path for `fire_batch`."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_rpc"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# `pie` is the runtime crate. After Phase 8 it has no `python` feature
+# to gate — pyo3 only lives here, in pie-rpc, which exclusively owns
+# the `RpcServer` pyclass and uses runtime as a typed dep.
+pie = { path = "../../runtime" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+anyhow = "1.0"

@@ -1,0 +1,13 @@
+[package]
+name = "knowledge-graph"
+version = "0.1.0"
+description = "Knowledge graph extraction + graph traversal via petgraph"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+max_tokens = {type = "int", optional = true, description = "Max tokens per generation step (default: 2048)"}
+depth = {type = "int", optional = true, description = "Graph traversal depth (default: 3)"}

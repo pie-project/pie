@@ -1,4 +1,20 @@
-"""Path utilities for Bakery."""
+"""Path utilities for Bakery.
+
+Resolves the locations bakery needs at build time: the SDK root (where
+``sdk/rust/inferlet/wit/`` and friends live), and the per-language
+inferlet libraries.
+
+Resolution order for each path:
+  1. ``PIE_SDK`` env var (explicit override; users opt in)
+  2. Walk upward from the current working directory looking for ``sdk/``
+  3. Walk upward from this package's install location — covers the
+     ``uv pip install -e sdk/tools/bakery`` case where bakery is editable
+     inside the pie checkout but the user invokes ``pie build`` from
+     somewhere else (e.g. their inferlet directory under /tmp).
+
+If all three fail we raise a ``FileNotFoundError`` with a clear hint
+about ``PIE_SDK``.
+"""
 
 import os
 from pathlib import Path
@@ -19,27 +35,45 @@ def get_config_path() -> Path:
     return get_bakery_home() / "config.toml"
 
 
+def _candidate_roots() -> list[Path]:
+    """Where to start the upward walk from.
+
+    cwd first (developer working in their inferlet), then the directory
+    bakery itself was installed from (covers the case where bakery is
+    editable inside a pie checkout but invoked from outside).
+    """
+    return [Path.cwd(), Path(__file__).resolve().parent]
+
+
+def _find_upward(anchor: Path) -> Path | None:
+    """Walk upward from each candidate root looking for ``parent / anchor``.
+
+    Returns the matching ``parent`` (the directory *containing* the
+    anchor), so callers can take any sub-path of it.
+    """
+    for start in _candidate_roots():
+        for parent in [start] + list(start.parents):
+            if (parent / anchor).exists():
+                return parent
+    return None
+
+
 def get_sdk_root() -> Path | None:
     """Find the SDK root directory.
 
-    Searches in order:
-    1. PIE_SDK environment variable
-    2. Walk up from current directory looking for sdk/
+    Searches in order: PIE_SDK env var, then upward from cwd / bakery
+    install location for a ``sdk/rust/inferlet/wit`` anchor (specific
+    enough to avoid matching unrelated ``sdk/`` directories).
 
     Returns:
-        Path to SDK root, or None if not found.
+        Path to ``sdk/``, or None if not found.
     """
     if pie_sdk := os.environ.get("PIE_SDK"):
         path = Path(pie_sdk)
         if path.exists():
             return path
-
-    current_dir = Path.cwd()
-    for parent in [current_dir] + list(current_dir.parents):
-        sdk_path = parent / "sdk"
-        if sdk_path.exists() and sdk_path.is_dir():
-            return sdk_path
-    return None
+    parent = _find_upward(Path("sdk/rust/inferlet/wit"))
+    return parent / "sdk" if parent is not None else None
 
 
 def get_inferlet_js_path() -> Path:
@@ -52,13 +86,9 @@ def get_inferlet_js_path() -> Path:
         path = Path(pie_sdk) / "javascript"
         if path.exists():
             return path
-
-    current_dir = Path.cwd()
-    for parent in [current_dir] + list(current_dir.parents):
-        inferlet_js_path = parent / "sdk" / "javascript"
-        if inferlet_js_path.exists() and (inferlet_js_path / "package.json").exists():
-            return inferlet_js_path
-
+    parent = _find_upward(Path("sdk/javascript/package.json"))
+    if parent is not None:
+        return parent / "sdk" / "javascript"
     raise FileNotFoundError(
         "Could not find inferlet-js library. Please set PIE_SDK environment variable."
     )
@@ -71,22 +101,18 @@ def get_wit_path() -> Path:
         FileNotFoundError: If WIT directory cannot be found.
     """
     if pie_sdk := os.environ.get("PIE_SDK"):
-        path = Path(pie_sdk) / "rust" / "inferlet" / "wit"
-        if path.exists() and (path / "world.wit").exists():
-            return path
-        path = Path(pie_sdk) / "interfaces"
-        if path.exists():
-            return path
-
-    current_dir = Path.cwd()
-    for parent in [current_dir] + list(current_dir.parents):
-        wit_path = parent / "sdk" / "rust" / "inferlet" / "wit"
-        if wit_path.exists() and (wit_path / "world.wit").exists():
-            return wit_path
-        wit_path = parent / "sdk" / "interfaces"
-        if wit_path.exists():
-            return wit_path
-
+        wit = Path(pie_sdk) / "rust" / "inferlet" / "wit"
+        if wit.exists() and (wit / "world.wit").exists():
+            return wit
+        legacy = Path(pie_sdk) / "interfaces"
+        if legacy.exists():
+            return legacy
+    parent = _find_upward(Path("sdk/rust/inferlet/wit/world.wit"))
+    if parent is not None:
+        return parent / "sdk" / "rust" / "inferlet" / "wit"
+    parent = _find_upward(Path("sdk/interfaces"))
+    if parent is not None:
+        return parent / "sdk" / "interfaces"
     raise FileNotFoundError(
         "Could not find WIT directory. Please set PIE_SDK environment variable."
     )
@@ -102,14 +128,9 @@ def get_inferlet_py_path() -> Path:
         path = Path(pie_sdk) / "python"
         if path.exists():
             return path
-
-    current_dir = Path.cwd()
-    for parent in [current_dir] + list(current_dir.parents):
-        inferlet_path = parent / "sdk" / "python"
-        if inferlet_path.exists() and (inferlet_path / "pyproject.toml").exists():
-            return inferlet_path
-
+    parent = _find_upward(Path("sdk/python/pyproject.toml"))
+    if parent is not None:
+        return parent / "sdk" / "python"
     raise FileNotFoundError(
         "Could not find inferlet library. Please set PIE_SDK environment variable."
     )
-

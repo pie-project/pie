@@ -1,0 +1,22 @@
+/// Shared MCP data types.
+///
+/// This interface is intentionally minimal: MCP responses are returned as
+/// opaque JSON strings so the WIT contract doesn't need to track every
+/// addition to the MCP spec. SDKs in each language layer typed wrappers
+/// on top.
+interface types {
+
+    /// Opaque JSON carried as a string. Never inspected by the runtime.
+    type json = string;
+
+    /// Transport / JSON-RPC error. Mirrors the JSON-RPC 2.0 error shape.
+    /// This represents protocol-level failures (server unreachable, method
+    /// not found, etc.). Tool-level failures (`isError: true` in a
+    /// `tools/call` response) arrive as a successful `json` payload that
+    /// SDKs should inspect.
+    record error {
+        code: s32,
+        message: string,
+        data: option<json>,
+    }
+}
