@@ -15,12 +15,13 @@ Pie's engine schedules forward passes across all live processes via a per-step c
 
 When many inferlets share an engine, the engine has to decide which context's next forward pass runs in this batch. Per-process priority would let one inferlet starve others. Round-robin would underuse the GPU when some processes have more useful work to do. Pie uses a market: each process gets a credit endowment, bids for batch slots, and the engine auctions them off.
 
-The mechanism comes from the SOSP paper. The summary you need:
+The mechanism is a per-tick second-price auction over GPU page slots, with rent revenue redistributed as endowment-weighted dividends, and shared KV prefixes split via Shapley values across the contexts that share them. The summary you need:
 
 - Every context has a **balance** (current credit holdings).
-- Every step pays a **rent** (the clearing price for one slot on the device this tick).
-- Every step pays a **dividend** back to participating processes proportional to endowment (revenue redistribution).
+- Every step pays a **rent** (the clearing price for one slot on the device this tick — the highest excluded bid).
+- Every step pays a **dividend** back to participating processes proportional to endowment, so rent revenue is conserved across participants.
 - The price of producing one new KV page is a constant 1 credit.
+- The conservation invariant is `Σ balance = Σ endowment − cumulative make cost`.
 
 You usually only see this through `Generator`'s auto-bidding, which keeps your context running until either the model emits a stop token or you hit `max_tokens`.
 
@@ -35,9 +36,9 @@ The `scheduling` module exposes the inputs to the bidding decision.
 use inferlet::scheduling;
 
 let bal = scheduling::balance(&model);
-let rnt = scheduling::rent(&ctx);
+let rnt = scheduling::rent(ctx.inner());
 let div = scheduling::dividend(&model);
-let lat = scheduling::latency(&ctx);
+let lat = scheduling::latency(ctx.inner());
 let p = scheduling::price();
 ```
 
@@ -170,10 +171,9 @@ The default is fine for most workloads. Override when you have a reason:
 - **Background work.** A pre-computation inferlet (e.g. building a prefix snapshot) that should run only when no foreground process needs the GPU. Bid 0 or call `idle()`.
 - **Custom fairness.** A multi-tenant deployment that wants to cap the bid one tenant can place. Wrap `set_bid` in your own policy.
 
-For research, the [SOSP paper](https://ingim.org/papers/gim2025pie.pdf) describes the auction mechanism in detail and proves the throughput properties. The implementation is in the `pie/src/pie_driver/` scheduler.
+The implementation lives in `runtime/src/context/sched.rs` (auction tick, rent, dividends, Shapley cost-sharing) and `pie/src/pie_driver/` (per-driver hooks). Read the module headers there for the conservation invariants and the eviction tiebreakers.
 
 ## Next
 
 - [The forward pass](../forward/overview): the primitive a bid pays for.
 - [I/O and messaging](../io/overview): coordination across inferlets, where `idle()` is most useful.
-- [SOSP paper](https://ingim.org/papers/gim2025pie.pdf): the design of the auction.

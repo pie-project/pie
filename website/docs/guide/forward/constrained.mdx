@@ -50,7 +50,7 @@ ctx.generate(Sampler::Argmax)
 
 // EBNF (Lark format)
 ctx.generate(Sampler::Argmax)
-   .constrain_with(Ebnf(my_grammar))?;
+   .constrain_with(Ebnf(&my_grammar))?;
 ```
 
 `Schema` is a trait. The built-in implementors `JsonSchema`, `AnyJson`, `Regex`, and `Ebnf` are tuple/unit structs. A pre-compiled `&Grammar` also implements `Schema`.
@@ -221,11 +221,11 @@ If the same grammar applies across many turns or streams, compile it once and re
 ```rust
 use inferlet::inference::Grammar;
 
-let grammar = Grammar::from_ebnf(my_grammar)?;
+let grammar = Grammar::from_ebnf(&my_grammar)?;
 
 let out = ctx
     .generate(Sampler::Argmax)
-    .constrain_with(&grammar)              // &Grammar implements Schema
+    .constrain_with(&grammar)?             // &Grammar implements Schema
     .max_tokens(256)
     .collect_text()
     .await?;

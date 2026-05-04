@@ -64,7 +64,7 @@ use inferlet::runtime;
 ```rust
 use inferlet::model::Model;
 
-let model = Model::load(name)?;
+let model = Model::load("default")?;
 ```
 
 | Method | Description |
@@ -346,8 +346,8 @@ A stateful walker over a compiled grammar automaton. Reach for it when implement
 ```rust
 use inferlet::inference::{Grammar, Matcher};
 
-let grammar = Grammar::from_ebnf(grammar_src)?;
-let mut m = Matcher::new(&grammar, model.tokenizer());
+let grammar = Grammar::from_ebnf(&grammar_src)?;
+let mut m = Matcher::new(&grammar, &model.tokenizer());
 
 m.accept_tokens(&prefix_tokens)?;
 let mask = m.next_token_logit_mask();
@@ -416,10 +416,10 @@ use inferlet::chat;
 
 let mut dec = chat::Decoder::new(&model);
 match dec.feed(&tokens)? {
-    chat::Event::Delta(s)            => /* visible text */,
-    chat::Event::Done(s)             => /* end of turn */,
-    chat::Event::Idle                => /* no semantic boundary */,
-    chat::Event::Interrupt(token_id) => /* template control token */,
+    chat::Event::Delta(s)            => { /* visible text */ }
+    chat::Event::Done(s)             => { /* end of turn */ }
+    chat::Event::Idle                => { /* no semantic boundary */ }
+    chat::Event::Interrupt(token_id) => { /* template control token */ }
 }
 ```
 
@@ -519,6 +519,9 @@ The session is the bidirectional channel between the inferlet and the client tha
 A `FutureString` resolves when the next inbound payload arrives:
 
 ```rust
+use inferlet::pie::core::session;
+use inferlet::FutureStringExt;
+
 let next = session::receive();
 let msg: Option<String> = next.wait_async().await;
 ```

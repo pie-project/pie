@@ -160,6 +160,22 @@ impl FutureStringExt for types::FutureString {
     }
 }
 
+/// Extension trait for FutureBlob — mirror of [`FutureStringExt`] for
+/// binary payloads (e.g. files arriving via `session::receive_file`).
+pub trait FutureBlobExt {
+    /// Waits for the blob asynchronously. `None` when the producer
+    /// closes the channel before sending a payload.
+    fn wait_async(&self) -> impl std::future::Future<Output = Option<Vec<u8>>>;
+}
+
+impl FutureBlobExt for types::FutureBlob {
+    async fn wait_async(&self) -> Option<Vec<u8>> {
+        let pollable = self.pollable();
+        AsyncPollable::new(pollable).wait_for().await;
+        self.get()
+    }
+}
+
 // =============================================================================
 // Argument Parsing (re-exported from pico_args)
 // =============================================================================
@@ -195,4 +211,5 @@ pub mod prelude {
     pub use crate::ForwardPassExt;
     pub use crate::SubscriptionExt;
     pub use crate::FutureStringExt;
+    pub use crate::FutureBlobExt;
 }

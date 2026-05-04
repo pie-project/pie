@@ -161,7 +161,7 @@ The first build is slow because the toolchain pulls dependencies. Subsequent reb
 `Result<T>` aliases `Result<T, String>`. Any `Err(s)` you return becomes the `Error` event the client receives.
 
 ```rust
-let model = Model::load(name)?;   // propagates Err("...") on failure
+let model = Model::load("default")?;   // propagates Err("...") on failure
 ```
 
 ### Debugging

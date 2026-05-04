@@ -130,7 +130,7 @@ The inferlet sees only the registered names. It does not know whether the underl
 use inferlet::mcp::client;
 
 let servers = client::available_servers();    // Vec<String>
-let session = client::connect(&servers[0])?;
+let session = client::connect(&servers[0]).map_err(|e| e.to_string())?;
 ```
 
 </TabItem>
@@ -168,7 +168,7 @@ The session resource closes when dropped (Rust) or when garbage-collected (Pytho
 ```rust
 use serde_json::{json, Value};
 
-let tools_json: String = session.list_tools()?;
+let tools_json: String = session.list_tools().map_err(|e| e.to_string())?;
 let tools: Value = serde_json::from_str(&tools_json)
     .map_err(|e| e.to_string())?;
 
@@ -178,7 +178,7 @@ for tool in tools["tools"].as_array().unwrap() {
 
 // Call a tool by name with JSON-encoded arguments.
 let args = json!({"query": "Rust release"}).to_string();
-let result_json = session.call_tool("search", &args)?;
+let result_json = session.call_tool("search", &args).map_err(|e| e.to_string())?;
 let result: Value = serde_json::from_str(&result_json)
     .map_err(|e| e.to_string())?;
 
@@ -252,11 +252,13 @@ for (const chunk of result.content) {
 <TabItem value="rust" label="Rust" default>
 
 ```rust
-let resources: serde_json::Value = serde_json::from_str(&session.list_resources()?)
-    .map_err(|e| e.to_string())?;
+let resources: serde_json::Value = serde_json::from_str(
+    &session.list_resources().map_err(|e| e.to_string())?
+).map_err(|e| e.to_string())?;
 let uri = resources["resources"][0]["uri"].as_str().unwrap();
-let content: serde_json::Value = serde_json::from_str(&session.read_resource(uri)?)
-    .map_err(|e| e.to_string())?;
+let content: serde_json::Value = serde_json::from_str(
+    &session.read_resource(uri).map_err(|e| e.to_string())?
+).map_err(|e| e.to_string())?;
 ```
 
 </TabItem>
@@ -288,12 +290,14 @@ const content = JSON.parse(mcpSession.readResource(uri));
 <TabItem value="rust" label="Rust" default>
 
 ```rust
-let prompts: serde_json::Value = serde_json::from_str(&session.list_prompts()?)
-    .map_err(|e| e.to_string())?;
+let prompts: serde_json::Value = serde_json::from_str(
+    &session.list_prompts().map_err(|e| e.to_string())?
+).map_err(|e| e.to_string())?;
 let name = prompts["prompts"][0]["name"].as_str().unwrap();
 let args = serde_json::json!({"topic": "Rust"}).to_string();
-let rendered: serde_json::Value = serde_json::from_str(&session.get_prompt(name, &args)?)
-    .map_err(|e| e.to_string())?;
+let rendered: serde_json::Value = serde_json::from_str(
+    &session.get_prompt(name, &args).map_err(|e| e.to_string())?
+).map_err(|e| e.to_string())?;
 ```
 
 </TabItem>
@@ -331,8 +335,9 @@ use inferlet::tools;
 
 // 1. Equip the model with the MCP tool schemas.
 let tools_json: serde_json::Value =
-    serde_json::from_str(&session.list_tools()?)
-        .map_err(|e| e.to_string())?;
+    serde_json::from_str(
+        &session.list_tools().map_err(|e| e.to_string())?
+    ).map_err(|e| e.to_string())?;
 
 let schemas: Vec<String> = tools_json["tools"]
     .as_array().unwrap()
@@ -351,7 +356,7 @@ let mut dec = tools::Decoder::new(&model);
 while let Some(step) = g.next()? {
     let out = step.execute().await?;
     if let tools::Event::Call(name, args) = dec.feed(&out.tokens)? {
-        let result_json = session.call_tool(&name, &args)?;
+        let result_json = session.call_tool(&name, &args).map_err(|e| e.to_string())?;
         let rendered = render_content(&result_json);
         let answer = tools::answer_prefix(&model, &name, &rendered);
         ctx.append(&answer);

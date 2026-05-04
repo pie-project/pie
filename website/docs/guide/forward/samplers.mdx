@@ -136,7 +136,7 @@ This is how you implement custom samplers, watermarking schemes, and beam-search
 A common pattern: given a context and several candidate strings, score each by its summed log-probability under the model. Tokenize the candidate, append it as input, probe `Logprob` at each position with the next expected token, sum the resulting per-position logprobs.
 
 ```rust
-async fn score_candidate(ctx: &Context, model: &Model, text: &str) -> Result<f32> {
+async fn score_candidate(ctx: &mut Context, model: &Model, text: &str) -> Result<f32> {
     let mut fwd = ctx.forward();
     let tk = model.tokenizer();
     let ids = tk.encode(text);

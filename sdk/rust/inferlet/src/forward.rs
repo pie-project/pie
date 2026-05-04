@@ -49,10 +49,19 @@ impl SampleHandle {
 
 /// Phantom-typed handle to a probe slot, returned by [`Forward::probe`]. The
 /// type parameter selects which `Output::*` accessor compiles.
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub struct ProbeHandle<P> {
     slot: u32,
     _kind: PhantomData<fn() -> P>,
+}
+
+// `PhantomData<fn() -> P>` is `Copy + Clone` regardless of `P`, but the
+// auto-derive generates `where P: Copy/Clone` bounds which surprise
+// callers using probe markers like `Logprobs(Vec<u32>)`. Hand-roll the
+// impls so handles are always `Copy`.
+impl<P> Copy for ProbeHandle<P> {}
+impl<P> Clone for ProbeHandle<P> {
+    fn clone(&self) -> Self { *self }
 }
 
 impl<P> ProbeHandle<P> {

@@ -25,7 +25,7 @@ Attach an adapter to a `Generator` or to a manual `forward()` pass. The adapter 
 ```rust
 use inferlet::adapter::Adapter;
 
-let adapter = Adapter::open(&model, "my-adapter")?;
+let adapter = Adapter::open(&model, "my-adapter").ok_or("adapter not found")?;
 
 let text = ctx
     .generate(sampler)

@@ -121,7 +121,7 @@ A common pattern: POST a JSON body, read JSON back.
 <TabItem value="rust" label="Rust" default>
 
 ```rust
-use inferlet::wstd::http::{Client, Method, Request};
+use inferlet::wstd::http::{body::IntoBody, Client, Method, Request};
 use inferlet::wstd::io::AsyncRead;
 
 async fn post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
@@ -130,7 +130,7 @@ async fn post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Va
         .uri(url)
         .method(Method::POST)
         .header("content-type", "application/json")
-        .body(body.to_string().into())
+        .body(body.to_string().into_body())
         .map_err(|e| e.to_string())?;
 
     let resp = client.send(req).await.map_err(|e| e.to_string())?;
@@ -180,6 +180,13 @@ For server-sent events or chunked responses, read the body incrementally:
 ```rust
 use inferlet::wstd::http::{Client, Method, Request};
 use inferlet::wstd::io::{empty, AsyncRead};
+
+let client = Client::new();
+let req = Request::builder()
+    .uri("https://example.com/stream")
+    .method(Method::GET)
+    .body(empty())
+    .map_err(|e| e.to_string())?;
 
 let resp = client.send(req).await.map_err(|e| e.to_string())?;
 let mut body = resp.into_body();

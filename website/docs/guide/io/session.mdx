@@ -66,7 +66,7 @@ use inferlet::pie::core::session;
 use inferlet::FutureStringExt;
 
 let next = session::receive();
-let msg: String = next.wait_async().await;
+let msg: Option<String> = next.wait_async().await;   // None if the client disconnected
 ```
 
 </TabItem>
@@ -198,8 +198,12 @@ For inferlets that operate on user-uploaded data, the client uploads via the cli
 
 ```rust
 use inferlet::pie::core::session;
+use inferlet::FutureBlobExt;
 
-let blob = session::receive_file().wait_async().await;     // Vec<u8>
+let blob: Vec<u8> = session::receive_file()
+    .wait_async()
+    .await
+    .ok_or("client disconnected")?;
 process_pdf(&blob)?;
 ```
 
@@ -238,8 +242,7 @@ use inferlet::pie::core::session;
 use inferlet::FutureStringExt;
 
 let next = session::receive();
-let msg: String = next.wait_async().await;
-if msg == "stop" {
+if next.wait_async().await.as_deref() == Some("stop") {
     return Ok("stopped".into());
 }
 ```

@@ -459,7 +459,7 @@ if let Some(grammar) = tools::native_grammar(&model, &[calculator_schema]) {
     let response = ctx
         .generate(Sampler::Argmax)
         .max_tokens(512)
-        .constrain_with(&grammar)         // &Grammar implements Schema
+        .constrain_with(&grammar)?        // &Grammar implements Schema
         .collect_text()
         .await?;
 }

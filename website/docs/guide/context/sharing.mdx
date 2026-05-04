@@ -145,8 +145,8 @@ A second pattern: keep a context alive across many inferlet runs as a *session*.
 
 ```rust
 let mut ctx = match Context::open(&model, "session-alice") {
-    Some(c) => c,
-    None => {
+    Ok(c) => c,
+    Err(_) => {
         let mut c = Context::new(&model)?;
         c.system("You are alice's assistant.");
         c.flush().await?;
