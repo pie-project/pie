@@ -7,7 +7,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
 
 use crate::paths;
@@ -57,9 +57,7 @@ pub fn run(cmd: ConfigCmd) -> Result<()> {
 fn init(path: Option<PathBuf>, force: bool) -> Result<()> {
     let cfg_path = path.unwrap_or_else(paths::default_config_path);
     if cfg_path.exists() && !force {
-        bail!(
-            "config file already exists at {cfg_path:?}; pass --force to overwrite"
-        );
+        bail!("config file already exists at {cfg_path:?}; pass --force to overwrite");
     }
     if let Some(parent) = cfg_path.parent() {
         std::fs::create_dir_all(parent)
@@ -89,8 +87,8 @@ fn show(path: Option<PathBuf>) -> Result<()> {
     if !cfg_path.exists() {
         bail!("config file not found at {cfg_path:?} (run `pie config init`)");
     }
-    let content = std::fs::read_to_string(&cfg_path)
-        .map_err(|e| anyhow!("read {cfg_path:?}: {e}"))?;
+    let content =
+        std::fs::read_to_string(&cfg_path).map_err(|e| anyhow!("read {cfg_path:?}: {e}"))?;
     let cwd = std::env::current_dir().ok();
     let display = cwd
         .as_deref()
@@ -210,18 +208,19 @@ fn set(key: String, value: String, path: Option<PathBuf>) -> Result<()> {
     if !cfg_path.exists() {
         bail!("config file not found at {cfg_path:?} (run `pie config init`)");
     }
-    let content = std::fs::read_to_string(&cfg_path)
-        .map_err(|e| anyhow!("read {cfg_path:?}: {e}"))?;
-    let mut value_table: toml::Value = toml::from_str(&content)
-        .map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
+    let content =
+        std::fs::read_to_string(&cfg_path).map_err(|e| anyhow!("read {cfg_path:?}: {e}"))?;
+    let mut value_table: toml::Value =
+        toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
 
     let parsed = parse_value(&value);
     set_nested(&mut value_table, &key, parsed.clone())?;
 
-    let serialized =
-        toml::to_string(&value_table).map_err(|e| anyhow!("serialize TOML: {e}"))?;
-    std::fs::write(&cfg_path, serialized)
-        .map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
+    let serialized = toml::to_string(&value_table).map_err(|e| anyhow!("serialize TOML: {e}"))?;
+    let cfg: crate::config::Config =
+        toml::from_str(&serialized).context("validating updated config")?;
+    cfg.validate().context("validating updated config")?;
+    std::fs::write(&cfg_path, serialized).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
 
     println!("✓ Set {key} = {}", display_value(&parsed));
     Ok(())
@@ -405,5 +404,35 @@ hf_repo = "x"
             .unwrap_err()
             .to_string();
         assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn set_rejects_invalid_result_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "dummy"
+device = ["cpu"]
+
+[model.driver.options]
+vocab_size = 151936
+arch_name = "qwen3"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        let err = set(
+            "runtime.worker_threads".to_string(),
+            "0".to_string(),
+            Some(path.clone()),
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("worker_threads"), "got: {err}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 }

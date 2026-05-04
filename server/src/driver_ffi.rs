@@ -2,11 +2,10 @@
 //! runtime [`Flavor`] dispatcher.
 //!
 //! Each driver crate / static lib exports a uniquely-named C entry
-//! pair (`pie_driver_{portable,cuda,dummy}_run` / `_request_stop`),
-//! so any subset of `driver-portable` / `driver-cuda` / `driver-dummy`
-//! can be linked into the same binary. The [`Flavor`] enum picks
-//! which one to invoke at runtime based on the model's TOML
-//! `driver.type`.
+//! pair (`pie_driver_{portable,cuda,dummy}_run` / `_request_stop`).
+//! Portable and cuda are selected by Cargo features; dummy is always
+//! linked. The [`Flavor`] enum picks which one to invoke at runtime
+//! based on the model's TOML `driver.type`.
 
 use std::os::raw::{c_char, c_int, c_void};
 
@@ -42,19 +41,16 @@ unsafe extern "C" {
 // its `extern "C"` entries directly — no `unsafe extern { ... }`
 // declaration needed, which sidesteps the link-time symbol GC that
 // strips unreferenced `#[no_mangle]` exports out of an rlib.
-#[cfg(feature = "driver-dummy")]
 use pie_driver_dummy_lib::{pie_driver_dummy_request_stop, pie_driver_dummy_run};
 
 /// Which driver flavor to dispatch to at runtime. Variants are
-/// gated by Cargo features — only the flavors compiled into this
-/// binary are constructible.
+/// gated by Cargo features for portable/cuda; dummy is always present.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Flavor {
     #[cfg(feature = "driver-portable")]
     Portable,
     #[cfg(feature = "driver-cuda")]
     Cuda,
-    #[cfg(feature = "driver-dummy")]
     Dummy,
 }
 
@@ -67,7 +63,6 @@ impl Flavor {
             Flavor::Portable => "portable",
             #[cfg(feature = "driver-cuda")]
             Flavor::Cuda => "cuda",
-            #[cfg(feature = "driver-dummy")]
             Flavor::Dummy => "dummy",
         }
     }
@@ -80,14 +75,13 @@ impl Flavor {
             Flavor::Portable => "pie_driver_portable",
             #[cfg(feature = "driver-cuda")]
             Flavor::Cuda => "pie_driver_cuda",
-            #[cfg(feature = "driver-dummy")]
             Flavor::Dummy => "pie_driver_dummy",
         }
     }
 
     /// Map a TOML `driver.type` to the flavor that should host it,
     /// erroring with a clear message when the requested flavor was
-    /// not compiled into this binary or is torch-hosted.
+    /// not compiled into this binary or is hosted by a Python subprocess.
     pub fn from_kind(kind: DriverKind) -> Result<Self, String> {
         match kind {
             DriverKind::Portable => {
@@ -110,29 +104,16 @@ impl Flavor {
                     Err(missing_feature_msg("cuda_native", "driver-cuda"))
                 }
             }
-            DriverKind::Dummy => {
-                #[cfg(feature = "driver-dummy")]
-                {
-                    Ok(Flavor::Dummy)
-                }
-                #[cfg(not(feature = "driver-dummy"))]
-                {
-                    Err(missing_feature_msg("dummy", "driver-dummy"))
-                }
-            }
+            DriverKind::Dummy => Ok(Flavor::Dummy),
             DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang => Err(format!(
-                "driver type {kind:?} is hosted by Python (`server/torch`) \
-                 and is not available in `server`."
+                "driver type {kind:?} is hosted by a Python subprocess, \
+                 not an embedded FFI flavor."
             )),
         }
     }
 }
 
-#[cfg(any(
-    not(feature = "driver-portable"),
-    not(feature = "driver-cuda"),
-    not(feature = "driver-dummy"),
-))]
+#[cfg(any(not(feature = "driver-portable"), not(feature = "driver-cuda"),))]
 fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
     format!(
         "driver type {toml_type:?} is not built into this binary. \
@@ -150,7 +131,6 @@ pub fn compiled_summary() -> String {
     out.push("portable");
     #[cfg(feature = "driver-cuda")]
     out.push("cuda");
-    #[cfg(feature = "driver-dummy")]
     out.push("dummy");
     out.join(", ")
 }
@@ -162,14 +142,13 @@ pub fn compiled_embedded() -> [(&'static str, bool); 3] {
     [
         ("portable", cfg!(feature = "driver-portable")),
         ("cuda_native", cfg!(feature = "driver-cuda")),
-        ("dummy", cfg!(feature = "driver-dummy")),
+        ("dummy", true),
     ]
 }
 
 /// Pick a sensible default flavor for commands that don't specify one
 /// (e.g. `pie smoke` without `--flavor`, `pie config init`'s template).
-/// Order: cuda → portable → dummy. Returns `None` only if no `driver-*`
-/// feature is enabled, which `build.rs` already disallows.
+/// Order: cuda → portable → dummy.
 pub fn default_flavor() -> Option<Flavor> {
     #[cfg(feature = "driver-cuda")]
     {
@@ -179,11 +158,7 @@ pub fn default_flavor() -> Option<Flavor> {
     {
         return Some(Flavor::Portable);
     }
-    #[cfg(all(
-        not(feature = "driver-cuda"),
-        not(feature = "driver-portable"),
-        feature = "driver-dummy",
-    ))]
+    #[cfg(all(not(feature = "driver-cuda"), not(feature = "driver-portable")))]
     {
         return Some(Flavor::Dummy);
     }
@@ -205,19 +180,12 @@ pub unsafe fn run(
     match flavor {
         #[cfg(feature = "driver-portable")]
         Flavor::Portable => unsafe {
-            pie_driver_portable_run(
-                argc,
-                argv,
-                install_signal_handlers,
-                ready_cb,
-                ready_ctx,
-            )
+            pie_driver_portable_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
         },
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => unsafe {
             pie_driver_cuda_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
         },
-        #[cfg(feature = "driver-dummy")]
         Flavor::Dummy => unsafe {
             pie_driver_dummy_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
         },
@@ -234,7 +202,6 @@ pub fn request_stop(flavor: Flavor) {
         Flavor::Portable => unsafe { pie_driver_portable_request_stop() },
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => unsafe { pie_driver_cuda_request_stop() },
-        #[cfg(feature = "driver-dummy")]
         Flavor::Dummy => unsafe { pie_driver_dummy_request_stop() },
     }
 }

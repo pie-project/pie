@@ -49,14 +49,6 @@ pub fn doctor() -> Result<()> {
         print_check(name, &val, st);
         tally(st, &mut passes, &mut warnings, &mut critical);
     }
-    if crate::driver_ffi::compiled_embedded().iter().all(|(_, on)| !on) {
-        // Edge case: no embedded driver compiled in. Subprocess flavors
-        // may still be available, so this is a warning, not a hard fail.
-        eprintln!(
-            "  (rebuild with `--features driver-portable,driver-cuda,driver-dummy` \
-             to compile drivers in)"
-        );
-    }
 
     // ── Subprocess drivers ────────────────────────────────────────────────
     println!("\n[subprocess drivers]");
@@ -94,7 +86,11 @@ pub fn doctor() -> Result<()> {
                             "{} (import {} FAILED: {})",
                             resolved.path.display(),
                             module,
-                            String::from_utf8_lossy(&out.stderr).trim().lines().next().unwrap_or(""),
+                            String::from_utf8_lossy(&out.stderr)
+                                .trim()
+                                .lines()
+                                .next()
+                                .unwrap_or(""),
                         ),
                         Status::Warn,
                     ),
@@ -154,12 +150,7 @@ fn print_check(key: &str, value: &str, status: Status) {
     println!("  {glyph} {:<20} {}", key, value);
 }
 
-fn tally(
-    s: Status,
-    passes: &mut usize,
-    warnings: &mut usize,
-    critical: &mut bool,
-) {
+fn tally(s: Status, passes: &mut usize, warnings: &mut usize, critical: &mut bool) {
     match s {
         Status::Pass => *passes += 1,
         Status::Warn => *warnings += 1,
@@ -191,11 +182,7 @@ fn check_gpus() -> Vec<(String, String, Status)> {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
             if lines.is_empty() {
-                vec![(
-                    "GPU".into(),
-                    "no NVIDIA GPUs detected".into(),
-                    Status::Warn,
-                )]
+                vec![("GPU".into(), "no NVIDIA GPUs detected".into(), Status::Warn)]
             } else {
                 lines
                     .into_iter()
@@ -210,10 +197,8 @@ fn check_gpus() -> Vec<(String, String, Status)> {
         }
         Ok(_) | Err(_) => vec![(
             "GPU".into(),
-            "nvidia-smi not available (CPU-only? non-NVIDIA? or driver missing)"
-                .into(),
+            "nvidia-smi not available (CPU-only? non-NVIDIA? or driver missing)".into(),
             Status::Warn,
         )],
     }
 }
-

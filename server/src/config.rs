@@ -41,16 +41,19 @@ pub struct Config {
 
 impl Config {
     pub fn from_toml_file(path: &std::path::Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
-        let cfg: Config = toml::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("parse {path:?}: {e}"))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
+        let cfg: Config =
+            toml::from_str(&text).map_err(|e| anyhow::anyhow!("parse {path:?}: {e}"))?;
         cfg.validate()?;
         Ok(cfg)
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(!self.models.is_empty(), "at least one [[model]] section is required");
+        ensure!(
+            !self.models.is_empty(),
+            "at least one [[model]] section is required"
+        );
 
         let mut seen = std::collections::HashSet::new();
         for m in &self.models {
@@ -92,7 +95,7 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub verbose: bool,
     #[serde(default = "default_registry")]
     pub registry: String,
@@ -107,7 +110,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
-            verbose: false,
+            verbose: true,
             registry: default_registry(),
             max_concurrent_processes: None,
             python_snapshot: true,
@@ -124,10 +127,18 @@ impl ServerConfig {
     }
 }
 
-fn default_host() -> String { "127.0.0.1".to_string() }
-fn default_port() -> u16 { 8080 }
-fn default_registry() -> String { "https://registry.pie-project.org/".to_string() }
-fn default_true() -> bool { true }
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_port() -> u16 {
+    8080
+}
+fn default_registry() -> String {
+    "https://registry.pie-project.org/".to_string()
+}
+fn default_true() -> bool {
+    true
+}
 
 // -----------------------------------------------------------------------------
 // [auth]
@@ -171,8 +182,12 @@ impl Default for TelemetryConfig {
     }
 }
 
-fn default_otlp_endpoint() -> String { "http://localhost:4317".to_string() }
-fn default_service_name() -> String { "pie".to_string() }
+fn default_otlp_endpoint() -> String {
+    "http://localhost:4317".to_string()
+}
+fn default_service_name() -> String {
+    "pie".to_string()
+}
 
 // -----------------------------------------------------------------------------
 // [runtime]
@@ -222,9 +237,18 @@ impl Default for RuntimeConfig {
 
 impl RuntimeConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(self.worker_threads > 0, "runtime.worker_threads must be > 0");
-        ensure!(self.wasm_max_instances > 0, "runtime.wasm_max_instances must be > 0");
-        ensure!(self.wasm_max_memory_mb > 0, "runtime.wasm_max_memory_mb must be > 0");
+        ensure!(
+            self.worker_threads > 0,
+            "runtime.worker_threads must be > 0"
+        );
+        ensure!(
+            self.wasm_max_instances > 0,
+            "runtime.wasm_max_instances must be > 0"
+        );
+        ensure!(
+            self.wasm_max_memory_mb > 0,
+            "runtime.wasm_max_memory_mb must be > 0"
+        );
         ensure!(self.max_upload_mb > 0, "runtime.max_upload_mb must be > 0");
         Ok(())
     }
@@ -235,12 +259,24 @@ fn default_worker_threads() -> usize {
         .map(|n| n.get())
         .unwrap_or(4)
 }
-fn default_wasm_max_instances() -> u32 { 1000 }
-fn default_wasm_max_memory_mb() -> usize { 4096 }
-fn default_wasm_warm_slots() -> u32 { 100 }
-fn default_fs_scratch_dir() -> PathBuf { std::env::temp_dir().join("pie") }
-fn default_network_allowed_hosts() -> Vec<String> { vec!["*".to_string()] }
-fn default_max_upload_mb() -> usize { 256 }
+fn default_wasm_max_instances() -> u32 {
+    1000
+}
+fn default_wasm_max_memory_mb() -> usize {
+    4096
+}
+fn default_wasm_warm_slots() -> u32 {
+    100
+}
+fn default_fs_scratch_dir() -> PathBuf {
+    std::env::temp_dir().join("pie")
+}
+fn default_network_allowed_hosts() -> Vec<String> {
+    vec!["*".to_string()]
+}
+fn default_max_upload_mb() -> usize {
+    256
+}
 
 // -----------------------------------------------------------------------------
 // [[model]]
@@ -258,7 +294,10 @@ pub struct ModelConfig {
 
 impl ModelConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(!self.name.is_empty(), "model.name must be a non-empty string");
+        ensure!(
+            !self.name.is_empty(),
+            "model.name must be a non-empty string"
+        );
         self.driver.validate()?;
         self.scheduler.validate()?;
         Ok(())
@@ -306,30 +345,45 @@ impl SchedulerConfig {
             "scheduler.batch_policy must be one of 'adaptive' | 'eager' | 'greedy' (got {:?})",
             self.batch_policy
         );
-        ensure!(self.request_timeout_secs > 0, "scheduler.request_timeout_secs must be > 0");
+        ensure!(
+            self.request_timeout_secs > 0,
+            "scheduler.request_timeout_secs must be > 0"
+        );
         if let Some(n) = self.default_token_limit {
             ensure!(n > 0, "scheduler.default_token_limit must be > 0 if set");
         }
-        ensure!(self.default_endowment_pages > 0, "scheduler.default_endowment_pages must be > 0");
+        ensure!(
+            self.default_endowment_pages > 0,
+            "scheduler.default_endowment_pages must be > 0"
+        );
         ensure!(
             self.admission_oversubscription_factor > 0.0
                 && self.admission_oversubscription_factor.is_finite(),
             "scheduler.admission_oversubscription_factor must be finite > 0"
         );
         ensure!(
-            self.restore_pause_at_utilization > 0.0
-                && self.restore_pause_at_utilization <= 1.0,
+            self.restore_pause_at_utilization > 0.0 && self.restore_pause_at_utilization <= 1.0,
             "scheduler.restore_pause_at_utilization must be in (0.0, 1.0]"
         );
         Ok(())
     }
 }
 
-fn default_batch_policy() -> String { "adaptive".to_string() }
-fn default_request_timeout_secs() -> u64 { 120 }
-fn default_endowment_pages() -> usize { 64 }
-fn default_oversubscription_factor() -> f64 { 4.0 }
-fn default_restore_pause_at_utilization() -> f64 { 0.85 }
+fn default_batch_policy() -> String {
+    "adaptive".to_string()
+}
+fn default_request_timeout_secs() -> u64 {
+    120
+}
+fn default_endowment_pages() -> usize {
+    64
+}
+fn default_oversubscription_factor() -> f64 {
+    4.0
+}
+fn default_restore_pause_at_utilization() -> f64 {
+    0.85
+}
 
 // -----------------------------------------------------------------------------
 // [model.driver]
@@ -340,9 +394,9 @@ fn default_restore_pause_at_utilization() -> f64 { 0.85 }
 #[allow(dead_code)] // forwarded to the embedded driver via TOML; not all
 // fields are read on the Rust side yet.
 pub struct DriverConfig {
-    /// Driver discriminator. `server` only accepts the
-    /// out-of-process native drivers (`portable`, `cuda_native`); the
-    /// torch-hosted drivers (`native`, `vllm`, `sglang`) require Python.
+    /// Driver discriminator. Embedded drivers (`portable`,
+    /// `cuda_native`, `dummy`) run in-process; Python drivers (`dev`,
+    /// `vllm`, `sglang`) are supervised as subprocesses.
     #[serde(rename = "type")]
     pub kind: DriverKind,
     /// Single string or list of strings — both accepted on input.
@@ -354,22 +408,22 @@ pub struct DriverConfig {
     pub activation_dtype: String,
     #[serde(default = "default_random_seed")]
     pub random_seed: u64,
-    /// Driver-specific knobs. The standalone server interprets this as
-    /// [`PortableDriverOptions`] / [`CudaNativeDriverOptions`] depending
-    /// on `kind`. Stored as a generic table here so unknown drivers
-    /// don't break parsing.
+    /// Driver-specific knobs. Embedded drivers parse this into typed
+    /// option structs; Python drivers receive the raw table after
+    /// standalone-only `venv` / `python` keys are stripped.
     #[serde(default)]
     pub options: toml::Table,
 }
 
 impl DriverConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(!self.device.is_empty(), "model.driver.device must be non-empty");
-        // All `DriverKind`s are valid here: embedded (portable / cuda_native /
-        // dummy) → handled in-process by the C++/Rust static libs; subprocess
-        // (dev / vllm / sglang) → handled by `crate::subprocess_driver`. The
-        // earlier `reject_torch_only()` gate is gone — subprocess support
-        // landed in Phase 3.
+        ensure!(
+            !self.device.is_empty(),
+            "model.driver.device must be non-empty"
+        );
+        // All `DriverKind`s are valid here: embedded flavors run in-process
+        // through static libs, while dev/vllm/sglang are supervised through
+        // `crate::subprocess_driver`.
         match self.kind {
             DriverKind::Portable => {
                 let _: PortableDriverOptions = toml::Value::Table(self.options.clone())
@@ -401,10 +455,25 @@ impl DriverConfig {
                         )
                     })?;
             }
-            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang => {}
+            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang => {
+                validate_subprocess_driver_options(&self.options, self.kind)?;
+            }
         }
         Ok(())
     }
+}
+
+fn validate_subprocess_driver_options(options: &toml::Table, kind: DriverKind) -> Result<()> {
+    for key in ["venv", "python"] {
+        if let Some(value) = options.get(key) {
+            ensure!(
+                value.as_str().is_some(),
+                "invalid [model.driver.options] for driver type {:?}: `{key}` must be a string",
+                kind,
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -415,8 +484,8 @@ pub enum DriverKind {
     /// Native CUDA driver — embedded as a static lib in `pie-server`
     /// (requires `--features driver-cuda`).
     CudaNative,
-    /// Rust dummy driver — random tokens, no model load. Embedded as a
-    /// Rust staticlib in `pie-server` (requires `--features driver-dummy`).
+    /// Rust dummy driver — random tokens, no model load. Always
+    /// embedded in `pie-server`.
     Dummy,
     /// Torch-backed reference Python driver (`pie_driver_dev`). Hosted
     /// out-of-process by [`crate::subprocess_driver::SubprocessDriver`].
@@ -427,9 +496,28 @@ pub enum DriverKind {
     Sglang,
 }
 
-fn default_tp_size() -> u32 { 1 }
-fn default_activation_dtype() -> String { "bfloat16".to_string() }
-fn default_random_seed() -> u64 { 42 }
+impl DriverKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DriverKind::Portable => "portable",
+            DriverKind::CudaNative => "cuda_native",
+            DriverKind::Dummy => "dummy",
+            DriverKind::Dev => "dev",
+            DriverKind::Vllm => "vllm",
+            DriverKind::Sglang => "sglang",
+        }
+    }
+}
+
+fn default_tp_size() -> u32 {
+    1
+}
+fn default_activation_dtype() -> String {
+    "bfloat16".to_string()
+}
+fn default_random_seed() -> u64 {
+    42
+}
 
 /// Accept either a single string or a list of strings, matching
 /// `pie/config.py::_parse_driver`'s `device` handling.
@@ -537,12 +625,24 @@ pub struct DummyDriverOptions {
     pub ready_timeout_s: f64,
 }
 
-fn default_kv_page_size() -> u32 { 16 }
-fn default_max_num_kv_pages() -> u32 { 256 }
-fn default_max_batch_tokens() -> u32 { 4096 }
-fn default_max_batch_size() -> u32 { 128 }
-fn default_max_model_len() -> u32 { 4096 }
-fn default_dummy_ready_timeout_s() -> f64 { 5.0 }
+fn default_kv_page_size() -> u32 {
+    16
+}
+fn default_max_num_kv_pages() -> u32 {
+    256
+}
+fn default_max_batch_tokens() -> u32 {
+    4096
+}
+fn default_max_batch_size() -> u32 {
+    128
+}
+fn default_max_model_len() -> u32 {
+    4096
+}
+fn default_dummy_ready_timeout_s() -> f64 {
+    5.0
+}
 
 /// `[model.driver.options]` for `type = "cuda_native"`.
 /// Mirrors `pie/src/pie_driver_cuda_native/config.py::CudaNativeDriverConfig`.
@@ -630,8 +730,8 @@ device = "cuda:0"
 
     #[test]
     fn accepts_subprocess_drivers() {
-        // Phase 3 made dev/vllm/sglang first-class — they're hosted
-        // out-of-process by `crate::subprocess_driver::SubprocessDriver`.
+        // dev/vllm/sglang are hosted out-of-process by
+        // `crate::subprocess_driver::SubprocessDriver`.
         for ty in ["dev", "vllm", "sglang"] {
             let toml_text = format!(
                 "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
@@ -697,12 +797,8 @@ runtime_quant = "fp8"
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.models[0].driver.kind, DriverKind::CudaNative);
-        let opts: CudaNativeDriverOptions = cfg.models[0]
-            .driver
-            .options
-            .clone()
-            .try_into()
-            .unwrap();
+        let opts: CudaNativeDriverOptions =
+            cfg.models[0].driver.options.clone().try_into().unwrap();
         assert_eq!(opts.max_num_kv_pages, 2048);
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
@@ -722,12 +818,8 @@ device = ["cuda:0"]
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
-        let opts: CudaNativeDriverOptions = cfg.models[0]
-            .driver
-            .options
-            .clone()
-            .try_into()
-            .unwrap();
+        let opts: CudaNativeDriverOptions =
+            cfg.models[0].driver.options.clone().try_into().unwrap();
         // Defaults match pie_driver_cuda_native/config.py.
         assert_eq!(opts.max_num_kv_pages, 1024);
         assert_eq!(opts.swap_pool_size, 0);
@@ -755,5 +847,25 @@ arch_name = "qwen3"
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("gpu_mem_utilization"), "got: {err}");
         assert!(err.contains("Dummy"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_non_string_subprocess_python_options() {
+        let bad = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "vllm"
+device = ["cuda:0"]
+
+[model.driver.options]
+venv = 123
+"#;
+        let cfg: Config = toml::from_str(bad).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("venv"), "got: {err}");
+        assert!(err.contains("string"), "got: {err}");
     }
 }

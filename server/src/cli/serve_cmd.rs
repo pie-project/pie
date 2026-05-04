@@ -47,9 +47,7 @@ pub struct ServeArgs {
 }
 
 pub fn run(args: ServeArgs) -> Result<()> {
-    let config_path = args
-        .config
-        .unwrap_or_else(paths::default_config_path);
+    let config_path = args.config.unwrap_or_else(paths::default_config_path);
 
     let mut cfg = config::Config::from_toml_file(&config_path)
         .with_context(|| format!("loading TOML config from {config_path:?}"))?;
@@ -71,6 +69,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
     if args.no_snapshot {
         cfg.server.python_snapshot = false;
     }
+    // Heavy testing phase: verbose startup details are enabled by
+    // default, regardless of older configs that set `verbose = false`.
+    cfg.server.verbose = true;
 
     if args.monitor {
         run_with_monitor(cfg)

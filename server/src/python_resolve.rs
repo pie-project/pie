@@ -7,12 +7,11 @@
 //!   2. `$PIE_PYTHON` — process-env override (CI, scripts).
 //!   3. `$VIRTUAL_ENV/bin/python` — the venv the user has activated.
 //!   4. `~/.pie/drivers.toml` `[driver.<type>].venv|python` — persisted
-//!      per-driver default (set via `pie driver <type> set venv …` in
-//!      Phase 5).
+//!      per-driver default set via `pie driver <type> set venv …`.
 //!   5. `~/.pie/drivers.toml` `[python].venv|python` — persisted shared
 //!      default for any subprocess driver that didn't override.
 //!   6. `which python3` from `$PATH`.
-//!   7. Hard error pointing at `pie driver <type> install` (Phase 5).
+//!   7. Hard error pointing at `pie driver <type> install`.
 //!
 //! `pie driver <type> show` prints the resolved path *and* the source
 //! step from this chain so users can debug a wrong choice without
@@ -77,8 +76,7 @@ impl DriversConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow!("read {path:?}: {e}"))?;
+        let text = std::fs::read_to_string(&path).map_err(|e| anyhow!("read {path:?}: {e}"))?;
         toml::from_str(&text).map_err(|e| anyhow!("parse {path:?}: {e}"))
     }
 }
@@ -193,11 +191,11 @@ pub fn strip_python_keys(options: &mut toml::Table) {
 
 /// Read `venv` / `python` out of an options-shaped TOML table, with
 /// "both set" rejected.
-fn python_from_options(
-    options: &toml::Table,
-    source: &str,
-) -> Result<Option<ResolvedPython>> {
-    let venv = options.get("venv").and_then(|v| v.as_str()).map(String::from);
+fn python_from_options(options: &toml::Table, source: &str) -> Result<Option<ResolvedPython>> {
+    let venv = options
+        .get("venv")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let python = options
         .get("python")
         .and_then(|v| v.as_str())
@@ -207,10 +205,7 @@ fn python_from_options(
 }
 
 /// Read `venv` / `python` out of a typed [`PythonBlock`].
-fn python_from_block(
-    block: &PythonBlock,
-    source: &str,
-) -> Result<Option<ResolvedPython>> {
+fn python_from_block(block: &PythonBlock, source: &str) -> Result<Option<ResolvedPython>> {
     match (block.venv.as_deref(), block.python.as_deref()) {
         (Some(_), Some(_)) => Err(anyhow!(
             "{source}: both `venv` and `python` are set — pick one. `venv` \
@@ -289,7 +284,11 @@ mod tests {
         let m = fixture_options("venv = \"/tmp/foo\"");
         let r = resolve_python(SubprocessFlavor::Vllm, &m, None).unwrap();
         assert_eq!(r.path, PathBuf::from("/tmp/foo/bin/python"));
-        assert!(r.source.contains("model.driver.options"), "got: {}", r.source);
+        assert!(
+            r.source.contains("model.driver.options"),
+            "got: {}",
+            r.source
+        );
     }
 
     #[test]
@@ -307,7 +306,10 @@ mod tests {
         clear_python_envs();
         let m = fixture_options("venv = \"/a\"\npython = \"/b\"");
         let err = resolve_python(SubprocessFlavor::Vllm, &m, None).unwrap_err();
-        assert!(err.to_string().contains("both `venv` and `python`"), "got: {err}");
+        assert!(
+            err.to_string().contains("both `venv` and `python`"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -379,10 +381,8 @@ mod tests {
 
     #[test]
     fn strip_python_keys_drops_both() {
-        let mut t: toml::Table = toml::from_str(
-            "venv = \"/tmp\"\npython = \"/x\"\nfoo = 1\n",
-        )
-        .unwrap();
+        let mut t: toml::Table =
+            toml::from_str("venv = \"/tmp\"\npython = \"/x\"\nfoo = 1\n").unwrap();
         strip_python_keys(&mut t);
         assert!(t.get("venv").is_none());
         assert!(t.get("python").is_none());
@@ -425,7 +425,10 @@ python = "/sgl/bin/python"
         unsafe { std::env::set_var("PIE_HOME", tmp.path()) };
         let cfg = DriversConfig::load().unwrap();
         assert_eq!(cfg.python.venv.as_deref(), Some("/shared"));
-        assert_eq!(cfg.drivers.get("vllm").unwrap().venv.as_deref(), Some("/vllm"));
+        assert_eq!(
+            cfg.drivers.get("vllm").unwrap().venv.as_deref(),
+            Some("/vllm")
+        );
         assert_eq!(
             cfg.drivers.get("sglang").unwrap().python.as_deref(),
             Some("/sgl/bin/python"),
@@ -435,5 +438,4 @@ python = "/sgl/bin/python"
         // Suppress unused-binding warning on `_ = path`.
         let _ = path;
     }
-
 }

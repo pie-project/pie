@@ -4,13 +4,12 @@
 //! Run with:
 //!
 //! ```bash
-//! cargo build -p pie-server --no-default-features \
-//!     --features driver-dummy --release
+//! cargo build -p pie-server --no-default-features --release
 //! cd inferlets/marketing-tab1-agent && cargo build --target wasm32-wasip2 --release
 //! cd inferlets/marketing-tab2-watermark && cargo build --target wasm32-wasip2 --release
 //! cd inferlets/marketing-tab3-lora-spec && cargo build --target wasm32-wasip2 --release
 //! cargo run --example dummy_roundtrip -p pie-server \
-//!     --no-default-features --features driver-dummy --release \
+//!     --no-default-features --release \
 //!     -- /path/to/dir/with/tokenizer.json
 //! ```
 //!
@@ -35,12 +34,12 @@ const PER_TAB_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let snapshot_dir = std::env::args()
-        .nth(1)
-        .ok_or_else(|| anyhow!(
+    let snapshot_dir = std::env::args().nth(1).ok_or_else(|| {
+        anyhow!(
             "usage: dummy_roundtrip <snapshot_dir> — pass a HF snapshot dir \
              containing tokenizer.json"
-        ))?;
+        )
+    })?;
     ensure_dir_with_tokenizer(Path::new(&snapshot_dir))?;
 
     let repo_root = repo_root()?;
@@ -48,8 +47,7 @@ async fn main() -> Result<()> {
     if !pie_bin.is_file() {
         anyhow::bail!(
             "pie binary not found at {pie_bin:?}; build it first with \
-             `cargo build -p pie-server --no-default-features \
-             --features driver-dummy --release`"
+             `cargo build -p pie-server --no-default-features --release`"
         );
     }
 
@@ -78,7 +76,9 @@ async fn main() -> Result<()> {
             anyhow::bail!(
                 "wasm not found for {}: {:?} — build with \
                  `cd inferlets/{} && cargo build --target wasm32-wasip2 --release`",
-                t.name, t.wasm, t.name
+                t.name,
+                t.wasm,
+                t.name
             );
         }
     }
@@ -199,7 +199,12 @@ async fn run_one_tab(client: &Client, t: &Tab) -> Result<()> {
 
     let inferlet = format!("{}@0.1.0", t.name);
     let mut process = client
-        .launch_process(inferlet, t.input.to_string(), /*capture_outputs=*/ true, None)
+        .launch_process(
+            inferlet,
+            t.input.to_string(),
+            /*capture_outputs=*/ true,
+            None,
+        )
         .await
         .with_context(|| format!("{}: launch_process", t.name))?;
     eprintln!("[runner] {}: launched (pid={})", t.name, process.id());

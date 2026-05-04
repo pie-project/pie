@@ -1,10 +1,10 @@
 //! Build the embedded native driver static libraries via CMake and link
 //! them into the `pie` binary as a single deployable artifact.
 //!
-//! Selection is via Cargo features. Any non-empty subset is allowed —
-//! the resulting binary contains every enabled driver and dispatches
-//! at runtime via `[[model]].driver.type` in the config TOML. The
-//! drivers expose distinctly-named C entry points
+//! Selection for native C++ drivers is via Cargo features. The Rust
+//! dummy driver is always linked; the resulting binary dispatches at
+//! runtime via `[[model]].driver.type` in the config TOML. The drivers
+//! expose distinctly-named C entry points
 //! (`pie_driver_{portable,cuda,dummy}_run` / `_request_stop`) so their
 //! static archives can coexist in one binary without symbol collisions.
 //!
@@ -15,22 +15,13 @@
 //!     (or `/usr/local/cuda`) so the resulting binary has zero CUDA
 //!     shared deps. Verified by the M3 spike (see
 //!     `driver/cuda/CMakeLists.txt`).
-//!   - `driver-dummy`: Rust staticlib — random tokens, no model load.
+//!   - dummy: Rust staticlib — random tokens, no model load; always linked.
 
 use std::path::{Path, PathBuf};
 
 fn main() {
     let portable = cfg!(feature = "driver-portable");
     let cuda = cfg!(feature = "driver-cuda");
-    let dummy = cfg!(feature = "driver-dummy");
-
-    if !(portable || cuda || dummy) {
-        panic!(
-            "no driver feature enabled — build with one or more of \
-             `--features driver-portable`, `--features driver-cuda`, \
-             `--features driver-dummy`"
-        );
-    }
 
     if portable {
         build_portable();
@@ -38,9 +29,7 @@ fn main() {
     if cuda {
         build_cuda();
     }
-    if dummy {
-        build_dummy();
-    }
+    build_dummy();
 }
 
 // -----------------------------------------------------------------------------
@@ -49,8 +38,8 @@ fn main() {
 
 fn build_dummy() {
     // pie-driver-dummy is a Cargo dep with crate-type = ["staticlib", "rlib"].
-    // Cargo links the rlib automatically through the optional dependency;
-    // nothing to build here. The rlib path is enough — the C ABI symbols
+    // Cargo links the rlib automatically through the dependency; nothing
+    // to build here. The rlib path is enough — the C ABI symbols
     // (`pie_driver_dummy_run` / `_request_stop`) come along.
 }
 
@@ -84,8 +73,7 @@ fn build_portable() {
     // other's CMake cache. Without this, the second cmake::Config
     // invocation overwrites the first's `build/` and reconfigures
     // it for the wrong project.
-    cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap())
-        .join("portable"));
+    cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("portable"));
     cfg.build_target("pie_driver_portable_lib")
         .define("BUILD_SHARED_LIBS", "OFF");
     enable_position_independent_archives(&mut cfg);
@@ -113,8 +101,7 @@ fn build_portable() {
             // is unused either way — disable to keep the libggml-cuda.a
             // self-contained.
             .define("GGML_CUDA_NCCL", "OFF");
-        let arch = std::env::var("PIE_PORTABLE_CUDA_ARCH")
-            .unwrap_or_else(|_| "native".to_string());
+        let arch = std::env::var("PIE_PORTABLE_CUDA_ARCH").unwrap_or_else(|_| "native".to_string());
         cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
     }
     if vulkan_enabled {
@@ -161,12 +148,7 @@ fn build_portable() {
         println!("cargo:rustc-link-arg=-framework");
         println!("cargo:rustc-link-arg=Accelerate");
         if metal_enabled {
-            for fw in [
-                "Foundation",
-                "Metal",
-                "MetalKit",
-                "MetalPerformanceShaders",
-            ] {
+            for fw in ["Foundation", "Metal", "MetalKit", "MetalPerformanceShaders"] {
                 println!("cargo:rustc-link-arg=-framework");
                 println!("cargo:rustc-link-arg={fw}");
             }
@@ -224,8 +206,7 @@ fn build_cuda() {
     let mut cfg = cmake::Config::new(&driver_dir);
     // See `build_portable` — per-flavor out_dir keeps the two CMake
     // configurations from clobbering each other in multi-driver builds.
-    cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap())
-        .join("cuda"));
+    cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("cuda"));
     cfg.build_target("pie_driver_cuda_lib")
         .define("BUILD_SHARED_LIBS", "OFF");
     enable_position_independent_archives(&mut cfg);
@@ -316,10 +297,7 @@ fn build_cuda() {
         // libnccl.so.2 without requiring `LD_LIBRARY_PATH` at runtime.
         // System-NCCL builds skip this — the loader finds the .so via
         // the standard ld.so search path.
-        println!(
-            "cargo:rustc-link-arg=-Wl,-rpath,{}",
-            nccl_lib_dir.display()
-        );
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", nccl_lib_dir.display());
     } else {
         println!("cargo:rustc-link-lib=nccl");
     }
@@ -359,8 +337,7 @@ fn enable_position_independent_archives(cfg: &mut cmake::Config) {
 /// by libcublas (we don't reference it directly).
 fn link_cuda_toolkit_dynamic(libs: &[&str]) {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
-    let cuda_home = std::env::var("CUDA_HOME")
-        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
     let cuda_lib = Path::new(&cuda_home).join("lib64");
     if !cuda_lib.is_dir() {
         panic!(
@@ -380,8 +357,7 @@ fn link_cuda_toolkit_dynamic(libs: &[&str]) {
 /// is universally present on any GPU host. Provides `cuMem*/cuCtx*`
 /// and friends used by both ggml-cuda and pie's custom-all-reduce.
 fn link_cuda_driver_stub() {
-    let cuda_home = std::env::var("CUDA_HOME")
-        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
     let stubs = Path::new(&cuda_home).join("lib64/stubs");
     if stubs.is_dir() {
         println!("cargo:rustc-link-search=native={}", stubs.display());
@@ -418,8 +394,14 @@ fn add_system_libs(metal: bool) {
 }
 
 fn rerun_if_changed(driver_dir: &Path) {
-    println!("cargo:rerun-if-changed={}", driver_dir.join("CMakeLists.txt").display());
-    println!("cargo:rerun-if-changed={}", driver_dir.join("src").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        driver_dir.join("CMakeLists.txt").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        driver_dir.join("src").display()
+    );
 }
 
 /// Walk `build_dir` looking for directories that contain at least one
@@ -434,7 +416,9 @@ fn add_link_search_paths(build_dir: &Path) {
 }
 
 fn walk(dir: &Path, out: &mut std::collections::HashSet<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut has_archive = false;
     for entry in entries.flatten() {
         let path = entry.path();

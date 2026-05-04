@@ -12,7 +12,7 @@
 //! pie model   list|download|remove
 //! pie driver  list | <type> {install,doctor,set,unset,show,exec}
 //! pie doctor
-//! pie check   <toml>
+//! pie check   <toml> [--debug]
 //! pie smoke   [--rpc]
 //! ```
 //!

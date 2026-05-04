@@ -4,19 +4,18 @@
 //!
 //! ```text
 //! pie serve   [--config --host --port --no-auth --verbose --no-snapshot]
-//! pie run     <inferlet> [--config --port --path --manifest -- args...]
+//! pie run     <inferlet> [--config --port --path --manifest --stdout]
 //! pie config  init|show|set
 //! pie auth    add|remove|list
 //! pie model   list|download|remove
 //!
 //! Diagnostics (standalone-specific):
-//!   pie check   <toml>     Validate a config TOML.
+//!   pie check   <toml> [--debug] Validate a config TOML.
 //!   pie smoke   [--rpc]    FFI / RpcServer smoke test.
 //! ```
 //!
-//! Authoring (`pie new`, `pie build`) lives in [`crate::cli::bakery_bridge`]
-//! once M7 lands — for now those subcommands print "install bakery"
-//! and exit non-zero so users discover the gap.
+//! Authoring (`pie new`, `pie build`) forwards to the Bakery tooling so
+//! the standalone CLI can share the same inferlet project workflow.
 
 use std::path::PathBuf;
 
@@ -40,7 +39,7 @@ mod serve_cmd;
     name = "pie",
     version,
     about = "Pie: Programmable Inference Engine (standalone)",
-    disable_help_subcommand = true,
+    disable_help_subcommand = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -96,6 +95,9 @@ pub enum Command {
     Check {
         /// Path to the config TOML.
         config: PathBuf,
+        /// Print the fully parsed config after validation.
+        #[arg(long)]
+        debug: bool,
     },
 
     /// FFI / RpcServer smoke test for diagnostics.
@@ -124,7 +126,7 @@ pub fn dispatch() -> Result<()> {
         Command::New(args) => bakery_cmd::run_new(args),
         Command::Build(args) => bakery_cmd::run_build(args),
         Command::Doctor => doctor_cmd::doctor(),
-        Command::Check { config } => diag_cmd::check(&config),
+        Command::Check { config, debug } => diag_cmd::check(&config, debug),
         Command::Smoke { rpc, flavor } => diag_cmd::smoke(rpc, flavor.as_deref()),
     }
 }

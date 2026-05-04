@@ -66,12 +66,7 @@ fn run(flavor: Flavor, server: Arc<RpcServer>, aux: Option<Arc<AuxIpcClient>>) {
 /// Dispatch a single RPC. Returns the msgpack-encoded response body.
 /// Errors are encoded as msgpack strings — same shape the Python
 /// wrapper's RPC loop produces.
-fn dispatch(
-    flavor: Flavor,
-    method: &str,
-    payload: &[u8],
-    aux: Option<&AuxIpcClient>,
-) -> Vec<u8> {
+fn dispatch(flavor: Flavor, method: &str, payload: &[u8], aux: Option<&AuxIpcClient>) -> Vec<u8> {
     match method {
         "ping" => encode(&PingResp { ok: true }),
         "query" => encode(&QueryResp {
@@ -82,27 +77,24 @@ fn dispatch(
         // Aux-IPC-backed methods. Routed to the embedded driver when
         // it exposes an aux socket; stubbed as `()` for the dummy
         // (which has no socket but inferlets exercise these paths);
-        // explicit error otherwise (cuda's aux listener is post-M3).
-        "copy_d2h" | "copy_h2d" | "copy_d2d" | "copy_h2h"
-        | "swap_out_pages" | "swap_in_pages" => {
+        // explicit error otherwise until cuda exposes an aux listener.
+        "copy_d2h" | "copy_h2d" | "copy_d2d" | "copy_h2h" | "swap_out_pages" | "swap_in_pages" => {
             dispatch_copy(flavor, method, payload, aux)
         }
         "load_adapter" => dispatch_load_adapter(flavor, payload, aux),
 
         // Methods Python's wrappers also stub out — none of the
         // standalone-supported drivers implement these.
-        "embed_image" | "initialize_adapter" | "update_adapter" | "save_adapter" => {
-            encode_err(format!(
-                "{method:?}: not implemented in {} driver",
-                flavor.as_str(),
-            ))
-        }
+        "embed_image" | "initialize_adapter" | "update_adapter" | "save_adapter" => encode_err(
+            format!("{method:?}: not implemented in {} driver", flavor.as_str(),),
+        ),
         // fire_batch should never come down the cold path — it's served
         // by the driver directly on /pie_shmem. If it does, surface a
         // clear error so we notice.
         "fire_batch" => encode_err(
             "fire_batch reached the cold path; \
-             this is a runtime↔driver wiring bug".to_string(),
+             this is a runtime↔driver wiring bug"
+                .to_string(),
         ),
         other => encode_err(format!("Method not found: {other}")),
     }
@@ -154,7 +146,10 @@ fn dispatch_copy(
                 Ok(a) => a,
                 Err(e) => return encode_err(format!("{method}: {e}")),
             };
-            (Method::CopyD2D, zip_pairs(&args.src_phys_ids, &args.dst_phys_ids))
+            (
+                Method::CopyD2D,
+                zip_pairs(&args.src_phys_ids, &args.dst_phys_ids),
+            )
         }
         "copy_h2h" => {
             let args: SrcDstSlotArgs = match decode(payload) {
@@ -177,11 +172,7 @@ fn dispatch_copy(
     }
 }
 
-fn dispatch_load_adapter(
-    flavor: Flavor,
-    payload: &[u8],
-    aux: Option<&AuxIpcClient>,
-) -> Vec<u8> {
+fn dispatch_load_adapter(flavor: Flavor, payload: &[u8], aux: Option<&AuxIpcClient>) -> Vec<u8> {
     let Some(client) = aux else {
         if is_dummy(flavor) {
             return encode(&());
@@ -208,11 +199,21 @@ fn dispatch_load_adapter(
     let safe_name: String = args
         .name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path: PathBuf = tmp_dir.join(format!(
         "{}-{:016x}.safetensors",
-        if safe_name.is_empty() { "adapter" } else { safe_name.as_str() },
+        if safe_name.is_empty() {
+            "adapter"
+        } else {
+            safe_name.as_str()
+        },
         args.adapter_ptr,
     ));
     if let Err(e) = std::fs::write(&path, &args.adapter_data) {
@@ -231,17 +232,10 @@ fn dispatch_load_adapter(
     }
 }
 
-/// True when the runtime flavor is dummy. Helper because `Flavor::Dummy`
-/// is cfg-gated — calling code can't reference it directly without
-/// duplicating the feature gate.
+/// True when the runtime flavor is dummy.
 #[inline]
-fn is_dummy(_flavor: Flavor) -> bool {
-    #[cfg(feature = "driver-dummy")]
-    {
-        return matches!(_flavor, Flavor::Dummy);
-    }
-    #[allow(unreachable_code)]
-    false
+fn is_dummy(flavor: Flavor) -> bool {
+    matches!(flavor, Flavor::Dummy)
 }
 
 fn zip_pairs(srcs: &[u32], dsts: &[u32]) -> Result<Vec<(u32, u32)>, String> {
@@ -252,7 +246,11 @@ fn zip_pairs(srcs: &[u32], dsts: &[u32]) -> Result<Vec<(u32, u32)>, String> {
             dsts.len()
         ));
     }
-    Ok(srcs.iter().zip(dsts.iter()).map(|(s, d)| (*s, *d)).collect())
+    Ok(srcs
+        .iter()
+        .zip(dsts.iter())
+        .map(|(s, d)| (*s, *d))
+        .collect())
 }
 
 #[derive(Serialize)]
@@ -331,8 +329,7 @@ mod tests {
     }
 
     fn any_flavor() -> Flavor {
-        crate::driver_ffi::default_flavor()
-            .expect("at least one driver feature must be enabled")
+        crate::driver_ffi::default_flavor().expect("at least one driver feature must be enabled")
     }
 
     #[test]
@@ -358,7 +355,6 @@ mod tests {
         assert!(s.contains("Method not found"), "got: {s}");
     }
 
-    #[cfg(feature = "driver-dummy")]
     #[test]
     fn copy_without_aux_dummy_returns_unit() {
         // Build a valid msgpack payload for copy_d2h's wire shape so
@@ -366,11 +362,11 @@ mod tests {
         let payload = rmp_serde::to_vec_named(&serde_json::json!({
             "phys_ids": [1u32, 2u32],
             "slots":    [10u32, 11u32],
-        })).unwrap();
+        }))
+        .unwrap();
 
         let resp = dispatch(Flavor::Dummy, "copy_d2h", &payload, None);
-        let _: () = rmp_serde::from_slice(&resp)
-            .expect("dummy: copy_d2h should decode as ()");
+        let _: () = rmp_serde::from_slice(&resp).expect("dummy: copy_d2h should decode as ()");
     }
 
     #[cfg(feature = "driver-portable")]
@@ -379,7 +375,8 @@ mod tests {
         let payload = rmp_serde::to_vec_named(&serde_json::json!({
             "phys_ids": [1u32, 2u32],
             "slots":    [10u32, 11u32],
-        })).unwrap();
+        }))
+        .unwrap();
         let resp = dispatch(Flavor::Portable, "copy_d2h", &payload, None);
         let s = decode_str(&resp);
         assert!(s.contains("no aux-IPC channel"), "got: {s}");

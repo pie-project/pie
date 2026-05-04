@@ -11,14 +11,16 @@ use anyhow::{Result, anyhow};
 use crate::config::{self, DriverKind};
 use crate::driver_ffi::{self, Flavor};
 
-/// `pie check <toml>` — parse + validate a config TOML and pretty-
-/// print the resulting struct. Exits non-zero on parse / validation
-/// failure.
-pub fn check(path: &Path) -> Result<()> {
+/// `pie check <toml>` — parse + validate a config TOML. Exits
+/// non-zero on parse / validation failure.
+pub fn check(path: &Path, debug: bool) -> Result<()> {
     match config::Config::from_toml_file(path) {
         Ok(cfg) => {
-            println!("[ok] {path:?}");
-            println!("{cfg:#?}");
+            println!("{}", check_summary(path, &cfg));
+            if debug {
+                println!();
+                println!("{cfg:#?}");
+            }
             Ok(())
         }
         Err(e) => {
@@ -26,6 +28,26 @@ pub fn check(path: &Path) -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+fn check_summary(path: &Path, cfg: &config::Config) -> String {
+    let model_count = cfg.models.len();
+    let model_word = if model_count == 1 { "model" } else { "models" };
+    let model_summary = cfg
+        .models
+        .iter()
+        .map(|m| format!("{}:{}", m.name, m.driver.kind.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let auth = if cfg.auth.enabled {
+        "auth enabled"
+    } else {
+        "auth disabled"
+    };
+    format!(
+        "✓ {} valid: {model_count} {model_word}; {auth}; {model_summary}",
+        path.display(),
+    )
 }
 
 /// `pie smoke [--rpc] [--flavor <name>]` — exercise the FFI / RPC
@@ -59,9 +81,8 @@ fn pick_smoke_flavor(name: Option<&str>) -> Result<Flavor> {
         };
         Flavor::from_kind(kind).map_err(|m| anyhow!("{m}"))
     } else {
-        driver_ffi::default_flavor().ok_or_else(|| {
-            anyhow!("no driver flavor compiled into this binary")
-        })
+        driver_ffi::default_flavor()
+            .ok_or_else(|| anyhow!("no driver flavor compiled into this binary"))
     }
 }
 

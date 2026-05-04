@@ -16,15 +16,16 @@
 //! The handshake JSON shape is the contract between this module and each
 //! launcher's `__main__.py`. **If you change `Handshake` here, update
 //! the JSON shape in all three of `driver/{dev,vllm,sglang}/src/.../__main__.py`
-//! to match.** The duplication is intentional — see the Phase 1.5 design
-//! decision (option (b)) recorded in the `__main__.py` docstrings.
+//! to match.** The duplication is intentional so the standalone can
+//! supervise every Python driver through one small protocol.
 
 use std::io::{BufRead, BufReader};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -32,6 +33,9 @@ use serde::Deserialize;
 
 use crate::config::ModelConfig;
 use crate::embedded_driver::DriverCapabilities;
+
+const SUBPROCESS_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const CHILD_WAIT_POLL: Duration = Duration::from_millis(50);
 
 /// Which Python driver flavor the subprocess hosts.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -182,8 +186,7 @@ pub fn write_subprocess_startup_toml(
     driver_section.insert("options".into(), toml::Value::Table(options));
     doc.insert("driver".into(), toml::Value::Table(driver_section));
 
-    let serialized =
-        toml::to_string(&doc).map_err(|e| anyhow!("serialize launcher TOML: {e}"))?;
+    let serialized = toml::to_string(&doc).map_err(|e| anyhow!("serialize launcher TOML: {e}"))?;
 
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)
@@ -214,11 +217,8 @@ pub struct SubprocessDriver {
 impl SubprocessDriver {
     /// Spawn one Python launcher subprocess for one DP group.
     ///
-    /// `python_exe` is the interpreter path. Phase 4 wires the
-    /// resolution chain (`model.driver.options.venv` →
-    /// `$PIE_PYTHON` → `~/.pie/config.toml [driver.<type>].venv` →
-    /// `$VIRTUAL_ENV/bin/python` → `which python3`); for now the
-    /// caller passes whatever they have.
+    /// `python_exe` is the interpreter path resolved by
+    /// [`crate::python_resolve`].
     ///
     /// Currently launches one subprocess per group. The Python
     /// launcher's `mp.spawn(world_size=…)` then forks per-rank workers
@@ -230,8 +230,9 @@ impl SubprocessDriver {
     /// info — `mp.spawn(world_size=N)` is invoked once per group with
     /// the same `[driver]` section. With DP > 1, the standalone calls
     /// `start` per group, so each call gets its own subprocess that
-    /// thinks it's alone. M4.5 may collapse to one Python subprocess
-    /// for all groups when TP rendezvous lands.
+    /// thinks it's alone. A future launcher can collapse this to one
+    /// Python subprocess for all groups without changing the runtime
+    /// handshake shape.
     pub fn start(
         flavor: SubprocessFlavor,
         python_exe: &Path,
@@ -241,9 +242,7 @@ impl SubprocessDriver {
         master_port: u16,
     ) -> Result<Self> {
         if !snapshot_dir.is_dir() {
-            bail!(
-                "snapshot_dir {snapshot_dir:?} does not exist or is not a directory"
-            );
+            bail!("snapshot_dir {snapshot_dir:?} does not exist or is not a directory");
         }
 
         let state_dir = subprocess_state_dir(flavor, group_id);
@@ -251,8 +250,9 @@ impl SubprocessDriver {
             .with_context(|| format!("create state dir {state_dir:?}"))?;
         let toml_path = state_dir.join("driver.toml");
 
-        // Conservative default — vllm + sglang both load big weights;
-        // 20 minutes covers a cold start. M4 surfaces this as a knob.
+        // Conservative default: vllm + sglang both load big weights, so
+        // 20 minutes covers a cold start. This can become a config knob if
+        // users need a shorter failure window.
         let ready_timeout_s = 1200.0;
 
         write_subprocess_startup_toml(
@@ -265,8 +265,7 @@ impl SubprocessDriver {
 
         // Build the handshake pipe. Parent reads, child writes (dup'd
         // to fd 3 in the child via `pre_exec`).
-        let (parent_read_fd, child_write_fd) = make_pipe()
-            .context("creating handshake pipe")?;
+        let (parent_read_fd, child_write_fd) = make_pipe().context("creating handshake pipe")?;
 
         // Move ownership of the child end into the pre_exec closure
         // by raw fd (CommandExt::pre_exec captures by Fn so the OwnedFd
@@ -318,14 +317,14 @@ impl SubprocessDriver {
             });
         }
 
-        let child = cmd
-            .spawn()
-            .with_context(|| format!(
+        let mut child = cmd.spawn().with_context(|| {
+            format!(
                 "spawn `{} -m {} --config {} --handshake-fd 3`",
                 python_exe.display(),
                 flavor.module_name(),
                 toml_path.display(),
-            ))?;
+            )
+        })?;
 
         // Close the parent's copy of the pipe's write end. The child
         // forked + dup2'd it to fd 3 in `pre_exec`; we have no use for
@@ -347,15 +346,18 @@ impl SubprocessDriver {
         // SAFETY: `parent_read_fd` is exclusively owned by us; the
         // OwnedFd takes ownership and is dropped at end of scope.
         let parent_read = parent_read_fd;
-        let reader = BufReader::new(unsafe {
-            std::fs::File::from_raw_fd(parent_read.into_raw_fd())
-        });
+        let reader =
+            BufReader::new(unsafe { std::fs::File::from_raw_fd(parent_read.into_raw_fd()) });
 
-        let handshake = read_handshake_for_group(reader, group_id, ready_timeout_s)
-            .with_context(|| format!(
-                "reading handshake for {} group {group_id}",
-                flavor.as_str(),
-            ))?;
+        let handshake = match read_handshake_for_group(reader, group_id, ready_timeout_s)
+            .with_context(|| format!("reading handshake for {} group {group_id}", flavor.as_str(),))
+        {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = terminate_child(&mut child, SUBPROCESS_SHUTDOWN_GRACE);
+                return Err(e);
+            }
+        };
 
         let expected_shmem = format!("/pie_shmem_g{group_id}");
         if handshake.shmem_name != expected_shmem {
@@ -413,10 +415,7 @@ impl SubprocessDriver {
         let Some(mut child) = guard.take() else {
             return 0;
         };
-        match child.wait() {
-            Ok(status) => status.code().unwrap_or(-1),
-            Err(_) => -1,
-        }
+        terminate_child(&mut child, SUBPROCESS_SHUTDOWN_GRACE)
     }
 }
 
@@ -426,11 +425,7 @@ impl Drop for SubprocessDriver {
     fn drop(&mut self) {
         let mut guard = self.child.lock().unwrap();
         if let Some(mut child) = guard.take() {
-            let pid = child.id() as i32;
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            let _ = child.wait();
+            let _ = terminate_child(&mut child, SUBPROCESS_SHUTDOWN_GRACE);
         }
     }
 }
@@ -487,23 +482,54 @@ fn make_pipe() -> Result<(OwnedFd, OwnedFd)> {
 }
 
 fn read_handshake_for_group(
-    mut reader: impl BufRead,
+    mut reader: impl BufRead + Send + 'static,
     expected_group_id: usize,
     timeout_s: f64,
 ) -> Result<Handshake> {
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_s.max(1.0));
+    let timeout = Duration::from_secs_f64(timeout_s.max(1.0));
+    let (tx, rx) = mpsc::channel::<Result<Option<String>>>();
+    thread::spawn(move || {
+        loop {
+            let mut line = String::new();
+            let result = match reader.read_line(&mut line) {
+                Ok(0) => Ok(None),
+                Ok(_) => Ok(Some(line)),
+                Err(e) => Err(anyhow!("read handshake line: {e}")),
+            };
+            let done = !matches!(result, Ok(Some(_)));
+            if tx.send(result).is_err() || done {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + timeout;
     let mut found: Option<GroupLine> = None;
 
     loop {
-        if Instant::now() > deadline {
+        let now = Instant::now();
+        if now >= deadline {
             bail!("launcher handshake timed out after {timeout_s:.1}s");
         }
 
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| anyhow!("read handshake line: {e}"))?;
-        if n == 0 {
+        let line = match rx.recv_timeout(deadline - now) {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => {
+                // EOF — launcher exited before sending sentinel.
+                bail!(
+                    "launcher exited before handshake completed; check stderr for the \
+                     launcher's last log line"
+                );
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                bail!("launcher handshake timed out after {timeout_s:.1}s");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("launcher handshake reader disconnected");
+            }
+        };
+        if line.is_empty() {
             // EOF — launcher exited before sending sentinel.
             bail!(
                 "launcher exited before handshake completed; check stderr for the \
@@ -523,14 +549,18 @@ fn read_handshake_for_group(
         let value: serde_json::Value = serde_json::from_str(trimmed)
             .map_err(|e| anyhow!("parse handshake line {trimmed:?}: {e}"))?;
         if value.get("ready").is_some() {
-            return found.map(|g| Handshake {
-                server_name: g.server_name,
-                shmem_name: g.shmem_name,
-                caps: g.caps,
-            }).ok_or_else(|| anyhow!(
-                "launcher emitted ready sentinel without a handshake line for \
+            return found
+                .map(|g| Handshake {
+                    server_name: g.server_name,
+                    shmem_name: g.shmem_name,
+                    caps: g.caps,
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "launcher emitted ready sentinel without a handshake line for \
                  group {expected_group_id}"
-            ));
+                    )
+                });
         }
 
         let group: GroupLine = serde_json::from_value(value)
@@ -551,9 +581,51 @@ fn read_handshake_for_group(
     }
 }
 
+fn terminate_child(child: &mut Child, grace: Duration) -> i32 {
+    if let Some(rc) = try_wait_code(child) {
+        return rc;
+    }
+
+    let pid = child.id() as i32;
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    if let Some(rc) = wait_child_code(child, grace) {
+        return rc;
+    }
+
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1)
+}
+
+fn wait_child_code(child: &mut Child, timeout: Duration) -> Option<i32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(rc) = try_wait_code(child) {
+            return Some(rc);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(CHILD_WAIT_POLL);
+    }
+}
+
+fn try_wait_code(child: &mut Child) -> Option<i32> {
+    match child.try_wait() {
+        Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
+        Ok(None) => None,
+        Err(_) => Some(-1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     fn fixture_caps_json() -> &'static str {
         // Single-line — the handshake protocol is line-delimited JSON.
@@ -576,7 +648,8 @@ mod tests {
              {{\"ready\":true,\"num_groups\":1}}\n",
             fixture_caps_json(),
         );
-        let h = read_handshake_for_group(stream.as_bytes(), 0, 5.0).unwrap();
+        let h =
+            read_handshake_for_group(std::io::Cursor::new(stream.into_bytes()), 0, 5.0).unwrap();
         assert_eq!(h.server_name, "/tmp/sock");
         assert_eq!(h.shmem_name, "/pie_shmem_g0");
         assert_eq!(h.caps.total_pages, 1024);
@@ -590,7 +663,8 @@ mod tests {
               \"shmem_name\":\"/pie_shmem_g0\",\"caps\":{}}}\n",
             fixture_caps_json(),
         );
-        let err = read_handshake_for_group(stream.as_bytes(), 0, 5.0).unwrap_err();
+        let err = read_handshake_for_group(std::io::Cursor::new(stream.into_bytes()), 0, 5.0)
+            .unwrap_err();
         assert!(
             err.to_string().contains("launcher exited before handshake"),
             "got: {err}"
@@ -605,17 +679,52 @@ mod tests {
              {{\"ready\":true,\"num_groups\":1}}\n",
             fixture_caps_json(),
         );
-        let err = read_handshake_for_group(stream.as_bytes(), 0, 5.0).unwrap_err();
+        let err = read_handshake_for_group(std::io::Cursor::new(stream.into_bytes()), 0, 5.0)
+            .unwrap_err();
         assert!(err.to_string().contains("group_id=7"), "got: {err}");
     }
 
     #[test]
     fn handshake_rejects_sentinel_without_group() {
         let stream = "{\"ready\":true,\"num_groups\":0}\n";
-        let err = read_handshake_for_group(stream.as_bytes(), 0, 5.0).unwrap_err();
+        let err =
+            read_handshake_for_group(std::io::Cursor::new(stream.as_bytes().to_vec()), 0, 5.0)
+                .unwrap_err();
         assert!(
             err.to_string().contains("without a handshake line"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn handshake_timeout_is_not_blocked_by_open_pipe() {
+        let (read_fd, write_fd) = make_pipe().unwrap();
+        let reader = BufReader::new(unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) });
+        let started = Instant::now();
+        let err = read_handshake_for_group(reader, 0, 1.0).unwrap_err();
+        drop(write_fd);
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout took {:?}",
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn terminate_child_escalates_after_grace() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 60")
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let rc = terminate_child(&mut child, Duration::from_millis(100));
+        assert_ne!(rc, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "termination took {:?}",
+            started.elapsed(),
         );
     }
 }

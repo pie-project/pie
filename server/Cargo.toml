@@ -22,16 +22,14 @@ name = "pie"
 path = "src/main.rs"
 
 [features]
-# Default to portable. Any non-empty subset is allowed: enabling
-# multiple `driver-*` features links every selected driver into the
-# binary and dispatches at runtime based on each `[[model]].driver.type`
-# in the config TOML. `build.rs` only fails when zero are enabled.
+# Default to portable plus the always-linked dummy driver. Enabling
+# `driver-cuda` also links the native CUDA driver. `driver-dummy` is
+# kept as a compatibility no-op for older build commands; the dummy
+# Rust driver is no longer gated.
 default = ["driver-portable"]
 driver-portable = []
 driver-cuda = []
-# Rust dummy driver — random tokens, no model load. Useful for plumbing
-# tests and the macOS dev loop where the C++ drivers don't build.
-driver-dummy = ["dep:pie-driver-dummy"]
+driver-dummy = []
 
 [dependencies]
 # `pie` is the runtime crate. After Phase 8 deleted the legacy
@@ -76,9 +74,8 @@ ratatui = "0.30"
 crossterm = "0.29"
 nvml-wrapper = "0.12"
 
-# Optional Rust drivers. The static lib is pulled in only when the matching
-# `driver-*` feature is enabled.
-pie-driver-dummy = { path = "../driver/dummy", optional = true }
+# Always-linked Rust dummy driver — random tokens, no model load.
+pie-driver-dummy = { path = "../driver/dummy" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
 # the engine subprocess we boot. Same crate the dummy_roundtrip example

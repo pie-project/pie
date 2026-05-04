@@ -160,7 +160,11 @@ pub fn run(cmd: DriverCmd) -> Result<()> {
 
 fn list(args: ListArgs) -> Result<()> {
     println!("Subprocess drivers (Python wheels):");
-    for f in [SubprocessFlavor::Dev, SubprocessFlavor::Vllm, SubprocessFlavor::Sglang] {
+    for f in [
+        SubprocessFlavor::Dev,
+        SubprocessFlavor::Vllm,
+        SubprocessFlavor::Sglang,
+    ] {
         println!("  {:<8}  python -m {}", f.as_str(), f.module_name());
     }
     println!();
@@ -169,29 +173,30 @@ fn list(args: ListArgs) -> Result<()> {
         println!(
             "  {:<12} {}",
             name,
-            if on { "(compiled in)" } else { "(not compiled)" },
+            if on {
+                "(compiled in)"
+            } else {
+                "(not compiled)"
+            },
         );
     }
 
     if let Some(path) = args.config {
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading config {path:?}"))?;
-        let cfg: crate::config::Config = toml::from_str(&text)
-            .with_context(|| format!("parsing {path:?}"))?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("reading config {path:?}"))?;
+        let cfg: crate::config::Config =
+            toml::from_str(&text).with_context(|| format!("parsing {path:?}"))?;
         println!();
         println!("[[model]] entries in {}:", path.display());
         for m in &cfg.models {
             println!(
                 "  {:<24}  type = {:?}, devices = {:?}",
-                m.name,
-                m.driver.kind,
-                m.driver.device,
+                m.name, m.driver.kind, m.driver.device,
             );
         }
     }
     Ok(())
 }
-
 
 // -----------------------------------------------------------------------------
 // subprocess actions
@@ -209,11 +214,7 @@ fn run_subprocess(flavor: SubprocessFlavor, action: PerDriverCmd) -> Result<()> 
 }
 
 fn install(flavor: SubprocessFlavor, path: Option<PathBuf>, run: bool) -> Result<()> {
-    let venv = path.unwrap_or_else(|| {
-        crate::paths::pie_home()
-            .join("venvs")
-            .join(flavor.as_str())
-    });
+    let venv = path.unwrap_or_else(|| crate::paths::pie_home().join("venvs").join(flavor.as_str()));
     let python_bin = venv.join("bin").join("python");
 
     let wheel_extras = match flavor {
@@ -284,29 +285,30 @@ fn install(flavor: SubprocessFlavor, path: Option<PathBuf>, run: bool) -> Result
 fn doctor_subprocess(flavor: SubprocessFlavor) -> Result<()> {
     let global = DriversConfig::load().context("loading ~/.pie/drivers.toml")?;
     let empty = toml::Table::new();
-    let resolved =
-        match python_resolve::resolve_python(flavor, &empty, Some(&global)) {
-            Ok(r) => r,
-            Err(e) => {
-                println!("[{}]", flavor.as_str());
-                println!("  python: NOT RESOLVED");
-                println!("  reason: {e}");
-                return Err(e);
-            }
-        };
+    let resolved = match python_resolve::resolve_python(flavor, &empty, Some(&global)) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[{}]", flavor.as_str());
+            println!("  python: NOT RESOLVED");
+            println!("  reason: {e}");
+            return Err(e);
+        }
+    };
 
     println!("[{}]", flavor.as_str());
     println!("  python: {}", resolved.path.display());
     println!("  source: {}", resolved.source);
 
     // 1. Interpreter is callable + reports its version.
-    let version = capture(&resolved.path, &["--version"])
-        .context("python --version")?;
+    let version = capture(&resolved.path, &["--version"]).context("python --version")?;
     println!("  python --version: {}", version.trim());
 
     // 2. Driver wheel imports.
     let module = flavor.module_name();
-    match capture(&resolved.path, &["-c", &format!("import {module}; print({module}.__file__)")]) {
+    match capture(
+        &resolved.path,
+        &["-c", &format!("import {module}; print({module}.__file__)")],
+    ) {
         Ok(out) => println!("  import {module}: {}", out.trim()),
         Err(e) => println!("  import {module}: FAIL ({e})"),
     }
@@ -410,10 +412,14 @@ fn exec(flavor: SubprocessFlavor, args: Vec<OsString>) -> Result<()> {
     // their interpreter-relative paths so users can `pie driver vllm
     // exec -- python -V` and have it resolve to the venv's python.
     let (program, rest) = match args[0].to_str() {
-        Some("python") | Some("python3") => {
-            (resolved.path.into_os_string(), args.into_iter().skip(1).collect::<Vec<_>>())
-        }
-        _ => (args[0].clone(), args.into_iter().skip(1).collect::<Vec<_>>()),
+        Some("python") | Some("python3") => (
+            resolved.path.into_os_string(),
+            args.into_iter().skip(1).collect::<Vec<_>>(),
+        ),
+        _ => (
+            args[0].clone(),
+            args.into_iter().skip(1).collect::<Vec<_>>(),
+        ),
     };
 
     let err = Command::new(&program).args(&rest).exec();
@@ -435,12 +441,16 @@ fn doctor_embedded(name: &str) -> Result<()> {
     let compiled = match name {
         "portable" => cfg!(feature = "driver-portable"),
         "cuda_native" => cfg!(feature = "driver-cuda"),
-        "dummy" => cfg!(feature = "driver-dummy"),
+        "dummy" => true,
         _ => false,
     };
     println!(
-        "  feature-gate: {}",
-        if compiled { "compiled in" } else { "NOT compiled in" }
+        "  availability: {}",
+        if compiled {
+            "compiled in"
+        } else {
+            "NOT compiled in"
+        }
     );
     if !compiled {
         println!(
@@ -452,7 +462,10 @@ fn doctor_embedded(name: &str) -> Result<()> {
     if name == "cuda_native" {
         // nvidia-smi is the cheapest "GPU visible" probe; no link to
         // libnvidia-ml needed.
-        match capture(&PathBuf::from("nvidia-smi"), &["--query-gpu=name,driver_version", "--format=csv,noheader"]) {
+        match capture(
+            &PathBuf::from("nvidia-smi"),
+            &["--query-gpu=name,driver_version", "--format=csv,noheader"],
+        ) {
             Ok(out) => {
                 println!("  nvidia-smi:");
                 for line in out.lines() {
@@ -491,8 +504,7 @@ fn capture(program: &std::path::Path, args: &[&str]) -> Result<String> {
 fn save_drivers_config(cfg: &DriversConfig) -> Result<()> {
     let path = python_resolve::drivers_config_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {parent:?}"))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
     }
     // Render manually; serializing through serde would carry the
     // `#[serde(default)]` defaults and produce a noisier file.
@@ -517,8 +529,7 @@ fn save_drivers_config(cfg: &DriversConfig) -> Result<()> {
         }
         out.push('\n');
     }
-    std::fs::write(&path, out)
-        .with_context(|| format!("writing {path:?}"))?;
+    std::fs::write(&path, out).with_context(|| format!("writing {path:?}"))?;
     Ok(())
 }
 

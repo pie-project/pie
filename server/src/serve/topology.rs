@@ -4,13 +4,11 @@
 
 use anyhow::{Result, anyhow};
 
-use crate::config::{self, DriverKind};
 #[cfg(feature = "driver-cuda")]
 use crate::config::CudaNativeDriverOptions;
-#[cfg(feature = "driver-dummy")]
-use crate::config::DummyDriverOptions;
 #[cfg(feature = "driver-portable")]
 use crate::config::PortableDriverOptions;
+use crate::config::{self, DriverKind, DummyDriverOptions};
 use crate::driver_ffi::Flavor;
 use crate::embedded_driver::DriverOptions;
 use crate::subprocess_driver::SubprocessFlavor;
@@ -32,10 +30,7 @@ pub enum ResolvedFlavor {
 ///
 /// Example: `world_size=4, tp_degree=2 → [[0,1], [2,3]]` — two DP
 /// replicas, each with two TP-sharded ranks.
-pub fn calculate_topology(
-    world_size: usize,
-    tp_degree: usize,
-) -> Result<Vec<Vec<usize>>> {
+pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec<usize>>> {
     if tp_degree == 0 {
         anyhow::bail!("tensor_parallel_size must be > 0");
     }
@@ -77,10 +72,7 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlav
 /// The cuda variant's `device` is filled from the first device in the
 /// model's list as a placeholder — the per-group spawn loop overwrites
 /// it with the right device for each DP replica.
-pub fn build_embedded_options(
-    m: &config::ModelConfig,
-    flavor: Flavor,
-) -> Result<DriverOptions> {
+pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result<DriverOptions> {
     match flavor {
         #[cfg(feature = "driver-portable")]
         Flavor::Portable => {
@@ -101,7 +93,10 @@ pub fn build_embedded_options(
                 .try_into()
                 .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
             let device = m.driver.device.first().ok_or_else(|| {
-                anyhow!("model {:?}: cuda_native requires at least one device", m.name)
+                anyhow!(
+                    "model {:?}: cuda_native requires at least one device",
+                    m.name
+                )
             })?;
             Ok(DriverOptions::CudaNative {
                 opts: c,
@@ -109,7 +104,6 @@ pub fn build_embedded_options(
                 hf_repo: m.hf_repo.clone(),
             })
         }
-        #[cfg(feature = "driver-dummy")]
         Flavor::Dummy => {
             let d: DummyDriverOptions = m
                 .driver
