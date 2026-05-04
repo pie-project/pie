@@ -300,6 +300,14 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          # Force a fresh cmake configure for pie-server's build script.
+          # The persistent CARGO_TARGET_DIR keeps pie-server-<hash>/out/
+          # between runs; if the cached CMakeCache.txt was written when
+          # `CMAKE_CUDA_COMPILER_LAUNCHER=sccache` was in env, removing
+          # the env var alone won't drop it from the cache and cmake's
+          # compile rules keep wrapping nvcc with sccache. Scoped to
+          # pie-server, so other crates' deps stay cached.
+          cargo clean -p pie-server --target x86_64-unknown-linux-gnu --release
           cargo build --release \
             --target x86_64-unknown-linux-gnu \
             -p pie-server \
