@@ -1,0 +1,281 @@
+name: build (manual)
+
+# Manual builds of `pie` for distribution. Each run rewrites the
+# `latest-build` rolling pre-release on this repo's GitHub Releases —
+# every artifact is uploaded with `gh release upload --clobber`, so
+# download URLs stay stable across runs.
+#
+# One-time setup before the first dispatch:
+#
+#   gh release create latest-build --prerelease --notes "Rolling build"
+#
+# After that, this workflow keeps the assets on that release fresh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to update (assets uploaded with --clobber)"
+        type: string
+        default: "latest-build"
+      portable:
+        description: "Build portable matrix (linux/macos/windows)"
+        type: boolean
+        default: true
+      cuda:
+        description: "Build CUDA matrix (linux/windows × cuda 12.6/12.8/13.0)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write     # needed for `gh release upload`
+
+env:
+  # Same release notes refresh for every job — keeps the page in sync
+  # with the latest workflow run.
+  RELEASE_NOTES: |
+    Rolling build from commit ${{ github.sha }} on ${{ github.ref_name }}.
+    Triggered: ${{ github.event.workflow_run.created_at || github.event.repository.updated_at }}
+    Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  # =========================================================================
+  # Portable matrix — no CUDA toolkit needed.
+  # =========================================================================
+  portable:
+    if: inputs.portable
+    name: portable / ${{ matrix.target.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - label: x86_64-manylinux_2_28
+            runner: ubuntu-22.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            triple: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            backend_env: ""
+          - label: aarch64-manylinux_2_28
+            runner: ubuntu-22.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            triple: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            backend_env: ""
+          - label: aarch64-darwin
+            runner: macos-14
+            container: ""
+            triple: aarch64-apple-darwin
+            archive: tar.gz
+            backend_env: "PIE_PORTABLE_METAL=1"
+          - label: x86_64-windows
+            runner: windows-latest
+            container: ""
+            triple: x86_64-pc-windows-msvc
+            archive: zip
+            backend_env: "PIE_PORTABLE_VULKAN=1"
+    runs-on: ${{ matrix.target.runner }}
+    container: ${{ matrix.target.container || '' }}
+    env:
+      ARTIFACT_NAME: pie-${{ matrix.target.label }}.${{ matrix.target.archive }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # manylinux containers ship gcc + cmake + ninja but no rust.
+      # Other runners have them via setup steps below.
+      - name: Install rustup (manylinux only)
+        if: startsWith(matrix.target.container, 'quay.io/pypa/manylinux')
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust (non-container runners)
+        if: matrix.target.container == ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.triple }}
+
+      - name: Install Vulkan SDK (windows only)
+        if: matrix.target.label == 'x86_64-windows'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: latest
+          cache: true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ matrix.target.label }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: build-${{ matrix.target.label }}-
+
+      - name: cargo build --release
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -n "${{ matrix.target.backend_env }}" ]; then
+            export ${{ matrix.target.backend_env }}
+          fi
+          cargo build --release \
+            --target ${{ matrix.target.triple }} \
+            -p pie-server \
+            --features driver-portable,driver-dummy
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          BIN_DIR="target/${{ matrix.target.triple }}/release"
+          if [[ "${{ matrix.target.archive }}" == "zip" ]]; then
+            # Windows .exe; 7z preinstalled on windows-latest.
+            7z a "dist/${ARTIFACT_NAME}" "${BIN_DIR}/pie.exe"
+          else
+            tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
+          fi
+          ls -la dist/
+
+      - name: Upload to release (--clobber)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"
+
+  # =========================================================================
+  # CUDA matrix — Linux jobs run inside `nvidia/cuda` images (toolkit + nccl
+  # preinstalled, glibc 2.28 → manylinux_2_28-compatible). Windows jobs use
+  # Jimver/cuda-toolkit on `windows-latest` (no Linux-only `driver-cuda`
+  # feature; CUDA reaches portable via PIE_PORTABLE_CUDA).
+  # =========================================================================
+  cuda:
+    if: inputs.cuda
+    name: cuda / ${{ matrix.os.label }} / cuda${{ matrix.cuda.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - label: x86_64-manylinux_2_28
+            runner: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            cargo_features: "driver-portable,driver-cuda,driver-dummy"
+            archive: tar.gz
+          - label: x86_64-windows
+            runner: windows-latest
+            triple: x86_64-pc-windows-msvc
+            cargo_features: "driver-portable,driver-dummy"
+            archive: zip
+        cuda:
+          - { version: "12.6.3", short: "12.6", arch: "75;80;86;89;90" }
+          - { version: "12.8.1", short: "12.8", arch: "75;80;86;89;90;100;120" }
+          - { version: "13.0.0", short: "13.0", arch: "75;80;86;89;90;100;120" }
+    runs-on: ${{ matrix.os.runner }}
+    container: ${{ matrix.os.label == 'x86_64-manylinux_2_28' && format('nvidia/cuda:{0}-devel-rockylinux8', matrix.cuda.version) || '' }}
+    env:
+      ARTIFACT_NAME: pie-${{ matrix.os.label }}-cuda${{ matrix.cuda.short }}.${{ matrix.os.archive }}
+      PIE_PORTABLE_CUDA: "1"
+      PIE_PORTABLE_CUDA_ARCH: ${{ matrix.cuda.arch }}
+      CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda.arch }}
+      CMAKE_CUDA_RUNTIME_LIBRARY: Shared
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Bootstrap container (linux)
+        if: matrix.os.label == 'x86_64-manylinux_2_28'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # nvidia/cuda:rockylinux8 images have glibc 2.28 (matches
+          # manylinux_2_28) but minimal userland. Add what we need.
+          dnf install -y --setopt=install_weak_deps=False \
+            cmake ninja-build gcc-toolset-12 git \
+            openssl-devel
+          source /opt/rh/gcc-toolset-12/enable
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # Persist the gcc-toolset env for subsequent steps.
+          echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}" >> "$GITHUB_ENV"
+          echo "MANPATH=/opt/rh/gcc-toolset-12/root/usr/share/man:" >> "$GITHUB_ENV"
+          echo "INFOPATH=/opt/rh/gcc-toolset-12/root/usr/share/info" >> "$GITHUB_ENV"
+
+      - name: Install Rust (windows)
+        if: matrix.os.label == 'x86_64-windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os.triple }}
+
+      - name: Install CUDA toolkit (windows)
+        if: matrix.os.label == 'x86_64-windows'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: ${{ matrix.cuda.version }}
+          method: network
+          # Headers + libs only; the runner already has a compatible MSVC.
+          sub-packages: '["nvcc", "cudart", "thrust", "cublas", "cublas_dev", "curand", "curand_dev"]'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-cuda-${{ matrix.os.label }}-${{ matrix.cuda.short }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: build-cuda-${{ matrix.os.label }}-${{ matrix.cuda.short }}-
+
+      - name: cargo build --release
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo build --release \
+            --target ${{ matrix.os.triple }} \
+            -p pie-server \
+            --features ${{ matrix.os.cargo_features }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          BIN_DIR="target/${{ matrix.os.triple }}/release"
+          if [[ "${{ matrix.os.archive }}" == "zip" ]]; then
+            7z a "dist/${ARTIFACT_NAME}" "${BIN_DIR}/pie.exe"
+          else
+            tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
+          fi
+          ls -la dist/
+
+      - name: Upload to release (--clobber)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"
+
+  # =========================================================================
+  # Refresh the release notes once after all builds finish.
+  # =========================================================================
+  refresh-notes:
+    if: always() && (inputs.portable || inputs.cuda)
+    needs: [portable, cuda]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Edit release notes + body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          gh release edit "${{ inputs.tag }}" \
+            --notes "${RELEASE_NOTES}" \
+            --repo "${{ github.repository }}"
