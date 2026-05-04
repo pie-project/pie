@@ -20,14 +20,17 @@ exclude = [
     "sdk/rust",
 ]
 
-# Distribution profile for `pie-server`. Trades build time for
-# binary size: full LTO, single codegen unit, abort-on-panic
-# (no unwinder + smaller .eh_frame), all symbols stripped. Use
-# `cargo build --profile release-min -p pie-server --release`.
-# The regular `release` profile stays as the default dev/bench path.
+# Distribution profile for `pie-server`. Use
+# `cargo build --profile release-min -p pie-server`. The regular
+# `release` profile stays as the default dev/bench path (no LTO).
+#
+# Thin LTO over fat: ~10× faster link than fat with most of the size
+# and runtime win. Fat LTO doubled CI build time on the cuda matrix
+# (CUDA kernel compile + Rust+C++ link grew from ~1h to many hours)
+# without measurably better artifacts. Thin LTO parallelizes across
+# codegen units, so we leave codegen-units at the default (16) too.
 [profile.release-min]
 inherits = "release"
-lto = "fat"
-codegen-units = 1
+lto = "thin"
 panic = "abort"
 strip = "symbols"
