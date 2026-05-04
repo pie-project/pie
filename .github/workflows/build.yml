@@ -112,6 +112,13 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False \
             openssl-devel pkg-config perl \
             gcc-toolset-14-gcc gcc-toolset-14-gcc-c++
+          # GitHub CLI — used by the upload step. The manylinux image
+          # doesn't ship `gh` and the upload step's --clobber flow has
+          # no clean curl equivalent.
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo \
+            https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y gh --repo gh-cli
           # Pin compiler + linker to gcc-toolset-14 for subsequent
           # steps. cmake-rs (via cc-rs) reads CC/CXX, so this forces
           # CMake to use gcc-14 even though manylinux's `/opt/clang/bin`
@@ -257,6 +264,11 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False \
             cmake ninja-build gcc-toolset-12 git \
             openssl-devel
+          # GitHub CLI — used by the upload step.
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo \
+            https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y gh --repo gh-cli
           source /opt/rh/gcc-toolset-12/enable
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable
