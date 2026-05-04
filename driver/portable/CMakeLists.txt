@@ -29,11 +29,6 @@ cpmaddpackage(
   GITHUB_REPOSITORY ggerganov/llama.cpp
   GIT_TAG b8994
   EXCLUDE_FROM_ALL YES
-  # patches/ggml-fast-argsort.patch swaps ggml-cpu's O(n²) bubble sort
-  # in `ggml_compute_forward_argsort_f32` for `std::sort`. Critical for
-  # CPU sampling fast paths: a single `ggml_top_k(probs, K)` over the
-  # full vocab (e.g. 152 k for Qwen3) otherwise takes ~22 s per token.
-  #
   # patches/ggml-pie-paged-attn-ext.patch adds GGML_OP_PAGED_ATTN_EXT and
   # the `ggml_paged_attn_ext` constructor — the op proper. Backend kernels
   # land in follow-up patches; with no backend advertising support, the
@@ -46,9 +41,7 @@ cpmaddpackage(
   # fresh download silently leaves ggml.h without `ggml_paged_attn_ext`,
   # which only surfaces ~60 minutes later as a model.cpp compile error.
   # `-N` is kept as belt-and-suspenders for the rare manual re-populate.
-  PATCH_COMMAND ${CMAKE_COMMAND} -E echo "applying ggml-fast-argsort.patch"
-        COMMAND patch -p1 -N -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fast-argsort.patch
-        COMMAND ${CMAKE_COMMAND} -E echo "applying ggml-pie-paged-attn-ext.patch"
+  PATCH_COMMAND ${CMAKE_COMMAND} -E echo "applying ggml-pie-paged-attn-ext.patch"
         COMMAND patch -p1 -N -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-pie-paged-attn-ext.patch
   OPTIONS
     "LLAMA_BUILD_TESTS OFF"
