@@ -89,7 +89,9 @@ async fn main() -> Result<()> {
     std::fs::write(&config_path, write_config(&snapshot_dir))?;
 
     // Spawn the server. Capture stdout so we can fish out the ws token.
+    // Subcommand is `serve` since the M6 CLI rewrite — see cli/serve_cmd.rs.
     let mut child = Command::new(&pie_bin)
+        .arg("serve")
         .arg("--config")
         .arg(&config_path)
         .stdout(Stdio::piped())

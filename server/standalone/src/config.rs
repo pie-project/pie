@@ -8,20 +8,20 @@
 //!     checks `huggingface_hub`-resolved paths until the driver actually
 //!     loads the model).
 //!
-//! The Rust [`Config`] type below is the user-facing TOML schema. The
-//! conversion to `pie::bootstrap::Config` (the runtime's own config) is
-//! a later step (M2.4 wires it up).
+//! The Rust [`Config`] type below is the user-facing TOML schema; the
+//! conversion to `pie::bootstrap::Config` (the runtime's own config)
+//! happens in [`crate::bootstrap_translate`].
 
 use std::path::PathBuf;
 
 use anyhow::{Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // -----------------------------------------------------------------------------
 // Top-level
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -84,7 +84,7 @@ impl Config {
 // [server]
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
@@ -132,7 +132,7 @@ fn default_true() -> bool { true }
 // [auth]
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     #[serde(default = "default_true")]
@@ -149,7 +149,7 @@ impl Default for AuthConfig {
 // [telemetry]
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     #[serde(default)]
@@ -177,7 +177,7 @@ fn default_service_name() -> String { "pie".to_string() }
 // [runtime]
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default = "default_worker_threads")]
@@ -245,7 +245,7 @@ fn default_max_upload_mb() -> usize { 256 }
 // [[model]]
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub name: String,
@@ -268,7 +268,7 @@ impl ModelConfig {
 // [model.scheduler]
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
     #[serde(default = "default_batch_policy")]
@@ -334,7 +334,7 @@ fn default_restore_pause_at_utilization() -> f64 { 0.85 }
 // [model.driver]
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)] // forwarded to the embedded driver via TOML; not all
 // fields are read on the Rust side yet.
@@ -369,7 +369,7 @@ impl DriverConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
     /// Portable ggml driver — embedded as a static lib in `pie-standalone`.
@@ -445,7 +445,7 @@ where
 
 /// `[model.driver.options]` for `type = "portable"`.
 /// Mirrors `pie/src/pie_driver_portable/config.py::PortableDriverConfig`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PortableDriverOptions {
     pub kv_page_size: u32,
@@ -483,7 +483,7 @@ impl Default for PortableDriverOptions {
 /// fabricates everything the portable driver would otherwise read from
 /// model weights — `vocab_size` and `arch_name` are required because no
 /// safe default exists. Page geometry and timeouts have generic defaults.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DummyDriverOptions {
     /// Vocabulary size advertised in the caps handshake. Required —
@@ -514,6 +514,52 @@ fn default_max_batch_tokens() -> u32 { 4096 }
 fn default_max_batch_size() -> u32 { 128 }
 fn default_max_model_len() -> u32 { 4096 }
 fn default_dummy_ready_timeout_s() -> f64 { 5.0 }
+
+/// `[model.driver.options]` for `type = "cuda_native"`.
+/// Mirrors `pie/src/pie_driver_cuda_native/config.py::CudaNativeDriverConfig`.
+///
+/// `binary_path` is accepted for config compatibility with the Python
+/// wrapper path but ignored — the standalone embeds the cuda driver as
+/// a static library, so there is no separate executable to discover.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CudaNativeDriverOptions {
+    pub binary_path: String,
+
+    pub gpu_mem_utilization: f64,
+    pub kv_page_size: u32,
+    pub max_batch_tokens: u32,
+    pub max_batch_size: u32,
+    pub max_num_kv_pages: u32,
+    pub swap_pool_size: u32,
+    pub weight_dtype: String,
+    /// Runtime quantization mode applied after weight load. Empty = none;
+    /// `"fp8"` enables per-tensor symmetric FP8_E4M3 on every llama-like
+    /// projection weight. Currently only honored for model_type=qwen3 by
+    /// the C++ side.
+    pub runtime_quant: String,
+
+    pub ready_timeout_s: f64,
+    pub shutdown_timeout_s: f64,
+}
+
+impl Default for CudaNativeDriverOptions {
+    fn default() -> Self {
+        Self {
+            binary_path: String::new(),
+            gpu_mem_utilization: 0.85,
+            kv_page_size: 32,
+            max_batch_tokens: 10240,
+            max_batch_size: 512,
+            max_num_kv_pages: 1024,
+            swap_pool_size: 0,
+            weight_dtype: "bfloat16".to_string(),
+            runtime_quant: String::new(),
+            ready_timeout_s: 600.0,
+            shutdown_timeout_s: 5.0,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -603,5 +649,61 @@ type = "portable"
 device = ["cpu"]
 "#;
         assert!(toml::from_str::<Config>(bad).is_err());
+    }
+
+    #[test]
+    fn parses_cuda_native_config() {
+        let cuda = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+max_num_kv_pages = 2048
+runtime_quant = "fp8"
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.models[0].driver.kind, DriverKind::CudaNative);
+        let opts: CudaNativeDriverOptions = cfg.models[0]
+            .driver
+            .options
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(opts.max_num_kv_pages, 2048);
+        assert_eq!(opts.runtime_quant, "fp8");
+        assert_eq!(opts.weight_dtype, "bfloat16"); // default
+        assert_eq!(opts.kv_page_size, 32); // default
+    }
+
+    #[test]
+    fn cuda_native_options_default_when_omitted() {
+        let cuda = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        cfg.validate().unwrap();
+        let opts: CudaNativeDriverOptions = cfg.models[0]
+            .driver
+            .options
+            .clone()
+            .try_into()
+            .unwrap();
+        // Defaults match pie_driver_cuda_native/config.py.
+        assert_eq!(opts.max_num_kv_pages, 1024);
+        assert_eq!(opts.swap_pool_size, 0);
+        assert_eq!(opts.gpu_mem_utilization, 0.85);
+        assert_eq!(opts.ready_timeout_s, 600.0);
     }
 }

@@ -9,24 +9,24 @@
 //! At M2.3 this module exposes:
 //!   * [`DriverCapabilities`] — typed view over the caps JSON the C
 //!     entry hands back via the `ready_cb` callback.
-//!   * [`write_startup_toml`] — emits the per-launch TOML the driver
-//!     reads on startup. Mirrors
-//!     `pie_driver_portable.worker._write_startup_toml`.
-//!
-//! The thread-spawn + caps-channel plumbing lands in M2.4 alongside the
-//! `bootstrap::Config` translation.
+//!   * [`write_startup_toml`] / [`write_cuda_startup_toml`] /
+//!     [`write_dummy_startup_toml`] — emit the per-launch TOML each
+//!     driver flavor reads on startup. Mirror
+//!     `pie_driver_*.worker._write_startup_toml`.
+//!   * [`EmbeddedDriver`] — owns the driver thread + its on-disk
+//!     launch state, and bridges the C `ready_cb` to a Rust channel.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
-use crate::config::{DummyDriverOptions, PortableDriverOptions};
+use crate::config::{CudaNativeDriverOptions, DummyDriverOptions, PortableDriverOptions};
 use crate::driver_ffi;
 
 /// Per-flavor driver options, passed to [`EmbeddedDriver::start`] so the
@@ -36,8 +36,22 @@ use crate::driver_ffi;
 /// alongside `DummyDriverOptions` because those are universal
 /// `[model.driver]` fields, not options — and `write_dummy_startup_toml`
 /// needs both to construct the caps payload.
+///
+/// `Clone` exists so `serve.rs` can rebuild a per-group variant
+/// (different `device`) from a model-level template without
+/// re-deserializing TOML.
+#[derive(Clone)]
 pub enum DriverOptions {
     Portable(PortableDriverOptions),
+    /// Cuda native driver. Carries `device` and `hf_repo` because the
+    /// cuda driver's TOML schema (`driver/cuda/src/config.hpp`) requires
+    /// both `model.device` and `model.hf_repo` — the portable driver
+    /// derives these from the snapshot dir alone.
+    CudaNative {
+        opts: CudaNativeDriverOptions,
+        device: String,
+        hf_repo: String,
+    },
     Dummy {
         opts: DummyDriverOptions,
         random_seed: u64,
@@ -51,20 +65,30 @@ pub fn shmem_name(group_id: usize) -> String {
     format!("/pie_shmem_g{group_id}")
 }
 
-/// `[shmem]` TOML block — req/resp sizes must match the runtime's
-/// `SHMEM_*` constants in `runtime/src/device.rs` exactly. Both
-/// startup-TOML writers below splice this in.
-fn render_shmem_block(group_id: usize) -> String {
+/// `[shmem]` TOML block. `req_buf` is fixed at 4 MiB across drivers;
+/// `resp_buf` varies — portable/dummy fit response payloads in 4 MiB,
+/// but the cuda driver must hold a full-vocab `Sampler::Dist` (≈2.6
+/// MiB on 150K-vocab models) plus per-request overhead and the
+/// spec-mode multi-slot tail, so it uses 8 MiB. The runtime reads the
+/// buffer sizes from the shmem header at attach time, so each driver
+/// can pick its own size.
+fn render_shmem_block(group_id: usize, resp_buf: usize) -> String {
     format!(
         "[shmem]\n\
 name = \"{}\"\n\
 num_slots = 8\n\
 req_buf = 4194304\n\
-resp_buf = 4194304\n\
+resp_buf = {resp_buf}\n\
 spin_us = 0\n",
         shmem_name(group_id),
     )
 }
+
+/// Default response buffer size for portable + dummy drivers (4 MiB).
+const SHMEM_RESP_BUF_DEFAULT: usize = 4 * 1024 * 1024;
+/// Response buffer size for the cuda driver (8 MiB) — sized to fit
+/// `Sampler::Dist` payloads on 150K-vocab models.
+const SHMEM_RESP_BUF_CUDA: usize = 8 * 1024 * 1024;
 
 /// Default per-launch state directory: `$PIE_HOME/standalone/<pid>/`.
 /// We use a per-pid subdir so concurrent invocations of `pie` (rare
@@ -149,7 +173,7 @@ cpu_pages = {cpu_pages}\n\
 \n\
 [aux_ipc]\n\
 socket_path = \"{aux_socket}\"\n",
-        shmem_block = render_shmem_block(group_id),
+        shmem_block = render_shmem_block(group_id, SHMEM_RESP_BUF_DEFAULT),
         snapshot = snapshot_dir.display(),
         n_gpu_layers = options.n_gpu_layers,
         n_ctx = options.n_ctx,
@@ -197,7 +221,7 @@ max_model_len = {max_model_len}\n\
 activation_dtype = \"{activation_dtype}\"\n\
 random_seed = {random_seed}\n\
 snapshot_dir = \"{snapshot}\"\n",
-        shmem_block = render_shmem_block(group_id),
+        shmem_block = render_shmem_block(group_id, SHMEM_RESP_BUF_DEFAULT),
         kv_page_size = opts.kv_page_size,
         max_num_kv_pages = opts.max_num_kv_pages,
         max_batch_tokens = opts.max_batch_tokens,
@@ -217,47 +241,131 @@ snapshot_dir = \"{snapshot}\"\n",
     Ok(())
 }
 
+/// Write the cuda driver's startup TOML. Schema mirrors
+/// `driver/cuda/src/config.hpp`: `[shmem]` (8 MiB resp_buf), `[model]`
+/// with `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional `runtime_quant`,
+/// and `[batching]` with KV-page geometry plus `swap_pool_size`.
+///
+/// `[distributed]` is omitted: single-rank is the default
+/// (`tp_size=1, tp_rank=0`), and the cuda driver entry expects TP > 1
+/// flags (`--tp-size`, `--tp-rank`, `--nccl-unique-id-hex`) on the
+/// command line — those are wired in M4.
+///
+/// `[aux_ipc]` is also omitted: the cuda driver currently uses a
+/// `--control-fd` inherited from a subprocess, which has no in-process
+/// analogue. M3 patches the cuda driver to accept `[aux_ipc].socket_path`
+/// so it becomes symmetric with portable.
+pub fn write_cuda_startup_toml(
+    out_path: &Path,
+    opts: &CudaNativeDriverOptions,
+    hf_repo: &str,
+    snapshot_dir: &Path,
+    device: &str,
+    group_id: usize,
+) -> Result<()> {
+    let runtime_quant_line = if opts.runtime_quant.is_empty() {
+        String::new()
+    } else {
+        format!("runtime_quant = \"{}\"\n", opts.runtime_quant)
+    };
+
+    let toml = format!(
+        "# Auto-generated by pie-standalone; do not edit.\n\
+\n\
+{shmem_block}\n\
+[model]\n\
+hf_repo = \"{hf_repo}\"\n\
+snapshot_dir = \"{snapshot}\"\n\
+device = \"{device}\"\n\
+dtype = \"{dtype}\"\n\
+{runtime_quant_line}\
+\n\
+[batching]\n\
+kv_page_size = {kv_page_size}\n\
+max_num_kv_pages = {max_num_kv_pages}\n\
+max_batch_tokens = {max_batch_tokens}\n\
+max_batch_size = {max_batch_size}\n\
+swap_pool_size = {swap_pool_size}\n",
+        shmem_block = render_shmem_block(group_id, SHMEM_RESP_BUF_CUDA),
+        snapshot = snapshot_dir.display(),
+        dtype = opts.weight_dtype,
+        kv_page_size = opts.kv_page_size,
+        max_num_kv_pages = opts.max_num_kv_pages,
+        max_batch_tokens = opts.max_batch_tokens,
+        max_batch_size = opts.max_batch_size,
+        swap_pool_size = opts.swap_pool_size,
+    );
+
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("create startup toml dir {parent:?}: {e}"))?;
+    }
+    std::fs::write(out_path, toml)
+        .map_err(|e| anyhow!("write startup toml {out_path:?}: {e}"))?;
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // EmbeddedDriver — thread that runs the in-process C++ driver entry.
 // -----------------------------------------------------------------------------
 //
-// The C++ entry hands caps back via a callback. Bridging that to a
-// Rust channel needs an `extern "C" fn`, which can't capture state, so
-// we route through a process-global slot that holds a one-shot
-// `SyncSender<String>` for the current launch. v0 supports a single
-// embedded driver instance per process — multi-replica is post-v1.
+// The C++ entry hands caps back via a `ready_cb(*const c_char, *mut c_void)`
+// callback. We pass each launch its own `Box<CapsCtx>` as `ready_ctx`,
+// reaching it back via raw pointer in the callback — that lets multiple
+// driver threads run concurrently (one per DP replica) without colliding
+// on a process-global slot.
+//
+// Lifetime: the box is leaked into C land for the driver thread's full
+// duration, and reclaimed via `Box::from_raw` in [`EmbeddedDriver::join`].
 
-fn caps_slot() -> &'static Mutex<Option<mpsc::SyncSender<String>>> {
-    static SLOT: OnceLock<Mutex<Option<mpsc::SyncSender<String>>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
+/// Per-launch callback target. Held alive by the parent `EmbeddedDriver`
+/// for the whole lifetime of the driver thread; the thread reads from
+/// it through a raw pointer.
+struct CapsCtx {
+    tx: Mutex<Option<mpsc::SyncSender<String>>>,
 }
 
-unsafe extern "C" fn embedded_caps_cb(caps_json: *const c_char, _ctx: *mut c_void) {
+unsafe extern "C" fn embedded_caps_cb(caps_json: *const c_char, ctx: *mut c_void) {
+    if ctx.is_null() {
+        return;
+    }
     let json = unsafe { CStr::from_ptr(caps_json) }
         .to_string_lossy()
         .into_owned();
-    if let Some(tx) = caps_slot().lock().unwrap().take() {
+    let ctx_ref = unsafe { &*(ctx as *const CapsCtx) };
+    if let Some(tx) = ctx_ref.tx.lock().unwrap().take() {
         let _ = tx.send(json);
     }
 }
 
-/// Owns the embedded driver thread + its on-disk launch state.
-///
-/// The driver runs `pie_driver_portable_run` to completion on its
-/// thread. To shut it down cleanly the host needs to (eventually)
-/// signal the C++ ShmemServer to stop — that path is wired in M2.4b.
-/// For now `EmbeddedDriver` owns a `JoinHandle` that completes when
-/// the driver returns naturally (e.g. on Ctrl-C in the host's signal
-/// handler, which we'll add).
+/// Owns the embedded driver thread + its on-disk launch state. The
+/// driver runs `pie_driver_<flavor>_run` to completion on its thread;
+/// [`Self::request_stop`] signals the C++ ShmemServer to exit and
+/// [`Self::join`] waits for the thread to land.
 pub struct EmbeddedDriver {
     pub caps: DriverCapabilities,
-    #[allow(dead_code)] // exposed for future RPC handshake; see M2.4b.
+    /// POSIX shmem region the driver owns (e.g. `/pie_shmem_g0`).
+    /// `serve.rs` `shm_unlink`s this on shutdown to clean up after a
+    /// hard kill that bypassed the driver's own teardown.
     pub shmem_name: String,
-    #[allow(dead_code)] // exposed for future RPC handshake; see M2.4b.
+    /// Driver's aux-IPC listener path. `serve.rs` opens an
+    /// [`AuxIpcClient`](crate::aux_ipc::AuxIpcClient) against this for
+    /// portable drivers. Empty/unused for cuda + dummy until each grows
+    /// its own aux listener.
     pub aux_socket_path: PathBuf,
     thread: Option<JoinHandle<i32>>,
+    /// Raw pointer to the leaked `Box<CapsCtx>`. The C driver thread
+    /// dereferences this via `embedded_caps_cb`, so it must outlive the
+    /// thread; reclaimed in [`Self::join`].
+    caps_ctx: *mut CapsCtx,
     _state_dir: PathBuf,
 }
+
+// `caps_ctx: *mut CapsCtx` is the only non-Send field. It points to a
+// heap-allocated `CapsCtx { tx: Mutex<...> }` we own exclusively; the
+// only other reader is the C driver thread, which is joined before
+// `caps_ctx` is freed. So crossing thread boundaries is sound.
+unsafe impl Send for EmbeddedDriver {}
 
 impl EmbeddedDriver {
     /// Spawn the driver thread for the given model snapshot. Blocks
@@ -288,6 +396,16 @@ impl EmbeddedDriver {
             DriverOptions::Portable(p) => {
                 write_startup_toml(&toml_path, p, snapshot_dir, &aux_socket_path, group_id)?;
             }
+            DriverOptions::CudaNative { opts, device, hf_repo } => {
+                write_cuda_startup_toml(
+                    &toml_path,
+                    opts,
+                    hf_repo,
+                    snapshot_dir,
+                    device,
+                    group_id,
+                )?;
+            }
             DriverOptions::Dummy { opts, random_seed, activation_dtype } => {
                 write_dummy_startup_toml(
                     &toml_path,
@@ -300,25 +418,30 @@ impl EmbeddedDriver {
             }
         }
 
-        // Install the one-shot caps slot. Refuse if a previous launch
-        // didn't drain the slot — indicates concurrent EmbeddedDriver,
-        // which we don't support in v0.
+        // Per-launch caps box, leaked into C as ready_ctx and reclaimed
+        // in `join()`. Each driver thread carries its own pointer, so
+        // multiple `start()` calls can run concurrently — which DP > 1
+        // exercises (one driver thread per replica).
         let (caps_tx, caps_rx) = mpsc::sync_channel::<String>(1);
-        {
-            let mut slot = caps_slot().lock().unwrap();
-            if slot.is_some() {
-                return Err(anyhow!(
-                    "another EmbeddedDriver launch is already in progress"
-                ));
-            }
-            *slot = Some(caps_tx);
-        }
+        let caps_ctx = Box::into_raw(Box::new(CapsCtx {
+            tx: Mutex::new(Some(caps_tx)),
+        }));
 
         let toml_path_str = toml_path
             .to_str()
-            .ok_or_else(|| anyhow!("toml path is not valid UTF-8: {toml_path:?}"))?
+            .ok_or_else(|| {
+                // SAFETY: we just allocated; nothing else points to it.
+                unsafe { drop(Box::from_raw(caps_ctx)) };
+                anyhow!("toml path is not valid UTF-8: {toml_path:?}")
+            })?
             .to_owned();
 
+        // Cast through usize so the raw pointer crosses the thread
+        // boundary — `*mut c_void` isn't `Send`, but the underlying
+        // address is just a number we promise (above, in `unsafe impl
+        // Send for EmbeddedDriver`) that nobody else writes through
+        // until the thread is joined.
+        let caps_ctx_addr = caps_ctx as usize;
         let thread = std::thread::Builder::new()
             .name(format!("pie-driver-{}-g{group_id}", driver_ffi::FLAVOR))
             .spawn(move || -> i32 {
@@ -340,31 +463,44 @@ impl EmbeddedDriver {
                         argv_ptrs.as_mut_ptr(),
                         /*install_signal_handlers=*/ 0,
                         embedded_caps_cb,
-                        std::ptr::null_mut(),
+                        caps_ctx_addr as *mut c_void,
                     )
                 }
             })
-            .map_err(|e| anyhow!("spawn pie-driver thread: {e}"))?;
+            .map_err(|e| {
+                // SAFETY: thread didn't start; we still hold the only
+                // reference to caps_ctx.
+                unsafe { drop(Box::from_raw(caps_ctx)) };
+                anyhow!("spawn pie-driver thread: {e}")
+            })?;
 
         let ready_timeout_s = match options {
             DriverOptions::Portable(p) => p.ready_timeout_s,
+            DriverOptions::CudaNative { opts, .. } => opts.ready_timeout_s,
             DriverOptions::Dummy { opts, .. } => opts.ready_timeout_s,
         };
         let timeout = Duration::from_secs_f64(ready_timeout_s.max(1.0));
         let json = match caps_rx.recv_timeout(timeout) {
             Ok(j) => j,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Sender hung up before sending → driver thread exited
+                // without firing the callback. Join, free the ctx, bail.
                 let rc = thread.join().unwrap_or(-1);
-                // Drop the slot in case the cb never fired but a
-                // sender is still installed.
-                caps_slot().lock().unwrap().take();
+                unsafe { drop(Box::from_raw(caps_ctx)) };
                 return Err(anyhow!(
                     "driver thread exited (rc={rc}) before emitting capabilities; \
-                     check stderr for the [pie-driver-portable] error message"
+                     check stderr for the [pie-driver-{}] error message",
+                    driver_ffi::FLAVOR,
                 ));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                caps_slot().lock().unwrap().take();
+                // Driver is still running (probably still loading
+                // weights past the deadline). We can't safely free the
+                // ctx — the thread might still fire the callback. Best
+                // we can do: leak it. The OS will reclaim on process
+                // exit; the `request_stop` path in shutdown should let
+                // the thread clean up first under normal teardown.
+                std::mem::forget(unsafe { Box::from_raw(caps_ctx) });
                 return Err(anyhow!(
                     "driver did not emit capabilities within {:.1}s",
                     timeout.as_secs_f64()
@@ -378,6 +514,7 @@ impl EmbeddedDriver {
             aux_socket_path,
             caps,
             thread: Some(thread),
+            caps_ctx,
             _state_dir: state_dir,
         })
     }
@@ -390,15 +527,55 @@ impl EmbeddedDriver {
         unsafe { driver_ffi::request_stop() };
     }
 
+    /// Non-consuming liveness check — true if the driver thread has
+    /// exited (cleanly or otherwise). Used by [`serve::run_async`]'s
+    /// watchdog to detect a driver dying mid-serve and trigger orderly
+    /// shutdown.
+    pub fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(true)
+    }
+
     /// Wait for the driver thread to exit, returning its rc. Caller
     /// should normally call [`Self::request_stop`] first; otherwise
     /// the driver will block forever in its serve loop.
+    ///
+    /// On return the per-launch caps box is freed — safe because the
+    /// thread is no longer running.
     pub fn join(mut self) -> i32 {
-        match self.thread.take().map(|h| h.join()) {
+        let rc = match self.thread.take().map(|h| h.join()) {
             Some(Ok(rc)) => rc,
             Some(Err(_)) => -1,
             None => 0,
+        };
+        // SAFETY: thread is joined; nobody else holds caps_ctx.
+        if !self.caps_ctx.is_null() {
+            unsafe { drop(Box::from_raw(self.caps_ctx)) };
+            self.caps_ctx = std::ptr::null_mut();
         }
+        rc
+    }
+}
+
+impl Drop for EmbeddedDriver {
+    /// Safety net for the "caller forgot to call `join`" path. We can't
+    /// reclaim `caps_ctx` here — the C driver thread might still be
+    /// running and reading through that pointer (callback can fire
+    /// arbitrarily late if the driver re-emits readiness on reload).
+    /// Leak intentionally; the OS reclaims on process exit. The
+    /// production path in `serve.rs` always pairs `request_stop` +
+    /// `join`, which takes the safe branch above.
+    fn drop(&mut self) {
+        if self.thread.is_none() {
+            // join() already ran; nothing to do.
+            return;
+        }
+        // Detach the thread (drop JoinHandle without joining); the
+        // thread runs until the process exits. Don't touch caps_ctx —
+        // it stays leaked but reachable.
+        let _ = self.thread.take();
     }
 }
 
@@ -449,8 +626,56 @@ mod tests {
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(val["shmem"]["name"].as_str().unwrap(), "/pie_shmem_g0");
+        assert_eq!(val["shmem"]["resp_buf"].as_integer().unwrap(), 4194304);
         assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
         assert_eq!(val["model"]["hf_path"].as_str().unwrap(), snap.to_str().unwrap());
         assert_eq!(val["aux_ipc"]["socket_path"].as_str().unwrap(), aux.to_str().unwrap());
+    }
+
+    #[test]
+    fn cuda_startup_toml_matches_driver_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let opts = CudaNativeDriverOptions::default();
+
+        write_cuda_startup_toml(&out, &opts, "Qwen/Qwen3-0.6B", &snap, "cuda:0", 0)
+            .unwrap();
+
+        // Re-parse the emitted TOML to confirm the schema the cuda
+        // driver expects matches what we wrote (driver-side parsing
+        // in driver/cuda/src/config.hpp).
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(val["shmem"]["name"].as_str().unwrap(), "/pie_shmem_g0");
+        // Cuda needs the larger 8 MiB resp_buf; the runtime reads this
+        // from the shmem header at attach time so the size must land
+        // exactly here.
+        assert_eq!(val["shmem"]["resp_buf"].as_integer().unwrap(), 8388608);
+        assert_eq!(val["model"]["hf_repo"].as_str().unwrap(), "Qwen/Qwen3-0.6B");
+        assert_eq!(val["model"]["snapshot_dir"].as_str().unwrap(), snap.to_str().unwrap());
+        assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:0");
+        assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
+        assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
+        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
+        assert_eq!(val["batching"]["max_num_kv_pages"].as_integer().unwrap(), 1024);
+        assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
+    }
+
+    #[test]
+    fn cuda_startup_toml_emits_runtime_quant_when_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.runtime_quant = "fp8".to_string();
+
+        write_cuda_startup_toml(&out, &opts, "Q/q", &snap, "cuda:1", 3).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(val["model"]["runtime_quant"].as_str().unwrap(), "fp8");
+        assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:1");
+        assert_eq!(val["shmem"]["name"].as_str().unwrap(), "/pie_shmem_g3");
     }
 }

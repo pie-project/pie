@@ -6,19 +6,23 @@
 //! and never reaches us.
 //!
 //! Mirrors the dispatch table in
-//! `pie/src/pie_driver_portable/worker.py::_make_methods`. v0 supports
-//! `ping` / `query` natively; the rest currently return clean
-//! "not yet wired" errors. The aux-IPC `copy_*` / `load_adapter`
-//! handlers land alongside the aux-IPC client (post-M2 work).
+//! `pie/src/pie_driver_portable/worker.py::_make_methods`. `ping` /
+//! `query` are answered natively; `copy_*` / `swap_*` / `load_adapter`
+//! are routed to the embedded driver's [`AuxIpcClient`] when present
+//! (portable today; cuda once it grows an `[aux_ipc]` listener).
+//! Dummy stubs aux-IPC methods as `()` so adapter / page-copy flows in
+//! inferlets succeed end-to-end against the dummy.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use pie::device::RpcServer;
 
+use crate::aux_ipc::{AuxIpcClient, Method};
 use crate::driver_ffi;
 
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
@@ -26,18 +30,21 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 /// Spawn the cold-path dispatch loop on a dedicated OS thread and
 /// return its join handle. Stop by calling `server.close()` from the
 /// outside — the loop exits the next time it polls.
-pub fn spawn(server: Arc<RpcServer>) -> JoinHandle<()> {
+///
+/// `aux` is `None` for drivers without an aux-IPC channel (currently
+/// dummy and cuda); `Some` for portable.
+pub fn spawn(server: Arc<RpcServer>, aux: Option<Arc<AuxIpcClient>>) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("pie-rpc-{}", server.server_name()))
-        .spawn(move || run(server))
+        .spawn(move || run(server, aux))
         .expect("spawn rpc dispatch thread")
 }
 
-fn run(server: Arc<RpcServer>) {
+fn run(server: Arc<RpcServer>, aux: Option<Arc<AuxIpcClient>>) {
     loop {
         match server.poll(POLL_TIMEOUT) {
             Ok(Some(req)) => {
-                let response = dispatch(&req.method, &req.payload);
+                let response = dispatch(&req.method, &req.payload, aux.as_deref());
                 if let Err(e) = server.respond(req.request_id, response) {
                     tracing::warn!("rpc respond failed: {e}");
                 }
@@ -55,31 +62,29 @@ fn run(server: Arc<RpcServer>) {
 /// Dispatch a single RPC. Returns the msgpack-encoded response body.
 /// Errors are encoded as msgpack strings — same shape the Python
 /// wrapper's RPC loop produces.
-fn dispatch(method: &str, _payload: &[u8]) -> Vec<u8> {
+fn dispatch(method: &str, payload: &[u8], aux: Option<&AuxIpcClient>) -> Vec<u8> {
     match method {
         "ping" => encode(&PingResp { ok: true }),
         "query" => encode(&QueryResp {
             driver: driver_ffi::FLAVOR,
             implemented: false,
         }),
-        // Aux-IPC-backed methods. The dummy driver doesn't have an aux
-        // socket — it accepts these as no-ops so adapter / page-copy
-        // flows in inferlets succeed end-to-end against the dummy. The
-        // C++ drivers wait on the aux-IPC client (post-M2 work).
+
+        // Aux-IPC-backed methods. Routed to the embedded driver when
+        // it exposes an aux socket; stubbed as `()` for the dummy
+        // (which has no socket but inferlets exercise these paths);
+        // explicit error otherwise (cuda's aux listener is post-M3).
         "copy_d2h" | "copy_h2d" | "copy_d2d" | "copy_h2h"
-        | "swap_out_pages" | "swap_in_pages" | "load_adapter" => {
-            if driver_ffi::FLAVOR == "dummy" {
-                encode(&())
-            } else {
-                encode_err(format!(
-                    "{method:?}: not yet wired in standalone server (aux-IPC client pending)"
-                ))
-            }
+        | "swap_out_pages" | "swap_in_pages" => {
+            dispatch_copy(method, payload, aux)
         }
-        // Truly never-implemented, mirror Python's stubs.
+        "load_adapter" => dispatch_load_adapter(payload, aux),
+
+        // Methods Python's wrappers also stub out — none of the
+        // standalone-supported drivers implement these.
         "embed_image" | "initialize_adapter" | "update_adapter" | "save_adapter" => {
             encode_err(format!(
-                "{method:?}: not implemented in {} driver (post-v1)",
+                "{method:?}: not implemented in {} driver",
                 driver_ffi::FLAVOR,
             ))
         }
@@ -94,6 +99,131 @@ fn dispatch(method: &str, _payload: &[u8]) -> Vec<u8> {
     }
 }
 
+fn dispatch_copy(method: &str, payload: &[u8], aux: Option<&AuxIpcClient>) -> Vec<u8> {
+    // Dummy has no aux socket; the runtime still calls these on swap
+    // restore paths — return `()` so deserialize succeeds.
+    let Some(client) = aux else {
+        if driver_ffi::FLAVOR == "dummy" {
+            return encode(&());
+        }
+        return encode_err(format!(
+            "{method:?}: this driver flavor ({}) has no aux-IPC channel",
+            driver_ffi::FLAVOR,
+        ));
+    };
+
+    // The runtime ships per-method-named arg shapes (see
+    // `runtime/src/device.rs`). Decode the matching shape and
+    // translate to (src, dst) page pairs in the order the aux wire
+    // expects.
+    let (m, pairs) = match method {
+        "copy_d2h" | "swap_out_pages" => {
+            // GPU → CPU: pairs are (gpu_phys_id, cpu_slot).
+            let args: PhysSlotArgs = match decode(payload) {
+                Ok(a) => a,
+                Err(e) => return encode_err(format!("{method}: {e}")),
+            };
+            (Method::CopyD2H, zip_pairs(&args.phys_ids, &args.slots))
+        }
+        "copy_h2d" | "swap_in_pages" => {
+            // CPU → GPU: the runtime sends (gpu_dst, cpu_src) under
+            // the names (phys_ids, slots); the wire format expects
+            // (src, dst) order, so flip on the way through.
+            let args: PhysSlotArgs = match decode(payload) {
+                Ok(a) => a,
+                Err(e) => return encode_err(format!("{method}: {e}")),
+            };
+            (Method::CopyH2D, zip_pairs(&args.slots, &args.phys_ids))
+        }
+        "copy_d2d" => {
+            let args: SrcDstPhysArgs = match decode(payload) {
+                Ok(a) => a,
+                Err(e) => return encode_err(format!("{method}: {e}")),
+            };
+            (Method::CopyD2D, zip_pairs(&args.src_phys_ids, &args.dst_phys_ids))
+        }
+        "copy_h2h" => {
+            let args: SrcDstSlotArgs = match decode(payload) {
+                Ok(a) => a,
+                Err(e) => return encode_err(format!("{method}: {e}")),
+            };
+            (Method::CopyH2H, zip_pairs(&args.src_slots, &args.dst_slots))
+        }
+        _ => unreachable!("dispatch_copy called with non-copy method"),
+    };
+
+    let pairs = match pairs {
+        Ok(p) => p,
+        Err(e) => return encode_err(format!("{method}: {e}")),
+    };
+
+    match client.copy(m, &pairs) {
+        Ok(()) => encode(&()),
+        Err(e) => encode_err(format!("{method}: {e}")),
+    }
+}
+
+fn dispatch_load_adapter(payload: &[u8], aux: Option<&AuxIpcClient>) -> Vec<u8> {
+    let Some(client) = aux else {
+        if driver_ffi::FLAVOR == "dummy" {
+            return encode(&());
+        }
+        return encode_err(format!(
+            "load_adapter: this driver flavor ({}) has no aux-IPC channel",
+            driver_ffi::FLAVOR,
+        ));
+    };
+
+    let args: LoadAdapterArgs = match decode(payload) {
+        Ok(a) => a,
+        Err(e) => return encode_err(format!("load_adapter: {e}")),
+    };
+
+    // Materialize the adapter blob to disk. The aux wire format
+    // sends only a path — the driver mmaps and parses it itself.
+    // Use a pid-scoped subdir so concurrent driver instances don't
+    // clobber each other; clean up after a successful send.
+    let tmp_dir = std::env::temp_dir().join(format!("pie-adapters-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+        return encode_err(format!("load_adapter: create temp dir: {e}"));
+    }
+    let safe_name: String = args
+        .name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path: PathBuf = tmp_dir.join(format!(
+        "{}-{:016x}.safetensors",
+        if safe_name.is_empty() { "adapter" } else { safe_name.as_str() },
+        args.adapter_ptr,
+    ));
+    if let Err(e) = std::fs::write(&path, &args.adapter_data) {
+        return encode_err(format!("load_adapter: write {path:?}: {e}"));
+    }
+
+    let result = client.load_adapter(args.adapter_ptr, &path);
+
+    // Driver has either consumed the file (mmap + parse) or failed;
+    // either way our copy isn't needed. Best-effort cleanup.
+    let _ = std::fs::remove_file(&path);
+
+    match result {
+        Ok(()) => encode(&()),
+        Err(e) => encode_err(format!("load_adapter: {e}")),
+    }
+}
+
+fn zip_pairs(srcs: &[u32], dsts: &[u32]) -> Result<Vec<(u32, u32)>, String> {
+    if srcs.len() != dsts.len() {
+        return Err(format!(
+            "src/dst length mismatch ({} vs {})",
+            srcs.len(),
+            dsts.len()
+        ));
+    }
+    Ok(srcs.iter().zip(dsts.iter()).map(|(s, d)| (*s, *d)).collect())
+}
+
 #[derive(Serialize)]
 struct PingResp {
     ok: bool,
@@ -103,6 +233,41 @@ struct PingResp {
 struct QueryResp {
     driver: &'static str,
     implemented: bool,
+}
+
+/// Wire shape for `copy_d2h` / `copy_h2d` / `swap_*_pages` — mirrors
+/// `runtime/src/device.rs::copy_d2h::Req`.
+#[derive(Deserialize)]
+struct PhysSlotArgs {
+    phys_ids: Vec<u32>,
+    slots: Vec<u32>,
+}
+
+/// Wire shape for `copy_d2d`.
+#[derive(Deserialize)]
+struct SrcDstPhysArgs {
+    src_phys_ids: Vec<u32>,
+    dst_phys_ids: Vec<u32>,
+}
+
+/// Wire shape for `copy_h2h`.
+#[derive(Deserialize)]
+struct SrcDstSlotArgs {
+    src_slots: Vec<u32>,
+    dst_slots: Vec<u32>,
+}
+
+/// Wire shape for `load_adapter` — mirrors
+/// `runtime/src/adapter.rs::LoadAdapterArgs`.
+#[derive(Deserialize)]
+struct LoadAdapterArgs {
+    adapter_ptr: u64,
+    name: String,
+    adapter_data: Vec<u8>,
+}
+
+fn decode<'a, T: Deserialize<'a>>(payload: &'a [u8]) -> Result<T, String> {
+    rmp_serde::from_slice(payload).map_err(|e| format!("decode args: {e}"))
 }
 
 fn encode<T: Serialize>(value: &T) -> Vec<u8> {
@@ -119,7 +284,6 @@ fn encode_err(msg: String) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
 
     #[derive(Deserialize)]
     struct PingDecoded {
@@ -137,14 +301,14 @@ mod tests {
 
     #[test]
     fn ping_returns_ok_true() {
-        let resp = dispatch("ping", &[]);
+        let resp = dispatch("ping", &[], None);
         let ping: PingDecoded = rmp_serde::from_slice(&resp).unwrap();
         assert!(ping.ok);
     }
 
     #[test]
     fn query_returns_driver_meta() {
-        let resp = dispatch("query", &[]);
+        let resp = dispatch("query", &[], None);
         let q: QueryDecoded = rmp_serde::from_slice(&resp).unwrap();
         assert_eq!(q.driver, driver_ffi::FLAVOR);
         assert!(!q.implemented);
@@ -152,22 +316,47 @@ mod tests {
 
     #[test]
     fn unknown_method_errors() {
-        let resp = dispatch("nope", &[]);
+        let resp = dispatch("nope", &[], None);
         let s = decode_str(&resp);
         assert!(s.contains("Method not found"), "got: {s}");
     }
 
     #[test]
-    fn aux_ipc_methods_match_flavor_capability() {
-        let resp = dispatch("copy_d2h", &[]);
+    fn copy_without_aux_handles_dummy_vs_native() {
+        // Build a valid msgpack payload for copy_d2h's wire shape so
+        // dispatch_copy doesn't bail on decode.
+        let payload = rmp_serde::to_vec_named(&serde_json::json!({
+            "phys_ids": [1u32, 2u32],
+            "slots":    [10u32, 11u32],
+        })).unwrap();
+
+        let resp = dispatch("copy_d2h", &payload, None);
         if driver_ffi::FLAVOR == "dummy" {
-            // Dummy stubs aux-IPC methods as `()` so the runtime's
-            // `device::call::<_, ()>` deserialize succeeds.
+            // Dummy: stubbed as ().
             let _: () = rmp_serde::from_slice(&resp)
                 .expect("dummy: copy_d2h should decode as ()");
         } else {
             let s = decode_str(&resp);
-            assert!(s.contains("aux-IPC client pending"), "got: {s}");
+            assert!(s.contains("no aux-IPC channel"), "got: {s}");
+        }
+    }
+
+    #[test]
+    fn copy_decode_errors_surface_clearly() {
+        // Garbage payload — dispatch_copy should produce a decode error
+        // string rather than panicking.
+        let resp = dispatch("copy_d2h", &[0xff, 0xff, 0xff], None);
+        if driver_ffi::FLAVOR == "dummy" {
+            // Dummy short-circuits before decode, so it returns ().
+            let _: () = rmp_serde::from_slice(&resp).unwrap();
+        } else {
+            let s = decode_str(&resp);
+            // Either decode error or "no aux-IPC channel" depending on
+            // whether the absent-aux branch hit first; both are valid.
+            assert!(
+                s.contains("decode args") || s.contains("no aux-IPC channel"),
+                "got: {s}"
+            );
         }
     }
 }

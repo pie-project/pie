@@ -1,113 +1,263 @@
-//! `pie --config <toml>` — the main serve path.
+//! `pie serve` core: boot drivers, wire RPC, hand off to the runtime,
+//! and surface an [`EngineHandle`] the caller drives.
 //!
-//! Wires together the standalone's pieces in dependency order:
-//!   1. Load + validate the user TOML.
-//!   2. Build a tokio runtime (worker_threads pinned by user config).
-//!   3. For each `[[model]]`:
-//!      a. Create the cold-path `RpcServer` and spawn its dispatch loop.
-//!      b. Start the [`EmbeddedDriver`] thread; block until the driver
-//!         emits caps via the `ready_cb` callback.
-//!   4. Translate (user TOML, handshakes) → [`pie::bootstrap::Config`]
+//! Wires the standalone's pieces in dependency order:
+//!   1. Translate user TOML to per-driver options.
+//!   2. For each `[[model]]`, partition devices into DP groups; for
+//!      each group spawn an [`EmbeddedDriver`] thread, attach an
+//!      [`AuxIpcClient`] (portable today) + a cold-path RPC dispatcher.
+//!   3. Translate the resulting handshakes → [`pie::bootstrap::Config`]
 //!      and call [`pie::bootstrap::bootstrap`]. The runtime now owns
 //!      the websocket server + scheduler.
-//!   5. Wait for SIGINT. On ctrl-c, close the cold-path channels and
-//!      exit. (Driver threads run to OS-level reap for now; a graceful
-//!      stop API lands post-M2 alongside the aux-IPC client.)
+//!   4. Caller decides what to do with the [`EngineHandle`]:
+//!        * `pie serve`: [`EngineHandle::wait_then_shutdown`] blocks
+//!          on SIGINT/SIGTERM/watchdog and tears down.
+//!        * `pie serve --monitor`: TUI runs concurrently and calls
+//!          [`EngineHandle::shutdown`] when the user quits.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
 
-use crate::bootstrap_translate::{self, ModelHandshake};
-use crate::config::{self, DriverKind, DummyDriverOptions, PortableDriverOptions};
+use crate::aux_ipc::AuxIpcClient;
+use crate::bootstrap_translate::{self, GroupHandshake, ModelHandshake};
+use crate::config::{self, DriverKind};
 use crate::embedded_driver::{DriverOptions, EmbeddedDriver};
+use crate::hf;
 use crate::rpc_loop;
 
-pub fn run(config_path: &Path) -> Result<()> {
-    let user_cfg =
-        config::Config::from_toml_file(config_path).context("loading TOML config")?;
+mod lifecycle;
+mod topology;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+pub use topology::calculate_topology;
+
+/// Live engine — drivers, RPC dispatch threads, the bootstrapped
+/// runtime token, and enough state to perform an orderly shutdown.
+/// Returned from [`start_engine`]; consumed by either
+/// [`EngineHandle::wait_then_shutdown`] (the `pie serve` path) or
+/// [`EngineHandle::shutdown`] (the `pie serve --monitor` path, where
+/// the TUI owns the wait loop).
+pub struct EngineHandle {
+    drivers: Vec<EmbeddedDriver>,
+    rpc_servers: Vec<Arc<pie::device::RpcServer>>,
+    rpc_threads: Vec<std::thread::JoinHandle<()>>,
+    shmem_names: Vec<String>,
+    /// Bootstrapped engine's WS auth token — handed to the monitor
+    /// provider so it can `auth_by_token`.
+    pub token: String,
+    /// `ws://host:port` the engine is listening on.
+    pub url: String,
+}
+
+impl EngineHandle {
+    /// Block on SIGINT / SIGTERM / driver-watchdog, then run the
+    /// shutdown sequence. The original `run_with_config` flow.
+    pub async fn wait_then_shutdown(self) -> Result<()> {
+        let shutdown_reason = tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = lifecycle::wait_for_sigterm() => "SIGTERM",
+            reason = lifecycle::watchdog(&self.drivers) => reason,
+        };
+        println!("\nshutting down ({shutdown_reason})...");
+        self.shutdown();
+        Ok(())
+    }
+
+    /// Tear down the engine without waiting for a signal. Used by the
+    /// monitor TUI, which owns its own input loop and decides when to
+    /// quit.
+    pub fn shutdown(self) {
+        // Close cold-path channels first so any in-flight RPCs bail.
+        for s in &self.rpc_servers {
+            s.close();
+        }
+        for t in self.rpc_threads {
+            let _ = t.join();
+        }
+        // Signal each driver's serve loop, then join the threads.
+        for d in &self.drivers {
+            d.request_stop();
+        }
+        for d in self.drivers {
+            let rc = d.join();
+            if rc != 0 {
+                tracing::warn!("driver thread exited with rc={rc}");
+            }
+        }
+        // Best-effort shmem cleanup — see `unlink_shmem`.
+        for name in &self.shmem_names {
+            lifecycle::unlink_shmem(name);
+        }
+    }
+}
+
+/// Boot the engine from an already-loaded + validated config. The CLI
+/// layer in [`crate::cli::serve_cmd`] is the only caller; it loads
+/// from TOML, applies `--host` / `--port` / `--no-auth` / `--verbose`
+/// / `--no-snapshot` overrides, then invokes us.
+pub fn run_with_config(user_cfg: config::Config) -> Result<()> {
+    // Best-effort install of the Python WASM runtime tarball.
+    // Python inferlets fail to instantiate without
+    // `$PIE_HOME/py-runtime/shared/componentize-py-runtime.wasm`;
+    // pre-fetching here mirrors `pie/src/pie/server.py::Server.__aenter__`.
+    // Failures (offline, registry down) just log a warning — the engine
+    // still boots, and non-Python inferlets work normally.
+    crate::py_runtime::ensure_installed_best_effort();
+
+    let runtime = build_runtime(&user_cfg)?;
+
+    runtime.block_on(async move {
+        let engine = start_engine(user_cfg).await?;
+        engine.wait_then_shutdown().await
+    })
+}
+
+/// Build the multi-threaded tokio runtime sized by the user's config.
+/// Exposed because the monitor command reuses it (it has to spawn the
+/// engine + the provider's polling task on the same runtime).
+pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(user_cfg.runtime.worker_threads)
         .enable_all()
         .build()
-        .context("building tokio runtime")?;
-
-    runtime.block_on(run_async(user_cfg))
+        .context("building tokio runtime")
 }
 
-async fn run_async(user_cfg: config::Config) -> Result<()> {
-    let mut handshakes = Vec::with_capacity(user_cfg.models.len());
-    let mut drivers: Vec<EmbeddedDriver> = Vec::with_capacity(user_cfg.models.len());
-    let mut rpc_servers: Vec<Arc<pie::device::RpcServer>> =
-        Vec::with_capacity(user_cfg.models.len());
-    let mut rpc_threads = Vec::with_capacity(user_cfg.models.len());
+/// Boot drivers + RPC + runtime bootstrap; return an [`EngineHandle`]
+/// the caller can drive (wait-and-shutdown for plain serve, or hand
+/// off to a TUI for the monitor path).
+pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
+    let mut handshakes: Vec<ModelHandshake> = Vec::with_capacity(user_cfg.models.len());
+    let mut drivers: Vec<EmbeddedDriver> = Vec::new();
+    let mut rpc_servers: Vec<Arc<pie::device::RpcServer>> = Vec::new();
+    let mut rpc_threads = Vec::new();
 
-    for (i, m) in user_cfg.models.iter().enumerate() {
-        let opts = match m.driver.kind {
-            DriverKind::Portable => {
-                let p: PortableDriverOptions = m
-                    .driver
-                    .options
-                    .clone()
-                    .try_into()
-                    .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
-                DriverOptions::Portable(p)
-            }
-            DriverKind::Dummy => {
-                let d: DummyDriverOptions = m
-                    .driver
-                    .options
-                    .clone()
-                    .try_into()
-                    .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
-                DriverOptions::Dummy {
-                    opts: d,
-                    random_seed: m.driver.random_seed,
-                    activation_dtype: m.driver.activation_dtype.clone(),
-                }
-            }
-            other => {
-                anyhow::bail!(
-                    "model {:?}: driver type {other:?} is not implemented in \
-                     server/standalone yet (cuda_native lands in M3/M4)",
-                    m.name,
-                );
-            }
+    // Global device index. The runtime's `device::spawn` returns
+    // indices in call order; the driver-side shmem region is named
+    // `/pie_shmem_g{device_idx}` (`runtime/src/device.rs::shmem_name`).
+    // Pass this counter as the driver's `group_id` so the names line
+    // up across all models, including DP > 1.
+    let mut next_global_device_idx: usize = 0;
+
+    for m in user_cfg.models.iter() {
+        topology::check_kind_matches_build(m.driver.kind, &m.name)?;
+
+        // Determine TP/DP topology. For multi-DP, we spawn one driver
+        // per group; each group gets its own snapshot+startup TOML.
+        let world_size = m.driver.device.len();
+        let tp_degree = if m.driver.tensor_parallel_size == 0 {
+            world_size
+        } else {
+            m.driver.tensor_parallel_size as usize
         };
+        let topology = calculate_topology(world_size, tp_degree)
+            .with_context(|| format!("model {:?} topology", m.name))?;
 
-        // v0: `hf_repo` is a local snapshot dir. HF download support is
-        // a separate piece of work — for now, error clearly if it
-        // doesn't exist locally.
-        let snapshot_dir = PathBuf::from(&m.hf_repo);
-        ensure!(
-            snapshot_dir.is_dir(),
-            "model {:?}: hf_repo {snapshot_dir:?} is not a local directory. \
-             Standalone v0 does not download from HF — point hf_repo at a \
-             local snapshot (e.g. via huggingface-cli download).",
-            m.name,
-        );
+        if tp_degree > 1 {
+            anyhow::bail!(
+                "model {:?}: tensor_parallel_size={tp_degree} is not yet \
+                 supported in server/standalone — only DP > 1 (one driver \
+                 per replica, tp=1) works today. NCCL rendezvous for \
+                 in-process TP lands in M4.5.",
+                m.name,
+            );
+        }
 
-        // Cold-path RPC server first — its server_name is what the
-        // runtime uses to connect via device::spawn.
-        let rpc_server = Arc::new(
-            pie::device::RpcServer::create()
-                .map_err(|e| anyhow!("RpcServer::create for model {:?}: {e}", m.name))?,
-        );
-        let rpc_thread = rpc_loop::spawn(Arc::clone(&rpc_server));
-        let rpc_server_name = rpc_server.server_name().to_owned();
+        // Build options once per model (cheap to clone per group).
+        let base_opts = topology::build_driver_options(m)?;
 
-        let driver = EmbeddedDriver::start(&opts, &snapshot_dir, i)
-            .with_context(|| format!("starting driver for model {:?}", m.name))?;
+        // Resolve snapshot once per model — every group serves the same
+        // weights against the same on-disk path.
+        let snapshot_dir = hf::resolve_or_download(&m.hf_repo)
+            .await
+            .with_context(|| format!("resolving hf_repo for model {:?}", m.name))?;
 
-        handshakes.push(ModelHandshake {
-            rpc_server_name,
-            caps: driver.caps.clone(),
-        });
-        drivers.push(driver);
-        rpc_servers.push(rpc_server);
-        rpc_threads.push(rpc_thread);
+        let mut group_handshakes: Vec<GroupHandshake> = Vec::with_capacity(topology.len());
+
+        for (group_idx, group) in topology.iter().enumerate() {
+            // For tp=1 the per-group device is just `device[group_idx]`.
+            // For tp>1 (gated above), it would be `device[group[0]]`.
+            let device_for_group = m
+                .driver
+                .device
+                .get(group[0])
+                .ok_or_else(|| {
+                    anyhow!(
+                        "model {:?}: group {group_idx} references device \
+                         index {} but only {} devices configured",
+                        m.name,
+                        group[0],
+                        m.driver.device.len(),
+                    )
+                })?
+                .clone();
+
+            // Cuda needs the device pinned per group (`model.device` in
+            // its TOML); other flavors derive everything else from the
+            // snapshot dir alone.
+            let opts = match &base_opts {
+                DriverOptions::CudaNative { opts, hf_repo, .. } => DriverOptions::CudaNative {
+                    opts: opts.clone(),
+                    device: device_for_group.clone(),
+                    hf_repo: hf_repo.clone(),
+                },
+                other => other.clone(),
+            };
+
+            let device_idx = next_global_device_idx;
+            next_global_device_idx += 1;
+
+            // Cold-path RPC server first; its server_name goes into the
+            // handshake bundle so bootstrap can wire one DeviceConfig
+            // per group.
+            let rpc_server = Arc::new(
+                pie::device::RpcServer::create()
+                    .map_err(|e| anyhow!(
+                        "RpcServer::create for model {:?} group {group_idx}: {e}",
+                        m.name,
+                    ))?,
+            );
+            let rpc_server_name = rpc_server.server_name().to_owned();
+
+            // Driver thread first: its `AuxServer` is constructed *before*
+            // ready_cb fires, so by the time `start()` returns the aux
+            // socket is accepting. Spawning the cold-path dispatcher
+            // before the driver would race the runtime's first call
+            // against an absent client.
+            let driver = EmbeddedDriver::start(&opts, &snapshot_dir, device_idx)
+                .with_context(|| format!(
+                    "starting driver for model {:?} group {group_idx}",
+                    m.name,
+                ))?;
+
+            // Connect the aux-IPC client only for drivers that listen
+            // (portable today). Cuda's `[aux_ipc]` listener and dummy's
+            // no-aux design both leave this `None` — `dispatch_copy`
+            // handles both cases (dummy: stub `()`; cuda: explicit error).
+            let aux_client: Option<Arc<AuxIpcClient>> = match m.driver.kind {
+                DriverKind::Portable => Some(Arc::new(
+                    AuxIpcClient::connect(driver.aux_socket_path.clone())
+                        .with_context(|| format!(
+                            "connecting aux-ipc socket for model {:?} group {group_idx}",
+                            m.name,
+                        ))?,
+                )),
+                _ => None,
+            };
+
+            let rpc_thread = rpc_loop::spawn(Arc::clone(&rpc_server), aux_client);
+
+            group_handshakes.push(GroupHandshake {
+                rpc_server_name,
+                caps: driver.caps.clone(),
+            });
+            drivers.push(driver);
+            rpc_servers.push(rpc_server);
+            rpc_threads.push(rpc_thread);
+        }
+
+        handshakes.push(ModelHandshake { groups: group_handshakes });
     }
 
     let boot_cfg = bootstrap_translate::build(&user_cfg, &handshakes)
@@ -126,32 +276,17 @@ async fn run_async(user_cfg: config::Config) -> Result<()> {
     println!("internal token: {token}");
     println!("press Ctrl-C to shut down");
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("listening for SIGINT")?;
-    println!("\nshutting down...");
+    let shmem_names: Vec<String> = drivers
+        .iter()
+        .map(|d| d.shmem_name.clone())
+        .collect();
 
-    // Close the cold-path channels first — the runtime's pending RPCs
-    // (if any) bail out cleanly.
-    for s in &rpc_servers {
-        s.close();
-    }
-    for t in rpc_threads {
-        let _ = t.join();
-    }
-
-    // Signal each driver's serve loop to exit, then join the threads
-    // so we exit only after the C++ side has had a chance to release
-    // its shmem segments.
-    for d in &drivers {
-        d.request_stop();
-    }
-    for d in drivers {
-        let rc = d.join();
-        if rc != 0 {
-            tracing::warn!("driver thread exited with rc={rc}");
-        }
-    }
-
-    Ok(())
+    Ok(EngineHandle {
+        drivers,
+        rpc_servers,
+        rpc_threads,
+        shmem_names,
+        token,
+        url: format!("ws://{}:{}", user_cfg.server.host, user_cfg.server.port),
+    })
 }

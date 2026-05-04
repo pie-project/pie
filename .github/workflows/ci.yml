@@ -83,6 +83,79 @@ jobs:
             && { echo "FAIL: ggml shared lib leaked into binary"; exit 1; } \
             || echo "OK: no ggml shared deps"
 
+  # Dummy driver — pure Rust, builds on every OS we support. Cheapest
+  # gate for "did the standalone wiring break end to end". Runs the
+  # full unit-test suite too since dummy doesn't pull in cmake.
+  pie-standalone-dummy:
+    name: pie-standalone (driver-dummy)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-pie-standalone-dummy-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo build (driver-dummy)
+        run: |
+          cargo build -p pie-standalone \
+            --no-default-features --features driver-dummy
+
+      - name: cargo test (pie-standalone, dummy)
+        run: |
+          cargo test --bin pie \
+            --no-default-features --features driver-dummy
+
+  # macOS portable build with Metal backend. Verifies build.rs's
+  # macOS branch + libomp link path. Doesn't run tests against a
+  # real model — just exercises the cmake + link path so PRs that
+  # touch driver/portable or build.rs fail fast on macOS.
+  pie-standalone-portable-metal:
+    name: pie-standalone (driver-portable + metal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install cmake ninja ccache libomp
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + cmake build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/Library/Caches/ccache
+            target
+          key: ${{ runner.os }}-pie-standalone-portable-metal-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+
+      - name: cargo build (driver-portable + metal)
+        env:
+          PIE_PORTABLE_METAL: "1"
+        run: cargo build -p pie-standalone
+
+      - name: cargo test (pie-standalone)
+        env:
+          PIE_PORTABLE_METAL: "1"
+        run: cargo test --bin pie
+
   # Cuda build — runs only when an opt-in label or schedule fires
   # (no CUDA on the default GH-hosted runners). Add a self-hosted
   # runner with a CUDA toolkit to enable this. Until then, M3's
