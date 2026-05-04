@@ -146,22 +146,6 @@ jobs:
         with:
           targets: ${{ matrix.target.triple }}
 
-      - name: Install libomp (macos only)
-        # `driver/portable/CMakeLists.txt:102` does
-        # `find_package(OpenMP REQUIRED)` for a diagnostic `#pragma omp`
-        # probe in src/model.cpp. Apple clang doesn't ship OpenMP, so
-        # we pull libomp via Homebrew and set OpenMP_ROOT for CMake's
-        # FindOpenMP. Keeps the probe working without code changes.
-        if: matrix.target.label == 'aarch64-darwin'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          brew install libomp
-          LIBOMP_PREFIX=$(brew --prefix libomp)
-          echo "OpenMP_ROOT=${LIBOMP_PREFIX}" >> "$GITHUB_ENV"
-          echo "LIBRARY_PATH=${LIBOMP_PREFIX}/lib" >> "$GITHUB_ENV"
-          echo "CPATH=${LIBOMP_PREFIX}/include" >> "$GITHUB_ENV"
-
       - name: Install Vulkan SDK (windows only)
         if: matrix.target.label == 'x86_64-windows'
         uses: humbletim/install-vulkan-sdk@v1.2
@@ -217,24 +201,32 @@ jobs:
   # CUDA matrix — runs on the project's self-hosted GPU runner.
   #
   # The runner is bare-metal Ubuntu 24.04 (glibc 2.39) with an RTX 4090,
-  # 32 cores, side-by-side CUDA toolkits (12.6 / 12.8 / 13.0 / 13.2),
-  # sccache pre-installed, and persistent `CARGO_HOME` /
-  # `CARGO_TARGET_DIR` outside the workspace — so we deliberately do NOT
-  # use `actions/cache` (would just shadow the runner's larger,
-  # always-warm caches).
+  # 32 cores, and side-by-side CUDA toolkits at /usr/local/cuda-X.Y.
+  # `CARGO_HOME` and `CARGO_TARGET_DIR` are preset to persistent paths
+  # outside the workspace, so we deliberately do NOT use `actions/cache`
+  # (would shadow the runner's larger, always-warm caches).
   #
   # Tradeoff vs the previous nvidia/cuda manylinux containers: the
   # resulting binary is glibc-2.39-floored — won't run on EL8 / Ubuntu
   # 20.04. CUDA users are typically on recent distros anyway, and
   # they need a recent NVIDIA driver to match the toolkit.
   #
+  # Two flavors per CUDA toolkit version:
+  #   * cuda  — full bundle: `driver-portable` (ggml-CUDA) + `driver-cuda`
+  #             (native CUDA + flashinfer + NCCL). The heavyweight binary
+  #             with both drivers; what users want for production.
+  #   * portable-cuda — same `driver-portable` with PIE_PORTABLE_CUDA=1,
+  #             but without the native `driver-cuda`. Smaller binary,
+  #             no NCCL / flashinfer dependency. Useful where the ggml
+  #             CUDA backend is enough.
+  #
   # The runner serializes jobs (one at a time), so the matrix entries
-  # below run sequentially. With sccache, kernels common across CUDA
-  # versions reuse cached object files between matrix entries.
+  # below run sequentially. Total wall-time scales with cuda-version
+  # count × flavor count.
   # =========================================================================
   cuda:
     if: inputs.cuda
-    name: cuda / linux-x64 / cuda${{ matrix.cuda.version }}
+    name: cuda / linux-x64 / ${{ matrix.flavor.id }}-${{ matrix.cuda.short }}
     runs-on: [self-hosted, linux, x64, gpu, cuda]
     strategy:
       fail-fast: false
@@ -243,23 +235,21 @@ jobs:
           - { version: "12.6.3", short: "12.6", path: "/usr/local/cuda-12.6", arch: "75;80;86;89;90" }
           - { version: "12.8.1", short: "12.8", path: "/usr/local/cuda-12.8", arch: "75;80;86;89;90;100;120" }
           - { version: "13.0.0", short: "13.0", path: "/usr/local/cuda-13.0", arch: "75;80;86;89;90;100;120" }
+        flavor:
+          - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
+          - { id: "portable-cuda", features: "driver-portable,driver-dummy" }
     env:
-      ARTIFACT_NAME: pie-x86_64-linux-cuda${{ matrix.cuda.short }}.tar.gz
+      ARTIFACT_NAME: pie-x86_64-linux-${{ matrix.flavor.id }}${{ matrix.cuda.short }}.tar.gz
       PIE_PORTABLE_CUDA: "1"
       PIE_PORTABLE_CUDA_ARCH: ${{ matrix.cuda.arch }}
       CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda.arch }}
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
-      # sccache for Rust (RUSTC_WRAPPER). The runner's $SCCACHE_DIR is
-      # 200 GB and persists across jobs.
-      #
-      # We do NOT enable sccache for nvcc via
-      # CMAKE_CUDA_COMPILER_LAUNCHER: sccache 0.10's clap-based CLI
-      # rejects intermediate `-E` invocations cmake issues for CUDA
-      # preprocessing passes ("Compiler not supported: unexpected
-      # argument '-E'"). The CUDA kernel build is parallelized across
-      # 32 cores anyway; we'd rather take the cache miss than corrupt
-      # the build.
-      RUSTC_WRAPPER: sccache
+      # sccache is intentionally disabled here. RUSTC_WRAPPER=sccache
+      # caused enough collateral problems (CMake build dirs cached
+      # CMAKE_CUDA_COMPILER_LAUNCHER=sccache stamps; sccache 0.10's
+      # clap CLI rejected `-E` from nvcc preprocessing) that it
+      # outweighed the cache benefit. The 32-core runner builds Rust
+      # crates fast enough cold; we can revisit later.
       CARGO_INCREMENTAL: "0"
 
     steps:
@@ -285,6 +275,8 @@ jobs:
           # NCCL is sometimes bundled inside the CUDA toolkit prefix.
           # If we find it there, point the cuda-driver build at it via
           # `PIE_NCCL_HOME` (`server/build.rs::build_cuda` honors this).
+          # Only matters for the `cuda` flavor; the `portable-cuda`
+          # flavor doesn't link NCCL.
           if [ -f "${CUDA_HOME}/include/nccl.h" ] \
               && ls "${CUDA_HOME}"/lib64/libnccl.so* >/dev/null 2>&1; then
             echo "PIE_NCCL_HOME=${CUDA_HOME}" >> "$GITHUB_ENV"
@@ -302,17 +294,15 @@ jobs:
           set -euxo pipefail
           # Force a fresh cmake configure for pie-server's build script.
           # The persistent CARGO_TARGET_DIR keeps pie-server-<hash>/out/
-          # between runs; if the cached CMakeCache.txt was written when
-          # `CMAKE_CUDA_COMPILER_LAUNCHER=sccache` was in env, removing
-          # the env var alone won't drop it from the cache and cmake's
-          # compile rules keep wrapping nvcc with sccache. Scoped to
-          # pie-server, so other crates' deps stay cached.
+          # between matrix entries, and cmake caches per-flavor CMake
+          # variables (compile launchers, define flags, etc.) that we
+          # don't want bleeding from one flavor's job to the next.
+          # Scoped to pie-server, so other crates' deps stay cached.
           cargo clean -p pie-server --target x86_64-unknown-linux-gnu --release
           cargo build --release \
             --target x86_64-unknown-linux-gnu \
             -p pie-server \
-            --features driver-portable,driver-cuda,driver-dummy
-          sccache --show-stats || true
+            --features ${{ matrix.flavor.features }}
 
       - name: Package
         shell: bash

@@ -102,16 +102,6 @@ target_compile_options(pie_driver_portable_lib PRIVATE
   -Wall -Wextra -Wno-unused-parameter
 )
 
-# We use `#pragma omp` directly in src/model.cpp (diagnostic probe of
-# the OpenMP runtime from our caller thread). The `OpenMP::OpenMP_CXX`
-# imported target already carries both the compile flags
-# (`INTERFACE_COMPILE_OPTIONS`) and the runtime lib link, so we don't
-# need a separate `target_compile_options(... ${OpenMP_CXX_FLAGS})` —
-# that line passed `OpenMP_CXX_FLAGS` as a single string, which broke
-# multi-word flag values like `"-Xclang -fopenmp"` on macOS clang.
-find_package(OpenMP REQUIRED)
-target_link_libraries(pie_driver_portable_lib PUBLIC OpenMP::OpenMP_CXX)
-
 target_include_directories(pie_driver_portable_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src)

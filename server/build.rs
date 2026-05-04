@@ -117,13 +117,10 @@ fn build_portable() {
     // ordered before `-Wl,--start-group … libggml-cpu.a` and the
     // linker discards libgomp before ggml-cpu.a's GOMP_* symbols
     // are seen, leading to `undefined reference to GOMP_barrier`.
-    // The portable driver's own `#pragma omp` probe in src/model.cpp
-    // still goes through `find_package(OpenMP REQUIRED)` and links
-    // libomp/libgomp via the OpenMP::OpenMP_CXX target — that one
-    // works because cmake places it correctly. Disabling ggml-cpu's
-    // OpenMP costs us multi-thread CPU inference on the portable
-    // backend; not relevant for CI artifacts where the GPU backends
-    // (Metal / CUDA / Vulkan) are the hot path.
+    // Cost: multi-thread CPU inference on the portable backend; not
+    // relevant for CI artifacts where the GPU backends (Metal / CUDA
+    // / Vulkan) are the hot path. The portable driver no longer uses
+    // OpenMP itself.
     cfg.define("GGML_OPENMP", "OFF");
     let dst = cfg.build();
     let build_dir = dst.join("build");
@@ -205,7 +202,7 @@ fn build_portable() {
         println!("cargo:rustc-link-lib=vulkan");
     }
 
-    add_system_libs(&["gomp"], metal_enabled);
+    add_system_libs(metal_enabled);
 
     println!(
         "cargo:rustc-env=PIE_DRIVER_PORTABLE_BUILD_DIR={}",
@@ -338,7 +335,7 @@ fn build_cuda() {
         println!("cargo:rustc-link-lib=nccl");
     }
 
-    add_system_libs(&[], /*metal=*/ false);
+    add_system_libs(/*metal=*/ false);
 
     println!(
         "cargo:rustc-env=PIE_DRIVER_CUDA_BUILD_DIR={}",
@@ -395,12 +392,9 @@ fn link_cuda_driver_stub() {
     println!("cargo:rustc-link-lib=cuda");
 }
 
-/// Emit per-OS system library link directives. `extra` is appended on
-/// linux only (typically `gomp` for OpenMP). On macOS, `metal=true`
-/// links the Metal/MetalKit/Foundation frameworks ggml-metal needs +
-/// resolves libomp from a typical brew location (override via
-/// `OPENMP_DIR`).
-fn add_system_libs(extra: &[&str], metal: bool) {
+/// Emit per-OS system library link directives. On macOS, `metal=true`
+/// also links the Metal/MetalKit/Foundation frameworks ggml-metal needs.
+fn add_system_libs(metal: bool) {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "linux" => {
@@ -409,32 +403,9 @@ fn add_system_libs(extra: &[&str], metal: bool) {
             println!("cargo:rustc-link-lib=m");
             println!("cargo:rustc-link-lib=dl");
             println!("cargo:rustc-link-lib=rt");
-            for lib in extra {
-                println!("cargo:rustc-link-lib={lib}");
-            }
         }
         "macos" => {
             println!("cargo:rustc-link-lib=c++");
-
-            // OpenMP via Homebrew's `libomp` (Apple Silicon: `/opt/homebrew`,
-            // Intel: `/usr/local`). Override via `OPENMP_DIR` for a custom
-            // install. We always link omp on macOS since ggml's CPU backend
-            // is OpenMP-enabled by default; missing it is a confusing
-            // link-time error.
-            println!("cargo:rerun-if-env-changed=OPENMP_DIR");
-            let openmp_dir = std::env::var("OPENMP_DIR").ok().map(PathBuf::from);
-            let candidates: Vec<PathBuf> = match openmp_dir {
-                Some(d) => vec![d.join("lib")],
-                None => vec![
-                    PathBuf::from("/opt/homebrew/opt/libomp/lib"),
-                    PathBuf::from("/usr/local/opt/libomp/lib"),
-                ],
-            };
-            for p in candidates.iter().filter(|p| p.is_dir()) {
-                println!("cargo:rustc-link-search=native={}", p.display());
-            }
-            println!("cargo:rustc-link-lib=omp");
-
             if metal {
                 // ggml-metal pulls these three frameworks. -framework on
                 // macOS is the moral equivalent of -l on linux.
