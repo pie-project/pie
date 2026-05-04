@@ -8,9 +8,13 @@
     <p></p>
   </picture>
 
-  [![CI](https://github.com/pie-project/pie/actions/workflows/ci.yml/badge.svg)](https://github.com/pie-project/pie/actions/workflows/ci.yml)
-  [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[Website] | [Guide] | [Reference] | [Paper (SOSP'25)]
 </div>
+
+[Website]: https://pie-project.org/
+[Guide]: https://pie-project.org/docs/guide/install
+[Reference]: https://pie-project.org/docs/reference/sdk-rust
+[Paper (SOSP'25)]: https://ingim.org/papers/gim2025pie.pdf
 
 A programmable serving system for custom inference logic,
 stateful agents, and serving-side optimization.
@@ -21,10 +25,6 @@ Pie accepts *inferlets* - small programs in Rust, Python, or TypeScript that com
 >
 > Pie is pre-release software under active development. It is best suited
 > for testing and research right now.
-
-- **[Documentation](https://pie-project.org/)**
-
-- **[Paper (SOSP '25)](https://ingim.org/papers/gim2025pie.pdf)**
 ## Quick Start
 
 Pie is a standalone binary (~14 MB on macOS) with no Python/PyTorch dependencies.
@@ -44,12 +44,12 @@ pie run text-completion --prompt "The capital of France is"
 
 | Directory | Description |
 |---|---|
-| `runtime/` | Wasm-based inferlet runtime (host-side) |
-| `server/` | `pie` CLI and standalone engine |
-| `inferlets/` | Example inferlets (agents, decoding strategies, tools, …) |
+| `runtime/` | Inferlet runtime |
+| `server/` | CLI |
+| `inferlets/` | Example inferlets |
 | `sdk/` | Inferlet SDKs (Rust · Python · JavaScript) |
 | `client/` | Client libraries (Rust · Python · JavaScript) |
-| `driver/` | Model backends (portable / CUDA / vLLM / SGLang) |
+| `driver/` | Pie drivers (portable / CUDA / vLLM / SGLang) |
 | `website/` | [pie-project.org](https://pie-project.org) docs site |
 
 ## Getting Help
