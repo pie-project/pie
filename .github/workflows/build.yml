@@ -90,32 +90,36 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # manylinux containers ship gcc + cmake + ninja but no rust and
-      # not every devel header. We dnf-install just the deps the build
-      # needs:
+      # manylinux containers ship gcc + cmake + ninja but no rust.
+      # We dnf-install:
       #   - `openssl-devel` + `pkg-config`: for `openssl-sys` (reqwest's
       #     default features).
       #   - `perl`: openssl-sys build script's vendored fallback.
-      #   - `gcc-toolset-14-libgomp-devel`: ggml-cpu's CMake links
-      #     `-lgomp` (OpenMP from GCC), which the toolset doesn't ship
-      #     by default. Without it the link step fails with
-      #     `undefined reference to GOMP_barrier`.
+      #   - `gcc-toolset-14-gcc(-c++)`: pulls libgomp matching the
+      #     toolset's ld. The system gcc-8/libgomp-8.5 is also installed
+      #     by default but that mismatches the toolset's linker, hence
+      #     `undefined reference to GOMP_barrier` if we don't activate
+      #     the toolset.
+      #
+      # Then `source enable` puts gcc-toolset-14's bin first on PATH so
+      # cmake-rs picks `gcc-toolset-14/cc` instead of the system one,
+      # and cmake-rs's compiler stays in lockstep with the linker.
       - name: Install build deps + rustup (manylinux only)
         if: startsWith(matrix.target.container, 'quay.io/pypa/manylinux')
         shell: bash
         run: |
           set -euxo pipefail
-          # Probe: list available gcc-toolset-14 packages so we know
-          # the actual libgomp package name. Then install it together
-          # with the base build deps. This noisy probe is cheap and
-          # helps when the package layout drifts across manylinux
-          # image revisions.
-          dnf list --available "gcc-toolset-14*libgomp*" "gcc-toolset-14*gcc*" 2>&1 | head -30 || true
-          dnf provides "/opt/rh/gcc-toolset-14/root/usr/lib*/libgomp.so*" 2>&1 | head -20 || true
           dnf install -y --setopt=install_weak_deps=False \
             openssl-devel pkg-config perl \
-            gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ \
-            libgomp
+            gcc-toolset-14-gcc gcc-toolset-14-gcc-c++
+          # Enable gcc-toolset-14 in subsequent steps (compile + link
+          # both go through it, so libgomp matches symbol-version).
+          {
+            echo "PATH=/opt/rh/gcc-toolset-14/root/usr/bin:${PATH}"
+            echo "MANPATH=/opt/rh/gcc-toolset-14/root/usr/share/man:"
+            echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib"
+            echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64/pkgconfig"
+          } >> "$GITHUB_ENV"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
