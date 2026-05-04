@@ -4,7 +4,9 @@
   "private": true,
   "scripts": {
     "docusaurus": "docusaurus",
+    "prestart": "cp ../scripts/install.sh static/install.sh",
     "start": "docusaurus start",
+    "prebuild": "cp ../scripts/install.sh static/install.sh",
     "build": "docusaurus build",
     "swizzle": "docusaurus swizzle",
     "deploy": "docusaurus deploy",
