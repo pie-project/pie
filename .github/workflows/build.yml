@@ -274,6 +274,27 @@ jobs:
       # outweighed the cache benefit. The 32-core runner builds Rust
       # crates fast enough cold; we can revisit later.
       CARGO_INCREMENTAL: "0"
+      # Block ggml's CMakeLists from auto-wiring sccache as the global
+      # `RULE_LAUNCH_COMPILE`. Its detection path is
+      # `if (GGML_CCACHE AND NOT CMAKE_C_COMPILER_LAUNCHER ...) find_program(... sccache)`
+      # so any non-empty value short-circuits the AND chain. `env` is
+      # the unix `env` command — when invoked as `env cc -c foo.c`, it
+      # executes the trailing args verbatim without altering anything,
+      # so it acts as a transparent launcher.
+      #
+      # Why this matters on a bare-metal runner: sccache's client
+      # connects to the daemon on the configured port (default 4226)
+      # without checking the daemon's owner. If a different user on the
+      # box (e.g. a developer's interactive session) has an sccache
+      # daemon running on 4226, every `sccache cc …` from this job
+      # routes through that foreign daemon. The daemon then forks the
+      # actual compiler under its own UID, the compiler tries to write
+      # `.o.d` / `.o` into the gh-runner-owned target tree, and EACCES
+      # kills the build with the misleading "Permission denied" trace
+      # we hit on run 25346461606.
+      CMAKE_C_COMPILER_LAUNCHER: env
+      CMAKE_CXX_COMPILER_LAUNCHER: env
+      CMAKE_CUDA_COMPILER_LAUNCHER: env
 
     steps:
       - uses: actions/checkout@v4
