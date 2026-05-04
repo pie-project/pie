@@ -111,10 +111,33 @@ async fn run_async(args: RunArgs) -> Result<()> {
     let url = format!("ws://{}:{}", cfg.server.host, cfg.server.port);
     let result = drive_inferlet(&url, &token, &args).await;
 
-    // Tear the child down regardless of result.
+    // Print the error before tearing the child down — `child.wait()`
+    // below has been observed to block indefinitely on macOS (engine
+    // SIGTERM handler stalls), and main only sees `result` after we
+    // return, so without this the user sees `cleaning up engine …`
+    // and silence rather than the underlying failure.
+    if let Err(e) = &result {
+        eprintln!("pie run: {e:#}");
+    }
+
     eprintln!("cleaning up engine (pid={pid})…");
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    let _ = child.wait();
+
+    // Bound the wait so a stalled engine can't wedge `pie run`.
+    const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                let _ = child.wait();
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
     let _ = std::fs::remove_file(&runtime_cfg_path);
 
     result
