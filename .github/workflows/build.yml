@@ -235,6 +235,15 @@ jobs:
     runs-on: [self-hosted, linux, x64, gpu, cuda]
     strategy:
       fail-fast: false
+      # Force serial execution on the self-hosted GPU runner. All matrix
+      # entries share the same `CARGO_TARGET_DIR` and write into the
+      # same `pie-server-<hash>/out/portable/build/` cmake build
+      # directory; running in parallel races on the per-object .o.d
+      # dependency files and trips EACCES the moment two jobs configure
+      # cmake at the same instant. The runner has 32 cores so each
+      # entry already fans out internally — serializing the matrix
+      # costs wall-clock but keeps the build cache coherent.
+      max-parallel: 1
       matrix:
         # sm_75 (Turing, e.g. T4 / RTX 20-series) intentionally
         # excluded: flashinfer's `vllm_custom_all_reduce.cuh` only
