@@ -439,19 +439,48 @@ impl Drop for SubprocessDriver {
 // helpers — pipe creation + handshake read loop.
 // -----------------------------------------------------------------------------
 
-/// Create a pipe with the read end set to close-on-exec so it doesn't
-/// leak into the child. Returns `(parent_read, child_write)`.
+/// Create a pipe with both ends set to close-on-exec so they don't
+/// leak into unrelated children. Returns `(parent_read, child_write)`.
+///
+/// Linux has `pipe2(O_CLOEXEC)` which sets the flag atomically.
+/// macOS only has `pipe(2)` — set FD_CLOEXEC via `fcntl` afterwards.
+/// (The race window between `pipe()` and `fcntl()` is irrelevant for
+/// our use: this function runs from a single thread in `start()`, and
+/// the only `fork+exec` in this process happens after `make_pipe`
+/// returns.)
 fn make_pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds: [libc::c_int; 2] = [0; 2];
-    // SAFETY: `pipe2` writes two ints into `fds`; we own that buffer.
+
+    #[cfg(target_os = "linux")]
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let rc = {
+        let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if r == 0 {
+            for fd in fds.iter() {
+                let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+                if flags < 0
+                    || unsafe { libc::fcntl(*fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+                {
+                    let err = std::io::Error::last_os_error();
+                    unsafe {
+                        libc::close(fds[0]);
+                        libc::close(fds[1]);
+                    }
+                    return Err(anyhow!("fcntl(FD_CLOEXEC): {err}"));
+                }
+            }
+        }
+        r
+    };
+
     if rc != 0 {
-        return Err(anyhow!("pipe2: {}", std::io::Error::last_os_error()));
+        return Err(anyhow!("pipe: {}", std::io::Error::last_os_error()));
     }
     // Child end must NOT be O_CLOEXEC after the dup2 in pre_exec — but
     // since we dup it explicitly there, it loses the flag automatically
     // (dup2'd fds always have CLOEXEC=0).
-    // SAFETY: each fd is fresh from pipe2; we own them.
+    // SAFETY: each fd is fresh from pipe(2); we own them.
     let parent_read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     let child_write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     Ok((parent_read, child_write))
