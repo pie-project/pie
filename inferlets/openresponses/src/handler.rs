@@ -8,10 +8,20 @@ use wstd::http::{IntoBody, Response};
 use wstd::io::AsyncWrite;
 
 use inferlet::Context;
-use inferlet::sample::Sampler;
+use inferlet::chat;
 use inferlet::model::Model;
 use inferlet::runtime;
-use inferlet::{};
+use inferlet::sample::Sampler;
+
+/// Best-effort wall-clock seconds since the Unix epoch. Returns 0 if the
+/// host's clock is not available (matters under sandboxed wasi targets that
+/// haven't wired `wasi:clocks/wall-clock`).
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Generate a unique ID for responses and messages
 fn generate_id(prefix: &str) -> String {
@@ -33,11 +43,13 @@ pub async fn handle_responses<B>(
         }
     };
 
-    // Extract messages from input
+    // Extract messages from input. Per spec, `input` may be a string
+    // (promoted to a single user message) or an array; normalize first.
     let mut system_message = request.instructions.clone();
     let mut user_messages = Vec::new();
+    let input_items = request.input.into_items();
 
-    for item in &request.input {
+    for item in &input_items {
         match item {
             InputItem::Message(msg) => {
                 let text = msg.content.as_text();
@@ -219,7 +231,10 @@ async fn handle_streaming_response(
     let mut tokens_generated: usize = 0;
 
     // Token-by-token generation loop with TRUE streaming
-    let mut stream = ctx.generate(sampler).max_tokens(max_tokens);
+    let mut stream = ctx
+        .generate(sampler)
+        .max_tokens(max_tokens)
+        .stop(&chat::stop_tokens(&model));
     while let Ok(Some(step)) = stream.next() {
         let out = match step.execute().await {
             Ok(o) => o,
@@ -263,13 +278,15 @@ async fn handle_streaming_response(
     emit!(emitter.output_item_done(0, &final_output_item));
 
     // Update and emit response.completed
-    response.status = response_status;
+    response.status = response_status.clone();
     response.output = vec![final_output_item];
-    if hit_max {
-        emit!(emitter.response_completed(&response));
-    } else {
-        emit!(emitter.response_completed(&response));
+    response.completed_at = Some(now_unix_secs());
+    if response_status == ResponseStatus::Incomplete {
+        response.incomplete_details = Some(IncompleteDetails {
+            reason: "max_output_tokens".to_string(),
+        });
     }
+    emit!(emitter.response_completed(&response));
 
     // Emit [DONE]
     emit!(StreamEmitter::done());
@@ -321,7 +338,10 @@ async fn handle_non_streaming_response(
 
     // Generate token by token to count tokens for incomplete detection
     let sampler = Sampler::TopP { temperature: temperature, p: top_p };
-    let mut stream = ctx.generate(sampler).max_tokens(max_tokens);
+    let mut stream = ctx
+        .generate(sampler)
+        .max_tokens(max_tokens)
+        .stop(&chat::stop_tokens(&model));
     let mut full_text = String::new();
     let mut tokens_generated: usize = 0;
 
@@ -351,10 +371,21 @@ async fn handle_non_streaming_response(
         }],
     });
 
+    let now = now_unix_secs();
+    let incomplete_details = if response_status == ResponseStatus::Incomplete {
+        Some(IncompleteDetails {
+            reason: "max_output_tokens".to_string(),
+        })
+    } else {
+        None
+    };
     let response = ResponseResource {
         id: response_id,
-        response_type: "response".to_string(),
+        object: "response".to_string(),
+        created_at: now,
+        completed_at: Some(now),
         status: response_status,
+        incomplete_details,
         model: model_name,
         output: vec![output_item],
         error: None,

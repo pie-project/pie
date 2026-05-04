@@ -15,8 +15,10 @@ pub struct CreateResponseBody {
     #[serde(default)]
     pub model: String,
 
-    /// Input items (messages, function call outputs, etc.)
-    pub input: Vec<InputItem>,
+    /// Input items (messages, function call outputs, etc.). Per spec, may be
+    /// either a string (interpreted as a single user message) or a list of
+    /// items.
+    pub input: InputBody,
 
     /// Whether to stream the response
     #[serde(default)]
@@ -59,7 +61,33 @@ pub enum Tool {
     },
 }
 
-/// Input item variants
+/// Spec-compliant `input` accepts either a bare string (promoted to a single
+/// user message) or an array of input items.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum InputBody {
+    Text(String),
+    Items(Vec<LooseInputItem>),
+}
+
+impl InputBody {
+    /// Normalize to a list of input items, promoting a bare string into a
+    /// single user message per spec.
+    pub fn into_items(self) -> Vec<InputItem> {
+        match self {
+            InputBody::Items(v) => v.into_iter().map(InputItem::from).collect(),
+            InputBody::Text(s) => vec![InputItem::Message(InputMessage {
+                id: None,
+                role: Role::User,
+                content: MessageContent::Text(s),
+                status: None,
+            })],
+        }
+    }
+}
+
+/// Input item variants. Each item carries a `type` discriminator; callers
+/// that omit it on a message item are accepted via [`LooseInputItem`].
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum InputItem {
@@ -74,6 +102,25 @@ pub enum InputItem {
 
     #[serde(rename = "item_reference")]
     ItemReference { id: String },
+}
+
+/// Loose deserializer for input items: tries the tagged form first, falls
+/// back to a bare `InputMessage` if `type` was omitted (spec default is
+/// `"message"`).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum LooseInputItem {
+    Tagged(InputItem),
+    UntaggedMessage(InputMessage),
+}
+
+impl From<LooseInputItem> for InputItem {
+    fn from(v: LooseInputItem) -> Self {
+        match v {
+            LooseInputItem::Tagged(it) => it,
+            LooseInputItem::UntaggedMessage(m) => InputItem::Message(m),
+        }
+    }
 }
 
 /// A function call input item (from model output, used in multi-turn)
@@ -171,15 +218,24 @@ pub struct Annotation {
 // Response Types
 // ============================================================================
 
-/// The complete response resource
+/// The complete response resource. Per the OpenResponses spec, the
+/// discriminator is `object`, not `type`; required scalar fields include
+/// `id`, `object`, `created_at`, `completed_at`, `status`, `model`, and
+/// `incomplete_details`.
 #[derive(Debug, Serialize)]
 pub struct ResponseResource {
     pub id: String,
 
-    #[serde(rename = "type")]
-    pub response_type: String,
+    #[serde(rename = "object")]
+    pub object: String,
+
+    pub created_at: i64,
+
+    pub completed_at: Option<i64>,
 
     pub status: ResponseStatus,
+
+    pub incomplete_details: Option<IncompleteDetails>,
 
     pub model: String,
 
@@ -194,16 +250,34 @@ pub struct ResponseResource {
 
 impl ResponseResource {
     pub fn new(id: String, model: String) -> Self {
+        // wstd's `wasi:clocks/wall-clock` round-trip is overkill for a
+        // best-effort timestamp; just stamp 0 in WASM where SystemTime is
+        // unavailable. OpenAI clients compare timestamps for ordering, not
+        // absolute values, so 0 is acceptable for now.
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         Self {
             id,
-            response_type: "response".to_string(),
+            object: "response".to_string(),
+            created_at,
+            completed_at: None,
             status: ResponseStatus::InProgress,
+            incomplete_details: None,
             model,
             output: Vec::new(),
             error: None,
             usage: None,
         }
     }
+}
+
+/// Reason a response stopped before completion (max tokens, content filter,
+/// etc.). Spec field — required even when null.
+#[derive(Debug, Clone, Serialize)]
+pub struct IncompleteDetails {
+    pub reason: String,
 }
 
 /// Response status

@@ -148,8 +148,11 @@ impl StreamEmitter {
 fn clone_response(r: &ResponseResource) -> ResponseResource {
     ResponseResource {
         id: r.id.clone(),
-        response_type: r.response_type.clone(),
+        object: r.object.clone(),
+        created_at: r.created_at,
+        completed_at: r.completed_at,
         status: r.status.clone(),
+        incomplete_details: r.incomplete_details.clone(),
         model: r.model.clone(),
         output: r.output.clone(),
         error: r.error.clone(),

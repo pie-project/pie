@@ -46,7 +46,10 @@ async fn main(mut req: Request<IncomingBody>, res: Responder) -> Finished {
     let method = req.method().clone();
 
     match (method, path) {
-        (Method::POST, "/responses") => {
+        // Accept both `/responses` and `/v1/responses`. The spec uses the
+        // `/v1/` prefix; supporting both lets callers point the OpenAI
+        // SDK at either `OpenAI(base_url="…/v1")` or the bare host.
+        (Method::POST, "/responses") | (Method::POST, "/v1/responses") => {
             // Read the request body
             let mut body_bytes = Vec::new();
             if let Err(_) = read_body(req.body_mut(), &mut body_bytes).await {
