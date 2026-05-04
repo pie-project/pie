@@ -307,6 +307,24 @@ def _wait_for_ready(proc: subprocess.Popen, timeout_s: float) -> dict:
         print(f"[pie_driver_portable] {line}")
 
 
+def _stream_stdout(proc: subprocess.Popen) -> None:
+    """Drain the binary's stdout silently. Without this, the kernel
+    pipe buffer (~64 KB) fills after a few hundred forward passes
+    and the binary's `printf`s start blocking — a ~30 ms tax per
+    forward pass that surfaces as a 6–14× tput regression vs the
+    standalone server (which writes directly to its own stderr,
+    no pipe). We discard rather than re-print so the bench output
+    isn't polluted; users who need the per-pass logs can run the
+    binary directly."""
+    if proc.stdout is None:
+        return
+    try:
+        for _ in iter(proc.stdout.readline, ""):
+            pass
+    except Exception:
+        pass
+
+
 def _stream_stderr(proc: subprocess.Popen) -> None:
     """Relay the binary's stderr into our own stderr (best-effort)."""
     if proc.stderr is None:
@@ -534,6 +552,20 @@ def worker_main(
         target=_stream_stderr, args=(proc,), daemon=True
     )
     stderr_thread.start()
+
+    # Critical: drain stdout too. After `_wait_for_ready` consumed the
+    # READY line, nothing else was reading stdout; the binary writes
+    # one log line per forward pass (`req_id=N engine.run done in M ms`),
+    # which fills the kernel pipe buffer (~64 KB) and then back-pressures
+    # the binary's `printf`s into multi-millisecond blocking writes once
+    # the buffer is full. That ate ~30 ms per forward pass under load
+    # — visible in tput as a 6–14× slowdown vs the standalone server,
+    # which embeds the binary in-process and writes directly to its
+    # own stderr (no pipe).
+    stdout_thread = threading.Thread(
+        target=_stream_stdout, args=(proc,), daemon=True
+    )
+    stdout_thread.start()
 
     # Translate the binary's capability JSON into DriverCapabilities.
     caps = DriverCapabilities(
