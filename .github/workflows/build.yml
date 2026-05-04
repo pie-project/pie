@@ -163,14 +163,18 @@ jobs:
           key: build-${{ matrix.target.label }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: build-${{ matrix.target.label }}-
 
-      - name: cargo build --release
+      - name: cargo build (release-min)
         shell: bash
         run: |
           set -euxo pipefail
           if [ -n "${{ matrix.target.backend_env }}" ]; then
             export ${{ matrix.target.backend_env }}
           fi
-          cargo build --release \
+          # `release-min`: fat LTO, codegen-units=1, panic=abort,
+          # strip=symbols. Defined in workspace Cargo.toml. Costlier
+          # to build but smaller + faster binary — what we want for
+          # distribution artifacts.
+          cargo build --profile release-min \
             --target ${{ matrix.target.triple }} \
             -p pie-server \
             --features driver-portable,driver-dummy
@@ -180,7 +184,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p dist
-          BIN_DIR="target/${{ matrix.target.triple }}/release"
+          BIN_DIR="target/${{ matrix.target.triple }}/release-min"
           if [[ "${{ matrix.target.archive }}" == "zip" ]]; then
             # Windows .exe; 7z preinstalled on windows-latest.
             7z a "dist/${ARTIFACT_NAME}" "${BIN_DIR}/pie.exe"
@@ -288,7 +292,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - name: cargo build --release
+      - name: cargo build (release-min)
         shell: bash
         run: |
           set -euxo pipefail
@@ -298,8 +302,10 @@ jobs:
           # variables (compile launchers, define flags, etc.) that we
           # don't want bleeding from one flavor's job to the next.
           # Scoped to pie-server, so other crates' deps stay cached.
-          cargo clean -p pie-server --target x86_64-unknown-linux-gnu --release
-          cargo build --release \
+          cargo clean -p pie-server --target x86_64-unknown-linux-gnu --profile release-min
+          # `release-min`: fat LTO, codegen-units=1, panic=abort,
+          # strip=symbols. Defined in workspace Cargo.toml.
+          cargo build --profile release-min \
             --target x86_64-unknown-linux-gnu \
             -p pie-server \
             --features ${{ matrix.flavor.features }}
