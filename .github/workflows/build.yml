@@ -286,6 +286,13 @@ jobs:
             echo "CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
             echo "CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
             echo "AR=/opt/rh/gcc-toolset-12/root/usr/bin/ar"
+            # nvcc auto-detects the host compiler via PATH, but the
+            # cuda image's `/usr/bin/g++` (gcc-8.5) shadows ours and
+            # nvcc silently drops `-std=c++20` against it
+            # ("flag is not supported with the configured host compiler"),
+            # which then breaks flashinfer's C++17 `std::is_same_v`.
+            # CUDAHOSTCXX forces nvcc to invoke the gcc-12 host compiler.
+            echo "CUDAHOSTCXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
             echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}"
             echo "MANPATH=/opt/rh/gcc-toolset-12/root/usr/share/man:"
             echo "INFOPATH=/opt/rh/gcc-toolset-12/root/usr/share/info"
