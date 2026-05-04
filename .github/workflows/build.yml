@@ -249,12 +249,18 @@ jobs:
       PIE_PORTABLE_CUDA_ARCH: ${{ matrix.cuda.arch }}
       CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda.arch }}
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
-      # Compile cache for both Rust (RUSTC_WRAPPER) and nvcc
-      # (CMAKE_CUDA_COMPILER_LAUNCHER). The runner's $SCCACHE_DIR is
+      # sccache for Rust (RUSTC_WRAPPER). The runner's $SCCACHE_DIR is
       # 200 GB and persists across jobs.
+      #
+      # We do NOT enable sccache for nvcc via
+      # CMAKE_CUDA_COMPILER_LAUNCHER: sccache 0.10's clap-based CLI
+      # rejects intermediate `-E` invocations cmake issues for CUDA
+      # preprocessing passes ("Compiler not supported: unexpected
+      # argument '-E'"). The CUDA kernel build is parallelized across
+      # 32 cores anyway; we'd rather take the cache miss than corrupt
+      # the build.
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
-      CMAKE_CUDA_COMPILER_LAUNCHER: sccache
 
     steps:
       - uses: actions/checkout@v4
