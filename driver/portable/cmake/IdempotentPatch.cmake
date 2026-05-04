@@ -3,17 +3,33 @@
 # Used as PATCH_COMMAND for vendored llama.cpp. On CI runners with a
 # persistent build cache (e.g. our self-hosted GPU runner keeps
 # `_deps/llama-src/` between jobs) the source can already be in the
-# patched state when ExternalProject re-runs the populate step —
-# `patch -N` then exits 1 ("Reversed or previously applied") and
-# breaks the build.
+# patched state when ExternalProject re-runs the populate step.
 #
-# Strategy: probe with `patch --dry-run`. If the forward apply would
-# succeed cleanly, run it for real. Otherwise the tree is already in
-# the patched state and we skip silently. Either way, the build
-# proceeds with a correctly-patched source. Real patch failures (a
-# stale hunk that no longer applies forward AND isn't already applied)
-# fail loudly here at configure time rather than ~60 min later as a
-# missing-symbol compile error.
+# Strategy: probe with `patch -N --dry-run`. The `-N` (`--forward`) flag
+# suppresses BSD `patch`'s auto-reverse heuristic — without it, a patched
+# tree + closed stdin makes `patch` silently reverse-apply the patch and
+# return rc=0, masking real drift. With `-N`:
+#
+#   * rc=0                                                → unpatched,
+#                                                           apply for real.
+#   * rc!=0 and output ~ "Ignoring previously applied"    → already
+#                                                           patched, skip.
+#   * else                                                → real failure
+#                                                           (hunk drift
+#                                                           after upstream
+#                                                           rev bump, or
+#                                                           corrupt tree).
+#                                                           Fail loudly at
+#                                                           configure time
+#                                                           with the
+#                                                           diagnostic
+#                                                           output, rather
+#                                                           than silently
+#                                                           skipping and
+#                                                           surfacing as a
+#                                                           missing-symbol
+#                                                           compile error
+#                                                           ~60 min later.
 #
 # Required: -DPATCH_FILE=<absolute path to .patch>
 
@@ -24,18 +40,28 @@ endif()
 get_filename_component(PATCH_NAME ${PATCH_FILE} NAME)
 
 execute_process(
-  COMMAND patch -p1 --dry-run --silent -i ${PATCH_FILE}
-  RESULT_VARIABLE dry_run_rc
-  OUTPUT_QUIET ERROR_QUIET)
+  COMMAND patch -p1 -N --dry-run -i ${PATCH_FILE}
+  RESULT_VARIABLE probe_rc
+  OUTPUT_VARIABLE probe_out
+  ERROR_VARIABLE  probe_err
+  INPUT_FILE      /dev/null)
 
-if(dry_run_rc EQUAL 0)
+if(probe_rc EQUAL 0)
   message(STATUS "applying ${PATCH_NAME}")
   execute_process(
-    COMMAND patch -p1 -i ${PATCH_FILE}
-    RESULT_VARIABLE apply_rc)
+    COMMAND patch -p1 -N -i ${PATCH_FILE}
+    RESULT_VARIABLE apply_rc
+    INPUT_FILE      /dev/null)
   if(NOT apply_rc EQUAL 0)
     message(FATAL_ERROR "${PATCH_NAME}: patch failed with exit ${apply_rc}")
   endif()
-else()
+elseif("${probe_out}${probe_err}" MATCHES "Ignoring previously applied")
   message(STATUS "${PATCH_NAME} already applied (skipped)")
+else()
+  message(FATAL_ERROR
+    "${PATCH_NAME}: hunks no longer apply forward and tree is not in "
+    "patched state — patch needs to be refreshed against the current "
+    "upstream source.\n"
+    "----- patch -N --dry-run output (rc=${probe_rc}) -----\n"
+    "${probe_out}${probe_err}")
 endif()
