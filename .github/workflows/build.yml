@@ -235,10 +235,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # sm_75 (Turing, e.g. T4 / RTX 20-series) intentionally
+        # excluded: flashinfer's `vllm_custom_all_reduce.cuh` only
+        # specializes the bf16 cast under `__CUDA_ARCH__ >= 800`, so
+        # nvcc's sm_75 pass fails to instantiate
+        # `CustomAllreduce::allreduce<__nv_bfloat16>`. Turing has no
+        # native bf16 anyway — supporting it here would mean carrying
+        # an fp16-only fallback that the rest of the cuda driver
+        # doesn't have. The portable-cuda flavor (no driver-cuda /
+        # flashinfer) covers Turing users.
         cuda:
-          - { version: "12.6.3", short: "12.6", path: "/usr/local/cuda-12.6", arch: "75;80;86;89;90" }
-          - { version: "12.8.1", short: "12.8", path: "/usr/local/cuda-12.8", arch: "75;80;86;89;90;100;120" }
-          - { version: "13.0.0", short: "13.0", path: "/usr/local/cuda-13.0", arch: "75;80;86;89;90;100;120" }
+          - { version: "12.6.3", short: "12.6", path: "/usr/local/cuda-12.6", arch: "80;86;89;90" }
+          - { version: "12.8.1", short: "12.8", path: "/usr/local/cuda-12.8", arch: "80;86;89;90;100;120" }
+          - { version: "13.0.0", short: "13.0", path: "/usr/local/cuda-13.0", arch: "80;86;89;90;100;120" }
         flavor:
           - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
           - { id: "portable-cuda", features: "driver-portable,driver-dummy" }
