@@ -262,8 +262,9 @@ jobs:
           set -euxo pipefail
           # nvidia/cuda:rockylinux8 images have glibc 2.28 (matches
           # manylinux_2_28) but minimal userland. `ninja-build` lives in
-          # EPEL on AlmaLinux 8, so enable that repo before installing.
-          dnf install -y epel-release
+          # the PowerTools repo on Rocky 8, EPEL provides extras.
+          dnf install -y epel-release dnf-plugins-core
+          dnf config-manager --set-enabled powertools
           dnf install -y --setopt=install_weak_deps=False \
             cmake ninja-build gcc-toolset-12 git \
             openssl-devel
