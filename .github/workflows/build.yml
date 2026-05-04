@@ -267,7 +267,7 @@ jobs:
           dnf config-manager --set-enabled powertools
           dnf install -y --setopt=install_weak_deps=False \
             cmake ninja-build gcc-toolset-12 git \
-            openssl-devel
+            openssl-devel patch
           # GitHub CLI — used by the upload step.
           dnf install -y 'dnf-command(config-manager)'
           dnf config-manager --add-repo \
