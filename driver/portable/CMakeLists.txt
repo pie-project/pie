@@ -34,15 +34,22 @@ cpmaddpackage(
   # land in follow-up patches; with no backend advertising support, the
   # Pie graph builders take the materialize+flash_attn_ext fallback path.
   #
-  # ExternalProject (which CPM uses under the hood) only runs PATCH_COMMAND
-  # once, after the initial populate step. Re-configures don't re-run the
-  # patch step, so we don't need to make `patch` idempotent. We also do
-  # NOT swallow patch's exit code with `|| true`: a failing patch on a
-  # fresh download silently leaves ggml.h without `ggml_paged_attn_ext`,
-  # which only surfaces ~60 minutes later as a model.cpp compile error.
-  # `-N` is kept as belt-and-suspenders for the rare manual re-populate.
-  PATCH_COMMAND ${CMAKE_COMMAND} -E echo "applying ggml-pie-paged-attn-ext.patch"
-        COMMAND patch -p1 -N -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-pie-paged-attn-ext.patch
+  # PATCH_COMMAND idempotency:
+  #   * On CI runners with a persistent build cache (our self-hosted
+  #     runner keeps `_deps/llama-src/` between jobs), the source tree
+  #     can already be patched when ExternalProject re-runs the populate
+  #     step — `patch -N` then exits 1 ("Reversed or previously applied")
+  #     and breaks the build.
+  #   * `--dry-run` lets us probe: if forward-apply succeeds the patch
+  #     hasn't been applied yet, so do it; otherwise the tree is already
+  #     in the patched state and we skip silently. Either way, the build
+  #     proceeds with a correctly-patched ggml.
+  #   * We deliberately do NOT swallow real patch failures: if a patch
+  #     stops applying cleanly (upstream rev bump, hunk drift), this
+  #     fails loudly at configure time rather than ~60 min later as a
+  #     missing-symbol error in model.cpp.
+  PATCH_COMMAND ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-pie-paged-attn-ext.patch
+                                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/IdempotentPatch.cmake
   OPTIONS
     "LLAMA_BUILD_TESTS OFF"
     "LLAMA_BUILD_EXAMPLES OFF"
