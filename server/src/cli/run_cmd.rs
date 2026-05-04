@@ -190,7 +190,11 @@ async fn drive_inferlet(url: &str, token: &str, args: &RunArgs) -> Result<()> {
             }
         }
     }
-    let _ = client.close().await;
+    // `run` is a one-shot CLI: once the process returned, teardown must not
+    // depend on the server completing the websocket close handshake. The child
+    // engine is terminated by the caller immediately after this function
+    // returns.
+    let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
     Ok(())
 }
 
