@@ -16,13 +16,37 @@ import asyncio
 import json
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from pie_client import Event
 
 
+@asynccontextmanager
+async def _get_client(args, cfg):
+    """Yield a connected `PieClient` for either path:
+       * In-process: build a `pie.server.Server` from `cfg` (the
+         original `tput.py` flow).
+       * External:   `--external-server ws://host:port` +
+         `--external-token <tok>` connect to an already-running
+         engine (e.g. a `pie serve` subprocess from the standalone
+         binary). Skips `cfg` entirely.
+    """
+    if getattr(args, "external_server", None):
+        from pie_client import PieClient
+        token = args.external_token or ""
+        async with PieClient(args.external_server) as client:
+            if token:
+                await client.auth_by_token(token)
+            yield client
+    else:
+        from pie.server import Server
+        async with Server(cfg) as server:
+            client = await server.connect()
+            yield client
+
+
 async def run_benchmark(args):
-    from pie.server import Server
     from pie.config import Config, ModelConfig, AuthConfig, RuntimeConfig, SchedulerConfig
 
     if args.driver == "native" and args.use_cuda_graphs:
@@ -115,10 +139,17 @@ async def run_benchmark(args):
         if getattr(args, "runtime_quant", ""):
             driver_subsection["runtime_quant"] = args.runtime_quant
     elif args.driver == "portable":
+        # n_gpu_layers: -1 = offload everything to GPU (cuda build),
+        # 0 = CPU only. Auto-pick based on the first device unless
+        # --portable-n-gpu-layers is set explicitly.
+        if args.portable_n_gpu_layers is not None:
+            n_gpu_layers = args.portable_n_gpu_layers
+        else:
+            n_gpu_layers = -1 if device[0].startswith("cuda:") else 0
         driver_subsection = {
             "max_batch_size": args.max_batch_size,
             "max_num_kv_pages": args.cuda_native_kv_pages,
-            "n_gpu_layers": -1,
+            "n_gpu_layers": n_gpu_layers,
         }
     else:  # dummy
         driver_subsection = {}
@@ -160,8 +191,7 @@ async def run_benchmark(args):
             ),
         ],
     )
-    async with Server(cfg) as server:
-        client = await server.connect()
+    async with _get_client(args, cfg) as client:
         # -- Install program --------------------------------------------------
 
         # Always install to pick up latest build
@@ -413,6 +443,20 @@ def main():
                         help="Tokio runtime worker-thread count override "
                              "(default: tokio's num_cpus). Lowering this on "
                              "many-core boxes can cut migration overhead.")
+    parser.add_argument("--external-server", default=None,
+                        help="Skip in-process Server creation and connect "
+                             "to an already-running engine at this URL "
+                             "(e.g. ws://127.0.0.1:8095). Use this to "
+                             "benchmark the Rust standalone subprocess.")
+    parser.add_argument("--external-token", default=None,
+                        help="Auth token for --external-server (parse the "
+                             "'internal token: ...' line from the engine's "
+                             "stdout).")
+    parser.add_argument("--portable-n-gpu-layers", dest="portable_n_gpu_layers",
+                        type=int, default=None,
+                        help="portable driver only: number of layers to "
+                             "offload to GPU (-1 = all, 0 = CPU only). "
+                             "Auto-detects from --device by default.")
 
     args = parser.parse_args()
 
