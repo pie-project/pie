@@ -801,9 +801,6 @@ def _leader_loop(
         dst = _torch.tensor(dst_ids, dtype=_torch.long, device=gpu_kv[0].device)
         for layer_idx in range(len(gpu_kv)):
             gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
-        # No torch.cuda.synchronize() — we rely on stream FIFO. Any
-        # subsequent fire_batch dispatched on this same thread
-        # enqueues onto the same default stream AFTER our kernels.
 
     def _handle_copy_h2d_shmem(view: memoryview) -> None:
         """Handle a METHOD_TAG_COPY_H2D shmem request.
@@ -848,8 +845,6 @@ def _leader_loop(
             gpu_kv[layer_idx].index_copy_(
                 0, dst, host_kv[layer_idx][src].to(gpu_kv[layer_idx].device)
             )
-        # No torch.cuda.synchronize() — single-threaded shmem
-        # dispatch + legacy default stream FIFO is sufficient.
 
     def _handle_copy_d2h_shmem(view: memoryview) -> None:
         """Handle a METHOD_TAG_COPY_D2H shmem request.

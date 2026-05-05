@@ -102,9 +102,7 @@ impl ContextManager {
                 .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working re-alloc"))?;
 
             if !cpu_working_pages.is_empty() && cpu_working_pages.len() == working_count {
-                if let Err(e) = device::copy_h2d_shmem(dev_idx as DeviceId, &gpu_pages, &cpu_working_pages) {
-                    tracing::error!("copy_h2d_shmem (working restore) failed: {}", e);
-                }
+                let _ = device::copy_h2d(dev_idx as DeviceId, &gpu_pages, &cpu_working_pages);
                 self.cpu_stores[dev_idx].free(&cpu_working_pages);
             }
 
@@ -144,9 +142,7 @@ impl ContextManager {
                 let gpu_pages = self.gpu_stores[dev_idx].alloc(cpu_prefix)
                     .ok_or_else(|| anyhow::anyhow!("No GPU pages for CPU-cache restore"))?;
 
-                if let Err(e) = device::copy_h2d_shmem(dev_idx as DeviceId, &gpu_pages, &cpu_phys) {
-                    tracing::error!("copy_h2d_shmem (suffix restore) failed: {}", e);
-                }
+                let _ = device::copy_h2d(dev_idx as DeviceId, &gpu_pages, &cpu_phys);
 
                 // Register in GPU trie.
                 let prefix = &committed_hashes[..prefix_len];

@@ -903,9 +903,7 @@ impl ContextManager {
 
             if cpu_offload {
                 if let Some(cpu_pages) = self.cpu_stores[dev_idx].alloc(working.len()) {
-                    if let Err(e) = device::copy_d2h_shmem(dev_idx as DeviceId, &working, &cpu_pages) {
-                        tracing::error!("copy_d2h_shmem (working stash) failed: {}", e);
-                    }
+                    let _ = device::copy_d2h(dev_idx as DeviceId, &working, &cpu_pages);
                     let ctx = self.contexts.get_mut(&ctx_id).unwrap();
                     ctx.cpu_working_pages = cpu_pages;
                 }
@@ -920,9 +918,7 @@ impl ContextManager {
         if cpu_offload && !evictable_hashes.is_empty() {
             let gpu_phys = self.gpu_stores[dev_idx].physical_ids(&evictable_hashes);
             if let Some(cpu_pages) = self.cpu_stores[dev_idx].alloc(gpu_phys.len()) {
-                if let Err(e) = device::copy_d2h_shmem(dev_idx as DeviceId, &gpu_phys, &cpu_pages) {
-                    tracing::error!("copy_d2h_shmem (evict stash) failed: {}", e);
-                }
+                let _ = device::copy_d2h(dev_idx as DeviceId, &gpu_phys, &cpu_pages);
                 self.cpu_stores[dev_idx].insert(&evictable_hashes, &cpu_pages);
             }
         }
