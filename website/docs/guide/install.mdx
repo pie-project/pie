@@ -55,6 +55,12 @@ curl -fsSL https://pie-project.org/install.sh | PIE_INSTALL_DIR=/usr/local/bin b
 
 Valid `PIE_FLAVOR` values are `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, `portable-cuda12.6`, `portable-cuda12.8`, and `portable-cuda13.0`.
 
+Linux CUDA builds require the matching NVIDIA driver, CUDA toolkit runtime libraries, and NCCL runtime libraries on the host. On Debian/Ubuntu systems configured with NVIDIA's package repositories, install NCCL with:
+
+```bash
+sudo apt install libnccl2 libnccl-dev
+```
+
 On Windows, the PowerShell installer downloads a zip archive and installs `pie.exe` into `%LOCALAPPDATA%\Pie\bin` by default. Valid Windows `PIE_FLAVOR` values are `portable-vulkan` and `portable-cuda`:
 
 ```powershell
