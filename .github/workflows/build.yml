@@ -166,7 +166,7 @@ jobs:
 
       - name: Install CUDA toolkit (windows portable cuda only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '12.9.1'
 
@@ -207,16 +207,16 @@ jobs:
             # Keep MSBuild/ggml from saturating smaller Windows hosts.
             export CMAKE_BUILD_PARALLEL_LEVEL=4
           fi
-          cargo_jobs=()
+          cargo_parallel_args=""
           if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
-            cargo_jobs=(-j 4)
+            cargo_parallel_args="-j 4"
           fi
           # `release-min`: thin LTO, panic=abort, strip=symbols.
           # Defined in workspace Cargo.toml. Smaller + faster than
           # plain `release` (no LTO at all by default), without fat
           # LTO's many-hour link cost. Distribution profile.
           cargo build --profile release-min \
-            "${cargo_jobs[@]}" \
+            ${cargo_parallel_args} \
             --target ${{ matrix.target.triple }} \
             -p pie-server \
             --features driver-portable,driver-dummy

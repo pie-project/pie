@@ -24,7 +24,7 @@ The accumulated per-request runtime overhead (Wasm instantiation, the tokio per-
 
 2. **Sampling has to be composable.** A black-box endpoint can fuse the entire sampler into one kernel. Pie splits sampling into composable steps so inferlets can mix and match, which costs extra kernel launches.
 
-In sum, this adds about 1ms per-token latency overhead compared to vLLM regardless of model size. For small models, this latency can be noticeable. That being said, the application-level optimizations typically yield much larger gains that amortize this cost away. For more details, see the [benchmarks](../benchmarks) page.
+In sum, this adds about 1ms per-token latency overhead compared to vLLM regardless of model size. For small models, this latency can be noticeable. That being said, the application-level optimizations typically yield much larger gains that amortize this cost away. For more details, see the [benchmarks](./benchmarks) page.
 
 ### How many inferlets can I run in parallel?
 
