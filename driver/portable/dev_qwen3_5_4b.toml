@@ -10,8 +10,6 @@ spin_us = 0
 
 [model]
 hf_path = "/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
-n_gpu_layers = -1
-n_ctx = 4096
 
 [batching]
 kv_page_size = 32

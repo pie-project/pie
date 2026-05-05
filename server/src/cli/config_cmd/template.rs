@@ -76,11 +76,9 @@ restore_pause_at_utilization = 0.85
 const PORTABLE_DRIVER_BLOCK: &str = r#"
 [model.driver]
 type = "portable"
-device = ["cpu"]
+device = ["auto"]
 
 [model.driver.options]
-n_ctx = 4096
-n_gpu_layers = 0
 max_batch_tokens = 10240
 max_batch_size = 512
 "#;

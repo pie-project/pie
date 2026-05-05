@@ -565,8 +565,8 @@ pub struct PortableDriverOptions {
     pub max_batch_tokens: u32,
     pub max_batch_size: u32,
     pub cpu_pages: u32,
-    pub n_ctx: u32,
-    pub n_gpu_layers: i32,
+    #[serde(skip)]
+    pub verbose: bool,
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
     /// Ignored in standalone (binary is statically linked); accepted
@@ -582,8 +582,7 @@ impl Default for PortableDriverOptions {
             max_batch_tokens: 10240,
             max_batch_size: 512,
             cpu_pages: 0,
-            n_ctx: 4096,
-            n_gpu_layers: 0,
+            verbose: false,
             ready_timeout_s: 120.0,
             shutdown_timeout_s: 5.0,
             binary_path: String::new(),

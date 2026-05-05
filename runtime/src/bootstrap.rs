@@ -1,7 +1,8 @@
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 
 use std::fs;
 use std::path::PathBuf;
+use tokio::net::TcpListener;
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -58,7 +59,6 @@ pub struct RuntimeConfig {
     // component_instances, memories, tables) — pie uses one of each per
     // inferlet, so we expose them as a single `wasm_max_instances` knob
     // and bump them in lockstep.
-
     /// Concurrent-inferlet cap (sets all four wasmtime `total_*` caps).
     pub wasm_max_instances: u32,
     /// Per-inferlet linear-memory cap, in MiB.
@@ -69,7 +69,6 @@ pub struct RuntimeConfig {
     pub wasm_warm_slots: u32,
 
     // ── filesystem ───────────────────────────────────────────────────
-
     /// Mount per-process scratch dir at `/scratch` with full read+write.
     pub allow_fs: bool,
     /// Base dir under which per-process scratch dirs are created.
@@ -77,7 +76,6 @@ pub struct RuntimeConfig {
     pub fs_scratch_dir: PathBuf,
 
     // ── network ──────────────────────────────────────────────────────
-
     /// Expose the host network to inferlets (both `wasi:sockets` and
     /// `wasi:http`). When false, sockets are denied and the `wasi:http`
     /// linker binding is dropped entirely.
@@ -89,7 +87,6 @@ pub struct RuntimeConfig {
     pub network_allowed_hosts: Vec<String>,
 
     // ── upload cap ───────────────────────────────────────────────────
-
     /// Per-upload cap on cumulative bytes (program installs +
     /// `session.send_file` blobs), in MiB.
     pub max_upload_mb: usize,
@@ -153,7 +150,24 @@ pub struct AuthConfig {
     pub authorized_users_dir: PathBuf,
 }
 
-pub async fn bootstrap(config: Config) -> Result<String> {
+#[derive(Debug, Clone)]
+pub struct BootstrapHandle {
+    pub token: String,
+    pub port: u16,
+}
+
+pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
+    bootstrap_inner(config, None).await
+}
+
+pub async fn bootstrap_with_listener(
+    config: Config,
+    listener: TcpListener,
+) -> Result<BootstrapHandle> {
+    bootstrap_inner(config, Some(listener)).await
+}
+
+async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Result<BootstrapHandle> {
     verify_config(&config)?;
 
     if !config.skip_tracing {
@@ -166,10 +180,7 @@ pub async fn bootstrap(config: Config) -> Result<String> {
     // runtime state rather than loading their own copies.
     crate::program::python::runtime::init(&wasm_engine, config.python_snapshot);
 
-    auth::spawn(
-        config.auth.enabled,
-        &config.auth.authorized_users_dir,
-    );
+    auth::spawn(config.auth.enabled, &config.auth.authorized_users_dir);
 
     program::spawn(
         &wasm_engine,
@@ -191,7 +202,10 @@ pub async fn bootstrap(config: Config) -> Result<String> {
 
     linker::spawn(&wasm_engine, fs_policy, network_policy);
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
-    server::spawn(&config.host, config.port, max_upload_bytes);
+    let bound_port = match listener {
+        Some(listener) => server::spawn_listener(listener, max_upload_bytes)?,
+        None => server::spawn(&config.host, config.port, max_upload_bytes).await?,
+    };
     messaging::spawn();
     process::init_admission(config.max_concurrent_processes);
 
@@ -203,9 +217,18 @@ pub async fn bootstrap(config: Config) -> Result<String> {
             cfg.tokenizer_path.clone(),
         )?;
 
-        let devices: Vec<usize> = cfg.devices.iter().map(|d| {
-            device::spawn(&d.hostname, d.total_pages, d.max_batch_size, d.max_batch_tokens)
-        }).collect();
+        let devices: Vec<usize> = cfg
+            .devices
+            .iter()
+            .map(|d| {
+                device::spawn(
+                    &d.hostname,
+                    d.total_pages,
+                    d.max_batch_size,
+                    d.max_batch_tokens,
+                )
+            })
+            .collect();
 
         let num_gpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.total_pages).collect();
         let num_cpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.cpu_pages).collect();
@@ -224,11 +247,15 @@ pub async fn bootstrap(config: Config) -> Result<String> {
             cfg.kv_page_size as u32,
             cfg.scheduler.request_timeout_secs,
             cfg.scheduler.batch_policy.clone(),
-        ).await;
+        )
+        .await;
         adapter::spawn(&devices);
     }
 
-    Ok(auth::get_internal_auth_token().await?)
+    Ok(BootstrapHandle {
+        token: auth::get_internal_auth_token().await?,
+        port: bound_port,
+    })
 }
 
 /// Boot-time checks for the values pie's Python layer cannot validate
@@ -242,28 +269,42 @@ fn verify_config(config: &Config) -> Result<()> {
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
 
     if config.auth.enabled {
-        fs::create_dir_all(&config.auth.authorized_users_dir)
-            .with_context(|| format!("Could not create auth users dir: {:?}", config.auth.authorized_users_dir))?;
+        fs::create_dir_all(&config.auth.authorized_users_dir).with_context(|| {
+            format!(
+                "Could not create auth users dir: {:?}",
+                config.auth.authorized_users_dir
+            )
+        })?;
     }
 
     for model in &config.models {
         ensure!(
             model.tokenizer_path.exists(),
-            "Model {:?}: tokenizer not found at {:?}", model.name, model.tokenizer_path
+            "Model {:?}: tokenizer not found at {:?}",
+            model.name,
+            model.tokenizer_path
         );
         for (i, dev) in model.devices.iter().enumerate() {
-            ensure!(dev.total_pages > 0,
-                "Model {:?} device {i}: total_pages must be > 0", model.name);
-            ensure!(dev.max_batch_size > 0,
-                "Model {:?} device {i}: max_batch_size must be > 0", model.name);
-            ensure!(dev.max_batch_tokens > 0,
-                "Model {:?} device {i}: max_batch_tokens must be > 0", model.name);
+            ensure!(
+                dev.total_pages > 0,
+                "Model {:?} device {i}: total_pages must be > 0",
+                model.name
+            );
+            ensure!(
+                dev.max_batch_size > 0,
+                "Model {:?} device {i}: max_batch_size must be > 0",
+                model.name
+            );
+            ensure!(
+                dev.max_batch_tokens > 0,
+                "Model {:?} device {i}: max_batch_tokens must be > 0",
+                model.name
+            );
         }
     }
 
     Ok(())
 }
-
 
 fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
@@ -282,13 +323,13 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     pooling_config.total_tables(runtime.wasm_max_instances);
     pooling_config.total_stacks(runtime.wasm_max_instances);
     pooling_config.max_memory_size(runtime.wasm_max_memory_mb.saturating_mul(1024 * 1024));
-    pooling_config.linear_memory_keep_resident(
-        runtime.wasm_warm_memory_mb.saturating_mul(1024 * 1024),
-    );
+    pooling_config
+        .linear_memory_keep_resident(runtime.wasm_warm_memory_mb.saturating_mul(1024 * 1024));
     pooling_config.max_unused_warm_slots(runtime.wasm_warm_slots);
 
-    wasm_config
-        .allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling_config));
+    wasm_config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
+        pooling_config,
+    ));
 
     wasmtime::Engine::new(&wasm_config).unwrap()
 }
@@ -299,12 +340,12 @@ fn init_tracing(
     verbose: bool,
     telemetry_config: &TelemetryConfig,
 ) -> Result<()> {
-    use tracing_subscriber::fmt;
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt;
 
     let default_level = if verbose { "debug" } else { "info" };
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
     // Optional file writer layer
     let file_layer = if let Some(dir) = log_dir {

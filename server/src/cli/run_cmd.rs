@@ -4,13 +4,18 @@
 //! one-shot engine, connects via `pie-client`, launches the inferlet,
 //! relays process events, and tears the engine down on completion.
 
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
+use serde::Deserialize;
 
 use pie_client::client::{Client, ProcessEvent};
 
@@ -45,10 +50,14 @@ pub struct RunArgs {
     #[arg(long, default_value = "{}")]
     pub input: String,
 
-    /// Include inferlet stdout as it is produced. Without this flag,
-    /// only the final return value is printed.
+    /// Include inferlet stdout/stderr as it is produced. Without this
+    /// flag, only the final return value is printed.
     #[arg(long = "stdout")]
     pub relay_stdout: bool,
+
+    /// Show engine, driver, server, and inferlet diagnostics.
+    #[arg(long)]
+    pub debug: bool,
 
     /// Suppress `pie run` progress chatter on stderr.
     #[arg(short = 'q', long)]
@@ -83,20 +92,38 @@ pub fn run(mut args: RunArgs) -> Result<()> {
         .unwrap_or_else(paths::default_config_path);
     let mut cfg = config::Config::from_toml_file(&cfg_path)
         .with_context(|| format!("loading TOML config from {cfg_path:?}"))?;
-    if let Some(p) = args.port {
-        cfg.server.port = p;
-    }
-    // Heavy testing phase: always show startup details, even for old
-    // temp configs that explicitly set `verbose = false`.
-    cfg.server.verbose = true;
+    cfg.server.port = args.port.unwrap_or(0);
+    cfg.server.verbose = args.debug;
 
     crate::py_runtime::ensure_installed_best_effort();
     let runtime = serve::build_runtime(&cfg)?;
 
     runtime.block_on(async move {
-        let engine = serve::start_engine(cfg)
+        if args.path.is_none() {
+            if let Some(inferlet) = args.inferlet.take() {
+                args.inferlet = Some(resolve_inferlet_id(&inferlet, &cfg.server.registry).await?);
+            }
+        }
+
+        let model_label = cfg
+            .models
+            .first()
+            .map(|m| m.hf_repo.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let status = RunStatus::start(args.quiet || args.debug, model_label);
+        let engine = match serve::start_engine(cfg)
             .await
-            .context("starting one-shot engine")?;
+            .context("starting one-shot engine")
+        {
+            Ok(engine) => {
+                status.finish();
+                engine
+            }
+            Err(e) => {
+                status.fail("Engine failed");
+                return Err(e);
+            }
+        };
         let url = engine.url.clone();
         let token = engine.token.clone();
         let result = drive_inferlet(&url, &token, &args).await;
@@ -107,7 +134,7 @@ pub fn run(mut args: RunArgs) -> Result<()> {
             eprintln!("pie run: {e:#}");
         }
 
-        shutdown_engine_bounded(engine, args.quiet);
+        shutdown_engine_bounded(engine, args.quiet || !args.debug);
 
         result
     })
@@ -143,7 +170,7 @@ async fn drive_inferlet(url: &str, token: &str, args: &RunArgs) -> Result<()> {
             .expect("argument-validation guaranteed inferlet is Some")
     };
 
-    let mut process = client
+    let mut process = match client
         .launch_process(
             inferlet_id.clone(),
             args.input.clone(),
@@ -151,11 +178,22 @@ async fn drive_inferlet(url: &str, token: &str, args: &RunArgs) -> Result<()> {
             /*token_budget=*/ None,
         )
         .await
-        .with_context(|| format!("launch_process {inferlet_id}"))?;
+        .with_context(|| format!("launch_process {inferlet_id}"))
+    {
+        Ok(process) => process,
+        Err(e) => {
+            return Err(e);
+        }
+    };
 
-    if !args.quiet {
+    if args.debug {
         eprintln!("(launched {inferlet_id} as {})", process.id());
     }
+
+    let mut status = RunStatus::spawn(
+        args.quiet || args.debug || args.relay_stdout,
+        inferlet_id.clone(),
+    );
 
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
@@ -168,20 +206,28 @@ async fn drive_inferlet(url: &str, token: &str, args: &RunArgs) -> Result<()> {
                 }
             }
             ProcessEvent::Stderr(s) => {
-                let _ = stderr.write_all(s.as_bytes());
-                let _ = stderr.flush();
+                if args.relay_stdout || args.debug {
+                    let _ = stderr.write_all(s.as_bytes());
+                    let _ = stderr.flush();
+                }
             }
             ProcessEvent::Message(m) => {
-                eprintln!("[message] {m}");
+                if args.debug {
+                    eprintln!("[message] {m}");
+                }
             }
             ProcessEvent::File(bytes) => {
-                eprintln!("[received file: {} bytes]", bytes.len());
+                if args.debug {
+                    eprintln!("[received file: {} bytes]", bytes.len());
+                }
             }
             ProcessEvent::Return(v) => {
-                println!("{v}");
+                status.stop();
+                print_return_value(&v, args.debug || args.relay_stdout)?;
                 break;
             }
             ProcessEvent::Error(e) => {
+                status.fail("Inferlet failed");
                 eprintln!("✗ {e}");
                 bail!("inferlet errored: {e}");
             }
@@ -190,6 +236,75 @@ async fn drive_inferlet(url: &str, token: &str, args: &RunArgs) -> Result<()> {
     // `run` is a one-shot CLI: once the process returned, teardown is
     // handled by the caller immediately after this function returns.
     let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RegistryInferlet {
+    versions: Vec<RegistryVersion>,
+}
+
+#[derive(Deserialize)]
+struct RegistryVersion {
+    num: String,
+}
+
+async fn resolve_inferlet_id(inferlet: &str, registry_url: &str) -> Result<String> {
+    let (name, should_resolve) = match inferlet.split_once('@') {
+        None => (inferlet, true),
+        Some((name, "latest")) => (name, true),
+        Some(_) => return Ok(inferlet.to_string()),
+    };
+
+    validate_bare_inferlet_name(name)?;
+    if !should_resolve {
+        return Ok(inferlet.to_string());
+    }
+
+    let url = format!(
+        "{}/api/v1/inferlets/{}",
+        registry_url.trim_end_matches('/'),
+        name
+    );
+    let resp = reqwest::get(&url)
+        .await
+        .with_context(|| format!("resolve latest inferlet version from {url}"))?;
+    if !resp.status().is_success() {
+        bail!(
+            "resolve latest inferlet version: {url} returned {}",
+            resp.status()
+        );
+    }
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("read latest inferlet metadata from {url}"))?;
+    let latest = latest_version_from_registry_json(&body)
+        .with_context(|| format!("resolve latest version for {name:?}"))?;
+    Ok(format!("{name}@{latest}"))
+}
+
+fn latest_version_from_registry_json(body: &str) -> Result<String> {
+    let info: RegistryInferlet =
+        serde_json::from_str(body).context("parse registry inferlet metadata")?;
+    info.versions
+        .into_iter()
+        .find(|v| !v.num.is_empty())
+        .map(|v| v.num)
+        .ok_or_else(|| anyhow!("registry returned no versions"))
+}
+
+fn validate_bare_inferlet_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("inferlet name is empty");
+    };
+    if !first.is_ascii_alphanumeric() {
+        bail!("invalid inferlet name {name:?}: must start with an ASCII letter or digit");
+    }
+    if chars.any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+        bail!("invalid inferlet name {name:?}: use only ASCII letters, digits, '-' and '_'");
+    }
     Ok(())
 }
 
@@ -280,5 +395,197 @@ fn shutdown_engine_bounded(engine: serve::EngineHandle, quiet: bool) {
     }
     if rx.recv_timeout(SHUTDOWN_GRACE).is_err() {
         eprintln!("engine shutdown did not finish within {SHUTDOWN_GRACE:?}; exiting");
+    }
+}
+
+struct RunStatus {
+    done: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    enabled: bool,
+}
+
+impl RunStatus {
+    fn start(disabled: bool, model_label: String) -> Self {
+        Self::spawn(disabled, format!("loading model ({model_label})"))
+    }
+
+    fn spawn(disabled: bool, label: String) -> Self {
+        let enabled = !disabled && io::stderr().is_terminal();
+        if !enabled {
+            return Self {
+                done: Arc::new(AtomicBool::new(true)),
+                handle: None,
+                enabled,
+            };
+        }
+
+        let done = Arc::new(AtomicBool::new(false));
+        let thread_done = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut idx = 0usize;
+            while !thread_done.load(Ordering::Relaxed) {
+                eprint!("\r\x1b[K{} {}", FRAMES[idx % FRAMES.len()], label);
+                let _ = io::stderr().flush();
+                idx = idx.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(90));
+            }
+        });
+        Self {
+            done,
+            handle: Some(handle),
+            enabled,
+        }
+    }
+
+    fn finish(mut self) {
+        self.stop();
+    }
+
+    fn fail(mut self, message: &str) {
+        self.stop();
+        if self.enabled {
+            eprintln!("\x1b[31m✗\x1b[0m {message}");
+        }
+    }
+
+    fn stop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        if self.enabled {
+            eprint!("\r\x1b[K");
+            let _ = io::stderr().flush();
+        }
+    }
+}
+
+impl Drop for RunStatus {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn print_return_value(value: &str, rich: bool) -> Result<()> {
+    if !rich || !io::stdout().is_terminal() {
+        println!("{value}");
+        return Ok(());
+    }
+
+    let display = serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .and_then(|json| serde_json::to_string_pretty(&json).ok())
+        .unwrap_or_else(|| value.to_string());
+    for line in display.lines() {
+        println!("{}", highlight_json_line(line));
+    }
+    Ok(())
+}
+
+fn highlight_json_line(line: &str) -> String {
+    const RESET: &str = "\x1b[0m";
+    const KEY: &str = "\x1b[1;36m";
+    const STRING: &str = "\x1b[32m";
+    const NUMBER: &str = "\x1b[33m";
+    const KEYWORD: &str = "\x1b[35m";
+    const PUNCT: &str = "\x1b[90m";
+
+    let mut out = String::with_capacity(line.len() + 32);
+    let mut i = 0usize;
+    let bytes = line.as_bytes();
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match c {
+            '"' => {
+                let start = i;
+                i += 1;
+                let mut escaped = false;
+                while i < bytes.len() {
+                    let ch = bytes[i] as char;
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                let token = &line[start..i.min(line.len())];
+                let rest = &line[i.min(line.len())..];
+                let is_key = rest.trim_start().starts_with(':');
+                out.push_str(if is_key { KEY } else { STRING });
+                out.push_str(token);
+                out.push_str(RESET);
+            }
+            '-' | '0'..='9' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && matches!(bytes[i] as char, '0'..='9' | '.' | 'e' | 'E' | '+' | '-')
+                {
+                    i += 1;
+                }
+                out.push_str(NUMBER);
+                out.push_str(&line[start..i]);
+                out.push_str(RESET);
+            }
+            't' | 'f' | 'n' => {
+                let rest = &line[i..];
+                let keyword = ["true", "false", "null"]
+                    .iter()
+                    .find(|kw| rest.starts_with(**kw));
+                if let Some(keyword) = keyword {
+                    i += keyword.len();
+                    out.push_str(KEYWORD);
+                    out.push_str(keyword);
+                    out.push_str(RESET);
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            '{' | '}' | '[' | ']' | ':' | ',' => {
+                out.push_str(PUNCT);
+                out.push(c);
+                out.push_str(RESET);
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latest_version_from_registry_json_uses_first_version() {
+        let body = r#"{
+            "versions": [
+                {"num": "0.2.14"},
+                {"num": "0.2.13"}
+            ]
+        }"#;
+
+        assert_eq!(latest_version_from_registry_json(body).unwrap(), "0.2.14");
+    }
+
+    #[test]
+    fn bare_inferlet_name_validation_matches_program_names() {
+        validate_bare_inferlet_name("text-completion").unwrap();
+        validate_bare_inferlet_name("foo_bar-1").unwrap();
+
+        assert!(validate_bare_inferlet_name("").is_err());
+        assert!(validate_bare_inferlet_name("-bad").is_err());
+        assert!(validate_bare_inferlet_name("bad/name").is_err());
+        assert!(validate_bare_inferlet_name("bad.name").is_err());
     }
 }

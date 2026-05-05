@@ -15,9 +15,7 @@ spin_us = 0         # 0 = pure busy spin
 # spawning this binary; for local dev, point directly at the snapshot.
 hf_path = "/path/to/huggingface/snapshot"
 # 0 = CPU only, -1 = offload all layers to GPU, N = first N layers on GPU.
-n_gpu_layers = -1   # -1 = all layers on GPU; 0 = CPU only
 # Informational max position. Real KV capacity is total_pages × kv_page_size.
-n_ctx = 4096
 
 # KV cache / batching — Pie's runtime owns page allocation. We allocate a
 # global pool of `max_num_kv_pages` pages of `kv_page_size` token slots each

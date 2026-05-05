@@ -9,11 +9,11 @@ test fixtures (`tests/inferlets/conftest.py::_run`, `benches/*`,
         ...
 
 Lifecycle:
-  * `__aenter__`: optionally auto-pick a free port (`ServerConfig.port == 0`),
-    serialize the `Config` to TOML, hand it to the pyo3 `bootstrap`. The
-    pyo3 layer blocks until drivers + WS listener are up, then returns
-    a handle. We run that on a thread (`asyncio.to_thread`) so the
-    asyncio loop isn't blocked.
+  * `__aenter__`: serialize the `Config` to TOML and hand it to the pyo3
+    `bootstrap`. If `ServerConfig.port == 0`, Rust asks the OS for an
+    ephemeral port and returns the bound URL. The pyo3 layer blocks until
+    drivers + WS listener are up, then returns a handle. We run that on a
+    thread (`asyncio.to_thread`) so the asyncio loop isn't blocked.
   * `connect()`: build a `pie_client.PieClient` against the bound URL +
     auth-token-handshake using the engine's internal token. Each call
     returns a fresh client; the user is responsible for closing them.
@@ -28,20 +28,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import socket
 from typing import TYPE_CHECKING, Any
 
 from pie.config import Config
 
 if TYPE_CHECKING:
     from pie_client import PieClient
-
-
-def _find_free_port() -> int:
-    """Bind a fresh socket to port 0 to discover a free local port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
 
 
 class Server:
@@ -74,11 +66,6 @@ class Server:
     def __init__(self, config: Config):
         # Copy so the user's object isn't mutated by the auto-port lookup.
         self._config = copy.deepcopy(config)
-
-        # Auto-assign a free port if the user requested one (matches the
-        # legacy `pie-server.Server.__init__` behavior).
-        if self._config.server.port == 0:
-            self._config.server.port = _find_free_port()
 
         self._handle: Any = None
         self._clients: list[Any] = []

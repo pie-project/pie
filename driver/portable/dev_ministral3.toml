@@ -8,8 +8,6 @@ spin_us = 0
 
 [model]
 hf_path = "/root/.cache/huggingface/hub/models--mistralai--Ministral-3-3B-Base-2512/snapshots/6f9c4b12a95b139af68670a6713616b757923735"
-n_gpu_layers = -1
-n_ctx = 8192
 
 [batching]
 kv_page_size = 32

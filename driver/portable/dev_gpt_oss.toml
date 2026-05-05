@@ -8,8 +8,6 @@ spin_us = 0
 
 [model]
 hf_path = "/root/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee"
-n_gpu_layers = -1
-n_ctx = 4096
 
 [batching]
 kv_page_size = 32

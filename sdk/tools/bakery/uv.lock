@@ -75,11 +75,11 @@ wheels = [
 
 [[package]]
 name = "factored-componentize-py"
-version = "0.20.5"
+version = "0.20.7"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/96/31/c8ef21f22f04cf8f6bfd22a4e9269ff47726e1ed488a360928d1a48a0310/factored_componentize_py-0.20.5.tar.gz", hash = "sha256:77600692d427ca14ad8254606629a2041bf0c7431646a0e9b2465d17b4fb8e48", size = 182543, upload-time = "2026-03-27T06:37:12.308Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a6/37/80ab2efca55295181aa469766a98801f9c3ddd9899a54a793afd3c20fe33/factored_componentize_py-0.20.5-cp39-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:f801f6ff7cfed9fdecdfdfb6d154f52f91db7f8ea71deb5d94b51bd07c5a6a71", size = 24068355, upload-time = "2026-03-27T06:37:09.872Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/4b/ecccc61797c9f64f6445b3d670bca134c1cd98ea0b4a321a99da0efd206f/factored_componentize_py-0.20.7-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:df3244974750a37ddba92a033ed06512f20b09a528e5f6caca0babf91ff7f02f", size = 22657359, upload-time = "2026-05-04T05:15:18.712Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/57/aa505be1ce222253bc4240a6ee2a3f897d9e3dd2e35b7852db5aa3fcee16/factored_componentize_py-0.20.7-cp39-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:cb2eccd49182a35d258d93e6dde20bf92f03acff646493ac406e85abb59caf84", size = 24040334, upload-time = "2026-05-04T05:21:59.278Z" },
 ]
 
 [[package]]
@@ -188,7 +188,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "esprima", specifier = ">=4.0.0" },
-    { name = "factored-componentize-py", specifier = ">=0.20.4" },
+    { name = "factored-componentize-py", specifier = ">=0.20.7" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "rich", specifier = ">=13.0.0" },

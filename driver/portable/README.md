@@ -42,12 +42,9 @@ device = ["cpu"]
 activation_dtype = "bfloat16"
 
 [model.driver.options]
-n_ctx = 4096
-n_gpu_layers = 0
 max_batch_tokens = 10240
 max_batch_size = 512
 max_num_kv_pages = 1024
 ```
 
-`n_gpu_layers = -1` offloads all layers when the selected ggml backend
-supports it.
+The driver prefers the best compiled ggml backend and falls back to CPU.
