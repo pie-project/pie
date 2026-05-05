@@ -8,6 +8,7 @@ on:
         required: true
         type: choice
         options:
+          - pie-client (client/rust/)
           - pie (runtime/)
           - inferlet (sdk/rust/inferlet/)
           - inferlet-macros (sdk/rust/inferlet-macros/)
@@ -33,6 +34,10 @@ jobs:
         id: info
         run: |
           case "${{ inputs.package }}" in
+            "pie-client (client/rust/)")
+              echo "path=client/rust" >> $GITHUB_OUTPUT
+              echo "name=pie-client" >> $GITHUB_OUTPUT
+              ;;
             "pie (runtime/)")
               echo "path=runtime" >> $GITHUB_OUTPUT
               echo "name=pie" >> $GITHUB_OUTPUT
