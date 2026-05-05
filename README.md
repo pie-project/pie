@@ -36,7 +36,7 @@ Then configure and run:
 
 ```bash
 pie config init
-pie run text-completion --prompt "The capital of France is"
+pie run text-completion -- --prompt "The capital of France is"
 ```
 
 ## Project Layout
