@@ -273,6 +273,20 @@ table tbody tr:hover {
   margin-right: 0.25rem;
 }
 
+/* Safari/WebKit can resolve fixed children of Docusaurus' sticky navbar
+   against the navbar box instead of the viewport, clipping the mobile menu
+   to one navbar row. Give the sidebar and backdrop explicit viewport sizing. */
+.navbar-sidebar,
+.navbar-sidebar__backdrop {
+  height: 100vh;
+  height: 100dvh;
+}
+
+.navbar-sidebar__items {
+  height: calc(100vh - var(--ifm-navbar-height));
+  height: calc(100dvh - var(--ifm-navbar-height));
+}
+
 /* Dropdown menu */
 .dropdown__menu {
   font-family: var(--pie-font-serif);
@@ -1010,4 +1024,3 @@ body.whypieagent-dark .footer__title {
 body.whypieagent-dark .footer__copyright {
   color: #808090;
 }
-
