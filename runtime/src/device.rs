@@ -264,6 +264,152 @@ pub async fn copy_d2d_shmem(
     Ok(())
 }
 
+/// CPU → GPU page copy with explicit completion ack — shmem fast path.
+///
+/// Companion to [`copy_d2d_shmem`]. Routes through the same shmem
+/// transport as `fire_batch` so the h2d kernel and any subsequent
+/// forward-pass kernels are dispatched by the SAME Python thread.
+/// CPU launch order is preserved → CUDA stream FIFO orders the
+/// kernels on GPU. Awaits the worker ack so callers can sequence
+/// `fire_batch` (or further ops) after.
+///
+/// Closes the second-bleed race documented in
+/// `project_pie_second_bleed_path_h2d_race.md`: under sustained pool
+/// overflow (axis-L L=6K c=16, pin-on), `restore()`'s `copy_h2d` was
+/// previously dispatched by the cold-path RPC main thread while
+/// `fire_batch` (and replay forward passes) were dispatched by the
+/// shmem busy-poll thread; submission order on the legacy default
+/// stream depended on Python thread scheduling, so a replay could
+/// land before its preceding h2d and read the previous owner's KV.
+/// Routing h2d through shmem closes the gap.
+///
+/// Wire format matches [`copy_d2d_shmem`] (little-endian):
+///   u32 src_count | src_count × u32 cpu_slot_ids
+///   u32 dst_count | dst_count × u32 gpu_phys_ids
+///
+/// `gpu_phys_ids`: destination GPU physical page IDs.
+/// `cpu_pages`: source CPU swap pool page IDs.
+///
+/// Implemented as `pub fn` (not `async fn`) because the body is
+/// synchronous (uses `block_in_place` over a busy-spin) and the
+/// callers in `restore.rs` / `sched.rs` are sync methods on
+/// `ContextManager` driven from the actor task — no async boundary
+/// needed at the call site.
+pub fn copy_h2d_shmem(
+    device_idx: DeviceId,
+    gpu_phys_ids: &[u32],
+    cpu_pages: &[u32],
+) -> Result<()> {
+    let _ = device_idx; // single-device today; SHMEM_CLIENTS keyed at 0
+    let client = get_or_init_shmem_client(0)?;
+    let req_id = SHMEM_REQ_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    let send_walltime_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+
+    let src = cpu_pages.to_vec();
+    let dst = gpu_phys_ids.to_vec();
+    let (_resp_bytes, _ts) = tokio::task::block_in_place(|| {
+        client.call_with(
+            req_id,
+            crate::shmem_ipc::METHOD_TAG_COPY_H2D,
+            send_walltime_us,
+            |buf| {
+                let needed = 4 + src.len() * 4 + 4 + dst.len() * 4;
+                if buf.len() < needed {
+                    return Err(anyhow!(
+                        "copy_h2d_shmem: req buf too small ({} < {needed})",
+                        buf.len()
+                    ));
+                }
+                let mut off = 0usize;
+                buf[off..off + 4].copy_from_slice(&(src.len() as u32).to_le_bytes());
+                off += 4;
+                for &p in &src {
+                    buf[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                    off += 4;
+                }
+                buf[off..off + 4].copy_from_slice(&(dst.len() as u32).to_le_bytes());
+                off += 4;
+                for &p in &dst {
+                    buf[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                    off += 4;
+                }
+                Ok(off)
+            },
+        )
+    })?;
+    Ok(())
+}
+
+/// GPU → CPU page copy with explicit completion ack — shmem fast path.
+///
+/// Companion to [`copy_h2d_shmem`]. Same single-threaded dispatch
+/// guarantee against `fire_batch`. Used by `suspend()` to stash
+/// working pages and committed-evictable pages to CPU before
+/// `gpu_stores.free()` returns the physical page IDs to the
+/// allocator — without this, a subsequent admission could grab the
+/// same page IDs and a `fire_batch` from the new owner could land on
+/// the stream before this d2h, polluting the suspended context's
+/// CPU stash with the new owner's KV.
+///
+/// Wire format (little-endian):
+///   u32 src_count | src_count × u32 gpu_phys_ids
+///   u32 dst_count | dst_count × u32 cpu_slot_ids
+///
+/// `gpu_phys_ids`: source GPU physical page IDs.
+/// `cpu_pages`: destination CPU swap pool page IDs.
+///
+/// See [`copy_h2d_shmem`] for why this is `pub fn` rather than `async fn`.
+pub fn copy_d2h_shmem(
+    device_idx: DeviceId,
+    gpu_phys_ids: &[u32],
+    cpu_pages: &[u32],
+) -> Result<()> {
+    let _ = device_idx; // single-device today; SHMEM_CLIENTS keyed at 0
+    let client = get_or_init_shmem_client(0)?;
+    let req_id = SHMEM_REQ_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    let send_walltime_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+
+    let src = gpu_phys_ids.to_vec();
+    let dst = cpu_pages.to_vec();
+    let (_resp_bytes, _ts) = tokio::task::block_in_place(|| {
+        client.call_with(
+            req_id,
+            crate::shmem_ipc::METHOD_TAG_COPY_D2H,
+            send_walltime_us,
+            |buf| {
+                let needed = 4 + src.len() * 4 + 4 + dst.len() * 4;
+                if buf.len() < needed {
+                    return Err(anyhow!(
+                        "copy_d2h_shmem: req buf too small ({} < {needed})",
+                        buf.len()
+                    ));
+                }
+                let mut off = 0usize;
+                buf[off..off + 4].copy_from_slice(&(src.len() as u32).to_le_bytes());
+                off += 4;
+                for &p in &src {
+                    buf[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                    off += 4;
+                }
+                buf[off..off + 4].copy_from_slice(&(dst.len() as u32).to_le_bytes());
+                off += 4;
+                for &p in &dst {
+                    buf[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                    off += 4;
+                }
+                Ok(off)
+            },
+        )
+    })?;
+    Ok(())
+}
+
 /// CPU → CPU page copy (fire-and-forget).
 /// `src_slots`: source CPU swap pool page IDs.
 /// `dst_slots`: destination CPU swap pool page IDs.

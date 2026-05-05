@@ -47,6 +47,13 @@ DEFAULT_SLOT_STRIDE = SLOT_HEADER_SIZE + DEFAULT_REQ_BUF + DEFAULT_RESP_BUF
 
 METHOD_TAG_FIRE_BATCH = 0
 METHOD_TAG_COPY_D2D = 1
+# h2d / d2h via shmem fast path. Mirrors METHOD_TAG_COPY_H2D /
+# METHOD_TAG_COPY_D2H in runtime/src/shmem_ipc.rs. Routes the
+# eviction/restore copies through the same Python thread that
+# dispatches fire_batch so CUDA stream FIFO orders the kernels.
+# See `project_pie_second_bleed_path_h2d_race.md`.
+METHOD_TAG_COPY_H2D = 2
+METHOD_TAG_COPY_D2H = 3
 METHOD_TAG_NONE = 255
 
 _librt = ctypes.CDLL("librt.so.1", use_errno=True)

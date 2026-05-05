@@ -30,6 +30,17 @@ pub const METHOD_TAG_FIRE_BATCH: u32 = 0;
 /// forward-pass kernels — see `project_pie_kv_bleed_d2d_fork_race.md`
 /// and pie-project/pie#339.
 pub const METHOD_TAG_COPY_D2D: u32 = 1;
+/// Routes `copy_h2d` (suspend→restore working-page bring-back, plus
+/// snapshot-restore committed-suffix) through the shmem fast path so
+/// it shares a thread with `fire_batch`. Same race surface as
+/// METHOD_TAG_COPY_D2D but on the eviction/restore code path —
+/// surfaces under sustained pool overflow at axis-L L=6K c=16,
+/// pin-on. See `project_pie_second_bleed_path_h2d_race.md`.
+pub const METHOD_TAG_COPY_H2D: u32 = 2;
+/// Routes `copy_d2h` (suspend's stash-to-CPU) through the shmem fast
+/// path. Companion to METHOD_TAG_COPY_H2D — same single-threaded
+/// dispatch ordering against `fire_batch`.
+pub const METHOD_TAG_COPY_D2H: u32 = 3;
 
 /// Slot header offsets relative to the start of the slot.
 const OFF_REQ_SEQ: usize = 0;
