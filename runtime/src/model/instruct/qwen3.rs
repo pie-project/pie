@@ -459,8 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_has_3_stop_tokens() {
-        assert_eq!(qwen3().stop_ids.len(), 3);
+    fn qwen3_has_2_stop_tokens() {
+        assert_eq!(qwen3().stop_ids.len(), 2);
     }
 
     #[test]
