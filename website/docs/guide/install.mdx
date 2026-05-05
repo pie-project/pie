@@ -1,77 +1,33 @@
 ---
 title: Installation
-description: Install the Pie CLI and optional Python-backed drivers
+description: Install the Pie CLI
 sidebar_position: 1
 ---
 
 # Installation
 
-This page gets the `pie` CLI onto your machine. After this, see [Initial setup](./setup) to create `~/.pie/config.toml` and run a prompt.
+This page installs the `pie` CLI. After this, see [Initial setup](./setup) to create a config and run your first prompt.
 
-## Supported platforms
+## Install
 
-| Platform | Builds |
-|---|---|
-| Linux x86_64 | `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, and `portable-cuda*` |
-| Linux aarch64 | `portable` |
-| macOS Apple Silicon | `portable` |
-| Windows x86_64 | `portable-vulkan`, `portable-cuda` |
-
-Intel Macs are not supported.
-
-`portable` includes the ggml-backed embedded driver and is the fallback everywhere. The CUDA flavors are Linux x86_64 only and include the embedded `cuda_native` driver.
-
-## Install the CLI
+On Linux and macOS:
 
 ```bash
 curl -fsSL https://pie-project.org/install.sh | bash
 ```
 
-On Windows PowerShell:
+On Windows (PowerShell):
 
 ```powershell
 irm https://pie-project.org/install.ps1 | iex
 ```
 
-On Windows CMD:
+The installer downloads a release archive and installs `pie` into `~/.local/bin` on Unix or `%LOCALAPPDATA%\Pie\bin` on Windows. It picks a build for your platform automatically:
 
-```cmd
-curl -fsSL https://pie-project.org/install.cmd -o install.cmd && install.cmd && del install.cmd
-```
-
-The Unix installer downloads a release tarball, installs `pie` into `~/.local/bin` by default, and auto-picks a flavor:
-
-- NVIDIA driver `>= 580`: `cuda13.0`
-- NVIDIA driver `>= 525`: `cuda12.8`
-- otherwise: `portable`
-
-Override the flavor or install directory with environment variables:
-
-```bash
-curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
-curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=portable bash
-curl -fsSL https://pie-project.org/install.sh | PIE_INSTALL_DIR=/usr/local/bin bash
-```
-
-Valid `PIE_FLAVOR` values are `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, `portable-cuda12.6`, `portable-cuda12.8`, and `portable-cuda13.0`.
-
-Linux CUDA builds require the matching NVIDIA driver, CUDA toolkit runtime libraries, and NCCL runtime libraries on the host. On Debian/Ubuntu systems configured with NVIDIA's package repositories, install NCCL with:
-
-```bash
-sudo apt install libnccl2 libnccl-dev
-```
-
-On Windows, the PowerShell installer downloads a zip archive and installs `pie.exe` into `%LOCALAPPDATA%\Pie\bin` by default. Valid Windows `PIE_FLAVOR` values are `portable-vulkan` and `portable-cuda`:
-
-```powershell
-$env:PIE_FLAVOR = "portable-cuda"; irm https://pie-project.org/install.ps1 | iex
-```
-
-To install a specific release tag:
-
-```bash
-curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=v0.1.2 bash
-```
+- Linux x86_64 with NVIDIA driver 580 or newer: `cuda13.0`.
+- Linux x86_64 with NVIDIA driver 525 or newer: `cuda12.8`.
+- Other Linux, macOS Apple Silicon: `portable`. Runs on CPU; uses the GPU through Vulkan or Metal where available.
+- Windows: `portable-vulkan`. Runs on CPU and any Vulkan-capable GPU.
 
 If `pie` is not on your `PATH`, add the install directory:
 
@@ -79,41 +35,79 @@ If `pie` is not on your `PATH`, add the install directory:
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 ```
 
+### Linux CUDA prerequisites
+
+The CUDA flavors require a matching NVIDIA driver, the CUDA toolkit runtime libraries, and NCCL on the host. On Debian or Ubuntu with NVIDIA's package repositories configured:
+
+```bash
+sudo apt install libnccl2 libnccl-dev
+```
+
+If `pie doctor` reports missing libraries on a CUDA build, install the runtime that matches the flavor (CUDA 12.x for `cuda12.6` / `cuda12.8`, CUDA 13.x for `cuda13.0`).
+
 ## Verify
 
 ```bash
 pie --version
 pie doctor
-pie driver list
 ```
 
-`pie doctor` reports platform readiness, compiled-in embedded drivers, GPU visibility, config status, and subprocess-driver venv resolution.
+`pie doctor` checks platform readiness, lists compiled-in drivers, probes GPU visibility, and confirms that `~/.pie/config.toml` and any subprocess driver venvs resolve.
 
-## Optional Python drivers
+## Optional: Python-backed drivers
 
-The `pie` binary can run embedded drivers without Python. Python is only needed for subprocess drivers: `dev`, `vllm`, and `sglang`.
-
-Install `uv`, then let `pie driver` print or run the matching venv recipe:
+The `pie` binary runs the embedded `cuda_native` and `portable` drivers without Python. Python is required only for the subprocess drivers: `dev`, `vllm`, and `sglang`. Install one with:
 
 ```bash
 pie driver dev install ~/.pie/venvs/dev --run
 pie driver dev set venv ~/.pie/venvs/dev
-pie driver dev doctor
 ```
 
-Use the same flow for vLLM or SGLang:
+Replace `dev` with `vllm` or `sglang` for the other two. Each driver gets a Python 3.12 virtual environment with its pinned wheels. See the [driver reference](../reference/drivers/cuda) for what each driver does and when to pick it.
+
+## Advanced installation
+
+Most users do not need anything in this section.
+
+### Choose a build manually
+
+Override the auto-picked flavor with `PIE_FLAVOR`:
 
 ```bash
-pie driver vllm install ~/.pie/venvs/vllm --run
-pie driver vllm set venv ~/.pie/venvs/vllm
-
-pie driver sglang install ~/.pie/venvs/sglang --run
-pie driver sglang set venv ~/.pie/venvs/sglang
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=portable bash
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
 ```
 
-The CLI creates Python 3.12 virtual environments and installs the matching wheels (`pie-driver-dev[cu128]`, `pie-driver-vllm`, or `pie-driver-sglang`). A model can also override the interpreter with `venv` or `python` under `[model.driver.options]`.
+On Windows:
 
-## Install from source
+```powershell
+$env:PIE_FLAVOR = "portable-cuda"; irm https://pie-project.org/install.ps1 | iex
+```
+
+| Platform | Available flavors |
+|---|---|
+| Linux x86_64 | `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, `portable-cuda12.6`, `portable-cuda12.8`, `portable-cuda13.0` |
+| Linux aarch64 | `portable` |
+| macOS Apple Silicon | `portable` |
+| Windows x86_64 | `portable-vulkan`, `portable-cuda` |
+
+Intel Macs are not supported.
+
+The bare `cuda*` flavors include only the embedded `cuda_native` driver. The `portable-cuda*` flavors include both `cuda_native` and `portable`, useful for hosts that need both code paths in one binary.
+
+### Override the install directory
+
+```bash
+curl -fsSL https://pie-project.org/install.sh | PIE_INSTALL_DIR=/usr/local/bin bash
+```
+
+### Install a specific version
+
+```bash
+curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=v0.1.2 bash
+```
+
+### Install from source
 
 For development:
 
@@ -121,7 +115,7 @@ For development:
 git clone https://github.com/pie-project/pie.git
 cd pie
 
-# Default features: embedded portable driver plus always-linked dummy.
+# Default features: embedded portable driver plus the always-linked dummy.
 cargo install --path server
 
 # Include the embedded CUDA driver too.
@@ -129,9 +123,15 @@ CUDACXX=/usr/local/cuda/bin/nvcc \
   cargo install --path server --features driver-portable,driver-cuda
 ```
 
-The installed CLI is still `pie`. Re-run `pie doctor` after building to confirm which embedded drivers are compiled in.
+Re-run `pie doctor` after building to confirm which drivers are compiled in.
 
-## Next
+### Windows CMD
+
+```cmd
+curl -fsSL https://pie-project.org/install.cmd -o install.cmd && install.cmd && del install.cmd
+```
+
+## Next steps
 
 - [Initial setup](./setup): create config, download a model, run a prompt.
 - [Development environment](./dev-env): install tools for writing inferlets.

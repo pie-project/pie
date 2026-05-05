@@ -26,11 +26,14 @@ Pie accepts *inferlets* - small programs in Rust, Python, or TypeScript that com
 > for testing and research right now.
 ## Quick Start
 
-Pie is a standalone binary (~14 MB on macOS) with no Python/PyTorch dependencies.
+Pie is a standalone binary with no Python/PyTorch dependencies.
 
+For Linux and macOS:
 ```bash
 curl -fsSL https://pie-project.org/install.sh | bash
 ```
+
+For Windows, follow the [installation guide](https://pie-project.org/docs/guide/install).
 
 Then configure and run:
 
