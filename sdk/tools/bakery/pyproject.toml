@@ -7,7 +7,7 @@ name = "pie-bakery"
 version = "0.1.0"
 description = "Pie Bakery - Build and publish inferlets"
 authors = [{ name = "Pie Team" }]
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,6 +17,7 @@ dependencies = [
     "esprima>=4.0.0",
     "rich>=13.0.0",
     "factored-componentize-py>=0.20.7",
+    "inferlet>=0.3.0,<0.4.0",
 ]
 
 [project.scripts]
@@ -29,3 +30,11 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+bakery = [
+    "templates/**/*.template",
+    "wit/**/*.wit",
+    "wit/**/*.toml",
+    "wit/**/*.lock",
+]

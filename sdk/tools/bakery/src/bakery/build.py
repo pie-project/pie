@@ -4,6 +4,7 @@ This module implements the `bakery build` subcommand for building
 JavaScript/TypeScript, Python, and Rust inferlets into WebAssembly components.
 """
 
+import importlib.util
 import json
 import os
 import shutil
@@ -18,6 +19,8 @@ from .console import console
 from . import path as path_utils
 from . import py_runtime
 import typer
+
+INFERLET_JS_PACKAGE = "@pie-project/inferlet"
 
 
 def read_package_name(project_dir: Path) -> str:
@@ -85,10 +88,12 @@ def find_command(cmd: str) -> str | None:
     ``componentize-py`` (installed by ``factored-componentize-py``) live
     there.
     """
+    candidate = Path(sys.executable).parent / cmd
+    if candidate.exists():
+        return str(candidate)
     if found := shutil.which(cmd):
         return found
-    candidate = Path(sys.executable).parent / cmd
-    return str(candidate) if candidate.exists() else None
+    return None
 
 
 def command_exists(cmd: str) -> bool:
@@ -99,6 +104,15 @@ def resolve_command(cmd: str) -> str:
     """Resolved path for ``cmd``, or the bare name as a fallback so the
     OS surfaces the usual "command not found" error."""
     return find_command(cmd) or cmd
+
+
+def get_installed_python_package_path(package_name: str) -> Path | None:
+    """Return an installed Python package directory, if importable."""
+    spec = importlib.util.find_spec(package_name)
+    if spec is None or spec.origin is None:
+        return None
+    package_path = Path(spec.origin).parent
+    return package_path if package_path.is_dir() else None
 
 
 def detect_platform(input_path: Path) -> str:
@@ -577,7 +591,16 @@ def handle_python_build(input_path: Path, output: Path, debug: bool = False) -> 
 
     # Resolve paths
     with console.status("[bold green]Resolving paths...[/bold green]"):
-        inferlet_path = path_utils.get_inferlet_py_path()
+        try:
+            inferlet_path = path_utils.get_inferlet_py_path()
+            inferlet_src = inferlet_path / "src" / "inferlet"
+        except FileNotFoundError:
+            inferlet_src = get_installed_python_package_path("inferlet")
+            if inferlet_src is None:
+                raise FileNotFoundError(
+                    "Could not find the inferlet Python package. "
+                    "Install inferlet>=0.3.0 or set PIE_SDK."
+                )
         wit_path = get_inferlet_wit_path()
 
     console.print("[bold]🏗️  Building Python inferlet...[/bold]")
@@ -618,7 +641,6 @@ def handle_python_build(input_path: Path, output: Path, debug: bool = False) -> 
 
             # Step 3: Copy inferlet library to temp directory so it gets bundled
             status.update("[bold green]📦 Bundling inferlet library...[/bold green]")
-            inferlet_src = inferlet_path / "src" / "inferlet"
             if inferlet_src.exists():
                 inferlet_dest = temp_path / "inferlet"
                 copy_dir_recursive(inferlet_src, inferlet_dest)
@@ -674,6 +696,30 @@ def detect_js_input_type(input_path: Path) -> tuple[str, Path]:
     raise ValueError(f"Input '{input_path}' does not exist")
 
 
+def get_inferlet_js_entry(project_dir: Path) -> Path:
+    """Resolve the JS SDK entry from the user's install or a local SDK checkout."""
+    package_entry = (
+        project_dir / "node_modules" / "@pie-project" / "inferlet" / "dist" / "index.js"
+    )
+    if package_entry.is_file():
+        return package_entry
+
+    try:
+        local_sdk = path_utils.get_inferlet_js_path()
+    except FileNotFoundError:
+        local_sdk = None
+
+    if local_sdk is not None:
+        source_entry = local_sdk / "src" / "index.ts"
+        if source_entry.is_file():
+            return source_entry
+
+    raise FileNotFoundError(
+        f"Could not find {INFERLET_JS_PACKAGE}. Run 'npm install' in "
+        f"{project_dir} or set PIE_SDK to a Pie SDK checkout."
+    )
+
+
 def run_esbuild_user_code(entry_point: Path, output_file: Path) -> None:
     """Bundle user code with esbuild (keeps inferlet imports external)."""
     cmd = [
@@ -691,6 +737,8 @@ def run_esbuild_user_code(entry_point: Path, output_file: Path) -> None:
         "--external:inferlet",
         "--external:wasi:*",
         "--external:inferlet:*",
+        f"--external:{INFERLET_JS_PACKAGE}",
+        f"--external:{INFERLET_JS_PACKAGE}/*",
     ]
 
     # Mark Node.js built-ins as external
@@ -723,17 +771,15 @@ def run_esbuild_user_code(entry_point: Path, output_file: Path) -> None:
 def run_esbuild(
     entry_point: Path,
     output_file: Path,
-    inferlet_js_path: Path,
+    inferlet_entry: Path,
     debug: bool,
 ) -> None:
     """Bundle with esbuild, resolving inferlet imports."""
 
-    # Validate inferlet alias target
-    inferlet_entry = inferlet_js_path / "src" / "index.ts"
     if not inferlet_entry.is_file():
         raise FileNotFoundError(
             f"inferlet entry not found at '{inferlet_entry}', "
-            "ensure inferlet-js/src/index.ts exists"
+            "run npm install or set PIE_SDK"
         )
 
     inferlet_entry = inferlet_entry.resolve()
@@ -750,6 +796,7 @@ def run_esbuild(
         "--main-fields=module,main",
         f"--outfile={output_file}",
         f"--alias:inferlet={inferlet_entry}",
+        f"--alias:{INFERLET_JS_PACKAGE}={inferlet_entry}",
     ]
 
     if debug:
@@ -758,7 +805,14 @@ def run_esbuild(
         cmd.append("--minify")
 
     # External WIT imports
-    cmd.extend(["--external:wasi:*", "--external:inferlet:*", "--external:pie:*"])
+    cmd.extend(
+        [
+            "--external:wasi:*",
+            "--external:inferlet:*",
+            f"--external:{INFERLET_JS_PACKAGE}/*",
+            "--external:pie:*",
+        ]
+    )
 
     # External Node.js built-ins
     nodejs_builtins = [
@@ -869,7 +923,7 @@ def check_for_nodejs_imports(bundled_js: Path) -> None:
         )
 
 
-def validate_user_code(bundled_js: Path) -> None:
+def validate_user_code(bundled_js: Path, package_dir: Path) -> None:
     """Validate user code for forbidden exports using Node.js AST analysis.
 
     Uses acorn parser via Node.js to properly handle ES2022+ features
@@ -963,11 +1017,10 @@ console.log("OK");
         script_path = f.name
 
     try:
-        # Run with NODE_PATH set to inferlet-js node_modules where acorn is available
-        inferlet_js_path = path_utils.get_inferlet_js_path()
-        node_modules = inferlet_js_path / "node_modules"
         env = os.environ.copy()
-        env["NODE_PATH"] = str(node_modules)
+        node_modules = package_dir / "node_modules"
+        if node_modules.exists():
+            env["NODE_PATH"] = str(node_modules)
 
         result = subprocess.run(
             ["node", script_path, str(bundled_js)],
@@ -979,7 +1032,11 @@ console.log("OK");
         stderr = result.stderr.strip()
 
         if result.returncode != 0:
-            if stderr.startswith("PARSE_ERROR:"):
+            if "Cannot find module 'acorn'" in stderr:
+                console.print(
+                    "[yellow]⚠️  Skipping JavaScript export validation because acorn is not installed.[/yellow]"
+                )
+            elif stderr.startswith("PARSE_ERROR:"):
                 raise RuntimeError(f"Failed to parse JavaScript: {stderr[12:]}")
             elif stderr.startswith("FORBIDDEN:run"):
                 raise RuntimeError(
@@ -1177,13 +1234,13 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
     project_dir = input_path if input_path.is_dir() else input_path.parent
     package_name = read_package_name(project_dir)
 
-    # Resolve paths
-    with console.status("[bold green]Resolving paths...[/bold green]"):
-        inferlet_js_path = path_utils.get_inferlet_js_path()
-        wit_path = get_inferlet_wit_path()
+    # Ensure project npm dependencies, then resolve the JS SDK and WIT paths.
+    if input_path.is_dir():
+        ensure_npm_dependencies(project_dir)
 
-    # Ensure npm dependencies
-    ensure_npm_dependencies(inferlet_js_path)
+    with console.status("[bold green]Resolving paths...[/bold green]"):
+        inferlet_js_entry = get_inferlet_js_entry(project_dir)
+        wit_path = get_inferlet_wit_path()
 
     console.print("[bold]🏗️  Building JS inferlet...[/bold]")
     console.print(f"   Input: [blue]{input_path}[/blue]")
@@ -1214,7 +1271,7 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
 
             # Step 3: Validate user code
             status.update("[bold green]🔍 Validating user code...[/bold green]")
-            validate_user_code(user_bundle)
+            validate_user_code(user_bundle, project_dir)
 
             # Step 4: Generate wrapper
             status.update("[bold green]🔧 Generating WIT wrapper...[/bold green]")
@@ -1222,7 +1279,7 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
 
             # Step 5: Bundle wrapper
             status.update("[bold green]📦 Bundling final output...[/bold green]")
-            run_esbuild(wrapper_js, final_bundle, inferlet_js_path, debug)
+            run_esbuild(wrapper_js, final_bundle, inferlet_js_entry, debug)
 
             # Step 6: Generate dynamic WIT directory with exec world
             status.update(

@@ -3,12 +3,12 @@
 // Demonstrates:
 // - Loading a model
 // - Using Context for chat-style prompt building
-// - Streaming generation with EventStream + callback API
+// - Returning the generated response to the caller
 
 import {
     Model, Context, Sampler,
     session, runtime,
-} from 'inferlet';
+} from '@pie-project/inferlet';
 
 interface Input {
     prompt?: string;
@@ -29,26 +29,14 @@ export async function main(input: Input) {
     const model = Model.load(runtime.models()[0]);
 
     // Build a chat context.
-    const ctx = Context.create(model);
+    const ctx = new Context(model);
     ctx.system(system);
     ctx.user(prompt);
 
-    // Stream the response. `decode: { reasoning: true }` surfaces
-    // <think>...</think> chunks as separate `thinking` events.
-    let output = '';
-    const stream = await ctx.generate({
-        sampler: Sampler.topP(temperature, topP),
-        maxTokens,
-        decode: { reasoning: true },
-    });
+    const output = await ctx
+        .generate(Sampler.topP(temperature, topP), { maxTokens })
+        .collectText();
 
-    await stream
-        .on('thinking', text => session.send(text))
-        .on('text', text => { session.send(text); output += text; })
-        .run();
-
-    // Emit a [done] marker. The 'done' chat event doesn't fire if the
-    // model produces zero tokens, so do this unconditionally.
-    session.send('\n[done]');
+    session.send(output);
     return output;
 }

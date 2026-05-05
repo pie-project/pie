@@ -2,5 +2,12 @@
   "name": "$name",
   "version": "0.1.0",
   "type": "module",
-  "main": "index.ts"
+  "main": "index.ts",
+  "dependencies": {
+    "@pie-project/inferlet": "^0.3.0"
+  },
+  "devDependencies": {
+    "acorn": "^8.14.0",
+    "typescript": "^5.7.2"
+  }
 }

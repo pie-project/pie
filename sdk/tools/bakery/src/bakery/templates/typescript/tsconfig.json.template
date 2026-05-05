@@ -6,12 +6,7 @@
     "moduleDetection": "force",
     "strict": true,
     "skipLibCheck": true,
-    "noEmit": true,
-    "baseUrl": ".",
-    "paths": {
-      "inferlet": ["$inferlet_path/src/index.ts"],
-      "inferlet/*": ["$inferlet_path/src/*"]
-    }
+    "noEmit": true
   },
-  "include": ["*.ts", "$inferlet_path/src/globals.d.ts"]
+  "include": ["*.ts"]
 }

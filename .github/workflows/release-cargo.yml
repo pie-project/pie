@@ -9,7 +9,6 @@ on:
         type: choice
         options:
           - pie-client (client/rust/)
-          - pie (runtime/)
           - inferlet (sdk/rust/inferlet/)
           - inferlet-macros (sdk/rust/inferlet-macros/)
       dry_run:
@@ -38,10 +37,6 @@ jobs:
               echo "path=client/rust" >> $GITHUB_OUTPUT
               echo "name=pie-client" >> $GITHUB_OUTPUT
               ;;
-            "pie (runtime/)")
-              echo "path=runtime" >> $GITHUB_OUTPUT
-              echo "name=pie" >> $GITHUB_OUTPUT
-              ;;
             "inferlet (sdk/rust/inferlet/)")
               echo "path=sdk/rust/inferlet" >> $GITHUB_OUTPUT
               echo "name=inferlet" >> $GITHUB_OUTPUT
@@ -60,10 +55,10 @@ jobs:
         working-directory: ${{ steps.info.outputs.path }}
         run: cargo test
       
-      - name: Dry run - package
+      - name: Dry run - publish
         if: inputs.dry_run == true
         working-directory: ${{ steps.info.outputs.path }}
-        run: cargo package --allow-dirty
+        run: cargo publish --dry-run --allow-dirty
       
       - name: Publish to crates.io
         if: inputs.dry_run == false

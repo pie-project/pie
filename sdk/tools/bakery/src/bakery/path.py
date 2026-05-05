@@ -1,8 +1,8 @@
 """Path utilities for Bakery.
 
 Resolves the locations bakery needs at build time: the SDK root (where
-``sdk/rust/inferlet/wit/`` and friends live), and the per-language
-inferlet libraries.
+``sdk/rust/inferlet/wit/`` and friends live), the per-language inferlet
+libraries, and Bakery's bundled WIT files for installed-wheel use.
 
 Resolution order for each path:
   1. ``PIE_SDK`` env var (explicit override; users opt in)
@@ -113,6 +113,9 @@ def get_wit_path() -> Path:
     parent = _find_upward(Path("sdk/interfaces"))
     if parent is not None:
         return parent / "sdk" / "interfaces"
+    bundled = Path(__file__).resolve().parent / "wit"
+    if (bundled / "world.wit").exists():
+        return bundled
     raise FileNotFoundError(
         "Could not find WIT directory. Please set PIE_SDK environment variable."
     )

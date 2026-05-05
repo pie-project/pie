@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "A simple text completion inferlet"
 
 [runtime]
-core = "^0.2.0"
-mcp = "^0.2.0"
+core = "^0.3.0"
+mcp = "^0.3.0"
 
 [parameters]
 prompt = { type = "string", description = "The user message to complete" }

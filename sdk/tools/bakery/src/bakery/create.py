@@ -12,8 +12,9 @@ from typing import Optional
 
 from rich.panel import Panel
 from .console import console
-from . import path as path_utils
 import typer
+
+INFERLET_VERSION = "0.3.0"
 
 
 def get_template(name: str) -> Template:
@@ -76,11 +77,10 @@ def generate_ts_package_json(project_dir: Path, name: str) -> None:
     (project_dir / "package.json").write_text(content)
 
 
-def generate_tsconfig(project_dir: Path, inferlet_path: Path) -> None:
+def generate_tsconfig(project_dir: Path) -> None:
     """Generate the tsconfig.json file."""
-    path_str = str(inferlet_path).replace("\\", "/")
     template = get_template("typescript/tsconfig.json.template")
-    content = template.substitute(inferlet_path=path_str)
+    content = template.substitute()
     (project_dir / "tsconfig.json").write_text(content)
 
 
@@ -116,8 +116,7 @@ def generate_rust_cargo_toml(project_dir: Path, name: str) -> None:
                 inferlet_dep = f'{{ path = "{rel_path}/sdk/rust/inferlet" }}'
                 break
         else:
-            # Fallback to relative paths assuming standard project layout
-            inferlet_dep = '{ path = "../sdk/rust/inferlet" }'
+            inferlet_dep = f'"{INFERLET_VERSION}"'
 
     template = get_template("rust/Cargo.toml.template")
     content = template.substitute(name=name, inferlet_dep=inferlet_dep)
@@ -195,21 +194,9 @@ def handle_create_command(
         console.print("   cargo build --release --target wasm32-wasip2")
     else:
         # Generate TypeScript project
-        try:
-            inferlet_js_path = path_utils.get_inferlet_js_path()
-            project_dir_abs = project_dir.resolve()
-            try:
-                relative_path = inferlet_js_path.resolve().relative_to(
-                    project_dir_abs.parent
-                )
-            except ValueError:
-                relative_path = inferlet_js_path.resolve()
-        except FileNotFoundError:
-            relative_path = Path("../inferlet-js")
-
         generate_ts_index(project_dir, project_name)
         generate_ts_package_json(project_dir, project_name)
-        generate_tsconfig(project_dir, relative_path)
+        generate_tsconfig(project_dir)
         generate_pie_toml(project_dir, project_name, language)
 
         console.print(
@@ -226,4 +213,5 @@ def handle_create_command(
 
         console.print("\n[bold]Next steps:[/bold]")
         console.print(f"   cd {project_dir}")
+        console.print("   npm install")
         console.print(f"   bakery build . -o {project_name}.wasm")

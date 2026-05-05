@@ -8,12 +8,12 @@ on:
         required: true
         type: choice
         options:
-          - pie-server (pie/)
           - pie-client (client/python/)
           - pie-bakery (sdk/tools/bakery/)
           - inferlet (sdk/python/)
+          - pie-rpc (sdk/python-rpc/)
       dry_run:
-        description: 'Dry run (build but do not publish)'
+        description: 'Dry run (build and validate but do not publish)'
         required: false
         type: boolean
         default: false
@@ -26,52 +26,128 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       package_path: ${{ steps.info.outputs.path }}
-      is_maturin: ${{ steps.info.outputs.is_maturin }}
+      build_backend: ${{ steps.info.outputs.backend }}
     steps:
       - name: Extract package info
         id: info
         run: |
           case "${{ inputs.package }}" in
-            "pie-server (pie/)")
-              echo "path=pie" >> $GITHUB_OUTPUT
-              echo "is_maturin=true" >> $GITHUB_OUTPUT
-              ;;
             "pie-client (client/python/)")
-              echo "path=client/python" >> $GITHUB_OUTPUT
-              echo "is_maturin=false" >> $GITHUB_OUTPUT
+              echo "path=client/python" >> "$GITHUB_OUTPUT"
+              echo "backend=python" >> "$GITHUB_OUTPUT"
               ;;
             "pie-bakery (sdk/tools/bakery/)")
-              echo "path=sdk/tools/bakery" >> $GITHUB_OUTPUT
-              echo "is_maturin=false" >> $GITHUB_OUTPUT
+              echo "path=sdk/tools/bakery" >> "$GITHUB_OUTPUT"
+              echo "backend=python" >> "$GITHUB_OUTPUT"
               ;;
             "inferlet (sdk/python/)")
-              echo "path=sdk/python" >> $GITHUB_OUTPUT
-              echo "is_maturin=false" >> $GITHUB_OUTPUT
+              echo "path=sdk/python" >> "$GITHUB_OUTPUT"
+              echo "backend=python" >> "$GITHUB_OUTPUT"
+              ;;
+            "pie-rpc (sdk/python-rpc/)")
+              echo "path=sdk/python-rpc" >> "$GITHUB_OUTPUT"
+              echo "backend=maturin" >> "$GITHUB_OUTPUT"
               ;;
           esac
 
   # ============================================================================
-  # Maturin builds (pie-server with Rust extension)
+  # Pure Python builds
+  # ============================================================================
+
+  build-python:
+    needs: setup
+    if: needs.setup.outputs.build_backend == 'python'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build twine uv
+
+      - name: Build package
+        run: python -m build "${{ needs.setup.outputs.package_path }}"
+
+      - name: Check metadata
+        run: python -m twine check "${{ needs.setup.outputs.package_path }}"/dist/*
+
+      - name: Check package data
+        if: needs.setup.outputs.package_path == 'sdk/tools/bakery'
+        run: |
+          python - <<'PY'
+          import pathlib
+          import sys
+          import zipfile
+
+          wheel = next(pathlib.Path("sdk/tools/bakery/dist").glob("*.whl"))
+          required = {
+              "bakery/templates/Pie.toml.template",
+              "bakery/templates/rust/Cargo.toml.template",
+              "bakery/templates/typescript/index.ts.template",
+              "bakery/wit/world.wit",
+              "bakery/wit/deps/core/runtime.wit",
+          }
+          with zipfile.ZipFile(wheel) as zf:
+              names = set(zf.namelist())
+          missing = sorted(required - names)
+          if missing:
+              print("Missing package data:")
+              for name in missing:
+                  print(f"  - {name}")
+              sys.exit(1)
+          PY
+
+      - name: Smoke test wheel
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/python" -m pip install "${{ needs.setup.outputs.package_path }}"/dist/*.whl
+
+          case "${{ needs.setup.outputs.package_path }}" in
+            "client/python")
+              "$RUNNER_TEMP/smoke/bin/python" -c "import pie_client"
+              "$RUNNER_TEMP/smoke/bin/pie-client" --help >/dev/null
+              ;;
+            "sdk/tools/bakery")
+              "$RUNNER_TEMP/smoke/bin/python" -c "import bakery"
+              "$RUNNER_TEMP/smoke/bin/bakery" --help >/dev/null
+              ;;
+            "sdk/python")
+              "$RUNNER_TEMP/smoke/bin/python" -c "import inferlet"
+              ;;
+          esac
+
+      - name: Dry run publish
+        if: inputs.dry_run == true
+        run: uv publish --dry-run "${{ needs.setup.outputs.package_path }}"/dist/*
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-python
+          path: ${{ needs.setup.outputs.package_path }}/dist
+
+  # ============================================================================
+  # Maturin builds
   # ============================================================================
 
   build-maturin-linux-x86_64:
     needs: setup
-    if: needs.setup.outputs.is_maturin == 'true'
+    if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.12'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: x86_64
-          args: --release --out dist -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+          args: --release --out dist -i python3.10 -i python3.11 -i python3.12 -i python3.13
           working-directory: ${{ needs.setup.outputs.package_path }}
           manylinux: auto
-          before-script-linux: |
-            if command -v yum &> /dev/null; then yum install -y openssl-devel pkgconfig perl-IPC-Cmd; else apt-get update && apt-get install -y libssl-dev pkg-config; fi
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-linux-x86_64
@@ -79,22 +155,20 @@ jobs:
 
   build-maturin-linux-aarch64:
     needs: setup
-    if: needs.setup.outputs.is_maturin == 'true'
+    if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.12'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: aarch64
-          args: --release --out dist -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+          args: --release --out dist -i python3.10 -i python3.11 -i python3.12 -i python3.13
           working-directory: ${{ needs.setup.outputs.package_path }}
           manylinux: auto
-          before-script-linux: |
-            if command -v yum &> /dev/null; then yum install -y openssl-devel pkgconfig perl-IPC-Cmd; else apt-get update && apt-get install -y libssl-dev pkg-config; fi
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-linux-aarch64
@@ -102,13 +176,13 @@ jobs:
 
   build-maturin-macos:
     needs: setup
-    if: needs.setup.outputs.is_maturin == 'true'
+    if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.12'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -122,13 +196,13 @@ jobs:
 
   build-maturin-windows:
     needs: setup
-    if: needs.setup.outputs.is_maturin == 'true'
+    if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.12'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -141,7 +215,7 @@ jobs:
 
   build-maturin-sdist:
     needs: setup
-    if: needs.setup.outputs.is_maturin == 'true'
+    if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -156,59 +230,68 @@ jobs:
           name: wheels-sdist
           path: ${{ needs.setup.outputs.package_path }}/dist
 
-  # ============================================================================
-  # Pure Python builds
-  # ============================================================================
-
-  build-python:
-    needs: setup
-    if: needs.setup.outputs.is_maturin == 'false'
+  check-maturin:
+    needs:
+      - setup
+      - build-maturin-linux-x86_64
+      - build-maturin-linux-aarch64
+      - build-maturin-macos
+      - build-maturin-windows
+      - build-maturin-sdist
+    if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.10'
-      - name: Install build tools
-        run: pip install build
-      - name: Build package
-        run: python -m build ${{ needs.setup.outputs.package_path }}
-      - uses: actions/upload-artifact@v6
-        with:
-          name: wheels-python
-          path: ${{ needs.setup.outputs.package_path }}/dist
-
-  # ============================================================================
-  # Publish
-  # ============================================================================
-
-  publish-maturin:
-    name: Publish to PyPI (maturin)
-    runs-on: ubuntu-latest
-    needs: [setup, build-maturin-linux-x86_64, build-maturin-linux-aarch64, build-maturin-macos, build-maturin-windows, build-maturin-sdist]
-    if: needs.setup.outputs.is_maturin == 'true' && inputs.dry_run == false
-    environment: pypi
     steps:
       - uses: actions/download-artifact@v7
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - uses: actions/setup-python@v6
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: python -m pip install --upgrade twine uv
+
+      - name: Check metadata
+        run: python -m twine check dist/*
+
+      - name: Dry run publish
+        if: inputs.dry_run == true
+        run: uv publish --dry-run dist/*
+
+  # ============================================================================
+  # Publish
+  # ============================================================================
 
   publish-python:
     name: Publish to PyPI (pure Python)
     runs-on: ubuntu-latest
     needs: [setup, build-python]
-    if: needs.setup.outputs.is_maturin == 'false' && inputs.dry_run == false
+    if: needs.setup.outputs.build_backend == 'python' && inputs.dry_run == false
     environment: pypi
     steps:
       - uses: actions/download-artifact@v7
         with:
           name: wheels-python
+          path: dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+  publish-maturin:
+    name: Publish to PyPI (maturin)
+    runs-on: ubuntu-latest
+    needs: [setup, check-maturin]
+    if: needs.setup.outputs.build_backend == 'maturin' && inputs.dry_run == false
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          merge-multiple: true
           path: dist
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
