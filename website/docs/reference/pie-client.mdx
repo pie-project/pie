@@ -47,10 +47,10 @@ Submit an inferlet to the engine, stream its events, and exit when it returns.
 
 ```bash
 # By registry name
-pie-client submit text-completion@0.1.0 --prompt "hello"
+pie-client submit text-completion@0.1.0 -- --prompt "hello"
 
 # By local build
-pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml --prompt "hello"
+pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml -- --prompt "hello"
 ```
 
 | Argument / flag | Description |
@@ -60,7 +60,7 @@ pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml --prompt "hell
 | `--manifest / -m <FILE>` | Path to the `Pie.toml` manifest for the local build. |
 | `--no-output / -d` | Don't capture the inferlet's stdout/stderr. |
 | `--link / -l <FILE>` | Path to a `.wasm` library file to link. May be repeated. |
-| `<arguments...>` (trailing positional) | Extra arguments forwarded to the inferlet's input dict. |
+| `<arguments...>` (after `--`) | Extra arguments forwarded to the inferlet's input dict. |
 | `--config <FILE>` | Override config file path. |
 | `--host`, `--port` | Override engine host / port. |
 | `--username`, `--private-key-path` | Override auth credentials. |
@@ -100,7 +100,7 @@ pie-client list --full      # show full UUIDs
 
 Attach to a running instance and stream its output until it returns. The instance keeps running across attach / detach cycles.
 
-```bash
+```text
 pie-client attach <instance-id-prefix>
 ```
 
@@ -115,7 +115,7 @@ The argument can be a UUID prefix (any unique substring works) or a full UUID.
 
 Request termination of a running instance.
 
-```bash
+```text
 pie-client abort <instance-id-prefix>
 ```
 

@@ -65,7 +65,7 @@ If you want to materialize a prefix without generating, call `flush()`:
 <TabItem value="rust" label="Rust" default>
 
 ```rust
-ctx.system("Long system prompt with lots of context...");
+ctx.system("Long system prompt with lots of context for the task.");
 ctx.user("Question");
 ctx.flush().await?;          // commit the prompt; nothing has been generated yet
 ```
@@ -74,7 +74,7 @@ ctx.flush().await?;          // commit the prompt; nothing has been generated ye
 <TabItem value="python" label="Python">
 
 ```python
-ctx.system("Long system prompt with lots of context...")
+ctx.system("Long system prompt with lots of context for the task.")
 ctx.user("Question")
 await ctx.flush()            # commit the prompt; nothing has been generated yet
 ```
@@ -83,7 +83,7 @@ await ctx.flush()            # commit the prompt; nothing has been generated yet
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-ctx.system('Long system prompt with lots of context...');
+ctx.system('Long system prompt with lots of context for the task.');
 ctx.user('Question');
 await ctx.flush();           // commit the prompt; nothing has been generated yet
 ```

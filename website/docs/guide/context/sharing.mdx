@@ -24,7 +24,7 @@ Forks share KV pages correctly on the dummy, but each branch's next token is dra
 
 ```rust
 let mut child = ctx.fork()?;
-child.user("...").cue();
+child.user("Compare Rust and Python in one sentence.").cue();
 let reply = child.generate(sampler).max_tokens(256).collect_text().await?;
 ```
 
@@ -33,7 +33,7 @@ let reply = child.generate(sampler).max_tokens(256).collect_text().await?;
 
 ```python
 child = ctx.fork()
-child.user("...").cue()
+child.user("Compare Rust and Python in one sentence.").cue()
 reply = await child.generate(sampler, max_tokens=256).collect_text()
 ```
 
@@ -42,7 +42,7 @@ reply = await child.generate(sampler, max_tokens=256).collect_text()
 
 ```typescript
 const child = ctx.fork();
-child.user('...').cue();
+child.user('Compare Rust and Python in one sentence.').cue();
 const reply = await child.generate(sampler, { maxTokens: 256 }).collectText();
 ```
 
@@ -70,7 +70,7 @@ Naming a context keeps its KV pages alive past the inferlet's exit. Other inferl
 ```rust
 // One-time setup: compute and cache the system prompt.
 let mut prefix = Context::new(&model)?;
-prefix.system("You are a helpful assistant. <long preamble...>");
+prefix.system("You are a helpful assistant. Answer with concise technical detail.");
 prefix.flush().await?;
 prefix.save("system-prompt-v1")?;
 
@@ -88,7 +88,7 @@ let resp = ctx.generate(sampler).collect_text().await?;
 ```python
 # One-time setup
 prefix = Context(model)
-prefix.system("You are a helpful assistant. <long preamble...>")
+prefix.system("You are a helpful assistant. Answer with concise technical detail.")
 await prefix.flush()
 prefix.save("system-prompt-v1")
 
@@ -105,7 +105,7 @@ resp = await ctx.generate(sampler, max_tokens=256).collect_text()
 ```typescript
 // One-time setup
 const prefix = new Context(model);
-prefix.system('You are a helpful assistant. <long preamble...>');
+prefix.system('You are a helpful assistant. Answer with concise technical detail.');
 await prefix.flush();
 prefix.save('system-prompt-v1');
 

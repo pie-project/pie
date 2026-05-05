@@ -64,6 +64,7 @@ See [bakery](../../reference/bakery) for the full flag list.
 pie run \
   --path ./research-agent.wasm \
   --manifest ./Pie.toml \
+  -- \
   --question "Compare the climates of Tokyo, Reykjavik, and Singapore."
 ```
 
@@ -85,7 +86,7 @@ climate: hot and humid year-round with no distinct seasons. The
 three differ primarily by latitude and ocean influence.
 ```
 
-The CLI flags after `--manifest` fold into the inferlet's input. `--question "..."` becomes `{"question": "..."}` because that is the parameter declared in `Pie.toml`. Type inference handles `--max-tokens 64` (int) or `--temperature 0.7` (float) when you add such parameters.
+The CLI flags after `--` fold into the inferlet's input. `--question "..."` becomes `{"question": "..."}`. Type inference handles values such as `--max-tokens 64` (int) or `--temperature 0.7` (float); `Pie.toml` documents those parameters, but the inferlet's input type performs the actual validation.
 
 ## Watching the steps
 
@@ -154,7 +155,7 @@ The fetch is reported as elapsed wall-clock time across all three requests, not 
 ```bash
 # After editing the source:
 bakery build . -o research-agent.wasm
-pie run --path ./research-agent.wasm --manifest ./Pie.toml --question "..."
+pie run --path ./research-agent.wasm --manifest ./Pie.toml -- --question "Compare the climates of Tokyo and Singapore."
 ```
 
 A Rust rebuild after a one-line change typically takes a few seconds. Python and JavaScript rebuilds are faster because they skip native compilation.

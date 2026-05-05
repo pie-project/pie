@@ -1,8 +1,9 @@
 //! Python runtime resources shared across the linker and program services.
 //!
-//! Loads the CPython interpreter and stdlib shared modules once at engine
-//! startup (from $PIE_HOME/py-runtime/shared/*.wasm) and exposes them as
-//! two variants:
+//! Tracks the CPython runtime directory and lazily loads the stdlib shared
+//! modules from $PIE_HOME/py-runtime/shared/*.wasm when a Python component
+//! is installed or instantiated. Non-Python components should not pay this
+//! compilation cost. Loaded modules are exposed as two variants:
 //!
 //! - **Full** modules — have their data segments and start functions intact.
 //!   Used when instantiating non-snapshotted Python components (CPython needs
@@ -11,7 +12,7 @@
 //!   removed. Used when instantiating snapshotted components so the shared
 //!   modules don't clobber the pre-initialized memory image.
 //!
-//! Both variants are compiled once at startup; snapshot status is decided
+//! Both variants are compiled at most once; snapshot status is decided
 //! per-component at instantiate time.
 
 use std::fs;
@@ -25,12 +26,13 @@ use crate::path;
 use super::snapshot;
 
 struct State {
+    /// Wasmtime engine used to compile shared modules lazily.
+    engine: Engine,
     /// $PIE_HOME/py-runtime directory, if it exists on disk.
     py_runtime_dir: Option<PathBuf>,
-    /// Shared modules with data segments and start sections intact.
-    shared_modules_full: Vec<(String, Module)>,
-    /// Shared modules with data segments and start sections stripped.
-    shared_modules_stripped: Vec<(String, Module)>,
+    /// Lazily compiled shared modules. Startup should not pay CPython
+    /// compilation cost for non-Python inferlets.
+    shared_modules: OnceLock<(Vec<(String, Module)>, Vec<(String, Module)>)>,
     /// Whether to apply the snapshot optimization to Python components.
     snapshot_enabled: bool,
 }
@@ -56,36 +58,18 @@ pub fn init(engine: &Engine, snapshot_enabled: bool) {
         }
     };
 
-    let (shared_modules_full, shared_modules_stripped) =
-        if let Some(ref dir) = py_runtime_dir {
-            let shared_dir = dir.join("shared");
-            if shared_dir.is_dir() {
-                load_shared_modules(engine, &shared_dir)
-            } else {
-                (Vec::new(), Vec::new())
-            }
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
-    if !shared_modules_full.is_empty() {
-        tracing::info!(
-            "Loaded {} shared core module(s); snapshot {}",
-            shared_modules_full.len(),
-            if snapshot_enabled { "enabled" } else { "disabled" },
-        );
-    }
-
     let _ = STATE.set(State {
+        engine: engine.clone(),
         py_runtime_dir,
-        shared_modules_full,
-        shared_modules_stripped,
+        shared_modules: OnceLock::new(),
         snapshot_enabled,
     });
 }
 
 fn state() -> &'static State {
-    STATE.get().expect("python::runtime::init must be called before use")
+    STATE
+        .get()
+        .expect("python::runtime::init must be called before use")
 }
 
 /// Returns the py-runtime directory path, or None if py-runtime is not installed.
@@ -95,12 +79,12 @@ pub fn dir() -> Option<&'static Path> {
 
 /// Returns the full (un-stripped) shared modules.
 pub fn full_modules() -> &'static [(String, Module)] {
-    &state().shared_modules_full
+    &loaded_modules().0
 }
 
 /// Returns the stripped (no data segments, no start sections) shared modules.
 pub fn stripped_modules() -> &'static [(String, Module)] {
-    &state().shared_modules_stripped
+    &loaded_modules().1
 }
 
 /// Whether the snapshot optimization is enabled for Python components.
@@ -110,7 +94,34 @@ pub fn is_snapshot_enabled() -> bool {
 
 /// Whether any shared modules were loaded (i.e., py-runtime is installed).
 pub fn is_available() -> bool {
-    !state().shared_modules_full.is_empty()
+    state().py_runtime_dir.is_some() && !full_modules().is_empty()
+}
+
+fn loaded_modules() -> &'static (Vec<(String, Module)>, Vec<(String, Module)>) {
+    let state = state();
+    state.shared_modules.get_or_init(|| {
+        let Some(dir) = state.py_runtime_dir.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        let shared_dir = dir.join("shared");
+        if !shared_dir.is_dir() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let loaded = load_shared_modules(&state.engine, &shared_dir);
+        if !loaded.0.is_empty() {
+            tracing::info!(
+                "Loaded {} shared core module(s); snapshot {}",
+                loaded.0.len(),
+                if state.snapshot_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+            );
+        }
+        loaded
+    })
 }
 
 /// Loads shared core modules (.wasm files) from a directory, producing both
@@ -174,10 +185,7 @@ fn load_shared_modules(
                         path.display()
                     ),
                 },
-                Err(e) => tracing::error!(
-                    "Failed to strip shared module {}: {e}",
-                    path.display()
-                ),
+                Err(e) => tracing::error!("Failed to strip shared module {}: {e}", path.display()),
             }
         }
     }

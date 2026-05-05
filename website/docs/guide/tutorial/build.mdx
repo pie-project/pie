@@ -132,7 +132,7 @@ core = "^0.2.0"
 question = { type = "string", description = "The question to research" }
 ```
 
-The Python tab adds `python-runtime = "^0.3.0"` to `[runtime]`. `bakery create --lang python` writes that automatically.
+The Python tab adds `python-runtime = "^0.3.0"` to `[runtime]`. Bakery does not scaffold Python projects yet; copy `inferlets/python-example` as a starting point and keep that runtime entry in `Pie.toml`.
 
 ## The program
 
@@ -403,7 +403,7 @@ This generation reuses every page of KV cache built up in steps 1 and 3. On a bl
 
 The minimal version parses the planner's output with `serde_json` / `json.loads` / `JSON.parse` and trusts the model to produce well-formed JSON. Two ways to tighten this up:
 
-- **Constrain the planner with a schema.** Pie supports JSON-schema-constrained decoding through `Schema::Json` (Rust), `Schema.json(...)` (Python), and `jsonSchema(...)` (JavaScript). Attach the schema to the planner's `generate` call and the model cannot emit invalid JSON. See [Structured generation](../forward/constrained).
+- **Constrain the planner with a schema.** Pie supports JSON-schema-constrained decoding through `JsonSchema(schema)` (Rust), `JsonSchema(schema=schema)` (Python), and `jsonSchema(schema)` (JavaScript). Attach the schema to the planner's `generate` call and the model cannot emit invalid JSON. See [Structured generation](../forward/constrained).
 - **Cap the fan-out.** Reject plans with more than four titles, or fewer than two. Use a Rust `if plan.titles.len() > 4 { ... }` guard or the Python/JS equivalent.
 
 For the tutorial, the unguarded version keeps the code small. The next page shows how to inspect what the planner emits when something goes wrong.

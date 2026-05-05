@@ -33,6 +33,7 @@ venv = "/home/me/.pie/venvs/sglang"
 attention_backend       = "triton"       # triton / flashinfer / fa3 / fa4 / …
 mem_fraction_static     = 0.65
 page_size               = 16
+disable_radix_cache     = true
 disable_cuda_graph      = false
 # cuda_graph_max_bs       = 256          # default: sglang auto-picks
 # max_running_requests    = 256          # default: sglang auto-picks
@@ -57,6 +58,7 @@ spec_ngram_capacity     = 1_000_000
 | `attention_backend` | `"triton"` | `triton` / `flashinfer` / `flex_attention` / `fa3` / `fa4` / `aiter` / `wave` / `torch_native` / etc. `triton` works on any NVIDIA SM 7.5+ and is stable across sglang versions. |
 | `mem_fraction_static` | `0.65` | Fraction of free GPU memory reserved for KV cache + activations. Lower than sglang's standalone `0.88` because pie's KV-rebind allocates a parallel tensor in pie's canonical layout. |
 | `page_size` | `16` | KV cache page size override. Unset lets sglang pick. |
+| `disable_radix_cache` | `true` | Disable SGLang's radix cache. Pie owns prefix sharing through its scheduler, so the default avoids duplicated caching work while still allowing explicit experiments. |
 | `disable_cuda_graph` | `false` | Run eager (no `torch.compile`, no CUDA graphs). |
 | `cuda_graph_max_bs` | unset | Override the largest CUDA-graph batch-size bin sglang captures. Unset = sglang's auto-pick. |
 | `max_running_requests` | unset | Cap on simultaneously-running requests. Unset = sglang's auto-pick based on `max_total_tokens`. |

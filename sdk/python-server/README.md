@@ -41,7 +41,8 @@ uv pip install pie-server
 From this checkout:
 
 ```bash
-uv pip install --python <venv>/bin/python -e sdk/python-server/
+uv venv /tmp/pie-python-server-venv
+uv pip install --python /tmp/pie-python-server-venv/bin/python -e sdk/python-server/
 ```
 
 ## Local embedded-driver build

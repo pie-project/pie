@@ -28,7 +28,7 @@ pie config init
 pie doctor
 pie driver list
 pie serve --config ~/.pie/config.toml
-pie run text-completion --prompt "Paris is"
+pie run text-completion -- --prompt "Paris is"
 pie model download Qwen/Qwen3-0.6B
 ```
 

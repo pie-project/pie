@@ -59,20 +59,21 @@ stochastic sampling rarely helps.
 
 | You want… | Rust | Python | JS / TS |
 | --- | --- | --- | --- |
-| JSON conforming to a schema string | `Schema::JsonSchema(s)` | `JsonSchema(s)` | `jsonSchema(s)` |
-| Any valid JSON | `Schema::Json` | `AnyJson()` | `anyJson()` |
-| Strings matching a regex | `Schema::Regex(p)` | `Regex(p)` | `regex(p)` |
-| Custom EBNF grammar | `Schema::Ebnf(g)` | `Ebnf(g)` | `ebnf(g)` |
-| Reuse a precompiled grammar across contexts | `Schema::Grammar(&g)` | implement the `Schema` Protocol | implement the `Schema` interface |
+| JSON conforming to a schema string | `JsonSchema(s)` | `JsonSchema(s)` | `jsonSchema(s)` |
+| Any valid JSON | `AnyJson` | `AnyJson()` | `anyJson()` |
+| Strings matching a regex | `Regex(p)` | `Regex(p)` | `regex(p)` |
+| Custom EBNF grammar | `Ebnf(g)` | `Ebnf(g)` | `ebnf(g)` |
+| Reuse a precompiled grammar across contexts | `&Grammar` or `GrammarConstraint` | wrap in `GrammarConstraint` | wrap in `GrammarConstraint` |
 | Banned tokens, learned constraints, anything stateful that isn't a grammar | implement `Constraint` directly | implement `Constraint` directly | implement `Constraint` directly |
 
 Schemas are declarative; the SDK compiles them into a stateful matcher
 and drives it per generated token. Custom `Constraint` impls do the
 driving themselves.
 
-In all three SDKs, attach via `Generator::constrain(c)` (a `Constraint`
-impl or a `Schema`). Multiple calls compose by AND-ing the per-step
-BRLE masks.
+Attach Rust schemas with `Generator::constrain_with(schema)?` and
+stateful constraints with `Generator::constrain(constraint)`. Python and
+JS accept schemas and constraints through the `constrain` option.
+Multiple calls compose by AND-ing the per-step BRLE masks.
 
 ### Typed JSON
 
@@ -98,14 +99,14 @@ there's no runtime mutual-exclusion check.
 
 ## Composition
 
-All three SDKs compose constraints by repeating `constrain(...)` —
-masks are AND-ed across all attached constraints per step:
+All three SDKs compose constraints by repeating the attach call — masks
+are AND-ed across all attached constraints per step:
 
 ```rust
 // Rust
 ctx.generate(Sampler::Argmax)
-    .constrain(Schema::Ebnf(grammar))?
-    .constrain(BannedTokens::new(...))
+    .constrain_with(Ebnf(grammar))?
+    .constrain(BannedTokens::new(banned_token_ids))
     .collect_text().await?;
 ```
 

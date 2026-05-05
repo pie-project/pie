@@ -20,6 +20,8 @@ Top-level commands:
 - **`pie new`**: scaffold a new inferlet project (Rust or TypeScript).
 - **`pie build`**: build an inferlet directory or source file to a `.wasm` component.
 - **`pie doctor`**: environment health check.
+- **`pie check`**: validate a TOML config without booting the engine.
+- **`pie smoke`**: run low-level FFI / RPC diagnostics.
 - **`pie config init|show|set`**: manage `~/.pie/config.toml`.
 - **`pie model list|download|remove`**: manage the HuggingFace model cache.
 - **`pie auth add|remove|list`**: manage authorized client keys.
@@ -71,7 +73,7 @@ To skip real weight loading and serve random tokens (for testing), set
 Launch an inferlet against a one-shot engine instance. The engine starts,
 runs the inferlet, prints its output, and exits.
 
-```bash
+```text
 pie run [OPTIONS] [INFERLET] [-- ARGS...]
 ```
 
@@ -86,7 +88,7 @@ pie run [OPTIONS] [INFERLET] [-- ARGS...]
 | `-c`, `--config <PATH>` | Path to a TOML config file. |
 | `--port <PORT>` | Override `[server].port`. |
 | `--log <PATH>` | Write logs to this file. |
-| `ARGS...` | Inferlet input. CLI flags become JSON keys (e.g., `--prompt foo` → `{"prompt": "foo"}`). |
+| `ARGS...` | Inferlet input after `--`. CLI flags become JSON keys (e.g., `-- --prompt foo` → `{"prompt": "foo"}`). |
 
 If the inferlet name has no `@version`, the latest version is resolved from the registry.
 
@@ -94,18 +96,19 @@ If the inferlet name has no `@version`, the latest version is resolved from the 
 
 ```bash
 # Run from the registry
-pie run text-completion --prompt "Hello world"
+pie run text-completion -- --prompt "Hello world"
 
 # Run a local build (needs the manifest too)
-pie run --path ./target/wasm32/release/my_inferlet.wasm \
+pie run --path ./target/wasm32-wasip2/release/my_inferlet.wasm \
         --manifest ./Pie.toml \
+        -- \
         --prompt "Hi"
 
 # Pin a version
-pie run text-completion@0.1.0 --prompt "Hi" --max-tokens 64
+pie run text-completion@0.1.0 -- --prompt "Hi" --max-tokens 64
 ```
 
-Argument parsing rules (`pie run … --key value …`):
+Argument parsing rules (`pie run … -- --key value …`):
 
 - `--key value` becomes `{"key": value}` with int/float/bool inference.
 - `--flag` (no value) becomes `{"flag": true}`.
@@ -119,7 +122,7 @@ Argument parsing rules (`pie run … --key value …`):
 Scaffold a fresh inferlet project. Wraps `bakery create`, which generates the
 template files locally.
 
-```bash
+```text
 pie new <NAME> [OPTIONS]
 ```
 
@@ -151,7 +154,7 @@ pie new my-agent --ts -o ~/projects
 Compile an inferlet directory (or single source file) to a WebAssembly
 component. Wraps `bakery build` and auto-detects the platform.
 
-```bash
+```text
 pie build <INPUT> -o <OUTPUT> [OPTIONS]
 ```
 
@@ -205,7 +208,7 @@ Manage `~/.pie/config.toml`.
 
 ### config init
 
-```bash
+```text
 pie config init [--path <PATH>]
 ```
 
@@ -214,7 +217,7 @@ the Python 3.14 inferlet runtime into `~/.pie/`. Safe to re-run.
 
 ### config show
 
-```bash
+```text
 pie config show [--path <PATH>]
 ```
 
@@ -222,7 +225,7 @@ Prints the current config file with TOML syntax highlighting.
 
 ### config set
 
-```bash
+```text
 pie config set <KEY> <VALUE> [--path <PATH>]
 ```
 
@@ -261,7 +264,7 @@ annotated with the detected architecture; incompatible repos are marked `○`.
 
 ### model download
 
-```bash
+```text
 pie model download <REPO_ID>
 ```
 
@@ -282,7 +285,7 @@ pie config set model.0.hf_repo Qwen/Qwen2.5-7B-Instruct
 
 ### model remove
 
-```bash
+```text
 pie model remove <REPO_ID>
 ```
 
@@ -294,7 +297,7 @@ Prompts for confirmation, then deletes the repo from the HF cache.
 
 Inspect embedded drivers and manage subprocess-driver Python environments.
 
-```bash
+```text
 pie driver list [-c <CONFIG>]
 pie driver <dev|vllm|sglang> install [PATH] [--run]
 pie driver <dev|vllm|sglang> set venv <PATH>
@@ -325,7 +328,7 @@ Manage authorized clients. The keystore lives at the path returned by
 
 ### auth add
 
-```bash
+```text
 pie auth add <USERNAME> [KEY_NAME]
 ```
 
@@ -344,7 +347,7 @@ pie auth add alice
 
 ### auth remove
 
-```bash
+```text
 pie auth remove <USERNAME> [KEY_NAME]
 ```
 

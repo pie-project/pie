@@ -89,6 +89,7 @@ For TypeScript / JavaScript inferlets, write TS or JS and declare deps in `packa
 pie run \
   --path ./target/wasm32-wasip2/release/my_inferlet.wasm \
   --manifest ./Pie.toml \
+  -- \
   --prompt "hello"
 ```
 
@@ -101,7 +102,7 @@ The dev loop is edit, build, run.
 ```bash
 # After editing your source:
 bakery build . -o hello.wasm
-pie run --path ./hello.wasm --manifest ./Pie.toml --prompt "..."
+pie run --path ./hello.wasm --manifest ./Pie.toml -- --prompt "Say hello in one sentence."
 ```
 
 A Rust rebuild after a one-line change is typically a few seconds. Python and JavaScript rebuilds are faster because they skip native compilation.

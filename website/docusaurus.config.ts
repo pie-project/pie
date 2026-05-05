@@ -40,9 +40,22 @@ const PIE_PALETTE = {
   },
 } as const;
 
+type PrismPalette = {
+  bg: string;
+  ink: string;
+  inkSoft: string;
+  inkMuted: string;
+  operator: string;
+  primary: string;
+  copper: string;
+  gold: string;
+  rust: string;
+  plum: string;
+};
+
 // Build a Prism theme from a palette half. All structural choices
 // (which token types share a color, weight bumps, etc.) live here.
-function buildPrismTheme(p: typeof PIE_PALETTE.light): PrismTheme {
+function buildPrismTheme(p: PrismPalette): PrismTheme {
   return {
     plain: { color: p.ink, backgroundColor: p.bg },
     styles: [

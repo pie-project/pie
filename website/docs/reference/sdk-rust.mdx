@@ -165,7 +165,7 @@ let g = ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
 | `.max_tokens(n)` | Stop after `n` accepted tokens. |
 | `.stop(&[...])` / `.add_stop(&[...])` | Extra stop-token IDs (added to the model's EOS). |
 | `.constrain(c)` | Apply a `Constrain` impl. |
-| `.constrain_with(Schema::JsonSchema(s))?` | Apply a declarative schema. |
+| `.constrain_with(JsonSchema(s))?` | Apply a declarative schema. |
 | `.speculator(s)` | Plug in a custom speculator. |
 | `.system_speculation()` | Use the runtime's draft model. |
 | `.adapter(&a)` | Apply a LoRA adapter. |

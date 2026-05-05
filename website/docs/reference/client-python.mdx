@@ -57,7 +57,7 @@ is closed cleanly on exit.
 
 ### Constructor
 
-```python
+```text
 PieClient(server_uri: str)
 ```
 
@@ -154,7 +154,7 @@ class Process:
 
 ```python
 process = await client.launch_process("my-inferlet@0.1.0",
-                                       input={"prompt": "..."})
+                                       input={"prompt": "Summarize Pie in one sentence."})
 
 while True:
     event, value = await process.recv()
@@ -219,7 +219,7 @@ buffers events for you (see *orphan events* in the source).
 
 ```python
 async with PieClient(uri) as c:
-    p = await c.launch_process("long-task@0.1.0", input={...})
+    p = await c.launch_process("long-task@0.1.0", input={"topic": "KV cache reuse"})
     pid = p.process_id
 
 # … later, possibly from a different process …

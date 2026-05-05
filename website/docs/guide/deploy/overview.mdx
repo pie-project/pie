@@ -31,7 +31,7 @@ The engine itself does not coordinate across instances today. For multi-engine d
 
 ### Inferlet distribution
 
-- **Local builds.** `pie run --path ./out.wasm --manifest ./Pie.toml ...`. The engine reads from disk. Right for tight dev loops.
+- **Local builds.** `pie run --path ./out.wasm --manifest ./Pie.toml -- ...`. The engine reads from disk. Right for tight dev loops.
 - **Client-uploaded builds.** A client uploads via the SDK's `add_program` / `install_program`. The engine keeps the upload while it is running. Right for CI deployments and one-off shares.
 - **Registry-published builds.** `bakery inferlet publish`. The engine pulls on first launch. Right for shared infrastructure and reproducibility.
 

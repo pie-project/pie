@@ -111,15 +111,16 @@ def submit(
         typer.Option("-l", "--link", help="Paths to .wasm library files to link."),
     ] = None,
     arguments: Annotated[
-        Optional[list[str]], typer.Argument(help="Arguments to pass to the inferlet.")
+        Optional[list[str]],
+        typer.Argument(help="Arguments to pass to the inferlet after `--`."),
     ] = None,
 ) -> None:
     """Submit an inferlet to a running Pie engine.
 
     You can specify an inferlet either by registry name or by path (mutually exclusive):
 
-    - By registry: pie-client submit text-completion@0.1.0
-    - By path: pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml
+    - By registry: pie-client submit text-completion@0.1.0 -- --prompt "hello"
+    - By path: pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml -- --prompt "hello"
     """
     try:
         submit_cmd.handle_submit_command(
