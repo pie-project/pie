@@ -11,7 +11,7 @@ The starting point. Each of these is a small inferlet that loads a model, builds
 | Inferlet | What it shows |
 |---|---|
 | [`helloworld`](https://github.com/pie-project/pie/tree/main/inferlets/helloworld) | Minimal `#[inferlet::main]` with typed JSON input/output. |
-| [`text-completion`](https://github.com/pie-project/pie/tree/main/inferlets/text-completion) | Chat-style generation via `Context::system / user / cue`, the per-step `Generator`, and independent `chat::Decoder` and `reasoning::Decoder`. |
+| [`text-completion`](https://github.com/pie-project/pie/tree/main/inferlets/text-completion) | Chat-style generation via `Context::system / user / cue`, the per-step `Generator`, and `chat::Decoder`. |
 | [`text-completion-spec`](https://github.com/pie-project/pie/tree/main/inferlets/text-completion-spec) | Same shape, but exercises the speculative-decoding path (`Speculation::Default` → backend NGRAM). |
 | [`python-example`](https://github.com/pie-project/pie/tree/main/inferlets/python-example) | Text completion in Python. |
 | [`js-example`](https://github.com/pie-project/pie/tree/main/inferlets/js-example) | Text completion in JavaScript. |

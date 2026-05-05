@@ -1,12 +1,12 @@
-# Text Completion Inferlet
+# text-completion
 
-A simple inferlet for text completion tasks.
+A small chat-style text generation inferlet.
 
 ## Usage
 
-This inferlet accepts a prompt and optional parameters to generate text completions.
+Accepts a prompt and optional sampling parameters.
 
-### Inputs
+## Inputs
 
 - `prompt`: The user message to complete.
 - `system` (optional): System prompt.
@@ -14,6 +14,6 @@ This inferlet accepts a prompt and optional parameters to generate text completi
 - `temperature` (optional): Sampling temperature.
 - `top_p` (optional): Nucleus sampling threshold.
 
-### Outputs
+## Output
 
-- `completion`: The generated text.
+A string containing the generated text. Thinking tags are left in the text when the model emits them.

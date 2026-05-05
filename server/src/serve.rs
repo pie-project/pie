@@ -183,6 +183,7 @@ pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtim
 /// the caller can drive (wait-and-shutdown for plain serve, or hand
 /// off to a TUI for the monitor path).
 pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
+    let listener = pie::server::bind(&user_cfg.server.host, user_cfg.server.port).await?;
     let mut handshakes: Vec<ModelHandshake> = Vec::with_capacity(user_cfg.models.len());
     let mut drivers: Vec<DriverHandle> = Vec::new();
     let mut rpc_servers: Vec<Arc<pie::device::RpcServer>> = Vec::new();
@@ -236,10 +237,11 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
 
         // Embedded options are typed; subprocess uses raw passthrough,
         // so it's only built when we know we're on the embedded path.
-        let embedded_base_opts = match resolved {
+        let mut embedded_base_opts = match resolved {
             ResolvedFlavor::Embedded(f) => Some(topology::build_embedded_options(m, f)?),
             ResolvedFlavor::Subprocess(_) => None,
         };
+        apply_portable_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
 
         // Resolve snapshot once per model — every group serves the same
         // weights against the same on-disk path.
@@ -314,20 +316,22 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
     let boot_cfg = bootstrap_translate::build(&user_cfg, &handshakes)
         .context("translating to bootstrap::Config")?;
 
-    let token = pie::bootstrap::bootstrap(boot_cfg)
+    let boot = pie::bootstrap::bootstrap_with_listener(boot_cfg, listener)
         .await
         .map_err(|e| anyhow!("pie::bootstrap::bootstrap: {e}"))?;
+    let bound_port = boot.port;
+    let token = boot.token;
 
-    eprintln!(
-        "pie-server serving on {}:{} ({} model(s))",
-        user_cfg.server.host,
-        user_cfg.server.port,
-        user_cfg.models.len(),
-    );
     if user_cfg.server.verbose {
+        eprintln!(
+            "pie-server serving on {}:{} ({} model(s))",
+            user_cfg.server.host,
+            bound_port,
+            user_cfg.models.len(),
+        );
         eprintln!("internal token: {token}");
+        eprintln!("press Ctrl-C to shut down");
     }
-    eprintln!("press Ctrl-C to shut down");
 
     let shmem_names: Vec<String> = drivers.iter().map(|d| d.shmem_name().to_string()).collect();
 
@@ -337,7 +341,7 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
         rpc_threads,
         shmem_names,
         token,
-        url: format!("ws://{}:{}", user_cfg.server.host, user_cfg.server.port),
+        url: format!("ws://{}:{}", user_cfg.server.host, bound_port),
     })
 }
 
@@ -482,6 +486,16 @@ fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> Driver
         },
         other => other.clone(),
     }
+}
+
+fn apply_portable_verbose(options: &mut Option<DriverOptions>, verbose: bool) {
+    #[cfg(feature = "driver-portable")]
+    if let Some(DriverOptions::Portable(p)) = options.as_mut() {
+        p.verbose = verbose;
+    }
+
+    #[cfg(not(feature = "driver-portable"))]
+    let _ = (options, verbose);
 }
 
 #[cfg(feature = "driver-cuda")]

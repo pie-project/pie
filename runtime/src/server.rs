@@ -14,8 +14,8 @@
 //! Process ↔ Client mappings are managed by the Process actor itself.
 //! Session state uses lock-free global DashMaps for zero-overhead lookups.
 
-mod handler;
 mod data_transfer;
+mod handler;
 
 pub use data_transfer::InFlightUpload;
 
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use base64::Engine as Base64Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -35,10 +35,9 @@ use tokio::task::{self, JoinHandle};
 use tokio_tungstenite::accept_async;
 use tungstenite::Message as WsMessage;
 
-
 use crate::auth;
+use crate::process::{self, ProcessEvent, ProcessId};
 use crate::service::{Service, ServiceHandler, ServiceMap};
-use crate::process::{self, ProcessId, ProcessEvent};
 use crate::workflow::{self, WorkflowId};
 
 /// Unique identifier for a connected client.
@@ -50,30 +49,55 @@ pub type ClientId = u32;
 
 static SERVICE: LazyLock<Service<ServerMessage>> = LazyLock::new(Service::new);
 
-/// Starts the server on the given address. `max_upload_bytes` caps
-/// per-upload buffer growth (program installs + blob transfers).
-pub fn spawn(host: &str, port: u16, max_upload_bytes: usize) {
+/// Binds the websocket listener. Callers that have expensive startup work can
+/// bind first, then pass the listener to [`spawn_listener`] after startup.
+pub async fn bind(host: &str, port: u16) -> Result<TcpListener> {
     let addr = format!("{}:{}", host, port);
+    TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("bind websocket listener on {addr}"))
+}
+
+/// Starts the server on a pre-bound listener. `max_upload_bytes` caps
+/// per-upload buffer growth (program installs + blob transfers).
+///
+/// Returns the actual bound port. This matters when the listener was bound to
+/// port `0`, where the OS picks an available ephemeral port.
+pub fn spawn_listener(listener: TcpListener, max_upload_bytes: usize) -> Result<u16> {
+    let bound_port = listener
+        .local_addr()
+        .context("read websocket listener local_addr")?
+        .port();
     SERVICE
-        .spawn::<Server, _>(move || Server::new(addr, max_upload_bytes))
-        .expect("Server already spawned");
+        .spawn::<Server, _>(move || Server::new(listener, max_upload_bytes))
+        .context("spawn websocket server actor")?;
+    Ok(bound_port)
+}
+
+/// Starts the server on the given address.
+pub async fn spawn(host: &str, port: u16, max_upload_bytes: usize) -> Result<u16> {
+    let listener = bind(host, port).await?;
+    spawn_listener(listener, max_upload_bytes)
 }
 
 // =============================================================================
 // Client Session Public API
 // =============================================================================
 
-static CLIENT_SERVICES: LazyLock<ServiceMap<ClientId, SessionMessage>> = LazyLock::new(ServiceMap::new);
+static CLIENT_SERVICES: LazyLock<ServiceMap<ClientId, SessionMessage>> =
+    LazyLock::new(ServiceMap::new);
 
 /// Sends a typed process event to a client.
 pub fn send_event(client_id: ClientId, process_id: ProcessId, event: &ProcessEvent) -> Result<()> {
-    CLIENT_SERVICES.send(&client_id, SessionMessage::Event {
-        process_id,
-        event: event.name().to_string(),
-        value: event.value().to_string(),
-    })
+    CLIENT_SERVICES.send(
+        &client_id,
+        SessionMessage::Event {
+            process_id,
+            event: event.name().to_string(),
+            value: event.value().to_string(),
+        },
+    )
 }
-
 
 /// Sends a binary file to a client for a specific process.
 pub fn send_file(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Result<()> {
@@ -83,7 +107,13 @@ pub fn send_file(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Res
 /// Registers a file waiter for a process. Returns the file bytes when the client delivers them.
 pub async fn receive_file(client_id: ClientId, process_id: ProcessId) -> Result<Bytes> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    CLIENT_SERVICES.send(&client_id, SessionMessage::ReceiveFile { process_id, sender: tx })?;
+    CLIENT_SERVICES.send(
+        &client_id,
+        SessionMessage::ReceiveFile {
+            process_id,
+            sender: tx,
+        },
+    )?;
     Ok(rx.await?)
 }
 
@@ -114,23 +144,22 @@ pub async fn send_mcp_request(
     params: String,
 ) -> Result<std::result::Result<String, String>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    CLIENT_SERVICES.send(&client_id, SessionMessage::McpRelay {
-        process_id,
-        server_name,
-        method,
-        params,
-        response: tx,
-    })?;
+    CLIENT_SERVICES.send(
+        &client_id,
+        SessionMessage::McpRelay {
+            process_id,
+            server_name,
+            method,
+            params,
+            response: tx,
+        },
+    )?;
     let (ok, result) = rx.await?;
     Ok(if ok { Ok(result) } else { Err(result) })
 }
 
 /// Spawns a new session actor for the given TCP connection.
-async fn spawn_session(
-    id: ClientId,
-    tcp_stream: TcpStream,
-    state: Arc<ServerState>,
-) -> Result<()> {
+async fn spawn_session(id: ClientId, tcp_stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
     let session = Session::new(id, tcp_stream, state).await?;
     CLIENT_SERVICES.spawn(id, || session)?;
     Ok(())
@@ -160,21 +189,20 @@ struct Server {
 }
 
 impl Server {
-    fn new(addr: String, max_upload_bytes: usize) -> Self {
+    fn new(listener: TcpListener, max_upload_bytes: usize) -> Self {
         let state = Arc::new(ServerState {
             next_client_id: AtomicU32::new(1),
             clients: DashMap::new(),
             max_upload_bytes,
         });
 
-        task::spawn(Self::listener_loop(addr, state.clone()));
+        task::spawn(Self::listener_loop(listener, state.clone()));
 
         Server { state }
     }
 
     /// Accepts incoming connections and spawns session actors.
-    async fn listener_loop(addr: String, state: Arc<ServerState>) {
-        let listener = TcpListener::bind(addr).await.unwrap();
+    async fn listener_loop(listener: TcpListener, state: Arc<ServerState>) {
         while let Ok((stream, _addr)) = listener.accept().await {
             // Disable Nagle's algorithm so small RPC messages don't sit waiting
             // for delayed-ACKs — without this, concurrent client requests see
@@ -243,13 +271,20 @@ static MCP_REGISTRATIONS: LazyLock<DashMap<ClientId, Vec<McpServerEntry>>> =
 #[derive(Debug)]
 enum SessionMessage {
     /// Text event to push to the client (stdout, stderr, message, return, error).
-    Event { process_id: ProcessId, event: String, value: String },
+    Event {
+        process_id: ProcessId,
+        event: String,
+        value: String,
+    },
     /// Binary file to push to the client.
     File { process_id: ProcessId, data: Bytes },
     /// WebSocket message received from client.
     ClientRequest(ClientMessage),
     /// Register a file waiter for a process (client → process delivery).
-    ReceiveFile { process_id: ProcessId, sender: tokio::sync::oneshot::Sender<Bytes> },
+    ReceiveFile {
+        process_id: ProcessId,
+        sender: tokio::sync::oneshot::Sender<Bytes>,
+    },
     /// MCP relay: inferlet wants to call an MCP server through this client.
     McpRelay {
         process_id: ProcessId,
@@ -293,11 +328,7 @@ struct Session {
 
 impl Session {
     /// Creates a new Session, accepting the TCP connection and spawning WS pumps.
-    async fn new(
-        id: ClientId,
-        tcp_stream: TcpStream,
-        state: Arc<ServerState>,
-    ) -> Result<Self> {
+    async fn new(id: ClientId, tcp_stream: TcpStream, state: Arc<ServerState>) -> Result<Self> {
         let (ws_msg_tx, mut ws_msg_rx) = mpsc::channel(1000);
 
         let ws_stream = accept_async(tcp_stream).await?;
@@ -334,7 +365,10 @@ impl Session {
                     };
 
                     // Send directly to session actor
-                    if CLIENT_SERVICES.send(&client_id, SessionMessage::ClientRequest(client_msg)).is_err() {
+                    if CLIENT_SERVICES
+                        .send(&client_id, SessionMessage::ClientRequest(client_msg))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -360,7 +394,6 @@ impl Session {
             mcp_corr_id: 1,
         })
     }
-
 
     /// Cleanup when session is terminated.
     fn cleanup(&mut self) {
@@ -406,7 +439,11 @@ impl ServiceHandler for Session {
                     self.handle_client_message(client_msg).await;
                 }
             }
-            SessionMessage::Event { process_id, event, value } => {
+            SessionMessage::Event {
+                process_id,
+                event,
+                value,
+            } => {
                 self.send_process_event(process_id, &event, value).await;
             }
             SessionMessage::File { process_id, data } => {
@@ -415,11 +452,18 @@ impl ServiceHandler for Session {
             SessionMessage::ReceiveFile { process_id, sender } => {
                 self.file_waiters.insert(process_id, sender);
             }
-            SessionMessage::McpRelay { process_id, server_name, method, params, response } => {
+            SessionMessage::McpRelay {
+                process_id,
+                server_name,
+                method,
+                params,
+                response,
+            } => {
                 let corr_id = self.mcp_corr_id;
                 self.mcp_corr_id += 1;
                 self.pending_mcp.insert(corr_id, response);
-                self.send_mcp_request_ws(corr_id, process_id, server_name, method, params).await;
+                self.send_mcp_request_ws(corr_id, process_id, server_name, method, params)
+                    .await;
             }
         }
     }
@@ -453,12 +497,22 @@ impl Session {
     async fn handle_auth_request(&mut self, corr_id: u32, username: String) -> Result<bool> {
         if !auth::is_auth_enabled().await? {
             self.username = username;
-            self.send_response(corr_id, true, "Authenticated (Engine disabled authentication)".to_string()).await;
+            self.send_response(
+                corr_id,
+                true,
+                "Authenticated (Engine disabled authentication)".to_string(),
+            )
+            .await;
             return Ok(true);
         }
 
         if !auth::user_exists(username.clone()).await? {
-            self.send_response(corr_id, false, format!("User '{}' is not authorized", username)).await;
+            self.send_response(
+                corr_id,
+                false,
+                format!("User '{}' is not authorized", username),
+            )
+            .await;
             bail!("User '{}' is not authorized", username)
         }
 
@@ -466,7 +520,10 @@ impl Session {
         let challenge_b64 = base64::engine::general_purpose::STANDARD.encode(&challenge);
         self.send_response(corr_id, true, challenge_b64).await;
 
-        self.pending_auth = Some(PendingAuth { username, challenge });
+        self.pending_auth = Some(PendingAuth {
+            username,
+            challenge,
+        });
         Ok(false)
     }
 
@@ -475,27 +532,38 @@ impl Session {
         let pending = match self.pending_auth.take() {
             Some(p) => p,
             None => {
-                self.send_response(corr_id, false, "No pending authentication".to_string()).await;
+                self.send_response(corr_id, false, "No pending authentication".to_string())
+                    .await;
                 bail!("Signature received without pending authentication")
             }
         };
 
-        let signature_bytes = match base64::engine::general_purpose::STANDARD.decode(signature_b64.as_bytes()) {
+        let signature_bytes = match base64::engine::general_purpose::STANDARD
+            .decode(signature_b64.as_bytes())
+        {
             Ok(bytes) => bytes,
             Err(e) => {
-                self.send_response(corr_id, false, format!("Invalid signature encoding: {}", e)).await;
+                self.send_response(corr_id, false, format!("Invalid signature encoding: {}", e))
+                    .await;
                 bail!("Failed to decode signature: {}", e)
             }
         };
 
-        let verified = auth::verify_signature(pending.username.clone(), pending.challenge, signature_bytes).await?;
+        let verified =
+            auth::verify_signature(pending.username.clone(), pending.challenge, signature_bytes)
+                .await?;
 
         if !verified {
-            self.send_response(corr_id, false, "Signature verification failed".to_string()).await;
-            bail!("Signature verification failed for user '{}'", pending.username)
+            self.send_response(corr_id, false, "Signature verification failed".to_string())
+                .await;
+            bail!(
+                "Signature verification failed for user '{}'",
+                pending.username
+            )
         }
 
-        self.send_response(corr_id, true, "Authenticated".to_string()).await;
+        self.send_response(corr_id, true, "Authenticated".to_string())
+            .await;
         self.username = pending.username;
         Ok(true)
     }
@@ -545,7 +613,12 @@ impl Session {
         .await;
     }
 
-    pub(super) async fn send_process_event(&self, process_id: ProcessId, event: &str, value: String) {
+    pub(super) async fn send_process_event(
+        &self,
+        process_id: ProcessId,
+        event: &str,
+        value: String,
+    ) {
         let uuid_str = process_id.to_string();
         self.send(WireServerMessage::ProcessEvent {
             process_id: uuid_str,
@@ -591,7 +664,7 @@ impl Session {
                 self.send_response(corr_id, false, "Already authenticated".to_string())
                     .await;
             }
-            
+
             ClientMessage::AuthByToken { corr_id, token: _ } => {
                 self.send_response(corr_id, true, "Already authenticated".to_string())
                     .await;
@@ -702,12 +775,19 @@ impl Session {
                 args,
                 url,
             } => {
-                let entry = McpServerEntry { name, transport, command, args, url };
+                let entry = McpServerEntry {
+                    name,
+                    transport,
+                    command,
+                    args,
+                    url,
+                };
                 MCP_REGISTRATIONS
                     .entry(self.id)
                     .or_insert_with(Vec::new)
                     .push(entry);
-                self.send_response(corr_id, true, "MCP server registered".to_string()).await;
+                self.send_response(corr_id, true, "MCP server registered".to_string())
+                    .await;
             }
 
             ClientMessage::McpResponse {

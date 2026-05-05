@@ -220,6 +220,10 @@ fn insert_str(table: &mut toml::Table, key: &str, value: impl Into<String>) {
     table.insert(key.into(), toml::Value::String(value.into()));
 }
 
+fn insert_bool(table: &mut toml::Table, key: &str, value: bool) {
+    table.insert(key.into(), toml::Value::Boolean(value));
+}
+
 fn insert_table(doc: &mut toml::Table, key: &str, table: toml::Table) {
     doc.insert(key.into(), toml::Value::Table(table));
 }
@@ -325,8 +329,6 @@ pub fn write_startup_toml(
 
     let mut model = toml::Table::new();
     insert_str(&mut model, "hf_path", path_string(snapshot_dir));
-    insert_int(&mut model, "n_gpu_layers", options.n_gpu_layers);
-    insert_int(&mut model, "n_ctx", options.n_ctx);
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -340,6 +342,10 @@ pub fn write_startup_toml(
     let mut aux_ipc = toml::Table::new();
     insert_str(&mut aux_ipc, "socket_path", path_string(aux_socket_path));
     insert_table(&mut doc, "aux_ipc", aux_ipc);
+
+    let mut runtime = toml::Table::new();
+    insert_bool(&mut runtime, "verbose", options.verbose);
+    insert_table(&mut doc, "runtime", runtime);
 
     write_toml_table(out_path, doc)
 }

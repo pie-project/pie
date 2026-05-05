@@ -8,9 +8,9 @@
 // — no GGUF involved. Multimodal-wrapper checkpoints (Ministral 3, Gemma 4)
 // substitute the canonical "model." prefix via Model::tname_().
 //
-// Backend selection follows ggml's registered devices: prefer_gpu picks
-// CUDA / Metal / Vulkan via ggml_backend_init_best() and falls back to
-// CPU when no GPU device is available.
+// Backend selection follows ggml's registered devices: pick the best compiled
+// backend via ggml_backend_init_best() and fall back to CPU when no GPU device
+// is available.
 
 #include <cstdint>
 #include <filesystem>
@@ -215,11 +215,10 @@ public:
     //   <snapshot_dir>/config.json
     //   <snapshot_dir>/model.safetensors  OR  <...>/model.safetensors.index.json
     //
-    // `prefer_gpu`: if true, picks the best registered GPU backend
-    // (CUDA / Metal / Vulkan, depending on what was compiled into ggml).
-    // Falls back to CPU if no GPU backend is available.
-    explicit Model(const std::filesystem::path& snapshot_dir,
-                   bool prefer_gpu = false);
+    // Picks the best registered backend (CUDA / Metal / Vulkan, depending on
+    // what was compiled into ggml). Falls back to CPU if no GPU backend is
+    // available.
+    explicit Model(const std::filesystem::path& snapshot_dir, bool verbose = false);
     ~Model();
 
     Model(const Model&) = delete;

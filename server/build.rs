@@ -111,7 +111,8 @@ fn build_portable() {
         // ggml-metal links against Apple's MetalKit / Foundation. The
         // C++ side handles those via xcrun; we just need to flip the
         // ggml flag and add the framework links below.
-        cfg.define("GGML_STATIC", "ON");
+        cfg.define("GGML_STATIC", "ON")
+            .define("GGML_METAL_EMBED_LIBRARY", "ON");
     }
     // Disable ggml-cpu's OpenMP unconditionally. macOS's Apple clang
     // doesn't ship libomp; on Linux, `-Wl,--as-needed -lgomp` is

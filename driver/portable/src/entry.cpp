@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <CLI/CLI.hpp>
+#include <ggml.h>
 #include <ggml-backend.h>
 #include <nlohmann/json.hpp>
 
@@ -111,6 +112,11 @@ std::vector<std::uint64_t> seq_ctx_ids(std::size_t count) {
     std::vector<std::uint64_t> v(count);
     for (std::size_t i = 0; i < count; ++i) v[i] = i + 1;
     return v;
+}
+
+void quiet_ggml_log(enum ggml_log_level level, const char* text, void*) {
+    (void)level;
+    (void)text;
 }
 
 enum class OfflineTestMode {
@@ -236,15 +242,18 @@ int run_impl(int argc,
     CLI11_PARSE(app, argc, argv);
 
     const auto cfg = pie_portable_driver::load_config(config_path);
+    if (!cfg.runtime.verbose) {
+        ggml_log_set(quiet_ggml_log, nullptr);
+    }
 
     // Informational logs go to stderr — stdout is reserved for the READY
     // handshake line consumed by the Python wrapper.
-    std::cerr << "[pie-driver-portable] config loaded\n"
-              << "  shmem.name        = " << cfg.shmem.name << "\n"
-              << "  shmem.num_slots   = " << cfg.shmem.num_slots << "\n"
-              << "  model.hf_path     = " << cfg.model.hf_path << "\n"
-              << "  model.n_gpu_layers= " << cfg.model.n_gpu_layers << "\n"
-              << "  model.n_ctx       = " << cfg.model.n_ctx << "\n";
+    if (cfg.runtime.verbose) {
+        std::cerr << "[pie-driver-portable] config loaded\n"
+                  << "  shmem.name        = " << cfg.shmem.name << "\n"
+                  << "  shmem.num_slots   = " << cfg.shmem.num_slots << "\n"
+                  << "  model.hf_path     = " << cfg.model.hf_path << "\n";
+    }
 
     // ---- Backend discovery. Registers all backends compiled into ggml
     // (CPU + CUDA / Metal / Vulkan when those `GGML_*=ON` flags were set
@@ -253,20 +262,23 @@ int run_impl(int argc,
     ggml_backend_load_all();
 
     // ---- Load the model. -----------------------------------------------------
-    const bool prefer_gpu = (cfg.model.n_gpu_layers != 0);
-    std::cerr << "[pie-driver-portable] loading model from " << cfg.model.hf_path
-              << " (prefer_gpu=" << (prefer_gpu ? "yes" : "no") << ")\n";
-    pie_portable_driver::Model model(cfg.model.hf_path, prefer_gpu);
+    if (cfg.runtime.verbose) {
+        std::cerr << "[pie-driver-portable] loading model from " << cfg.model.hf_path
+                  << " (backend=best-available)\n";
+    }
+    pie_portable_driver::Model model(cfg.model.hf_path, cfg.runtime.verbose);
     const auto& h = model.hparams();
-    std::cerr << "[pie-driver-portable] loaded "
-              << model.arch_name_pie() << " ("
-              << h.num_hidden_layers << " layers, hidden=" << h.hidden_size
-              << ", heads=" << h.num_attention_heads << "/"
-              << h.num_key_value_heads << " kv, head_dim=" << h.head_dim
-              << ", vocab=" << h.vocab_size
-              << ", dtype=" << model.activation_dtype_str()
-              << ", buf=" << (model.buffer_size() / (1024.0 * 1024.0)) << " MiB"
-              << ", backend=" << model.backend_name() << ")\n";
+    if (cfg.runtime.verbose) {
+        std::cerr << "[pie-driver-portable] loaded "
+                  << model.arch_name_pie() << " ("
+                  << h.num_hidden_layers << " layers, hidden=" << h.hidden_size
+                  << ", heads=" << h.num_attention_heads << "/"
+                  << h.num_key_value_heads << " kv, head_dim=" << h.head_dim
+                  << ", vocab=" << h.vocab_size
+                  << ", dtype=" << model.activation_dtype_str()
+                  << ", buf=" << (model.buffer_size() / (1024.0 * 1024.0)) << " MiB"
+                  << ", backend=" << model.backend_name() << ")\n";
+    }
 
     // ---- Allocate forward engine + paged KV pool. ---------------------------
     // The runtime owns page allocation; we report total_pages and page_size
@@ -277,10 +289,12 @@ int run_impl(int argc,
     const std::int32_t page_size =
         static_cast<std::int32_t>(cfg.batching.kv_page_size);
     pie_portable_driver::ForwardEngine engine(model, total_pages, page_size);
-    std::cerr << "[pie-driver-portable] forward engine ready (total_pages="
-              << total_pages << ", page_size=" << page_size
-              << ", kv_buf=" << (engine.kv_buffer_size() / (1024.0 * 1024.0))
-              << " MiB)\n";
+    if (cfg.runtime.verbose) {
+        std::cerr << "[pie-driver-portable] forward engine ready (total_pages="
+                  << total_pages << ", page_size=" << page_size
+                  << ", kv_buf=" << (engine.kv_buffer_size() / (1024.0 * 1024.0))
+                  << " MiB)\n";
+    }
 
     // ---- Optional host swap pool + aux IPC (M7). ----------------------------
     std::unique_ptr<pie_portable_driver::HostSwapPool> swap_pool;
@@ -298,13 +312,15 @@ int run_impl(int argc,
             cpu_pages,
             page_size,
             ggml_type_size(GGML_TYPE_F16));
-        std::cerr << "[pie-driver-portable] host swap pool: "
-                  << cpu_pages << " pages × "
-                  << (swap_pool->page_bytes() / 1024.0) << " KiB/layer × "
-                  << hp.num_hidden_layers << " layers × 2 (K+V) = "
-                  << (cpu_pages * swap_pool->page_bytes() *
-                      hp.num_hidden_layers * 2 / (1024.0 * 1024.0))
-                  << " MiB\n";
+        if (cfg.runtime.verbose) {
+            std::cerr << "[pie-driver-portable] host swap pool: "
+                      << cpu_pages << " pages × "
+                      << (swap_pool->page_bytes() / 1024.0) << " KiB/layer × "
+                      << hp.num_hidden_layers << " layers × 2 (K+V) = "
+                      << (cpu_pages * swap_pool->page_bytes() *
+                          hp.num_hidden_layers * 2 / (1024.0 * 1024.0))
+                      << " MiB\n";
+        }
     }
     if (!cfg.aux_ipc.socket_path.empty()) {
         aux_server = std::make_unique<pie_portable_driver::AuxServer>(
@@ -314,8 +330,10 @@ int run_impl(int argc,
             adapters.get(),
             model.backend(),
             &model.hparams());
-        std::cerr << "[pie-driver-portable] aux IPC listening on "
-                  << cfg.aux_ipc.socket_path << "\n";
+        if (cfg.runtime.verbose) {
+            std::cerr << "[pie-driver-portable] aux IPC listening on "
+                      << cfg.aux_ipc.socket_path << "\n";
+        }
     }
 
     // ---- Offline self-test paths. ------------------------------------------
@@ -357,13 +375,15 @@ int run_impl(int argc,
     }
 
     // ---- Capability handshake. ----------------------------------------------
-    // Pie's runtime reads this JSON line and constructs a `DriverCapabilities`
-    // (see `pie/src/pie/capabilities.py`). KV pages and swap pool size stay
-    // 0 in M1.2 — the KV manager (M2) computes real values.
+    // Advertise the largest single context the KV pool can hold. Model
+    // metadata such as max_position_embeddings may describe the training
+    // window, but it should not impose a runtime admission cap.
     const std::uint32_t max_model_len =
-        static_cast<std::uint32_t>(std::min<std::int32_t>(
-            h.max_position_embeddings,
-            static_cast<std::int32_t>(cfg.model.n_ctx)));
+        static_cast<std::uint32_t>(
+            std::max<std::int64_t>(
+                0,
+                static_cast<std::int64_t>(total_pages) *
+                    static_cast<std::int64_t>(page_size)));
     nlohmann::json caps = {
         {"total_pages",      total_pages},
         {"kv_page_size",     page_size},
@@ -383,10 +403,12 @@ int run_impl(int argc,
     const std::string caps_json = caps.dump();
     ready_cb(caps_json.c_str(), ready_ctx);
 
-    std::cerr << "[pie-driver-portable] serving on shmem " << server.name()
-              << " (" << server.num_slots() << " slots, "
-              << "req_buf=" << server.req_buf_size() << ", "
-              << "resp_buf=" << server.resp_buf_size() << ")\n";
+    if (cfg.runtime.verbose) {
+        std::cerr << "[pie-driver-portable] serving on shmem " << server.name()
+                  << " (" << server.num_slots() << " slots, "
+                  << "req_buf=" << server.req_buf_size() << ", "
+                  << "resp_buf=" << server.resp_buf_size() << ")\n";
+    }
 
     std::uint64_t handled = 0;
 
@@ -408,7 +430,7 @@ int run_impl(int argc,
             return 0;
         }
 
-        if (handled <= 4 || handled % 100 == 0) {
+        if (cfg.runtime.verbose && (handled <= 4 || handled % 100 == 0)) {
             const auto tokens =
                 decoded.as<std::uint32_t>(pie_portable_driver::schema::A_TOKEN_IDS);
             const auto context_ids =
@@ -426,8 +448,10 @@ int run_impl(int argc,
             const auto compute_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - t_compute_start).count();
-            std::cerr << "[pie-driver-portable] req_id=" << req.req_id
-                      << " engine.run done in " << compute_ms << " ms\n";
+            if (cfg.runtime.verbose) {
+                std::cerr << "[pie-driver-portable] req_id=" << req.req_id
+                          << " engine.run done in " << compute_ms << " ms\n";
+            }
             return rc;
         } catch (const std::exception& e) {
             std::cerr << "[pie-driver-portable] forward failed for req_id="
@@ -437,8 +461,10 @@ int run_impl(int argc,
     });
 
     unregister_server(&server);
-    std::cerr << "[pie-driver-portable] shutting down (handled " << handled
-              << " requests)\n";
+    if (cfg.runtime.verbose) {
+        std::cerr << "[pie-driver-portable] shutting down (handled " << handled
+                  << " requests)\n";
+    }
     // Print per-stage timings on demand (e.g. e2e benchmarks). Default
     // off so production logs stay quiet.
     if (std::getenv("PIE_PORTABLE_LOG_TIMINGS")) {

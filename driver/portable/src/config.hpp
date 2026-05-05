@@ -24,19 +24,16 @@ struct AuxIpcConfig {
     std::string socket_path;
 };
 
+struct RuntimeConfig {
+    bool verbose = false;
+};
+
 struct ModelConfig {
     // Path to a HuggingFace snapshot directory containing config.json and
     // model.safetensors (optionally model.safetensors.index.json for sharded
     // checkpoints). Resolved by the Python wrapper from `hf_repo`, or set
     // directly for local dev. Required.
     std::string hf_path;
-    // 0 = CPU only, -1 = offload all layers to GPU, N = first N on GPU.
-    // Backend is CPU-only in v1; this knob lands when CUDA/Metal backends
-    // are wired up in M11.
-    std::int32_t n_gpu_layers = 0;
-    // Upper bound on max_position_embeddings the runtime may dispatch.
-    // Informational — does not size the KV cache (total_pages does).
-    std::uint32_t n_ctx = 4096;
 };
 
 struct BatchingConfig {
@@ -54,6 +51,7 @@ struct Config {
     ModelConfig    model;
     BatchingConfig batching;
     AuxIpcConfig   aux_ipc;
+    RuntimeConfig  runtime;
 };
 
 inline Config load_config(const std::filesystem::path& path) {
@@ -73,8 +71,6 @@ inline Config load_config(const std::filesystem::path& path) {
     }
     if (auto m = tbl["model"].as_table()) {
         c.model.hf_path      = (*m)["hf_path"].value_or(std::string{});
-        c.model.n_gpu_layers = (*m)["n_gpu_layers"].value_or<int64_t>(c.model.n_gpu_layers);
-        c.model.n_ctx        = (*m)["n_ctx"].value_or<int64_t>(c.model.n_ctx);
     }
     if (auto b = tbl["batching"].as_table()) {
         c.batching.kv_page_size     = (*b)["kv_page_size"].value_or<int64_t>(c.batching.kv_page_size);
@@ -85,6 +81,9 @@ inline Config load_config(const std::filesystem::path& path) {
     }
     if (auto a = tbl["aux_ipc"].as_table()) {
         c.aux_ipc.socket_path = (*a)["socket_path"].value_or(std::string{});
+    }
+    if (auto r = tbl["runtime"].as_table()) {
+        c.runtime.verbose = (*r)["verbose"].value_or(c.runtime.verbose);
     }
 
     if (c.model.hf_path.empty()) {
