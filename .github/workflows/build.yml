@@ -95,7 +95,12 @@ jobs:
             archive: zip
             backend: cuda
             backend_env: "PIE_PORTABLE_CUDA=1"
-            cuda_arch: "75;80;86;89;90"
+            # Windows MSBuild + nvcc compiles ggml-cuda template instances
+            # very slowly on GitHub-hosted runners. Build one real+PTX arch
+            # for now; the PTX keeps the artifact forward-JIT-able on newer
+            # NVIDIA GPUs while keeping this target inside a practical CI
+            # budget.
+            cuda_arch: "75"
     runs-on: ${{ matrix.target.runner }}
     container: ${{ matrix.target.container || '' }}
     env:
