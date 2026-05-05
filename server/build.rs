@@ -127,7 +127,7 @@ fn build_portable() {
     }
     if vulkan_enabled {
         println!("cargo:rerun-if-env-changed=VULKAN_SDK");
-        define_vulkan_sdk_paths(&mut cfg, target_os);
+        define_vulkan_sdk_paths(&mut cfg, &target_os);
         cfg.define("GGML_STATIC", "ON");
     }
     if metal_enabled {
