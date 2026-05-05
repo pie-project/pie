@@ -41,7 +41,7 @@ pie serve [OPTIONS]
 | `--host <HOST>` | Override `[server].host` |
 | `--port <PORT>` | Override `[server].port` |
 | `--no-auth` | Disable authentication for this run |
-| `-v`, `--verbose` | Enable verbose logging |
+| `--debug` | Show engine, driver, and server diagnostics |
 | `-m`, `--monitor` | Launch the real-time TUI monitor alongside the server |
 | `--no-snapshot` | Disable the host-side Python snapshot optimization (overrides `[server].python_snapshot`) |
 
@@ -52,7 +52,7 @@ pie serve [OPTIONS]
 pie serve
 
 # Disable auth for development
-pie serve --no-auth -v
+pie serve --no-auth --debug
 
 # TUI monitor on a custom port
 pie serve -m --port 9000

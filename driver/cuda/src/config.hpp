@@ -62,11 +62,16 @@ struct DistributedConfig {
     std::string startup_barrier_path;
 };
 
+struct RuntimeConfig {
+    bool verbose = false;
+};
+
 struct Config {
     ShmemConfig shmem;
     ModelConfig model;
     BatchingConfig batching;
     DistributedConfig distributed;
+    RuntimeConfig runtime;
 };
 
 inline Config load_config(const std::filesystem::path& path) {
@@ -109,6 +114,9 @@ inline Config load_config(const std::filesystem::path& path) {
             (*d)["nccl_unique_id_hex"].value_or(std::string{});
         c.distributed.startup_barrier_path =
             (*d)["startup_barrier_path"].value_or(std::string{});
+    }
+    if (auto r = tbl["runtime"].as_table()) {
+        c.runtime.verbose = (*r)["verbose"].value_or(c.runtime.verbose);
     }
 
     if (c.model.hf_repo.empty()) {

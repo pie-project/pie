@@ -204,6 +204,7 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
     Engine e;
     e.boot_ = boot_cfg;
+    const bool verbose = boot_cfg.runtime.verbose;
 
     const std::filesystem::path snapshot{boot_cfg.model.snapshot_dir};
     e.hf_ = parse_hf_config(snapshot / "config.json");
@@ -548,10 +549,12 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
                 (void)bias_name;
             }
             CUDA_CHECK(cudaDeviceSynchronize());
-            std::cerr << "[pie-driver-cuda] AWQ -> bf16 eager dequant: "
-                      << awq_qw_names.size() << " projections, "
-                      << (awq_freed / (1024 * 1024)) << " MiB int4 -> "
-                      << (awq_allocated / (1024 * 1024)) << " MiB bf16\n";
+            if (verbose) {
+                std::cerr << "[pie-driver-cuda] AWQ -> bf16 eager dequant: "
+                          << awq_qw_names.size() << " projections, "
+                          << (awq_freed / (1024 * 1024)) << " MiB int4 -> "
+                          << (awq_allocated / (1024 * 1024)) << " MiB bf16\n";
+            }
             loaded_bytes = loaded_bytes - awq_freed + awq_allocated;
             break;  // Skip the marlin pass entirely.
         }
@@ -649,13 +652,15 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
                 e.weights_.emplace(canonical_w, std::move(bf16_w));
             }
             CUDA_CHECK(cudaDeviceSynchronize());
-            std::cerr << "[pie-driver-cuda] GPTQ -> bf16 eager dequant ("
-                      << (e.hf_.quant_desc_act ? "desc_act=true" : "")
-                      << (e.hf_.quant_desc_act && (!e.hf_.quant_sym || e.hf_.quant_zero_point) ? "+" : "")
-                      << ((!e.hf_.quant_sym || e.hf_.quant_zero_point) ? "asym" : "")
-                      << "): " << qw_names.size() << " projections, "
-                      << (freed / (1024 * 1024)) << " MiB int4 -> "
-                      << (allocated / (1024 * 1024)) << " MiB bf16\n";
+            if (verbose) {
+                std::cerr << "[pie-driver-cuda] GPTQ -> bf16 eager dequant ("
+                          << (e.hf_.quant_desc_act ? "desc_act=true" : "")
+                          << (e.hf_.quant_desc_act && (!e.hf_.quant_sym || e.hf_.quant_zero_point) ? "+" : "")
+                          << ((!e.hf_.quant_sym || e.hf_.quant_zero_point) ? "asym" : "")
+                          << "): " << qw_names.size() << " projections, "
+                          << (freed / (1024 * 1024)) << " MiB int4 -> "
+                          << (allocated / (1024 * 1024)) << " MiB bf16\n";
+            }
             loaded_bytes = loaded_bytes - freed + allocated;
             break;  // Skip the marlin pass.
         }
@@ -941,10 +946,12 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
         const double mib_b = static_cast<double>(bytes_before) / (1024.0 * 1024.0);
         const double mib_a = static_cast<double>(bytes_after) / (1024.0 * 1024.0);
-        std::cerr << "[pie-driver-cuda] gptq-int4 marlin: repacked "
-                  << quant_count << " projections, " << static_cast<std::uint64_t>(mib_b)
-                  << " -> " << static_cast<std::uint64_t>(mib_a)
-                  << " MiB (gz=" << group_size << ")\n";
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] gptq-int4 marlin: repacked "
+                      << quant_count << " projections, " << static_cast<std::uint64_t>(mib_b)
+                      << " -> " << static_cast<std::uint64_t>(mib_a)
+                      << " MiB (gz=" << group_size << ")\n";
+        }
 #endif
     } while (false);
 
@@ -1011,9 +1018,11 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
         }
         if (ct_count > 0) {
             CUDA_CHECK(cudaDeviceSynchronize());
-            std::cerr << "[pie-driver-cuda] compressed-tensors FP8: "
-                      << "registered " << ct_count
-                      << " quantised weights\n";
+            if (verbose) {
+                std::cerr << "[pie-driver-cuda] compressed-tensors FP8: "
+                          << "registered " << ct_count
+                          << " quantised weights\n";
+            }
         } else {
             // compressed-tensors covers FP8 / INT8 / W4A16 / etc. We
             // only handle the FP8 sub-mode (weights stored as FP8_E4M3
@@ -1083,9 +1092,11 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
                 e.weights_.emplace(n, std::move(bf16));
             }
             CUDA_CHECK(cudaDeviceSynchronize());
-            std::cerr << "[pie-driver-cuda] cast " << cast_names.size()
-                      << " tensors {fp16,fp32} -> bf16 to match the "
-                      << "GEMM pipeline\n";
+            if (verbose) {
+                std::cerr << "[pie-driver-cuda] cast " << cast_names.size()
+                          << " tensors {fp16,fp32} -> bf16 to match the "
+                          << "GEMM pipeline\n";
+            }
         }
     }
 
@@ -1259,12 +1270,14 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
         const double mib_before = static_cast<double>(bytes_before) / (1024.0 * 1024.0);
         const double mib_after  = static_cast<double>(bytes_after)  / (1024.0 * 1024.0);
-        std::cerr << "[pie-driver-cuda] runtime_quant=" << mode
-                  << " quantised " << quantized_count << " projections: "
-                  << static_cast<std::uint64_t>(mib_before) << " -> "
-                  << static_cast<std::uint64_t>(mib_after) << " MiB ("
-                  << static_cast<int>(100.0 * mib_after / std::max(mib_before, 1.0))
-                  << "% of original)\n";
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] runtime_quant=" << mode
+                      << " quantised " << quantized_count << " projections: "
+                      << static_cast<std::uint64_t>(mib_before) << " -> "
+                      << static_cast<std::uint64_t>(mib_after) << " MiB ("
+                      << static_cast<int>(100.0 * mib_after / std::max(mib_before, 1.0))
+                      << "% of original)\n";
+        }
     } while (false);
 
     // ── sm<89 eager FP8 → bf16 dequant ────────────────────────────────
@@ -1330,12 +1343,14 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
                 e.weights_.erase(s);
             }
             CUDA_CHECK(cudaDeviceSynchronize());
-            std::cerr << "[pie-driver-cuda] eager FP8 -> bf16 dequant "
-                      << "(sm" << dev_prop.major << dev_prop.minor
-                      << ", no native FP8 GEMM): " << fp8_weights.size()
-                      << " weights, " << (freed / (1024 * 1024))
-                      << " MiB FP8 -> " << (allocated / (1024 * 1024))
-                      << " MiB bf16\n";
+            if (verbose) {
+                std::cerr << "[pie-driver-cuda] eager FP8 -> bf16 dequant "
+                          << "(sm" << dev_prop.major << dev_prop.minor
+                          << ", no native FP8 GEMM): " << fp8_weights.size()
+                          << " weights, " << (freed / (1024 * 1024))
+                          << " MiB FP8 -> " << (allocated / (1024 * 1024))
+                          << " MiB bf16\n";
+            }
             loaded_bytes = loaded_bytes - freed + allocated;
         }
     }
@@ -1440,9 +1455,11 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
             }
             if (fused_count > 0) {
                 CUDA_CHECK(cudaDeviceSynchronize());
-                std::cerr << "[pie-driver-cuda] MoE fuse: synthesized "
-                          << fused_count << " (gate_up_proj, down_proj) "
-                          << "fused 3-D tensors from per-expert 2-D\n";
+                if (verbose) {
+                    std::cerr << "[pie-driver-cuda] MoE fuse: synthesized "
+                              << fused_count << " (gate_up_proj, down_proj) "
+                              << "fused 3-D tensors from per-expert 2-D\n";
+                }
             }
         }
     }
@@ -1451,10 +1468,12 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     const double mib = static_cast<double>(loaded_bytes) / (1024.0 * 1024.0);
 
-    std::cerr << "[pie-driver-cuda] loaded " << e.weights_.size() << " tensors ("
-              << static_cast<std::uint64_t>(mib) << " MiB on this rank, "
-              << "tp=" << tp_size << ") in " << static_cast<int>(ms)
-              << " ms; arch=" << e.hf_.arch_name << " (" << e.hf_.model_type << ")\n";
+    if (verbose) {
+        std::cerr << "[pie-driver-cuda] loaded " << e.weights_.size() << " tensors ("
+                  << static_cast<std::uint64_t>(mib) << " MiB on this rank, "
+                  << "tp=" << tp_size << ") in " << static_cast<int>(ms)
+                  << " ms; arch=" << e.hf_.arch_name << " (" << e.hf_.model_type << ")\n";
+    }
 
     return e;
 }

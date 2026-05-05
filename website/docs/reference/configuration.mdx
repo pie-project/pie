@@ -75,7 +75,7 @@ To add a second model, append another `[[model]]` block with a unique `name` and
 |-----|---------|-------------|
 | `host` | `127.0.0.1` | Bind address for the WebSocket server. |
 | `port` | `8080` | TCP port for client connections. |
-| `verbose` | `false` | Enable verbose engine logs (also reachable via `pie serve -v`). |
+| `verbose` | `false` | Enable engine diagnostics (also reachable via `pie serve --debug`). |
 | `registry` | `https://registry.pie-project.org/` | Inferlet registry the engine fetches from when `pie run <name>` is used without `--path`. |
 | `python_snapshot` | `true` | Use the host-side Python snapshot to skip cold-start interpreter init for Python inferlets. Disable with `--no-snapshot` for debugging. |
 | `max_concurrent_processes` | unset | Cap on simultaneously running inferlets. When set, an admission semaphore gates spawn requests; new processes wait for a slot. Unset means unlimited. Must be `> 0`. |

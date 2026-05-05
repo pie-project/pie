@@ -35,13 +35,13 @@ The server now accepts WebSocket clients. The model loads once at startup and se
 | `--host <HOST>` | Override `[server].host`. |
 | `--port <PORT>` | Override `[server].port`. |
 | `--no-auth` | Disable authentication for this run. |
-| `-v`, `--verbose` | Verbose logging. |
+| `--debug` | Show engine, driver, and server diagnostics. |
 | `-m`, `--monitor` | Launch the TUI alongside the server. |
 | `--no-snapshot` | Disable the host-side Python snapshot optimization. |
 
 ```bash
-# Custom port, no auth, verbose (dev)
-pie serve --port 9000 --no-auth -v
+# Custom port, no auth, debug diagnostics (dev)
+pie serve --port 9000 --no-auth --debug
 
 # Alternate config (e.g. for staging)
 pie serve -c ./staging.toml

@@ -149,7 +149,7 @@ impl EngineHandle {
 
 /// Boot the engine from an already-loaded + validated config. The CLI
 /// layer in [`crate::cli::serve_cmd`] is the only caller; it loads
-/// from TOML, applies `--host` / `--port` / `--no-auth` / `--verbose`
+/// from TOML, applies `--host` / `--port` / `--no-auth` / `--debug`
 /// / `--no-snapshot` overrides, then invokes us.
 pub fn run_with_config(user_cfg: config::Config) -> Result<()> {
     // Best-effort install of the Python WASM runtime tarball.
@@ -241,7 +241,7 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
             ResolvedFlavor::Embedded(f) => Some(topology::build_embedded_options(m, f)?),
             ResolvedFlavor::Subprocess(_) => None,
         };
-        apply_portable_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
+        apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
 
         // Resolve snapshot once per model — every group serves the same
         // weights against the same on-disk path.
@@ -488,13 +488,18 @@ fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> Driver
     }
 }
 
-fn apply_portable_verbose(options: &mut Option<DriverOptions>, verbose: bool) {
+fn apply_embedded_verbose(options: &mut Option<DriverOptions>, verbose: bool) {
     #[cfg(feature = "driver-portable")]
     if let Some(DriverOptions::Portable(p)) = options.as_mut() {
         p.verbose = verbose;
     }
 
-    #[cfg(not(feature = "driver-portable"))]
+    #[cfg(feature = "driver-cuda")]
+    if let Some(DriverOptions::CudaNative { opts, .. }) = options.as_mut() {
+        opts.verbose = verbose;
+    }
+
+    #[cfg(not(any(feature = "driver-portable", feature = "driver-cuda")))]
     let _ = (options, verbose);
 }
 

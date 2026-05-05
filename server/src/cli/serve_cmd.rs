@@ -31,9 +31,9 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_auth: bool,
 
-    /// Enable verbose logging (sets `[server].verbose = true`).
-    #[arg(short = 'v', long)]
-    pub verbose: bool,
+    /// Show engine, driver, and server diagnostics.
+    #[arg(long)]
+    pub debug: bool,
 
     /// Disable the host-side Python snapshot optimization for this run
     /// (overrides `[server].python_snapshot`).
@@ -63,16 +63,12 @@ pub fn run(args: ServeArgs) -> Result<()> {
     if args.no_auth {
         cfg.auth.enabled = false;
     }
-    if args.verbose {
+    if args.debug {
         cfg.server.verbose = true;
     }
     if args.no_snapshot {
         cfg.server.python_snapshot = false;
     }
-    // Heavy testing phase: verbose startup details are enabled by
-    // default, regardless of older configs that set `verbose = false`.
-    cfg.server.verbose = true;
-
     if args.monitor {
         run_with_monitor(cfg)
     } else {
