@@ -126,6 +126,8 @@ fn build_portable() {
         cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
     }
     if vulkan_enabled {
+        println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+        define_vulkan_sdk_paths(&mut cfg, target_os);
         cfg.define("GGML_STATIC", "ON");
     }
     if metal_enabled {
@@ -349,6 +351,33 @@ fn build_cuda() {
 // -----------------------------------------------------------------------------
 // Shared helpers
 // -----------------------------------------------------------------------------
+
+fn define_vulkan_sdk_paths(cfg: &mut cmake::Config, target_os: &str) {
+    let Ok(sdk) = std::env::var("VULKAN_SDK") else {
+        return;
+    };
+    let sdk = PathBuf::from(sdk);
+
+    let include_dir = sdk.join("Include");
+    if include_dir.join("vulkan").join("vulkan.h").is_file() {
+        cfg.define("Vulkan_INCLUDE_DIR", include_dir.display().to_string());
+    }
+
+    let library_candidates: &[&str] = if target_os == "windows" {
+        &["Lib/vulkan-1.lib", "lib/vulkan-1.lib"]
+    } else if target_os == "macos" {
+        &["lib/libvulkan.dylib", "Lib/libvulkan.dylib"]
+    } else {
+        &["lib/libvulkan.so", "Lib/libvulkan.so"]
+    };
+    for candidate in library_candidates {
+        let library = sdk.join(candidate);
+        if library.is_file() {
+            cfg.define("Vulkan_LIBRARY", library.display().to_string());
+            break;
+        }
+    }
+}
 
 /// The embedded drivers are static CMake archives, but downstream crates may
 /// link them into a shared object (notably the pyo3 `pie-server` wheel). Keep

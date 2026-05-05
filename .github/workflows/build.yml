@@ -164,6 +164,26 @@ jobs:
           version: latest
           cache: true
 
+      - name: Install Vulkan SDK development files (windows only)
+        if: matrix.target.platform == 'windows' && matrix.target.backend == 'vulkan'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # humbletim/install-vulkan-sdk extracts the SDK tools directly from
+          # the Windows installer, but CMake's FindVulkan also needs the
+          # headers and import library. Run the official unattended installer
+          # into the same VULKAN_SDK root and verify the files ggml needs.
+          rm -rf "$VULKAN_SDK"
+          mkdir -p "$VULKAN_SDK"
+          ./vulkan_sdk.exe \
+            --root "$VULKAN_SDK" \
+            --accept-licenses \
+            --default-answer \
+            --confirm-command install \
+            copy_only=1
+          test -f "$VULKAN_SDK/Include/vulkan/vulkan.h"
+          test -f "$VULKAN_SDK/Lib/vulkan-1.lib"
+
       - name: Install CUDA toolkit (windows portable cuda only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35
