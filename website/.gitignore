@@ -12,8 +12,10 @@
 # Generated files
 .docusaurus
 .cache-loader
-# Copied from scripts/install.sh by the prestart/prebuild npm scripts.
+# Copied from scripts/install.* by the prestart/prebuild npm scripts.
 static/install.sh
+static/install.ps1
+static/install.cmd
 
 # Misc
 .DS_Store

@@ -15,8 +15,9 @@ This page gets the `pie` CLI onto your machine. After this, see [Initial setup](
 | Linux x86_64 | `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, and `portable-cuda*` |
 | Linux aarch64 | `portable` |
 | macOS Apple Silicon | `portable` |
+| Windows x86_64 | `portable-vulkan`, `portable-cuda` |
 
-Windows native and Intel Macs are not supported. On Windows, use WSL and the Linux build.
+Intel Macs are not supported.
 
 `portable` includes the ggml-backed embedded driver and is the fallback everywhere. The CUDA flavors are Linux x86_64 only and include the embedded `cuda_native` driver.
 
@@ -26,7 +27,19 @@ Windows native and Intel Macs are not supported. On Windows, use WSL and the Lin
 curl -fsSL https://pie-project.org/install.sh | bash
 ```
 
-The installer downloads a release tarball, installs `pie` into `~/.local/bin` by default, and auto-picks a flavor:
+On Windows PowerShell:
+
+```powershell
+irm https://pie-project.org/install.ps1 | iex
+```
+
+On Windows CMD:
+
+```cmd
+curl -fsSL https://pie-project.org/install.cmd -o install.cmd && install.cmd && del install.cmd
+```
+
+The Unix installer downloads a release tarball, installs `pie` into `~/.local/bin` by default, and auto-picks a flavor:
 
 - NVIDIA driver `>= 580`: `cuda13.0`
 - NVIDIA driver `>= 525`: `cuda12.8`
@@ -41,6 +54,12 @@ curl -fsSL https://pie-project.org/install.sh | PIE_INSTALL_DIR=/usr/local/bin b
 ```
 
 Valid `PIE_FLAVOR` values are `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, `portable-cuda12.6`, `portable-cuda12.8`, and `portable-cuda13.0`.
+
+On Windows, the PowerShell installer downloads a zip archive and installs `pie.exe` into `%LOCALAPPDATA%\Pie\bin` by default. Valid Windows `PIE_FLAVOR` values are `portable-vulkan` and `portable-cuda`:
+
+```powershell
+$env:PIE_FLAVOR = "portable-cuda"; irm https://pie-project.org/install.ps1 | iex
+```
 
 To install a specific release tag:
 
