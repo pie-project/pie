@@ -6,9 +6,18 @@ sidebar_position: 5
 
 # SGLang
 
-`type = "sglang"`. Mirrors SGLang's `ServerArgs`; field names mirror SGLang verbatim so values flow through.
+`type = "sglang"`. A subprocess Python driver that delegates the forward pass to SGLang. Pie wraps SGLang's `ServerArgs`; field names match SGLang exactly, so values pass through unchanged.
 
-Pick SGLang when you want strong custom-mask support or its n-gram speculative decoding. Like vLLM, some inferlet features that depend on raw forward-pass control are not available through SGLang; those require a Pie-controlled driver such as [`cuda_native` or `dev`](./cuda).
+Use this driver to run a model that the embedded [`cuda_native` and `dev`](./cuda) drivers do not yet implement, or to run against SGLang's attention kernels and its n-gram speculative decoding.
+
+## Capabilities
+
+The bridge runs SGLang's standard causal attention. It replaces SGLang's `LogitsProcessor` with a hidden-state capture hook and runs the stock forward pass; there is no path for arbitrary attention masks. It reports the following through `DriverCapabilities`:
+
+- `supports_user_attention_mask = false`. User-supplied attention masks are silently dropped.
+- `supports_adapters = false`. `init_adapter`, `update_adapter`, and `load_adapter` raise `NotImplementedError`.
+
+Inferlets that need custom masks or adapter math must run on the [`cuda_native` or `dev`](./cuda) driver.
 
 ## Install
 
@@ -18,7 +27,7 @@ pie driver sglang set venv ~/.pie/venvs/sglang
 pie driver sglang doctor
 ```
 
-This installs `pie-driver-sglang` into a Python 3.12 virtual environment. SGLang, Torch, and FlashInfer pins are co-resolved; expect a large install.
+This installs `pie-driver-sglang` into a Python 3.12 virtual environment. SGLang, Torch, and FlashInfer pins are co-resolved. The install is large: roughly 5 to 10 GiB on disk.
 
 ## Configuration
 
@@ -43,10 +52,10 @@ kv_cache_dtype          = "auto"
 trust_remote_code       = true
 # context_length          = 8192         # default: read from HF config
 
-# Pinned-host KV pool for D2H/H2D swap (GiB). 0 = disabled.
+# Pinned-host KV pool for D2H/H2D swap (GiB). 0 disables swap.
 cpu_mem_budget_in_gb    = 0
 
-# n-gram speculative decoding (driver-supplied drafts)
+# n-gram speculative decoding (driver-side drafts)
 spec_ngram_enabled      = false
 spec_ngram_num_drafts   = 4
 spec_ngram_max_depth    = 18
@@ -55,20 +64,20 @@ spec_ngram_capacity     = 1_000_000
 
 | Key | Default | Description |
 |---|---|---|
-| `attention_backend` | `"triton"` | `triton` / `flashinfer` / `flex_attention` / `fa3` / `fa4` / `aiter` / `wave` / `torch_native` / etc. `triton` works on any NVIDIA SM 7.5+ and is stable across sglang versions. |
-| `mem_fraction_static` | `0.65` | Fraction of free GPU memory reserved for KV cache + activations. Lower than sglang's standalone `0.88` because pie's KV-rebind allocates a parallel tensor in pie's canonical layout. |
-| `page_size` | `16` | KV cache page size override. Unset lets sglang pick. |
-| `disable_radix_cache` | `true` | Disable SGLang's radix cache. Pie owns prefix sharing through its scheduler, so the default avoids duplicated caching work while still allowing explicit experiments. |
+| `attention_backend` | `"triton"` | `triton` / `flashinfer` / `flex_attention` / `fa3` / `fa4` / `aiter` / `wave` / `torch_native` / etc. `triton` works on any NVIDIA SM 7.5+ and is stable across SGLang versions. |
+| `mem_fraction_static` | `0.65` | Fraction of free GPU memory reserved for KV cache + activations. Lower than SGLang's standalone `0.88` because Pie's KV-rebind allocates a parallel tensor in Pie's canonical layout. |
+| `page_size` | `16` | KV cache page size override. Unset lets SGLang pick. |
+| `disable_radix_cache` | `true` | Disable SGLang's radix cache. Pie's scheduler owns prefix sharing, so the default avoids duplicated caching work. |
 | `disable_cuda_graph` | `false` | Run eager (no `torch.compile`, no CUDA graphs). |
-| `cuda_graph_max_bs` | unset | Override the largest CUDA-graph batch-size bin sglang captures. Unset = sglang's auto-pick. |
-| `max_running_requests` | unset | Cap on simultaneously-running requests. Unset = sglang's auto-pick based on `max_total_tokens`. |
-| `max_total_tokens` | unset | Cap on total tokens (across requests) per fire_batch. Unset = sglang's auto-pick. |
+| `cuda_graph_max_bs` | unset | Override the largest CUDA-graph batch-size bin SGLang captures. Unset uses SGLang's auto-pick. |
+| `max_running_requests` | unset | Cap on simultaneously-running requests. Unset uses SGLang's auto-pick based on `max_total_tokens`. |
+| `max_total_tokens` | unset | Cap on total tokens (across requests) per `fire_batch`. Unset uses SGLang's auto-pick. |
 | `chunked_prefill_size` | unset | Chunked-prefill size override. |
 | `kv_cache_dtype` | `"auto"` | KV cache element dtype. `auto` inherits the activation dtype. |
 | `trust_remote_code` | `true` | Trust user-supplied remote code in HF repos (needed for some models). |
 | `context_length` | unset | Explicit context length cap. Unset reads from HF config. |
-| `cpu_mem_budget_in_gb` | `0` | Pinned-host KV pool for D2H/H2D swap, in GiB. `0` disables swap. (Pie knob, not an sglang ServerArgs field.) |
-| `spec_ngram_enabled` | `false` | Enable n-gram speculative decoding (sglang-side drafting). The inferlet opts in to seeing drafts via `output_speculative_tokens(true)` on its forward pass; otherwise they are dropped. |
+| `cpu_mem_budget_in_gb` | `0` | Pinned-host KV pool for D2H/H2D swap, in GiB. `0` disables swap. (Pie knob, not an SGLang `ServerArgs` field.) |
+| `spec_ngram_enabled` | `false` | Enable n-gram speculative decoding. The driver maintains a per-session token history, proposes linear draft continuations, and the runtime verifies them in the shared batch path. The inferlet opts in to receiving drafts by calling `output_speculative_tokens(true)`; otherwise drafts are dropped. |
 | `spec_ngram_num_drafts` | `4` | Drafts proposed per accepted iteration. |
 | `spec_ngram_max_depth` | `18` | Maximum n-gram trie depth. |
 | `spec_ngram_capacity` | `1_000_000` | Approximate node budget for the trie. |

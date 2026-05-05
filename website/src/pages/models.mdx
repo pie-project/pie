@@ -51,13 +51,7 @@ import useBaseUrl from '@docusaurus/useBaseUrl';
     color: var(--pie-ink);
     margin: .15rem 0 0;
   }
-  .m-card-tag {
-    font-size: .72rem;
-    text-transform: uppercase;
-    letter-spacing: .04em;
-    color: var(--pie-ink-muted);
-    margin: 0;
-  }
+
   .m-card-desc {
     font-size: .88rem;
     color: var(--pie-ink-soft);
@@ -298,24 +292,24 @@ For configuration and supported architectures of each driver, see
 <div className="m-cards">
 
   <div className="m-card first">
-    <div className="m-card-tag">First-party</div>
+
     <h3 className="m-card-name">cuda</h3>
     <div className="m-card-desc">
-      Standalone C++/CUDA binary on FlashInfer. Pie's first-party path on
-      NVIDIA hardware, with the full inferlet feature set: custom forward,
-      page-trim, raw-logits sampling, LoRA.
+      Standalone C++/CUDA binary for high-throughput inference.
     </div>
     <div className="m-spec">
       <div className="m-spec-row">
         <span className="m-spec-label">Hardware</span>
         <div className="m-chips">
-          <span className="m-chip">CUDA SM 8.0+</span>
+          <span className="m-chip">SM 8.0+</span>
         </div>
       </div>
       <div className="m-spec-row">
         <span className="m-spec-label">Weights</span>
         <div className="m-chips">
           <span className="m-chip">bf16</span>
+          <span className="m-chip">int8</span>
+          <span className="m-chip">int4</span>
         </div>
       </div>
       <div className="m-spec-row">
@@ -329,31 +323,27 @@ For configuration and supported architectures of each driver, see
     </div>
   </div>
 
-  <div className="m-card cross">
-    <div className="m-card-tag">Cross-platform</div>
+  <div className="m-card first">
+
     <h3 className="m-card-name">portable</h3>
     <div className="m-card-desc">
-      Standalone C++ binary on <code>libggml</code>. Loads HF safetensors
-      and GGUF directly. GPU backend is selected at C++ build time.
+      Standalone C++ binary for local inference based on ggml.
     </div>
     <div className="m-spec">
       <div className="m-spec-row">
         <span className="m-spec-label">Hardware</span>
         <div className="m-chips">
           <span className="m-chip">CPU</span>
-          <span className="m-chip">CUDA</span>
           <span className="m-chip">Metal</span>
           <span className="m-chip">Vulkan</span>
-          <span className="m-chip">HIP</span>
-          <span className="m-chip">SYCL</span>
         </div>
       </div>
       <div className="m-spec-row">
         <span className="m-spec-label">Weights</span>
         <div className="m-chips">
           <span className="m-chip">bf16</span>
-          <span className="m-chip">fp16</span>
-          <span className="m-chip">Q4_K_M</span>
+          <span className="m-chip">int8</span>
+          <span className="m-chip">int4</span>
         </div>
       </div>
       <div className="m-spec-row">
@@ -368,11 +358,10 @@ For configuration and supported architectures of each driver, see
   </div>
 
   <div className="m-card delegate">
-    <div className="m-card-tag">Delegate</div>
+
     <h3 className="m-card-name">vllm@0.16.0</h3>
     <div className="m-card-desc">
-      Forwards inference to vLLM. Inherits vLLM's model zoo, decode kernels,
-      and quantization stack.
+        Delegates forward pass execution to vLLM. Check the Inferlet API <a href="/docs/reference/drivers/vllm">capability</a>.
     </div>
     <div className="m-spec">
       <div className="m-spec-row">
@@ -400,10 +389,10 @@ For configuration and supported architectures of each driver, see
   </div>
 
   <div className="m-card delegate">
-    <div className="m-card-tag">Delegate</div>
+
     <h3 className="m-card-name">sglang@0.5.9</h3>
     <div className="m-card-desc">
-      Forwards inference to SGLang. Spec-decoding via SGLang.
+      Delegates forward pass execution to SGLang. Check the Inferlet API <a href="/docs/reference/drivers/sglang">capability</a>.
     </div>
     <div className="m-spec">
       <div className="m-spec-row">
@@ -931,30 +920,5 @@ For configuration and supported architectures of each driver, see
 </tbody>
 </table>
 </div>
-
-<div className="m-foot">
-  <p>The <code>cuda</code> column reflects the <code>native</code> (PyTorch) driver, which is the default. The <code>cuda_native</code> C++/CUDA driver covers a slightly different set (e.g. it adds <code>qwen3_moe</code>, <code>qwen3_5_moe</code>, <code>gemma3n</code>, <code>olmo2</code>, plain <code>mistral</code>); see the <a href="/docs/reference/drivers/cuda">CUDA driver page</a> for details.</p>
-  <p>The <code>vllm</code> and <code>sglang</code> columns reflect the pinned versions Pie ships against (vllm 0.16.0, sglang 0.5.9). Architectures merged upstream after those releases — currently Gemma 4 / Gemma 4 MoE in both, and Qwen 3.5 / 3.6 in vllm — show as unsupported here even when newer builds carry them.</p>
-  <p>Some inferlet features (custom attention masks, page-trim, raw-logits samplers) remain native-only and are not available through the delegate drivers.</p>
-</div>
-
-## Adding a new architecture
-
-For a one-off, route the model at the `vllm` or `sglang` driver and rely on
-the upstream zoo. To add it as a first-party architecture, drop a
-`pie/src/pie_driver/model/<name>.py` file and register it in
-`pie/src/pie_driver/model/__init__.py` against the matching HF `model_type`.
-
-If your target architecture is not in the upstream backends either,
-[open an issue](https://github.com/pie-project/pie/issues) with the
-HuggingFace link.
-
-## Next
-
-- [CUDA driver](/docs/reference/drivers/cuda). Native + cuda_native config and architectures.
-- [Portable driver](/docs/reference/drivers/portable). ggml-backed standalone binary.
-- [vLLM driver](/docs/reference/drivers/vllm). vLLM-backed inference.
-- [SGLang driver](/docs/reference/drivers/sglang). SGLang-backed inference.
-- [Configuration](/docs/reference/configuration). Full `~/.pie/config.toml` reference.
 
 </div>

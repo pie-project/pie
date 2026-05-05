@@ -6,9 +6,18 @@ sidebar_position: 4
 
 # vLLM
 
-`type = "vllm"`. Pie wraps vLLM's `EngineArgs`; field names mirror vLLM verbatim so values flow through.
+`type = "vllm"`. A subprocess Python driver that delegates the forward pass to vLLM. Pie wraps vLLM's `EngineArgs`; field names match vLLM exactly, so values pass through unchanged.
 
-Pick vLLM when you need a model Pie's embedded drivers do not support yet but vLLM does, or when you want vLLM's mature decode-batch throughput on stock setups. Inferlet features that depend on raw forward-pass control (custom attention masks, page-trim, raw-logits samplers) are not available through vLLM; those require a Pie-controlled driver such as [`cuda_native` or `dev`](./cuda).
+Use this driver to run a model that the embedded [`cuda_native` and `dev`](./cuda) drivers do not yet implement, or to run against vLLM's attention kernels.
+
+## Capabilities
+
+The bridge runs vLLM's standard causal attention. It reports the following through `DriverCapabilities`:
+
+- `supports_user_attention_mask = false`. User-supplied attention masks are silently dropped.
+- `supports_adapters = false`. `init_adapter`, `update_adapter`, and `load_adapter` raise `NotImplementedError`.
+
+Inferlets that need custom masks or adapter math must run on the [`cuda_native` or `dev`](./cuda) driver.
 
 ## Install
 
@@ -18,7 +27,7 @@ pie driver vllm set venv ~/.pie/venvs/vllm
 pie driver vllm doctor
 ```
 
-This installs `pie-driver-vllm` into a Python 3.12 virtual environment. vLLM, Torch, and FlashInfer pins are co-resolved; expect a large install.
+This installs `pie-driver-vllm` into a Python 3.12 virtual environment. vLLM, Torch, and FlashInfer pins are co-resolved. The install is large: roughly 5 to 10 GiB on disk.
 
 ## Configuration
 
@@ -37,7 +46,7 @@ max_num_seqs            = 256
 # block_size              = 16           # default: vllm picks per attention backend
 enforce_eager           = false          # disable CUDA graphs
 
-# n-gram speculative decoding (driver-supplied drafts)
+# n-gram speculative decoding (driver-side drafts)
 spec_ngram_enabled      = false
 spec_ngram_num_drafts   = 4
 spec_ngram_min_n        = 2
@@ -49,10 +58,10 @@ spec_ngram_max_n        = 4
 | `attention_backend` | unset | `FLASHINFER` / `FLASH_ATTN` / `TRITON_ATTN` / `FLEX_ATTENTION` / etc. Unset lets vLLM auto-pick per platform. |
 | `gpu_memory_utilization` | `0.9` | Fraction of free GPU memory for KV cache + activations. |
 | `max_num_seqs` | `256` | Max concurrent sequences in a batch. |
-| `max_num_batched_tokens` | unset | Max tokens (across all sequences) in a batch. Unset = vLLM's default. |
-| `block_size` | unset | KV cache block size override. Unset = vLLM picks based on attention backend's allowed sizes (FlashInfer: 16/32/64; FlashAttention: 16/32). |
+| `max_num_batched_tokens` | unset | Max tokens (across all sequences) in a batch. Unset uses vLLM's default. |
+| `block_size` | unset | KV cache block size override. Unset lets vLLM pick based on the attention backend's allowed sizes (FlashInfer: 16/32/64; FlashAttention: 16/32). |
 | `enforce_eager` | `false` | Disable `torch.compile` and CUDA graphs. |
-| `spec_ngram_enabled` | `false` | Enable n-gram speculative decoding (vLLM-side drafting). |
+| `spec_ngram_enabled` | `false` | Enable n-gram speculative decoding. The driver maintains a per-session token history, proposes linear draft continuations, and the runtime verifies them in the shared batch path. The inferlet opts in to receiving drafts by calling `output_speculative_tokens(true)`; otherwise drafts are dropped. |
 | `spec_ngram_num_drafts` | `4` | Drafts proposed per accepted iteration. |
 | `spec_ngram_min_n` | `2` | n-gram match window minimum. |
 | `spec_ngram_max_n` | `4` | n-gram match window maximum. |
