@@ -571,6 +571,7 @@ int run_impl(int argc,
     if (cli_tp_rank >= 0) cfg.distributed.tp_rank = cli_tp_rank;
     if (!cli_nccl_unique_id_hex.empty())
         cfg.distributed.nccl_unique_id_hex = cli_nccl_unique_id_hex;
+    const bool verbose = cfg.runtime.verbose;
     if (cfg.distributed.tp_size > 1 &&
         cfg.distributed.tp_rank > 0 &&
         cfg.distributed.nccl_unique_id_hex.empty()) {
@@ -597,14 +598,16 @@ int run_impl(int argc,
 
     // Informational logs go to stderr — stdout is reserved for the READY
     // handshake line consumed by the Python wrapper.
-    std::cerr << "[pie-driver-cuda] config loaded\n"
-              << "  shmem.name      = " << cfg.shmem.name << "\n"
-              << "  shmem.num_slots = " << cfg.shmem.num_slots << "\n"
-              << "  model.hf_repo   = " << cfg.model.hf_repo << "\n"
-              << "  model.device    = " << cfg.model.device << "\n"
-              << "  model.dtype     = " << cfg.model.dtype << "\n"
-              << "  tp_size         = " << cfg.distributed.tp_size << "\n"
-              << "  tp_rank         = " << cfg.distributed.tp_rank << "\n";
+    if (verbose) {
+        std::cerr << "[pie-driver-cuda] config loaded\n"
+                  << "  shmem.name      = " << cfg.shmem.name << "\n"
+                  << "  shmem.num_slots = " << cfg.shmem.num_slots << "\n"
+                  << "  model.hf_repo   = " << cfg.model.hf_repo << "\n"
+                  << "  model.device    = " << cfg.model.device << "\n"
+                  << "  model.dtype     = " << cfg.model.dtype << "\n"
+                  << "  tp_size         = " << cfg.distributed.tp_size << "\n"
+                  << "  tp_rank         = " << cfg.distributed.tp_rank << "\n";
+    }
 
     // Bind the requested CUDA device before NCCL init — ncclCommInitRank
     // captures whatever is current on the calling thread.
@@ -637,9 +640,11 @@ int run_impl(int argc,
         }
         tp_comm = pie_cuda_driver::NcclComm(
             cfg.distributed.tp_size, cfg.distributed.tp_rank, uid);
-        std::cerr << "[pie-driver-cuda] NCCL comm initialised "
-                  << "(world=" << tp_comm.world_size()
-                  << ", rank=" << tp_comm.rank() << ")\n";
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] NCCL comm initialised "
+                      << "(world=" << tp_comm.world_size()
+                      << ", rank=" << tp_comm.rank() << ")\n";
+        }
 
         // Smoke test: every rank contributes (rank+1); sum should be
         // world*(world+1)/2. Catches mis-numbered ranks at startup.
@@ -665,8 +670,10 @@ int run_impl(int argc,
                       << h_v << ", expected " << expected << "\n";
             return 3;
         }
-        std::cerr << "[pie-driver-cuda] NCCL smoke test ok ("
-                  << h_v << "==" << expected << ")\n";
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] NCCL smoke test ok ("
+                      << h_v << "==" << expected << ")\n";
+        }
     }
     pie_cuda_driver::NcclComm* tp_comm_ptr =
         (cfg.distributed.tp_size > 1) ? &tp_comm : nullptr;
@@ -783,11 +790,13 @@ int run_impl(int argc,
       : is_qwen3_5_arch   ? weights_qwen3_5.layers.size()
       : is_qwen3_5_moe_arch ? weights_qwen3_5_moe.layers.size()
                             : weights_llama.layers.size();
-    std::cerr << "[pie-driver-cuda] schema bound: "
-              << num_layers_bound << " layers ("
-              << engine.hf_config().model_type
-              << (engine.hf_config().use_qk_norm ? ", q/k norm" : "")
-              << ")\n";
+    if (verbose) {
+        std::cerr << "[pie-driver-cuda] schema bound: "
+                  << num_layers_bound << " layers ("
+                  << engine.hf_config().model_type
+                  << (engine.hf_config().use_qk_norm ? ", q/k norm" : "")
+                  << ")\n";
+    }
 
     // Pre-allocate persistent state for serving.
     //
@@ -915,14 +924,16 @@ int run_impl(int argc,
         const std::size_t total_bytes = num_linear_layers *
             static_cast<std::size_t>(q35_max_slots) *
             (per_slot_recurrent_bytes + per_slot_conv_bytes);
-        std::cerr << "[pie-driver-cuda] qwen3.5 state cache: "
-                  << num_linear_layers << " linear layers, "
-                  << q35_max_slots << " slots, "
-                  << (per_slot_recurrent_bytes + per_slot_conv_bytes)
-                  << " B/slot (recurrent="
-                  << per_slot_recurrent_bytes << " conv="
-                  << per_slot_conv_bytes << "), total ~"
-                  << (total_bytes / (1024 * 1024)) << " MiB\n";
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] qwen3.5 state cache: "
+                      << num_linear_layers << " linear layers, "
+                      << q35_max_slots << " slots, "
+                      << (per_slot_recurrent_bytes + per_slot_conv_bytes)
+                      << " B/slot (recurrent="
+                      << per_slot_recurrent_bytes << " conv="
+                      << per_slot_conv_bytes << "), total ~"
+                      << (total_bytes / (1024 * 1024)) << " MiB\n";
+        }
 
         if (is_qwen3_5_moe_arch) {
             qwen3_5_moe_ws = pie_cuda_driver::model::Qwen3_5MoeMlpWorkspace::allocate(
@@ -959,11 +970,13 @@ int run_impl(int argc,
         /*max_kv_pages=*/kv_cache.num_pages(),
         max_mask_bytes);
 
-    std::cerr << "[pie-driver-cuda] kv_cache: "
-              << kv_cache.num_pages() << " pages × "
-              << kv_cache.page_size() << " tokens; "
-              << "workspace tokens=" << max_workspace_tokens
-              << "; swap_pool=" << swap_pool.num_pages() << " pages\n";
+    if (verbose) {
+        std::cerr << "[pie-driver-cuda] kv_cache: "
+                  << kv_cache.num_pages() << " pages × "
+                  << kv_cache.page_size() << " tokens; "
+                  << "workspace tokens=" << max_workspace_tokens
+                  << "; swap_pool=" << swap_pool.num_pages() << " pages\n";
+    }
 
     // Cold-path control thread. Runtime → wrapper (RPC) → us (socketpair)
     // for KV swap operations. Gated on the wrapper having passed a valid
@@ -1106,12 +1119,14 @@ int run_impl(int argc,
             }
         }
 
-        std::cerr << "[pie-driver-cuda] model_type=" << mt
-                  << " use_qk_norm=" << fwd_cfg.use_qk_norm
-                  << " use_qkv_bias=" << fwd_cfg.use_qkv_bias
-                  << " rope=" << (fwd_cfg.rope_kind ==
-                       pie_cuda_driver::model::RopeKind::YaRN ? "yarn" : "standard")
-                  << "\n";
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] model_type=" << mt
+                      << " use_qk_norm=" << fwd_cfg.use_qk_norm
+                      << " use_qkv_bias=" << fwd_cfg.use_qkv_bias
+                      << " rope=" << (fwd_cfg.rope_kind ==
+                           pie_cuda_driver::model::RopeKind::YaRN ? "yarn" : "standard")
+                      << "\n";
+        }
     }
 
     if (is_gemma4_arch) {
@@ -1414,9 +1429,10 @@ int run_impl(int argc,
 
     pie_cuda_driver::ForwardContext fwd_ctx{
         engine, ws, kv_cache, attn_ws, cublas,
-        max_workspace_tokens, persistent_inputs, std::move(forward_fn),
+        max_workspace_tokens, persistent_inputs, verbose, std::move(forward_fn),
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
+        /*tp_cpu_gate_key=*/{},
         /*slot_alloc=*/{},
     };
     fwd_ctx.tp_cpu_gate_key = cfg.distributed.startup_barrier_path;
@@ -1428,7 +1444,7 @@ int run_impl(int argc,
         qwen3_5_state_cache.max_slots() > 0) {
         fwd_ctx.slot_alloc.reset(qwen3_5_state_cache.max_slots());
     }
-    if (use_cuda_graphs) {
+    if (verbose && use_cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
     }
 
@@ -1441,13 +1457,15 @@ int run_impl(int argc,
     tp_startup_cpu_barrier(cfg);
 
     if (is_tp_follower) {
-        std::cerr << "[pie-driver-cuda] tp follower rank "
-                  << cfg.distributed.tp_rank
-                  << " ready (waiting on rank-0 broadcasts"
-                  << (fwd_ctx.tp_cpu_gate_key.empty()
-                          ? ", cpu_gate=off"
-                          : ", cpu_gate=on")
-                  << ")\n";
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] tp follower rank "
+                      << cfg.distributed.tp_rank
+                      << " ready (waiting on rank-0 broadcasts"
+                      << (fwd_ctx.tp_cpu_gate_key.empty()
+                              ? ", cpu_gate=off"
+                              : ", cpu_gate=on")
+                      << ")\n";
+        }
         // Followers: block on rank-0 broadcasts until shutdown.
         std::atomic<bool> stop{false};
         pie_cuda_driver::tp_follower_serve(fwd_ctx, stop);
@@ -1475,10 +1493,12 @@ int run_impl(int argc,
         const std::string caps_json = caps.dump();
         ready_cb(caps_json.c_str(), ready_ctx);
 
-        std::cerr << "[pie-driver-cuda] serving on shmem " << server_p->name()
-                  << " (" << server_p->num_slots() << " slots, "
-                  << "req_buf=" << server_p->req_buf_size() << ", "
-                  << "resp_buf=" << server_p->resp_buf_size() << ")\n";
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] serving on shmem " << server_p->name()
+                      << " (" << server_p->num_slots() << " slots, "
+                      << "req_buf=" << server_p->req_buf_size() << ", "
+                      << "resp_buf=" << server_p->resp_buf_size() << ")\n";
+        }
         server_p->serve_forever([&](const pie_cuda_driver::SlotRequest& req,
                                     std::span<std::uint8_t> response) -> std::size_t {
             ++handled;
@@ -1501,8 +1521,10 @@ int run_impl(int argc,
     if (server_p) {
         unregister_server(server_p.get());
     }
-    std::cerr << "[pie-driver-cuda] shutting down (handled " << handled
-              << " requests)\n";
+    if (verbose) {
+        std::cerr << "[pie-driver-cuda] shutting down (handled " << handled
+                  << " requests)\n";
+    }
 
     if (control_thread.joinable()) {
         // Closing the wrapper-side fd makes recv() return 0 and the thread

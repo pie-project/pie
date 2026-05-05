@@ -3,7 +3,7 @@
 //! Subcommand layout is identical to the Python `pie_cli`:
 //!
 //! ```text
-//! pie serve   [--config --host --port --no-auth --verbose --no-snapshot]
+//! pie serve   [--config --host --port --no-auth --debug --no-snapshot]
 //! pie run     <inferlet> [--config --port --path --manifest --stdout]
 //! pie config  init|show|set
 //! pie auth    add|remove|list

@@ -95,7 +95,7 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub verbose: bool,
     #[serde(default = "default_registry")]
     pub registry: String,
@@ -110,7 +110,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
-            verbose: true,
+            verbose: false,
             registry: default_registry(),
             max_concurrent_processes: None,
             python_snapshot: true,
@@ -661,6 +661,8 @@ pub struct CudaNativeDriverOptions {
     pub max_num_kv_pages: u32,
     pub swap_pool_size: u32,
     pub weight_dtype: String,
+    #[serde(skip)]
+    pub verbose: bool,
     /// Runtime quantization mode applied after weight load. Empty = none;
     /// `"fp8"` enables per-tensor symmetric FP8_E4M3 on every llama-like
     /// projection weight. Currently only honored for model_type=qwen3 by
@@ -682,6 +684,7 @@ impl Default for CudaNativeDriverOptions {
             max_num_kv_pages: 1024,
             swap_pool_size: 0,
             weight_dtype: "bfloat16".to_string(),
+            verbose: false,
             runtime_quant: String::new(),
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,

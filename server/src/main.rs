@@ -3,7 +3,7 @@
 //! Subcommand layout (mirrors the legacy `pie_cli`):
 //!
 //! ```text
-//! pie serve   [--config --host --port --no-auth --verbose --no-snapshot --monitor]
+//! pie serve   [--config --host --port --no-auth --debug --no-snapshot --monitor]
 //! pie run     <inferlet> [...]
 //! pie new     <name> [--ts -o <dir>]      # forwards to `python3 -m bakery create`
 //! pie build   <path> -o <output>          # forwards to `python3 -m bakery build`

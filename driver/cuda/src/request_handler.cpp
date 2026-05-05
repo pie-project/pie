@@ -488,7 +488,7 @@ std::size_t handle_fire_batch(
                 cudaStreamDestroy(cstream);
                 ctx.graph_cache->put(key, exec);
                 const auto sz = ctx.graph_cache->size();
-                if (sz <= 4 || sz % 16 == 0) {
+                if (ctx.verbose && (sz <= 4 || sz % 16 == 0)) {
                     std::cerr << "[pie-driver-cuda] graph captured: R=" << R
                               << " (cache size=" << sz << ")\n";
                 }
@@ -746,7 +746,7 @@ std::size_t handle_fire_batch(
                 response, per_request_counts, sampled_tokens);
         }
 
-        if (handled <= 4 || handled % 100 == 0) {
+        if (ctx.verbose && (handled <= 4 || handled % 100 == 0)) {
             std::cerr << "[pie-driver-cuda] req_id=" << req.req_id
                       << " R=" << R << " N=" << N
                       << " sampled=" << num_sampling

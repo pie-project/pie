@@ -135,6 +135,7 @@ struct ForwardContext {
     // Pre-allocated input buffers — refreshed per fire via memcpy
     // rather than re-allocated. See `persistent_inputs.hpp`.
     PersistentInputs& inputs;
+    bool verbose = false;
     // Type-erased forward call. The captured weights / cfg / model
     // function are model-specific; the call site is uniform.
     ForwardFn forward_fn;

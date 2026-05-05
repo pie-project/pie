@@ -439,7 +439,8 @@ pub fn write_dummy_startup_toml(
 /// Write the cuda driver's startup TOML. Schema mirrors
 /// `driver/cuda/src/config.hpp`: `[shmem]` (8 MiB resp_buf), `[model]`
 /// with `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional `runtime_quant`,
-/// and `[batching]` with KV-page geometry plus `swap_pool_size`.
+/// `[batching]` with KV-page geometry plus `swap_pool_size`, and
+/// `[runtime]` with the server verbosity flag.
 ///
 /// `[distributed]` is emitted only for TP launches; single-rank uses the
 /// cuda driver's default (`tp_size=1, tp_rank=0`).
@@ -481,6 +482,10 @@ pub(crate) fn write_cuda_startup_toml(
     insert_int(&mut batching, "max_batch_size", opts.max_batch_size);
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
     insert_table(&mut doc, "batching", batching);
+
+    let mut runtime = toml::Table::new();
+    insert_bool(&mut runtime, "verbose", opts.verbose);
+    insert_table(&mut doc, "runtime", runtime);
 
     if let Some(tp) = tp {
         let mut distributed = toml::Table::new();
@@ -928,6 +933,22 @@ mod tests {
             1024
         );
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
+        assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn cuda_startup_toml_emits_runtime_verbose_when_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.verbose = true;
+
+        write_cuda_startup_toml(&out, &opts, "Q/q", &snap, "cuda:0", 0, None).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), true);
     }
 
     #[test]
