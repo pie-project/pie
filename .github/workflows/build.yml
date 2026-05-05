@@ -19,7 +19,7 @@ on:
         type: string
         default: "latest-build"
       portable:
-        description: "Build portable matrix (manylinux x86_64/aarch64 + macOS arm64)"
+        description: "Build portable matrix (manylinux x86_64/aarch64 + macOS arm64 + Windows x86_64 Vulkan/CUDA)"
         type: boolean
         default: true
       cuda:
@@ -43,7 +43,7 @@ env:
 
 jobs:
   # =========================================================================
-  # Portable matrix — no CUDA toolkit needed.
+  # Portable matrix — CPU/Metal/Vulkan plus Windows portable CUDA.
   # =========================================================================
   portable:
     if: inputs.portable
@@ -55,14 +55,18 @@ jobs:
           - label: x86_64-manylinux_2_28
             runner: ubuntu-22.04
             container: quay.io/pypa/manylinux_2_28_x86_64
+            platform: linux
             triple: x86_64-unknown-linux-gnu
             archive: tar.gz
+            backend: cpu
             backend_env: ""
           - label: aarch64-manylinux_2_28
             runner: ubuntu-22.04-arm
             container: quay.io/pypa/manylinux_2_28_aarch64
+            platform: linux
             triple: aarch64-unknown-linux-gnu
             archive: tar.gz
+            backend: cpu
             backend_env: ""
           - label: aarch64-darwin
             # macos-15 gets Xcode 16 with libc++ 17, which has
@@ -70,22 +74,28 @@ jobs:
             # libc++ 15, which doesn't.
             runner: macos-15
             container: ""
+            platform: macos
             triple: aarch64-apple-darwin
             archive: tar.gz
+            backend: metal
             backend_env: "PIE_PORTABLE_METAL=1"
-          # TODO(windows): re-enable once `runtime/src/shmem_ipc.rs`
-          # has a Windows backend (CreateFileMapping/MapViewOfFile).
-          # Currently it uses POSIX-only libc symbols (mmap, mode_t,
-          # PROT_READ, …) unconditionally, so the runtime crate
-          # doesn't compile on x86_64-pc-windows-msvc. Once shmem_ipc
-          # has a Windows impl, restore this entry with
-          # backend_env: "PIE_PORTABLE_VULKAN=1".
-          # - label: x86_64-windows
-          #   runner: windows-latest
-          #   container: ""
-          #   triple: x86_64-pc-windows-msvc
-          #   archive: zip
-          #   backend_env: "PIE_PORTABLE_VULKAN=1"
+          - label: x86_64-windows-portable-vulkan
+            runner: windows-latest
+            container: ""
+            platform: windows
+            triple: x86_64-pc-windows-msvc
+            archive: zip
+            backend: vulkan
+            backend_env: "PIE_PORTABLE_VULKAN=1"
+          - label: x86_64-windows-portable-cuda
+            runner: windows-latest
+            container: ""
+            platform: windows
+            triple: x86_64-pc-windows-msvc
+            archive: zip
+            backend: cuda
+            backend_env: "PIE_PORTABLE_CUDA=1"
+            cuda_arch: "75;80;86;89;90"
     runs-on: ${{ matrix.target.runner }}
     container: ${{ matrix.target.container || '' }}
     env:
@@ -148,11 +158,25 @@ jobs:
           targets: ${{ matrix.target.triple }}
 
       - name: Install Vulkan SDK (windows only)
-        if: matrix.target.label == 'x86_64-windows'
+        if: matrix.target.platform == 'windows' && matrix.target.backend == 'vulkan'
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: latest
           cache: true
+
+      - name: Install CUDA toolkit (windows portable cuda only)
+        if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.9.1'
+
+      - name: Verify CUDA toolkit (windows portable cuda only)
+        if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          nvcc --version
+          test -n "${CUDA_PATH:-${CUDA_HOME:-}}"
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -171,11 +195,28 @@ jobs:
           if [ -n "${{ matrix.target.backend_env }}" ]; then
             export ${{ matrix.target.backend_env }}
           fi
+          if [[ "${{ matrix.target.backend }}" == "cuda" ]]; then
+            export PIE_PORTABLE_CUDA_ARCH='${{ matrix.target.cuda_arch }}'
+          fi
+          if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
+            # ggml-vulkan nests a shader-generator CMake build under Cargo's
+            # OUT_DIR, and ggml-cuda produces many long object paths. Keep the
+            # target root short enough for MSBuild's legacy 260-character path
+            # limit on Windows, and isolate backend flavors from each other.
+            export CARGO_TARGET_DIR="C:/t/pie-${{ matrix.target.backend }}"
+            # Keep MSBuild/ggml from saturating smaller Windows hosts.
+            export CMAKE_BUILD_PARALLEL_LEVEL=4
+          fi
+          cargo_jobs=()
+          if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
+            cargo_jobs=(-j 4)
+          fi
           # `release-min`: thin LTO, panic=abort, strip=symbols.
           # Defined in workspace Cargo.toml. Smaller + faster than
           # plain `release` (no LTO at all by default), without fat
           # LTO's many-hour link cost. Distribution profile.
           cargo build --profile release-min \
+            "${cargo_jobs[@]}" \
             --target ${{ matrix.target.triple }} \
             -p pie-server \
             --features driver-portable,driver-dummy
@@ -185,7 +226,11 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p dist
-          BIN_DIR="target/${{ matrix.target.triple }}/release-min"
+          TARGET_ROOT="target"
+          if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
+            TARGET_ROOT="C:/t/pie-${{ matrix.target.backend }}"
+          fi
+          BIN_DIR="${TARGET_ROOT}/${{ matrix.target.triple }}/release-min"
           if [[ "${{ matrix.target.archive }}" == "zip" ]]; then
             # Windows .exe; 7z preinstalled on windows-latest.
             7z a "dist/${ARTIFACT_NAME}" "${BIN_DIR}/pie.exe"

@@ -52,7 +52,7 @@ fn build_portable() {
     let cuda_enabled = std::env::var("PIE_PORTABLE_CUDA").is_ok();
     let vulkan_enabled = std::env::var("PIE_PORTABLE_VULKAN").is_ok();
     let metal_enabled = std::env::var("PIE_PORTABLE_METAL").is_ok();
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_os = target_os();
     println!("cargo:rerun-if-env-changed=PIE_PORTABLE_CUDA");
     println!("cargo:rerun-if-env-changed=PIE_PORTABLE_VULKAN");
     println!("cargo:rerun-if-env-changed=PIE_PORTABLE_METAL");
@@ -73,7 +73,28 @@ fn build_portable() {
     // other's CMake cache. Without this, the second cmake::Config
     // invocation overwrites the first's `build/` and reconfigures
     // it for the wrong project.
-    cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("portable"));
+    let portable_out_dir = if target_os == "windows" {
+        // ggml-vulkan creates a nested shader-generator CMake project.
+        // Keeping this out of Cargo's hashed OUT_DIR avoids MSBuild's legacy
+        // 260-character path limit on Windows.
+        let target_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("OUT_DIR").unwrap()));
+        let mut flavor = String::from("portable");
+        if cuda_enabled {
+            flavor.push_str("-cuda");
+        }
+        if vulkan_enabled {
+            flavor.push_str("-vulkan");
+        }
+        if metal_enabled {
+            flavor.push_str("-metal");
+        }
+        target_root.join("cmake").join(flavor)
+    } else {
+        PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("portable")
+    };
+    cfg.out_dir(portable_out_dir);
     cfg.build_target("pie_driver_portable_lib")
         .define("BUILD_SHARED_LIBS", "OFF");
     enable_position_independent_archives(&mut cfg);
@@ -169,14 +190,27 @@ fn build_portable() {
     if vulkan_enabled {
         // libvulkan.so is the standard system name on Linux. If
         // VULKAN_SDK is set, prefer its lib dir (so a project-vendored
-        // SDK works without sudo apt install libvulkan-dev).
+        // SDK works without sudo apt install libvulkan-dev). The
+        // Windows SDK uses `Lib`, while Unix installs normally use `lib`.
         if let Ok(sdk) = std::env::var("VULKAN_SDK") {
-            let sdk_lib = Path::new(&sdk).join("lib");
-            if sdk_lib.is_dir() {
-                println!("cargo:rustc-link-search=native={}", sdk_lib.display());
+            let lib_dirs: &[&str] = if target_os == "windows" {
+                &["Lib", "lib"]
+            } else {
+                &["lib", "Lib"]
+            };
+            for lib_dir in lib_dirs {
+                let sdk_lib = Path::new(&sdk).join(lib_dir);
+                if sdk_lib.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", sdk_lib.display());
+                }
             }
         }
-        println!("cargo:rustc-link-lib=vulkan");
+        let vulkan_lib = if target_os == "windows" {
+            "vulkan-1"
+        } else {
+            "vulkan"
+        };
+        println!("cargo:rustc-link-lib={vulkan_lib}");
     }
 
     add_system_libs(metal_enabled);
@@ -193,7 +227,7 @@ fn build_portable() {
 // -----------------------------------------------------------------------------
 
 fn build_cuda() {
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_os = target_os();
     if target_os != "linux" {
         panic!(
             "--features driver-cuda is Linux-only (got target_os={target_os:?}). \
@@ -338,12 +372,18 @@ fn enable_position_independent_archives(cfg: &mut cmake::Config) {
 /// by libcublas (we don't reference it directly).
 fn link_cuda_toolkit_dynamic(libs: &[&str]) {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
-    let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
-    let cuda_lib = Path::new(&cuda_home).join("lib64");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    let target_os = target_os();
+    let cuda_home = cuda_home();
+    let cuda_lib = if target_os == "windows" {
+        Path::new(&cuda_home).join("lib").join("x64")
+    } else {
+        Path::new(&cuda_home).join("lib64")
+    };
     if !cuda_lib.is_dir() {
         panic!(
             "could not locate CUDA toolkit lib dir at {cuda_lib:?}. \
-             Set $CUDA_HOME or install CUDA toolkit at /usr/local/cuda."
+             Set $CUDA_HOME/$CUDA_PATH or install the CUDA toolkit."
         );
     }
     println!("cargo:rustc-link-search=native={}", cuda_lib.display());
@@ -358,18 +398,59 @@ fn link_cuda_toolkit_dynamic(libs: &[&str]) {
 /// is universally present on any GPU host. Provides `cuMem*/cuCtx*`
 /// and friends used by both ggml-cuda and pie's custom-all-reduce.
 fn link_cuda_driver_stub() {
-    let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
-    let stubs = Path::new(&cuda_home).join("lib64/stubs");
-    if stubs.is_dir() {
-        println!("cargo:rustc-link-search=native={}", stubs.display());
+    let target_os = target_os();
+    let cuda_home = cuda_home();
+    if target_os == "windows" {
+        let lib = Path::new(&cuda_home).join("lib").join("x64");
+        if lib.is_dir() {
+            println!("cargo:rustc-link-search=native={}", lib.display());
+        }
+    } else {
+        let stubs = Path::new(&cuda_home).join("lib64/stubs");
+        if stubs.is_dir() {
+            println!("cargo:rustc-link-search=native={}", stubs.display());
+        }
     }
     println!("cargo:rustc-link-lib=cuda");
+}
+
+fn cuda_home() -> String {
+    std::env::var("CUDA_HOME")
+        .or_else(|_| std::env::var("CUDA_PATH"))
+        .unwrap_or_else(|_| "/usr/local/cuda".to_string())
+}
+
+fn target_os() -> String {
+    if let Ok(os) = std::env::var("CARGO_CFG_TARGET_OS") {
+        if !os.is_empty() {
+            return os;
+        }
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.contains("windows") {
+        return "windows".to_string();
+    }
+    if target.contains("apple-darwin") {
+        return "macos".to_string();
+    }
+    if target.contains("linux") {
+        return "linux".to_string();
+    }
+    if cfg!(windows) {
+        "windows".to_string()
+    } else if cfg!(target_os = "macos") {
+        "macos".to_string()
+    } else if cfg!(target_os = "linux") {
+        "linux".to_string()
+    } else {
+        target
+    }
 }
 
 /// Emit per-OS system library link directives. On macOS, `metal=true`
 /// also links the Metal/MetalKit/Foundation frameworks ggml-metal needs.
 fn add_system_libs(metal: bool) {
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_os = target_os();
     match target_os.as_str() {
         "linux" => {
             println!("cargo:rustc-link-lib=stdc++");
@@ -388,6 +469,7 @@ fn add_system_libs(metal: bool) {
                 println!("cargo:rustc-link-lib=framework=Foundation");
             }
         }
+        "windows" => {}
         other => {
             panic!("pie-server: unsupported target OS {other:?}");
         }
@@ -406,7 +488,8 @@ fn rerun_if_changed(driver_dir: &Path) {
 }
 
 /// Walk `build_dir` looking for directories that contain at least one
-/// `.a` file, and emit `cargo:rustc-link-search` for each.
+/// static archive (`.a` on Unix, `.lib` on Windows), and emit
+/// `cargo:rustc-link-search` for each.
 fn add_link_search_paths(build_dir: &Path) {
     use std::collections::HashSet;
     let mut dirs: HashSet<PathBuf> = HashSet::new();
@@ -425,7 +508,7 @@ fn walk(dir: &Path, out: &mut std::collections::HashSet<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             walk(&path, out);
-        } else if path.extension().is_some_and(|e| e == "a") {
+        } else if path.extension().is_some_and(|e| e == "a" || e == "lib") {
             has_archive = true;
         }
     }

@@ -1,7 +1,8 @@
 //! Shutdown helpers for [`super::EngineHandle`]: SIGTERM listener,
-//! per-driver liveness watchdog, and the best-effort POSIX shmem
-//! cleanup that runs after the drivers have joined.
+//! per-driver liveness watchdog, and best-effort shmem cleanup that runs
+//! after the drivers have joined.
 
+#[cfg(unix)]
 use std::ffi::CString;
 use std::time::Duration;
 
@@ -13,16 +14,24 @@ use super::DriverHandle;
 /// panicking, so the rest of the shutdown branches still race
 /// normally.
 pub async fn wait_for_sigterm() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut stream = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("could not install SIGTERM handler: {e}");
-            std::future::pending::<()>().await;
-            return;
-        }
-    };
-    stream.recv().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut stream = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("could not install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        stream.recv().await;
+    }
+
+    #[cfg(windows)]
+    {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Per-second poll of every driver's liveness. Returns the
@@ -58,6 +67,7 @@ pub async fn watchdog(drivers: &[DriverHandle]) -> &'static str {
 
 /// Best-effort `shm_unlink`. Logs non-`ENOENT` failures (a missing
 /// segment is the success case — driver cleaned up first).
+#[cfg(unix)]
 pub fn unlink_shmem(name: &str) {
     let Ok(c) = CString::new(name) else {
         tracing::warn!("shmem name {name:?} contains a NUL; skipping unlink");
@@ -71,3 +81,8 @@ pub fn unlink_shmem(name: &str) {
         }
     }
 }
+
+/// Windows named mappings disappear when the last handle closes; there is
+/// no `shm_unlink` equivalent.
+#[cfg(windows)]
+pub fn unlink_shmem(_name: &str) {}

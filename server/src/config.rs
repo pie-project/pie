@@ -566,6 +566,8 @@ pub struct PortableDriverOptions {
     pub max_batch_size: u32,
     pub cpu_pages: u32,
     #[serde(skip)]
+    pub device: String,
+    #[serde(skip)]
     pub verbose: bool,
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
@@ -582,6 +584,7 @@ impl Default for PortableDriverOptions {
             max_batch_tokens: 10240,
             max_batch_size: 512,
             cpu_pages: 0,
+            device: "auto".to_string(),
             verbose: false,
             ready_timeout_s: 120.0,
             shutdown_timeout_s: 5.0,

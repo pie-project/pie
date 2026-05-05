@@ -1,10 +1,13 @@
 #include "gguf_archive.hpp"
 
-#include <fcntl.h>
+#include <fstream>
 #include <stdexcept>
+#ifndef _WIN32
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <gguf.h>
 #include <ggml.h>
@@ -12,6 +15,27 @@
 namespace pie_portable_driver {
 
 namespace {
+
+#ifdef _WIN32
+std::vector<std::uint8_t> read_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        throw std::runtime_error("gguf: open failed for " + path.string());
+    }
+    const auto end = in.tellg();
+    if (end < 0) {
+        throw std::runtime_error("gguf: tellg failed for " + path.string());
+    }
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(end));
+    in.seekg(0, std::ios::beg);
+    if (!data.empty() &&
+        !in.read(reinterpret_cast<char*>(data.data()),
+                 static_cast<std::streamsize>(data.size()))) {
+        throw std::runtime_error("gguf: read failed for " + path.string());
+    }
+    return data;
+}
+#endif
 
 // `ggml_get_rows` on the CUDA backend supports a fixed set of source
 // dtypes. tok_embd.weight is consumed by `ggml_get_rows`, so when the
@@ -92,12 +116,17 @@ std::string gguf_to_hf_name(const std::string& g) {
 }  // namespace
 
 void GGUFArchive::close_mmap_() noexcept {
+#ifdef _WIN32
+    owned_data_.clear();
+    owned_data_.shrink_to_fit();
+#else
     if (mmap_base_ != nullptr && mmap_size_ > 0) {
         ::munmap(const_cast<std::uint8_t*>(mmap_base_), mmap_size_);
     }
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+#endif
     mmap_base_ = nullptr;
     mmap_size_ = 0;
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
 }
 
 GGUFArchive::GGUFArchive(const std::filesystem::path& gguf_file) {
@@ -120,6 +149,11 @@ GGUFArchive::GGUFArchive(const std::filesystem::path& gguf_file) {
 
     // Now mmap the whole file so we can hand stable data pointers to
     // the loader. Tensor data starts at gguf_get_data_offset(gctx).
+#ifdef _WIN32
+    owned_data_ = read_file(gguf_file);
+    mmap_size_ = owned_data_.size();
+    mmap_base_ = owned_data_.data();
+#else
     fd_ = ::open(gguf_file.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) {
         gguf_free(gctx_); gctx_ = nullptr;
@@ -137,6 +171,7 @@ GGUFArchive::GGUFArchive(const std::filesystem::path& gguf_file) {
         throw std::runtime_error("gguf: mmap failed");
     }
     mmap_base_ = static_cast<const std::uint8_t*>(base);
+#endif
 
     const std::size_t data_offset = gguf_get_data_offset(gctx_);
 

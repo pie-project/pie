@@ -18,7 +18,26 @@
 //!
 //! All of the work happens in `pie_server::cli::dispatch`.
 
+#[cfg(windows)]
 fn main() {
+    let handle = std::thread::Builder::new()
+        .name("pie-main".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(run)
+        .expect("spawn pie main thread");
+
+    match handle.join() {
+        Ok(()) => {}
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+#[cfg(not(windows))]
+fn main() {
+    run();
+}
+
+fn run() {
     if let Err(e) = pie_server::cli::dispatch() {
         eprintln!("pie: {e:#}");
         std::process::exit(1);

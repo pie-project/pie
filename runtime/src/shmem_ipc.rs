@@ -24,7 +24,14 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::CloseHandle;
+#[cfg(windows)]
+use windows_sys::Win32::System::Memory::{
+    FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingA,
+    UnmapViewOfFile,
+};
 
 pub const MAGIC: u32 = 0x50494533; // 'PIE3'
 /// Bump in lockstep with `pie_driver_dev/shmem_ipc.py::SCHEMA_VERSION` and the
@@ -55,6 +62,7 @@ const OFF_RESP_LEN: usize = 28;
 const OFF_SEND_WT: usize = 32;
 const OFF_RESPOND_WT: usize = 40;
 
+#[cfg(unix)]
 #[cfg_attr(target_os = "linux", link(name = "rt"))]
 unsafe extern "C" {
     fn shm_open(name: *const libc::c_char, oflag: libc::c_int, mode: libc::mode_t) -> libc::c_int;
@@ -94,68 +102,29 @@ impl ShmemClient {
     /// (`num_slots`, `slot_stride`, `req_buf_size`, `resp_buf_size`) is read
     /// out of the global header — the driver is the source of truth.
     pub fn open(name: &str, spin_us: u64) -> Result<Self> {
-        let cname = CString::new(name)?;
-        let fd = unsafe { shm_open(cname.as_ptr(), libc::O_RDWR, 0o600) };
-        if fd < 0 {
-            return Err(anyhow!(
-                "shm_open({name}) failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        // The driver `ftruncate`d the region to its full size before
-        // publishing it, so `fstat` is enough to learn how much to mmap.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st as *mut _) } != 0 {
-            let err = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(anyhow!("fstat({name}) failed: {err}"));
-        }
-        let total_size = st.st_size as usize;
-        if total_size < HEADER_SIZE {
-            unsafe { libc::close(fd) };
-            return Err(anyhow!(
-                "shmem region {name} too small: {total_size} < {HEADER_SIZE}"
-            ));
-        }
-
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            unsafe { libc::close(fd) };
-            return Err(anyhow!("mmap failed"));
-        }
-        // We can close the fd now; the mapping persists.
-        unsafe { libc::close(fd) };
-
-        let base = base as *mut u8;
-        let read_u32 = |off: usize| -> u32 {
-            unsafe { (base.add(off) as *const u32).read_volatile() }
-        };
+        let mapping = map_shmem(name)?;
+        let base = mapping.base;
+        let total_size = mapping.total_size;
+        let read_u32 =
+            |off: usize| -> u32 { unsafe { (base.add(off) as *const u32).read_volatile() } };
 
         let magic = read_u32(HDR_OFF_MAGIC);
         if magic != MAGIC {
-            unsafe { libc::munmap(base as *mut _, total_size) };
+            unsafe { unmap_shmem(base, total_size) };
             return Err(anyhow!(
                 "shmem magic mismatch: got 0x{:08x}, want 0x{:08x}",
-                magic, MAGIC
+                magic,
+                MAGIC
             ));
         }
         let schema = read_u32(HDR_OFF_SCHEMA);
         if schema != SCHEMA_VERSION {
-            unsafe { libc::munmap(base as *mut _, total_size) };
+            unsafe { unmap_shmem(base, total_size) };
             return Err(anyhow!(
                 "shmem schema version mismatch: got {}, want {}. \
                  Rebuild the driver and runtime against the same tree.",
-                schema, SCHEMA_VERSION
+                schema,
+                SCHEMA_VERSION
             ));
         }
         let num_slots = read_u32(HDR_OFF_NUM_SLOTS) as usize;
@@ -169,7 +138,7 @@ impl ShmemClient {
         // silently overrunning a buffer.
         let expected_stride = SLOT_HEADER_SIZE + req_buf_size + resp_buf_size;
         if slot_stride != expected_stride {
-            unsafe { libc::munmap(base as *mut _, total_size) };
+            unsafe { unmap_shmem(base, total_size) };
             return Err(anyhow!(
                 "shmem header inconsistent: slot_stride={slot_stride} \
                  != SLOT_HEADER_SIZE({SLOT_HEADER_SIZE}) + req_buf({req_buf_size}) + resp_buf({resp_buf_size}) = {expected_stride}"
@@ -180,13 +149,13 @@ impl ShmemClient {
         // larger file but reject one that's actually short.
         let expected_total = HEADER_SIZE + num_slots * slot_stride;
         if total_size < expected_total {
-            unsafe { libc::munmap(base as *mut _, total_size) };
+            unsafe { unmap_shmem(base, total_size) };
             return Err(anyhow!(
                 "shmem size too small: file is {total_size} bytes, header implies {expected_total} (slots={num_slots} stride={slot_stride})"
             ));
         }
         if num_slots == 0 {
-            unsafe { libc::munmap(base as *mut _, total_size) };
+            unsafe { unmap_shmem(base, total_size) };
             return Err(anyhow!("shmem header reports num_slots=0"));
         }
 
@@ -233,7 +202,13 @@ impl ShmemClient {
     ///
     /// `writer` is called with the request payload buffer; it returns the
     /// number of bytes it wrote.
-    pub fn call_with<F>(&self, request_id: u32, method_tag: u32, send_walltime_us: u64, writer: F) -> Result<(Vec<u8>, u64)>
+    pub fn call_with<F>(
+        &self,
+        request_id: u32,
+        method_tag: u32,
+        send_walltime_us: u64,
+        writer: F,
+    ) -> Result<(Vec<u8>, u64)>
     where
         F: FnOnce(&mut [u8]) -> Result<usize>,
     {
@@ -263,10 +238,15 @@ impl ShmemClient {
         let i = slot_idx;
 
         // Write request payload.
-        let req_buf = unsafe { std::slice::from_raw_parts_mut(self.req_payload_addr(i), self.req_buf_size) };
+        let req_buf =
+            unsafe { std::slice::from_raw_parts_mut(self.req_payload_addr(i), self.req_buf_size) };
         let written = writer(req_buf).context("request writer failed")?;
         if written > self.req_buf_size {
-            return Err(anyhow!("request payload {} exceeds buffer {}", written, self.req_buf_size));
+            return Err(anyhow!(
+                "request payload {} exceeds buffer {}",
+                written,
+                self.req_buf_size
+            ));
         }
 
         // Write slot-header fields (non-atomic): req_id, method_tag, req_len, send_walltime.
@@ -302,14 +282,17 @@ impl ShmemClient {
             if self.aborted.load(Ordering::Acquire) {
                 return Err(anyhow!(
                     "shmem call aborted: driver exited (slot {}, request_id {})",
-                    i, request_id
+                    i,
+                    request_id
                 ));
             }
             let elapsed = started.elapsed();
             if elapsed >= hard_timeout {
                 return Err(anyhow!(
                     "shmem call timed out after {:?} (slot {}, request_id {})",
-                    hard_timeout, i, request_id
+                    hard_timeout,
+                    i,
+                    request_id
                 ));
             }
             if elapsed >= yield_after {
@@ -319,12 +302,11 @@ impl ShmemClient {
         }
 
         // Read response.
-        let resp_len = unsafe { (slot_base.add(OFF_RESP_LEN) as *const u32).read_volatile() } as usize;
+        let resp_len =
+            unsafe { (slot_base.add(OFF_RESP_LEN) as *const u32).read_volatile() } as usize;
         let respond_walltime_us =
             unsafe { (slot_base.add(OFF_RESPOND_WT) as *const u64).read_volatile() };
-        let resp_bytes = unsafe {
-            std::slice::from_raw_parts(self.resp_payload_addr(i), resp_len)
-        };
+        let resp_bytes = unsafe { std::slice::from_raw_parts(self.resp_payload_addr(i), resp_len) };
         let owned = resp_bytes.to_vec();
         Ok((owned, respond_walltime_us))
     }
@@ -332,8 +314,132 @@ impl ShmemClient {
 
 impl Drop for ShmemClient {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.base as *mut _, self.total_size) };
+        unsafe { unmap_shmem(self.base, self.total_size) };
     }
+}
+
+struct Mapping {
+    base: *mut u8,
+    total_size: usize,
+}
+
+#[cfg(unix)]
+fn map_shmem(name: &str) -> Result<Mapping> {
+    let cname = CString::new(name)?;
+    let fd = unsafe { shm_open(cname.as_ptr(), libc::O_RDWR, 0o600) };
+    if fd < 0 {
+        return Err(anyhow!(
+            "shm_open({name}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // The driver `ftruncate`d the region to its full size before
+    // publishing it, so `fstat` is enough to learn how much to mmap.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st as *mut _) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(anyhow!("fstat({name}) failed: {err}"));
+    }
+    let total_size = st.st_size as usize;
+    if total_size < HEADER_SIZE {
+        unsafe { libc::close(fd) };
+        return Err(anyhow!(
+            "shmem region {name} too small: {total_size} < {HEADER_SIZE}"
+        ));
+    }
+
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        unsafe { libc::close(fd) };
+        return Err(anyhow!("mmap failed"));
+    }
+    unsafe { libc::close(fd) };
+
+    Ok(Mapping {
+        base: base as *mut u8,
+        total_size,
+    })
+}
+
+#[cfg(unix)]
+unsafe fn unmap_shmem(base: *mut u8, total_size: usize) {
+    unsafe {
+        libc::munmap(base as *mut _, total_size);
+    }
+}
+
+#[cfg(windows)]
+fn map_shmem(name: &str) -> Result<Mapping> {
+    let cname = windows_mapping_name(name)?;
+    let handle = unsafe { OpenFileMappingA(FILE_MAP_ALL_ACCESS, 0, cname.as_ptr().cast()) };
+    if handle.is_null() {
+        return Err(anyhow!(
+            "OpenFileMappingA({name}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let header_view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, HEADER_SIZE) };
+    if header_view.Value.is_null() {
+        let err = std::io::Error::last_os_error();
+        unsafe { CloseHandle(handle) };
+        return Err(anyhow!("MapViewOfFile({name}, header) failed: {err}"));
+    }
+
+    let header = header_view.Value as *mut u8;
+    let read_u32 =
+        |off: usize| -> u32 { unsafe { (header.add(off) as *const u32).read_volatile() } };
+    let num_slots = read_u32(HDR_OFF_NUM_SLOTS) as usize;
+    let slot_stride = read_u32(HDR_OFF_SLOT_STRIDE) as usize;
+    let total_size = HEADER_SIZE + num_slots * slot_stride;
+    unsafe { UnmapViewOfFile(header_view) };
+
+    if total_size < HEADER_SIZE {
+        unsafe { CloseHandle(handle) };
+        return Err(anyhow!(
+            "shmem region {name} too small: {total_size} < {HEADER_SIZE}"
+        ));
+    }
+
+    let base = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, total_size) };
+    let map_err = std::io::Error::last_os_error();
+    unsafe { CloseHandle(handle) };
+    if base.Value.is_null() {
+        return Err(anyhow!("MapViewOfFile({name}) failed: {map_err}"));
+    }
+
+    Ok(Mapping {
+        base: base.Value as *mut u8,
+        total_size,
+    })
+}
+
+#[cfg(windows)]
+unsafe fn unmap_shmem(base: *mut u8, _total_size: usize) {
+    unsafe {
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base.cast() });
+    }
+}
+
+#[cfg(windows)]
+fn windows_mapping_name(name: &str) -> Result<CString> {
+    let trimmed = name.trim_start_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return Err(anyhow!("shmem name {name:?} is empty after normalization"));
+    }
+    let normalized = trimmed.replace(['/', '\\'], "_");
+    CString::new(format!("Local\\{normalized}")).context("Windows shmem name contains NUL")
 }
 
 /// Backstop timeout for `call_with`'s busy-spin. The watchdog `aborted`

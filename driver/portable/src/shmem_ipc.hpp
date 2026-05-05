@@ -87,7 +87,11 @@ private:
     std::size_t total_size_;
     std::uint64_t spin_us_;
 
+#ifdef _WIN32
+    void* mapping_ = nullptr;
+#else
     int fd_ = -1;
+#endif
     std::uint8_t* base_ = nullptr;
 
     std::atomic<bool> stop_{false};

@@ -5,11 +5,13 @@
 #include <iostream>
 #include <stdexcept>
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#endif
 
 #include <ggml-backend.h>
 
@@ -50,6 +52,33 @@ std::uint8_t* HostSwapPool::v_slot(std::int32_t layer, std::int32_t page) noexce
 // =============================================================================
 // AuxServer
 // =============================================================================
+
+#ifdef _WIN32
+
+AuxServer::AuxServer(const std::string& socket_path,
+                     KvCachePaged& kv,
+                     HostSwapPool* swap,
+                     AdapterPool* adapters,
+                     ggml_backend_t adapter_backend,
+                     const Hparams* hparams)
+    : kv_(kv), swap_(swap),
+      adapters_(adapters),
+      adapter_backend_(adapter_backend),
+      hparams_(hparams),
+      socket_path_(socket_path) {
+    throw std::runtime_error("aux IPC is not supported on Windows yet");
+}
+
+AuxServer::~AuxServer() = default;
+void AuxServer::stop() {}
+void AuxServer::run_() {}
+aux::Status AuxServer::handle_command_(
+        aux::Method,
+        const std::vector<aux::AuxPagePair>&) {
+    return aux::Status::BackendError;
+}
+
+#else
 
 namespace {
 
@@ -350,5 +379,7 @@ aux::Status AuxServer::handle_command_(
             return aux::Status::BadMethod;
     }
 }
+
+#endif
 
 }  // namespace pie_portable_driver

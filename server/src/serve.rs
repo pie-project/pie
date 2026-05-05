@@ -474,10 +474,17 @@ fn start_embedded_drivers(
 }
 
 fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> DriverOptions {
-    #[cfg(not(feature = "driver-cuda"))]
+    #[cfg(not(any(feature = "driver-portable", feature = "driver-cuda")))]
     let _ = &device;
+
     #[allow(unreachable_patterns)]
     match base_opts {
+        #[cfg(feature = "driver-portable")]
+        DriverOptions::Portable(opts) => {
+            let mut opts = opts.clone();
+            opts.device = device;
+            DriverOptions::Portable(opts)
+        }
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative { opts, hf_repo, .. } => DriverOptions::CudaNative {
             opts: opts.clone(),

@@ -34,6 +34,10 @@ struct ModelConfig {
     // checkpoints). Resolved by the Python wrapper from `hf_repo`, or set
     // directly for local dev. Required.
     std::string hf_path;
+    // Backend selector from `model.driver.device`. `auto` keeps ggml's
+    // best-available behavior; `cpu` forces CPU even when GPU backends are
+    // compiled in.
+    std::string backend = "auto";
 };
 
 struct BatchingConfig {
@@ -71,6 +75,7 @@ inline Config load_config(const std::filesystem::path& path) {
     }
     if (auto m = tbl["model"].as_table()) {
         c.model.hf_path      = (*m)["hf_path"].value_or(std::string{});
+        c.model.backend      = (*m)["backend"].value_or(c.model.backend);
     }
     if (auto b = tbl["batching"].as_table()) {
         c.batching.kv_page_size     = (*b)["kv_page_size"].value_or<int64_t>(c.batching.kv_page_size);

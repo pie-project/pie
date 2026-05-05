@@ -1,6 +1,7 @@
 #include "model.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -169,7 +170,9 @@ ggml_tensor* new_tensor_from_st(ggml_context* ctx,
 
 }  // namespace
 
-Model::Model(const std::filesystem::path& snapshot_dir, bool verbose)
+Model::Model(const std::filesystem::path& snapshot_dir,
+             std::string backend,
+             bool verbose)
     : snapshot_dir_(snapshot_dir) {
     // The "snapshot" can be either:
     //   * an HF snapshot directory (config.json + *.safetensors)
@@ -194,12 +197,20 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool verbose)
     }
     resolve_tensor_prefix_();
 
+    std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
     // Backend selection. With `GGML_CUDA=ON` (or Metal / Vulkan) at build
-    // time, `ggml_backend_load_all()` registers them as device providers and
-    // `ggml_backend_init_best()` picks GPU > CPU. Falls back to CPU if no
-    // GPU backend was compiled in or no device is available.
-    backend_ = ggml_backend_init_best();
-    if (!backend_) {
+    // time, `ggml_backend_load_all()` registers them as device providers.
+    // `auto` picks GPU > CPU via ggml; `cpu` is an explicit override for
+    // small-memory hosts and deterministic smoke tests.
+    if (backend == "cpu") {
+        backend_ = ggml_backend_cpu_init();
+    } else {
+        backend_ = ggml_backend_init_best();
+    }
+    if (!backend_ && backend != "cpu") {
         std::cerr << "[model] ggml_backend_init_best() returned null; "
                      "falling back to CPU\n";
     }

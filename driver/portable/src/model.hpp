@@ -8,9 +8,9 @@
 // — no GGUF involved. Multimodal-wrapper checkpoints (Ministral 3, Gemma 4)
 // substitute the canonical "model." prefix via Model::tname_().
 //
-// Backend selection follows ggml's registered devices: pick the best compiled
-// backend via ggml_backend_init_best() and fall back to CPU when no GPU device
-// is available.
+// Backend selection follows ggml's registered devices by default: pick the best
+// compiled backend via ggml_backend_init_best() and fall back to CPU when no GPU
+// device is available. Passing `backend = "cpu"` forces CPU.
 
 #include <cstdint>
 #include <filesystem>
@@ -218,7 +218,9 @@ public:
     // Picks the best registered backend (CUDA / Metal / Vulkan, depending on
     // what was compiled into ggml). Falls back to CPU if no GPU backend is
     // available.
-    explicit Model(const std::filesystem::path& snapshot_dir, bool verbose = false);
+    explicit Model(const std::filesystem::path& snapshot_dir,
+                   std::string backend = "auto",
+                   bool verbose = false);
     ~Model();
 
     Model(const Model&) = delete;

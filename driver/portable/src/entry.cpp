@@ -264,9 +264,10 @@ int run_impl(int argc,
     // ---- Load the model. -----------------------------------------------------
     if (cfg.runtime.verbose) {
         std::cerr << "[pie-driver-portable] loading model from " << cfg.model.hf_path
-                  << " (backend=best-available)\n";
+                  << " (backend=" << cfg.model.backend << ")\n";
     }
-    pie_portable_driver::Model model(cfg.model.hf_path, cfg.runtime.verbose);
+    pie_portable_driver::Model model(
+        cfg.model.hf_path, cfg.model.backend, cfg.runtime.verbose);
     const auto& h = model.hparams();
     if (cfg.runtime.verbose) {
         std::cerr << "[pie-driver-portable] loaded "
@@ -284,16 +285,40 @@ int run_impl(int argc,
     // The runtime owns page allocation; we report total_pages and page_size
     // in the READY handshake and honor the page IDs the runtime sends in
     // every BPIQ request.
-    const std::int32_t total_pages =
+    std::int32_t total_pages =
         static_cast<std::int32_t>(cfg.batching.max_num_kv_pages);
     const std::int32_t page_size =
         static_cast<std::int32_t>(cfg.batching.kv_page_size);
-    pie_portable_driver::ForwardEngine engine(model, total_pages, page_size);
+    const std::int32_t requested_pages = total_pages;
+    std::unique_ptr<pie_portable_driver::ForwardEngine> engine_ptr;
+    while (total_pages >= 64) {
+        try {
+            engine_ptr = std::make_unique<pie_portable_driver::ForwardEngine>(
+                model, total_pages, page_size);
+            break;
+        } catch (const std::exception& e) {
+            if (total_pages == 64) throw;
+            const std::int32_t next_pages = std::max<std::int32_t>(64, total_pages / 2);
+            std::cerr << "[pie-driver-portable] warning: KV cache allocation "
+                      << "failed at " << total_pages << " pages: " << e.what()
+                      << "; retrying with " << next_pages << " pages\n";
+            total_pages = next_pages;
+        }
+    }
+    if (!engine_ptr) {
+        throw std::runtime_error("forward: failed to allocate KV cache");
+    }
+    auto& engine = *engine_ptr;
     if (cfg.runtime.verbose) {
         std::cerr << "[pie-driver-portable] forward engine ready (total_pages="
                   << total_pages << ", page_size=" << page_size
                   << ", kv_buf=" << (engine.kv_buffer_size() / (1024.0 * 1024.0))
                   << " MiB)\n";
+    }
+    if (total_pages != requested_pages) {
+        std::cerr << "[pie-driver-portable] warning: reduced KV cache from "
+                  << requested_pages << " to " << total_pages
+                  << " pages to fit the selected backend\n";
     }
 
     // ---- Optional host swap pool + aux IPC (M7). ----------------------------

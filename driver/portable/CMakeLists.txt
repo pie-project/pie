@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.23)
 
 project(PIE_DRIVER_GGML CXX)
 
+if(MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+endif()
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -99,7 +103,8 @@ add_library(pie_driver_portable_lib STATIC
 )
 
 target_compile_options(pie_driver_portable_lib PRIVATE
-  -Wall -Wextra -Wno-unused-parameter
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall -Wextra -Wno-unused-parameter>
 )
 
 target_include_directories(pie_driver_portable_lib
@@ -112,7 +117,7 @@ target_link_libraries(pie_driver_portable_lib PUBLIC
   nlohmann_json::nlohmann_json
   ggml
 )
-if(NOT APPLE)
+if(UNIX AND NOT APPLE)
   target_link_libraries(pie_driver_portable_lib PUBLIC rt)
 endif()
 
@@ -127,9 +132,10 @@ target_link_libraries(pie_driver_portable PRIVATE pie_driver_portable_lib)
 # wraps FlashInfer's BatchDecodeWithPagedKVCache, which is the
 # production-quality kernel for vLLM/SGLang-style paged decode.
 #
-# Self-contained: no impact on Metal / Vulkan / CPU-only builds.
-# FlashInfer is fetched only when GGML_CUDA=ON.
-if(GGML_CUDA)
+# Self-contained: no impact on Metal / Vulkan / CPU-only builds. FlashInfer
+# 0.2.7 is not MSVC-clean, so Windows CUDA uses ggml-cuda's materialized
+# attention path until FlashInfer grows Windows support here.
+if(GGML_CUDA AND NOT MSVC)
   enable_language(CUDA)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     # Match ggml-cuda's default. Caller can override with -DCMAKE_CUDA_ARCHITECTURES=...
@@ -142,6 +148,7 @@ if(GGML_CUDA)
     NAME flashinfer
     GITHUB_REPOSITORY flashinfer-ai/flashinfer
     GIT_TAG v0.2.7
+    GIT_SUBMODULES 3rdparty/cutlass
     DOWNLOAD_ONLY YES)
 
   target_sources(pie_driver_portable_lib PRIVATE

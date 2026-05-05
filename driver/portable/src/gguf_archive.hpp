@@ -55,7 +55,11 @@ public:
 
 private:
     // mmap state.
+#ifdef _WIN32
+    std::vector<std::uint8_t> owned_data_;
+#else
     int          fd_ = -1;
+#endif
     std::size_t  mmap_size_ = 0;
     const std::uint8_t* mmap_base_ = nullptr;
 

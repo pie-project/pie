@@ -34,6 +34,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::CloseHandle;
+#[cfg(windows)]
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingA, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    PAGE_READWRITE, UnmapViewOfFile,
+};
 
 pub const MAGIC: u32 = 0x50494533;
 pub const SCHEMA_VERSION: u32 = 2;
@@ -63,9 +70,13 @@ pub struct ShmemServer {
     req_buf_size: usize,
     resp_buf_size: usize,
     slot_stride: usize,
+    #[cfg_attr(windows, allow(dead_code))]
     total_size: usize,
     spin_us: u64,
+    #[cfg(unix)]
     fd: libc::c_int,
+    #[cfg(windows)]
+    mapping: *mut libc::c_void,
     base: *mut u8,
     stop: AtomicBool,
 }
@@ -78,55 +89,89 @@ unsafe impl Sync for ShmemServer {}
 impl ShmemServer {
     /// Create a new shmem region. Replaces any stale region with the same
     /// name (best-effort `shm_unlink` first).
-    pub fn create(name: &str, num_slots: usize, req_buf: usize, resp_buf: usize, spin_us: u64) -> Result<Self> {
-        let cname = CString::new(name)
-            .map_err(|e| anyhow!("shmem name {name:?} contains NUL: {e}"))?;
+    pub fn create(
+        name: &str,
+        num_slots: usize,
+        req_buf: usize,
+        resp_buf: usize,
+        spin_us: u64,
+    ) -> Result<Self> {
+        let cname =
+            CString::new(name).map_err(|e| anyhow!("shmem name {name:?} contains NUL: {e}"))?;
         let slot_stride = SLOT_HEADER_SIZE + req_buf + resp_buf;
         let total_size = HEADER_SIZE + num_slots * slot_stride;
 
-        // Best-effort cleanup of stale region.
-        unsafe { libc::shm_unlink(cname.as_ptr()) };
+        #[cfg(unix)]
+        let (base, fd) = {
+            // Best-effort cleanup of stale region.
+            unsafe { libc::shm_unlink(cname.as_ptr()) };
 
-        let fd =
-            unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
-        if fd < 0 {
-            return Err(anyhow!(
-                "shm_open({name}) failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if unsafe { libc::ftruncate(fd, total_size as libc::off_t) } != 0 {
-            unsafe {
-                libc::close(fd);
-                libc::shm_unlink(cname.as_ptr());
+            let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
+            if fd < 0 {
+                return Err(anyhow!(
+                    "shm_open({name}) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
-            return Err(anyhow!(
-                "ftruncate({total_size}) failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+            if unsafe { libc::ftruncate(fd, total_size as libc::off_t) } != 0 {
+                unsafe {
+                    libc::close(fd);
+                    libc::shm_unlink(cname.as_ptr());
+                }
+                return Err(anyhow!(
+                    "ftruncate({total_size}) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
 
-        let p = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                total_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
+            let p = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    total_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                unsafe {
+                    libc::close(fd);
+                    libc::shm_unlink(cname.as_ptr());
+                }
+                return Err(anyhow!("mmap failed: {}", std::io::Error::last_os_error()));
+            }
+            let base = p as *mut u8;
+            (base, fd)
         };
-        if p == libc::MAP_FAILED {
-            unsafe {
-                libc::close(fd);
-                libc::shm_unlink(cname.as_ptr());
+
+        #[cfg(windows)]
+        let (base, mapping) = {
+            let wname = windows_mapping_name(name)?;
+            let mapping = unsafe {
+                CreateFileMappingA(
+                    (-1isize) as *mut libc::c_void,
+                    ptr::null_mut(),
+                    PAGE_READWRITE,
+                    ((total_size >> 32) & 0xffff_ffff) as u32,
+                    (total_size & 0xffff_ffff) as u32,
+                    wname.as_ptr().cast(),
+                )
+            };
+            if mapping.is_null() {
+                return Err(anyhow!(
+                    "CreateFileMappingA({name}) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
-            return Err(anyhow!(
-                "mmap failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let base = p as *mut u8;
+            let base = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, total_size) };
+            if base.Value.is_null() {
+                let err = std::io::Error::last_os_error();
+                unsafe { CloseHandle(mapping) };
+                return Err(anyhow!("MapViewOfFile({name}) failed: {err}"));
+            }
+            (base.Value as *mut u8, mapping)
+        };
 
         // Zero + write the header.
         unsafe {
@@ -147,7 +192,10 @@ impl ShmemServer {
             slot_stride,
             total_size,
             spin_us,
+            #[cfg(unix)]
             fd,
+            #[cfg(windows)]
+            mapping,
             base,
             stop: AtomicBool::new(false),
         })
@@ -156,9 +204,15 @@ impl ShmemServer {
     pub fn name(&self) -> &str {
         self.name.to_str().unwrap_or("<invalid utf-8>")
     }
-    pub fn num_slots(&self) -> usize { self.num_slots }
-    pub fn req_buf_size(&self) -> usize { self.req_buf_size }
-    pub fn resp_buf_size(&self) -> usize { self.resp_buf_size }
+    pub fn num_slots(&self) -> usize {
+        self.num_slots
+    }
+    pub fn req_buf_size(&self) -> usize {
+        self.req_buf_size
+    }
+    pub fn resp_buf_size(&self) -> usize {
+        self.resp_buf_size
+    }
 
     /// Set the stop flag. Idempotent. The serve loop checks this between
     /// slot polls and exits cleanly.
@@ -189,9 +243,8 @@ impl ShmemServer {
                 let method_tag = read_u32(slot, OFF_METHOD_TAG);
                 let req_len = read_u32(slot, OFF_REQ_LEN) as usize;
 
-                let req_payload = unsafe {
-                    std::slice::from_raw_parts(slot.add(SLOT_HEADER_SIZE), req_len)
-                };
+                let req_payload =
+                    unsafe { std::slice::from_raw_parts(slot.add(SLOT_HEADER_SIZE), req_len) };
                 let resp_payload = unsafe {
                     std::slice::from_raw_parts_mut(
                         slot.add(SLOT_HEADER_SIZE + self.req_buf_size),
@@ -200,7 +253,11 @@ impl ShmemServer {
                 };
 
                 let resp_len = handler(
-                    &SlotRequest { req_id, method_tag, payload: req_payload },
+                    &SlotRequest {
+                        req_id,
+                        method_tag,
+                        payload: req_payload,
+                    },
                     resp_payload,
                 );
 
@@ -228,12 +285,23 @@ impl Drop for ShmemServer {
     fn drop(&mut self) {
         unsafe {
             if !self.base.is_null() {
+                #[cfg(unix)]
                 libc::munmap(self.base as *mut libc::c_void, self.total_size);
+                #[cfg(windows)]
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.base.cast(),
+                });
             }
+            #[cfg(unix)]
             if self.fd >= 0 {
                 libc::close(self.fd);
             }
+            #[cfg(unix)]
             libc::shm_unlink(self.name.as_ptr());
+            #[cfg(windows)]
+            if !self.mapping.is_null() {
+                CloseHandle(self.mapping);
+            }
         }
     }
 }
@@ -269,6 +337,17 @@ fn now_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn windows_mapping_name(name: &str) -> Result<CString> {
+    let trimmed = name.trim_start_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return Err(anyhow!("shmem name {name:?} is empty after normalization"));
+    }
+    let normalized = trimmed.replace(['/', '\\'], "_");
+    CString::new(format!("Local\\{normalized}"))
+        .map_err(|e| anyhow!("Windows shmem name contains NUL: {e}"))
 }
 
 #[cfg(test)]

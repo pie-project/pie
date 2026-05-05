@@ -25,11 +25,14 @@
 //! these drivers run as static libs in this binary.
 
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
+use anyhow::anyhow;
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
 use crate::python_resolve::{self, DriversConfig, PythonBlock};
@@ -422,8 +425,20 @@ fn exec(flavor: SubprocessFlavor, args: Vec<OsString>) -> Result<()> {
         ),
     };
 
-    let err = Command::new(&program).args(&rest).exec();
-    Err(anyhow!("execvp({program:?}) failed: {err}"))
+    #[cfg(unix)]
+    {
+        let err = Command::new(&program).args(&rest).exec();
+        Err(anyhow!("execvp({program:?}) failed: {err}"))
+    }
+
+    #[cfg(windows)]
+    {
+        let status = Command::new(&program)
+            .args(&rest)
+            .status()
+            .with_context(|| format!("spawn {program:?}"))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 // -----------------------------------------------------------------------------

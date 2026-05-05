@@ -6,10 +6,12 @@
 #include <stdexcept>
 #include <utility>
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -18,6 +20,27 @@ namespace pie_portable_driver {
 namespace {
 
 constexpr std::size_t MAX_HEADER_SIZE = 128ull * 1024 * 1024;  // 128 MiB sanity cap
+
+#ifdef _WIN32
+std::vector<std::uint8_t> read_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        throw std::runtime_error("safetensors: open(" + path.string() + ") failed");
+    }
+    const auto end = in.tellg();
+    if (end < 0) {
+        throw std::runtime_error("safetensors: tellg failed: " + path.string());
+    }
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(end));
+    in.seekg(0, std::ios::beg);
+    if (!data.empty() &&
+        !in.read(reinterpret_cast<char*>(data.data()),
+                 static_cast<std::streamsize>(data.size()))) {
+        throw std::runtime_error("safetensors: read failed: " + path.string());
+    }
+    return data;
+}
+#endif
 
 StDtype parse_dtype(const std::string& s) {
     // Names per safetensors spec: F16, BF16, F32, F64, I8, U8, I16, U16,
@@ -77,6 +100,15 @@ const char* st_dtype_name(StDtype dt) {
 
 SafetensorsShard::SafetensorsShard(const std::filesystem::path& path)
     : path_(path) {
+#ifdef _WIN32
+    owned_data_ = read_file(path_);
+    mmap_size_ = owned_data_.size();
+    if (mmap_size_ < 8) {
+        throw std::runtime_error("safetensors: file too small: " +
+                                 path_.string());
+    }
+    base_ = owned_data_.data();
+#else
     fd_ = ::open(path_.c_str(), O_RDONLY);
     if (fd_ < 0) {
         throw std::runtime_error("safetensors: open(" + path_.string() +
@@ -111,6 +143,7 @@ SafetensorsShard::SafetensorsShard(const std::filesystem::path& path)
     // on large models. POSIX_MADV_WILLNEED is best-effort.
     ::posix_madvise(const_cast<void*>(static_cast<const void*>(base_)),
                     mmap_size_, POSIX_MADV_WILLNEED);
+#endif
 
     // Parse header.
     std::uint64_t header_size = 0;
@@ -190,11 +223,19 @@ SafetensorsShard::SafetensorsShard(const std::filesystem::path& path)
 
 SafetensorsShard::SafetensorsShard(SafetensorsShard&& other) noexcept
     : path_(std::move(other.path_)),
+#ifdef _WIN32
+      owned_data_(std::move(other.owned_data_)),
+#else
       fd_(other.fd_),
+#endif
       mmap_size_(other.mmap_size_),
       base_(other.base_),
       tensors_(std::move(other.tensors_)) {
+#ifdef _WIN32
+    base_ = owned_data_.empty() ? nullptr : owned_data_.data();
+#else
     other.fd_ = -1;
+#endif
     other.mmap_size_ = 0;
     other.base_ = nullptr;
 }
@@ -203,11 +244,18 @@ SafetensorsShard& SafetensorsShard::operator=(SafetensorsShard&& other) noexcept
     if (this != &other) {
         close_mmap();
         path_ = std::move(other.path_);
+#ifdef _WIN32
+        owned_data_ = std::move(other.owned_data_);
+        base_ = owned_data_.empty() ? nullptr : owned_data_.data();
+#else
         fd_ = other.fd_;
-        mmap_size_ = other.mmap_size_;
         base_ = other.base_;
+#endif
+        mmap_size_ = other.mmap_size_;
         tensors_ = std::move(other.tensors_);
+#ifndef _WIN32
         other.fd_ = -1;
+#endif
         other.mmap_size_ = 0;
         other.base_ = nullptr;
     }
@@ -217,6 +265,10 @@ SafetensorsShard& SafetensorsShard::operator=(SafetensorsShard&& other) noexcept
 SafetensorsShard::~SafetensorsShard() { close_mmap(); }
 
 void SafetensorsShard::close_mmap() noexcept {
+#ifdef _WIN32
+    owned_data_.clear();
+    owned_data_.shrink_to_fit();
+#else
     if (base_ && mmap_size_ > 0) {
         ::munmap(const_cast<void*>(static_cast<const void*>(base_)),
                  mmap_size_);
@@ -224,9 +276,10 @@ void SafetensorsShard::close_mmap() noexcept {
     if (fd_ >= 0) {
         ::close(fd_);
     }
+    fd_ = -1;
+#endif
     base_ = nullptr;
     mmap_size_ = 0;
-    fd_ = -1;
 }
 
 // -----------------------------------------------------------------------------

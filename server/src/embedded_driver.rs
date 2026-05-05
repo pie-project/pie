@@ -329,6 +329,7 @@ pub fn write_startup_toml(
 
     let mut model = toml::Table::new();
     insert_str(&mut model, "hf_path", path_string(snapshot_dir));
+    insert_str(&mut model, "backend", &options.device);
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -340,7 +341,12 @@ pub fn write_startup_toml(
     insert_table(&mut doc, "batching", batching);
 
     let mut aux_ipc = toml::Table::new();
-    insert_str(&mut aux_ipc, "socket_path", path_string(aux_socket_path));
+    let aux_path = if cfg!(windows) {
+        String::new()
+    } else {
+        path_string(aux_socket_path)
+    };
+    insert_str(&mut aux_ipc, "socket_path", aux_path);
     insert_table(&mut doc, "aux_ipc", aux_ipc);
 
     let mut runtime = toml::Table::new();
@@ -550,8 +556,8 @@ pub struct EmbeddedDriver {
     /// dispatches via this so heterogeneous configs (e.g. one cuda +
     /// one portable model) signal the right entry.
     pub flavor: Flavor,
-    /// POSIX shmem region the driver owns (e.g. `/pie_shmem_g0`).
-    /// `serve.rs` `shm_unlink`s this on shutdown to clean up after a
+    /// Shared-memory region the driver owns (e.g. `/pie_shmem_g0`).
+    /// Unix builds `shm_unlink` this on shutdown to clean up after a
     /// hard kill that bypassed the driver's own teardown.
     pub shmem_name: String,
     /// Driver's aux-IPC listener path. `serve.rs` opens an
@@ -894,6 +900,7 @@ mod tests {
             val["model"]["hf_path"].as_str().unwrap(),
             snap.to_str().unwrap()
         );
+        assert_eq!(val["model"]["backend"].as_str().unwrap(), "auto");
         assert_eq!(
             val["aux_ipc"]["socket_path"].as_str().unwrap(),
             aux.to_str().unwrap()

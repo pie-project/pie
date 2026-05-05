@@ -87,7 +87,11 @@ public:
 
 private:
     std::filesystem::path path_;
+#ifdef _WIN32
+    std::vector<std::uint8_t> owned_data_;
+#else
     int fd_ = -1;
+#endif
     std::size_t mmap_size_ = 0;
     const std::uint8_t* base_ = nullptr;
     std::unordered_map<std::string, StTensor> tensors_;

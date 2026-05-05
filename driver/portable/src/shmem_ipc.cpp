@@ -9,10 +9,15 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace pie_portable_driver {
 
@@ -36,6 +41,27 @@ std::uint64_t atomic_load_u64(const std::uint8_t* p) noexcept {
         .load(std::memory_order_acquire);
 }
 
+#ifdef _WIN32
+std::string windows_mapping_name(const std::string& name) {
+    std::string normalized = name;
+    while (!normalized.empty() &&
+           (normalized.front() == '/' || normalized.front() == '\\')) {
+        normalized.erase(normalized.begin());
+    }
+    for (char& ch : normalized) {
+        if (ch == '/' || ch == '\\') ch = '_';
+    }
+    if (normalized.empty()) {
+        throw std::runtime_error("empty Windows shmem mapping name");
+    }
+    return "Local\\" + normalized;
+}
+
+std::string windows_error(DWORD code) {
+    return "Windows error " + std::to_string(code);
+}
+#endif
+
 }  // namespace
 
 ShmemServer::ShmemServer(std::string name,
@@ -50,6 +76,40 @@ ShmemServer::ShmemServer(std::string name,
       slot_stride_(SLOT_HEADER_SIZE + req_buf + resp_buf),
       total_size_(HEADER_SIZE + num_slots * (SLOT_HEADER_SIZE + req_buf + resp_buf)),
       spin_us_(spin_us) {
+#ifdef _WIN32
+    const std::string mapping_name = windows_mapping_name(name_);
+    mapping_ = CreateFileMappingA(
+        INVALID_HANDLE_VALUE,
+        nullptr,
+        PAGE_READWRITE,
+        static_cast<DWORD>((total_size_ >> 32) & 0xffffffffu),
+        static_cast<DWORD>(total_size_ & 0xffffffffu),
+        mapping_name.c_str());
+    if (!mapping_) {
+        throw std::runtime_error("CreateFileMappingA(" + name_ +
+                                 ") failed: " + windows_error(GetLastError()));
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(static_cast<HANDLE>(mapping_));
+        mapping_ = nullptr;
+        throw std::runtime_error("CreateFileMappingA(" + name_ +
+                                 ") failed: mapping already exists");
+    }
+
+    void* p = MapViewOfFile(static_cast<HANDLE>(mapping_),
+                            FILE_MAP_ALL_ACCESS,
+                            0,
+                            0,
+                            total_size_);
+    if (!p) {
+        const DWORD err = GetLastError();
+        CloseHandle(static_cast<HANDLE>(mapping_));
+        mapping_ = nullptr;
+        throw std::runtime_error("MapViewOfFile(" + name_ +
+                                 ") failed: " + windows_error(err));
+    }
+    base_ = static_cast<std::uint8_t*>(p);
+#else
     // Best-effort cleanup of any stale region from a previous run.
     shm_unlink(name_.c_str());
 
@@ -74,6 +134,7 @@ ShmemServer::ShmemServer(std::string name,
                                  std::strerror(errno));
     }
     base_ = static_cast<std::uint8_t*>(p);
+#endif
 
     // Zero the region and write the header. Rust/Python read the header to
     // sanity-check the schema.
@@ -91,12 +152,22 @@ ShmemServer::ShmemServer(std::string name,
 
 ShmemServer::~ShmemServer() {
     if (base_) {
+#ifdef _WIN32
+        UnmapViewOfFile(base_);
+#else
         munmap(base_, total_size_);
+#endif
     }
+#ifdef _WIN32
+    if (mapping_) {
+        CloseHandle(static_cast<HANDLE>(mapping_));
+    }
+#else
     if (fd_ >= 0) {
         ::close(fd_);
     }
     shm_unlink(name_.c_str());
+#endif
 }
 
 void ShmemServer::serve_forever(const RequestHandler& handler) {
