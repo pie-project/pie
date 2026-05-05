@@ -7,6 +7,17 @@ description: Full inferlet SDK API for Rust — Model, Context, Generator, Forwa
 
 The full inferlet SDK API for Rust. The [Guide](../guide/install) walks through how to use these APIs with runnable code; this page enumerates the surface.
 
+## Installation
+
+The Rust inferlet SDK is published on crates.io as [`inferlet`](https://crates.io/crates/inferlet). The procedural
+macro crate [`inferlet-macros`](https://crates.io/crates/inferlet-macros) is pulled in by `inferlet`.
+
+```toml
+[dependencies]
+inferlet = "0.3"
+serde = { version = "1", features = ["derive"] }
+```
+
 ## Inferlet entry point
 
 ```rust

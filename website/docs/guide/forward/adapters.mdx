@@ -58,7 +58,7 @@ text = await ctx.generate(
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Adapter } from 'inferlet';
+import { Adapter } from '@pie-project/inferlet';
 
 const adapter = Adapter.open(model, 'my-adapter');
 
@@ -120,7 +120,7 @@ a.load("/data/adapters/draft-v1.bin")
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Adapter } from 'inferlet';
+import { Adapter } from '@pie-project/inferlet';
 
 const a = Adapter.create(model, 'draft-adapter');
 const a2 = a.fork('draft-adapter-v2');       // fork takes the new name

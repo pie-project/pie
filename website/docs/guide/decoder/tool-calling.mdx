@@ -99,7 +99,7 @@ for _ in range(max_iterations):
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler } from 'inferlet';
+import { Sampler } from '@pie-project/inferlet';
 
 const SYSTEM_PROMPT = `\
 You have these tools:
@@ -207,7 +207,7 @@ ctx.cue()
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { tools } from 'inferlet';
+import { tools } from '@pie-project/inferlet';
 
 const calculatorSchema = {
     name: 'calculator',
@@ -287,7 +287,7 @@ async for step in g:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler, tools } from 'inferlet';
+import { Sampler, tools } from '@pie-project/inferlet';
 
 const g = ctx.generate(Sampler.argmax(), { maxTokens: 512 });
 const dec = new tools.Decoder(model);
@@ -484,7 +484,7 @@ if matcher:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler, GrammarConstraint, tools } from 'inferlet';
+import { Sampler, GrammarConstraint, tools } from '@pie-project/inferlet';
 
 const matcher = tools.nativeMatcher(model, [JSON.stringify(calculatorSchema)]);
 if (matcher) {

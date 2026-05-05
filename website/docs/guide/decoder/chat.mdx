@@ -61,7 +61,7 @@ async for step in g:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler, chat } from 'inferlet';
+import { Sampler, chat } from '@pie-project/inferlet';
 
 const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
 const parser = new chat.Decoder(model);
@@ -126,7 +126,7 @@ async for step in g:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { session } from 'inferlet';
+import { session } from '@pie-project/inferlet';
 
 for await (const step of g) {
     const out = await step.execute();

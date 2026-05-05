@@ -12,14 +12,16 @@ names.
 
 ## Installation
 
+The JavaScript client is published on npm as [`@pie-project/client`](https://www.npmjs.com/package/@pie-project/client).
+
 ```bash
-npm install pie-client
+npm install @pie-project/client@0.3.0
 ```
 
 ## Quick start
 
 ```javascript
-import { PieClient } from 'pie-client';
+import { PieClient } from '@pie-project/client';
 
 const client = new PieClient("ws://127.0.0.1:8080");
 await client.connect();

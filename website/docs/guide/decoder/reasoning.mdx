@@ -82,7 +82,7 @@ async for step in g:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler, chat, reasoning } from 'inferlet';
+import { Sampler, chat, reasoning } from '@pie-project/inferlet';
 
 const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 512 });
 
@@ -161,7 +161,7 @@ match chat_dec.feed(out.tokens):
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { session } from 'inferlet';
+import { session } from '@pie-project/inferlet';
 
 const rev = thinkDec.feed(out.tokens);
 if (rev.type === 'delta') session.send({ channel: 'think', text: rev.text });

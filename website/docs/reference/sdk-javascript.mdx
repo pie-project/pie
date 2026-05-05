@@ -7,6 +7,14 @@ description: Full inferlet SDK API for JavaScript / TypeScript
 
 The full inferlet SDK API for JavaScript and TypeScript. The [Guide](../guide/install) walks through how to use these APIs with runnable code; this page enumerates the surface.
 
+## Installation
+
+The JavaScript inferlet SDK is published on npm as [`@pie-project/inferlet`](https://www.npmjs.com/package/@pie-project/inferlet).
+
+```bash
+npm install @pie-project/inferlet@0.3.0
+```
+
 ## Inferlet entry point
 
 ```typescript
@@ -21,7 +29,7 @@ Throw to fail the run; the message becomes the `Error` event.
 
 ## Imports
 
-The whole SDK lives under `inferlet`:
+The whole SDK is imported from `@pie-project/inferlet`:
 
 ```typescript
 import {
@@ -32,13 +40,13 @@ import {
     jsonSchema, anyJson, regex, ebnf, grammar,
     chat, reasoning, tools,
     runtime, scheduling, session, messaging, mcp,
-} from 'inferlet';
+} from '@pie-project/inferlet';
 ```
 
 ## Runtime
 
 ```typescript
-import { runtime } from 'inferlet';
+import { runtime } from '@pie-project/inferlet';
 ```
 
 | Function | Returns | Description |
@@ -51,7 +59,7 @@ import { runtime } from 'inferlet';
 ## Model
 
 ```typescript
-import { Model } from 'inferlet';
+import { Model } from '@pie-project/inferlet';
 ```
 
 | Method | Description |
@@ -72,7 +80,7 @@ import { Model } from 'inferlet';
 ## Context
 
 ```typescript
-import { Context } from 'inferlet';
+import { Context } from '@pie-project/inferlet';
 
 using ctx = new Context(model);
 ```
@@ -125,7 +133,7 @@ The JS SDK does not expose raw page operations (`reserve_working_pages`, `commit
 ## Generator
 
 ```typescript
-import { Sampler } from 'inferlet';
+import { Sampler } from '@pie-project/inferlet';
 
 const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
 ```
@@ -243,7 +251,7 @@ const token = out.token(h);
 ## Samplers
 
 ```typescript
-import { Sampler } from 'inferlet';
+import { Sampler } from '@pie-project/inferlet';
 ```
 
 | Constructor | Description |
@@ -258,7 +266,7 @@ import { Sampler } from 'inferlet';
 ## Probes
 
 ```typescript
-import { Logits, Distribution, Logprob, Logprobs, Entropy } from 'inferlet';
+import { Logits, Distribution, Logprob, Logprobs, Entropy } from '@pie-project/inferlet';
 ```
 
 | Probe | Output accessor | Returns |
@@ -274,7 +282,7 @@ import { Logits, Distribution, Logprob, Logprobs, Entropy } from 'inferlet';
 ### Schema
 
 ```typescript
-import { jsonSchema, anyJson, regex, ebnf, grammar } from 'inferlet';
+import { jsonSchema, anyJson, regex, ebnf, grammar } from '@pie-project/inferlet';
 ```
 
 | Function | Returns | Description |
@@ -302,7 +310,7 @@ Any object with a `buildConstraint(model)` method satisfies the `Schema` interfa
 ### Custom Constraint
 
 ```typescript
-import type { Constraint } from 'inferlet';
+import type { Constraint } from '@pie-project/inferlet';
 
 class MyConstraint implements Constraint {
     step(accepted: Uint32Array): Uint32Array {
@@ -316,7 +324,7 @@ Return an empty `Uint32Array` for "no restriction this step."
 ### Grammar / GrammarConstraint / Matcher
 
 ```typescript
-import { Grammar, GrammarConstraint, Matcher } from 'inferlet';
+import { Grammar, GrammarConstraint, Matcher } from '@pie-project/inferlet';
 ```
 
 | Method | Description |
@@ -339,7 +347,7 @@ import { Grammar, GrammarConstraint, Matcher } from 'inferlet';
 ## Speculative decoding
 
 ```typescript
-import type { Speculator } from 'inferlet';
+import type { Speculator } from '@pie-project/inferlet';
 
 class MySpec implements Speculator {
     draft(): [Uint32Array, Uint32Array] {
@@ -365,7 +373,7 @@ Pass via `ctx.generate(sampler, { speculator: new MySpec() })`. `systemSpeculati
 ## Adapters
 
 ```typescript
-import { Adapter } from 'inferlet';
+import { Adapter } from '@pie-project/inferlet';
 ```
 
 | Method | Description |
@@ -390,7 +398,7 @@ All three follow the same shape: `new chat.Decoder(model)` constructor, `feed(to
 ### chat.Decoder
 
 ```typescript
-import { chat } from 'inferlet';
+import { chat } from '@pie-project/inferlet';
 
 const dec = new chat.Decoder(model);
 const ev = dec.feed(tokens);
@@ -409,7 +417,7 @@ Helpers: `chat.system(model, msg)`, `chat.user(...)`, `chat.assistant(...)`, `ch
 ### reasoning.Decoder
 
 ```typescript
-import { reasoning } from 'inferlet';
+import { reasoning } from '@pie-project/inferlet';
 ```
 
 | Event `type` | Fields | Meaning |
@@ -422,7 +430,7 @@ import { reasoning } from 'inferlet';
 ### tools.Decoder
 
 ```typescript
-import { tools } from 'inferlet';
+import { tools } from '@pie-project/inferlet';
 ```
 
 | Event `type` | Fields | Meaning |
@@ -443,7 +451,7 @@ Helpers:
 ### Session
 
 ```typescript
-import { session } from 'inferlet';
+import { session } from '@pie-project/inferlet';
 ```
 
 | Function | Returns | Description |
@@ -458,7 +466,7 @@ Signals from `proc.signal(...)` arrive through `session.receive`.
 ### Messaging
 
 ```typescript
-import { messaging, Subscription } from 'inferlet';
+import { messaging, Subscription } from '@pie-project/inferlet';
 ```
 
 | Function | Description |
@@ -479,7 +487,7 @@ import { messaging, Subscription } from 'inferlet';
 ### MCP
 
 ```typescript
-import { mcp, McpSession } from 'inferlet';
+import { mcp, McpSession } from '@pie-project/inferlet';
 ```
 
 | Function | Returns | Description |
@@ -501,7 +509,7 @@ import { mcp, McpSession } from 'inferlet';
 ## Scheduling
 
 ```typescript
-import { scheduling } from 'inferlet';
+import { scheduling } from '@pie-project/inferlet';
 ```
 
 | Function | Returns | Description |

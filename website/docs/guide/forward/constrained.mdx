@@ -95,7 +95,7 @@ await ctx.generate(
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler, jsonSchema, anyJson, regex, ebnf } from 'inferlet';
+import { Sampler, jsonSchema, anyJson, regex, ebnf } from '@pie-project/inferlet';
 
 // Force any valid JSON
 const result = await ctx.generate(
@@ -253,7 +253,7 @@ out = await ctx.generate(
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Grammar, grammar as gschema } from 'inferlet';
+import { Grammar, grammar as gschema } from '@pie-project/inferlet';
 
 const g = Grammar.fromEbnf(myGrammar);
 
@@ -336,7 +336,7 @@ out = await ctx.generate(
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import type { Constraint } from 'inferlet';
+import type { Constraint } from '@pie-project/inferlet';
 
 class MyConstraint implements Constraint {
     step(accepted: Uint32Array): Uint32Array {

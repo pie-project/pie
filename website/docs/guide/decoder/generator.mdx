@@ -49,7 +49,7 @@ The Python API takes options as keyword arguments to `generate`. Every Rust buil
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler } from 'inferlet';
+import { Sampler } from '@pie-project/inferlet';
 
 const g = ctx.generate(
     Sampler.topP(0.6, 0.95),
@@ -173,7 +173,7 @@ async for step in g:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler, Logits } from 'inferlet';
+import { Sampler, Logits } from '@pie-project/inferlet';
 
 const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
 
@@ -238,7 +238,7 @@ g = ctx.generate(sampler, max_tokens=512, stop=stops)
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { chat } from 'inferlet';
+import { chat } from '@pie-project/inferlet';
 
 const stops = [...chat.stopTokens(model), ...myExtraStopIds];
 const g = ctx.generate(sampler, { maxTokens: 512, stop: stops });

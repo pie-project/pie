@@ -48,7 +48,7 @@ The engine accepts WebSocket connections at `ws://127.0.0.1:8080`. It loads the 
 ```toml
 # In your client project's Cargo.toml
 [dependencies]
-pie-client = "*"
+pie-client = "0.3"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -66,7 +66,7 @@ pip install pie-client
 <TabItem value="js" label="JavaScript">
 
 ```bash
-npm install pie-client
+npm install @pie-project/client
 ```
 
 </TabItem>
@@ -211,7 +211,7 @@ asyncio.run(main())
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { PieClient } from 'pie-client';
+import { PieClient } from '@pie-project/client';
 
 async function main() {
     const client = new PieClient('ws://127.0.0.1:8080');

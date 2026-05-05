@@ -59,7 +59,7 @@ msg = await sub.next()              # returns str | None
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { messaging } from 'inferlet';
+import { messaging } from '@pie-project/inferlet';
 
 // Publisher
 messaging.broadcast('events', 'new-data');
@@ -117,7 +117,7 @@ msg = await messaging.pull("jobs")
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { messaging } from 'inferlet';
+import { messaging } from '@pie-project/inferlet';
 
 // Producer
 messaging.push('jobs', jobPayload);

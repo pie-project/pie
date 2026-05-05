@@ -147,7 +147,7 @@ mcp_session = mcp.connect(servers[0])
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { mcp } from 'inferlet';
+import { mcp } from '@pie-project/inferlet';
 
 const servers = mcp.availableServers();
 const mcpSession = mcp.connect(servers[0]);
@@ -402,7 +402,7 @@ async for step in g:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { tools } from 'inferlet';
+import { tools } from '@pie-project/inferlet';
 
 // 1. Equip the model with the MCP tool schemas.
 const mcpTools = JSON.parse(mcpSession.listTools());

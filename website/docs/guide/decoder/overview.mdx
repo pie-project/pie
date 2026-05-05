@@ -79,7 +79,7 @@ text = await ctx.generate(
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler } from 'inferlet';
+import { Sampler } from '@pie-project/inferlet';
 
 const text = await ctx.generate(
     Sampler.topP(0.6, 0.95),
@@ -140,7 +140,7 @@ async for step in g:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Sampler, chat } from 'inferlet';
+import { Sampler, chat } from '@pie-project/inferlet';
 
 const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
 const parser = new chat.Decoder(model);
