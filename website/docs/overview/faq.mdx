@@ -16,13 +16,19 @@ No. Pie is a research prototype under active development. APIs change between re
 
 No. Inferlets can be written in Rust, Python, or TypeScript. Rust is the canonical SDK, and a few advanced primitives (the raw `forward()` API, custom speculators, custom adapters) are Rust-only today. The Python and TypeScript SDKs cover generation, KV cache control, structured output, MCP, and tool calling. See [Your first inferlet](../guide/first-inferlet) for the Rust path and the `python-example` and `js-example` inferlets for the other two.
 
-## Does this architecture introduce too much overhead?
+## What is the cost we pay for programmability?
 
 The accumulated per-request runtime overhead (Wasm instantiation, the tokio per-inferlet executor, Wasm/host boundary crossings, and the runtime-to-driver IPC) sits in the 100-500 microsecond range even under load. That's small relative to a forward pass. The main "programmability tax" per-step comes from two places:
 
 1. **Optimizations the driver can no longer apply.** The driver doesn't know which API calls the inferlet will issue next, so it can't pipeline CPU-side batch preparation with GPU execution, and it can't do in-place batch updates that only edit newly added tokens.
 
 2. **Sampling has to be composable.** A black-box endpoint can fuse the entire sampler into one kernel. Pie splits sampling into composable steps so inferlets can mix and match, which costs extra kernel launches.
+
+In sum, this adds about 1ms per-token latency overhead compared to vLLM regardless of model size. For small models, this latency can be noticeable. That being said, the application-level optimizations typically yield much larger gains that amortize this cost away. For more details, see the [benchmarks](../benchmarks) page.
+
+### How many inferlets can I run in parallel?
+
+You can spawn as many inferlets as you can fit in memory. Pie reliably handles thousands of concurrent inferlets without noticeable overhead. The forward pass calls from these inferlets are batched together efficiently, e.g., under high concurrent load using text-completion inferlets, Pie matches vLLM's peak throughput.
 
 
 ## Does Pie support multi-GPU and multi-node?
