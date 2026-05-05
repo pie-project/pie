@@ -11,8 +11,8 @@ The full inferlet SDK API for Python. The [Guide](../guide/install) walks throug
 
 ```python
 async def main(input: dict) -> str:
-    # ...
-    return result
+    name = input.get("name", "world")
+    return f"hello {name}"
 ```
 
 The Python inferlet runtime invokes a top-level `async def main(input)` coroutine. `input` is a parsed JSON dict whose shape matches the manifest's `[parameters]` block. The return value is JSON-serialized into the `Return` event the client receives.
@@ -279,7 +279,7 @@ All four are dataclasses. Pass them to `ctx.generate(constrain=...)` or `g.const
 ```python
 class MySchema:
     def build_constraint(self, model: Model) -> GrammarConstraint:
-        ...
+        return GrammarConstraint.json(model)
 ```
 
 Any class with a `build_constraint(model)` method satisfies the `Schema` protocol.
@@ -289,8 +289,7 @@ Any class with a `build_constraint(model)` method satisfies the `Schema` protoco
 ```python
 class MyConstraint:
     def step(self, accepted: list[int]) -> list[int]:
-        # return a BRLE-encoded logit mask
-        ...
+        return []  # no restriction this step
 ```
 
 Any class with a `step(accepted)` method satisfies the `Constraint` protocol. Return `[]` for "no restriction this step."
@@ -324,10 +323,17 @@ from inferlet import Grammar, GrammarConstraint, Matcher
 from inferlet.spec import Speculator
 
 class MySpec:
-    def draft(self) -> tuple[list[int], list[int]]: ...
-    def accept(self, tokens: list[int]) -> None: ...
-    def rollback(self, n: int) -> None: ...
-    def reset(self) -> None: ...
+    def draft(self) -> tuple[list[int], list[int]]:
+        return [], []
+
+    def accept(self, tokens: list[int]) -> None:
+        return None
+
+    def rollback(self, n: int) -> None:
+        return None
+
+    def reset(self) -> None:
+        return None
 ```
 
 Any class implementing the four methods satisfies the protocol. Pass to `ctx.generate(speculator=MySpec())`.

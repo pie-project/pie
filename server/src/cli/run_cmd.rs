@@ -72,6 +72,7 @@ pub struct RunArgs {
 }
 
 pub fn run(mut args: RunArgs) -> Result<()> {
+    normalize_path_args(&mut args)?;
     if args.inferlet.is_none() && args.path.is_none() {
         bail!("specify an inferlet name or --path");
     }
@@ -138,6 +139,23 @@ pub fn run(mut args: RunArgs) -> Result<()> {
 
         result
     })
+}
+
+fn normalize_path_args(args: &mut RunArgs) -> Result<()> {
+    if args.path.is_none() {
+        return Ok(());
+    }
+
+    let Some(first_positional) = args.inferlet.take() else {
+        return Ok(());
+    };
+
+    if first_positional.starts_with('-') || !args.extra.is_empty() {
+        args.extra.insert(0, first_positional);
+        return Ok(());
+    }
+
+    bail!("--path is mutually exclusive with inferlet name {first_positional:?}");
 }
 
 async fn drive_inferlet(url: &str, token: &str, args: &RunArgs) -> Result<()> {
@@ -565,6 +583,48 @@ fn highlight_json_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_run_args(inferlet: Option<&str>, extra: Vec<&str>) -> RunArgs {
+        RunArgs {
+            inferlet: inferlet.map(str::to_string),
+            path: Some(PathBuf::from("out.wasm")),
+            manifest: Some(PathBuf::from("Pie.toml")),
+            config: None,
+            port: None,
+            input: "{}".to_string(),
+            relay_stdout: false,
+            debug: false,
+            quiet: true,
+            extra: extra.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn path_run_keeps_documented_trailing_flags_as_input() {
+        let mut args = local_run_args(
+            Some("--prompt"),
+            vec!["The capital of France is", "--max-tokens", "4"],
+        );
+
+        normalize_path_args(&mut args).unwrap();
+
+        assert!(args.inferlet.is_none());
+        let input = cli_args_to_json(&args.extra);
+        assert_eq!(input["prompt"], "The capital of France is");
+        assert_eq!(input["max_tokens"], 4);
+    }
+
+    #[test]
+    fn path_run_rejects_inferlet_name_without_extra_input() {
+        let mut args = local_run_args(Some("text-completion"), vec![]);
+
+        let err = normalize_path_args(&mut args).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("--path is mutually exclusive with inferlet name")
+        );
+    }
 
     #[test]
     fn latest_version_from_registry_json_uses_first_version() {

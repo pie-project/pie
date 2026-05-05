@@ -96,7 +96,7 @@ interface Input {
 
 ## How the CLI folds flags into input
 
-`pie run <name> --question "What is 2+2?" --max-tokens 64 --verbose` produces:
+`pie run <name> -- --question "What is 2+2?" --max-tokens 64 --verbose` produces:
 
 ```json
 {
@@ -106,7 +106,7 @@ interface Input {
 }
 ```
 
-`pie run` walks the trailing flags and turns each `--flag value` pair into a JSON entry. Hyphens in long-form flag names become underscores in JSON keys (`--max-tokens` → `"max_tokens"`). Types are inferred from the value itself, not from `[parameters]`: `pie run` tries `int`, then `float`, then `bool`, then falls back to `string`. The manifest's declared `type` is documentation; the CLI does not consult it.
+`pie run` walks the flags after `--` and turns each `--flag value` pair into a JSON entry. Hyphens in long-form flag names become underscores in JSON keys (`--max-tokens` → `"max_tokens"`). Types are inferred from the value itself, not from `[parameters]`: `pie run` tries `int`, then `float`, then `bool`, then falls back to `string`. The manifest's declared `type` is documentation; the CLI does not consult it.
 
 A bare `--flag` (no value) becomes `"flag": true`.
 

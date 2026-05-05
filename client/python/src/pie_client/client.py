@@ -121,6 +121,8 @@ class PieClient:
             Exception,
         ):
             pass
+        finally:
+            self._fail_pending_requests(ConnectionError("WebSocket connection closed"))
 
     async def _process_server_message(self, message: dict):
         """Route incoming server messages based on their type."""
@@ -206,6 +208,15 @@ class PieClient:
                 await self.listener_task
             except asyncio.CancelledError:
                 pass
+        self._fail_pending_requests(ConnectionError("WebSocket connection closed"))
+
+    def _fail_pending_requests(self, exc: Exception):
+        """Reject all requests still waiting for a server response."""
+        pending = list(self.pending_requests.items())
+        self.pending_requests.clear()
+        for _, future in pending:
+            if not future.done():
+                future.set_exception(exc)
 
     def _get_next_corr_id(self):
         """Generate a unique correlation ID for a request."""
@@ -219,8 +230,15 @@ class PieClient:
         future = asyncio.get_event_loop().create_future()
         self.pending_requests[corr_id] = future
         encoded = msgpack.packb(msg, use_bin_type=True)
-        await self.ws.send(encoded)
-        return await future
+        try:
+            await self.ws.send(encoded)
+        except Exception:
+            self.pending_requests.pop(corr_id, None)
+            raise
+        try:
+            return await future
+        finally:
+            self.pending_requests.pop(corr_id, None)
 
     # =========================================================================
     # Authentication
@@ -357,8 +375,6 @@ class PieClient:
 
     async def _upload_chunked(self, data_bytes: bytes, msg_template: dict):
         """Internal helper to handle generic chunked uploads with response."""
-        data_hash = msg_template.get("program_hash") or msg_template.get("file_hash")
-
         chunk_size = 256 * 1024
         total_size = len(data_bytes)
         total_chunks = (
@@ -368,24 +384,30 @@ class PieClient:
         corr_id = self._get_next_corr_id()
         msg_template["corr_id"] = corr_id
         msg_template["total_chunks"] = total_chunks
-
-        if total_size == 0:
-            msg = msg_template.copy()
-            msg.update({"chunk_index": 0, "chunk_data": b""})
-            await self.ws.send(msgpack.packb(msg, use_bin_type=True))
-        else:
-            for chunk_index in range(total_chunks):
-                start = chunk_index * chunk_size
-                end = min(start + chunk_size, total_size)
-                msg = msg_template.copy()
-                msg.update(
-                    {"chunk_index": chunk_index, "chunk_data": data_bytes[start:end]}
-                )
-                await self.ws.send(msgpack.packb(msg, use_bin_type=True))
-
         future = asyncio.get_event_loop().create_future()
         self.pending_requests[corr_id] = future
-        ok, result = await future
+
+        try:
+            if total_size == 0:
+                msg = msg_template.copy()
+                msg.update({"chunk_index": 0, "chunk_data": b""})
+                await self.ws.send(msgpack.packb(msg, use_bin_type=True))
+            else:
+                for chunk_index in range(total_chunks):
+                    start = chunk_index * chunk_size
+                    end = min(start + chunk_size, total_size)
+                    msg = msg_template.copy()
+                    msg.update(
+                        {"chunk_index": chunk_index, "chunk_data": data_bytes[start:end]}
+                    )
+                    await self.ws.send(msgpack.packb(msg, use_bin_type=True))
+        except Exception:
+            self.pending_requests.pop(corr_id, None)
+            raise
+        try:
+            ok, result = await future
+        finally:
+            self.pending_requests.pop(corr_id, None)
 
         if not ok:
             raise Exception(f"Upload failed: {result}")

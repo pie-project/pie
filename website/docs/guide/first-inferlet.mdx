@@ -58,7 +58,7 @@ prompt     = { type = "string", description = "User prompt" }
 max_tokens = { type = "int", optional = true }
 ```
 
-The `[parameters]` block declares the JSON input the inferlet expects. `pie run --prompt "..."` uses these declarations to fold CLI flags into the input dict.
+The `[parameters]` block documents the JSON input the inferlet expects. `pie run -- --prompt "..."` folds CLI flags into the input dict; your inferlet's `Input` type performs the actual validation.
 
 ## The code
 
@@ -123,6 +123,7 @@ Both paths produce the same artifact.
 pie run \
   --path ./my-inferlet.wasm \
   --manifest ./Pie.toml \
+  -- \
   --prompt "What is the capital of France?" \
   --max-tokens 64
 ```
@@ -140,7 +141,7 @@ You see something like:
 The capital of France is Paris.
 ```
 
-CLI flags after `--manifest` are folded into `Input` (with int / float / bool inference). `--prompt "..."` becomes `{"prompt": "..."}`. `--max-tokens 64` becomes `{"max_tokens": 64}`.
+CLI flags after `--` are folded into `Input` (with int / float / bool inference). `--prompt "..."` becomes `{"prompt": "..."}`. `--max-tokens 64` becomes `{"max_tokens": 64}`.
 
 ## Iterate
 
@@ -149,7 +150,7 @@ The dev loop is edit, build, run.
 ```bash
 # After editing src/lib.rs:
 bakery build . -o my-inferlet.wasm
-pie run --path ./my-inferlet.wasm --manifest ./Pie.toml --prompt "..."
+pie run --path ./my-inferlet.wasm --manifest ./Pie.toml -- --prompt "Summarize KV caching in one sentence."
 ```
 
 The first build is slow because the toolchain pulls dependencies. Subsequent rebuilds are incremental.

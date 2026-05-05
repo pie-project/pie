@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import type { ReactElement } from 'react';
 import Layout from '@theme/Layout';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import BrowserOnly from '@docusaurus/BrowserOnly';
@@ -181,7 +182,7 @@ function WhyPieAgentContent() {
   );
 }
 
-export default function WhyPieAgent(): JSX.Element {
+export default function WhyPieAgent(): ReactElement {
   return (
     <Layout
       title="Why Pie for Agents"

@@ -11,7 +11,7 @@ The full inferlet SDK API for JavaScript and TypeScript. The [Guide](../guide/in
 
 ```typescript
 export async function main(input: Input): Promise<Output> {
-    // ...
+    return { message: `hello ${input.name ?? 'world'}` } as Output;
 }
 ```
 
@@ -291,7 +291,9 @@ Pass to `ctx.generate(sampler, { constrain })` or `g.constrain(...)`.
 
 ```typescript
 class MySchema {
-    buildConstraint(model: Model): GrammarConstraint { /* ... */ }
+    buildConstraint(model: Model): GrammarConstraint {
+        return GrammarConstraint.json(model);
+    }
 }
 ```
 
@@ -340,10 +342,21 @@ import { Grammar, GrammarConstraint, Matcher } from 'inferlet';
 import type { Speculator } from 'inferlet';
 
 class MySpec implements Speculator {
-    draft(): [Uint32Array, Uint32Array] { /* ... */ }
-    accept(tokens: Uint32Array): void { /* ... */ }
-    rollback(n: number): void { /* ... */ }
-    reset(): void { /* ... */ }
+    draft(): [Uint32Array, Uint32Array] {
+        return [new Uint32Array(), new Uint32Array()];
+    }
+
+    accept(tokens: Uint32Array): void {
+        return;
+    }
+
+    rollback(n: number): void {
+        return;
+    }
+
+    reset(): void {
+        return;
+    }
 }
 ```
 

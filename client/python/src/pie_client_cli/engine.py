@@ -196,13 +196,14 @@ async def _stream_inferlet_output_async(
 
     # Set up stdin EOF detection in a separate thread
     eof_received = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
     def stdin_monitor():
         try:
             while True:
                 data = sys.stdin.read(1)
                 if not data:  # EOF
-                    asyncio.get_event_loop().call_soon_threadsafe(eof_received.set)
+                    loop.call_soon_threadsafe(eof_received.set)
                     break
         except Exception:
             pass

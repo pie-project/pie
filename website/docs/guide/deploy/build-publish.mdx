@@ -37,6 +37,7 @@ See the [bakery reference](../../reference/bakery) for every flag.
 pie run \
   --path ./my-inferlet.wasm \
   --manifest ./Pie.toml \
+  -- \
   --question "test input"
 ```
 
@@ -69,8 +70,8 @@ bakery inferlet publish ./my-inferlet
 After publishing, anyone connected to the same registry can launch it:
 
 ```bash
-pie run my-inferlet --question "..."             # latest version
-pie run my-inferlet@0.1.0 --question "..."       # pinned
+pie run my-inferlet -- --question "What changed in this release?"             # latest version
+pie run my-inferlet@0.1.0 -- --question "What changed in this release?"       # pinned
 ```
 
 The first run on a fresh engine pulls the artifact and caches it. Subsequent runs are local.
@@ -98,7 +99,7 @@ bakery inferlet info text-completion
 If your deployment pulls images through CI or you do not want to use the public registry, two options exist:
 
 - **Client-uploaded builds.** A client process uploads the `.wasm` and `Pie.toml` to a specific engine via the SDK's `add_program` / `install_program`. The engine keeps the upload while it is running. See [Connecting clients](./clients).
-- **Direct local runs.** `pie run --path ./out.wasm --manifest ./Pie.toml ...` reads from disk. The engine launches one-shot. See [Tutorial: run](../tutorial/run).
+- **Direct local runs.** `pie run --path ./out.wasm --manifest ./Pie.toml -- ...` reads from disk. The engine launches one-shot. See [Tutorial: run](../tutorial/run).
 
 Both paths skip the registry. The trade is that the inferlet is no longer addressable by name across engines.
 

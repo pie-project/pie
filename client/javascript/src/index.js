@@ -7,7 +7,8 @@
  */
 
 import msgpack from 'msgpack-lite';
-import { blake3 } from 'blake3';
+import { blake3 } from '@noble/hashes/blake3.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 
 import { BridgeRegistry, JsonRpcError } from './mcp_bridge.js';
 
@@ -45,6 +46,10 @@ class AsyncQueue {
 }
 
 const CHUNK_SIZE = 256 * 1024; // 256 KiB
+
+function hashBytes(bytes) {
+    return bytesToHex(blake3(bytes));
+}
 
 /**
  * Represents a running process on the server.
@@ -152,10 +157,12 @@ export class PieClient {
 
                 this.ws.onerror = (error) => {
                     reject(new Error("WebSocket connection failed."));
+                    this._rejectPendingRequests(new Error("WebSocket connection failed."));
                     this.connectionPromise = null;
                 };
 
                 this.ws.onclose = () => {
+                    this._rejectPendingRequests(new Error("WebSocket connection closed."));
                     this.ws = null;
                     this.connectionPromise = null;
                 };
@@ -244,7 +251,7 @@ export class PieClient {
         if (chunk_index === total_chunks - 1) {
             this.pendingDownloads.delete(file_hash);
             const completeData = Buffer.concat(download.buffer);
-            const computedHash = blake3(completeData).toString('hex');
+            const computedHash = hashBytes(completeData);
             if (computedHash === file_hash && this.processEventQueues.has(download.processId)) {
                 this.processEventQueues.get(download.processId).put(['file', completeData]);
             }
@@ -258,13 +265,28 @@ export class PieClient {
     async close() {
         try { await this.mcpBridge.closeAll(); } catch {}
         return new Promise((resolve) => {
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                this.ws.onclose = () => resolve();
-                this.ws.close();
-            } else {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                this._rejectPendingRequests(new Error("WebSocket connection closed."));
                 resolve();
+                return;
             }
+
+            const ws = this.ws;
+            const previousOnClose = ws.onclose;
+            ws.onclose = (event) => {
+                if (previousOnClose) previousOnClose.call(ws, event);
+                resolve();
+            };
+            ws.close();
         });
+    }
+
+    /** @private */
+    _rejectPendingRequests(error) {
+        for (const { reject } of this.pendingRequests.values()) {
+            reject(error);
+        }
+        this.pendingRequests.clear();
     }
 
     /** @private */
@@ -387,7 +409,7 @@ export class PieClient {
         const fs = await import('fs');
         const programBytes = fs.readFileSync(wasmPath);
         const manifest = fs.readFileSync(manifestPath, 'utf-8');
-        const programHash = blake3(programBytes).toString('hex');
+        const programHash = hashBytes(programBytes);
 
         const totalChunks = Math.max(1, Math.ceil(programBytes.length / CHUNK_SIZE));
         const corr_id = this._getNextCorrId();
@@ -424,7 +446,7 @@ export class PieClient {
 
     /** @private */
     async _transferFile(processId, fileBytes) {
-        const fileHash = blake3(fileBytes).toString('hex');
+        const fileHash = hashBytes(fileBytes);
         const totalChunks = Math.max(1, Math.ceil(fileBytes.length / CHUNK_SIZE));
 
         for (let i = 0; i < totalChunks; i++) {

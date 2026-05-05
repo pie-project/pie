@@ -13,13 +13,13 @@ names.
 ## Installation
 
 ```bash
-npm install @pie/client
+npm install pie-client
 ```
 
 ## Quick start
 
 ```javascript
-import { PieClient } from '@pie/client';
+import { PieClient } from 'pie-client';
 
 const client = new PieClient("ws://127.0.0.1:8080");
 await client.connect();
@@ -40,7 +40,7 @@ while (true) {
   else if (event === "error")  { console.error("\n[error]", value); break; }
 }
 
-client.close();
+await client.close();
 ```
 
 ## PieClient
@@ -48,8 +48,8 @@ client.close();
 ```javascript
 const client = new PieClient(serverUri);
 await client.connect();
-// …
-client.close();
+await client.ping();
+await client.close();
 ```
 
 | Method | Description |
@@ -105,14 +105,14 @@ await client.registerMcpServer('fs', {
 
 ## Process
 
-```javascript
-class Process {
+```typescript
+interface Process {
   processId: string;
 
-  async signal(message);
-  async transferFile(fileBytes);   // Uint8Array | Buffer
-  async recv();                    // → { event, value }
-  async terminate();
+  signal(message: string): Promise<void>;
+  transferFile(fileBytes: Uint8Array | Buffer): Promise<void>;
+  recv(): Promise<{ event: string; value: string | Uint8Array }>;
+  terminate(): Promise<void>;
 }
 ```
 
@@ -167,9 +167,9 @@ server buffers events for you.
 
 ```javascript
 const c1 = new PieClient(uri); await c1.connect();
-const proc = await c1.launchProcess("long-task@0.1.0", { /* … */ });
+const proc = await c1.launchProcess("long-task@0.1.0", { topic: "KV cache reuse" });
 const pid = proc.processId;
-c1.close();
+await c1.close();
 
 // … later …
 const c2 = new PieClient(uri); await c2.connect();

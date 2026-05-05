@@ -11,12 +11,11 @@ Every inferlet listed in this section is a complete, runnable project under [`in
 Build and run any of them locally:
 
 ```bash
-pie run --path target/wasm32-wasip2/release/<name>.wasm \
-        --manifest inferlets/<name>/Pie.toml \
-        --prompt "..."
+bakery build inferlets/text-completion -o text-completion.wasm
+pie run --path ./text-completion.wasm --manifest inferlets/text-completion/Pie.toml -- --prompt "Write one sentence about Pie."
 ```
 
-For a published version: `pie run <name> --prompt "..."`.
+For a published version: `pie run text-completion -- --prompt "Write one sentence about Pie."`.
 
 ## Categories
 

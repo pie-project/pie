@@ -36,7 +36,7 @@ A `Context` holds a token sequence and its KV cache as a chain of fixed-size pag
 
 ```rust
 let mut prefix = Context::new(&model)?;
-prefix.system("You are a helpful assistant. <long preamble...>");
+prefix.system("You are a helpful assistant. Answer with concise technical detail.");
 prefix.flush().await?;
 prefix.save("system-prompt-v1")?;
 
