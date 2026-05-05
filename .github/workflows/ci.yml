@@ -72,7 +72,7 @@ jobs:
         run: cargo build -p pie-server
 
       - name: cargo test (pie-server)
-        run: cargo test --bin pie
+        run: cargo test -p pie-server --bin pie
 
       - name: Verify single-binary linkage
         run: |
@@ -115,7 +115,7 @@ jobs:
 
       - name: cargo test (pie-server, dummy)
         run: |
-          cargo test --bin pie \
+          cargo test -p pie-server --bin pie \
             --no-default-features --features driver-dummy
 
   # macOS portable build with Metal backend. Verifies build.rs's
@@ -154,7 +154,7 @@ jobs:
       - name: cargo test (pie-server)
         env:
           PIE_PORTABLE_METAL: "1"
-        run: cargo test --bin pie
+        run: cargo test -p pie-server --bin pie
 
   # Cuda build — runs only when an opt-in label or schedule fires
   # (no CUDA on the default GH-hosted runners). Add a self-hosted
