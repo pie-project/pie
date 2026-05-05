@@ -19,16 +19,39 @@ PIE_REPO="${PIE_REPO:-pie-project/pie}"
 PIE_VERSION="${PIE_VERSION:-latest-build}"
 PIE_INSTALL_DIR="${PIE_INSTALL_DIR:-${HOME}/.local/bin}"
 PIE_DOWNLOAD_BASE="${PIE_DOWNLOAD_BASE:-https://github.com/${PIE_REPO}/releases/download/${PIE_VERSION}}"
+PIE_DETECTED_FLAVOR=""
+PIE_FLAVOR_REASON=""
 
-bold=""; reset=""
-if [ -t 2 ]; then bold=$'\033[1m'; reset=$'\033[0m'; fi
-info() { printf '%s==>%s %s\n' "$bold" "$reset" "$*" >&2; }
-err()  { printf '%serror:%s %s\n' "$bold" "$reset" "$*" >&2; exit 1; }
+bold=""; dim=""; red=""; green=""; yellow=""; reset=""
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
+  bold=$'\033[1m'
+  dim=$'\033[2m'
+  red=$'\033[31m'
+  green=$'\033[32m'
+  yellow=$'\033[33m'
+  reset=$'\033[0m'
+fi
+
+heading() { printf '\n%s%s%s\n' "$bold" "$*" "$reset" >&2; }
+detail()  { printf '  %s%s%s\n' "$dim" "$*" "$reset" >&2; }
+step()    { printf '%s==>%s %s\n' "$bold" "$reset" "$*" >&2; }
+ok()      { printf '%ssuccess:%s %s\n' "$green" "$reset" "$*" >&2; }
+warn()    { printf '%swarning:%s %s\n' "$yellow" "$reset" "$*" >&2; }
+err()     { printf '%serror:%s %s\n' "$red" "$reset" "$*" >&2; exit 1; }
+debug()   { if [ -n "${PIE_VERBOSE:-}" ]; then detail "$*"; fi; }
 
 if command -v curl >/dev/null 2>&1; then
-  fetch() { curl -fsSL --retry 3 -o "$2" "$1"; }
+  if [ -t 2 ]; then
+    fetch() { curl -fL --progress-bar --retry 3 -o "$2" "$1"; }
+  else
+    fetch() { curl -fsSL --retry 3 -o "$2" "$1"; }
+  fi
 elif command -v wget >/dev/null 2>&1; then
-  fetch() { wget -q -O "$2" "$1"; }
+  if [ -t 2 ]; then
+    fetch() { wget -q --show-progress -O "$2" "$1"; }
+  else
+    fetch() { wget -q -O "$2" "$1"; }
+  fi
 else
   err "neither curl nor wget found; install one and re-run"
 fi
@@ -75,25 +98,38 @@ fi
 # ---------------------------------------------------------------------------
 
 detect_cuda_flavor() {
-  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  command -v nvidia-smi >/dev/null 2>&1 || {
+    PIE_FLAVOR_REASON="no NVIDIA driver detected"
+    return 0
+  }
   local driver major
   driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)"
-  [ -n "$driver" ] || return 0
+  [ -n "$driver" ] || {
+    PIE_FLAVOR_REASON="could not read NVIDIA driver version"
+    return 0
+  }
   major="${driver%%.*}"
-  case "$major" in *[!0-9]*|"") return 0 ;; esac
+  case "$major" in
+    *[!0-9]*|"")
+      PIE_FLAVOR_REASON="could not parse NVIDIA driver version '$driver'"
+      return 0
+      ;;
+  esac
   if [ "$major" -ge 580 ]; then
-    echo cuda13.0
+    PIE_FLAVOR_REASON="NVIDIA driver $driver supports CUDA 13"
+    PIE_DETECTED_FLAVOR=cuda13.0
   elif [ "$major" -ge 525 ]; then
-    echo cuda12.8
+    PIE_FLAVOR_REASON="NVIDIA driver $driver supports CUDA 12"
+    PIE_DETECTED_FLAVOR=cuda12.8
   else
-    info "NVIDIA driver $driver is older than 525 (CUDA 12 minimum); using portable build"
+    PIE_FLAVOR_REASON="NVIDIA driver $driver is older than 525 (CUDA 12 minimum)"
   fi
 }
 
 if [ -z "${PIE_FLAVOR:-}" ]; then
   if [ "$os" = linux ] && [ "$arch" = x86_64 ]; then
-    PIE_FLAVOR="$(detect_cuda_flavor || true)"
-    PIE_FLAVOR="${PIE_FLAVOR:-portable}"
+    detect_cuda_flavor || true
+    PIE_FLAVOR="${PIE_DETECTED_FLAVOR:-portable}"
   else
     PIE_FLAVOR=portable
   fi
@@ -121,10 +157,13 @@ asset="$(asset_for "$PIE_FLAVOR")" || err \
   "no '$PIE_FLAVOR' build for $os/$arch. Valid flavors: portable; or (Linux x86_64 only) cuda12.6, cuda12.8, cuda13.0, portable-cuda12.6, portable-cuda12.8, portable-cuda13.0."
 
 url="${PIE_DOWNLOAD_BASE}/${asset}"
-info "platform: ${os}/${arch}"
-info "flavor:   ${PIE_FLAVOR}"
-info "version:  ${PIE_VERSION}"
-info "asset:    ${url}"
+heading "Installing Pie"
+detail "Version:  ${PIE_VERSION}"
+detail "Platform: ${os}/${arch}"
+detail "Flavor:   ${PIE_FLAVOR}"
+[ -n "$PIE_FLAVOR_REASON" ] && detail "Reason:   ${PIE_FLAVOR_REASON}"
+detail "Target:   ${PIE_INSTALL_DIR}/pie"
+debug "Asset:    ${url}"
 
 # ---------------------------------------------------------------------------
 # Download + install
@@ -133,24 +172,76 @@ info "asset:    ${url}"
 tmp="$(mktemp -d -t pie-install.XXXXXX)"
 trap 'rm -rf "$tmp"' EXIT
 
-info "downloading…"
-fetch "$url" "${tmp}/${asset}"
+step "Downloading release archive"
+if ! fetch "$url" "${tmp}/${asset}"; then
+  err "download failed for ${url}. Check PIE_VERSION=${PIE_VERSION} and PIE_FLAVOR=${PIE_FLAVOR}, then try again."
+fi
 
-info "verifying archive…"
-tar -tzf "${tmp}/${asset}" >/dev/null
+step "Verifying archive"
+if ! tar -tzf "${tmp}/${asset}" >/dev/null; then
+  err "downloaded file is not a valid gzip tar archive: ${url}"
+fi
 
 tar -C "${tmp}" -xzf "${tmp}/${asset}"
 [ -f "${tmp}/pie" ] || err "archive did not contain a 'pie' binary"
 
-mkdir -p "${PIE_INSTALL_DIR}"
-install -m 0755 "${tmp}/pie" "${PIE_INSTALL_DIR}/pie"
+step "Installing binary"
+if ! mkdir -p "${PIE_INSTALL_DIR}"; then
+  err "could not create install directory: ${PIE_INSTALL_DIR}"
+fi
+if ! install -m 0755 "${tmp}/pie" "${PIE_INSTALL_DIR}/pie"; then
+  err "could not install pie to ${PIE_INSTALL_DIR}/pie. Try a user-writable PIE_INSTALL_DIR, for example: PIE_INSTALL_DIR=\"\$HOME/.local/bin\""
+fi
 
-info "installed: ${PIE_INSTALL_DIR}/pie"
+ok "Pie was installed to ${PIE_INSTALL_DIR}/pie"
+
+path_for_shell() {
+  case "${PIE_INSTALL_DIR}" in
+    "${HOME}") printf '$HOME' ;;
+    "${HOME}"/*) printf '$HOME/%s' "${PIE_INSTALL_DIR#"${HOME}/"}" ;;
+    *) printf '%s' "${PIE_INSTALL_DIR}" ;;
+  esac
+}
+
+profile_hint() {
+  local shell_name
+  shell_name="$(basename "${SHELL:-}")"
+  case "$shell_name" in
+    zsh)  printf '%s' "$HOME/.zshrc" ;;
+    bash)
+      if [ "$os" = darwin ]; then
+        printf '%s' "$HOME/.bash_profile"
+      else
+        printf '%s' "$HOME/.bashrc"
+      fi
+      ;;
+    fish) printf '%s' "$HOME/.config/fish/config.fish" ;;
+    *)    printf '%s' "$HOME/.profile" ;;
+  esac
+}
 
 case ":${PATH}:" in
   *":${PIE_INSTALL_DIR}:"*) ;;
   *)
-    info "${PIE_INSTALL_DIR} is not on your PATH. Add it with e.g.:"
-    info "  echo 'export PATH=\"${PIE_INSTALL_DIR}:\$PATH\"' >> ~/.bashrc"
+    shell_name="$(basename "${SHELL:-}")"
+    install_dir_expr="$(path_for_shell)"
+    profile="$(profile_hint)"
+    warn "${PIE_INSTALL_DIR} is not on your PATH yet"
+    printf '\nTo use pie in this terminal, run:\n' >&2
+    if [ "$shell_name" = fish ]; then
+      printf '  set -gx PATH "%s" $PATH\n' "$install_dir_expr" >&2
+      printf '\nTo make that permanent, run:\n' >&2
+      printf '  mkdir -p "%s"\n' "${profile%/*}" >&2
+      printf '  echo '\''fish_add_path "%s"'\'' >> "%s"\n' "$install_dir_expr" "$profile" >&2
+    else
+      printf '  export PATH="%s:$PATH"\n' "$install_dir_expr" >&2
+      printf '\nTo make that permanent, run:\n' >&2
+      printf '  echo '\''export PATH="%s:$PATH"'\'' >> "%s"\n' "$install_dir_expr" "$profile" >&2
+    fi
     ;;
 esac
+
+heading "Next steps"
+detail "pie --version"
+detail "pie config init"
+detail "pie doctor"
