@@ -2,10 +2,38 @@
 
 from __future__ import annotations
 
+import os
+import threading
 from dataclasses import dataclass
 from typing import NamedTuple
 
 from . import telemetry
+
+# Per-step CSV dump for ad-hoc profiling. Bypasses OTLP. Enabled by setting
+# PIE_LATENCY_LOG=1 in the engine environment; output path overrideable via
+# PIE_LATENCY_LOG_PATH (default /tmp/pie-latency.csv). One CSV row per step;
+# columns documented in the header. Used for axis-L overhead investigation
+# (#68085 Path 1).
+_LATENCY_CSV_LOCK = threading.Lock()
+_LATENCY_CSV_FH = None
+_LATENCY_CSV_HEADER_WRITTEN = False
+
+
+def _maybe_open_csv():
+    global _LATENCY_CSV_FH, _LATENCY_CSV_HEADER_WRITTEN
+    if not os.environ.get("PIE_LATENCY_LOG"):
+        return None
+    if _LATENCY_CSV_FH is None:
+        path = os.environ.get("PIE_LATENCY_LOG_PATH", "/tmp/pie-latency.csv")
+        _LATENCY_CSV_FH = open(path, "a", buffering=1)
+        if not _LATENCY_CSV_HEADER_WRITTEN:
+            _LATENCY_CSV_FH.write(
+                "step,total_ms,build_batch_ms,get_inputs_ms,get_sampling_meta_ms,"
+                "broadcast_ms,inference_ms,create_responses_ms,"
+                "decode_u32_ms,mask_loop_ms,brle_decode_ms,sampler_loop_ms\n"
+            )
+            _LATENCY_CSV_HEADER_WRITTEN = True
+    return _LATENCY_CSV_FH
 
 
 class StepTiming(NamedTuple):
@@ -45,6 +73,24 @@ class LatencyStats:
             traceparent: Optional W3C traceparent string for cross-language propagation.
         """
         self.step_count += 1
+
+        fh = _maybe_open_csv()
+        if fh is not None:
+            with _LATENCY_CSV_LOCK:
+                fh.write(
+                    f"{self.step_count},"
+                    f"{timing.total*1000:.3f},"
+                    f"{timing.build_batch*1000:.3f},"
+                    f"{timing.get_inputs*1000:.3f},"
+                    f"{timing.get_sampling_meta*1000:.3f},"
+                    f"{timing.broadcast*1000:.3f},"
+                    f"{timing.inference*1000:.3f},"
+                    f"{timing.create_responses*1000:.3f},"
+                    f"{timing.decode_u32*1000:.3f},"
+                    f"{timing.mask_loop*1000:.3f},"
+                    f"{timing.brle_decode*1000:.3f},"
+                    f"{timing.sampler_loop*1000:.3f}\n"
+                )
 
         if not self.enabled:
             return
