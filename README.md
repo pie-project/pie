@@ -19,21 +19,30 @@
 A programmable serving system for custom inference logic,
 stateful agents, and serving-side optimization.
 
-Pie accepts *inferlets* - small programs in Rust, Python, or TypeScript that compile to WebAssembly and run inside the engine with direct access to the KV cache, token stream, and forward pass.
+
 
 > **Note**
 > Pie is pre-release software under active development. It is best suited
 > for testing and research right now.
+
+
+## What is Pie?
+
+Today's LLM serving engines (e.g., vLLM, SGLang, TensorRT-LLM) are black boxes: prompt in, tokens out. But AI agents are a different kind of workload. They branch, call tools, retry, and coordinate long-running workflows, and forcing them through a monolithic token-generation pipeline leads to wasted round trips, KV cache thrashing, and engine patches for every new decoding trick.
+
+Pie is a programmable serving system. It runs small user-supplied WebAssembly programs, called *inferlets*, directly next to the model. Inferlets have direct access to the KV cache and forward pass, so agent loops, tool calls, custom samplers, and cache policies can be customized and optimized per-application without modifying the engine.
+
 ## Quick Start
 
-Pie is a standalone binary with no Python/PyTorch dependencies.
+Pie is a standalone binary, no Python needed.
 
-For Linux and macOS:
+For macOS and Linux:
 ```bash
 curl -fsSL https://pie-project.org/install.sh | bash
 ```
 
 For Windows, follow the [installation guide](https://pie-project.org/docs/guide/install).
+
 
 Then configure and run:
 
