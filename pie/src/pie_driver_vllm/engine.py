@@ -376,6 +376,10 @@ class VllmEngine:
         self.forward_pass._cg_positions_buf = torch.empty(
             (max_size,), dtype=torch.int64, device=device
         )
+        # int64 to match `build_common_metadata`'s slot_mapping dtype.
+        self.forward_pass._cg_slot_mapping_buf = torch.empty(
+            (max_size,), dtype=torch.int64, device=device
+        )
         self.forward_pass._cg_query_len = query_len
 
         # Wrap the model. vllm's CUDAGraphWrapper.__call__ checks

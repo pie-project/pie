@@ -70,6 +70,14 @@ class VllmForwardPass:
         # Sized to max_cudagraph_capture_size at capture time.
         self._cg_inputs_embeds_buf: torch.Tensor | None = None
         self._cg_positions_buf: torch.Tensor | None = None
+        # `slot_mapping` indexes the KV cache write target per query token; the
+        # KV-append op reads the tensor directly from forward_context, so it
+        # MUST live at the same data_ptr across capture and replay. (Backend
+        # attention metadata — paged_kv_indptr, kv_indices, block_table — is
+        # routed through the FlashInfer wrapper's plan(), which copies into
+        # FlashInfer's own persistent cudagraph buffers, so those are
+        # transparent to us. slot_mapping has no such wrapper.)
+        self._cg_slot_mapping_buf: torch.Tensor | None = None
         self._cg_query_len = 1  # 1 + num_speculative_tokens; set at capture.
 
     def _ensure_metadata_builder(self) -> None:
@@ -224,6 +232,24 @@ class VllmForwardPass:
         if padded_tokens != num_tokens:
             # Mark padded query tokens as no-write so KV cache stays clean.
             common.slot_mapping[num_tokens:padded_tokens] = -1
+
+        # When replaying a captured graph, the KV-append op (and any other op
+        # that reads slot_mapping out of forward_context) was captured against
+        # the data_ptr() of `common.slot_mapping` at capture time. Per-call
+        # tensors land at fresh addresses, so the captured graph reads stale
+        # / freed memory and silently corrupts KV writes — symptom is
+        # progressively-degenerate decode output (e.g. token "Instructions"
+        # repeated). Substitute the persistent buffer in `common` BEFORE
+        # `builder.build` so any backend that snapshots `common.slot_mapping`
+        # into its own AttentionMetadata struct also picks up the persistent
+        # reference.
+        if cudagraph_runtime_mode != CUDAGraphMode.NONE:
+            assert self._cg_slot_mapping_buf is not None
+            sm_buf = self._cg_slot_mapping_buf
+            sm_buf[:padded_tokens].copy_(
+                common.slot_mapping[:padded_tokens], non_blocking=True
+            )
+            common.slot_mapping = sm_buf[:padded_tokens]
 
         # Backend-specific metadata. `common_prefix_len=0` disables cascade
         # attention (we don't use it from pie's side).

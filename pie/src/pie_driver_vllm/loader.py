@@ -108,6 +108,24 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
         if v is not None:
             engine_kwargs[k] = v
 
+    # Pin attention backend to FLASHINFER when cudagraph capture is going
+    # to be active (Lever 5 / ticket #100). The decode-side cudagraph path
+    # captures `model.forward` whole; pie passes per-call attention
+    # metadata (slot_mapping, block_table, paged_kv_*) that lands at fresh
+    # GPU addresses each step, but the captured graph aliases capture-time
+    # data_ptrs. FlashInfer's BatchDecodeWithPagedKVCacheWrapper runs
+    # `plan()` per call and copies our metadata into ITS persistent
+    # cudagraph buffers (paged_kv_indptr/indices/last_page_len), so the
+    # captured graph reads stable addresses on replay. FLASH_ATTN/TRITON
+    # have no such wrapper-internal persistence — they read block_table /
+    # seq_lens directly off pie's per-call tensors, so the captured graph
+    # silently reads stale memory and decode output degenerates. Promotion
+    # is gated on (a) cudagraph mode is going to be active, AND (b) the
+    # user did not pin a different backend. Eager mode keeps vllm's
+    # default backend selection.
+    if not driver_config.enforce_eager and driver_config.attention_backend is None:
+        engine_kwargs["attention_backend"] = "FLASHINFER"
+
     args = EngineArgs(**engine_kwargs)
     vllm_config = args.create_engine_config()
 
