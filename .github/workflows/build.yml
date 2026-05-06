@@ -1,4 +1,4 @@
-name: build (manual)
+name: Publish Nightly
 
 # Manual builds of `pie` for distribution. Each run rewrites the
 # `nightly` rolling pre-release on this repo's GitHub Releases —
