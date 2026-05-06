@@ -11,6 +11,16 @@ import TabItem from '@theme/TabItem';
 
 `bakery` compiles your inferlet to a WebAssembly component and uploads it to the Pie registry. Once published, anyone connected to the same registry can launch it by name. Read this after [Deployment overview](./overview).
 
+## Install
+
+```bash
+pip install pie-bakery
+```
+
+This installs the standalone `bakery` command from PyPI. Rust inferlets still
+need `cargo` and `rustup target add wasm32-wasip2`; TypeScript / JavaScript
+inferlets need Node.js.
+
 ## Build
 
 ```bash
@@ -65,7 +75,7 @@ If the token expires or you want to re-authenticate, run `bakery login` again.
 bakery inferlet publish ./my-inferlet
 ```
 
-`publish` reads `Pie.toml`, runs `bakery build` if needed, and uploads both the `.wasm` and the manifest to the registry. The version in `Pie.toml` becomes the registry version; bumping it is your responsibility.
+`publish` reads `Pie.toml`, locates an existing `.wasm` artifact, and uploads both the `.wasm` and the manifest to the registry. Run `bakery build . -o <name>.wasm` first. The version in `Pie.toml` becomes the registry version; bumping it is your responsibility.
 
 After publishing, anyone connected to the same registry can launch it:
 

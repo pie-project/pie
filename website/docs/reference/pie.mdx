@@ -122,6 +122,12 @@ Argument parsing rules (`pie run … -- --key value …`):
 Scaffold a fresh inferlet project. Wraps `bakery create`, which generates the
 template files locally.
 
+`pie new` requires the Python Bakery package to be importable by `python3`:
+
+```bash
+pip install pie-bakery
+```
+
 ```text
 pie new <NAME> [OPTIONS]
 ```
@@ -153,6 +159,9 @@ pie new my-agent --ts -o ~/projects
 
 Compile an inferlet directory (or single source file) to a WebAssembly
 component. Wraps `bakery build` and auto-detects the platform.
+
+`pie build` uses the same PyPI-installed Bakery package as the standalone
+`bakery` command.
 
 ```text
 pie build <INPUT> -o <OUTPUT> [OPTIONS]

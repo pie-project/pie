@@ -16,7 +16,7 @@ The build chain depends on the language. All three end at a `.wasm` component yo
 |---|---|---|
 | Rust | bakery + cargo | rustc + `wasm32-wasip2` target |
 | TypeScript / JavaScript | bakery | JS inferlet runtime (bundled with bakery) |
-| Python | hand-authored project (no scaffold) | Python 3.14 inferlet runtime (downloaded by `pie config init`) |
+| Python | bakery, hand-authored project (no scaffold) | Python 3.14 inferlet runtime (downloaded on first use) |
 
 Rust is the canonical SDK. A few advanced primitives (custom speculators, the `Constrain` trait, the raw `ctx.inner()` page operations) are Rust-only today.
 
@@ -27,7 +27,8 @@ Rust is the canonical SDK. A few advanced primitives (custom speculators, the `C
 `bakery` is the inferlet toolchain. It scaffolds projects, compiles to WebAssembly, and publishes to the registry. It is invoked directly as `bakery` and is also wrapped by `pie new` / `pie build`:
 
 ```bash
-bakery --version
+pip install pie-bakery
+bakery --help
 ```
 
 Common commands:
@@ -36,7 +37,7 @@ Common commands:
 |---|---|
 | `bakery create <name>` | Scaffold a new Rust inferlet. |
 | `bakery create <name> --ts` | Scaffold a TypeScript inferlet. |
-| `bakery build <dir> -o <output.wasm>` | Compile to a `.wasm` component (Rust crate, TS/JS project, or single `.ts` / `.js` file). |
+| `bakery build <dir> -o <output.wasm>` | Compile to a `.wasm` component (Rust crate, Python project, TS/JS project, or single `.py` / `.ts` / `.js` file). |
 | `bakery login` | GitHub OAuth flow for the Pie registry. |
 | `bakery inferlet publish <dir>` | Publish to the registry. |
 | `bakery inferlet search <query>` | Search the registry. |
@@ -71,7 +72,7 @@ If `bakery build` succeeds and `pie run` prints a hello message, the Rust toolch
 
 ## Python and JavaScript runtimes
 
-`pie config init` downloads the Python 3.14 inferlet runtime into `~/.pie/`. The JavaScript runtime is bundled with bakery itself, so no separate download step is needed for TypeScript / JavaScript projects.
+`pie config init` downloads the Python 3.14 inferlet runtime into `~/.pie/`. If the runtime is missing, `bakery build` for a Python inferlet also fetches it on first use. The JavaScript runtime is bundled with Bakery itself, so no separate download step is needed for TypeScript / JavaScript projects.
 
 ```bash
 pie config init           # writes ~/.pie/config.toml + downloads the Python runtime

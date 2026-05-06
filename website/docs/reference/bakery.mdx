@@ -12,10 +12,18 @@ For the end-to-end workflow narrative, see [Your first inferlet](../guide/first-
 ## Install
 
 ```bash
-pip install -e sdk/tools/bakery        # from a Pie checkout
+pip install pie-bakery
 ```
 
-When developing inside a Pie checkout, set `PIE_SDK` so bakery can find the SDK libraries:
+This installs the `bakery` command from PyPI. It also installs the published
+Python inferlet SDK dependency used by Python builds.
+
+When developing Bakery itself from a Pie checkout, use an editable install and
+optionally set `PIE_SDK` so Bakery resolves SDK files from the checkout:
+
+```bash
+pip install -e sdk/tools/bakery
+```
 
 ```bash
 export PIE_SDK=/path/to/pie/sdk
@@ -26,7 +34,7 @@ export PIE_SDK=/path/to/pie/sdk
 ```
 bakery [COMMAND]
   create        Scaffold a new inferlet project
-  build         Build a project (Rust crate or JS/TS) to WASM
+  build         Build a project (Rust, Python, JS/TS) to WASM
   login         Authenticate with the Pie Registry (GitHub OAuth)
   inferlet      Manage published inferlets (search / info / publish)
 ```
@@ -49,17 +57,20 @@ bakery build <input> -o <output.wasm> [--debug]
 
 | Argument | Description |
 |---|---|
-| `<input>` | Path to a project directory (Rust: contains `Cargo.toml`; JS/TS: contains `package.json`) or a single `.js`/`.ts` file. |
+| `<input>` | Path to a project directory (Rust: contains `Cargo.toml`; Python: contains `pyproject.toml` or `main.py`; JS/TS: contains `package.json`) or a single `.py`, `.js`, or `.ts` file. |
 | `-o, --output <FILE>` | Where to write the `.wasm`. **Required**. |
 | `--debug` | Debug build (JS/TS only): includes source maps. |
 
 ```bash
 bakery build ./my-rust-inferlet  -o build/my-inferlet.wasm
+bakery build ./my-py-inferlet    -o build/my-inferlet.wasm
 bakery build ./my-ts-inferlet    -o build/my-inferlet.wasm
 bakery build ./index.ts          -o build/single-file.wasm
 ```
 
-The platform is auto-detected from the input. For Rust projects bakery just runs the right `cargo build --target wasm32-wasip2 --release` under the hood.
+The platform is auto-detected from the input. For Rust projects Bakery runs
+`cargo build --target wasm32-wasip2 --release` under the hood. Create the
+parent directory for `--output` before building.
 
 ## bakery login
 
@@ -67,7 +78,9 @@ The platform is auto-detected from the input. For Rust projects bakery just runs
 bakery login
 ```
 
-Opens a GitHub OAuth flow. The token is stored in `~/.pie/auth/registry.json` and used by `bakery inferlet publish`.
+Opens a GitHub OAuth flow. The token is stored under `~/.pie/bakery/` by
+default and used by `bakery inferlet publish`. Override the state directory
+with `BAKERY_HOME`.
 
 ## bakery inferlet
 
@@ -75,7 +88,7 @@ Opens a GitHub OAuth flow. The token is stored in `~/.pie/auth/registry.json` an
 bakery inferlet
   search <query>       Search published inferlets
   info <name>          Show metadata for a published inferlet
-  publish <path>       Build and publish an inferlet directory
+  publish <path>       Publish a built inferlet directory
 ```
 
 ```bash
@@ -91,6 +104,7 @@ bakery inferlet publish ./my-inferlet
 | Platform | What you need |
 |---|---|
 | Rust inferlets | `cargo`, `rustup target add wasm32-wasip2` |
+| Python inferlets | Python 3.10+, pure-Python dependencies only |
 | JS / TS inferlets | Node.js v18+, `npm`/`npx` |
 
 ## Related
