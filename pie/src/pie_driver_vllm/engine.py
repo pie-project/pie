@@ -155,6 +155,22 @@ class VllmEngine:
             print(f"[vllm warmup] FAILED: {_e}\n{_tb.format_exc()}", flush=True)
             raise
 
+        # Lever 5 (ticket #100): wrap the model with vllm's FULL-mode
+        # CUDAGraphWrapper and run synthetic decode passes so each
+        # `cudagraph_capture_sizes` shape gets its captured graph. After
+        # this returns, transform() can dispatch decode batches through
+        # the captured graphs by threading the runtime mode + descriptor
+        # through set_forward_context.
+        try:
+            engine._capture_cudagraphs(_log)
+        except Exception as _e:
+            import traceback as _tb
+            print(
+                f"[vllm cudagraph] FAILED: {_e}\n{_tb.format_exc()}",
+                flush=True,
+            )
+            raise
+
         return engine
 
     @torch.inference_mode()
@@ -279,6 +295,213 @@ class VllmEngine:
             f"vllm engine warmup: prefill ({n_prefill} tok) {t_prefill:.2f}s, "
             f"decode (1 tok) {t_decode:.2f}s",
             "INFO",
+        )
+
+    @torch.inference_mode()
+    def _capture_cudagraphs(self, log_fn=None) -> None:
+        """Capture FULL-mode cudagraphs for decode batches (Lever 5).
+
+        Mirrors vllm's `GPUModelRunner.capture_model` for the slice we need:
+        wrap the model in `CUDAGraphWrapper(runtime_mode=FULL)`, build a
+        `CudagraphDispatcher` so we know the set of capture sizes, allocate
+        persistent input buffers in `forward_pass`, and run one synthetic
+        forward per `BatchDescriptor` inside `graph_capture(...)` with the
+        runtime mode threaded through forward context. After this returns,
+        transform() can dispatch decode batches into the captured graphs.
+
+        Skipped (no-op) when:
+          - device is not CUDA;
+          - cudagraph_mode is NONE (eager mode requested by user);
+          - FlashInfer / attention backend reports no cudagraph support.
+        """
+        import time as _time
+
+        from ._vllm_compat import (
+            CUDAGraphMode,
+            CUDAGraphWrapper,
+            CudagraphDispatcher,
+            graph_capture,
+            set_cudagraph_capturing_enabled,
+            set_current_vllm_config,
+            set_forward_context,
+        )
+
+        device = self.forward_pass.device
+
+        def _log(msg: str, level: str = "INFO") -> None:
+            print(f"[vllm cudagraph] {msg}", flush=True)
+            if log_fn is not None:
+                log_fn(msg, level)
+
+        if not torch.cuda.is_available() or not str(device).startswith("cuda"):
+            _log(f"skipped (device={device})", "INFO")
+            return
+
+        vllm_config = self.forward_pass.vllm_config
+        cc = vllm_config.compilation_config
+        cg_mode = cc.cudagraph_mode
+
+        if cg_mode == CUDAGraphMode.NONE:
+            _log("skipped (cudagraph_mode=NONE)", "INFO")
+            return
+
+        # Pie does not own a vllm GPUModelRunner, so the cudagraph_capture_sizes
+        # list may not have been populated by vllm's own resolution. Guard
+        # for that and bail out cleanly — transform() will then fall back
+        # to the eager path on every batch.
+        if not cc.cudagraph_capture_sizes or cc.max_cudagraph_capture_size is None:
+            _log(
+                "skipped (no cudagraph_capture_sizes resolved by vllm)", "WARN"
+            )
+            return
+
+        # Drain any kernels still queued by warmup before switching streams.
+        # `graph_capture()` enters a separate CUDA stream; capture must not
+        # observe in-flight default-stream work.
+        torch.cuda.synchronize()
+
+        spec_cfg = vllm_config.speculative_config
+        query_len = 1 if spec_cfg is None else 1 + spec_cfg.num_speculative_tokens
+
+        # Allocate persistent input buffers sized to the largest captured
+        # batch. inputs_embeds dim comes from the first warmup forward
+        # (decode_hidden in _warmup_compile would also work, but we read
+        # straight off the model config to avoid coupling).
+        max_size = int(cc.max_cudagraph_capture_size)
+        hidden_size = int(self.model_config.get_hidden_size())
+        embed_dtype = self.config.activation_dtype
+        self.forward_pass._cg_inputs_embeds_buf = torch.empty(
+            (max_size, hidden_size), dtype=embed_dtype, device=device
+        )
+        self.forward_pass._cg_positions_buf = torch.empty(
+            (max_size,), dtype=torch.int64, device=device
+        )
+        self.forward_pass._cg_query_len = query_len
+
+        # Wrap the model. vllm's CUDAGraphWrapper.__call__ checks
+        # forward_context for cudagraph_runtime_mode/batch_descriptor and
+        # captures (first call per descriptor) or replays (subsequent).
+        # Pass-through if mode does not match (e.g. prefill batches).
+        wrapped = CUDAGraphWrapper(
+            self.forward_pass.model,
+            vllm_config,
+            runtime_mode=CUDAGraphMode.FULL,
+        )
+        self.forward_pass.model = wrapped
+
+        dispatcher = CudagraphDispatcher(vllm_config)
+        dispatcher.initialize_cudagraph_keys(cg_mode, query_len)
+        # Stash on forward_pass; transform() dispatches via this.
+        self.forward_pass._cg_dispatcher = dispatcher
+
+        capture_descs = dispatcher.get_capture_descs()
+        if not capture_descs:
+            _log("skipped (dispatcher has no capture descs)", "WARN")
+            self.forward_pass._cg_dispatcher = None
+            return
+
+        # Drive synthetic decode forwards through the wrapped model. We
+        # reuse pie's existing transform()/embed_inputs path so any backend
+        # (FlashInfer, FA3, Triton, …) builds its persistent metadata
+        # buffers exactly as it would at runtime. The dispatcher is
+        # already installed on forward_pass, so transform() will route
+        # each call through `set_forward_context(cudagraph_runtime_mode=FULL,
+        # batch_descriptor=desc)` once we feed it a uniform-decode batch.
+        torch.cuda.empty_cache()
+        start_free = torch.cuda.mem_get_info()[0]
+        t0 = _time.perf_counter()
+
+        set_cudagraph_capturing_enabled(True)
+        try:
+            with set_current_vllm_config(vllm_config), graph_capture(device=device):
+                for runtime_mode, batch_descs in capture_descs:
+                    if runtime_mode != CUDAGraphMode.FULL:
+                        # We only install a FULL wrapper; PIECEWISE descs
+                        # would need a separate wrapper / inductor partition
+                        # path, out of scope for ticket #100.
+                        continue
+                    for desc in batch_descs:
+                        n = desc.num_tokens
+                        if n > max_size:
+                            continue
+                        self._capture_one_decode(n, query_len)
+                        torch.cuda.synchronize()
+        finally:
+            set_cudagraph_capturing_enabled(False)
+
+        end_free = torch.cuda.mem_get_info()[0]
+        elapsed = _time.perf_counter() - t0
+        graph_bytes = max(0, start_free - end_free)
+        _log(
+            f"captured FULL graphs for {sum(len(d) for _, d in capture_descs)} "
+            f"descriptor(s) in {elapsed:.2f}s "
+            f"({graph_bytes / (1 << 20):.1f} MiB graph memory)",
+            "INFO",
+        )
+
+        # Capture writes K/V into pie's KV layers for pages we used as
+        # scratch (page 0). Zero them so the first real context that gets
+        # allocated those pages doesn't read stale capture activations.
+        for layer_kv in self.kv_cache_at_layer:
+            layer_kv[0].zero_()
+
+    @torch.inference_mode()
+    def _capture_one_decode(self, n: int, query_len: int) -> None:
+        """One synthetic uniform-decode forward at exactly `n` query tokens.
+
+        Triggers FlashInfer to plan the cudagraph-enabled decode wrapper at
+        size `n` (under the `enable_cuda_graph and pure_decode and
+        num_decode_tokens <= max_bs` branch in FlashInferMetadataBuilder.build),
+        and runs the wrapped model so CUDAGraphWrapper captures the forward.
+
+        Layout: `n / query_len` requests, each with `query_len` query tokens
+        attending to a single KV page (page 0, pie's reserved warmup
+        scratch). Position 0 across all requests — chosen for simplicity;
+        FlashInfer's plan() does not validate position values for capture.
+        """
+        device = self.forward_pass.device
+        page_size = int(self.forward_pass._kv_spec.block_size)
+
+        assert n % query_len == 0, (
+            f"capture size {n} must be divisible by query_len {query_len}"
+        )
+        num_reqs = n // query_len
+
+        token_ids = torch.zeros(n, dtype=torch.long)
+        position_ids = torch.zeros(n, dtype=torch.int32, device=device)
+        # uniform decode → qo_indptr step is `query_len` per request.
+        qo_indptr = (
+            torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
+            * query_len
+        )
+        # Each req points at page 0; last_page_len=query_len so seq_len = query_len.
+        kv_page_indices = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+        kv_page_indptr = torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
+        kv_last_page_lens = torch.full(
+            (num_reqs,), max(query_len, 1), dtype=torch.int32, device=device
+        )
+
+        inputs = {
+            "token_ids": token_ids,
+            "position_ids": position_ids,
+            "qo_indptr": qo_indptr,
+            "kv_page_indices": kv_page_indices,
+            "kv_page_indptr": kv_page_indptr,
+            "kv_last_page_lens": kv_last_page_lens,
+        }
+
+        embeds = self.forward_pass.embed_inputs(inputs)
+        # transform() will see a uniform-decode batch (all qo diffs =
+        # query_len) and the dispatcher will return FULL with a descriptor
+        # for size `n`. CUDAGraphWrapper captures on first call per
+        # descriptor.
+        _ = self.forward_pass.transform(
+            input_embeds=embeds,
+            position_ids=position_ids,
+            qo_indptr=qo_indptr,
+            kv_page_indices=kv_page_indices,
+            kv_page_indptr=kv_page_indptr,
+            kv_last_page_lens=kv_last_page_lens,
         )
 
     @torch.inference_mode()

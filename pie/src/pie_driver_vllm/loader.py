@@ -109,7 +109,29 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
             engine_kwargs[k] = v
 
     args = EngineArgs(**engine_kwargs)
-    return args.create_engine_config()
+    vllm_config = args.create_engine_config()
+
+    # Decode-side cudagraph (Lever 5, ticket #100). Pie drives the model
+    # outside vllm's GPUModelRunner, so vllm's auto-resolution of
+    # cudagraph_mode never runs against pie's actual call shapes — vllm
+    # leaves it at NONE/PIECEWISE depending on the version. Promote it to
+    # FULL_DECODE_ONLY so the FlashInfer decode wrapper publishes its
+    # cudagraph capture path (full decode forward as a single graph; mixed
+    # / prefill batches stay eager). Only override when not already FULL,
+    # so an explicit user choice (e.g. FULL_AND_PIECEWISE) is preserved.
+    from vllm.config import CUDAGraphMode
+
+    if not driver_config.enforce_eager:
+        cc = vllm_config.compilation_config
+        if cc.cudagraph_mode in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE):
+            cc.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+            # FULL capture wraps the whole decode forward; the splitting_ops
+            # belong to PIECEWISE (used to split inductor partitions at
+            # attention boundaries) — clear them so vllm doesn't try to
+            # piecewise-split a graph we want captured monolithically.
+            cc.splitting_ops = []
+
+    return vllm_config
 
 
 def _ensure_vllm_distributed(vllm_config: Any, rank: int, local_rank: int) -> None:
