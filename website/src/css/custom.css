@@ -981,6 +981,38 @@ div[class*='codeBlockTitle'] {
 }
 
 /* =====================================================================
+   Sidebar "Experimental" pill — applied to a sidebar item via
+   className: 'sidebar-experimental'. Page-side equivalent is a
+   :::warning Experimental admonition.
+   ===================================================================== */
+.sidebar-experimental .menu__link {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.sidebar-experimental .menu__link::after {
+  content: "Experimental";
+  font-family: var(--pie-font-sans);
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--pie-amber-bg);
+  color: var(--pie-amber);
+  border: 1px solid var(--pie-amber-border);
+}
+
+[data-theme='dark'] .sidebar-experimental .menu__link::after {
+  background: var(--pie-amber-bg-dark);
+  color: var(--pie-amber-light);
+  border-color: var(--pie-amber-border-dark);
+}
+
+/* =====================================================================
    /whypieagent dark theme override
    Scoped to body.whypieagent-dark because Docusaurus actively manages the
    <html> className on route changes and clobbers any class added there.

@@ -65,7 +65,7 @@ const sidebars: SidebarsConfig = {
         'guide/context/overview',
         'guide/context/pages',
         'guide/context/sharing',
-        'guide/context/scheduling',
+        {type: 'doc', id: 'guide/context/scheduling', className: 'sidebar-experimental'},
       ],
     },
     {
@@ -77,8 +77,8 @@ const sidebars: SidebarsConfig = {
         'guide/forward/inputs',
         'guide/forward/samplers',
         'guide/forward/constrained',
-        'guide/forward/adapters',
         'guide/forward/speculation',
+        {type: 'doc', id: 'guide/forward/adapters', className: 'sidebar-experimental'},
       ],
     },
     {
@@ -103,7 +103,7 @@ const sidebars: SidebarsConfig = {
         'guide/io/messaging',
         'guide/io/http',
         'guide/io/filesystem',
-        'guide/io/mcp',
+        {type: 'doc', id: 'guide/io/mcp', className: 'sidebar-experimental'},
       ],
     },
     {
@@ -148,7 +148,7 @@ const sidebars: SidebarsConfig = {
       collapsed: false,
       items: [
         'reference/pie',
-        'reference/bakery',
+        {type: 'doc', id: 'reference/bakery', className: 'sidebar-experimental'},
         'reference/pie-client',
       ],
     },
@@ -159,8 +159,8 @@ const sidebars: SidebarsConfig = {
       items: [
         'reference/drivers/cuda',
         'reference/drivers/portable',
-        'reference/drivers/vllm',
-        'reference/drivers/sglang',
+        {type: 'doc', id: 'reference/drivers/vllm', className: 'sidebar-experimental'},
+        {type: 'doc', id: 'reference/drivers/sglang', className: 'sidebar-experimental'},
       ],
     },
     {

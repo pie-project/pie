@@ -6,6 +6,10 @@ sidebar_position: 4
 
 # vLLM
 
+:::warning[Experimental]
+The vLLM driver is a prototype. Interfaces, defaults, and capabilities change frequently.
+:::
+
 `type = "vllm"`. A subprocess Python driver that delegates the forward pass to vLLM. Pie wraps vLLM's `EngineArgs`; field names match vLLM exactly, so values pass through unchanged.
 
 Use this driver to run a model that the embedded [`cuda_native` and `dev`](./cuda) drivers do not yet implement, or to run against vLLM's attention kernels.

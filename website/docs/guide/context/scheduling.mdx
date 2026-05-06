@@ -9,6 +9,10 @@ import TabItem from '@theme/TabItem';
 
 # Scheduling and budgets
 
+:::warning[Experimental]
+The credit auction and bidding API are a prototype. Interfaces, defaults, and capabilities change frequently.
+:::
+
 Pie's engine schedules forward passes across all live processes via a per-step credit auction. Each context bids for compute on every tick, and the engine fills its batch by clearing the highest bids first. This page covers the bidding API. **Most inferlets do not need to touch it.** The default `Generator` auto-bids using a budget-exhausting strategy that spreads the wallet over the horizon. Read on if you want to write a custom bid strategy or understand what the default is doing. Read this after [Pages](./pages).
 
 ## Why credits

@@ -192,7 +192,7 @@ raw.truncate_working_page_tokens(n);    // drop the last n tokens within the wor
 
 Working pages must be full (every slot written) before they can commit. Calling `commit_working_pages(k)` while the k-th page is still partial returns an error. Most code lets `flush()` decide when to commit; the manual form is for hand-written forward-pass loops.
 
-For when to use these operations, see [Inputs: tokens, positions, masks](../forward/inputs).
+For when to use these operations, see [Tokens, positions, and masks](../forward/inputs).
 
 ## When pages get freed
 

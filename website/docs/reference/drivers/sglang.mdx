@@ -6,6 +6,10 @@ sidebar_position: 5
 
 # SGLang
 
+:::warning[Experimental]
+The SGLang driver is a prototype. Interfaces, defaults, and capabilities change frequently.
+:::
+
 `type = "sglang"`. A subprocess Python driver that delegates the forward pass to SGLang. Pie wraps SGLang's `ServerArgs`; field names match SGLang exactly, so values pass through unchanged.
 
 Use this driver to run a model that the embedded [`cuda_native` and `dev`](./cuda) drivers do not yet implement, or to run against SGLang's attention kernels and its n-gram speculative decoding.
