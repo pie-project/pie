@@ -495,10 +495,11 @@ class VllmEngine:
         }
 
         embeds = self.forward_pass.embed_inputs(inputs)
-        # transform() will see a uniform-decode batch (all qo diffs =
-        # query_len) and the dispatcher will return FULL with a descriptor
-        # for size `n`. CUDAGraphWrapper captures on first call per
-        # descriptor.
+        # transform() will see a synthetic uniform-decode batch and the
+        # dispatcher will return FULL with a descriptor for size `n`.
+        # CUDAGraphWrapper captures on first call per descriptor. We force
+        # single_token_mode=True so the dispatch gate fires (the runtime
+        # would normally have set it on a real decode batch).
         _ = self.forward_pass.transform(
             input_embeds=embeds,
             position_ids=position_ids,
@@ -506,6 +507,7 @@ class VllmEngine:
             kv_page_indices=kv_page_indices,
             kv_page_indptr=kv_page_indptr,
             kv_last_page_lens=kv_last_page_lens,
+            single_token_mode=True,
         )
 
     @torch.inference_mode()
@@ -555,6 +557,7 @@ class VllmEngine:
             kv_page_indices=inputs["kv_page_indices"],
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
+            single_token_mode=inputs.get("single_token_inference_mode", False),
         )
 
         if gpu_timings is not None:

@@ -133,6 +133,7 @@ class VllmForwardPass:
         kv_page_indices: torch.Tensor,
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
+        single_token_mode: bool = False,
     ) -> torch.Tensor:
         """Run the model's transformer trunk inside `set_forward_context`.
 
@@ -153,32 +154,31 @@ class VllmForwardPass:
         page_size = self._kv_spec.block_size
         num_tokens = int(input_embeds.shape[0])
 
-        # Decide cudagraph dispatch. Uniform-decode = every request has
-        # exactly `_cg_query_len` query tokens (1 for plain decode,
-        # 1+num_spec_tokens for spec). Cheap host-side check on the small
-        # qo_indptr tensor.
+        # Decide cudagraph dispatch. We dispatch only on uniform-decode
+        # batches at query_len=1, gated on the existing pie convention
+        # `single_token_mode` (set by the Rust runtime in shmem_schema.py
+        # and consumed by phi3/mistral3/olmo3 model files for the same
+        # purpose). This is a pure host-side bool; no GPU sync. Spec-
+        # decode uniform batches (query_len > 1) currently fall through
+        # to eager — separate follow-up to extend pie's runtime flag for
+        # spec-aware uniform detection.
         cudagraph_runtime_mode = CUDAGraphMode.NONE
         batch_descriptor: BatchDescriptor | None = None
         padded_tokens = num_tokens
         if (
             self._cg_dispatcher is not None
             and self._cg_dispatcher.cudagraph_mode != CUDAGraphMode.NONE
+            and single_token_mode
+            and self._cg_query_len == 1
         ):
-            qo_host = qo_indptr.detach().to("cpu", non_blocking=False)
-            diffs = qo_host[1:] - qo_host[:-1]
-            uniform_decode = bool(
-                diffs.numel() > 0
-                and torch.all(diffs == self._cg_query_len).item()
-            )
-            if uniform_decode:
-                cudagraph_runtime_mode, batch_descriptor = (
-                    self._cg_dispatcher.dispatch(
-                        num_tokens=num_tokens,
-                        uniform_decode=True,
-                    )
+            cudagraph_runtime_mode, batch_descriptor = (
+                self._cg_dispatcher.dispatch(
+                    num_tokens=num_tokens,
+                    uniform_decode=True,
                 )
-                if cudagraph_runtime_mode != CUDAGraphMode.NONE:
-                    padded_tokens = batch_descriptor.num_tokens
+            )
+            if cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                padded_tokens = batch_descriptor.num_tokens
 
         # Build attention metadata. Pad to `padded_tokens` when replaying so
         # the captured graph's persistent FlashInfer buffers are populated
