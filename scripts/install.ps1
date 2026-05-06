@@ -2,10 +2,10 @@
 #
 #   irm https://pie-project.org/install.ps1 | iex
 #   $env:PIE_FLAVOR = "portable-cuda"; irm https://pie-project.org/install.ps1 | iex
-#   $env:PIE_VERSION = "v0.1.2"; irm https://pie-project.org/install.ps1 | iex
+#   $env:PIE_VERSION = "0.3.0"; irm https://pie-project.org/install.ps1 | iex
 #
 # Environment overrides:
-#   PIE_VERSION       Release tag (default: latest-build).
+#   PIE_VERSION       Release tag (default: nightly).
 #   PIE_FLAVOR        portable-vulkan | portable-cuda (default: portable-vulkan).
 #   PIE_INSTALL_DIR   Install location for pie.exe (default: %LOCALAPPDATA%\Pie\bin).
 #   PIE_REPO          GitHub owner/name (default: pie-project/pie).
@@ -139,7 +139,7 @@ if ($machineArch -notin @("AMD64", "x86_64")) {
 }
 
 $repo = Get-EnvOrDefault "PIE_REPO" "pie-project/pie"
-$version = Get-EnvOrDefault "PIE_VERSION" "latest-build"
+$version = Get-EnvOrDefault "PIE_VERSION" "nightly"
 $installDir = Get-EnvOrDefault "PIE_INSTALL_DIR" (Join-Path $env:LOCALAPPDATA "Pie\bin")
 $downloadBase = Get-EnvOrDefault "PIE_DOWNLOAD_BASE" "https://github.com/$repo/releases/download/$version"
 $flavor = Get-EnvOrDefault "PIE_FLAVOR" "portable-vulkan"

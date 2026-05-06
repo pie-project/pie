@@ -1,15 +1,12 @@
 name: build (manual)
 
 # Manual builds of `pie` for distribution. Each run rewrites the
-# `latest-build` rolling pre-release on this repo's GitHub Releases —
+# `nightly` rolling pre-release on this repo's GitHub Releases —
 # every artifact is uploaded with `gh release upload --clobber`, so
 # download URLs stay stable across runs.
 #
-# One-time setup before the first dispatch:
-#
-#   gh release create latest-build --prerelease --notes "Rolling build"
-#
-# After that, this workflow keeps the assets on that release fresh.
+# The prepare-release job creates the release if needed before any
+# matrix jobs start uploading assets.
 
 on:
   workflow_dispatch:
@@ -17,7 +14,7 @@ on:
       tag:
         description: "Release tag to update (assets uploaded with --clobber)"
         type: string
-        default: "latest-build"
+        default: "nightly"
       portable:
         description: "Build portable matrix (manylinux x86_64/aarch64 + macOS arm64 + Windows x86_64 Vulkan/CUDA)"
         type: boolean
@@ -43,10 +40,49 @@ env:
 
 jobs:
   # =========================================================================
+  # Create/update the rolling release before any matrix job tries to upload.
+  # This keeps `gh release upload` from racing a missing release, and keeps
+  # the rolling build out of GitHub's "Latest" release slot.
+  # =========================================================================
+  prepare-release:
+    if: inputs.portable || inputs.cuda || inputs.cuda_manylinux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Ensure rolling release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euxo pipefail
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            release_id="$(gh release view "${TAG}" --json databaseId --jq .databaseId --repo "${GITHUB_REPOSITORY}")"
+            gh api \
+              -X PATCH \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+              -f tag_name="${TAG}" \
+              -f name="${TAG}" \
+              -f body="${RELEASE_NOTES}" \
+              -F draft=false \
+              -F prerelease=true \
+              -f make_latest=false
+          else
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "${TAG}" \
+              --notes "${RELEASE_NOTES}" \
+              --prerelease \
+              --latest=false
+          fi
+
+  # =========================================================================
   # Portable matrix — CPU/Metal/Vulkan plus Windows portable CUDA.
   # =========================================================================
   portable:
     if: inputs.portable
+    needs: prepare-release
     name: portable / ${{ matrix.target.label }}
     strategy:
       fail-fast: false
@@ -301,6 +337,7 @@ jobs:
   # =========================================================================
   cuda:
     if: inputs.cuda
+    needs: prepare-release
     name: cuda / linux-x64 / ${{ matrix.flavor.id }}-${{ matrix.cuda.short }}
     runs-on: [self-hosted, linux, x64, gpu, cuda]
     strategy:
@@ -441,6 +478,7 @@ jobs:
           tag_name: ${{ inputs.tag }}
           files: dist/${{ env.ARTIFACT_NAME }}
           fail_on_unmatched_files: true
+          make_latest: false
 
   # =========================================================================
   # CUDA matrix on GH-hosted runners with manylinux_2_28 base — produces
@@ -454,6 +492,7 @@ jobs:
   # =========================================================================
   cuda-manylinux:
     if: inputs.cuda_manylinux
+    needs: prepare-release
     name: cuda / x86_64-manylinux_2_28 / ${{ matrix.flavor.id }}-${{ matrix.cuda.short }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -548,6 +587,7 @@ jobs:
           tag_name: ${{ inputs.tag }}
           files: dist/${{ env.ARTIFACT_NAME }}
           fail_on_unmatched_files: true
+          make_latest: false
 
   # =========================================================================
   # Refresh the release notes once after all builds finish.
@@ -562,8 +602,16 @@ jobs:
       - name: Edit release notes + body
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
         run: |
           set -euxo pipefail
-          gh release edit "${{ inputs.tag }}" \
-            --notes "${RELEASE_NOTES}" \
-            --repo "${{ github.repository }}"
+          release_id="$(gh release view "${TAG}" --json databaseId --jq .databaseId --repo "${GITHUB_REPOSITORY}")"
+          gh api \
+            -X PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -f tag_name="${TAG}" \
+            -f name="${TAG}" \
+            -f body="${RELEASE_NOTES}" \
+            -F draft=false \
+            -F prerelease=true \
+            -f make_latest=false
