@@ -30,7 +30,9 @@ def _maybe_open_csv():
             _LATENCY_CSV_FH.write(
                 "step,total_ms,build_batch_ms,get_inputs_ms,get_sampling_meta_ms,"
                 "broadcast_ms,inference_ms,create_responses_ms,"
-                "decode_u32_ms,mask_loop_ms,brle_decode_ms,sampler_loop_ms\n"
+                "decode_u32_ms,mask_loop_ms,brle_decode_ms,sampler_loop_ms,"
+                "embed_gpu_ms,transform_gpu_ms,sample_gpu_ms,"
+                "batch_total_tokens,batch_num_seqs\n"
             )
             _LATENCY_CSV_HEADER_WRITTEN = True
     return _LATENCY_CSV_FH
@@ -52,6 +54,16 @@ class StepTiming(NamedTuple):
     mask_loop: float
     brle_decode: float
     sampler_loop: float
+    # engine.fire_batch GPU sub-stages (cuda.Event elapsed_time, in seconds for
+    # consistency with other fields; multiplied by 1e-3 in worker.py before
+    # passing in). Zero when profiling is disabled.
+    embed_gpu: float = 0.0
+    transform_gpu: float = 0.0
+    sample_gpu: float = 0.0
+    # Batch shape probe — directly correlates per-step latency with batch
+    # tokens (sum of new tokens) and request count.
+    batch_total_tokens: int = 0
+    batch_num_seqs: int = 0
 
 
 @dataclass
@@ -89,7 +101,12 @@ class LatencyStats:
                     f"{timing.decode_u32*1000:.3f},"
                     f"{timing.mask_loop*1000:.3f},"
                     f"{timing.brle_decode*1000:.3f},"
-                    f"{timing.sampler_loop*1000:.3f}\n"
+                    f"{timing.sampler_loop*1000:.3f},"
+                    f"{timing.embed_gpu*1000:.3f},"
+                    f"{timing.transform_gpu*1000:.3f},"
+                    f"{timing.sample_gpu*1000:.3f},"
+                    f"{timing.batch_total_tokens},"
+                    f"{timing.batch_num_seqs}\n"
                 )
 
         if not self.enabled:
@@ -112,5 +129,10 @@ class LatencyStats:
             broadcast_ms=timing.broadcast * 1000,
             inference_ms=timing.inference * 1000,
             create_responses_ms=timing.create_responses * 1000,
+            embed_gpu_ms=timing.embed_gpu * 1000,
+            transform_gpu_ms=timing.transform_gpu * 1000,
+            sample_gpu_ms=timing.sample_gpu * 1000,
+            batch_total_tokens=timing.batch_total_tokens,
+            batch_num_seqs=timing.batch_num_seqs,
         ) as span:
             pass  # span is closed automatically

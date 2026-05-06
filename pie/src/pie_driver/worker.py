@@ -565,13 +565,44 @@ def _leader_loop(
             if dist.get_world_size(group=compute_pg) > 1:
                 dist.barrier(group=compute_pg)
 
+        # Only enable GPU sub-stage profiling when the latency CSV is
+        # active — cuda.Events + elapsed_time force a sync that costs ~tens
+        # of microseconds per step, fine for profiling but unwanted on the
+        # hot path.
+        import os as _os
+        gpu_timings: dict | None = (
+            {} if _os.environ.get("PIE_LATENCY_LOG") else None
+        )
+
         t0 = time.perf_counter()
-        sampling_results = engine.fire_batch(inputs, sampling_metadata)
+        # Only pass gpu_timings when profiling is on; pie_driver_sgl /
+        # pie_driver base don't accept the kwarg, so unconditional pass
+        # would break them.
+        if gpu_timings is not None:
+            sampling_results = engine.fire_batch(
+                inputs, sampling_metadata, gpu_timings=gpu_timings
+            )
+        else:
+            sampling_results = engine.fire_batch(inputs, sampling_metadata)
         t_inference = time.perf_counter() - t0
 
         if batch.has_speculative_inputs:
             batch.verify_drafts(sampling_results)
         _populate_next_drafts(batch, sampling_results, engine)
+
+        # Batch shape — sum of new tokens this step + number of requests.
+        # `qo_indptr[-1]` is the running cumulative sum of new tokens
+        # across requests; `len(qo_indptr) - 1` is the request count.
+        batch_total_tokens = 0
+        batch_num_seqs = 0
+        if gpu_timings is not None:
+            try:
+                qo = inputs.get("qo_indptr")
+                if qo is not None:
+                    batch_total_tokens = int(qo[-1].item())
+                    batch_num_seqs = int(qo.shape[0]) - 1
+            except Exception:
+                pass
 
         timings = {
             "t_start": t_start,
@@ -582,10 +613,14 @@ def _leader_loop(
             "inference": t_inference,
             "build_timing": build_timing,
             "traceparent": kwargs.get("trace_context"),
+            "gpu_timings": gpu_timings,
+            "batch_total_tokens": batch_total_tokens,
+            "batch_num_seqs": batch_num_seqs,
         }
         return sampling_results, batch, timings
 
     def _record_step_timing(timings, t_create_responses):
+        gpu = timings.get("gpu_timings") or {}
         latency_stats.record_span(
             StepTiming(
                 build_batch=timings["build_batch"],
@@ -599,6 +634,12 @@ def _leader_loop(
                 mask_loop=timings["build_timing"]["mask_loop"],
                 brle_decode=timings["build_timing"]["brle_decode"],
                 sampler_loop=timings["build_timing"]["sampler_loop"],
+                # cuda.Event elapsed_time returns ms; StepTiming is in s.
+                embed_gpu=gpu.get("embed_ms", 0.0) / 1000.0,
+                transform_gpu=gpu.get("transform_ms", 0.0) / 1000.0,
+                sample_gpu=gpu.get("sample_ms", 0.0) / 1000.0,
+                batch_total_tokens=int(timings.get("batch_total_tokens", 0)),
+                batch_num_seqs=int(timings.get("batch_num_seqs", 0)),
             ),
             traceparent=timings["traceparent"],
         )
