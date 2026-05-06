@@ -133,6 +133,9 @@ cargo install --path server
 # Include the embedded CUDA driver too.
 CUDACXX=/usr/local/cuda/bin/nvcc \
   cargo install --path server --features driver-portable,driver-cuda
+
+# Build the release binary for Linux/macOS.
+cargo install --path server --features driver-portable
 ```
 
 Re-run `pie doctor` after building to confirm which drivers are compiled in.
