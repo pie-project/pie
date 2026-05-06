@@ -565,13 +565,44 @@ def _leader_loop(
             if dist.get_world_size(group=compute_pg) > 1:
                 dist.barrier(group=compute_pg)
 
+        # Only enable GPU sub-stage profiling when the latency CSV is
+        # active — cuda.Events + elapsed_time force a sync that costs ~tens
+        # of microseconds per step, fine for profiling but unwanted on the
+        # hot path.
+        import os as _os
+        gpu_timings: dict | None = (
+            {} if _os.environ.get("PIE_LATENCY_LOG") else None
+        )
+
         t0 = time.perf_counter()
-        sampling_results = engine.fire_batch(inputs, sampling_metadata)
+        # Only pass gpu_timings when profiling is on; pie_driver_sgl /
+        # pie_driver base don't accept the kwarg, so unconditional pass
+        # would break them.
+        if gpu_timings is not None:
+            sampling_results = engine.fire_batch(
+                inputs, sampling_metadata, gpu_timings=gpu_timings
+            )
+        else:
+            sampling_results = engine.fire_batch(inputs, sampling_metadata)
         t_inference = time.perf_counter() - t0
 
         if batch.has_speculative_inputs:
             batch.verify_drafts(sampling_results)
         _populate_next_drafts(batch, sampling_results, engine)
+
+        # Batch shape — sum of new tokens this step + number of requests.
+        # `qo_indptr[-1]` is the running cumulative sum of new tokens
+        # across requests; `len(qo_indptr) - 1` is the request count.
+        batch_total_tokens = 0
+        batch_num_seqs = 0
+        if gpu_timings is not None:
+            try:
+                qo = inputs.get("qo_indptr")
+                if qo is not None:
+                    batch_total_tokens = int(qo[-1].item())
+                    batch_num_seqs = int(qo.shape[0]) - 1
+            except Exception:
+                pass
 
         timings = {
             "t_start": t_start,
@@ -582,10 +613,14 @@ def _leader_loop(
             "inference": t_inference,
             "build_timing": build_timing,
             "traceparent": kwargs.get("trace_context"),
+            "gpu_timings": gpu_timings,
+            "batch_total_tokens": batch_total_tokens,
+            "batch_num_seqs": batch_num_seqs,
         }
         return sampling_results, batch, timings
 
     def _record_step_timing(timings, t_create_responses):
+        gpu = timings.get("gpu_timings") or {}
         latency_stats.record_span(
             StepTiming(
                 build_batch=timings["build_batch"],
@@ -599,6 +634,12 @@ def _leader_loop(
                 mask_loop=timings["build_timing"]["mask_loop"],
                 brle_decode=timings["build_timing"]["brle_decode"],
                 sampler_loop=timings["build_timing"]["sampler_loop"],
+                # cuda.Event elapsed_time returns ms; StepTiming is in s.
+                embed_gpu=gpu.get("embed_ms", 0.0) / 1000.0,
+                transform_gpu=gpu.get("transform_ms", 0.0) / 1000.0,
+                sample_gpu=gpu.get("sample_ms", 0.0) / 1000.0,
+                batch_total_tokens=int(timings.get("batch_total_tokens", 0)),
+                batch_num_seqs=int(timings.get("batch_num_seqs", 0)),
             ),
             traceparent=timings["traceparent"],
         )
@@ -801,9 +842,87 @@ def _leader_loop(
         dst = _torch.tensor(dst_ids, dtype=_torch.long, device=gpu_kv[0].device)
         for layer_idx in range(len(gpu_kv)):
             gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
-        # No torch.cuda.synchronize() — we rely on stream FIFO. Any
-        # subsequent fire_batch dispatched on this same thread
-        # enqueues onto the same default stream AFTER our kernels.
+
+    def _handle_copy_h2d_shmem(view: memoryview) -> None:
+        """Handle a METHOD_TAG_COPY_H2D shmem request.
+
+        Wire format (matches `device::copy_h2d_shmem` on the Rust
+        side, little-endian):
+            u32 src_count | src_count × u32 cpu_slot_ids
+            u32 dst_count | dst_count × u32 gpu_phys_ids
+
+        Routing this through the same thread as `fire_batch` is what
+        closes the second-bleed race documented in
+        `project_pie_second_bleed_path_h2d_race.md`: under axis-L
+        L=6K c=16 pin-on, restore()'s copy_h2d previously ran on the
+        cold-path RPC main thread while replay fire_batch ran on the
+        shmem busy-poll thread; submission order on the legacy
+        default stream depended on Python thread scheduling, so a
+        replay could land before its preceding h2d and read the
+        previous owner's KV. Single-threaded shmem dispatch fixes it.
+        """
+        import struct
+        import torch as _torch
+        gpu_kv = engine.kv_cache_at_layer
+        host_kv = engine.kv_cache_at_layer_host
+        b = bytes(view)
+        off = 0
+        (src_n,) = struct.unpack_from("<I", b, off); off += 4
+        src_ids = list(struct.unpack_from(f"<{src_n}I", b, off)); off += src_n * 4
+        (dst_n,) = struct.unpack_from("<I", b, off); off += 4
+        dst_ids = list(struct.unpack_from(f"<{dst_n}I", b, off))
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        # src_ids = CPU slot ids; dst_ids = GPU phys ids.
+        for s in src_ids:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2d_shmem: CPU slot {s} out of bounds [0, {max_cpu})")
+        for p in dst_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_h2d_shmem: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        dst = _torch.tensor(dst_ids, dtype=_torch.long, device=gpu_kv[0].device)
+        src = _torch.tensor(src_ids, dtype=_torch.long)  # CPU
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(
+                0, dst, host_kv[layer_idx][src].to(gpu_kv[layer_idx].device)
+            )
+
+    def _handle_copy_d2h_shmem(view: memoryview) -> None:
+        """Handle a METHOD_TAG_COPY_D2H shmem request.
+
+        Wire format (matches `device::copy_d2h_shmem` on the Rust
+        side, little-endian):
+            u32 src_count | src_count × u32 gpu_phys_ids
+            u32 dst_count | dst_count × u32 cpu_slot_ids
+
+        Companion to `_handle_copy_h2d_shmem` — same single-threaded
+        dispatch guarantee against `fire_batch`. Used by `suspend()`.
+        """
+        import struct
+        import torch as _torch
+        gpu_kv = engine.kv_cache_at_layer
+        host_kv = engine.kv_cache_at_layer_host
+        b = bytes(view)
+        off = 0
+        (src_n,) = struct.unpack_from("<I", b, off); off += 4
+        src_ids = list(struct.unpack_from(f"<{src_n}I", b, off)); off += src_n * 4
+        (dst_n,) = struct.unpack_from("<I", b, off); off += 4
+        dst_ids = list(struct.unpack_from(f"<{dst_n}I", b, off))
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        # src_ids = GPU phys ids; dst_ids = CPU slot ids.
+        for p in src_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2h_shmem: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in dst_ids:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_d2h_shmem: CPU slot {s} out of bounds [0, {max_cpu})")
+        src = _torch.tensor(src_ids, dtype=_torch.long, device=gpu_kv[0].device)
+        dst = _torch.tensor(dst_ids, dtype=_torch.long)  # CPU
+        for layer_idx in range(len(gpu_kv)):
+            host_kv[layer_idx].index_copy_(
+                0, dst, gpu_kv[layer_idx][src].cpu()
+            )
 
     def _shmem_loop():
         while not stop_event.is_set():
@@ -823,6 +942,26 @@ def _leader_loop(
                 except Exception as e:
                     import traceback
                     print(f"[Shmem Worker Error] copy_d2d: {e}\n{traceback.format_exc()}")
+                    _shmem_server.respond(slot, msgpack.packb(str(e)), 0)
+                continue
+
+            if method_tag == _shm.METHOD_TAG_COPY_H2D:
+                try:
+                    _handle_copy_h2d_shmem(memoryview(view))
+                    _shmem_server.respond(slot, msgpack.packb(None), 0)
+                except Exception as e:
+                    import traceback
+                    print(f"[Shmem Worker Error] copy_h2d: {e}\n{traceback.format_exc()}")
+                    _shmem_server.respond(slot, msgpack.packb(str(e)), 0)
+                continue
+
+            if method_tag == _shm.METHOD_TAG_COPY_D2H:
+                try:
+                    _handle_copy_d2h_shmem(memoryview(view))
+                    _shmem_server.respond(slot, msgpack.packb(None), 0)
+                except Exception as e:
+                    import traceback
+                    print(f"[Shmem Worker Error] copy_d2h: {e}\n{traceback.format_exc()}")
                     _shmem_server.respond(slot, msgpack.packb(str(e)), 0)
                 continue
 

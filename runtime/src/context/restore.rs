@@ -102,7 +102,6 @@ impl ContextManager {
                 .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working re-alloc"))?;
 
             if !cpu_working_pages.is_empty() && cpu_working_pages.len() == working_count {
-                // H2D copy from CPU stash.
                 let _ = device::copy_h2d(dev_idx as DeviceId, &gpu_pages, &cpu_working_pages);
                 self.cpu_stores[dev_idx].free(&cpu_working_pages);
             }
