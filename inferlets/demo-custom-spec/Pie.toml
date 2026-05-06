@@ -1,0 +1,17 @@
+[package]
+name = "demo-custom-spec"
+version = "0.1.2"
+description = "Demo: speedup from a custom prompt-lookup speculator shipped inside the inferlet (uniquely Pie)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+mode = {type = "string", optional = true, description = "'baseline' | 'speculated' | 'both' (default 'both')"}
+task = {type = "string", optional = true, description = "Override the user task (default: a code-edit task with high prompt overlap)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens to generate per attempt (default: 200)"}
+draft_len = {type = "int", optional = true, description = "Tokens proposed per spec round in SPECULATED (default: 8)"}
+ngram_n = {type = "int", optional = true, description = "Suffix length used to look up draft tokens (default: 2)"}
+delay = {type = "int", optional = true, description = "Per-token delay in ms — slows the stream so the visual is readable on video (default: 0)"}
