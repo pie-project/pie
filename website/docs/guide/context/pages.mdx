@@ -48,7 +48,7 @@ The dedup is automatic and engine-wide. You do not opt in. Two consequences wort
 
 Working pages stay out of the trie because their content is still being written. Committing is what moves a page into the shareable space.
 
-For the runtime side (chained hash, two-tier GPU/CPU trie, eviction policy), see `runtime/src/context/STORAGE.md` and the SOSP paper.
+The runtime implements this with chained hashes, a two-tier GPU/CPU trie, and an eviction policy described in the SOSP paper.
 
 ## Prefill, decode, and flush
 

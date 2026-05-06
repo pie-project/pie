@@ -1,8 +1,8 @@
 """`pie.server.Server` — async context manager around the embedded engine.
 
 Mirrors the legacy `pie-server` Python wheel's `Server` class so existing
-test fixtures (`tests/inferlets/conftest.py::_run`, `benches/*`,
-`sdk/demo/zo-training/*`) keep working unchanged.
+test fixtures (`tests/inferlets/conftest.py::_run`, `benches/*`) keep
+working unchanged.
 
     async with Server(cfg) as server:
         client = await server.connect()

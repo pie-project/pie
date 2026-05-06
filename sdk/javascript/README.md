@@ -42,6 +42,3 @@ Regenerate WIT bindings after runtime WIT changes:
 ```bash
 npm run generate-bindings
 ```
-
-For constrained decoding details, see
-[`sdk/CONSTRAINED_DECODING.md`](../CONSTRAINED_DECODING.md).

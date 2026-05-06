@@ -39,6 +39,3 @@ Build through Bakery:
 ```bash
 pie build ./my-python-inferlet -o out.wasm
 ```
-
-For constrained decoding details, see
-[`sdk/CONSTRAINED_DECODING.md`](../CONSTRAINED_DECODING.md).

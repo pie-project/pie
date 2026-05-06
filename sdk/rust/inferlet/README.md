@@ -39,5 +39,4 @@ rustup target add wasm32-wasip2
 cargo build --target wasm32-wasip2 --release
 ```
 
-Most examples live under `inferlets/`. For constrained decoding details, see
-[`sdk/CONSTRAINED_DECODING.md`](../../CONSTRAINED_DECODING.md).
+Most examples live under `inferlets/`.

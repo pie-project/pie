@@ -24,7 +24,7 @@ use crate::pie::instruct::chat;
 /// Budget-exhausting bid: the maximum per-page-per-step rent the process
 /// can sustain over `μ` steps of generation without going bankrupt.
 ///
-/// Formula (SCHED.md §5):
+/// Formula:
 ///
 /// ```text
 ///     bid = (B/μ + d) / (p + μ(1 + cv²) / (2s))
@@ -448,4 +448,3 @@ impl<'a> Drop for Idle<'a> {
         self.ctx.inner.bid(self.saved);
     }
 }
-

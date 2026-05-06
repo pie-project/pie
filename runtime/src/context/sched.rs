@@ -367,8 +367,8 @@ impl ContextManager {
             else if ctx.is_active() { n_active += 1; }
         }
 
-        // Contention gate (SCHED.md §3.2): the clearing price is the critical
-        // value — the bid at which an admitted context would be displaced.
+        // Contention gate: the clearing price is the critical value — the bid
+        // at which an admitted context would be displaced.
         // When no one is waiting and the device has free capacity, no context
         // faces displacement pressure, so the critical value is zero.
         //
@@ -755,7 +755,7 @@ impl ContextManager {
     }
 
     // =========================================================================
-    // CPU Eviction — tier-boundary contention (STORAGE.md §4.1b)
+    // CPU Eviction — tier-boundary contention
     // =========================================================================
 
     /// Find the best CPU eviction victim on a device.
@@ -856,7 +856,7 @@ impl ContextManager {
     ///
     /// When the CPU pool is full, runs an eviction loop to free CPU pages
     /// from the lowest-bid suspended context before falling through to
-    /// recompute (STORAGE.md §4.1b).
+    /// recompute.
     pub(crate) fn suspend(&mut self, ctx_id: ContextId) {
         let (dev_idx, working, committed_hashes) = match self.contexts.get(&ctx_id) {
             Some(ctx) if ctx.is_active() || ctx.is_pinned() => {

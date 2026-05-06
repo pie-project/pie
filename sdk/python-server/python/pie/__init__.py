@@ -29,7 +29,7 @@ Embed `pie serve` inside a Python script:
     asyncio.run(main())
 
 Mirrors the legacy `pie-server` Python wheel surface so existing tests
-(`tests/inferlets/`, `benches/`, `sdk/demo/`) keep working unchanged.
+(`tests/inferlets/`, `benches/`) keep working unchanged.
 """
 
 from pie.server import Server  # noqa: F401
