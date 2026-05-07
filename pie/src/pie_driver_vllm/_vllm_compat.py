@@ -24,13 +24,21 @@ from __future__ import annotations
 # Engine / config surface
 # ----------------------------------------------------------------------------
 
-from vllm.config import set_current_vllm_config
+from vllm.config import CUDAGraphMode, set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
-from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.distributed.parallel_state import graph_capture
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 
 
 # ----------------------------------------------------------------------------
@@ -63,7 +71,11 @@ def get_flashinfer_impl():
 
 __all__ = [
     "AttentionLayerBase",
+    "BatchDescriptor",
+    "CUDAGraphMode",
+    "CUDAGraphWrapper",
     "CommonAttentionMetadata",
+    "CudagraphDispatcher",
     "EngineArgs",
     "bind_kv_cache",
     "ensure_model_parallel_initialized",
@@ -72,7 +84,9 @@ __all__ = [
     "get_flashinfer_impl",
     "get_forward_context",
     "get_model_loader",
+    "graph_capture",
     "init_distributed_environment",
+    "set_cudagraph_capturing_enabled",
     "set_current_vllm_config",
     "set_forward_context",
 ]
