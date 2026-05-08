@@ -50,20 +50,46 @@ def _state_slot_for_requests(
     **This is the only place in the driver where the slot id is derived
     from KV-page metadata.** Today the slot is the request's first KV
     page id — relying on pie's allocator giving each in-flight request
-    at least one page. That coupling is documented in `kv_cache.py` as
-    a known limitation: post-fork siblings share their first committed
-    page (refcount), so the first-page-id collides between siblings,
-    which silently produces wrong recurrent state on hybrid models.
-    Capability flag `supports_kv_fork=False` lets pie's runtime route
-    fork-using inferlets away on hybrid; #108 will replace this body
-    with a per-request slot allocator that doesn't depend on page ids
-    at all (likely keyed on a runtime-supplied request id once IPC
-    cooperation lands).
+    at least one page. That coupling has a known fork-aliasing
+    limitation: post-fork siblings share their first committed page
+    (refcount), so two siblings in the same fire_batch would derive the
+    same slot id and silently corrupt each other's recurrent state.
+
+    Ticket #107 deliberately refuses to add IPC cooperation (the only
+    runtime-correct fix); #108 will replace this body with a
+    per-request slot allocator keyed on a stable runtime-supplied id.
+    Until then, capability flag `supports_kv_fork=False` lets pie's
+    runtime route fork-using inferlets away on hybrid models, and the
+    in-batch duplicate-slot check below trips loudly if a fork-using
+    inferlet does reach the driver anyway (covers the case where the
+    runtime hasn't enforced the capability yet).
 
     Returning a CPU tensor here keeps the call site indexed-copy free;
     the caller stages the tensor onto the device via `non_blocking=True`.
     """
-    return kv_page_indices_cpu[kv_page_indptr_cpu[:-1]]
+    slots = kv_page_indices_cpu[kv_page_indptr_cpu[:-1]]
+    # Defensive: catch the fork-siblings-in-same-batch case at the
+    # earliest point. On hybrid, two requests sharing a first-page id
+    # mean both would write to the same conv_state / ssm_state slot in
+    # the next forward and silently corrupt each other; far better to
+    # raise here than to debug a stale-state bug downstream. O(B) on
+    # CPU; B ≤ scheduler max_num_seqs (16 by default), so the cost is
+    # negligible.
+    if int(slots.unique().numel()) != int(slots.numel()):
+        # Surface the colliding slot ids so the operator can map them
+        # back to fork lineages in pie's logs. Repr is small (B ≤ 16).
+        raise RuntimeError(
+            "Hybrid mamba state-slot collision in fire_batch: two "
+            "requests share their first KV page id, which means pie "
+            "issued ctx.fork() on a hybrid model whose driver "
+            "advertises supports_kv_fork=False. Mamba's per-request "
+            "recurrent state cannot be safely shared across forked "
+            "siblings under the current page-id-as-slot scheme. Route "
+            "fork-using inferlets to cuda_native or portable, or wait "
+            "for ticket #108 to land the per-request slot allocator. "
+            f"Slot ids in this batch: {slots.tolist()}"
+        )
+    return slots
 
 
 def build_gdn_metadata(
