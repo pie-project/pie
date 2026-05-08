@@ -1,0 +1,121 @@
+{
+  "id": "persistent-kv",
+  "title": "Save and reopen KV caches",
+  "tagline": "In Pie the KV cache is a named object inside the engine. Save it after turn 1 and reopen it on turn 2 from user code. Only the new message pays prefill; chat history is the cache itself.",
+  "question": "Two-turn chat. Turn 1: 'What is Python?' Turn 2: 'Name three common uses.'",
+  "naive": {
+    "label": "Naive",
+    "sublabel": "stateless client — every turn re-prefills the full history",
+    "tone": "warn",
+    "events": [
+      {
+        "t": 0,
+        "kind": "section",
+        "value": "turn 1"
+      },
+      {
+        "t": 100,
+        "kind": "info",
+        "value": "user: What is Python?"
+      },
+      {
+        "t": 400,
+        "kind": "text",
+        "value": "Python is a high-level, interpreted programming language used for many kinds of applications.\n"
+      },
+      {
+        "t": 1100,
+        "kind": "info",
+        "value": "prefill 41 tokens"
+      },
+      {
+        "t": 1400,
+        "kind": "section",
+        "value": "turn 2  (rebuild context, replay history)"
+      },
+      {
+        "t": 1500,
+        "kind": "info",
+        "value": "user: Name three common uses."
+      },
+      {
+        "t": 1900,
+        "kind": "text",
+        "value": "1. A scripting language\n2. A web development tool\n3. A data analysis and ML language\n"
+      },
+      {
+        "t": 2900,
+        "kind": "bad",
+        "value": "prefill 66 tokens — system + turn 1 user + turn 1 assistant + turn 2 user"
+      },
+      {
+        "t": 3300,
+        "kind": "result",
+        "value": "total prefill 107 tokens  •  about 194 ms wall"
+      }
+    ]
+  },
+  "pie": {
+    "label": "Pie",
+    "sublabel": "Context::save() after turn 1, Context::open() before turn 2",
+    "tone": "good",
+    "events": [
+      {
+        "t": 0,
+        "kind": "section",
+        "value": "turn 1"
+      },
+      {
+        "t": 100,
+        "kind": "info",
+        "value": "user: What is Python?"
+      },
+      {
+        "t": 400,
+        "kind": "text",
+        "value": "Python is a high-level, interpreted programming language used for many kinds of applications.\n"
+      },
+      {
+        "t": 1100,
+        "kind": "info",
+        "value": "prefill 41 tokens, then ctx.save(\"conv-1\") ✓"
+      },
+      {
+        "t": 1400,
+        "kind": "section",
+        "value": "turn 2  (Context::open, append only the new user message)"
+      },
+      {
+        "t": 1500,
+        "kind": "info",
+        "value": "user: Name three common uses."
+      },
+      {
+        "t": 1900,
+        "kind": "text",
+        "value": "1. A scripting language\n2. A web development tool\n3. A data analysis and ML language\n"
+      },
+      {
+        "t": 2700,
+        "kind": "good",
+        "value": "prefill 17 tokens — only the new user message + cue"
+      },
+      {
+        "t": 3000,
+        "kind": "result",
+        "value": "total prefill 58 tokens  •  about 114 ms wall  •  3.9× less turn-2 prefill"
+      }
+    ]
+  },
+  "code": {
+    "naive": {
+      "language": "bash",
+      "value": "# Turn 1\ncurl /v1/responses -d '{\n  \"model\": \"qwen3-0.6b\",\n  \"input\": [{\"role\":\"user\",\"content\":\"What is Python?\"}]\n}'\n\n# Turn 2 — must replay the entire history every request.\ncurl /v1/responses -d '{\n  \"model\": \"qwen3-0.6b\",\n  \"input\": [\n    {\"role\":\"user\",\"content\":\"What is Python?\"},\n    {\"role\":\"assistant\",\"content\":\"Python is...\"},\n    {\"role\":\"user\",\"content\":\"Name three uses.\"}\n  ]\n}'"
+    },
+    "pie": {
+      "language": "rust",
+      "value": "// Same engine instance: save the post-turn-1 KV cache, then reopen it.\nlet mut ctx = Context::new(&model)?;\nctx.system(SYS).user(&turn1).cue();\nlet _answer1 = ctx.generate(Sampler::Argmax)\n    .max_tokens(100)\n    .collect_text().await?;\nctx.flush().await?;\nctx.save(\"conv-42\")?;                     // named KV snapshot\n\nlet mut ctx = Context::open(&model, \"conv-42\")?;\nlet before = ctx.seq_len();\nctx.user(&turn2).cue();                   // only new tokens enter buffer\nlet turn2_prefill = ctx.seq_len() - before + ctx.buffer().len() as u32;\nlet _answer2 = ctx.generate(Sampler::Argmax)\n    .max_tokens(100)\n    .collect_text().await?;"
+    }
+  },
+  "runCommand": "pie run demo-persistent-kv -- --mode both --turn1 \"What is Python?\" --turn2 \"Name three common uses.\""
+}

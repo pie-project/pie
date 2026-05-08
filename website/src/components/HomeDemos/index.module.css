@@ -1,0 +1,121 @@
+.wrap {
+  max-width: 1100px;
+  margin-inline: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* =====================================================================
+   Card row — three demos surfaced as bubble boxes
+   ===================================================================== */
+.cards {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.65rem;
+}
+
+@media (min-width: 720px) {
+  .cards {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.75rem;
+  }
+}
+
+.card {
+  position: relative;
+  text-align: left;
+  padding: 0.7rem 0.95rem 0.8rem;
+  background: var(--pie-bg-elev);
+  border: 1px solid var(--pie-border);
+  border-radius: 10px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  transition: border-color 150ms ease, background 150ms ease, transform 150ms ease;
+  font: inherit;
+  color: inherit;
+}
+
+.card:hover {
+  border-color: var(--pie-border-strong);
+  transform: translateY(-1px);
+}
+
+.cardActive {
+  border-color: var(--ifm-color-primary);
+  background: color-mix(in oklab, var(--ifm-color-primary) 5%, var(--pie-bg-elev));
+  transform: translateY(-1px);
+}
+
+/* visual pointer connecting active card to the panel below */
+.cardActive::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -8px;
+  transform: translateX(-50%) rotate(45deg);
+  width: 12px;
+  height: 12px;
+  background: color-mix(in oklab, var(--ifm-color-primary) 5%, var(--pie-bg-elev));
+  border-right: 1px solid var(--ifm-color-primary);
+  border-bottom: 1px solid var(--ifm-color-primary);
+  z-index: 2;
+}
+
+@media (max-width: 719px) {
+  .cardActive::after {
+    display: none;
+  }
+}
+
+.cardName {
+  font-family: var(--pie-font-serif);
+  font-weight: 600;
+  font-size: var(--pie-text-base);
+  color: var(--pie-ink);
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
+.cardActive .cardName {
+  color: var(--ifm-color-primary);
+}
+
+.cardMetric {
+  font-family: var(--pie-font-mono);
+  font-size: var(--pie-text-xs);
+  color: var(--pie-ink-muted);
+}
+
+.cardActive .cardMetric {
+  color: var(--pie-ink-soft);
+}
+
+/* =====================================================================
+   Panel — the active player nested in a bordered box
+   ===================================================================== */
+.panel {
+  margin-top: 1.1rem;
+  padding: 1.25rem clamp(0.9rem, 2vw, 1.5rem) 1.4rem;
+  background: var(--pie-bg);
+  border: 1px solid var(--ifm-color-primary);
+  border-radius: 12px;
+  box-shadow: 0 4px 18px -10px color-mix(in oklab, var(--ifm-color-primary) 30%, transparent);
+  position: relative;
+  min-height: 380px;
+}
+
+.placeholder {
+  text-align: center;
+  padding: 4rem 1rem;
+  color: var(--pie-ink-muted);
+  font-family: var(--pie-font-mono);
+  font-size: var(--pie-text-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card { transition: none; }
+  .card:hover, .cardActive { transform: none; }
+}

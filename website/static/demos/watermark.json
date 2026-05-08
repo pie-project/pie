@@ -1,0 +1,81 @@
+{
+  "id": "watermark",
+  "title": "Custom sampler with an in-engine detector",
+  "tagline": "In Pie the sampler and per-token distribution are exposed to user code. Apply a green-list bias before sampling, then run a detector in the same engine. Both outputs read naturally; only one carries a verifiable signal.",
+  "question": "Explain in three sentences how LLMs decode tokens. Plain ASCII, no markdown.",
+  "naive": {
+    "label": "Naive",
+    "sublabel": "argmax sample from the model's distribution — no bias",
+    "tone": "warn",
+    "events": [
+      {
+        "t": 0,
+        "kind": "info",
+        "value": "Probe::Distribution at every step, then unbiased argmax"
+      },
+      {
+        "t": 200,
+        "kind": "text",
+        "value": "LLMs decode tokens by analyzing the context and using a combination of linguistic and statistical models to generate the most likely next token. They process the input in a sequence, using a finite state machine to track the current state of the conversation and make predictions based on the available information.\n"
+      },
+      {
+        "t": 3500,
+        "kind": "info",
+        "value": "detector scans generated tokens against the green-list seeded by each previous token…"
+      },
+      {
+        "t": 4000,
+        "kind": "bad",
+        "value": "green-list hits 22/62 (35%)  •  z = -2.29  •  no watermark detected"
+      },
+      {
+        "t": 4400,
+        "kind": "result",
+        "value": "indistinguishable from any other LLM output — no provenance"
+      }
+    ]
+  },
+  "pie": {
+    "label": "Pie",
+    "sublabel": "+δ bias on green-list logits, then argmax of the biased distribution",
+    "tone": "good",
+    "events": [
+      {
+        "t": 0,
+        "kind": "info",
+        "value": "in-WASM hash + bias + sampler — no client RTT, no engine plugin"
+      },
+      {
+        "t": 200,
+        "kind": "text",
+        "value": "LLMs decode tokens using probabilistic models, where each token is interpreted based on its context and the model's underlying structure. The decoding process involves analyzing context to understand which part of the original input corresponds to each token. The resulting output reflects a combination of the input and the encoded context that was used during training.\n"
+      },
+      {
+        "t": 3500,
+        "kind": "info",
+        "value": "detector runs the same green-list rule and counts hits…"
+      },
+      {
+        "t": 4000,
+        "kind": "good",
+        "value": "green-list hits 44/53 (83%)  •  z = 4.81  •  watermark detected ✓"
+      },
+      {
+        "t": 4400,
+        "kind": "result",
+        "value": "verifiably signed output  •  detector co-located with the inferlet"
+      }
+    ]
+  },
+  "code": {
+    "naive": {
+      "language": "bash",
+      "value": "# argmax sample from the model's distribution — no bias\ncurl https://api.example.com/v1/responses \\\n  -d '{\n    \"model\": \"qwen3-0.6b\",\n    \"input\": \"Explain in three sentences how LLMs decode tokens.\"\n  }'\n\n# No way to inject per-token bias from the client. Watermarking\n# requires a fork of the engine, not a request-time feature."
+    },
+    "pie": {
+      "language": "rust",
+      "value": "// +δ bias on green-list logits, then argmax of the biased distribution\nlet mut watermark = WatermarkState::new(GAMMA, DELTA);\nlet mut pending = vec![first_token];\n\nfor _ in 0..max_tokens {\n    let mut pass = ctx.forward();\n    pass.input(&pending);\n    let last_idx = (pending.len() - 1) as u32;\n\n    // Read the model's natural softmax (k=0 → full vocab).\n    let h = pass.probe(last_idx, Distribution { temperature: 1.0, k: 0 });\n    let out = pass.execute().await?;\n    let (ids, probs) = out.distribution(h).unwrap();\n\n    // In-WASM hash → green list → +δ bias → argmax.\n    let chosen = watermark.sample_biased(ids, probs);\n    pending = vec![chosen];\n}\n// Co-located detector verifies via z-score:\n//   z = (hits − n·γ) / sqrt(n·γ·(1 − γ))"
+    }
+  },
+  "runCommand": "pie run demo-watermark -- --gamma 0.5 --delta 8.0 --max-tokens 80"
+}

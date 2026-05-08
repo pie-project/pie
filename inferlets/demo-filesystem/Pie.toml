@@ -1,0 +1,15 @@
+[package]
+name = "demo-filesystem"
+version = "0.1.1"
+description = "Demo: per-process /scratch directory acts as inline persistent state — no sidecar, no DB (uniquely Pie)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+mode = {type = "string", optional = true, description = "'baseline' | 'cached' | 'both' — pick one for side-by-side recording (default: 'both')"}
+question = {type = "string", optional = true, description = "Question whose answer is cacheable (default: a Pythagorean fact)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens per generate (default: 120)"}
+delay = {type = "int", optional = true, description = "Per-token delay in ms — slows the stream so the visual is readable on video (default: 0)"}

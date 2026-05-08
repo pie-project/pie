@@ -1,0 +1,16 @@
+[package]
+name = "demo-messaging"
+version = "0.1.1"
+description = "Demo: inferlets coordinate via messaging::broadcast/subscribe — no coordinator client (uniquely Pie)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+mode = {type = "string", optional = true, description = "'baseline' | 'pubsub' | 'idea' | 'plot' | 'dialogue' | 'both' — side-by-side or separate topic role (default: 'both')"}
+prompt = {type = "string", optional = true, description = "Story idea seed (default: a daydreaming-in-a-park premise)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens per stage (default: 80)"}
+rtt_ms = {type = "int", optional = true, description = "Simulated client round-trip per pipeline hop in BASELINE (default: 100)"}
+delay = {type = "int", optional = true, description = "Per-token delay in ms — slows the stream so the visual is readable on video (default: 0)"}

@@ -1,0 +1,16 @@
+[package]
+name = "demo-mcp-tools"
+version = "0.1.1"
+description = "Demo: tool calls run inline in the inferlet — zero client round-trip per call (uniquely Pie)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+mode = {type = "string", optional = true, description = "'baseline' | 'inline' | 'both' — pick one for side-by-side recording (default: 'both')"}
+prompt = {type = "string", optional = true, description = "User prompt that triggers tool use (default: a multi-step weather + arithmetic question)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens per generate step (default: 256)"}
+rtt_ms = {type = "int", optional = true, description = "Simulated client round-trip per tool call in BASELINE (default: 80)"}
+delay = {type = "int", optional = true, description = "Per-token delay in ms — slows the stream so the visual is readable on video (default: 0)"}

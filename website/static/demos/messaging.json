@@ -1,0 +1,131 @@
+{
+  "id": "messaging",
+  "title": "Coordinate inferlets through engine topics",
+  "tagline": "In Pie the engine hosts topics. User code publishes and subscribes through the broker, so producers and consumers hand off work without a conductor process pulling and pushing. This recording runs the three stages in one inferlet for a reproducible one-shot demo.",
+  "question": "3-stage writer's room: idea → plot → dialogue over engine topics.",
+  "naive": {
+    "label": "Naive",
+    "sublabel": "client-orchestrated — every hop costs a round-trip",
+    "tone": "warn",
+    "events": [
+      {
+        "t": 0,
+        "kind": "section",
+        "value": "stage 1 ▸ idea"
+      },
+      {
+        "t": 200,
+        "kind": "text",
+        "value": "A young girl wandered through the park, her mind drifting to the day she first met her favorite book.\n"
+      },
+      {
+        "t": 1100,
+        "kind": "rewind",
+        "value": "→ ship to coordinator → coordinator queues → ship to plot worker"
+      },
+      {
+        "t": 1200,
+        "kind": "info",
+        "value": "client RTT: 100 ms"
+      },
+      {
+        "t": 1300,
+        "kind": "section",
+        "value": "stage 2 ▸ plot"
+      },
+      {
+        "t": 1500,
+        "kind": "text",
+        "value": "Setup: A girl walks the park, lost in thought.\nConfrontation: She finds a dusty book on a bench.\nResolution: The book remembers her.\n"
+      },
+      {
+        "t": 2400,
+        "kind": "rewind",
+        "value": "→ ship to coordinator → ship to dialogue worker"
+      },
+      {
+        "t": 2500,
+        "kind": "info",
+        "value": "client RTT: 100 ms"
+      },
+      {
+        "t": 2600,
+        "kind": "section",
+        "value": "stage 3 ▸ dialogue"
+      },
+      {
+        "t": 2800,
+        "kind": "text",
+        "value": "\"Did you ever wonder if the book you read was reading you?\"\n"
+      },
+      {
+        "t": 3500,
+        "kind": "result",
+        "value": "about 600 ms  •  2 hops  •  RTT overhead about 200 ms"
+      }
+    ]
+  },
+  "pie": {
+    "label": "Pie",
+    "sublabel": "messaging::broadcast / subscribe — direct in-engine hops",
+    "tone": "good",
+    "events": [
+      {
+        "t": 0,
+        "kind": "section",
+        "value": "stage 1 ▸ idea"
+      },
+      {
+        "t": 200,
+        "kind": "text",
+        "value": "A young girl wandered through the park, her mind drifting to the day she first met her favorite book.\n"
+      },
+      {
+        "t": 1100,
+        "kind": "good",
+        "value": "broadcast on \"demo-idea-to-plot\" → subscriber received  (in-engine)"
+      },
+      {
+        "t": 1200,
+        "kind": "section",
+        "value": "stage 2 ▸ plot"
+      },
+      {
+        "t": 1400,
+        "kind": "text",
+        "value": "Setup: A girl walks the park, lost in thought.\nConfrontation: She finds a dusty book on a bench.\nResolution: The book remembers her.\n"
+      },
+      {
+        "t": 2300,
+        "kind": "good",
+        "value": "broadcast on \"demo-plot-to-dialogue\" → subscriber received  (in-engine)"
+      },
+      {
+        "t": 2400,
+        "kind": "section",
+        "value": "stage 3 ▸ dialogue"
+      },
+      {
+        "t": 2600,
+        "kind": "text",
+        "value": "\"Did you ever wonder if the book you read was reading you?\"\n"
+      },
+      {
+        "t": 3300,
+        "kind": "result",
+        "value": "about 310 ms  •  2 hops  •  0 RTT  •  about 1.9× wall-time"
+      }
+    ]
+  },
+  "code": {
+    "naive": {
+      "language": "bash",
+      "value": "# Coordinator orchestrates each hop with HTTP RTTs.\nidea=$(curl /v1/responses \\\n  -d '{\"model\":\"qwen3-0.6b\", \"input\":\"Story seed: a park\"}')\n\nplot=$(curl /v1/responses \\\n  -d \"{\\\"model\\\":\\\"qwen3-0.6b\\\", \\\"input\\\":\\\"Plot for: $idea\\\"}\")\n\ndialogue=$(curl /v1/responses \\\n  -d \"{\\\"model\\\":\\\"qwen3-0.6b\\\", \\\"input\\\":\\\"Climax line for: $plot\\\"}\")"
+    },
+    "pie": {
+      "language": "rust",
+      "value": "// Reproducible one-shot path used by this demo.\n// The same topic API can connect separate inferlets on a shared engine.\nlet idea = generate_with(SYS_IDEA, &seed).await?;\n\nlet plot_sub = messaging::subscribe(\"demo-idea-to-plot\");\nmessaging::broadcast(\"demo-idea-to-plot\", idea.trim());\nlet idea = plot_sub.get_async().await.unwrap();\n\nlet plot = generate_with(SYS_PLOT, &format!(\"Concept: {idea}\")).await?;\nlet combined = format!(\"{idea}\\n\\nPlot:\\n{}\", plot.trim());\n\nlet dialogue_sub = messaging::subscribe(\"demo-plot-to-dialogue\");\nmessaging::broadcast(\"demo-plot-to-dialogue\", &combined);\nlet plot_context = dialogue_sub.get_async().await.unwrap();\n\nlet dialogue = generate_with(SYS_DIALOGUE, &format!(\"Story so far:\\n{plot_context}\")).await?;"
+    }
+  },
+  "runCommand": "pie run demo-messaging -- --mode both --rtt-ms 100 --max-tokens 80"
+}

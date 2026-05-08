@@ -1,0 +1,16 @@
+[package]
+name = "demo-grammar"
+version = "0.1.1"
+description = "Demo: in-WASM JSON-Schema matcher masks logits per token — output is always valid by construction (uniquely Pie)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+mode = {type = "string", optional = true, description = "'baseline' | 'constrained' | 'both' — pick one for side-by-side recording (default: 'both')"}
+bio = {type = "string", optional = true, description = "Source paragraph to extract from (default: a short Alice bio)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens per attempt (default: 200)"}
+max_retries = {type = "int", optional = true, description = "Max retries in BASELINE on parse/validation failure (default: 3)"}
+delay = {type = "int", optional = true, description = "Per-token delay in ms — slows the stream so the visual is readable on video (default: 0)"}

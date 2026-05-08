@@ -1,0 +1,161 @@
+{
+  "id": "self-correct",
+  "title": "Verify, then rewind the cache",
+  "tagline": "In Pie the KV cache supports mid-flight rewind. Run the model, check the answer in user code, and rewind to a checkpoint when the math is wrong. The verifier and the cache live in the same process.",
+  "question": "Compute (156 * 32) + (248 * 19). Show each multiplication on its own line, then state the final sum.",
+  "naive": {
+    "label": "Naive",
+    "sublabel": "one greedy roll-out, commit and ship",
+    "tone": "warn",
+    "events": [
+      {
+        "t": 0,
+        "kind": "info",
+        "value": "Qwen3-0.6B at T=0.0 — same answer every time"
+      },
+      {
+        "t": 250,
+        "kind": "text",
+        "value": "156 * 32 = 5000\n"
+      },
+      {
+        "t": 950,
+        "kind": "text",
+        "value": "248 * 19 = 4712\n"
+      },
+      {
+        "t": 1700,
+        "kind": "text",
+        "value": "Final Answer: 5000 + 4712\n"
+      },
+      {
+        "t": 2400,
+        "kind": "bad",
+        "value": "expected 9704 — model fumbled 156 * 32 (4992)"
+      },
+      {
+        "t": 2900,
+        "kind": "result",
+        "value": "answer 9712 ✗  •  about 213 ms  •  1 attempt"
+      }
+    ]
+  },
+  "pie": {
+    "label": "Pie",
+    "sublabel": "Rust verifier scans each X op Y = Z; Context::fork() rewinds the KV cache",
+    "tone": "good",
+    "events": [
+      {
+        "t": 0,
+        "kind": "section",
+        "value": "attempt 1  (T=0.0)"
+      },
+      {
+        "t": 200,
+        "kind": "text",
+        "value": "156 * 32 = 5000\n"
+      },
+      {
+        "t": 800,
+        "kind": "text",
+        "value": "248 * 19 = 4712\n"
+      },
+      {
+        "t": 1400,
+        "kind": "text",
+        "value": "Final Answer: 5000 + 4712\n"
+      },
+      {
+        "t": 1900,
+        "kind": "bad",
+        "value": "verifier: 156 * 32 = 5000 ≠ 4992, Final Answer 9712 ≠ 9704"
+      },
+      {
+        "t": 2200,
+        "kind": "rewind",
+        "value": "Context::fork() rewinds KV to base (123 tokens), retry @ T=0.6"
+      },
+      {
+        "t": 2700,
+        "kind": "section",
+        "value": "attempt 2  (T=0.6)"
+      },
+      {
+        "t": 2900,
+        "kind": "text",
+        "value": "50 + 30 = 80\n156 * 32 = 5000\n"
+      },
+      {
+        "t": 3500,
+        "kind": "text",
+        "value": "248 * 19 = 4712\n5000 + 4712 = 9712\n"
+      },
+      {
+        "t": 4100,
+        "kind": "text",
+        "value": "Final Answer: 9712\n"
+      },
+      {
+        "t": 4700,
+        "kind": "bad",
+        "value": "verifier: 156 * 32 = 5000 ≠ 4992, Final Answer 9712 ≠ 9704"
+      },
+      {
+        "t": 5000,
+        "kind": "rewind",
+        "value": "Context::fork() rewinds KV to base (123 tokens), retry @ T=0.9"
+      },
+      {
+        "t": 5500,
+        "kind": "section",
+        "value": "attempt 3  (T=0.9)"
+      },
+      {
+        "t": 5700,
+        "kind": "text",
+        "value": "- 156 * 32 = 5008\n- 248 * 19 = 4712\nFinal Answer: 5008 + 4712\n"
+      },
+      {
+        "t": 6500,
+        "kind": "bad",
+        "value": "verifier: 156 * 32 = 5008 ≠ 4992, Final Answer 9720 ≠ 9704"
+      },
+      {
+        "t": 6800,
+        "kind": "rewind",
+        "value": "Context::fork() rewinds KV to base (123 tokens), retry @ T=1.2"
+      },
+      {
+        "t": 7300,
+        "kind": "section",
+        "value": "attempt 4  (T=1.2)"
+      },
+      {
+        "t": 7500,
+        "kind": "text",
+        "value": "- 156 * 32 = 4992\n- 248 * 19 = 4712\n- 4992 + 4712 = 9704\n\nFinal Answer: 9704\n"
+      },
+      {
+        "t": 8500,
+        "kind": "good",
+        "value": "verifier: arithmetic claims and final answer check out"
+      },
+      {
+        "t": 8900,
+        "kind": "result",
+        "value": "answer 9704 ✓  •  about 602 ms  •  4 attempts / 3 rewinds"
+      }
+    ]
+  },
+  "code": {
+    "naive": {
+      "language": "bash",
+      "value": "# one greedy roll-out, commit and ship\ncurl https://api.example.com/v1/responses \\\n  -d '{\n    \"model\": \"qwen3-0.6b\",\n    \"input\": \"Compute (156 * 32) + (248 * 19). Show each step.\",\n    \"temperature\": 0.0\n  }'\n\n# No mid-flight access. If the answer is wrong, retry from\n# scratch and re-prefill the entire prompt every time."
+    },
+    "pie": {
+      "language": "rust",
+      "value": "// Rust verifier scans every X op Y = Z and checks Final Answer.\nlet mut base = Context::new(&model)?;\nbase.system(SYSTEM).user(&question).cue();\n\nfor attempt in 1..=MAX_RETRIES {\n    let mut ctx = base.fork()?;           // KV checkpoint\n    let text = ctx.generate(sampler)\n        .max_tokens(400)\n        .collect_text().await?;\n\n    if verify_attempt(&text, expected).is_empty() {\n        return Ok(text);                  // ✓ verifier passed\n    }\n\n    // ✗ wrong answer: drop `ctx`, fork base again at higher T.\n    sampler = hotter_sampler(attempt);\n}"
+    }
+  },
+  "runCommand": "pie run demo-self-correct -- --question \"Compute (156 * 32) + (248 * 19).\" --max-retries 5"
+}

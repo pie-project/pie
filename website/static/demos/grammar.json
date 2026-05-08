@@ -1,0 +1,141 @@
+{
+  "id": "grammar",
+  "title": "Write your own logit mask",
+  "tagline": "In Pie the logit mask is user code. JSON Schema is a built-in, and the Constrain trait lets you write your own state machine when the built-ins do not fit.",
+  "question": "Bio: \"Hi, I am Bob, bob@x.io, 35yo.\" — extract {name, email, age}.",
+  "naive": {
+    "label": "Naive",
+    "sublabel": "free decode (no response_format) → strict JSON parse → retry on failure",
+    "tone": "warn",
+    "events": [
+      {
+        "t": 0,
+        "kind": "info",
+        "value": "without response_format, the model wraps the JSON in markdown fences"
+      },
+      {
+        "t": 200,
+        "kind": "section",
+        "value": "attempt 1  (T=0.0)"
+      },
+      {
+        "t": 400,
+        "kind": "text",
+        "value": "```json\n{\n  \"name\": \"Bob\",\n  \"email\": \"bob@x.io\",\n  \"age\": 35\n"
+      },
+      {
+        "t": 1500,
+        "kind": "bad",
+        "value": "expected value at line 1 column 1 (head: \"```json\")"
+      },
+      {
+        "t": 1900,
+        "kind": "section",
+        "value": "attempt 2  (T=0.6)"
+      },
+      {
+        "t": 2100,
+        "kind": "text",
+        "value": "```json\n{\n  \"name\": \"Bob\",\n  \"email\": \"bob@x.io\",\n  \"age\": \"35\"\n"
+      },
+      {
+        "t": 3200,
+        "kind": "bad",
+        "value": "expected value at line 1 column 1 (head: \"```json\")"
+      },
+      {
+        "t": 3600,
+        "kind": "section",
+        "value": "attempt 3  (T=0.9)"
+      },
+      {
+        "t": 3800,
+        "kind": "text",
+        "value": "```json\n{\n  \"name\": \"Bob\",\n  \"email\": \"bob@x.io\",\n  \"age\": 35\n"
+      },
+      {
+        "t": 4900,
+        "kind": "bad",
+        "value": "expected value at line 1 column 1 (head: \"```json\")"
+      },
+      {
+        "t": 5300,
+        "kind": "result",
+        "value": "✗ failed after 3 attempts  •  66 tokens wasted  •  about 360 ms"
+      }
+    ]
+  },
+  "pie": {
+    "label": "Pie",
+    "sublabel": "constrain_with(JsonSchema) — built in; or write your own Constrain impl",
+    "tone": "good",
+    "events": [
+      {
+        "t": 0,
+        "kind": "info",
+        "value": "matcher constrains the JSON payload; user code extracts the first complete object and stops"
+      },
+      {
+        "t": 200,
+        "kind": "burst",
+        "value": "```json\n{"
+      },
+      {
+        "t": 400,
+        "kind": "burst",
+        "value": "\"name\":"
+      },
+      {
+        "t": 600,
+        "kind": "burst",
+        "value": "\"Bob\","
+      },
+      {
+        "t": 850,
+        "kind": "burst",
+        "value": "\"email\":"
+      },
+      {
+        "t": 1100,
+        "kind": "burst",
+        "value": "\"bob@x.io\","
+      },
+      {
+        "t": 1450,
+        "kind": "burst",
+        "value": "\"age\":"
+      },
+      {
+        "t": 1650,
+        "kind": "burst",
+        "value": "35"
+      },
+      {
+        "t": 1800,
+        "kind": "burst",
+        "value": "}"
+      },
+      {
+        "t": 2100,
+        "kind": "good",
+        "value": "valid payload on the first attempt — extracted before the fence closes"
+      },
+      {
+        "t": 2400,
+        "kind": "result",
+        "value": "✓ 1 attempt  •  21 decoded (0 wasted)  •  about 158 ms  •  no retry"
+      }
+    ]
+  },
+  "code": {
+    "naive": {
+      "language": "bash",
+      "value": "# Most engines DO accept request-time JSON Schema. The issue is\n# what you can express — anything outside the engine's grammar zoo\n# (a domain protocol, a learned parser, a runtime state machine)\n# requires an engine fork.\ncurl https://api.example.com/v1/responses \\\n  -d '{\n    \"model\": \"qwen3-0.6b\",\n    \"input\": \"Extract {name, email, age} from this bio: ...\",\n    \"response_format\": {\n      \"type\": \"json_schema\",\n      \"json_schema\": { \"name\": \"Contact\", \"schema\": { ... } }\n    }\n  }'"
+    },
+    "pie": {
+      "language": "rust",
+      "value": "// Batteries included: JsonSchema, Regex, Ebnf, AnyJson.\nlet mut generator = ctx\n    .generate(Sampler::Argmax)\n    .max_tokens(200)\n    .constrain_with(JsonSchema(SCHEMA))?;\n\nlet mut text = String::new();\nwhile let Some(step) = generator.next()? {\n    let out = step.execute().await?;\n    text.push_str(&decode_visible_delta(&model, &out.tokens)?);\n    if let Ok(contact) = parse_json_payload::<Contact>(&text) {\n        return Ok(contact);               // first valid payload wins\n    }\n}\n\n// …or implement Constrain yourself — your own state machine,\n// shipped with the request, evaluated in the inferlet's WASM.\nstruct ChessNotation { /* ply, side, etc. */ }\nimpl inferlet::Constrain for ChessNotation {\n    fn step(&mut self, accepted: &[u32]) -> &[u32] { /* BRLE mask */ }\n}"
+    }
+  },
+  "runCommand": "pie run demo-grammar -- --bio \"Hi, I'm Bob, bob@x.io, 35yo.\""
+}

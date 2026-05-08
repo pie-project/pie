@@ -65,6 +65,20 @@
   background-image: radial-gradient(rgba(255, 245, 220, 0.05) 1px, transparent 1px);
 }
 
+.closingCta {
+  border-top: 1px solid var(--pie-border);
+  border-bottom: none;
+  background:
+    radial-gradient(70% 55% at 50% -15%,
+      color-mix(in oklab, var(--ifm-color-primary) 9%, transparent) 0%,
+      transparent 75%),
+    var(--pie-bg);
+}
+
+.closingCta::after {
+  mask-image: linear-gradient(to top, black, transparent);
+}
+
 .heroTitle {
   font-family: var(--pie-font-serif);
   font-size: clamp(var(--pie-text-3xl), 4.5vw, 3.25rem);
@@ -184,14 +198,7 @@
   }
 }
 
-/* =====================================================================
-   Code Snippet Section
-   ===================================================================== */
-.codeSection {
-  background: var(--pie-bg-elev);
-  border-top: 1px solid var(--pie-border);
-  border-bottom: 1px solid var(--pie-border);
-}
+/* (alt-bg variant removed — sections share a single background) */
 
 .codeContainer {
   max-width: 760px;
@@ -235,5 +242,59 @@
 .codeContainer :global(.theme-code-block) {
   border-radius: 0 12px 12px 12px;
   margin: 0;
+}
+
+/* =====================================================================
+   Theme sections (Token-level / KV / I/O) — quiet spine
+   ===================================================================== */
+.themeSection {
+  padding-block: clamp(3rem, 6vw, 4.5rem);
+  border-top: 1px solid var(--pie-border);
+}
+
+.themeEyebrow {
+  margin: 0 0 0.75rem;
+  text-align: center;
+  font-family: var(--pie-font-mono);
+  font-size: var(--pie-text-sm);
+  letter-spacing: 0.16em;
+  color: var(--ifm-color-primary);
+  text-transform: uppercase;
+  font-weight: 700;
+}
+
+.themeHeading {
+  margin: 0 0 var(--space-3);
+  text-align: center;
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-3xl);
+  font-weight: 600;
+  color: var(--pie-ink);
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+.themeSubtitle {
+  margin: 0 auto var(--space-6);
+  text-align: center;
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-md);
+  color: var(--pie-ink-soft);
+  max-width: 60ch;
+  line-height: 1.65;
+}
+
+.codeCardsGrid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1rem;
+  max-width: 1100px;
+  margin: 1.5rem auto 0;
+}
+
+@media (min-width: 820px) {
+  .codeCardsGrid {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 

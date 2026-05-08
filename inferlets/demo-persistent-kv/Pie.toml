@@ -1,0 +1,17 @@
+[package]
+name = "demo-persistent-kv"
+version = "0.1.1"
+description = "Demo: KV state persists across requests via Context::save/open — turn 2 skips the conversation re-prefill (uniquely Pie)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+mode = {type = "string", optional = true, description = "'baseline' | 'resumed' | 'save' | 'open' | 'both' — side-by-side or two-invocation snapshot demo (default: 'both')"}
+turn1 = {type = "string", optional = true, description = "First user message (default: a request to pick a programming language)"}
+turn2 = {type = "string", optional = true, description = "Second user message — references whatever the model picked (default: a follow-up about its main use case)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens per turn (default: 100)"}
+snapshot = {type = "string", optional = true, description = "Named KV snapshot used by save/open modes (default: demo-persistent-kv-conv)"}
+delay = {type = "int", optional = true, description = "Per-token delay in ms — slows the stream so the visual is readable on video (default: 0)"}

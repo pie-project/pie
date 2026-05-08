@@ -23,13 +23,7 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use inferlet::{
-    Context, Result, chat,
-    model::Model,
-    runtime,
-    sample::Sampler,
-    wstd,
-};
+use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler, wstd};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -49,8 +43,19 @@ struct Input {
     #[serde(default = "default_max_retries")]
     max_retries: usize,
 
+    #[serde(default = "default_system")]
+    system: String,
+
     #[serde(default)]
     delay: u64,
+}
+
+fn default_system() -> String {
+    "You are a careful arithmetic solver. Solve the problem step by step. \
+     Write each computation on its own line as a complete equation (e.g., \
+     50 + 30 = 80). Use *, +, -, /, plain ASCII — no LaTeX, no markdown. \
+     End with exactly one line: Final Answer: <number>"
+        .into()
 }
 
 fn default_mode() -> String {
@@ -61,7 +66,8 @@ fn default_question() -> String {
     // fumbles 156 * 32 (often emits 5056); higher-T sampling on the
     // primed base gives the rewind loop a fighting chance to recover.
     "Compute (156 * 32) + (248 * 19). Show each multiplication on its \
-     own line, then state the final sum.".into()
+     own line, then state the final sum."
+        .into()
 }
 fn default_expected() -> String {
     // 156*32=4992, 248*19=4712, sum=9704
@@ -83,12 +89,6 @@ const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const CYAN: &str = "\x1b[36m";
 const MAGENTA: &str = "\x1b[35m";
-
-const SYSTEM: &str = "\
-You are a careful arithmetic solver. Solve the problem step by step. \
-Write each computation on its own line as a complete equation (e.g., \
-50 + 30 = 80). Use *, +, -, /, plain ASCII — no LaTeX, no markdown. \
-End with exactly one line: Final Answer: <number>";
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
@@ -114,10 +114,12 @@ async fn main(input: Input) -> Result<String> {
             println!();
             comparison(&p, &s, &input.expected);
         }
-        other => return Err(format!(
-            "unknown mode '{}': expected 'baseline', 'verified', or 'both'",
-            other
-        )),
+        other => {
+            return Err(format!(
+                "unknown mode '{}': expected 'baseline', 'verified', or 'both'",
+                other
+            ));
+        }
     }
 
     Ok(String::new())
@@ -133,10 +135,16 @@ struct ModeResult {
 
 // ── BASELINE: one greedy roll-out ─────────────────────────────────────────
 async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
-    print_header("BASELINE", YELLOW, "one greedy roll-out", model_name, &input.question);
+    print_header(
+        "BASELINE",
+        YELLOW,
+        "one greedy roll-out",
+        model_name,
+        &input.question,
+    );
 
     let mut ctx = Context::new(model)?;
-    ctx.system(SYSTEM);
+    ctx.system(&input.system);
     ctx.user(&format!("{} /no_think", input.question));
     ctx.cue();
 
@@ -145,7 +153,12 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
     let elapsed = start.elapsed();
     let answer = extract_answer(&text);
     print_footer("BASELINE", YELLOW, &answer, elapsed, 0, 1, &input.expected);
-    Ok(ModeResult { answer, elapsed, rewinds: 0, attempts: 1 })
+    Ok(ModeResult {
+        answer,
+        elapsed,
+        rewinds: 0,
+        attempts: 1,
+    })
 }
 
 // ── VERIFIED: full-attempt verify + fork()-based KV rewind ────────────────
@@ -183,7 +196,7 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
     // step does the prefill in one batched forward pass — bit-for-bit
     // parity with BASELINE's path.
     let mut ctx_base_raw = Context::new(model)?;
-    ctx_base_raw.system(SYSTEM);
+    ctx_base_raw.system(&input.system);
     ctx_base_raw.user(&format!("{} /no_think", input.question));
     ctx_base_raw.cue();
 
@@ -193,8 +206,7 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
     if !prime.is_empty() {
         ctx_base_primed.append(&prime);
     }
-    let base_seq_len =
-        ctx_base_primed.seq_len() + ctx_base_primed.buffer().len() as u32;
+    let base_seq_len = ctx_base_primed.seq_len() + ctx_base_primed.buffer().len() as u32;
 
     let start = Instant::now();
     let mut rewinds = 0usize;
@@ -232,10 +244,13 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
         };
 
         let text = stream_attempt(&mut ctx, model, input.max_tokens, temp, input.delay).await?;
-        let errs = check_arithmetic(&text);
+        let errs = verify_attempt(&text, &input.expected);
 
         if errs.is_empty() {
-            println!("  {}{}✓ verifier: all arithmetic claims check out{}", BOLD, GREEN, RESET);
+            println!(
+                "  {}{}✓ verifier: arithmetic claims and final answer check out{}",
+                BOLD, GREEN, RESET
+            );
             final_text = text;
             final_answer = extract_answer(&final_text);
             break;
@@ -244,13 +259,13 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
         // Show what the verifier rejected.
         println!(
             "  {}{}✗ verifier rejected {} claim(s):{}",
-            BOLD, RED, errs.len(), RESET
+            BOLD,
+            RED,
+            errs.len(),
+            RESET
         );
-        for (claim, _claimed, actual) in &errs {
-            println!(
-                "      {}{} {}≠ {} (actual){}",
-                DIM, claim, RED, actual, RESET
-            );
+        for err in &errs {
+            println!("      {}{}{}", DIM, err, RESET);
         }
 
         if attempt_idx > input.max_retries {
@@ -288,7 +303,12 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
         &input.expected,
     );
     let _ = final_text;
-    Ok(ModeResult { answer: final_answer, elapsed, rewinds, attempts: attempt_idx })
+    Ok(ModeResult {
+        answer: final_answer,
+        elapsed,
+        rewinds,
+        attempts: attempt_idx,
+    })
 }
 
 // ── Stream one full attempt, return the decoded text ──────────────────
@@ -310,7 +330,10 @@ async fn stream_attempt(
     let sampler = if temperature <= 0.0 {
         Sampler::Argmax
     } else {
-        Sampler::TopP { temperature, p: 0.95 }
+        Sampler::TopP {
+            temperature,
+            p: 0.95,
+        }
     };
 
     let mut g = ctx
@@ -361,7 +384,10 @@ struct ThinkStripper {
 
 impl ThinkStripper {
     fn new() -> Self {
-        Self { in_think: false, pending: String::new() }
+        Self {
+            in_think: false,
+            pending: String::new(),
+        }
     }
 
     fn process(&mut self, delta: &str) -> String {
@@ -405,16 +431,35 @@ impl ThinkStripper {
 // ── Arithmetic verifier ───────────────────────────────────────────────
 //
 // Scans the text for explicit `A op B = C` patterns and recomputes each
-// one. Returns mismatches as (claim, claimed, actual). Conservative:
-// skips lines containing "final answer" (compound expressions) and
-// matches where the operands are flanked by another operator (chains).
+// one, then checks that the final answer line matches the expected answer.
+// Conservative: skips lines containing "final answer" while checking
+// intermediate equations and matches where operands are flanked by another
+// operator (chains).
+fn verify_attempt(text: &str, expected: &str) -> Vec<String> {
+    let mut errors = check_arithmetic(text)
+        .into_iter()
+        .map(|(claim, _claimed, actual)| format!("{claim} ≠ {actual} (actual)"))
+        .collect::<Vec<_>>();
+
+    match extract_answer(text) {
+        Some(ans) if ans == expected => {}
+        Some(ans) => errors.push(format!("Final Answer: {ans} ≠ {expected} (expected)")),
+        None => errors.push(format!("missing Final Answer: {expected}")),
+    }
+
+    errors
+}
+
 fn check_arithmetic(text: &str) -> Vec<(String, i64, i64)> {
     let mut errors = Vec::new();
     for line in text.split('\n') {
         if line.to_lowercase().contains("final answer") {
             continue;
         }
-        let cleaned: String = line.chars().map(|c| if c == ',' { ' ' } else { c }).collect();
+        let cleaned: String = line
+            .chars()
+            .map(|c| if c == ',' { ' ' } else { c })
+            .collect();
         let chars: Vec<char> = cleaned.chars().collect();
         let n = chars.len();
         let mut i = 0;
@@ -431,9 +476,7 @@ fn check_arithmetic(text: &str) -> Vec<(String, i64, i64)> {
             // `=` is NEVER a chaining op: it separates LHS/RHS.
             if let Some((prev, prev_pos)) = preceding_nonspace_pos(&chars, i) {
                 if matches!(prev, '+' | '-' | '*' | '/' | '×' | '÷' | 'x' | 'X') {
-                    let has_digit_before = chars[..prev_pos]
-                        .iter()
-                        .any(|c| c.is_ascii_digit());
+                    let has_digit_before = chars[..prev_pos].iter().any(|c| c.is_ascii_digit());
                     if has_digit_before {
                         let (_, ai) = parse_int(&chars, i);
                         i = ai.max(i + 1);
@@ -548,7 +591,20 @@ fn extract_answer(text: &str) -> Option<String> {
         .filter(|c| {
             !matches!(
                 c,
-                '*' | '_' | '`' | '#' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '$'
+                '*' | '_'
+                    | '`'
+                    | '#'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '"'
+                    | '\''
+                    | '$'
             )
         })
         .collect();

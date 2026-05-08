@@ -1,0 +1,111 @@
+{
+  "id": "filesystem",
+  "title": "Persistent /scratch via WASI",
+  "tagline": "In Pie inferlets get a WASI filesystem capability. The engine pre-opens /scratch as a writable, per-user persistent directory. User code calls std::fs directly, no Redis, no sidecar service.",
+  "question": "Same question, asked twice. Answer once, cache to /scratch, return the cached value the second time.",
+  "naive": {
+    "label": "Naive",
+    "sublabel": "no inline storage — every call re-asks the model",
+    "tone": "warn",
+    "events": [
+      {
+        "t": 0,
+        "kind": "section",
+        "value": "call 1  (no cache available)"
+      },
+      {
+        "t": 200,
+        "kind": "text",
+        "value": "Speed of light is a constant, approximately 299,792,458 meters per second.\n"
+      },
+      {
+        "t": 1900,
+        "kind": "info",
+        "value": "generated, about 156 ms — answer goes to the client; nothing persists"
+      },
+      {
+        "t": 2200,
+        "kind": "section",
+        "value": "call 2  (same question, no place to remember)"
+      },
+      {
+        "t": 2400,
+        "kind": "text",
+        "value": "Speed of light is a constant, approximately 299,792,458 meters per second.\n"
+      },
+      {
+        "t": 4000,
+        "kind": "bad",
+        "value": "regenerated, about 72 ms — 100% redundant work"
+      },
+      {
+        "t": 4400,
+        "kind": "result",
+        "value": "about 229 ms total  •  2 model calls  •  no persistence"
+      }
+    ]
+  },
+  "pie": {
+    "label": "Pie",
+    "sublabel": "memoize via /scratch/answers.json — second call is a file read",
+    "tone": "good",
+    "events": [
+      {
+        "t": 0,
+        "kind": "section",
+        "value": "call 1  (lookup /scratch/answers.json)"
+      },
+      {
+        "t": 200,
+        "kind": "info",
+        "value": "miss → generate → write to /scratch"
+      },
+      {
+        "t": 400,
+        "kind": "text",
+        "value": "Speed of light is a constant, approximately 299,792,458 meters per second.\n"
+      },
+      {
+        "t": 1900,
+        "kind": "good",
+        "value": "wrote /scratch/answers.json — about 73 ms"
+      },
+      {
+        "t": 2200,
+        "kind": "section",
+        "value": "call 2  (lookup /scratch/answers.json)"
+      },
+      {
+        "t": 2300,
+        "kind": "info",
+        "value": "hit ✓ — answered from disk, no model call"
+      },
+      {
+        "t": 2350,
+        "kind": "text",
+        "value": "Speed of light is a constant, approximately 299,792,458 meters per second.\n"
+      },
+      {
+        "t": 2700,
+        "kind": "good",
+        "value": "served from disk in 0 ms"
+      },
+      {
+        "t": 3000,
+        "kind": "result",
+        "value": "about 73 ms total  •  1 model call  •  3.1× total, call 2 served from disk"
+      }
+    ]
+  },
+  "code": {
+    "naive": {
+      "language": "bash",
+      "value": "# To memoize: stand up Redis (or a DB) in front of the LLM.\nkey=$(echo \"$Q\" | sha1sum | cut -d' ' -f1)\nhit=$(redis-cli GET \"answer:$key\")\nif [ -n \"$hit\" ]; then echo \"$hit\"; exit; fi\n\nresp=$(curl /v1/responses \\\n  -d \"{\\\"model\\\":\\\"qwen3-0.6b\\\", \\\"input\\\":\\\"$Q\\\"}\")\n\nredis-cli SET \"answer:$key\" \"$resp\"\necho \"$resp\""
+    },
+    "pie": {
+      "language": "rust",
+      "value": "// memoize via /scratch/answers.json — second call is a file read\nlet key = cache_key(&question);\nlet cache = read_cache();                 // /scratch/answers.json\n\nif let Some(text) = cache.get(&key) {\n    return Ok(text.clone());              // hit — no model call\n}\n\nlet text = generate_answer(&model, &question).await?;\nlet mut cache = read_cache();\ncache.insert(key, text.clone());\n\nfs::write(\n    \"/scratch/answers.json\",\n    serde_json::to_vec(&cache).map_err(|e| e.to_string())?,\n).map_err(|e| e.to_string())?;\nOk(text)"
+    }
+  },
+  "runCommand": "# enable filesystem in ~/.pie/config.toml: allow_fs = true\npie run demo-filesystem -- --question \"What is the speed of light?\""
+}

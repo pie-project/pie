@@ -30,13 +30,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use inferlet::{
-    Context, Result, Speculator, chat,
-    model::Model,
-    runtime,
-    sample::Sampler,
-    wstd,
-};
+use inferlet::{Context, Result, Speculator, chat, model::Model, runtime, sample::Sampler, wstd};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -56,8 +50,15 @@ struct Input {
     #[serde(default = "default_ngram_n")]
     ngram_n: usize,
 
+    #[serde(default = "default_system")]
+    system: String,
+
     #[serde(default)]
     delay: u64,
+}
+
+fn default_system() -> String {
+    "You are a careful code-refactoring assistant. /no_think".into()
 }
 
 fn default_mode() -> String {
@@ -94,7 +95,7 @@ fn default_task() -> String {
          def get_total(self):\n\
              return self.total\n\
      ```"
-        .into()
+    .into()
 }
 fn default_max_tokens() -> usize {
     400
@@ -105,8 +106,6 @@ fn default_draft_len() -> usize {
 fn default_ngram_n() -> usize {
     2
 }
-
-const SYSTEM: &str = "You are a careful code-refactoring assistant. /no_think";
 
 // ── ANSI helpers ───────────────────────────────────────────────────────
 const RESET: &str = "\x1b[0m";
@@ -162,10 +161,15 @@ struct ModeResult {
 
 // ── BASELINE: vanilla one-token-per-step decode ───────────────────────────
 async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
-    print_header("BASELINE", YELLOW, "vanilla one-token-per-step decode", model_name);
+    print_header(
+        "BASELINE",
+        YELLOW,
+        "vanilla one-token-per-step decode",
+        model_name,
+    );
 
     let mut ctx = Context::new(model)?;
-    ctx.system(SYSTEM);
+    ctx.system(&input.system);
     ctx.user(&input.task);
     ctx.cue();
 
@@ -207,7 +211,12 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
     println!();
     print_footer_plain("BASELINE", YELLOW, tokens, elapsed);
 
-    Ok(ModeResult { tokens, elapsed, drafts_proposed: 0, drafts_accepted: 0 })
+    Ok(ModeResult {
+        tokens,
+        elapsed,
+        drafts_proposed: 0,
+        drafts_accepted: 0,
+    })
 }
 
 // ── SPECULATED: prompt-lookup speculator via Generator::speculator ────────
@@ -225,7 +234,7 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
     println!();
 
     let mut ctx = Context::new(model)?;
-    ctx.system(SYSTEM);
+    ctx.system(&input.system);
     ctx.user(&input.task);
     ctx.cue();
     // Prefill the prompt as a standalone forward, then bootstrap the
@@ -239,7 +248,7 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
     ctx.flush().await?;
 
     let tokenizer = model.tokenizer();
-    let prompt_str = format!("{}\n{}", SYSTEM, input.task);
+    let prompt_str = format!("{}\n{}", input.system, input.task);
     // Pool seeded from the user task tokenized stand-alone. Chat
     // template alignment isn't critical: accepted tokens grow the pool
     // as generation progresses, so n-gram suffix matches still find
@@ -339,8 +348,7 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
                         print!("{}", RESET);
                         let _ = io::stdout().flush();
                         if input.delay > 0 {
-                            wstd::task::sleep(wstd::time::Duration::from_millis(input.delay))
-                                .await;
+                            wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
                         }
                     }
                 }
@@ -385,7 +393,10 @@ struct ThinkStripper {
 
 impl ThinkStripper {
     fn new() -> Self {
-        Self { in_think: false, pending: String::new() }
+        Self {
+            in_think: false,
+            pending: String::new(),
+        }
     }
 
     fn process(&mut self, delta: &str) -> String {

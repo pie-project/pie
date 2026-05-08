@@ -1,0 +1,54 @@
+.card {
+  background: var(--pie-bg-elev);
+  border: 1px solid var(--pie-border);
+  border-radius: 12px;
+  padding: 1.25rem 1.25rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  height: 100%;
+}
+
+.head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.title {
+  margin: 0;
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-lg);
+  font-weight: 600;
+  color: var(--pie-ink);
+  letter-spacing: -0.01em;
+}
+
+.description {
+  margin: 0;
+  font-family: var(--pie-font-serif);
+  font-size: var(--pie-text-sm);
+  color: var(--pie-ink-soft);
+  line-height: 1.55;
+}
+
+.codeWrap :global(.theme-code-block) {
+  margin: 0;
+  border-radius: 8px;
+  font-size: 0.78rem;
+}
+
+.codeWrap :global(pre) {
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+
+.callout {
+  margin: 0;
+  font-family: var(--pie-font-mono);
+  font-size: var(--pie-text-xs);
+  color: var(--pie-ink-muted);
+  line-height: 1.55;
+  border-top: 1px solid var(--pie-border);
+  padding-top: 0.65rem;
+}

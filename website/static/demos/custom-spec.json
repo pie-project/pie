@@ -1,0 +1,231 @@
+{
+  "id": "custom-spec",
+  "title": "Write your own speculator",
+  "tagline": "In Pie the speculative decoding loop is user code. Write your own drafting mechanism, ship it with the request, and run draft and verify in one forward pass. The drafter here is a prompt-lookup table.",
+  "question": "Refactor the Python class: rename the field `total` to `subtotal` everywhere it appears.",
+  "naive": {
+    "label": "Naive",
+    "sublabel": "vanilla one token per step — about 311 tok/s",
+    "tone": "warn",
+    "events": [
+      {
+        "t": 0,
+        "kind": "info",
+        "value": "tokens drip out at the GPU's per-token cadence"
+      },
+      {
+        "t": 200,
+        "kind": "text",
+        "value": "class "
+      },
+      {
+        "t": 320,
+        "kind": "text",
+        "value": "ShoppingCart"
+      },
+      {
+        "t": 440,
+        "kind": "text",
+        "value": ":\n"
+      },
+      {
+        "t": 560,
+        "kind": "text",
+        "value": "    def "
+      },
+      {
+        "t": 680,
+        "kind": "text",
+        "value": "__init__"
+      },
+      {
+        "t": 800,
+        "kind": "text",
+        "value": "(self, "
+      },
+      {
+        "t": 920,
+        "kind": "text",
+        "value": "customer_id"
+      },
+      {
+        "t": 1040,
+        "kind": "text",
+        "value": "):\n"
+      },
+      {
+        "t": 1160,
+        "kind": "text",
+        "value": "        self."
+      },
+      {
+        "t": 1280,
+        "kind": "text",
+        "value": "subtotal"
+      },
+      {
+        "t": 1400,
+        "kind": "text",
+        "value": " = 0\n"
+      },
+      {
+        "t": 1520,
+        "kind": "text",
+        "value": "        self."
+      },
+      {
+        "t": 1640,
+        "kind": "text",
+        "value": "items"
+      },
+      {
+        "t": 1760,
+        "kind": "text",
+        "value": " = []\n"
+      },
+      {
+        "t": 1880,
+        "kind": "text",
+        "value": "    def add_item"
+      },
+      {
+        "t": 2000,
+        "kind": "text",
+        "value": "(self, item, quantity"
+      },
+      {
+        "t": 2200,
+        "kind": "text",
+        "value": "):\n"
+      },
+      {
+        "t": 2320,
+        "kind": "text",
+        "value": "        self.items.append"
+      },
+      {
+        "t": 2440,
+        "kind": "text",
+        "value": "((item, quantity))\n"
+      },
+      {
+        "t": 2560,
+        "kind": "text",
+        "value": "        self."
+      },
+      {
+        "t": 2680,
+        "kind": "text",
+        "value": "subtotal"
+      },
+      {
+        "t": 2800,
+        "kind": "text",
+        "value": " += item.price * quantity\n"
+      },
+      {
+        "t": 3100,
+        "kind": "result",
+        "value": "147 tokens  •  about 473 ms  •  about 311 tok/s"
+      }
+    ]
+  },
+  "pie": {
+    "label": "Pie",
+    "sublabel": "prompt-lookup drafter + verify in one forward pass — multi-token bursts",
+    "tone": "good",
+    "events": [
+      {
+        "t": 0,
+        "kind": "info",
+        "value": "drafter proposes K tokens from prompt suffixes; verifier accepts a run per round"
+      },
+      {
+        "t": 200,
+        "kind": "burst",
+        "value": "class ShoppingCart:"
+      },
+      {
+        "t": 360,
+        "kind": "text",
+        "value": "\n"
+      },
+      {
+        "t": 460,
+        "kind": "burst",
+        "value": "    def __init__(self, customer_id):"
+      },
+      {
+        "t": 660,
+        "kind": "text",
+        "value": "\n"
+      },
+      {
+        "t": 760,
+        "kind": "burst",
+        "value": "        self.subtotal = 0"
+      },
+      {
+        "t": 940,
+        "kind": "text",
+        "value": "\n"
+      },
+      {
+        "t": 1040,
+        "kind": "burst",
+        "value": "        self.items = []"
+      },
+      {
+        "t": 1220,
+        "kind": "text",
+        "value": "\n"
+      },
+      {
+        "t": 1320,
+        "kind": "burst",
+        "value": "    def add_item(self, item, quantity):"
+      },
+      {
+        "t": 1540,
+        "kind": "text",
+        "value": "\n"
+      },
+      {
+        "t": 1640,
+        "kind": "burst",
+        "value": "        self.items.append((item, quantity))"
+      },
+      {
+        "t": 1900,
+        "kind": "text",
+        "value": "\n"
+      },
+      {
+        "t": 2000,
+        "kind": "burst",
+        "value": "        self.subtotal += item.price * quantity"
+      },
+      {
+        "t": 2300,
+        "kind": "good",
+        "value": "high prompt overlap — drafter accepts long runs"
+      },
+      {
+        "t": 2600,
+        "kind": "result",
+        "value": "133 tokens  •  about 93 ms  •  about 1,430 tok/s  •  64% draft accept"
+      }
+    ]
+  },
+  "code": {
+    "naive": {
+      "language": "bash",
+      "value": "# vanilla one token per step — about 311 tok/s on this trace\ncurl https://api.example.com/v1/responses \\\n  -d '{\n    \"model\": \"qwen3-0.6b\",\n    \"input\": \"Refactor: rename `total` to `subtotal` everywhere.\",\n    \"temperature\": 0.0\n  }'\n\n# Speculation, if the deploy supports it, is a deploy-time draft\n# model — not a per-request choice and not customizable from here."
+    },
+    "pie": {
+      "language": "rust",
+      "value": "// Ship a custom drafter with the request. Generator verifies drafts.\nstruct PromptLookup {\n    pool: Vec<u32>,\n    cursor: u32,\n    ngram_n: usize,\n    draft_len: usize,\n}\n\nimpl Speculator for PromptLookup {\n    fn draft(&mut self) -> (Vec<u32>, Vec<u32>) {\n        let drafts = lookup_suffix_match(&self.pool, self.ngram_n, self.draft_len);\n        let positions = (self.cursor..self.cursor + drafts.len() as u32).collect();\n        (drafts, positions)\n    }\n\n    fn accept(&mut self, accepted: &[u32]) {\n        // accepted[0] is the free model token; the rest are verified drafts.\n        self.pool.extend_from_slice(accepted);\n        self.cursor += accepted.len() as u32;\n    }\n}\n\nlet drafter = PromptLookup::new(prompt_tokens, ngram_n, draft_len, cursor);\nlet mut generator = ctx.generate(Sampler::Argmax)\n    .max_tokens(max_tokens)\n    .stop(&chat::stop_tokens(&model))\n    .speculator(drafter);\n\nwhile let Some(step) = generator.next()? {\n    let out = step.execute().await?;      // [free token, accepted drafts...]\n    stream_tokens(&out.tokens)?;\n}"
+    }
+  },
+  "runCommand": "pie run demo-custom-spec -- --draft-len 8 --ngram-n 2"
+}
