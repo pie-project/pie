@@ -11,17 +11,14 @@ and bind each `Attention` layer's `self.kv_cache` attribute via
 For hybrid Transformer + Mamba models (Qwen3.5-MoE, Qwen3-Next: alternating
 `full_attention` + `linear_attention` layers) we additionally allocate a
 per-mamba-layer `[conv_state, ssm_state]` pool sized to the same `num_blocks`
-as the attention pool. The state slot for a request is derived in
-`gdn_metadata._state_slot_for_requests` — today that derivation reuses the
-request's first KV page id (so any pie page id is a valid index into the
-state pool). The coupling to page ids has known fork-aliasing limitations:
-post-fork siblings share their committed prefix's first page id (refcount),
-so on hybrid models we advertise `supports_kv_fork=False` via capabilities
-and pie's runtime is expected to route fork-using inferlets to a different
-driver. Ticket #108 replaces the slot derivation with a per-request
-allocator (likely keyed on a stable runtime-supplied id) — when it lands,
-`gdn_metadata._state_slot_for_requests` is the single point of change in
-this driver. We follow vllm's `mamba_cache_mode="none"` (1 block per request)
+as the attention pool. The state slot for a request is supplied by
+`mamba_state.MambaSlotAllocator` (#108 phase 5a), keyed on the stable
+ContextId carried in `BatchedForwardPassRequest.context_ids` — the
+allocator hands out indices into dim-0 of these state tensors. Sizing the
+pool to `num_blocks` is now a budget choice rather than an addressing
+constraint: in practice in-flight context count ≤ `max_num_seqs` (16),
+which is well below `num_blocks` (thousands), so the allocator never
+evicts. We follow vllm's `mamba_cache_mode="none"` (1 block per request)
 for budget computation.
 
 Pie's Rust scheduler still owns block IDs — they're integer indices into
@@ -31,8 +28,11 @@ the block dimension of these tensors. The CLI handshake fixes `kv_page_size`
 Host pool: skipped on the vllm driver (Phase 1.5+). For hybrid models we
 explicitly refuse a non-zero swap budget — the per-layer copy logic in
 `pie_driver/worker.py` doesn't know about mamba state, so swap-out would
-silently lose recurrent state. Capabilities advertises `supports_kv_fork=False`
-on hybrid so pie's runtime routes fork-using inferlets to a different driver.
+silently lose recurrent state. Capabilities still advertises
+`supports_kv_fork=False` on hybrid post-#108-phase-5a: distinct slots no
+longer alias, but a freshly-forked child has zero state until phase 5b
+copies the parent's state into the child's slot via the new
+`copy_mamba_state_shmem` op. The flag flips to True once 5b lands.
 """
 
 from __future__ import annotations

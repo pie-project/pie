@@ -45,6 +45,7 @@ class VllmForwardPass:
         model_config: Any,
         mamba_layers: list[tuple[str, torch.Tensor, torch.Tensor]] | None = None,
         is_hybrid: bool = False,
+        mamba_allocator: Any = None,
     ):
         self.model = model
         self.vllm_config = vllm_config
@@ -52,8 +53,9 @@ class VllmForwardPass:
         self.model_config = model_config
         self.device = torch.device(runtime_config.device)
 
-        # Hybrid (Transformer + Mamba) support — see kv_cache.py for the
-        # state-slot addressing (state slot = request's first KV page id).
+        # Hybrid (Transformer + Mamba) support. State slots are now
+        # ContextId-keyed (#108 phase 5a) via `mamba_allocator`; see
+        # `mamba_state.py` for the rationale.
         self._is_hybrid = is_hybrid
         # `mamba_layer_names`: layer prefixes for which `transform()` must
         # publish a `GDNAttentionMetadata` entry into the per-layer
@@ -61,6 +63,9 @@ class VllmForwardPass:
         self._mamba_layer_names: list[str] = (
             [name for name, _, _ in (mamba_layers or [])]
         )
+        # Per-request slot allocator. Required on hybrid; ignored on
+        # pure-attention (transform skips the GDN metadata branch).
+        self._mamba_allocator = mamba_allocator
 
         # Lazy: built on first transform() call so we know the resolved
         # backend (set during model construction inside set_current_vllm_config).
@@ -162,6 +167,7 @@ class VllmForwardPass:
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
         single_token_mode: bool = False,
+        context_ids: list[int] | None = None,
     ) -> torch.Tensor:
         """Run the model's transformer trunk inside `set_forward_context`.
 
@@ -311,18 +317,40 @@ class VllmForwardPass:
         if self._is_hybrid and self._mamba_layer_names:
             from .gdn_metadata import build_gdn_metadata
 
+            if self._mamba_allocator is None:
+                raise RuntimeError(
+                    "Hybrid model loaded without a mamba state-slot "
+                    "allocator. Engine.load() must construct a "
+                    "MambaSlotAllocator and pass it to VllmForwardPass "
+                    "(#108 phase 5a)."
+                )
+
+            # Per-row state slots from the allocator. ContextId comes
+            # from the runtime via `BatchedForwardPassRequest.context_ids`
+            # and is plumbed through `Engine.fire_batch -> transform`.
+            # Pure synthetic warmup calls (e.g. `_warmup_compile`) skip
+            # the GDN metadata branch implicitly: warmup happens on
+            # pure-attention models or via a separate code path.
+            if context_ids is None:
+                raise RuntimeError(
+                    "Hybrid transform requires context_ids; got None. "
+                    "Caller must thread `context_ids` from the batch "
+                    "(see Batch.get_model_inputs in pie_driver/batching.py)."
+                )
+
+            slot_ids = self._mamba_allocator.slots_for(context_ids)
+
             # Reuse `common`'s computed seq_lens / num_computed_tokens to
             # avoid re-walking pie's CSR. `common.compute_num_computed_tokens()`
             # caches; second access is free.
             num_computed_tokens = common.compute_num_computed_tokens()
             gdn = build_gdn_metadata(
                 qo_indptr=qo_indptr_eff,
-                kv_page_indices=kv_page_indices_eff,
-                kv_page_indptr=kv_page_indptr_eff,
                 seq_lens=common.seq_lens,
                 num_computed_tokens=num_computed_tokens,
                 num_actual_tokens=padded_tokens,
                 device=self.device,
+                state_slot_ids=slot_ids,
             )
             for name in self._mamba_layer_names:
                 per_layer_metadata[name] = gdn

@@ -377,6 +377,13 @@ class Batch:
                 else None
             ),
             "single_token_inference_mode": self.single_token_mode,
+            # Per-row stable ContextId from pie runtime
+            # (BatchedForwardPassRequest.context_ids, A_CONTEXT_IDS=27).
+            # The vllm driver routes this to its mamba state-slot allocator
+            # for hybrid Transformer+Mamba models (#108 phase 5a). Other
+            # drivers ignore the field; left in the dict so we don't fork
+            # the input contract per-driver.
+            "context_ids": self.context_ids,
             **self._adapter_inputs(device),
             "spec_token_ids": (
                 torch.as_tensor(self.spec_token_ids, device=device, dtype=torch.long)
@@ -580,6 +587,10 @@ class Batch:
                 attention_masks_ext, device=device, dtype=torch.bool
             ),
             "single_token_inference_mode": single_token_mode_ext,
+            # See get_model_inputs for the contract; spec-expanded path
+            # carries the same per-request ContextId ordering since
+            # spec only adds tokens within a request, not new requests.
+            "context_ids": self.context_ids,
             **self._adapter_inputs(device),
         }
 

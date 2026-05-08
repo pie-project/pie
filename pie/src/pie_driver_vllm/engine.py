@@ -115,6 +115,12 @@ class VllmEngine:
         self._ngram_buffers = None
         self._ngram_history: dict[int, list[int]] = {}
 
+        # Mamba state-slot allocator (#108 phase 5a). Always set by
+        # `Engine.load`; left as None here so unit tests that bypass
+        # load() don't have to construct one. `forward_pass.transform`
+        # gates use on `is_hybrid` AND `mamba_allocator is not None`.
+        self.mamba_allocator = None
+
     @classmethod
     def load(
         cls,
@@ -128,6 +134,7 @@ class VllmEngine:
         from .forward_pass import VllmForwardPass
         from .kv_cache import allocate_and_bind_kv_cache, allocate_host_pool
         from .loader import load_vllm_model
+        from .mamba_state import MambaSlotAllocator
 
         def _log(msg: str, level: str = "INFO"):
             if log_queue is not None:
@@ -157,6 +164,14 @@ class VllmEngine:
             layout.attention_layers_in_order, config.swap_budget_bytes
         )
 
+        # Per-request mamba state-slot allocator (#108 phase 5a).
+        # `allocate_and_bind_kv_cache` sized the mamba state pools to
+        # `config.max_num_kv_pages = num_blocks`; the allocator hands
+        # out indices into that dim-0. Created on every load (allocator
+        # is a no-op container on pure-attention since `transform()`
+        # gates its use on `is_hybrid`); cheap to construct.
+        mamba_allocator = MambaSlotAllocator(int(config.max_num_kv_pages))
+
         forward_pass = VllmForwardPass(
             model=loaded.model,
             vllm_config=loaded.vllm_config,
@@ -165,6 +180,7 @@ class VllmEngine:
             model_config=loaded.model_config,
             mamba_layers=layout.mamba_layers,
             is_hybrid=layout.is_hybrid,
+            mamba_allocator=mamba_allocator,
         )
 
         engine = cls(
@@ -182,6 +198,7 @@ class VllmEngine:
             mamba_layers=layout.mamba_layers,
             is_hybrid=layout.is_hybrid,
         )
+        engine.mamba_allocator = mamba_allocator
 
         # Hybrid one-shot operator warning. `capabilities()` reports
         # `supports_kv_fork=False` when `is_hybrid=True`, but until
@@ -295,6 +312,9 @@ class VllmEngine:
             kv_page_indices=prefill_inputs["kv_page_indices"],
             kv_page_indptr=prefill_inputs["kv_page_indptr"],
             kv_last_page_lens=prefill_inputs["kv_last_page_lens"],
+            # Synthetic ContextId for warmup; allocator hands out a
+            # slot we never read state from (qlen>1 prefill, has_initial_state=False).
+            context_ids=[0],
         )
         torch.cuda.synchronize()
         t_prefill = _time.perf_counter() - t0
@@ -319,6 +339,11 @@ class VllmEngine:
             kv_page_indices=decode_inputs["kv_page_indices"],
             kv_page_indptr=decode_inputs["kv_page_indptr"],
             kv_last_page_lens=decode_inputs["kv_last_page_lens"],
+            # Same synthetic ContextId as the prefill warmup so the
+            # allocator returns the same slot — keeps the warmup decode
+            # reading state written by the warmup prefill, matching the
+            # production path order.
+            context_ids=[0],
         )
         torch.cuda.synchronize()
         t_decode = _time.perf_counter() - t0
@@ -589,6 +614,11 @@ class VllmEngine:
             kv_page_indptr=kv_page_indptr,
             kv_last_page_lens=kv_last_page_lens,
             single_token_mode=True,
+            # Cudagraph capture is gated off for hybrid (#107), so the GDN
+            # branch in transform() never fires here. We still pass synthetic
+            # ids so the contract is uniform — defensive against a future
+            # hybrid cudagraph path.
+            context_ids=[0] * num_reqs,
         )
 
     @torch.inference_mode()
@@ -639,6 +669,10 @@ class VllmEngine:
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
             single_token_mode=inputs.get("single_token_inference_mode", False),
+            # Per-row stable ContextIds (#108 phase 5a). On hybrid models
+            # `forward_pass` routes these to the mamba state-slot allocator;
+            # pure-attention paths ignore the field.
+            context_ids=inputs.get("context_ids"),
         )
 
         if gpu_timings is not None:
