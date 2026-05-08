@@ -160,6 +160,8 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     # Users who want bigger pie batches set `[model.X.driver.vllm].max_num_batched_tokens`
     # explicitly; we respect that override.
     if engine_kwargs.get("max_num_batched_tokens") is None:
+        mpe = 0
+        probe_err: Exception | None = None
         try:
             from transformers import AutoConfig
 
@@ -172,7 +174,7 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
             # exists for HF causal LMs.
             mpe = int(getattr(hf_cfg, "max_position_embeddings", 0) or 0)
         except Exception as _e:
-            mpe = 0
+            probe_err = _e
         if mpe > 0:
             engine_kwargs["max_num_batched_tokens"] = mpe
             # Pin pie's BatchAccumulator cap to vllm's pre-fix chat-model default
@@ -189,6 +191,29 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
                 f"override either.",
                 flush=True,
             )
+        else:
+            # Probe failed (offline cache miss, malformed config.json, network
+            # error with cache_dir unset, transformers version skew on
+            # trust_remote_code archs, …). Without engine_kwargs[…] set,
+            # vllm derives compile_ranges_endpoints against its 2048 chat
+            # default and any single-request prefill > 2048 trips the
+            # piecewise_backend assertion. The post-`create_engine_config`
+            # backstop below catches this for all models with
+            # `max_model_len > 2048`, but only after the operator sees what
+            # looks like a regression in this PR's fix. Emit a loud,
+            # grep-able warning so it's not silent.
+            print(
+                f"[pie_driver_vllm] WARNING: HF max_position_embeddings probe "
+                f"for {config.hf_repo!r} failed ({probe_err!r}); "
+                f"engine_kwargs['max_num_batched_tokens'] left unset. "
+                f"vllm will use its chat-model default (2048) and the "
+                f"post-create_engine_config backstop will widen the compile "
+                f"range based on model_config.max_model_len after construction. "
+                f"If you see Shape:N out-of-(1,2048) crashes after this, the "
+                f"backstop also failed — re-check vllm version and pie's "
+                f"_set_compile_ranges integration.",
+                flush=True,
+            )
 
     args = EngineArgs(**engine_kwargs)
     vllm_config = args.create_engine_config()
@@ -200,16 +225,27 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     # scheduler budget and recompute compile ranges. `_set_compile_ranges`
     # is internal to vllm but the only documented path that re-derives
     # compile_ranges_endpoints from scheduler_config without rebuilding
-    # the whole VllmConfig.
+    # the whole VllmConfig — if a vllm version refactor renames or removes
+    # this helper, fail loudly at engine init rather than silently leaving
+    # the compile range narrow (would resurface the Shape:N crash this
+    # branch was added to fix).
     sc = vllm_config.scheduler_config
     mc = vllm_config.model_config
     if sc.max_num_batched_tokens < mc.max_model_len:
+        if not hasattr(vllm_config, "_set_compile_ranges"):
+            raise RuntimeError(
+                "pie_driver_vllm: VllmConfig is missing the private "
+                "_set_compile_ranges helper that this loader relies on to "
+                "re-derive compile_ranges_endpoints after raising "
+                "scheduler_config.max_num_batched_tokens. The installed vllm "
+                "version is incompatible with pie's compile-range backstop. "
+                "Pin a compatible vllm or update pie/pie/src/pie_driver_vllm/loader.py."
+            )
         old = sc.max_num_batched_tokens
         sc.max_num_batched_tokens = mc.max_model_len
         if getattr(sc, "max_num_prefill_tokens", None) == old:
             sc.max_num_prefill_tokens = mc.max_model_len
-        if hasattr(vllm_config, "_set_compile_ranges"):
-            vllm_config._set_compile_ranges()
+        vllm_config._set_compile_ranges()
         print(
             f"[pie_driver_vllm] backstop raised max_num_batched_tokens "
             f"{old} -> {mc.max_model_len} (resolved max_model_len exceeded "
