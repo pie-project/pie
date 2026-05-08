@@ -86,6 +86,8 @@ async def run_benchmark(args):
         }
         if args.vllm_attention_backend is not None:
             driver_subsection["attention_backend"] = args.vllm_attention_backend
+        if args.vllm_max_num_batched_tokens is not None:
+            driver_subsection["max_num_batched_tokens"] = args.vllm_max_num_batched_tokens
     elif args.driver == "native":
         driver_subsection = {
             "gpu_mem_utilization": args.gpu_mem_util,
@@ -293,6 +295,8 @@ def main():
                         help="KV pages for the cuda_native driver. Each page = kv_page_size tokens.")
     parser.add_argument("--vllm-attention-backend", default=None,
                         help="vLLM attention backend (FLASH_ATTN / FLASHINFER / etc.). Only used when --driver=vllm")
+    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=None,
+                        help="vLLM max_num_batched_tokens. Caps tokens per fire_batch (also pie's max_batch_tokens via DriverCapabilities). Default None = vllm auto. Only used when --driver=vllm")
     parser.add_argument("--sglang-attention-backend", default=None,
                         help="SGLang attention backend (triton / flashinfer / flex_attention / fa3). Only used when --driver=sglang")
     parser.add_argument("--use-cuda-graphs", action="store_true",
