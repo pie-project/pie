@@ -43,12 +43,24 @@ class VllmForwardPass:
         attn_backend: Any,
         runtime_config: RuntimeConfig,
         model_config: Any,
+        mamba_layers: list[tuple[str, torch.Tensor, torch.Tensor]] | None = None,
+        is_hybrid: bool = False,
     ):
         self.model = model
         self.vllm_config = vllm_config
         self.runtime_config = runtime_config
         self.model_config = model_config
         self.device = torch.device(runtime_config.device)
+
+        # Hybrid (Transformer + Mamba) support — see kv_cache.py for the
+        # state-slot addressing (state slot = request's first KV page id).
+        self._is_hybrid = is_hybrid
+        # `mamba_layer_names`: layer prefixes for which `transform()` must
+        # publish a `GDNAttentionMetadata` entry into the per-layer
+        # forward-context dict. Order matches `engine.mamba_layers`.
+        self._mamba_layer_names: list[str] = (
+            [name for name, _, _ in (mamba_layers or [])]
+        )
 
         # Lazy: built on first transform() call so we know the resolved
         # backend (set during model construction inside set_current_vllm_config).
@@ -106,6 +118,15 @@ class VllmForwardPass:
         attn_layers.sort(key=lambda x: extract_layer_index(x[0]))
 
         self._layer_names = [name for name, _ in attn_layers]
+        if not attn_layers:
+            # Pure-mamba models — not in pie's smoke-test target. The
+            # FlashInfer builder isn't constructed, but `transform()` still
+            # needs to publish GDN metadata, which only consumes
+            # `CommonAttentionMetadata` (we build it directly below). Set
+            # `_kv_spec` to None and let the GDN-only path handle it.
+            self._kv_spec = None
+            self._builder = None
+            return
         first_layer = attn_layers[0][1]
         backend = first_layer.attn_backend
 
@@ -151,17 +172,23 @@ class VllmForwardPass:
 
         self._ensure_metadata_builder()
 
-        page_size = self._kv_spec.block_size
+        # On hybrid models, `_kv_spec` is the attention spec; the mamba
+        # layers don't share its block_size. Use the attention page_size
+        # for FlashInfer-side metadata; GDN metadata is built independently.
+        page_size = self._kv_spec.block_size if self._kv_spec is not None else 0
         num_tokens = int(input_embeds.shape[0])
 
         # Decide cudagraph dispatch. We dispatch only on uniform-decode
         # batches at query_len=1, gated on the existing pie convention
         # `single_token_mode` (set by the Rust runtime in shmem_schema.py
         # and consumed by phi3/mistral3/olmo3 model files for the same
-        # purpose). This is a pure host-side bool; no GPU sync. Spec-
-        # decode uniform batches (query_len > 1) currently fall through
-        # to eager — separate follow-up to extend pie's runtime flag for
-        # spec-aware uniform detection.
+        # purpose). This is a pure host-side bool; no GPU sync.
+        #
+        # Hybrid models: cudagraph capture is disabled at engine init for
+        # ticket #107 (the GDN backend has its own UNIFORM_BATCH cudagraph
+        # path that conflicts with pie's FULL_DECODE_ONLY capture
+        # machinery). The dispatcher is None on hybrid, so this gate
+        # naturally falls through to eager.
         cudagraph_runtime_mode = CUDAGraphMode.NONE
         batch_descriptor: BatchDescriptor | None = None
         padded_tokens = num_tokens
@@ -225,7 +252,7 @@ class VllmForwardPass:
             kv_page_indices=kv_page_indices_eff,
             kv_page_indptr=kv_page_indptr_eff,
             kv_last_page_lens=kv_last_page_lens_eff,
-            page_size=page_size,
+            page_size=page_size if page_size > 0 else 1,
             device=self.device,
         )
 
@@ -251,17 +278,56 @@ class VllmForwardPass:
             )
             common.slot_mapping = sm_buf[:padded_tokens]
 
-        # Backend-specific metadata. `common_prefix_len=0` disables cascade
-        # attention (we don't use it from pie's side).
-        backend_metadata = self._builder.build(
-            common_prefix_len=0,
-            common_attn_metadata=common,
-        )
+        # Backend-specific attention metadata. `common_prefix_len=0`
+        # disables cascade attention. Returns one dataclass shared by all
+        # attention layers (FlashInfer reads `common.block_table_tensor`
+        # etc. directly out of forward_context, so we only need one).
+        if self._builder is not None:
+            backend_metadata = self._builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=common,
+            )
+        else:
+            backend_metadata = None
 
-        # Same slot_mapping for every layer (no cross-attention or shared KV).
-        slot_mapping_dict = {
-            name: common.slot_mapping for name in self._layer_names
-        }
+        # Per-layer attn_metadata dict. vllm's hybrid path (qwen3-next /
+        # qwen3.5-moe) reads `forward_context.attn_metadata[layer.prefix]`
+        # — Attention layers expect their own FlashInfer struct, GDN
+        # layers expect a `GDNAttentionMetadata`. We always publish a
+        # dict (uniform shape on hybrid and pure-attention) so model code
+        # doesn't branch on the metadata type.
+        per_layer_metadata: dict[str, Any] = {}
+        if backend_metadata is not None:
+            for name in self._layer_names:
+                per_layer_metadata[name] = backend_metadata
+
+        if self._is_hybrid and self._mamba_layer_names:
+            from .gdn_metadata import build_gdn_metadata
+
+            # Reuse `common`'s computed seq_lens / num_computed_tokens to
+            # avoid re-walking pie's CSR. `common.compute_num_computed_tokens()`
+            # caches; second access is free.
+            num_computed_tokens = common.compute_num_computed_tokens()
+            gdn = build_gdn_metadata(
+                qo_indptr=qo_indptr_eff,
+                kv_page_indices=kv_page_indices_eff,
+                kv_page_indptr=kv_page_indptr_eff,
+                seq_lens=common.seq_lens,
+                num_computed_tokens=num_computed_tokens,
+                num_actual_tokens=padded_tokens,
+                device=self.device,
+            )
+            for name in self._mamba_layer_names:
+                per_layer_metadata[name] = gdn
+
+        # Same slot_mapping for every attention layer (no cross-attention
+        # or shared KV). Mamba layers don't read slot_mapping; they get
+        # their state slots via `non_spec_state_indices_tensor` in the
+        # GDN metadata.
+        slot_mapping_dict = (
+            {name: common.slot_mapping for name in self._layer_names}
+            if self._layer_names else {}
+        )
 
         # vllm's RoPE kernel expects int64 positions; pie uses int32.
         positions = position_ids.to(self.device, dtype=torch.int64, non_blocking=True)
@@ -292,7 +358,7 @@ class VllmForwardPass:
             model_positions = positions
 
         with set_forward_context(
-            attn_metadata=backend_metadata,
+            attn_metadata=per_layer_metadata,
             vllm_config=self.vllm_config,
             num_tokens=padded_tokens,
             slot_mapping=slot_mapping_dict,

@@ -61,6 +61,15 @@ class VllmEngine:
     model_config: object
     kv_cache_at_layer: list[torch.Tensor]
     kv_cache_at_layer_host: list[torch.Tensor]
+    # `(layer_name, conv_state, ssm_state)` per mamba layer on hybrid models.
+    # NOT included in `kv_cache_at_layer` so pie's per-page copy_d2d/h2d/d2h
+    # handlers (which assume page-id indexing valid across all listed layers)
+    # never see them. Hybrid models advertise `supports_kv_fork=False` via
+    # capabilities, so pie's runtime won't issue fork on them; if it does
+    # anyway, attention pages are still copied correctly while mamba state
+    # stays at the (shared) parent slot — see ticket #107 / #108.
+    mamba_layers: list[tuple[str, torch.Tensor, torch.Tensor]]
+    is_hybrid: bool
     swap_pool_size: int
     adapter_at_layer: list
     adapters: dict
@@ -81,6 +90,8 @@ class VllmEngine:
         snapshot_dir: str | None = None,
         kv_cache_at_layer_host: list | None = None,
         swap_pool_size: int = 0,
+        mamba_layers: list | None = None,
+        is_hybrid: bool = False,
     ):
         self.config = config
         self.driver_config = driver_config
@@ -88,6 +99,8 @@ class VllmEngine:
         self.forward_pass = forward_pass
         self.kv_cache_at_layer = kv_cache_at_layer
         self.kv_cache_at_layer_host = kv_cache_at_layer_host or []
+        self.mamba_layers = mamba_layers or []
+        self.is_hybrid = is_hybrid
         self.swap_pool_size = swap_pool_size
         self.adapter_at_layer = adapter_at_layer
         self.arch_type = arch_type
@@ -139,8 +152,10 @@ class VllmEngine:
         )
         _log("Loaded vllm model", "DEBUG")
 
-        kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
-        host_kv, pool_size = allocate_host_pool(kv_cache_at_layer, config.swap_budget_bytes)
+        layout = allocate_and_bind_kv_cache(loaded, config, driver_config)
+        host_kv, pool_size = allocate_host_pool(
+            layout.attention_layers_in_order, config.swap_budget_bytes
+        )
 
         forward_pass = VllmForwardPass(
             model=loaded.model,
@@ -148,6 +163,8 @@ class VllmEngine:
             attn_backend=loaded.attn_backend,
             runtime_config=config,
             model_config=loaded.model_config,
+            mamba_layers=layout.mamba_layers,
+            is_hybrid=layout.is_hybrid,
         )
 
         engine = cls(
@@ -155,13 +172,15 @@ class VllmEngine:
             driver_config=driver_config,
             model_config=loaded.model_config,
             forward_pass=forward_pass,
-            kv_cache_at_layer=kv_cache_at_layer,
+            kv_cache_at_layer=layout.attention_layers_in_order,
             adapter_at_layer=[],
             arch_type=loaded.arch_type,
             info=loaded.info,
             snapshot_dir=loaded.snapshot_dir,
             kv_cache_at_layer_host=host_kv,
             swap_pool_size=pool_size,
+            mamba_layers=layout.mamba_layers,
+            is_hybrid=layout.is_hybrid,
         )
 
         # Compile + JIT warmup. Drives a synthetic prefill+decode forward
@@ -310,6 +329,13 @@ class VllmEngine:
         # warmup activations as committed K/V.
         for layer_kv in self.kv_cache_at_layer:
             layer_kv[0].zero_()
+        # Zero slot 0 of every mamba state pool too — warmup wrote
+        # recurrent state at the synthetic request's slot (= first page id
+        # = 0 by construction), so the first real request that's allocated
+        # page 0 must see a clean state.
+        for _name, conv_state, ssm_state in self.mamba_layers:
+            conv_state[0].zero_()
+            ssm_state[0].zero_()
 
         _log(
             f"vllm engine warmup: prefill ({n_prefill} tok) {t_prefill:.2f}s, "
@@ -363,6 +389,17 @@ class VllmEngine:
 
         if cg_mode == CUDAGraphMode.NONE:
             _log("skipped (cudagraph_mode=NONE)", "INFO")
+            return
+
+        if self.is_hybrid:
+            # Hybrid Transformer+Mamba: GDN backend has its own
+            # AttentionCGSupport.UNIFORM_BATCH cudagraph path that captures
+            # the FLA / causal_conv1d kernels itself, with persistent
+            # buffers sized to `decode_cudagraph_max_bs`. Mixing it with
+            # pie's FULL_DECODE_ONLY wrapper around the whole forward
+            # would double-capture and corrupt mamba state. Defer hybrid
+            # cudagraph to ticket #107's perf follow-up; eager works.
+            _log("skipped (hybrid Transformer+Mamba — eager only)", "INFO")
             return
 
         # Pie does not own a vllm GPUModelRunner, so the cudagraph_capture_sizes
@@ -821,5 +858,11 @@ class VllmEngine:
             # causal attention and silently drops user masks. Inferlets
             # that need non-causal patterns must run on `native`.
             supports_user_attention_mask=False,
+            # Hybrid Transformer+Mamba models can't safely fork on the
+            # vllm driver yet — pie's per-page copy_d2d/h2d/d2h handlers
+            # don't migrate mamba's per-request recurrent state. Pure-
+            # attention models on this driver fork like before. See
+            # ticket #107 / #108 for the runtime-cooperation fix.
+            supports_kv_fork=not self.is_hybrid,
             snapshot_dir=str(self.snapshot_dir),
         )
