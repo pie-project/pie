@@ -362,6 +362,25 @@ def load_vllm_model(
         _log("Bringing up vllm parallel state", "DEBUG")
         _ensure_vllm_distributed(vllm_config, rank=config.rank, local_rank=local_rank)
 
+        # vllm 0.20.0 introduced a process-wide WorkspaceManager that
+        # ALL transformer-layer ops fetch scratch buffers from
+        # (`current_workspace_manager().get_simultaneous(...)`). vllm's
+        # GPUModelRunner.__init__ calls `init_workspace_manager(device)`
+        # before any forward; pie drives the model directly and doesn't
+        # construct GPUModelRunner, so we have to initialize it here. If
+        # an older vllm (no module / no symbol) is in use, swallow the
+        # ImportError so the driver still works on pre-0.20.0 stacks.
+        try:
+            from vllm.v1.worker.workspace import (
+                init_workspace_manager,
+                is_workspace_manager_initialized,
+            )
+            if not is_workspace_manager_initialized():
+                _log("Initializing vllm WorkspaceManager", "DEBUG")
+                init_workspace_manager(torch.device(device_str))
+        except ImportError:
+            pass
+
         _log(f"Loading model weights ({config.hf_repo})", "INFO")
         loader = get_model_loader(vllm_config.load_config)
         model = loader.load_model(
