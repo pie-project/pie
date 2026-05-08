@@ -105,13 +105,20 @@ class VllmForwardPass:
         from ._vllm_compat import (
             AttentionLayerBase,
             extract_layer_index,
+            get_mamba_base,
             set_current_vllm_config,
         )
 
+        # vllm 0.20.0 has `MambaBase(AttentionLayerBase)`, so a plain
+        # AttentionLayerBase isinstance check captures GDN/Mamba layers too.
+        # We need only the genuine attention layers here (FlashInfer
+        # metadata is built from their kv_spec).
+        MambaBase = get_mamba_base()
         fc = self.vllm_config.compilation_config.static_forward_context
         attn_layers = [
             (name, layer) for name, layer in fc.items()
             if isinstance(layer, AttentionLayerBase)
+            and not isinstance(layer, MambaBase)
         ]
         # Sort by extracted index so layer ordering is stable & matches
         # pie's swap RPC indexing.

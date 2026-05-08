@@ -147,13 +147,21 @@ def allocate_and_bind_kv_cache(
     # and mamba layers (recurrent state). Both kinds register themselves in
     # this dict via their __init__ — see `Attention` and `MambaBase`
     # subclasses (Qwen3NextGatedDeltaNet, etc.).
-    attn_layers: dict[str, "AttentionLayerBase"] = {
-        name: layer for name, layer in fc.items()
-        if isinstance(layer, AttentionLayerBase)
-    }
+    #
+    # NB: in vllm 0.20.0 `MambaBase` extends `AttentionLayerBase` (so
+    # GDN/Mamba layers pass the AttentionLayerBase isinstance check too).
+    # The mamba check has to come first, and the attention list must
+    # explicitly EXCLUDE mamba layers — otherwise we'd treat mamba layers
+    # as attention and call `get_kv_cache_spec` on them, which raises
+    # MambaSpec downstream of the attention-only flow.
     mamba_layers: dict[str, MambaBase] = {
         name: layer for name, layer in fc.items()
         if isinstance(layer, MambaBase)
+    }
+    attn_layers: dict[str, "AttentionLayerBase"] = {
+        name: layer for name, layer in fc.items()
+        if isinstance(layer, AttentionLayerBase)
+        and not isinstance(layer, MambaBase)
     }
 
     if not attn_layers and not mamba_layers:
