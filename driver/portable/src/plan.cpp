@@ -346,17 +346,22 @@ void plan_single_request(const PlanArrays& a,
     // Runtime emits sampling_indices as per-request relative offsets
     // (0 = first token of that request's qo range, n_tok-1 = last). We
     // carry global flat-array positions through the plan, so add qo_start.
-    const std::int32_t rel_primary =
-        static_cast<std::int32_t>(a.sampling_idx[s_start]);
-    if (rel_primary < 0 || rel_primary >= n_tok) {
-        throw std::runtime_error(
-            "plan: request " + std::to_string(r) +
-            " sampling_index " + std::to_string(rel_primary) +
-            " out of relative [0," + std::to_string(n_tok) + ")");
+    // A request can carry multiple samplers (the SDK uses this for
+    // speculative-decoding verify passes that route drafts through the
+    // regular `input_tokens` channel rather than `spec_token_ids`), so
+    // honor every entry in [s_start, s_end).
+    for (std::int32_t k = s_start; k < s_end; ++k) {
+        const std::int32_t rel = static_cast<std::int32_t>(a.sampling_idx[k]);
+        if (rel < 0 || rel >= n_tok) {
+            throw std::runtime_error(
+                "plan: request " + std::to_string(r) +
+                " sampling_index " + std::to_string(rel) +
+                " out of relative [0," + std::to_string(n_tok) + ")");
+        }
+        const std::int32_t idx = qo_start + rel;
+        rp.sampling_positions.push_back(idx);
+        plan.sampling_pos_i32.push_back(idx);
     }
-    const std::int32_t primary_idx = qo_start + rel_primary;
-    rp.sampling_positions.push_back(primary_idx);
-    plan.sampling_pos_i32.push_back(primary_idx);
 
     if (a.batch_has_drafts) {
         const std::int32_t d_start = static_cast<std::int32_t>(a.spec_indptr[r]);

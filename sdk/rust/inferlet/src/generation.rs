@@ -457,23 +457,49 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             crate::pie::zo::zo::adapter_seed(&pass, seed);
         }
 
-        if n_pending > 0 {
-            let positions: Vec<u32> =
+        // Custom-mode drafts ride alongside pending in `input_tokens` and
+        // are verified by the SDK walk below. This keeps verification
+        // driver-agnostic: the runtime's `spec_token_ids` channel only
+        // carries the host-side `output_speculative_tokens` flow used
+        // by System-mode (where the runtime returns next-iter drafts).
+        let is_custom = matches!(parent.speculation, SpecMode::Custom(_));
+        let do_sdk_verify = is_custom && n_drafted > 0 && n_pending > 0;
+
+        if do_sdk_verify {
+            let mut all_tokens = Vec::with_capacity((n_pending + n_drafted) as usize);
+            all_tokens.extend_from_slice(&pending);
+            all_tokens.extend_from_slice(&drafts);
+            let mut all_positions: Vec<u32> =
                 (parent.ctx.seq_len..parent.ctx.seq_len + n_pending).collect();
-            pass.input_tokens(&pending, &positions);
-        }
-        if !drafts.is_empty() {
-            pass.input_speculative_tokens(&drafts, &draft_positions);
+            all_positions.extend_from_slice(&draft_positions);
+            pass.input_tokens(&all_tokens, &all_positions);
+        } else {
+            if n_pending > 0 {
+                let positions: Vec<u32> =
+                    (parent.ctx.seq_len..parent.ctx.seq_len + n_pending).collect();
+                pass.input_tokens(&pending, &positions);
+            }
+            if !drafts.is_empty() {
+                pass.input_speculative_tokens(&drafts, &draft_positions);
+            }
         }
         if matches!(parent.speculation, SpecMode::System { .. }) {
             pass.output_speculative_tokens(true);
         }
 
-        // Sampler at last input position (or 0 if drafts only).
+        // Sampler attach. Custom-with-drafts attaches (1 + n_drafted)
+        // consecutive samplers: one for the anchor's free pick plus one
+        // per draft position. The walk below compares each pick against
+        // the corresponding draft.
         let sample_idx = if n_pending > 0 { n_pending - 1 } else { 0 };
         if !user_cleared_sampler {
             let wit: WitSampler = parent.sampler.clone().into();
-            pass.sampler(&[sample_idx], &wit);
+            if do_sdk_verify {
+                let indices: Vec<u32> = (sample_idx..=sample_idx + n_drafted).collect();
+                pass.sampler(&indices, &wit);
+            } else {
+                pass.sampler(&[sample_idx], &wit);
+            }
         }
 
         // Per-step probes (registered on the Generator).
@@ -494,12 +520,47 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             .await
             .map_err(|e| format!("GenStep::execute forward: {e}"))?;
 
-        // Read accepted tokens off the auto-sampler slot. In speculative
-        // mode the verifier may produce multiple Token slots in sequence;
-        // the convention is that consecutive Token slots from index 0
-        // form the accepted prefix.
+        // Read accepted tokens off the auto-sampler slots.
+        //
+        // System-mode and non-spec passes: the verifier (or single-shot
+        // sampler) emits one Token slot per accept, so the leading
+        // Token-slot run from index 0 is exactly the accepted chain.
+        //
+        // Custom-with-drafts (do_sdk_verify): walk the (1 + n_drafted)
+        // sampled picks against `drafts`. Slot 0 is the anchor's free
+        // pick (always accepted). Each subsequent slot is accepted iff
+        // the previous draft matched its picked token. The final slot
+        // is either the next verification anchor or, after a full-
+        // accept run, the post-draft free pick.
         let accepted_tokens: Vec<u32> = if user_cleared_sampler {
             Vec::new()
+        } else if do_sdk_verify {
+            let n_picks = (n_drafted + 1) as usize;
+            let lm_picks: Vec<u32> = raw
+                .slots
+                .iter()
+                .take(n_picks)
+                .filter_map(|s| match s {
+                    SlotOutput::Token(t) => Some(*t),
+                    _ => None,
+                })
+                .collect();
+            if lm_picks.len() != n_picks {
+                return Err(format!(
+                    "GenStep::execute verify: expected {} Token slots, got {}",
+                    n_picks,
+                    lm_picks.len()
+                ));
+            }
+            let mut accepted = Vec::with_capacity(n_picks);
+            accepted.push(lm_picks[0]);
+            for k in 0..n_drafted as usize {
+                if lm_picks[k] != drafts[k] {
+                    break;
+                }
+                accepted.push(lm_picks[k + 1]);
+            }
+            accepted
         } else {
             raw.slots
                 .iter()

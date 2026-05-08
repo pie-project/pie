@@ -191,7 +191,14 @@ void resolve_request_output(const ForwardEngine::ReqPlan& rp,
     const std::int32_t n_drafts =
         static_cast<std::int32_t>(rp.draft_tokens.size());
     if (n_drafts == 0) {
-        dst.tokens.push_back(slot_out[0].token);
+        // No driver-side drafts. Emit every sampled slot. The SDK uses
+        // multi-position sampling for speculative-decoding verify
+        // passes that route drafts through `input_tokens` rather than
+        // the `spec_token_ids` channel, and expects one token per slot.
+        dst.tokens.reserve(slot_out.size());
+        for (auto& s : slot_out) {
+            dst.tokens.push_back(s.token);
+        }
         return;
     }
     // Spec verifier walk. Slot k predicts the token that should follow
