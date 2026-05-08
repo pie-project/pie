@@ -10,12 +10,19 @@ and bind each `Attention` layer's `self.kv_cache` attribute via
 
 For hybrid Transformer + Mamba models (Qwen3.5-MoE, Qwen3-Next: alternating
 `full_attention` + `linear_attention` layers) we additionally allocate a
-per-mamba-layer `[conv_state, ssm_state]` pair sized to the same `num_blocks`
-as the attention pool. The state slot for a request is the request's first
-KV page id (see `gdn_metadata.build_gdn_metadata`); since pie's allocator
-gives a request at least one page, that page id doubles as the state slot
-index. We follow vllm's `mamba_cache_mode="none"` (1 block per request) for
-budget computation.
+per-mamba-layer `[conv_state, ssm_state]` pool sized to the same `num_blocks`
+as the attention pool. The state slot for a request is derived in
+`gdn_metadata._state_slot_for_requests` — today that derivation reuses the
+request's first KV page id (so any pie page id is a valid index into the
+state pool). The coupling to page ids has known fork-aliasing limitations:
+post-fork siblings share their committed prefix's first page id (refcount),
+so on hybrid models we advertise `supports_kv_fork=False` via capabilities
+and pie's runtime is expected to route fork-using inferlets to a different
+driver. Ticket #108 replaces the slot derivation with a per-request
+allocator (likely keyed on a stable runtime-supplied id) — when it lands,
+`gdn_metadata._state_slot_for_requests` is the single point of change in
+this driver. We follow vllm's `mamba_cache_mode="none"` (1 block per request)
+for budget computation.
 
 Pie's Rust scheduler still owns block IDs — they're integer indices into
 the block dimension of these tensors. The CLI handshake fixes `kv_page_size`

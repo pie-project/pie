@@ -6,9 +6,12 @@ pie does not exercise via vllm — pie's NGRAM drafter is engine-side and
 never produces > 1 query/req on this path). The struct also carries:
 
 * per-request **state-slot indices** — `non_spec_state_indices_tensor`,
-  one int32 per request pointing at the mamba state slot for that request.
-  Pie uses the request's first KV page id as the state slot (see
-  `kv_cache.py` for the addressing rationale).
+  one int32 per non-spec request pointing at the mamba state slot for
+  that request. The slot id is computed via `_state_slot_for_request`
+  below, deliberately isolated behind a single helper so #108's
+  per-request slot allocator can replace the current first-page-id
+  derivation in one place. See `kv_cache.py` for the addressing
+  rationale and the known fork-aliasing limitation.
 * per-prefill **conv1d metadata** — `nums_dict / batch_ptr /
   token_chunk_offset_ptr`, computed once per batch via
   `compute_causal_conv1d_metadata`.
@@ -16,8 +19,15 @@ never produces > 1 query/req on this path). The struct also carries:
   (qwen3-next / qwen3.5-moe specific) — computed via
   `prepare_chunk_indices` / `prepare_chunk_offsets` on the non-spec
   `query_start_loc_cpu`.
-* `has_initial_state` — `True` for prefill rows that carry pre-existing
-  recurrent state (i.e., `num_computed_tokens > 0`).
+* `has_initial_state` — `True` for non-spec rows whose context_lens > 0
+  (i.e., recurrent state is carried over from a prior fire_batch). vllm's
+  builder emits the same shape: full non-spec batch length (in our
+  no-spec path that is the whole batch); the GDN forward then consumes
+  the full vector when `causal_conv1d_fn` is dispatched on prefill rows
+  (it walks `non_spec_query_start_loc` to know which token slice belongs
+  to which row). See `vllm/v1/attention/backends/gdn_attn.py:build` for
+  the canonical reference and `gdn_linear_attn.py:_forward` for the
+  consumption pattern.
 
 We don't populate any spec-decode fields (`spec_*`, `num_accepted_tokens`,
 `spec_token_indx`, …) — pie's runtime won't issue spec-decode batches
@@ -29,6 +39,31 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+
+
+def _state_slot_for_requests(
+    kv_page_indices_cpu: torch.Tensor,  # int32 (total_pages,)
+    kv_page_indptr_cpu: torch.Tensor,   # int32 (batch+1,)
+) -> torch.Tensor:
+    """Return one int32 mamba state-slot id per request, on CPU.
+
+    **This is the only place in the driver where the slot id is derived
+    from KV-page metadata.** Today the slot is the request's first KV
+    page id — relying on pie's allocator giving each in-flight request
+    at least one page. That coupling is documented in `kv_cache.py` as
+    a known limitation: post-fork siblings share their first committed
+    page (refcount), so the first-page-id collides between siblings,
+    which silently produces wrong recurrent state on hybrid models.
+    Capability flag `supports_kv_fork=False` lets pie's runtime route
+    fork-using inferlets away on hybrid; #108 will replace this body
+    with a per-request slot allocator that doesn't depend on page ids
+    at all (likely keyed on a runtime-supplied request id once IPC
+    cooperation lands).
+
+    Returning a CPU tensor here keeps the call site indexed-copy free;
+    the caller stages the tensor onto the device via `non_blocking=True`.
+    """
+    return kv_page_indices_cpu[kv_page_indptr_cpu[:-1]]
 
 
 def build_gdn_metadata(
@@ -84,18 +119,24 @@ def build_gdn_metadata(
     num_decode_tokens = num_decodes  # qlen=1 each
     num_prefill_tokens = int(query_lens_cpu.sum().item()) - num_decode_tokens
 
-    # Per-request state-slot index. Pie addresses mamba state by the
-    # request's first KV page id (see `kv_cache.py`); pull that off CPU
-    # CSR and ship a contiguous int32 tensor to GPU.
-    first_pages_cpu = kv_page_indices_cpu[kv_page_indptr_cpu[:-1]]
-    non_spec_state_indices_tensor = first_pages_cpu.to(
+    # Per-request state-slot index. Derivation lives in
+    # `_state_slot_for_requests` (single point of change for #108).
+    state_slots_cpu = _state_slot_for_requests(
+        kv_page_indices_cpu, kv_page_indptr_cpu
+    )
+    non_spec_state_indices_tensor = state_slots_cpu.to(
         device, dtype=torch.int32, non_blocking=True
     )
 
-    # `has_initial_state[req]` flags prefill rows whose recurrent state is
+    # `has_initial_state[req]` flags rows whose recurrent state is
     # carried over from a prior fire_batch (i.e., `num_computed_tokens >
-    # 0`). Decode rows always have non-zero state but the field is sliced
-    # to non-spec prefill rows only.
+    # 0`). Length = full non-spec batch (= `batch` in our no-spec path),
+    # matching vllm 0.20.0's GDN builder: the field is computed over the
+    # non-spec batch and passed unsliced into `GDNAttentionMetadata`.
+    # `gdn_linear_attn._forward` then dispatches `causal_conv1d_fn` only
+    # when `num_prefills > 0` and walks `non_spec_query_start_loc` to
+    # pick the per-row token slices, so decode rows in a mixed batch are
+    # tolerated despite carrying a `True` flag.
     has_initial_state: torch.Tensor | None = None
     nums_dict = None
     batch_ptr = None

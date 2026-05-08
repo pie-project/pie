@@ -183,6 +183,30 @@ class VllmEngine:
             is_hybrid=layout.is_hybrid,
         )
 
+        # Hybrid one-shot operator warning. `capabilities()` reports
+        # `supports_kv_fork=False` when `is_hybrid=True`, but until
+        # ticket #108 lands a runtime admission gate the contract is
+        # advisory: an inferlet that calls `ctx.fork()` on a hybrid
+        # model still completes, with attention pages physically copied
+        # but mamba's per-request recurrent state aliased back to the
+        # parent's slot. Wrong outputs, no crash, no clear signal —
+        # exactly the failure the warning surfaces. Logged at WARNING
+        # so it shows up in the operator's startup log without spamming
+        # the per-request hot path. Removed (or downgraded to INFO)
+        # when #108 makes the gate runtime-enforced.
+        if layout.is_hybrid:
+            logger.warning(
+                "vllm driver loaded a hybrid Transformer+Mamba model "
+                "(%s). supports_kv_fork=False is advertised via "
+                "capabilities, but pie's runtime does not yet enforce "
+                "it (see ticket #108). If any inferlet calls ctx.fork() "
+                "on this model, mamba's per-request recurrent state "
+                "will alias the parent's slot and produce silently-wrong "
+                "outputs. Route fork-using inferlets to cuda_native or "
+                "portable until #108 lands.",
+                loaded.arch_type,
+            )
+
         # Compile + JIT warmup. Drives a synthetic prefill+decode forward
         # so torch.compile (Dynamo + AOT) and FlashInfer JIT (ninja/nvcc)
         # complete during init rather than on the inferlet's first
