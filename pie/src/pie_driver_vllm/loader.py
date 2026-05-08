@@ -7,6 +7,7 @@ This module owns the "what kind of vllm model are we running" decisions so
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,8 @@ import torch
 import torch.distributed as dist
 
 from pie_driver.config import RuntimeConfig
+
+logger = logging.getLogger(__name__)
 
 
 # Map pie's RuntimeConfig.activation_dtype (torch.dtype) to vllm's string form.
@@ -126,8 +129,131 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     if not driver_config.enforce_eager and driver_config.attention_backend is None:
         engine_kwargs["attention_backend"] = "FLASHINFER"
 
+    # vllm's torch.compile + V1 attention backends (FlashInfer, FlashAttn, …)
+    # size their compile ranges and per-call CPU/GPU buffers to
+    # `scheduler_config.max_num_batched_tokens`. vllm defaults this to 2048
+    # for chat models with chunked prefill enabled — but pie drives the model
+    # outside vllm's GPUModelRunner, so its scheduler chunking does NOT
+    # constrain pie's batches. Pie can fire any single-request prefill up to
+    # the model's max sequence length, and a 2052-token prefill against a
+    # (1, 2048) compile range trips:
+    #   AssertionError: Shape: N out of considered ranges: [(1, 2048)]
+    #     in vllm/compilation/piecewise_backend.py
+    # On the FlashInfer side the same misconfiguration cascades into a
+    # `max() iterable argument is empty` from `flashinfer/decode.py:plan` once
+    # subsequent calls find FlashInfer's persistent metadata corrupted.
+    #
+    # Pie sets vllm's compile ceiling to the HF model's max position
+    # embeddings so any single-request prefill is within compile range. We
+    # probe HF config directly (rather than letting vllm resolve max_model_len
+    # then mutate) because vllm derives `compile_ranges_endpoints` inside
+    # `VllmConfig.__post_init__` against the scheduler value at that time;
+    # setting it before EngineArgs avoids touching vllm's private
+    # `_set_compile_ranges` after the fact.
+    #
+    # Important: we do NOT also raise pie's BatchAccumulator cap. `engine.capabilities()`
+    # reads `driver_config.max_num_batched_tokens` first; only when that's None
+    # does it fall back to `vc.scheduler_config.max_num_batched_tokens`. If we let
+    # capabilities fall through to the raised vllm value, pie's BatchAccumulator
+    # would also widen to max_position_embeddings — bringing 16-context bursts
+    # into single 32K-token forwards and OOM'ing at activation time. Pin the
+    # driver-side cap to vllm's chat-model default (2048) so pie's BatchAccumulator
+    # behaves the same as before this change. Memory cost is therefore bounded
+    # to the extra inductor compile range, which is one extra graph bucket.
+    # Users who want bigger pie batches set `[model.X.driver.vllm].max_num_batched_tokens`
+    # explicitly; we respect that override.
+    if engine_kwargs.get("max_num_batched_tokens") is None:
+        mpe = 0
+        probe_err: Exception | None = None
+        try:
+            from transformers import AutoConfig
+
+            hf_cfg = AutoConfig.from_pretrained(
+                config.hf_repo, trust_remote_code=True, cache_dir=config.cache_dir
+            )
+            # max_position_embeddings is the universal field. Some models also
+            # expose `model_max_length` or rope_scaling-extended context;
+            # max_position_embeddings is the safe lower bound that always
+            # exists for HF causal LMs.
+            mpe = int(getattr(hf_cfg, "max_position_embeddings", 0) or 0)
+        except Exception as _e:
+            probe_err = _e
+        if mpe > 0:
+            engine_kwargs["max_num_batched_tokens"] = mpe
+            # Pin pie's BatchAccumulator cap to vllm's pre-fix chat-model default
+            # so memory pressure does not regress. driver_config is mutated in
+            # place (it is not frozen); capabilities() will return this value.
+            if driver_config.max_num_batched_tokens is None:
+                driver_config.max_num_batched_tokens = 2048
+            logger.info(
+                "setting vllm max_num_batched_tokens=%d "
+                "(from HF max_position_embeddings) for compile-range coverage; "
+                "pinning pie BatchAccumulator cap to %d so per-batch memory stays bounded. "
+                "Set [model.X.driver.vllm].max_num_batched_tokens explicitly to override either.",
+                mpe,
+                driver_config.max_num_batched_tokens,
+            )
+        else:
+            # Probe failed (offline cache miss, malformed config.json, network
+            # error with cache_dir unset, transformers version skew on
+            # trust_remote_code archs, …). Without engine_kwargs[…] set,
+            # vllm derives compile_ranges_endpoints against its 2048 chat
+            # default and any single-request prefill > 2048 trips the
+            # piecewise_backend assertion. The post-`create_engine_config`
+            # backstop below catches this for all models with
+            # `max_model_len > 2048`, but only after the operator sees what
+            # looks like a regression in this PR's fix. Emit a loud,
+            # grep-able warning so it's not silent.
+            logger.warning(
+                "HF max_position_embeddings probe for %r failed (%r); "
+                "engine_kwargs['max_num_batched_tokens'] left unset. "
+                "vllm will use its chat-model default (2048) and the "
+                "post-create_engine_config backstop will widen the compile "
+                "range based on model_config.max_model_len after construction. "
+                "If you see Shape:N out-of-(1,2048) crashes after this, the "
+                "backstop also failed — re-check vllm version and pie's "
+                "_set_compile_ranges integration.",
+                config.hf_repo,
+                probe_err,
+            )
+
     args = EngineArgs(**engine_kwargs)
     vllm_config = args.create_engine_config()
+
+    # Defensive backstop: if vllm's resolved `max_model_len` exceeds the
+    # value we passed in (e.g. rope scaling extends context beyond HF's
+    # max_position_embeddings, or the user lowered max_num_batched_tokens
+    # explicitly), the compile range can still be too narrow. Raise the
+    # scheduler budget and recompute compile ranges. `_set_compile_ranges`
+    # is internal to vllm but the only documented path that re-derives
+    # compile_ranges_endpoints from scheduler_config without rebuilding
+    # the whole VllmConfig — if a vllm version refactor renames or removes
+    # this helper, fail loudly at engine init rather than silently leaving
+    # the compile range narrow (would resurface the Shape:N crash this
+    # branch was added to fix).
+    sc = vllm_config.scheduler_config
+    mc = vllm_config.model_config
+    if sc.max_num_batched_tokens < mc.max_model_len:
+        if not hasattr(vllm_config, "_set_compile_ranges"):
+            raise RuntimeError(
+                "pie_driver_vllm: VllmConfig is missing the private "
+                "_set_compile_ranges helper that this loader relies on to "
+                "re-derive compile_ranges_endpoints after raising "
+                "scheduler_config.max_num_batched_tokens. The installed vllm "
+                "version is incompatible with pie's compile-range backstop. "
+                "Pin a compatible vllm or update pie/pie/src/pie_driver_vllm/loader.py."
+            )
+        old = sc.max_num_batched_tokens
+        sc.max_num_batched_tokens = mc.max_model_len
+        if getattr(sc, "max_num_prefill_tokens", None) == old:
+            sc.max_num_prefill_tokens = mc.max_model_len
+        vllm_config._set_compile_ranges()
+        logger.info(
+            "backstop raised max_num_batched_tokens %d -> %d "
+            "(resolved max_model_len exceeded the pre-construction estimate from HF config).",
+            old,
+            mc.max_model_len,
+        )
 
     # Decode-side cudagraph (Lever 5, ticket #100). Pie drives the model
     # outside vllm's GPUModelRunner, so vllm's auto-resolution of
@@ -235,6 +361,25 @@ def load_vllm_model(
     with set_current_vllm_config(vllm_config):
         _log("Bringing up vllm parallel state", "DEBUG")
         _ensure_vllm_distributed(vllm_config, rank=config.rank, local_rank=local_rank)
+
+        # vllm 0.20.0 introduced a process-wide WorkspaceManager that
+        # ALL transformer-layer ops fetch scratch buffers from
+        # (`current_workspace_manager().get_simultaneous(...)`). vllm's
+        # GPUModelRunner.__init__ calls `init_workspace_manager(device)`
+        # before any forward; pie drives the model directly and doesn't
+        # construct GPUModelRunner, so we have to initialize it here. If
+        # an older vllm (no module / no symbol) is in use, swallow the
+        # ImportError so the driver still works on pre-0.20.0 stacks.
+        try:
+            from vllm.v1.worker.workspace import (
+                init_workspace_manager,
+                is_workspace_manager_initialized,
+            )
+            if not is_workspace_manager_initialized():
+                _log("Initializing vllm WorkspaceManager", "DEBUG")
+                init_workspace_manager(torch.device(device_str))
+        except ImportError:
+            pass
 
         _log(f"Loading model weights ({config.hf_repo})", "INFO")
         loader = get_model_loader(vllm_config.load_config)

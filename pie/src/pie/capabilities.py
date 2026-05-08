@@ -86,6 +86,16 @@ class DriverCapabilities:
     # hook in a follow-up.
     supports_user_attention_mask: bool = False
 
+    # Whether the driver supports KV-context fork (`ctx.fork()`) and the
+    # subsequent copy_d2d/h2d/d2h page transfers. False on the vllm
+    # driver when serving hybrid Transformer+Mamba models (Qwen3.5-MoE,
+    # Qwen3-Next, …) because pie's per-page copy handlers can't migrate
+    # mamba's per-request recurrent state (see ticket #107 / #108).
+    # Defaults True so existing drivers (cuda_native, portable, vllm on
+    # pure-attention models) are treated as fork-capable. Python-only
+    # today; pie's runtime gains an admission hook in a follow-up.
+    supports_kv_fork: bool = True
+
     # ── Filesystem ─────────────────────────────────────────────────────
     # Local directory containing tokenizer.json + config.json. The Rust
     # runtime reads tokenizer.json from `<snapshot_dir>/tokenizer.json`.

@@ -12,17 +12,33 @@ use crate::inference::structured::json_schema::{builtin_json_grammar, json_schem
 use crate::inference::structured::regex::regex_to_grammar;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::matcher::GrammarMatcher;
+use crate::context::pagestore::compute_last_page_len;
 use crate::{context, inference};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::iter;
 use std::mem::take;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 use wasmtime_wasi::async_trait;
 use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
+
+/// Chunked-prefill chunk size in tokens. 0 disables chunking.
+///
+/// Read from env var `PIE_CHUNKED_PREFILL_SIZE` once at first access. Default
+/// 2048 matches vllm's `max_num_batched_tokens` default. Set to 0 to disable
+/// (legacy single-submit prefill).
+fn chunked_prefill_size() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("PIE_CHUNKED_PREFILL_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(2048)
+    })
+}
 
 #[derive(Debug)]
 pub struct ForwardPass {
@@ -426,25 +442,144 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             return Ok(Err(msg));
         }
 
-        let request = ForwardPassRequest {
-            context_id,
-            tokens,
-            positions,
-            speculative_tokens,
-            speculative_positions,
-            output_speculative_tokens,
-            masks,
-            has_user_mask,
-            logit_mask,
-            sampling_indices,
-            samplers,
-            adapter_id,
-            adapter_seed,
+        // Step 5: Submit to inference service (inference actor just dispatches — never blocks).
+        //
+        // Chunked-prefill path: when the request would mega-batch a long
+        // prefill (>chunk_size tokens) we split it into N sequential
+        // sub-requests so concurrent decoders from other contexts can
+        // interleave between chunks. Mirrors vllm's chunked-prefill admission
+        // shape; the wall-clock win comes from decode interleaving, not from
+        // a faster single forward pass. See restore.rs:288+ for the prior-art
+        // sequential-submit pattern this code parallels.
+        //
+        // Guards: `has_user_mask` / `speculative_tokens` would need
+        // mask-slicing or spec-shape rewrite to chunk safely — skipped.
+        // `sampling_indices` outside the last chunk would need per-chunk
+        // sampler emission — also skipped (rare for normal generate).
+        let device_idx = device_id as usize;
+        let chunk_size = chunked_prefill_size();
+        let last_chunk_start = if chunk_size > 0 && num_input_tokens > 0 {
+            ((num_input_tokens - 1) / chunk_size) * chunk_size
+        } else {
+            0
+        };
+        let can_chunk = chunk_size > 0
+            && num_input_tokens > chunk_size
+            && !has_user_mask
+            && speculative_tokens.is_empty()
+            && sampling_indices
+                .iter()
+                .all(|&i| (i as usize) >= last_chunk_start);
+
+        let submit_result: Result<ForwardPassOutput> = if can_chunk {
+            // Borrow the per-chunk slices off the originals; consume the
+            // tail-only fields (samplers, sampling_indices, logit_mask) into
+            // the last chunk's request so we don't allocate them N times.
+            let n_chunks = (num_input_tokens + chunk_size - 1) / chunk_size;
+            let mut last_output: Option<ForwardPassOutput> = None;
+            let mut sampling_indices_opt = Some(sampling_indices);
+            let mut samplers_opt = Some(samplers);
+            let mut logit_mask_opt = logit_mask;
+            let mut chunk_err: Option<String> = None;
+
+            for ci in 0..n_chunks {
+                let start = ci * chunk_size;
+                let end = ((ci + 1) * chunk_size).min(num_input_tokens);
+                let is_last = ci == n_chunks - 1;
+
+                let chunk_tokens = tokens[start..end].to_vec();
+                let chunk_positions = positions[start..end].to_vec();
+                let chunk_masks = masks[start..end].to_vec();
+
+                let total_kv_after = kv_len + end as u32;
+                let num_pages_for_chunk =
+                    ((total_kv_after + page_size - 1) / page_size) as usize;
+                let chunk_phys = physical_page_ids[..num_pages_for_chunk].to_vec();
+                let chunk_last_page_len = compute_last_page_len(
+                    total_kv_after,
+                    num_pages_for_chunk as u32,
+                    page_size,
+                );
+
+                let (chunk_sampling_indices, chunk_samplers, chunk_logit_mask) = if is_last {
+                    let raw_indices = sampling_indices_opt.take().unwrap_or_default();
+                    let remapped: Vec<u32> = raw_indices
+                        .iter()
+                        .map(|&i| i - start as u32)
+                        .collect();
+                    (
+                        remapped,
+                        samplers_opt.take().unwrap_or_default(),
+                        logit_mask_opt.take(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), None)
+                };
+
+                let chunk_request = ForwardPassRequest {
+                    context_id,
+                    tokens: chunk_tokens,
+                    positions: chunk_positions,
+                    speculative_tokens: Vec::new(),
+                    speculative_positions: Vec::new(),
+                    output_speculative_tokens: false,
+                    masks: chunk_masks,
+                    has_user_mask: false,
+                    logit_mask: chunk_logit_mask,
+                    sampling_indices: chunk_sampling_indices,
+                    samplers: chunk_samplers,
+                    adapter_id,
+                    adapter_seed,
+                };
+
+                match inference::submit(
+                    model_id, chunk_request, device_idx, chunk_phys, chunk_last_page_len,
+                )
+                .await
+                {
+                    Ok(output) => {
+                        if is_last {
+                            last_output = Some(output);
+                        }
+                        // intermediate-chunk outputs (no samplers) are empty by
+                        // construction and intentionally discarded.
+                    }
+                    Err(e) => {
+                        chunk_err = Some(format!(
+                            "chunk {}/{}: {e:#}", ci + 1, n_chunks
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            match (chunk_err, last_output) {
+                (Some(msg), _) => Err(anyhow::anyhow!(msg)),
+                (None, Some(out)) => Ok(out),
+                (None, None) => Err(anyhow::anyhow!(
+                    "chunked prefill produced no output (n_chunks={n_chunks})"
+                )),
+            }
+        } else {
+            let request = ForwardPassRequest {
+                context_id,
+                tokens,
+                positions,
+                speculative_tokens,
+                speculative_positions,
+                output_speculative_tokens,
+                masks,
+                has_user_mask,
+                logit_mask,
+                sampling_indices,
+                samplers,
+                adapter_id,
+                adapter_seed,
+            };
+            inference::submit(model_id, request, device_idx, physical_page_ids.clone(), last_page_len).await
         };
 
-        // Step 5: Submit to inference service (inference actor just dispatches — never blocks)
-        let device_idx = device_id as usize;
-        match inference::submit(model_id, request, device_idx, physical_page_ids.clone(), last_page_len).await {
+        match submit_result {
             Ok(output) => {
                 // Diagnostic: log prefill metadata to trace corruption
                 // if num_input_tokens > 1 {

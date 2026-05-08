@@ -59,6 +59,13 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.worker.utils import bind_kv_cache
 
 
+# ----------------------------------------------------------------------------
+# KV-cache spec types (full attention vs mamba) — used to detect hybrid models
+# ----------------------------------------------------------------------------
+
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, MambaSpec
+
+
 # Per-backend impl classes — imported lazily because vllm's per-backend
 # modules pull in heavy deps (flashinfer kernels, fa3 wheels, etc.). Most
 # call sites need just one impl, so we expose a getter that imports on
@@ -69,6 +76,34 @@ def get_flashinfer_impl():
     return FlashInferImpl
 
 
+# GDN backend, GDNAttentionMetadata, and per-prefill conv1d helpers — only
+# imported when a hybrid model is detected so non-hybrid loads stay clean.
+def get_gdn_backend():
+    from vllm.v1.attention.backends.gdn_attn import (
+        GDNAttentionBackend,
+        GDNAttentionMetadata,
+        GDNAttentionMetadataBuilder,
+    )
+    return GDNAttentionBackend, GDNAttentionMetadata, GDNAttentionMetadataBuilder
+
+
+def get_mamba_helpers():
+    """conv1d-metadata + null-block-id constants used by the GDN builder."""
+    from vllm.v1.attention.backends.utils import (
+        NULL_BLOCK_ID,
+        compute_causal_conv1d_metadata,
+    )
+    return NULL_BLOCK_ID, compute_causal_conv1d_metadata
+
+
+def get_mamba_base():
+    """`MambaBase` is the marker class GDN/Mamba2 layers inherit from. Used to
+    detect mamba layers in the static_forward_context (alongside
+    `AttentionLayerBase` for attention layers)."""
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
+    return MambaBase
+
+
 __all__ = [
     "AttentionLayerBase",
     "BatchDescriptor",
@@ -77,12 +112,18 @@ __all__ = [
     "CommonAttentionMetadata",
     "CudagraphDispatcher",
     "EngineArgs",
+    "FullAttentionSpec",
+    "KVCacheSpec",
+    "MambaSpec",
     "bind_kv_cache",
     "ensure_model_parallel_initialized",
     "extract_layer_index",
     "get_attention_context",
     "get_flashinfer_impl",
     "get_forward_context",
+    "get_gdn_backend",
+    "get_mamba_base",
+    "get_mamba_helpers",
     "get_model_loader",
     "graph_capture",
     "init_distributed_environment",
