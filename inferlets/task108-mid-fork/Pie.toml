@@ -1,0 +1,13 @@
+[package]
+name = "task108-mid-fork"
+version = "0.1.0"
+description = "Phase 5b mid-conversation fork smoke (#108): parent decodes, forks, parent + child decode again. Twins test: identical prompts + Argmax must yield byte-identical post-fork tokens iff mamba state was copied on fork."
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+warmup_tokens = {type = "int", optional = true, description = "Tokens parent decodes before forking, accumulating mamba state (default: 4)"}
+post_tokens = {type = "int", optional = true, description = "Tokens each twin decodes after fork (default: 4)"}
