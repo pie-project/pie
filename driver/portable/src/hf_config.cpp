@@ -44,7 +44,9 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
     if (hf_model_type == "gptoss")      return PieArch::GptOss;
     if (hf_model_type == "phi3")        return PieArch::Phi3;
     if (hf_model_type == "mixtral")     return PieArch::Mixtral;
-    if (hf_model_type == "qwen3_5")     return PieArch::Qwen3_5;
+    if (hf_model_type == "qwen3_5" ||
+        hf_model_type == "qwen3_5_moe" ||
+        hf_model_type == "qwen3_5_moe_text") return PieArch::Qwen3_5;
     if (hf_model_type == "qwen3_moe")   return PieArch::Qwen3_5;
     throw std::runtime_error(
         "hf_config: unsupported model_type '" + hf_model_type + "'");
