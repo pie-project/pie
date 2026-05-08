@@ -1,6 +1,6 @@
 [package]
 name = "demo-self-correct"
-version = "0.1.1"
+version = "0.1.2"
 description = "Demo: self-correcting math via co-located verifier + Context::snapshot/take rewind (uniquely Pie)"
 authors = ["Pie Team"]
 

@@ -1,6 +1,6 @@
 [package]
 name = "demo-custom-spec"
-version = "0.1.2"
+version = "0.1.3"
 description = "Demo: speedup from a custom prompt-lookup speculator shipped inside the inferlet (uniquely Pie)"
 authors = ["Pie Team"]
 
