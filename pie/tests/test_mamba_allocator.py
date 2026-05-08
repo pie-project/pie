@@ -28,6 +28,7 @@ def _load_mamba_state():
 
 _mod = _load_mamba_state()
 MambaSlotAllocator = _mod.MambaSlotAllocator
+fork_mamba_slot = _mod.fork_mamba_slot
 
 
 def test_distinct_ctx_ids_get_distinct_slots():
@@ -105,3 +106,81 @@ def test_slots_for_accepts_iterables_and_scalars():
     s = a.slots_for(ids.tolist())
     assert len(s) == 3
     assert len(set(s)) == 3
+
+
+# ---------------------------------------------------------------------------
+# fork_mamba_slot — Phase 5b copy-on-fork helper. Pure tensor-shape work, no
+# CUDA. Uses torch CPU tensors as stand-ins for the conv/ssm state pools.
+# ---------------------------------------------------------------------------
+
+
+def test_fork_mamba_slot_noop_on_pure_attention():
+    a = MambaSlotAllocator(num_blocks=4)
+    # Pure-attention engines pass an empty mamba_layers list.
+    parent_slot, child_slot = fork_mamba_slot(101, 202, [], a)
+    assert (parent_slot, child_slot) == (-1, -1)
+    # Must not have allocated any slots.
+    assert a.in_use == 0
+
+
+def test_fork_mamba_slot_copies_state_per_layer():
+    import torch
+
+    num_blocks = 8
+    conv_shape = (3, 5)  # (channels, kernel)
+    ssm_shape = (4, 6)   # (state_size, d_inner)
+
+    a = MambaSlotAllocator(num_blocks=num_blocks)
+    # Two layers; deterministic non-zero contents per slot to detect aliasing.
+    layers = []
+    for layer_idx in range(2):
+        conv = torch.zeros((num_blocks,) + conv_shape, dtype=torch.float32)
+        ssm = torch.zeros((num_blocks,) + ssm_shape, dtype=torch.float32)
+        layers.append((f"layer_{layer_idx}", conv, ssm))
+
+    parent_ctx = 7
+    child_ctx = 11
+
+    # Parent allocates slot first; populate parent slot with layer-specific data.
+    parent_slot = a.get_or_alloc(parent_ctx)
+    for layer_idx, (_, conv, ssm) in enumerate(layers):
+        conv[parent_slot].fill_(layer_idx + 1.0)
+        ssm[parent_slot].fill_(-(layer_idx + 1.0) * 2)
+
+    # Fork.
+    p_out, c_out = fork_mamba_slot(parent_ctx, child_ctx, layers, a)
+    assert p_out == parent_slot
+    assert c_out != parent_slot
+    # Allocator state — both ctx ids tracked, distinct slots.
+    assert a.in_use == 2
+
+    # Child slot now matches parent's per-layer values; mutating child must
+    # not retroactively change parent.
+    for layer_idx, (_, conv, ssm) in enumerate(layers):
+        assert torch.equal(conv[c_out], conv[parent_slot])
+        assert torch.equal(ssm[c_out], ssm[parent_slot])
+        conv[c_out].add_(100.0)
+        ssm[c_out].add_(-100.0)
+        assert not torch.equal(conv[c_out], conv[parent_slot])
+        assert torch.equal(conv[parent_slot], torch.full(conv_shape, layer_idx + 1.0))
+
+
+def test_fork_mamba_slot_distinct_ctx_distinct_slots():
+    import torch
+
+    a = MambaSlotAllocator(num_blocks=4)
+    conv = torch.zeros((4, 2, 2))
+    ssm = torch.zeros((4, 3, 3))
+    layers = [("layer_0", conv, ssm)]
+    # Two siblings of the same parent both forked off the same parent ctx —
+    # each sibling gets its own slot, neither aliases the parent.
+    p_slot = a.get_or_alloc(1)
+    conv[p_slot].fill_(42.0)
+    a_p, a_c1 = fork_mamba_slot(1, 2, layers, a)
+    a_p2, a_c2 = fork_mamba_slot(1, 3, layers, a)
+    assert a_p == p_slot and a_p2 == p_slot
+    assert {a_c1, a_c2} == {s for s in range(4) if s != p_slot} or len({a_c1, a_c2, p_slot}) == 3
+    # Mutate child 2; parent + child 1 unchanged.
+    conv[a_c2].fill_(7.0)
+    assert torch.equal(conv[p_slot], torch.full((2, 2), 42.0))
+    assert torch.equal(conv[a_c1], torch.full((2, 2), 42.0))

@@ -28,11 +28,12 @@ the block dimension of these tensors. The CLI handshake fixes `kv_page_size`
 Host pool: skipped on the vllm driver (Phase 1.5+). For hybrid models we
 explicitly refuse a non-zero swap budget — the per-layer copy logic in
 `pie_driver/worker.py` doesn't know about mamba state, so swap-out would
-silently lose recurrent state. Capabilities still advertises
-`supports_kv_fork=False` on hybrid post-#108-phase-5a: distinct slots no
-longer alias, but a freshly-forked child has zero state until phase 5b
-copies the parent's state into the child's slot via the new
-`copy_mamba_state_shmem` op. The flag flips to True once 5b lands.
+silently lose recurrent state. Fork is now supported on hybrid:
+phase 5a's allocator gives every fork a fresh slot keyed on
+ContextId, and phase 5b's `mamba_fork_shmem` op (snapshot.rs →
+worker.py → `Engine.mamba_fork`) copies the parent's per-layer
+recurrent state into the child's slot before the runtime resolves
+`Ok(new_id)`. Capabilities advertise `supports_kv_fork=True` on hybrid.
 """
 
 from __future__ import annotations

@@ -924,6 +924,32 @@ def _leader_loop(
                 0, dst, gpu_kv[layer_idx][src].cpu()
             )
 
+    def _handle_mamba_fork_shmem(view: memoryview) -> None:
+        """Handle a METHOD_TAG_MAMBA_FORK shmem request (#108 phase 5b).
+
+        Wire format (matches `device::mamba_fork_shmem` on the Rust
+        side, little-endian):
+            u64 parent_ctx_id | u64 child_ctx_id
+
+        Routes through the same Python thread as fire_batch so the
+        per-layer state[child].copy_(state[parent]) lands BEFORE any
+        subsequent fire_batch from the inferlet's child can run on
+        GPU. Engines without a `mamba_fork` method (cuda_native,
+        portable, sgl, dummy, vllm pure-attention) silently no-op via
+        the getattr guard — runtime emits this op unconditionally.
+        """
+        import struct
+        b = bytes(view)
+        if len(b) < 16:
+            raise ValueError(
+                f"mamba_fork_shmem: payload too short ({len(b)} < 16)"
+            )
+        parent_ctx_id, child_ctx_id = struct.unpack_from("<QQ", b, 0)
+        fork_fn = getattr(engine, "mamba_fork", None)
+        if fork_fn is None:
+            return  # driver doesn't support hybrid mamba; ack as no-op
+        fork_fn(parent_ctx_id, child_ctx_id)
+
     def _shmem_loop():
         while not stop_event.is_set():
             req = _shmem_server.busy_poll_any_slot(SHMEM_BUSY_US)
@@ -962,6 +988,16 @@ def _leader_loop(
                 except Exception as e:
                     import traceback
                     print(f"[Shmem Worker Error] copy_d2h: {e}\n{traceback.format_exc()}")
+                    _shmem_server.respond(slot, msgpack.packb(str(e)), 0)
+                continue
+
+            if method_tag == _shm.METHOD_TAG_MAMBA_FORK:
+                try:
+                    _handle_mamba_fork_shmem(memoryview(view))
+                    _shmem_server.respond(slot, msgpack.packb(None), 0)
+                except Exception as e:
+                    import traceback
+                    print(f"[Shmem Worker Error] mamba_fork: {e}\n{traceback.format_exc()}")
                     _shmem_server.respond(slot, msgpack.packb(str(e)), 0)
                 continue
 

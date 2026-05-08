@@ -264,6 +264,63 @@ pub async fn copy_d2d_shmem(
     Ok(())
 }
 
+/// Notify the Python worker that a fork happened so it can copy the
+/// parent's per-request mamba state into the child's slot — shmem fast
+/// path companion to [`copy_d2d_shmem`].
+///
+/// Hybrid Transformer+Mamba models (Qwen3-Next, Qwen3.5-MoE) hold
+/// per-request recurrent state in conv/ssm slot tensors keyed by
+/// ContextId (#108 phase 5a `MambaSlotAllocator`). On fork the
+/// `copy_d2d_shmem` above handles attention KV pages, but it does not
+/// touch the mamba pools — without this op, the child resumes from a
+/// fresh (zero) recurrent state and produces incorrect output. This
+/// op tells the worker: "copy `state[parent_slot] → state[child_slot]`
+/// for every mamba layer". Routes through shmem so it lands on the
+/// same Python thread as fire_batch — child can be safely batched as
+/// soon as we resolve `Ok(new_id)`.
+///
+/// Engines without mamba layers (pure-attention vllm, cuda_native,
+/// portable, etc.) recognize the tag and ack as no-op — the worker's
+/// `Engine.mamba_fork` is a `getattr`-guarded call, gracefully empty
+/// when the driver doesn't bind the method.
+///
+/// Wire format (binary, little-endian):
+///   u64 parent_ctx_id | u64 child_ctx_id
+pub async fn mamba_fork_shmem(
+    device_idx: DeviceId,
+    parent_ctx: u64,
+    child_ctx: u64,
+) -> Result<()> {
+    let _ = device_idx; // single-device today; SHMEM_CLIENTS keyed at 0
+    let client = get_or_init_shmem_client(0)?;
+    let req_id = SHMEM_REQ_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    let send_walltime_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+
+    let (_resp_bytes, _ts) = tokio::task::block_in_place(|| {
+        client.call_with(
+            req_id,
+            crate::shmem_ipc::METHOD_TAG_MAMBA_FORK,
+            send_walltime_us,
+            |buf| {
+                let needed = 16usize;
+                if buf.len() < needed {
+                    return Err(anyhow!(
+                        "mamba_fork_shmem: req buf too small ({} < {needed})",
+                        buf.len()
+                    ));
+                }
+                buf[0..8].copy_from_slice(&parent_ctx.to_le_bytes());
+                buf[8..16].copy_from_slice(&child_ctx.to_le_bytes());
+                Ok(needed)
+            },
+        )
+    })?;
+    Ok(())
+}
+
 /// CPU → GPU page copy with explicit completion ack — shmem fast path.
 ///
 /// Companion to [`copy_d2d_shmem`]. Routes through the same shmem

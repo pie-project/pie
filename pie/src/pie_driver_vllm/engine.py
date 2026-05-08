@@ -200,27 +200,12 @@ class VllmEngine:
         )
         engine.mamba_allocator = mamba_allocator
 
-        # Hybrid one-shot operator warning. `capabilities()` reports
-        # `supports_kv_fork=False` when `is_hybrid=True`, but until
-        # ticket #108 lands a runtime admission gate the contract is
-        # advisory: an inferlet that calls `ctx.fork()` on a hybrid
-        # model still completes, with attention pages physically copied
-        # but mamba's per-request recurrent state aliased back to the
-        # parent's slot. Wrong outputs, no crash, no clear signal —
-        # exactly the failure the warning surfaces. Logged at WARNING
-        # so it shows up in the operator's startup log without spamming
-        # the per-request hot path. Removed (or downgraded to INFO)
-        # when #108 makes the gate runtime-enforced.
         if layout.is_hybrid:
-            logger.warning(
+            logger.info(
                 "vllm driver loaded a hybrid Transformer+Mamba model "
-                "(%s). supports_kv_fork=False is advertised via "
-                "capabilities, but pie's runtime does not yet enforce "
-                "it (see ticket #108). If any inferlet calls ctx.fork() "
-                "on this model, mamba's per-request recurrent state "
-                "will alias the parent's slot and produce silently-wrong "
-                "outputs. Route fork-using inferlets to cuda_native or "
-                "portable until #108 lands.",
+                "(%s) with supports_kv_fork=True (#108 phase 5a/5b: "
+                "ContextId-keyed allocator + runtime-side mamba "
+                "copy-on-fork wired).",
                 loaded.arch_type,
             )
 
@@ -621,6 +606,35 @@ class VllmEngine:
             context_ids=[0] * num_reqs,
         )
 
+    def mamba_fork(self, parent_ctx_id: int, child_ctx_id: int) -> None:
+        """Copy parent's mamba recurrent state into the child's slot (#108 phase 5b).
+
+        Wired to the runtime's `device::mamba_fork_shmem` op via the
+        `pie_driver/worker.py` shmem dispatcher. Always called on fork
+        from pie's runtime — no-op on pure-attention (`mamba_layers`
+        empty) so the runtime can emit the op unconditionally.
+
+        On hybrid models the actual tensor copy lives in
+        `mamba_state.fork_mamba_slot`; we delegate so the per-layer
+        loop is testable in isolation without an Engine instance.
+        """
+        if self.mamba_allocator is None:
+            # Engine constructed without `Engine.load` (unit tests bypass
+            # the loader). On non-hybrid that's fine — no state to copy.
+            # On hybrid this would indicate a wiring bug; surface it.
+            if self.is_hybrid:
+                raise RuntimeError(
+                    "VllmEngine.mamba_fork called on hybrid model with "
+                    "no MambaSlotAllocator wired. Engine.load must "
+                    "construct one (#108 phase 5a)."
+                )
+            return
+        from .mamba_state import fork_mamba_slot
+
+        fork_mamba_slot(
+            parent_ctx_id, child_ctx_id, self.mamba_layers, self.mamba_allocator
+        )
+
     @torch.inference_mode()
     def fire_batch(
         self,
@@ -916,11 +930,15 @@ class VllmEngine:
             # causal attention and silently drops user masks. Inferlets
             # that need non-causal patterns must run on `native`.
             supports_user_attention_mask=False,
-            # Hybrid Transformer+Mamba models can't safely fork on the
-            # vllm driver yet — pie's per-page copy_d2d/h2d/d2h handlers
-            # don't migrate mamba's per-request recurrent state. Pure-
-            # attention models on this driver fork like before. See
-            # ticket #107 / #108 for the runtime-cooperation fix.
-            supports_kv_fork=not self.is_hybrid,
+            # Phase 5a's MambaSlotAllocator gives every fork a fresh
+            # slot keyed on its (distinct) ContextId, and phase 5b's
+            # `mamba_fork_shmem` op (snapshot.rs → worker.py →
+            # `Engine.mamba_fork`) copies parent's per-layer recurrent
+            # state into that slot before the runtime resolves
+            # `Ok(new_id)`. Hybrid forks now produce a child that
+            # inherits the parent's exact mamba state up to the fork
+            # point — same correctness guarantee as the attention KV
+            # pages that copy_d2d_shmem already handles.
+            supports_kv_fork=True,
             snapshot_dir=str(self.snapshot_dir),
         )

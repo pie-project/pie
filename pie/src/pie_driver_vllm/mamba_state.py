@@ -125,3 +125,64 @@ class MambaSlotAllocator:
     @property
     def in_use(self) -> int:
         return len(self._alive)
+
+
+def fork_mamba_slot(
+    parent_ctx_id: int,
+    child_ctx_id: int,
+    mamba_layers,
+    allocator: "MambaSlotAllocator",
+) -> tuple[int, int]:
+    """Copy parent's per-layer mamba state into the child's slot (#108 phase 5b).
+
+    Called by the worker's shmem dispatch when the runtime emits a
+    `mamba_fork(parent, child)` notification after `ctx.fork()` (see
+    `runtime/src/context/snapshot.rs::fork`). Routed on the same Python
+    thread as `fire_batch` to preserve CUDA stream FIFO order against
+    the child's first forward pass.
+
+    `mamba_layers` is `engine.mamba_layers` — the list
+    `[(layer_name, conv_state, ssm_state), ...]` from
+    `kv_cache.allocate_and_bind_kv_cache`. Empty on non-hybrid models;
+    function returns early.
+
+    Allocator is the engine's `MambaSlotAllocator`. We **must** use the
+    allocator's existing slot for the parent (it was set when the
+    parent's most recent fire_batch staged the GDN metadata). For the
+    child we ALWAYS allocate a fresh slot via `get_or_alloc` rather than
+    blindly trusting that the child's first batch hasn't arrived yet —
+    in the synchronous shmem path the runtime awaits this op before
+    `Ok(new_id)` returns to the inferlet, so the child cannot have
+    appeared in any prior fire_batch yet, but that ordering is a
+    runtime invariant; we don't depend on it here.
+
+    Returns `(parent_slot, child_slot)` for logging / test assertions.
+    """
+    if not mamba_layers:
+        # Non-hybrid driver / pure-attention model: no recurrent state
+        # to migrate. Cheap fast path; called on every fork even on
+        # non-hybrid since the runtime emits the op unconditionally.
+        return (-1, -1)
+
+    parent_slot = allocator.get_or_alloc(parent_ctx_id)
+    child_slot = allocator.get_or_alloc(child_ctx_id)
+    if parent_slot == child_slot:
+        # Should never happen — distinct ContextIds always map to
+        # distinct slots under MambaSlotAllocator's invariants. Fail
+        # loud so a future allocator regression doesn't silently
+        # alias parent and child here.
+        raise RuntimeError(
+            f"fork_mamba_slot: parent and child mapped to the same slot "
+            f"({parent_slot}); parent_ctx={parent_ctx_id} "
+            f"child_ctx={child_ctx_id}. Allocator invariant violation."
+        )
+
+    for _layer_name, conv_state, ssm_state in mamba_layers:
+        # `conv_state` and `ssm_state` shape: (num_blocks, *spec.shapes[i]).
+        # Slot ids index dim-0. Per-layer cost: two contiguous slice
+        # copies, no host sync; runs on the calling Python thread
+        # (worker shmem dispatcher), which is the same thread that
+        # later issues the child's fire_batch.
+        conv_state[child_slot].copy_(conv_state[parent_slot])
+        ssm_state[child_slot].copy_(ssm_state[parent_slot])
+    return (parent_slot, child_slot)

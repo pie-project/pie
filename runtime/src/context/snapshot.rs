@@ -181,22 +181,28 @@ impl ContextManager {
 
             match result {
                 Ok((new_id, needs_d2d_shmem, src_pages, dst_pages)) => {
-                    if needs_d2d_shmem {
-                        // Working-page d2d via shmem: routes to the
-                        // SAME Python thread that handles fire_batch,
-                        // so CPU launch order is preserved (FIFO on
-                        // legacy default stream → kernels run in
-                        // launch order on GPU). We await the ack
-                        // before resolving Ok(new_id) — that ensures
-                        // any later fire_batch from the inferlet
-                        // arrives at the shmem queue *after* the d2d
-                        // has been dispatched. Closes both races in
-                        // pie-project/pie#339 without a cold-path
-                        // round-trip. See
-                        // `project_pie_kv_bleed_d2d_fork_race.md`.
-                        let device = captured_device;
-                        let dev_idx_for_log = captured_dev_idx;
-                        tokio::spawn(async move {
+                    // Working-page d2d via shmem when needed; same Python
+                    // thread as fire_batch, so CPU launch order is
+                    // preserved (FIFO on legacy default stream → kernels
+                    // run in launch order on GPU). Ack-await before
+                    // resolving Ok(new_id) — any later fire_batch from
+                    // the inferlet arrives at the shmem queue *after*
+                    // the d2d has been dispatched (closes pie#339; see
+                    // `project_pie_kv_bleed_d2d_fork_race.md`).
+                    //
+                    // After the d2d (or directly when src has no
+                    // working pages), notify the worker for hybrid
+                    // mamba state copy-on-fork via
+                    // `device::mamba_fork_shmem` (#108 phase 5b). Same
+                    // ack-await pattern. Engines without mamba layers
+                    // ack as no-op via `Engine.mamba_fork` getattr-
+                    // guard, so this is unconditional from the
+                    // runtime's side.
+                    let device = captured_device;
+                    let dev_idx_for_log = captured_dev_idx;
+                    let parent_id = id;
+                    tokio::spawn(async move {
+                        if needs_d2d_shmem {
                             if let Err(e) = device::copy_d2d_shmem(
                                 device, &src_pages, &dst_pages,
                             ).await {
@@ -207,11 +213,19 @@ impl ContextManager {
                                 let _ = response.send(Err(e));
                                 return;
                             }
-                            let _ = response.send(Ok(new_id));
-                        });
-                    } else {
+                        }
+                        if let Err(e) = device::mamba_fork_shmem(
+                            device, parent_id as u64, new_id as u64,
+                        ).await {
+                            tracing::error!(
+                                ctx = new_id, device = dev_idx_for_log,
+                                "fork: mamba_fork_shmem failed: {e:#}"
+                            );
+                            let _ = response.send(Err(e));
+                            return;
+                        }
                         let _ = response.send(Ok(new_id));
-                    }
+                    });
                 }
                 Err(e) => {
                     let _ = response.send(Err(e));
