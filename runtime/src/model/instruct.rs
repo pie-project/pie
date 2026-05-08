@@ -114,7 +114,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
     use self::qwen3::{QwenInstruct, ChatMLConfig};
 
     match arch_name {
-        "qwen3" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
+        "qwen3" | "qwen3_5" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
             has_thinking: true,
             has_tools: true,
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
@@ -165,6 +165,23 @@ mod tests {
             ReasoningEvent::Start => {}
             other => panic!(
                 "create(\"qwen3\") gave a no-op reasoning decoder: {other:?}"
+            ),
+        }
+    }
+
+    /// Qwen3.5 reuses the qwen3 ChatML template (thinking + tools, same stop
+    /// tokens). Pinned here so the qwen3_5 arm doesn't silently regress to
+    /// the no-thinking fallback.
+    #[test]
+    fn qwen3_5_pie_name_enables_thinking() {
+        let tok = make_tok();
+        let inst = create("qwen3_5", tok.clone());
+        let mut dec = inst.reasoning_decoder();
+        let think_id = tok.encode("<think>");
+        match dec.feed(&think_id) {
+            ReasoningEvent::Start => {}
+            other => panic!(
+                "create(\"qwen3_5\") gave a no-op reasoning decoder: {other:?}"
             ),
         }
     }

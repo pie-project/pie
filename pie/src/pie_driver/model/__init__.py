@@ -169,7 +169,7 @@ def _attr_or_key(obj, key, default):
 register("llama3",   "pie_driver.model.llama3",   aliases=("l4ma",), hf_model_types=("llama",))
 register("qwen2",    "pie_driver.model.qwen2",                       hf_model_types=("qwen2",))
 register("qwen3",    "pie_driver.model.qwen3",                       hf_model_types=("qwen3",))
-register("qwen3_5",  "pie_driver.model.qwen3_5",                     hf_model_types=("qwen3_5",))
+register("qwen3_5",  "pie_driver.model.qwen3_5",                     hf_model_types=("qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text"))
 register("phi3",     "pie_driver.model.phi3",                        hf_model_types=("phi3",))
 register("mixtral",  "pie_driver.model.mixtral",                     hf_model_types=("mixtral",))
 register("gemma2",   "pie_driver.model.gemma2",                      hf_model_types=("gemma2",))
