@@ -86,8 +86,40 @@ def allocate_and_bind_kv_cache(
     if not attn_layers:
         raise RuntimeError("No attention layers found in vllm forward context.")
 
+    # Resolve every layer's spec up front so we can detect heterogeneous
+    # layouts (hybrid Transformer + Mamba/GDN models like Qwen3.5 / Qwen3-Next)
+    # and refuse them with a clear error instead of a downstream AttributeError
+    # on `MambaSpec.num_kv_heads`. Hybrid support requires a parallel
+    # state-cache allocator + a GDN attention-metadata builder inside this
+    # driver — tracked as the layer-3 follow-up to pie-agents#102.
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+
+    layer_specs: dict[str, KVCacheSpec] = {}
     with set_current_vllm_config(vllm_config):
-        first_spec = next(iter(attn_layers.values())).get_kv_cache_spec(vllm_config)
+        for name, layer in attn_layers.items():
+            layer_specs[name] = layer.get_kv_cache_spec(vllm_config)
+
+    non_full_attention = {
+        name: type(spec).__name__
+        for name, spec in layer_specs.items()
+        if not isinstance(spec, FullAttentionSpec)
+    }
+    if non_full_attention:
+        # Spell out the exact spec mix so the error survives in logs and
+        # points the reader at the right follow-up.
+        sample = ", ".join(f"{n}={t}" for n, t in list(non_full_attention.items())[:5])
+        raise NotImplementedError(
+            f"pie_driver_vllm only supports models whose attention layers all "
+            f"return FullAttentionSpec; got {len(non_full_attention)} layer(s) "
+            f"with a different spec ({sample}{'...' if len(non_full_attention) > 5 else ''}). "
+            f"Hybrid Transformer + Mamba/GDN models (e.g. Qwen3.5 / Qwen3-Next "
+            f"with model_type='qwen3_5_moe' or 'qwen3_next') need a separate "
+            f"per-spec allocator and a GDN attention-metadata builder inside "
+            f"pie_driver_vllm — not yet implemented. Use the cuda_native or "
+            f"portable driver for these models, or track pie-agents#102 layer 3."
+        )
+
+    first_spec = next(iter(layer_specs.values()))
     page_size_bytes = first_spec.page_size_bytes
     block_size = first_spec.block_size
     num_kv_heads = first_spec.num_kv_heads
