@@ -27,10 +27,11 @@
 //! other.
 
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use inferlet::{
-    Context, Result, chat,
+    Context, Result, Speculator, chat,
     model::Model,
     runtime,
     sample::Sampler,
@@ -209,7 +210,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
     Ok(ModeResult { tokens, elapsed, drafts_proposed: 0, drafts_accepted: 0 })
 }
 
-// ── SPECULATED: prompt-lookup speculator + manual draft/verify ──────────────
+// ── SPECULATED: prompt-lookup speculator via Generator::speculator ────────
 async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "SPECULATED",
@@ -227,25 +228,29 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
     ctx.system(SYSTEM);
     ctx.user(&input.task);
     ctx.cue();
+    // Prefill the prompt as a standalone forward, then bootstrap the
+    // first model token, then enter the speculator loop. Letting the
+    // Generator fuse prompt prefill with the first verify pass works on
+    // some backends but not others: greedy-argmax is sensitive to small
+    // numerical differences between "prefill alone" and "prefill +
+    // multi-position samplers" kernel shapes, and on cuda 0.1.0 the
+    // fused shape produces logits that drift off the greedy trajectory.
+    // The split-pass pattern matches inferlets/cacheback-decoding.
     ctx.flush().await?;
 
-    // Build the initial pool from system + user + cue tokens. The
-    // speculator searches this pool (and its own accepted output) for
-    // n-gram matches.
     let tokenizer = model.tokenizer();
     let prompt_str = format!("{}\n{}", SYSTEM, input.task);
-    // We can't easily reconstruct the exact tokenization the chat
-    // template used, so seed the lookup pool from the user task itself
-    // (tokenized stand-alone). Misalignment is fine — every token added
-    // by the model after bootstrap is added to the pool too, and the
-    // n-gram match still finds suffix repetitions across both halves.
+    // Pool seeded from the user task tokenized stand-alone. Chat
+    // template alignment isn't critical: accepted tokens grow the pool
+    // as generation progresses, so n-gram suffix matches still find
+    // prompt-repetition hits across both halves.
     let prompt_tokens = tokenizer.encode(&prompt_str);
-
     let stop_tokens = chat::stop_tokens(model);
 
-    // Bootstrap: feed the last cue token to read the first prediction.
-    // (The cue tokens are already committed via flush; this trick is
-    // standard — see inferlets/cacheback-decoding for prior art.)
+    // Bootstrap: re-feed the last cue token at the next free slot and
+    // sample the model's first response token. The cue is already in
+    // KV from flush(); duplicating its last token kicks the decoder
+    // out of prefill into a normal sampling step.
     let cue = chat::cue(model);
     let trigger = *cue.last().ok_or("empty cue")?;
     let first_token = {
@@ -255,6 +260,26 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
         let out = pass.execute().await?;
         out.token(h).ok_or("bootstrap produced no token")?
     };
+    // Stage first_token as iter 1's pending. The Generator drains
+    // buffer into pending on each `next()`, so iter 1 forwards it at
+    // position seq_len; drafts then start at seq_len + 1.
+    ctx.append(&[first_token]);
+
+    let stats = Arc::new(Mutex::new(SpecStats::default()));
+    let cursor = ctx.seq_len() + ctx.buffer().len() as u32;
+    // Pre-seed the pool with first_token so iter 1's n-gram lookup
+    // searches suffix [last_prompt_tok, first_token]. Without this seed
+    // iter 1 would draft against a model-token-free pool and the very
+    // first lookup would miss.
+    let mut pool = prompt_tokens;
+    pool.push(first_token);
+    let drafter = PromptLookup::new(
+        pool,
+        input.ngram_n,
+        input.draft_len,
+        cursor,
+        Arc::clone(&stats),
+    );
 
     let mut decoder = chat::Decoder::new(model);
     let mut stripper = ThinkStripper::new();
@@ -263,9 +288,10 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
     print!("  {}>{} ", CYAN, RESET);
     let _ = io::stdout().flush();
 
-    // Render bootstrap token immediately.
     let mut tokens = 0usize;
-    let mut hit_stop = false;
+    let mut rounds = 0usize;
+
+    // Render the bootstrap token (sampled outside the Generator loop).
     if let chat::Event::Delta(s) = decoder.feed(&[first_token])? {
         let visible = stripper.process(&s);
         if !visible.is_empty() {
@@ -278,105 +304,57 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
         }
     }
     tokens += 1;
-    if stop_tokens.contains(&first_token) {
-        hit_stop = true;
-    }
 
-    let mut drafter = PromptLookup::new(prompt_tokens, input.ngram_n, input.draft_len);
-    drafter.accept(&[first_token]);
+    // If the very first sample is a stop token, skip the loop entirely.
+    let bootstrap_done = stop_tokens.contains(&first_token) || tokens >= input.max_tokens;
 
-    let mut anchor = first_token;
-    let mut rounds = 0usize;
-    let mut drafts_proposed = 0usize;
-    let mut drafts_accepted = 0usize;
+    let mut g = ctx
+        .generate(Sampler::Argmax)
+        .max_tokens(input.max_tokens.saturating_sub(tokens))
+        .stop(&stop_tokens)
+        .speculator(drafter);
 
-    while !hit_stop && tokens < input.max_tokens {
-        let drafts = drafter.draft();
-
-        // Build the verifier input: anchor + drafts.
-        let mut verify_in = vec![anchor];
-        verify_in.extend_from_slice(&drafts);
-        let n_in = verify_in.len();
-
-        // Verify with samplers at every position.
-        let mut pass = ctx.forward();
-        pass.input(&verify_in);
-        let sample_indices: Vec<u32> = (0..n_in as u32).collect();
-        let h = pass.sample(&sample_indices, Sampler::Argmax);
-        let out = pass.execute().await?;
-        let verified = out.tokens_at(h);
-        if verified.is_empty() {
-            break;
-        }
-
-        // accepted_count = 1 (free token) + matching drafts prefix.
-        let mut accepted_count = 1usize;
-        for i in 0..drafts.len().min(verified.len().saturating_sub(0)) {
-            if i + 1 > verified.len() {
-                break;
+    if !bootstrap_done {
+        while let Some(step) = g.next()? {
+            let out = step.execute().await?;
+            if out.tokens.is_empty() {
+                continue;
             }
-            // verified[i] is the model's pick at slot i; for draft[i] to
-            // be accepted, verified[i] must equal draft[i].
-            if i < drafts.len() && i < verified.len() && verified[i] == drafts[i] {
-                accepted_count += 1;
-            } else {
-                break;
-            }
-        }
-        let kept: Vec<u32> = verified[..accepted_count.min(verified.len())].to_vec();
-
-        // Truncate rejected drafts from KV.
-        let n_rejected = (n_in - kept.len()) as u32;
-        if n_rejected > 0 {
-            ctx.truncate(n_rejected);
-        }
-
-        // Stats.
-        rounds += 1;
-        drafts_proposed += drafts.len();
-        drafts_accepted += accepted_count - 1; // free token doesn't count
-
-        // Stream the kept tokens. Color the draft-accepted run green so
-        // the visual difference vs BASELINE (steady drip) is obvious.
-        for (idx, &t) in kept.iter().enumerate() {
-            let from_draft = idx > 0;
-            if let chat::Event::Delta(s) = decoder.feed(&[t])? {
-                let visible = stripper.process(&s);
-                if !visible.is_empty() {
-                    let rendered = visible.replace('\n', "\n    ");
-                    if from_draft {
-                        print!("{}{}{}", BOLD, GREEN, rendered);
-                    } else {
-                        print!("{}", rendered);
-                    }
-                    print!("{}", RESET);
-                    let _ = io::stdout().flush();
-                    if input.delay > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
+            rounds += 1;
+            // out.tokens shape: [free_pick, ...accepted_drafts...]. Render
+            // the free pick in normal cyan stream color; color draft-
+            // accepted tokens green/bold so the burst is visible against
+            // BASELINE's steady drip.
+            for (idx, &t) in out.tokens.iter().enumerate() {
+                let from_draft = idx > 0;
+                if let chat::Event::Delta(s) = decoder.feed(&[t])? {
+                    let visible = stripper.process(&s);
+                    if !visible.is_empty() {
+                        let rendered = visible.replace('\n', "\n    ");
+                        if from_draft {
+                            print!("{}{}{}", BOLD, GREEN, rendered);
+                        } else {
+                            print!("{}", rendered);
+                        }
+                        print!("{}", RESET);
+                        let _ = io::stdout().flush();
+                        if input.delay > 0 {
+                            wstd::task::sleep(wstd::time::Duration::from_millis(input.delay))
+                                .await;
+                        }
                     }
                 }
+                tokens += 1;
             }
-            tokens += 1;
-            if stop_tokens.contains(&t) {
-                hit_stop = true;
-                break;
-            }
-            if tokens >= input.max_tokens {
-                break;
-            }
-        }
-
-        drafter.accept(&kept);
-
-        if let Some(&last) = kept.last() {
-            anchor = last;
-        } else {
-            break;
         }
     }
 
     let elapsed = start.elapsed();
     println!();
+    let (drafts_proposed, drafts_accepted) = {
+        let s = stats.lock().unwrap();
+        (s.proposed, s.accepted)
+    };
     print_footer_smart(
         "SPECULATED",
         GREEN,
@@ -387,7 +365,6 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
         drafts_accepted,
     );
 
-    let _ = rounds;
     Ok(ModeResult {
         tokens,
         elapsed,
@@ -446,39 +423,57 @@ impl ThinkStripper {
     }
 }
 
+#[derive(Default)]
+struct SpecStats {
+    proposed: usize,
+    accepted: usize,
+}
+
 struct PromptLookup {
     pool: Vec<u32>,
     ngram_n: usize,
     draft_len: usize,
+    /// Position the next draft would occupy in the model's KV.
+    cursor: u32,
+    /// Drafts proposed in the most recent `draft()` call. Read by
+    /// `accept()` to attribute hits.
+    last_proposed: usize,
+    stats: Arc<Mutex<SpecStats>>,
 }
 
 impl PromptLookup {
-    fn new(prompt_tokens: Vec<u32>, ngram_n: usize, draft_len: usize) -> Self {
-        Self { pool: prompt_tokens, ngram_n: ngram_n.max(1), draft_len: draft_len.max(1) }
-    }
-
-    fn accept(&mut self, tokens: &[u32]) {
-        self.pool.extend_from_slice(tokens);
+    fn new(
+        prompt_tokens: Vec<u32>,
+        ngram_n: usize,
+        draft_len: usize,
+        cursor: u32,
+        stats: Arc<Mutex<SpecStats>>,
+    ) -> Self {
+        Self {
+            pool: prompt_tokens,
+            ngram_n: ngram_n.max(1),
+            draft_len: draft_len.max(1),
+            cursor,
+            last_proposed: 0,
+            stats,
+        }
     }
 
     /// Find the most recent occurrence of the trailing n-gram in the
     /// pool (excluding the trailing n-gram itself) and propose the
     /// `draft_len` tokens that follow.
-    fn draft(&self) -> Vec<u32> {
+    fn lookup(&self) -> Vec<u32> {
         let n = self.ngram_n;
         let pool_len = self.pool.len();
         if pool_len < n + 1 {
             return Vec::new();
         }
         let suffix = &self.pool[pool_len - n..pool_len];
-        // Search positions [0, pool_len - n - 1] for matches; backward
-        // for recency.
         let last_search = pool_len - n - 1;
         for i in (0..=last_search).rev() {
             if &self.pool[i..i + n] == suffix {
                 let start = i + n;
-                // Don't draft into the suffix itself (would just feed
-                // back what's already there).
+                // Don't draft into the suffix itself.
                 let end_cap = pool_len - n;
                 let end = (start + self.draft_len).min(end_cap);
                 if start < end {
@@ -489,6 +484,32 @@ impl PromptLookup {
         }
         Vec::new()
     }
+}
+
+impl Speculator for PromptLookup {
+    fn draft(&mut self) -> (Vec<u32>, Vec<u32>) {
+        let drafts = self.lookup();
+        self.last_proposed = drafts.len();
+        let positions: Vec<u32> = (self.cursor..self.cursor + drafts.len() as u32).collect();
+        (drafts, positions)
+    }
+
+    fn accept(&mut self, accepted: &[u32]) {
+        // accepted[0] is the anchor's free pick (not from drafts).
+        // The remaining tokens, up to last_proposed, are draft hits.
+        let n_drafts_hit = accepted.len().saturating_sub(1).min(self.last_proposed);
+        {
+            let mut s = self.stats.lock().unwrap();
+            s.proposed += self.last_proposed;
+            s.accepted += n_drafts_hit;
+        }
+        self.last_proposed = 0;
+        self.pool.extend_from_slice(accepted);
+        self.cursor += accepted.len() as u32;
+    }
+
+    // rollback: pool only grows via accept(), so there's nothing to undo
+    // on draft rejection. Default no-op fits.
 }
 
 // ── TUI helpers ────────────────────────────────────────────────────────
