@@ -7,6 +7,7 @@ This module owns the "what kind of vllm model are we running" decisions so
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,8 @@ import torch
 import torch.distributed as dist
 
 from pie_driver.config import RuntimeConfig
+
+logger = logging.getLogger(__name__)
 
 
 # Map pie's RuntimeConfig.activation_dtype (torch.dtype) to vllm's string form.
@@ -182,14 +185,13 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
             # place (it is not frozen); capabilities() will return this value.
             if driver_config.max_num_batched_tokens is None:
                 driver_config.max_num_batched_tokens = 2048
-            print(
-                f"[pie_driver_vllm] setting vllm max_num_batched_tokens={mpe} "
-                f"(from HF max_position_embeddings) for compile-range coverage; "
-                f"pinning pie BatchAccumulator cap to "
-                f"{driver_config.max_num_batched_tokens} so per-batch memory stays bounded. "
-                f"Set [model.X.driver.vllm].max_num_batched_tokens explicitly to "
-                f"override either.",
-                flush=True,
+            logger.info(
+                "setting vllm max_num_batched_tokens=%d "
+                "(from HF max_position_embeddings) for compile-range coverage; "
+                "pinning pie BatchAccumulator cap to %d so per-batch memory stays bounded. "
+                "Set [model.X.driver.vllm].max_num_batched_tokens explicitly to override either.",
+                mpe,
+                driver_config.max_num_batched_tokens,
             )
         else:
             # Probe failed (offline cache miss, malformed config.json, network
@@ -202,17 +204,17 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
             # `max_model_len > 2048`, but only after the operator sees what
             # looks like a regression in this PR's fix. Emit a loud,
             # grep-able warning so it's not silent.
-            print(
-                f"[pie_driver_vllm] WARNING: HF max_position_embeddings probe "
-                f"for {config.hf_repo!r} failed ({probe_err!r}); "
-                f"engine_kwargs['max_num_batched_tokens'] left unset. "
-                f"vllm will use its chat-model default (2048) and the "
-                f"post-create_engine_config backstop will widen the compile "
-                f"range based on model_config.max_model_len after construction. "
-                f"If you see Shape:N out-of-(1,2048) crashes after this, the "
-                f"backstop also failed — re-check vllm version and pie's "
-                f"_set_compile_ranges integration.",
-                flush=True,
+            logger.warning(
+                "HF max_position_embeddings probe for %r failed (%r); "
+                "engine_kwargs['max_num_batched_tokens'] left unset. "
+                "vllm will use its chat-model default (2048) and the "
+                "post-create_engine_config backstop will widen the compile "
+                "range based on model_config.max_model_len after construction. "
+                "If you see Shape:N out-of-(1,2048) crashes after this, the "
+                "backstop also failed — re-check vllm version and pie's "
+                "_set_compile_ranges integration.",
+                config.hf_repo,
+                probe_err,
             )
 
     args = EngineArgs(**engine_kwargs)
@@ -246,11 +248,11 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
         if getattr(sc, "max_num_prefill_tokens", None) == old:
             sc.max_num_prefill_tokens = mc.max_model_len
         vllm_config._set_compile_ranges()
-        print(
-            f"[pie_driver_vllm] backstop raised max_num_batched_tokens "
-            f"{old} -> {mc.max_model_len} (resolved max_model_len exceeded "
-            f"the pre-construction estimate from HF config).",
-            flush=True,
+        logger.info(
+            "backstop raised max_num_batched_tokens %d -> %d "
+            "(resolved max_model_len exceeded the pre-construction estimate from HF config).",
+            old,
+            mc.max_model_len,
         )
 
     # Decode-side cudagraph (Lever 5, ticket #100). Pie drives the model

@@ -8,6 +8,7 @@ imported directly from `pie_driver`.
 
 from __future__ import annotations
 
+import logging
 import random
 
 import numpy as np
@@ -17,6 +18,28 @@ from pie_driver.config import RuntimeConfig
 from pie_driver import telemetry
 
 from . import _require_vllm
+
+logger = logging.getLogger(__name__)
+
+
+# Existing `_log(msg, level: str)` helpers in this module accept string
+# level names like "INFO" / "WARN" / "DEBUG" (matching pie's log_queue
+# convention). Map them to stdlib logging integer levels so we can route
+# through `logger.log(level_int, ...)` without a method lookup per call.
+# `WARN` is normalized to `WARNING` (stdlib's canonical name).
+_LEVEL_NAME_TO_INT = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARN": logging.WARNING,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def _level_to_int(level: str) -> int:
+    """Map a pie log_queue level string to a stdlib logging int level."""
+    return _LEVEL_NAME_TO_INT.get(level.upper(), logging.INFO)
 
 
 class VllmEngine:
@@ -150,9 +173,9 @@ class VllmEngine:
         # and surface downstream as flashinfer "max() iterable empty".
         try:
             engine._warmup_compile(_log)
-        except Exception as _e:
-            import traceback as _tb
-            print(f"[vllm warmup] FAILED: {_e}\n{_tb.format_exc()}", flush=True)
+        except Exception:
+            # logger.exception attaches the active traceback automatically.
+            logger.exception("vllm warmup FAILED")
             raise
 
         # Lever 5 (ticket #100): wrap the model with vllm's FULL-mode
@@ -163,12 +186,9 @@ class VllmEngine:
         # through set_forward_context.
         try:
             engine._capture_cudagraphs(_log)
-        except Exception as _e:
-            import traceback as _tb
-            print(
-                f"[vllm cudagraph] FAILED: {_e}\n{_tb.format_exc()}",
-                flush=True,
-            )
+        except Exception:
+            # logger.exception attaches the active traceback automatically.
+            logger.exception("vllm cudagraph FAILED")
             raise
 
         return engine
@@ -192,7 +212,7 @@ class VllmEngine:
         device = self.forward_pass.device
 
         def _log(msg: str, level: str = "INFO") -> None:
-            print(f"[vllm warmup] {msg}", flush=True)
+            logger.log(_level_to_int(level), "warmup: %s", msg)
             if log_fn is not None:
                 log_fn(msg, level)
 
@@ -329,7 +349,7 @@ class VllmEngine:
         device = self.forward_pass.device
 
         def _log(msg: str, level: str = "INFO") -> None:
-            print(f"[vllm cudagraph] {msg}", flush=True)
+            logger.log(_level_to_int(level), "cudagraph: %s", msg)
             if log_fn is not None:
                 log_fn(msg, level)
 
