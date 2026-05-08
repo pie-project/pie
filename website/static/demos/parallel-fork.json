@@ -208,5 +208,5 @@
       "value": "// 1 prefill + Context::fork() ×4 — KV pages shared across all forks\nlet mut base = Context::new(&model)?;\nbase.system(SYSTEM).user(&question);\nbase.flush().await?;                      // prefill ONCE — KV pages shared\n\nlet mut ctxs = Vec::with_capacity(n);\nfor _ in 0..n {\n    let mut c = base.fork()?;             // every fork sees the same prefix\n    c.cue();\n    ctxs.push(c);\n}\n\nlet futs = ctxs.into_iter().map(|mut c| async move {\n    c.generate(Sampler::TopP { temperature: 0.7, p: 0.95 })\n        .max_tokens(160)\n        .collect_text().await\n});\nlet answers = future::join_all(futs).await;"
     }
   },
-  "runCommand": "pie run demo-parallel-fork -- --num-forks 4 --temperature 0.7"
+  "runCommand": "pie run --stdout demo-parallel-fork -- --num-forks 4 --temperature 0.7"
 }

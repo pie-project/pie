@@ -227,5 +227,5 @@
       "value": "// Ship a custom drafter with the request. Generator verifies drafts.\nstruct PromptLookup {\n    pool: Vec<u32>,\n    cursor: u32,\n    ngram_n: usize,\n    draft_len: usize,\n}\n\nimpl Speculator for PromptLookup {\n    fn draft(&mut self) -> (Vec<u32>, Vec<u32>) {\n        let drafts = lookup_suffix_match(&self.pool, self.ngram_n, self.draft_len);\n        let positions = (self.cursor..self.cursor + drafts.len() as u32).collect();\n        (drafts, positions)\n    }\n\n    fn accept(&mut self, accepted: &[u32]) {\n        // accepted[0] is the free model token; the rest are verified drafts.\n        self.pool.extend_from_slice(accepted);\n        self.cursor += accepted.len() as u32;\n    }\n}\n\nlet drafter = PromptLookup::new(prompt_tokens, ngram_n, draft_len, cursor);\nlet mut generator = ctx.generate(Sampler::Argmax)\n    .max_tokens(max_tokens)\n    .stop(&chat::stop_tokens(&model))\n    .speculator(drafter);\n\nwhile let Some(step) = generator.next()? {\n    let out = step.execute().await?;      // [free token, accepted drafts...]\n    stream_tokens(&out.tokens)?;\n}"
     }
   },
-  "runCommand": "pie run demo-custom-spec -- --draft-len 8 --ngram-n 2"
+  "runCommand": "pie run --stdout demo-custom-spec -- --draft-len 8 --ngram-n 2"
 }

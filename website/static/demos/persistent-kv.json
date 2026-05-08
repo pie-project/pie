@@ -117,5 +117,5 @@
       "value": "// Same engine instance: save the post-turn-1 KV cache, then reopen it.\nlet mut ctx = Context::new(&model)?;\nctx.system(SYS).user(&turn1).cue();\nlet _answer1 = ctx.generate(Sampler::Argmax)\n    .max_tokens(100)\n    .collect_text().await?;\nctx.flush().await?;\nctx.save(\"conv-42\")?;                     // named KV snapshot\n\nlet mut ctx = Context::open(&model, \"conv-42\")?;\nlet before = ctx.seq_len();\nctx.user(&turn2).cue();                   // only new tokens enter buffer\nlet turn2_prefill = ctx.seq_len() - before + ctx.buffer().len() as u32;\nlet _answer2 = ctx.generate(Sampler::Argmax)\n    .max_tokens(100)\n    .collect_text().await?;"
     }
   },
-  "runCommand": "pie run demo-persistent-kv -- --mode both --turn1 \"What is Python?\" --turn2 \"Name three common uses.\""
+  "runCommand": "pie run --stdout demo-persistent-kv -- --mode both --turn1 \"What is Python?\" --turn2 \"Name three common uses.\""
 }

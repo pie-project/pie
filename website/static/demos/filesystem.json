@@ -107,5 +107,5 @@
       "value": "// memoize via /scratch/answers.json — second call is a file read\nlet key = cache_key(&question);\nlet cache = read_cache();                 // /scratch/answers.json\n\nif let Some(text) = cache.get(&key) {\n    return Ok(text.clone());              // hit — no model call\n}\n\nlet text = generate_answer(&model, &question).await?;\nlet mut cache = read_cache();\ncache.insert(key, text.clone());\n\nfs::write(\n    \"/scratch/answers.json\",\n    serde_json::to_vec(&cache).map_err(|e| e.to_string())?,\n).map_err(|e| e.to_string())?;\nOk(text)"
     }
   },
-  "runCommand": "# enable filesystem in ~/.pie/config.toml: allow_fs = true\npie run demo-filesystem -- --question \"What is the speed of light?\""
+  "runCommand": "# enable filesystem in ~/.pie/config.toml: allow_fs = true\npie run --stdout demo-filesystem -- --question \"What is the speed of light?\""
 }

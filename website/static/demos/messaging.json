@@ -127,5 +127,5 @@
       "value": "// Reproducible one-shot path used by this demo.\n// The same topic API can connect separate inferlets on a shared engine.\nlet idea = generate_with(SYS_IDEA, &seed).await?;\n\nlet plot_sub = messaging::subscribe(\"demo-idea-to-plot\");\nmessaging::broadcast(\"demo-idea-to-plot\", idea.trim());\nlet idea = plot_sub.get_async().await.unwrap();\n\nlet plot = generate_with(SYS_PLOT, &format!(\"Concept: {idea}\")).await?;\nlet combined = format!(\"{idea}\\n\\nPlot:\\n{}\", plot.trim());\n\nlet dialogue_sub = messaging::subscribe(\"demo-plot-to-dialogue\");\nmessaging::broadcast(\"demo-plot-to-dialogue\", &combined);\nlet plot_context = dialogue_sub.get_async().await.unwrap();\n\nlet dialogue = generate_with(SYS_DIALOGUE, &format!(\"Story so far:\\n{plot_context}\")).await?;"
     }
   },
-  "runCommand": "pie run demo-messaging -- --mode both --rtt-ms 100 --max-tokens 80"
+  "runCommand": "pie run --stdout demo-messaging -- --mode both --rtt-ms 100 --max-tokens 80"
 }

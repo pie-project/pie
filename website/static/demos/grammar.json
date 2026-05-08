@@ -137,5 +137,5 @@
       "value": "// Batteries included: JsonSchema, Regex, Ebnf, AnyJson.\nlet mut generator = ctx\n    .generate(Sampler::Argmax)\n    .max_tokens(200)\n    .constrain_with(JsonSchema(SCHEMA))?;\n\nlet mut text = String::new();\nwhile let Some(step) = generator.next()? {\n    let out = step.execute().await?;\n    text.push_str(&decode_visible_delta(&model, &out.tokens)?);\n    if let Ok(contact) = parse_json_payload::<Contact>(&text) {\n        return Ok(contact);               // first valid payload wins\n    }\n}\n\n// …or implement Constrain yourself — your own state machine,\n// shipped with the request, evaluated in the inferlet's WASM.\nstruct ChessNotation { /* ply, side, etc. */ }\nimpl inferlet::Constrain for ChessNotation {\n    fn step(&mut self, accepted: &[u32]) -> &[u32] { /* BRLE mask */ }\n}"
     }
   },
-  "runCommand": "pie run demo-grammar -- --bio \"Hi, I'm Bob, bob@x.io, 35yo.\""
+  "runCommand": "pie run --stdout demo-grammar -- --bio \"Hi, I'm Bob, bob@x.io, 35yo.\""
 }

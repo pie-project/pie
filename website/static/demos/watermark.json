@@ -77,5 +77,5 @@
       "value": "// +δ bias on green-list logits, then argmax of the biased distribution\nlet mut watermark = WatermarkState::new(GAMMA, DELTA);\nlet mut pending = vec![first_token];\n\nfor _ in 0..max_tokens {\n    let mut pass = ctx.forward();\n    pass.input(&pending);\n    let last_idx = (pending.len() - 1) as u32;\n\n    // Read the model's natural softmax (k=0 → full vocab).\n    let h = pass.probe(last_idx, Distribution { temperature: 1.0, k: 0 });\n    let out = pass.execute().await?;\n    let (ids, probs) = out.distribution(h).unwrap();\n\n    // In-WASM hash → green list → +δ bias → argmax.\n    let chosen = watermark.sample_biased(ids, probs);\n    pending = vec![chosen];\n}\n// Co-located detector verifies via z-score:\n//   z = (hits − n·γ) / sqrt(n·γ·(1 − γ))"
     }
   },
-  "runCommand": "pie run demo-watermark -- --gamma 0.5 --delta 8.0 --max-tokens 80"
+  "runCommand": "pie run --stdout demo-watermark -- --gamma 0.5 --delta 8.0 --max-tokens 80"
 }

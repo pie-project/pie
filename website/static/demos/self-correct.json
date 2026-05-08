@@ -157,5 +157,5 @@
       "value": "// Rust verifier scans every X op Y = Z and checks Final Answer.\nlet mut base = Context::new(&model)?;\nbase.system(SYSTEM).user(&question).cue();\n\nfor attempt in 1..=MAX_RETRIES {\n    let mut ctx = base.fork()?;           // KV checkpoint\n    let text = ctx.generate(sampler)\n        .max_tokens(400)\n        .collect_text().await?;\n\n    if verify_attempt(&text, expected).is_empty() {\n        return Ok(text);                  // ✓ verifier passed\n    }\n\n    // ✗ wrong answer: drop `ctx`, fork base again at higher T.\n    sampler = hotter_sampler(attempt);\n}"
     }
   },
-  "runCommand": "pie run demo-self-correct -- --question \"Compute (156 * 32) + (248 * 19).\" --max-retries 5"
+  "runCommand": "pie run --stdout demo-self-correct -- --question \"Compute (156 * 32) + (248 * 19).\" --max-retries 5"
 }

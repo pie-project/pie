@@ -117,5 +117,5 @@
       "value": "// Tools run in the inferlet — same WASM, no transport.\n#[tool] async fn get_temperature(city: String) -> Result<String> { ... }\n#[tool] async fn fahrenheit_to_celsius(f: f64) -> Result<String> { ... }\n\nlet mut ctx = Context::new(&model)?;\nctx.system(SYS);\nctx.equip(&[&get_temperature, &fahrenheit_to_celsius])?;\nctx.user(&prompt);\n\nlet (_name, args) = decode_tool_call(&mut ctx).await?;\nlet fahrenheit = get_temperature::call(&args).await?;\nctx.append(&tools::answer_prefix(&model, \"get_temperature\", &fahrenheit));\n\nlet celsius_args = format!(r#\"{{\\\"f\\\":{fahrenheit}}}\"#);\nlet celsius = fahrenheit_to_celsius::call(&celsius_args).await?;\nctx.append(&tools::answer_prefix(&model, \"fahrenheit_to_celsius\", &celsius));\nOk(celsius)                              // 22.2, no client RTT"
     }
   },
-  "runCommand": "pie run demo-mcp-tools -- --rtt-ms 120"
+  "runCommand": "pie run --stdout demo-mcp-tools -- --rtt-ms 120"
 }
