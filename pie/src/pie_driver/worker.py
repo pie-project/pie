@@ -494,6 +494,15 @@ def _leader_loop(
         _kv_page_size = engine.capabilities().kv_page_size
     _max_dist_size = getattr(config, "max_dist_size", 32)
 
+    # Phase 13 instrumentation: track the wall gap between successive
+    # fire_batch calls. End-to-end real wall = Python total + this gap +
+    # GPU forward (already inside Python total). The gap captures Rust
+    # scheduler decide() + shmem IPC RT + inferlet WASM time between
+    # successive decode_step submissions — the only latency component
+    # not already covered by `latency.py`. Closure-mutable holder so the
+    # hot path doesn't pay attribute lookup overhead.
+    _inter_call_state = {"last_t_end": 0.0}
+
     def _run_fire_batch_inner(kwargs):
         """Run the model + verify-drafts + populate-drafts steps and return
         `(sampling_results, batch, timings)` where `timings` is a dict ready
@@ -503,6 +512,8 @@ def _leader_loop(
         compatibility) and the shmem fast path that encodes directly.
         """
         t_start = time.perf_counter()
+        _last_t_end = _inter_call_state["last_t_end"]
+        inter_call_gap = (t_start - _last_t_end) if _last_t_end else 0.0
 
         t0 = time.perf_counter()
         batch = Batch(
@@ -616,7 +627,13 @@ def _leader_loop(
             "gpu_timings": gpu_timings,
             "batch_total_tokens": batch_total_tokens,
             "batch_num_seqs": batch_num_seqs,
+            "inter_call_gap": inter_call_gap,
         }
+        # Mark this call's end-of-Python-work for the next call's gap
+        # measurement. Updated AFTER timings is built so the perf_counter
+        # snapshot includes the spec/draft work above and matches what
+        # _record_step_timing will report as `total`.
+        _inter_call_state["last_t_end"] = time.perf_counter()
         return sampling_results, batch, timings
 
     def _record_step_timing(timings, t_create_responses):
@@ -640,6 +657,7 @@ def _leader_loop(
                 sample_gpu=gpu.get("sample_ms", 0.0) / 1000.0,
                 batch_total_tokens=int(timings.get("batch_total_tokens", 0)),
                 batch_num_seqs=int(timings.get("batch_num_seqs", 0)),
+                inter_call_gap=float(timings.get("inter_call_gap", 0.0)),
             ),
             traceparent=timings["traceparent"],
         )
