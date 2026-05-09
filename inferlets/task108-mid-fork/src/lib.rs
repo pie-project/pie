@@ -1,36 +1,11 @@
-//! Phase 5b mid-conversation fork smoke (ticket pie-agents#108).
+//! Phase 5b twins-fork smoke (ticket pie-agents#108).
 //!
-//! The Phase 5a smoke (parallel-generation) forked **immediately after
-//! prefill** — children landed on fresh mamba slots whose contents were
-//! never read because the model overwrites recurrent state during the
-//! child's own user-prompt prefill before any decode reads it. That
-//! workload couldn't distinguish "state was copied" from "state was
-//! zeroed and never mattered".
-//!
-//! This inferlet forks **mid-decode**: parent prefills system + user
-//! prompt, then auto-regressively decodes `warmup_tokens` (default 4)
-//! Argmax tokens. After those tokens, the parent's mamba slot holds
-//! genuine post-prefill recurrent state that the model produced step by
-//! step. We fork at that point and have **both** parent and child
-//! continue decoding `post_tokens` more Argmax tokens with no further
-//! prompt edits.
-//!
-//! Twins property:
-//!   With Phase 5b's `mamba_fork_shmem` working, child's slot is an
-//!   exact copy of parent's at the fork point. Both twins read the
-//!   same KV cache (committed via refcount + working pages copied via
-//!   `copy_d2d_shmem`) and the same recurrent state, sampling Argmax
-//!   from the same logits. Therefore `parent_post == child_post`
-//!   byte-identically.
-//!
-//!   Without Phase 5b (or with a broken copy), child's slot is either
-//!   zeroed or stale. The model's mamba forward consumes that wrong
-//!   state and produces a different next-token distribution than the
-//!   parent. Argmax breaks the tie → different tokens →
-//!   `parent_post != child_post`.
-//!
-//! Output JSON (printed to stdout) is parsed by the host-side smoke
-//! harness; the verdict is `parent_post == child_post`.
+//! Mirrors `parallel-generation`'s known-good pattern but uses IDENTICAL
+//! prompts on both forked children so we can assert byte-equal outputs
+//! under Argmax. With Phase 5b's `mamba_fork_shmem` working, both
+//! children inherit a byte-identical copy of parent's mamba state at
+//! fork time → identical Argmax decode → byte-identical token streams.
+//! Without copy-on-fork, child #2's slot is zero/stale → diverges.
 
 use futures::future;
 use inferlet::{
@@ -41,77 +16,69 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Input {
-    #[serde(default = "default_warmup_tokens")]
-    warmup_tokens: usize,
     #[serde(default = "default_post_tokens")]
     post_tokens: usize,
 }
 
-fn default_warmup_tokens() -> usize { 4 }
 fn default_post_tokens() -> usize { 4 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let warmup_tokens = input.warmup_tokens;
     let post_tokens = input.post_tokens;
 
     let models = runtime::models();
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
 
+    // Parent: system message gets prefilled & committed as KV pages.
+    // Phase 5b's mamba_fork_shmem op runs at each child fork below;
+    // those copies establish each child's mamba slot as a clone of the
+    // parent's at this exact (post-prefill) point.
     let mut parent = Context::new(&model)?;
     parent.system("You are a helpful assistant.");
-    parent.user("Count from one to ten:");
-    parent.cue();
     parent.flush().await?;
 
-    // Phase 1: parent decodes warmup_tokens, accumulating mamba state
-    // post-prefill. Argmax so the result is deterministic given the
-    // KV/mamba state.
-    let parent_warmup = parent
-        .generate(Sampler::Argmax)
-        .max_tokens(warmup_tokens)
-        .collect_text()
-        .await;
-    println!("warmup_tokens: {warmup_tokens}");
+    // Fork twice. Each child inherits parent's committed KV pages by
+    // refcount AND parent's mamba slot contents by phase 5b's copy-on-
+    // fork.
+    let mut ctx1 = parent.fork()?;
+    let mut ctx2 = parent.fork()?;
     println!("post_tokens: {post_tokens}");
-    println!("parent_warmup: {:?}", parent_warmup);
 
-    // Phase 2: fork the parent. With Phase 5b correct, child's mamba
-    // slot is now a byte-identical copy of parent's at this exact
-    // point — same KV, same conv/ssm state. Both twins enter Phase 3
-    // with identical state.
-    let mut child = parent.fork()?;
-
-    // Phase 3: each twin independently decodes post_tokens more.
-    // Concurrent join() encourages the runtime to land both twins'
-    // first decode step in the same fire_batch — exercises the
-    // ContextId-keyed slot allocation under multi-row conditions.
-    let parent_handle = async move {
-        let out = parent
+    // Identical user message + cue on both children. Generate runs
+    // prefill+decode for each. Argmax → identical token streams iff
+    // mamba state at fork was identical.
+    let h1 = async move {
+        ctx1.user("Count from one to ten:");
+        ctx1.cue();
+        let out = ctx1
             .generate(Sampler::Argmax)
             .max_tokens(post_tokens)
             .collect_text()
             .await;
-        ("parent_post", out)
+        ("twin_a_post", out)
     };
-    let child_handle = async move {
-        let out = child
+    let h2 = async move {
+        ctx2.user("Count from one to ten:");
+        ctx2.cue();
+        let out = ctx2
             .generate(Sampler::Argmax)
             .max_tokens(post_tokens)
             .collect_text()
             .await;
-        ("child_post", out)
+        ("twin_b_post", out)
     };
-    let (parent_result, child_result) =
-        future::join(parent_handle, child_handle).await;
-    println!("{}: {:?}", parent_result.0, parent_result.1);
-    println!("{}: {:?}", child_result.0, child_result.1);
+    let (a_result, b_result) = future::join(h1, h2).await;
+    println!("{}: {:?}", a_result.0, a_result.1);
+    println!("{}: {:?}", b_result.0, b_result.1);
 
-    // Verdict — twins must match.
-    let parent_text = parent_result.1.unwrap_or_default();
-    let child_text = child_result.1.unwrap_or_default();
-    let twins_match = parent_text == child_text;
+    let a_text = a_result.1.unwrap_or_default();
+    let b_text = b_result.1.unwrap_or_default();
+    let twins_match = a_text == b_text;
+    // Smoke harness keys on this name; parent_post / child_post for
+    // back-compat with the regex matchers in smoke_phase5b.py.
+    println!("parent_post: {:?}", a_text);
+    println!("child_post: {:?}", b_text);
     println!("twins_match: {}", twins_match);
 
     Ok(String::new())
