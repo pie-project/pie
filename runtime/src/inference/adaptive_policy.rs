@@ -196,6 +196,17 @@ impl SchedulingPolicy for AdaptivePolicy {
             self.last_latency = latency.as_secs_f64();
         }
         self.in_flight = false;
+        // Restart the accumulation window from when the GPU becomes free,
+        // not from the `on_arrival` that opened it. Any request that arrived
+        // mid-fire would otherwise leave `batch_start_time` set to a point
+        // in the past, and `decide()` step (5) would compute
+        // `elapsed >= last_latency` on the very next call — firing whatever
+        // partial cohort is currently accumulated (often a singleton)
+        // instead of waiting the few microseconds it takes for the rest of
+        // the in-flight requests to submit `decode_step`.
+        if self.batch_start_time.is_some() {
+            self.batch_start_time = Some(Instant::now());
+        }
     }
 
     fn on_fired(&mut self) {
