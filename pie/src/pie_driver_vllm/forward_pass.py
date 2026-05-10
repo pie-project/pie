@@ -13,14 +13,28 @@ inferlets that need non-causal patterns must run on the `native` driver.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
 
 from pie_driver.config import RuntimeConfig
-from pie_driver.model.common import sample_common
+from pie_driver.model.common import (
+    NEEDS_PROBS_TYPES,
+    LOGPROB_TYPES,
+    RAW_LOGITS_TYPE,
+    sample_common,
+    scaled_softmax,
+)
+from pie_kernels.sampling import top_p_sampling_from_probs
 
 from .attn_metadata import build_common_metadata
+
+
+# Sampler type id for TopP (matches Rust `Sampler::type_id()`); defined as
+# a module constant so the sample fast-path eligibility check is a host-side
+# integer compare with no GPU sync.
+_SAMPLER_IDX_TOP_P = 3
 
 
 class VllmForwardPass:
@@ -96,6 +110,20 @@ class VllmForwardPass:
         # transparent to us. slot_mapping has no such wrapper.)
         self._cg_slot_mapping_buf: torch.Tensor | None = None
         self._cg_query_len = 1  # 1 + num_speculative_tokens; set at capture.
+
+        # Captured sample fast-path: one cuda graph per discrete capture
+        # size wraps compute_logits + scaled_softmax + top_p_sampling.
+        # Replay from sample() when the batch is uniform TopP with no
+        # logprobs/dists. Disabled by default; PIE_SAMPLE_GRAPH=1 to enable.
+        self._cg_sample_enabled = False
+        self._cg_sample_graphs: dict[int, "torch.cuda.CUDAGraph"] = {}
+        self._cg_sample_hidden_buf: torch.Tensor | None = None
+        self._cg_sample_top_p_buf: torch.Tensor | None = None
+        self._cg_sample_temperatures_buf: torch.Tensor | None = None
+        self._cg_sample_tokens_buf: torch.Tensor | None = None
+        # Whether the captured sample graph fired on the most recent batch.
+        # Surfaced via gpu_timings for bench-side probing.
+        self._sample_fastpath_used_last = False
 
     def _ensure_metadata_builder(self) -> None:
         """Construct the per-backend AttentionMetadataBuilder once.
@@ -417,7 +445,32 @@ class VllmForwardPass:
         return hidden_states
 
     def sample(self, hidden_states: torch.Tensor, sampling_metadata: dict) -> dict:
-        """Sample via pie_driver's sample_common; vllm's LM head is the lm_head_fn."""
+        """Sample via pie_driver's sample_common; vllm's LM head is the lm_head_fn.
+
+        Fast path: when captured sample graphs are available and the
+        batch shape passes the eligibility gate (all TopP samplers, no
+        logprobs/dists/raw-logits/sampling_masks, batch size in
+        `_cg_sample_graphs`), replay the captured graph instead of
+        running compute_logits + softmax + flashinfer eagerly.
+        Eligibility is host-only, so the slow-path fall-through is free.
+        """
+        self._sample_fastpath_used_last = False
+        if self._cg_sample_enabled and self._sample_fastpath_eligible(
+            hidden_states, sampling_metadata
+        ):
+            tokens = self._sample_fastpath_replay(hidden_states, sampling_metadata)
+            if tokens is not None:
+                self._sample_fastpath_used_last = True
+                num = len(sampling_metadata["indices_for_logits"])
+                return {
+                    "tokens": tokens,
+                    "dists": [None] * num,
+                    "logits": [None] * num,
+                    "logprobs": [None] * num,
+                    "entropies": [None] * num,
+                    "nan_indices": [],
+                }
+
         return sample_common(
             hidden_states=hidden_states,
             sampling_metadata=sampling_metadata,
@@ -425,3 +478,121 @@ class VllmForwardPass:
             device=self.device,
             dtype=self.runtime_config.activation_dtype,
         )
+
+    # ------------------------------------------------------------------
+    # Sample-stage cudagraph capture + replay
+    # ------------------------------------------------------------------
+
+    def _sample_fastpath_eligible(
+        self, hidden_states: torch.Tensor, sampling_metadata: dict
+    ) -> bool:
+        """Host-side gate: is this batch shaped right for the captured graph?
+
+        All checks must be CPU-only (no `.item()` / `.tolist()` on device
+        tensors) so the eligibility decision adds no GPU sync to the slow
+        path.
+
+        Conditions:
+          - sample graphs were captured (`_cg_sample_graphs` non-empty);
+          - exactly one sampler type, and that type is TopP (idx=3);
+          - logits requested for every row of `hidden_states` (no skipping);
+          - no `sampling_masks`, no logprobs/dists/raw-logits requests;
+          - batch size matches one of the captured graph sizes.
+        """
+        if not self._cg_sample_graphs:
+            return False
+        if sampling_metadata.get("sampling_masks") is not None:
+            return False
+
+        sampler_groups = sampling_metadata.get("sampler_groups", {})
+        # One sampler type total. `dict.keys()` over a small dict is host-side.
+        non_empty = [k for k, v in sampler_groups.items() if v]
+        if len(non_empty) != 1 or non_empty[0] != _SAMPLER_IDX_TOP_P:
+            return False
+        # No raw-logits / logprobs / entropy / dist requests anywhere.
+        if RAW_LOGITS_TYPE in sampler_groups and sampler_groups[RAW_LOGITS_TYPE]:
+            return False
+        if any(t in sampler_groups and sampler_groups[t] for t in LOGPROB_TYPES):
+            return False
+        if 0 in sampler_groups and sampler_groups[0]:
+            return False  # Distribution sampler
+
+        indices = sampling_metadata.get("indices_for_logits", [])
+        if not indices:
+            return False
+        n = hidden_states.shape[0]
+        # We capture graphs sized to `padded_tokens` from transform(). When
+        # the captured trunk path was used, num_logit_requests usually equals
+        # the padded transform size. For the eager-trunk + captured-sample
+        # combo (PIE_CUDA_GRAPHS=0 PIE_SAMPLE_GRAPH=1), n is the un-padded
+        # request count — also fine if it happens to match a capture size.
+        if len(indices) != n:
+            return False
+        if n not in self._cg_sample_graphs:
+            return False
+
+        # Pre-built sampler param tensors must exist (sample_common builds
+        # them once per fire_batch in pie_driver.batching).
+        if sampling_metadata.get("top_p") is None:
+            return False
+        if sampling_metadata.get("temperatures") is None:
+            return False
+        return True
+
+    def _sample_fastpath_replay(
+        self, hidden_states: torch.Tensor, sampling_metadata: dict
+    ) -> list[int] | None:
+        """Replay the captured sample graph for `n = hidden_states.shape[0]`.
+
+        Copies inputs into the persistent buffers the graph was captured
+        against, replays, then returns the sampled token IDs as a list of
+        ints. The trailing `.tolist()` forces a CPU sync — same shape as
+        the slow path's final sync, so total per-batch sync count is
+        unchanged.
+        """
+        n = hidden_states.shape[0]
+        graph = self._cg_sample_graphs.get(n)
+        if graph is None:
+            return None
+        hbuf = self._cg_sample_hidden_buf
+        pbuf = self._cg_sample_top_p_buf
+        tbuf = self._cg_sample_temperatures_buf
+        out = self._cg_sample_tokens_buf
+        if hbuf is None or pbuf is None or tbuf is None or out is None:
+            return None
+
+        top_p = sampling_metadata["top_p"]
+        temps = sampling_metadata["temperatures"]
+        # Pre-built tensors live on device already (pie's batching.py builds
+        # them via torch.as_tensor(..., device=device)). If the upstream ever
+        # changes, the .to() below is a no-op when already on-device.
+        if top_p.device != self.device:
+            top_p = top_p.to(self.device, non_blocking=True)
+        if temps.device != self.device:
+            temps = temps.to(self.device, non_blocking=True)
+
+        # `indices_for_logits` selects the rows of hidden_states the slow
+        # path would have gathered before compute_logits. Captured graphs
+        # always operate on the FIRST `n` rows of the persistent buffer, so
+        # we must apply that gather *before* the copy. For the common case
+        # where every row is a logit request (decode-only batch) the gather
+        # is a no-op — `indices_for_logits == range(n)`. We assert that
+        # under DEBUG, but skip the check on the hot path.
+        indices = sampling_metadata["indices_for_logits"]
+        if list(indices) == list(range(n)):
+            hidden_in = hidden_states
+        else:
+            idx_t = torch.as_tensor(indices, device=self.device, dtype=torch.long)
+            hidden_in = hidden_states.index_select(0, idx_t)
+
+        # Per-row clamp: scaled_softmax inside the captured graph also clamps
+        # at `greedy_threshold=1e-5`, so we only need to forward the raw
+        # temperatures here. dtype must match the captured graph (float32).
+        hbuf[:n].copy_(hidden_in, non_blocking=True)
+        pbuf[:n].copy_(top_p, non_blocking=True)
+        tbuf[:n].copy_(temps.unsqueeze(1) if temps.ndim == 1 else temps,
+                       non_blocking=True)
+
+        graph.replay()
+
+        return out[:n].tolist()
