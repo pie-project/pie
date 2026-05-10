@@ -54,6 +54,13 @@ METHOD_TAG_COPY_D2D = 1
 # See `project_pie_second_bleed_path_h2d_race.md`.
 METHOD_TAG_COPY_H2D = 2
 METHOD_TAG_COPY_D2H = 3
+# Mamba copy-on-fork notification (#108 phase 5b). Mirrors
+# METHOD_TAG_MAMBA_FORK in runtime/src/shmem_ipc.rs. Carries
+# `(parent_ctx_id: u64, child_ctx_id: u64)` little-endian so the
+# Python worker can copy mamba recurrent state from parent slot to
+# child slot before any later fire_batch reaches the child. Same
+# single-threaded dispatch ordering as METHOD_TAG_COPY_D2D.
+METHOD_TAG_MAMBA_FORK = 4
 METHOD_TAG_NONE = 255
 
 _librt = ctypes.CDLL("librt.so.1", use_errno=True)

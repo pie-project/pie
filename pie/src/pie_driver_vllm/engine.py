@@ -115,6 +115,12 @@ class VllmEngine:
         self._ngram_buffers = None
         self._ngram_history: dict[int, list[int]] = {}
 
+        # Mamba state-slot allocator (#108 phase 5a). Always set by
+        # `Engine.load`; left as None here so unit tests that bypass
+        # load() don't have to construct one. `forward_pass.transform`
+        # gates use on `is_hybrid` AND `mamba_allocator is not None`.
+        self.mamba_allocator = None
+
     @classmethod
     def load(
         cls,
@@ -128,6 +134,7 @@ class VllmEngine:
         from .forward_pass import VllmForwardPass
         from .kv_cache import allocate_and_bind_kv_cache, allocate_host_pool
         from .loader import load_vllm_model
+        from .mamba_state import MambaSlotAllocator
 
         def _log(msg: str, level: str = "INFO"):
             if log_queue is not None:
@@ -157,6 +164,14 @@ class VllmEngine:
             layout.attention_layers_in_order, config.swap_budget_bytes
         )
 
+        # Per-request mamba state-slot allocator (#108 phase 5a).
+        # `allocate_and_bind_kv_cache` sized the mamba state pools to
+        # `config.max_num_kv_pages = num_blocks`; the allocator hands
+        # out indices into that dim-0. Created on every load (allocator
+        # is a no-op container on pure-attention since `transform()`
+        # gates its use on `is_hybrid`); cheap to construct.
+        mamba_allocator = MambaSlotAllocator(int(config.max_num_kv_pages))
+
         forward_pass = VllmForwardPass(
             model=loaded.model,
             vllm_config=loaded.vllm_config,
@@ -165,6 +180,7 @@ class VllmEngine:
             model_config=loaded.model_config,
             mamba_layers=layout.mamba_layers,
             is_hybrid=layout.is_hybrid,
+            mamba_allocator=mamba_allocator,
         )
 
         engine = cls(
@@ -182,28 +198,14 @@ class VllmEngine:
             mamba_layers=layout.mamba_layers,
             is_hybrid=layout.is_hybrid,
         )
+        engine.mamba_allocator = mamba_allocator
 
-        # Hybrid one-shot operator warning. `capabilities()` reports
-        # `supports_kv_fork=False` when `is_hybrid=True`, but until
-        # ticket #108 lands a runtime admission gate the contract is
-        # advisory: an inferlet that calls `ctx.fork()` on a hybrid
-        # model still completes, with attention pages physically copied
-        # but mamba's per-request recurrent state aliased back to the
-        # parent's slot. Wrong outputs, no crash, no clear signal —
-        # exactly the failure the warning surfaces. Logged at WARNING
-        # so it shows up in the operator's startup log without spamming
-        # the per-request hot path. Removed (or downgraded to INFO)
-        # when #108 makes the gate runtime-enforced.
         if layout.is_hybrid:
-            logger.warning(
+            logger.info(
                 "vllm driver loaded a hybrid Transformer+Mamba model "
-                "(%s). supports_kv_fork=False is advertised via "
-                "capabilities, but pie's runtime does not yet enforce "
-                "it (see ticket #108). If any inferlet calls ctx.fork() "
-                "on this model, mamba's per-request recurrent state "
-                "will alias the parent's slot and produce silently-wrong "
-                "outputs. Route fork-using inferlets to cuda_native or "
-                "portable until #108 lands.",
+                "(%s) with supports_kv_fork=True (#108 phase 5a/5b: "
+                "ContextId-keyed allocator + runtime-side mamba "
+                "copy-on-fork wired).",
                 loaded.arch_type,
             )
 
@@ -295,6 +297,9 @@ class VllmEngine:
             kv_page_indices=prefill_inputs["kv_page_indices"],
             kv_page_indptr=prefill_inputs["kv_page_indptr"],
             kv_last_page_lens=prefill_inputs["kv_last_page_lens"],
+            # Synthetic ContextId for warmup; allocator hands out a
+            # slot we never read state from (qlen>1 prefill, has_initial_state=False).
+            context_ids=[0],
         )
         torch.cuda.synchronize()
         t_prefill = _time.perf_counter() - t0
@@ -319,6 +324,11 @@ class VllmEngine:
             kv_page_indices=decode_inputs["kv_page_indices"],
             kv_page_indptr=decode_inputs["kv_page_indptr"],
             kv_last_page_lens=decode_inputs["kv_last_page_lens"],
+            # Same synthetic ContextId as the prefill warmup so the
+            # allocator returns the same slot — keeps the warmup decode
+            # reading state written by the warmup prefill, matching the
+            # production path order.
+            context_ids=[0],
         )
         torch.cuda.synchronize()
         t_decode = _time.perf_counter() - t0
@@ -589,6 +599,40 @@ class VllmEngine:
             kv_page_indptr=kv_page_indptr,
             kv_last_page_lens=kv_last_page_lens,
             single_token_mode=True,
+            # Cudagraph capture is gated off for hybrid (#107), so the GDN
+            # branch in transform() never fires here. We still pass synthetic
+            # ids so the contract is uniform — defensive against a future
+            # hybrid cudagraph path.
+            context_ids=[0] * num_reqs,
+        )
+
+    def mamba_fork(self, parent_ctx_id: int, child_ctx_id: int) -> None:
+        """Copy parent's mamba recurrent state into the child's slot (#108 phase 5b).
+
+        Wired to the runtime's `device::mamba_fork_shmem` op via the
+        `pie_driver/worker.py` shmem dispatcher. Always called on fork
+        from pie's runtime — no-op on pure-attention (`mamba_layers`
+        empty) so the runtime can emit the op unconditionally.
+
+        On hybrid models the actual tensor copy lives in
+        `mamba_state.fork_mamba_slot`; we delegate so the per-layer
+        loop is testable in isolation without an Engine instance.
+        """
+        if self.mamba_allocator is None:
+            # Engine constructed without `Engine.load` (unit tests bypass
+            # the loader). On non-hybrid that's fine — no state to copy.
+            # On hybrid this would indicate a wiring bug; surface it.
+            if self.is_hybrid:
+                raise RuntimeError(
+                    "VllmEngine.mamba_fork called on hybrid model with "
+                    "no MambaSlotAllocator wired. Engine.load must "
+                    "construct one (#108 phase 5a)."
+                )
+            return
+        from .mamba_state import fork_mamba_slot
+
+        fork_mamba_slot(
+            parent_ctx_id, child_ctx_id, self.mamba_layers, self.mamba_allocator
         )
 
     @torch.inference_mode()
@@ -639,6 +683,10 @@ class VllmEngine:
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
             single_token_mode=inputs.get("single_token_inference_mode", False),
+            # Per-row stable ContextIds (#108 phase 5a). On hybrid models
+            # `forward_pass` routes these to the mamba state-slot allocator;
+            # pure-attention paths ignore the field.
+            context_ids=inputs.get("context_ids"),
         )
 
         if gpu_timings is not None:
@@ -882,11 +930,15 @@ class VllmEngine:
             # causal attention and silently drops user masks. Inferlets
             # that need non-causal patterns must run on `native`.
             supports_user_attention_mask=False,
-            # Hybrid Transformer+Mamba models can't safely fork on the
-            # vllm driver yet — pie's per-page copy_d2d/h2d/d2h handlers
-            # don't migrate mamba's per-request recurrent state. Pure-
-            # attention models on this driver fork like before. See
-            # ticket #107 / #108 for the runtime-cooperation fix.
-            supports_kv_fork=not self.is_hybrid,
+            # Phase 5a's MambaSlotAllocator gives every fork a fresh
+            # slot keyed on its (distinct) ContextId, and phase 5b's
+            # `mamba_fork_shmem` op (snapshot.rs → worker.py →
+            # `Engine.mamba_fork`) copies parent's per-layer recurrent
+            # state into that slot before the runtime resolves
+            # `Ok(new_id)`. Hybrid forks now produce a child that
+            # inherits the parent's exact mamba state up to the fork
+            # point — same correctness guarantee as the attention KV
+            # pages that copy_d2d_shmem already handles.
+            supports_kv_fork=True,
             snapshot_dir=str(self.snapshot_dir),
         )

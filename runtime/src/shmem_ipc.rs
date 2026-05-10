@@ -41,6 +41,15 @@ pub const METHOD_TAG_COPY_H2D: u32 = 2;
 /// path. Companion to METHOD_TAG_COPY_H2D — same single-threaded
 /// dispatch ordering against `fire_batch`.
 pub const METHOD_TAG_COPY_D2H: u32 = 3;
+/// Notify Python that a `ctx.fork()` happened on a hybrid
+/// Transformer+Mamba model: copy parent's mamba recurrent state into
+/// the child's per-request state slot before any later `fire_batch`
+/// touches the child. Same ordering guarantee as METHOD_TAG_COPY_D2D
+/// (sibling shmem op on the same Python thread that runs fire_batch).
+/// Payload is two little-endian u64 ContextIds. Engine ignores the op
+/// when it has no mamba layers (pure-attention vllm, helloworld
+/// tests, etc.) — see ticket pie-agents#108 phase 5b.
+pub const METHOD_TAG_MAMBA_FORK: u32 = 4;
 
 /// Slot header offsets relative to the start of the slot.
 const OFF_REQ_SEQ: usize = 0;

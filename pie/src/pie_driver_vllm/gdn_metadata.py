@@ -41,66 +41,41 @@ from typing import Any
 import torch
 
 
-def _state_slot_for_requests(
-    kv_page_indices_cpu: torch.Tensor,  # int32 (total_pages,)
-    kv_page_indptr_cpu: torch.Tensor,   # int32 (batch+1,)
+def _state_slot_tensor(
+    state_slot_ids: list[int],
+    expected_batch: int,
 ) -> torch.Tensor:
     """Return one int32 mamba state-slot id per request, on CPU.
 
-    **This is the only place in the driver where the slot id is derived
-    from KV-page metadata.** Today the slot is the request's first KV
-    page id — relying on pie's allocator giving each in-flight request
-    at least one page. That coupling has a known fork-aliasing
-    limitation: post-fork siblings share their first committed page
-    (refcount), so two siblings in the same fire_batch would derive the
-    same slot id and silently corrupt each other's recurrent state.
-
-    Ticket #107 deliberately refuses to add IPC cooperation (the only
-    runtime-correct fix); #108 will replace this body with a
-    per-request slot allocator keyed on a stable runtime-supplied id.
-    Until then, capability flag `supports_kv_fork=False` lets pie's
-    runtime route fork-using inferlets away on hybrid models, and the
-    in-batch duplicate-slot check below trips loudly if a fork-using
-    inferlet does reach the driver anyway (covers the case where the
-    runtime hasn't enforced the capability yet).
+    Slots come from `mamba_state.MambaSlotAllocator` (#108 phase 5a),
+    which is keyed on the stable per-context `ContextId` carried in
+    `BatchedForwardPassRequest.context_ids` (shmem A_CONTEXT_IDS=27,
+    Rust `runtime/src/inference/request.rs:431`). Pie mints a fresh
+    ContextId on fork, so siblings reach the driver with distinct ids
+    and the page-id-keyed alias hazard from #107 cannot occur — the
+    duplicate-slot guard from the previous scheme is therefore dropped.
 
     Returning a CPU tensor here keeps the call site indexed-copy free;
     the caller stages the tensor onto the device via `non_blocking=True`.
     """
-    slots = kv_page_indices_cpu[kv_page_indptr_cpu[:-1]]
-    # Defensive: catch the fork-siblings-in-same-batch case at the
-    # earliest point. On hybrid, two requests sharing a first-page id
-    # mean both would write to the same conv_state / ssm_state slot in
-    # the next forward and silently corrupt each other; far better to
-    # raise here than to debug a stale-state bug downstream. O(B) on
-    # CPU; B ≤ scheduler max_num_seqs (16 by default), so the cost is
-    # negligible.
-    if int(slots.unique().numel()) != int(slots.numel()):
-        # Surface the colliding slot ids so the operator can map them
-        # back to fork lineages in pie's logs. Repr is small (B ≤ 16).
+    if len(state_slot_ids) != expected_batch:
         raise RuntimeError(
-            "Hybrid mamba state-slot collision in fire_batch: two "
-            "requests share their first KV page id, which means pie "
-            "issued ctx.fork() on a hybrid model whose driver "
-            "advertises supports_kv_fork=False. Mamba's per-request "
-            "recurrent state cannot be safely shared across forked "
-            "siblings under the current page-id-as-slot scheme. Route "
-            "fork-using inferlets to cuda_native or portable, or wait "
-            "for ticket #108 to land the per-request slot allocator. "
-            f"Slot ids in this batch: {slots.tolist()}"
+            f"GDN state slot count {len(state_slot_ids)} does not match "
+            f"batch size {expected_batch}; the runtime must publish a "
+            "ContextId per non-spec request via "
+            "BatchedForwardPassRequest.context_ids."
         )
-    return slots
+    return torch.tensor(state_slot_ids, dtype=torch.int32)
 
 
 def build_gdn_metadata(
     *,
     qo_indptr: torch.Tensor,            # int32 (batch+1,) on GPU or CPU
-    kv_page_indices: torch.Tensor,      # int32 (total_pages,) GPU or CPU
-    kv_page_indptr: torch.Tensor,       # int32 (batch+1,) GPU or CPU
     seq_lens: torch.Tensor,             # int32 (batch,) GPU
     num_computed_tokens: torch.Tensor,  # int32 (batch,) GPU
     num_actual_tokens: int,
     device: torch.device,
+    state_slot_ids: list[int],
 ) -> Any:
     """Construct a `GDNAttentionMetadata` from pie batch fields.
 
@@ -124,15 +99,6 @@ def build_gdn_metadata(
     else:
         query_start_loc_gpu = query_start_loc_cpu.to(device, non_blocking=True)
 
-    if kv_page_indptr.device.type == "cpu":
-        kv_page_indptr_cpu = kv_page_indptr.to(torch.int32)
-    else:
-        kv_page_indptr_cpu = kv_page_indptr.to(torch.int32).cpu()
-    if kv_page_indices.device.type == "cpu":
-        kv_page_indices_cpu = kv_page_indices.to(torch.int32)
-    else:
-        kv_page_indices_cpu = kv_page_indices.to(torch.int32).cpu()
-
     batch = int(query_start_loc_cpu.shape[0]) - 1
     query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
@@ -145,11 +111,11 @@ def build_gdn_metadata(
     num_decode_tokens = num_decodes  # qlen=1 each
     num_prefill_tokens = int(query_lens_cpu.sum().item()) - num_decode_tokens
 
-    # Per-request state-slot index. Derivation lives in
-    # `_state_slot_for_requests` (single point of change for #108).
-    state_slots_cpu = _state_slot_for_requests(
-        kv_page_indices_cpu, kv_page_indptr_cpu
-    )
+    # Per-request state-slot index. The slot list is supplied by the
+    # caller (typically `forward_pass.transform` via
+    # `MambaSlotAllocator.slots_for(context_ids)`). See `_state_slot_tensor`
+    # for the rationale (#108 phase 5a — ContextId-keyed allocation).
+    state_slots_cpu = _state_slot_tensor(state_slot_ids, batch)
     non_spec_state_indices_tensor = state_slots_cpu.to(
         device, dtype=torch.int32, non_blocking=True
     )
