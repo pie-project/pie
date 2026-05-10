@@ -658,6 +658,8 @@ def _leader_loop(
                 batch_total_tokens=int(timings.get("batch_total_tokens", 0)),
                 batch_num_seqs=int(timings.get("batch_num_seqs", 0)),
                 inter_call_gap=float(timings.get("inter_call_gap", 0.0)),
+                # VllmEngine sets this in gpu_timings; other drivers default to 0.
+                sample_fastpath_used=int(bool(gpu.get("sample_fastpath_used", False))),
             ),
             traceparent=timings["traceparent"],
         )

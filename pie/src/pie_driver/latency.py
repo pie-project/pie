@@ -32,7 +32,8 @@ def _maybe_open_csv():
                 "broadcast_ms,inference_ms,create_responses_ms,"
                 "decode_u32_ms,mask_loop_ms,brle_decode_ms,sampler_loop_ms,"
                 "embed_gpu_ms,transform_gpu_ms,sample_gpu_ms,"
-                "batch_total_tokens,batch_num_seqs,inter_call_gap_ms\n"
+                "batch_total_tokens,batch_num_seqs,inter_call_gap_ms,"
+                "sample_fastpath_used\n"
             )
             _LATENCY_CSV_HEADER_WRITTEN = True
     return _LATENCY_CSV_FH
@@ -70,6 +71,9 @@ class StepTiming(NamedTuple):
     # bookkeeping between successive decode_step calls. First step has
     # no predecessor → 0.0. Phase 13 attribution.
     inter_call_gap: float = 0.0
+    # 1 when the captured sample-stage graph fired this step, 0 when
+    # sample_common ran eagerly. 0 also for drivers that don't expose it.
+    sample_fastpath_used: int = 0
 
 
 @dataclass
@@ -113,7 +117,8 @@ class LatencyStats:
                     f"{timing.sample_gpu*1000:.3f},"
                     f"{timing.batch_total_tokens},"
                     f"{timing.batch_num_seqs},"
-                    f"{timing.inter_call_gap*1000:.3f}\n"
+                    f"{timing.inter_call_gap*1000:.3f},"
+                    f"{timing.sample_fastpath_used}\n"
                 )
 
         if not self.enabled:
