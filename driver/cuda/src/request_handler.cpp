@@ -240,6 +240,32 @@ std::size_t handle_fire_batch(
         const bool try_graphs =
             ctx.graph_cache != nullptr && is_pure_decode && !have_custom_mask;
         if (try_graphs) {
+            // Hoist flashinfer DecodePlan OUTSIDE the capture region.
+            // Per forward_graph.hpp constraint #2, plan_attention does
+            // host-side work (vector alloc, work estimation, page-locked
+            // fill into attn_ws.int_buffer()). If captured, that host
+            // work runs once at capture; on replay the dispatch reads
+            // STALE plan_info contents (request_indices, kv_tile_indices,
+            // block_valid_mask) and produces gibberish output. The plan
+            // must run EVERY fire, just before launch, refreshing the
+            // contents of attn_ws.int_buffer() at the offsets the
+            // captured kernels read from. flashinfer's own
+            // `enable_cuda_graph=true` mode (set in plan_attention) keeps
+            // params.padded_batch_size / split_kv stable across fires by
+            // padding to a fixed worst-case bound — the per-fire work
+            // variation is encoded in block_valid_mask, not kernel args.
+            ops::DecodePlanCachePtr decode_plan = ops::make_decode_plan();
+            ops::plan_attention_flashinfer_decode_bf16(
+                *decode_plan,
+                h_kvpp,
+                R,
+                engine.hf_config().num_attention_heads,
+                engine.hf_config().num_key_value_heads,
+                engine.hf_config().head_dim,
+                kv_cache.page_size(),
+                attn_ws,
+                /*stream=*/nullptr);
+
             const ForwardGraphKey key{R};
             cudaGraphExec_t exec = ctx.graph_cache->get(key);
             if (exec == nullptr) {
@@ -258,20 +284,38 @@ std::size_t handle_fire_batch(
                     pi.qo_indptr.data(), pi.kv_page_indices.data(),
                     pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
                     h_qo, h_kvpp,
-                    N, R, is_pure_decode, nullptr, nullptr);
+                    N, R, is_pure_decode, nullptr, nullptr,
+                    decode_plan.get(),
+                    /*stream=*/cstream);
                 cudaGraph_t graph = nullptr;
                 CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
+                // Node count is queried only for the throttled capture
+                // log line below — useful when triaging "did capture
+                // pick up cuBLAS gemms?" without re-instrumenting.
+                std::size_t node_count = 0;
+                CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &node_count));
                 CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
                 cudaGraphDestroy(graph);
                 cudaStreamDestroy(cstream);
                 ctx.graph_cache->put(key, exec);
+                // Capture records kernels into the graph but does NOT
+                // execute them — fire #1 must launch the captured graph
+                // explicitly to produce real logits. Without this
+                // launch fire #1 returns whatever stale state the
+                // workspace held before capture (gibberish output).
+                // Restore cuBLAS to the legacy default stream so the
+                // post-forward sampler/copies (run outside the graph)
+                // aren't accidentally enqueued on the destroyed cstream.
+                CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
+                cublas.set_stream(/*stream=*/nullptr);
                 // Throttle the capture log: first 4 captures, then every
                 // 16th. At saturation R can swing across many distinct
                 // values, and one line per shape blows up the log.
                 const auto sz = ctx.graph_cache->size();
                 if (sz <= 4 || sz % 16 == 0) {
                     std::cerr << "[pie-driver-cuda] graph captured: R=" << R
-                              << " (cache size=" << sz << ")\n";
+                              << " (cache size=" << sz
+                              << ", nodes=" << node_count << ")\n";
                 }
             } else {
                 CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));

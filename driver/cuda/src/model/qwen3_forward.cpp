@@ -159,7 +159,9 @@ void qwen3_forward_paged(
     int R,
     bool is_pure_decode,
     const std::uint8_t*  custom_mask_d,
-    const std::int32_t*  custom_mask_indptr_d)
+    const std::int32_t*  custom_mask_indptr_d,
+    const ops::DecodePlanCache* decode_plan_in,
+    cudaStream_t stream)
 {
     const int H  = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
@@ -168,7 +170,12 @@ void qwen3_forward_paged(
     const int V  = cfg.vocab_size;
     const int d  = cfg.head_dim;
     const float eps = cfg.rms_norm_eps;
-    cudaStream_t stream = nullptr;
+
+    // Bind cuBLAS to the requested stream. When stream is non-null this
+    // is the cuda-graph capture stream — without this every cublas gemm
+    // would fall through to the legacy default stream and bypass capture
+    // (graph replays nothing → gibberish on fires 2+ in graphs-on mode).
+    cublas.set_stream(stream);
 
     // 1. Embed.
     kernels::launch_embed_bf16(
@@ -180,11 +187,18 @@ void qwen3_forward_paged(
     // num_kv_heads, head_dim, page_size) — all stable across layers.
     // Doing it once here saves 27 redundant DecodePlan calls per fire
     // (each ~25 µs of host work + a small device kernel).
-    ops::DecodePlanCachePtr decode_plan;
-    if (is_pure_decode) {
-        decode_plan = ops::make_decode_plan();
+    //
+    // On the cuda-graph path the request handler hoists the plan even
+    // further — to *before* cudaStreamBeginCapture — so DecodePlan's
+    // host-side work (page-locked fill, work estimation) doesn't get
+    // baked into the captured graph and produce stale layouts on replay
+    // (gibberish output). When `decode_plan_in` is non-null, use it.
+    ops::DecodePlanCachePtr owned_plan;
+    const ops::DecodePlanCache* decode_plan = decode_plan_in;
+    if (is_pure_decode && decode_plan_in == nullptr) {
+        owned_plan = ops::make_decode_plan();
         ops::plan_attention_flashinfer_decode_bf16(
-            *decode_plan,
+            *owned_plan,
             kv_page_indptr_h,
             R,
             cfg.num_attention_heads,
@@ -193,6 +207,7 @@ void qwen3_forward_paged(
             cache.page_size(),
             attn_ws,
             stream);
+        decode_plan = owned_plan.get();
     }
 
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {

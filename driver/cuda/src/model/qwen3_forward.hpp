@@ -6,6 +6,8 @@
 
 #include <cstdint>
 
+#include <cuda_runtime.h>
+
 #include "engine.hpp"
 #include "model/qwen3.hpp"
 #include "ops/gemm.hpp"
@@ -49,6 +51,7 @@ void qwen3_forward_prefill(
 // ── Paged variant ──────────────────────────────────────────────────────────
 #include "attention_workspace.hpp"
 #include "kv_cache.hpp"
+#include "ops/attention_flashinfer.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -82,6 +85,20 @@ void qwen3_forward_paged(
     // Optional custom mask. When non-null, the prefill path uses
     // flashinfer's MaskMode::kCustom; ignored on the decode path.
     const std::uint8_t*  custom_mask_d = nullptr,
-    const std::int32_t*  custom_mask_indptr_d = nullptr);
+    const std::int32_t*  custom_mask_indptr_d = nullptr,
+    // Optional precomputed flashinfer decode plan. Non-null only on the
+    // pure-decode + cuda-graph path: the request handler runs the plan
+    // OUTSIDE cudaStreamBeginCapture so its host-side work (vector
+    // allocation, work estimation, page-locked fill) doesn't get baked
+    // into the captured graph and produce stale layouts on replay
+    // (see forward_graph.hpp constraint #2). When null, the function
+    // computes its own plan inline (eager path).
+    const ops::DecodePlanCache* decode_plan_in = nullptr,
+    // Stream to launch all forward-pass kernels on. Required for cuda
+    // graph capture: cudaStreamBeginCapture only records ops on the
+    // captured stream, so launches on the default (nullptr) stream
+    // bypass capture and the resulting graph runs zero kernels on
+    // replay. Default keeps the eager path on the legacy default stream.
+    cudaStream_t stream = nullptr);
 
 }  // namespace pie_cuda_driver::model
