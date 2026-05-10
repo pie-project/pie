@@ -9,6 +9,7 @@ imported directly from `pie_driver`.
 from __future__ import annotations
 
 import logging
+import os
 import random
 
 import numpy as np
@@ -235,6 +236,18 @@ class VllmEngine:
             # logger.exception attaches the active traceback automatically.
             logger.exception("vllm cudagraph FAILED")
             raise
+
+        # Optionally capture compute_logits + scaled_softmax +
+        # top_p_sampling_from_probs into one cuda graph per capture size.
+        # Adds ~2-3 s to startup and ~30-50 MiB of graph memory; replay
+        # is TopP-only and meaningful only when the forward-trunk graph
+        # is also captured. Default off.
+        if int(os.environ.get("PIE_SAMPLE_GRAPH", "0")) == 1:
+            try:
+                engine._capture_sample_graphs(_log)
+            except Exception:
+                logger.exception("vllm sample-graph capture FAILED")
+                raise
 
         return engine
 
@@ -636,6 +649,146 @@ class VllmEngine:
         )
 
     @torch.inference_mode()
+    def _capture_sample_graphs(self, log_fn=None) -> None:
+        """Capture one cuda graph per decode size for the sample fast-path.
+
+        Each graph wraps three eager kernel sequences that run outside
+        the forward-trunk graph:
+          1. ``compute_logits(hidden)`` — vllm's LM head matmul.
+          2. ``scaled_softmax(logits, temperatures)``.
+          3. ``top_p_sampling_from_probs(probs, top_p)`` — flashinfer kernel.
+
+        At replay, ``forward_pass.sample()`` copies the per-batch inputs
+        into the persistent buffers captured against, replays, and reads
+        tokens out of ``_cg_sample_tokens_buf``. One graph per ``n`` in
+        ``cudagraph_capture_sizes``.
+        """
+        import time as _time
+
+        from .forward_pass import VllmForwardPass  # noqa: F401  type-only
+
+        device = self.forward_pass.device
+
+        def _log(msg: str, level: str = "INFO") -> None:
+            logger.log(_level_to_int(level), "sample-cudagraph: %s", msg)
+            if log_fn is not None:
+                log_fn(msg, level)
+
+        if not torch.cuda.is_available() or not str(device).startswith("cuda"):
+            _log(f"skipped (device={device})", "INFO")
+            return
+
+        from ._vllm_compat import CUDAGraphMode
+
+        vllm_config = self.forward_pass.vllm_config
+        cc = vllm_config.compilation_config
+        if cc.cudagraph_mode == CUDAGraphMode.NONE:
+            _log("skipped (cudagraph_mode=NONE; trunk capture also off)", "INFO")
+            return
+        cap_sizes = list(cc.cudagraph_capture_sizes or [])
+        if not cap_sizes:
+            _log("skipped (no cudagraph_capture_sizes resolved by vllm)", "WARN")
+            return
+
+        from pie_driver.model.common import scaled_softmax
+        from pie_kernels.sampling import top_p_sampling_from_probs
+
+        # Drain pending kernels before switching to the capture stream.
+        torch.cuda.synchronize()
+
+        max_n = int(max(cap_sizes))
+        hidden_size = int(self.model_config.get_hidden_size())
+        embed_dtype = self.config.activation_dtype
+
+        fp = self.forward_pass
+        # Persistent input/output buffers. Float32 for top_p / temperatures
+        # to match flashinfer's expected dtype and `scaled_softmax`'s clamp
+        # semantics. tokens come back as int64 (flashinfer returns int32 on
+        # some builds; we copy into a long buffer so .tolist() yields
+        # plain Python ints with no dtype branching downstream).
+        fp._cg_sample_hidden_buf = torch.empty(
+            (max_n, hidden_size), dtype=embed_dtype, device=device
+        )
+        fp._cg_sample_top_p_buf = torch.empty(
+            (max_n,), dtype=torch.float32, device=device
+        )
+        # `scaled_softmax` reshapes a 1-D temperature vector to (B, 1) per
+        # call; we pre-shape to match so the captured kernel sees the same
+        # tensor shape every replay.
+        fp._cg_sample_temperatures_buf = torch.empty(
+            (max_n, 1), dtype=torch.float32, device=device
+        )
+        fp._cg_sample_tokens_buf = torch.empty(
+            (max_n,), dtype=torch.int64, device=device
+        )
+
+        # Initialize buffers to legal values so the warmup forward and the
+        # captured graph never see NaN-from-uninit memory. top_p in
+        # (0, 1] and temperature ≥ 1e-5 keep the kernels in their fast
+        # branches.
+        fp._cg_sample_hidden_buf.zero_()
+        fp._cg_sample_top_p_buf.fill_(0.9)
+        fp._cg_sample_temperatures_buf.fill_(1.0)
+
+        compute_logits = self.forward_pass.model.compute_logits
+
+        torch.cuda.empty_cache()
+        start_free = torch.cuda.mem_get_info()[0]
+        t0 = _time.perf_counter()
+
+        # Two warm-ups at max_n so flashinfer's lazy buffer / kernel
+        # selection stabilizes before capture. Without the warmup, the
+        # *first* capture sees JIT compile cost folded into the graph
+        # replay state and replays slower than steady state.
+        for _ in range(2):
+            h = fp._cg_sample_hidden_buf[:max_n]
+            logits = compute_logits(h)
+            probs = scaled_softmax(logits, fp._cg_sample_temperatures_buf[:max_n])
+            sampled = top_p_sampling_from_probs(
+                probs, top_p=fp._cg_sample_top_p_buf[:max_n], seed=None
+            )
+            fp._cg_sample_tokens_buf[:max_n].copy_(sampled.to(torch.int64))
+        torch.cuda.synchronize()
+
+        # Capture per-size. cuda graph capture state is per-stream, so we
+        # use a dedicated stream and synchronize between captures.
+        capture_stream = torch.cuda.Stream(device=device)
+        for n in sorted(set(int(s) for s in cap_sizes)):
+            if n <= 0 or n > max_n:
+                continue
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(capture_stream):
+                # `.copy_` of warmup data into the slice is unnecessary
+                # — the prior warmup already populated the buffers — but
+                # we re-zero hidden so the captured logits aren't a
+                # function of stale max_n state.
+                with torch.cuda.graph(graph, stream=capture_stream):
+                    h = fp._cg_sample_hidden_buf[:n]
+                    logits = compute_logits(h)
+                    probs = scaled_softmax(
+                        logits, fp._cg_sample_temperatures_buf[:n]
+                    )
+                    sampled = top_p_sampling_from_probs(
+                        probs, top_p=fp._cg_sample_top_p_buf[:n], seed=None
+                    )
+                    fp._cg_sample_tokens_buf[:n].copy_(sampled.to(torch.int64))
+            torch.cuda.synchronize()
+            fp._cg_sample_graphs[n] = graph
+
+        end_free = torch.cuda.mem_get_info()[0]
+        elapsed = _time.perf_counter() - t0
+        graph_bytes = max(0, start_free - end_free)
+        fp._cg_sample_enabled = True
+        _log(
+            f"captured sample graphs for {len(fp._cg_sample_graphs)} "
+            f"size(s) in {elapsed:.2f}s "
+            f"({graph_bytes / (1 << 20):.1f} MiB graph memory); "
+            f"sizes={sorted(fp._cg_sample_graphs.keys())[:5]}"
+            f"{'...' if len(fp._cg_sample_graphs) > 5 else ''}",
+            "INFO",
+        )
+
+    @torch.inference_mode()
     def fire_batch(
         self,
         inputs: dict,
@@ -701,6 +854,11 @@ class VllmEngine:
             gpu_timings["embed_ms"] = (t1 - t0) * 1000.0
             gpu_timings["transform_ms"] = (t2 - t1) * 1000.0
             gpu_timings["sample_ms"] = (t3 - t2) * 1000.0
+            # Surface whether the captured sample graph fired this batch
+            # (for bench-side localization of residual sample cost).
+            gpu_timings["sample_fastpath_used"] = (
+                self.forward_pass._sample_fastpath_used_last
+            )
 
         return out
 
