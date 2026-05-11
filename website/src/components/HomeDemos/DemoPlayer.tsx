@@ -132,6 +132,7 @@ function Pane({
 export default function DemoPlayer({ trace }: Props) {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [running, setRunning] = useState(true);
+  const [codeOpen, setCodeOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const startRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -228,6 +229,7 @@ export default function DemoPlayer({ trace }: Props) {
   // Reset when trace changes.
   useEffect(() => {
     hasStartedRef.current = false;
+    setCodeOpen(false);
     play();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trace.id]);
@@ -257,7 +259,10 @@ export default function DemoPlayer({ trace }: Props) {
         </button>
       </div>
       <div className={styles.question}>
-        <span className={styles.questionLabel}>Task</span>
+        <div className={styles.cardHeader}>
+          <span className={styles.glyph} aria-hidden>1</span>
+          <span className={styles.questionLabel}>Task</span>
+        </div>
         <p className={styles.questionText}>{trace.question}</p>
       </div>
       <div className={styles.panes}>
@@ -265,37 +270,59 @@ export default function DemoPlayer({ trace }: Props) {
         <Pane pane={trace.pie} elapsedMs={elapsedMs} />
       </div>
       {trace.code ? (
-        <div className={styles.codeRow}>
-          <div className={clsx(styles.codeColumn, styles.codeColumn_warn)}>
-            <div className={styles.codeHeader}>
-              <span className={styles.codeLabel}>Naive</span>
-            </div>
-            <CodeBlock language={trace.code.naive.language}>
-              {trace.code.naive.value}
-            </CodeBlock>
-          </div>
-          <div className={clsx(styles.codeColumn, styles.codeColumn_good)}>
-            <div className={styles.codeHeader}>
-              <span className={styles.codeLabel}>Pie inferlet</span>
-              <a
-                className={styles.codeSource}
-                href={inferletUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                inferlets/{inferletDir} ↗
-              </a>
-            </div>
-            <CodeBlock language={trace.code.pie.language}>
-              {trace.code.pie.value}
-            </CodeBlock>
-            {trace.runCommand ? (
-              <div className={styles.tryIt}>
-                <span className={styles.tryItLabel}>Try it yourself</span>
-                <CodeBlock language="bash">{trace.runCommand}</CodeBlock>
+        <div className={styles.codeWrap}>
+          <button
+            type="button"
+            className={clsx(styles.codeToggle, codeOpen && styles.codeToggleOpen)}
+            onClick={() => setCodeOpen((v) => !v)}
+            aria-expanded={codeOpen}
+            aria-controls={`demo-code-${trace.id}`}
+          >
+            <span className={styles.glyph} aria-hidden>2</span>
+            <span className={styles.codeToggleLabel}>
+              {codeOpen ? 'Hide the code' : 'Read the code'}
+            </span>
+            <span className={styles.codeToggleCaret} aria-hidden>
+              {codeOpen ? '▾' : '▸'}
+            </span>
+          </button>
+          {codeOpen ? (
+            <div id={`demo-code-${trace.id}`} className={styles.codeRow}>
+              <div className={clsx(styles.codeColumn, styles.codeColumn_warn)}>
+                <div className={styles.codeHeader}>
+                  <span className={styles.codeLabel}>Naive</span>
+                </div>
+                <CodeBlock language={trace.code.naive.language}>
+                  {trace.code.naive.value}
+                </CodeBlock>
               </div>
-            ) : null}
+              <div className={clsx(styles.codeColumn, styles.codeColumn_good)}>
+                <div className={styles.codeHeader}>
+                  <span className={styles.codeLabel}>Pie inferlet</span>
+                  <a
+                    className={styles.codeSource}
+                    href={inferletUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    inferlets/{inferletDir} ↗
+                  </a>
+                </div>
+                <CodeBlock language={trace.code.pie.language}>
+                  {trace.code.pie.value}
+                </CodeBlock>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {trace.runCommand ? (
+        <div className={styles.tryIt}>
+          <div className={styles.cardHeader}>
+            <span className={styles.glyph} aria-hidden>3</span>
+            <span className={styles.tryItLabel}>Try it yourself</span>
           </div>
+          <CodeBlock language="bash">{trace.runCommand}</CodeBlock>
         </div>
       ) : null}
     </div>
