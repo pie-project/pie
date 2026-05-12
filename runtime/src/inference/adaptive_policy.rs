@@ -73,6 +73,23 @@ use std::time::{Duration, Instant};
 
 use super::scheduler::{Decision, SchedulingPolicy};
 
+/// Largest fire size at which the cohort high-water ratchet is active.
+///
+/// At low concurrency (≤ 32) per-fire CPU overhead dominates, so the
+/// post-fire B=1 race (first inferlet to re-pin trips `B >= active`
+/// at B=1) costs 25-55% throughput. The ratchet fixes it by requiring
+/// the next batch to reach the previous fire's size before firing.
+///
+/// Above this threshold the ratchet causes wave-transition deadlocks
+/// with CUDA graphs: after a wave of N inferlets finishes, the next
+/// wave's first batched fire executes, but subsequent decode fires
+/// never materialise — likely a race between wave-1 KV-page release
+/// and wave-2 page allocation that's downstream of CUDA-graph state.
+/// We don't trip it if we fall back to plain `B >= active` early
+/// enough. Threshold is the empirical boundary on Qwen3-8B + L40
+/// where both effects are tolerable; revisit per workload if needed.
+const RATCHET_THRESHOLD: usize = 36;
+
 // =============================================================================
 // AdaptivePolicy — the default. Cohort cap + GPU-busy gate + safety bound.
 // =============================================================================
@@ -164,6 +181,17 @@ pub(super) struct AdaptivePolicy {
     /// Set in `on_fired` and cleared in `on_complete` — true while
     /// the device is executing a batch.
     in_flight: bool,
+    /// Max `pinned_count` seen since the last fire. Each call to
+    /// `decide` ratchets this up from the live atomic; resets on
+    /// `on_fired`. Climbs from 0 to the live cohort size as
+    /// inferlets pin, then plateaus.
+    cohort_high_water: usize,
+    /// Max fire size observed across all completed fires. Only
+    /// ratchets up. Used (under the `RATCHET_THRESHOLD` gate) as
+    /// the target for the cohort cap, so the policy waits through
+    /// the post-fire unpin/re-pin window instead of firing a B=1
+    /// batch on the first inferlet to re-pin.
+    fired_high_water: usize,
 }
 
 impl AdaptivePolicy {
@@ -175,6 +203,8 @@ impl AdaptivePolicy {
             last_latency: 0.0,
             batches_completed: 0,
             in_flight: false,
+            cohort_high_water: 0,
+            fired_high_water: 0,
         }
     }
 }
@@ -198,12 +228,16 @@ impl SchedulingPolicy for AdaptivePolicy {
         self.in_flight = false;
     }
 
-    fn on_fired(&mut self) {
+    fn on_fired(&mut self, fired_size: usize) {
         self.batch_start_time = None;
         self.in_flight = true;
+        if fired_size > self.fired_high_water {
+            self.fired_high_water = fired_size;
+        }
+        self.cohort_high_water = 0;
     }
 
-    fn decide(&self, current_batch_size: usize) -> Decision {
+    fn decide(&mut self, current_batch_size: usize) -> Decision {
         // (1) Structural cap. Always fires, even when in_flight,
         //     because the batch can't grow further.
         if current_batch_size >= self.max_batch_size {
@@ -220,9 +254,23 @@ impl SchedulingPolicy for AdaptivePolicy {
             return Decision::Wait(Duration::from_secs(60));
         }
         // GPU is free below this point.
-        // (4) Cohort cap.
+        // (4) Cohort cap. The target is either `fired_high_water`
+        //     (when bounded by `RATCHET_THRESHOLD`, to ride out the
+        //     post-fire pin race) or the live `pinned_count` (above
+        //     that threshold, where the ratchet causes wave-
+        //     transition deadlocks — see RATCHET_THRESHOLD docs).
         let active = crate::context::pinned_count(self.device_idx);
-        if active > 0 && current_batch_size >= active {
+        if active > self.cohort_high_water {
+            self.cohort_high_water = active;
+        }
+        let target = if self.fired_high_water > 0
+            && self.fired_high_water <= RATCHET_THRESHOLD
+        {
+            self.cohort_high_water.max(self.fired_high_water)
+        } else {
+            active
+        };
+        if target > 0 && current_batch_size >= target {
             return Decision::Fire;
         }
         // (5) Safety bound — never wait longer than one previous
@@ -263,6 +311,8 @@ pub(super) struct EagerPolicy {
     batch_start_time: Option<Instant>,
     last_latency: f64,
     batches_completed: usize,
+    cohort_high_water: usize,
+    fired_high_water: usize,
 }
 
 impl EagerPolicy {
@@ -273,6 +323,8 @@ impl EagerPolicy {
             batch_start_time: None,
             last_latency: 0.0,
             batches_completed: 0,
+            cohort_high_water: 0,
+            fired_high_water: 0,
         }
     }
 }
@@ -291,16 +343,31 @@ impl SchedulingPolicy for EagerPolicy {
         }
     }
 
-    fn on_fired(&mut self) {
+    fn on_fired(&mut self, fired_size: usize) {
         self.batch_start_time = None;
+        if fired_size > self.fired_high_water {
+            self.fired_high_water = fired_size;
+        }
+        self.cohort_high_water = 0;
     }
 
-    fn decide(&self, current_batch_size: usize) -> Decision {
+    fn decide(&mut self, current_batch_size: usize) -> Decision {
         if current_batch_size >= self.max_batch_size {
             return Decision::Fire;
         }
+        // Cohort cap with the same bounded ratchet as AdaptivePolicy.
         let active = crate::context::pinned_count(self.device_idx);
-        if active > 0 && current_batch_size >= active {
+        if active > self.cohort_high_water {
+            self.cohort_high_water = active;
+        }
+        let target = if self.fired_high_water > 0
+            && self.fired_high_water <= RATCHET_THRESHOLD
+        {
+            self.cohort_high_water.max(self.fired_high_water)
+        } else {
+            active
+        };
+        if target > 0 && current_batch_size >= target {
             return Decision::Fire;
         }
         if self.last_latency == 0.0 {
@@ -345,9 +412,9 @@ impl GreedyPolicy {
 impl SchedulingPolicy for GreedyPolicy {
     fn on_arrival(&mut self) {}
     fn on_complete(&mut self, _latency: Duration) {}
-    fn on_fired(&mut self) {}
+    fn on_fired(&mut self, _fired_size: usize) {}
 
-    fn decide(&self, _current_batch_size: usize) -> Decision {
+    fn decide(&mut self, _current_batch_size: usize) -> Decision {
         // The scheduler only calls `decide` when the batch is
         // non-empty, and the BatchAccumulator already enforces
         // `max_batch_size` upstream of the policy. So: just fire,
@@ -364,7 +431,7 @@ mod tests {
 
     #[test]
     fn adaptive_cold_start_fires() {
-        let policy = AdaptivePolicy::new(512, 0);
+        let mut policy = AdaptivePolicy::new(512, 0);
         // No batches completed yet — last_latency = 0; fire to make
         // progress.
         assert!(matches!(policy.decide(1), Decision::Fire));
@@ -375,7 +442,7 @@ mod tests {
         let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_complete(Duration::from_millis(500)); // skipped
         policy.on_complete(Duration::from_millis(20));
-        policy.on_fired();
+        policy.on_fired(8);
         // The structural cap fires unconditionally.
         assert!(matches!(policy.decide(512), Decision::Fire));
     }
@@ -385,7 +452,7 @@ mod tests {
         let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_complete(Duration::from_millis(500));
         policy.on_complete(Duration::from_millis(20));
-        policy.on_fired();
+        policy.on_fired(8);
         // Even at large B (cohort cap would normally fire), we wait
         // because the GPU is occupied.
         assert!(matches!(policy.decide(100), Decision::Wait(_)));
@@ -396,12 +463,34 @@ mod tests {
         let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_complete(Duration::from_millis(500));
         policy.on_complete(Duration::from_millis(20));
-        policy.on_fired();
+        policy.on_fired(8);
         assert!(matches!(policy.decide(1), Decision::Wait(_)));
         policy.on_complete(Duration::from_millis(20));
         // GPU free, no batch_start_time → Fire (defensive).
         assert!(matches!(policy.decide(1), Decision::Fire));
     }
+
+    #[test]
+    fn adaptive_fired_high_water_ratchet_blocks_post_fire_singleton() {
+        // After a fire of size 8, the cohort cap should NOT fire on
+        // the first re-pinner (B=1). Without the ratchet, B=1 trips
+        // `B >= active` if the live count happens to read 1; the
+        // ratchet pegs the target at 8.
+        let mut policy = AdaptivePolicy::new(512, 0);
+        policy.on_complete(Duration::from_millis(500)); // skipped
+        policy.on_complete(Duration::from_millis(20));
+        policy.on_fired(8);
+        policy.on_complete(Duration::from_millis(20)); // clears in_flight
+        policy.on_arrival();
+        // In a unit test the live pinned_count for device 0 is
+        // whatever previous tests left it at — we can't drive it
+        // directly. But fired_high_water=8 is enough to keep the
+        // target at 8 even if pinned_count momentarily reads less.
+        assert!(matches!(policy.decide(1), Decision::Wait(_)));
+        // Once the batch matches the previous fire size, fire.
+        assert!(matches!(policy.decide(8), Decision::Fire));
+    }
+
 
     #[test]
     fn adaptive_skips_first_batch_in_latency_update() {
@@ -427,13 +516,13 @@ mod tests {
 
     #[test]
     fn eager_cold_start_fires() {
-        let policy = EagerPolicy::new(512, 0);
+        let mut policy = EagerPolicy::new(512, 0);
         assert!(matches!(policy.decide(1), Decision::Fire));
     }
 
     #[test]
     fn eager_fires_at_max_batch_size() {
-        let policy = EagerPolicy::new(512, 0);
+        let mut policy = EagerPolicy::new(512, 0);
         assert!(matches!(policy.decide(512), Decision::Fire));
     }
 
@@ -448,7 +537,7 @@ mod tests {
 
     #[test]
     fn greedy_always_fires() {
-        let policy = GreedyPolicy::new();
+        let mut policy = GreedyPolicy::new();
         assert!(matches!(policy.decide(1), Decision::Fire));
         assert!(matches!(policy.decide(100), Decision::Fire));
         assert!(matches!(policy.decide(512), Decision::Fire));

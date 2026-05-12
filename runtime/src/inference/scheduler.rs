@@ -111,11 +111,17 @@ pub(super) trait SchedulingPolicy: Send {
     /// the forward pass took on the device.
     fn on_complete(&mut self, latency: Duration);
 
-    /// The current batch was fired.
-    fn on_fired(&mut self);
+    /// The current batch was fired. `fired_size` is the count of
+    /// requests in the batch that just went to the device — policies
+    /// use it to ratchet a high-water mark so the next batch targets
+    /// at least the same size, even if `pinned_count` briefly dips
+    /// while inferlets switch from "submitted" back to "pinned".
+    fn on_fired(&mut self, fired_size: usize);
 
     /// Decide whether to fire or wait, given the current batch size.
-    fn decide(&self, current_batch_size: usize) -> Decision;
+    /// Takes `&mut self` so policies can ratchet cohort high-water
+    /// marks from the current `pinned_count` reading on each call.
+    fn decide(&mut self, current_batch_size: usize) -> Decision;
 }
 
 // =============================================================================
@@ -349,7 +355,7 @@ impl BatchScheduler {
 
                     let total_tokens = batch.total_tokens();
                     let requests_to_fire = batch.take();
-                    policy.on_fired();
+                    policy.on_fired(requests_to_fire.len());
 
                     // Collect batch context IDs for accurate rent charging.
                     let batch_ctx_ids: Vec<u64> = requests_to_fire.iter()

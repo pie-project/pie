@@ -353,7 +353,7 @@ wheels = [
 
 [[package]]
 name = "pie-client"
-version = "0.2.1"
+version = "0.3.0"
 source = { editable = "../../client/python" }
 dependencies = [
     { name = "blake3" },

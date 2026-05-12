@@ -94,6 +94,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/rmsnorm.cu
   src/kernels/embed.cu
   src/kernels/swiglu.cu
+  src/kernels/unpack_qkv.cu
+  src/kernels/fused_qk_norm_rope.cu
   src/kernels/rope.cu
   src/kernels/argmax.cu
   src/kernels/kv_paged.cu

@@ -5,8 +5,11 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include "cuda_check.hpp"
 #include "kernels/dequant_fp8.hpp"
@@ -47,6 +50,12 @@ void CublasHandle::set_stream(cudaStream_t s) {
 
 namespace {
 
+// Forward decl — definition is after `LtCtx`.
+bool try_gemm_bf16_lt_cached(
+    cudaStream_t stream,
+    const void* act, const void* W, void* y,
+    int M, int N, int K, float beta);
+
 void gemm_bf16_impl(
     cublasHandle_t handle,
     const void* act, const void* W, void* y,
@@ -64,8 +73,19 @@ void gemm_bf16_impl(
     //                                          = sum_k op(A)[n,k] * op(B)[k,m]
     // where op(A) needs to be N × K (so transpose W'), op(B) needs to be
     // K × M (so leave act' as-is). Hence OP_T for A=W, OP_N for B=act.
-    const float alpha = 1.f;
 
+    // Fast path: pre-tuned cuBLASLt algo cached for this shape. Cache
+    // miss falls through to the legacy cublasGemmEx path; that's a
+    // never-tuned shape (e.g. a prefill M not in the bucket ladder),
+    // which is correct just not as fast as it could be.
+    cudaStream_t stream = nullptr;
+    {
+        const auto s = cublasGetStream(handle, &stream);
+        if (s != CUBLAS_STATUS_SUCCESS) stream = nullptr;
+    }
+    if (try_gemm_bf16_lt_cached(stream, act, W, y, M, N, K, beta)) return;
+
+    const float alpha = 1.f;
     const auto status = cublasGemmEx(
               handle,
               /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
@@ -278,7 +298,242 @@ struct LtCtx {
     GrowScratch int8_act;       // [M, K] int8 quantised activation
     GrowScratch int8_act_scale; // [M] fp32 act_scale_inv
     GrowScratch int32_acc;      // [M, N] int32 W8A8 accumulator
+    GrowScratch bf16_tune_out;  // bf16 [M, N] scratch for Lt autotune;
+                                //   never read after init.
 };
+
+// ── bf16 GEMM cache + pre-tune ────────────────────────────────────────
+//
+// Goal: skip cublas's small-M `gemvx` routing for the projection matmuls
+// in the transformer forward. Pre-tuning happens at engine init and
+// caches `(algo, descriptors, workspace_bytes)` keyed on (M, N, K).
+// `gemm_bf16_impl` looks up the cached entry on every call and falls
+// back to `cublasGemmEx` when the shape isn't tuned (no runtime tuning
+// — that path was net negative in earlier experiments).
+//
+// Memory layout (per cached entry): one cublasLtMatmulDesc + three
+// cublasLtMatrixLayout handles. These live for the lifetime of the
+// process; a never-tuned shape just goes through cublasGemmEx instead.
+struct Bf16LtAlgoCache {
+    struct Key {
+        int M, N, K;
+        bool operator==(const Key& o) const noexcept {
+            return M == o.M && N == o.N && K == o.K;
+        }
+    };
+    struct Hash {
+        std::size_t operator()(const Key& k) const noexcept {
+            std::size_t h = static_cast<std::size_t>(k.M);
+            h = h * 1000003u ^ static_cast<std::size_t>(k.N);
+            h = h * 1000003u ^ static_cast<std::size_t>(k.K);
+            return h;
+        }
+    };
+    struct Entry {
+        bool                   unsupported = false;
+        cublasLtMatmulAlgo_t   algo{};
+        std::size_t            workspace_bytes = 0;
+        cublasLtMatmulDesc_t   desc = nullptr;
+        cublasLtMatrixLayout_t a_layout = nullptr;
+        cublasLtMatrixLayout_t b_layout = nullptr;
+        cublasLtMatrixLayout_t d_layout = nullptr;
+    };
+    std::mutex mu;
+    std::unordered_map<Key, Entry, Hash> map;
+
+    static Bf16LtAlgoCache& instance() {
+        static Bf16LtAlgoCache c;
+        return c;
+    }
+};
+
+// Populate `out` with the best algo for (M, N, K) by timing several
+// heuristic candidates. Allocates persistent cuBLASLt descriptors —
+// these live with the cache entry, not with the calling scope. Tuning
+// writes to a scratch output buffer (LtCtx::bf16_tune_out grows on
+// demand), never to the caller's `y`.
+//
+// Caller holds the cache mutex. Returns with `out.unsupported = true`
+// when no algo is viable for this shape.
+void autotune_bf16_lt_entry(
+    Bf16LtAlgoCache::Entry& out,
+    int M, int N, int K,
+    const void* act_scratch, const void* W_scratch,
+    cudaStream_t stream)
+{
+    auto& ctx = LtCtx::instance();
+
+    LT_CHECK(cublasLtMatmulDescCreate(&out.desc,
+                                      CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    cublasOperation_t op_t = CUBLAS_OP_T;
+    cublasOperation_t op_n = CUBLAS_OP_N;
+    LT_CHECK(cublasLtMatmulDescSetAttribute(
+        out.desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t)));
+    LT_CHECK(cublasLtMatmulDescSetAttribute(
+        out.desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
+
+    // m=N, n=M, k=K — same row-major/col-major reinterpretation the
+    // cublasGemmEx path uses (see gemm_bf16_impl above).
+    LT_CHECK(cublasLtMatrixLayoutCreate(&out.a_layout, CUDA_R_16BF,
+                                        /*rows=*/K, /*cols=*/N, /*ld=*/K));
+    LT_CHECK(cublasLtMatrixLayoutCreate(&out.b_layout, CUDA_R_16BF,
+                                        /*rows=*/K, /*cols=*/M, /*ld=*/K));
+    LT_CHECK(cublasLtMatrixLayoutCreate(&out.d_layout, CUDA_R_16BF,
+                                        /*rows=*/N, /*cols=*/M, /*ld=*/N));
+
+    constexpr int kCandidates = 16;
+    cublasLtMatmulPreference_t pref = nullptr;
+    LT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+    LT_CHECK(cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &ctx.workspace_bytes, sizeof(ctx.workspace_bytes)));
+
+    cublasLtMatmulHeuristicResult_t heur[kCandidates] = {};
+    int returned = 0;
+    cublasLtMatmulAlgoGetHeuristic(
+        ctx.handle, out.desc, out.a_layout, out.b_layout,
+        out.d_layout, out.d_layout, pref,
+        kCandidates, heur, &returned);
+    cublasLtMatmulPreferenceDestroy(pref);
+
+    if (returned == 0) {
+        out.unsupported = true;
+        return;
+    }
+
+    // Scratch output buffer for the timing runs.
+    const std::size_t out_bytes =
+        static_cast<std::size_t>(M) * static_cast<std::size_t>(N) * 2u;
+    void* tune_y = ctx.bf16_tune_out.ensure(out_bytes);
+
+    cudaEvent_t e_start = nullptr, e_stop = nullptr;
+    CUDA_CHECK(cudaEventCreate(&e_start));
+    CUDA_CHECK(cudaEventCreate(&e_stop));
+    const float alpha = 1.f;
+    const float zero_beta = 0.f;
+
+    int best_idx = -1;
+    float best_ms = std::numeric_limits<float>::infinity();
+    for (int i = 0; i < returned; ++i) {
+        if (heur[i].state != CUBLAS_STATUS_SUCCESS) continue;
+        // 2 warmups.
+        bool ok = true;
+        for (int w = 0; w < 2 && ok; ++w) {
+            const auto s = cublasLtMatmul(
+                ctx.handle, out.desc, &alpha,
+                W_scratch, out.a_layout, act_scratch, out.b_layout,
+                &zero_beta, tune_y, out.d_layout, tune_y, out.d_layout,
+                &heur[i].algo, ctx.workspace, heur[i].workspaceSize,
+                stream);
+            if (s != CUBLAS_STATUS_SUCCESS) ok = false;
+        }
+        if (!ok) continue;
+        // 3 timed iterations.
+        CUDA_CHECK(cudaEventRecord(e_start, stream));
+        for (int r = 0; r < 3 && ok; ++r) {
+            const auto s = cublasLtMatmul(
+                ctx.handle, out.desc, &alpha,
+                W_scratch, out.a_layout, act_scratch, out.b_layout,
+                &zero_beta, tune_y, out.d_layout, tune_y, out.d_layout,
+                &heur[i].algo, ctx.workspace, heur[i].workspaceSize,
+                stream);
+            if (s != CUBLAS_STATUS_SUCCESS) ok = false;
+        }
+        if (!ok) continue;
+        CUDA_CHECK(cudaEventRecord(e_stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(e_stop));
+        float ms = 0.f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, e_start, e_stop));
+        if (ms < best_ms) {
+            best_ms = ms;
+            best_idx = i;
+        }
+    }
+    cudaEventDestroy(e_start);
+    cudaEventDestroy(e_stop);
+
+    if (best_idx < 0) {
+        out.unsupported = true;
+        return;
+    }
+    out.algo            = heur[best_idx].algo;
+    out.workspace_bytes = heur[best_idx].workspaceSize;
+}
+
+// Scratch input buffers for autotune. Allocated lazily by
+// `pretune_bf16_gemm`, sized to the largest seen (M*K) and (N*K).
+// Filled with arbitrary (but valid) bf16 data so cublasLt's algo
+// selection runs against representative memory traffic.
+struct PretuneScratch {
+    void*       act = nullptr;  // [M_max * K_max] bf16
+    void*       w   = nullptr;  // [N_max * K_max] bf16
+    std::size_t act_bytes = 0;
+    std::size_t w_bytes   = 0;
+    bool        initialised = false;
+
+    static PretuneScratch& instance() {
+        static PretuneScratch s;
+        return s;
+    }
+
+    void ensure(std::size_t want_act, std::size_t want_w) {
+        if (want_act > act_bytes) {
+            if (act) CUDA_CHECK(cudaFree(act));
+            CUDA_CHECK(cudaMalloc(&act, want_act));
+            CUDA_CHECK(cudaMemset(act, 0x3c, want_act));  // ~1.0 in bf16
+            act_bytes = want_act;
+        }
+        if (want_w > w_bytes) {
+            if (w) CUDA_CHECK(cudaFree(w));
+            CUDA_CHECK(cudaMalloc(&w, want_w));
+            CUDA_CHECK(cudaMemset(w, 0x3c, want_w));
+            w_bytes = want_w;
+        }
+        initialised = true;
+    }
+};
+
+bool try_gemm_bf16_lt_cached(
+    cudaStream_t stream,
+    const void* act, const void* W, void* y,
+    int M, int N, int K, float beta)
+{
+    auto& ctx = LtCtx::instance();
+    if (!ctx.handle) return false;  // Lt never initialised → no cache
+
+    auto& cache = Bf16LtAlgoCache::instance();
+    const Bf16LtAlgoCache::Key key{M, N, K};
+
+    const Bf16LtAlgoCache::Entry* entry = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(cache.mu);
+        auto it = cache.map.find(key);
+        if (it == cache.map.end()) return false;  // not pre-tuned
+        if (it->second.unsupported) return false;
+        entry = &it->second;
+    }
+
+    const float alpha = 1.f;
+    const auto status = cublasLtMatmul(
+        ctx.handle, entry->desc,
+        &alpha,
+        /*A=*/W,   entry->a_layout,
+        /*B=*/act, entry->b_layout,
+        &beta,
+        /*C=*/y,   entry->d_layout,
+        /*D=*/y,   entry->d_layout,
+        &entry->algo,
+        ctx.workspace, entry->workspace_bytes,
+        stream);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        // Drop the entry so the next call falls back to cublasGemmEx
+        // until something repopulates it (typically a re-pretune).
+        std::lock_guard<std::mutex> lk(cache.mu);
+        cache.map.erase(key);
+        return false;
+    }
+    return true;
+}
 
 // Dequant fallback for sm<89 — materialises a bf16 copy of the FP8
 // weight, then runs the classic cuBLAS bf16 GEMM. Costs one extra
@@ -604,6 +859,44 @@ void gemm_batched_act_x_w(
         return;
     }
     unsupported("gemm_batched_act_x_w", act_dtype, w_dtype, y_dtype);
+}
+
+void pretune_bf16_gemm(std::span<const Bf16GemmShape> shapes,
+                       cudaStream_t stream)
+{
+    if (shapes.empty()) return;
+
+    auto& ctx = LtCtx::instance();
+    ctx.ensure_init();
+
+    // Size the scratch input buffers to the largest M*K (activation)
+    // and N*K (weight) we'll see. bf16 = 2 bytes/element.
+    std::size_t max_act = 0, max_w = 0;
+    for (const auto& s : shapes) {
+        max_act = std::max<std::size_t>(
+            max_act,
+            static_cast<std::size_t>(s.M) * static_cast<std::size_t>(s.K) * 2u);
+        max_w = std::max<std::size_t>(
+            max_w,
+            static_cast<std::size_t>(s.N) * static_cast<std::size_t>(s.K) * 2u);
+    }
+    auto& ps = PretuneScratch::instance();
+    ps.ensure(max_act, max_w);
+
+    auto& cache = Bf16LtAlgoCache::instance();
+    std::lock_guard<std::mutex> lk(cache.mu);
+    for (const auto& s : shapes) {
+        const Bf16LtAlgoCache::Key key{s.M, s.N, s.K};
+        if (cache.map.find(key) != cache.map.end()) continue;
+        auto [it, inserted] = cache.map.emplace(key, Bf16LtAlgoCache::Entry{});
+        autotune_bf16_lt_entry(it->second, s.M, s.N, s.K,
+                               ps.act, ps.w, stream);
+    }
+    if (stream) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 }
 
 }  // namespace pie_cuda_driver::ops

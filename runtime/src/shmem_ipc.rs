@@ -273,8 +273,17 @@ impl ShmemClient {
         // CI runs override (lower for fast failure, higher if a benchmark
         // legitimately blocks longer than 60s).
         let started = std::time::Instant::now();
-        let yield_after = std::time::Duration::from_micros(self.spin_us);
         let hard_timeout = *HARD_TIMEOUT;
+        // `yield_after` is `None` for pure-spin (spin_us == 0); the prior
+        // logic compared `elapsed >= Duration::from_micros(0)`, which is
+        // always true, so `std::thread::yield_now()` ran every loop
+        // iteration and the supposedly "busy-spin" path was actually
+        // scheduler-roundtrip-bound (~40-100 µs / yield on Linux).
+        let yield_after = if self.spin_us == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_micros(self.spin_us))
+        };
         loop {
             if self.resp_seq_atomic(i).load(Ordering::Acquire) >= new_seq {
                 break;
@@ -295,8 +304,10 @@ impl ShmemClient {
                     request_id
                 ));
             }
-            if elapsed >= yield_after {
-                std::thread::yield_now();
+            if let Some(ya) = yield_after {
+                if elapsed >= ya {
+                    std::thread::yield_now();
+                }
             }
             std::hint::spin_loop();
         }

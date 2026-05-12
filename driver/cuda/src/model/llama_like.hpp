@@ -87,6 +87,15 @@ struct LlamaLikeForwardCfg {
 // graph capture region — no host-side work, no allocations.
 struct LlamaLikePlanState {
     ops::DecodePlanCachePtr decode_plan;
+    // Cache key for `decode_plan`. With `enable_cuda_graph=true` in the
+    // plan call, flashinfer's plan_info is determined by
+    // (R, num_q_heads, num_kv_heads, head_dim, page_size) — independent
+    // of the per-request KV length distribution. The per-fire KV
+    // contents flow through the workspace int-buffer (whose addresses
+    // are stable) and are refreshed by the next plan call's H2D
+    // memcpy. Reusing the plan across fires with the same R skips
+    // ~25 µs of host scheduling + the small device memcpy per fire.
+    int cached_num_requests = -1;
 };
 
 // Refresh the decode plan for the current fire. Caller invokes this

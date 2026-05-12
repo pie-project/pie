@@ -27,6 +27,8 @@ namespace pie_cuda_driver::model { struct Qwen3Workspace; }
 
 namespace pie_cuda_driver {
 
+struct PersistentInputs;
+
 struct SamplingPlan {
     // Whether any slot needs the topk+top-p kernel. False routes to the
     // simpler temperature/min-p path.
@@ -49,8 +51,14 @@ struct SamplingPlan {
 // `int32_t`s. Non-sample rows are left unspecified; only positions
 // listed in `plan.sample_idx` are written by the topk+top-p path,
 // while the temp/min-p path writes every row.
+//
+// `pi` supplies persistent device + pinned-host scratch (alloced once
+// at engine init). The plan arrays are uploaded via async H2D into the
+// stable buffers; the topk/topp scatter uses pinned host staging so
+// the D2H + H2D copies bypass the driver's pageable-staging fallback.
 void dispatch_sampling(
     model::Qwen3Workspace& ws,
+    PersistentInputs& pi,
     std::int32_t* d_sampled_out,
     const SamplingPlan& plan,
     int N,

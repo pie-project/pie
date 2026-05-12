@@ -30,6 +30,14 @@ struct Qwen3LayerWeights {
     const DeviceTensor* v_proj = nullptr;      // [num_kv_heads*head_dim, hidden]
     const DeviceTensor* o_proj = nullptr;      // [hidden, num_q_heads*head_dim]
 
+    // Optional fused QKV weight `[Hq + 2*Hk, H]` = [q_proj; k_proj; v_proj]
+    // concatenated along the output dim. Populated at bind time for bf16
+    // layers; null when any of q/k/v is quantized (separate-GEMM
+    // fallback). When non-null, the forward calls one GEMM into a
+    // scratch buffer + an unpack kernel that fills the existing ws.q,
+    // ws.k, ws.v contiguous buffers.
+    const DeviceTensor* qkv_proj = nullptr;
+
     // Optional QKV bias terms. Set on Qwen-2 / OLMo-3 / GPT-OSS, null on
     // Llama-3 / Qwen-3 / Phi-3 / Mistral. When non-null, applied
     // post-projection via `launch_add_bias_bf16`.
@@ -46,6 +54,13 @@ struct Qwen3LayerWeights {
     const DeviceTensor* gate_proj = nullptr;   // [intermediate, hidden]
     const DeviceTensor* up_proj   = nullptr;   // [intermediate, hidden]
     const DeviceTensor* down_proj = nullptr;   // [hidden, intermediate]
+
+    // Optional fused gate+up weight `[2*I, H]` = [gate_proj; up_proj].
+    // Populated for bf16 layers; null when either gate or up is
+    // quantized. Forward calls one GEMM into ws.gate_up + strided
+    // swiglu (no unpack — swiglu reads gate at offset 0, up at offset
+    // I within each row, then writes to a separate contiguous ws.gate).
+    const DeviceTensor* gate_up_proj = nullptr;
 
     // Optional QuantMeta companions for each weight. Null when the
     // weight is plain bf16 (the common case). When set, the forward
@@ -88,10 +103,15 @@ struct Qwen3Weights {
 /// `embed` when `tie_word_embeddings` is set). Reads `cfg.use_qk_norm` to
 /// decide whether to require q/k_norm weights, and `cfg.use_qkv_bias` to
 /// decide whether to bind q/k/v bias terms.
-Qwen3Weights bind_llama_like(const Engine& engine);
+///
+/// Also materialises a fused `qkv_proj` weight per layer when q/k/v are all
+/// plain bf16 (most common case). The fused weight is registered in the
+/// engine under `model.layers.{i}.self_attn.qkv_proj_packed.weight` and
+/// drives a single-GEMM-plus-unpack path in the forward.
+Qwen3Weights bind_llama_like(Engine& engine);
 
 // Backward-compatible alias for callers still using `bind_qwen3`.
-inline Qwen3Weights bind_qwen3(const Engine& engine) { return bind_llama_like(engine); }
+inline Qwen3Weights bind_qwen3(Engine& engine) { return bind_llama_like(engine); }
 
 // Phi-3 ships fused `qkv_proj` and `gate_up_proj` weights. The bind
 // function below splits them into the standard q/k/v/gate/up slots
@@ -107,6 +127,6 @@ Qwen3Weights bind_phi3(Engine& engine);
 // OLMo-3 has no `input_layernorm` because the architecture is
 // post-norm. The forward path for OLMo-3 selects post-norm via
 // `LlamaLikeForwardCfg::norm_placement = NormPlacement::Post`.
-Qwen3Weights bind_olmo3(const Engine& engine);
+Qwen3Weights bind_olmo3(Engine& engine);
 
 }  // namespace pie_cuda_driver::model

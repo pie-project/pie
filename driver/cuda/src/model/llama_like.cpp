@@ -5,12 +5,14 @@
 #include "cuda_check.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/embed.hpp"
+#include "kernels/fused_qk_norm_rope.hpp"
 #include "kernels/head_dim_pad.hpp"
 #include "kernels/kv_paged.hpp"
 #include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/swiglu.hpp"
+#include "kernels/unpack_qkv.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
 
@@ -85,6 +87,16 @@ void prepare_llama_like_decode_plan(
     if (!state.decode_plan) {
         state.decode_plan = ops::make_decode_plan();
     }
+    // Skip re-planning when the shape key is unchanged from the last
+    // fire. The per-fire KV index updates live in `pi.kv_page_indices`
+    // / `pi.kv_last_page_lens` (device pointers + H2D refresh) which
+    // the dispatch reads directly — those are NOT in the plan_info
+    // struct and don't require re-planning. Verified safe with
+    // `enable_cuda_graph=true` (flashinfer's plan_info fields are
+    // determined entirely by shape constants in that mode).
+    if (state.cached_num_requests == num_requests) {
+        return;
+    }
     const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
     const int num_q_heads_local  = cfg.num_attention_heads / T;
     const int num_kv_heads_local = cfg.num_key_value_heads / T;
@@ -92,6 +104,7 @@ void prepare_llama_like_decode_plan(
         *state.decode_plan, kv_page_indptr_h, num_requests,
         num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
         cache.page_size(), attn_ws, /*stream=*/nullptr);
+    state.cached_num_requests = num_requests;
 }
 
 void llama_like_forward_paged(
@@ -139,7 +152,14 @@ void llama_like_forward_paged(
     const int Hk_kern = num_kv_heads_local * dk;
     const bool head_dim_padded = (d != dk);
     const float eps = cfg.rms_norm_eps;
+    // Stream comes from the cublas handle. The request handler swaps
+    // the cublas stream to the capture stream before
+    // `cudaStreamBeginCapture` and restores it after, so when this
+    // body runs inside a captured region all its kernel launches land
+    // on the captured stream (and thus into the graph). Outside the
+    // captured region the stream stays nullptr (legacy default).
     cudaStream_t stream = nullptr;
+    cublasGetStream(cublas.handle(), &stream);
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
     // When head_dim is padded, the attention kernel runs at `dk`
@@ -172,6 +192,22 @@ void llama_like_forward_paged(
 
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
 
+    // GEMM-M padding: round per-fire row count up to the next power
+    // of two (min 8). cublas's heuristic at small / odd M routes to
+    // the `gemvx` batched-GEMV path; at the bucketed M values it
+    // picks a tensor-core GEMM. Padding only the GEMM calls keeps
+    // the change scoped — input rows in [N..pN) are uninitialized
+    // junk and the corresponding output rows are never read
+    // downstream (per-row independence of matmul guarantees rows
+    // [0..N) are unchanged).
+    auto next_pow2 = [](int x) {
+        if (x <= 8) return 8;
+        int r = 8;
+        while (r < x) r <<= 1;
+        return r;
+    };
+    const int pN = next_pow2(N);
+
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
 
@@ -186,15 +222,33 @@ void llama_like_forward_paged(
             qkv_in = ws.norm_x.data();
         }
 
-        ops::gemm_act_x_w(cublas.handle(),
-            qkv_in, make_weight_view(layer.q_proj, layer.q_proj_quant),
-            ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            qkv_in, make_weight_view(layer.k_proj, layer.k_proj_quant),
-            ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            qkv_in, make_weight_view(layer.v_proj, layer.v_proj_quant),
-            ws.v.data(), N, Hk, H);
+        // QKV — single fused GEMM + unpack when a packed weight was
+        // materialised at bind time (bf16-only path, no biases). Falls
+        // back to three separate GEMMs for quantized or biased layers.
+        // TP-safe: T=1 here in the bench, and the fused weight only
+        // exists when q_proj/k_proj/v_proj are all bf16 (handled at
+        // bind time).
+        const bool fuse_qkv = (layer.qkv_proj != nullptr) &&
+                              !fwd_cfg.use_qkv_bias;
+        if (fuse_qkv) {
+            ops::gemm_act_x_w(cublas.handle(),
+                qkv_in, ops::WeightView(*layer.qkv_proj),
+                ws.qkv_packed.data(), pN, Hq + 2 * Hk, H);
+            kernels::launch_unpack_qkv_bf16(
+                ws.qkv_packed.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                pN, Hq, Hk, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                qkv_in, make_weight_view(layer.q_proj, layer.q_proj_quant),
+                ws.q.data(), pN, Hq, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                qkv_in, make_weight_view(layer.k_proj, layer.k_proj_quant),
+                ws.k.data(), pN, Hk, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                qkv_in, make_weight_view(layer.v_proj, layer.v_proj_quant),
+                ws.v.data(), pN, Hk, H);
+        }
 
         if (fwd_cfg.use_qkv_bias) {
             maybe_add_bias(ws.q.data(), layer.q_bias, N, Hq, stream);
@@ -226,17 +280,41 @@ void llama_like_forward_paged(
                     N * num_heads_local, d, eps, stream);
             }
         };
-        if (fwd_cfg.use_qk_norm && layer.q_norm) {
-            rmsnorm_qk(ws.q.data(), layer.q_norm, num_q_heads_local, Hq);
+        // qk-norm + RoPE — fused into one kernel when:
+        //   * both norms are per-head (weight shape `[head_dim]`),
+        //   * RoPE is the standard (non-YaRN) variant,
+        //   * head_dim is supported by the fused kernel (64/128/256).
+        // Saves 2 launches per layer (rmsnorm × 2 → just rope) plus
+        // the read/write churn on Q/K through gmem.
+        const bool both_per_head_norm =
+            fwd_cfg.use_qk_norm && layer.q_norm && layer.k_norm &&
+            layer.q_norm->shape().size() == 1 &&
+            layer.q_norm->shape()[0] == d &&
+            layer.k_norm->shape().size() == 1 &&
+            layer.k_norm->shape()[0] == d;
+        const bool fuse_qknorm_rope =
+            both_per_head_norm &&
+            fwd_cfg.rope_kind == RopeKind::Standard &&
+            (d == 64 || d == 128 || d == 256);
+        if (fuse_qknorm_rope) {
+            kernels::launch_fused_qk_norm_rope_bf16(
+                ws.q.data(), ws.k.data(),
+                positions,
+                layer.q_norm->data(), layer.k_norm->data(),
+                N, num_q_heads_local, num_kv_heads_local, d,
+                eps, cfg.rope_theta, stream);
+        } else {
+            if (fwd_cfg.use_qk_norm && layer.q_norm) {
+                rmsnorm_qk(ws.q.data(), layer.q_norm, num_q_heads_local, Hq);
+            }
+            if (fwd_cfg.use_qk_norm && layer.k_norm) {
+                rmsnorm_qk(ws.k.data(), layer.k_norm, num_kv_heads_local, Hk);
+            }
+            apply_rope(fwd_cfg, cfg,
+                       ws.q.data(), ws.k.data(), positions,
+                       N, num_q_heads_local, num_kv_heads_local, d,
+                       stream);
         }
-        if (fwd_cfg.use_qk_norm && layer.k_norm) {
-            rmsnorm_qk(ws.k.data(), layer.k_norm, num_kv_heads_local, Hk);
-        }
-
-        apply_rope(fwd_cfg, cfg,
-                   ws.q.data(), ws.k.data(), positions,
-                   N, num_q_heads_local, num_kv_heads_local, d,
-                   stream);
 
         // Pad Q/K/V to `dk` when the model's head_dim isn't a flashinfer
         // dispatch value. The padded buffers are zero on the trailing
@@ -322,11 +400,11 @@ void llama_like_forward_paged(
             if (T == 1) {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
-                    ws.y.data(), N, H, Hq, /*beta=*/1.f);
+                    ws.y.data(), pN, H, Hq, /*beta=*/1.f);
             } else {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
-                    ws.norm_x.data(), N, H, Hq, /*beta=*/0.f);
+                    ws.norm_x.data(), pN, H, Hq, /*beta=*/0.f);
                 tp->all_reduce_bf16(ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
                 kernels::launch_residual_add_bf16(
@@ -337,7 +415,7 @@ void llama_like_forward_paged(
             // norm_attn(norm_x) → norm_y, then y += norm_y.
             ops::gemm_act_x_w(cublas.handle(),
                 ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
-                ws.norm_x.data(), N, H, Hq, /*beta=*/0.f);
+                ws.norm_x.data(), pN, H, Hq, /*beta=*/0.f);
             if (T > 1) {
                 tp->all_reduce_bf16(ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
@@ -358,15 +436,26 @@ void llama_like_forward_paged(
             mlp_in = ws.norm_y.data();
         }
 
-        ops::gemm_act_x_w(cublas.handle(),
-            mlp_in, make_weight_view(layer.gate_proj, layer.gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            mlp_in, make_weight_view(layer.up_proj, layer.up_proj_quant),
-            ws.up.data(),   N, I, H);
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
+        // Gate / up — fused via chunked-swiglu when a packed weight is
+        // available (bf16, no quant). Single GEMM produces `[N, 2*I]`;
+        // swiglu reads gate from offset 0, up from offset I.
+        if (layer.gate_up_proj) {
+            ops::gemm_act_x_w(cublas.handle(),
+                mlp_in, ops::WeightView(*layer.gate_up_proj),
+                ws.gate_up.data(), pN, 2 * I, H);
+            kernels::launch_chunked_swiglu_bf16(
+                ws.gate_up.data(), ws.gate.data(), N, I, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                mlp_in, make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+                ws.gate.data(), pN, I, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                mlp_in, make_weight_view(layer.up_proj, layer.up_proj_quant),
+                ws.up.data(),   pN, I, H);
+            kernels::launch_swiglu_bf16(
+                ws.gate.data(), ws.up.data(), ws.gate.data(),
+                N * I, stream);
+        }
 
         if (!post_norm) {
             // down_proj is row-parallel: same all-reduce + residual-add
@@ -376,11 +465,11 @@ void llama_like_forward_paged(
             if (T == 1) {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
-                    ws.y.data(), N, H, I, /*beta=*/1.f);
+                    ws.y.data(), pN, H, I, /*beta=*/1.f);
             } else {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
-                    ws.norm_x.data(), N, H, I, /*beta=*/0.f);
+                    ws.norm_x.data(), pN, H, I, /*beta=*/0.f);
                 tp->all_reduce_bf16(ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
                 kernels::launch_residual_add_bf16(
@@ -390,7 +479,7 @@ void llama_like_forward_paged(
             // Post-norm MLP: down_proj → norm_x scratch, norm_mlp, += y.
             ops::gemm_act_x_w(cublas.handle(),
                 ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
-                ws.norm_x.data(), N, H, I, /*beta=*/0.f);
+                ws.norm_x.data(), pN, H, I, /*beta=*/0.f);
             if (T > 1) {
                 tp->all_reduce_bf16(ws.norm_x.data(),
                     static_cast<std::size_t>(N) * H, ncclSum, stream);
@@ -408,7 +497,7 @@ void llama_like_forward_paged(
         N, H, eps, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.norm_x.data(), *w.lm_head, ws.logits.data(),
-        N, V, H);
+        pN, V, H);
 }
 
 }  // namespace pie_cuda_driver::model
