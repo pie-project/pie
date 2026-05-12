@@ -33,9 +33,15 @@ async def run_benchmark(args):
     from pie.config import Config, ModelConfig, AuthConfig, RuntimeConfig
 
     if args.driver == "native" and args.use_cuda_graphs:
-        print("ERROR: --use-cuda-graphs is not supported on the native driver.",
-              file=sys.stderr)
-        sys.exit(1)
+        # `native` (the pure-Python driver) cannot do CUDA graph capture.
+        # If the user passed --no-use-cuda-graphs explicitly we honor that
+        # silently; only reject when the (default-on or explicit-on) graphs
+        # request collides with the driver's incapability.
+        if args.cuda_graphs_explicit:
+            print("ERROR: --use-cuda-graphs is not supported on the native driver.",
+                  file=sys.stderr)
+            sys.exit(1)
+        args.use_cuda_graphs = False
 
     # -- Resolve paths --------------------------------------------------------
 
@@ -308,8 +314,17 @@ def main():
                         help="vLLM max_num_batched_tokens. Caps tokens per fire_batch (also pie's max_batch_tokens via DriverCapabilities). Default None = vllm auto. Only used when --driver=vllm")
     parser.add_argument("--sglang-attention-backend", default=None,
                         help="SGLang attention backend (triton / flashinfer / flex_attention / fa3). Only used when --driver=sglang")
-    parser.add_argument("--use-cuda-graphs", action="store_true",
-                        help="Enable CUDA graphs (vllm/sglang only — native driver does not support this).")
+    parser.add_argument("--use-cuda-graphs", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable CUDA graphs on the backing engine (vllm/sglang/cuda_native). "
+                             "Default on — running engines in eager mode disables their primary "
+                             "optimization and understates throughput (ticket #116 bug #2). "
+                             "The `native` driver does not support CUDA graphs; it silently runs "
+                             "in eager mode unless --use-cuda-graphs is explicitly requested, in "
+                             "which case it errors.")
+    # Track whether the user explicitly set --use-cuda-graphs / --no-use-cuda-graphs
+    # so the `native` driver guard can distinguish explicit-request (error) from
+    # default-on (silent downgrade to eager).
+    cuda_graphs_explicit = any(a in ("--use-cuda-graphs", "--no-use-cuda-graphs") for a in sys.argv[1:])
     parser.add_argument("--default-endowment-pages", type=int, default=64,
                         help="Per-process KV-page endowment used by the admission gate (lower = more concurrent processes admitted)")
     parser.add_argument("--oversubscription-factor", type=float, default=1000.0,
@@ -323,6 +338,7 @@ def main():
                              "many-core boxes can cut migration overhead.")
 
     args = parser.parse_args()
+    args.cuda_graphs_explicit = cuda_graphs_explicit
 
     try:
         asyncio.run(run_benchmark(args))

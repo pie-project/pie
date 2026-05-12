@@ -426,7 +426,9 @@ def main():
     parser.add_argument("--driver", default="native", choices=["native", "vllm", "sglang", "dummy"])
     parser.add_argument("--vllm-attention-backend", default=None)
     parser.add_argument("--sglang-attention-backend", default=None)
-    parser.add_argument("--use-cuda-graphs", action="store_true")
+    parser.add_argument("--use-cuda-graphs", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable CUDA graphs (vllm/sglang). Default on — matches engine "
+                             "production configuration. Native driver runs eager regardless.")
 
     # Open-loop driving controls
     parser.add_argument("--rps", type=float, default=4.0,
