@@ -57,6 +57,7 @@ async def _run_churn(client, inferlet_name, args, phases: list[tuple[float, floa
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "system": "You are a helpful benchmarking assistant.",
+        "ignore_eos": args.ignore_eos,
     }
 
     rng = random.Random(args.seed)
@@ -168,6 +169,7 @@ async def _run_one_rate(client, inferlet_name, args, rps: float):
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "system": "You are a helpful benchmarking assistant.",
+        "ignore_eos": args.ignore_eos,
     }
 
     rng = random.Random(args.seed)
@@ -263,13 +265,18 @@ async def run_benchmark(args):
     )
 
     script_dir = Path(__file__).parent.resolve()
+    inferlet_dir = script_dir.parent / "inferlets" / "text-completion-bench"
     wasm_path = (
-        script_dir.parent / "inferlets" / "text-completion"
-        / "target" / "wasm32-wasip2" / "release" / "text_completion.wasm"
+        inferlet_dir / "target" / "wasm32-wasip2" / "release"
+        / "text_completion_bench.wasm"
     )
-    manifest_path = script_dir.parent / "inferlets" / "text-completion" / "Pie.toml"
+    manifest_path = inferlet_dir / "Pie.toml"
     if not wasm_path.exists():
         print(f"Error: WASM binary not found at {wasm_path}")
+        print(
+            "Build with: cargo build -p text-completion-bench "
+            "--target wasm32-wasip2 --release"
+        )
         sys.exit(1)
 
     import tomllib
@@ -362,6 +369,7 @@ async def run_benchmark(args):
                 "prompt": args.prompt, "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
                 "system": "You are a helpful benchmarking assistant.",
+                "ignore_eos": args.ignore_eos,
             }
             warm = [asyncio.create_task(_consume_one(client, inferlet_name, warm_input))
                     for _ in range(args.warmup_requests)]
@@ -407,7 +415,11 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--gpu-mem-util", type=float, default=0.8)
     parser.add_argument("--cpu-mem-budget", type=int, default=0)
-    parser.add_argument("--unique-prompts", action="store_true")
+    parser.add_argument("--unique-prompts", action="store_true",
+                        help="Append per-request id to defeat KV-cache reuse beyond the shared system prefix")
+    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True,
+                        help="Ignore stop tokens so every request consumes the full --max-tokens budget. "
+                             "On by default to keep output-token totals deterministic across runs.")
     parser.add_argument("--default-token-budget", type=int, required=True)
     parser.add_argument("--max-concurrent-processes", type=int, default=None)
     parser.add_argument("--max-batch-size", type=int, default=512)

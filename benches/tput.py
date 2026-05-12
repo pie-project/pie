@@ -1,8 +1,15 @@
 """Pie throughput benchmark.
 
 Spins up a local Pie server using the ``Server`` API, installs the
-text-completion inferlet, then fires concurrent requests and reports
-throughput.
+text-completion-bench inferlet, then fires concurrent requests and
+reports throughput.
+
+The bench inferlet returns authoritative ``num_prompt_tokens`` /
+``num_output_tokens`` in its Return-event JSON envelope (rather than
+streaming chars over stdout), so tokens/sec is measured, not estimated
+chars/4. It also accepts ``ignore_eos`` so every request consumes the
+full ``max_tokens`` budget — keeping output-token totals identical
+across engines for an apples-to-apples comparison with vllm/sglang.
 
 Usage::
 
@@ -13,6 +20,7 @@ Usage::
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -32,20 +40,22 @@ async def run_benchmark(args):
     # -- Resolve paths --------------------------------------------------------
 
     script_dir = Path(__file__).parent.resolve()
+    inferlet_dir = script_dir.parent / "inferlets" / "text-completion-bench"
     wasm_path = (
-        script_dir.parent
-        / "inferlets"
-        / "text-completion"
+        inferlet_dir
         / "target"
         / "wasm32-wasip2"
         / "release"
-        / "text_completion.wasm"
+        / "text_completion_bench.wasm"
     )
-    manifest_path = script_dir.parent / "inferlets" / "text-completion" / "Pie.toml"
+    manifest_path = inferlet_dir / "Pie.toml"
 
     if not wasm_path.exists():
         print(f"Error: WASM binary not found at {wasm_path}")
-        print("Run `cargo build --target wasm32-wasip2 --release` in text-completion first.")
+        print(
+            "Build with: cargo build -p text-completion-bench "
+            "--target wasm32-wasip2 --release"
+        )
         sys.exit(1)
     if not manifest_path.exists():
         print(f"Error: Manifest not found at {manifest_path}")
@@ -158,6 +168,7 @@ async def run_benchmark(args):
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "system": "You are a helpful benchmarking assistant.",
+            "ignore_eos": args.ignore_eos,
         }
 
         queue = asyncio.Queue()
@@ -165,15 +176,15 @@ async def run_benchmark(args):
         # warmup and timed phases don't share queue items.
 
         completed = 0
-        total_chars = 0
-        total_tokens_est = 0
+        total_output_tokens = 0
+        total_prompt_tokens = 0
         output_samples = []  # Collect (req_id, text) tuples
         output_lock = asyncio.Lock()
 
         # -- Workers ----------------------------------------------------------
 
         async def worker(worker_id: int):
-            nonlocal completed, total_chars, total_tokens_est
+            nonlocal completed, total_output_tokens, total_prompt_tokens
             while not queue.empty():
                 try:
                     req_id = queue.get_nowait()
@@ -187,29 +198,24 @@ async def run_benchmark(args):
                     process = await client.launch_process(
                         inferlet_name, input=req_input,
                     )
-                    req_chars = 0
-                    req_text = []
                     while True:
                         event, msg = await process.recv()
-                        if event == Event.Stdout:
-                            req_chars += len(msg)
-                            req_text.append(msg)
-                        elif event == Event.Stderr:
-                            req_chars += len(msg)
-                        elif event == Event.Return:
-                            req_chars += len(msg)
-                            req_text.append(msg)
-                            total_chars += req_chars
-                            total_tokens_est += req_chars / 4.0
+                        if event == Event.Return:
+                            # text-completion-bench's Return payload is JSON:
+                            # {num_prompt_tokens, num_output_tokens, text}.
+                            payload = json.loads(msg)
+                            total_output_tokens += int(payload["num_output_tokens"])
+                            total_prompt_tokens += int(payload["num_prompt_tokens"])
                             completed += 1
-                            # Save output
                             async with output_lock:
-                                output_samples.append((req_id, "".join(req_text)))
+                                output_samples.append((req_id, payload.get("text", "")))
                             print(".", end="", flush=True)
                             break
                         elif event == Event.Error:
                             print(f"\n[{worker_id}] Req {req_id} failed: {msg}")
                             break
+                        # Bench inferlet does not emit Stdout/Stderr; ignore
+                        # any unexpected ones rather than counting them.
                 except Exception as e:
                     print(f"\n[{worker_id}] Error: {e}")
                 finally:
@@ -227,8 +233,8 @@ async def run_benchmark(args):
             await asyncio.wait(warmup_workers)
             # Reset counters so warmup doesn't pollute the timed measurement.
             completed = 0
-            total_chars = 0
-            total_tokens_est = 0
+            total_output_tokens = 0
+            total_prompt_tokens = 0
             output_samples.clear()
             print(" done")
 
@@ -250,10 +256,10 @@ async def run_benchmark(args):
         print(f"\n\n{'─' * 40}")
         print(f"{'Total Time:':<25} {duration:.2f} s")
         print(f"{'Completed:':<25} {completed}/{args.num_requests}")
-        print(f"{'Total Chars:':<25} {total_chars}")
-        print(f"{'Est. Total Tokens:':<25} {total_tokens_est:.0f}")
+        print(f"{'Total Prompt Tokens:':<25} {total_prompt_tokens}")
+        print(f"{'Total Out Tokens:':<25} {total_output_tokens}")
         print(f"{'Requests/sec:':<25} {completed / duration:.2f}")
-        print(f"{'Est. Tokens/sec:':<25} {total_tokens_est / duration:.2f}")
+        print(f"{'Tokens/sec:':<25} {total_output_tokens / duration:.2f}")
         print(f"{'─' * 40}")
 
         # -- Save output samples ----------------------------------------------
@@ -281,7 +287,10 @@ def main():
     parser.add_argument("--cpu-mem-budget", type=int, default=0, help="CPU memory budget in GB for working page swap (0 = disabled)")
     parser.add_argument("--save-outputs", type=str, default=None, help="Save output samples to this file path")
     parser.add_argument("--num-samples", type=int, default=10, help="Number of output samples to save (default: 10)")
-    parser.add_argument("--unique-prompts", action="store_true", help="Make each request's prompt unique (append request #N)")
+    parser.add_argument("--unique-prompts", action="store_true", help="Make each request's prompt unique (append request #N) — defeats per-request KV-cache reuse beyond the shared system prefix")
+    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True,
+                        help="Ignore stop tokens so every request consumes the full --max-tokens budget. "
+                             "On by default to keep output-token totals identical across engines.")
     parser.add_argument("--default-token-budget", type=int, required=True, help="Default token budget per process (required)")
     parser.add_argument("--max-concurrent-processes", type=int, default=None,
                         help="Maximum number of concurrent processes (default: None — uncapped, saturate the GPU)")

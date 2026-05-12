@@ -28,20 +28,32 @@ def main():
                    help="Append a per-request id to the prompt to defeat KV-cache reuse")
     p.add_argument("--warmup-n", type=int, default=0,
                    help="Run a warmup batch of this size before timing")
-    p.add_argument("--cuda-graphs", action="store_true",
-                   help="Enable CUDA graphs (sglang's default is enabled; this flag is for explicit-on)")
+    p.add_argument("--disable-cuda-graphs", action="store_true",
+                   help="Disable SGLang CUDA graphs. Default off — SGLang uses CUDA graphs, "
+                        "matching its production configuration. Old default disabled them, "
+                        "which masked SGLang's primary optimization (mirrors ticket #116 bug #2 "
+                        "for vllm).")
     p.add_argument("--max-running-requests", type=int, default=None,
                    help="Cap concurrent in-flight requests (matches pie's max_concurrent_processes)")
+    p.add_argument("--max-model-len", type=int, default=None,
+                   help="SGLang context_length. Pin to match pie's config when comparing engines "
+                        "(default None = sglang auto from model config).")
+    p.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True,
+                   help="Ignore stop tokens so every request consumes the full --max-tokens budget. "
+                        "On by default to keep output-token totals identical across engines.")
     args = p.parse_args()
 
     import sglang as sgl
 
-    engine = sgl.Engine(
+    engine_kwargs = dict(
         model_path=args.model,
         mem_fraction_static=args.mem_frac,
-        disable_cuda_graph=not args.cuda_graphs,
+        disable_cuda_graph=args.disable_cuda_graphs,
         max_running_requests=args.max_running_requests,
     )
+    if args.max_model_len is not None:
+        engine_kwargs["context_length"] = args.max_model_len
+    engine = sgl.Engine(**engine_kwargs)
 
     base = "Write a short story about a robot."
     system = "You are a helpful benchmarking assistant."
@@ -64,7 +76,8 @@ def main():
 
     # Match pie's inferlet sampler: temperature=0.6 + top_p=0.95.
     sampling = {"temperature": 0.6, "top_p": 0.95,
-                "max_new_tokens": args.max_tokens}
+                "max_new_tokens": args.max_tokens,
+                "ignore_eos": args.ignore_eos}
 
     if args.warmup_n > 0:
         print(f"Warmup ({args.warmup_n} reqs)...", flush=True)

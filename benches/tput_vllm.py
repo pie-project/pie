@@ -26,18 +26,32 @@ def main():
     p.add_argument("--max-tokens", type=int, default=100,
                    help="Max generated tokens per request")
     p.add_argument("--max-num-seqs", type=int, default=512)
+    p.add_argument("--max-model-len", type=int, default=None,
+                   help="vLLM max_model_len. Pin to match pie's config when comparing engines "
+                        "(default None = vllm auto from model config).")
     p.add_argument("--unique-prompts", action="store_true",
                    help="Append a per-request id to the prompt to defeat KV-cache reuse")
     p.add_argument("--warmup-n", type=int, default=0,
                    help="Run a warmup batch of this size before timing")
+    p.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True,
+                   help="Ignore stop tokens so every request consumes the full --max-tokens budget. "
+                        "On by default to keep output-token totals identical across engines.")
+    p.add_argument("--enforce-eager", action="store_true",
+                   help="Run vLLM in eager mode (CUDA graphs disabled). Default off — "
+                        "vLLM uses CUDA graphs, matching its production configuration. "
+                        "Old default was True, which masked vLLM's primary optimization "
+                        "and inflated pie-vs-vllm headlines (ticket #116 bug #2).")
     args = p.parse_args()
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=args.model,
         gpu_memory_utilization=args.gpu_mem_util,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,
         max_num_seqs=args.max_num_seqs,
     )
+    if args.max_model_len is not None:
+        llm_kwargs["max_model_len"] = args.max_model_len
+    llm = LLM(**llm_kwargs)
 
     base = "Write a short story about a robot."
     system = "You are a helpful benchmarking assistant."
@@ -60,7 +74,8 @@ def main():
 
     # Match pie's inferlet sampler: temperature=0.6 + top_p=0.95.
     sampling = SamplingParams(
-        temperature=0.6, top_p=0.95, max_tokens=args.max_tokens
+        temperature=0.6, top_p=0.95, max_tokens=args.max_tokens,
+        ignore_eos=args.ignore_eos,
     )
 
     if args.warmup_n > 0:
