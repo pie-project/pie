@@ -183,11 +183,14 @@ class VllmForwardPass:
         # passed at capture time and slice off them.
         actual_n = common.num_actual_tokens
         if self.cg_dispatcher is not None:
+            # vllm 0.17 dropped the `disable_full=False` kwarg from
+            # `CudagraphDispatcher.dispatch`. The default (no `valid_modes`
+            # / `invalid_modes` restriction) allows both PIECEWISE and FULL,
+            # which is what `disable_full=False` meant on 0.16.
             cg_mode, batch_desc = self.cg_dispatcher.dispatch(
                 num_tokens=actual_n,
                 uniform_decode=False,
                 has_lora=False,
-                disable_full=False,
             )
         else:
             cg_mode, batch_desc = CUDAGraphMode.NONE, BatchDescriptor(actual_n)
