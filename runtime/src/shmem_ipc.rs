@@ -43,6 +43,10 @@ pub const HEADER_SIZE: usize = 64;
 pub const SLOT_HEADER_SIZE: usize = 64;
 
 pub const METHOD_TAG_FIRE_BATCH: u32 = 0;
+pub const METHOD_TAG_COPY_D2D: u32 = 1;
+pub const METHOD_TAG_COPY_H2D: u32 = 2;
+pub const METHOD_TAG_COPY_D2H: u32 = 3;
+pub const METHOD_TAG_MAMBA_FORK: u32 = 4;
 
 /// Global-header field offsets (relative to base).
 const HDR_OFF_MAGIC: usize = 0;

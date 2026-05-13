@@ -136,6 +136,161 @@ pub async fn fire_batch(
     crate::shmem_schema::read_response(&resp_bytes)
 }
 
+/// GPU → GPU page copy with explicit completion ack — shmem fast path.
+///
+/// Routes through the same shmem transport as `fire_batch` so the d2d
+/// kernel and any subsequent forward-pass kernels are dispatched by
+/// the SAME Python thread. CPU launch order is preserved → CUDA
+/// stream FIFO orders the kernels on GPU. Closes pie-project/pie#339
+/// (stream-ordering + IPC-arrival races on fork-from-Active).
+///
+/// Wire format (binary, little-endian):
+///   u32 src_count | src_count × u32 src_phys_ids
+///   u32 dst_count | dst_count × u32 dst_phys_ids
+pub async fn copy_d2d_shmem(
+    device_idx: DeviceId,
+    src_phys_ids: &[u32],
+    dst_phys_ids: &[u32],
+) -> Result<()> {
+    let client = get_or_init_shmem_client(device_idx)?;
+    let req_id = SHMEM_REQ_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    let send_walltime_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+
+    let src = src_phys_ids.to_vec();
+    let dst = dst_phys_ids.to_vec();
+    let (_resp_bytes, _ts) = tokio::task::block_in_place(|| {
+        client.call_with(
+            req_id,
+            crate::shmem_ipc::METHOD_TAG_COPY_D2D,
+            send_walltime_us,
+            |buf| {
+                let needed = 4 + src.len() * 4 + 4 + dst.len() * 4;
+                if buf.len() < needed {
+                    return Err(anyhow!(
+                        "copy_d2d_shmem: req buf too small ({} < {needed})",
+                        buf.len()
+                    ));
+                }
+                let mut off = 0usize;
+                buf[off..off + 4].copy_from_slice(&(src.len() as u32).to_le_bytes());
+                off += 4;
+                for &p in &src {
+                    buf[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                    off += 4;
+                }
+                buf[off..off + 4].copy_from_slice(&(dst.len() as u32).to_le_bytes());
+                off += 4;
+                for &p in &dst {
+                    buf[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                    off += 4;
+                }
+                Ok(off)
+            },
+        )
+    })?;
+    Ok(())
+}
+
+/// CPU → GPU page copy with explicit completion ack — shmem fast path.
+///
+/// Companion to [`copy_d2d_shmem`]. Closes the second-bleed race where
+/// cold-path `copy_h2d` could be reordered against shmem-path
+/// fire_batch on the legacy default stream.
+///
+/// Wire format (binary, little-endian):
+///   u32 src_count | src_count × u32 cpu_slot_ids
+///   u32 dst_count | dst_count × u32 gpu_phys_ids
+pub fn copy_h2d_shmem(
+    device_idx: DeviceId,
+    gpu_phys_ids: &[u32],
+    cpu_pages: &[u32],
+) -> Result<()> {
+    let client = get_or_init_shmem_client(device_idx)?;
+    let req_id = SHMEM_REQ_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    let send_walltime_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+
+    let src = cpu_pages.to_vec();
+    let dst = gpu_phys_ids.to_vec();
+    let (_resp_bytes, _ts) = tokio::task::block_in_place(|| {
+        client.call_with(
+            req_id,
+            crate::shmem_ipc::METHOD_TAG_COPY_H2D,
+            send_walltime_us,
+            |buf| {
+                let needed = 4 + src.len() * 4 + 4 + dst.len() * 4;
+                if buf.len() < needed {
+                    return Err(anyhow!(
+                        "copy_h2d_shmem: req buf too small ({} < {needed})",
+                        buf.len()
+                    ));
+                }
+                let mut off = 0usize;
+                buf[off..off + 4].copy_from_slice(&(src.len() as u32).to_le_bytes());
+                off += 4;
+                for &p in &src {
+                    buf[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                    off += 4;
+                }
+                buf[off..off + 4].copy_from_slice(&(dst.len() as u32).to_le_bytes());
+                off += 4;
+                for &p in &dst {
+                    buf[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                    off += 4;
+                }
+                Ok(off)
+            },
+        )
+    })?;
+    Ok(())
+}
+
+/// Notify the Python worker that a fork happened so it can copy the
+/// parent's per-request mamba state into the child's slot — shmem
+/// fast-path companion to [`copy_d2d_shmem`]. Engines without mamba
+/// layers ack as no-op (worker's `Engine.mamba_fork` is `getattr`-guarded).
+///
+/// Wire format (binary, little-endian):
+///   u64 parent_ctx_id | u64 child_ctx_id
+pub async fn mamba_fork_shmem(
+    device_idx: DeviceId,
+    parent_ctx: u64,
+    child_ctx: u64,
+) -> Result<()> {
+    let client = get_or_init_shmem_client(device_idx)?;
+    let req_id = SHMEM_REQ_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    let send_walltime_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+
+    let (_resp_bytes, _ts) = tokio::task::block_in_place(|| {
+        client.call_with(
+            req_id,
+            crate::shmem_ipc::METHOD_TAG_MAMBA_FORK,
+            send_walltime_us,
+            |buf| {
+                let needed = 16usize;
+                if buf.len() < needed {
+                    return Err(anyhow!(
+                        "mamba_fork_shmem: req buf too small ({} < {needed})",
+                        buf.len()
+                    ));
+                }
+                buf[0..8].copy_from_slice(&parent_ctx.to_le_bytes());
+                buf[8..16].copy_from_slice(&child_ctx.to_le_bytes());
+                Ok(needed)
+            },
+        )
+    })?;
+    Ok(())
+}
+
 /// Lazy-initialized shmem clients keyed by device index. Each DP replica
 /// has its own shmem region (`/pie_shmem_g{idx}`) so requests routed to
 /// device i talk only to replica i's worker.
