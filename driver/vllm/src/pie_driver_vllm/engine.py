@@ -132,20 +132,6 @@ class VllmEngine:
             cg_dispatcher=cg_dispatcher,
         )
 
-        # Compile + JIT warmup. Drives synthetic prefill + decode + sampling
-        # forwards so torch.compile (Dynamo + AOT) and FlashInfer JIT
-        # (ninja/nvcc) complete during init rather than on the inferlet's
-        # first fire_batch. Complements `_capture_vllm_cudagraphs` below
-        # (which only warms uniform-decode shapes): warmup additionally
-        # exercises a multi-token prefill (different FlashInfer kernel) and
-        # the sampling path (lm_head + flashinfer top_k_top_p). Without
-        # this, the first real fire_batch pays 15-60s of JIT cost on cold
-        # sm_89 — and on the shmem fast path it can exceed the call
-        # deadline.
-        _log("Warmup (prefill+decode+sample JIT)", "INFO")
-        _warmup_compile(forward_pass, kv_cache_at_layer, _log)
-        _log("Warmup done", "INFO")
-
         if cg_dispatcher is not None:
             max_cg_n = (
                 loaded.vllm_config.compilation_config.max_cudagraph_capture_size
@@ -164,6 +150,21 @@ class VllmEngine:
                 config=config,
             )
             _log("Capture done", "INFO")
+
+        # Compile + JIT warmup. Runs AFTER `_capture_vllm_cudagraphs` so
+        # the persistent cg buffers are wired up before `transform()` can
+        # dispatch through them.
+        #
+        # Complements main's cudagraph capture (which only warms uniform-
+        # decode shapes via mode=NONE passes); warmup additionally
+        # exercises a multi-token prefill (different FlashInfer kernel
+        # path) and the sampling tail (lm_head + flashinfer top_k_top_p,
+        # neither of which capture drives). Without these the inferlet's
+        # first fire_batch pays 15-60+ s of JIT cost on cold sm_89 — on
+        # the shmem fast path that can exceed the call deadline.
+        _log("Warmup (prefill+sample JIT)", "INFO")
+        _warmup_compile(forward_pass, kv_cache_at_layer, _log)
+        _log("Warmup done", "INFO")
 
         return cls(
             config=config,
