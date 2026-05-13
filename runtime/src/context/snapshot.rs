@@ -64,11 +64,22 @@ impl ContextManager {
         // We use the source context for contention — the fork inherits
         // the source's scheduling state.
         self.when_allocated(id, dev_idx, needed, move |mgr, gpu_pages| {
-            let result = (|| -> Result<ContextId> {
+            // Captured outside the inner closure so the post-closure
+            // d2d-spawn block can reach them.
+            let mut captured_device: DeviceId = 0;
+            let mut captured_dev_idx: usize = 0;
+            let result = (|| -> Result<(
+                ContextId,
+                bool,
+                Vec<crate::context::pagestore::PhysicalPageId>,
+                Vec<crate::context::pagestore::PhysicalPageId>,
+            )> {
                 let ctx = mgr.contexts.get(&id)
                     .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 let device = dev_idx as DeviceId;
+                captured_device = device;
+                captured_dev_idx = dev_idx;
                 let src_on_gpu = !ctx.is_off_gpu();
 
                 // Snapshot source state.
@@ -105,13 +116,22 @@ impl ContextManager {
                     mgr.gpu_stores[dev_idx].free(&surplus);
                 }
 
-                // Copy source working → child working using pre-allocated pages.
-                if !src.is_empty() && !working_pages.is_empty() {
-                    let _ = if src_on_gpu {
-                        device::copy_d2d(device, &src, &working_pages)
-                    } else {
-                        device::copy_h2d(device, &working_pages, &src)
-                    };
+                // Decide page-copy transport:
+                //   * src_on_gpu  → defer to shmem-routed copy_d2d_shmem
+                //     (spawned below; closes pie-project/pie#339 fork-
+                //     from-Active stream-ordering + IPC-arrival races)
+                //   * !src_on_gpu → keep legacy cold-path h2d
+                //     (restore flow already serializes h2d vs forward
+                //     passes; #339 is fork-from-Active only)
+                let needs_d2d_shmem = src_on_gpu
+                    && !src.is_empty()
+                    && !working_pages.is_empty();
+                let needs_h2d = !src_on_gpu
+                    && !src.is_empty()
+                    && !working_pages.is_empty();
+
+                if needs_h2d {
+                    let _ = device::copy_h2d(device, &working_pages, &src);
                 }
 
                 // Retain committed prefix. For Active sources, retain the full chain.
@@ -120,8 +140,12 @@ impl ContextManager {
                     mgr.gpu_stores[dev_idx].fork(&committed_hashes[..prefix_len]);
                 }
 
-                // Create the child context (state set below after replay check).
+                // Create the child context. Clone working_pages once for
+                // the d2d task; the original moves into the new Context's
+                // struct field.
                 let new_id = mgr.next_id();
+                let dst_pages_for_d2d = working_pages.clone();
+                let src_pages_for_d2d = src.clone();
                 mgr.contexts.insert(new_id, Context {
                     owner: Some(owner),
                     device: Some(device),
@@ -159,9 +183,42 @@ impl ContextManager {
                 mgr.process_entry(owner).context_ids.push(new_id);
                 mgr.publish_context_counts(new_id);
 
-                Ok(new_id)
+                Ok((new_id, needs_d2d_shmem, src_pages_for_d2d, dst_pages_for_d2d))
             })();
-            let _ = response.send(result);
+
+            match result {
+                Ok((new_id, needs_d2d_shmem, src_pages, dst_pages)) => {
+                    if needs_d2d_shmem {
+                        // Working-page d2d via shmem; same Python thread
+                        // as fire_batch, so CPU launch order is preserved
+                        // (FIFO on legacy default stream → kernels run in
+                        // launch order on GPU). Ack-await before resolving
+                        // Ok(new_id) — any later fire_batch from the
+                        // inferlet arrives at the shmem queue *after* the
+                        // d2d has been dispatched (closes pie#339).
+                        let device = captured_device;
+                        let dev_idx_for_log = captured_dev_idx;
+                        tokio::spawn(async move {
+                            if let Err(e) = device::copy_d2d_shmem(
+                                device, &src_pages, &dst_pages,
+                            ).await {
+                                tracing::error!(
+                                    ctx = new_id, device = dev_idx_for_log,
+                                    "fork: copy_d2d_shmem failed: {e:#}"
+                                );
+                                let _ = response.send(Err(e));
+                                return;
+                            }
+                            let _ = response.send(Ok(new_id));
+                        });
+                    } else {
+                        let _ = response.send(Ok(new_id));
+                    }
+                }
+                Err(e) => {
+                    let _ = response.send(Err(e));
+                }
+            }
         });
     }
 
