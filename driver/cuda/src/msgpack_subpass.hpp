@@ -21,10 +21,17 @@ namespace pie_cuda_driver::schema { struct DecodedRequest; }
 
 namespace pie_cuda_driver {
 
+struct PersistentInputs;
+
 // Inputs every sub-pass needs. Aggregated to keep the per-pass
 // signatures short.
 struct MsgpackSubpassContext {
     model::Qwen3Workspace& ws;
+    // Persistent device scratch + pinned host staging. Subpasses use
+    // these instead of per-fire `DeviceBuffer::from_host` so the kernel
+    // arg pointers stay stable across fires and the H2D/D2H copies run
+    // off the default stream against pinned memory.
+    PersistentInputs& pi;
     int R;
     int num_sampling;
     int vocab_size;

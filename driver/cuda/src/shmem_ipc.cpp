@@ -1,8 +1,11 @@
 #include "shmem_ipc.hpp"
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -99,8 +102,104 @@ ShmemServer::~ShmemServer() {
     shm_unlink(name_.c_str());
 }
 
+// SPSC ring buffer for pending requests. IPC scanner thread is the
+// producer; the forward-worker thread is the consumer. Power-of-two
+// capacity keeps the modulo a single AND. Capacity = 64 covers the 8
+// shmem slots with plenty of headroom.
+namespace {
+
+struct PendingFire {
+    std::size_t  slot;
+    std::uint32_t req_id;
+    std::uint32_t method_tag;
+    std::uint64_t req_seq;
+    std::uint32_t req_len;
+};
+
+class PendingRing {
+public:
+    static constexpr std::size_t CAP = 64;
+    static_assert((CAP & (CAP - 1)) == 0, "CAP must be power of two");
+    bool try_push(const PendingFire& f) noexcept {
+        const auto t = tail_.load(std::memory_order_relaxed);
+        const auto h = head_.load(std::memory_order_acquire);
+        if (t - h >= CAP) return false;
+        buf_[t & (CAP - 1)] = f;
+        tail_.store(t + 1, std::memory_order_release);
+        return true;
+    }
+    bool try_pop(PendingFire& out) noexcept {
+        const auto h = head_.load(std::memory_order_relaxed);
+        const auto t = tail_.load(std::memory_order_acquire);
+        if (h == t) return false;
+        out = buf_[h & (CAP - 1)];
+        head_.store(h + 1, std::memory_order_release);
+        return true;
+    }
+private:
+    alignas(64) std::atomic<std::uint64_t> head_{0};
+    alignas(64) std::atomic<std::uint64_t> tail_{0};
+    std::array<PendingFire, CAP> buf_{};
+};
+
+void cpu_pause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#endif
+}
+
+}  // namespace
+
 void ShmemServer::serve_forever(const RequestHandler& handler) {
     std::vector<std::uint64_t> last_seen(num_slots_, 0);
+
+    // ── Forward worker thread ─────────────────────────────────────────
+    // The IPC scanner (this thread) pushes work into `pending`; the
+    // worker pops, runs the handler (which may block on the GPU for
+    // 20+ ms per fire), and publishes the response. Decoupling lets
+    // the scanner stage the next fire's BPIQ while the worker's
+    // current fire is still running on the GPU.
+    //
+    // All CUDA calls happen on the worker thread — the IPC scanner
+    // touches only shmem + atomic counters, so there's no CUDA-context
+    // sharing concern.
+    PendingRing pending;
+    std::atomic<bool> worker_stop{false};
+
+    std::thread worker([&]() {
+        while (!worker_stop.load(std::memory_order_relaxed)) {
+            PendingFire f;
+            if (!pending.try_pop(f)) {
+                cpu_pause();
+                continue;
+            }
+            std::uint8_t* slot = slot_ptr(f.slot);
+            const std::uint8_t* req_payload = slot + SLOT_HEADER_SIZE;
+            std::uint8_t* resp_payload =
+                slot + SLOT_HEADER_SIZE + req_buf_size_;
+            SlotRequest req{
+                .req_id = f.req_id,
+                .method_tag = f.method_tag,
+                .payload =
+                    std::span<const std::uint8_t>(req_payload, f.req_len),
+            };
+            std::span<std::uint8_t> resp_buf(resp_payload, resp_buf_size_);
+
+            const std::size_t resp_len = handler(req, resp_buf);
+
+            const std::uint32_t resp_len_u32 =
+                static_cast<std::uint32_t>(resp_len);
+            std::memcpy(slot + OFF_RESP_LEN, &resp_len_u32, 4);
+            const std::uint64_t respond_wt = now_us();
+            std::memcpy(slot + OFF_RESPOND_WT, &respond_wt, 8);
+            // Publish — release-ordered so the runtime sees the
+            // resp_len / payload writes above before observing the
+            // new resp_seq.
+            atomic_store_u64(slot + OFF_RESP_SEQ, f.req_seq);
+        }
+    });
 
     while (!stop_.load(std::memory_order_relaxed)) {
         bool did_work = false;
@@ -111,7 +210,9 @@ void ShmemServer::serve_forever(const RequestHandler& handler) {
             const std::uint64_t req_seq = atomic_load_u64(slot + OFF_REQ_SEQ);
             if (req_seq == last_seen[i]) continue;
 
-            // New request available.
+            // New request available. Capture all the per-slot metadata
+            // we need (the worker will dereference req_payload via
+            // slot index after popping).
             std::uint32_t req_id = 0;
             std::uint32_t method_tag = 0;
             std::uint32_t req_len = 0;
@@ -119,40 +220,29 @@ void ShmemServer::serve_forever(const RequestHandler& handler) {
             std::memcpy(&method_tag, slot + OFF_METHOD_TAG, 4);
             std::memcpy(&req_len, slot + OFF_REQ_LEN, 4);
 
-            const std::uint8_t* req_payload = slot + SLOT_HEADER_SIZE;
-            std::uint8_t* resp_payload =
-                slot + SLOT_HEADER_SIZE + req_buf_size_;
-
-            SlotRequest req{
-                .req_id = req_id,
-                .method_tag = method_tag,
-                .payload = std::span<const std::uint8_t>(req_payload, req_len),
-            };
-            std::span<std::uint8_t> resp_buf(resp_payload, resp_buf_size_);
-
-            const std::size_t resp_len = handler(req, resp_buf);
-
-            const std::uint32_t resp_len_u32 =
-                static_cast<std::uint32_t>(resp_len);
-            std::memcpy(slot + OFF_RESP_LEN, &resp_len_u32, 4);
-
-            const std::uint64_t respond_wt = now_us();
-            std::memcpy(slot + OFF_RESPOND_WT, &respond_wt, 8);
-
-            // Publish: bump resp_seq to match req_seq.
-            atomic_store_u64(slot + OFF_RESP_SEQ, req_seq);
+            PendingFire pf{i, req_id, method_tag, req_seq, req_len};
+            // Backpressure: queue holds 64; pause until worker drains
+            // if we somehow get ahead (capacity 64 vs 8 slots → never
+            // fires in practice, but defensive).
+            while (!pending.try_push(pf)) cpu_pause();
 
             last_seen[i] = req_seq;
             did_work = true;
         }
 
-        if (!did_work && spin_us_ > 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(spin_us_));
-        } else if (!did_work) {
-            // Yield CPU briefly under pure-spin mode so we don't peg a core.
-            std::this_thread::yield();
+        if (!did_work) {
+            if (spin_us_ > 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(spin_us_));
+            } else {
+                cpu_pause();
+            }
         }
     }
+
+    // Drain & shut down the worker. The worker may still be running a
+    // fire; wait for it before destroying captures.
+    worker_stop.store(true, std::memory_order_release);
+    worker.join();
 }
 
 }  // namespace pie_cuda_driver

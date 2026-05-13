@@ -15,6 +15,7 @@
 #include "kernels/gather_rows.hpp"
 #include "kernels/logprobs.hpp"
 #include "model/qwen3_forward.hpp"
+#include "persistent_inputs.hpp"
 #include "sampler_type.hpp"
 #include "shmem_schema.hpp"
 
@@ -61,13 +62,17 @@ void gather_raw_logits(
     // Pass 2: one kernel launch + one D2H. Replaces the previous
     // per-slot `cudaMemcpy` loop, which serialized on the default
     // stream and incurred a launch overhead per slot.
+    //
+    // `d_packed` stays per-fire (size = n × V × u16, conditional on
+    // RawLogits slots being present — uncommon enough that a
+    // persistent worst-case allocation would waste GBs of VRAM).
     const std::size_t n = rows.size();
-    auto d_rows   = DeviceBuffer<std::int32_t>::from_host(
+    ctx.pi.subpass_rows.copy_from_host(
         std::span<const std::int32_t>(rows));
     auto d_packed = DeviceBuffer<std::uint16_t>::alloc(n * V);
     kernels::launch_gather_bf16_rows(
         static_cast<const std::uint16_t*>(ctx.ws.logits.data()),
-        d_rows.data(), d_packed.data(),
+        ctx.pi.subpass_rows.data(), d_packed.data(),
         static_cast<int>(n), V, /*stream=*/nullptr);
     const std::vector<std::uint16_t> h_packed = d_packed.to_host();
 
@@ -108,16 +113,22 @@ void compute_entropy_slots(
     }
     if (ent_rows.empty()) return;
 
-    auto d_ent_rows = DeviceBuffer<std::int32_t>::from_host(
+    const std::size_t n_ent = ent_rows.size();
+    ctx.pi.subpass_ent_rows.copy_from_host(
         std::span<const std::int32_t>(ent_rows));
-    auto d_ent_out  = DeviceBuffer<float>::alloc(ent_rows.size());
     kernels::launch_entropy_bf16(
-        ctx.ws.logits.data(), d_ent_rows.data(), d_ent_out.data(),
-        static_cast<int>(ent_rows.size()),
+        ctx.ws.logits.data(),
+        ctx.pi.subpass_ent_rows.data(), ctx.pi.subpass_ent_out.data(),
+        static_cast<int>(n_ent),
         ctx.vocab_size, /*stream=*/nullptr);
-    const auto h_ent = d_ent_out.to_host();
+    // Async D2H into pinned staging — the host pushes into per_req
+    // immediately after, so we sync the stream before reading.
+    CUDA_CHECK(cudaMemcpyAsync(
+        ctx.pi.h_ent_pinned, ctx.pi.subpass_ent_out.data(),
+        sizeof(float) * n_ent, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaStreamSynchronize(/*stream=*/nullptr));
     for (std::size_t i = 0; i < ent_req_idx.size(); ++i) {
-        per_req[ent_req_idx[i]].entropies.push_back(h_ent[i]);
+        per_req[ent_req_idx[i]].entropies.push_back(ctx.pi.h_ent_pinned[i]);
     }
 }
 
@@ -170,37 +181,37 @@ void compute_logprob_slots(
     }
     if (lp_rows.empty()) return;
 
-    auto d_lp_rows    = DeviceBuffer<std::int32_t>::from_host(
+    ctx.pi.subpass_lp_rows   .copy_from_host(
         std::span<const std::int32_t>(lp_rows));
-    auto d_lp_lindptr = DeviceBuffer<std::int32_t>::from_host(
+    ctx.pi.subpass_lp_lindptr.copy_from_host(
         std::span<const std::int32_t>(lp_label_indptr));
-    // Always allocate at least 1 element so the kernel gets a valid
-    // pointer for the "labels for every slot are empty" edge case.
-    auto d_lp_lids = lp_label_ids.empty()
-        ? DeviceBuffer<std::int32_t>::alloc(1)
-        : DeviceBuffer<std::int32_t>::from_host(
-              std::span<const std::int32_t>(lp_label_ids));
-    auto d_lp_out = DeviceBuffer<float>::alloc(
-        std::max<std::size_t>(lp_label_ids.size(), 1));
+    // Always launch the kernel with a valid `lp_lids` pointer; the
+    // persistent buffer is empty-safe (zero-byte copy is a no-op).
+    if (!lp_label_ids.empty()) {
+        ctx.pi.subpass_lp_lids.copy_from_host(
+            std::span<const std::int32_t>(lp_label_ids));
+    }
 
     kernels::launch_logprobs_bf16(
-        ctx.ws.logits.data(), d_lp_rows.data(), d_lp_lindptr.data(),
-        d_lp_lids.data(), d_lp_out.data(),
+        ctx.ws.logits.data(),
+        ctx.pi.subpass_lp_rows.data(), ctx.pi.subpass_lp_lindptr.data(),
+        ctx.pi.subpass_lp_lids.data(), ctx.pi.subpass_lp_out.data(),
         static_cast<int>(lp_rows.size()),
         ctx.vocab_size, /*stream=*/nullptr);
 
-    std::vector<float> h_lp(lp_label_ids.size());
     if (!lp_label_ids.empty()) {
-        CUDA_CHECK(cudaMemcpy(h_lp.data(), d_lp_out.data(),
-                              sizeof(float) * h_lp.size(),
-                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(
+            ctx.pi.h_lp_pinned, ctx.pi.subpass_lp_out.data(),
+            sizeof(float) * lp_label_ids.size(),
+            cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaStreamSynchronize(/*stream=*/nullptr));
     }
 
     for (std::size_t i = 0; i < lp_req_idx.size(); ++i) {
         const std::int32_t lo = lp_label_indptr[i];
         const std::int32_t hi = lp_label_indptr[i + 1];
         per_req[lp_req_idx[i]].logprobs.emplace_back(
-            h_lp.data() + lo, h_lp.data() + hi);
+            ctx.pi.h_lp_pinned + lo, ctx.pi.h_lp_pinned + hi);
     }
 }
 
@@ -240,15 +251,19 @@ void compute_dist_slots(
     }
     if (dist_rows.empty()) return;
 
+    // `d_dist_probs` stays per-fire (size = nd × V × f32, conditional
+    // on Dist slots being present — same rationale as `d_packed` in
+    // gather_raw_logits).
     const std::size_t nd = dist_rows.size();
-    auto d_dist_rows  = DeviceBuffer<std::int32_t>::from_host(
+    ctx.pi.subpass_dist_rows .copy_from_host(
         std::span<const std::int32_t>(dist_rows));
-    auto d_dist_temps = DeviceBuffer<float>::from_host(
+    ctx.pi.subpass_dist_temps.copy_from_host(
         std::span<const float>(dist_temps));
     auto d_dist_probs = DeviceBuffer<float>::alloc(nd * static_cast<std::size_t>(V));
 
     kernels::launch_softmax_temp_bf16(
-        ctx.ws.logits.data(), d_dist_rows.data(), d_dist_temps.data(),
+        ctx.ws.logits.data(),
+        ctx.pi.subpass_dist_rows.data(), ctx.pi.subpass_dist_temps.data(),
         d_dist_probs.data(), static_cast<int>(nd), V, /*stream=*/nullptr);
 
     const std::vector<float> h_dist_probs = d_dist_probs.to_host();

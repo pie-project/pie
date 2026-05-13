@@ -7,7 +7,9 @@
 #include "kernels/kv_paged.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
+#include "kernels/fused_qk_norm_rope.hpp"
 #include "kernels/swiglu.hpp"
+#include "kernels/unpack_qkv.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/attention_naive.hpp"
 #include "ops/gemm.hpp"
@@ -26,17 +28,19 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     const int N  = max_tokens;
 
     Qwen3Workspace ws;
-    ws.y        = DeviceTensor::allocate(DType::BF16, {N, H});
-    ws.norm_x   = DeviceTensor::allocate(DType::BF16, {N, H});
-    ws.q        = DeviceTensor::allocate(DType::BF16, {N, Hq});
-    ws.k        = DeviceTensor::allocate(DType::BF16, {N, Hk});
-    ws.v        = DeviceTensor::allocate(DType::BF16, {N, Hk});
-    ws.attn_out = DeviceTensor::allocate(DType::BF16, {N, Hq});
-    ws.norm_y   = DeviceTensor::allocate(DType::BF16, {N, H});
-    ws.gate     = DeviceTensor::allocate(DType::BF16, {N, I});
-    ws.up       = DeviceTensor::allocate(DType::BF16, {N, I});
-    ws.logits   = DeviceTensor::allocate(DType::BF16, {N, V});
-    ws.probs    = DeviceTensor::allocate(DType::FP32, {N, V});
+    ws.y         = DeviceTensor::allocate(DType::BF16, {N, H});
+    ws.norm_x    = DeviceTensor::allocate(DType::BF16, {N, H});
+    ws.q         = DeviceTensor::allocate(DType::BF16, {N, Hq});
+    ws.k         = DeviceTensor::allocate(DType::BF16, {N, Hk});
+    ws.v         = DeviceTensor::allocate(DType::BF16, {N, Hk});
+    ws.qkv_packed = DeviceTensor::allocate(DType::BF16, {N, Hq + 2 * Hk});
+    ws.attn_out  = DeviceTensor::allocate(DType::BF16, {N, Hq});
+    ws.norm_y    = DeviceTensor::allocate(DType::BF16, {N, H});
+    ws.gate      = DeviceTensor::allocate(DType::BF16, {N, I});
+    ws.up        = DeviceTensor::allocate(DType::BF16, {N, I});
+    ws.gate_up   = DeviceTensor::allocate(DType::BF16, {N, 2 * I});
+    ws.logits    = DeviceTensor::allocate(DType::BF16, {N, V});
+    ws.probs     = DeviceTensor::allocate(DType::FP32, {N, V});
 
     // Padded q/k/v/attn_out only when head_dim != head_dim_kernel
     // (currently only Phi-3 at 96 → 128). Empty allocations otherwise
@@ -96,37 +100,58 @@ void qwen3_forward_prefill(
             ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
 
-        // 3. QKV projections (no fusion yet).
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
-            ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
-            ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
-            ws.v.data(), N, Hk, H);
-
-        // 4. Per-head q_norm / k_norm. Qwen3-only — Llama 3 / Mistral /
-        //    Qwen 2 leave these null and skip the extra RMSNorm. Reshape Q
-        //    from [N, h_q*d] to [N*h_q, d] (same memory, different per-row
-        //    interpretation); the RMSNorm kernel takes (num_rows, hidden).
-        if (layer.q_norm) {
-            kernels::launch_rmsnorm_bf16(
-                ws.q.data(), layer.q_norm->data(), ws.q.data(),
-                N * cfg.num_attention_heads, d, eps, stream);
-        }
-        if (layer.k_norm) {
-            kernels::launch_rmsnorm_bf16(
-                ws.k.data(), layer.k_norm->data(), ws.k.data(),
-                N * cfg.num_key_value_heads, d, eps, stream);
+        // 3. QKV — single fused GEMM + unpack when a packed weight was
+        // materialised at bind time (bf16-only path). See qwen3_forward_paged
+        // for the rationale.
+        if (layer.qkv_proj) {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), ops::WeightView(*layer.qkv_proj),
+                ws.qkv_packed.data(), N, Hq + 2 * Hk, H);
+            kernels::launch_unpack_qkv_bf16(
+                ws.qkv_packed.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                N, Hq, Hk, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
+                ws.q.data(), N, Hq, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
+                ws.k.data(), N, Hk, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
+                ws.v.data(), N, Hk, H);
         }
 
-        // 5. RoPE (in place on Q and K).
-        kernels::launch_rope_bf16(
-            ws.q.data(), ws.k.data(), positions,
-            N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-            cfg.rope_theta, stream);
+        // 4-5. q/k norm + RoPE — fused into one launch when both norms
+        // are present and head_dim is supported. See qwen3_forward_paged
+        // for the rationale.
+        const bool fuse_qknorm_rope_prefill =
+            layer.q_norm && layer.k_norm &&
+            (d == 64 || d == 128 || d == 256);
+        if (fuse_qknorm_rope_prefill) {
+            kernels::launch_fused_qk_norm_rope_bf16(
+                ws.q.data(), ws.k.data(),
+                positions,
+                layer.q_norm->data(), layer.k_norm->data(),
+                N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                eps, cfg.rope_theta, stream);
+        } else {
+            if (layer.q_norm) {
+                kernels::launch_rmsnorm_bf16(
+                    ws.q.data(), layer.q_norm->data(), ws.q.data(),
+                    N * cfg.num_attention_heads, d, eps, stream);
+            }
+            if (layer.k_norm) {
+                kernels::launch_rmsnorm_bf16(
+                    ws.k.data(), layer.k_norm->data(), ws.k.data(),
+                    N * cfg.num_key_value_heads, d, eps, stream);
+            }
+            kernels::launch_rope_bf16(
+                ws.q.data(), ws.k.data(), positions,
+                N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                cfg.rope_theta, stream);
+        }
 
         // 6. Attention (naive O(N^2) over full sequence).
         ops::launch_attention_naive_bf16(
@@ -143,18 +168,25 @@ void qwen3_forward_prefill(
             ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
             N, H, eps, stream);
 
-        // 9. Gate / up projections.
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
-            ws.up.data(),   N, I, H);
-
-        // 10. SwiGLU into ws.gate (in place: gate <- silu(gate) * up).
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
+        // 9-10. Gate / up + SwiGLU — fused via chunked-swiglu when a
+        // packed weight is available.
+        if (layer.gate_up_proj) {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), ops::WeightView(*layer.gate_up_proj),
+                ws.gate_up.data(), N, 2 * I, H);
+            kernels::launch_chunked_swiglu_bf16(
+                ws.gate_up.data(), ws.gate.data(), N, I, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+                ws.gate.data(), N, I, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
+                ws.up.data(),   N, I, H);
+            kernels::launch_swiglu_bf16(
+                ws.gate.data(), ws.up.data(), ws.gate.data(),
+                N * I, stream);
+        }
 
         // 11. Down projection + residual: y = y + gate @ down_proj^T.
         ops::gemm_act_x_w(cublas.handle(),
@@ -205,6 +237,22 @@ void qwen3_forward_paged(
     const float eps = cfg.rms_norm_eps;
     cudaStream_t stream = nullptr;
 
+    // GEMM padding: round per-fire row count up to the next power of 2
+    // (min bucket = 8). cublas's heuristic at small / odd M routes to
+    // the `gemvx` batched-GEMV path; at the bucketed M values it picks
+    // a tensor-core GEMM. Padding only the GEMM calls (not rmsnorm,
+    // rope, attention, kv-write) keeps the change scoped: the input
+    // rows in [N..pN) are uninitialized junk and the corresponding
+    // output rows are never read downstream (per-row independence in
+    // matmul guarantees rows [0..N) of the output are unchanged).
+    auto next_pow2 = [](int x) {
+        if (x <= 8) return 8;
+        int r = 8;
+        while (r < x) r <<= 1;
+        return r;
+    };
+    const int pN = next_pow2(N);
+
     // 1. Embed.
     kernels::launch_embed_bf16(
         token_ids, w.embed->data(), ws.y.data(),
@@ -238,34 +286,60 @@ void qwen3_forward_paged(
             ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
 
-        // 3. QKV
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
-            ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
-            ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
-            ws.v.data(), N, Hk, H);
-
-        // 4. q/k norm (Qwen3 only — null on Llama-likes).
-        if (layer.q_norm) {
-            kernels::launch_rmsnorm_bf16(
-                ws.q.data(), layer.q_norm->data(), ws.q.data(),
-                N * cfg.num_attention_heads, d, eps, stream);
+        // 3. QKV — single fused GEMM + unpack when a packed weight was
+        // materialised at bind time (bf16-only path). Falls back to
+        // three separate GEMMs for quantized layers; semantics are
+        // identical either way (ws.q/k/v end up filled the same).
+        if (layer.qkv_proj) {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), ops::WeightView(*layer.qkv_proj),
+                ws.qkv_packed.data(), pN, Hq + 2 * Hk, H);
+            kernels::launch_unpack_qkv_bf16(
+                ws.qkv_packed.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                pN, Hq, Hk, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
+                ws.q.data(), pN, Hq, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
+                ws.k.data(), pN, Hk, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
+                ws.v.data(), pN, Hk, H);
         }
-        if (layer.k_norm) {
-            kernels::launch_rmsnorm_bf16(
-                ws.k.data(), layer.k_norm->data(), ws.k.data(),
-                N * cfg.num_key_value_heads, d, eps, stream);
-        }
 
-        // 5. RoPE
-        kernels::launch_rope_bf16(
-            ws.q.data(), ws.k.data(), positions,
-            N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-            cfg.rope_theta, stream);
+        // 4-5. q/k norm + RoPE — fused into one launch when both q_norm
+        // and k_norm are present (Qwen3 / Gemma-3 / OLMo-3 pattern) and
+        // the head_dim is supported (64/128/256). Saves 2 kernel
+        // launches per layer over the unfused path.
+        const bool fuse_qknorm_rope =
+            layer.q_norm && layer.k_norm &&
+            (d == 64 || d == 128 || d == 256);
+        if (fuse_qknorm_rope) {
+            kernels::launch_fused_qk_norm_rope_bf16(
+                ws.q.data(), ws.k.data(),
+                positions,
+                layer.q_norm->data(), layer.k_norm->data(),
+                N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                eps, cfg.rope_theta, stream);
+        } else {
+            if (layer.q_norm) {
+                kernels::launch_rmsnorm_bf16(
+                    ws.q.data(), layer.q_norm->data(), ws.q.data(),
+                    N * cfg.num_attention_heads, d, eps, stream);
+            }
+            if (layer.k_norm) {
+                kernels::launch_rmsnorm_bf16(
+                    ws.k.data(), layer.k_norm->data(), ws.k.data(),
+                    N * cfg.num_key_value_heads, d, eps, stream);
+            }
+            kernels::launch_rope_bf16(
+                ws.q.data(), ws.k.data(), positions,
+                N, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                cfg.rope_theta, stream);
+        }
 
         // 6. Write current K/V into the page table for this layer.
         kernels::launch_write_kv_to_pages_bf16(
@@ -307,33 +381,47 @@ void qwen3_forward_paged(
                 cache.page_size(), attn_ws, stream);
         }
 
-        // 8. O proj + residual
+        // 8. O proj + residual — padded M; the [N..pN) rows of attn_out
+        // are stale junk and the matching rows of y get garbage that's
+        // never read (final rmsnorm + lm_head operate on real N).
         ops::gemm_act_x_w(cublas.handle(),
             ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
-            ws.y.data(), N, H, Hq, /*beta=*/1.f);
+            ws.y.data(), pN, H, Hq, /*beta=*/1.f);
 
         // 9. mlp norm
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
             N, H, eps, stream);
 
-        // 10. gate / up
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
-            ws.up.data(),   N, I, H);
+        // 10-11. gate / up + SwiGLU — fused via chunked-swiglu when the
+        // packed weight was materialised. Reads gate / up halves from
+        // a single `[N, 2*I]` GEMM output, writes silu(gate)*up directly
+        // to ws.gate. Falls back to two separate GEMMs + classic
+        // swiglu when the layer is quantized.
+        if (layer.gate_up_proj) {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), ops::WeightView(*layer.gate_up_proj),
+                ws.gate_up.data(), pN, 2 * I, H);
+            kernels::launch_chunked_swiglu_bf16(
+                ws.gate_up.data(), ws.gate.data(), N, I, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+                ws.gate.data(), pN, I, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
+                ws.up.data(),   pN, I, H);
+            kernels::launch_swiglu_bf16(
+                ws.gate.data(), ws.up.data(), ws.gate.data(),
+                N * I, stream);
+        }
 
-        // 11. SwiGLU (in-place into ws.gate)
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-
-        // 12. down + residual
+        // 12. down + residual — padded M. ws.gate[N..pN] contains the
+        // raw gate*up GEMM output (not SwiGLU'd, but never read for
+        // those rows since the residual add only matters at [0..N)).
         ops::gemm_act_x_w(cublas.handle(),
             ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
-            ws.y.data(), N, H, I, /*beta=*/1.f);
+            ws.y.data(), pN, H, I, /*beta=*/1.f);
     }
 
     // 13. final norm
@@ -341,10 +429,12 @@ void qwen3_forward_paged(
         ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
         N, H, eps, stream);
 
-    // 14. lm_head
+    // 14. lm_head — padded M. Final rmsnorm only normalizes [0..N) so
+    // norm_x[N..pN] is stale; lm_head writes pN logit rows but only
+    // [0..N) are consumed by the sampler.
     ops::gemm_act_x_w(cublas.handle(),
         ws.norm_x.data(), *w.lm_head, ws.logits.data(),
-        N, V, H);
+        pN, V, H);
 }
 
 }  // namespace pie_cuda_driver::model

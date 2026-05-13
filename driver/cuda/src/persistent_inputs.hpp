@@ -56,11 +56,66 @@ struct PersistentInputs {
     DeviceBuffer<std::int32_t>  slot_ids;
     DeviceBuffer<std::uint8_t>  is_fresh;
 
+    // Token-sampler scratch (rank 0 only — TP followers don't sample).
+    // Replaces the per-fire `DeviceBuffer::from_host` allocations in
+    // `sampling_dispatch.cpp`. Pre-allocated to `max_workspace_tokens`
+    // so any fire's plan arrays (length N ≤ max_workspace_tokens) fit.
+    // Per-slot scratch buffers (`sample_idx`, `per_sample_tok`, `valid`)
+    // are sized identically — `num_sampling ≤ N` for the token-sampler
+    // path. Refreshed per fire via `copy_from_host` (async H2D).
+    DeviceBuffer<float>         sampling_temp;
+    DeviceBuffer<float>         sampling_min_p;
+    DeviceBuffer<float>         sampling_top_p;
+    DeviceBuffer<std::int32_t>  sampling_top_k;
+    DeviceBuffer<std::uint32_t> sampling_seed_u32;   // temp/min-p path
+    DeviceBuffer<std::uint64_t> sampling_seed_u64;   // topk/topp path
+    DeviceBuffer<std::int32_t>  sampling_sample_idx;
+    DeviceBuffer<std::int32_t>  sampling_per_sample_tok;
+    DeviceBuffer<bool>          sampling_valid;      // kernel scratch
+
+    // Msgpack-subpass scratch (rank 0 only). The four subpasses
+    // (entropy/logprob/dist/raw-logits) each previously did up to four
+    // `DeviceBuffer::from_host` per fire when their slot type was
+    // present. These persistent buffers replace the small per-row
+    // arrays. The two genuinely large per-fire allocations stay
+    // per-fire because they're conditional and size-proportional to
+    // vocab_size: gather-packed bf16 logits (n × V × u16) and dist
+    // probs (n × V × f32). Those slot types are absent from typical
+    // text-completion bench loads.
+    DeviceBuffer<std::int32_t>  subpass_rows;        // gather-rows index
+    DeviceBuffer<std::int32_t>  subpass_lp_rows;
+    DeviceBuffer<std::int32_t>  subpass_lp_lindptr;  // CSR indptr
+    DeviceBuffer<std::int32_t>  subpass_lp_lids;     // label ids
+    DeviceBuffer<float>         subpass_lp_out;      // logprob outputs
+    DeviceBuffer<std::int32_t>  subpass_ent_rows;
+    DeviceBuffer<float>         subpass_ent_out;
+    DeviceBuffer<std::int32_t>  subpass_dist_rows;
+    DeviceBuffer<float>         subpass_dist_temps;
+
+    // Pinned host staging for D2H reads and the topk/topp scatter.
+    // Allocated via cudaMallocHost so async copies bypass the driver's
+    // internal pageable-staging path. Sized to max_workspace_tokens.
+    std::int32_t* h_per_sample_tok_pinned = nullptr;
+    std::int32_t* h_all_sampled_pinned    = nullptr;
+    std::int32_t* h_sampled_pinned        = nullptr;  // D2H read of pi.sampled
+    // Pinned host staging for entropy/logprob D2H reads (sized to
+    // max_workspace_tokens — the row count never exceeds N, and label
+    // counts in practice are bounded similarly).
+    float*        h_ent_pinned            = nullptr;
+    float*        h_lp_pinned             = nullptr;
+
     static PersistentInputs allocate(
         int max_workspace_tokens,
         int max_requests,
         int max_kv_pages,
         std::size_t max_custom_mask_bytes);
+
+    PersistentInputs() = default;
+    PersistentInputs(const PersistentInputs&) = delete;
+    PersistentInputs& operator=(const PersistentInputs&) = delete;
+    PersistentInputs(PersistentInputs&&) noexcept;
+    PersistentInputs& operator=(PersistentInputs&&) noexcept;
+    ~PersistentInputs();
 };
 
 }  // namespace pie_cuda_driver

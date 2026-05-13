@@ -491,6 +491,7 @@ pub(crate) fn write_cuda_startup_toml(
 
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", opts.verbose);
+    insert_bool(&mut runtime, "cuda_graphs", opts.cuda_graphs);
     insert_table(&mut doc, "runtime", runtime);
 
     if let Some(tp) = tp {

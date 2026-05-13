@@ -23,7 +23,7 @@ from common import (
 
 
 BENCH_INFERLET = "text-completion-bench"
-EMBEDDED_CLI_DRIVERS: set[str] = set()
+EMBEDDED_CLI_DRIVERS: set[str] = {"cuda_native", "dummy"}
 
 
 def bench_inferlet_paths() -> tuple[Path, Path, str]:
@@ -73,6 +73,7 @@ def build_config(args: argparse.Namespace):
             "max_batch_size": args.max_batch_size,
             "max_batch_tokens": args.max_batch_tokens,
             "max_num_kv_pages": args.kv_pages,
+            "cuda_graphs": args.cuda_graphs,
         }
     elif args.driver == "portable":
         driver_options = {
@@ -104,6 +105,7 @@ def build_config(args: argparse.Namespace):
         server=ServerConfig(
             host="127.0.0.1",
             port=0,
+            verbose=True,
             max_concurrent_processes=args.concurrency if args.mode == "tput" else 1,
         ),
         auth=AuthConfig(enabled=False),
@@ -333,6 +335,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--worker-threads", type=int, default=None)
         sp.add_argument("--vllm-attention-backend", default=None)
         sp.add_argument("--sglang-attention-backend", default=None)
+        sp.add_argument("--cuda-graphs", action="store_true", default=False,
+                        help="Enable CUDA-graph capture for cuda_native decode forwards.")
         sp.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
     return p

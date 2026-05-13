@@ -64,6 +64,11 @@ struct DistributedConfig {
 
 struct RuntimeConfig {
     bool verbose = false;
+    // Capture decode forwards into CUDA graphs and replay per shape
+    // bucket. Mirrors the standalone `--cuda-graphs` flag. Wired from
+    // the Rust server's `[runtime].cuda_graphs` field via the embedded
+    // driver's TOML startup file.
+    bool cuda_graphs = false;
 };
 
 struct Config {
@@ -117,6 +122,8 @@ inline Config load_config(const std::filesystem::path& path) {
     }
     if (auto r = tbl["runtime"].as_table()) {
         c.runtime.verbose = (*r)["verbose"].value_or(c.runtime.verbose);
+        c.runtime.cuda_graphs =
+            (*r)["cuda_graphs"].value_or(c.runtime.cuda_graphs);
     }
 
     if (c.model.hf_repo.empty()) {

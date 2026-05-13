@@ -674,6 +674,12 @@ pub struct CudaNativeDriverOptions {
 
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
+
+    /// Capture decode forwards into CUDA graphs and replay per shape
+    /// bucket. Requires the structural-stable-pointer guarantees in
+    /// `driver/cuda/src/forward_graph.hpp`. Off by default — flip on
+    /// once you've confirmed the workload is decode-dominated.
+    pub cuda_graphs: bool,
 }
 
 impl Default for CudaNativeDriverOptions {
@@ -691,6 +697,7 @@ impl Default for CudaNativeDriverOptions {
             runtime_quant: String::new(),
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
+            cuda_graphs: false,
         }
     }
 }

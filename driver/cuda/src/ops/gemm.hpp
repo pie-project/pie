@@ -12,6 +12,8 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <memory>
+#include <span>
+#include <vector>
 
 #include "engine.hpp"
 #include "tensor.hpp"
@@ -159,5 +161,31 @@ inline void gemm_batched_act_x_wt_bf16(
                          act_ptrs_dev, W_ptrs_dev, y_ptrs_dev,
                          M, N, K, batch_count, beta);
 }
+
+// Pre-tune the cuBLASLt bf16 GEMM cache. For each shape in `shapes`,
+// the autotuner runs `cublasLtMatmulAlgoGetHeuristic`, times several
+// candidate algorithms against scratch I/O buffers, and stores the
+// fastest one keyed on `(M, N, K)`. Subsequent `gemm_act_x_w` calls of
+// a cached shape dispatch directly through `cublasLtMatmul`; cache
+// misses fall back to `cublasGemmEx` (the default cuBLAS heuristic).
+//
+// Designed to run once at engine init, after weights are loaded but
+// before the first fire. Tuning a typical Qwen3-8B catalog of ~25
+// (M, N, K) tuples takes ~1 second on Ada; the cached algos pay back
+// across the entire inference session because pie's persistent-input
+// + GEMM-padding pipeline keeps the shape catalog small.
+//
+// Safe to call multiple times — already-cached shapes are skipped.
+// Throws on out-of-memory; on any cuBLASLt failure the shape is
+// marked unsupported in the cache and the caller's subsequent
+// `gemm_act_x_w` for that shape will fall back to `cublasGemmEx`.
+struct Bf16GemmShape {
+    int M;  // rows of `act` / output
+    int N;  // rows of `W` (output dim per row of act)
+    int K;  // shared dim (hidden)
+};
+
+void pretune_bf16_gemm(std::span<const Bf16GemmShape> shapes,
+                       cudaStream_t stream = nullptr);
 
 }  // namespace pie_cuda_driver::ops

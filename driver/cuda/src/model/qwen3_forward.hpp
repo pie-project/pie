@@ -22,10 +22,25 @@ struct Qwen3Workspace {
     DeviceTensor q;          // [max_tokens, h_q  * head_dim]   — packed
     DeviceTensor k;          // [max_tokens, h_kv * head_dim]   — packed
     DeviceTensor v;          // [max_tokens, h_kv * head_dim]   — packed
+
+    // Fused QKV scratch — destination for the single packed GEMM. The
+    // per-head q/k/v buffers above are filled by an unpack kernel that
+    // splits this buffer's [N, Hq + 2*Hk] rows into three contiguous
+    // [N, *] tensors. Empty (numel()==0) when the layer's qkv_proj is
+    // null (quantized layers, or any model without a fused weight); the
+    // forward falls back to three separate GEMMs in that case.
+    DeviceTensor qkv_packed; // [max_tokens, Hq + 2*Hk]
     DeviceTensor attn_out;   // [max_tokens, h_q  * head_dim]   — packed
     DeviceTensor norm_y;     // [max_tokens, hidden]
     DeviceTensor gate;       // [max_tokens, intermediate]
     DeviceTensor up;         // [max_tokens, intermediate]
+
+    // Fused gate+up GEMM destination. Mirrors qkv_packed: when the
+    // layer has a fused gate_up_proj weight, the forward writes here
+    // and feeds the chunked-swiglu kernel that reads gate from offset 0
+    // and up from offset I within each row. Empty when gate_up_proj is
+    // null (quantized layers, or models without the fused weight).
+    DeviceTensor gate_up;    // [max_tokens, 2 * intermediate]
     DeviceTensor logits;     // [max_tokens, vocab]
     DeviceTensor probs;      // [max_tokens, vocab] FP32 — softmax scratch for sampling
 

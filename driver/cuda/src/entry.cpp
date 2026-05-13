@@ -571,6 +571,9 @@ int run_impl(int argc,
     if (cli_tp_rank >= 0) cfg.distributed.tp_rank = cli_tp_rank;
     if (!cli_nccl_unique_id_hex.empty())
         cfg.distributed.nccl_unique_id_hex = cli_nccl_unique_id_hex;
+    // CLI flag forces graphs on; TOML can also enable. Either-or, never
+    // unset what TOML asked for.
+    if (use_cuda_graphs) cfg.runtime.cuda_graphs = true;
     const bool verbose = cfg.runtime.verbose;
     if (cfg.distributed.tp_size > 1 &&
         cfg.distributed.tp_rank > 0 &&
@@ -977,6 +980,16 @@ int run_impl(int argc,
                   << "workspace tokens=" << max_workspace_tokens
                   << "; swap_pool=" << swap_pool.num_pages() << " pages\n";
     }
+
+    // bf16 GEMM cuBLASLt pre-tune is wired (see ops/gemm.cpp:pretune_
+    // bf16_gemm and the cached path in gemm_bf16_impl). It is OFF by
+    // default because in benchmarking the autotuned algos consistently
+    // landed 4-5% slower than cublasGemmEx's default routing — cuBLAS
+    // has its own per-call adaptive heuristic that considers runtime
+    // context (concurrent kernels, recent allocations) which a static
+    // "fastest in isolation" picker can't model. The infrastructure
+    // stays in tree so we can revisit with better autotune methodology
+    // (per-shape multi-iteration timing inside a fake fire, etc.).
 
     // Cold-path control thread. Runtime → wrapper (RPC) → us (socketpair)
     // for KV swap operations. Gated on the wrapper having passed a valid
@@ -1425,12 +1438,21 @@ int run_impl(int argc,
                 qo_indptr_h, kv_page_indptr_h,
                 N, R, is_pure_decode, mask_d, mask_indptr_d);
         };
+        // Pure-decode path is graph-safe: all kernel arg pointers are
+        // persistent (PersistentInputs, ws.*, kv_cache pages), the
+        // decode plan is run by the prepare hook *outside* the capture
+        // region (so per-fire scheduling lives in int_buffer at stable
+        // offsets), and flashinfer's plan_info fields are deterministic
+        // given (R, num_q_heads, num_kv_heads, head_dim, page_size).
+        // Activated only when cuda_graphs config is on AND the fire is
+        // pure-decode without a custom mask.
+        forward_fn.graph_safe = true;
     }
 
     pie_cuda_driver::ForwardContext fwd_ctx{
         engine, ws, kv_cache, attn_ws, cublas,
         max_workspace_tokens, persistent_inputs, verbose, std::move(forward_fn),
-        use_cuda_graphs ? &graph_cache : nullptr,
+        cfg.runtime.cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
         /*slot_alloc=*/{},
@@ -1444,7 +1466,7 @@ int run_impl(int argc,
         qwen3_5_state_cache.max_slots() > 0) {
         fwd_ctx.slot_alloc.reset(qwen3_5_state_cache.max_slots());
     }
-    if (verbose && use_cuda_graphs) {
+    if (verbose && cfg.runtime.cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
     }
 
