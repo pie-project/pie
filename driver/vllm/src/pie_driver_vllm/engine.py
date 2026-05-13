@@ -180,12 +180,37 @@ class VllmEngine:
         )
 
     @torch.inference_mode()
-    def fire_batch(self, inputs: dict, sampling_metadata: dict) -> list:
+    def fire_batch(
+        self,
+        inputs: dict,
+        sampling_metadata: dict,
+        gpu_timings: dict | None = None,
+    ) -> list:
         # This driver runs causal-only attention; user-supplied masks are
         # silently dropped. The capability is advertised via
         # DriverCapabilities so the runtime can route mask-dependent
         # inferlets elsewhere (currently only `native`).
+        #
+        # When `gpu_timings` is provided, we sync-then-time around each
+        # stage to break apart the GPU-side cost of embed / transform /
+        # sample. The difference between two adjacent `torch.cuda.
+        # synchronize()` + `perf_counter()` reads IS the GPU time of the
+        # intervening stage. Heavier than cuda.Events (4× sync per
+        # fire_batch) but reliable across vllm/inductor's dedicated
+        # streams — cuda.Events on the default stream miss compiled-graph
+        # kernels and can interfere with concurrent fork() copy_d2d.
+        # Only enabled when gpu_timings is requested, so the hot path is
+        # unaffected.
+        if gpu_timings is not None:
+            import time as _time
+            torch.cuda.synchronize()
+            t0 = _time.perf_counter()
+
         input_embeds = self.forward_pass.embed_inputs(inputs)
+
+        if gpu_timings is not None:
+            torch.cuda.synchronize()
+            t1 = _time.perf_counter()
 
         hidden_states = self.forward_pass.transform(
             input_embeds=input_embeds,
@@ -196,7 +221,20 @@ class VllmEngine:
             kv_last_page_lens=inputs["kv_last_page_lens"],
         )
 
-        return self.forward_pass.sample(hidden_states, sampling_metadata)
+        if gpu_timings is not None:
+            torch.cuda.synchronize()
+            t2 = _time.perf_counter()
+
+        out = self.forward_pass.sample(hidden_states, sampling_metadata)
+
+        if gpu_timings is not None:
+            torch.cuda.synchronize()
+            t3 = _time.perf_counter()
+            gpu_timings["embed_ms"] = (t1 - t0) * 1000.0
+            gpu_timings["transform_ms"] = (t2 - t1) * 1000.0
+            gpu_timings["sample_ms"] = (t3 - t2) * 1000.0
+
+        return out
 
     # ------------------------------------------------------------------
     # Speculative decoding: NGRAM drafter
