@@ -4,7 +4,8 @@
   "tagline": "In Pie the KV cache is a named object inside the engine. Save it after turn 1 and reopen it on turn 2 from user code. Only the new message pays prefill; chat history is the cache itself.",
   "question": "Two-turn chat. Turn 1: 'What is Python?' Turn 2: 'Name three common uses.'",
   "naive": {
-    "label": "Naive",
+    "label": "With Stock API",
+    "note": "(via vLLM/SGLang/llama.cpp)",
     "sublabel": "stateless client — every turn re-prefills the full history",
     "tone": "warn",
     "events": [
@@ -56,7 +57,7 @@
     ]
   },
   "pie": {
-    "label": "Pie",
+    "label": "With Pie",
     "sublabel": "Context::save() after turn 1, Context::open() before turn 2",
     "tone": "good",
     "events": [

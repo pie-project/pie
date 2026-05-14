@@ -4,7 +4,8 @@
   "tagline": "In Pie inferlets get a WASI filesystem capability. The engine pre-opens /scratch as a writable, per-user persistent directory. User code calls std::fs directly, no Redis, no sidecar service.",
   "question": "Same question, asked twice. Answer once, cache to /scratch, return the cached value the second time.",
   "naive": {
-    "label": "Naive",
+    "label": "With Stock API",
+    "note": "(via vLLM/SGLang/llama.cpp)",
     "sublabel": "no inline storage — every call re-asks the model",
     "tone": "warn",
     "events": [
@@ -46,7 +47,7 @@
     ]
   },
   "pie": {
-    "label": "Pie",
+    "label": "With Pie",
     "sublabel": "memoize via /scratch/answers.json — second call is a file read",
     "tone": "good",
     "events": [

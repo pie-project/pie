@@ -120,6 +120,7 @@ function Pane({
     <div className={clsx(styles.pane, styles[`pane_${pane.tone}`])}>
       <div className={styles.paneHeader}>
         <span className={styles.paneLabel}>{pane.label}</span>
+        {pane.note ? <span className={styles.paneNote}>{pane.note}</span> : null}
       </div>
       <div ref={ref} className={styles.paneBody}>
         {visible.map((ev, i) => renderEvent(ev, i))}
@@ -290,7 +291,7 @@ export default function DemoPlayer({ trace }: Props) {
             <div id={`demo-code-${trace.id}`} className={styles.codeRow}>
               <div className={clsx(styles.codeColumn, styles.codeColumn_warn)}>
                 <div className={styles.codeHeader}>
-                  <span className={styles.codeLabel}>Naive</span>
+                  <span className={styles.codeLabel}>Stock API</span>
                 </div>
                 <CodeBlock language={trace.code.naive.language}>
                   {trace.code.naive.value}

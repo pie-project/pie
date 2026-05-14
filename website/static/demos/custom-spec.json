@@ -4,7 +4,8 @@
   "tagline": "In Pie the speculative decoding loop is user code. Write your own drafting mechanism, ship it with the request, and run draft and verify in one forward pass. The drafter here is a prompt-lookup table.",
   "question": "Refactor the Python class: rename the field `total` to `subtotal` everywhere it appears.",
   "naive": {
-    "label": "Naive",
+    "label": "With Stock API",
+    "note": "(via vLLM/SGLang/llama.cpp)",
     "sublabel": "vanilla one token per step — about 311 tok/s",
     "tone": "warn",
     "events": [
@@ -131,7 +132,7 @@
     ]
   },
   "pie": {
-    "label": "Pie",
+    "label": "With Pie",
     "sublabel": "prompt-lookup drafter + verify in one forward pass — multi-token bursts",
     "tone": "good",
     "events": [
