@@ -41,6 +41,14 @@ struct Input {
     /// guarantee identical token counts across runs / engines.
     #[serde(default)]
     ignore_eos: bool,
+    /// Busy-spin inside WASM for this many microseconds between
+    /// every `step.execute()` call. Simulates per-token inferlet
+    /// work — agent reasoning, tool-call deserialization, etc. —
+    /// without needing to wire a real workload. Used by
+    /// SPECULATIVE_EXECUTION_DESIGN.md phase B4b.3 to measure
+    /// chain-firing overlap with WASM time.
+    #[serde(default)]
+    wasm_delay_us: u64,
 }
 
 fn default_max_tokens() -> usize { 256 }
@@ -69,11 +77,12 @@ async fn main(input: Input) -> Result<Output> {
     let mut ctx = Context::new(&model)?;
     ctx.system(&input.system).user(&input.prompt).cue();
 
-    // Snapshot the prompt token count (chat-templated prefill length)
-    // before the generation loop mutates the context. `seq_len()`
-    // returns the number of tokens currently committed to the
-    // context — at this point that's exactly the chat-templated prompt.
-    let num_prompt_tokens = ctx.seq_len() as usize;
+    // Snapshot the prompt token count BEFORE the generation loop
+    // fires its first forward pass. `seq_len()` only counts
+    // tokens already pushed through a forward — the chat fillers
+    // above only buffer locally — so the right number lives in
+    // `buffer()` at this point.
+    let num_prompt_tokens = ctx.buffer().len();
 
     let stop_tokens: Vec<u32> = if input.ignore_eos {
         Vec::new()
@@ -90,12 +99,19 @@ async fn main(input: Input) -> Result<Output> {
         .max_tokens(input.max_tokens)
         .stop(&stop_tokens);
 
+    let wasm_delay = std::time::Duration::from_micros(input.wasm_delay_us);
     while let Some(step) = g.next()? {
         let out = step.execute().await?;
         if out.tokens.is_empty() {
             continue;
         }
         all_output_tokens.extend(out.tokens.iter().copied());
+        // Sleep to simulate per-token inferlet WASM work. Yields the
+        // CPU so chain-firing happening concurrently in the driver's
+        // C++ thread can overlap. Skipped when wasm_delay_us == 0 (default).
+        if input.wasm_delay_us > 0 {
+            std::thread::sleep(wasm_delay);
+        }
     }
 
     let num_output_tokens = all_output_tokens.len();

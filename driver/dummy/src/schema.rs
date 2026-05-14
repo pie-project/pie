@@ -11,9 +11,9 @@ use anyhow::{Result, anyhow, ensure};
 use serde::Serialize;
 
 pub const REQ_MAGIC: u32 = 0x42504951; // 'BPIQ'
-pub const REQ_SCHEMA_VERSION: u32 = 1;
-pub const REQ_HEADER_SIZE: usize = 256;
-pub const NUM_ARRAYS: usize = 28;
+pub const REQ_SCHEMA_VERSION: u32 = 2;
+pub const REQ_HEADER_SIZE: usize = 512;
+pub const NUM_ARRAYS: usize = 29;
 
 const FIXED_HEADER: usize = 32;
 

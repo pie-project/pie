@@ -57,6 +57,7 @@
 #include <unistd.h>
 #include "ops/gemm.hpp"
 #include "request_handler.hpp"
+#include "response_writer.hpp"
 #include "shmem_ipc.hpp"
 
 namespace {
@@ -1436,6 +1437,9 @@ int run_impl(int argc,
         /*slot_alloc=*/{},
     };
     fwd_ctx.tp_cpu_gate_key = cfg.distributed.startup_barrier_path;
+    // Phase D: speculation lives entirely in the runtime now. The
+    // driver no longer runs chain steps; the runtime depth knob is
+    // `scheduler.speculation_depth` in the toml.
     // Size the linear-attn slot allocator only when this arch actually
     // uses a state cache. Default-constructed (max_slots=0) on every
     // other arch — handle_fire_batch's `use_slots` predicate stays false
@@ -1478,17 +1482,17 @@ int run_impl(int argc,
         c.max_batch_tokens = max_workspace_tokens;
         c.swap_pool_size = swap_pool.num_pages();
         nlohmann::json caps = {
-            {"total_pages",      c.total_pages},
-            {"kv_page_size",     c.kv_page_size},
-            {"swap_pool_size",   c.swap_pool_size},
-            {"max_batch_tokens", c.max_batch_tokens},
-            {"max_batch_size",   c.max_batch_size},
-            {"arch_name",        c.arch_name},
-            {"vocab_size",       c.vocab_size},
-            {"max_model_len",    c.max_model_len},
-            {"activation_dtype", c.activation_dtype},
-            {"snapshot_dir",     c.snapshot_dir},
-            {"shmem_name",       cfg.shmem.name},
+            {"total_pages",           c.total_pages},
+            {"kv_page_size",          c.kv_page_size},
+            {"swap_pool_size",        c.swap_pool_size},
+            {"max_batch_tokens",      c.max_batch_tokens},
+            {"max_batch_size",        c.max_batch_size},
+            {"arch_name",             c.arch_name},
+            {"vocab_size",            c.vocab_size},
+            {"max_model_len",         c.max_model_len},
+            {"activation_dtype",      c.activation_dtype},
+            {"snapshot_dir",          c.snapshot_dir},
+            {"shmem_name",            cfg.shmem.name},
         };
         const std::string caps_json = caps.dump();
         ready_cb(caps_json.c_str(), ready_ctx);
@@ -1500,15 +1504,18 @@ int run_impl(int argc,
                       << "resp_buf=" << server_p->resp_buf_size() << ")\n";
         }
         server_p->serve_forever([&](const pie_cuda_driver::SlotRequest& req,
-                                    std::span<std::uint8_t> response) -> std::size_t {
+                                    std::span<std::uint8_t> response,
+                                    pie_cuda_driver::Responder& responder) -> std::size_t {
             ++handled;
-            if (req.method_tag != pie_cuda_driver::METHOD_TAG_FIRE_BATCH) {
-                std::cerr << "[pie-driver-cuda] unsupported method_tag="
-                          << req.method_tag << " req_id=" << req.req_id << "\n";
-                return 0;
+            switch (req.method_tag) {
+                case pie_cuda_driver::METHOD_TAG_FIRE_BATCH:
+                    return pie_cuda_driver::handle_fire_batch(
+                        req, response, responder, fwd_ctx, handled);
+                default:
+                    std::cerr << "[pie-driver-cuda] unsupported method_tag="
+                              << req.method_tag << " req_id=" << req.req_id << "\n";
+                    return 0;
             }
-            return pie_cuda_driver::handle_fire_batch(
-                req, response, fwd_ctx, handled);
         });
         // Leader exited serve loop — wake followers so they can tear
         // down cleanly.

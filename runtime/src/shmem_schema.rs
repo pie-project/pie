@@ -3,27 +3,33 @@
 //! ## Layout
 //!
 //! ```text
-//! [256-byte header]
+//! [512-byte header]
 //!   0:  u32 magic = 0x42504951 ("BPIQ")
-//!   4:  u32 schema_version = 1
+//!   4:  u32 schema_version = 2
 //!   8:  u32 device_id
 //!   12: u32 flags  (bit 0 = single_token_mode)
-//!   16: u32 num_arrays = 28
+//!   16: u32 num_arrays = 29
 //!   20: u32 reserved
 //!   24: u64 reserved
-//!   32: 28 × (u32 offset, u32 len_in_elements) = 224 bytes
-//!   256: array data (concatenated, each array 8-byte aligned)
+//!   32: 29 × (u32 offset, u32 len_in_elements) = 232 bytes
+//!   264..512: reserved (room for future array slots without resizing)
+//!   512: array data (concatenated, each array 8-byte aligned)
 //! ```
 //!
 //! Byte order: little-endian, matches host. We assume both processes are
 //! on x86_64 LE.
+//!
+//! v2 added `A_PREDICT_FLAGS` (one u8 per request) for pass-level
+//! speculative execution and bumped HEADER_SIZE 256 → 512 so the
+//! offset/len table has room (32 + 29*8 = 264 > 256). See
+//! SPECULATIVE_EXECUTION_DESIGN.md.
 
 use crate::inference::request::BatchedForwardPassRequest;
 
 pub const MAGIC: u32 = 0x42504951; // 'BPIQ'
-pub const SCHEMA_VERSION: u32 = 1;
-pub const HEADER_SIZE: usize = 256;
-pub const NUM_ARRAYS: usize = 28;
+pub const SCHEMA_VERSION: u32 = 2;
+pub const HEADER_SIZE: usize = 512;
+pub const NUM_ARRAYS: usize = 29;
 
 const FIXED_HEADER: usize = 32;
 
@@ -56,10 +62,11 @@ pub const A_SPEC_POSITION_IDS: usize = 24;
 pub const A_SPEC_INDPTR: usize = 25;
 pub const A_OUTPUT_SPEC_FLAGS: usize = 26; // u8
 pub const A_CONTEXT_IDS: usize = 27; // u64
+pub const A_PREDICT_FLAGS: usize = 28; // u8 (v2)
 
 const ELEM_SIZE: [usize; NUM_ARRAYS] = [
     4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 8, 8, 4, 4, 4, 1, 8,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 8, 8, 4, 4, 4, 1, 8, 1,
 ];
 
 #[inline]
@@ -104,6 +111,7 @@ pub fn write_request(req: &BatchedForwardPassRequest, buf: &mut [u8]) -> anyhow:
         req.spec_indptr.0.len(),
         req.output_spec_flags.len(),
         req.context_ids.len(),
+        req.predict_flags.len(),
     ];
 
     // Compute offsets.
@@ -220,6 +228,14 @@ pub fn write_request(req: &BatchedForwardPassRequest, buf: &mut [u8]) -> anyhow:
         let bytes: &[u8] = bytemuck::cast_slice(&req.context_ids);
         let nbytes = req.context_ids.len() * 8;
         buf[off..off + nbytes].copy_from_slice(bytes);
+    }
+
+    // predict_flags as u8 (v2).
+    {
+        let off = offsets[A_PREDICT_FLAGS] as usize;
+        for (k, b) in req.predict_flags.iter().enumerate() {
+            buf[off + k] = if *b { 1 } else { 0 };
+        }
     }
 
     Ok(total)

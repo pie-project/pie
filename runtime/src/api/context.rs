@@ -3,9 +3,11 @@
 use crate::api::model::Model;
 use crate::api::pie;
 use crate::context::{self, ContextId};
+use crate::inference::StagedBatch;
 use crate::instance::InstanceState;
 use crate::model::ModelId;
 use anyhow::Result;
+use std::sync::OnceLock;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -16,6 +18,13 @@ pub struct Context {
     pub context_id: ContextId,
     /// The model ID (for routing to the correct ContextManager).
     pub model_id: ModelId,
+    /// Lazily-populated speculator handle for this ctx's
+    /// `(model, device)`. Populated on first `pass.context()` call
+    /// from the inferlet so `execute()` skips the global REGISTRY
+    /// lookup on every iteration. `Some(None)` means speculation is
+    /// disabled for this model; the OnceLock distinguishes that from
+    /// "not yet initialized".
+    pub spec: OnceLock<Option<StagedBatch>>,
 }
 
 impl pie::core::context::Host for InstanceState {}
@@ -31,7 +40,7 @@ impl pie::core::context::HostContext for InstanceState {
 
         match context::create(model_id, process_id).await {
             Ok(context_id) => {
-                let ctx = Context { context_id, model_id };
+                let ctx = Context { context_id, model_id, spec: OnceLock::new() };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -54,7 +63,7 @@ impl pie::core::context::HostContext for InstanceState {
         };
         match context::fork(model_id, snapshot_id, process_id).await {
             Ok(context_id) => {
-                let ctx = Context { context_id, model_id };
+                let ctx = Context { context_id, model_id, spec: OnceLock::new() };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -73,7 +82,7 @@ impl pie::core::context::HostContext for InstanceState {
 
         match context::take(model_id, username, name, process_id).await {
             Ok(context_id) => {
-                let ctx = Context { context_id, model_id };
+                let ctx = Context { context_id, model_id, spec: OnceLock::new() };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -106,7 +115,7 @@ impl pie::core::context::HostContext for InstanceState {
 
         match context::fork(model_id, context_id, process_id).await {
             Ok(new_context_id) => {
-                let new_ctx = Context { context_id: new_context_id, model_id };
+                let new_ctx = Context { context_id: new_context_id, model_id, spec: OnceLock::new() };
                 Ok(Ok(self.ctx().table.push(new_ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -150,14 +159,31 @@ impl pie::core::context::HostContext for InstanceState {
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
 
+        // Drop any speculation chain BEFORE the context store
+        // releases the ctx. Order matters: the chain queue holds
+        // ForwardPassOutput channels keyed by the ctx; we want them
+        // dropped while the ctx still exists so any in-flight
+        // BatchComplete handler that races us sees a coherent state
+        // (chain gone → output silently discarded).
+        crate::inference::invalidate_speculation_for_ctx(model_id, context_id);
         let _ = context::destroy(model_id, context_id).await;
         self.ctx().table.delete(this)?;
         Ok(())
     }
 
     async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
-        // Context cleanup is handled by DestroyAll on instance drop.
-        // Individual handle drops just remove the resource table entry.
+        // Pull ctx + model identifiers BEFORE we release the table
+        // entry — the resource handle is invalid after delete.
+        let (model_id, context_id) = {
+            let ctx = self.ctx().table.get(&this)?;
+            (ctx.model_id, ctx.context_id)
+        };
+        // Drop the speculation chain associated with this ctx. The
+        // ctx itself stays alive for the process's wider cleanup
+        // path (InstanceState::drop → unregister_process); only the
+        // speculative state attached to it goes away here. Idempotent
+        // if no chain exists.
+        crate::inference::invalidate_speculation_for_ctx(model_id, context_id);
         self.ctx().table.delete(this)?;
         Ok(())
     }
@@ -237,7 +263,15 @@ impl pie::core::context::HostContext for InstanceState {
         this: Resource<Context>,
     ) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
-        match context::suspend(ctx.model_id, ctx.context_id).await {
+        let (model_id, context_id) = (ctx.model_id, ctx.context_id);
+        // Eviction safety: drop the speculation chain BEFORE the
+        // context store releases the ctx's GPU pages. Chain entries
+        // hold fingerprints referencing KV positions that won't exist
+        // after the page reclaim; the next inferlet hit would read
+        // from a stale slot. See SPECULATIVE_EXECUTION_DESIGN.md
+        // §"Eviction safety".
+        crate::inference::invalidate_speculation_for_ctx(model_id, context_id);
+        match context::suspend(model_id, context_id).await {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }

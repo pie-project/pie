@@ -135,6 +135,12 @@ pub struct SchedulerConfig {
     /// contexts when any device's GPU page utilization exceeds this fraction.
     /// Prevents the evict→restore→re-evict thrash cascade. Range: (0.0, 1.0].
     pub restore_pause_at_utilization: f64,
+    /// Per-context depth of pass-level speculative execution.
+    /// `0` disables speculation entirely; every submit goes
+    /// through the cold path. `1` is piggyback (one staged pass
+    /// per real pass); higher values let chain firing overlap
+    /// with the inferlet's WASM time. Range: 0..=64.
+    pub speculation_depth: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +253,7 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             cfg.kv_page_size as u32,
             cfg.scheduler.request_timeout_secs,
             cfg.scheduler.batch_policy.clone(),
+            cfg.scheduler.speculation_depth,
         )
         .await;
         adapter::spawn(&devices);

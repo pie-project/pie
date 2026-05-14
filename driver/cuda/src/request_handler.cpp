@@ -192,6 +192,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
 std::size_t handle_fire_batch(
     const SlotRequest& req,
     std::span<std::uint8_t> response,
+    Responder& responder,
     ForwardContext& ctx,
     std::uint64_t handled)
 {
@@ -656,6 +657,31 @@ std::size_t handle_fire_batch(
                               sizeof(std::int32_t) * N,
                               cudaMemcpyDeviceToHost));
 
+        // =====================================================================
+        // Pass-level speculation (phase B4b.3 — async chain firing)
+        //
+        // Two halves, split around the response write below:
+        //
+        //   (pre-respond)  Build `cands` from the real pass's outputs
+        //                  and snapshot any payload-backed data the
+        //                  chain needs. We MUST snapshot before
+        //                  `responder.respond()` fires: once the
+        //                  Rust client unblocks, it can reuse this
+        //                  slot and overwrite the request payload
+        //                  while we're still reading from it.
+        //   (post-respond) Fire chain-step kernels, sample, push
+        //                  events. This runs after responder.respond
+        //                  so the inferlet's WASM time overlaps with
+        //                  the chain.
+        //
+        // Constraints (skip otherwise):
+        //   - has_spec_drafts == false  (combined mode is a later step)
+        //   - use_slots == false        (linear-attn state cache is per-fire)
+        //   - Phase D: chain step removed. Runtime now self-stages
+        //     the next forward pass through the normal scheduler
+        //     queue. The driver is stateless wrt speculation.
+        // =====================================================================
+
         // Flat-path arrays: token sampler is the only slot type allowed
         // here (need_msgpack would have flipped otherwise), so counts
         // align 1:1 with sampling slots.
@@ -753,6 +779,9 @@ std::size_t handle_fire_batch(
                       << " max_kv=" << max_kv_len
                       << " resp=" << resp_bytes << "B\n";
         }
+
+        // Publish the response to unblock the Rust client.
+        responder.respond(resp_bytes);
         return resp_bytes;
 
     } catch (const std::exception& e) {

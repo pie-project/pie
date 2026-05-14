@@ -28,6 +28,11 @@ use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 pub struct ForwardPass {
     pub model_id: usize,
     context_id: Option<crate::context::ContextId>,
+    /// Snapshot of the bound ctx's cached speculator handle. Set in
+    /// `pass.context()`; `None` until then, or when speculation is
+    /// disabled for the model. Lets `execute()` call `try_hit`
+    /// without taking the global REGISTRY lock.
+    spec: Option<inference::StagedBatch>,
     input_tokens: Vec<u32>,
     input_token_positions: Vec<u32>,
     speculative_tokens: Vec<u32>,
@@ -175,6 +180,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let pass = ForwardPass {
             model_id: model.model_id,
             context_id: None,
+            spec: None,
             input_tokens: vec![],
             input_token_positions: vec![],
             speculative_tokens: vec![],
@@ -193,8 +199,18 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     async fn context(&mut self, this: Resource<ForwardPass>, context: Resource<Context>) -> Result<()> {
         let ctx = self.ctx().table.get(&context)?;
         let context_id = ctx.context_id;
+        let model_id = ctx.model_id;
+        // Initialize the ctx's speculator cache on the first call
+        // for this ctx. The OnceLock makes this lock-free on every
+        // subsequent `pass.context()`, eliminating REGISTRY lookups
+        // from the per-iteration hot path.
+        let spec = ctx.spec.get_or_init(|| {
+            let device_idx = context::get_device(model_id, context_id);
+            inference::lookup_for_ctx(model_id, device_idx)
+        }).clone();
         let pass = self.ctx().table.get_mut(&this)?;
         pass.context_id = Some(context_id);
+        pass.spec = spec;
         Ok(())
     }
 
@@ -325,197 +341,121 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         &mut self,
         this: Resource<ForwardPass>,
     ) -> Result<Result<Resource<FutureOutput>, String>> {
+        // 1. Drain the accumulated WIT state into owned values.
         let pass = self.ctx().table.get_mut(&this)?;
-
-        // Extract accumulated state
         let model_id = pass.model_id;
+        let context_id = pass.context_id
+            .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
         let tokens = take(&mut pass.input_tokens);
         let positions = take(&mut pass.input_token_positions);
         let speculative_tokens = take(&mut pass.speculative_tokens);
         let speculative_positions = take(&mut pass.speculative_positions);
         let output_speculative_tokens = pass.output_speculative_tokens;
-        let masks = take(&mut pass.mask);
-        // Track whether the user actually supplied masks; the kernel-dispatch
-        // hint downstream needs to distinguish user masks from the runtime's
-        // synthesized causal default.
-        let has_user_mask = !masks.is_empty();
-
-        // WIT spec: "if not provided, fallback to causal mask".
-        // Each token at position `pos` must attend to all (pos + 1) preceding
-        // positions including itself — i.e., the row is all-True over its
-        // valid prefix. Under the starts-with-False BRLE convention, that's
-        // a zero-length false-run prefix followed by a true run of pos+1.
-        let masks = if masks.is_empty() && !positions.is_empty() {
-            positions.iter().map(|&pos| Brle::all_true((pos + 1) as usize)).collect()
-        } else {
-            masks
-        };
+        let user_masks = take(&mut pass.mask);
+        let has_user_mask = !user_masks.is_empty();
         let logit_mask = pass.logit_mask.take();
         let sampling_indices = take(&mut pass.output_token_indices);
-        let sampler_maps = take(&mut pass.output_token_samplers);
+        let samplers: Vec<inference::Sampler> = take(&mut pass.output_token_samplers)
+            .iter().map(convert_sampler).collect();
         let adapter_id = pass.adapter.map(|id| id as u64);
         let adapter_seed = pass.adapter_seed;
+        let spec_handle = pass.spec.take();
+        let num_input_tokens = tokens.len() as u32;
 
-        // Convert sampler maps to request::Sampler enums
-        let samplers: Vec<inference::Sampler> = sampler_maps.iter()
-            .map(convert_sampler)
-            .collect();
-
-        // Save data needed for context::append_working_page_tokens() before
-        // moving into request. We also clone the speculative arrays so we
-        // can append the verified-prefix to the working-page lineage once
-        // the response tells us how many drafts were accepted.
-        let num_input_tokens = tokens.len();
-        let fill_tokens = tokens.clone();
-        let fill_positions = positions.clone();
-        let fill_masks = masks.clone();
-        let spec_tokens_for_fill = speculative_tokens.clone();
-        let spec_positions_for_fill = speculative_positions.clone();
-
-        let context_id = pass.context_id
-            .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
-
-        // =====================================================================
-        // Context preparation — runs in THIS process's tokio task, not the
-        // inference actor. This is critical: blocking here only stalls this
-        // one process, not the entire inference pipeline.
-        //
-        // STATE MACHINE (new 3-state context module):
-        //
-        //   reserve_working_pages: blocks if process is suspended — actor handles
-        //     restoration via drain_queues, process resumes automatically.
-        //   pin: Active → Pinned (non-evictable).
-        //   unpin: Pinned → Active (evictable again).
-        //
-        // The process calls unpin after fill, which is the ONLY
-        // transition Pinned → Active. Eviction of Pinned contexts is
-        // deferred via pending_suspend flag.
-        // =====================================================================
-
-        // Step 1: Resolve physical page IDs. Atomically pins the context
-        // (Active → Pinned) so pages cannot be evicted during the forward pass.
-        let pinned = match context::pin(model_id, context_id, num_input_tokens as u32).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("pin failed for ctx {context_id}: {e:#}");
-                return Ok(Err(e.to_string()));
-            }
+        // 2. WIT default: when the inferlet didn't supply attention
+        //    masks, synthesize a causal mask per input token. Each row
+        //    is all-True over its (pos+1)-long valid prefix; under the
+        //    starts-with-False BRLE convention that's a zero-length
+        //    false run followed by a true run of (pos+1).
+        let masks = if has_user_mask {
+            user_masks
+        } else {
+            positions.iter().map(|&pos| Brle::all_true((pos + 1) as usize)).collect()
         };
-        let kv_len = pinned.kv_len;
-        let last_page_len = pinned.last_page_len;
-        let device_id = pinned.device;
-        let physical_page_ids = pinned.pages;
 
-        let num_pages = physical_page_ids.len() as u32;
-        let page_size = context::tokens_per_page(model_id);
-        let total_kv = kv_len + num_input_tokens as u32;
-
-        // INVARIANT: total_kv must fit within the allocated pages.
-        // Violation means working pages were lost between reserve_working_pages
-        // and execute — see swap lifecycle diagnostics.
-        let page_capacity = num_pages * page_size;
-        if total_kv > page_capacity || num_pages == 0 {
-            let msg = format!(
-                "KV_INVARIANT_VIOLATION ctx={context_id} total_kv={total_kv} \
-                 page_capacity={page_capacity} num_pages={num_pages} \
-                 kv_len={kv_len} num_input={num_input_tokens} page_size={page_size} \
-                 phys_ids={physical_page_ids:?}"
-            );
-            eprintln!("{msg}");
-            context::unpin(model_id, context_id);
-            return Ok(Err(msg));
+        // 3. Pre-compute the fill payload for
+        //    `append_working_page_tokens` — the lineage append that
+        //    runs on the success path. Real inputs + the full
+        //    speculative-draft chain; the SDK truncates rejected
+        //    drafts afterwards via `truncate_working_page_tokens`.
+        //    Speculative tokens get synthesized causal masks.
+        let mut fill_tokens = tokens.clone();
+        let mut fill_positions = positions.clone();
+        let mut fill_masks = masks.clone();
+        fill_tokens.extend_from_slice(&speculative_tokens);
+        fill_positions.extend_from_slice(&speculative_positions);
+        for &pos in &speculative_positions {
+            fill_masks.push(Brle::all_true((pos + 1) as usize));
         }
 
         let request = ForwardPassRequest {
             context_id,
-            tokens,
-            positions,
-            speculative_tokens,
-            speculative_positions,
-            output_speculative_tokens,
-            masks,
+            tokens, positions, masks,
+            speculative_tokens, speculative_positions, output_speculative_tokens,
             has_user_mask,
             logit_mask,
-            sampling_indices,
-            samplers,
-            adapter_id,
-            adapter_seed,
+            sampling_indices, samplers,
+            adapter_id, adapter_seed,
         };
 
-        // Step 5: Submit to inference service (inference actor just dispatches — never blocks)
-        let device_idx = device_id as usize;
-        match inference::submit(model_id, request, device_idx, physical_page_ids.clone(), last_page_len).await {
-            Ok(output) => {
-                // Diagnostic: log prefill metadata to trace corruption
-                // if num_input_tokens > 1 {
-                //     eprintln!(
-                //         "PREFILL_RESULT ctx={context_id} kv={kv_len} np={num_pages} \
-                //          inp={num_input_tokens} lpl={last_page_len} pages={physical_page_ids:?}"
-                //     );
-                // }
-                // Diagnostic: log first decode step metadata
-                // if num_input_tokens == 1 && kv_len < 45 {
-                //     eprintln!(
-                //         "DECODE_STEP ctx={context_id} kv={kv_len} np={num_pages} \
-                //          lpl={last_page_len} pos={:?} pages={physical_page_ids:?}",
-                //         fill_positions,
-                //     );
-                // }
-                // Step 3: Mark input tokens as forwarded WHILE still Pinned
-                // (non-evictable). This ensures working_page_tokens + lineage are consistent
-                // before the context becomes Active (evictable).
-                //
-                // For speculative-decoding flows, the forward pass also
-                // wrote KV for every speculative token (accepted or not).
-                // The SDK's stream code accounts for this exact pattern:
-                //   * lineage += pending + ALL_drafts
-                //   * truncate(n_rejected) to drop the tail of rejected drafts
-                //   * commit_working_pages(...) using the post-truncate state
-                // So we append the FULL speculative chain here and rely on
-                // the SDK to call `truncate_working_page_tokens(n_rejected)`
-                // afterwards. Skipping that truncate would leave stale
-                // entries in the lineage; in practice the SDK's
-                // `Stream::generate_step` always issues it.
-                let mut all_fill_tokens = fill_tokens;
-                let mut all_fill_positions = fill_positions;
-                let mut all_fill_masks = fill_masks;
-                if !spec_tokens_for_fill.is_empty() {
-                    all_fill_tokens.extend_from_slice(&spec_tokens_for_fill);
-                    all_fill_positions.extend_from_slice(&spec_positions_for_fill);
-                    // Synthesize causal masks for each spec token, matching
-                    // the convention applied above for un-masked inputs.
-                    for &pos in &spec_positions_for_fill {
-                        all_fill_masks.push(Brle::all_true((pos + 1) as usize));
-                    }
-                }
-                if !all_fill_tokens.is_empty() {
-                    if let Err(e) = context::append_working_page_tokens(
-                        model_id, context_id, all_fill_tokens,
-                        all_fill_positions, all_fill_masks, adapter_id, adapter_seed,
-                    ).await {
-                        context::unpin(model_id, context_id);
-                        tracing::warn!("context::fill failed for ctx {context_id}: {e:#}");
+        // 4. Try the lock-free staged hit before pinning. On hit we
+        //    skip pin/unpin entirely (the staged fire is running on
+        //    pages from the prior cycle). On miss we pin + submit.
+        //    The ctx-cached `spec` handle lets us skip the REGISTRY
+        //    lookup that used to live inside `try_hit`.
+        let (was_pinned, submit_result) = if let Some(rx) = spec_handle
+            .as_ref()
+            .and_then(|s| inference::try_hit(s, context_id, &request))
+        {
+            (false, rx.await.map_err(|_| anyhow::anyhow!("staged rx dropped")))
+        } else {
+                let p = match context::pin(model_id, context_id, num_input_tokens).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("pin failed for ctx {context_id}: {e:#}");
                         return Ok(Err(e.to_string()));
                     }
-                }
-
-                // Unpin — forward pass completed and tokens recorded in lineage.
-                // Context is now safe to evict: lineage is consistent with working_page_tokens.
-                context::unpin(model_id, context_id);
-
-                let future_output = FutureOutput {
-                    result: Some(convert_output(output)),
-                    rx: None,
-                    done: true,
                 };
-                Ok(Ok(self.ctx().table.push(future_output)?))
-            }
+                let result = inference::submit(
+                    model_id, request,
+                    p.device as usize, p.pages, p.extra_pages, p.last_page_len,
+                ).await;
+                (true, result)
+            };
+
+        // 5. On submit failure, unpin (if we pinned) and return early.
+        let output = match submit_result {
+            Ok(o) => o,
             Err(e) => {
-                context::unpin(model_id, context_id);
+                if was_pinned { context::unpin(model_id, context_id); }
                 tracing::warn!("inference::submit failed for ctx {context_id}: {e:#}");
                 return Ok(Err(e.to_string()));
-            },
+            }
+        };
+
+        // 6. Queue the lineage append on the context actor. Fire-and-
+        //    forget: errors get logged at the handler. Subsequent
+        //    ops on this ctx (`unpin`, the next `pin`, `commit`,
+        //    `truncate`, eviction) all go through the same mpsc and
+        //    are naturally ordered behind this message, so every
+        //    state-reading consumer sees a consistent post-append
+        //    view — just slightly later in wall time.
+        if !fill_tokens.is_empty() {
+            context::append_working_page_tokens(
+                model_id, context_id,
+                fill_tokens, fill_positions, fill_masks,
+                adapter_id, adapter_seed,
+            );
         }
+
+        // 7. Unpin (no-op on staged hit) and hand the output back.
+        if was_pinned { context::unpin(model_id, context_id); }
+        let future_output = FutureOutput {
+            result: Some(convert_output(output)),
+            rx: None,
+            done: true,
+        };
+        Ok(Ok(self.ctx().table.push(future_output)?))
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {

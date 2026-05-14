@@ -261,6 +261,9 @@ class Batch:
         self.spec_position_ids = _decode_u32(args["spec_position_ids"]).astype(np.int32)
         self.spec_indptr = _decode_u32(args["spec_indptr"]).astype(np.int32)
         self.output_spec_flags = args["output_spec_flags"]
+        # Pass-level speculation flag per request (schema v2). The dev
+        # driver doesn't act on it yet; stored for future use.
+        self.predict_flags = args.get("predict_flags", [])
         self.sampler_seeds_arr = _decode_u32(args["sampler_seeds"])
         # Host-side check: if every sampler's seed is 0 (the "user did not
         # ask for determinism" sentinel), we can short-circuit the device-

@@ -5,16 +5,21 @@
 //
 // Layout (little-endian, host x86_64):
 //
-//   [256-byte header]
+//   [512-byte header]
 //     0:  u32 magic = 0x42504951 ("BPIQ")
-//     4:  u32 schema_version = 1
+//     4:  u32 schema_version = 2
 //     8:  u32 device_id
 //     12: u32 flags  (bit 0 = single_token_mode)
-//     16: u32 num_arrays = 28
+//     16: u32 num_arrays = 29
 //     20: u32 reserved
 //     24: u64 reserved
-//     32: 28 × (u32 offset, u32 len_in_elements) = 224 bytes
-//     256: array data (concatenated, each array 8-byte aligned)
+//     32: 29 × (u32 offset, u32 len_in_elements) = 232 bytes
+//     264..512: reserved
+//     512: array data (concatenated, each array 8-byte aligned)
+//
+// v2 added `A_PREDICT_FLAGS` (u8 per request) for pass-level
+// speculative execution and bumped HEADER_SIZE 256 → 512 so the
+// offset/len table fits. See SPECULATIVE_EXECUTION_DESIGN.md.
 
 #include <cstddef>
 #include <cstdint>
@@ -25,9 +30,9 @@
 namespace pie_cuda_driver::schema {
 
 inline constexpr std::uint32_t MAGIC = 0x42504951;  // 'BPIQ'
-inline constexpr std::uint32_t SCHEMA_VERSION = 1;
-inline constexpr std::size_t HEADER_SIZE = 256;
-inline constexpr std::size_t NUM_ARRAYS = 28;
+inline constexpr std::uint32_t SCHEMA_VERSION = 2;
+inline constexpr std::size_t HEADER_SIZE = 512;
+inline constexpr std::size_t NUM_ARRAYS = 29;
 inline constexpr std::size_t FIXED_HEADER = 32;
 
 // Array indices — must match `runtime/src/shmem_schema.rs` and
@@ -61,11 +66,12 @@ enum ArrayIndex : std::size_t {
     A_SPEC_INDPTR = 25,
     A_OUTPUT_SPEC_FLAGS = 26,     // u8
     A_CONTEXT_IDS = 27,           // u64
+    A_PREDICT_FLAGS = 28,         // u8 (v2)
 };
 
 inline constexpr std::size_t ELEM_SIZE[NUM_ARRAYS] = {
     4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 8, 8, 4, 4, 4, 1, 8,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 8, 8, 4, 4, 4, 1, 8, 1,
 };
 
 struct DecodedRequest {

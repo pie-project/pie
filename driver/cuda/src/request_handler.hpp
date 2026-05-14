@@ -18,6 +18,7 @@
 #include "distributed.hpp"
 #include "forward_graph.hpp"
 #include "model/llama_like.hpp"
+#include "response_writer.hpp"
 #include "persistent_inputs.hpp"
 #include "slot_allocator.hpp"
 
@@ -27,6 +28,7 @@ class Engine;
 class KvCache;
 class AttentionWorkspace;
 struct SlotRequest;
+class Responder;
 
 namespace model {
 struct Qwen3Weights;
@@ -169,6 +171,7 @@ struct ForwardContext {
 std::size_t handle_fire_batch(
     const SlotRequest& req,
     std::span<std::uint8_t> response,
+    Responder& responder,
     ForwardContext& ctx,
     std::uint64_t handled);
 

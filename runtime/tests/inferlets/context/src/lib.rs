@@ -1,7 +1,7 @@
 //! Context test inferlet — exercises model, context, and tokenizer host APIs.
 
 use inferlet::{
-    context::Context,
+    Context,
     model::Model,
     runtime,
     Result,
@@ -18,14 +18,14 @@ async fn main(_input: String) -> Result<String> {
     let encoded = tokenizer.encode("hello world");
 
     // Create a context
-    let ctx = Context::create(&model)?;
+    let mut ctx = Context::new(&model)?;
 
     // Stage some buffered tokens
-    ctx.set_buffered_tokens(&encoded);
-    let buffered = ctx.buffered_tokens();
+    ctx.append(&encoded);
+    let buffered = ctx.buffer();
 
     // Query page info
-    let page_size = ctx.tokens_per_page();
+    let page_size = ctx.page_size();
 
     Ok(format!(
         "encoded:{} buffered:{} page_size:{}",

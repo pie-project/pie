@@ -323,7 +323,19 @@ pub struct SchedulerConfig {
     pub admission_oversubscription_factor: f64,
     #[serde(default = "default_restore_pause_at_utilization")]
     pub restore_pause_at_utilization: f64,
+    /// Per-context depth of pass-level speculative execution.
+    /// `0` disables speculation entirely (every submit goes
+    /// through the cold path). `1` is the piggyback path —
+    /// one staged pass pre-fired per real pass. Higher values
+    /// let chain firing overlap with the inferlet's WASM time
+    /// (see SPECULATIVE_EXECUTION_DESIGN.md phase B4b.3). The
+    /// eventual ceiling is page-boundary-limited. Valid range:
+    /// 0..=64. Default 1.
+    #[serde(default = "default_speculation_depth")]
+    pub speculation_depth: u32,
 }
+
+fn default_speculation_depth() -> u32 { 1 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -334,6 +346,7 @@ impl Default for SchedulerConfig {
             default_endowment_pages: default_endowment_pages(),
             admission_oversubscription_factor: default_oversubscription_factor(),
             restore_pause_at_utilization: default_restore_pause_at_utilization(),
+            speculation_depth: default_speculation_depth(),
         }
     }
 }
@@ -364,6 +377,11 @@ impl SchedulerConfig {
         ensure!(
             self.restore_pause_at_utilization > 0.0 && self.restore_pause_at_utilization <= 1.0,
             "scheduler.restore_pause_at_utilization must be in (0.0, 1.0]"
+        );
+        ensure!(
+            self.speculation_depth <= 64,
+            "scheduler.speculation_depth must be in 0..=64 (got {}); 0 disables speculation",
+            self.speculation_depth
         );
         Ok(())
     }

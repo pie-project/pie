@@ -173,8 +173,11 @@ static PINNED_COUNTS: [std::sync::atomic::AtomicUsize; 8] = [
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CachedContextInfo {
     pub device: usize,
+    /// Visible working pages — what the SDK's `working_page_count()` returns.
     pub working_pages: u32,
     pub committed_pages: u32,
+    /// Visible working-page tokens — what the SDK's
+    /// `working_page_token_count()` returns.
     pub working_tokens: u32,
 }
 
@@ -525,16 +528,21 @@ pub async fn truncate_working_page_tokens(model_idx: usize, id: ContextId, count
     rx.await.context("context::truncate_working_page_tokens: actor dropped response")?
 }
 
-pub async fn append_working_page_tokens(
+/// Fire-and-forget: queues a lineage append on the context actor's
+/// mailbox and returns immediately. Errors (e.g., ctx already
+/// destroyed mid-flight) are logged inside the handler rather than
+/// propagated. Subsequent ops on the same ctx (`pin`, `commit`,
+/// `truncate`, `destroy`, eviction) traverse the same mpsc and so
+/// are naturally ordered behind this append — the state remains
+/// consistent for every actor-side reader.
+pub fn append_working_page_tokens(
     model_idx: usize, id: ContextId, tokens: Vec<u32>,
     positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
     adapter_seed: Option<i64>,
-) -> Result<()> {
-    let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::AppendWorkingPageTokens {
-        id, tokens, positions, masks, adapter, adapter_seed, response: tx,
-    })?;
-    rx.await.context("context::append_working_page_tokens: actor dropped response")?
+) {
+    let _ = SERVICES.send(model_idx, Message::AppendWorkingPageTokens {
+        id, tokens, positions, masks, adapter, adapter_seed,
+    });
 }
 
 // =============================================================================
@@ -544,7 +552,16 @@ pub async fn append_working_page_tokens(
 #[derive(Debug)]
 pub struct PinnedContext {
     pub device: DeviceId,
+    /// Active pages: committed + the working prefix needed to cover
+    /// `kv_len + num_input_tokens`. The kernel reads
+    /// `total_kv = (pages.len()-1)*page_size + last_page_len`, so
+    /// pages must contain only the active prefix for the math to
+    /// be correct.
     pub pages: Vec<PhysicalPageId>,
+    /// Working pages that the ctx has reserved beyond the active
+    /// prefix in `pages`. Available to the speculator's chain
+    /// extender for cross-page extension without re-allocating.
+    pub extra_pages: Vec<PhysicalPageId>,
     pub kv_len: u32,
     pub last_page_len: u32,
 }
@@ -1010,26 +1027,38 @@ impl ContextManager {
 
     // ==================== Page Management ====================
 
-    /// Handle a ReserveWorkingPages message per DESIGN.md §4.
-    /// Delegates to the universal `when_allocated` contention primitive.
-    pub(crate) fn reserve_working_pages(
+    /// Idempotent allocator: ensure ctx has at least `target` visible
+    /// working pages. Three cases:
+    ///
+    /// 1. `target <= visible`: no-op.
+    /// 2. `target <= visible + predicted_extra`: promote
+    ///    `target - visible` pages from predicted-extra into visible.
+    /// 3. Otherwise: promote all predicted-extra, then allocate the
+    ///    remainder from the device pool (may evict / defer).
+    ///
+    /// See SPECULATIVE_EXECUTION_DESIGN.md §"Promotion: how
+    /// predicted_extra → visible".
+    pub(crate) fn ensure_working_pages(
         &mut self,
         id: ContextId,
-        num_pages: usize,
+        target: usize,
         response: oneshot::Sender<anyhow::Result<()>>,
     ) {
-        if num_pages == 0 {
-            let _ = response.send(Ok(()));
-            return;
-        }
-
         let ctx = match self.contexts.get(&id) {
             Some(c) => c,
             None => { let _ = response.send(Err(anyhow::anyhow!("Context not found"))); return; }
         };
+        let physical = ctx.working_pages.len();
+
+        if target <= physical {
+            let _ = response.send(Ok(()));
+            return;
+        }
+
+        let needed = target - physical;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
 
-        self.when_allocated(id, dev_idx, num_pages, move |mgr, pages| {
+        self.when_allocated(id, dev_idx, needed, move |mgr, pages| {
             if let Some(ctx) = mgr.contexts.get_mut(&id) {
                 ctx.working_pages.extend_from_slice(&pages);
                 ctx.device = Some(dev_idx);
@@ -1201,21 +1230,37 @@ impl ContextManager {
                 ctx.state = State::Pinned;
                 PINNED_COUNTS[dev_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                let mut page_ids = Vec::new();
+                let mut committed_pages = Vec::new();
                 if !committed_hashes.is_empty() {
-                    page_ids.extend(mgr.gpu_stores[dev_idx].physical_ids(&committed_hashes));
+                    committed_pages.extend(
+                        mgr.gpu_stores[dev_idx].physical_ids(&committed_hashes),
+                    );
                 }
-                page_ids.extend(&working);
 
-                let num_pages = page_ids.len() as u32;
                 let page_size = mgr.page_size as u32;
                 let total_kv = kv_len + num_input_tokens;
+                // Active page count: how many pages are needed to cover
+                // `total_kv` tokens. The rest of `working` is held in
+                // reserve for the speculator's chain extender.
+                let active_pages_total = total_kv.div_ceil(page_size) as usize;
+                let active_working = active_pages_total
+                    .saturating_sub(committed_pages.len())
+                    .min(working.len());
+                let mut pages = committed_pages;
+                pages.extend(working[..active_working].iter().copied());
+                let extra_pages: Vec<PhysicalPageId> =
+                    working[active_working..].to_vec();
+
+                let num_pages = pages.len() as u32;
                 let last_page_len = pagestore::compute_last_page_len(
                     total_kv, num_pages, page_size,
                 );
                 Ok(PinnedContext {
-                    device: dev_idx as DeviceId, pages: page_ids,
-                    kv_len, last_page_len,
+                    device: dev_idx as DeviceId,
+                    pages,
+                    extra_pages,
+                    kv_len,
+                    last_page_len,
                 })
             })();
             let _ = response.send(result);
@@ -1454,10 +1499,11 @@ pub(crate) enum Message {
 
     // Actor-routed write APIs
     TruncateWorkingPageTokens { id: ContextId, count: u32, response: oneshot::Sender<Result<()>> },
+    /// Fire-and-forget lineage append. Errors are logged at the
+    /// handler, not propagated — see `context::append_working_page_tokens`.
     AppendWorkingPageTokens {
         id: ContextId, tokens: Vec<u32>, positions: Vec<u32>,
         masks: Vec<Brle>, adapter: Option<AdapterId>, adapter_seed: Option<i64>,
-        response: oneshot::Sender<Result<()>>,
     },
 
     DebugState { id: ContextId, response: oneshot::Sender<String> },
@@ -1520,7 +1566,19 @@ impl ServiceHandler for ContextManager {
             }
             Message::ReserveWorkingPages { id, num_pages, response } => {
                 let t0 = Instant::now();
-                self.reserve_working_pages(id, num_pages, response);
+                // WIT semantics: "reserve N additional pages." Dispatch
+                // through `ensure_working_pages` with target =
+                // physical + N.
+                let target = match self.contexts.get(&id) {
+                    Some(ctx) => ctx.working_pages.len() + num_pages,
+                    None => {
+                        let _ = response.send(Err(anyhow::anyhow!("Context not found")));
+                        self.sched_counters.reserve_us += t0.elapsed().as_micros() as u64;
+                        self.sched_counters.reserve_count += 1;
+                        return;
+                    }
+                };
+                self.ensure_working_pages(id, target, response);
                 self.sched_counters.reserve_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.reserve_count += 1;
             }
@@ -1555,9 +1613,11 @@ impl ServiceHandler for ContextManager {
                 let _ = response.send(self.truncate_working_page_tokens(id, count));
                 self.publish_context_counts(id);
             }
-            Message::AppendWorkingPageTokens { id, tokens, positions, masks, adapter, adapter_seed, response } => {
+            Message::AppendWorkingPageTokens { id, tokens, positions, masks, adapter, adapter_seed } => {
                 let t0 = Instant::now();
-                let _ = response.send(self.append_working_page_tokens(id, tokens, positions, masks, adapter, adapter_seed));
+                if let Err(e) = self.append_working_page_tokens(id, tokens, positions, masks, adapter, adapter_seed) {
+                    tracing::warn!("append_working_page_tokens for ctx {id}: {e:#}");
+                }
                 self.publish_context_counts(id);
                 self.sched_counters.append_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.append_count += 1;

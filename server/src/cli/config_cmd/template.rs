@@ -70,6 +70,14 @@ request_timeout_secs = 120
 default_endowment_pages = 64
 admission_oversubscription_factor = 4.0
 restore_pause_at_utilization = 0.85
+# Per-context depth of pass-level speculative execution. `0`
+# disables speculation entirely (every submit goes through the
+# cold path — useful for A/B benchmarking). `1` is piggyback
+# (one staged pass per real pass; the steady-state default).
+# Higher values let chain firing overlap with the inferlet's
+# WASM time, but won't help workloads where WASM ≈ 0 (e.g.
+# text completion). Range 0..=64.
+speculation_depth = 1
 "#;
 
 #[cfg(feature = "driver-portable")]

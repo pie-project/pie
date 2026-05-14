@@ -99,7 +99,7 @@ def build_config(args: argparse.Namespace):
     else:
         driver_options = {}
 
-    scheduler = "greedy" if args.mode == "latency" else "adaptive"
+    scheduler = args.batch_policy or ("greedy" if args.mode == "latency" else "adaptive")
     cfg = Config(
         server=ServerConfig(
             host="127.0.0.1",
@@ -121,6 +121,7 @@ def build_config(args: argparse.Namespace):
                     default_token_limit=args.default_token_limit,
                     default_endowment_pages=args.default_endowment_pages,
                     admission_oversubscription_factor=args.admission_oversubscription_factor,
+                    speculation_depth=args.speculation_depth,
                 ),
                 driver=DriverConfig(
                     type=args.driver,
@@ -131,7 +132,12 @@ def build_config(args: argparse.Namespace):
             )
         ],
     )
-    return cfg, {"driver": args.driver, "scheduler": scheduler, **driver_options}
+    config_blob = {"driver": args.driver, "scheduler": scheduler, **driver_options}
+    if args.speculation_depth is not None:
+        # Surface for the summary's "spec chain yield" derived stat —
+        # yield = hits / (attempted × depth).
+        config_blob["speculation depth"] = args.speculation_depth
+    return cfg, config_blob
 
 
 @asynccontextmanager
@@ -249,6 +255,8 @@ async def run(args: argparse.Namespace):
     async with pie_client(args) as (client, engine_config):
         await client.install_program(wasm, manifest, force_overwrite=True)
 
+        first_output_text: list[str | None] = [None]
+
         async def one(i: int) -> RequestResult:
             inp = {
                 "prompt": prompts[i],
@@ -257,6 +265,7 @@ async def run(args: argparse.Namespace):
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
+                "wasm_delay_us": args.wasm_delay_us,
             }
             start = time.perf_counter()
             try:
@@ -267,6 +276,8 @@ async def run(args: argparse.Namespace):
                     )
                     if ev == Event.Return:
                         obj = json.loads(msg)
+                        if i == 0 and first_output_text[0] is None:
+                            first_output_text[0] = obj.get("text", "")
                         return RequestResult(
                             True,
                             time.perf_counter() - start,
@@ -294,6 +305,48 @@ async def run(args: argparse.Namespace):
 
             results = await asyncio.gather(*(guarded(i) for i in range(n)))
         wall = time.perf_counter() - start
+
+        # Pull speculation counters out of the server's model status
+        # so the bench output reflects what actually happened. Zero
+        # on devices without speculation capability or with the
+        # operator override disabled.
+        try:
+            ok, body = await client.query("model_status", "")
+            if ok:
+                model_status = json.loads(body)
+                for key, label in (
+                    ("default.spec_attempted", "spec attempted"),
+                    ("default.spec_hits", "spec hits"),
+                    ("default.spec_misses", "spec misses"),
+                    ("default.spec_rule_skipped", "spec rule skipped"),
+                    ("default.spec_budget_skipped", "spec budget skipped"),
+                    ("default.spec_dropped_orphan", "spec dropped orphan"),
+                    ("default.spec_need_pages", "spec need pages"),
+                    ("default.spec_chain_entries", "spec chain now"),
+                    ("default.spec_chain_entries_high_water", "spec chain peak"),
+                    ("default.spec_longest_chain", "spec longest chain"),
+                    ("default.total_batches", "total batches"),
+                    ("default.avg_batch_latency_us", "avg batch latency us"),
+                    ("default.last_batch_latency_us", "last batch latency us"),
+                    ("default.bypass_hits", "bypass hits"),
+                    ("default.chain_submits", "chain submits"),
+                    ("default.chain_drops", "chain drops"),
+                    ("default.total_requests_processed", "total requests"),
+                    ("default.max_batch_size_observed", "max batch size"),
+                    ("default.batch_size_hist", "batch size hist"),
+                ):
+                    if key in model_status:
+                        engine_config[label] = model_status[key]
+        except Exception:  # noqa: BLE001
+            # Stats are advisory — never break a bench on a failed query.
+            pass
+
+    if args.dump_first_text and first_output_text[0] is not None:
+        import hashlib
+        sha = hashlib.sha256(first_output_text[0].encode()).hexdigest()[:16]
+        print(f"\nFIRST REQUEST OUTPUT (sha256[:16]={sha}):")
+        print(first_output_text[0])
+        print(f"END OUTPUT (chars={len(first_output_text[0])})")
 
     summary = summarize(
         mode=args.mode,
@@ -331,6 +384,28 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--kv-pages", type=int, default=2048)
         sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
+        sp.add_argument(
+            "--speculation-depth",
+            type=int,
+            default=None,
+            help="Per-ctx depth of pass-level speculative execution (0..=64). "
+                 "0 disables speculation; 1 is piggyback (default). Forwards "
+                 "to scheduler.speculation_depth in the generated toml.",
+        )
+        sp.add_argument(
+            "--dump-first-text",
+            action="store_true",
+            help="Print the first request's full output text + its sha256 prefix. "
+                 "Use to A/B-compare spec vs no-spec runs at temperature=0.",
+        )
+        sp.add_argument(
+            "--batch-policy",
+            default=None,
+            choices=["adaptive", "eager", "greedy", "hot"],
+            help="Override scheduler.batch_policy. Default: greedy (latency) "
+                 "or adaptive (tput). Use 'hot' to enable cohort-aware "
+                 "batching for Phase B-hot experiments.",
+        )
         sp.add_argument("--vllm-attention-backend", default=None)
         sp.add_argument("--sglang-attention-backend", default=None)
         sp.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))

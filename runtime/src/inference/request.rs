@@ -137,7 +137,7 @@ impl TrimPlan {
 }
 
 /// Sampler configuration for token generation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Sampler {
     Multinomial { temperature: f32, seed: Option<u32> },
     TopK { temperature: f32, k: u32 },
@@ -425,6 +425,15 @@ pub struct BatchedForwardPassRequest {
     pub spec_indptr: ByteVec,
     pub output_spec_flags: Vec<bool>,
 
+    // === Pass-level speculation (per request) ===
+    /// True iff the runtime wants the driver to build a speculative
+    /// next-pass for this ctx after sampling. The driver is free to
+    /// decline (e.g., if it would cross a KV-page boundary). See
+    /// SPECULATIVE_EXECUTION_DESIGN.md §"Driver-runtime protocol".
+    /// Default false until step 6d wires the predicate.
+    #[serde(default)]
+    pub predict_flags: Vec<bool>,
+
     // === Context (per request) ===
     // Stable per-context identifier — preferred session key for backends
     // that maintain per-context state (e.g. n-gram drafter token history).
@@ -475,6 +484,7 @@ impl BatchedForwardPassRequest {
             spec_position_ids: ByteVec(Vec::new()),
             spec_indptr: ByteVec(vec![0]),
             output_spec_flags: Vec::new(),
+            predict_flags: Vec::new(),
             context_ids: Vec::new(),
             single_token_mode: true,
             has_user_mask: false,
@@ -534,6 +544,7 @@ impl BatchedForwardPassRequest {
         physical_page_ids: &[PhysicalPageId],
         last_page_len: u32,
         page_size: u32,
+        predict: bool,
     ) {
         // Tokens and positions
         self.token_ids.0.extend(&req.tokens);
@@ -601,6 +612,9 @@ impl BatchedForwardPassRequest {
         self.spec_indptr.0.push(self.spec_token_ids.0.len() as u32);
         self.output_spec_flags.push(req.output_speculative_tokens);
 
+        // Pass-level speculation flag (per request).
+        self.predict_flags.push(predict);
+
         // Context (stable id for per-context backend state)
         self.context_ids.push(req.context_id);
 
@@ -630,7 +644,7 @@ impl BatchedForwardPassRequest {
 }
 
 /// Batched forward pass response from Python.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BatchedForwardPassResponse {
     pub results: Vec<ForwardPassResponse>,
 }
@@ -706,7 +720,7 @@ mod tests {
         let pages: Vec<PhysicalPageId> = vec![100, 101, 102];
 
         let mut batch = BatchedForwardPassRequest::new(0);
-        batch.add_request(&req, &pages, 16, 16);
+        batch.add_request(&req, &pages, 16, 16, false);
 
         assert_eq!(batch.kv_page_indices.0, vec![100, 101, 102]);
         assert_eq!(batch.kv_page_indptr.0, vec![0, 3]);
@@ -733,7 +747,7 @@ mod tests {
             (0..20).map(|i| 1000 + i as PhysicalPageId).collect();
 
         let mut batch = BatchedForwardPassRequest::new(0);
-        batch.add_request(&req, &pages, 16, 16);
+        batch.add_request(&req, &pages, 16, 16, false);
 
         // Surviving pages: 0, 16, 17, 18, 19 (5 pages).
         let expected_pages: Vec<u32> = vec![1000, 1016, 1017, 1018, 1019];
@@ -765,7 +779,7 @@ mod tests {
             (0..20).map(|i| 2000 + i as PhysicalPageId).collect();
 
         let mut batch = BatchedForwardPassRequest::new(0);
-        batch.add_request(&req, &pages, 16, 16);
+        batch.add_request(&req, &pages, 16, 16, false);
 
         let expected_pages: Vec<u32> = (15..20).map(|i| 2000 + i).collect();
         assert_eq!(batch.kv_page_indices.0, expected_pages);
@@ -791,7 +805,7 @@ mod tests {
         let pages: Vec<PhysicalPageId> = vec![777];
 
         let mut batch = BatchedForwardPassRequest::new(0);
-        batch.add_request(&req, &pages, 16, 16);
+        batch.add_request(&req, &pages, 16, 16, false);
 
         // No pages dropped; original mask buffer preserved.
         assert_eq!(batch.kv_page_indices.0, vec![777]);
@@ -817,7 +831,7 @@ mod tests {
         let pages: Vec<PhysicalPageId> = vec![10, 11, 12, 13];
 
         let mut batch = BatchedForwardPassRequest::new(0);
-        batch.add_request(&req, &pages, 16, 16);
+        batch.add_request(&req, &pages, 16, 16, false);
 
         // Fast path: original pages and mask buffers byte-for-byte.
         assert_eq!(batch.kv_page_indices.0, vec![10, 11, 12, 13]);
@@ -845,7 +859,7 @@ mod tests {
         let mut batch = BatchedForwardPassRequest::new(0);
         // Three new tokens at positions 317..319, kv_before=317 →
         // first_writeable_page=19. Pages 1..=15 still dropped by the mask.
-        batch.add_request(&req, &pages, 16, 16);
+        batch.add_request(&req, &pages, 16, 16, false);
 
         let expected_pages: Vec<u32> = vec![5000, 5016, 5017, 5018, 5019];
         assert_eq!(batch.kv_page_indices.0, expected_pages);

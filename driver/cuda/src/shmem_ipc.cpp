@@ -38,6 +38,17 @@ std::uint64_t atomic_load_u64(const std::uint8_t* p) noexcept {
 
 }  // namespace
 
+void Responder::respond(std::size_t bytes) {
+    if (responded_) return;
+    responded_ = true;
+    const std::uint32_t bytes_u32 = static_cast<std::uint32_t>(bytes);
+    std::memcpy(slot_ + OFF_RESP_LEN, &bytes_u32, 4);
+    const std::uint64_t respond_wt = now_us();
+    std::memcpy(slot_ + OFF_RESPOND_WT, &respond_wt, 8);
+    // Release-store on resp_seq unblocks the Rust client.
+    atomic_store_u64(slot_ + OFF_RESP_SEQ, req_seq_);
+}
+
 ShmemServer::ShmemServer(std::string name,
                          std::size_t num_slots,
                          std::size_t req_buf,
@@ -130,17 +141,16 @@ void ShmemServer::serve_forever(const RequestHandler& handler) {
             };
             std::span<std::uint8_t> resp_buf(resp_payload, resp_buf_size_);
 
-            const std::size_t resp_len = handler(req, resp_buf);
+            Responder responder(slot, req_seq);
+            const std::size_t resp_len = handler(req, resp_buf, responder);
 
-            const std::uint32_t resp_len_u32 =
-                static_cast<std::uint32_t>(resp_len);
-            std::memcpy(slot + OFF_RESP_LEN, &resp_len_u32, 4);
-
-            const std::uint64_t respond_wt = now_us();
-            std::memcpy(slot + OFF_RESPOND_WT, &respond_wt, 8);
-
-            // Publish: bump resp_seq to match req_seq.
-            atomic_store_u64(slot + OFF_RESP_SEQ, req_seq);
+            if (!responder.responded()) {
+                // Handler didn't early-respond — publish on return.
+                responder.respond(resp_len);
+            }
+            // else: handler already published mid-function and may
+            // have done extra work after that (e.g., firing
+            // chain-step kernels). Nothing more to do here.
 
             last_seen[i] = req_seq;
             did_work = true;

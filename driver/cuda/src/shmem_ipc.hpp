@@ -43,10 +43,44 @@ struct SlotRequest {
     std::span<const std::uint8_t> payload;
 };
 
-// Handler returns the number of bytes written into `response`. Returning 0
-// is fine (empty response).
+// Lets a request handler signal the client mid-function ("write
+// response, unblock client, then continue working") instead of only
+// at return. Used by the chain firing path (phase B4b.3): real
+// kernel + sample completes → handler calls `respond()` so the
+// inferlet unblocks → handler continues firing chain kernels in the
+// same thread; the chain work overlaps with the inferlet's WASM.
+//
+// Idempotent — only the first call signals. If the handler never
+// calls respond(), serve_forever auto-responds with the handler's
+// return value.
+class Responder {
+public:
+    Responder(std::uint8_t* slot, std::uint64_t req_seq) noexcept
+        : slot_(slot), req_seq_(req_seq), responded_(false) {}
+
+    void respond(std::size_t bytes);
+
+    [[nodiscard]] bool responded() const noexcept { return responded_; }
+
+private:
+    std::uint8_t* slot_;
+    std::uint64_t req_seq_;
+    bool responded_;
+};
+
+// Handler returns the number of bytes written into `response`.
+//
+// A handler may either:
+//   (a) Return the response size and let serve_forever publish the
+//       response on return — the simple synchronous case.
+//   (b) Call `responder.respond(bytes)` mid-function to publish
+//       early (so the client unblocks), then continue working in
+//       the same thread before returning. The return value is then
+//       ignored — `responder.responded()` short-circuits the
+//       auto-publish in serve_forever.
 using RequestHandler = std::function<std::size_t(
-    const SlotRequest& req, std::span<std::uint8_t> response)>;
+    const SlotRequest& req, std::span<std::uint8_t> response,
+    Responder& responder)>;
 
 class ShmemServer {
 public:

@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result, anyhow};
 
 use crate::handler::Handler;
-use crate::shmem::{METHOD_TAG_FIRE_BATCH, ShmemServer};
+use crate::shmem::ShmemServer;
 
 pub type ReadyCb = unsafe extern "C" fn(caps_json: *const c_char, ctx: *mut c_void);
 
@@ -167,14 +167,18 @@ fn run_impl(
 
     server.serve_forever(|req, resp| {
         handled += 1;
-        if req.method_tag != METHOD_TAG_FIRE_BATCH {
-            eprintln!(
-                "[pie-driver-dummy] unsupported method_tag={} req_id={}",
-                req.method_tag, req.req_id
-            );
-            return 0;
+        match req.method_tag {
+            crate::shmem::METHOD_TAG_FIRE_BATCH => {
+                handler.handle_fire_batch(req.payload, resp)
+            }
+            other => {
+                eprintln!(
+                    "[pie-driver-dummy] unsupported method_tag={} req_id={}",
+                    other, req.req_id
+                );
+                0
+            }
         }
-        handler.handle_fire_batch(req.payload, resp)
     });
 
     eprintln!("[pie-driver-dummy] shutting down (handled {handled} requests)");

@@ -249,3 +249,5 @@ website/src/data/models.json
 PIEX.md
 pie/rollout_logs/
 *.out
+
+*.csv

@@ -404,6 +404,7 @@ impl ContextManager {
                 let result = inference::submit(
                     model_idx, fwd_req,
                     device_id, phys_ids,
+                    Vec::new(),
                     last_page_len,
                 ).await;
 

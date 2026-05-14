@@ -56,7 +56,7 @@ std::size_t write_msgpack_response(std::span<std::uint8_t> dst,
                       /*total_tokens=*/ 0);  // unused in msgpack mode
 
     MsgpackWriter w(dst.subspan(BPIS_HEADER_SIZE));
-    // {"results": [ ... ]}
+    // {"results": [...]}
     w.map_header(1);
     w.str("results");
     w.array_header(outs.size());
@@ -115,6 +115,7 @@ std::size_t write_msgpack_response(std::span<std::uint8_t> dst,
         w.str("spec_positions");
         w.array_header(0);
     }
+
     return BPIS_HEADER_SIZE + w.size();
 }
 
