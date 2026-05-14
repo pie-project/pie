@@ -13,10 +13,12 @@ import random
 import numpy as np
 import torch
 
-from pie_driver_dev.config import RuntimeConfig
-from pie_driver_dev import telemetry
+from ._bridge.config import RuntimeConfig
+from ._bridge.batching import Batch
+from ._bridge import telemetry
 
 from . import _require_vllm
+from . import batch_tensors
 
 
 class VllmEngine:
@@ -73,7 +75,7 @@ class VllmEngine:
         self.adapters = {}
 
         # Speculative decoding: driver-side n-gram drafter. Verification
-        # and splice live in the shared `pie_driver_dev.batching.Batch`; this
+        # and splice live in the shared `._bridge.batching.Batch`; this
         # engine owns drafting via `spec_step`. Buffers are lazy-init so
         # the numba JIT cost is only paid when spec is actually used.
         self._ngram_buffers = None
@@ -165,6 +167,86 @@ class VllmEngine:
             swap_pool_size=pool_size,
         )
 
+    # ------------------------------------------------------------------
+    # KV swap — page copies. Bridge stays torch-free; the index_copy_
+    # calls live here next to the engine's KV tensors.
+    # ------------------------------------------------------------------
+
+    def kv_copy_d2h(self, phys_ids: list[int], slots: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        host_kv = self.kv_cache_at_layer_host
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for p in phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"swap_out: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"swap_out: CPU slot {s} out of bounds [0, {max_cpu})")
+        src = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(slots, dtype=torch.long)
+        for layer_idx in range(len(gpu_kv)):
+            host_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src].cpu())
+
+    def kv_copy_h2d(self, phys_ids: list[int], slots: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        host_kv = self.kv_cache_at_layer_host
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for p in phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"swap_in: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"swap_in: CPU slot {s} out of bounds [0, {max_cpu})")
+        dst = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        src = torch.tensor(slots, dtype=torch.long)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src].to(gpu_kv[layer_idx].device))
+
+    def kv_copy_d2d(self, src_phys_ids: list[int], dst_phys_ids: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        max_gpu = gpu_kv[0].shape[0]
+        for p in src_phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d: src phys_id {p} out of bounds [0, {max_gpu})")
+        for p in dst_phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d: dst phys_id {p} out of bounds [0, {max_gpu})")
+        src = torch.tensor(src_phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(dst_phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
+
+    def kv_copy_h2h(self, src_slots: list[int], dst_slots: list[int]) -> None:
+        host_kv = self.kv_cache_at_layer_host
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for s in src_slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2h: src slot {s} out of bounds [0, {max_cpu})")
+        for s in dst_slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2h: dst slot {s} out of bounds [0, {max_cpu})")
+        src = torch.tensor(src_slots, dtype=torch.long)
+        dst = torch.tensor(dst_slots, dtype=torch.long)
+        for layer_idx in range(len(host_kv)):
+            host_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src])
+
+    def build_model_inputs(self, batch: Batch) -> dict:
+        device = torch.device(self.config.device)
+        if batch.has_speculative_inputs:
+            return batch_tensors.build_spec_expanded_model_inputs(batch, device)
+        return batch_tensors.build_model_inputs(batch, device)
+
+    def build_sampling_metadata(self, batch: Batch) -> dict:
+        device = torch.device(self.config.device)
+        dtype = getattr(torch, self.config.activation_dtype)
+        if batch.has_speculative_inputs:
+            return batch_tensors.build_spec_expanded_sampling_metadata(
+                batch, device, dtype
+            )
+        return batch_tensors.build_sampling_metadata(batch, device, dtype)
+
     @torch.inference_mode()
     def fire_batch(self, inputs: dict, sampling_metadata: dict) -> list:
         # This driver runs causal-only attention; user-supplied masks are
@@ -188,9 +270,9 @@ class VllmEngine:
     # Speculative decoding: NGRAM drafter
     # ------------------------------------------------------------------
     #
-    # `spec_step` is the contract `pie_driver_dev.worker._populate_next_drafts`
+    # `spec_step` is the contract `._bridge.worker._populate_next_drafts`
     # probes for via `getattr`. Verification + splice are shared (live in
-    # `Batch.get_spec_expanded_*` and `Batch.verify_drafts`); this engine
+    # `batch_tensors.build_spec_expanded_*` + `Batch.verify_drafts`); this engine
     # only owns the drafter side.
 
     def _ensure_ngram(self):
@@ -362,7 +444,7 @@ class VllmEngine:
         Fails loudly if any expected value is missing — the runtime/Rust
         side relies on these being correct, so silent defaulting is unsafe.
         """
-        from pie_driver_dev.capabilities import DriverCapabilities
+        from ._bridge.capabilities import DriverCapabilities
 
         vc = self.forward_pass.vllm_config
         mc = vc.model_config
@@ -492,7 +574,7 @@ def _capture_vllm_cudagraphs(
     page_size = forward_pass._kv_spec.block_size
     device = forward_pass.device
     embed_dim = vllm_config.model_config.get_hidden_size()
-    dtype = config.activation_dtype
+    dtype = getattr(torch, config.activation_dtype)
 
     capture_descs = [
         (mode, desc)

@@ -1,17 +1,16 @@
 #pragma once
 
-// Forward engine. Builds a per-batch ggml graph from the BPIQ wire
-// payload, runs it on the model's backend, samples per-request, and
-// writes the BPIS response. Per-arch graph builders live in
-// graph_qwen3.cpp (covers 11 archs via ArchSpec flags) and
-// graph_gemma4.cpp.
+// Forward engine. Builds a per-batch ggml graph from the request view,
+// runs it on the model's backend, samples per-request, and writes the
+// structured response view via `pie_driver::ResponseBuilder`. Per-arch
+// graph builders live in graph_qwen3.cpp (covers 11 archs via ArchSpec
+// flags) and graph_gemma4.cpp.
 //
 // Honors the runtime's paged KV state (kv_page_indices / kv_page_indptr
 // / kv_last_page_lens) and supports the full feature surface:
 // speculative-decode verification (M8), LoRA deltas (M9), special
-// samplers + msgpack responses (M10), GPU greedy + uniform top-K fast
-// paths (M11), per-token custom attention masks (M6), per-request logit
-// masks (M5).
+// samplers (M10), GPU greedy + uniform top-K fast paths (M11), per-
+// token custom attention masks (M6), per-request logit masks (M5).
 
 #include <cstddef>
 #include <cstdint>
@@ -20,10 +19,11 @@
 #include <vector>
 
 #include "adapter.hpp"
+#include <pie_bridge/inproc_server.hpp>      // pie_driver::PieForwardRequestView / ResponseView
 #include "kv_cache.hpp"
 #include "model.hpp"
+#include <pie_bridge/response_builder.hpp>   // pie_driver::ResponseBuilder
 #include "sampler.hpp"
-#include "shmem_schema.hpp"
 #include "state_cache.hpp"
 
 namespace pie_portable_driver {
@@ -38,8 +38,12 @@ public:
     ForwardEngine(const ForwardEngine&) = delete;
     ForwardEngine& operator=(const ForwardEngine&) = delete;
 
-    std::size_t run(const schema::DecodedRequest& req,
-                    std::span<std::uint8_t> response);
+    // Run one forward pass + sampling. Fills `out` via `builder` (which
+    // owns the per-array scratch the view's `PieSlice`s point at). The
+    // view stays valid until the next call on the same builder.
+    void run(const pie_driver::PieForwardRequestView& req,
+             pie_driver::ResponseBuilder& builder,
+             pie_driver::PieForwardResponseView& out);
 
     // Greedy generation harness — single context. Internally allocates a
     // contiguous block of pages starting at `page_offset` for this run.
@@ -78,7 +82,20 @@ public:
         // blocksparse layers in graph_phi3small.cpp.
         std::vector<std::uint16_t> mask_blocksparse_f16;
         std::vector<std::int32_t>  gather_idxs;  // [n_kv] physical KV row indices
-        SamplerParams sampler;        // per-request sampler config (shared across slots)
+        // Per-slot sampler configs — one entry per `sampling_positions[i]`.
+        // The inferlet SDK lets a single forward-pass slot carry multiple
+        // sampler kinds (e.g. Argmax + RawLogits + Distribution on the same
+        // position), so we need to dispatch per slot, not per request.
+        std::vector<SamplerParams> samplers;
+        // Convenience handle used by graph builders + fast-path detection,
+        // which can only consume one sampler per request. Set to
+        // `samplers[0]` whenever `samplers` is non-empty, or a default
+        // `SamplerParams{}` for prefill-only requests. The graph-side
+        // temperature softmax (`plan.reqs[0].sampler.temperature`) assumes
+        // uniform temperature across slots; the fast-path detection below
+        // only activates when every slot is a single token-producing kind,
+        // so the graph never sees mixed temperatures.
+        SamplerParams sampler;
         std::vector<std::uint32_t> logit_mask_runs;  // BRLE; empty = no mask
 
         // Per-slot sampling positions (offsets into the expanded batch).
@@ -117,7 +134,7 @@ public:
         // in build_pure_decode_packing alongside the materialize-path
         // arrays above; only the `model.supports_paged_attn_ext()` branch
         // in graph builders actually consumes them. The values are
-        // direct copies of the BPIQ wire payload (kv_page_indices /
+        // direct copies of the wire payload (kv_page_indices /
         // kv_page_indptr / kv_last_page_lens) — i32-cast from the
         // u32 wire fields.
         std::vector<std::int32_t>   page_indices_i32;     // [total_pages_in_batch] flat
@@ -178,7 +195,7 @@ public:
     void log_timings(const char* label) const;
 
 private:
-    BatchPlan plan_(const schema::DecodedRequest& req);
+    BatchPlan plan_(const pie_driver::PieForwardRequestView& req);
     BatchPlan plan_test_simple_(std::span<const std::uint32_t> token_ids,
                                 std::span<const std::uint32_t> position_ids,
                                 std::int32_t sampling_pos,

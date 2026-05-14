@@ -21,8 +21,6 @@ pub struct ShmemConfig {
     pub num_slots: usize,
     pub req_buf: usize,
     pub resp_buf: usize,
-    #[serde(default)]
-    pub spin_us: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +67,6 @@ name = "/pie_shmem_g0"
 num_slots = 8
 req_buf = 4194304
 resp_buf = 4194304
-spin_us = 0
 
 [dummy]
 kv_page_size = 16

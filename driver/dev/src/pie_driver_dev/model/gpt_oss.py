@@ -26,9 +26,9 @@ from .gpt_oss_utils import (
     prepare_gptoss_moe_gate_up,
     prepare_gptoss_moe_down,
 )
-from ..config import RuntimeConfig
+from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
 from ..adapter import AdapterSubpass
-from ..utils import get_available_memory
+from pie_driver_dev.utils import get_available_memory
 from ..schema import Schema, Source, WeightStore
 
 import pie_kernels as ops

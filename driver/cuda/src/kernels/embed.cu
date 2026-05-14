@@ -7,7 +7,7 @@ namespace pie_cuda_driver::kernels {
 namespace {
 
 // One block per token. Threads stride across `hidden`. Bounds-clamp the
-// token id so a runaway BPIQ payload can't OOB-read. (Out-of-vocab → 0 row.)
+// token id so a runaway wire payload can't OOB-read. (Out-of-vocab → 0 row.)
 __global__ void embed_bf16_kernel(
     const std::int32_t* __restrict__ token_ids,
     const __nv_bfloat16* __restrict__ weight,

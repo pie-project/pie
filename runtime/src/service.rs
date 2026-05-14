@@ -33,32 +33,39 @@
 //! REGISTRY.send(client_id, msg)?;
 //! ```
 
+use anyhow::{Result, anyhow, bail, ensure};
+use dashmap::DashMap;
 use std::future::Future;
 use std::hash::Hash;
 use std::sync::OnceLock;
-use anyhow::{Result, anyhow, bail, ensure};
-use dashmap::DashMap;
-use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task;
 
 /// Trait for message handlers that process messages asynchronously.
 pub(crate) trait ServiceHandler: Send + 'static {
     /// The message type this handler processes.
     type Message: Send + 'static;
-    
+
     /// Called once when the service starts, before processing any messages.
-    fn started(&mut self) -> impl Future<Output = ()> + Send { async {} }
-    
+    fn started(&mut self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+
     /// Handles a message. Called sequentially for each message.
     fn handle(&mut self, msg: Self::Message) -> impl Future<Output = ()> + Send;
-    
+
     /// Called once when the service stops, after all messages are processed.
-    fn stopped(&mut self) -> impl Future<Output = ()> + Send { async {} }
+    fn stopped(&mut self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// Runs a handler in a spawned task with lifecycle hooks.
 /// Returns a JoinHandle to await shutdown.
-fn run_handler<H: ServiceHandler>(mut handler: H, mut rx: UnboundedReceiver<H::Message>) -> task::JoinHandle<()> {
+fn run_handler<H: ServiceHandler>(
+    mut handler: H,
+    mut rx: UnboundedReceiver<H::Message>,
+) -> task::JoinHandle<()> {
     task::spawn(async move {
         handler.started().await;
         while let Some(msg) = rx.recv().await {
@@ -83,9 +90,11 @@ pub struct Service<Msg: Send + 'static> {
 impl<Msg: Send + 'static> Service<Msg> {
     /// Creates a new empty service.
     pub const fn new() -> Self {
-        Self { tx: OnceLock::new() }
+        Self {
+            tx: OnceLock::new(),
+        }
     }
-    
+
     /// Spawns the service using a factory function for custom initialization.
     pub fn spawn<H, F>(&self, factory: F) -> Result<()>
     where
@@ -102,13 +111,16 @@ impl<Msg: Send + 'static> Service<Msg> {
         let _ = run_handler(handler, rx);
         Ok(())
     }
-    
+
     /// Sends a message to the service.
     pub fn send(&self, msg: Msg) -> Result<()> {
-        let tx = self.tx.get().ok_or_else(|| anyhow!("Service not spawned"))?;
+        let tx = self
+            .tx
+            .get()
+            .ok_or_else(|| anyhow!("Service not spawned"))?;
         tx.send(msg).map_err(|_| anyhow!("Service channel closed"))
     }
-    
+
     /// Returns true if the service has been spawned.
     pub fn is_spawned(&self) -> bool {
         self.tx.get().is_some()
@@ -134,7 +146,7 @@ impl<Msg: Send + 'static> ServiceArray<Msg> {
             table: boxcar::Vec::new(),
         }
     }
-    
+
     /// Spawns a new service and returns its index.
     pub fn spawn<H, F>(&self, factory: F) -> Result<usize>
     where
@@ -149,18 +161,21 @@ impl<Msg: Send + 'static> ServiceArray<Msg> {
 
         Ok(idx)
     }
-    
+
     /// Sends a message to a service by index.
     pub fn send(&self, idx: usize, msg: Msg) -> Result<()> {
-        let tx = self.table.get(idx).ok_or_else(|| anyhow!("Invalid service index: {}", idx))?;
+        let tx = self
+            .table
+            .get(idx)
+            .ok_or_else(|| anyhow!("Invalid service index: {}", idx))?;
         tx.send(msg).map_err(|_| anyhow!("Service channel closed"))
     }
-    
+
     /// Returns the number of services.
     pub fn len(&self) -> usize {
         self.table.count()
     }
-    
+
     /// Returns true if no services exist.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -217,10 +232,13 @@ where
     }
 
     /// Sends a message to a service by key.
-    /// 
+    ///
     /// If the service has stopped (channel closed), it is automatically removed.
     pub fn send(&self, key: &K, msg: Msg) -> Result<()> {
-        let tx = self.map.get(key).ok_or_else(|| anyhow!("Service not found"))?;
+        let tx = self
+            .map
+            .get(key)
+            .ok_or_else(|| anyhow!("Service not found"))?;
         if tx.send(msg).is_err() {
             let closed_tx = tx.clone();
             drop(tx);
@@ -241,9 +259,13 @@ where
     /// Removes a service and awaits its shutdown.
     pub async fn join(&self, key: &K) -> Result<()> {
         self.map.remove(key);
-        let (_, handle) = self.handles.remove(key)
+        let (_, handle) = self
+            .handles
+            .remove(key)
             .ok_or_else(|| anyhow!("Service not found"))?;
-        handle.await.map_err(|e| anyhow!("Service task panicked: {}", e))
+        handle
+            .await
+            .map_err(|e| anyhow!("Service task panicked: {}", e))
     }
 
     /// Returns true if a service with the given key exists.

@@ -2,7 +2,7 @@
 
 // Write current-step K/V into the paged KV pool.
 //
-// Per-token destination resolved as (described in BPIQ):
+// Per-token destination resolved as (described in the wire format):
 //   pre_kv_len_r   = total_kv_after_r - num_new_tokens_r
 //   abs_kv_pos     = pre_kv_len_r + offset_in_new_tokens
 //   page_idx_in_r  = abs_kv_pos / page_size

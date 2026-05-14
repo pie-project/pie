@@ -105,15 +105,11 @@ impl InstanceState {
         let scratch_dir = policy.fs.base_dir.join(id.to_string());
 
         if policy.fs.allow {
-            std::fs::create_dir_all(&scratch_dir)
-                .expect("failed to create scratch dir");
+            std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
 
-            builder.preopened_dir(
-                &scratch_dir,
-                "/scratch",
-                DirPerms::all(),
-                FilePerms::all(),
-            ).expect("failed to preopen scratch dir");
+            builder
+                .preopened_dir(&scratch_dir, "/scratch", DirPerms::all(), FilePerms::all())
+                .expect("failed to preopen scratch dir");
         }
 
         // Set up Python runtime environment if py-runtime directory is available.

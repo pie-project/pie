@@ -67,19 +67,13 @@ cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 
 
-# pie_driver_portable — portable ggml backend, sibling to ../cuda (native CUDA +
-# flashinfer) and ../../runtime (Rust). Talks to the runtime via the shmem
-# fast path; no ZMQ/protobuf needed. Loads HuggingFace safetensors directly
-# (no GGUF conversion). Built two ways from the same translation units:
-#   - `pie_driver_portable_lib` (STATIC): linked in-process by
-#     `server/standalone` so the all-Rust binary contains the driver.
-#   - `pie_driver_portable` (executable): a thin shim around the lib's
-#     `pie_driver_portable_run` entry. Consumed by the Python wrapper
-#     `pie_driver_portable` via subprocess.
+# pie_driver_portable — portable ggml backend, sibling to ../cuda (native
+# CUDA + flashinfer) and ../../runtime (Rust). Embedded-only: linked
+# in-process by `server/standalone` and invoked via the FFI vtable the
+# Rust runtime's `InProcChannel` hands in. Loads HuggingFace safetensors
+# directly (no GGUF conversion).
 add_library(pie_driver_portable_lib STATIC
   src/entry.cpp
-  src/shmem_ipc.cpp
-  src/shmem_schema.cpp
   src/safetensors.cpp
   src/hf_config.cpp
   src/gguf_archive.cpp
@@ -95,10 +89,9 @@ add_library(pie_driver_portable_lib STATIC
   src/graph_qwen3_5.cpp
   src/graph_phi3small.cpp
   src/graph_phi3_5moe.cpp
-  src/response.cpp
   src/forward.cpp
   src/sampler.cpp
-  src/aux_server.cpp
+  src/host_swap_pool.cpp
   src/adapter.cpp
 )
 
@@ -109,7 +102,8 @@ target_compile_options(pie_driver_portable_lib PRIVATE
 
 target_include_directories(pie_driver_portable_lib
   PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${PIE_BRIDGE_INCLUDE_DIR})
 
 target_link_libraries(pie_driver_portable_lib PUBLIC
   CLI11::CLI11
@@ -120,9 +114,6 @@ target_link_libraries(pie_driver_portable_lib PUBLIC
 if(UNIX AND NOT APPLE)
   target_link_libraries(pie_driver_portable_lib PUBLIC rt)
 endif()
-
-add_executable(pie_driver_portable src/main.cpp)
-target_link_libraries(pie_driver_portable PRIVATE pie_driver_portable_lib)
 
 # ── CUDA paged-attention (FlashInfer) ─────────────────────────────────────
 #

@@ -1,7 +1,7 @@
 #pragma once
 
 // Qwen3 forward pass — single-sequence prefill, no KV cache, no batching.
-// **Parity-test path only.** The full BPIQ-driven path with paged KV lands
+// **Parity-test path only.** The full wire-driven path with paged KV lands
 // in M1.3.
 
 #include <cstdint>
@@ -19,11 +19,15 @@ namespace pie_cuda_driver::model {
 struct Qwen3Workspace {
     DeviceTensor y;          // [max_tokens, hidden]
     DeviceTensor norm_x;     // [max_tokens, hidden]
+    DeviceTensor qkv_fused;  // [max_tokens, Hq + 2*Hk]   — only allocated when fused
+                             // QKV path is in use; empty otherwise.
     DeviceTensor q;          // [max_tokens, h_q  * head_dim]   — packed
     DeviceTensor k;          // [max_tokens, h_kv * head_dim]   — packed
     DeviceTensor v;          // [max_tokens, h_kv * head_dim]   — packed
     DeviceTensor attn_out;   // [max_tokens, h_q  * head_dim]   — packed
     DeviceTensor norm_y;     // [max_tokens, hidden]
+    DeviceTensor gate_up_fused; // [max_tokens, 2*I] — fused gate+up output, empty
+                                // when unfused
     DeviceTensor gate;       // [max_tokens, intermediate]
     DeviceTensor up;         // [max_tokens, intermediate]
     DeviceTensor logits;     // [max_tokens, vocab]
@@ -81,7 +85,7 @@ void qwen3_forward_prefill(
 namespace pie_cuda_driver::model {
 
 // Same forward pass but routes K/V through the paged KV pool, matching the
-// BPIQ contract. Each layer's K/V is written into `cache` at the locations
+// wire contract. Each layer's K/V is written into `cache` at the locations
 // described by the page-indptr arrays, and the attention call reads back
 // from those same pages.
 //

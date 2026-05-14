@@ -1,6 +1,6 @@
 //! Mock test environment for integration tests.
 //!
-//! Provides `MockEnv` which bundles a mock device backend with a
+//! Provides `MockEnv` which bundles a mock driver backend with a
 //! complete `Config`, ready to pass to `bootstrap::bootstrap()`.
 
 use std::path::PathBuf;
@@ -9,8 +9,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use pie::bootstrap::{
-    AuthConfig, Config, DeviceConfig, ModelConfig, RuntimeConfig, SchedulerConfig,
-    TelemetryConfig,
+    AuthConfig, Config, DriverConfig, ModelConfig, RuntimeConfig, SchedulerConfig, TelemetryConfig,
 };
 
 use super::mock_device::{Behavior, MockBackend};
@@ -62,14 +61,17 @@ pub fn create_mock_env(
     let temp_auth = TempDir::new().expect("Failed to create temp auth dir");
 
     // Path to bundled test tokenizer fixture
-    let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/common/fixtures/test_tokenizer.json");
+    let tokenizer_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/fixtures/test_tokenizer.json");
 
-    let devices: Vec<DeviceConfig> = backend
-        .server_names()
-        .iter()
-        .map(|name| DeviceConfig {
-            hostname: name.clone(),
+    // The pre-registered mock channels live at `backend.driver_ids()`.
+    // `bootstrap::bootstrap` allocates its own DriverIds starting from
+    // the global counter — these may not match the mock IDs in the same
+    // process. Tests that depend on full end-to-end flow are expected
+    // to consume the IDs from MockBackend directly rather than re-route
+    // through bootstrap's allocator.
+    let drivers: Vec<DriverConfig> = (0..num_devices)
+        .map(|_| DriverConfig {
             total_pages: num_pages,
             cpu_pages: 0,
             max_batch_size: 32,
@@ -98,12 +100,12 @@ pub fn create_mock_env(
             arch_name: String::new(),
             kv_page_size: 16,
             tokenizer_path,
-            devices,
+            drivers,
             scheduler: SchedulerConfig {
                 batch_policy: "adaptive".into(),
                 request_timeout_secs: 30,
-                default_token_limit: None,           // unlimited by default
-                default_endowment_pages: 4,          // small endowment for mock GPUs
+                default_token_limit: None,  // unlimited by default
+                default_endowment_pages: 4, // small endowment for mock GPUs
                 // Permissive for tests: allow up to 32× overbook so fixtures
                 // don't trip the admission gate on small-capacity mock devices.
                 admission_oversubscription_factor: 32.0,

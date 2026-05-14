@@ -4,6 +4,13 @@ Pie driver backed by vLLM. Wraps vLLM's model implementations and kernels
 under pie's RPC + shmem surface so vLLM-supported models run inside the
 pie scheduler.
 
+Shared Python scaffolding (worker loop, `Batch` wire model, shmem IPC,
+capabilities handshake, standalone launcher) is imported from
+[`pie-driver-bridge`](../bridge_py/) — same bridge used by
+`pie-driver-{dev,sglang}`. This wheel ships only `VllmEngine` and the
+vllm-specific `worker_main` shim that plugs it into
+`._bridge.worker.run_worker`.
+
 ## Install
 
 ```sh

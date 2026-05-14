@@ -10,7 +10,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::adapter;
 use crate::auth;
 use crate::context;
-use crate::device;
+use crate::driver;
 use crate::inference;
 use crate::linker;
 use crate::messaging;
@@ -98,13 +98,12 @@ pub struct ModelConfig {
     pub arch_name: String,
     pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
-    pub devices: Vec<DeviceConfig>,
+    pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }
 
 #[derive(Debug, Clone)]
-pub struct DeviceConfig {
-    pub hostname: String,
+pub struct DriverConfig {
     pub total_pages: usize,
     pub cpu_pages: usize,
     pub max_batch_tokens: usize,
@@ -132,7 +131,7 @@ pub struct SchedulerConfig {
     /// capacity, betting on non-peak duty cycles (like a typical airline).
     pub admission_oversubscription_factor: f64,
     /// Hard admission gate for the restore loop: pause restoring suspended
-    /// contexts when any device's GPU page utilization exceeds this fraction.
+    /// contexts when any driver's GPU page utilization exceeds this fraction.
     /// Prevents the evict→restore→re-evict thrash cascade. Range: (0.0, 1.0].
     pub restore_pause_at_utilization: f64,
 }
@@ -217,21 +216,20 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             cfg.tokenizer_path.clone(),
         )?;
 
-        let devices: Vec<usize> = cfg
-            .devices
+        let drivers: Vec<usize> = cfg
+            .drivers
             .iter()
             .map(|d| {
-                device::spawn(
-                    &d.hostname,
-                    d.total_pages,
-                    d.max_batch_size,
-                    d.max_batch_tokens,
-                )
+                driver::register_driver(driver::DriverSpec {
+                    num_kv_pages: d.total_pages,
+                    max_batch_size: d.max_batch_size,
+                    max_batch_tokens: d.max_batch_tokens,
+                })
             })
             .collect();
 
-        let num_gpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.total_pages).collect();
-        let num_cpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.cpu_pages).collect();
+        let num_gpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.total_pages).collect();
+        let num_cpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.cpu_pages).collect();
 
         context::spawn(
             cfg.kv_page_size,
@@ -243,13 +241,13 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             cfg.scheduler.restore_pause_at_utilization,
         );
         inference::spawn(
-            &devices,
+            &drivers,
             cfg.kv_page_size as u32,
             cfg.scheduler.request_timeout_secs,
             cfg.scheduler.batch_policy.clone(),
         )
         .await;
-        adapter::spawn(&devices);
+        adapter::spawn(&drivers);
     }
 
     Ok(BootstrapHandle {
@@ -260,7 +258,7 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
 
 /// Boot-time checks for the values pie's Python layer cannot validate
 /// itself: filesystem-side effects (cache/auth dirs) and worker-handshake
-/// outputs (tokenizer file, device capability numbers). Field-level
+/// outputs (tokenizer file, driver capability numbers). Field-level
 /// validation of user-supplied scalars (`batch_policy`, timeouts, market
 /// knobs, etc.) happens in `pie.config.*.__post_init__` — by the time
 /// they reach Rust they're already known-good.
@@ -284,20 +282,20 @@ fn verify_config(config: &Config) -> Result<()> {
             model.name,
             model.tokenizer_path
         );
-        for (i, dev) in model.devices.iter().enumerate() {
+        for (i, dev) in model.drivers.iter().enumerate() {
             ensure!(
                 dev.total_pages > 0,
-                "Model {:?} device {i}: total_pages must be > 0",
+                "Model {:?} driver {i}: total_pages must be > 0",
                 model.name
             );
             ensure!(
                 dev.max_batch_size > 0,
-                "Model {:?} device {i}: max_batch_size must be > 0",
+                "Model {:?} driver {i}: max_batch_size must be > 0",
                 model.name
             );
             ensure!(
                 dev.max_batch_tokens > 0,
-                "Model {:?} device {i}: max_batch_tokens must be > 0",
+                "Model {:?} driver {i}: max_batch_tokens must be > 0",
                 model.name
             );
         }

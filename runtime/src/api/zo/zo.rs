@@ -1,9 +1,9 @@
 //! pie:zo/zo - Zero-Order Optimization functions
 
 use crate::adapter;
-use crate::api::pie;
-use crate::api::inference::ForwardPass;
 use crate::api::adapter::Adapter;
+use crate::api::inference::ForwardPass;
+use crate::api::pie;
 use crate::instance::InstanceState;
 use anyhow::Result;
 use wasmtime::component::Resource;
@@ -30,8 +30,16 @@ impl pie::zo::zo::Host for InstanceState {
         let model_idx = adapter.model_idx;
 
         match adapter::zo_initialize(
-            model_idx, adapter_id, rank, alpha, population_size, mu_fraction, initial_sigma,
-        ).await {
+            model_idx,
+            adapter_id,
+            rank,
+            alpha,
+            population_size,
+            mu_fraction,
+            initial_sigma,
+        )
+        .await
+        {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }

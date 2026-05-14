@@ -10,9 +10,9 @@
 //! `(left_id, right_id) → (rank, merged_id)`, avoiding variable-length
 //! byte hashing entirely.  Symbol lookup (`bytes → TokenId`) is separate.
 
-use std::collections::HashMap;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use std::collections::HashMap;
 
 /// Token ID (the value returned to the caller).
 pub type TokenId = u32;
@@ -40,8 +40,7 @@ impl BpeTable {
     pub fn from_decoder_map(map: HashMap<TokenId, Vec<u8>>) -> Self {
         let max_id = map.keys().copied().max().unwrap_or(0) as usize;
         let mut id_to_bytes = vec![Vec::new(); max_id + 1];
-        let mut token_to_id =
-            FxHashMap::with_capacity_and_hasher(map.len(), Default::default());
+        let mut token_to_id = FxHashMap::with_capacity_and_hasher(map.len(), Default::default());
         let mut merges = FxHashMap::default();
 
         // First pass: register all symbols.
@@ -102,8 +101,7 @@ impl BpeTable {
     ) -> Self {
         let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
         let mut id_to_bytes = vec![Vec::new(); max_id + 1];
-        let mut token_to_id =
-            FxHashMap::with_capacity_and_hasher(vocab.len(), Default::default());
+        let mut token_to_id = FxHashMap::with_capacity_and_hasher(vocab.len(), Default::default());
         let mut merges = FxHashMap::default();
 
         // First pass: register all symbols.
@@ -128,16 +126,15 @@ impl BpeTable {
             // Look up b's token ID using the stripped key.
             // At runtime, lower-level merges produce the *stripped* token (e.g. "he"
             // not "▁he"), so the right_id must be the stripped token's ID.
-            let b_stripped = if !continuing_subword_prefix.is_empty()
-                && b != continuing_subword_prefix
-            {
-                match b.strip_prefix(continuing_subword_prefix) {
-                    Some(stripped) => stripped,
-                    None => b.as_str(),
-                }
-            } else {
-                b.as_str()
-            };
+            let b_stripped =
+                if !continuing_subword_prefix.is_empty() && b != continuing_subword_prefix {
+                    match b.strip_prefix(continuing_subword_prefix) {
+                        Some(stripped) => stripped,
+                        None => b.as_str(),
+                    }
+                } else {
+                    b.as_str()
+                };
             let b_key = if raw_byte_keys {
                 gpt2_unicode_to_raw_bytes(b_stripped)
             } else {
@@ -155,7 +152,9 @@ impl BpeTable {
             ) {
                 let rank = (idx + 1) as Rank;
                 // First occurrence wins (lower rank = higher priority).
-                merges.entry((left_id, right_id)).or_insert((rank, merged_id));
+                merges
+                    .entry((left_id, right_id))
+                    .or_insert((rank, merged_id));
             }
         }
 
@@ -753,10 +752,10 @@ mod tests {
     fn test_bpe_merge_levels() {
         let ranks = make_test_ranks();
         assert_eq!(byte_pair_encode(b"unrelated", &ranks), vec![15]); // full
-        assert_eq!(byte_pair_encode(b"un", &ranks), vec![11]);        // partial
-        assert_eq!(byte_pair_encode(b"u", &ranks), vec![0]);          // atom
-        assert!(byte_pair_encode(b"", &ranks).is_empty());            // empty
-        assert_eq!(byte_pair_encode(b"unat", &ranks), vec![11, 9]);   // multi-token
+        assert_eq!(byte_pair_encode(b"un", &ranks), vec![11]); // partial
+        assert_eq!(byte_pair_encode(b"u", &ranks), vec![0]); // atom
+        assert!(byte_pair_encode(b"", &ranks).is_empty()); // empty
+        assert_eq!(byte_pair_encode(b"unat", &ranks), vec![11, 9]); // multi-token
     }
 
     #[test]
@@ -794,7 +793,10 @@ mod tests {
         vocab.insert("<0x80>".to_string(), 10);
 
         let bpe = BpeTable::from_vocab_and_merges(
-            &vocab, &[("h".to_string(), "i".to_string())], "", false,
+            &vocab,
+            &[("h".to_string(), "i".to_string())],
+            "",
+            false,
         );
 
         let mut out = Vec::new();
@@ -838,4 +840,3 @@ mod tests {
         }
     }
 }
-

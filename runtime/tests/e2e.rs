@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 mod common;
-use common::{create_mock_env, MockEnv, mock_device::EchoBehavior, inferlets};
+use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
 use pie::process;
 use pie::program::ProgramName;
@@ -45,11 +45,7 @@ fn program_name(name: &str) -> ProgramName {
 
 /// Spawn a process within the tokio runtime and wait for it to complete.
 /// Returns true if the process exited within the timeout.
-fn spawn_and_wait(
-    s: &TestState,
-    name: &str,
-    input: String,
-) -> bool {
+fn spawn_and_wait(s: &TestState, name: &str, input: String) -> bool {
     let pid = s.rt.block_on(async {
         inferlets::add_and_install(name).await;
         process::spawn(
@@ -141,7 +137,7 @@ fn concurrent_spawns() {
                     false,
                     None,
                     None, // no workflow
-            None, // token_budget
+                    None, // token_budget
                 )
                 .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"));
                 pid
@@ -159,7 +155,10 @@ fn concurrent_spawns() {
             })
             .await
             .is_ok();
-            assert!(completed, "concurrent echo {i} (pid {pid}) did not complete");
+            assert!(
+                completed,
+                "concurrent echo {i} (pid {pid}) did not complete"
+            );
         }
     });
 }
@@ -179,7 +178,7 @@ fn rapid_sequential_spawns() {
                 false,
                 None,
                 None, // no workflow
-            None, // token_budget
+                None, // token_budget
             )
             .unwrap_or_else(|e| panic!("sequential spawn {i} failed: {e}"));
 
@@ -193,12 +192,18 @@ fn rapid_sequential_spawns() {
             })
             .await
             .is_ok();
-            assert!(completed, "sequential echo {i} (pid {pid}) did not complete");
+            assert!(
+                completed,
+                "sequential echo {i} (pid {pid}) did not complete"
+            );
         }
 
         // After all processes finish, the process list should not grow unboundedly
         let remaining = process::list().len();
-        assert!(remaining < 5, "expected few residual processes, got {remaining}");
+        assert!(
+            remaining < 5,
+            "expected few residual processes, got {remaining}"
+        );
     });
 }
 
@@ -224,7 +229,7 @@ fn mixed_success_and_error() {
                 false,
                 None,
                 None, // no workflow
-            None, // token_budget
+                None, // token_budget
             )
             .unwrap_or_else(|e| panic!("mixed spawn {i} ({name}) failed: {e}"));
             pids.push((i, name, pid));
@@ -302,6 +307,9 @@ fn spawn_after_termination() {
         })
         .await
         .is_ok();
-        assert!(completed, "process spawned after termination should complete normally");
+        assert!(
+            completed,
+            "process spawned after termination should complete normally"
+        );
     });
 }

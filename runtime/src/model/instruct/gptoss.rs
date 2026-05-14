@@ -3,15 +3,10 @@
 //! Uses channel-based formatting with analysis/final channels.
 //! Reasoning uses the `analysis` channel, not XML tags.
 
-use std::sync::Arc;
-use crate::model::instruct::{
-    ChatDecoder,
-    Instruct,
-    ReasoningDecoder,
-    ToolDecoder,
-};
-use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder, NoopToolDecoder};
+use crate::model::instruct::decoders::{GenericChatDecoder, NoopToolDecoder, ThinkingDecoder};
+use crate::model::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use crate::model::tokenizer::Tokenizer;
+use std::sync::Arc;
 
 static TEMPLATE: &str = r#"
 {#-
@@ -335,7 +330,6 @@ static TEMPLATE: &str = r#"
 {%- endif -%}
 "#;
 
-
 pub struct GptOssInstruct {
     tokenizer: Arc<Tokenizer>,
     system_prefix: Vec<u32>,
@@ -422,7 +416,11 @@ fn render_typescript_type(spec: &serde_json::Value) -> String {
                     .map(|s| format!("\"{}\"", s))
                     .collect();
                 parts.join(" | ")
-            } else if spec.get("nullable").and_then(|n| n.as_bool()).unwrap_or(false) {
+            } else if spec
+                .get("nullable")
+                .and_then(|n| n.as_bool())
+                .unwrap_or(false)
+            {
                 "string | null".to_string()
             } else {
                 "string".to_string()
@@ -446,8 +444,17 @@ fn render_typescript_type(spec: &serde_json::Value) -> String {
                     .unwrap_or_default();
                 let mut lines = Vec::new();
                 for (name, pspec) in props {
-                    let opt = if required.contains(&name.as_str()) { "" } else { "?" };
-                    lines.push(format!("{}{}: {}", name, opt, render_typescript_type(pspec)));
+                    let opt = if required.contains(&name.as_str()) {
+                        ""
+                    } else {
+                        "?"
+                    };
+                    lines.push(format!(
+                        "{}{}: {}",
+                        name,
+                        opt,
+                        render_typescript_type(pspec)
+                    ));
                 }
                 format!("{{\n{}\n}}", lines.join(",\n"))
             } else {
@@ -500,7 +507,10 @@ impl Instruct for GptOssInstruct {
         for tool_json in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool_json) {
                 let func = parsed.get("function").unwrap_or(&parsed);
-                let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                let name = func
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown");
                 let desc = func
                     .get("description")
                     .and_then(|d| d.as_str())
@@ -523,7 +533,11 @@ impl Instruct for GptOssInstruct {
                         if let Some(pdesc) = pspec.get("description").and_then(|d| d.as_str()) {
                             prompt.push_str(&format!("// {}\n", pdesc));
                         }
-                        let opt = if required.contains(&pname.as_str()) { "" } else { "?" };
+                        let opt = if required.contains(&pname.as_str()) {
+                            ""
+                        } else {
+                            "?"
+                        };
                         let ptype = render_typescript_type(pspec);
                         prompt.push_str(&format!("{}{}: {},\n", pname, opt, ptype));
                     }
@@ -543,8 +557,7 @@ impl Instruct for GptOssInstruct {
             "<|start|>functions.{} to=assistant<|channel|>commentary<|message|>",
             name
         );
-        let json_value =
-            serde_json::to_string(value).unwrap_or_else(|_| format!("\"{}\"", value));
+        let json_value = serde_json::to_string(value).unwrap_or_else(|_| format!("\"{}\"", value));
         let mut tokens = self.tokenizer.encode(&header);
         tokens.extend(self.tokenizer.encode(&json_value));
         tokens.extend(&self.end_token);
@@ -552,7 +565,10 @@ impl Instruct for GptOssInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
+        Box::new(GenericChatDecoder::new(
+            self.tokenizer.clone(),
+            self.stop_ids.clone(),
+        ))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
@@ -574,8 +590,8 @@ impl Instruct for GptOssInstruct {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::model::tokenizer::Tokenizer;
+    use std::sync::Arc;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
@@ -584,10 +600,21 @@ mod tests {
 
     fn gptoss() -> GptOssInstruct {
         let tok = make_tok(&[
-            "<|start|>", "<|message|>", "<|channel|>", "<|end|>",
-            "<|endoftext|>", "<|return|>", "<|call|>",
-            "system", "developer", "user", "assistant", "analysis", "final",
-            "\n", "Hello",
+            "<|start|>",
+            "<|message|>",
+            "<|channel|>",
+            "<|end|>",
+            "<|endoftext|>",
+            "<|return|>",
+            "<|call|>",
+            "system",
+            "developer",
+            "user",
+            "assistant",
+            "analysis",
+            "final",
+            "\n",
+            "Hello",
         ]);
         GptOssInstruct::new(tok)
     }
@@ -604,7 +631,10 @@ mod tests {
         let inst = gptoss();
         let sys = inst.system("Hello");
         assert!(!sys.is_empty());
-        assert_eq!(&sys[..inst.developer_prefix.len()], &inst.developer_prefix[..]);
+        assert_eq!(
+            &sys[..inst.developer_prefix.len()],
+            &inst.developer_prefix[..]
+        );
     }
 
     #[test]

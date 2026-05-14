@@ -15,7 +15,7 @@ pub mod hf_loader;
 use std::borrow::Cow;
 
 use aho_corasick::AhoCorasick;
-use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 
 use bpe::BpeTable;
 
@@ -136,7 +136,11 @@ pub enum DecodeStep {
     /// Replace pattern bytes → replacement bytes (per token).
     Replace { pattern: Vec<u8>, content: Vec<u8> },
     /// Strip `content` from start/end of each token N times.
-    Strip { content: Vec<u8>, start: usize, stop: usize },
+    Strip {
+        content: Vec<u8>,
+        start: usize,
+        stop: usize,
+    },
     /// Strip `content` from start of the FIRST token only (Metaspace add_prefix_space).
     StripFirst { content: Vec<u8> },
     /// Fuse all tokens into a single buffer.
@@ -338,21 +342,9 @@ impl Tokenizer {
         }
         let bf = self.vocab_type.byte_fallback();
         if self.vocab_type.is_byte_level() {
-            bpe::bpe_encode_bytes(
-                piece.as_bytes(),
-                &self.bpe,
-                bf,
-                self.unk_token_id,
-                ids,
-            );
+            bpe::bpe_encode_bytes(piece.as_bytes(), &self.bpe, bf, self.unk_token_id, ids);
         } else {
-            bpe::bpe_encode_chars(
-                piece,
-                &self.bpe,
-                bf,
-                self.unk_token_id,
-                ids,
-            );
+            bpe::bpe_encode_chars(piece, &self.bpe, bf, self.unk_token_id, ids);
         }
     }
 
@@ -414,13 +406,15 @@ impl Tokenizer {
 
                 // Remap bytes → GPT-2 unicode (reuse scratch buffer).
                 scratch.remap_buf.clear();
-                scratch.remap_buf.extend(bytes.iter().map(|&b| lut[b as usize]));
+                scratch
+                    .remap_buf
+                    .extend(bytes.iter().map(|&b| lut[b as usize]));
 
                 // Build char→byte offset table (reuse scratch buffer).
                 scratch.char_offsets.clear();
-                scratch.char_offsets.extend(
-                    scratch.remap_buf.char_indices().map(|(i, _)| i),
-                );
+                scratch
+                    .char_offsets
+                    .extend(scratch.remap_buf.char_indices().map(|(i, _)| i));
                 let n_chars = scratch.char_offsets.len();
 
                 for m in regex.find_iter(&scratch.remap_buf) {
@@ -473,9 +467,7 @@ impl Tokenizer {
                         if s.is_empty() && i == 0 {
                             continue;
                         }
-                        let mut piece = String::with_capacity(
-                            replacement_str.len() + s.len(),
-                        );
+                        let mut piece = String::with_capacity(replacement_str.len() + s.len());
                         piece.push_str(replacement_str);
                         piece.push_str(s);
                         result.push(piece);
@@ -561,9 +553,7 @@ impl Tokenizer {
             // ByteLevel: raw-byte keyed — just concatenate.
             let mut buf = Vec::with_capacity(ids.len() * 4);
             for &id in ids {
-                if skip_special
-                    && self.special_token_ids.binary_search(&id).is_ok()
-                {
+                if skip_special && self.special_token_ids.binary_search(&id).is_ok() {
                     continue;
                 }
                 if let Some(bytes) = self.bpe.id_to_bytes(id) {
@@ -576,9 +566,7 @@ impl Tokenizer {
         // CharLevel: collect per-token raw bytes, apply decode steps.
         let mut tokens: Vec<Vec<u8>> = Vec::with_capacity(ids.len());
         for &id in ids {
-            if skip_special
-                && self.special_token_ids.binary_search(&id).is_ok()
-            {
+            if skip_special && self.special_token_ids.binary_search(&id).is_ok() {
                 continue;
             }
             if let Some(raw) = self.bpe.id_to_bytes(id) {
@@ -593,10 +581,7 @@ impl Tokenizer {
                     let old = std::mem::take(&mut tokens);
                     let mut byte_buf: Vec<u8> = Vec::new();
                     for token in old {
-                        if token.len() == 6
-                            && token.starts_with(b"<0x")
-                            && token[5] == b'>'
-                        {
+                        if token.len() == 6 && token.starts_with(b"<0x") && token[5] == b'>' {
                             if let Ok(hex) = std::str::from_utf8(&token[3..5]) {
                                 if let Ok(byte) = u8::from_str_radix(hex, 16) {
                                     byte_buf.push(byte);
@@ -615,14 +600,14 @@ impl Tokenizer {
                 }
                 DecodeStep::Replace { pattern, content } => {
                     for token in tokens.iter_mut() {
-                        *token = replace_bytes_owned(
-                            std::mem::take(token),
-                            pattern,
-                            content,
-                        );
+                        *token = replace_bytes_owned(std::mem::take(token), pattern, content);
                     }
                 }
-                DecodeStep::Strip { content, start, stop } => {
+                DecodeStep::Strip {
+                    content,
+                    start,
+                    stop,
+                } => {
                     for token in tokens.iter_mut() {
                         for _ in 0..*start {
                             if token.starts_with(content.as_slice()) {
@@ -695,8 +680,9 @@ impl Tokenizer {
     /// Returns an empty string if no regex-based split step is configured.
     pub fn get_split_regex(&self) -> String {
         match &self.split_step {
-            SplitStep::Gpt2RegexSplit(re)
-            | SplitStep::RegexSplitIsolated(re) => re.as_str().to_string(),
+            SplitStep::Gpt2RegexSplit(re) | SplitStep::RegexSplitIsolated(re) => {
+                re.as_str().to_string()
+            }
             _ => String::new(),
         }
     }
@@ -835,13 +821,19 @@ mod tests {
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        let mut bpe = bpe::BpeTable::from_vocab_and_merges(
-            &vocab_map, &merge_pairs, "", false,
-        );
+        let mut bpe = bpe::BpeTable::from_vocab_and_merges(&vocab_map, &merge_pairs, "", false);
         for at in &added_tokens {
             bpe.insert(at.content.as_bytes().to_vec(), at.id);
         }
-        Tokenizer::new(bpe, VocabType::ByteLevel, norm_steps, split_step, decode_steps, None, added_tokens)
+        Tokenizer::new(
+            bpe,
+            VocabType::ByteLevel,
+            norm_steps,
+            split_step,
+            decode_steps,
+            None,
+            added_tokens,
+        )
     }
 
     fn make_char_tokenizer(
@@ -857,10 +849,16 @@ mod tests {
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        let bpe = bpe::BpeTable::from_vocab_and_merges(
-            &vocab_map, &merge_pairs, "", false,
-        );
-        Tokenizer::new(bpe, VocabType::CharLevel, norm_steps, split_step, decode_steps, None, vec![])
+        let bpe = bpe::BpeTable::from_vocab_and_merges(&vocab_map, &merge_pairs, "", false);
+        Tokenizer::new(
+            bpe,
+            VocabType::CharLevel,
+            norm_steps,
+            split_step,
+            decode_steps,
+            None,
+            vec![],
+        )
     }
 
     #[test]
@@ -868,7 +866,10 @@ mod tests {
         let tok = make_byte_tokenizer(
             &[("h", 0), ("i", 1), ("hi", 2)],
             &[("h", "i")],
-            vec![], SplitStep::None, vec![], vec![],
+            vec![],
+            SplitStep::None,
+            vec![],
+            vec![],
         );
         let ids = tok.encode("hi");
         assert_eq!(ids, vec![2]);
@@ -880,8 +881,10 @@ mod tests {
         let tok = make_byte_tokenizer(
             &[("\u{00E9}", 0)], // NFC form
             &[],
-            vec![NormStep::Nfc], SplitStep::None,
-            vec![], vec![],
+            vec![NormStep::Nfc],
+            SplitStep::None,
+            vec![],
+            vec![],
         );
         assert_eq!(tok.encode("\u{0065}\u{0301}"), vec![0]); // NFD → NFC
     }
@@ -891,8 +894,10 @@ mod tests {
         let tok = make_byte_tokenizer(
             &[(" ", 0), ("h", 1), ("i", 2)],
             &[],
-            vec![NormStep::PrependSpace], SplitStep::None,
-            vec![], vec![],
+            vec![NormStep::PrependSpace],
+            SplitStep::None,
+            vec![],
+            vec![],
         );
         assert_eq!(tok.encode("hi"), vec![0, 1, 2]);
         assert_eq!(tok.encode(" hi"), vec![0, 1, 2]); // no double-prepend
@@ -903,9 +908,13 @@ mod tests {
         let tok = make_byte_tokenizer(
             &[("X", 0), ("!", 1)],
             &[],
-            vec![NormStep::Replace { from: "hello".into(), to: "X".into() }],
+            vec![NormStep::Replace {
+                from: "hello".into(),
+                to: "X".into(),
+            }],
             SplitStep::None,
-            vec![], vec![],
+            vec![],
+            vec![],
         );
         assert_eq!(tok.encode("hello!"), vec![0, 1]);
     }
@@ -950,8 +959,10 @@ mod tests {
         let tok = make_byte_tokenizer(
             &[("a", 0), ("1", 1), ("2", 2), ("b", 3), ("12", 4)],
             &[("1", "2")],
-            vec![], SplitStep::RegexSplitIsolated(re),
-            vec![], vec![],
+            vec![],
+            SplitStep::RegexSplitIsolated(re),
+            vec![],
+            vec![],
         );
         assert_eq!(tok.encode("a12b"), vec![0, 4, 3]);
     }
@@ -969,8 +980,13 @@ mod tests {
                 split: false,
             },
             vec![
-                DecodeStep::Replace { pattern: "▁".as_bytes().to_vec(), content: b" ".to_vec() },
-                DecodeStep::StripFirst { content: b" ".to_vec() },
+                DecodeStep::Replace {
+                    pattern: "▁".as_bytes().to_vec(),
+                    content: b" ".to_vec(),
+                },
+                DecodeStep::StripFirst {
+                    content: b" ".to_vec(),
+                },
             ],
         );
         let ids = tok.encode("hi");
@@ -982,7 +998,8 @@ mod tests {
         let tok = make_byte_tokenizer(
             &[("a", 0), ("<0xE5>", 1), ("<0x8F>", 2), ("<0xAB>", 3)],
             &[],
-            vec![], SplitStep::None,
+            vec![],
+            SplitStep::None,
             vec![DecodeStep::ByteFallback],
             vec![],
         );
@@ -994,14 +1011,24 @@ mod tests {
         let tok = make_byte_tokenizer(
             &[("h", 0), ("i", 1), ("hi", 2)],
             &[("h", "i")],
-            vec![], SplitStep::None, vec![],
+            vec![],
+            SplitStep::None,
+            vec![],
             vec![
-                AddedToken { id: 100, content: "<s>".into(), special: true },
-                AddedToken { id: 101, content: "</s>".into(), special: true },
+                AddedToken {
+                    id: 100,
+                    content: "<s>".into(),
+                    special: true,
+                },
+                AddedToken {
+                    id: 101,
+                    content: "</s>".into(),
+                    special: true,
+                },
             ],
         );
         assert_eq!(tok.encode("<s>hi</s>"), vec![100, 2, 101]);
-        assert_eq!(tok.decode(&[100, 2], true), "hi");     // skip special
-        assert_eq!(tok.decode(&[100, 2], false), "<s>hi");  // include special
+        assert_eq!(tok.decode(&[100, 2], true), "hi"); // skip special
+        assert_eq!(tok.decode(&[100, 2], false), "<s>hi"); // include special
     }
 }

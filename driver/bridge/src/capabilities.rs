@@ -1,0 +1,44 @@
+//! Driver capability handshake — NOT a rkyv wire type.
+//!
+//! Each driver advertises its capabilities (page geometry, batching limits,
+//! tokenizer arch, etc.) at startup via a JSON blob delivered to the runtime.
+//! The runtime parses it into [`DriverCapabilities`] for scheduling and
+//! batching decisions. The shape is wire-stable — fields appear verbatim
+//! in the driver's ready-callback JSON (see `driver/cuda/src/entry.cpp`,
+//! `driver/portable/src/entry.cpp`, `driver/dummy/src/lib.rs`).
+//!
+//! This is intentionally not under `#[schema]` — the handshake happens
+//! once at driver startup and uses JSON over a side channel, not the
+//! rkyv ring.
+
+use serde::{Deserialize, Serialize};
+
+/// Static driver capabilities reported at handshake time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriverCapabilities {
+    /// Total KV pages available for context residency.
+    pub total_pages: u32,
+    /// KV page size in tokens.
+    pub kv_page_size: u32,
+    /// Number of CPU-resident swap-pool pages (0 if no swap support).
+    pub swap_pool_size: u32,
+    /// Maximum tokens accepted per forward-pass batch.
+    pub max_batch_tokens: u32,
+    /// Maximum requests accepted per forward-pass batch.
+    pub max_batch_size: u32,
+    /// Architecture name (e.g. `llama3`, `qwen3`) — used for tokenizer dispatch.
+    pub arch_name: String,
+    /// Vocabulary size — pinned by the loaded model.
+    pub vocab_size: u32,
+    /// Maximum model context length (positions). Drives scheduler ceiling.
+    pub max_model_len: u32,
+    /// Activation dtype on the driver side (`bf16` / `f16` / `f32`).
+    pub activation_dtype: String,
+    /// Optional snapshot directory the driver can use to persist state.
+    #[serde(default)]
+    pub snapshot_dir: String,
+    /// Optional shmem region name; only Some when the driver speaks shmem
+    /// (subprocess flavors). In-process drivers leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shmem_name: Option<String>,
+}

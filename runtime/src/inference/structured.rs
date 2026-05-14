@@ -3,10 +3,10 @@
 //! This constrains language model output to follow formal grammars
 //! (EBNF, JSON Schema, regex), enabling structured generation with guaranteed
 //! syntactic correctness.
-//! 
-//! The large portion of this code is a port of the xgrammar library to Rust. 
+//!
+//! The large portion of this code is a port of the xgrammar library to Rust.
 //! (@ingim: add credit to xgrammar in the README)
-//! 
+//!
 //! # Usage
 //!
 //! The typical flow is:
@@ -114,4 +114,3 @@ pub mod grammar;
 pub mod json_schema;
 pub mod matcher;
 pub mod regex;
-

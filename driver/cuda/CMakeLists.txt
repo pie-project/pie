@@ -67,11 +67,9 @@ add_library(pie_driver_cuda_lib STATIC
   src/entry.cpp
   src/persistent_inputs.cpp
   src/request_handler.cpp
-  src/msgpack_subpass.cpp
+  src/response_subpass.cpp
   src/sampling_dispatch.cpp
   src/spec_expansion.cpp
-  src/shmem_ipc.cpp
-  src/shmem_schema.cpp
   src/tensor.cpp
   src/engine.cpp
   src/loader/hf_config.cpp
@@ -90,11 +88,12 @@ add_library(pie_driver_cuda_lib STATIC
   src/ops/gemm.cpp
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
-  src/response_writer.cpp
   src/kernels/rmsnorm.cu
   src/kernels/embed.cu
   src/kernels/swiglu.cu
   src/kernels/rope.cu
+  src/kernels/split_packed.cu
+  src/kernels/scatter_int32.cu
   src/kernels/argmax.cu
   src/kernels/kv_paged.cu
   src/kernels/sample_temp.cu
@@ -128,7 +127,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/qwen3_5_moe_forward.cpp
   src/attention_workspace.cpp
   src/brle.cpp
-  src/control_socket.cpp
   src/swap_pool.cpp
   src/distributed.cpp
   src/custom_all_reduce.cu
@@ -162,6 +160,7 @@ target_compile_options(pie_driver_cuda PRIVATE
 target_include_directories(pie_driver_cuda_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${PIE_BRIDGE_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
@@ -204,24 +203,12 @@ target_compile_options(sample_flashinfer_test PRIVATE
 target_link_libraries(sample_flashinfer_test PRIVATE CUDA::cudart)
 
 # Wire-format unit tests. Pure C++ (no CUDA), short runtime; CTest runs
-# them under `cmake --build build --target test`. The msgpack roundtrip
-# verification is delegated to a sibling pytest that reads the binary's
-# output files.
+# them under `cmake --build build --target test`.
 add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
 target_include_directories(test_brle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-add_executable(test_response_writer
-  tests/test_response_writer.cpp
-  src/response_writer.cpp)
-target_include_directories(test_response_writer PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
-add_test(NAME response_writer
-  COMMAND test_response_writer
-    ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_flat.bin
-    ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_msgpack.bin)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

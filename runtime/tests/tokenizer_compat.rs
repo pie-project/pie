@@ -143,7 +143,12 @@ const TEXTS: &[&str] = &[
     "\u{00A0}non-breaking\u{00A0}spaces\u{00A0}",
     "fi fl ffi ffl ﬁ ﬂ ﬃ ﬄ",
     "2⁰ 2¹ 2² 2³ 2⁴ 2⁵ 2⁶ 2⁷ 2⁸ 2⁹",
-    "a", "Ω", "🎵", "\n", "\t", " ",
+    "a",
+    "Ω",
+    "🎵",
+    "\n",
+    "\t",
+    " ",
     "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. How vexingly quick daft zebras jump! The five boxing wizards jump quickly. Sphinx of black quartz, judge my vow.",
 ];
 
@@ -172,16 +177,22 @@ fn test_encode_compatibility() {
                 let t = if text.len() > 60 { &text[..60] } else { text };
                 mismatches.push(format!(
                     "  {} | {t:?} | mini={} hf={}",
-                    model.name, m.len(), h.len()
+                    model.name,
+                    m.len(),
+                    h.len()
                 ));
             }
         }
     }
 
     let pct = 100.0 * (total - mismatches.len()) as f64 / total as f64;
-    eprintln!("\n=== ENCODE: {}/{total} match ({pct:.1}%) across {loaded} models ===",
-        total - mismatches.len());
-    for m in &mismatches { eprintln!("{m}"); }
+    eprintln!(
+        "\n=== ENCODE: {}/{total} match ({pct:.1}%) across {loaded} models ===",
+        total - mismatches.len()
+    );
+    for m in &mismatches {
+        eprintln!("{m}");
+    }
 
     assert!(total > 0, "no models found in HF cache");
     assert!(
@@ -200,21 +211,25 @@ fn test_cross_decode() {
     let models = discover_models();
     let mut tested = 0;
     for model in &models {
-        let Some((mini, hf)) = load_both(&model.dir) else { continue };
+        let Some((mini, hf)) = load_both(&model.dir) else {
+            continue;
+        };
 
         for text in TEXTS {
             let hf_ids: Vec<u32> = hf.encode(*text, false).unwrap().get_ids().to_vec();
             assert_eq!(
                 mini.decode(&hf_ids, false),
                 hf.decode(&hf_ids, false).unwrap(),
-                "\n[CROSS-DECODE HF→mini] {} | {text:?}", model.name,
+                "\n[CROSS-DECODE HF→mini] {} | {text:?}",
+                model.name,
             );
 
             let mini_ids = mini.encode(text);
             assert_eq!(
                 mini.decode(&mini_ids, false),
                 hf.decode(&mini_ids, false).unwrap(),
-                "\n[CROSS-DECODE mini→HF] {} | {text:?}", model.name,
+                "\n[CROSS-DECODE mini→HF] {} | {text:?}",
+                model.name,
             );
             tested += 1;
         }
@@ -234,19 +249,28 @@ fn test_vocab_size() {
     let mut mismatches = 0usize;
 
     for model in &models {
-        let Some((mini, hf)) = load_both(&model.dir) else { continue };
+        let Some((mini, hf)) = load_both(&model.dir) else {
+            continue;
+        };
         checked += 1;
         let ms = mini.vocab_size();
         let hs = hf.get_vocab_size(true);
         if ms != hs {
             mismatches += 1;
-            eprintln!("  [VOCAB SIZE] {}: mini={ms} hf={hs} (diff={})", model.name, ms as i64 - hs as i64);
+            eprintln!(
+                "  [VOCAB SIZE] {}: mini={ms} hf={hs} (diff={})",
+                model.name,
+                ms as i64 - hs as i64
+            );
         } else {
             eprintln!("{}: {ms} tokens ✓", model.name);
         }
     }
     let pct = 100.0 * (checked - mismatches) as f64 / checked as f64;
-    eprintln!("vocab size: {}/{checked} match ({pct:.1}%)", checked - mismatches);
+    eprintln!(
+        "vocab size: {}/{checked} match ({pct:.1}%)",
+        checked - mismatches
+    );
     assert!(checked > 0, "no models found");
     assert!(pct >= 90.0, "vocab size match {pct:.1}% < 90%");
 }
@@ -262,24 +286,34 @@ fn test_decode_sequential_ids() {
     let mut mismatches = 0usize;
 
     for model in &models {
-        let Some((mini, hf)) = load_both(&model.dir) else { continue };
+        let Some((mini, hf)) = load_both(&model.dir) else {
+            continue;
+        };
         let vocab = mini.vocab_size() as u32;
 
         for start in [0u32, 100, 1000, 10000, 50000] {
-            if start >= vocab { continue; }
+            if start >= vocab {
+                continue;
+            }
             total += 1;
             let ids: Vec<u32> = (start..(start + 50).min(vocab)).collect();
             let m = mini.decode(&ids, false);
             let h = hf.decode(&ids, false).unwrap();
             if m != h {
                 mismatches += 1;
-                eprintln!("  [DECODE SEQ] {} ids[{start}..{}]: mismatch",
-                    model.name, start + ids.len() as u32);
+                eprintln!(
+                    "  [DECODE SEQ] {} ids[{start}..{}]: mismatch",
+                    model.name,
+                    start + ids.len() as u32
+                );
             }
         }
     }
     let pct = 100.0 * (total - mismatches) as f64 / total as f64;
-    eprintln!("sequential decode: {}/{total} match ({pct:.1}%)", total - mismatches);
+    eprintln!(
+        "sequential decode: {}/{total} match ({pct:.1}%)",
+        total - mismatches
+    );
     assert!(total > 0);
     assert!(pct >= 90.0, "sequential decode {pct:.1}% < 90%");
 }
@@ -294,14 +328,17 @@ fn test_long_input() {
         .map(|i| format!("Sentence {i}. The quick brown fox jumps over the lazy dog. "))
         .collect::<String>();
 
-    let code = "fn fib(n: u64) -> u64 { match n { 0 => 0, 1 => 1, _ => fib(n-1) + fib(n-2) } }\n".repeat(20);
+    let code = "fn fib(n: u64) -> u64 { match n { 0 => 0, 1 => 1, _ => fib(n-1) + fib(n-2) } }\n"
+        .repeat(20);
 
     let cjk = "日本語の長いテキスト。".repeat(100);
 
     let models = discover_models();
     let mut checked = 0;
     for model in &models {
-        let Some((mini, hf)) = load_both(&model.dir) else { continue };
+        let Some((mini, hf)) = load_both(&model.dir) else {
+            continue;
+        };
 
         for text in [long_prose.as_str(), code.as_str(), cjk.as_str()] {
             let hf_ids: Vec<u32> = hf.encode(text, false).unwrap().get_ids().to_vec();
@@ -326,7 +363,9 @@ fn test_single_ascii_chars() {
     let mut mismatches: Vec<String> = Vec::new();
 
     for model in &models {
-        let Some((mini, hf)) = load_both(&model.dir) else { continue };
+        let Some((mini, hf)) = load_both(&model.dir) else {
+            continue;
+        };
         let mut model_ok = true;
 
         for b in 0x20u8..=0x7E {
@@ -336,7 +375,10 @@ fn test_single_ascii_chars() {
             let h: Vec<u32> = hf.encode(ch.as_str(), false).unwrap().get_ids().to_vec();
             if m != h {
                 model_ok = false;
-                mismatches.push(format!("  {} 0x{b:02X} {ch:?}: mini={m:?} hf={h:?}", model.name));
+                mismatches.push(format!(
+                    "  {} 0x{b:02X} {ch:?}: mini={m:?} hf={h:?}",
+                    model.name
+                ));
             }
         }
         if model_ok {
@@ -344,8 +386,13 @@ fn test_single_ascii_chars() {
         }
     }
     let pct = 100.0 * (total - mismatches.len()) as f64 / total as f64;
-    eprintln!("\nASCII chars: {}/{total} match ({pct:.1}%)", total - mismatches.len());
-    for m in &mismatches { eprintln!("{m}"); }
+    eprintln!(
+        "\nASCII chars: {}/{total} match ({pct:.1}%)",
+        total - mismatches.len()
+    );
+    for m in &mismatches {
+        eprintln!("{m}");
+    }
     assert!(total > 0, "no models found");
     assert!(pct >= 90.0, "ASCII char match {pct:.1}% < 90%");
 }

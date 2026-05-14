@@ -26,11 +26,17 @@ pub struct LogStream {
 
 impl LogStream {
     pub fn new_stdout(process_id: ProcessId) -> Self {
-        LogStream { process_id, is_stderr: false }
+        LogStream {
+            process_id,
+            is_stderr: false,
+        }
     }
 
     pub fn new_stderr(process_id: ProcessId) -> Self {
-        LogStream { process_id, is_stderr: true }
+        LogStream {
+            process_id,
+            is_stderr: true,
+        }
     }
 
     /// Dispatch output to the process actor.

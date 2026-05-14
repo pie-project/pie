@@ -1,8 +1,8 @@
 //! pie:core/scheduling - Market prices and program account queries
 
-use crate::api::pie;
-use crate::api::model::Model;
 use crate::api::context::Context;
+use crate::api::model::Model;
+use crate::api::pie;
 use crate::context;
 use crate::instance::InstanceState;
 
@@ -18,14 +18,14 @@ impl pie::core::scheduling::Host for InstanceState {
         Ok(1.0)
     }
 
-    /// Rent (clearing price) on this context's device, last step.
+    /// Rent (clearing price) on this context's driver, last step.
     async fn rent(&mut self, ctx: Resource<Context>) -> Result<f64> {
         let ctx = self.ctx().table.get(&ctx)?;
         let model_idx = ctx.model_id;
         let context_id = ctx.context_id;
 
-        let device = context::get_device(model_idx, context_id);
-        Ok(context::get_clearing_price(model_idx, device))
+        let driver_idx = context::get_driver(model_idx, context_id);
+        Ok(context::get_clearing_price(model_idx, driver_idx))
     }
 
     /// Dividend this process received last step.
@@ -38,16 +38,16 @@ impl pie::core::scheduling::Host for InstanceState {
         Ok(dividend_rate * endowment)
     }
 
-    // ── Device ──────────────────────────────────────────────────────
+    // ── Driver ──────────────────────────────────────────────────────
 
-    /// Per-tick latency of this context's device (seconds), updated each tick.
+    /// Per-tick latency of this context's driver (seconds), updated each tick.
     async fn latency(&mut self, ctx: Resource<Context>) -> Result<f64> {
         let ctx = self.ctx().table.get(&ctx)?;
         let model_idx = ctx.model_id;
         let context_id = ctx.context_id;
 
-        let device = context::get_device(model_idx, context_id);
-        Ok(context::get_tick_latency(model_idx, device))
+        let driver_idx = context::get_driver(model_idx, context_id);
+        Ok(context::get_tick_latency(model_idx, driver_idx))
     }
 
     // ── Account ────────────────────────────────────────────────────

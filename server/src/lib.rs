@@ -9,7 +9,6 @@
 //! the surface they need — `serve::start_engine`, `config::Config`,
 //! `subprocess_driver::SubprocessDriver`, etc.
 
-pub mod aux_ipc;
 pub mod bootstrap_translate;
 pub mod cli;
 pub mod config;
@@ -19,6 +18,5 @@ pub mod hf;
 pub mod paths;
 pub mod py_runtime;
 pub mod python_resolve;
-pub mod rpc_loop;
 pub mod serve;
 pub mod subprocess_driver;

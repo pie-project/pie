@@ -10,6 +10,7 @@
 #include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
+#include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
@@ -139,7 +140,12 @@ void llama_like_forward_paged(
     const int Hk_kern = num_kv_heads_local * dk;
     const bool head_dim_padded = (d != dk);
     const float eps = cfg.rms_norm_eps;
-    cudaStream_t stream = nullptr;
+    // Inherit the stream bound to `cublas` so manual kernel launches stay
+    // on the same stream as the cublas matmuls. The graph-capture path
+    // in request_handler.cpp binds `cublas` to its `cstream` for the
+    // duration of capture so every launch in this body — cublas-issued or
+    // not — lands on the captured graph.
+    cudaStream_t stream = cublas.stream();
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
     // When head_dim is padded, the attention kernel runs at `dk`
@@ -186,15 +192,31 @@ void llama_like_forward_paged(
             qkv_in = ws.norm_x.data();
         }
 
-        ops::gemm_act_x_w(cublas.handle(),
-            qkv_in, make_weight_view(layer.q_proj, layer.q_proj_quant),
-            ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            qkv_in, make_weight_view(layer.k_proj, layer.k_proj_quant),
-            ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            qkv_in, make_weight_view(layer.v_proj, layer.v_proj_quant),
-            ws.v.data(), N, Hk, H);
+        // QKV: fused path when the bind helper materialised
+        // `qkv_proj_fused` (single wide gemm + split kernel), unfused
+        // fallback for quantized projections / TP-sharded loads /
+        // architectures that haven't opted in yet.
+        const bool use_fused_qkv = (layer.qkv_proj_fused != nullptr) &&
+                                   !ws.qkv_fused.empty();
+        if (use_fused_qkv) {
+            ops::gemm_act_x_w(cublas.handle(),
+                qkv_in, ops::WeightView(*layer.qkv_proj_fused),
+                ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+            kernels::launch_split_qkv_bf16(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                N, Hq, Hk, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                qkv_in, make_weight_view(layer.q_proj, layer.q_proj_quant),
+                ws.q.data(), N, Hq, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                qkv_in, make_weight_view(layer.k_proj, layer.k_proj_quant),
+                ws.k.data(), N, Hk, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                qkv_in, make_weight_view(layer.v_proj, layer.v_proj_quant),
+                ws.v.data(), N, Hk, H);
+        }
 
         if (fwd_cfg.use_qkv_bias) {
             maybe_add_bias(ws.q.data(), layer.q_bias, N, Hq, stream);
@@ -358,12 +380,25 @@ void llama_like_forward_paged(
             mlp_in = ws.norm_y.data();
         }
 
-        ops::gemm_act_x_w(cublas.handle(),
-            mlp_in, make_weight_view(layer.gate_proj, layer.gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            mlp_in, make_weight_view(layer.up_proj, layer.up_proj_quant),
-            ws.up.data(),   N, I, H);
+        // gate + up: same fused-vs-unfused dispatch as QKV.
+        const bool use_fused_gu = (layer.gate_up_proj_fused != nullptr) &&
+                                  !ws.gate_up_fused.empty();
+        if (use_fused_gu) {
+            ops::gemm_act_x_w(cublas.handle(),
+                mlp_in, ops::WeightView(*layer.gate_up_proj_fused),
+                ws.gate_up_fused.data(), N, 2 * I, H);
+            kernels::launch_split_gate_up_bf16(
+                ws.gate_up_fused.data(),
+                ws.gate.data(), ws.up.data(),
+                N, I, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                mlp_in, make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+                ws.gate.data(), N, I, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                mlp_in, make_weight_view(layer.up_proj, layer.up_proj_quant),
+                ws.up.data(),   N, I, H);
+        }
         kernels::launch_swiglu_bf16(
             ws.gate.data(), ws.up.data(), ws.gate.data(),
             N * I, stream);

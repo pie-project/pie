@@ -20,7 +20,7 @@ hf_path = "/path/to/huggingface/snapshot"
 # KV cache / batching — Pie's runtime owns page allocation. We allocate a
 # global pool of `max_num_kv_pages` pages of `kv_page_size` token slots each
 # and report those values in the READY capabilities. The runtime then hands
-# us `kv_page_indices` per request in every BPIQ payload; we honor them.
+# us `kv_page_indices` per request in every wire payload; we honor them.
 #
 # Total KV memory per layer = max_num_kv_pages × kv_page_size × n_kv_heads
 #                             × head_dim × 2 (K+V) × dtype_size.

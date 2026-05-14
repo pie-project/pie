@@ -42,28 +42,48 @@ fn test_output_negated_character_class() {
 fn test_output_character_class_star() {
     // CharacterClassStar optimization: no aux rule generated
     let g = parse_and_display("root ::= [a-z]*");
-    assert!(g.contains("[a-z]*"), "expected CharacterClassStar, got: {}", g);
+    assert!(
+        g.contains("[a-z]*"),
+        "expected CharacterClassStar, got: {}",
+        g
+    );
     // Should NOT have auxiliary rules
-    assert!(!g.contains("root_1"), "should not have aux rule for char class star, got: {}", g);
+    assert!(
+        !g.contains("root_1"),
+        "should not have aux rule for char class star, got: {}",
+        g
+    );
 }
 
 #[test]
 fn test_output_string_star() {
     // "a"* DOES need auxiliary rule
     let g = parse_and_display(r#"root ::= "a"*"#);
-    assert!(g.contains("root_1"), "should have aux rule for string star, got: {}", g);
+    assert!(
+        g.contains("root_1"),
+        "should have aux rule for string star, got: {}",
+        g
+    );
 }
 
 #[test]
 fn test_output_string_plus() {
     let g = parse_and_display(r#"root ::= "a"+"#);
-    assert!(g.contains("root_1"), "should have aux rule for plus, got: {}", g);
+    assert!(
+        g.contains("root_1"),
+        "should have aux rule for plus, got: {}",
+        g
+    );
 }
 
 #[test]
 fn test_output_string_question() {
     let g = parse_and_display(r#"root ::= "a"?"#);
-    assert!(g.contains("root_1"), "should have aux rule for ?, got: {}", g);
+    assert!(
+        g.contains("root_1"),
+        "should have aux rule for ?, got: {}",
+        g
+    );
 }
 
 #[test]
@@ -87,21 +107,37 @@ fn test_output_sequence() {
 fn test_output_repetition_exact() {
     let g = parse_and_display(r#"root ::= "a"{3}"#);
     // {3} becomes Repeat(root_1, 3, 3) where root_1 ::= "a"
-    assert!(g.contains("root_1{3,3}"), "expected root_1{{3,3}}, got: {}", g);
-    assert!(g.contains("root_1 ::= \"a\""), "expected root_1 rule, got: {}", g);
+    assert!(
+        g.contains("root_1{3,3}"),
+        "expected root_1{{3,3}}, got: {}",
+        g
+    );
+    assert!(
+        g.contains("root_1 ::= \"a\""),
+        "expected root_1 rule, got: {}",
+        g
+    );
 }
 
 #[test]
 fn test_output_repetition_range() {
     let g = parse_and_display(r#"root ::= "a"{2,4}"#);
     // {2,4} becomes Repeat(root_1, 2, 4)
-    assert!(g.contains("root_1{2,4}"), "expected root_1{{2,4}}, got: {}", g);
+    assert!(
+        g.contains("root_1{2,4}"),
+        "expected root_1{{2,4}}, got: {}",
+        g
+    );
 }
 
 #[test]
 fn test_output_repetition_unbounded() {
     let g = parse_and_display(r#"root ::= "a"{2,}"#);
-    assert!(g.contains("root_1"), "should have aux rule for {{2,}}, got: {}", g);
+    assert!(
+        g.contains("root_1"),
+        "should have aux rule for {{2,}}, got: {}",
+        g
+    );
 }
 
 #[test]
@@ -187,7 +223,11 @@ fn test_output_char_class_special_chars() {
 #[test]
 fn test_output_empty_parens() {
     let g = parse_and_display("root ::= ()");
-    assert!(g.contains("\"\""), "empty parens should produce empty string, got: {}", g);
+    assert!(
+        g.contains("\"\""),
+        "empty parens should produce empty string, got: {}",
+        g
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +239,11 @@ fn test_error_unterminated_string() {
     let result = Grammar::from_ebnf(r#"root ::= "abc"#, "root");
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("unterminated") || msg.contains("string"), "unexpected error: {}", msg);
+    assert!(
+        msg.contains("unterminated") || msg.contains("string"),
+        "unexpected error: {}",
+        msg
+    );
 }
 
 #[test]
@@ -207,7 +251,11 @@ fn test_error_invalid_escape() {
     let result = Grammar::from_ebnf(r#"root ::= "\q""#, "root");
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("escape") || msg.contains("invalid"), "unexpected error: {}", msg);
+    assert!(
+        msg.contains("escape") || msg.contains("invalid"),
+        "unexpected error: {}",
+        msg
+    );
 }
 
 #[test]
@@ -232,8 +280,11 @@ fn test_error_unclosed_char_class() {
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(
-        msg.contains("unterminated") || msg.contains("character class") || msg.contains("expected ]"),
-        "unexpected error: {}", msg
+        msg.contains("unterminated")
+            || msg.contains("character class")
+            || msg.contains("expected ]"),
+        "unexpected error: {}",
+        msg
     );
 }
 
@@ -252,7 +303,8 @@ fn test_error_reversed_char_class_range() {
     let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("lower bound") || msg.contains("invalid"),
-        "unexpected error: {}", msg
+        "unexpected error: {}",
+        msg
     );
 }
 
@@ -263,7 +315,8 @@ fn test_error_unclosed_paren() {
     let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("expected )") || msg.contains("paren"),
-        "unexpected error: {}", msg
+        "unexpected error: {}",
+        msg
     );
 }
 
@@ -293,7 +346,11 @@ fn test_error_repetition_lower_gt_upper() {
     let result = Grammar::from_ebnf(r#"root ::= "a"{5,2}"#, "root");
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("lower bound") || msg.contains("larger"), "unexpected error: {}", msg);
+    assert!(
+        msg.contains("lower bound") || msg.contains("larger"),
+        "unexpected error: {}",
+        msg
+    );
 }
 
 #[test]
@@ -309,6 +366,7 @@ fn test_error_newline_in_string() {
     let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("unterminated") || msg.contains("string"),
-        "unexpected error: {}", msg
+        "unexpected error: {}",
+        msg
     );
 }

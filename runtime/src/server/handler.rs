@@ -6,7 +6,6 @@
 use bytes::Bytes;
 use pie_client::message::ServerMessage;
 
-
 use crate::context;
 use crate::daemon;
 use crate::inference;
@@ -24,12 +23,7 @@ use super::data_transfer::{ChunkResult, InFlightUpload};
 // =============================================================================
 
 impl Session {
-    pub(super) async fn handle_check_program(
-        &self,
-        corr_id: u32,
-        name: String,
-        version: String,
-    ) {
+    pub(super) async fn handle_check_program(&self, corr_id: u32, name: String, version: String) {
         let full_name = format!("{}@{}", name, version);
         let program_name = match ProgramName::parse(&full_name) {
             Ok(p) => p,
@@ -50,24 +44,40 @@ impl Session {
                 for (model_idx, model_name) in model::models().iter().enumerate() {
                     // KV page pool stats
                     let kv = context::get_stats(model_idx).await;
-                    let (used, total) = kv.iter().fold((0u64, 0u64), |(u, t), &(a, b)| (u + a as u64, t + b as u64));
-                    stats.insert(format!("{}.kv_pages_used", model_name), serde_json::Value::from(used));
-                    stats.insert(format!("{}.kv_pages_total", model_name), serde_json::Value::from(total));
+                    let (used, total) = kv
+                        .iter()
+                        .fold((0u64, 0u64), |(u, t), &(a, b)| (u + a as u64, t + b as u64));
+                    stats.insert(
+                        format!("{}.kv_pages_used", model_name),
+                        serde_json::Value::from(used),
+                    );
+                    stats.insert(
+                        format!("{}.kv_pages_total", model_name),
+                        serde_json::Value::from(total),
+                    );
 
                     // Inference stats (throughput, latency, batch count)
                     let inf = inference::get_stats(model_idx).await;
-                    stats.insert(format!("{}.total_batches", model_name), serde_json::Value::from(inf.total_batches));
-                    stats.insert(format!("{}.total_tokens_processed", model_name), serde_json::Value::from(inf.total_tokens_processed));
-                    stats.insert(format!("{}.last_batch_latency_us", model_name), serde_json::Value::from(inf.last_batch_latency_us));
-                    stats.insert(format!("{}.avg_batch_latency_us", model_name), serde_json::Value::from(inf.avg_batch_latency_us));
+                    stats.insert(
+                        format!("{}.total_batches", model_name),
+                        serde_json::Value::from(inf.total_batches),
+                    );
+                    stats.insert(
+                        format!("{}.total_tokens_processed", model_name),
+                        serde_json::Value::from(inf.total_tokens_processed),
+                    );
+                    stats.insert(
+                        format!("{}.last_batch_latency_us", model_name),
+                        serde_json::Value::from(inf.last_batch_latency_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_batch_latency_us", model_name),
+                        serde_json::Value::from(inf.avg_batch_latency_us),
+                    );
                 }
 
-                self.send_response(
-                    corr_id,
-                    true,
-                    serde_json::Value::Object(stats).to_string(),
-                )
-                .await;
+                self.send_response(corr_id, true, serde_json::Value::Object(stats).to_string())
+                    .await;
             }
             _ => println!("Unknown query subject: {}", subject),
         }
@@ -204,7 +214,8 @@ impl Session {
                 if capture_outputs {
                     // Client mapping was pre-registered by process::spawn
                     self.attached_processes.push(process_id);
-                    self.send_response(corr_id, true, process_id.to_string()).await;
+                    self.send_response(corr_id, true, process_id.to_string())
+                        .await;
                 } else {
                     self.send_response(corr_id, true, String::new()).await;
                 }
@@ -236,12 +247,7 @@ impl Session {
             return;
         }
 
-        match daemon::spawn(
-            self.username.clone(),
-            program_name,
-            port as u16,
-            input,
-        ) {
+        match daemon::spawn(self.username.clone(), program_name, port as u16, input) {
             Ok(_daemon_id) => {
                 self.send_response(corr_id, true, "server launched".to_string())
                     .await;
@@ -362,7 +368,10 @@ impl Session {
         };
 
         if !self.attached_processes.contains(&process_id) {
-            tracing::error!("TransferFile: process {} not owned by client", process_id_str);
+            tracing::error!(
+                "TransferFile: process {} not owned by client",
+                process_id_str
+            );
             return;
         }
 
@@ -399,7 +408,11 @@ impl Session {
                 // Verify hash matches
                 let final_hash = blake3::hash(&buffer).to_hex().to_string();
                 if final_hash != file_hash {
-                    tracing::error!("TransferFile hash mismatch: expected {}, got {}", file_hash, final_hash);
+                    tracing::error!(
+                        "TransferFile hash mismatch: expected {}, got {}",
+                        file_hash,
+                        final_hash
+                    );
                     return;
                 }
 
@@ -416,11 +429,15 @@ impl Session {
     /// Send file chunks from server to client (inferlet → client download).
     pub(super) async fn send_file_download(&mut self, process_id: ProcessId, data: Bytes) {
         let file_hash = blake3::hash(&data).to_hex().to_string();
-        let total_chunks = (data.len() + pie_client::message::CHUNK_SIZE_BYTES - 1) / pie_client::message::CHUNK_SIZE_BYTES;
+        let total_chunks = (data.len() + pie_client::message::CHUNK_SIZE_BYTES - 1)
+            / pie_client::message::CHUNK_SIZE_BYTES;
 
         let uuid_str = process_id.to_string();
 
-        for (i, chunk) in data.chunks(pie_client::message::CHUNK_SIZE_BYTES).enumerate() {
+        for (i, chunk) in data
+            .chunks(pie_client::message::CHUNK_SIZE_BYTES)
+            .enumerate()
+        {
             self.send(ServerMessage::File {
                 process_id: uuid_str.clone(),
                 file_hash: file_hash.clone(),
@@ -445,7 +462,8 @@ impl Session {
                 // The workflow actor stores the result internally.
                 drop(result_rx);
                 self.attached_workflows.push(workflow_id);
-                self.send_response(corr_id, true, workflow_id.to_string()).await;
+                self.send_response(corr_id, true, workflow_id.to_string())
+                    .await;
             }
             Err(e) => {
                 self.send_response(corr_id, false, e.to_string()).await;
@@ -457,13 +475,15 @@ impl Session {
         let wf_id = match workflow_id.parse() {
             Ok(id) => id,
             Err(_) => {
-                self.send_response(corr_id, false, "Invalid workflow ID".to_string()).await;
+                self.send_response(corr_id, false, "Invalid workflow ID".to_string())
+                    .await;
                 return;
             }
         };
         match crate::workflow::cancel(&wf_id) {
             Ok(()) => {
-                self.send_response(corr_id, true, "Workflow cancelled".to_string()).await;
+                self.send_response(corr_id, true, "Workflow cancelled".to_string())
+                    .await;
             }
             Err(e) => {
                 self.send_response(corr_id, false, e.to_string()).await;
@@ -475,7 +495,8 @@ impl Session {
         let wf_id: WorkflowId = match workflow_id.parse() {
             Ok(id) => id,
             Err(_) => {
-                self.send_response(corr_id, false, "Invalid workflow ID".to_string()).await;
+                self.send_response(corr_id, false, "Invalid workflow ID".to_string())
+                    .await;
                 return;
             }
         };
@@ -483,11 +504,13 @@ impl Session {
         // Authorization: only the same user can attach
         match crate::workflow::get_username(&wf_id).await {
             Ok(owner) if owner != self.username => {
-                self.send_response(corr_id, false, "Permission denied".to_string()).await;
+                self.send_response(corr_id, false, "Permission denied".to_string())
+                    .await;
                 return;
             }
             Err(_) => {
-                self.send_response(corr_id, false, "Workflow not found".to_string()).await;
+                self.send_response(corr_id, false, "Workflow not found".to_string())
+                    .await;
                 return;
             }
             _ => {}
@@ -496,7 +519,8 @@ impl Session {
         match crate::workflow::attach(&wf_id, self.id).await {
             Ok(()) => {
                 self.attached_workflows.push(wf_id);
-                self.send_response(corr_id, true, "Workflow attached".to_string()).await;
+                self.send_response(corr_id, true, "Workflow attached".to_string())
+                    .await;
             }
             Err(e) => {
                 self.send_response(corr_id, false, e.to_string()).await;
@@ -508,13 +532,15 @@ impl Session {
         let wf_id: WorkflowId = match workflow_id.parse() {
             Ok(id) => id,
             Err(_) => {
-                self.send_response(corr_id, false, "Invalid workflow ID".to_string()).await;
+                self.send_response(corr_id, false, "Invalid workflow ID".to_string())
+                    .await;
                 return;
             }
         };
 
         crate::workflow::detach(&wf_id);
         self.attached_workflows.retain(|id| id != &wf_id);
-        self.send_response(corr_id, true, "Workflow detached".to_string()).await;
+        self.send_response(corr_id, true, "Workflow detached".to_string())
+            .await;
     }
 }

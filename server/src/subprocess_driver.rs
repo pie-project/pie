@@ -8,7 +8,7 @@
 //! | Launch          | `driver_ffi::run` on a thread     | `python -m pie_driver_<flavor>`   |
 //! | Startup config  | Per-flavor TOML via `embedded_driver::write_*_startup_toml` | A flavor-neutral TOML this module writes (`write_subprocess_startup_toml`) |
 //! | Handshake       | `ready_cb(caps_json)` callback    | One JSON line per group on a pipe (fd 3) terminated by a `{"ready":true}` sentinel |
-//! | Cold-path RPC   | Standalone hosts via [`pie::device::RpcServer`] + [`crate::rpc_loop`] | Python launcher hosts its own `RpcServer` (via the `pie-rpc` wheel) inside `worker.py::_leader_loop`; standalone connects as the client |
+//! | Cold-path RPC   | Standalone hosts via [`pie::driver::RpcServer`] + [`crate::rpc_loop`] | Python launcher hosts its own `RpcServer` (via the `_rpc_native` extension bundled in `pie-driver-bridge`) inside `worker.py::_leader_loop`; standalone connects as the client |
 //! | Shmem fast path | Driver allocates `/pie_shmem_g{N}` | Same — Python `pie_driver_dev.shmem_ipc.ShmemServer` |
 //! | Stop signal     | `driver_ffi::request_stop`        | `SIGTERM` to the child            |
 //! | Watchdog        | `JoinHandle::is_finished()`       | `Child::try_wait()`               |
@@ -78,7 +78,6 @@ mod unix_impl {
     #[derive(Debug, Deserialize)]
     struct GroupLine {
         group_id: usize,
-        server_name: String,
         /// Echoed back from the launcher for cross-checking against the
         /// standalone's expectation (`/pie_shmem_g{group_id}`). Mismatch is
         /// a hard error.
@@ -89,7 +88,6 @@ mod unix_impl {
     /// Decoded handshake — what `start_one_group` returns to the caller.
     #[derive(Debug)]
     pub struct Handshake {
-        pub server_name: String,
         pub shmem_name: String,
         pub caps: DriverCapabilities,
     }
@@ -182,6 +180,13 @@ mod unix_impl {
             "ready_timeout_s".into(),
             toml::Value::Float(ready_timeout_s),
         );
+        // Channel-level wait strategy — forwarded so the Python
+        // launcher can pass to `ShmemServer`. See
+        // `pie_bridge::ipc::ShmemServer::create`.
+        driver_section.insert(
+            "spin_budget_us".into(),
+            toml::Value::Integer(model.driver.spin_budget_us as i64),
+        );
         // [driver.options] — passthrough, minus the standalone-side
         // `venv` / `python` keys (which `crate::python_resolve` consumed
         // before this function was called). The launcher's typed
@@ -209,9 +214,6 @@ mod unix_impl {
     pub struct SubprocessDriver {
         pub flavor: SubprocessFlavor,
         pub caps: DriverCapabilities,
-        /// Server name from the Python launcher's `RpcServer` (cold-path
-        /// channel). Goes straight into [`crate::bootstrap_translate::GroupHandshake`].
-        pub server_name: String,
         /// `/pie_shmem_g{group_id}` — same convention as embedded; the
         /// launcher computes it from `group_id` and echoes it back so we
         /// can cross-check.
@@ -382,7 +384,6 @@ mod unix_impl {
             Ok(SubprocessDriver {
                 flavor,
                 caps: handshake.caps,
-                server_name: handshake.server_name,
                 shmem_name: handshake.shmem_name,
                 child: Mutex::new(Some(child)),
                 _state_dir: state_dir,
@@ -560,7 +561,6 @@ mod unix_impl {
             if value.get("ready").is_some() {
                 return found
                     .map(|g| Handshake {
-                        server_name: g.server_name,
                         shmem_name: g.shmem_name,
                         caps: g.caps,
                     })
@@ -653,14 +653,13 @@ mod unix_impl {
         #[test]
         fn handshake_parses_group_then_sentinel() {
             let stream = format!(
-                "{{\"group_id\":0,\"server_name\":\"/tmp/sock\",\
+                "{{\"group_id\":0,\
               \"shmem_name\":\"/pie_shmem_g0\",\"caps\":{}}}\n\
              {{\"ready\":true,\"num_groups\":1}}\n",
                 fixture_caps_json(),
             );
             let h = read_handshake_for_group(std::io::Cursor::new(stream.into_bytes()), 0, 5.0)
                 .unwrap();
-            assert_eq!(h.server_name, "/tmp/sock");
             assert_eq!(h.shmem_name, "/pie_shmem_g0");
             assert_eq!(h.caps.total_pages, 1024);
             assert_eq!(h.caps.arch_name, "qwen3");
@@ -669,7 +668,7 @@ mod unix_impl {
         #[test]
         fn handshake_rejects_eof_before_sentinel() {
             let stream = format!(
-                "{{\"group_id\":0,\"server_name\":\"/tmp/sock\",\
+                "{{\"group_id\":0,\
               \"shmem_name\":\"/pie_shmem_g0\",\"caps\":{}}}\n",
                 fixture_caps_json(),
             );
@@ -684,7 +683,7 @@ mod unix_impl {
         #[test]
         fn handshake_rejects_wrong_group_id() {
             let stream = format!(
-                "{{\"group_id\":7,\"server_name\":\"/tmp/sock\",\
+                "{{\"group_id\":7,\
               \"shmem_name\":\"/pie_shmem_g7\",\"caps\":{}}}\n\
              {{\"ready\":true,\"num_groups\":1}}\n",
                 fixture_caps_json(),
@@ -707,7 +706,7 @@ mod unix_impl {
         }
 
         #[test]
-        fn startup_toml_uses_group_device_slice() {
+        fn startup_toml_uses_group_driver_slice() {
             let path = std::env::temp_dir().join(format!(
                 "pie-subprocess-startup-{}-{}.toml",
                 std::process::id(),
@@ -722,6 +721,7 @@ mod unix_impl {
                     tensor_parallel_size: 1,
                     activation_dtype: "bfloat16".to_string(),
                     random_seed: 42,
+                    spin_budget_us: 100,
                     options: toml::Table::new(),
                 },
                 scheduler: SchedulerConfig::default(),
@@ -816,7 +816,6 @@ use anyhow::{Result, bail};
 #[cfg(windows)]
 #[derive(Debug)]
 pub struct Handshake {
-    pub server_name: String,
     pub shmem_name: String,
     pub caps: DriverCapabilities,
 }
@@ -839,7 +838,6 @@ pub fn write_subprocess_startup_toml(
 pub struct SubprocessDriver {
     pub flavor: SubprocessFlavor,
     pub caps: DriverCapabilities,
-    pub server_name: String,
     pub shmem_name: String,
 }
 

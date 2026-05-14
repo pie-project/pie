@@ -17,8 +17,8 @@ from typing import Any
 
 import torch
 
-from pie_driver_dev.config import RuntimeConfig
-from pie_driver_dev.model.common import sample_common
+from ._bridge.config import RuntimeConfig
+from .common import sample_common
 
 from .attn_metadata import build_common_metadata
 
@@ -50,6 +50,10 @@ class VllmForwardPass:
         self.runtime_config = runtime_config
         self.model_config = model_config
         self.device = torch.device(runtime_config.device)
+        # `runtime_config.activation_dtype` is a string (bridge stays
+        # torch-free); resolve once here so the sampling hot path doesn't
+        # do a getattr per call.
+        self.activation_dtype = getattr(torch, runtime_config.activation_dtype)
 
         # Lazy: built on first transform() call so we know the resolved
         # backend (set during model construction inside set_current_vllm_config).
@@ -83,7 +87,7 @@ class VllmForwardPass:
         self._buf_max_n = max_n
         self._buf_input_embeds = torch.zeros(
             max_n, hidden_size,
-            dtype=self.runtime_config.activation_dtype,
+            dtype=self.activation_dtype,
             device=self.device,
         )
         self._buf_positions = torch.zeros(
@@ -187,7 +191,6 @@ class VllmForwardPass:
                 num_tokens=actual_n,
                 uniform_decode=False,
                 has_lora=False,
-                disable_full=False,
             )
         else:
             cg_mode, batch_desc = CUDAGraphMode.NONE, BatchDescriptor(actual_n)
@@ -271,5 +274,5 @@ class VllmForwardPass:
             sampling_metadata=sampling_metadata,
             lm_head_fn=self.model.compute_logits,
             device=self.device,
-            dtype=self.runtime_config.activation_dtype,
+            dtype=self.activation_dtype,
         )

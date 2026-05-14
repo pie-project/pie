@@ -12,9 +12,7 @@ use lru::LruCache;
 use rustc_hash::FxHasher;
 
 use crate::inference::structured::bitmask;
-use crate::inference::structured::fsm::{
-    build_rule_fsms, DfaTable, FsmEdge, Automaton, StateId,
-};
+use crate::inference::structured::fsm::{Automaton, DfaTable, FsmEdge, StateId, build_rule_fsms};
 use crate::inference::structured::grammar::Grammar;
 use crate::inference::structured::grammar::normalize::normalize_grammar;
 use crate::model::tokenizer::Tokenizer;
@@ -80,13 +78,21 @@ impl StateFlags {
     pub(crate) const PASS_THROUGH: u8 = 8;
 
     #[inline(always)]
-    pub(crate) fn has_char_edges(self) -> bool { self.0 & Self::CHAR_EDGES != 0 }
+    pub(crate) fn has_char_edges(self) -> bool {
+        self.0 & Self::CHAR_EDGES != 0
+    }
     #[inline(always)]
-    pub(crate) fn has_rule_ref(self) -> bool { self.0 & Self::RULE_REF != 0 }
+    pub(crate) fn has_rule_ref(self) -> bool {
+        self.0 & Self::RULE_REF != 0
+    }
     #[inline(always)]
-    pub(crate) fn is_accepting(self) -> bool { self.0 & Self::ACCEPTING != 0 }
+    pub(crate) fn is_accepting(self) -> bool {
+        self.0 & Self::ACCEPTING != 0
+    }
     #[inline(always)]
-    pub(crate) fn is_pass_through(self) -> bool { self.0 & Self::PASS_THROUGH != 0 }
+    pub(crate) fn is_pass_through(self) -> bool {
+        self.0 & Self::PASS_THROUGH != 0
+    }
 }
 
 /// Pre-computed action for a (rule_id, dfa_state) pair.
@@ -151,7 +157,8 @@ impl CompiledGrammar {
     /// Look up the pre-computed action for a (rule_id, dfa_state) pair.
     #[inline(always)]
     pub(crate) fn action(&self, rule_id: u16, dfa_state: u16) -> &StateAction {
-        &self.state_actions[self.state_action_offsets[rule_id as usize] as usize + dfa_state as usize]
+        &self.state_actions
+            [self.state_action_offsets[rule_id as usize] as usize + dfa_state as usize]
     }
 }
 
@@ -172,7 +179,8 @@ impl CompiledGrammar {
 
         // Build per-rule NFAs and convert to DFAs
         let nfa_fsms = build_rule_fsms(&normalized);
-        let rule_dfas: Vec<_> = nfa_fsms.iter()
+        let rule_dfas: Vec<_> = nfa_fsms
+            .iter()
             .map(|nfa| nfa.to_dfa().to_compact())
             .collect();
 
@@ -182,15 +190,23 @@ impl CompiledGrammar {
 
         // Pre-compute token masks
         let token_masks = precompute_token_masks(
-            &rule_dfas, tokenizer_info, &state_actions, &state_action_offsets,
+            &rule_dfas,
+            tokenizer_info,
+            &state_actions,
+            &state_action_offsets,
         );
 
         // Detect single-DFA: root rule has no RuleRef edges at any state
         let is_single_dfa = {
             let root_id = normalized.root_rule().0 as usize;
             let root_offset = state_action_offsets[root_id] as usize;
-            let root_end = state_action_offsets.get(root_id + 1).copied().unwrap_or(state_actions.len() as u32) as usize;
-            state_actions[root_offset..root_end].iter().all(|a| !a.flags.has_rule_ref())
+            let root_end = state_action_offsets
+                .get(root_id + 1)
+                .copied()
+                .unwrap_or(state_actions.len() as u32) as usize;
+            state_actions[root_offset..root_end]
+                .iter()
+                .all(|a| !a.flags.has_rule_ref())
         };
 
         CompiledGrammar {
@@ -219,7 +235,10 @@ impl CompiledGrammar {
 
     /// Store a computed bitmask in the cache.
     pub(crate) fn cache_bitmask(&self, key: u64, bitmask: &[u32]) {
-        let mut cache = self.bitmask_cache.write().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self
+            .bitmask_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         cache.insert(key, bitmask.to_vec());
     }
 }
@@ -230,9 +249,7 @@ impl CompiledGrammar {
 
 /// Pre-compute state actions for all (rule_id, dfa_state) pairs.
 /// Returns (flat_actions, offsets_per_rule, has_self_ref_chains).
-fn compute_state_actions(
-    rule_dfas: &[Automaton<DfaTable>],
-) -> (Vec<StateAction>, Vec<u32>, bool) {
+fn compute_state_actions(rule_dfas: &[Automaton<DfaTable>]) -> (Vec<StateAction>, Vec<u32>, bool) {
     let mut actions = Vec::new();
     let mut offsets = Vec::with_capacity(rule_dfas.len());
     let mut has_self_ref_chains = false;
@@ -263,10 +280,18 @@ fn compute_state_actions(
             let pass_through = accepting && !has_char && !has_rr;
 
             let mut flags = 0u8;
-            if has_char { flags |= StateFlags::CHAR_EDGES; }
-            if has_rr { flags |= StateFlags::RULE_REF; }
-            if accepting { flags |= StateFlags::ACCEPTING; }
-            if pass_through { flags |= StateFlags::PASS_THROUGH; }
+            if has_char {
+                flags |= StateFlags::CHAR_EDGES;
+            }
+            if has_rr {
+                flags |= StateFlags::RULE_REF;
+            }
+            if accepting {
+                flags |= StateFlags::ACCEPTING;
+            }
+            if pass_through {
+                flags |= StateFlags::PASS_THROUGH;
+            }
 
             // Pre-extract RuleRef edges
             let mut rule_refs = Vec::new();
@@ -315,7 +340,11 @@ fn classify_token(
 ) -> TokenClass {
     let mut cur = start_state;
     // Track whether any accepting state was reached (including start state for * patterns)
-    let mut saw_end = dfa.ends.get(start_state.0 as usize).copied().unwrap_or(false);
+    let mut saw_end = dfa
+        .ends
+        .get(start_state.0 as usize)
+        .copied()
+        .unwrap_or(false);
 
     for &byte in token_bytes.iter() {
         match dfa.fsm.next_state(cur, byte) {
@@ -333,7 +362,10 @@ fn classify_token(
                     return TokenClass::Uncertain;
                 }
                 // If RuleRef edges exist, a sub-rule might consume this byte.
-                if state_actions[actions_offset + cur.0 as usize].flags.has_rule_ref() {
+                if state_actions[actions_offset + cur.0 as usize]
+                    .flags
+                    .has_rule_ref()
+                {
                     return TokenClass::Uncertain;
                 }
                 return TokenClass::Rejected;
@@ -455,7 +487,8 @@ fn precompute_token_masks(
                         i += 1;
                     }
                     TokenClass::Rejected => {
-                        if bytes.len() >= 1 && dfa.fsm.next_state(dfa_state, bytes[0]).is_none()
+                        if bytes.len() >= 1
+                            && dfa.fsm.next_state(dfa_state, bytes[0]).is_none()
                             && !flags.has_rule_ref()
                         {
                             i = trie_end[i];

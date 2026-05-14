@@ -76,11 +76,7 @@ fn test_token_acceptance_sequence() {
 
 #[test]
 fn test_token_rejection() {
-    let mut m = make_matcher(
-        r#"root ::= "hello""#,
-        "root",
-        &["hello", "world"],
-    );
+    let mut m = make_matcher(r#"root ::= "hello""#, "root", &["hello", "world"]);
 
     assert!(!m.accept_token(1)); // "world" should fail
     // Parser unchanged after rejection
@@ -153,11 +149,7 @@ fn test_accept_string_rejection() {
 
 #[test]
 fn test_bitmask_simple_choices() {
-    let mut m = make_matcher(
-        r#"root ::= "ab" | "cd""#,
-        "root",
-        &["ab", "cd", "ef"],
-    );
+    let mut m = make_matcher(r#"root ::= "ab" | "cd""#, "root", &["ab", "cd", "ef"]);
 
     let mut bm = vec![0u32; bitmask::bitmask_size(3)];
     m.fill_next_token_bitmask(&mut bm);
@@ -226,7 +218,9 @@ fn test_bitmask_many_tokens() {
     let mut m = make_matcher(
         r#"root ::= "true" | "false" | "null""#,
         "root",
-        &["t", "tr", "true", "f", "fa", "false", "n", "nu", "null", "x"],
+        &[
+            "t", "tr", "true", "f", "fa", "false", "n", "nu", "null", "x",
+        ],
     );
 
     let mut bm = vec![0u32; bitmask::bitmask_size(10)];
@@ -251,11 +245,7 @@ fn test_bitmask_many_tokens() {
 
 #[test]
 fn test_rollback_single() {
-    let mut m = make_matcher(
-        r#"root ::= "abc""#,
-        "root",
-        &["a", "b", "c"],
-    );
+    let mut m = make_matcher(r#"root ::= "abc""#, "root", &["a", "b", "c"]);
 
     assert!(m.accept_token(0)); // "a"
     assert!(m.accept_token(1)); // "b"
@@ -269,11 +259,7 @@ fn test_rollback_single() {
 
 #[test]
 fn test_rollback_multiple() {
-    let mut m = make_matcher(
-        r#"root ::= "abcd""#,
-        "root",
-        &["a", "b", "c", "d"],
-    );
+    let mut m = make_matcher(r#"root ::= "abcd""#, "root", &["a", "b", "c", "d"]);
 
     assert!(m.accept_token(0)); // "a"
     assert!(m.accept_token(1)); // "b"
@@ -289,11 +275,7 @@ fn test_rollback_multiple() {
 
 #[test]
 fn test_rollback_all() {
-    let mut m = make_matcher(
-        r#"root ::= "ab""#,
-        "root",
-        &["a", "b"],
-    );
+    let mut m = make_matcher(r#"root ::= "ab""#, "root", &["a", "b"]);
 
     assert!(m.accept_token(0)); // "a"
     assert!(m.accept_token(1)); // "b"
@@ -308,11 +290,7 @@ fn test_rollback_all() {
 
 #[test]
 fn test_rollback_with_different_path() {
-    let mut m = make_matcher(
-        r#"root ::= "abc" | "abd""#,
-        "root",
-        &["a", "b", "c", "d"],
-    );
+    let mut m = make_matcher(r#"root ::= "abc" | "abd""#, "root", &["a", "b", "c", "d"]);
 
     assert!(m.accept_token(0)); // "a"
     assert!(m.accept_token(1)); // "b"
@@ -331,11 +309,7 @@ fn test_rollback_with_different_path() {
 
 #[test]
 fn test_reset() {
-    let mut m = make_matcher(
-        r#"root ::= "ab""#,
-        "root",
-        &["a", "b"],
-    );
+    let mut m = make_matcher(r#"root ::= "ab""#, "root", &["a", "b"]);
 
     assert!(m.accept_token(0)); // "a"
     assert!(m.accept_token(1)); // "b"
@@ -355,12 +329,7 @@ fn test_reset() {
 
 #[test]
 fn test_termination_with_stop_token() {
-    let mut m = make_matcher_with_stop(
-        r#"root ::= "hello""#,
-        "root",
-        &["hello", "<eos>"],
-        vec![1],
-    );
+    let mut m = make_matcher_with_stop(r#"root ::= "hello""#, "root", &["hello", "<eos>"], vec![1]);
 
     assert!(!m.is_terminated());
     assert!(m.accept_token(0)); // "hello"
@@ -398,11 +367,7 @@ fn test_stop_token_rejected_when_incomplete() {
 
 #[test]
 fn test_jump_forward_deterministic() {
-    let mut m = make_matcher(
-        r#"root ::= "hello""#,
-        "root",
-        &["hello"],
-    );
+    let mut m = make_matcher(r#"root ::= "hello""#, "root", &["hello"]);
 
     let jf = m.find_jump_forward_string();
     assert_eq!(jf, "hello");
@@ -422,11 +387,7 @@ fn test_jump_forward_partial() {
 
 #[test]
 fn test_jump_forward_after_accept() {
-    let mut m = make_matcher(
-        r#"root ::= "ab" "cd""#,
-        "root",
-        &["ab", "cd"],
-    );
+    let mut m = make_matcher(r#"root ::= "ab" "cd""#, "root", &["ab", "cd"]);
 
     m.accept_token(0); // "ab"
     let jf = m.find_jump_forward_string();
@@ -435,11 +396,7 @@ fn test_jump_forward_after_accept() {
 
 #[test]
 fn test_jump_forward_with_choices() {
-    let mut m = make_matcher(
-        r#"root ::= "a" | "b""#,
-        "root",
-        &["a", "b"],
-    );
+    let mut m = make_matcher(r#"root ::= "a" | "b""#, "root", &["a", "b"]);
 
     let jf = m.find_jump_forward_string();
     // Multiple choices → empty jump forward
@@ -448,11 +405,7 @@ fn test_jump_forward_with_choices() {
 
 #[test]
 fn test_jump_forward_does_not_advance_parser() {
-    let mut m = make_matcher(
-        r#"root ::= "hello""#,
-        "root",
-        &["hello"],
-    );
+    let mut m = make_matcher(r#"root ::= "hello""#, "root", &["hello"]);
 
     let jf1 = m.find_jump_forward_string();
     let jf2 = m.find_jump_forward_string();
@@ -469,11 +422,7 @@ fn test_jump_forward_does_not_advance_parser() {
 
 #[test]
 fn test_accept_rollback_bitmask() {
-    let mut m = make_matcher(
-        r#"root ::= "abc""#,
-        "root",
-        &["a", "b", "c", "x"],
-    );
+    let mut m = make_matcher(r#"root ::= "abc""#, "root", &["a", "b", "c", "x"]);
 
     let mut bm = vec![0u32; bitmask::bitmask_size(4)];
 
@@ -514,11 +463,7 @@ fn test_multitoken_string() {
 
 #[test]
 fn test_char_class_star_bitmask() {
-    let mut m = make_matcher(
-        r#"root ::= [a-z]*"#,
-        "root",
-        &["a", "b", "abc", "1", "A"],
-    );
+    let mut m = make_matcher(r#"root ::= [a-z]*"#, "root", &["a", "b", "abc", "1", "A"]);
 
     let mut bm = vec![0u32; bitmask::bitmask_size(5)];
     m.fill_next_token_bitmask(&mut bm);
@@ -636,17 +581,16 @@ fn test_json_rollback_and_bitmask_consistency() {
     let mut bm_again = vec![0u32; bm_size];
     m.fill_next_token_bitmask(&mut bm_again);
 
-    assert_eq!(bm_after, bm_again, "bitmask should be identical after rollback + re-accept");
+    assert_eq!(
+        bm_after, bm_again,
+        "bitmask should be identical after rollback + re-accept"
+    );
 }
 
 #[test]
 fn test_graceful_rollback_after_failed_token() {
     // After a token fails, the matcher should gracefully rollback
-    let mut m = make_matcher(
-        r#"root ::= "ab" | "ac""#,
-        "root",
-        &["a", "b", "c", "d"],
-    );
+    let mut m = make_matcher(r#"root ::= "ab" | "ac""#, "root", &["a", "b", "c", "d"]);
 
     assert!(m.accept_token(0)); // "a"
 

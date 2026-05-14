@@ -12,12 +12,14 @@ import random
 import numpy as np
 import torch
 
-from .config import NativeRuntimeConfig as RuntimeConfig
+from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
+from ._bridge.batching import Batch
 from .loader import ModelLoader
 from .adapter import AdapterSubpass, CmaesAdapter
+from . import batch_tensors
 from . import model as model_registry
 from . import hf_utils
-from . import telemetry
+from ._bridge import telemetry
 
 
 class Engine:
@@ -278,7 +280,91 @@ class Engine:
     # Inference
     # ========================================================================
 
+    # ========================================================================
+    # KV swap — page copies. Bridge stays torch-free; the index_copy_ calls
+    # live here next to the engine that owns the GPU and pinned-host KV
+    # tensors.
+    # ========================================================================
+
+    def kv_copy_d2h(self, phys_ids: list[int], slots: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        host_kv = self.kv_cache_at_layer_host
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for p in phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"swap_out: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"swap_out: CPU slot {s} out of bounds [0, {max_cpu})")
+        src = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(slots, dtype=torch.long)
+        for layer_idx in range(len(gpu_kv)):
+            host_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src].cpu())
+
+    def kv_copy_h2d(self, phys_ids: list[int], slots: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        host_kv = self.kv_cache_at_layer_host
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for p in phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"swap_in: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"swap_in: CPU slot {s} out of bounds [0, {max_cpu})")
+        dst = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        src = torch.tensor(slots, dtype=torch.long)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src].to(gpu_kv[layer_idx].device))
+
+    def kv_copy_d2d(self, src_phys_ids: list[int], dst_phys_ids: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        max_gpu = gpu_kv[0].shape[0]
+        for p in src_phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d: src phys_id {p} out of bounds [0, {max_gpu})")
+        for p in dst_phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d: dst phys_id {p} out of bounds [0, {max_gpu})")
+        src = torch.tensor(src_phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(dst_phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
+
+    def kv_copy_h2h(self, src_slots: list[int], dst_slots: list[int]) -> None:
+        host_kv = self.kv_cache_at_layer_host
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for s in src_slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2h: src slot {s} out of bounds [0, {max_cpu})")
+        for s in dst_slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2h: dst slot {s} out of bounds [0, {max_cpu})")
+        src = torch.tensor(src_slots, dtype=torch.long)
+        dst = torch.tensor(dst_slots, dtype=torch.long)
+        for layer_idx in range(len(host_kv)):
+            host_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src])
+
     @torch.inference_mode()
+    def build_model_inputs(self, batch: Batch) -> dict:
+        """Materialize a Batch into the dict of torch tensors `fire_batch` expects."""
+        if batch.has_speculative_inputs:
+            return batch_tensors.build_spec_expanded_model_inputs(
+                batch, self.config.device
+            )
+        return batch_tensors.build_model_inputs(batch, self.config.device)
+
+    def build_sampling_metadata(self, batch: Batch) -> dict:
+        """Materialize a Batch into the sampling-metadata dict `fire_batch` expects."""
+        if batch.has_speculative_inputs:
+            return batch_tensors.build_spec_expanded_sampling_metadata(
+                batch, self.config.device, self.config.activation_dtype
+            )
+        return batch_tensors.build_sampling_metadata(
+            batch, self.config.device, self.config.activation_dtype
+        )
+
     def fire_batch(self, inputs: dict, sampling_metadata: dict) -> list:
         """Execute a single inference step (Embed → Transform → Sample).
 
@@ -307,7 +393,7 @@ class Engine:
             )
 
         # Bounds-check kv_page_indices/indptr/last_page_lens. The caller
-        # (Batch.get_model_inputs) is expected to attach pre-computed CPU
+        # (batch_tensors.build_model_inputs) is expected to attach pre-computed CPU
         # min/max in `inputs` so we don't have to issue 6 CUDA syncs every
         # forward pass. Falls back to GPU `.item()` if the precomputed
         # values are absent (legacy paths).
@@ -479,9 +565,9 @@ class Engine:
     def capabilities(self):
         """Report this driver's resolved capacities up to pie's runtime.
 
-        See `pie_driver_dev.capabilities.DriverCapabilities` for the contract.
+        See `pie_driver_dev._bridge.capabilities.DriverCapabilities` for the contract.
         """
-        from pie_driver_dev.capabilities import DriverCapabilities
+        from ._bridge.capabilities import DriverCapabilities
 
         hf_cfg = self.info.get("hf_config", {}) if isinstance(self.info, dict) else {}
         # max_model_len: prefer max_position_embeddings; some configs use

@@ -8,7 +8,7 @@ namespace pie_cuda_driver::brle {
 namespace {
 
 // Per-request KV length: (num_pages - 1) * page_size + last_page_len.
-// Returns the *post-write* length (matches BPIQ semantics).
+// Returns the *post-write* length (matches wire semantics).
 int kv_len_for(
     int r, int page_size,
     std::span<const std::uint32_t> kv_page_indptr_h,

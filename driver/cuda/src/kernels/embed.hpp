@@ -4,7 +4,7 @@
 //
 //     y[n, h] = weight[token_ids[n], h]
 //
-// `token_ids` is i32 (matches BPIQ A_TOKEN_IDS dtype). `weight` and `y` are
+// `token_ids` is i32 (matches wire A_TOKEN_IDS dtype). `weight` and `y` are
 // bf16 row-major.
 
 #include <cstdint>

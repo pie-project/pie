@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <condition_variable>
 #include <iostream>
@@ -23,15 +25,12 @@
 #include "distributed.hpp"
 #include "engine.hpp"
 #include "kv_cache.hpp"
-#include "msgpack_subpass.hpp"
+#include "response_subpass.hpp"
 #include "model/qwen3.hpp"
 #include "model/qwen3_forward.hpp"
 #include "ops/gemm.hpp"
-#include "response_writer.hpp"
 #include "sampler_type.hpp"
 #include "sampling_dispatch.hpp"
-#include "shmem_ipc.hpp"
-#include "shmem_schema.hpp"
 #include "spec_expansion.hpp"
 
 namespace pie_cuda_driver {
@@ -189,12 +188,45 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
 
 }  // namespace
 
-std::size_t handle_fire_batch(
-    const SlotRequest& req,
-    std::span<std::uint8_t> response,
+// Per-stage timing instrumentation. Logged every ~50 fires so the
+// throughput bench's per-fire timeline shows where the host overhead
+// goes between flashinfer's plan, the GPU sync, and msgpack
+// encode/decode. Toggle by setting PIE_TIMING=1 in the env.
+struct FireTiming {
+    std::uint64_t t_start_us;
+    std::uint64_t t_after_parse_us;
+    std::uint64_t t_after_views_us;
+    std::uint64_t t_after_uploads_us;
+    std::uint64_t t_after_prepare_us;
+    std::uint64_t t_after_launch_us;
+    std::uint64_t t_after_sync_us;
+    std::uint64_t t_after_response_us;
+    int R;
+    int N;
+};
+
+inline std::uint64_t fire_now_us() noexcept {
+    using namespace std::chrono;
+    return duration_cast<microseconds>(
+               steady_clock::now().time_since_epoch()).count();
+}
+
+inline bool fire_timing_enabled() {
+    static const bool enabled = std::getenv("PIE_TIMING") != nullptr;
+    return enabled;
+}
+
+void handle_fire_batch(
+    std::uint32_t req_id,
+    const pie_driver::PieForwardRequestView& view,
+    pie_driver::PieForwardResponseView& out_resp,
     ForwardContext& ctx,
     std::uint64_t handled)
 {
+    FireTiming tm{};
+    const bool tm_on = fire_timing_enabled();
+    if (tm_on) tm.t_start_us = fire_now_us();
+
     // Local references so the (lifted) body uses the same names it had
     // when it lived as a `[&]`-capturing lambda in main.cpp. Avoids a
     // mechanical rename across ~900 lines.
@@ -216,39 +248,68 @@ std::size_t handle_fire_batch(
     int mask_indptr_count = 0;
 
     try {
-        namespace S = pie_cuda_driver::schema;
-        const auto dec = S::decode_request(req.payload);
+        const auto tok_view_orig   = view.token_ids.as<std::uint32_t>();
+        const auto pos_view_orig   = view.position_ids.as<std::uint32_t>();
+        const auto qo_view_orig    = view.qo_indptr.as<std::uint32_t>();
+        const auto kvpi_view = view.kv_page_indices.as<std::uint32_t>();
+        const auto kvpp_view = view.kv_page_indptr.as<std::uint32_t>();
+        const auto kvlpl_view_orig = view.kv_last_page_lens.as<std::uint32_t>();
 
-        const auto tok_view_orig   = dec.as<std::uint32_t>(S::A_TOKEN_IDS);
-        const auto pos_view_orig   = dec.as<std::uint32_t>(S::A_POSITION_IDS);
-        const auto qo_view_orig    = dec.as<std::uint32_t>(S::A_QO_INDPTR);
-        const auto kvpi_view = dec.as<std::uint32_t>(S::A_KV_PAGE_INDICES);
-        const auto kvpp_view = dec.as<std::uint32_t>(S::A_KV_PAGE_INDPTR);
-        const auto kvlpl_view_orig = dec.as<std::uint32_t>(S::A_KV_LAST_PAGE_LENS);
-        const auto sidx_view_orig  = dec.as<std::uint32_t>(S::A_SAMPLING_INDICES);
-        const auto sptr_view_orig  = dec.as<std::uint32_t>(S::A_SAMPLING_INDPTR);
+        // Wire-trace, enabled via `PIE_CUDA_TRACE_KV=1`. Used during the
+        // 2026-05-14 diagnosis that proved cuda's multi-token prefill is
+        // broken (produces token-0 argmax) while the bridge wire is
+        // identical to portable's. Kept in tree as a low-cost diagnostic.
+        if (std::getenv("PIE_CUDA_TRACE_KV")) {
+            const auto sidx_trace = view.sampling_indices.as<std::uint32_t>();
+            const auto sptr_trace = view.sampling_indptr.as<std::uint32_t>();
+            const auto types_trace = view.sampler_types.as<std::uint32_t>();
+            const auto temp_trace = view.sampler_temperatures.as<float>();
+            std::cerr << "[cuda-trace] req: tokens=[";
+            for (auto t : tok_view_orig) std::cerr << t << ",";
+            std::cerr << "] positions=[";
+            for (auto p : pos_view_orig) std::cerr << p << ",";
+            std::cerr << "] qo_indptr=[";
+            for (auto q : qo_view_orig) std::cerr << q << ",";
+            std::cerr << "] sampling_indices=[";
+            for (auto s : sidx_trace) std::cerr << s << ",";
+            std::cerr << "] sampling_indptr=[";
+            for (auto s : sptr_trace) std::cerr << s << ",";
+            std::cerr << "] sampler_types=[";
+            for (auto s : types_trace) std::cerr << s << ",";
+            std::cerr << "] sampler_temps=[";
+            for (auto s : temp_trace) std::cerr << s << ",";
+            std::cerr << "] kv_pages=[";
+            for (auto k : kvpi_view) std::cerr << k << ",";
+            std::cerr << "] kv_indptr=[";
+            for (auto k : kvpp_view) std::cerr << k << ",";
+            std::cerr << "] kv_last_lens=[";
+            for (auto k : kvlpl_view_orig) std::cerr << k << ",";
+            std::cerr << "]\n";
+        }
+        const auto sidx_view_orig  = view.sampling_indices.as<std::uint32_t>();
+        const auto sptr_view_orig  = view.sampling_indptr.as<std::uint32_t>();
         // Per-request stable context ids — used to drive the linear-attn
         // state-cache slot allocator below.
-        const auto ctx_id_view     = dec.as<std::uint64_t>(S::A_CONTEXT_IDS);
+        const auto ctx_id_view     = view.context_ids.as<std::uint64_t>();
 
-        // Sampler params (per-sampler arrays in BPIQ wire). Decoded here
-        // (rather than further down) so the spec expansion below can
-        // append cloned entries for the verification block.
-        const auto temp_view_orig  = dec.as<float>(S::A_SAMPLER_TEMPERATURES);
-        const auto top_k_view_orig = dec.as<std::uint32_t>(S::A_SAMPLER_TOP_K);
-        const auto top_p_view_orig = dec.as<float>(S::A_SAMPLER_TOP_P);
-        const auto min_p_view_orig = dec.as<float>(S::A_SAMPLER_MIN_P);
-        const auto types_view_orig = dec.as<std::uint32_t>(S::A_SAMPLER_TYPES);
-        const auto seed_view_orig  = dec.as<std::uint32_t>(S::A_SAMPLER_SEEDS);
-        const auto rns_view_orig   = dec.as<std::uint32_t>(S::A_REQUEST_NUM_SAMPLERS);
+        // Sampler params (per-sampler arrays). Read here (rather than
+        // further down) so the spec expansion below can append cloned
+        // entries for the verification block.
+        const auto temp_view_orig  = view.sampler_temperatures.as<float>();
+        const auto top_k_view_orig = view.sampler_top_k.as<std::uint32_t>();
+        const auto top_p_view_orig = view.sampler_top_p.as<float>();
+        const auto min_p_view_orig = view.sampler_min_p.as<float>();
+        const auto types_view_orig = view.sampler_types.as<std::uint32_t>();
+        const auto seed_view_orig  = view.sampler_seeds.as<std::uint32_t>();
+        const auto rns_view_orig   = view.request_num_samplers.as<std::uint32_t>();
 
-        // Spec-decoding wire fields. When non-empty for some request,
-        // splice drafts into the forward and append a verification
-        // block to the sampling layout (one extra sample per draft +
-        // one bonus). Mirrors pie_driver's `get_spec_expanded_*`.
-        const auto spec_tok_view  = dec.as<std::uint32_t>(S::A_SPEC_TOKEN_IDS);
-        const auto spec_pos_view  = dec.as<std::uint32_t>(S::A_SPEC_POSITION_IDS);
-        const auto spec_iptr_view = dec.as<std::uint32_t>(S::A_SPEC_INDPTR);
+        // Spec-decoding fields. When non-empty for some request, splice
+        // drafts into the forward and append a verification block to
+        // the sampling layout (one extra sample per draft + one bonus).
+        // Mirrors pie_driver's `get_spec_expanded_*`.
+        const auto spec_tok_view  = view.spec_token_ids.as<std::uint32_t>();
+        const auto spec_pos_view  = view.spec_position_ids.as<std::uint32_t>();
+        const auto spec_iptr_view = view.spec_indptr.as<std::uint32_t>();
         const bool has_spec_drafts = !spec_tok_view.empty();
 
         const int R = static_cast<int>(qo_view_orig.size()) - 1;
@@ -256,7 +317,7 @@ std::size_t handle_fire_batch(
         // Spec-decoding batch expansion. When `has_spec_drafts` is false
         // the result has empty vectors and `verify_slot_start[r] == -1`
         // for every r; the active spans below fall through to the
-        // original BPIQ views.
+        // original wire views.
         const SpecExpansion spec = expand_spec_batch(
             SpecExpansionInputs{
                 tok_view_orig, pos_view_orig, qo_view_orig, kvlpl_view_orig,
@@ -271,7 +332,7 @@ std::size_t handle_fire_batch(
         const std::vector<int>& verify_n_drafts   = spec.verify_n_drafts;
 
         // Active views: spec-expanded if drafts present, else direct
-        // BPIQ wire. The rest of the function uses these.
+        // wire. The rest of the function uses these.
         const std::span<const std::uint32_t> tok_view   = spec.has_drafts ? std::span<const std::uint32_t>(spec.tokens)               : tok_view_orig;
         const std::span<const std::uint32_t> pos_view   = spec.has_drafts ? std::span<const std::uint32_t>(spec.positions)            : pos_view_orig;
         const std::span<const std::uint32_t> qo_view    = spec.has_drafts ? std::span<const std::uint32_t>(spec.qo_indptr)            : qo_view_orig;
@@ -290,15 +351,16 @@ std::size_t handle_fire_batch(
         const int num_sampling = static_cast<int>(sidx_view.size());
 
         if (N == 0 || R <= 0) {
-            // Empty batch — emit a zero-token flat response.
-            std::vector<std::uint32_t> counts(std::max(R, 0), 0u);
-            return pie_cuda_driver::response::write_flat_response(
-                response, counts, {});
+            // Empty batch — emit a zero-request response view.
+            std::vector<pie_driver::PerRequestOutput> empty(std::max(R, 0));
+            ctx.response_builder.build(empty, out_resp);
+            return;
         }
         if (N > max_workspace_tokens) {
             std::cerr << "[pie-driver-cuda] batch tokens=" << N
                       << " exceeds workspace=" << max_workspace_tokens << "\n";
-            return 0;
+            out_resp = pie_driver::PieForwardResponseView{};
+            return;
         }
 
         // Compute max KV length across requests for shmem sizing.
@@ -319,7 +381,8 @@ std::size_t handle_fire_batch(
             if (h_qo[r + 1] - h_qo[r] != 1u) is_pure_decode = false;
         }
 
-        // Refill persistent device buffers with this fire's BPIQ inputs.
+        if (tm_on) tm.t_after_parse_us = fire_now_us();
+        // Refill persistent device buffers with this fire's wire inputs.
         // Same device addresses every fire — required for graph-replay
         // safety; cheap (single async memcpy each) on its own.
         pi.tokens.copy_from_host(tok_view);
@@ -335,8 +398,8 @@ std::size_t handle_fire_batch(
         // doesn't support custom masks; we proceed without one (a
         // limitation we'd have to fix by routing decode through the
         // prefill kernel for custom-mask inferlets).
-        const auto fmask_view  = dec.as<std::uint32_t>(S::A_FLATTENED_MASKS);
-        const auto mskptr_view = dec.as<std::uint32_t>(S::A_MASK_INDPTR);
+        const auto fmask_view  = view.flattened_masks.as<std::uint32_t>();
+        const auto mskptr_view = view.mask_indptr.as<std::uint32_t>();
         if (has_spec_drafts) {
             // Spec mode: synthesize a causal mask for the expanded
             // sequence directly (bypasses BRLE decode). This mirrors
@@ -441,14 +504,140 @@ std::size_t handle_fire_batch(
                                 /*stream=*/nullptr);
         }
 
+        // ── Sample-plan construction (hoisted) ──────────────────
+        // The body call below is wrapped in a CUDA-graph capture region
+        // when `forward_fn.graph_safe`. For the captured graph to
+        // include the sampling kernel + scatter (so we don't pay
+        // per-fire kernel-launch overhead on the sampling step either),
+        // the per-row sampler params must be uploaded to `pi.sample_*`
+        // BEFORE we begin capture. So: build the host-side plan here,
+        // then upload via cudaMemcpyAsync on the default stream — same
+        // pattern as `pi.tokens.copy_from_host` for the wire payload.
+        // Legacy-default-stream semantics keep the captured kernel
+        // (on `cstream`) ordered after the upload.
+        const auto outspec_view = view.output_spec_flags.as<std::uint8_t>();
+        bool need_msgpack = false;
+        for (auto t : types_view) {
+            if (pie_cuda_driver::is_msgpack_only(t)) { need_msgpack = true; break; }
+        }
+        if (!need_msgpack) {
+            for (auto f : outspec_view) {
+                if (f) { need_msgpack = true; break; }
+            }
+        }
+        if (has_spec_drafts) need_msgpack = true;
+
+        std::vector<float> h_per_temp(N, 0.f);
+        std::vector<float> h_per_min_p(N, 0.f);
+        std::vector<float> h_per_top_p(N, 1.f);
+        std::vector<std::int32_t> h_per_top_k(N, 0);
+        std::vector<std::uint32_t> h_per_seed(N, 0u);
+
+        const std::uint32_t* h_sptr  = sptr_view.data();
+        const std::uint32_t* h_sidx  = sidx_view.data();
+        const std::uint32_t* h_rns   = rns_view.data();
+        const float*         h_temp  = temp_view.data();
+        const std::uint32_t* h_top_k = top_k_view.data();
+        const float*         h_top_p = top_p_view.data();
+        const float*         h_min_p = min_p_view.data();
+        const std::uint32_t* h_seed  = seed_view.data();
+
+        std::vector<std::uint32_t> per_slot_type(num_sampling, 1u);
+        std::vector<float>         per_slot_temp (num_sampling, 0.f);
+        std::vector<float>         per_slot_top_p(num_sampling, 1.f);
+        std::vector<float>         per_slot_min_p(num_sampling, 0.f);
+        std::vector<std::int32_t>  per_slot_top_k(num_sampling, 0);
+        std::vector<std::uint32_t> per_slot_seed (num_sampling, 0u);
+
+        bool any_topk_topp = false;
+        {
+            std::uint32_t sampler_off = 0;
+            for (int r = 0; r < R; ++r) {
+                const std::uint32_t ns =
+                    (rns_view.size() > static_cast<std::size_t>(r)) ? h_rns[r] : 0u;
+                const std::uint32_t lo = h_sptr[r];
+                const std::uint32_t hi = h_sptr[r + 1];
+                const std::uint32_t qo_lo = h_qo[r];
+                for (std::uint32_t k = lo; k < hi; ++k) {
+                    const std::uint32_t s_idx = sampler_off + (k - lo);
+                    const std::uint32_t type =
+                        (s_idx < types_view.size()) ? types_view[s_idx] : 1u;
+                    per_slot_type[k] = type;
+                    const float T = (s_idx < temp_view.size()) ? h_temp[s_idx] : 1.f;
+                    const float Tp = (s_idx < top_p_view.size()) ? h_top_p[s_idx] : 1.f;
+                    const float Mp = (s_idx < min_p_view.size()) ? h_min_p[s_idx] : 0.f;
+                    const std::int32_t Tk_raw = (s_idx < top_k_view.size())
+                        ? static_cast<std::int32_t>(h_top_k[s_idx]) : 0;
+                    const std::int32_t Tk =
+                        (Tk_raw == 0) ? engine.hf_config().vocab_size : Tk_raw;
+                    const std::uint32_t s = (s_idx < seed_view.size()) ? h_seed[s_idx] : 0u;
+                    per_slot_temp[k] = T;
+                    per_slot_top_p[k] = Tp;
+                    per_slot_min_p[k] = Mp;
+                    per_slot_top_k[k] = Tk;
+                    per_slot_seed[k] = s;
+                    const bool is_token = pie_cuda_driver::is_token_sampler(type);
+                    if (is_token) {
+                        if ((Tk_raw > 0 || Tp < 1.f) && T > 0.f) any_topk_topp = true;
+                        const std::uint32_t row = qo_lo + h_sidx[k];
+                        if (row < static_cast<std::uint32_t>(N)) {
+                            h_per_temp[row]  = T;
+                            h_per_top_k[row] = Tk;
+                            h_per_top_p[row] = Tp;
+                            h_per_min_p[row] = Mp;
+                            h_per_seed[row]  = s;
+                        }
+                    }
+                }
+                sampler_off += ns;
+            }
+        }
+
+        // Per-slot → row mapping for the topk+top-p scatter. Built
+        // unconditionally so the sampling-dispatch entry has a uniform
+        // input shape.
+        std::vector<std::int32_t> h_sample_idx(num_sampling, 0);
+        {
+            int k_g = 0;
+            for (int r = 0; r < R; ++r) {
+                const std::uint32_t qo_lo = h_qo[r];
+                for (std::uint32_t k = h_sptr[r]; k < h_sptr[r + 1]; ++k, ++k_g) {
+                    h_sample_idx[k_g] =
+                        static_cast<std::int32_t>(qo_lo + h_sidx[k]);
+                }
+            }
+        }
+
+        const SamplingPlan sample_plan{
+            any_topk_topp,
+            std::span<const float>(h_per_temp),
+            std::span<const float>(h_per_top_p),
+            std::span<const float>(h_per_min_p),
+            std::span<const std::int32_t>(h_per_top_k),
+            std::span<const std::uint32_t>(h_per_seed),
+            std::span<const std::int32_t>(h_sample_idx),
+        };
+
         // ── prepare hook ────────────────────────────────────────
         // Always run the per-arch prepare phase first (when present).
         // For graph-capable archs this updates pinned host / device
         // plan state for the captured body to read. Lives outside any
         // capture region so the host work re-runs every fire.
+        if (tm_on) tm.t_after_views_us = fire_now_us();
         if (forward_fn.prepare) {
             forward_fn.prepare(attn_ws, h_kvpp, R, is_pure_decode);
         }
+        if (tm_on) tm.t_after_prepare_us = fire_now_us();
+
+        // ── Upload sampling inputs (must precede capture) ──────
+        // Per-row sampler params land in `pi.sample_*`. We do this on
+        // the default stream so the captured body's sampling kernel —
+        // launched on `cstream` — sees the fresh values via legacy
+        // default-stream ordering. Doing the upload INSIDE capture
+        // would dangling-reference the host-side `h_per_*` vectors on
+        // replay (they're per-fire stack locals).
+        upload_sampling_inputs(pi, sample_plan, N, /*stream=*/nullptr);
+        if (tm_on) tm.t_after_uploads_us = fire_now_us();
 
         // ── Forward pass ────────────────────────────────────────
         // Graph-capture path activates only when the arch declares
@@ -467,8 +656,23 @@ std::size_t handle_fire_batch(
                 // Persistent inputs (pi.*) provide stable kernel-arg
                 // pointers; the next replay reads new contents from the
                 // same addresses, refreshed by `prepare` above.
+                //
+                // Bind cuBLAS to `cstream` for the duration of capture
+                // so its kernel launches are recorded onto the captured
+                // graph rather than slipping onto the default stream.
+                // Relaxed mode allows cross-stream operations during
+                // capture but only operations on the captured stream
+                // (or streams joined to it) make it into the graph.
                 cudaStream_t cstream = nullptr;
                 CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
+                // Upload sampling params on `cstream` so the cudaMemcpyAsync
+                // calls inside `dispatch_sampling` are recorded into the
+                // graph rather than slipping onto the default stream.
+                // For replay, the host-side handler re-uploads via the
+                // same dispatch_sampling call on the same stream — the
+                // captured memcpy nodes copy from the same host pointers
+                // each time, which CUDA Graph handles via pinned-staging.
+                cublas.set_stream(cstream);
                 CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
                 forward_fn.body(
                     ws, kv_cache, attn_ws, cublas,
@@ -481,8 +685,19 @@ std::size_t handle_fire_batch(
                     use_slots ? slot_ids_h.data() : nullptr,
                     use_slots ? is_fresh_h.data() : nullptr,
                     use_slots ? pi.slot_ids.data() : nullptr);
+                // Sampling kernel + on-device scatter live inside the
+                // captured graph. `pi.sample_*` were uploaded on the
+                // default stream just before this block; legacy-default-
+                // stream semantics order them before the captured
+                // kernel even though the upload itself is not captured.
+                launch_sampling_kernel(
+                    ws, pi.sampled.data(), pi, sample_plan,
+                    N, num_sampling, engine.hf_config().vocab_size,
+                    /*prng_offset=*/static_cast<std::uint64_t>(handled),
+                    /*stream=*/cstream);
                 cudaGraph_t graph = nullptr;
                 CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
+                cublas.set_stream(nullptr);
                 CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
                 cudaGraphDestroy(graph);
                 cudaStreamDestroy(cstream);
@@ -510,151 +725,34 @@ std::size_t handle_fire_batch(
                 use_slots ? slot_ids_h.data() : nullptr,
                 use_slots ? is_fresh_h.data() : nullptr,
                 use_slots ? pi.slot_ids.data() : nullptr);
+            launch_sampling_kernel(
+                ws, pi.sampled.data(), pi, sample_plan,
+                N, num_sampling, engine.hf_config().vocab_size,
+                /*prng_offset=*/static_cast<std::uint64_t>(handled),
+                /*stream=*/cublas.stream());
         }
 
-        // Sampler param views (temp_view, top_k_view, …, rns_view) were
-        // hoisted to the top of the request handler to support the spec
-        // expansion. Only `outspec_view` is decoded here.
-        const auto outspec_view = dec.as<std::uint8_t>(S::A_OUTPUT_SPEC_FLAGS);
-
-        // Detect msgpack slow path. Sampler types {0, 7, 8, 9, 10} cover
-        // Logprob / Logprobs / RawLogits / Entropy / dist-output. Output
-        // spec flags trigger the slow path too. Mirrors Python's
-        // `_SPECIAL_SAMPLERS` predicate in shmem_schema.py.
-        bool need_msgpack = false;
-        for (auto t : types_view) {
-            if (pie_cuda_driver::is_msgpack_only(t)) { need_msgpack = true; break; }
-        }
-        if (!need_msgpack) {
-            for (auto f : outspec_view) {
-                if (f) { need_msgpack = true; break; }
-            }
-        }
-        // Spec verification produces variable-length per-request token
-        // lists (the accepted prefix). The runtime detects this via
-        // tokens.len() != expected_token_slots, but the flat path bakes
-        // per_request_counts from the sampling layout — wrong for spec.
-        // Force msgpack so we can write per_req[r].tokens precisely.
-        if (has_spec_drafts) need_msgpack = true;
-
-        std::vector<float> h_per_temp(N, 0.f);
-        std::vector<float> h_per_min_p(N, 0.f);
-        std::vector<float> h_per_top_p(N, 1.f);
-        std::vector<std::int32_t> h_per_top_k(N, 0);
-        std::vector<std::uint32_t> h_per_seed(N, 0u);
-
-        const std::uint32_t* h_sptr  = sptr_view.data();
-        const std::uint32_t* h_sidx  = sidx_view.data();
-        const std::uint32_t* h_rns   = rns_view.data();
-        const float*         h_temp  = temp_view.data();
-        const std::uint32_t* h_top_k = top_k_view.data();
-        const float*         h_top_p = top_p_view.data();
-        const float*         h_min_p = min_p_view.data();
-        const std::uint32_t* h_seed  = seed_view.data();
-
-        // Per-slot sampler type. Each (sampling_index, sampler) pair is
-        // one slot, and `request_num_samplers[r]` == sampling_indptr step
-        // for r — so global slot k maps to global sampler index
-        // `sampler_off(r) + (k - h_sptr[r])`.
-        std::vector<std::uint32_t> per_slot_type(num_sampling, 1u);
-        // Per-slot sampler params (used by token samplers; ignored
-        // for special types but kept aligned for indexing simplicity).
-        std::vector<float>         per_slot_temp (num_sampling, 0.f);
-        std::vector<float>         per_slot_top_p(num_sampling, 1.f);
-        std::vector<float>         per_slot_min_p(num_sampling, 0.f);
-        std::vector<std::int32_t>  per_slot_top_k(num_sampling, 0);
-        std::vector<std::uint32_t> per_slot_seed (num_sampling, 0u);
-
-        bool any_topk_topp = false;
-        std::uint32_t sampler_off = 0;
-        for (int r = 0; r < R; ++r) {
-            const std::uint32_t ns =
-                (rns_view.size() > static_cast<std::size_t>(r)) ? h_rns[r] : 0u;
-            const std::uint32_t lo = h_sptr[r];
-            const std::uint32_t hi = h_sptr[r + 1];
-            const std::uint32_t qo_lo = h_qo[r];
-            for (std::uint32_t k = lo; k < hi; ++k) {
-                const std::uint32_t s_idx = sampler_off + (k - lo);
-                const std::uint32_t type =
-                    (s_idx < types_view.size()) ? types_view[s_idx] : 1u;
-                per_slot_type[k] = type;
-
-                const float T = (s_idx < temp_view.size()) ? h_temp[s_idx] : 1.f;
-                const float Tp = (s_idx < top_p_view.size()) ? h_top_p[s_idx] : 1.f;
-                const float Mp = (s_idx < min_p_view.size()) ? h_min_p[s_idx] : 0.f;
-                // BPIQ uses 0 to mean "no top-k filter"; flashinfer
-                // interprets 0 as "keep zero tokens" (always returns 0).
-                // Map to vocab so the filter is a no-op.
-                const std::int32_t Tk_raw = (s_idx < top_k_view.size())
-                    ? static_cast<std::int32_t>(h_top_k[s_idx]) : 0;
-                const std::int32_t Tk =
-                    (Tk_raw == 0) ? engine.hf_config().vocab_size : Tk_raw;
-                const std::uint32_t s = (s_idx < seed_view.size()) ? h_seed[s_idx] : 0u;
-
-                per_slot_temp[k] = T;
-                per_slot_top_p[k] = Tp;
-                per_slot_min_p[k] = Mp;
-                per_slot_top_k[k] = Tk;
-                per_slot_seed[k] = s;
-
-                // Token-sampler types: 1=Multinomial, 2=TopK, 3=TopP,
-                // 4=MinP, 5=TopKTopP. Only these consume the row-indexed
-                // sampling kernel output; non-token slots get their data
-                // from the msgpack-only sub-passes below.
-                const bool is_token = pie_cuda_driver::is_token_sampler(type);
-                if (is_token) {
-                    if ((Tk_raw > 0 || Tp < 1.f) && T > 0.f) any_topk_topp = true;
-                    const std::uint32_t row = qo_lo + h_sidx[k];
-                    if (row < static_cast<std::uint32_t>(N)) {
-                        h_per_temp[row]  = T;
-                        h_per_top_k[row] = Tk;
-                        h_per_top_p[row] = Tp;
-                        h_per_min_p[row] = Mp;
-                        h_per_seed[row]  = s;
-                    }
-                }
-            }
-            sampler_off += ns;
-        }
-
-        // d_sampled lives in `pi.sampled` (capacity = max_workspace_tokens).
-        // Only the first N rows are written/read this fire.
-
-        // Map each sampling slot to its global logit-row index. Only the
-        // topk+top-p path uses this; we build it unconditionally so the
-        // sampling-dispatch helper has a uniform input shape.
-        std::vector<std::int32_t> h_sample_idx(num_sampling, 0);
-        {
-            int k_g = 0;
-            for (int r = 0; r < R; ++r) {
-                const std::uint32_t qo_lo = h_qo[r];
-                for (std::uint32_t k = h_sptr[r]; k < h_sptr[r + 1]; ++k, ++k_g) {
-                    h_sample_idx[k_g] =
-                        static_cast<std::int32_t>(qo_lo + h_sidx[k]);
-                }
-            }
-        }
-
-        dispatch_sampling(
-            ws, pi.sampled.data(),
-            SamplingPlan{
-                any_topk_topp,
-                std::span<const float>(h_per_temp),
-                std::span<const float>(h_per_top_p),
-                std::span<const float>(h_per_min_p),
-                std::span<const std::int32_t>(h_per_top_k),
-                std::span<const std::uint32_t>(h_per_seed),
-                std::span<const std::int32_t>(h_sample_idx),
-            },
-            N, num_sampling, engine.hf_config().vocab_size,
-            /*prng_offset=*/static_cast<std::uint64_t>(handled));
+        // Sample plan was built above the prepare hook (hoisted so the
+        // sampling kernel can run inside the captured graph). The host
+        // variables (`need_msgpack`, `per_slot_*`, `any_topk_topp`,
+        // `h_per_*`, `h_sample_idx`) are still in scope here for the
+        // response builder.
 
         // Only copy the first N entries — `pi.sampled` is sized for
         // max_workspace_tokens, but only [0, N) are valid this fire.
+        // Async on the same stream the sampler ran on so it slots into
+        // the stream's FIFO; we sync immediately after because the
+        // response payload depends on these tokens. (Future work moves
+        // the sync past the host-side response-prep so the host
+        // and GPU can overlap.)
+        if (tm_on) tm.t_after_launch_us = fire_now_us();
         std::vector<std::int32_t> all_sampled(N);
-        CUDA_CHECK(cudaMemcpy(all_sampled.data(), pi.sampled.data(),
-                              sizeof(std::int32_t) * N,
-                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(all_sampled.data(), pi.sampled.data(),
+                                   sizeof(std::int32_t) * N,
+                                   cudaMemcpyDeviceToHost,
+                                   cublas.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+        if (tm_on) tm.t_after_sync_us = fire_now_us();
 
         // Flat-path arrays: token sampler is the only slot type allowed
         // here (need_msgpack would have flipped otherwise), so counts
@@ -681,11 +779,13 @@ std::size_t handle_fire_batch(
             std::cerr << '\n';
         }
 
-        std::size_t resp_bytes;
-        if (need_msgpack) {
-            std::vector<pie_cuda_driver::response::PerRequestMsgpack> per_req(R);
+        // Single structured response. The fast path (need_msgpack ==
+        // false) populates only `tokens`; rich paths additionally fill
+        // dists/logits/logprobs/entropies via the per-sampler sub-passes.
+        std::vector<pie_driver::PerRequestOutput> per_req(R);
 
-            const MsgpackSubpassContext sub_ctx{
+        if (need_msgpack) {
+            const ResponseSubpassContext sub_ctx{
                 ws,
                 R, num_sampling, engine.hf_config().vocab_size,
                 std::span<const std::uint32_t>(per_slot_type),
@@ -695,19 +795,17 @@ std::size_t handle_fire_batch(
             };
             gather_raw_logits(sub_ctx, per_req);
             compute_entropy_slots(sub_ctx, per_req);
-            compute_logprob_slots(sub_ctx, dec, per_req);
+            compute_logprob_slots(sub_ctx, view, per_req);
             compute_dist_slots(sub_ctx, per_req);
 
             // Per-request token list. For non-spec requests this is the
-            // token-typed slots' samples (regular path). For spec
-            // requests we walk the verification block (cloned token
-            // samplers at the bonus + each draft position) and produce
-            // the accepted prefix; the inferlet's own samples for that
-            // request are discarded.
-            std::vector<std::vector<std::uint32_t>> per_req_tokens(R);
+            // token-typed slots' samples. For spec requests we walk the
+            // verification block (cloned token samplers at the bonus +
+            // each draft position) and produce the accepted prefix; the
+            // inferlet's own samples for that request are discarded.
             for (int r = 0; r < R; ++r) {
                 const std::uint32_t qo_lo = h_qo[r];
-                auto& bucket = per_req_tokens[r];
+                auto& bucket = per_req[r].tokens;
 
                 if (has_spec_drafts && verify_slot_start[r] >= 0) {
                     const int vs = verify_slot_start[r];
@@ -736,29 +834,58 @@ std::size_t handle_fire_batch(
                         bucket.push_back(static_cast<std::uint32_t>(all_sampled[row]));
                     }
                 }
-                per_req[r].tokens = std::span<const std::uint32_t>(
-                    bucket.data(), bucket.size());
             }
-            resp_bytes = pie_cuda_driver::response::write_msgpack_response(
-                response, per_req);
         } else {
-            resp_bytes = pie_cuda_driver::response::write_flat_response(
-                response, per_request_counts, sampled_tokens);
+            // Token-only fast path: split sampled_tokens by per_request_counts.
+            std::size_t cursor = 0;
+            for (int r = 0; r < R; ++r) {
+                const std::uint32_t n = per_request_counts[r];
+                per_req[r].tokens.assign(
+                    sampled_tokens.begin() + cursor,
+                    sampled_tokens.begin() + cursor + n);
+                cursor += n;
+            }
+        }
+
+        ctx.response_builder.build(per_req, out_resp);
+
+        if (tm_on) {
+            tm.t_after_response_us = fire_now_us();
+            tm.R = R;
+            tm.N = N;
+            // Per-fire timeline. Print every 50 fires after warmup to
+            // avoid spam — first dozens are unrepresentative (kernel
+            // JIT, plan first-fire-only costs).
+            if (handled >= 50 && handled % 50 == 0) {
+                const auto us = [&](std::uint64_t a, std::uint64_t b){
+                    return (b > a) ? static_cast<double>(b - a) : 0.0;
+                };
+                std::cerr
+                    << "[fire " << handled << " R=" << R << " N=" << N << "] "
+                    << "parse=" << us(tm.t_start_us, tm.t_after_parse_us) << "us "
+                    << "views=" << us(tm.t_after_parse_us, tm.t_after_views_us) << "us "
+                    << "prep="  << us(tm.t_after_views_us, tm.t_after_prepare_us) << "us "
+                    << "upld="  << us(tm.t_after_prepare_us, tm.t_after_uploads_us) << "us "
+                    << "launch=" << us(tm.t_after_uploads_us, tm.t_after_launch_us) << "us "
+                    << "sync="  << us(tm.t_after_launch_us, tm.t_after_sync_us) << "us "
+                    << "resp="  << us(tm.t_after_sync_us, tm.t_after_response_us) << "us "
+                    << "TOTAL=" << us(tm.t_start_us, tm.t_after_response_us) << "us\n";
+            }
         }
 
         if (ctx.verbose && (handled <= 4 || handled % 100 == 0)) {
-            std::cerr << "[pie-driver-cuda] req_id=" << req.req_id
+            std::cerr << "[pie-driver-cuda] req_id=" << req_id
                       << " R=" << R << " N=" << N
                       << " sampled=" << num_sampling
-                      << " max_kv=" << max_kv_len
-                      << " resp=" << resp_bytes << "B\n";
+                      << " max_kv=" << max_kv_len << "\n";
         }
-        return resp_bytes;
+        return;
 
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-cuda] fire_batch failed for req_id="
-                  << req.req_id << ": " << e.what() << "\n";
-        return 0;
+                  << req_id << ": " << e.what() << "\n";
+        out_resp = pie_driver::PieForwardResponseView{};
+        return;
     }
 }
 

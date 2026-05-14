@@ -4,35 +4,29 @@
 //!
 //! Each model gets a dedicated InferenceService that:
 //! - Translates logical KV page IDs to physical page IDs
-//! - Routes requests to per-device BatchSchedulers based on page affinity
+//! - Routes requests to per-driver BatchSchedulers based on page affinity
 //!
 //! Batch scheduling, RPC execution, and response notification are handled
-//! by individual BatchScheduler instances (one per device).
+//! by individual BatchScheduler instances (one per driver).
 
-pub mod brle;
+mod adaptive_policy;
 pub mod request;
 pub mod scheduler;
 pub mod structured;
-mod adaptive_policy;
-
-
 
 use tokio::sync::oneshot;
 
-use crate::service::{ServiceArray, ServiceHandler};
 use crate::context::pagestore::PhysicalPageId;
-use crate::device::DeviceId;
+use crate::driver::DriverId;
+use crate::service::{ServiceArray, ServiceHandler};
 use anyhow::Result;
-use request::{ForwardPassOutput, ForwardPassRequest};
 use scheduler::BatchScheduler;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
-// Re-export public types
-pub use request::{ForwardPassOutput as Output, Sampler};
 pub use scheduler::SchedulerStats;
 
-/// Aggregated inference stats for a single model (across all devices).
+/// Aggregated inference stats for a single model (across all drivers).
 #[derive(Debug, Default, serde::Serialize)]
 pub struct InferenceStats {
     pub total_batches: u64,
@@ -45,54 +39,67 @@ pub struct InferenceStats {
 // Public API
 // =============================================================================
 
-static SERVICES: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLock::new(ServiceArray::new);
+static SERVICES: std::sync::LazyLock<ServiceArray<Message>> =
+    std::sync::LazyLock::new(ServiceArray::new);
 
 /// Spawns a new inference service for a model.
 pub async fn spawn(
-    device_indices: &[usize],
+    driver_indices: &[usize],
     page_size: u32,
     request_timeout_secs: u64,
     batch_policy: String,
 ) -> usize {
-    // Fetch device info before entering the sync closure.
-    let device_ids: Vec<DeviceId> = device_indices.to_vec();
-    let mut device_batch_limits = Vec::with_capacity(device_indices.len());
-    for &device_idx in device_indices {
-        let info = crate::device::get_spec(device_idx).await
-            .unwrap_or_else(|e| panic!("Failed to get device info for index {device_idx}: {e}"));
-        device_batch_limits.push((info.max_batch_size, info.max_batch_tokens));
+    // Fetch driver info before entering the sync closure.
+    let driver_ids: Vec<DriverId> = driver_indices.to_vec();
+    let mut driver_batch_limits = Vec::with_capacity(driver_indices.len());
+    for &driver_idx in driver_indices {
+        let info = crate::driver::get_spec(driver_idx)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to get driver info for index {driver_idx}: {e}"));
+        driver_batch_limits.push((info.max_batch_size, info.max_batch_tokens));
     }
 
     let model_idx = SERVICES.len();
-    SERVICES.spawn(move || InferenceService::new(
-        model_idx,
-        device_ids,
-        device_batch_limits,
-        page_size,
-        request_timeout_secs,
-        batch_policy,
-    )).expect("Failed to spawn inference service")
+    SERVICES
+        .spawn(move || {
+            InferenceService::new(
+                model_idx,
+                driver_ids,
+                driver_batch_limits,
+                page_size,
+                request_timeout_secs,
+                batch_policy,
+            )
+        })
+        .expect("Failed to spawn inference service")
 }
 
-/// Submits a pre-resolved forward pass to the appropriate device scheduler.
+/// Submits a pre-resolved forward pass to the appropriate driver scheduler.
 ///
 /// All context operations (ensure_resident, page resolution) must be done
 /// by the caller BEFORE calling this. The inference actor just dispatches
 /// to the batch scheduler — it never blocks on context operations.
 pub async fn submit(
     model_idx: usize,
-    request: ForwardPassRequest,
-    device_idx: usize,
+    request: pie_bridge::ForwardRequest,
+    driver_idx: usize,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
-) -> Result<ForwardPassOutput> {
+) -> Result<pie_bridge::ForwardResponse> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Submit {
-        request, device_idx, physical_page_ids, last_page_len, response: tx,
-    })?;
-    Ok(rx.await.map_err(|_| anyhow::anyhow!(
-        "inference submit: scheduler dropped response channel"
-    ))?)
+    SERVICES.send(
+        model_idx,
+        Message::Submit {
+            request,
+            driver_idx,
+            physical_page_ids,
+            last_page_len,
+            response: tx,
+        },
+    )?;
+    Ok(rx
+        .await
+        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?)
 }
 
 /// Returns aggregated inference stats for a model (lock-free, non-blocking).
@@ -108,11 +115,11 @@ pub async fn get_stats(model_idx: usize) -> InferenceStats {
 
 /// The inference service handles forward pass operations.
 ///
-/// Routes requests to the appropriate per-device `BatchScheduler`
+/// Routes requests to the appropriate per-driver `BatchScheduler`
 /// based on physical page affinity from the context service.
 struct InferenceService {
     model_idx: usize,
-    num_devices: usize,
+    num_drivers: usize,
     schedulers: Vec<BatchScheduler>,
     scheduler_stats: Vec<Arc<SchedulerStats>>,
 }
@@ -124,40 +131,43 @@ impl std::fmt::Debug for InferenceService {
 }
 
 impl InferenceService {
-
     fn new(
         model_idx: usize,
-        device_ids: Vec<DeviceId>,
-        device_batch_limits: Vec<(usize, usize)>,
+        driver_ids: Vec<DriverId>,
+        driver_batch_limits: Vec<(usize, usize)>,
         page_size: u32,
         request_timeout_secs: u64,
         batch_policy: String,
     ) -> Self {
-        let num_devices = device_ids.len();
-        let schedulers: Vec<BatchScheduler> = device_ids.iter().enumerate().map(|(device_idx, &device_id)| {
-            let (max_batch_size, max_batch_tokens) = device_batch_limits[device_idx];
-            BatchScheduler::new(
-                device_id,
-                device_idx,
-                page_size,
-                max_batch_size,
-                max_batch_tokens,
-                request_timeout_secs,
-                batch_policy.clone(),
-            )
-        }).collect();
+        let num_drivers = driver_ids.len();
+        let schedulers: Vec<BatchScheduler> = driver_ids
+            .iter()
+            .enumerate()
+            .map(|(driver_idx, &driver_id)| {
+                let (max_batch_size, max_batch_tokens) = driver_batch_limits[driver_idx];
+                BatchScheduler::new(
+                    driver_id,
+                    driver_idx,
+                    page_size,
+                    max_batch_size,
+                    max_batch_tokens,
+                    request_timeout_secs,
+                    batch_policy.clone(),
+                )
+            })
+            .collect();
 
         let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
 
         InferenceService {
             model_idx,
-            num_devices,
+            num_drivers,
             schedulers,
             scheduler_stats,
         }
     }
 
-    /// Aggregate stats from all per-device schedulers.
+    /// Aggregate stats from all per-driver schedulers.
     fn aggregate_stats(&self) -> InferenceStats {
         let mut total_batches = 0u64;
         let mut total_tokens = 0u64;
@@ -184,7 +194,6 @@ impl InferenceService {
             avg_batch_latency_us: avg_latency,
         }
     }
-
 }
 
 // =============================================================================
@@ -197,26 +206,33 @@ enum Message {
     /// Submit a pre-resolved forward pass to the scheduler.
     /// All context operations must be done by the caller before sending this.
     Submit {
-        request: ForwardPassRequest,
-        device_idx: usize,
+        request: pie_bridge::ForwardRequest,
+        driver_idx: usize,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
-        response: oneshot::Sender<ForwardPassOutput>,
+        response: oneshot::Sender<pie_bridge::ForwardResponse>,
     },
-    GetStats { response: oneshot::Sender<InferenceStats> },
+    GetStats {
+        response: oneshot::Sender<InferenceStats>,
+    },
 }
-
 
 impl ServiceHandler for InferenceService {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Submit { request, device_idx, physical_page_ids, last_page_len, response } => {
-                let idx = device_idx.min(self.num_devices.saturating_sub(1));
-                if let Err(e) = self.schedulers[idx].submit(
-                    request, response, physical_page_ids, last_page_len,
-                ) {
+            Message::Submit {
+                request,
+                driver_idx,
+                physical_page_ids,
+                last_page_len,
+                response,
+            } => {
+                let idx = driver_idx.min(self.num_drivers.saturating_sub(1));
+                if let Err(e) =
+                    self.schedulers[idx].submit(request, response, physical_page_ids, last_page_len)
+                {
                     tracing::error!("Failed to submit to scheduler: {}", e);
                 }
             }
@@ -226,4 +242,3 @@ impl ServiceHandler for InferenceService {
         }
     }
 }
-

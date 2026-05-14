@@ -34,9 +34,11 @@ driver-dummy = []
 [dependencies]
 # `pie` is the runtime crate. After Phase 8 deleted the legacy
 # `pie._runtime` maturin module, runtime has no `python` feature to
-# disable — pyo3 only lives in `sdk/python-rpc/` (the `pie-rpc` wheel)
-# now, not in the runtime crate itself.
+# disable — pyo3 only lives in `driver/bridge_py/` (the Rust extension
+# bundled into the `pie-driver-bridge` wheel via maturin), not in the
+# runtime crate itself.
 pie = { path = "../runtime" }
+pie-bridge = { path = "../driver/bridge" }
 anyhow = "1.0"
 rmp-serde = "1.3"
 serde = { version = "1.0", features = ["derive"] }

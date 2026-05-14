@@ -23,7 +23,7 @@ from common import (
 
 
 BENCH_INFERLET = "text-completion-bench"
-EMBEDDED_CLI_DRIVERS: set[str] = set()
+EMBEDDED_CLI_DRIVERS: set[str] = {"cuda_native", "portable", "dummy", "vllm", "sglang", "dev"}
 
 
 def bench_inferlet_paths() -> tuple[Path, Path, str]:
@@ -78,13 +78,14 @@ def build_config(args: argparse.Namespace):
         driver_options = {
             "max_batch_size": args.max_batch_size,
             "max_num_kv_pages": args.kv_pages,
-            "n_gpu_layers": args.portable_n_gpu_layers,
         }
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
             "max_num_seqs": args.max_batch_size,
         }
+        if getattr(args, "venv", None):
+            driver_options["venv"] = args.venv
         if args.vllm_attention_backend:
             driver_options["attention_backend"] = args.vllm_attention_backend
     elif args.driver == "sglang":
@@ -94,6 +95,8 @@ def build_config(args: argparse.Namespace):
             "disable_radix_cache": True,
             "cpu_mem_budget_in_gb": args.cpu_mem_budget,
         }
+        if getattr(args, "venv", None):
+            driver_options["venv"] = args.venv
         if args.sglang_attention_backend:
             driver_options["attention_backend"] = args.sglang_attention_backend
     else:
@@ -104,6 +107,7 @@ def build_config(args: argparse.Namespace):
         server=ServerConfig(
             host="127.0.0.1",
             port=0,
+            verbose=True,
             max_concurrent_processes=args.concurrency if args.mode == "tput" else 1,
         ),
         auth=AuthConfig(enabled=False),
@@ -175,12 +179,18 @@ async def cli_pie_client(args: argparse.Namespace):
 
     async def drain_stdout() -> None:
         assert proc.stdout is not None
+        import sys
         while True:
             line = await proc.stdout.readline()
             if not line:
                 return
-            server_lines.append(line.decode("utf-8", errors="replace"))
+            txt = line.decode("utf-8", errors="replace")
+            server_lines.append(txt)
             del server_lines[:-200]
+            # Surface per-fire timing the moment it lands; otherwise mute.
+            if txt.startswith("[fire ") or txt.startswith("[sched-fire ") or txt.startswith("[outer-fire "):
+                sys.stderr.write(txt)
+                sys.stderr.flush()
 
     try:
         assert proc.stdout is not None
@@ -335,6 +345,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--sglang-attention-backend", default=None)
         sp.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
+        sp.add_argument("--venv", default=None,
+                        help="Path to a Python venv for subprocess drivers (vllm/sglang/dev)")
     return p
 
 

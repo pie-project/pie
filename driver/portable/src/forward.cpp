@@ -25,7 +25,6 @@
 #include "graph_phi3_5moe.hpp"
 #include "graph_qwen3_5.hpp"
 #include "plan.hpp"
-#include "response.hpp"
 #include "sampler.hpp"
 
 namespace pie_portable_driver {
@@ -159,6 +158,11 @@ std::vector<SlotOutput> sample_request_slots(const ForwardEngine::ReqPlan& rp,
                                              std::int32_t n_slots,
                                              std::int32_t vocab_size) {
     std::vector<SlotOutput> out(n_slots);
+    // Each slot can have its own sampler kind (an inferlet may attach
+    // Argmax + RawLogits + Distribution + ... at the same position in
+    // one fire). Fall back to `rp.sampler` when the per-slot array
+    // doesn't cover an index — that only happens for spec-decode bonus
+    // slots, which all share the request's primary sampler.
     for (std::int32_t s = 0; s < n_slots; ++s) {
         float* row = slots_logits_base + static_cast<std::size_t>(s) * vocab_size;
         if (!rp.logit_mask_runs.empty()) {
@@ -166,7 +170,11 @@ std::vector<SlotOutput> sample_request_slots(const ForwardEngine::ReqPlan& rp,
                                   rp.logit_mask_runs.data(),
                                   rp.logit_mask_runs.size());
         }
-        sample_slot(row, vocab_size, rp.sampler, out[s]);
+        const SamplerParams& sp =
+            s < static_cast<std::int32_t>(rp.samplers.size())
+                ? rp.samplers[static_cast<std::size_t>(s)]
+                : rp.sampler;
+        sample_slot(row, vocab_size, sp, out[s]);
     }
     return out;
 }
@@ -441,10 +449,10 @@ void ForwardEngine::log_timings(const char* label) const {
 }
 
 // -----------------------------------------------------------------------------
-// Plan: BPIQ → BatchPlan (real page-table)
+// Plan: wire → BatchPlan (real page-table)
 // -----------------------------------------------------------------------------
 
-ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req) {
+ForwardEngine::BatchPlan ForwardEngine::plan_(const pie_driver::PieForwardRequestView& req) {
     const auto& hpar = model_.hparams();
     const ArchSpec spec = arch_spec_for(hpar.arch, hpar);
     // Slow-only path: skip the in-graph `ggml_top_k` (which would emit
@@ -514,12 +522,15 @@ ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req)
                                   spec.sliding_window, need_full_mask);
     }
 
-    // GPU-greedy detection: every slot is sampled by argmax (temperature
-    // ≤ ε), and no request applies a logit mask. When set, the graph
-    // builder substitutes `argmax(logits)` for the logits output.
-    plan.all_greedy = !plan.reqs.empty() && !slow_only;
-    for (const auto& rp : plan.reqs) {
-        const auto& s = rp.sampler;
+    // GPU-greedy detection: EVERY slot (across all requests) is sampled
+    // by argmax (temperature ≤ ε) with a token-producing sampler kind,
+    // and no request applies a logit mask. A request with a special
+    // sampler (Distribution / RawLogits / Logprob / Logprobs / Entropy)
+    // on any slot disqualifies the fast path even if other slots are
+    // greedy — the graph emits one logits output per slot, but the
+    // GPU-greedy graph replaces logits with argmax(token id) and
+    // special samplers need raw logits to compute their payloads.
+    auto sampler_is_greedy_token = [](const SamplerParams& s) {
         const bool greedy_temp = s.temperature <= 1e-5f;
         const bool token_producing =
                s.type == SamplerType::Multinomial
@@ -527,40 +538,52 @@ ForwardEngine::BatchPlan ForwardEngine::plan_(const schema::DecodedRequest& req)
             || s.type == SamplerType::TopP
             || s.type == SamplerType::MinP
             || s.type == SamplerType::TopKTopP;
-        if (!greedy_temp || !token_producing || !rp.logit_mask_runs.empty()) {
-            plan.all_greedy = false;
-            break;
+        return greedy_temp && token_producing;
+    };
+    plan.all_greedy = !plan.reqs.empty() && !slow_only;
+    for (const auto& rp : plan.reqs) {
+        if (!rp.logit_mask_runs.empty()) { plan.all_greedy = false; break; }
+        bool all_slots_greedy = !rp.samplers.empty();
+        for (const auto& s : rp.samplers) {
+            if (!sampler_is_greedy_token(s)) { all_slots_greedy = false; break; }
         }
+        if (!all_slots_greedy) { plan.all_greedy = false; break; }
     }
 
     // GPU uniform-top-sample detection (non-greedy fast path). All slots
     // must use the same temperature, none can have a logit mask, and
-    // none can be Multinomial (which needs the full vocab distribution).
-    // Per-slot top_k / top_p / min_p remain heterogeneous — they're
-    // applied host-side on the downloaded top-K list.
+    // none can be Multinomial (which needs the full vocab distribution)
+    // or any special sampler kind. Per-slot top_k / top_p / min_p
+    // remain heterogeneous — they're applied host-side on the downloaded
+    // top-K list.
     if (!plan.all_greedy && !plan.reqs.empty() && !slow_only) {
-        const auto& first = plan.reqs[0].sampler;
-        bool ok = true;
+        // Anchor temperature on the first slot of the first request that
+        // has samplers — prefill-only requests have empty `samplers`.
+        const SamplerParams* anchor = nullptr;
+        for (const auto& rp : plan.reqs) {
+            if (!rp.samplers.empty()) { anchor = &rp.samplers[0]; break; }
+        }
+        bool ok = anchor != nullptr;
         std::int32_t k_max = 0;
         for (const auto& rp : plan.reqs) {
-            const auto& s = rp.sampler;
-            if (s.temperature <= 1e-5f
-                || s.temperature != first.temperature
-                || s.type == SamplerType::Multinomial
-                || s.type == SamplerType::Distribution
-                || s.type == SamplerType::RawLogits
-                || s.type == SamplerType::Logprob
-                || s.type == SamplerType::Logprobs
-                || s.type == SamplerType::Entropy
-                || !rp.logit_mask_runs.empty()) {
-                ok = false;
-                break;
+            if (!rp.logit_mask_runs.empty()) { ok = false; break; }
+            for (const auto& s : rp.samplers) {
+                if (s.temperature <= 1e-5f
+                    || s.temperature != anchor->temperature
+                    || s.type == SamplerType::Multinomial
+                    || s.type == SamplerType::Distribution
+                    || s.type == SamplerType::RawLogits
+                    || s.type == SamplerType::Logprob
+                    || s.type == SamplerType::Logprobs
+                    || s.type == SamplerType::Entropy) {
+                    ok = false;
+                    break;
+                }
+                const std::int32_t k = s.top_k > 0
+                    ? static_cast<std::int32_t>(s.top_k) : 0;
+                if (k > k_max) k_max = k;
             }
-            // top_k == 0 means "no K cap" → we still pick a generous
-            // default for nucleus sampling; otherwise honor the slot's K.
-            const std::int32_t k = s.top_k > 0
-                ? static_cast<std::int32_t>(s.top_k) : 0;
-            if (k > k_max) k_max = k;
+            if (!ok) break;
         }
         if (ok) {
             // Default K of 256 covers >99% of nucleus mass for typical
@@ -660,6 +683,7 @@ ForwardEngine::BatchPlan ForwardEngine::plan_test_simple_(
                           plan.positions_i32.data());
     rp.sampler = SamplerParams{};
     rp.sampler.temperature = 0.0f; // greedy for offline test mode
+    rp.samplers.assign(1, rp.sampler);
     rp.state_slot = 0;             // single-context test harness
     plan.sampling_pos_i32.push_back(sampling_pos);
     plan.reqs.push_back(std::move(rp));
@@ -866,8 +890,9 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
 // Public entry points
 // -----------------------------------------------------------------------------
 
-std::size_t ForwardEngine::run(const schema::DecodedRequest& req,
-                               std::span<std::uint8_t> response) {
+void ForwardEngine::run(const pie_driver::PieForwardRequestView& req,
+                        pie_driver::ResponseBuilder& builder,
+                        pie_driver::PieForwardResponseView& out) {
     using clock = std::chrono::steady_clock;
     auto t_stage = clock::now();
     auto take_us = [&](std::uint64_t& bucket) {
@@ -877,12 +902,33 @@ std::size_t ForwardEngine::run(const schema::DecodedRequest& req,
         t_stage = now;
     };
 
+    // Empty-batch fast path. The runtime drains its queue with zero-token
+    // fires (token_ids empty, qo_indptr like [0,0,...,0]) — e.g. when a
+    // ForwardPass is built and submitted with no `input_tokens` calls, or
+    // during scheduler idle ticks. Emit one empty PerRequestOutput per
+    // request slot so the response count matches what fire_batch expects.
+    // Matches the driver/cuda/src/request_handler.cpp:321 short-circuit.
+    {
+        const auto tok_view = req.token_ids.as<std::uint32_t>();
+        const auto qo_view  = req.qo_indptr.as<std::uint32_t>();
+        const int R = qo_view.empty()
+            ? 0
+            : static_cast<int>(qo_view.size()) - 1;
+        if (tok_view.empty() || R <= 0) {
+            std::vector<pie_driver::PerRequestOutput> empty(
+                static_cast<std::size_t>(std::max(R, 0)));
+            builder.build(empty, out);
+            return;
+        }
+    }
+
     BatchPlan plan;
     try {
         plan = plan_(req);
     } catch (const std::exception& e) {
         std::cerr << "[forward] plan failed: " << e.what() << "\n";
-        return 0;
+        out = pie_driver::PieForwardResponseView{};
+        return;
     }
     take_us(timings_.plan_us);
 
@@ -891,31 +937,65 @@ std::size_t ForwardEngine::run(const schema::DecodedRequest& req,
         sampled = compute_(plan);
     } catch (const std::exception& e) {
         std::cerr << "[forward] compute failed: " << e.what() << "\n";
-        return 0;
+        out = pie_driver::PieForwardResponseView{};
+        return;
     }
     // compute_() credits its own sub-buckets + total + n_calls.
     t_stage = clock::now();
 
-    std::size_t resp_size;
-    if (needs_msgpack_mode(sampled)) {
-        resp_size = write_msgpack_response(response, sampled);
-    } else {
-        // Flat fast path — every slot is token-producing. Variable-length
-        // per-request tokens (M8 spec decode) are concatenated; the per-
-        // request count goes into the counts table.
-        std::vector<std::uint32_t> tokens_per_req;
-        std::vector<std::uint32_t> tokens;
-        tokens_per_req.reserve(sampled.size());
-        for (const auto& s : sampled) {
-            tokens_per_req.push_back(static_cast<std::uint32_t>(s.tokens.size()));
-            tokens.insert(tokens.end(), s.tokens.begin(), s.tokens.end());
+    // Translate per-request SamplerOutput → pie_driver::PerRequestOutput.
+    //
+    // Two cases:
+    //   * All slots are token-producing samplers. `resolve_request_output`
+    //     filled `s.tokens` directly; `special_slots` is empty.
+    //   * Any slot is a special sampler. `resolve_request_output` moved
+    //     the whole `slot_out` list into `special_slots` (so it could
+    //     keep the per-slot payloads next to each other), which means
+    //     `s.tokens` is empty even though token-producing slots may be
+    //     present. Walk `rp.samplers` in lock-step with `special_slots`
+    //     to route each slot's payload into the right per_req array.
+    std::vector<pie_driver::PerRequestOutput> per_req;
+    per_req.reserve(sampled.size());
+    for (std::size_t r = 0; r < sampled.size(); ++r) {
+        auto& s = sampled[r];
+        const auto& rp = plan.reqs[r];
+        pie_driver::PerRequestOutput pr;
+        pr.tokens = std::move(s.tokens);
+        for (std::size_t i = 0; i < s.special_slots.size(); ++i) {
+            auto& slot = s.special_slots[i];
+            const SamplerParams& sampler = i < rp.samplers.size()
+                ? rp.samplers[i] : rp.sampler;
+            switch (sampler.type) {
+                case SamplerType::Multinomial:
+                case SamplerType::TopK:
+                case SamplerType::TopP:
+                case SamplerType::MinP:
+                case SamplerType::TopKTopP:
+                    pr.tokens.push_back(slot.token);
+                    break;
+                case SamplerType::Distribution:
+                    pr.dists.emplace_back(std::move(slot.dist_ids),
+                                          std::move(slot.dist_vals));
+                    break;
+                case SamplerType::RawLogits:
+                    pr.logits.push_back(std::move(slot.raw_logits));
+                    break;
+                case SamplerType::Logprob:
+                case SamplerType::Logprobs:
+                    pr.logprobs.push_back(std::move(slot.logprobs));
+                    break;
+                case SamplerType::Entropy:
+                    pr.entropies.push_back(slot.entropy);
+                    break;
+                default:
+                    break;
+            }
         }
-        resp_size = write_flat_response(response,
-                                        std::span<const std::uint32_t>(tokens_per_req),
-                                        std::span<const std::uint32_t>(tokens));
+        per_req.push_back(std::move(pr));
     }
+
+    builder.build(per_req, out);
     take_us(timings_.response_pack_us);
-    return resp_size;
 }
 
 std::vector<std::uint32_t> ForwardEngine::generate(
@@ -1058,6 +1138,7 @@ std::vector<std::vector<std::uint32_t>> ForwardEngine::generate_multi(
             const std::int32_t one_pos[1] = {pos};
             build_causal_mask_f16(rp.mask_f16, n_kv_eff, 1, MASK_PAD, one_pos);
             rp.sampler.temperature = 0.0f;  // greedy for the test harness
+            rp.samplers.assign(1, rp.sampler);
             plan.reqs.push_back(std::move(rp));
         }
 

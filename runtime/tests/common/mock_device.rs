@@ -1,15 +1,22 @@
-//! Mock device backend for integration tests.
+//! Mock driver backend for integration tests.
 //!
-//! Provides a trait-based mock that speaks the real IPC protocol
-//! via `RpcServer`, allowing integration tests to exercise the full
-//! RPC stack without a Python backend.
+//! Implements [`DriverChannel`] directly and pre-registers one channel
+//! per device through [`register_driver`] + [`install_channel`]. The
+//! unified driver surface means there's no RPC server, no mqueue, and
+//! no shmem ring in the test path — just a typed channel that dispatches
+//! `DriverRequest::Forward` to a [`Behavior`] and treats every cold
+//! method as a no-op `Status(0)`.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use pie::device::RpcServer;
+use anyhow::Result;
+use async_trait::async_trait;
+
+use pie::driver::{
+    DriverChannel, DriverRequest, DriverResponse, DriverSpec, install_channel, register_driver,
+};
 use pie::inference::request::{
     BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassResponse,
 };
@@ -18,11 +25,8 @@ use pie::inference::request::{
 // Behavior Trait
 // =============================================================================
 
-/// Trait for defining mock device behavior.
-///
-/// Implementors define how the mock device responds to `fire_batch` RPC calls.
+/// How the mock device handles a forward batch.
 pub trait Behavior: Send + Sync + 'static {
-    /// Handle a batched forward pass request and return a response.
     fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse;
 }
 
@@ -30,17 +34,20 @@ pub trait Behavior: Send + Sync + 'static {
 // Built-in Behaviors
 // =============================================================================
 
-/// Always returns the same token for every request in the batch.
+/// Always returns the same token for every request.
 pub struct EchoBehavior(pub u32);
 
 impl Behavior for EchoBehavior {
     fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
-        let num_requests = req.num_requests();
+        let num = req.num_requests();
         BatchedForwardPassResponse {
-            results: (0..num_requests)
+            results: (0..num)
                 .map(|_| ForwardPassResponse {
                     tokens: vec![self.0],
                     dists: vec![],
+                    logits: vec![],
+                    logprobs: vec![],
+                    entropies: vec![],
                     spec_tokens: vec![],
                     spec_positions: vec![],
                 })
@@ -49,7 +56,7 @@ impl Behavior for EchoBehavior {
     }
 }
 
-/// Returns sequential tokens starting from the given value.
+/// Returns sequential tokens starting from `start`.
 pub struct CounterBehavior {
     next: AtomicU32,
 }
@@ -64,104 +71,59 @@ impl CounterBehavior {
 
 impl Behavior for CounterBehavior {
     fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
-        let num_requests = req.num_requests();
-        BatchedForwardPassResponse {
-            results: (0..num_requests)
-                .map(|_| {
-                    let token = self.next.fetch_add(1, Ordering::Relaxed);
-                    ForwardPassResponse {
-                        tokens: vec![token],
-                        dists: vec![],
-                        spec_tokens: vec![],
-                        spec_positions: vec![],
-                    }
-                })
-                .collect(),
+        let num = req.num_requests();
+        let mut results = Vec::with_capacity(num);
+        for _ in 0..num {
+            let t = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            results.push(ForwardPassResponse {
+                tokens: vec![t],
+                dists: vec![],
+                logits: vec![],
+                logprobs: vec![],
+                entropies: vec![],
+                spec_tokens: vec![],
+                spec_positions: vec![],
+            });
         }
-    }
-}
-
-/// Wraps another behavior and adds simulated latency before responding.
-pub struct DelayedBehavior<B: Behavior> {
-    pub inner: B,
-    pub latency: Duration,
-}
-
-impl<B: Behavior> Behavior for DelayedBehavior<B> {
-    fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
-        std::thread::sleep(self.latency);
-        self.inner.handle_fire_batch(req)
-    }
-}
-
-/// Wraps another behavior and fails after N successful calls.
-pub struct FailAfterBehavior<B: Behavior> {
-    pub inner: B,
-    remaining: AtomicU32,
-}
-
-impl<B: Behavior> FailAfterBehavior<B> {
-    pub fn new(inner: B, success_count: u32) -> Self {
-        Self {
-            inner,
-            remaining: AtomicU32::new(success_count),
-        }
-    }
-}
-
-impl<B: Behavior> Behavior for FailAfterBehavior<B> {
-    fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
-        if self.remaining.fetch_sub(1, Ordering::Relaxed) == 0 {
-            // Return empty results to simulate failure
-            BatchedForwardPassResponse { results: vec![] }
-        } else {
-            self.inner.handle_fire_batch(req)
-        }
+        BatchedForwardPassResponse { results }
     }
 }
 
 // =============================================================================
-// Call Recorder
+// CallRecorder
 // =============================================================================
 
-/// A recorded RPC call for test assertions.
 #[derive(Debug, Clone)]
 pub struct RecordedCall {
     pub device_idx: usize,
-    pub method: String,
+    pub method: &'static str,
     pub num_requests: usize,
     pub total_tokens: usize,
     pub timestamp: Instant,
 }
 
-/// Records all RPC calls made to mock devices for later assertion.
+#[derive(Debug, Default)]
 pub struct CallRecorder {
     calls: Mutex<Vec<RecordedCall>>,
 }
 
 impl CallRecorder {
-    fn new() -> Self {
-        Self {
-            calls: Mutex::new(Vec::new()),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     fn record(&self, call: RecordedCall) {
         self.calls.lock().unwrap().push(call);
     }
 
-    /// Returns the total number of recorded calls.
     pub fn call_count(&self) -> usize {
         self.calls.lock().unwrap().len()
     }
 
-    /// Returns a snapshot of all recorded calls.
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.calls.lock().unwrap().clone()
     }
 
-    /// Blocks until at least `n` calls have been recorded, or until `timeout`.
-    /// Returns `true` if the condition was met, `false` on timeout.
     pub fn wait_for_calls(&self, n: usize, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -177,144 +139,100 @@ impl CallRecorder {
 }
 
 // =============================================================================
-// Mock Backend
+// MockChannel — DriverChannel impl per device.
 // =============================================================================
 
-/// A mock device backend that runs `RpcServer` instances in background threads.
-///
-/// Each device gets its own `RpcServer` and poll/respond thread.
-/// Drop closes all servers and joins threads.
+struct MockChannel {
+    device_idx: usize,
+    behavior: Arc<dyn Behavior>,
+    recorder: Arc<CallRecorder>,
+    aborted: Mutex<bool>,
+}
+
+#[async_trait]
+impl DriverChannel for MockChannel {
+    async fn submit(&self, req: DriverRequest) -> Result<DriverResponse> {
+        if *self.aborted.lock().unwrap() {
+            anyhow::bail!("mock channel {}: aborted", self.device_idx);
+        }
+        match req {
+            DriverRequest::Forward(batch) => {
+                self.recorder.record(RecordedCall {
+                    device_idx: self.device_idx,
+                    method: "fire_batch",
+                    num_requests: batch.num_requests(),
+                    total_tokens: batch.total_tokens(),
+                    timestamp: Instant::now(),
+                });
+                let resp = self.behavior.handle_fire_batch(&batch);
+                Ok(DriverResponse::Forward(resp))
+            }
+            DriverRequest::CopyD2H { .. }
+            | DriverRequest::CopyH2D { .. }
+            | DriverRequest::CopyD2D { .. }
+            | DriverRequest::CopyH2H { .. }
+            | DriverRequest::LoadAdapter { .. }
+            | DriverRequest::SaveAdapter { .. }
+            | DriverRequest::ZoInitializeAdapter { .. }
+            | DriverRequest::ZoUpdateAdapter { .. } => Ok(DriverResponse::Status(0)),
+        }
+    }
+
+    fn notify(&self, _req: DriverRequest) -> Result<()> {
+        // Cold ops are no-ops in the mock — they always "succeed".
+        Ok(())
+    }
+
+    fn abort(&self) {
+        *self.aborted.lock().unwrap() = true;
+    }
+}
+
+// =============================================================================
+// MockBackend — owns the per-device channels.
+// =============================================================================
+
 pub struct MockBackend {
-    servers: Vec<Arc<RpcServer>>,
-    handles: Vec<JoinHandle<()>>,
-    server_names: Vec<String>,
+    driver_ids: Vec<usize>,
     recorder: Arc<CallRecorder>,
 }
 
 impl MockBackend {
-    /// Create a new mock backend with `num_devices` devices, all using the same behavior.
+    /// Pre-register `num_devices` mock channels with the runtime. Each
+    /// channel gets a fresh [`DriverId`] from the runtime's allocator;
+    /// callers thread those IDs through their bootstrap config so the
+    /// scheduler dispatches forward batches into the mocks.
     pub fn new(num_devices: usize, behavior: Arc<dyn Behavior>) -> Self {
         let recorder = Arc::new(CallRecorder::new());
-        let mut servers = Vec::with_capacity(num_devices);
-        let mut handles = Vec::with_capacity(num_devices);
-        let mut server_names = Vec::with_capacity(num_devices);
-
+        let mut driver_ids = Vec::with_capacity(num_devices);
         for device_idx in 0..num_devices {
-            let server = Arc::new(
-                RpcServer::create().expect("Failed to create mock RpcServer"),
-            );
-            let name = server.server_name().to_string();
-
-            let server_clone = Arc::clone(&server);
-            let behavior_clone = Arc::clone(&behavior);
-            let recorder_clone = Arc::clone(&recorder);
-
-            let handle = std::thread::Builder::new()
-                .name(format!("mock-device-{device_idx}"))
-                .spawn(move || {
-                    Self::poll_loop(device_idx, server_clone, behavior_clone, recorder_clone);
-                })
-                .expect("Failed to spawn mock device thread");
-
-            servers.push(server);
-            handles.push(handle);
-            server_names.push(name);
+            let channel = Arc::new(MockChannel {
+                device_idx,
+                behavior: Arc::clone(&behavior),
+                recorder: Arc::clone(&recorder),
+                aborted: Mutex::new(false),
+            });
+            let id = register_driver(DriverSpec {
+                num_kv_pages: 64,
+                max_batch_size: 32,
+                max_batch_tokens: 4096,
+            });
+            install_channel(id, channel);
+            driver_ids.push(id);
         }
-
         Self {
-            servers,
-            handles,
-            server_names,
+            driver_ids,
             recorder,
         }
     }
 
-    /// Returns the IPC server names, one per device.
-    /// Use these as `DeviceConfig.hostname`.
-    pub fn server_names(&self) -> &[String] {
-        &self.server_names
+    /// Driver IDs allocated by [`Self::new`], one per device. Hand to
+    /// the bootstrap config builder.
+    pub fn driver_ids(&self) -> &[usize] {
+        &self.driver_ids
     }
 
-    /// Access the shared call recorder for assertions.
     pub fn recorder(&self) -> &CallRecorder {
         &self.recorder
-    }
-
-    fn poll_loop(
-        device_idx: usize,
-        server: Arc<RpcServer>,
-        behavior: Arc<dyn Behavior>,
-        recorder: Arc<CallRecorder>,
-    ) {
-        let poll_timeout = Duration::from_millis(100);
-
-        loop {
-            match server.poll(poll_timeout) {
-                Ok(Some(request)) => {
-                    let method = request.method.clone();
-
-                    let response_payload = if method == "fire_batch" {
-                        // Deserialize the batched request
-                        let batch_req: BatchedForwardPassRequest =
-                            rmp_serde::from_slice(&request.payload)
-                                .expect("Failed to deserialize BatchedForwardPassRequest");
-
-                        // Record the call
-                        recorder.record(RecordedCall {
-                            device_idx,
-                            method: method.clone(),
-                            num_requests: batch_req.num_requests(),
-                            total_tokens: batch_req.total_tokens(),
-                            timestamp: Instant::now(),
-                        });
-
-                        // Dispatch to behavior
-                        let response = behavior.handle_fire_batch(&batch_req);
-                        rmp_serde::to_vec(&response)
-                            .expect("Failed to serialize BatchedForwardPassResponse")
-                    } else {
-                        // Record unknown methods too
-                        recorder.record(RecordedCall {
-                            device_idx,
-                            method: method.clone(),
-                            num_requests: 0,
-                            total_tokens: 0,
-                            timestamp: Instant::now(),
-                        });
-                        // Return empty response for unknown methods
-                        vec![]
-                    };
-
-                    if let Err(e) = server.respond(request.request_id, response_payload) {
-                        tracing::warn!(
-                            "Mock device {device_idx}: failed to send response: {e}"
-                        );
-                    }
-                }
-                Ok(None) => {
-                    // Timeout, check if closed
-                    if server.is_closed() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    // Server closed or channel error
-                    break;
-                }
-            }
-        }
-    }
-}
-
-impl Drop for MockBackend {
-    fn drop(&mut self) {
-        // Close all servers first
-        for server in &self.servers {
-            server.close();
-        }
-        // Then join all threads
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
-        }
     }
 }

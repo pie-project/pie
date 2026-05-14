@@ -22,17 +22,29 @@ impl std::fmt::Debug for Decoder {
 }
 
 impl pie::instruct::chat::Host for InstanceState {
-    async fn system(&mut self, model: Resource<crate::api::model::Model>, message: String) -> Result<Vec<u32>> {
+    async fn system(
+        &mut self,
+        model: Resource<crate::api::model::Model>,
+        message: String,
+    ) -> Result<Vec<u32>> {
         let model = self.ctx().table.get(&model)?;
         Ok(model.model.instruct().system(&message))
     }
 
-    async fn user(&mut self, model: Resource<crate::api::model::Model>, message: String) -> Result<Vec<u32>> {
+    async fn user(
+        &mut self,
+        model: Resource<crate::api::model::Model>,
+        message: String,
+    ) -> Result<Vec<u32>> {
         let model = self.ctx().table.get(&model)?;
         Ok(model.model.instruct().user(&message))
     }
 
-    async fn assistant(&mut self, model: Resource<crate::api::model::Model>, message: String) -> Result<Vec<u32>> {
+    async fn assistant(
+        &mut self,
+        model: Resource<crate::api::model::Model>,
+        message: String,
+    ) -> Result<Vec<u32>> {
         let model = self.ctx().table.get(&model)?;
         Ok(model.model.instruct().assistant(&message))
     }
@@ -52,7 +64,10 @@ impl pie::instruct::chat::Host for InstanceState {
         Ok(model.model.instruct().seal())
     }
 
-    async fn create_decoder(&mut self, model: Resource<crate::api::model::Model>) -> Result<Resource<Decoder>> {
+    async fn create_decoder(
+        &mut self,
+        model: Resource<crate::api::model::Model>,
+    ) -> Result<Resource<Decoder>> {
         let model = self.ctx().table.get(&model)?;
         let inner = model.model.instruct().chat_decoder();
         let decoder = Decoder { inner };
@@ -61,7 +76,11 @@ impl pie::instruct::chat::Host for InstanceState {
 }
 
 impl pie::instruct::chat::HostDecoder for InstanceState {
-    async fn feed(&mut self, this: Resource<Decoder>, tokens: Vec<u32>) -> Result<Result<pie::instruct::chat::Event, pie::core::types::Error>> {
+    async fn feed(
+        &mut self,
+        this: Resource<Decoder>,
+        tokens: Vec<u32>,
+    ) -> Result<Result<pie::instruct::chat::Event, pie::core::types::Error>> {
         let decoder = self.ctx().table.get_mut(&this)?;
         let event = decoder.inner.feed(&tokens);
         Ok(Ok(match event {

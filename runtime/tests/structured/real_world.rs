@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use pie::inference::structured::bitmask;
 use pie::inference::structured::grammar::Grammar;
-use pie::inference::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
+use pie::inference::structured::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
 use pie::inference::structured::matcher::GrammarMatcher;
 use pie::model::tokenizer::Tokenizer;
 
@@ -384,10 +384,7 @@ fn test_schema_ref_defs_nested() {
     }"##;
 
     // Leaf (empty children)
-    assert!(schema_accepts(
-        schema,
-        r#"{"name":"root","children":[]}"#,
-    ));
+    assert!(schema_accepts(schema, r#"{"name":"root","children":[]}"#,));
     // With children
     assert!(schema_accepts(
         schema,
@@ -450,14 +447,26 @@ fn test_bitmask_mid_json_object() {
     m.fill_next_token_bitmask(&mut bm);
 
     // After colon, expect value tokens: "\"", "42", "true", "{", "["
-    assert!(bitmask::get_bit(&bm, 2), "quote (string start) should be valid");
+    assert!(
+        bitmask::get_bit(&bm, 2),
+        "quote (string start) should be valid"
+    );
     assert!(bitmask::get_bit(&bm, 6), "42 (number) should be valid");
     assert!(bitmask::get_bit(&bm, 7), "true should be valid");
-    assert!(bitmask::get_bit(&bm, 0), "{{ (nested object) should be valid");
+    assert!(
+        bitmask::get_bit(&bm, 0),
+        "{{ (nested object) should be valid"
+    );
     assert!(bitmask::get_bit(&bm, 8), "[ (array) should be valid");
     // Should not accept "}" or "]" at this position
-    assert!(!bitmask::get_bit(&bm, 1), "}} should not be valid after colon");
-    assert!(!bitmask::get_bit(&bm, 9), "] should not be valid after colon");
+    assert!(
+        !bitmask::get_bit(&bm, 1),
+        "}} should not be valid after colon"
+    );
+    assert!(
+        !bitmask::get_bit(&bm, 9),
+        "] should not be valid after colon"
+    );
 }
 
 #[test]
@@ -480,10 +489,16 @@ fn test_bitmask_after_comma_in_array() {
     assert!(bitmask::get_bit(&bm, 3), "1 should be valid");
     assert!(bitmask::get_bit(&bm, 4), "2 should be valid");
     assert!(bitmask::get_bit(&bm, 5), "3 should be valid");
-    assert!(bitmask::get_bit(&bm, 7), "quote (string start) should be valid");
+    assert!(
+        bitmask::get_bit(&bm, 7),
+        "quote (string start) should be valid"
+    );
     assert!(bitmask::get_bit(&bm, 8), "true should be valid");
     // Should NOT accept ] immediately after comma (no trailing comma in JSON)
-    assert!(!bitmask::get_bit(&bm, 1), "] should not be valid after comma");
+    assert!(
+        !bitmask::get_bit(&bm, 1),
+        "] should not be valid after comma"
+    );
 }
 
 // ===========================================================================
@@ -492,17 +507,13 @@ fn test_bitmask_after_comma_in_array() {
 
 #[test]
 fn test_interleave_accept_string_and_token() {
-    let mut m = make_matcher(
-        JSON_GRAMMAR,
-        "root",
-        &["{", "}", "\"", "a", ":", "1", ","],
-    );
+    let mut m = make_matcher(JSON_GRAMMAR, "root", &["{", "}", "\"", "a", ":", "1", ","]);
 
     // Build {"a":1} by interleaving accept_string and accept_token
-    assert!(m.accept_string("{\"a\""));  // accept_string for {\"a\"
-    assert!(m.accept_token(4));          // accept_token for :
-    assert!(m.accept_string("1"));       // accept_string for 1
-    assert!(m.accept_token(1));          // accept_token for }
+    assert!(m.accept_string("{\"a\"")); // accept_string for {\"a\"
+    assert!(m.accept_token(4)); // accept_token for :
+    assert!(m.accept_string("1")); // accept_string for 1
+    assert!(m.accept_token(1)); // accept_token for }
     assert!(m.can_terminate());
 }
 
@@ -518,7 +529,7 @@ fn test_rollback_across_utf8_boundary() {
 
     // Rollback one character (3 bytes = 1 token worth, but accept_string is 6 bytes total)
     // We need to rollback 6 bytes to undo the accept_string
-    m.rollback(1);  // rollback one "token" (the whole accept_string)
+    m.rollback(1); // rollback one "token" (the whole accept_string)
 
     // Should be able to accept again
     assert!(m.accept_string("\u{4F60}\u{597D}"));
@@ -530,8 +541,10 @@ fn test_rollback_deep_then_diverge() {
     let mut m = make_matcher(
         r#"root ::= [a-z]+ ("!" | "?")"#,
         "root",
-        &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
-          "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "!","?"],
+        &[
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+            "r", "s", "t", "!", "?",
+        ],
     );
 
     // Accept 20 letter tokens: a, b, c, ..., t
@@ -544,7 +557,11 @@ fn test_rollback_deep_then_diverge() {
 
     // Take a different path: accept 5 new letters then "!"
     for i in 10..15 {
-        assert!(m.accept_token(i), "should accept token {} after rollback", i);
+        assert!(
+            m.accept_token(i),
+            "should accept token {} after rollback",
+            i
+        );
     }
     assert!(m.accept_token(20)); // "!"
     assert!(m.can_terminate());
@@ -552,11 +569,7 @@ fn test_rollback_deep_then_diverge() {
 
 #[test]
 fn test_reset_mid_parse_json() {
-    let mut m = make_matcher(
-        JSON_GRAMMAR,
-        "root",
-        &["{", "}", "\"", "x", ":", "1"],
-    );
+    let mut m = make_matcher(JSON_GRAMMAR, "root", &["{", "}", "\"", "x", ":", "1"]);
 
     // Start parsing an object
     assert!(m.accept_string(r#"{"x":"#));
@@ -610,7 +623,10 @@ fn test_json_number_edge_cases() {
     assert!(is_grammar_accept_string_g(&g, "1e0"));
     assert!(is_grammar_accept_string_g(&g, "1E+0"));
     assert!(is_grammar_accept_string_g(&g, "1e-0"));
-    assert!(is_grammar_accept_string_g(&g, "123456789012345678901234567890"));
+    assert!(is_grammar_accept_string_g(
+        &g,
+        "123456789012345678901234567890"
+    ));
 
     // Invalid
     assert!(!is_grammar_accept_string_g(&g, "+1"));
@@ -626,10 +642,7 @@ fn test_json_whitespace_variations() {
 
     // Whitespace is allowed: after { and [, before } and ], after comma, around colon in pair
     // Note: the EBNF grammar does NOT allow whitespace before commas (only after)
-    assert!(is_grammar_accept_string_g(
-        &g,
-        r#"{ "a" : 1, "b" : 2 }"#,
-    ));
+    assert!(is_grammar_accept_string_g(&g, r#"{ "a" : 1, "b" : 2 }"#,));
     assert!(is_grammar_accept_string_g(
         &g,
         "{\n\t\"a\"\n:\n1,\n\"b\"\n:\n2\n}",

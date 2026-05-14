@@ -1,20 +1,20 @@
 //! pie:core/inference - ForwardPass, FutureOutput, Sampler, Output
 
-use crate::api::pie;
+use crate::api::adapter::Adapter;
 use crate::api::context::Context;
 use crate::api::model::Model;
-use crate::api::adapter::Adapter;
-use crate::instance::InstanceState;
-use crate::inference::brle::Brle;
-use crate::inference::request::{ForwardPassRequest, ForwardPassOutput, SlotOutput};
-use crate::inference::structured::grammar::Grammar as InternalGrammar;
-use crate::inference::structured::json_schema::{builtin_json_grammar, json_schema_to_grammar, JsonSchemaOptions};
-use crate::inference::structured::regex::regex_to_grammar;
+use crate::api::pie;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
+use crate::inference::structured::grammar::Grammar as InternalGrammar;
+use crate::inference::structured::json_schema::{
+    JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar,
+};
 use crate::inference::structured::matcher::GrammarMatcher;
+use crate::inference::structured::regex::regex_to_grammar;
+use crate::instance::InstanceState;
 use crate::{context, inference};
 use anyhow::Result;
-use std::collections::HashMap;
+use pie_bridge::Brle;
 use std::iter;
 use std::mem::take;
 use std::sync::Arc;
@@ -24,27 +24,28 @@ use wasmtime_wasi::WasiView;
 use wasmtime_wasi::async_trait;
 use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 
+/// WASM-facing forward-pass accumulator. The WIT methods append/set
+/// into `req: pie_bridge::ForwardRequest` directly — at `execute()`
+/// we just finalize the per-request indptrs and submit. `model_id`
+/// is WASM-side routing info (not on the wire) and `adapter_seed`
+/// is stored separately because it doesn't have its own WIT setter
+/// but is used at execute-time to populate the adapter binding.
 #[derive(Debug)]
 pub struct ForwardPass {
     pub model_id: usize,
     context_id: Option<crate::context::ContextId>,
-    input_tokens: Vec<u32>,
-    input_token_positions: Vec<u32>,
-    speculative_tokens: Vec<u32>,
-    speculative_positions: Vec<u32>,
-    mask: Vec<Brle>,
-    logit_mask: Option<Brle>,
-    output_token_indices: Vec<u32>,
-    output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
-    output_speculative_tokens: bool,
-    adapter: Option<u32>,
     pub adapter_seed: Option<i64>,
+    req: pie_bridge::ForwardRequest,
 }
 
 #[derive(Debug)]
 pub struct FutureOutput {
     result: Option<pie::core::inference::Output>,
-    rx: Option<oneshot::Receiver<ForwardPassOutput>>,
+    rx: Option<oneshot::Receiver<pie_bridge::ForwardResponse>>,
+    /// Samplers from the originating request — cloned before draining
+    /// `pass.req` at execute() time so we can reconstruct the WIT
+    /// per-slot output list against this slot order.
+    samplers: Vec<pie_bridge::Sampler>,
     done: bool,
 }
 
@@ -56,8 +57,8 @@ impl Pollable for FutureOutput {
         }
         if let Some(rx) = self.rx.take() {
             match rx.await {
-                Ok(output) => {
-                    self.result = Some(convert_output(output));
+                Ok(resp) => {
+                    self.result = Some(build_wit_output(&resp, &self.samplers));
                     self.done = true;
                 }
                 Err(_) => {
@@ -75,96 +76,158 @@ impl Pollable for FutureOutput {
     }
 }
 
-/// Convert internal ForwardPassOutput (per-slot results + spec channel) to
-/// the WIT `Output` record.
-fn convert_output(output: ForwardPassOutput) -> pie::core::inference::Output {
-    let slots = output
-        .slots
-        .into_iter()
-        .map(|s| match s {
-            SlotOutput::Token(t) => pie::core::inference::SlotOutput::Token(t),
-            SlotOutput::Distribution(ids, ps) => {
-                pie::core::inference::SlotOutput::Distribution((ids, ps))
+/// Build the WIT-shaped per-slot output from a per-request
+/// [`pie_bridge::ForwardResponse`] (single-request shape: `num_requests = 1`,
+/// indptrs `[0, N]`) plus the original sampler list. Walks samplers in
+/// slot order, pulling one item from the matching response field per
+/// slot — preserving the 1:1 mapping between `pass.sampler(...)` calls
+/// and returned slots.
+///
+/// Spec-mode requests are detected via a token-count mismatch (the
+/// verifier produces a token sequence whose length is unrelated to the
+/// inferlet's sampler count); in that case all slots collapse to
+/// `Token` entries.
+fn build_wit_output(
+    resp: &pie_bridge::ForwardResponse,
+    samplers: &[pie_bridge::Sampler],
+) -> pie::core::inference::Output {
+    use pie::core::inference::SlotOutput as WitSlot;
+    use pie_bridge::Sampler;
+
+    // Spec channel: pie historically returned `spec_tokens` /
+    // `spec_positions` inline; the schema's ForwardResponse doesn't
+    // surface them as separate fields, so they default to empty.
+    let spec_tokens: Vec<u32> = Vec::new();
+    let spec_positions: Vec<u32> = Vec::new();
+
+    let expected_token_slots = samplers
+        .iter()
+        .filter(|s| {
+            matches!(
+                s,
+                Sampler::Multinomial { .. }
+                    | Sampler::TopK { .. }
+                    | Sampler::TopP { .. }
+                    | Sampler::MinP { .. }
+                    | Sampler::TopKTopP { .. }
+            )
+        })
+        .count();
+
+    let tokens: Vec<u32> = resp.tokens.clone();
+    let is_spec_walk = !tokens.is_empty()
+        && tokens.len() != expected_token_slots
+        && resp.dists_ids.is_empty()
+        && resp.logits_bytes.is_empty()
+        && resp.logprobs_values.is_empty()
+        && resp.entropies.is_empty();
+
+    if is_spec_walk {
+        let slots = tokens.into_iter().map(WitSlot::Token).collect();
+        return pie::core::inference::Output {
+            slots,
+            spec_tokens,
+            spec_positions,
+        };
+    }
+
+    let mut tok_iter = tokens.into_iter();
+    // Dists: walk the kv_indptr ranges for request 0.
+    let mut dist_iter: Box<dyn Iterator<Item = (Vec<u32>, Vec<f32>)>> =
+        if resp.dists_kv_indptr.len() >= 2 {
+            let kvs: Vec<_> = (0..resp.dists_kv_indptr.len() - 1)
+                .map(|k| {
+                    let lo = resp.dists_kv_indptr[k] as usize;
+                    let hi = resp.dists_kv_indptr[k + 1] as usize;
+                    (
+                        resp.dists_ids[lo..hi].to_vec(),
+                        resp.dists_probs[lo..hi].to_vec(),
+                    )
+                })
+                .collect();
+            Box::new(kvs.into_iter())
+        } else {
+            Box::new(std::iter::empty())
+        };
+    // Logits: walk the byte_indptr ranges for request 0.
+    let mut logit_iter: Box<dyn Iterator<Item = Vec<u8>>> = if resp.logits_byte_indptr.len() >= 2 {
+        let blobs: Vec<_> = (0..resp.logits_byte_indptr.len() - 1)
+            .map(|b| {
+                let lo = resp.logits_byte_indptr[b] as usize;
+                let hi = resp.logits_byte_indptr[b + 1] as usize;
+                resp.logits_bytes[lo..hi].to_vec()
+            })
+            .collect();
+        Box::new(blobs.into_iter())
+    } else {
+        Box::new(std::iter::empty())
+    };
+    // Logprobs: walk the val_indptr ranges.
+    let mut lp_iter: Box<dyn Iterator<Item = Vec<f32>>> = if resp.logprobs_val_indptr.len() >= 2 {
+        let slots: Vec<_> = (0..resp.logprobs_val_indptr.len() - 1)
+            .map(|s| {
+                let lo = resp.logprobs_val_indptr[s] as usize;
+                let hi = resp.logprobs_val_indptr[s + 1] as usize;
+                resp.logprobs_values[lo..hi].to_vec()
+            })
+            .collect();
+        Box::new(slots.into_iter())
+    } else {
+        Box::new(std::iter::empty())
+    };
+    let mut ent_iter = resp.entropies.iter().copied();
+
+    let slots: Vec<WitSlot> = samplers
+        .iter()
+        .filter_map(|s| match s {
+            Sampler::Multinomial { .. }
+            | Sampler::TopK { .. }
+            | Sampler::TopP { .. }
+            | Sampler::MinP { .. }
+            | Sampler::TopKTopP { .. } => tok_iter.next().map(WitSlot::Token),
+            Sampler::Dist { .. } => dist_iter.next().map(WitSlot::Distribution),
+            Sampler::RawLogits => logit_iter.next().map(WitSlot::Logits),
+            Sampler::Logprob { .. } | Sampler::Logprobs { .. } => {
+                lp_iter.next().map(WitSlot::Logprobs)
             }
-            SlotOutput::Logits(b) => pie::core::inference::SlotOutput::Logits(b),
-            SlotOutput::Logprobs(v) => pie::core::inference::SlotOutput::Logprobs(v),
-            SlotOutput::Entropy(h) => pie::core::inference::SlotOutput::Entropy(h),
-            SlotOutput::Embedding(b) => pie::core::inference::SlotOutput::Embedding(b),
+            Sampler::Entropy => ent_iter.next().map(WitSlot::Entropy),
+            // Embedding is reserved but not currently produced by the worker.
+            Sampler::Embedding => None,
         })
         .collect();
+
     pie::core::inference::Output {
         slots,
-        spec_tokens: output.spec_tokens,
-        spec_positions: output.spec_positions,
+        spec_tokens,
+        spec_positions,
     }
 }
 
-/// Convert a sampler HashMap to a request::Sampler enum.
-fn convert_sampler(map: &HashMap<String, rmpv::Value>) -> inference::Sampler {
-    let sampler_type = map.get("sampler")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u32;
-    let temperature = map.get("temperature")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0) as f32;
-
-    match sampler_type {
-        0 => {
-            let num_tokens = map.get("top_k").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-            inference::Sampler::Dist { temperature, num_tokens }
+/// Translate the WIT-defined [`pie::core::inference::Sampler`] (which
+/// uses anonymous tuple variants — see `runtime/wit/core/wit/
+/// inference.wit`) to the canonical [`pie_bridge::Sampler`] enum
+/// (re-export of [`pie_bridge::Sampler`]). The variant set matches
+/// 1:1; this is just rearranging field names.
+fn wit_to_bridge_sampler(s: pie::core::inference::Sampler) -> pie_bridge::Sampler {
+    use pie::core::inference::Sampler as Wit;
+    match s {
+        Wit::Multinomial((temperature, seed)) => {
+            pie_bridge::Sampler::Multinomial { temperature, seed }
         }
-        1 => {
-            let seed = map.get("seed").and_then(|v| v.as_u64()).map(|s| s as u32);
-            inference::Sampler::Multinomial { temperature, seed }
-        }
-        2 => {
-            let k = map.get("top_k").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
-            inference::Sampler::TopK { temperature, k }
-        }
-        3 => {
-            let p = map.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-            inference::Sampler::TopP { temperature, p }
-        }
-        4 => {
-            let p = map.get("min_p").and_then(|v| v.as_f64()).unwrap_or(0.05) as f32;
-            inference::Sampler::MinP { temperature, p }
-        }
-        5 => {
-            let k = map.get("top_k").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
-            let p = map.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-            inference::Sampler::TopKTopP { temperature, k, p }
-        }
-        6 => inference::Sampler::Embedding,
-        7 => inference::Sampler::RawLogits,
-        8 => {
-            let token_id = map.get("token_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            inference::Sampler::Logprob { token_id }
-        }
-        9 => {
-            let token_ids = map
-                .get("token_ids")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).map(|x| x as u32).collect())
-                .unwrap_or_default();
-            inference::Sampler::Logprobs { token_ids }
-        }
-        10 => inference::Sampler::Entropy,
-        _ => inference::Sampler::Multinomial { temperature, seed: None },
+        Wit::TopK((temperature, k)) => pie_bridge::Sampler::TopK { temperature, k },
+        Wit::TopP((temperature, p)) => pie_bridge::Sampler::TopP { temperature, p },
+        Wit::MinP((temperature, p)) => pie_bridge::Sampler::MinP { temperature, p },
+        Wit::TopKTopP((temperature, k, p)) => pie_bridge::Sampler::TopKTopP { temperature, k, p },
+        Wit::Embedding => pie_bridge::Sampler::Embedding,
+        Wit::Dist((temperature, num_tokens)) => pie_bridge::Sampler::Dist {
+            temperature,
+            num_tokens,
+        },
+        Wit::RawLogits => pie_bridge::Sampler::RawLogits,
+        Wit::Logprob(token_id) => pie_bridge::Sampler::Logprob { token_id },
+        Wit::Logprobs(token_ids) => pie_bridge::Sampler::Logprobs { token_ids },
+        Wit::Entropy => pie_bridge::Sampler::Entropy,
     }
-}
-
-enum SamplerType {
-    Distribution = 0,
-    Multinomial = 1,
-    TopK = 2,
-    TopP = 3,
-    MinP = 4,
-    TopKTopP = 5,
-    Embedding = 6,
-    RawLogits = 7,
-    Logprob = 8,
-    Logprobs = 9,
-    Entropy = 10,
 }
 
 impl pie::core::inference::Host for InstanceState {}
@@ -172,25 +235,31 @@ impl pie::core::inference::Host for InstanceState {}
 impl pie::core::inference::HostForwardPass for InstanceState {
     async fn new(&mut self, model: Resource<Model>) -> Result<Resource<ForwardPass>> {
         let model = self.ctx().table.get(&model)?;
+        // Initialize the accumulator with the per-request invariants:
+        // single adapter binding (-1 sentinels = unbound), and a default
+        // `output_speculative_tokens = true` written into the single
+        // entry of `output_spec_flags`.
         let pass = ForwardPass {
             model_id: model.model_id,
             context_id: None,
-            input_tokens: vec![],
-            input_token_positions: vec![],
-            speculative_tokens: vec![],
-            speculative_positions: vec![],
-            mask: vec![],
-            logit_mask: None,
-            output_token_indices: vec![],
-            output_token_samplers: vec![],
-            output_speculative_tokens: true, // enabled by default
-            adapter: None,
             adapter_seed: None,
+            req: pie_bridge::ForwardRequest {
+                adapter_bindings: vec![pie_bridge::AdapterBinding {
+                    adapter_id: -1,
+                    seed: -1,
+                }],
+                output_spec_flags: vec![true],
+                ..Default::default()
+            },
         };
         Ok(self.ctx().table.push(pass)?)
     }
 
-    async fn context(&mut self, this: Resource<ForwardPass>, context: Resource<Context>) -> Result<()> {
+    async fn context(
+        &mut self,
+        this: Resource<ForwardPass>,
+        context: Resource<Context>,
+    ) -> Result<()> {
         let ctx = self.ctx().table.get(&context)?;
         let context_id = ctx.context_id;
         let pass = self.ctx().table.get_mut(&this)?;
@@ -205,8 +274,8 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         positions: Vec<u32>,
     ) -> Result<()> {
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.input_tokens.extend(tokens);
-        pass.input_token_positions.extend(positions);
+        pass.req.token_ids.extend(tokens);
+        pass.req.position_ids.extend(positions);
         Ok(())
     }
 
@@ -217,8 +286,8 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         positions: Vec<u32>,
     ) -> Result<()> {
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.speculative_tokens.extend(tokens);
-        pass.speculative_positions.extend(positions);
+        pass.req.spec_token_ids.extend(tokens);
+        pass.req.spec_position_ids.extend(positions);
         Ok(())
     }
 
@@ -228,15 +297,19 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         flag: bool,
     ) -> Result<()> {
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.output_speculative_tokens = flag;
+        pass.req.output_spec_flags = vec![flag];
         Ok(())
     }
 
-    async fn attention_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<Vec<u32>>) -> Result<()> {
+    async fn attention_mask(
+        &mut self,
+        this: Resource<ForwardPass>,
+        mask: Vec<Vec<u32>>,
+    ) -> Result<()> {
         let brle_masks: Vec<Brle> = mask.into_iter().map(Brle::from_vec).collect();
 
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.mask = brle_masks;
+        pass.req.masks = brle_masks;
         Ok(())
     }
 
@@ -244,7 +317,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let brle = Brle::from_vec(mask);
 
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.logit_mask = Some(brle);
+        pass.req.logit_masks = vec![brle];
         Ok(())
     }
 
@@ -254,70 +327,24 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         indices: Vec<u32>,
         sampler: pie::core::inference::Sampler,
     ) -> Result<()> {
-        let mut sampler_map = HashMap::new();
-        
-        match sampler {
-            pie::core::inference::Sampler::Multinomial((temp, seed)) => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Multinomial as u32));
-                sampler_map.insert("temperature".to_string(), rmpv::Value::from(temp));
-                sampler_map.insert("seed".to_string(), rmpv::Value::from(seed));
-            }
-            pie::core::inference::Sampler::TopK((temp, k)) => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::TopK as u32));
-                sampler_map.insert("temperature".to_string(), rmpv::Value::from(temp));
-                sampler_map.insert("top_k".to_string(), rmpv::Value::from(k));
-            }
-            pie::core::inference::Sampler::TopP((temp, p)) => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::TopP as u32));
-                sampler_map.insert("temperature".to_string(), rmpv::Value::from(temp));
-                sampler_map.insert("top_p".to_string(), rmpv::Value::from(p));
-            }
-            pie::core::inference::Sampler::MinP((temp, p)) => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::MinP as u32));
-                sampler_map.insert("temperature".to_string(), rmpv::Value::from(temp));
-                sampler_map.insert("min_p".to_string(), rmpv::Value::from(p));
-            }
-            pie::core::inference::Sampler::TopKTopP((temp, k, p)) => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::TopKTopP as u32));
-                sampler_map.insert("temperature".to_string(), rmpv::Value::from(temp));
-                sampler_map.insert("top_k".to_string(), rmpv::Value::from(k));
-                sampler_map.insert("top_p".to_string(), rmpv::Value::from(p));
-            }
-            pie::core::inference::Sampler::Dist((temp, k)) => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Distribution as u32));
-                sampler_map.insert("temperature".to_string(), rmpv::Value::from(temp));
-                sampler_map.insert("top_k".to_string(), rmpv::Value::from(k));
-            }
-            pie::core::inference::Sampler::Embedding => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Embedding as u32));
-            }
-            pie::core::inference::Sampler::RawLogits => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::RawLogits as u32));
-            }
-            pie::core::inference::Sampler::Logprob(token_id) => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Logprob as u32));
-                sampler_map.insert("token_id".to_string(), rmpv::Value::from(token_id));
-            }
-            pie::core::inference::Sampler::Logprobs(token_ids) => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Logprobs as u32));
-                let arr: Vec<rmpv::Value> = token_ids.iter().map(|&x| rmpv::Value::from(x)).collect();
-                sampler_map.insert("token_ids".to_string(), rmpv::Value::Array(arr));
-            }
-            pie::core::inference::Sampler::Entropy => {
-                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Entropy as u32));
-            }
-        }
-
+        // Convert directly to the canonical bridge enum and replicate
+        // once per index — no stringly-typed intermediate.
+        let bridge = wit_to_bridge_sampler(sampler);
+        let n = indices.len();
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.output_token_samplers.extend(iter::repeat(sampler_map).take(indices.len()));
-        pass.output_token_indices.extend(indices);
+        pass.req.samplers.extend(iter::repeat_n(bridge, n));
+        pass.req.sampling_indices.extend(indices);
         Ok(())
     }
 
-    async fn adapter(&mut self, this: Resource<ForwardPass>, adapter: Resource<Adapter>) -> Result<()> {
+    async fn adapter(
+        &mut self,
+        this: Resource<ForwardPass>,
+        adapter: Resource<Adapter>,
+    ) -> Result<()> {
         let adapter_id = self.ctx().table.get(&adapter)?.adapter_id;
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.adapter = Some(adapter_id as u32);
+        pass.req.adapter_bindings[0].adapter_id = adapter_id as i64;
         Ok(())
     }
 
@@ -327,53 +354,75 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     ) -> Result<Result<Resource<FutureOutput>, String>> {
         let pass = self.ctx().table.get_mut(&this)?;
 
-        // Extract accumulated state
         let model_id = pass.model_id;
-        let tokens = take(&mut pass.input_tokens);
-        let positions = take(&mut pass.input_token_positions);
-        let speculative_tokens = take(&mut pass.speculative_tokens);
-        let speculative_positions = take(&mut pass.speculative_positions);
-        let output_speculative_tokens = pass.output_speculative_tokens;
-        let masks = take(&mut pass.mask);
+        let context_id = pass
+            .context_id
+            .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
+        let adapter_seed = pass.adapter_seed;
+        // Drain the accumulator. The remaining work is to synthesize
+        // masks if absent and stamp the per-request indptrs onto the
+        // ForwardRequest, then submit.
+        let mut req = take(&mut pass.req);
+        // Clone samplers BEFORE finalizing so we can reconstruct the
+        // per-slot WIT output against the original slot order. (Calling
+        // `req.samplers.clone()` after the indptr stamping is fine, but
+        // moving it before keeps the dependency chain explicit.)
+        let samplers_for_output = req.samplers.clone();
+
         // Track whether the user actually supplied masks; the kernel-dispatch
         // hint downstream needs to distinguish user masks from the runtime's
         // synthesized causal default.
-        let has_user_mask = !masks.is_empty();
+        let has_user_mask = !req.masks.is_empty();
 
         // WIT spec: "if not provided, fallback to causal mask".
         // Each token at position `pos` must attend to all (pos + 1) preceding
         // positions including itself — i.e., the row is all-True over its
         // valid prefix. Under the starts-with-False BRLE convention, that's
         // a zero-length false-run prefix followed by a true run of pos+1.
-        let masks = if masks.is_empty() && !positions.is_empty() {
-            positions.iter().map(|&pos| Brle::all_true((pos + 1) as usize)).collect()
-        } else {
-            masks
-        };
-        let logit_mask = pass.logit_mask.take();
-        let sampling_indices = take(&mut pass.output_token_indices);
-        let sampler_maps = take(&mut pass.output_token_samplers);
-        let adapter_id = pass.adapter.map(|id| id as u64);
-        let adapter_seed = pass.adapter_seed;
-
-        // Convert sampler maps to request::Sampler enums
-        let samplers: Vec<inference::Sampler> = sampler_maps.iter()
-            .map(convert_sampler)
-            .collect();
+        if req.masks.is_empty() && !req.position_ids.is_empty() {
+            req.masks = req
+                .position_ids
+                .iter()
+                .map(|&pos| Brle::all_true((pos + 1) as usize))
+                .collect();
+        }
+        req.has_user_mask = has_user_mask;
+        req.single_token_mode = !has_user_mask && req.token_ids.len() <= 1;
+        // Finalize per-request indptr shape ([0, N]).
+        let n_tokens = req.token_ids.len() as u32;
+        let n_masks = req.masks.len() as u32;
+        let n_logit = req.logit_masks.len() as u32;
+        let n_sampling = req.sampling_indices.len() as u32;
+        let n_samplers = req.samplers.len() as u32;
+        let n_spec = req.spec_token_ids.len() as u32;
+        req.qo_indptr = vec![0, n_tokens];
+        req.mask_indptr = vec![0, n_masks];
+        req.logit_mask_indptr = vec![0, n_logit];
+        req.sampling_indptr = vec![0, n_sampling];
+        req.sampler_indptr = vec![0, n_samplers];
+        req.spec_indptr = vec![0, n_spec];
+        req.kv_page_indptr = vec![0];
+        req.context_ids = vec![context_id];
+        // adapter_bindings[0] already has the adapter_id set by `adapter()`;
+        // stamp the seed picked up out-of-band.
+        req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
 
         // Save data needed for context::append_working_page_tokens() before
         // moving into request. We also clone the speculative arrays so we
         // can append the verified-prefix to the working-page lineage once
         // the response tells us how many drafts were accepted.
-        let num_input_tokens = tokens.len();
-        let fill_tokens = tokens.clone();
-        let fill_positions = positions.clone();
-        let fill_masks = masks.clone();
-        let spec_tokens_for_fill = speculative_tokens.clone();
-        let spec_positions_for_fill = speculative_positions.clone();
-
-        let context_id = pass.context_id
-            .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
+        let num_input_tokens = req.token_ids.len();
+        let fill_tokens = req.token_ids.clone();
+        let fill_positions = req.position_ids.clone();
+        let fill_masks = req.masks.clone();
+        let spec_tokens_for_fill = req.spec_token_ids.clone();
+        let spec_positions_for_fill = req.spec_position_ids.clone();
+        // Adapter id for context::append_working_page_tokens (which keeps an
+        // `Option<AdapterId>`-shaped lineage); -1 sentinel means unbound.
+        let adapter_id: Option<crate::adapter::AdapterId> = {
+            let bound = req.adapter_bindings[0].adapter_id;
+            if bound < 0 { None } else { Some(bound as u64) }
+        };
 
         // =====================================================================
         // Context preparation — runs in THIS process's tokio task, not the
@@ -403,7 +452,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         };
         let kv_len = pinned.kv_len;
         let last_page_len = pinned.last_page_len;
-        let device_id = pinned.device;
+        let driver_id = pinned.driver;
         let physical_page_ids = pinned.pages;
 
         let num_pages = physical_page_ids.len() as u32;
@@ -426,25 +475,17 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             return Ok(Err(msg));
         }
 
-        let request = ForwardPassRequest {
-            context_id,
-            tokens,
-            positions,
-            speculative_tokens,
-            speculative_positions,
-            output_speculative_tokens,
-            masks,
-            has_user_mask,
-            logit_mask,
-            sampling_indices,
-            samplers,
-            adapter_id,
-            adapter_seed,
-        };
-
         // Step 5: Submit to inference service (inference actor just dispatches — never blocks)
-        let device_idx = device_id as usize;
-        match inference::submit(model_id, request, device_idx, physical_page_ids.clone(), last_page_len).await {
+        let driver_idx = driver_id as usize;
+        match inference::submit(
+            model_id,
+            req,
+            driver_idx,
+            physical_page_ids.clone(),
+            last_page_len,
+        )
+        .await
+        {
             Ok(output) => {
                 // Diagnostic: log prefill metadata to trace corruption
                 // if num_input_tokens > 1 {
@@ -490,9 +531,16 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 }
                 if !all_fill_tokens.is_empty() {
                     if let Err(e) = context::append_working_page_tokens(
-                        model_id, context_id, all_fill_tokens,
-                        all_fill_positions, all_fill_masks, adapter_id, adapter_seed,
-                    ).await {
+                        model_id,
+                        context_id,
+                        all_fill_tokens,
+                        all_fill_positions,
+                        all_fill_masks,
+                        adapter_id,
+                        adapter_seed,
+                    )
+                    .await
+                    {
                         context::unpin(model_id, context_id);
                         tracing::warn!("context::fill failed for ctx {context_id}: {e:#}");
                         return Ok(Err(e.to_string()));
@@ -504,8 +552,9 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 context::unpin(model_id, context_id);
 
                 let future_output = FutureOutput {
-                    result: Some(convert_output(output)),
+                    result: Some(build_wit_output(&output, &samplers_for_output)),
                     rx: None,
+                    samplers: samplers_for_output,
                     done: true,
                 };
                 Ok(Ok(self.ctx().table.push(future_output)?))
@@ -514,7 +563,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 context::unpin(model_id, context_id);
                 tracing::warn!("inference::submit failed for ctx {context_id}: {e:#}");
                 return Ok(Err(e.to_string()));
-            },
+            }
         }
     }
 
@@ -529,7 +578,10 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
         subscribe(self.ctx().table, this)
     }
 
-    async fn get(&mut self, this: Resource<FutureOutput>) -> Result<Option<pie::core::inference::Output>> {
+    async fn get(
+        &mut self,
+        this: Resource<FutureOutput>,
+    ) -> Result<Option<pie::core::inference::Output>> {
         let result = self.ctx().table.get_mut(&this)?;
         if result.done {
             Ok(take(&mut result.result))
@@ -583,10 +635,7 @@ impl pie::core::inference::HostGrammar for InstanceState {
         Ok(self.ctx().table.push(grammar)?)
     }
 
-    async fn from_regex(
-        &mut self,
-        pattern: String,
-    ) -> Result<Result<Resource<Grammar>, String>> {
+    async fn from_regex(&mut self, pattern: String) -> Result<Result<Resource<Grammar>, String>> {
         match regex_to_grammar(&pattern) {
             Ok(g) => {
                 let grammar = Grammar {
@@ -599,10 +648,7 @@ impl pie::core::inference::HostGrammar for InstanceState {
         }
     }
 
-    async fn from_ebnf(
-        &mut self,
-        ebnf: String,
-    ) -> Result<Result<Resource<Grammar>, String>> {
+    async fn from_ebnf(&mut self, ebnf: String) -> Result<Result<Resource<Grammar>, String>> {
         match InternalGrammar::from_ebnf(&ebnf, "root") {
             Ok(g) => {
                 let grammar = Grammar {
@@ -676,27 +722,18 @@ impl pie::core::inference::HostMatcher for InstanceState {
         Ok(Ok(()))
     }
 
-    async fn next_token_logit_mask(
-        &mut self,
-        this: Resource<Matcher>,
-    ) -> Result<Vec<u32>> {
+    async fn next_token_logit_mask(&mut self, this: Resource<Matcher>) -> Result<Vec<u32>> {
         let matcher = self.ctx().table.get_mut(&this)?;
         let brle = matcher.inner.fill_next_token_brle();
         Ok(brle.buffer)
     }
 
-    async fn is_terminated(
-        &mut self,
-        this: Resource<Matcher>,
-    ) -> Result<bool> {
+    async fn is_terminated(&mut self, this: Resource<Matcher>) -> Result<bool> {
         let matcher = self.ctx().table.get(&this)?;
         Ok(matcher.inner.is_terminated())
     }
 
-    async fn reset(
-        &mut self,
-        this: Resource<Matcher>,
-    ) -> Result<()> {
+    async fn reset(&mut self, this: Resource<Matcher>) -> Result<()> {
         let matcher = self.ctx().table.get_mut(&this)?;
         matcher.inner.reset();
         Ok(())

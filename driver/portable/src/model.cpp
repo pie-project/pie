@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -221,14 +222,23 @@ Model::Model(const std::filesystem::path& snapshot_dir,
         throw std::runtime_error("model: backend init failed");
     }
 
-    // Pin the CPU backend to all available HW threads. ggml's default is
-    // 4 (sometimes 1 depending on backend init path), which leaves a
-    // 13900K idling. The static-lib build path in particular gets
-    // initialized from a Rust-spawned thread that may not inherit the
-    // process-level OpenMP affinity, so be explicit.
+    // Pin the CPU backend to a reasonable number of HW threads. ggml's
+    // default is 4 (sometimes 1 depending on backend init path), which
+    // leaves a 13900K idling. The static-lib build path in particular
+    // gets initialized from a Rust-spawned thread that may not inherit
+    // the process-level OpenMP affinity, so be explicit. Cap at 32 —
+    // beyond that ggml's per-op fork/join sync overhead dominates and
+    // throughput drops (observed on a 255-logical-CPU EPYC). Respect
+    // GGML_N_THREADS env override when the user wants something else.
     auto pin_cpu_threads = [](ggml_backend_t b) {
-        unsigned n = std::thread::hardware_concurrency();
-        if (n == 0) n = 4;
+        unsigned n = 0;
+        if (const char* env = std::getenv("GGML_N_THREADS")) {
+            n = std::strtoul(env, nullptr, 10);
+        }
+        if (n == 0) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            n = hw == 0 ? 4 : std::min<unsigned>(hw, 32);
+        }
         ggml_backend_cpu_set_n_threads(b, static_cast<int>(n));
         return n;
     };
