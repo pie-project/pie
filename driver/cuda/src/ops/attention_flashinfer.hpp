@@ -15,7 +15,7 @@ namespace pie_cuda_driver::ops {
 
 // Opaque cache of flashinfer's `DecodePlanInfo` plus the few scheduling
 // fields the dispatch needs. Lifecycle: created once (e.g. in
-// ForwardContext), reset each fire by `plan_attention_flashinfer_decode_bf16`,
+// Executor), reset each fire by `plan_attention_flashinfer_decode_bf16`,
 // then reused by 28 per-layer dispatch calls within that fire. Hoisting
 // the plan out of the per-layer loop saves ~27 redundant DecodePlan
 // invocations per fire — the plan is identical across all layers in

@@ -233,7 +233,7 @@ public:
     ggml_backend_t       backend() const noexcept { return backend_; }
     std::string          backend_name() const noexcept;
 
-    // CPU-side companion backend, used by `ForwardEngine`'s
+    // CPU-side companion backend, used by `Executor`'s
     // `ggml_backend_sched` as the fallback when the primary backend
     // (e.g. ggml-vulkan, ggml-metal) doesn't implement an op the graph
     // requires. Returns null when the primary backend already IS the
@@ -243,7 +243,7 @@ public:
     // True iff the primary backend can run `ggml_argsort` on the full
     // vocab. ggml-vulkan caps argsort at 1024 cols which is far below
     // any modern LLM vocab (Qwen3 = 152k). When this returns false,
-    // ForwardEngine should drive the slow-only path that downloads
+    // Executor should drive the slow-only path that downloads
     // raw logits and samples host-side, avoiding `ggml_top_k` in the
     // graph entirely. Probed once at model load time. Returns true on
     // CPU/CUDA/Metal (full coverage) and on Vulkan only for tiny
@@ -456,7 +456,7 @@ private:
     ggml_backend_t        backend_     = nullptr;
     // CPU companion for the multi-backend scheduler. Created only when
     // `backend_` is a non-CPU backend (i.e. GPU). Null otherwise. The
-    // scheduler in `ForwardEngine` uses it to absorb ops the GPU
+    // scheduler in `Executor` uses it to absorb ops the GPU
     // backend can't dispatch (e.g. ggml-vulkan's missing CPY pipelines
     // for some bf16 source types). For Qwen3 family + Part A (norm
     // weights upcast to f32), no actual fallback fires in steady state
@@ -464,7 +464,7 @@ private:
     // hard-abort the runtime.
     ggml_backend_t        cpu_fallback_ = nullptr;
     // Probed in the constructor once the primary backend exists. Drives
-    // the slow_only sampling path in ForwardEngine when false.
+    // the slow_only sampling path in Executor when false.
     bool                  supports_in_graph_topk_ = true;
     // Probed alongside `supports_in_graph_topk_`. False until at least one
     // backend ships a `ggml_paged_attn_ext` implementation.

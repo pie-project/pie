@@ -337,9 +337,17 @@ impl DriverChannel for InProcChannel {
     fn abort(&self) {
         self.state.signal_abort();
         let slots = if let Ok(mut p) = self.state.pending.lock() {
-            p.drain()
-                .filter_map(|(_, entry)| entry.slot)
-                .collect::<Vec<_>>()
+            let mut slots = Vec::new();
+            p.retain(|_, entry| {
+                if let Some(slot) = entry.slot.as_ref() {
+                    slots.push(slot.clone());
+                }
+                // Keep entries already handed to the driver alive until
+                // send_response returns. Their views contain raw pointers
+                // into the frame allocation owned by the pending entry.
+                entry.view.is_some()
+            });
+            slots
         } else {
             Vec::new()
         };

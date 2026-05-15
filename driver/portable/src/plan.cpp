@@ -131,7 +131,7 @@ PlanArrays extract_plan_arrays(const pie_driver::PieForwardRequestView& req) {
     a.spec_indptr          = req.spec_indptr.as<std::uint32_t>();
 
     // Wire-trace, enabled via `PIE_PORTABLE_TRACE_KV=1`. Paired with
-    // the cuda trace in `driver/cuda/src/request_handler.cpp`; together
+    // the cuda trace in `driver/cuda/src/executor/executor.cpp`; together
     // they let us diff what each driver sees per request. Low-cost
     // diagnostic kept in tree.
     if (std::getenv("PIE_PORTABLE_TRACE_KV")) {
@@ -246,7 +246,7 @@ void plan_single_request(const PlanArrays& a,
                          std::int32_t page_size,
                          std::int32_t total_pages,
                          const ArchSpec& spec,
-                         ForwardEngine::BatchPlan& plan) {
+                         Executor::BatchPlan& plan) {
     // 0 sampler slots = prefill-only (e.g. `Context::flush`): write KV for
     // the supplied tokens, no logit sampling. Decode is 1 slot, M8
     // spec-decode is 1 + n_drafts.
@@ -311,7 +311,7 @@ void plan_single_request(const PlanArrays& a,
                                            pages_off, page_size, pos_i);
     }
 
-    ForwardEngine::ReqPlan rp;
+    Executor::ReqPlan rp;
     rp.qo_start     = qo_start;
     rp.n_tokens     = n_tok;
     rp.n_tokens_pad = ((n_tok + MASK_PAD - 1) / MASK_PAD) * MASK_PAD;
@@ -486,7 +486,7 @@ void plan_single_request(const PlanArrays& a,
     plan.reqs.push_back(std::move(rp));
 }
 
-void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
+void build_pure_decode_packing(Executor::BatchPlan& plan,
                                std::int32_t n_request,
                                std::int32_t page_size,
                                std::int32_t sliding_window,

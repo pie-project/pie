@@ -116,10 +116,12 @@ impl EngineHandle {
     /// monitor TUI, which owns its own input loop and decides when to
     /// quit.
     pub fn shutdown(self) {
-        // Signal each driver's serve loop, then join the threads.
+        // Signal each driver's serve loop, wake any transport-side
+        // waiters/recv loops, then join the threads.
         for d in &self.drivers {
             d.request_stop();
         }
+        pie::driver::abort_all_driver_channels();
         for d in self.drivers {
             let rc = d.join();
             if rc != 0 {

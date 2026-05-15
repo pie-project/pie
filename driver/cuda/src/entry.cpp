@@ -35,7 +35,7 @@
 #include "brle.hpp"
 #include "config.hpp"
 #include "cuda_check.hpp"
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "kernels/argmax.hpp"
 #include "kernels/sample_flashinfer.hpp"
 #include "kernels/sample_temp.hpp"
@@ -57,7 +57,8 @@
 #include <thread>
 #include <unistd.h>
 #include "ops/gemm.hpp"
-#include "request_handler.hpp"
+#include "executor/executor.hpp"
+#include "service/inproc_service.hpp"
 #include <pie_bridge/inproc_server.hpp>
 
 namespace {
@@ -101,7 +102,7 @@ void on_signal(int) {
 // process. Rendezvous via an in-process `std::barrier` keyed by the
 // shared `nccl_unique_id_hex` (which is per-DP-group by construction).
 // `nccl_unique_id_hex` doubles as `tp_cpu_gate_key` for the per-fire
-// CPU gate downstream (request_handler.cpp).
+// CPU gate downstream (executor/executor.cpp).
 void tp_startup_cpu_barrier(const pie_cuda_driver::Config& cfg) {
     if (cfg.distributed.tp_size <= 1) return;
 
@@ -138,7 +139,7 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                bool decode_after_prefill = false,
                pie_cuda_driver::NcclComm* tp_comm = nullptr)
 {
-    auto engine = pie_cuda_driver::Engine::load(cfg, tp_comm);
+    auto engine = pie_cuda_driver::LoadedModel::load(cfg, tp_comm);
     const auto& mt_for_parity = engine.hf_config().model_type;
     const bool is_gpt_oss  = (mt_for_parity == "gpt_oss");
     const bool is_gemma3n  = (mt_for_parity == "gemma3n" || mt_for_parity == "gemma3n_text");
@@ -686,7 +687,7 @@ int run_impl(int argc,
                           parity_decode_after_prefill, tp_comm_ptr);
     }
 
-    auto engine = pie_cuda_driver::Engine::load(cfg, tp_comm_ptr);
+    auto engine = pie_cuda_driver::LoadedModel::load(cfg, tp_comm_ptr);
 
     {
         const auto& mt = engine.hf_config().model_type;
@@ -983,7 +984,7 @@ int run_impl(int argc,
     std::unique_ptr<pie_driver::InProcServer> server_p;
     if (!is_tp_follower && vtable_opt != nullptr) {
         // Response scratch lives in the per-backend `ResponseBuilder`
-        // inside ForwardContext — no central byte buffer on this path.
+        // inside Executor — no central byte buffer on this path.
         server_p = std::make_unique<pie_driver::InProcServer>(*vtable_opt);
         register_server(server_p.get());
     } else if (!is_tp_follower && vtable_opt == nullptr) {
@@ -1399,15 +1400,16 @@ int run_impl(int argc,
         };
     }
 
-    pie_cuda_driver::ForwardContext fwd_ctx{
+    pie_cuda_driver::Executor executor{
         engine, ws, kv_cache, attn_ws, cublas,
         max_workspace_tokens, persistent_inputs, verbose, std::move(forward_fn),
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
         /*slot_alloc=*/{},
+        /*response_builder=*/{},
     };
-    fwd_ctx.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
+    executor.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
     // Speculation lives entirely in the runtime. The driver runs
     // forward passes; the runtime's `scheduler.speculation_depth`
     // toml knob controls per-ctx chain depth.
@@ -1417,7 +1419,7 @@ int run_impl(int argc,
     // and the body's slot_ids/is_fresh args remain nullptr.
     if ((is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
         qwen3_5_state_cache.max_slots() > 0) {
-        fwd_ctx.slot_alloc.reset(qwen3_5_state_cache.max_slots());
+        executor.slot_alloc.reset(qwen3_5_state_cache.max_slots());
     }
     if (verbose && use_cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
@@ -1436,14 +1438,14 @@ int run_impl(int argc,
             std::cerr << "[pie-driver-cuda] tp follower rank "
                       << cfg.distributed.tp_rank
                       << " ready (waiting on rank-0 broadcasts"
-                      << (fwd_ctx.tp_cpu_gate_key.empty()
+                      << (executor.tp_cpu_gate_key.empty()
                               ? ", cpu_gate=off"
                               : ", cpu_gate=on")
                       << ")\n";
         }
         // Followers: block on rank-0 broadcasts until shutdown.
         std::atomic<bool> stop{false};
-        pie_cuda_driver::tp_follower_serve(fwd_ctx, stop);
+        pie_cuda_driver::tp_follower_serve(executor, stop);
     } else {
         // Capabilities reflect both the loaded HF config and the live
         // KV cache. Only rank 0 reports — the wrapper expects exactly
@@ -1470,89 +1472,15 @@ int run_impl(int argc,
         if (verbose) {
             std::cerr << "[pie-driver-cuda] serving on in-process channel\n";
         }
-        server_p->serve_forever(
-            [&](std::uint32_t req_id,
-                const pie_driver::PieInProcRequestView& req,
-                pie_driver::PieInProcResponseView& out) {
-                switch (req.method) {
-                    case pie_driver::PIE_METHOD_FORWARD: {
-                        ++handled;
-                        pie_cuda_driver::handle_fire_batch(
-                            req_id, req.forward, out.forward, fwd_ctx, handled);
-                        out.status = 0;
-                        break;
-                    }
-                    case pie_driver::PIE_METHOD_COPY_D2H: {
-                        try {
-                            swap_pool.copy_d2h(
-                                kv_cache,
-                                req.copy_srcs.as<std::uint32_t>(),
-                                req.copy_dsts.as<std::uint32_t>());
-                            out.status = 0;
-                        } catch (const std::exception& e) {
-                            std::cerr << "[pie-driver-cuda] copy_d2h: " << e.what() << "\n";
-                            out.status = 5;
-                        }
-                        break;
-                    }
-                    case pie_driver::PIE_METHOD_COPY_H2D: {
-                        try {
-                            swap_pool.copy_h2d(
-                                kv_cache,
-                                req.copy_srcs.as<std::uint32_t>(),
-                                req.copy_dsts.as<std::uint32_t>());
-                            out.status = 0;
-                        } catch (const std::exception& e) {
-                            std::cerr << "[pie-driver-cuda] copy_h2d: " << e.what() << "\n";
-                            out.status = 5;
-                        }
-                        break;
-                    }
-                    case pie_driver::PIE_METHOD_COPY_D2D: {
-                        try {
-                            swap_pool.copy_d2d(
-                                kv_cache,
-                                req.copy_srcs.as<std::uint32_t>(),
-                                req.copy_dsts.as<std::uint32_t>());
-                            out.status = 0;
-                        } catch (const std::exception& e) {
-                            std::cerr << "[pie-driver-cuda] copy_d2d: " << e.what() << "\n";
-                            out.status = 5;
-                        }
-                        break;
-                    }
-                    case pie_driver::PIE_METHOD_COPY_H2H: {
-                        try {
-                            swap_pool.copy_h2h(
-                                req.copy_srcs.as<std::uint32_t>(),
-                                req.copy_dsts.as<std::uint32_t>());
-                            out.status = 0;
-                        } catch (const std::exception& e) {
-                            std::cerr << "[pie-driver-cuda] copy_h2h: " << e.what() << "\n";
-                            out.status = 5;
-                        }
-                        break;
-                    }
-                    case pie_driver::PIE_METHOD_LOAD_ADAPTER:
-                    case pie_driver::PIE_METHOD_SAVE_ADAPTER:
-                    case pie_driver::PIE_METHOD_ZO_INITIALIZE_ADAPTER:
-                    case pie_driver::PIE_METHOD_ZO_UPDATE_ADAPTER:
-                        // Cuda has no AdapterPool yet — every adapter
-                        // method is a no-op stub returning success.
-                        out.status = 0;
-                        break;
-                    default:
-                        std::cerr << "[pie-driver-cuda] unknown method "
-                                  << req.method << "\n";
-                        out.status = 2;
-                        break;
-                }
-            });
+        pie_cuda_driver::service::InProcService service{
+            executor, kv_cache, swap_pool};
+        service.serve_forever(*server_p);
+        handled = service.handled();
         // Leader exited serve loop — wake followers so they can tear
         // down cleanly.
         if (cfg.distributed.tp_size > 1) {
             pie_cuda_driver::tp_send_shutdown(
-                *tp_comm_ptr, fwd_ctx.tp_cpu_gate_key);
+                *tp_comm_ptr, executor.tp_cpu_gate_key);
         }
     }
 

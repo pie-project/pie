@@ -32,11 +32,11 @@
 // Returns a `MixtralWeights` so the runtime dispatch can reuse
 // `mixtral_forward_paged` directly.
 
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "model/mixtral.hpp"
 
 namespace pie_cuda_driver::model {
 
-MixtralWeights bind_gpt_oss(Engine& engine);
+MixtralWeights bind_gpt_oss(LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

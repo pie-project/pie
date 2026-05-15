@@ -25,7 +25,7 @@
 //      list of one fire shape. Different `(R, num_pages, …)` shapes need
 //      different graphs, hence the bucket cache.
 //
-// Used only when the request handler decides the fire is "pure decode"
+// Used only when the executor decides the fire is "pure decode"
 // (every request has qo_len == 1) and the `--cuda-graphs` flag is on.
 
 #include <cstddef>
@@ -55,7 +55,7 @@ struct ForwardGraphKeyHash {
     }
 };
 
-// Cache of executable graphs keyed by shape. Owned by ForwardContext;
+// Cache of executable graphs keyed by shape. Owned by Executor;
 // graphs are destroyed in the destructor. Bounded LRU is overkill at the
 // shapes we see — a few buckets suffice; we let it grow unbounded.
 class ForwardGraphCache {

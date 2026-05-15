@@ -142,7 +142,7 @@ void llama_like_forward_paged(
     const float eps = cfg.rms_norm_eps;
     // Inherit the stream bound to `cublas` so manual kernel launches stay
     // on the same stream as the cublas matmuls. The graph-capture path
-    // in request_handler.cpp binds `cublas` to its `cstream` for the
+    // in executor/executor.cpp binds `cublas` to its `cstream` for the
     // duration of capture so every launch in this body — cublas-issued or
     // not — lands on the captured graph.
     cudaStream_t stream = cublas.stream();
@@ -172,7 +172,7 @@ void llama_like_forward_paged(
     // Decode plan was set up by the prepare hook (runs outside any
     // cudaStream capture region) — the body just reads from
     // `plan_state.decode_plan`. Keeps the body purely device-side so
-    // the request handler can capture it into a CUDA graph.
+    // the executor can capture it into a CUDA graph.
     const ops::DecodePlanCache* decode_plan =
         plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;
 

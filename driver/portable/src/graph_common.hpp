@@ -7,7 +7,7 @@
 // the L4MA-vs-Gemma RMSNorm weighting variants, `build_moe_ffn` is the
 // shared MoE block, etc. The graph-input/output structs `GraphInputs`
 // and `GraphResult` are produced by every per-arch builder and consumed
-// by `ForwardEngine::compute_`.
+// by `Executor::compute_`.
 
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +15,7 @@
 
 #include <ggml.h>
 
-#include "forward.hpp"
+#include "executor/executor.hpp"
 
 namespace pie_portable_driver {
 
@@ -144,7 +144,7 @@ struct GraphResult {
 // between the slow (per-request) path and the M11 packed-decode fast path
 // based on `plan.pure_decode`.
 void upload_graph_inputs(const GraphResult& g,
-                         const ForwardEngine::BatchPlan& plan);
+                         const Executor::BatchPlan& plan);
 
 // Allocate the standard set of per-batch graph input tensors
 // (`tok_input`, `pos_input`, `kv_idxs`, `out_idx`) plus either the
@@ -153,7 +153,7 @@ void upload_graph_inputs(const GraphResult& g,
 // Returns the populated GraphInputs; per-arch builders chain layer
 // computation off these tensors.
 GraphInputs declare_graph_inputs(ggml_context* ctx,
-                                 const ForwardEngine::BatchPlan& plan,
+                                 const Executor::BatchPlan& plan,
                                  std::int32_t n_total,
                                  std::int32_t n_req,
                                  bool         supports_paged_attn_ext);

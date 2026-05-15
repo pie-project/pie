@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 fn main() {
     let portable = cfg!(feature = "driver-portable");
     let cuda = cfg!(feature = "driver-cuda");
+    println!("cargo:rerun-if-changed=../driver/common/include");
+    println!("cargo:rerun-if-changed=../driver/common/src");
 
     if portable {
         build_portable();
@@ -37,9 +39,10 @@ fn main() {
 /// CMake via `-DPIE_BRIDGE_INCLUDE_DIR=...` so each C++ driver backend
 /// can pick the header up with `target_include_directories`.
 fn pie_bridge_include_dir() -> PathBuf {
-    let dir = std::env::var("DEP_PIE_BRIDGE_INCLUDE")
-        .expect("pie-bridge's build.rs did not emit cargo:include — \
-                 check that `links = \"pie_bridge\"` is set in driver/bridge/Cargo.toml");
+    let dir = std::env::var("DEP_PIE_BRIDGE_INCLUDE").expect(
+        "pie-bridge's build.rs did not emit cargo:include — \
+                 check that `links = \"pie_bridge\"` is set in driver/bridge/Cargo.toml",
+    );
     PathBuf::from(dir)
 }
 
@@ -269,9 +272,7 @@ fn build_cuda() {
     // env script first.
     println!("cargo:rerun-if-env-changed=CUDACXX");
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_COMPILER");
-    if std::env::var_os("CUDACXX").is_none()
-        && std::env::var_os("CMAKE_CUDA_COMPILER").is_none()
-    {
+    if std::env::var_os("CUDACXX").is_none() && std::env::var_os("CMAKE_CUDA_COMPILER").is_none() {
         for candidate in [
             "/usr/local/cuda/bin/nvcc",
             "/usr/local/cuda-12/bin/nvcc",

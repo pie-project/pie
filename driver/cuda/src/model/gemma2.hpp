@@ -23,7 +23,7 @@
 #include <vector>
 
 #include "distributed.hpp"
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
 #include "model/llama_like.hpp"
 #include "model/qwen3.hpp"
@@ -103,11 +103,11 @@ struct Gemma2ForwardCfg {
     NcclComm* tp_comm = nullptr;
 };
 
-Gemma2Weights bind_gemma2(const Engine& engine);
+Gemma2Weights bind_gemma2(const LoadedModel& engine);
 
 // Gemma-3 reuses the same `Gemma2Weights` shape — the only schema delta
 // is that `q_norm` / `k_norm` are non-null per layer.
-Gemma2Weights bind_gemma3(const Engine& engine);
+Gemma2Weights bind_gemma3(const LoadedModel& engine);
 
 void gemma2_forward_paged(
     const Gemma2Weights& w,

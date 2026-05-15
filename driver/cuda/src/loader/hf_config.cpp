@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include <nlohmann/json.hpp>
+#include <pie_driver_common/hf_config_json.hpp>
 
 namespace pie_cuda_driver {
 
@@ -12,16 +13,12 @@ namespace {
 
 template <typename T>
 T require(const nlohmann::json& j, const char* key, const std::string& path) {
-    if (!j.contains(key)) {
-        throw std::runtime_error("config.json (" + path + "): missing key '" + key + "'");
-    }
-    return j[key].get<T>();
+    return pie_driver_common::json_require<T>(j, key, path);
 }
 
 template <typename T>
 T optional(const nlohmann::json& j, const char* key, T default_value) {
-    if (!j.contains(key) || j[key].is_null()) return default_value;
-    return j[key].get<T>();
+    return pie_driver_common::json_get_or<T>(j, key, default_value);
 }
 
 // Qwen3-specific signal: HF marks `use_qk_norm` implicitly via model_type.
@@ -54,12 +51,9 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // architecture name + a stub `model_type=gemma4` at the top level.
     // Dereference once so the rest of the parser reads from the text
     // sub-config when present.
-    const auto& j = j_root.contains("text_config") &&
-                            j_root["text_config"].is_object()
-                        ? j_root["text_config"]
-                        : j_root;
-    cfg.model_type = optional<std::string>(j, "model_type",
-                       optional<std::string>(j_root, "model_type", ""));
+    const auto view = pie_driver_common::hf_config_json_view(j_root);
+    const auto& j = view.text;
+    cfg.model_type = view.text_or_outer_model_type();
 
     cfg.hidden_size              = require<int>(j, "hidden_size", path_str);
     // `intermediate_size` is normally a scalar, but Gemma-3n stores a
@@ -308,24 +302,20 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // some other models. Defaults to 1.0 (full rotation) for everything
     // else.
     cfg.partial_rotary_factor = 1.0f;
-    if (j.contains("rope_parameters") && j["rope_parameters"].is_object()
-            && j["rope_parameters"].contains("partial_rotary_factor")) {
+    if (const auto* rp = pie_driver_common::flat_rope_parameters_view(j);
+        rp != nullptr && rp->contains("partial_rotary_factor")) {
         cfg.partial_rotary_factor =
-            j["rope_parameters"]["partial_rotary_factor"].get<float>();
+            (*rp)["partial_rotary_factor"].get<float>();
     } else {
         cfg.partial_rotary_factor =
             optional<float>(j, "partial_rotary_factor", 1.0f);
     }
     // Qwen3.5 stores `rope_theta` under `rope_parameters` rather than
     // at the top level. Use that as the source of truth when present.
-    if (j.contains("rope_parameters") && j["rope_parameters"].is_object()
-            && j["rope_parameters"].contains("rope_theta")
-            && cfg.layer_types.empty()) {
-        // Only apply when not Gemma-4-style per-layer-type rope_parameters
-        // (those have nested objects keyed by layer type).
-        const auto& rp = j["rope_parameters"];
-        if (rp["rope_theta"].is_number()) {
-            cfg.rope_theta = rp["rope_theta"].get<float>();
+    if (const auto* rp = pie_driver_common::flat_rope_parameters_view(j);
+        rp != nullptr && rp->contains("rope_theta")) {
+        if ((*rp)["rope_theta"].is_number()) {
+            cfg.rope_theta = (*rp)["rope_theta"].get<float>();
         }
     }
 
@@ -356,8 +346,6 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // side tensors entirely. Detection key is the top-level model_type:
     // mistral3 (Mistral-Small-3.1-FP8), llava (Llava-1.6), llava_next,
     // qwen2_5_vl, gemma3 (multimodal variant has vision_config), …
-    const std::string root_model_type =
-        optional<std::string>(j_root, "model_type", "");
     const bool has_vision_config =
         j_root.contains("vision_config") && j_root["vision_config"].is_object();
     const bool is_multimodal_wrapper =

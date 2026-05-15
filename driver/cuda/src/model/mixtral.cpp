@@ -26,7 +26,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("mixtral: missing weight '" + name + "'");
     }
@@ -35,7 +35,7 @@ const DeviceTensor& must(const Engine& e, const std::string& name) {
 
 }  // namespace
 
-MixtralWeights bind_mixtral(const Engine& engine) {
+MixtralWeights bind_mixtral(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int E = cfg.num_experts;
     if (E <= 0) {

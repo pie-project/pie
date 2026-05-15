@@ -1,8 +1,8 @@
 #pragma once
 
-// Single-request handler for the `fire_batch` inproc method. Lifted from
-// `main.cpp` so the entry point stays focused on init and the dispatch
-// loop. Body is unchanged from its lambda incarnation; follow-up
+// Forward executor for the `fire_batch` inproc method. Lifted from
+// entry.cpp so the entry point stays focused on startup and service
+// wiring. Body is unchanged from its lambda incarnation; follow-up
 // refactors (spec expansion, sampling dispatch, sub-passes) split this
 // further.
 
@@ -16,16 +16,16 @@
 #include <atomic>
 
 #include "distributed.hpp"
-#include "forward_graph.hpp"
-#include <pie_bridge/inproc_server.hpp>
+#include "executor/forward_graph.hpp"
+#include <pie_bridge/view.hpp>
 #include "model/llama_like.hpp"
-#include "persistent_inputs.hpp"
+#include "executor/persistent_inputs.hpp"
 #include <pie_bridge/response_builder.hpp>
 #include "slot_allocator.hpp"
 
 namespace pie_cuda_driver {
 
-class Engine;
+class LoadedModel;
 class KvCache;
 class AttentionWorkspace;
 
@@ -47,7 +47,7 @@ class CublasHandle;
 //                  plan) and uploads it to pinned/device buffers that
 //                  the captured body reads via cudaMemcpyAsync. When
 //                  empty, the body is treated as self-contained — but
-//                  the request handler then disables graph capture for
+//                  the executor then disables graph capture for
 //                  that arch (host-side work inside a captured region
 //                  freezes the plan at first-fire KV size, producing
 //                  garbage after the KV grows past one page).
@@ -58,9 +58,9 @@ class CublasHandle;
 //                  `prepare` refreshes. No host loops, no allocs, no
 //                  std::vector inside.
 //
-// main.cpp builds both closures from the per-arch weights + cfg.
+// entry.cpp builds both closures from the per-arch weights + cfg.
 struct ForwardFn {
-    // Whether the request handler may capture this forward into a CUDA
+    // Whether the executor may capture this forward into a CUDA
     // graph for replay. False by default — flashinfer's decode plan
     // bakes per-fire metadata (`padded_batch_size`, `split_kv`, etc.)
     // into kernel args at capture time, which goes stale once the KV
@@ -102,7 +102,7 @@ struct ForwardFn {
         bool                 /* is_pure_decode */
     )>;
 
-    // Empty by default → request handler falls back to "direct call only;
+    // Empty by default → executor falls back to "direct call only;
     // no graph capture" mode for this arch.
     PrepareFn prepare;
     BodyFn    body;
@@ -123,11 +123,11 @@ struct ForwardFn {
     ForwardFn& operator=(ForwardFn&&) noexcept = default;
 };
 
-// Stable references the request handler needs across calls. Constructed
-// once after engine/workspace allocation in `main()` and held alongside
-// the shmem server.
-struct ForwardContext {
-    Engine& engine;
+// Stable references the executor needs across calls. Constructed
+// once after loaded-model/workspace allocation in entry.cpp and held by
+// the service.
+struct Executor {
+    LoadedModel& loaded_model;
     model::Qwen3Workspace& ws;
     KvCache& kv_cache;
     AttentionWorkspace& attn_ws;
@@ -145,7 +145,7 @@ struct ForwardContext {
     ForwardGraphCache* graph_cache = nullptr;
 
     // Tensor-parallel comm. Non-null on rank 0 when tp_size > 1 — the
-    // request handler broadcasts the per-fire inputs to TP followers
+    // executor broadcasts the per-fire inputs to TP followers
     // before invoking the forward kernels. On TP followers a parallel
     // service loop (`tp_follower_serve`) consumes those broadcasts.
     NcclComm* tp_comm = nullptr;
@@ -169,7 +169,7 @@ struct ForwardContext {
 };
 
 // Run the forward pass + sampling pipeline on one forward-pass request
-// and fill out `out_resp` via `ctx.response_builder`. `req_id` is the
+// and fill out `out_resp` via `executor.response_builder`. `req_id` is the
 // per-fire identifier used in error logging; `handled` is the
 // cumulative fire counter used as PRNG offset and logging-cadence gate.
 // The caller's inproc transport hands `out_resp` to `send_response`
@@ -178,7 +178,7 @@ void handle_fire_batch(
     std::uint32_t req_id,
     const pie_driver::PieForwardRequestView& view,
     pie_driver::PieForwardResponseView& out_resp,
-    ForwardContext& ctx,
+    Executor& executor,
     std::uint64_t handled);
 
 // TP-follower service loop. Called only on TP ranks > 0. Mirrors
@@ -188,7 +188,7 @@ void handle_fire_batch(
 // against rank 0, then loops. `stop` is checked between fires; rank 0
 // also sends an explicit shutdown header before tearing down so a
 // follower waiting on a broadcast unblocks cleanly.
-void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop);
+void tp_follower_serve(Executor& executor, std::atomic<bool>& stop);
 
 // Send the shutdown sentinel header from rank 0 so followers exit their
 // `tp_follower_serve` loop on the next broadcast.

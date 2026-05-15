@@ -38,7 +38,7 @@ struct ResponseSubpassContext {
     std::span<const float>         per_slot_temp;
     std::span<const std::int32_t>  per_slot_top_k;
 
-    // Active wire control views (see request_handler).
+    // Active wire control views (see executor).
     std::span<const std::uint32_t> qo_indptr;       // length R+1
     std::span<const std::uint32_t> sampling_indptr; // length R+1
     std::span<const std::uint32_t> sampling_indices; // length num_sampling

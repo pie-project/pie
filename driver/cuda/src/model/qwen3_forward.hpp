@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "model/qwen3.hpp"
 #include "ops/gemm.hpp"
 #include "tensor.hpp"

@@ -6,7 +6,7 @@
 // then append a verification block (n_drafts+1 cloned token samplers per
 // spec request) to the sampling layout.
 //
-// Returns owned vectors; the request handler switches its active spans
+// Returns owned vectors; the executor switches its active spans
 // to point at them when `has_drafts` is true.
 
 #include <cstdint>

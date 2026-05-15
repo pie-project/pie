@@ -15,7 +15,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -32,11 +31,12 @@
 #include "adapter.hpp"
 #include "host_swap_pool.hpp"
 #include "config.hpp"
-#include "forward.hpp"
+#include "executor/executor.hpp"
 #include "hf_config.hpp"
 #include <pie_bridge/inproc_server.hpp>
 #include "kv_cache.hpp"
 #include "model.hpp"
+#include "service/inproc_service.hpp"
 
 namespace {
 
@@ -129,10 +129,10 @@ enum class OfflineTestMode {
 };
 
 // Drives generate_multi() with the supplied prompts + ctx_ids and prints
-// outputs + timing per the test mode. After the run, the engine's
+// outputs + timing per the test mode. After the run, the executor's
 // per-stage timing breakdown is logged (covers the prefill + decode loop
 // across all contexts).
-void run_offline_test(pie_portable_driver::ForwardEngine& engine,
+void run_offline_test(pie_portable_driver::Executor& executor,
                       std::vector<std::vector<std::uint32_t>> prompts,
                       std::vector<std::uint64_t> ctx_ids,
                       int max_new,
@@ -157,9 +157,9 @@ void run_offline_test(pie_portable_driver::ForwardEngine& engine,
             break;
     }
 
-    engine.reset_timings();
+    executor.reset_timings();
     const auto t0 = clock::now();
-    auto outs = engine.generate_multi(prompts, max_new, ctx_ids);
+    auto outs = executor.generate_multi(prompts, max_new, ctx_ids);
     const long dt_ms = static_cast<long>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             clock::now() - t0).count());
@@ -207,7 +207,7 @@ void run_offline_test(pie_portable_driver::ForwardEngine& engine,
     // Per-stage breakdown (covers every compute_() call across prefill +
     // decode). Useful for spotting whether time is going into graph
     // build, the GPU compute itself, the logits download, or sampling.
-    engine.log_timings("offline-test");
+    executor.log_timings("offline-test");
 }
 
 // All meaningful logic lives in `run_impl`; the `extern "C"` wrapper at
@@ -283,7 +283,7 @@ int run_impl(int argc,
                   << ", backend=" << model.backend_name() << ")\n";
     }
 
-    // ---- Allocate forward engine + paged KV pool. ---------------------------
+    // ---- Allocate forward executor + paged KV pool. ---------------------------
     // The runtime owns page allocation; we report total_pages and page_size
     // in the READY handshake and honor the page IDs the runtime sends in
     // every wire request.
@@ -292,10 +292,10 @@ int run_impl(int argc,
     const std::int32_t page_size =
         static_cast<std::int32_t>(cfg.batching.kv_page_size);
     const std::int32_t requested_pages = total_pages;
-    std::unique_ptr<pie_portable_driver::ForwardEngine> engine_ptr;
+    std::unique_ptr<pie_portable_driver::Executor> executor_ptr;
     while (total_pages >= 64) {
         try {
-            engine_ptr = std::make_unique<pie_portable_driver::ForwardEngine>(
+            executor_ptr = std::make_unique<pie_portable_driver::Executor>(
                 model, total_pages, page_size);
             break;
         } catch (const std::exception& e) {
@@ -307,14 +307,14 @@ int run_impl(int argc,
             total_pages = next_pages;
         }
     }
-    if (!engine_ptr) {
+    if (!executor_ptr) {
         throw std::runtime_error("forward: failed to allocate KV cache");
     }
-    auto& engine = *engine_ptr;
+    auto& executor = *executor_ptr;
     if (cfg.runtime.verbose) {
-        std::cerr << "[pie-driver-portable] forward engine ready (total_pages="
+        std::cerr << "[pie-driver-portable] forward executor ready (total_pages="
                   << total_pages << ", page_size=" << page_size
-                  << ", kv_buf=" << (engine.kv_buffer_size() / (1024.0 * 1024.0))
+                  << ", kv_buf=" << (executor.kv_buffer_size() / (1024.0 * 1024.0))
                   << " MiB)\n";
     }
     if (total_pages != requested_pages) {
@@ -326,7 +326,7 @@ int run_impl(int argc,
     // ---- Optional host swap pool + cold-path registration. ------------------
     std::unique_ptr<pie_portable_driver::HostSwapPool> swap_pool;
     auto adapters = std::make_unique<pie_portable_driver::AdapterPool>();
-    engine.set_adapters(adapters.get());
+    executor.set_adapters(adapters.get());
     const std::int32_t cpu_pages =
         static_cast<std::int32_t>(cfg.batching.cpu_pages);
     if (cpu_pages > 0) {
@@ -352,14 +352,14 @@ int run_impl(int argc,
     if (!test_multi_prompts.empty()) {
         auto prompts = parse_pipe_csv_u32(test_multi_prompts);
         auto ctx_ids = seq_ctx_ids(prompts.size());
-        run_offline_test(engine, std::move(prompts), std::move(ctx_ids),
+        run_offline_test(executor, std::move(prompts), std::move(ctx_ids),
                          test_max_new, OfflineTestMode::Multi);
         return 0;
     }
     if (test_replicate > 0 && !test_prompt_tokens.empty()) {
         auto prompt  = parse_csv_u32(test_prompt_tokens);
         std::vector<std::vector<std::uint32_t>> prompts(test_replicate, prompt);
-        run_offline_test(engine, std::move(prompts),
+        run_offline_test(executor, std::move(prompts),
                          seq_ctx_ids(static_cast<std::size_t>(test_replicate)),
                          test_max_new, OfflineTestMode::Replicate);
         return 0;
@@ -367,17 +367,15 @@ int run_impl(int argc,
     if (!test_prompt_tokens.empty()) {
         std::vector<std::vector<std::uint32_t>> prompts{
             parse_csv_u32(test_prompt_tokens)};
-        run_offline_test(engine, std::move(prompts), seq_ctx_ids(1),
+        run_offline_test(executor, std::move(prompts), seq_ctx_ids(1),
                          test_max_new, OfflineTestMode::Single);
         return 0;
     }
 
     // ---- Open the in-process server. ----------------------------------------
     // The runtime owns the channel; we receive requests via the FFI vtable
-    // it handed us. Response scratch lives in `ResponseBuilder` below
-    // (per-fire concat into reusable arenas).
+    // it handed us.
     pie_driver::InProcServer server(vtable);
-    pie_driver::ResponseBuilder response_builder;
     register_server(&server);
 
     if (install_signal_handlers) {
@@ -417,146 +415,10 @@ int run_impl(int argc,
         std::cerr << "[pie-driver-portable] serving on in-process channel\n";
     }
 
-    std::uint64_t handled = 0;
-
-    // Per-(layer, page) byte count used by the copy methods. The kv tensor's
-    // dtype is constant across layers; we cache once.
-    const auto page_bytes_of = [&](pie_portable_driver::KvCachePaged& kv) -> std::size_t {
-        return static_cast<std::size_t>(kv.n_embd_gqa()) * kv.page_size()
-               * ggml_type_size(kv.k(0)->type);
-    };
-
-    server.serve_forever([&](std::uint32_t req_id,
-                             const pie_driver::PieInProcRequestView& req,
-                             pie_driver::PieInProcResponseView& out) {
-        out.method = req.method;
-        switch (req.method) {
-            case pie_driver::PIE_METHOD_FORWARD: {
-                ++handled;
-                const auto& view = req.forward;
-                if (cfg.runtime.verbose && (handled <= 4 || handled % 100 == 0)) {
-                    const auto tokens = view.token_ids.as<std::uint32_t>();
-                    const auto context_ids = view.context_ids.as<std::uint64_t>();
-                    std::cerr << "[pie-driver-portable] req_id=" << req_id
-                              << " device=" << view.driver_id
-                              << " single_token=" << (view.single_token_mode ? 1 : 0)
-                              << " tokens=" << tokens.size()
-                              << " contexts=" << context_ids.size() << "\n";
-                }
-                try {
-                    engine.run(view, response_builder, out.forward);
-                    out.status = 0;
-                } catch (const std::exception& e) {
-                    std::cerr << "[pie-driver-portable] forward failed for req_id="
-                              << req_id << ": " << e.what() << "\n";
-                    out.forward = pie_driver::PieForwardResponseView{};
-                    out.status = 5;
-                }
-                break;
-            }
-            case pie_driver::PIE_METHOD_COPY_D2H:
-            case pie_driver::PIE_METHOD_COPY_H2D:
-            case pie_driver::PIE_METHOD_COPY_D2D:
-            case pie_driver::PIE_METHOD_COPY_H2H: {
-                const auto srcs = req.copy_srcs.as<std::uint32_t>();
-                const auto dsts = req.copy_dsts.as<std::uint32_t>();
-                if (srcs.size() != dsts.size()) {
-                    out.status = 5;
-                    break;
-                }
-                auto& kv = engine.kv();
-                const std::size_t per_page = page_bytes_of(kv);
-                const int total_dev = kv.total_pages();
-                const int total_host = swap_pool ? swap_pool->cpu_pages() : 0;
-                bool ok = true;
-                try {
-                    for (std::size_t i = 0; i < srcs.size(); ++i) {
-                        const std::uint32_t s = srcs[i], d = dsts[i];
-                        if (req.method == pie_driver::PIE_METHOD_COPY_D2H) {
-                            if (!swap_pool) { out.status = 4; ok = false; break; }
-                            if (s >= (std::uint32_t)total_dev || d >= (std::uint32_t)total_host) {
-                                out.status = 3; ok = false; break;
-                            }
-                            const std::size_t off = (std::size_t)s * per_page;
-                            for (std::int32_t il = 0; il < kv.n_layers(); ++il) {
-                                ggml_backend_tensor_get(kv.k(il), swap_pool->k_slot(il, d), off, per_page);
-                                ggml_backend_tensor_get(kv.v(il), swap_pool->v_slot(il, d), off, per_page);
-                            }
-                        } else if (req.method == pie_driver::PIE_METHOD_COPY_H2D) {
-                            if (!swap_pool) { out.status = 4; ok = false; break; }
-                            if (s >= (std::uint32_t)total_host || d >= (std::uint32_t)total_dev) {
-                                out.status = 3; ok = false; break;
-                            }
-                            const std::size_t off = (std::size_t)d * per_page;
-                            for (std::int32_t il = 0; il < kv.n_layers(); ++il) {
-                                ggml_backend_tensor_set(kv.k(il), swap_pool->k_slot(il, s), off, per_page);
-                                ggml_backend_tensor_set(kv.v(il), swap_pool->v_slot(il, s), off, per_page);
-                            }
-                        } else if (req.method == pie_driver::PIE_METHOD_COPY_D2D) {
-                            if (s >= (std::uint32_t)total_dev || d >= (std::uint32_t)total_dev) {
-                                out.status = 3; ok = false; break;
-                            }
-                            std::vector<std::uint8_t> tmp(per_page);
-                            const std::size_t soff = (std::size_t)s * per_page;
-                            const std::size_t doff = (std::size_t)d * per_page;
-                            for (std::int32_t il = 0; il < kv.n_layers(); ++il) {
-                                ggml_backend_tensor_get(kv.k(il), tmp.data(), soff, per_page);
-                                ggml_backend_tensor_set(kv.k(il), tmp.data(), doff, per_page);
-                                ggml_backend_tensor_get(kv.v(il), tmp.data(), soff, per_page);
-                                ggml_backend_tensor_set(kv.v(il), tmp.data(), doff, per_page);
-                            }
-                        } else { // PIE_METHOD_COPY_H2H
-                            if (!swap_pool) { out.status = 4; ok = false; break; }
-                            if (s >= (std::uint32_t)total_host || d >= (std::uint32_t)total_host) {
-                                out.status = 3; ok = false; break;
-                            }
-                            for (std::int32_t il = 0; il < kv.n_layers(); ++il) {
-                                std::memcpy(swap_pool->k_slot(il, d), swap_pool->k_slot(il, s), per_page);
-                                std::memcpy(swap_pool->v_slot(il, d), swap_pool->v_slot(il, s), per_page);
-                            }
-                        }
-                    }
-                    if (ok) out.status = 0;
-                } catch (const std::exception& e) {
-                    std::cerr << "[pie-driver-portable] copy failed: " << e.what() << "\n";
-                    out.status = 5;
-                }
-                break;
-            }
-            case pie_driver::PIE_METHOD_LOAD_ADAPTER: {
-                const auto path_bytes = req.adapter_path.as<char>();
-                std::string path(path_bytes.data(), path_bytes.size());
-                try {
-                    const auto& hpar = model.hparams();
-                    auto ad = std::make_unique<pie_portable_driver::Adapter>(
-                        model.backend(),
-                        hpar.num_hidden_layers,
-                        /*guessed_rank=*/0,
-                        /*scale=*/1.0f,
-                        std::filesystem::path(path),
-                        hpar);
-                    adapters->insert(req.adapter_id, std::move(ad));
-                    out.status = 0;
-                } catch (const std::exception& e) {
-                    std::cerr << "[pie-driver-portable] load_adapter: " << e.what() << "\n";
-                    out.status = 5;
-                }
-                break;
-            }
-            case pie_driver::PIE_METHOD_SAVE_ADAPTER:
-            case pie_driver::PIE_METHOD_ZO_INITIALIZE_ADAPTER:
-            case pie_driver::PIE_METHOD_ZO_UPDATE_ADAPTER:
-                // No-op stubs — adapter persistence and zeroth-order
-                // training are not implemented in portable.
-                out.status = 0;
-                break;
-            default:
-                std::cerr << "[pie-driver-portable] unknown method "
-                          << req.method << "\n";
-                out.status = 2;
-                break;
-        }
-    });
+    pie_portable_driver::service::InProcService service{
+        executor, model, swap_pool.get(), *adapters, cfg.runtime.verbose};
+    service.serve_forever(server);
+    const std::uint64_t handled = service.handled();
 
     unregister_server(&server);
     if (cfg.runtime.verbose) {
@@ -566,7 +428,7 @@ int run_impl(int argc,
     // Print per-stage timings on demand (e.g. e2e benchmarks). Default
     // off so production logs stay quiet.
     if (std::getenv("PIE_PORTABLE_LOG_TIMINGS")) {
-        engine.log_timings("shmem-loop");
+        executor.log_timings("shmem-loop");
     }
     return 0;
 }

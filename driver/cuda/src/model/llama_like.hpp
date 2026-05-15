@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "distributed.hpp"
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "model/qwen3.hpp"           // Qwen3Weights / Qwen3Workspace shared
 #include "model/qwen3_forward.hpp"   // Qwen3Workspace (already declared)
 #include "ops/attention_flashinfer.hpp"

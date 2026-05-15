@@ -12,7 +12,7 @@
 // pointers would read stale memory and produce gibberish.
 //
 // With this struct, the 9 wire control arrays + sampled-token output
-// live at stable addresses. The request handler refreshes their
+// live at stable addresses. The executor refreshes their
 // *contents* via `copy_from_host` / `copy_from_bytes` per fire and
 // hands raw pointers to the forward + sampling kernels.
 //
@@ -57,7 +57,7 @@ struct PersistentInputs {
     DeviceBuffer<std::uint8_t>  is_fresh;
 
     // Sampler per-row parameters. Capacity = max_workspace_tokens.
-    // Refreshed per fire by `request_handler::handle_fire_batch`.
+    // Refreshed per fire by `executor::handle_fire_batch`.
     // Held here (rather than allocated inside `dispatch_sampling`) so
     // the sampling kernel runs without per-fire `cudaMalloc/cudaFree`
     // churn — the prior path opened 3–6 fresh device allocations per

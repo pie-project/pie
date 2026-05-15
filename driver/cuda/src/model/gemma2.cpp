@@ -20,7 +20,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("gemma2: missing weight '" + name + "'");
     }
@@ -29,7 +29,7 @@ const DeviceTensor& must(const Engine& e, const std::string& name) {
 
 }  // namespace
 
-Gemma2Weights bind_gemma2(const Engine& engine) {
+Gemma2Weights bind_gemma2(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     Gemma2Weights w;
     w.embed      = &must(engine, "model.embed_tokens.weight");
@@ -63,7 +63,7 @@ Gemma2Weights bind_gemma2(const Engine& engine) {
     return w;
 }
 
-Gemma2Weights bind_gemma3(const Engine& engine) {
+Gemma2Weights bind_gemma3(const LoadedModel& engine) {
     // Gemma-3 ships the same weight schema as Gemma-2 plus per-head
     // q_norm / k_norm. We delegate the bulk of binding and just patch
     // the qk-norm fields layer-by-layer.

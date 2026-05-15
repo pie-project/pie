@@ -51,7 +51,7 @@ ggml_tensor* compute_altup_modalities(ggml_context* ctx,
 GraphResult build_qwen3_graph(ggml_context* ctx,
                               const Model& model,
                               KvCachePaged& kv,
-                              const ForwardEngine::BatchPlan& plan) {
+                              const Executor::BatchPlan& plan) {
     const auto& h = model.hparams();
     const auto& w = model.weights();
     const std::int32_t head_dim   = h.head_dim;

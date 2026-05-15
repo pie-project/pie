@@ -1,4 +1,4 @@
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <pie_driver_common/tensor_names.hpp>
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
@@ -35,7 +36,7 @@ namespace {
 //
 // Mixtral / Qwen3.5-MoE / Gemma-4 / Gemma-3n have additional weight names
 // (expert FFNs, AltUp, …) — they're not in this first cut and the engine
-// rejects them at the top of Engine::load when tp_size > 1.
+// rejects them at the top of LoadedModel::load when tp_size > 1.
 int llama_like_shard_axis(const std::string& name) {
     auto ends_with = [&](const char* suffix) {
         const auto n = std::char_traits<char>::length(suffix);
@@ -195,14 +196,14 @@ DeviceTensor slice_bf16_per_rank(
 
 }  // namespace
 
-Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
+LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     if (boot_cfg.model.snapshot_dir.empty()) {
         throw std::runtime_error(
             "engine: model.snapshot_dir is empty — pass it in dev.toml or "
             "let the wrapper resolve it via pie_driver.hf_utils");
     }
 
-    Engine e;
+    LoadedModel e;
     e.boot_ = boot_cfg;
     const bool verbose = boot_cfg.runtime.verbose;
 
@@ -310,14 +311,6 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
     const bool shard_q35_moe_experts = (tp_size > 1) &&
         (e.hf_.model_type == "qwen3_5_moe" ||
          e.hf_.model_type == "qwen3_5_moe_text");
-    auto ends_with = [](const std::string& s, const std::string& suf) {
-        return s.size() >= suf.size() &&
-               s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
-    };
-    auto starts_with = [](const std::string& s, const std::string& pre) {
-        return s.size() >= pre.size() &&
-               s.compare(0, pre.size(), pre) == 0;
-    };
     // Multimodal text-tower extraction (Mistral3 / Llava / Qwen2.5-VL).
     // For these archs HF stores LLM weights under "language_model." and
     // vision-side weights under separate prefixes; we run the LLM only,
@@ -325,16 +318,10 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
     const std::string& mm_strip = e.hf_.mm_lm_strip_prefix;
     const auto& mm_skip = e.hf_.mm_skip_prefixes;
     auto remap_name = [&](const std::string& raw) -> std::string {
-        if (!mm_strip.empty() && starts_with(raw, mm_strip)) {
-            return raw.substr(mm_strip.size());
-        }
-        return raw;
+        return pie_driver_common::strip_prefix(raw, mm_strip);
     };
     auto skip_tensor = [&](const std::string& raw) -> bool {
-        for (const auto& p : mm_skip) {
-            if (starts_with(raw, p)) return true;
-        }
-        return false;
+        return pie_driver_common::starts_with_any(raw, mm_skip);
     };
 
     for (const auto& raw_name : loader.tensor_names()) {
@@ -344,7 +331,7 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
         // load time avoids ever materialising the full fused tensor on a
         // rank, which is what OOM'd Qwen3.6-35B-A3B at TP=2.
         if (shard_q35_moe_experts &&
-            ends_with(name, ".mlp.experts.gate_up_proj")) {
+            pie_driver_common::ends_with(name, ".mlp.experts.gate_up_proj")) {
             DeviceTensor t = loader.load_to_device_moe_gate_up_sharded(
                 raw_name, tp_rank, tp_size);
             loaded_bytes += t.nbytes();
@@ -352,14 +339,15 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
             continue;
         }
         if (shard_q35_moe_experts &&
-            ends_with(name, ".mlp.experts.down_proj")) {
+            pie_driver_common::ends_with(name, ".mlp.experts.down_proj")) {
             DeviceTensor t = loader.load_to_device_moe_down_sharded(
                 raw_name, tp_rank, tp_size);
             loaded_bytes += t.nbytes();
             e.weights_.emplace(name, std::move(t));
             continue;
         }
-        if (unfuse_phi3 && ends_with(name, ".self_attn.qkv_proj.weight")) {
+        if (unfuse_phi3 &&
+            pie_driver_common::ends_with(name, ".self_attn.qkv_proj.weight")) {
             const std::string prefix = name.substr(
                 0, name.size() - std::string(".self_attn.qkv_proj.weight").size());
             const std::int64_t Hq = static_cast<std::int64_t>(e.hf_.num_attention_heads) * e.hf_.head_dim;
@@ -376,7 +364,8 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
             e.weights_.emplace(prefix + ".self_attn.v_proj.weight", std::move(v));
             continue;
         }
-        if (unfuse_phi3 && ends_with(name, ".mlp.gate_up_proj.weight")) {
+        if (unfuse_phi3 &&
+            pie_driver_common::ends_with(name, ".mlp.gate_up_proj.weight")) {
             const std::string prefix = name.substr(
                 0, name.size() - std::string(".mlp.gate_up_proj.weight").size());
             const std::int64_t I = e.hf_.intermediate_size;
@@ -400,9 +389,7 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     auto ends_with_str = [](const std::string& s, const char* sfx) {
-        const auto n = std::char_traits<char>::length(sfx);
-        return s.size() >= n &&
-               s.compare(s.size() - n, n, sfx) == 0;
+        return pie_driver_common::ends_with(s, sfx);
     };
 
     // ── Offline GPTQ INT4 (W4A16 via marlin) ──────────────────────────
@@ -1104,7 +1091,7 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
     // When `boot_cfg.model.runtime_quant == "fp8"`, walk every standard
     // llama-like projection weight (q/k/v/o/gate/up/down) and replace it
     // with a FP8_E4M3 tensor + per-tensor scale. The forward path picks
-    // up the QuantMeta companion via Engine::quant_meta and routes
+    // up the QuantMeta companion via LoadedModel::quant_meta and routes
     // through cuBLASLt FP8 GEMM. v1 restrictions:
     //   * Only model_type=qwen3 is wired through the new GEMM dispatch
     //     (qwen3_forward.cpp). Other archs still use the bf16-only
@@ -1139,7 +1126,7 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
             throw std::runtime_error(
                 "engine: runtime_quant=" + mode + " with tp_size>1 "
                 "requires a NcclComm (internal: caller must pass tp_comm "
-                "to Engine::load).");
+                "to LoadedModel::load).");
         }
 
         // On sm<89 there's no native FP8 GEMM, so the eager-dequant pass
@@ -1478,8 +1465,8 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
     return e;
 }
 
-EngineCapabilities Engine::capabilities() const {
-    EngineCapabilities c;
+LoadedModelCapabilities LoadedModel::capabilities() const {
+    LoadedModelCapabilities c;
     c.total_pages = 0;  // populated in M1.2.2 once kv_cache lands
     c.kv_page_size = static_cast<int>(boot_.batching.kv_page_size);
     c.swap_pool_size = 0;
@@ -1508,13 +1495,13 @@ EngineCapabilities Engine::capabilities() const {
     return c;
 }
 
-std::uint64_t Engine::total_weight_bytes() const noexcept {
+std::uint64_t LoadedModel::total_weight_bytes() const noexcept {
     std::uint64_t n = 0;
     for (const auto& [_, t] : weights_) n += t.nbytes();
     return n;
 }
 
-const DeviceTensor& Engine::get(const std::string& name) const {
+const DeviceTensor& LoadedModel::get(const std::string& name) const {
     auto it = weights_.find(name);
     if (it == weights_.end()) {
         throw std::runtime_error("engine: weight not loaded: " + name);
@@ -1522,18 +1509,18 @@ const DeviceTensor& Engine::get(const std::string& name) const {
     return it->second;
 }
 
-void Engine::insert(std::string name, DeviceTensor tensor) {
+void LoadedModel::insert(std::string name, DeviceTensor tensor) {
     auto [it, inserted] = weights_.emplace(std::move(name), std::move(tensor));
     if (!inserted) {
         throw std::runtime_error("engine: weight already registered: " + it->first);
     }
 }
 
-void Engine::replace(std::string name, DeviceTensor tensor) {
+void LoadedModel::replace(std::string name, DeviceTensor tensor) {
     weights_.insert_or_assign(std::move(name), std::move(tensor));
 }
 
-void Engine::set_quant_meta(const std::string& name, QuantMeta meta) {
+void LoadedModel::set_quant_meta(const std::string& name, QuantMeta meta) {
     if (weights_.find(name) == weights_.end()) {
         throw std::runtime_error(
             "engine::set_quant_meta: weight '" + name + "' not registered");
@@ -1549,7 +1536,7 @@ void Engine::set_quant_meta(const std::string& name, QuantMeta meta) {
     }
 }
 
-std::optional<QuantMeta> Engine::quant_meta(const std::string& name) const {
+std::optional<QuantMeta> LoadedModel::quant_meta(const std::string& name) const {
     auto it = quant_meta_.find(name);
     if (it == quant_meta_.end()) return std::nullopt;
     return it->second;

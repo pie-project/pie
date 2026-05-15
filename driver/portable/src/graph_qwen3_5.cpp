@@ -395,7 +395,7 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
                                 const Model& model,
                                 KvCachePaged& kv,
                                 StateCache& state,
-                                const ForwardEngine::BatchPlan& plan) {
+                                const Executor::BatchPlan& plan) {
     const auto& h = model.hparams();
     const auto& w = model.weights();
     const std::int32_t n_total  = plan.total_n_tokens;

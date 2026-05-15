@@ -1,4 +1,4 @@
-#include "persistent_inputs.hpp"
+#include "executor/persistent_inputs.hpp"
 
 namespace pie_cuda_driver {
 

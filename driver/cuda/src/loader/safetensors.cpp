@@ -1,6 +1,7 @@
 #include "loader/safetensors.hpp"
 
 #include <cerrno>
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -14,6 +15,8 @@
 #include <nlohmann/json.hpp>
 
 #include "cuda_check.hpp"
+#include <pie_driver_common/safetensors_manifest.hpp>
+#include <pie_driver_common/shard_plan.hpp>
 
 namespace pie_cuda_driver {
 
@@ -70,30 +73,11 @@ void SafetensorsLoader::parse_shard_header_(
 
 SafetensorsLoader SafetensorsLoader::open(const std::filesystem::path& snapshot_dir) {
     SafetensorsLoader loader;
-
-    const auto single = snapshot_dir / "model.safetensors";
-    const auto index_json = snapshot_dir / "model.safetensors.index.json";
-
-    std::vector<std::filesystem::path> shard_paths;
-    if (std::filesystem::exists(single)) {
-        shard_paths.push_back(single);
-    } else if (std::filesystem::exists(index_json)) {
-        std::ifstream in(index_json);
-        nlohmann::json j;
-        in >> j;
-        // weight_map: { tensor_name -> shard_filename }
-        std::vector<std::string> uniq;
-        for (auto& [_, v] : j.at("weight_map").items()) {
-            const auto fn = v.get<std::string>();
-            if (std::find(uniq.begin(), uniq.end(), fn) == uniq.end()) uniq.push_back(fn);
-        }
-        std::sort(uniq.begin(), uniq.end());
-        for (auto& fn : uniq) shard_paths.push_back(snapshot_dir / fn);
-    } else {
-        throw std::runtime_error(
-            "no safetensors at " + snapshot_dir.string() +
-            " (looked for model.safetensors and model.safetensors.index.json)");
-    }
+    const auto manifest =
+        pie_driver_common::discover_safetensors_manifest(
+            snapshot_dir,
+            pie_driver_common::SafetensorsLayoutPreference::SingleFile);
+    const auto& shard_paths = manifest.shard_paths;
 
     loader.shards_.reserve(shard_paths.size());
     for (auto& p : shard_paths) {
@@ -180,37 +164,16 @@ DeviceTensor SafetensorsLoader::load_to_device_sharded(
     }
 
     const auto& ti = info(name);
-    if (rank < 0 || rank >= world_size) {
-        throw std::runtime_error("load_to_device_sharded: rank " +
-                                 std::to_string(rank) + " out of range for world " +
-                                 std::to_string(world_size));
-    }
-    if (ti.shape.empty() || ti.shape.size() > 2) {
-        throw std::runtime_error("load_to_device_sharded: " + name +
-                                 " has unsupported rank " +
-                                 std::to_string(ti.shape.size()));
-    }
-    if (axis >= static_cast<int>(ti.shape.size())) {
-        throw std::runtime_error("load_to_device_sharded: axis " +
-                                 std::to_string(axis) + " out of range for " + name);
-    }
-    const std::int64_t orig_dim = ti.shape[axis];
-    if (orig_dim % world_size != 0) {
-        throw std::runtime_error("load_to_device_sharded: " + name +
-                                 " dim " + std::to_string(orig_dim) +
-                                 " not divisible by world_size " +
-                                 std::to_string(world_size));
-    }
-    const std::int64_t shard_dim = orig_dim / world_size;
+    const auto plan = pie_driver_common::plan_axis_shard(
+        ti.shape, axis, rank, world_size, "load_to_device_sharded: " + name);
+    const std::int64_t shard_dim = plan.shard_dim;
 
     auto& shard = shards_[ti.shard_id];
     if (!shard.data) open_shard_(shard);
     const auto* host_base = shard.data + shard.data_section_offset + ti.data_offset;
     const std::size_t elem = dtype_bytes(ti.dtype);
 
-    std::vector<std::int64_t> out_shape = ti.shape;
-    out_shape[axis] = shard_dim;
-    auto t = DeviceTensor::allocate(ti.dtype, out_shape);
+    auto t = DeviceTensor::allocate(ti.dtype, plan.output_shape);
 
     if (axis == 0) {
         // Contiguous slice along the leading dim: rank `r` owns bytes
@@ -250,26 +213,12 @@ DeviceTensor SafetensorsLoader::load_to_device_row_range_sharded(
                                  " must be 2-D, got rank " +
                                  std::to_string(ti.shape.size()));
     }
-    if (world_size <= 0 || rank < 0 || rank >= world_size) {
-        throw std::runtime_error("load_to_device_row_range_sharded: bad rank/world");
-    }
-    if (rows <= 0 || rows % world_size != 0) {
-        throw std::runtime_error("load_to_device_row_range_sharded: row range " +
-                                 std::to_string(rows) +
-                                 " not divisible by world_size " +
-                                 std::to_string(world_size));
-    }
     const std::int64_t total_rows = ti.shape[0];
-    if (row_offset < 0 || row_offset + rows > total_rows) {
-        throw std::runtime_error(
-            "load_to_device_row_range_sharded: range [" +
-            std::to_string(row_offset) + ", " +
-            std::to_string(row_offset + rows) +
-            ") out of bounds for " + name +
-            " (rows=" + std::to_string(total_rows) + ")");
-    }
+    const auto plan = pie_driver_common::plan_row_range_shard(
+        total_rows, row_offset, rows, rank, world_size,
+        "load_to_device_row_range_sharded: " + name);
     const std::int64_t cols = ti.shape[1];
-    const std::int64_t shard_rows = rows / world_size;
+    const std::int64_t shard_rows = plan.rows;
 
     auto& shard = shards_[ti.shard_id];
     if (!shard.data) open_shard_(shard);
@@ -278,7 +227,7 @@ DeviceTensor SafetensorsLoader::load_to_device_row_range_sharded(
 
     // Per-rank start row within the file. Each rank gets a contiguous
     // slab of `shard_rows` rows from the requested range.
-    const std::int64_t my_row_start = row_offset + static_cast<std::int64_t>(rank) * shard_rows;
+    const std::int64_t my_row_start = plan.row_start;
     const std::size_t bytes = static_cast<std::size_t>(shard_rows) *
                               static_cast<std::size_t>(cols) * elem;
     const auto* host_src = host_base + static_cast<std::size_t>(my_row_start) *
@@ -297,9 +246,8 @@ DeviceTensor SafetensorsLoader::load_to_device_moe_gate_up_sharded(
         throw std::runtime_error("load_to_device_moe_gate_up_sharded: " + name +
                                  " must be 3-D [E, 2*Im, H]");
     }
-    if (world_size <= 0 || rank < 0 || rank >= world_size) {
-        throw std::runtime_error("load_to_device_moe_gate_up_sharded: bad rank/world");
-    }
+    pie_driver_common::validate_rank(
+        rank, world_size, "load_to_device_moe_gate_up_sharded: " + name);
     const std::int64_t E       = ti.shape[0];
     const std::int64_t two_Im  = ti.shape[1];
     const std::int64_t H       = ti.shape[2];
@@ -350,9 +298,8 @@ DeviceTensor SafetensorsLoader::load_to_device_moe_down_sharded(
         throw std::runtime_error("load_to_device_moe_down_sharded: " + name +
                                  " must be 3-D [E, H, Im]");
     }
-    if (world_size <= 0 || rank < 0 || rank >= world_size) {
-        throw std::runtime_error("load_to_device_moe_down_sharded: bad rank/world");
-    }
+    pie_driver_common::validate_rank(
+        rank, world_size, "load_to_device_moe_down_sharded: " + name);
     const std::int64_t E   = ti.shape[0];
     const std::int64_t H   = ti.shape[1];
     const std::int64_t Im  = ti.shape[2];

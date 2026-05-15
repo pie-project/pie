@@ -11,6 +11,7 @@
 #include <thread>
 
 #include <ggml-cpu.h>
+#include <pie_driver_common/tensor_names.hpp>
 
 #include "gguf_archive.hpp"
 #include "gguf_hparams.hpp"
@@ -52,12 +53,8 @@ bool is_small_weight_for_upcast(const std::string& hf_name) {
     //   `*.bias`       — any attention / projection bias
     static constexpr std::string_view kNormSuffix = "norm.weight";
     static constexpr std::string_view kBiasSuffix = ".bias";
-    auto ends_with = [&](std::string_view suf) {
-        return hf_name.size() >= suf.size() &&
-               hf_name.compare(hf_name.size() - suf.size(),
-                               suf.size(), suf) == 0;
-    };
-    return ends_with(kNormSuffix) || ends_with(kBiasSuffix);
+    return pie_driver_common::ends_with(hf_name, kNormSuffix) ||
+           pie_driver_common::ends_with(hf_name, kBiasSuffix);
 }
 
 ggml_type st_to_ggml_dtype(StDtype dt, const std::string& tensor_name) {
@@ -250,7 +247,7 @@ Model::Model(const std::filesystem::path& snapshot_dir,
         }
     } else {
         // Primary is a GPU backend. Set up a CPU companion so the
-        // ForwardEngine's `ggml_backend_sched` has somewhere to route
+        // Executor's `ggml_backend_sched` has somewhere to route
         // ops the GPU can't handle. Cost is minimal: the CPU backend
         // doesn't allocate anything until sched actually splits work
         // to it. With Part A's norm-weight upcast, the steady-state
@@ -276,7 +273,7 @@ Model::Model(const std::filesystem::path& snapshot_dir,
         // Probe: can the primary backend run argsort on a vocab-sized
         // input? ggml-vulkan caps at 1024 cols (max_argsort_cols), so
         // Qwen3 (152k vocab) etc. fail. When this returns false the
-        // ForwardEngine forces the `slow_only` sampling path: download
+        // Executor forces the `slow_only` sampling path: download
         // raw logits, sample host-side, no in-graph `ggml_top_k`. This
         // keeps Vulkan steady-state decode at GPU speed instead of
         // round-tripping each token through CPU for the argsort.
@@ -448,13 +445,7 @@ Model::~Model() {
 }
 
 std::string Model::tname_(const std::string& name) const {
-    if (tensor_prefix_.empty()) return name;
-    constexpr std::string_view kModelPrefix = "model.";
-    if (name.size() >= kModelPrefix.size() &&
-        std::string_view(name).substr(0, kModelPrefix.size()) == kModelPrefix) {
-        return tensor_prefix_ + std::string(name.substr(kModelPrefix.size()));
-    }
-    return tensor_prefix_ + name;
+    return pie_driver_common::apply_tensor_prefix(name, tensor_prefix_);
 }
 
 void Model::resolve_tensor_prefix_() {
@@ -721,10 +712,7 @@ void Model::load_top_level_() {
     // the actual safetensors index and override the hparam to match.
     constexpr std::string_view kModelSuffix = "model.";
     std::string wrapper = tensor_prefix_;
-    if (wrapper.size() >= kModelSuffix.size() &&
-        std::string_view(wrapper).substr(wrapper.size() - kModelSuffix.size()) == kModelSuffix) {
-        wrapper = wrapper.substr(0, wrapper.size() - kModelSuffix.size());
-    }
+    wrapper = pie_driver_common::strip_suffix(wrapper, kModelSuffix);
     const std::string lm_wrapped = wrapper + "lm_head.weight";
     const std::string lm_plain   = "lm_head.weight";
     const std::string* found = nullptr;

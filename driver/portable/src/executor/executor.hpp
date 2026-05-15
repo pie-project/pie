@@ -1,6 +1,6 @@
 #pragma once
 
-// Forward engine. Builds a per-batch ggml graph from the request view,
+// Forward executor. Builds a per-batch ggml graph from the request view,
 // runs it on the model's backend, samples per-request, and writes the
 // structured response view via `pie_driver::ResponseBuilder`. Per-arch
 // graph builders live in graph_qwen3.cpp (covers 11 archs via ArchSpec
@@ -28,15 +28,15 @@
 
 namespace pie_portable_driver {
 
-class ForwardEngine {
+class Executor {
 public:
-    ForwardEngine(Model& model,
-                  std::int32_t total_pages,
-                  std::int32_t page_size);
-    ~ForwardEngine();
+    Executor(Model& model,
+             std::int32_t total_pages,
+             std::int32_t page_size);
+    ~Executor();
 
-    ForwardEngine(const ForwardEngine&) = delete;
-    ForwardEngine& operator=(const ForwardEngine&) = delete;
+    Executor(const Executor&) = delete;
+    Executor& operator=(const Executor&) = delete;
 
     // Run one forward pass + sampling. Fills `out` via `builder` (which
     // owns the per-array scratch the view's `PieSlice`s point at). The
@@ -66,7 +66,7 @@ public:
     // Access the KV cache (for the M7 aux IPC server's page copies).
     KvCachePaged& kv() noexcept { return kv_; }
 
-    // Wire in the adapter pool (M9). The engine looks up active adapters
+    // Wire in the adapter pool (M9). The executor looks up active adapters
     // per batch from this pool.
     void set_adapters(AdapterPool* pool) noexcept { adapters_ = pool; }
 
@@ -143,7 +143,7 @@ public:
         // Optional companion "no-SWA" mask for archs with mixed
         // sliding+full attention patterns (Gemma 4): full-attention
         // layers attend the entire context, so they need a different
-        // packed mask. Empty unless the engine builds it.
+        // packed mask. Empty unless the executor builds it.
         std::vector<std::uint16_t>  packed_mask_full_f16;
 
         // M9 LoRA: active adapter for this whole batch (single-adapter-
@@ -177,7 +177,7 @@ public:
     // Per-stage timing accumulators. Used both for offline benchmarks
     // and to validate optimization changes. Each counter accumulates
     // microseconds; `n_calls` counts compute_() invocations. Print on
-    // demand (or at engine destruction when calls > 0).
+    // demand (or at executor destruction when calls > 0).
     struct PhaseTimings {
         std::uint64_t plan_us         = 0;
         std::uint64_t graph_build_us  = 0;

@@ -1,4 +1,4 @@
-#include "forward.hpp"
+#include "executor/executor.hpp"
 
 #include <algorithm>
 #include <array>
@@ -36,7 +36,7 @@ namespace pie_portable_driver {
 // (prefill, custom attention masks, mixed n_tokens) cache too — useful
 // when consecutive prefill batches share shape (e.g. replicate tests
 // or identical-prompt re-runs).
-struct ForwardEngine::GraphCache {
+struct Executor::GraphCache {
     // Signature fields — every value the graph topology depends on.
     bool          valid              = false;
     PieArch       arch{};
@@ -62,7 +62,7 @@ struct ForwardEngine::GraphCache {
     GraphResult   result;
 
     bool matches(PieArch a,
-                 const ForwardEngine::BatchPlan& plan) const noexcept {
+                 const Executor::BatchPlan& plan) const noexcept {
         if (!valid) return false;
         if (arch != a) return false;
         if (pure_decode != plan.pure_decode) return false;
@@ -91,7 +91,7 @@ struct ForwardEngine::GraphCache {
     }
 
     void store_key(PieArch a,
-                   const ForwardEngine::BatchPlan& plan) {
+                   const Executor::BatchPlan& plan) {
         valid              = true;
         arch               = a;
         pure_decode        = plan.pure_decode;
@@ -153,7 +153,7 @@ inline bool any_slot_special(const std::vector<SlotOutput>& slots) {
 }
 
 // Sample every slot for one request (after BRLE logit-mask application).
-std::vector<SlotOutput> sample_request_slots(const ForwardEngine::ReqPlan& rp,
+std::vector<SlotOutput> sample_request_slots(const Executor::ReqPlan& rp,
                                              float* slots_logits_base,
                                              std::int32_t n_slots,
                                              std::int32_t vocab_size) {
@@ -185,7 +185,7 @@ std::vector<SlotOutput> sample_request_slots(const ForwardEngine::ReqPlan& rp,
 //   - spec decode: walk drafts vs predictions, accept matching prefix +
 //     1 bonus token
 //   - plain: emit the single sampled token
-void resolve_request_output(const ForwardEngine::ReqPlan& rp,
+void resolve_request_output(const Executor::ReqPlan& rp,
                             std::vector<SlotOutput>&& slot_out,
                             SamplerOutput& dst) {
     // Prefill-only requests carry no sampler slots — emit nothing.
@@ -231,7 +231,7 @@ void resolve_request_output(const ForwardEngine::ReqPlan& rp,
 
 // Top-level batch sampler: walk the per-request slot output starting at
 // `all_logits` (laid out flat as [n_slots, vocab_size]).
-std::vector<SamplerOutput> sample_batch(const ForwardEngine::BatchPlan& plan,
+std::vector<SamplerOutput> sample_batch(const Executor::BatchPlan& plan,
                                         float* all_logits,
                                         std::int32_t vocab_size) {
     const std::int32_t n_req = static_cast<std::int32_t>(plan.reqs.size());
@@ -254,7 +254,7 @@ std::vector<SamplerOutput> sample_batch(const ForwardEngine::BatchPlan& plan,
 // graph. Walk per-slot, dispatch to sampler::sample_token_from_topk,
 // and stitch through resolve_request_output (which handles spec-decode).
 std::vector<SamplerOutput> sample_batch_uniform_top(
-        const ForwardEngine::BatchPlan& plan,
+        const Executor::BatchPlan& plan,
         const std::int32_t* top_idx_flat,   // [K, n_slots]
         const float*        top_prob_flat,  // [K, n_slots]
         std::int32_t        K) {
@@ -283,7 +283,7 @@ std::vector<SamplerOutput> sample_batch_uniform_top(
 // stitch the i32 ids back into per-request SamplerOutput, running the
 // spec-decode verifier walk where applicable. Skips the per-slot logit
 // mask + softmax + sort the host-side sampler does.
-std::vector<SamplerOutput> sample_batch_greedy(const ForwardEngine::BatchPlan& plan,
+std::vector<SamplerOutput> sample_batch_greedy(const Executor::BatchPlan& plan,
                                                const std::int32_t* slot_tokens) {
     const std::int32_t n_req = static_cast<std::int32_t>(plan.reqs.size());
     std::vector<SamplerOutput> sampled(n_req);
@@ -341,12 +341,12 @@ KvCachePaged build_kv_for_(Model& model,
 }  // namespace
 
 // =============================================================================
-// ForwardEngine
+// Executor
 // =============================================================================
 
-ForwardEngine::ForwardEngine(Model& model,
-                             std::int32_t total_pages,
-                             std::int32_t page_size)
+Executor::Executor(Model& model,
+                   std::int32_t total_pages,
+                   std::int32_t page_size)
     : model_(model),
       kv_(build_kv_for_(model, total_pages, page_size)),
       cache_(std::make_unique<GraphCache>()) {
@@ -405,14 +405,14 @@ ForwardEngine::ForwardEngine(Model& model,
     }
 }
 
-ForwardEngine::~ForwardEngine() {
+Executor::~Executor() {
     // Release cached graph context BEFORE the scheduler: sched owns
     // the backend buffers that back the cached graph's tensors.
     if (cache_) cache_->release();
     if (sched_) ggml_backend_sched_free(sched_);
 }
 
-void ForwardEngine::log_timings(const char* label) const {
+void Executor::log_timings(const char* label) const {
     if (timings_.n_calls == 0) return;
     const double n = static_cast<double>(timings_.n_calls);
     auto pct = [&](std::uint64_t b) {
@@ -452,7 +452,7 @@ void ForwardEngine::log_timings(const char* label) const {
 // Plan: wire → BatchPlan (real page-table)
 // -----------------------------------------------------------------------------
 
-ForwardEngine::BatchPlan ForwardEngine::plan_(const pie_driver::PieForwardRequestView& req) {
+Executor::BatchPlan Executor::plan_(const pie_driver::PieForwardRequestView& req) {
     const auto& hpar = model_.hparams();
     const ArchSpec spec = arch_spec_for(hpar.arch, hpar);
     // Slow-only path: skip the in-graph `ggml_top_k` (which would emit
@@ -617,7 +617,7 @@ ForwardEngine::BatchPlan ForwardEngine::plan_(const pie_driver::PieForwardReques
 // starting at `page_offset`.
 // -----------------------------------------------------------------------------
 
-ForwardEngine::BatchPlan ForwardEngine::plan_test_simple_(
+Executor::BatchPlan Executor::plan_test_simple_(
         std::span<const std::uint32_t> token_ids,
         std::span<const std::uint32_t> position_ids,
         std::int32_t sampling_pos,
@@ -711,7 +711,7 @@ ForwardEngine::BatchPlan ForwardEngine::plan_test_simple_(
 // Compute
 // -----------------------------------------------------------------------------
 
-std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
+std::vector<SamplerOutput> Executor::compute_(const BatchPlan& plan) {
     using clock = std::chrono::steady_clock;
     const auto t_compute_start = clock::now();
     auto stage_start = t_compute_start;
@@ -890,7 +890,7 @@ std::vector<SamplerOutput> ForwardEngine::compute_(const BatchPlan& plan) {
 // Public entry points
 // -----------------------------------------------------------------------------
 
-void ForwardEngine::run(const pie_driver::PieForwardRequestView& req,
+void Executor::run(const pie_driver::PieForwardRequestView& req,
                         pie_driver::ResponseBuilder& builder,
                         pie_driver::PieForwardResponseView& out) {
     using clock = std::chrono::steady_clock;
@@ -907,7 +907,7 @@ void ForwardEngine::run(const pie_driver::PieForwardRequestView& req,
     // ForwardPass is built and submitted with no `input_tokens` calls, or
     // during scheduler idle ticks. Emit one empty PerRequestOutput per
     // request slot so the response count matches what fire_batch expects.
-    // Matches the driver/cuda/src/request_handler.cpp:321 short-circuit.
+    // Matches the driver/cuda/src/executor/executor.cpp:321 short-circuit.
     {
         const auto tok_view = req.token_ids.as<std::uint32_t>();
         const auto qo_view  = req.qo_indptr.as<std::uint32_t>();
@@ -998,7 +998,7 @@ void ForwardEngine::run(const pie_driver::PieForwardRequestView& req,
     take_us(timings_.response_pack_us);
 }
 
-std::vector<std::uint32_t> ForwardEngine::generate(
+std::vector<std::uint32_t> Executor::generate(
         std::span<const std::uint32_t> prompt_tokens,
         std::int32_t max_new_tokens,
         std::uint64_t /*context_id*/,
@@ -1037,7 +1037,7 @@ std::vector<std::uint32_t> ForwardEngine::generate(
     return out;
 }
 
-std::vector<std::vector<std::uint32_t>> ForwardEngine::generate_multi(
+std::vector<std::vector<std::uint32_t>> Executor::generate_multi(
         std::vector<std::vector<std::uint32_t>>& prompts,
         std::int32_t max_new_tokens,
         std::vector<std::uint64_t> /*context_ids*/) {

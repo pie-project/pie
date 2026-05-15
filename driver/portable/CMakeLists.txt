@@ -17,6 +17,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+if(NOT PIE_BRIDGE_INCLUDE_DIR)
+  set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
+endif()
+
 include(cmake/CPM.cmake)
 
 # We vendor llama.cpp for the `ggml` library only. `EXCLUDE_FROM_ALL` keeps
@@ -74,6 +78,7 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 # directly (no GGUF conversion).
 add_library(pie_driver_portable_lib STATIC
   src/entry.cpp
+  ../common/src/safetensors_manifest.cpp
   src/safetensors.cpp
   src/hf_config.cpp
   src/gguf_archive.cpp
@@ -89,7 +94,8 @@ add_library(pie_driver_portable_lib STATIC
   src/graph_qwen3_5.cpp
   src/graph_phi3small.cpp
   src/graph_phi3_5moe.cpp
-  src/forward.cpp
+  src/executor/executor.cpp
+  src/service/inproc_service.cpp
   src/sampler.cpp
   src/host_swap_pool.cpp
   src/adapter.cpp
@@ -103,6 +109,7 @@ target_compile_options(pie_driver_portable_lib PRIVATE
 target_include_directories(pie_driver_portable_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_BRIDGE_INCLUDE_DIR})
 
 target_link_libraries(pie_driver_portable_lib PUBLIC

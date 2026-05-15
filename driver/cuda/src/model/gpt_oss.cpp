@@ -15,7 +15,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("gpt_oss: missing weight '" + name + "'");
     }
@@ -30,7 +30,7 @@ constexpr int kTensorsPerExpert = 6;
 
 }  // namespace
 
-MixtralWeights bind_gpt_oss(Engine& engine) {
+MixtralWeights bind_gpt_oss(LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int E = cfg.num_experts;
     if (E <= 0) {

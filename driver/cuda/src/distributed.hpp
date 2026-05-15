@@ -7,7 +7,7 @@
 // (`pie_driver_cuda_native/worker.py`) generates the unique-id, passes it
 // to all ranks via the startup TOML, and only rank 0 of each group exposes
 // a shmem server to the runtime. Followers consume their inputs by NCCL
-// broadcast from rank 0 — see request_handler for the broadcast plumbing.
+// broadcast from rank 0 — see executor for the broadcast plumbing.
 
 #include <cstddef>
 #include <cstdint>

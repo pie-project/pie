@@ -12,7 +12,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("llama-like: missing weight '" + name + "'");
     }
@@ -27,7 +27,7 @@ const DeviceTensor& must(const Engine& e, const std::string& name) {
 //
 // Returns a non-owning pointer to the inserted DeviceTensor.
 const DeviceTensor* fuse_three_rowwise_bf16(
-    Engine& engine,
+    LoadedModel& engine,
     const DeviceTensor& a, const DeviceTensor& b, const DeviceTensor& c,
     const std::string& fused_name)
 {
@@ -64,7 +64,7 @@ const DeviceTensor* fuse_three_rowwise_bf16(
 
 // Two-input variant used by gate+up.
 const DeviceTensor* fuse_two_rowwise_bf16(
-    Engine& engine,
+    LoadedModel& engine,
     const DeviceTensor& a, const DeviceTensor& b,
     const std::string& fused_name)
 {
@@ -93,7 +93,7 @@ const DeviceTensor* fuse_two_rowwise_bf16(
 
 }  // namespace
 
-Qwen3Weights bind_llama_like(Engine& engine) {
+Qwen3Weights bind_llama_like(LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
 
     Qwen3Weights w;
@@ -204,7 +204,7 @@ namespace {
 // projection weights as row-major `[out_dim, in_dim]`, which is the
 // flashinfer/cublas convention used downstream).
 void register_row_slice(
-    Engine& e,
+    LoadedModel& e,
     const std::string& fused_name,
     const std::string& slice_name,
     std::int64_t row_offset, std::int64_t rows, std::int64_t cols,
@@ -224,7 +224,7 @@ void register_row_slice(
 
 }  // namespace
 
-Qwen3Weights bind_phi3(Engine& engine) {
+Qwen3Weights bind_phi3(LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const std::int64_t H  = cfg.hidden_size;
     const std::int64_t Hq = static_cast<std::int64_t>(cfg.num_attention_heads) * cfg.head_dim;
@@ -270,7 +270,7 @@ Qwen3Weights bind_phi3(Engine& engine) {
     return bind_llama_like(engine);
 }
 
-Qwen3Weights bind_olmo3(Engine& engine) {
+Qwen3Weights bind_olmo3(LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
 
     Qwen3Weights w;

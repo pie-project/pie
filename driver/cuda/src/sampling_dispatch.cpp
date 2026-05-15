@@ -10,7 +10,7 @@
 #include "kernels/sample_temp.hpp"
 #include "kernels/scatter_int32.hpp"
 #include "model/qwen3_forward.hpp"
-#include "persistent_inputs.hpp"
+#include "executor/persistent_inputs.hpp"
 
 namespace pie_cuda_driver {
 

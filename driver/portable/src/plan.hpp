@@ -2,7 +2,7 @@
 
 // Plan: wire payload → BatchPlan.
 //
-// Splits the work of `ForwardEngine::plan_` into composable phases:
+// Splits the work of `Executor::plan_` into composable phases:
 //   1. extract_plan_arrays:   pull all 23+ typed views from the wire blob
 //   2. validate_plan_top_level: check the top-level invariants (batch shape)
 //   3. resolve_active_adapter_id: enforce single-adapter-per-batch (v1)
@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "arch_spec.hpp"
-#include "forward.hpp"
+#include "executor/executor.hpp"
 #include <pie_bridge/inproc_server.hpp>   // pie_driver::PieForwardRequestView
 
 namespace pie_portable_driver {
@@ -125,7 +125,7 @@ void plan_single_request(const PlanArrays& a,
                          std::int32_t page_size,
                          std::int32_t total_pages,
                          const ArchSpec& spec,
-                         ForwardEngine::BatchPlan& plan);
+                         Executor::BatchPlan& plan);
 
 // M11 packed-decode fast path. Caller has already verified every request
 // has n_tokens == 1 and there are no custom attention masks, so the whole
@@ -139,7 +139,7 @@ void plan_single_request(const PlanArrays& a,
 // builds an additional mask in `packed_mask_full_f16` with NO sliding
 // clip. Used by archs with mixed sliding+full layer patterns (Gemma 4)
 // so the full-attention layers can attend the entire context.
-void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
+void build_pure_decode_packing(Executor::BatchPlan& plan,
                                std::int32_t n_request,
                                std::int32_t page_size,
                                std::int32_t sliding_window,

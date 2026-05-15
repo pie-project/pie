@@ -21,6 +21,10 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
 
+if(NOT PIE_BRIDGE_INCLUDE_DIR)
+  set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
+endif()
+
 # NCCL for tensor-parallel collectives. Single-GPU runs never load it (the
 # call sites are gated on tp_size > 1), but we always link so a TP-enabled
 # wrapper can talk to the same binary. System NCCL only — vendoring via CPM
@@ -65,13 +69,15 @@ cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 #     `pie_driver_cuda_native` via subprocess.
 add_library(pie_driver_cuda_lib STATIC
   src/entry.cpp
-  src/persistent_inputs.cpp
-  src/request_handler.cpp
+  src/executor/persistent_inputs.cpp
+  src/executor/executor.cpp
+  src/service/inproc_service.cpp
   src/response_subpass.cpp
   src/sampling_dispatch.cpp
   src/spec_expansion.cpp
   src/tensor.cpp
-  src/engine.cpp
+  src/model/loaded_model.cpp
+  ../common/src/safetensors_manifest.cpp
   src/loader/hf_config.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
@@ -160,6 +166,7 @@ target_compile_options(pie_driver_cuda PRIVATE
 target_include_directories(pie_driver_cuda_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_BRIDGE_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
@@ -207,8 +214,16 @@ target_link_libraries(sample_flashinfer_test PRIVATE CUDA::cudart)
 add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
 target_include_directories(test_brle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+add_executable(test_driver_common
+  ../common/tests/test_common.cpp
+  ../common/src/safetensors_manifest.cpp)
+target_include_directories(test_driver_common PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
+add_test(NAME driver_common COMMAND test_driver_common)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

@@ -14,14 +14,14 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("qwen3_5_moe: missing weight '" + name + "'");
     }
     return e.get(name);
 }
 
-const DeviceTensor* maybe(const Engine& e, const std::string& name) {
+const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
     return e.has(name) ? &e.get(name) : nullptr;
 }
 
@@ -49,7 +49,7 @@ DeviceBuffer<float> to_fp32(const DeviceTensor& t) {
 // weights live under `model.language_model.…`. Qwen3-MoE (Qwen3-30B-A3B)
 // is a pure text model and uses `model.…` directly. Pick the prefix from
 // what the engine actually loaded so a single bind covers both.
-const char* select_prefix(const Engine& e) {
+const char* select_prefix(const LoadedModel& e) {
     if (e.has("model.language_model.embed_tokens.weight")) {
         return "model.language_model.";
     }
@@ -109,7 +109,7 @@ DeviceTensor slice_la_kkv_blocked(
 
 }  // namespace
 
-Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
+Qwen3_5MoeWeights bind_qwen3_5_moe(LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int L = cfg.num_hidden_layers;
     // Qwen3-MoE (Qwen3-30B-A3B) is full-attention only — its config has

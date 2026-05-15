@@ -27,7 +27,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("gemma3n: missing weight '" + name + "'");
     }
@@ -41,7 +41,7 @@ constexpr const char* kPrefix = "model.language_model.";
 
 }  // namespace
 
-Gemma3nWeights bind_gemma3n(Engine& engine) {
+Gemma3nWeights bind_gemma3n(LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int L = cfg.num_hidden_layers;
 

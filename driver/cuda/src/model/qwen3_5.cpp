@@ -13,14 +13,14 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("qwen3_5: missing weight '" + name + "'");
     }
     return e.get(name);
 }
 
-const DeviceTensor* maybe(const Engine& e, const std::string& name) {
+const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
     return e.has(name) ? &e.get(name) : nullptr;
 }
 
@@ -122,7 +122,7 @@ DeviceTensor slice_la_kkv_blocked(
 
 }  // namespace
 
-Qwen3_5Weights bind_qwen3_5(Engine& engine) {
+Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int L = cfg.num_hidden_layers;
 

@@ -27,7 +27,7 @@
 #include <vector>
 
 #include "device_buffer.hpp"
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "ops/gemm.hpp"
 #include "tensor.hpp"
 
@@ -74,7 +74,7 @@ struct Qwen3_5LayerWeights {
 
     // Optional QuantMeta companions for the GEMM-fed projections —
     // populated when runtime_quant or an offline-quantized checkpoint
-    // tags these weights via `Engine::set_quant_meta`. Linear-attn
+    // tags these weights via `LoadedModel::set_quant_meta`. Linear-attn
     // weights stay bf16 for now (their fused [K1|K2|V] block layout
     // needs per-block scale handling that isn't wired yet).
     std::optional<QuantMeta> fa_q_proj_quant;
@@ -112,6 +112,6 @@ struct Qwen3_5Weights {
     std::vector<DeviceTensor> owned_bf16_buffers;
 };
 
-Qwen3_5Weights bind_qwen3_5(Engine& engine);
+Qwen3_5Weights bind_qwen3_5(LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

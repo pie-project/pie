@@ -39,7 +39,7 @@
 
 #include "device_buffer.hpp"
 #include "distributed.hpp"
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
 #include "model/llama_like.hpp"
 #include "model/qwen3.hpp"
@@ -187,7 +187,7 @@ struct Gemma4ForwardCfg {
 // Bind helper: validates the Gemma-4 schema, populates per-layer
 // dimensions + KV-source mapping from `HfConfig::layer_types` and
 // `num_kv_shared_layers`. Throws on missing tensors.
-Gemma4Weights bind_gemma4(const Engine& engine);
+Gemma4Weights bind_gemma4(const LoadedModel& engine);
 
 void gemma4_forward_paged(
     const Gemma4Weights& w,

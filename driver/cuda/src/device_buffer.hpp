@@ -2,7 +2,7 @@
 
 // Owning RAII wrapper around `cudaMalloc`'d memory. Replaces the scattered
 // raw `T* d_x = nullptr; cudaMalloc(&d_x, …); … cudaFree(d_x);` pattern in
-// the request handler so cleanup happens implicitly on scope exit and
+// the executor so cleanup happens implicitly on scope exit and
 // exception paths.
 //
 // Move-only. `data()` returns the device pointer for kernel calls. Build

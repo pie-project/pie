@@ -18,7 +18,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
 #include "model/llama_like.hpp"
 #include "model/qwen3.hpp"
@@ -75,13 +75,13 @@ struct MixtralWeights {
 
     // Owns the bf16 expert tensors that bind_gpt_oss synthesises by
     // dequantising MXFP4 fused weights. Plain bind_mixtral leaves this
-    // empty (per-expert tensors live in the Engine). Kept here so they
+    // empty (per-expert tensors live in the LoadedModel). Kept here so they
     // outlive any lookup-by-name path; pointers in `experts[*]` index
     // into this vector.
     std::vector<DeviceTensor> owned_expert_buffers;
 };
 
-MixtralWeights bind_mixtral(const Engine& engine);
+MixtralWeights bind_mixtral(const LoadedModel& engine);
 
 void mixtral_forward_paged(
     const MixtralWeights& w,

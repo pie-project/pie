@@ -25,7 +25,7 @@
 #include <vector>
 
 #include "device_buffer.hpp"
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::model {
@@ -96,6 +96,6 @@ struct Qwen3_5MoeWeights {
     std::vector<DeviceTensor> owned_bf16_buffers;
 };
 
-Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine);
+Qwen3_5MoeWeights bind_qwen3_5_moe(LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

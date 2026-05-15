@@ -60,7 +60,7 @@ struct Qwen3_5LinearAttnWorkspace {
 // for the full-attention layers. `force_prefill_path = true` keeps every
 // fire on the prefill kernel even when `is_pure_decode == true` — useful
 // for parity-mode where we want the same dispatch shape across the run.
-// In serving (request_handler) we leave it false so the graph-capturable
+// In serving (executor) we leave it false so the graph-capturable
 // decode kernel is picked when `is_pure_decode` fires, which is the
 // only mode the graph cache key supports.
 struct Qwen3_5ForwardCfg {
@@ -81,7 +81,7 @@ struct Qwen3_5ForwardCfg {
 // (which calls `prepare_qwen3_5_decode_plan`) and by `qwen3_5_forward_paged`
 // itself when it dispatches the captured attention kernel. Plan() is the
 // host-side work that breaks graph capture if folded into the body — by
-// hoisting it here we let the request handler refresh it once per fire,
+// hoisting it here we let the executor refresh it once per fire,
 // outside any cudaStream capture region.
 struct Qwen3_5PlanState {
     ops::DecodePlanCachePtr decode_plan;

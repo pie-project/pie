@@ -1,8 +1,8 @@
 #pragma once
 
-// Engine — owns the loaded model. Built once at startup; queried from main
+// LoadedModel — owns the loaded model. Built once at startup; queried from main
 // to populate the READY capability JSON and (later milestones) handed to the
-// shmem request handler for forward-pass execution.
+// shmem executor for forward-pass execution.
 
 #include <memory>
 #include <optional>
@@ -20,7 +20,7 @@ namespace pie_cuda_driver {
 // the weight's name; absent entries mean "use the raw bf16/fp16/fp32 path".
 //
 // The pointers reference DeviceTensors registered separately under their
-// own names in Engine::weights_ — Engine::set_quant_meta does not own them
+// own names in LoadedModel::weights_ — LoadedModel::set_quant_meta does not own them
 // and validates that they were inserted first.
 //
 // `kind` describes the scale layout:
@@ -43,7 +43,7 @@ struct QuantMeta {
     int channel_axis = 0;
 };
 
-struct EngineCapabilities {
+struct LoadedModelCapabilities {
     int total_pages = 0;          // populated when KV cache lands (M1.2.2/3)
     int kv_page_size = 0;
     int swap_pool_size = 0;
@@ -58,23 +58,23 @@ struct EngineCapabilities {
 
 class NcclComm;  // distributed.hpp
 
-class Engine {
+class LoadedModel {
 public:
     /// Load weights + config from disk. Throws on missing files / wrong dtypes.
     /// Pass `tp_comm` when `boot_cfg.distributed.tp_size > 1` to enable
     /// TP-aware runtime quantization (cross-rank absmax all-reduce for
     /// row-parallel weights). For single-GPU (tp_size=1) this can be null.
-    static Engine load(const Config& boot_cfg, NcclComm* tp_comm = nullptr);
+    static LoadedModel load(const Config& boot_cfg, NcclComm* tp_comm = nullptr);
 
-    Engine() = default;
-    Engine(const Engine&) = delete;
-    Engine& operator=(const Engine&) = delete;
-    Engine(Engine&&) noexcept = default;
-    Engine& operator=(Engine&&) noexcept = default;
+    LoadedModel() = default;
+    LoadedModel(const LoadedModel&) = delete;
+    LoadedModel& operator=(const LoadedModel&) = delete;
+    LoadedModel(LoadedModel&&) noexcept = default;
+    LoadedModel& operator=(LoadedModel&&) noexcept = default;
 
     const HfConfig& hf_config() const noexcept { return hf_; }
     const DistributedConfig& distributed() const noexcept { return boot_.distributed; }
-    EngineCapabilities capabilities() const;
+    LoadedModelCapabilities capabilities() const;
 
     /// Number of weights physically resident on device.
     std::size_t num_loaded_tensors() const noexcept { return weights_.size(); }

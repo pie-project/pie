@@ -35,7 +35,7 @@ ggml_tensor* layernorm_with_bias(ggml_context* ctx, ggml_tensor* x,
 GraphResult build_phi3_5moe_graph(ggml_context* ctx,
                                const Model& model,
                                KvCachePaged& kv,
-                               const ForwardEngine::BatchPlan& plan) {
+                               const Executor::BatchPlan& plan) {
     const auto& h = model.hparams();
     const auto& w = model.weights();
     const std::int32_t n_q_heads  = h.num_attention_heads;

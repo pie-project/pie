@@ -16,7 +16,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("mistral3: missing weight '" + name + "'");
     }
@@ -28,7 +28,7 @@ const DeviceTensor& must(const Engine& e, const std::string& name) {
 // `bf16_name`. If `fp8_name` doesn't exist (e.g. a model variant that
 // already shipped this projection in bf16), it's a no-op.
 void dequant_fp8_in_place(
-    Engine& engine,
+    LoadedModel& engine,
     const std::string& fp8_name,
     const std::string& scale_name,
     const std::string& bf16_name)
@@ -71,7 +71,7 @@ void dequant_fp8_in_place(
 
 }  // namespace
 
-Qwen3Weights bind_mistral3(Engine& engine) {
+Qwen3Weights bind_mistral3(LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
 
     // Mistral-Small-3.1 keeps norms and the embedding in bf16 (or

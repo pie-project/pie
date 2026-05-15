@@ -1,4 +1,4 @@
-#include "request_handler.hpp"
+#include "executor/executor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -23,7 +23,7 @@
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
 #include "distributed.hpp"
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
 #include "response_subpass.hpp"
 #include "model/qwen3.hpp"
@@ -104,7 +104,7 @@ constexpr std::int32_t TP_STOP_MAGIC = 0x504F5453;  // 'STOP' tag
 
 // Lazily-allocated 32-byte device buffer holding the broadcast header.
 // Both rank 0 and followers reuse it across fires; no need to plumb it
-// through ForwardContext.
+// through Executor.
 std::int32_t* tp_hdr_dev_buf() {
     thread_local std::int32_t* buf = nullptr;
     if (buf == nullptr) {
@@ -220,7 +220,7 @@ void handle_fire_batch(
     std::uint32_t req_id,
     const pie_driver::PieForwardRequestView& view,
     pie_driver::PieForwardResponseView& out_resp,
-    ForwardContext& ctx,
+    Executor& executor,
     std::uint64_t handled)
 {
     FireTiming tm{};
@@ -230,14 +230,14 @@ void handle_fire_batch(
     // Local references so the (lifted) body uses the same names it had
     // when it lived as a `[&]`-capturing lambda in main.cpp. Avoids a
     // mechanical rename across ~900 lines.
-    auto& engine               = ctx.engine;
-    auto& ws                   = ctx.ws;
-    auto& kv_cache             = ctx.kv_cache;
-    auto& attn_ws              = ctx.attn_ws;
-    auto& cublas               = ctx.cublas;
-    auto& pi                   = ctx.inputs;  // persistent input slabs
-    auto& forward_fn           = ctx.forward_fn;
-    const int max_workspace_tokens = ctx.max_workspace_tokens;
+    auto& engine               = executor.loaded_model;
+    auto& ws                   = executor.ws;
+    auto& kv_cache             = executor.kv_cache;
+    auto& attn_ws              = executor.attn_ws;
+    auto& cublas               = executor.cublas;
+    auto& pi                   = executor.inputs;  // persistent input slabs
+    auto& forward_fn           = executor.forward_fn;
+    const int max_workspace_tokens = executor.max_workspace_tokens;
 
     // Track whether the custom-mask path was populated this fire so the
     // forward kernel knows whether to consume `pi.custom_mask`. Sizes are
@@ -353,7 +353,7 @@ void handle_fire_batch(
         if (N == 0 || R <= 0) {
             // Empty batch — emit a zero-request response view.
             std::vector<pie_driver::PerRequestOutput> empty(std::max(R, 0));
-            ctx.response_builder.build(empty, out_resp);
+            executor.response_builder.build(empty, out_resp);
             return;
         }
         if (N > max_workspace_tokens) {
@@ -474,17 +474,17 @@ void handle_fire_batch(
         std::vector<std::int32_t> slot_ids_h;
         std::vector<std::uint8_t> is_fresh_h;
         const bool use_slots =
-            ctx.slot_alloc.max_slots() > 0 && R > 0 &&
+            executor.slot_alloc.max_slots() > 0 && R > 0 &&
             ctx_id_view.size() == static_cast<std::size_t>(R);
         if (use_slots) {
             slot_ids_h.resize(R);
             is_fresh_h.resize(R);
             for (int r = 0; r < R; ++r) {
-                const auto acq = ctx.slot_alloc.acquire(ctx_id_view[r]);
+                const auto acq = executor.slot_alloc.acquire(ctx_id_view[r]);
                 slot_ids_h[r]  = acq.slot;
                 is_fresh_h[r]  = acq.is_fresh ? 1u : 0u;
             }
-            ctx.slot_alloc.end_of_fire();
+            executor.slot_alloc.end_of_fire();
             pi.slot_ids.copy_from_host(std::span<const std::int32_t>(slot_ids_h));
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
         }
@@ -494,9 +494,9 @@ void handle_fire_batch(
         // the same forward kernels against an identical view of inputs.
         // The all-reduces inside `forward_fn.body` then synchronise the
         // ranks layer-by-layer.
-        if (ctx.tp_comm != nullptr) {
-            tp_cpu_gate_notify(ctx.tp_cpu_gate_key);
-            tp_broadcast_inputs(*ctx.tp_comm, pi,
+        if (executor.tp_comm != nullptr) {
+            tp_cpu_gate_notify(executor.tp_cpu_gate_key);
+            tp_broadcast_inputs(*executor.tp_comm, pi,
                                 N, R, is_pure_decode,
                                 static_cast<int>(kvpi_view.size()),
                                 mask_bytes, mask_indptr_count,
@@ -645,11 +645,11 @@ void handle_fire_batch(
         // main.cpp once the dispatch upgrades to graph-stable kernel
         // args (currently none — see ForwardFn::graph_safe).
         const bool try_graphs =
-            ctx.graph_cache != nullptr && is_pure_decode && !have_custom_mask
+            executor.graph_cache != nullptr && is_pure_decode && !have_custom_mask
             && forward_fn.graph_safe;
         if (try_graphs) {
             const ForwardGraphKey key{R};
-            cudaGraphExec_t exec = ctx.graph_cache->get(key);
+            cudaGraphExec_t exec = executor.graph_cache->get(key);
             if (exec == nullptr) {
                 // First fire of this shape: capture. Body writes its
                 // output to `ws` workspace buffers + `cache.k/v` pages.
@@ -701,9 +701,9 @@ void handle_fire_batch(
                 CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
                 cudaGraphDestroy(graph);
                 cudaStreamDestroy(cstream);
-                ctx.graph_cache->put(key, exec);
-                const auto sz = ctx.graph_cache->size();
-                if (ctx.verbose && (sz <= 4 || sz % 16 == 0)) {
+                executor.graph_cache->put(key, exec);
+                const auto sz = executor.graph_cache->size();
+                if (executor.verbose && (sz <= 4 || sz % 16 == 0)) {
                     std::cerr << "[pie-driver-cuda] graph captured: R=" << R
                               << " (cache size=" << sz << ")\n";
                 }
@@ -847,7 +847,7 @@ void handle_fire_batch(
             }
         }
 
-        ctx.response_builder.build(per_req, out_resp);
+        executor.response_builder.build(per_req, out_resp);
 
         if (tm_on) {
             tm.t_after_response_us = fire_now_us();
@@ -873,7 +873,7 @@ void handle_fire_batch(
             }
         }
 
-        if (ctx.verbose && (handled <= 4 || handled % 100 == 0)) {
+        if (executor.verbose && (handled <= 4 || handled % 100 == 0)) {
             std::cerr << "[pie-driver-cuda] req_id=" << req_id
                       << " R=" << R << " N=" << N
                       << " sampled=" << num_sampling
@@ -904,13 +904,13 @@ void handle_fire_batch(
 // The loop blocks on `ncclBroadcast` for the header. NCCL serialises ops
 // per-comm, so a follower naturally idles until rank 0 issues the
 // matching broadcast in `tp_broadcast_inputs`.
-void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
-    if (ctx.tp_comm == nullptr) {
+void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
+    if (executor.tp_comm == nullptr) {
         std::cerr << "[pie-driver-cuda] tp_follower_serve: no tp_comm\n";
         return;
     }
-    auto& pi      = ctx.inputs;
-    auto& comm    = *ctx.tp_comm;
+    auto& pi      = executor.inputs;
+    auto& comm    = *executor.tp_comm;
     auto* d_hdr   = tp_hdr_dev_buf();
     cudaStream_t stream = nullptr;
     std::uint64_t cpu_gate_seq = 0;
@@ -919,7 +919,7 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
     std::vector<std::uint32_t> h_qo, h_kvpp;
 
     while (!stop.load()) {
-        tp_cpu_gate_wait(ctx.tp_cpu_gate_key, cpu_gate_seq, stop);
+        tp_cpu_gate_wait(executor.tp_cpu_gate_key, cpu_gate_seq, stop);
         // 1. Receive header.
         NCCL_CHECK(ncclBroadcast(d_hdr, d_hdr, sizeof(TpFireHeader),
                                  ncclChar, 0, comm.comm(), stream));
@@ -1017,8 +1017,8 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
         // 4. Run the same forward function as rank 0. The all-reduces
         // inside synchronise both ranks; we don't sample or write a
         // response — that's rank-0-only.
-        if (ctx.forward_fn.prepare) {
-            ctx.forward_fn.prepare(ctx.attn_ws, h_kvpp.data(), R, is_pure_decode);
+        if (executor.forward_fn.prepare) {
+            executor.forward_fn.prepare(executor.attn_ws, h_kvpp.data(), R, is_pure_decode);
         }
         // Mirror rank 0's graph capture/replay decision so NCCL ops
         // inside the body record on both ranks simultaneously (otherwise
@@ -1027,17 +1027,17 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
         // graph caches in lockstep; the captured graph on rank 1 has no
         // sampling / response work, just the forward kernels + NCCL.
         const bool try_graphs =
-            ctx.graph_cache != nullptr && is_pure_decode && !have_custom_mask
-            && ctx.forward_fn.graph_safe;
+            executor.graph_cache != nullptr && is_pure_decode && !have_custom_mask
+            && executor.forward_fn.graph_safe;
         if (try_graphs) {
             const ForwardGraphKey key{R};
-            cudaGraphExec_t exec = ctx.graph_cache->get(key);
+            cudaGraphExec_t exec = executor.graph_cache->get(key);
             if (exec == nullptr) {
                 cudaStream_t cstream = nullptr;
                 CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
                 CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
-                ctx.forward_fn.body(
-                    ctx.ws, ctx.kv_cache, ctx.attn_ws, ctx.cublas,
+                executor.forward_fn.body(
+                    executor.ws, executor.kv_cache, executor.attn_ws, executor.cublas,
                     reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
                     reinterpret_cast<const std::int32_t*>(pi.positions.data()),
                     pi.qo_indptr.data(), pi.kv_page_indices.data(),
@@ -1052,13 +1052,13 @@ void tp_follower_serve(ForwardContext& ctx, std::atomic<bool>& stop) {
                 CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
                 cudaGraphDestroy(graph);
                 cudaStreamDestroy(cstream);
-                ctx.graph_cache->put(key, exec);
+                executor.graph_cache->put(key, exec);
             } else {
                 CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
             }
         } else {
-            ctx.forward_fn.body(
-                ctx.ws, ctx.kv_cache, ctx.attn_ws, ctx.cublas,
+            executor.forward_fn.body(
+                executor.ws, executor.kv_cache, executor.attn_ws, executor.cublas,
                 reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
                 reinterpret_cast<const std::int32_t*>(pi.positions.data()),
                 pi.qo_indptr.data(), pi.kv_page_indices.data(),

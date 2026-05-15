@@ -13,7 +13,7 @@
 #include <cuda_runtime.h>
 #include <memory>
 
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::ops {
@@ -53,7 +53,7 @@ struct WeightView {
     }
 
     // Quantized weight: ties together a weight DeviceTensor and a
-    // `QuantMeta` snapshot pulled from `Engine::quant_meta`.
+    // `QuantMeta` snapshot pulled from `LoadedModel::quant_meta`.
     static WeightView quantized(const DeviceTensor& weight, const QuantMeta& meta) {
         WeightView v;
         v.data = weight.data();

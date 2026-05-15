@@ -547,7 +547,7 @@ void moe_block(
         //   5. `batched_weighted_sum` collapses [top_k, H] → moe_out[0].
         //
         // Every step has fixed kernel topology and stable device-pointer
-        // arguments, so the request handler's graph-capture path can fire
+        // arguments, so the executor's graph-capture path can fire
         // for the whole forward.
         kernels::launch_build_moe_ptrs_decode_bf16(
             moe_ws.topk_idx.data(),
