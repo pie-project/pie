@@ -96,6 +96,7 @@ class SchedulerConfig:
     default_endowment_pages: Optional[int] = None
     admission_oversubscription_factor: Optional[float] = None
     restore_pause_at_utilization: Optional[float] = None
+    speculation_depth: Optional[int] = None
 
 
 @dataclass

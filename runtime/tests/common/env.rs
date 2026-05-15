@@ -110,6 +110,7 @@ pub fn create_mock_env(
                 // don't trip the admission gate on small-capacity mock devices.
                 admission_oversubscription_factor: 32.0,
                 restore_pause_at_utilization: 0.85,
+                speculation_depth: 1,
             },
         }],
         runtime: RuntimeConfig {

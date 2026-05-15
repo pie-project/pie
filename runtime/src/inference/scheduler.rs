@@ -70,6 +70,15 @@ pub(super) enum Decision {
 pub struct SchedulerStats {
     pub total_batches: AtomicU64,
     pub total_tokens_processed: AtomicU64,
+    /// Total request count across all batches (sum of batch sizes).
+    /// Divide by `total_batches` for mean batch size in requests.
+    pub total_requests_processed: AtomicU64,
+    /// Largest batch size (in requests) ever fired by this scheduler.
+    pub max_batch_size_observed: AtomicU64,
+    /// Coarse histogram of batch sizes. Buckets:
+    /// [0]=1, [1]=2-3, [2]=4-7, [3]=8-15, [4]=16-31,
+    /// [5]=32-63, [6]=64-127, [7]=128+.
+    pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
 }
@@ -139,6 +148,36 @@ impl BatchAccumulator {
 }
 
 // =============================================================================
+// SchedulerHandle
+// =============================================================================
+
+/// Cloneable submit handle. Used by the speculator's chain extender
+/// (spawned outside the scheduler's `run` loop) to resubmit
+/// pre-staged forward passes.
+#[derive(Clone)]
+pub(crate) struct SchedulerHandle {
+    tx: mpsc::UnboundedSender<PendingRequest>,
+}
+
+impl SchedulerHandle {
+    pub fn submit(
+        &self,
+        request: pie_bridge::ForwardRequest,
+        response_tx: oneshot::Sender<pie_bridge::ForwardResponse>,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+    ) -> Result<()> {
+        self.tx.send(PendingRequest {
+            request,
+            response_tx,
+            physical_page_ids,
+            last_page_len,
+        })?;
+        Ok(())
+    }
+}
+
+// =============================================================================
 // BatchScheduler
 // =============================================================================
 
@@ -202,6 +241,14 @@ impl BatchScheduler {
             last_page_len,
         })?;
         Ok(())
+    }
+
+    /// Cloneable handle for tasks that need to submit outside the
+    /// scheduler's `run` loop (e.g., the speculator chain extender).
+    pub(crate) fn handle(&self) -> SchedulerHandle {
+        SchedulerHandle {
+            tx: self.tx.clone(),
+        }
     }
 
     // =========================================================================
@@ -324,6 +371,7 @@ impl BatchScheduler {
                         .iter()
                         .map(|r| r.request.context_ids[0])
                         .collect();
+                    let batch_size = batch_ctx_ids.len() as u64;
 
                     // Spawn batch execution
                     let latency_tx_clone = latency_tx.clone();
@@ -353,6 +401,23 @@ impl BatchScheduler {
                         stats_clone
                             .total_tokens_processed
                             .fetch_add(total_tokens as u64, Relaxed);
+                        stats_clone
+                            .total_requests_processed
+                            .fetch_add(batch_size, Relaxed);
+                        stats_clone
+                            .max_batch_size_observed
+                            .fetch_max(batch_size, Relaxed);
+                        let bucket = match batch_size {
+                            0 | 1 => 0,
+                            2..=3 => 1,
+                            4..=7 => 2,
+                            8..=15 => 3,
+                            16..=31 => 4,
+                            32..=63 => 5,
+                            64..=127 => 6,
+                            _ => 7,
+                        };
+                        stats_clone.batch_size_hist[bucket].fetch_add(1, Relaxed);
                         stats_clone
                             .last_batch_latency_us
                             .store(latency.as_micros() as u64, Relaxed);

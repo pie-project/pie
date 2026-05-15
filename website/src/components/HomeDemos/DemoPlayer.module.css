@@ -264,6 +264,91 @@
   to { visibility: hidden; }
 }
 
+.codeWrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.codeToggle {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  width: 100%;
+  padding: 0.85rem 1.1rem;
+  background: var(--pie-bg-elev);
+  border: 1px solid var(--pie-border);
+  border-radius: 10px;
+  color: var(--pie-ink);
+  font-family: inherit;
+  font-size: var(--pie-text-sm);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease,
+    transform 150ms ease;
+}
+
+.codeToggle:hover {
+  border-color: var(--ifm-color-primary);
+  background: rgba(var(--pie-accent-300-rgb), 0.06);
+}
+
+.codeToggle:active {
+  transform: translateY(1px);
+}
+
+.codeToggle:focus-visible {
+  outline: 2px solid var(--ifm-color-primary);
+  outline-offset: 2px;
+}
+
+.codeToggleOpen {
+  border-color: var(--ifm-color-primary);
+  background: rgba(var(--pie-accent-300-rgb), 0.06);
+}
+
+.cardHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.glyph {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.2rem;
+  height: 1.2rem;
+  border-radius: 4px;
+  background: var(--ifm-color-primary);
+  color: var(--pie-paper-50, #fff);
+  font-family: var(--pie-font-mono);
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1;
+}
+
+.codeToggleLabel {
+  font-family: var(--pie-font-mono);
+  font-size: var(--pie-text-xs);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ifm-color-primary);
+}
+
+.codeToggleCaret {
+  flex: 0 0 auto;
+  width: 0.9rem;
+  margin-left: auto;
+  text-align: center;
+  color: var(--ifm-color-primary);
+  font-family: var(--pie-font-mono);
+}
+
 .codeRow {
   display: grid;
   grid-template-columns: 1fr;
@@ -364,9 +449,11 @@
 .tryIt {
   display: flex;
   flex-direction: column;
-  gap: 0.35rem;
-  padding: 0.7rem 0.9rem 0.9rem;
-  border-top: 1px solid var(--pie-border);
+  gap: 0.4rem;
+  padding: 0.85rem 1.1rem;
+  border: 1px solid var(--pie-border);
+  border-radius: 10px;
+  background: var(--pie-bg-elev);
 }
 
 .tryItLabel {

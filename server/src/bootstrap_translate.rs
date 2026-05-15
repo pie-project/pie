@@ -100,17 +100,13 @@ pub fn build(
     })
 }
 
-fn build_model(
-    m: &config::ModelConfig,
-    hs: &ModelHandshake,
-) -> pie::bootstrap::ModelConfig {
+fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::ModelConfig {
     // Arch + kv_page_size + tokenizer come from group 0; all groups
     // serve the same model so they agree. Per-group caps differ only
     // in `total_pages` / `swap_pool_size` (potentially) — those flow
     // through the per-driver entries.
     let group0_caps = &hs.groups[0].caps;
-    let tokenizer_path =
-        PathBuf::from(&group0_caps.snapshot_dir).join("tokenizer.json");
+    let tokenizer_path = PathBuf::from(&group0_caps.snapshot_dir).join("tokenizer.json");
 
     let drivers = hs
         .groups
@@ -136,6 +132,7 @@ fn build_model(
             default_endowment_pages: m.scheduler.default_endowment_pages,
             admission_oversubscription_factor: m.scheduler.admission_oversubscription_factor,
             restore_pause_at_utilization: m.scheduler.restore_pause_at_utilization,
+            speculation_depth: m.scheduler.speculation_depth,
         },
     }
 }
@@ -188,7 +185,10 @@ device = ["cpu"]
         assert_eq!(m.name, "default");
         assert_eq!(m.arch_name, "qwen3");
         assert_eq!(m.kv_page_size, 32);
-        assert_eq!(m.tokenizer_path, PathBuf::from("/tmp/snapshot/tokenizer.json"));
+        assert_eq!(
+            m.tokenizer_path,
+            PathBuf::from("/tmp/snapshot/tokenizer.json")
+        );
         assert_eq!(m.drivers.len(), 1);
         assert_eq!(m.drivers[0].total_pages, 1024);
         assert_eq!(m.scheduler.batch_policy, "adaptive");
@@ -218,9 +218,7 @@ device = ["cuda:0", "cuda:1"]
                 GroupHandshake {
                     caps: fixture_caps(),
                 },
-                GroupHandshake {
-                    caps: g1,
-                },
+                GroupHandshake { caps: g1 },
             ],
         }];
 
@@ -261,12 +259,9 @@ device = ["cpu"]
 "#,
         )
         .unwrap();
-        let err = build(
-            &user,
-            &[ModelHandshake { groups: vec![] }],
-        )
-        .unwrap_err()
-        .to_string();
+        let err = build(&user, &[ModelHandshake { groups: vec![] }])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("zero group handshakes"), "got: {err}");
     }
 }

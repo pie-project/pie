@@ -4,8 +4,8 @@
 //! per device through [`register_driver`] + [`install_channel`]. The
 //! unified driver surface means there's no RPC server, no mqueue, and
 //! no shmem ring in the test path — just a typed channel that dispatches
-//! `DriverRequest::Forward` to a [`Behavior`] and treats every cold
-//! method as a no-op `Status(0)`.
+//! `RequestPayload::Forward` to a [`Behavior`] and treats every cold
+//! method as a no-op status response.
 
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
@@ -17,17 +17,52 @@ use async_trait::async_trait;
 use pie::driver::{
     DriverChannel, DriverRequest, DriverResponse, DriverSpec, install_channel, register_driver,
 };
-use pie::inference::request::{
-    BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassResponse,
-};
 
 // =============================================================================
 // Behavior Trait
 // =============================================================================
 
-/// How the mock device handles a forward batch.
+/// How the mock device handles a forward batch. The behavior receives
+/// the batched [`pie_bridge::ForwardRequest`] (with indptrs delimiting
+/// each per-request slice) and returns a batched
+/// [`pie_bridge::ForwardResponse`] keyed by the same indptrs.
 pub trait Behavior: Send + Sync + 'static {
-    fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse;
+    fn handle_fire_batch(&self, req: &pie_bridge::ForwardRequest) -> pie_bridge::ForwardResponse;
+}
+
+/// Helper: derive the request count from `qo_indptr`. The batched
+/// shape stores `num_requests + 1` entries (one indptr per request +
+/// the trailing total).
+fn num_requests(req: &pie_bridge::ForwardRequest) -> u32 {
+    req.qo_indptr.len().saturating_sub(1) as u32
+}
+
+fn total_tokens(req: &pie_bridge::ForwardRequest) -> usize {
+    req.token_ids.len()
+}
+
+/// Build a `ForwardResponse` that emits exactly one token per request
+/// — the common case for both `Echo` and `Counter` behaviors.
+fn build_token_response(tokens: Vec<u32>) -> pie_bridge::ForwardResponse {
+    let n = tokens.len() as u32;
+    let tokens_indptr: Vec<u32> = (0..=n).collect();
+    pie_bridge::ForwardResponse {
+        num_requests: n,
+        tokens_indptr,
+        tokens,
+        dists_req_indptr: vec![0; (n + 1) as usize],
+        dists_kv_indptr: vec![0],
+        dists_ids: Vec::new(),
+        dists_probs: Vec::new(),
+        logits_req_indptr: vec![0; (n + 1) as usize],
+        logits_byte_indptr: vec![0],
+        logits_bytes: Vec::new(),
+        logprobs_req_indptr: vec![0; (n + 1) as usize],
+        logprobs_val_indptr: vec![0],
+        logprobs_values: Vec::new(),
+        entropies_indptr: vec![0; (n + 1) as usize],
+        entropies: Vec::new(),
+    }
 }
 
 // =============================================================================
@@ -38,21 +73,9 @@ pub trait Behavior: Send + Sync + 'static {
 pub struct EchoBehavior(pub u32);
 
 impl Behavior for EchoBehavior {
-    fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
-        let num = req.num_requests();
-        BatchedForwardPassResponse {
-            results: (0..num)
-                .map(|_| ForwardPassResponse {
-                    tokens: vec![self.0],
-                    dists: vec![],
-                    logits: vec![],
-                    logprobs: vec![],
-                    entropies: vec![],
-                    spec_tokens: vec![],
-                    spec_positions: vec![],
-                })
-                .collect(),
-        }
+    fn handle_fire_batch(&self, req: &pie_bridge::ForwardRequest) -> pie_bridge::ForwardResponse {
+        let n = num_requests(req) as usize;
+        build_token_response(vec![self.0; n])
     }
 }
 
@@ -70,22 +93,60 @@ impl CounterBehavior {
 }
 
 impl Behavior for CounterBehavior {
-    fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
-        let num = req.num_requests();
-        let mut results = Vec::with_capacity(num);
-        for _ in 0..num {
-            let t = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            results.push(ForwardPassResponse {
-                tokens: vec![t],
-                dists: vec![],
-                logits: vec![],
-                logprobs: vec![],
-                entropies: vec![],
-                spec_tokens: vec![],
-                spec_positions: vec![],
-            });
+    fn handle_fire_batch(&self, req: &pie_bridge::ForwardRequest) -> pie_bridge::ForwardResponse {
+        let n = num_requests(req) as usize;
+        let tokens: Vec<u32> = (0..n)
+            .map(|_| self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        build_token_response(tokens)
+    }
+}
+
+/// Wraps another behavior and adds simulated latency before responding.
+pub struct DelayedBehavior<B: Behavior> {
+    pub inner: B,
+    pub latency: Duration,
+}
+
+impl<B: Behavior> Behavior for DelayedBehavior<B> {
+    fn handle_fire_batch(&self, req: &pie_bridge::ForwardRequest) -> pie_bridge::ForwardResponse {
+        std::thread::sleep(self.latency);
+        self.inner.handle_fire_batch(req)
+    }
+}
+
+/// Wraps another behavior and fails after N successful calls.
+pub struct FailAfterBehavior<B: Behavior> {
+    pub inner: B,
+    remaining: AtomicU32,
+}
+
+impl<B: Behavior> FailAfterBehavior<B> {
+    pub fn new(inner: B, success_count: u32) -> Self {
+        Self {
+            inner,
+            remaining: AtomicU32::new(success_count),
         }
-        BatchedForwardPassResponse { results }
+    }
+}
+
+impl<B: Behavior> Behavior for FailAfterBehavior<B> {
+    fn handle_fire_batch(&self, req: &pie_bridge::ForwardRequest) -> pie_bridge::ForwardResponse {
+        if self
+            .remaining
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            // Empty response to simulate failure: zero tokens, no
+            // dists/logits/etc.
+            pie_bridge::ForwardResponse {
+                num_requests: 0,
+                tokens_indptr: vec![0],
+                ..Default::default()
+            }
+        } else {
+            self.inner.handle_fire_batch(req)
+        }
     }
 }
 
@@ -149,32 +210,37 @@ struct MockChannel {
     aborted: Mutex<bool>,
 }
 
+fn status_response(status: i32) -> DriverResponse {
+    DriverResponse {
+        aborted: false,
+        payload: pie_bridge::ResponsePayload::Status(pie_bridge::StatusResponse { status }),
+    }
+}
+
 #[async_trait]
 impl DriverChannel for MockChannel {
     async fn submit(&self, req: DriverRequest) -> Result<DriverResponse> {
         if *self.aborted.lock().unwrap() {
             anyhow::bail!("mock channel {}: aborted", self.device_idx);
         }
-        match req {
-            DriverRequest::Forward(batch) => {
+        match req.payload {
+            pie_bridge::RequestPayload::Forward(fwd) => {
                 self.recorder.record(RecordedCall {
                     device_idx: self.device_idx,
                     method: "fire_batch",
-                    num_requests: batch.num_requests(),
-                    total_tokens: batch.total_tokens(),
+                    num_requests: num_requests(&fwd) as usize,
+                    total_tokens: total_tokens(&fwd),
                     timestamp: Instant::now(),
                 });
-                let resp = self.behavior.handle_fire_batch(&batch);
-                Ok(DriverResponse::Forward(resp))
+                let resp = self.behavior.handle_fire_batch(&fwd);
+                Ok(DriverResponse {
+                    aborted: false,
+                    payload: pie_bridge::ResponsePayload::Forward(resp),
+                })
             }
-            DriverRequest::CopyD2H { .. }
-            | DriverRequest::CopyH2D { .. }
-            | DriverRequest::CopyD2D { .. }
-            | DriverRequest::CopyH2H { .. }
-            | DriverRequest::LoadAdapter { .. }
-            | DriverRequest::SaveAdapter { .. }
-            | DriverRequest::ZoInitializeAdapter { .. }
-            | DriverRequest::ZoUpdateAdapter { .. } => Ok(DriverResponse::Status(0)),
+            pie_bridge::RequestPayload::Copy(_)
+            | pie_bridge::RequestPayload::Adapter(_)
+            | pie_bridge::RequestPayload::Health => Ok(status_response(0)),
         }
     }
 
@@ -199,9 +265,10 @@ pub struct MockBackend {
 
 impl MockBackend {
     /// Pre-register `num_devices` mock channels with the runtime. Each
-    /// channel gets a fresh [`DriverId`] from the runtime's allocator;
-    /// callers thread those IDs through their bootstrap config so the
-    /// scheduler dispatches forward batches into the mocks.
+    /// channel gets a fresh [`pie::driver::DriverId`] from the
+    /// runtime's allocator; callers thread those IDs through their
+    /// bootstrap config so the scheduler dispatches forward batches
+    /// into the mocks.
     pub fn new(num_devices: usize, behavior: Arc<dyn Behavior>) -> Self {
         let recorder = Arc::new(CallRecorder::new());
         let mut driver_ids = Vec::with_capacity(num_devices);

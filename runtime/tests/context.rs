@@ -29,15 +29,29 @@ fn state() -> &'static TestState {
 const MODEL: usize = 0;
 const USER: &str = "test-user";
 
-fn test_pid() -> uuid::Uuid {
-    uuid::Uuid::new_v4()
+/// Register a fresh process and return its pid. The context actor
+/// panics on `create` if the process isn't registered first.
+async fn fresh_pid() -> uuid::Uuid {
+    let pid = uuid::Uuid::new_v4();
+    pie::context::register_process(pid, None).await.unwrap();
+    pid
+}
+
+/// Wait for any pending fire-and-forget messages on the context
+/// actor (e.g., `append_working_page_tokens`) to drain. The mailbox
+/// is FIFO, so any actor-routed roundtrip after a fire-and-forget
+/// send is guaranteed to observe the latter's effects.
+async fn flush_mailbox(id: pie::context::ContextId) {
+    let _ = pie::context::debug_context_state(MODEL, id).await;
 }
 
 #[test]
 fn create_and_save_and_open() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, test_pid()).await.unwrap();
+        let id = pie::context::create(MODEL, fresh_pid().await)
+            .await
+            .unwrap();
 
         // Anonymous context is not findable by name
         let found = pie::context::lookup(MODEL, USER.to_string(), "test-ctx".into()).await;
@@ -52,7 +66,7 @@ fn create_and_save_and_open() {
         let snapshot_id = pie::context::lookup(MODEL, USER.to_string(), "test-ctx".into())
             .await
             .unwrap();
-        let found = pie::context::fork(MODEL, snapshot_id, test_pid()).await;
+        let found = pie::context::fork(MODEL, snapshot_id, fresh_pid().await).await;
         assert!(found.is_ok());
     });
 }
@@ -61,12 +75,14 @@ fn create_and_save_and_open() {
 fn destroy_removes_context() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, test_pid()).await.unwrap();
+        let id = pie::context::create(MODEL, fresh_pid().await)
+            .await
+            .unwrap();
 
         pie::context::destroy(MODEL, id).await.unwrap();
 
         // Fork from destroyed context should fail
-        let fork_result = pie::context::fork(MODEL, id, test_pid()).await;
+        let fork_result = pie::context::fork(MODEL, id, fresh_pid().await).await;
         assert!(
             fork_result.is_err(),
             "fork from destroyed context should fail"
@@ -78,7 +94,9 @@ fn destroy_removes_context() {
 fn force_destroy() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, test_pid()).await.unwrap();
+        let id = pie::context::create(MODEL, fresh_pid().await)
+            .await
+            .unwrap();
 
         // Destroy should succeed on a fresh context
         pie::context::destroy(MODEL, id).await.unwrap();
@@ -89,7 +107,9 @@ fn force_destroy() {
 fn working_page_token_ops() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, test_pid()).await.unwrap();
+        let id = pie::context::create(MODEL, fresh_pid().await)
+            .await
+            .unwrap();
 
         // Append tokens
         pie::context::append_working_page_tokens(
@@ -100,9 +120,8 @@ fn working_page_token_ops() {
             vec![],
             None,
             None,
-        )
-        .await
-        .unwrap();
+        );
+        flush_mailbox(id).await;
 
         // working_page_token_count = 5
         let count = pie::context::working_page_token_count(MODEL, id);
@@ -124,9 +143,11 @@ fn working_page_token_ops() {
 fn fork_context() {
     let s = state();
     s.rt.block_on(async {
-        let parent_id = pie::context::create(MODEL, test_pid()).await.unwrap();
+        let parent_id = pie::context::create(MODEL, fresh_pid().await)
+            .await
+            .unwrap();
 
-        let child_id = pie::context::fork(MODEL, parent_id, test_pid())
+        let child_id = pie::context::fork(MODEL, parent_id, fresh_pid().await)
             .await
             .unwrap();
 
@@ -151,8 +172,9 @@ fn full_page_lifecycle() {
 
         // ── Phase 1: Create anonymous context and fill prompt tokens ──
         let prompt: Vec<u32> = (1000..1032).collect(); // 32 tokens
-        let pid = uuid::Uuid::new_v4();
-        let id = pie::context::create(MODEL, pid).await.unwrap();
+        let id = pie::context::create(MODEL, fresh_pid().await)
+            .await
+            .unwrap();
 
         // Tokens per page should match the model config
         assert_eq!(
@@ -178,9 +200,8 @@ fn full_page_lifecycle() {
             vec![],
             None,
             None,
-        )
-        .await
-        .unwrap();
+        );
+        flush_mailbox(id).await;
 
         assert_eq!(pie::context::working_page_token_count(MODEL, id), 32);
 
@@ -226,9 +247,8 @@ fn full_page_lifecycle() {
             vec![],
             None,
             None,
-        )
-        .await
-        .unwrap();
+        );
+        flush_mailbox(id).await;
         assert_eq!(pie::context::working_page_token_count(MODEL, id), 3);
 
         // ── Phase 6: Prepare state with filled tokens, then fork ──
@@ -245,12 +265,13 @@ fn full_page_lifecycle() {
             vec![],
             None,
             None,
-        )
-        .await
-        .unwrap();
+        );
+        flush_mailbox(id).await;
         assert_eq!(pie::context::working_page_token_count(MODEL, id), 2);
 
-        let child_id = pie::context::fork(MODEL, id, test_pid()).await.unwrap();
+        let child_id = pie::context::fork(MODEL, id, fresh_pid().await)
+            .await
+            .unwrap();
 
         assert_ne!(id, child_id);
 

@@ -441,8 +441,15 @@ impl ContextManager {
 
         tokio::spawn(async move {
             for (fwd_req, phys_ids, last_page_len) in requests {
-                let result =
-                    inference::submit(model_idx, fwd_req, driver_id, phys_ids, last_page_len).await;
+                let result = inference::submit(
+                    model_idx,
+                    fwd_req,
+                    driver_id,
+                    phys_ids,
+                    Vec::new(),
+                    last_page_len,
+                )
+                .await;
 
                 if let Err(e) = result {
                     tracing::error!(

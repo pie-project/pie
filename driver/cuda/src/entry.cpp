@@ -1408,6 +1408,9 @@ int run_impl(int argc,
         /*slot_alloc=*/{},
     };
     fwd_ctx.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
+    // Speculation lives entirely in the runtime. The driver runs
+    // forward passes; the runtime's `scheduler.speculation_depth`
+    // toml knob controls per-ctx chain depth.
     // Size the linear-attn slot allocator only when this arch actually
     // uses a state cache. Default-constructed (max_slots=0) on every
     // other arch — handle_fire_batch's `use_slots` predicate stays false

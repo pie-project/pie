@@ -1,0 +1,1832 @@
+{
+  "summary": {
+    "mode": "tput",
+    "engine": "pie",
+    "model": "Qwen/Qwen3-0.6B",
+    "requests": 256,
+    "completed": 256,
+    "failed": 0,
+    "wall_s": 5.134706929093227,
+    "output_tokens": 65536,
+    "prompt_tokens": 9132,
+    "req_per_s": 49.85678901156074,
+    "output_tok_per_s": 12763.33798695955,
+    "latency_mean_ms": 1282.3366008406083,
+    "latency_p50_ms": 1289.455208927393,
+    "latency_p95_ms": 1298.0034342035651,
+    "latency_p99_ms": 1299.2491820361465,
+    "config": {
+      "system": "You are a helpful benchmarking assistant.",
+      "prompt": "Write a short story about a robot.",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "ignore_eos": true,
+      "unique_prompts": true,
+      "driver": "cuda_native",
+      "scheduler": "adaptive",
+      "max_batch_size": 512,
+      "max_batch_tokens": 10240,
+      "max_num_kv_pages": 2048,
+      "speculation depth": 8,
+      "total batches": 5143,
+      "avg batch latency us": 2952,
+      "last batch latency us": 5728,
+      "bypass hits": 67184
+    }
+  },
+  "requests": [
+    {
+      "ok": true,
+      "latency_s": 1.249247687868774,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2497975290752947,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2498081831727177,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.249076714972034,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2490789799485356,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2497326349839568,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.249017694965005,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.248918890953064,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.248936299001798,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2496093842200935,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2496861370746046,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2489196709357202,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2496133579406887,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.248984043020755,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2495706910267472,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2489950540475547,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2488780489657074,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.254412111826241,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2548999008722603,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2566250280942768,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2565645310096443,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2578266141936183,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2542949290946126,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2554117292165756,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2563988871406764,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.256576569052413,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2559452638961375,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2572388108819723,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2572522829286754,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.255948489997536,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2559499209746718,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2559686379972845,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2547744628973305,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2535819029435515,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2557356120087206,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2570102671161294,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2570817470550537,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2535607959143817,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2546863569878042,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2570953369140625,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.253601182019338,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.254849674878642,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2534296188969165,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2569371631834656,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.25700430595316,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2546402218285948,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2540170340798795,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2555717669893056,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2547540108207613,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2547750188969076,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2545278668403625,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2557210910599679,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2557632031384856,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2557295800652355,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2555233368184417,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2544151179026812,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2557362408842891,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2568271858617663,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2538598468527198,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2555012528318912,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2533589398954064,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2533253419678658,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2555157239548862,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2567308121360838,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.290550186065957,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.29034310602583,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2904931630473584,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2904827899765223,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2903619690332562,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.290384636959061,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2903789181727916,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2901118050795048,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.290015087928623,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2894912261981517,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2899321031291038,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2898408530745655,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.289816833799705,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2897939879912883,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.289865651866421,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2896249711047858,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2897046629805118,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2851001620292664,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.28506647516042,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2913736819755286,
+      "output_tokens": 256,
+      "prompt_tokens": 35,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2907845119480044,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2907478620763868,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2907674498856068,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2912057561334223,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2911726671736687,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.290957051096484,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2903586099855602,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2900480721145868,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2886983170174062,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2894885218702257,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.28944027912803,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.288794299820438,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2885559799615294,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.289023257093504,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2893286631442606,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2888661359902471,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2884107620920986,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2885344550013542,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2889478171709925,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2883744249120355,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.287790991133079,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2883427417837083,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2883372199721634,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.28822449198924,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2876094109378755,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2878682541195303,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2875479620415717,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2881696459371597,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2886211180593818,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.288487099809572,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.288022933062166,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2884479770436883,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2884288770146668,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2872698260471225,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2873530690558255,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2871987451799214,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2877178587950766,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2868173678871244,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2870394310448319,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2870816250797361,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2866208939813077,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.287515376927331,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2863312079571187,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2862731029745191,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2972819050773978,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2965589568484575,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2957245260477066,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2955895741470158,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2956777140498161,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.295674756867811,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.295543564017862,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2962837100494653,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.296145447064191,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2954703338909894,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.296141647035256,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2953202330973,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2959990589879453,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2953702569939196,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2952874479815364,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.295900794910267,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2959474958479404,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2950558080337942,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.3029857610817999,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2987814908847213,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2971547150518745,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.297000627964735,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2983085289597511,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2984139109030366,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2969400389119983,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.296845796983689,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.296768699074164,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.29838788905181,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2969105909578502,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2983876559883356,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2983521958813071,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2983450680039823,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2966468059457839,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2980502981226891,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2967469710856676,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2978185110259801,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2979878128971905,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.297876558965072,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.296336940024048,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2992626070044935,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2992701651528478,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2976837188471109,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2975756600499153,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.296321980888024,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2992381979711354,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.296117367921397,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.297592471819371,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2975603088270873,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2992020100355148,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.296082619810477,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2961717140860856,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.295997163048014,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2961775839794427,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2971870340406895,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.297117258887738,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2971181741449982,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.295800446998328,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.297330497065559,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2958719381131232,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2973537808284163,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.297327158972621,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2973801160696894,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2973533649928868,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2971522961743176,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2912257690913975,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2909080320969224,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.290953311836347,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2909612290095538,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2908949879929423,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2910819079261273,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.290846147807315,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2903852188028395,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2908233341295272,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2907665900420398,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.290473295841366,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2903575899545103,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.290539155015722,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2905155080370605,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2903727099765092,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2902260459959507,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.290149113861844,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2900761549826711,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2845432080794126,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2845887148287147,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2846019368153065,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2914416058920324,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2912810458801687,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.29144496191293,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2841615660581738,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.291344447992742,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2912765990477055,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2910310679581016,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2906524210702628,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2910387190058827,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2904169929679483,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2908497171010822,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2907310819718987,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2899206529837102,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2907619189936668,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.289394314866513,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2894264778587967,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2892862029839307,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.289371650898829,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2888612251263112,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2893196761142462,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2892931869719177,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2891978069674224,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.289691821904853,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2896070959977806,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.289450618904084,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2896628510206938,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2895546259824187,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2889259059447795,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.288855325197801,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2894657079596072,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2893072178121656,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.289459798950702,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2888062559068203,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2887093489989638,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2893023879732937,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2890454679727554,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2881373059935868,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2889744061976671,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2890981521923095,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2874921800103039,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2879358339123428,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2881699251011014,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    },
+    {
+      "ok": true,
+      "latency_s": 1.2882774220779538,
+      "output_tokens": 256,
+      "prompt_tokens": 36,
+      "error": null
+    }
+  ]
+}

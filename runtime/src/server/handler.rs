@@ -67,12 +67,45 @@ impl Session {
                         serde_json::Value::from(inf.total_tokens_processed),
                     );
                     stats.insert(
+                        format!("{}.total_requests_processed", model_name),
+                        serde_json::Value::from(inf.total_requests_processed),
+                    );
+                    stats.insert(
+                        format!("{}.max_batch_size_observed", model_name),
+                        serde_json::Value::from(inf.max_batch_size_observed),
+                    );
+                    stats.insert(
+                        format!("{}.batch_size_hist", model_name),
+                        serde_json::Value::from(inf.batch_size_hist.to_vec()),
+                    );
+                    stats.insert(
                         format!("{}.last_batch_latency_us", model_name),
                         serde_json::Value::from(inf.last_batch_latency_us),
                     );
                     stats.insert(
                         format!("{}.avg_batch_latency_us", model_name),
                         serde_json::Value::from(inf.avg_batch_latency_us),
+                    );
+                    // Speculation hit counters — observability for
+                    // `try_hit`/chain submissions/drops.
+                    stats.insert(
+                        format!("{}.bypass_hits", model_name),
+                        serde_json::Value::from(
+                            inference::BYPASS_HIT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                    );
+                    stats.insert(
+                        format!("{}.chain_submits", model_name),
+                        serde_json::Value::from(
+                            inference::CHAIN_SUBMIT_COUNT
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                    );
+                    stats.insert(
+                        format!("{}.chain_drops", model_name),
+                        serde_json::Value::from(
+                            inference::CHAIN_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
                     );
                 }
 
