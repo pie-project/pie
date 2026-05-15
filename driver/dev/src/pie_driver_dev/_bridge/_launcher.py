@@ -201,9 +201,9 @@ def launch(
     activation_dtype = driver_section.get("activation_dtype", "bfloat16")
     random_seed = int(driver_section.get("random_seed", 42))
     # Channel-level wait strategy from pie config's `[model.driver]`.
-    # Default matches `pie_bridge::ipc::DEFAULT_SPIN_BUDGET_US`. The
-    # worker passes this to `ShmemServer(...)`.
-    shmem_spin_budget_us = int(driver_section.get("spin_budget_us", 100))
+    # Default matches Pie's balanced IPC profile. The worker passes
+    # this to `ShmemServer(...)`.
+    shmem_spin_budget_us = int(driver_section.get("spin_budget_us", 1000))
 
     if validate_devices is not None:
         validate_devices(devices)

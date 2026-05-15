@@ -150,7 +150,7 @@ impl PyShmemServer {
     /// Create a new shmem region. `schema_hash` defaults to the bridge
     /// crate's `SCHEMA_HASH` (the value the runtime side will compare).
     ///
-    /// Wait strategy: `spin_budget_us` (default `100`) is the
+    /// Wait strategy: `spin_budget_us` (default `1000`) is the
     /// busy-spin window after `poll_blocking` comes up empty —
     /// catches back-to-back requests with sub-µs wake. After the
     /// budget elapses, the server parks on the global `req_wake`
@@ -160,7 +160,7 @@ impl PyShmemServer {
     #[new]
     #[pyo3(signature = (
         name, num_slots, req_buf, resp_buf,
-        schema_hash=None, spin_budget_us=100
+        schema_hash=None, spin_budget_us=1000
     ))]
     fn new(
         name: &str,

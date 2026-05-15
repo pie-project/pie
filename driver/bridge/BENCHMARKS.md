@@ -90,9 +90,10 @@ conversion. Use `python/tests/bench_zero_copy.py` for the Python read-side
 microbench. The runtime channel bench is intended to answer: "what does the
 Rust runtime pay to submit through the real channel shape?"
 
-Both runtime channels use the production default `spin_budget_us = 100`.
-Set this in `runtime/benches/driver_channel.rs` if you want a park-only
-comparison.
+The `inproc_channel` and `shmem_channel` benches use the `balanced` profile
+default (`spin_budget_us = 1000`). The `inproc_polling_channel` bench uses the
+`low_latency` profile default (unbounded spin). Set these constants in
+`runtime/benches/driver_channel.rs` if you want a park-only comparison.
 
 Current focused reruns after replacing in-proc Tokio oneshot completion with a
 synchronous response slot, Criterion mean:

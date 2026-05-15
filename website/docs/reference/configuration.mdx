@@ -58,6 +58,7 @@ device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 random_seed = 42
+ipc_profile = "balanced"
 
 [model.driver.options]
 gpu_mem_utilization = 0.85
@@ -146,6 +147,8 @@ Driver discriminator + universal driver fields:
 | `tensor_parallel_size` | `1` | TP world size. |
 | `activation_dtype` | `"bfloat16"` | Activation dtype for forward passes. |
 | `random_seed` | `42` | Seed used by samplers and dropout-free stochastic ops. |
+| `ipc_profile` | `"balanced"` | IPC wait profile. `low_latency` uses the polling in-process channel for embedded CUDA/portable drivers and busy-spins on shmem; `balanced` spins for 1000 us then parks; `low_power` parks immediately. |
+| `spin_budget_us` | unset | Expert override for the profile's busy-spin window in microseconds. Leave unset unless tuning latency/CPU tradeoffs directly. |
 
 ### `[model.driver.options]`
 

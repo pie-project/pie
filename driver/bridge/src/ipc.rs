@@ -455,8 +455,8 @@ impl ShmemServer {
     pub fn poll_blocking(&self, timeout: Duration) -> Option<Lease> {
         let started = Instant::now();
         let deadline = started + timeout;
-        let spin_budget = Duration::from_micros(self.inner.spin_budget_us);
-        let spin_deadline = started + spin_budget;
+        let spin_deadline = (self.inner.spin_budget_us != u64::MAX)
+            .then(|| started + Duration::from_micros(self.inner.spin_budget_us));
 
         // Phase 1: busy-spin. `Instant::now()` is a vDSO call (~10 ns)
         // but still worth amortizing — sample the deadline every 256
@@ -476,7 +476,7 @@ impl ShmemServer {
                     if now >= deadline {
                         return None;
                     }
-                    if now >= spin_deadline {
+                    if spin_deadline.is_some_and(|deadline| now >= deadline) {
                         break;
                     }
                 }
@@ -833,7 +833,8 @@ impl ShmemClient {
         //     __ulock_wait on the slot's `resp_wake` atomic.
         let started = Instant::now();
         let hard_timeout = *HARD_TIMEOUT;
-        let spin_deadline = started + Duration::from_micros(self.spin_budget_us);
+        let spin_deadline = (self.spin_budget_us != u64::MAX)
+            .then(|| started + Duration::from_micros(self.spin_budget_us));
 
         // Phase 1: pure busy-spin. Hot loop, no syscalls.
         if self.spin_budget_us > 0 {
@@ -860,7 +861,7 @@ impl ShmemClient {
                             "shmem call timed out after {hard_timeout:?} (slot {i}, request_id {request_id})"
                         ));
                     }
-                    if now >= spin_deadline {
+                    if spin_deadline.is_some_and(|deadline| now >= deadline) {
                         break;
                     }
                 }
@@ -940,6 +941,14 @@ mod tests {
             .err()
             .expect("zero-slot region should fail");
         assert!(format!("{err}").contains("num_slots"));
+    }
+
+    #[test]
+    fn unbounded_spin_poll_respects_timeout() {
+        let name = unique_name("unbounded_spin");
+        let server = ShmemServer::create(&name, 1, 128, 128, u64::MAX, [0u8; 8]).unwrap();
+
+        assert!(server.poll_blocking(Duration::ZERO).is_none());
     }
 
     #[test]

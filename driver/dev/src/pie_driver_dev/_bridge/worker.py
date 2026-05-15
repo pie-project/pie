@@ -187,7 +187,7 @@ def run_worker(
                 # where the runtime would attach to a not-yet-existing
                 # shmem region and see zero magic. We pass a callable so
                 # the leader loop can fire it at the right moment.
-                _shmem_spin_budget_us = int(model_config.get("shmem_spin_budget_us", 100))
+                _shmem_spin_budget_us = int(model_config.get("shmem_spin_budget_us", 1000))
                 caps = engine.capabilities()
                 def _signal_ready():
                     ready_queue.put((rank, "", caps))
@@ -317,7 +317,7 @@ def _leader_loop(
     stop_event,
     group_id: int,
     runtime_ops,
-    shmem_spin_budget_us: int = 100,
+    shmem_spin_budget_us: int = 1000,
     on_ready=None,
 ) -> None:
     """Unified shmem dispatch loop for group leaders.

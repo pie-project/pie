@@ -114,6 +114,23 @@ pub(crate) struct TpLaunch {
     nccl_unique_id_hex: String,
 }
 
+#[derive(Clone, Copy)]
+enum InProcCtxKind {
+    Blocking,
+    Polling,
+}
+
+unsafe fn release_inproc_ctx(kind: Option<InProcCtxKind>, ctx: *mut c_void) {
+    if ctx.is_null() {
+        return;
+    }
+    match kind {
+        Some(InProcCtxKind::Blocking) => unsafe { pie::driver::InProcChannel::release(ctx) },
+        Some(InProcCtxKind::Polling) => unsafe { pie::driver::InProcPollingChannel::release(ctx) },
+        None => {}
+    }
+}
+
 struct PendingEmbeddedDriver {
     flavor: Flavor,
     /// `/pie_shmem_g{idx}` for shmem-based drivers (dummy + subprocess
@@ -124,9 +141,10 @@ struct PendingEmbeddedDriver {
     caps_ctx: *mut CapsCtx,
     caps_rx: Option<mpsc::Receiver<String>>,
     state_dir: PathBuf,
-    /// FFI ctx pointer from `pie::driver::InProcChannel::ffi_vtable`,
+    /// FFI ctx pointer from an in-process channel's `ffi_vtable`,
     /// or null for non-inproc paths. Released on `join`.
     inproc_ctx: *mut c_void,
+    inproc_ctx_kind: Option<InProcCtxKind>,
 }
 
 impl PendingEmbeddedDriver {
@@ -145,8 +163,9 @@ impl PendingEmbeddedDriver {
                     self.caps_ctx = std::ptr::null_mut();
                 }
                 if !self.inproc_ctx.is_null() {
-                    unsafe { pie::driver::InProcChannel::release(self.inproc_ctx) };
+                    unsafe { release_inproc_ctx(self.inproc_ctx_kind, self.inproc_ctx) };
                     self.inproc_ctx = std::ptr::null_mut();
+                    self.inproc_ctx_kind = None;
                 }
                 return Err(anyhow!(
                     "driver thread exited (rc={rc}) before emitting capabilities; \
@@ -166,6 +185,7 @@ impl PendingEmbeddedDriver {
 
     fn into_driver(mut self, caps: DriverCapabilities) -> EmbeddedDriver {
         let inproc_ctx = std::mem::replace(&mut self.inproc_ctx, std::ptr::null_mut());
+        let inproc_ctx_kind = self.inproc_ctx_kind.take();
         EmbeddedDriver {
             shmem_name: self.shmem_name.clone(),
             flavor: self.flavor,
@@ -174,6 +194,7 @@ impl PendingEmbeddedDriver {
             caps_ctx: self.caps_ctx,
             _state_dir: self.state_dir.clone(),
             inproc_ctx,
+            inproc_ctx_kind,
         }
     }
 }
@@ -202,12 +223,13 @@ pub fn shmem_name(group_id: usize) -> String {
 /// spec-mode multi-slot tail, so it uses 8 MiB. The runtime reads the
 /// buffer sizes from the shmem header at attach time, so each driver
 /// can pick its own size.
-fn shmem_table(group_id: usize, resp_buf: usize) -> toml::Table {
+fn shmem_table(group_id: usize, resp_buf: usize, spin_budget_us: u64) -> toml::Table {
     let mut table = toml::Table::new();
     insert_str(&mut table, "name", shmem_name(group_id));
     insert_int(&mut table, "num_slots", 8);
     insert_int(&mut table, "req_buf", 4 * 1024 * 1024);
     insert_int(&mut table, "resp_buf", resp_buf as i64);
+    insert_u64(&mut table, "spin_budget_us", spin_budget_us);
     table
 }
 
@@ -217,6 +239,14 @@ fn insert_int(table: &mut toml::Table, key: &str, value: impl Into<i64>) {
 
 fn insert_str(table: &mut toml::Table, key: &str, value: impl Into<String>) {
     table.insert(key.into(), toml::Value::String(value.into()));
+}
+
+fn insert_u64(table: &mut toml::Table, key: &str, value: u64) {
+    if let Ok(value) = i64::try_from(value) {
+        insert_int(table, key, value);
+    } else {
+        insert_str(table, key, value.to_string());
+    }
 }
 
 fn insert_bool(table: &mut toml::Table, key: &str, value: bool) {
@@ -359,6 +389,7 @@ pub fn write_dummy_startup_toml(
     random_seed: u64,
     activation_dtype: &str,
     group_id: usize,
+    spin_budget_us: u64,
 ) -> Result<()> {
     let (vocab_size, arch_name) = match (opts.vocab_size, opts.arch_name.as_deref()) {
         (Some(v), Some(a)) => (v, a.to_string()),
@@ -380,7 +411,7 @@ pub fn write_dummy_startup_toml(
     insert_table(
         &mut doc,
         "shmem",
-        shmem_table(group_id, SHMEM_RESP_BUF_DEFAULT),
+        shmem_table(group_id, SHMEM_RESP_BUF_DEFAULT, spin_budget_us),
     );
 
     let mut dummy = toml::Table::new();
@@ -526,9 +557,10 @@ pub struct EmbeddedDriver {
     /// thread; reclaimed in [`Self::join`].
     caps_ctx: *mut CapsCtx,
     _state_dir: PathBuf,
-    /// FFI ctx pointer from `pie::driver::InProcChannel::ffi_vtable`,
+    /// FFI ctx pointer from an in-process channel's `ffi_vtable`,
     /// or null for non-inproc paths. Released on `join`.
     inproc_ctx: *mut c_void,
+    inproc_ctx_kind: Option<InProcCtxKind>,
 }
 
 // `caps_ctx: *mut CapsCtx` is the only non-Send field. It points to a
@@ -548,9 +580,17 @@ impl EmbeddedDriver {
         options: &DriverOptions,
         snapshot_dir: &Path,
         group_id: usize,
+        use_inproc_polling_channel: bool,
         spin_budget_us: u64,
     ) -> Result<Self> {
-        let mut pending = Self::spawn_rank(options, snapshot_dir, group_id, None, spin_budget_us)?;
+        let mut pending = Self::spawn_rank(
+            options,
+            snapshot_dir,
+            group_id,
+            None,
+            use_inproc_polling_channel,
+            spin_budget_us,
+        )?;
         let timeout = ready_timeout(options);
         let caps = pending.wait_for_caps(timeout)?;
         Ok(pending.into_driver(caps))
@@ -563,6 +603,7 @@ impl EmbeddedDriver {
         options_by_rank: &[DriverOptions],
         snapshot_dir: &Path,
         group_id: usize,
+        use_inproc_polling_channel: bool,
         spin_budget_us: u64,
     ) -> Result<Vec<Self>> {
         if options_by_rank.is_empty() {
@@ -573,6 +614,7 @@ impl EmbeddedDriver {
                 &options_by_rank[0],
                 snapshot_dir,
                 group_id,
+                use_inproc_polling_channel,
                 spin_budget_us,
             )?]);
         }
@@ -597,6 +639,7 @@ impl EmbeddedDriver {
                     rank,
                     nccl_unique_id_hex: uid.clone(),
                 }),
+                use_inproc_polling_channel,
                 spin_budget_us,
             )?);
         }
@@ -618,6 +661,7 @@ impl EmbeddedDriver {
         snapshot_dir: &Path,
         group_id: usize,
         tp: Option<TpLaunch>,
+        use_inproc_polling_channel: bool,
         spin_budget_us: u64,
     ) -> Result<PendingEmbeddedDriver> {
         if !snapshot_dir.is_dir() {
@@ -663,6 +707,7 @@ impl EmbeddedDriver {
                     *random_seed,
                     activation_dtype,
                     group_id,
+                    spin_budget_us,
                 )?;
             }
         }
@@ -695,6 +740,7 @@ impl EmbeddedDriver {
         let tp_is_leader = tp.as_ref().map(|t| t.rank == 0).unwrap_or(true);
         let mut inproc_vtable: Option<pie::driver::InProcVTable> = None;
         let mut inproc_ctx: *mut c_void = std::ptr::null_mut();
+        let mut inproc_ctx_kind: Option<InProcCtxKind> = None;
         let uses_inproc = match flavor {
             #[cfg(feature = "driver-cuda")]
             Flavor::Cuda => true,
@@ -703,20 +749,25 @@ impl EmbeddedDriver {
             _ => false,
         };
         if uses_inproc {
-            // `spin_budget_us` from the user's `[model.driver]` config
-            // (default 100 µs) — busy-spin window before falling back
-            // to `Condvar::wait`. See
-            // `pie::driver::DEFAULT_SPIN_BUDGET_US`.
-            let channel = pie::driver::InProcChannel::with_spin_budget(spin_budget_us);
-            let vtable = channel.ffi_vtable();
+            let vtable = if use_inproc_polling_channel {
+                let channel = pie::driver::InProcPollingChannel::with_spin_budget(spin_budget_us)?;
+                let vtable = channel.ffi_vtable();
+                inproc_ctx_kind = Some(InProcCtxKind::Polling);
+                if tp_is_leader {
+                    pie::driver::install_channel(group_id, Arc::new(channel));
+                }
+                vtable
+            } else {
+                let channel = pie::driver::InProcChannel::with_spin_budget(spin_budget_us);
+                let vtable = channel.ffi_vtable();
+                inproc_ctx_kind = Some(InProcCtxKind::Blocking);
+                if tp_is_leader {
+                    pie::driver::install_channel(group_id, Arc::new(channel));
+                }
+                vtable
+            };
             inproc_ctx = vtable.ctx;
             inproc_vtable = Some(vtable);
-            // Only leaders accept fire_batch requests from the runtime.
-            // Follower channels are unreachable (no entry in CHANNELS);
-            // their leaked Arc gets released on join.
-            if tp_is_leader {
-                pie::driver::install_channel(group_id, Arc::new(channel));
-            }
         }
 
         // Cast through usize so the raw pointer crosses the thread
@@ -762,7 +813,7 @@ impl EmbeddedDriver {
                 // remains installed in CHANNELS — drop our local handle.
                 unsafe { drop(Box::from_raw(caps_ctx)) };
                 if !inproc_ctx.is_null() {
-                    unsafe { pie::driver::InProcChannel::release(inproc_ctx) };
+                    unsafe { release_inproc_ctx(inproc_ctx_kind, inproc_ctx) };
                 }
                 anyhow!("spawn pie-driver thread: {e}")
             })?;
@@ -783,6 +834,7 @@ impl EmbeddedDriver {
             caps_rx: Some(caps_rx),
             state_dir,
             inproc_ctx,
+            inproc_ctx_kind,
         })
     }
 
@@ -823,8 +875,9 @@ impl EmbeddedDriver {
             self.caps_ctx = std::ptr::null_mut();
         }
         if !self.inproc_ctx.is_null() {
-            unsafe { pie::driver::InProcChannel::release(self.inproc_ctx) };
+            unsafe { release_inproc_ctx(self.inproc_ctx_kind, self.inproc_ctx) };
             self.inproc_ctx = std::ptr::null_mut();
+            self.inproc_ctx_kind = None;
         }
         rc
     }
@@ -879,6 +932,32 @@ mod tests {
         assert_eq!(caps.total_pages, 1024);
         assert_eq!(caps.arch_name, "qwen3");
         assert_eq!(caps.shmem_name.as_deref(), Some("/pie_shmem_g0"));
+    }
+
+    #[test]
+    fn dummy_startup_toml_writes_spin_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("dummy.toml");
+        let snap = tmp.path().join("snap");
+        let opts = DummyDriverOptions {
+            vocab_size: Some(32000),
+            arch_name: Some("qwen3".to_string()),
+            kv_page_size: 16,
+            max_num_kv_pages: 256,
+            max_batch_tokens: 4096,
+            max_batch_size: 128,
+            max_model_len: 4096,
+            ready_timeout_s: 5.0,
+        };
+
+        write_dummy_startup_toml(&out, &opts, &snap, 42, "bfloat16", 0, u64::MAX).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            val["shmem"]["spin_budget_us"].as_str(),
+            Some("18446744073709551615"),
+        );
     }
 
     #[test]

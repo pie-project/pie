@@ -17,7 +17,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -367,6 +366,19 @@ fn start_embedded_group(
         )
     })?;
     let caps = primary.caps.clone();
+    if let Some(shmem_name) = primary.shmem_name.as_deref() {
+        let channel = pie::driver::ShmemChannel::open(
+            shmem_name,
+            m.driver.effective_spin_budget_us(),
+        )
+        .with_context(|| {
+            format!(
+                "opening shmem channel for embedded driver ({}) group {group_idx}",
+                flavor.as_str(),
+            )
+        })?;
+        pie::driver::install_channel(driver_idx, Arc::new(channel));
+    }
     let handshake = GroupHandshake { caps };
     let drivers = group_drivers
         .into_iter()
@@ -386,7 +398,8 @@ fn start_embedded_drivers(
     driver_idx: usize,
     tp_degree: usize,
 ) -> Result<Vec<EmbeddedDriver>> {
-    let spin_budget_us = m.driver.spin_budget_us;
+    let spin_budget_us = m.driver.effective_spin_budget_us();
+    let use_inproc_polling_channel = m.driver.use_inproc_polling_channel();
 
     #[cfg(feature = "driver-cuda")]
     {
@@ -396,6 +409,7 @@ fn start_embedded_drivers(
                 &rank_opts,
                 snapshot_dir,
                 driver_idx,
+                use_inproc_polling_channel,
                 spin_budget_us,
             )
             .with_context(|| {
@@ -420,9 +434,14 @@ fn start_embedded_drivers(
     let opts = embedded_opts_for_device(base_opts, device);
 
     Ok(vec![
-        EmbeddedDriver::start(&opts, snapshot_dir, driver_idx, spin_budget_us).with_context(
-            || format!("starting driver for model {:?} group {group_idx}", m.name,),
-        )?,
+        EmbeddedDriver::start(
+            &opts,
+            snapshot_dir,
+            driver_idx,
+            use_inproc_polling_channel,
+            spin_budget_us,
+        )
+        .with_context(|| format!("starting driver for model {:?} group {group_idx}", m.name,))?,
     ])
 }
 
@@ -545,17 +564,15 @@ fn start_subprocess_group(
     // Pre-install the shmem channel for this driver with the
     // user-configured spin params. Without this, `get_channel` would
     // lazy-attach on first use with the channel module's defaults,
-    // ignoring `m.driver.spin_*` from the pie config.
-    let channel = pie::driver::ShmemChannel::open(
-        &driver.shmem_name,
-        m.driver.spin_budget_us,
-    )
-    .with_context(|| {
-        format!(
-            "opening shmem channel for subprocess driver ({}) group {group_idx}",
-            sub_flavor.as_str(),
-        )
-    })?;
+    // ignoring `m.driver.ipc_profile` / `spin_budget_us` from the pie config.
+    let channel =
+        pie::driver::ShmemChannel::open(&driver.shmem_name, m.driver.effective_spin_budget_us())
+            .with_context(|| {
+                format!(
+                    "opening shmem channel for subprocess driver ({}) group {group_idx}",
+                    sub_flavor.as_str(),
+                )
+            })?;
     pie::driver::install_channel(driver_idx, std::sync::Arc::new(channel));
 
     let handshake = GroupHandshake {

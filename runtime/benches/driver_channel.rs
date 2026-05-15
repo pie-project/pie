@@ -9,6 +9,9 @@
 //!   conversion. The fake C++ driver thread mirrors `InProcServer` just
 //!   enough to convert the request descriptor to legacy scratch and send
 //!   a small `ForwardResponse`.
+//! - `inproc_polling_channel/*` uses
+//!   `pie::driver::InProcPollingChannel::submit`, the same FFI callbacks,
+//!   and fixed preallocated slots with polling/yield waits.
 //! - `shmem_channel/*` uses `pie::driver::ShmemChannel::submit` and a
 //!   real `pie_bridge::ipc::ShmemServer`. The fake Python worker copies
 //!   the shmem payload to bytes, parses/touches it, builds a small
@@ -29,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 use pie::driver::{
-    DriverChannel, DriverRequest, InProcChannel, InProcRingChannel, InProcVTable, ShmemChannel,
+    DriverChannel, DriverRequest, InProcChannel, InProcPollingChannel, InProcVTable, ShmemChannel,
 };
 use pie_bridge::ipc::ShmemServer;
 use pie_bridge::schema::{
@@ -45,7 +48,8 @@ use pie_bridge::{
     ResponsePayload, SCHEMA_HASH, Sampler,
 };
 
-const SPIN_BUDGET_US: u64 = 100;
+const BALANCED_SPIN_BUDGET_US: u64 = 1_000;
+const LOW_LATENCY_SPIN_BUDGET_US: u64 = u64::MAX;
 const DRIVER_ID: usize = 0;
 
 fn make_request(n_tokens: usize) -> DriverRequest {
@@ -393,7 +397,7 @@ fn bench_inproc_channel(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let mut group = c.benchmark_group("inproc_channel");
     for &n in &[16usize, 256, 4096, 16_384] {
-        let channel = Arc::new(InProcChannel::with_spin_budget(SPIN_BUDGET_US));
+        let channel = Arc::new(InProcChannel::with_spin_budget(BALANCED_SPIN_BUDGET_US));
         let vt = channel.ffi_vtable();
         let ctx = vt.ctx;
         let driver = spawn_inproc_driver(vt, InProcDriverMode::ForwardWithLegacyDemux);
@@ -420,13 +424,13 @@ fn bench_inproc_channel(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_inproc_ring_channel(c: &mut Criterion) {
+fn bench_inproc_polling_channel(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let mut group = c.benchmark_group("inproc_ring_channel");
+    let mut group = c.benchmark_group("inproc_polling_channel");
     for &n in &[16usize, 256, 4096, 16_384] {
         let channel = Arc::new(
-            InProcRingChannel::with_capacity_and_spin_budget(1024, SPIN_BUDGET_US)
-                .expect("ring channel"),
+            InProcPollingChannel::with_capacity_and_spin_budget(1024, LOW_LATENCY_SPIN_BUDGET_US)
+                .expect("polling channel"),
         );
         let vt = channel.ffi_vtable();
         let ctx = vt.ctx;
@@ -438,7 +442,7 @@ fn bench_inproc_ring_channel(c: &mut Criterion) {
                 |req| {
                     let resp = rt
                         .block_on(async { channel.submit(req).await })
-                        .expect("inproc ring submit");
+                        .expect("inproc polling submit");
                     black_box(resp);
                 },
                 BatchSize::SmallInput,
@@ -446,10 +450,10 @@ fn bench_inproc_ring_channel(c: &mut Criterion) {
         });
 
         channel.abort();
-        driver.join().expect("inproc ring driver join");
+        driver.join().expect("inproc polling driver join");
         // SAFETY: ctx was produced by ffi_vtable and the driver thread is
         // no longer using it.
-        unsafe { InProcRingChannel::release(ctx as *mut c_void) };
+        unsafe { InProcPollingChannel::release(ctx as *mut c_void) };
     }
     group.finish();
 }
@@ -467,7 +471,7 @@ fn bench_inproc_channel_breakdown(c: &mut Criterion) {
         ),
     ] {
         for &n in &[16usize, 16_384] {
-            let channel = Arc::new(InProcChannel::with_spin_budget(SPIN_BUDGET_US));
+            let channel = Arc::new(InProcChannel::with_spin_budget(BALANCED_SPIN_BUDGET_US));
             let vt = channel.ffi_vtable();
             let ctx = vt.ctx;
             let driver = spawn_inproc_driver(vt, mode);
@@ -716,7 +720,7 @@ fn spawn_shmem_driver(name: &str) -> (Arc<ShmemServer>, thread::JoinHandle<()>, 
             8,
             4 * 1024 * 1024,
             8 * 1024 * 1024,
-            SPIN_BUDGET_US,
+            BALANCED_SPIN_BUDGET_US,
             SCHEMA_HASH,
         )
         .expect("shmem server create"),
@@ -746,7 +750,8 @@ fn bench_shmem_channel(c: &mut Criterion) {
     for &n in &[16usize, 256, 4096, 16_384] {
         let name = unique_name(&format!("n{n}"));
         let (server, driver, stop) = spawn_shmem_driver(&name);
-        let channel = ShmemChannel::open(&name, SPIN_BUDGET_US).expect("shmem channel open");
+        let channel =
+            ShmemChannel::open(&name, BALANCED_SPIN_BUDGET_US).expect("shmem channel open");
 
         group.bench_function(format!("tokens={n}"), |b| {
             b.iter_batched(
@@ -773,6 +778,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(2));
-    targets = bench_inproc_channel, bench_inproc_ring_channel, bench_inproc_channel_breakdown, bench_inproc_local_costs, bench_shmem_channel
+    targets = bench_inproc_channel, bench_inproc_polling_channel, bench_inproc_channel_breakdown, bench_inproc_local_costs, bench_shmem_channel
 }
 criterion_main!(benches);

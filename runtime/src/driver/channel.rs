@@ -23,7 +23,7 @@ fn shmem_name(driver_idx: usize) -> String {
 
 // Channel-level spin budgets are configured at startup via
 // `serve::start_subprocess_group` (which pre-installs the channel
-// with the user's `[model.driver].spin_budget_us`). The lazy-attach
+// with the user's `[model.driver].ipc_profile` / `spin_budget_us`). The lazy-attach
 // fallback below uses the bridge's default budget; in practice no
 // production path hits it because subprocess + embedded drivers
 // both pre-install.
@@ -68,10 +68,11 @@ pub(crate) fn get_channel(driver_idx: DriverId) -> Result<Arc<dyn DriverChannel>
     // to the shmem region named `/pie_shmem_g{idx}`. The spin budget
     // here is a fallback default — in practice both subprocess and
     // embedded drivers pre-install via `install_channel` with the
-    // user's `[model.driver].spin_budget_us`, so this branch is rarely
-    // hit. 100 µs matches `InProcChannel::new()`'s default.
+    // user's `[model.driver].ipc_profile` / `spin_budget_us`, so this
+    // branch is rarely hit. 1000 µs matches `InProcChannel::new()`'s
+    // default.
     let name = shmem_name(driver_idx);
-    let channel = ShmemChannel::open(&name, 100)?;
+    let channel = ShmemChannel::open(&name, 1_000)?;
     let arc: Arc<dyn DriverChannel> = Arc::new(channel);
     CHANNELS.insert(driver_idx, arc.clone());
     Ok(arc)

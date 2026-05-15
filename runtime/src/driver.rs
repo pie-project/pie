@@ -14,15 +14,15 @@
 //!   - [`InProcChannel`] — embedded drivers (cuda + portable + dummy
 //!     linked into `pie-server`). Heap-backed queue + condvar wakeup;
 //!     the FFI hands the C++ driver a typed view of the request data.
-//!   - [`InProcRingChannel`] — experimental embedded-driver channel
-//!     with the same FFI surface but fixed slots instead of the
-//!     heap-backed pending map/inbox.
+//!   - [`InProcPollingChannel`] — low-latency embedded-driver channel
+//!     with the same FFI surface but fixed slots and polling waits
+//!     instead of the heap-backed pending map/inbox.
 //!   - [`ShmemChannel`] — subprocess drivers (Python `dev`, `vllm`,
 //!     `sglang`). POSIX-shmem ring carrying rkyv-encoded frames.
 
 mod channel;
 mod inproc;
-mod inproc_ring;
+mod inproc_polling;
 mod ops;
 mod shmem;
 
@@ -90,7 +90,7 @@ pub use channel::{
     abort_all_driver_channels, fire_batch, get_spec, install_channel, install_spec, register_driver,
 };
 pub use inproc::{InProcChannel, InProcVTable};
-pub use inproc_ring::InProcRingChannel;
+pub use inproc_polling::InProcPollingChannel;
 
 pub use ops::{
     copy_d2d, copy_d2h, copy_h2d, copy_h2h, load_adapter, save_adapter, zo_initialize_adapter,

@@ -6,7 +6,7 @@
 //! this file via `embedded_driver::write_dummy_startup_toml`.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -21,6 +21,11 @@ pub struct ShmemConfig {
     pub num_slots: usize,
     pub req_buf: usize,
     pub resp_buf: usize,
+    #[serde(
+        default = "default_spin_budget_us",
+        deserialize_with = "deserialize_u64_or_string"
+    )]
+    pub spin_budget_us: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,9 +52,54 @@ fn default_activation_dtype() -> String {
     "bfloat16".to_string()
 }
 
+fn default_spin_budget_us() -> u64 {
+    1_000
+}
+
+fn deserialize_u64_or_string<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct U64Visitor;
+
+    impl Visitor<'_> for U64Visitor {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a non-negative integer or decimal integer string")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u64::try_from(value).map_err(|_| E::custom("integer must be non-negative"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            value.parse::<u64>().map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(U64Visitor)
+}
+
 pub fn load(path: &Path) -> Result<Config> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read startup TOML {path:?}"))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("read startup TOML {path:?}"))?;
     let cfg: Config =
         toml::from_str(&text).with_context(|| format!("parse startup TOML {path:?}"))?;
     Ok(cfg)
@@ -80,7 +130,31 @@ snapshot_dir = "/tmp/snap"
 "#;
         let cfg: Config = toml::from_str(txt).unwrap();
         assert_eq!(cfg.shmem.name, "/pie_shmem_g0");
+        assert_eq!(cfg.shmem.spin_budget_us, 1_000);
         assert_eq!(cfg.dummy.vocab_size, 32000);
         assert_eq!(cfg.dummy.arch_name, "qwen3");
+    }
+
+    #[test]
+    fn shmem_spin_budget_accepts_string_u64() {
+        let txt = r#"
+[shmem]
+name = "/pie_shmem_g0"
+num_slots = 8
+req_buf = 4194304
+resp_buf = 4194304
+spin_budget_us = "18446744073709551615"
+
+[dummy]
+kv_page_size = 16
+max_num_kv_pages = 256
+max_batch_tokens = 4096
+max_batch_size = 128
+vocab_size = 32000
+arch_name = "qwen3"
+max_model_len = 4096
+"#;
+        let cfg: Config = toml::from_str(txt).unwrap();
+        assert_eq!(cfg.shmem.spin_budget_us, u64::MAX);
     }
 }

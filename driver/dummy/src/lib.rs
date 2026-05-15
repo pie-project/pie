@@ -97,7 +97,7 @@ fn run_impl(
         cfg.shmem.num_slots,
         cfg.shmem.req_buf,
         cfg.shmem.resp_buf,
-        100, // spin_budget_us — default matches runtime
+        cfg.shmem.spin_budget_us,
         SCHEMA_HASH,
     )?;
 

@@ -66,9 +66,9 @@ mod unix_impl {
     use anyhow::{Context, Result, anyhow, bail};
     use serde::Deserialize;
 
+    use super::SubprocessFlavor;
     use crate::config::ModelConfig;
     use crate::embedded_driver::DriverCapabilities;
-    use super::SubprocessFlavor;
 
     const SUBPROCESS_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
     const CHILD_WAIT_POLL: Duration = Duration::from_millis(50);
@@ -183,9 +183,10 @@ mod unix_impl {
         // Channel-level wait strategy — forwarded so the Python
         // launcher can pass to `ShmemServer`. See
         // `pie_bridge::ipc::ShmemServer::create`.
-        driver_section.insert(
-            "spin_budget_us".into(),
-            toml::Value::Integer(model.driver.spin_budget_us as i64),
+        insert_u64(
+            &mut driver_section,
+            "spin_budget_us",
+            model.driver.effective_spin_budget_us(),
         );
         // [driver.options] — passthrough, minus the standalone-side
         // `venv` / `python` keys (which `crate::python_resolve` consumed
@@ -206,6 +207,13 @@ mod unix_impl {
         std::fs::write(out_path, serialized)
             .map_err(|e| anyhow!("write launcher TOML {out_path:?}: {e}"))?;
         Ok(())
+    }
+
+    fn insert_u64(table: &mut toml::Table, key: &str, value: u64) {
+        let value = i64::try_from(value)
+            .map(toml::Value::Integer)
+            .unwrap_or_else(|_| toml::Value::String(value.to_string()));
+        table.insert(key.into(), value);
     }
 
     /// Owns the Python child process for one DP replica. Same lifecycle
@@ -633,7 +641,7 @@ mod unix_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::config::{DriverConfig, DriverKind, ModelConfig, SchedulerConfig};
+        use crate::config::{DriverConfig, DriverKind, IpcProfile, ModelConfig, SchedulerConfig};
         use std::process::Command;
         use std::time::{Duration, Instant};
 
@@ -721,7 +729,8 @@ mod unix_impl {
                     tensor_parallel_size: 1,
                     activation_dtype: "bfloat16".to_string(),
                     random_seed: 42,
-                    spin_budget_us: 100,
+                    ipc_profile: IpcProfile::Balanced,
+                    spin_budget_us: None,
                     options: toml::Table::new(),
                 },
                 scheduler: SchedulerConfig::default(),
@@ -761,6 +770,55 @@ mod unix_impl {
                     .get("tensor_parallel_size")
                     .and_then(toml::Value::as_integer),
                 Some(1),
+            );
+            assert_eq!(
+                driver
+                    .get("spin_budget_us")
+                    .and_then(toml::Value::as_integer),
+                Some(1_000),
+            );
+            let _ = std::fs::remove_file(path);
+        }
+
+        #[test]
+        fn startup_toml_writes_unbounded_spin_as_string() {
+            let path = std::env::temp_dir().join(format!(
+                "pie-subprocess-startup-{}-{}.toml",
+                std::process::id(),
+                "unbounded-spin",
+            ));
+            let model = ModelConfig {
+                name: "default".to_string(),
+                hf_repo: "Qwen/Qwen3-0.6B-Base".to_string(),
+                driver: DriverConfig {
+                    kind: DriverKind::Vllm,
+                    device: vec!["cuda:0".to_string()],
+                    tensor_parallel_size: 1,
+                    activation_dtype: "bfloat16".to_string(),
+                    random_seed: 42,
+                    ipc_profile: IpcProfile::LowLatency,
+                    spin_budget_us: None,
+                    options: toml::Table::new(),
+                },
+                scheduler: SchedulerConfig::default(),
+            };
+
+            write_subprocess_startup_toml(
+                &path,
+                &model,
+                Path::new("/tmp/snapshot"),
+                0,
+                &["cuda:0".to_string()],
+                1,
+                29610,
+                1200.0,
+            )
+            .unwrap();
+            let doc: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                doc["driver"]["spin_budget_us"].as_str(),
+                Some("18446744073709551615"),
             );
             let _ = std::fs::remove_file(path);
         }

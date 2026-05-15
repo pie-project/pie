@@ -91,14 +91,17 @@ impl ResponseSlot {
 
     fn wait(&self, spin_budget_us: u64) -> Result<DriverResponse> {
         if spin_budget_us > 0 {
-            let deadline = Instant::now() + Duration::from_micros(spin_budget_us);
+            let started = Instant::now();
+            let deadline = (spin_budget_us != u64::MAX)
+                .then(|| started + Duration::from_micros(spin_budget_us));
             let mut iters: u32 = 0;
             loop {
                 if self.ready.load(Ordering::Acquire) {
                     return self.take_result();
                 }
                 iters = iters.wrapping_add(1);
-                if iters & 0xFF == 0 && Instant::now() >= deadline {
+                if iters & 0xFF == 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                {
                     break;
                 }
                 std::hint::spin_loop();
@@ -182,7 +185,7 @@ impl Default for InProcChannel {
 
 /// Default spin budget for the driver-side `recv` callback before it
 /// falls back to `Condvar::wait`. See [`InProcState::spin_budget_us`].
-pub const DEFAULT_SPIN_BUDGET_US: u64 = 100;
+pub const DEFAULT_SPIN_BUDGET_US: u64 = 1_000;
 
 impl InProcChannel {
     pub fn new() -> Self {
@@ -364,7 +367,9 @@ impl DriverChannel for InProcChannel {
 /// and the consumer's `lock()`.
 fn recv_with_spin(state: &InProcState) -> Option<u32> {
     if state.spin_budget_us > 0 {
-        let deadline = Instant::now() + Duration::from_micros(state.spin_budget_us);
+        let started = Instant::now();
+        let deadline = (state.spin_budget_us != u64::MAX)
+            .then(|| started + Duration::from_micros(state.spin_budget_us));
         let mut iters: u32 = 0;
         loop {
             if state.aborted.load(Ordering::Acquire) {
@@ -378,7 +383,7 @@ fn recv_with_spin(state: &InProcState) -> Option<u32> {
             iters = iters.wrapping_add(1);
             // `Instant::now()` is a vDSO call but still ~10 ns per
             // invocation; amortize by sampling every 256 spin iters.
-            if iters & 0xFF == 0 && Instant::now() >= deadline {
+            if iters & 0xFF == 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 break;
             }
             std::hint::spin_loop();
