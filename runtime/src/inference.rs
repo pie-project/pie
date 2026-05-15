@@ -4,36 +4,37 @@
 //!
 //! Each model gets a dedicated InferenceService that:
 //! - Translates logical KV page IDs to physical page IDs
-//! - Routes requests to per-device BatchSchedulers based on page affinity
+//! - Routes requests to per-driver BatchSchedulers based on page affinity
 //!
 //! Batch scheduling, RPC execution, and response notification are handled
-//! by individual BatchScheduler instances (one per device).
+//! by individual BatchScheduler instances (one per driver).
 
-pub mod brle;
+mod adaptive_policy;
 pub mod request;
 pub mod scheduler;
 pub mod speculator;
 pub mod structured;
-mod adaptive_policy;
-
-pub use speculator::{try_hit, lookup_for_ctx, StagedBatch, BYPASS_HIT_COUNT, CHAIN_SUBMIT_COUNT, CHAIN_DROP_COUNT};
 
 use tokio::sync::oneshot;
 
-use crate::service::{ServiceArray, ServiceHandler};
 use crate::context::pagestore::PhysicalPageId;
+use crate::driver::DriverId;
+use crate::service::{ServiceArray, ServiceHandler};
 use anyhow::Result;
-use request::{ForwardPassOutput, ForwardPassRequest};
 use scheduler::BatchScheduler;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
 
-// Re-export public types
-pub use request::{ForwardPassOutput as Output, Sampler};
 pub use scheduler::SchedulerStats;
+pub use speculator::{
+    BYPASS_HIT_COUNT, CHAIN_DROP_COUNT, CHAIN_SUBMIT_COUNT, StagedBatch, lookup_for_ctx, try_hit,
+};
 
-/// Aggregated inference stats for a single model (across all devices).
+use speculator::StagedEntry;
+
+/// Aggregated inference stats for a single model (across all drivers).
 #[derive(Debug, Default, serde::Serialize)]
 pub struct InferenceStats {
     pub total_batches: u64,
@@ -50,7 +51,8 @@ pub struct InferenceStats {
 // Public API
 // =============================================================================
 
-static SERVICES: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLock::new(ServiceArray::new);
+static SERVICES: std::sync::LazyLock<ServiceArray<Message>> =
+    std::sync::LazyLock::new(ServiceArray::new);
 
 /// Spawns a new inference service for a model.
 ///
@@ -58,53 +60,72 @@ static SERVICES: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLoc
 /// speculative execution (`scheduler.speculation_depth` in toml).
 /// `0` disables pass-level speculation entirely.
 pub async fn spawn(
-    device_indices: &[usize],
+    driver_indices: &[usize],
     page_size: u32,
     request_timeout_secs: u64,
     batch_policy: String,
     speculation_depth: u32,
 ) -> usize {
-    // Fetch device info before entering the sync closure.
-    let mut device_batch_limits = Vec::with_capacity(device_indices.len());
-    for &device_idx in device_indices {
-        let info = crate::device::get_spec(device_idx).await
-            .unwrap_or_else(|e| panic!("Failed to get device info for index {device_idx}: {e}"));
-        device_batch_limits.push((info.max_batch_size, info.max_batch_tokens));
+    // Fetch driver info before entering the sync closure.
+    let driver_ids: Vec<DriverId> = driver_indices.to_vec();
+    let mut driver_batch_limits = Vec::with_capacity(driver_indices.len());
+    for &driver_idx in driver_indices {
+        let info = crate::driver::get_spec(driver_idx)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to get driver info for index {driver_idx}: {e}"));
+        driver_batch_limits.push((info.max_batch_size, info.max_batch_tokens));
     }
 
     let model_idx = SERVICES.len();
-    let num_devices = device_indices.len();
-    SERVICES.spawn(move || InferenceService::new(
-        model_idx,
-        num_devices,
-        device_batch_limits,
-        page_size,
-        request_timeout_secs,
-        batch_policy,
-        speculation_depth as usize,
-    )).expect("Failed to spawn inference service")
+    SERVICES
+        .spawn(move || {
+            InferenceService::new(
+                model_idx,
+                driver_ids,
+                driver_batch_limits,
+                page_size,
+                request_timeout_secs,
+                batch_policy,
+                speculation_depth as usize,
+            )
+        })
+        .expect("Failed to spawn inference service")
 }
 
-/// Submits a pre-resolved forward pass to the appropriate device scheduler.
+/// Submits a pre-resolved forward pass to the appropriate driver scheduler.
 ///
 /// All context operations (ensure_resident, page resolution) must be done
 /// by the caller BEFORE calling this. The inference actor just dispatches
 /// to the batch scheduler — it never blocks on context operations.
+///
+/// `extra_pages` lists working pages the ctx has reserved beyond the
+/// active prefix in `physical_page_ids`. They are passed to the
+/// speculator's chain extender so it can extend the chain across the
+/// full reserved range without re-pinning. Pass an empty vec when
+/// speculation is disabled or the caller has no extra pages.
 pub async fn submit(
     model_idx: usize,
-    request: ForwardPassRequest,
-    device_idx: usize,
+    request: pie_bridge::ForwardRequest,
+    driver_idx: usize,
     physical_page_ids: Vec<PhysicalPageId>,
     extra_pages: Vec<PhysicalPageId>,
     last_page_len: u32,
-) -> Result<ForwardPassOutput> {
+) -> Result<pie_bridge::ForwardResponse> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Submit {
-        request, device_idx, physical_page_ids, extra_pages, last_page_len, response: tx,
-    })?;
-    Ok(rx.await.map_err(|_| anyhow::anyhow!(
-        "inference submit: scheduler dropped response channel"
-    ))?)
+    SERVICES.send(
+        model_idx,
+        Message::Submit {
+            request,
+            driver_idx,
+            physical_page_ids,
+            extra_pages,
+            last_page_len,
+            response: tx,
+        },
+    )?;
+    Ok(rx
+        .await
+        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?)
 }
 
 /// Returns aggregated inference stats for a model (lock-free, non-blocking).
@@ -117,14 +138,8 @@ pub async fn get_stats(model_idx: usize) -> InferenceStats {
 /// Drop any outstanding speculation chain for a ctx that's about to
 /// be destroyed. Fire-and-forget: the speculator just clears its
 /// per-device deque for this ctx; callers don't need confirmation.
-pub fn invalidate_speculation_for_ctx(
-    model_idx: usize,
-    ctx_id: crate::context::ContextId,
-) {
-    let _ = SERVICES.send(
-        model_idx,
-        Message::InvalidateSpeculationForCtx { ctx_id },
-    );
+pub fn invalidate_speculation_for_ctx(model_idx: usize, ctx_id: crate::context::ContextId) {
+    let _ = SERVICES.send(model_idx, Message::InvalidateSpeculationForCtx { ctx_id });
 }
 
 // =============================================================================
@@ -133,28 +148,25 @@ pub fn invalidate_speculation_for_ctx(
 
 /// The inference service handles forward pass operations.
 ///
-/// Routes requests to the appropriate per-device `BatchScheduler`
+/// Routes requests to the appropriate per-driver `BatchScheduler`
 /// based on physical page affinity from the context service.
 struct InferenceService {
     model_idx: usize,
-    num_devices: usize,
+    num_drivers: usize,
     schedulers: Vec<BatchScheduler>,
     scheduler_stats: Vec<Arc<SchedulerStats>>,
-    /// Per-context depth of pass-level speculation. Each ctx
-    /// can have up to this many pre-fired stages in its deque.
-    /// Sourced from `scheduler.speculation_depth` in the toml.
-    /// `0` disables speculation: no staged entries are ever
-    /// pushed and every submit goes through the cold path.
+    /// Per-context depth of pass-level speculation. Each ctx can
+    /// have up to this many pre-fired stages in its deque. Sourced
+    /// from `scheduler.speculation_depth` in the toml. `0` disables
+    /// speculation: no staged entries are ever pushed and every
+    /// submit goes through the cold path.
     speculation_depth: usize,
-    /// Per-device speculation state: a deque of pre-fired
-    /// PendingRequests per ctx_id. Inferlet `execute()` calls
-    /// hit-check the front of the deque; the chain extender pushes
-    /// new entries as each fire completes (bounded by
-    /// `speculation_depth`).
-    staged_batch: Vec<Arc<Mutex<HashMap<crate::context::ContextId, std::collections::VecDeque<StagedEntry>>>>>,
+    /// Per-device speculation state: a deque of pre-fired stages
+    /// per ctx_id. Inferlet `execute()` calls hit-check the front
+    /// of the deque; the chain extender pushes new entries as each
+    /// fire completes (bounded by `speculation_depth`).
+    staged_batch: Vec<Arc<Mutex<HashMap<crate::context::ContextId, VecDeque<StagedEntry>>>>>,
 }
-
-use speculator::StagedEntry;
 
 impl std::fmt::Debug for InferenceService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,37 +175,44 @@ impl std::fmt::Debug for InferenceService {
 }
 
 impl InferenceService {
-
     fn new(
         model_idx: usize,
-        num_devices: usize,
-        device_batch_limits: Vec<(usize, usize)>,
+        driver_ids: Vec<DriverId>,
+        driver_batch_limits: Vec<(usize, usize)>,
         page_size: u32,
         request_timeout_secs: u64,
         batch_policy: String,
         speculation_depth: usize,
     ) -> Self {
-        let schedulers: Vec<BatchScheduler> = (0..num_devices).map(|device_idx| {
-            let (max_batch_size, max_batch_tokens) = device_batch_limits[device_idx];
-            BatchScheduler::new(
-                model_idx,
-                device_idx,
-                page_size,
-                max_batch_size,
-                max_batch_tokens,
-                request_timeout_secs,
-                batch_policy.clone(),
-            )
-        }).collect();
+        let num_drivers = driver_ids.len();
+        let schedulers: Vec<BatchScheduler> = driver_ids
+            .iter()
+            .enumerate()
+            .map(|(driver_idx, &driver_id)| {
+                let (max_batch_size, max_batch_tokens) = driver_batch_limits[driver_idx];
+                BatchScheduler::new(
+                    driver_id,
+                    driver_idx,
+                    page_size,
+                    max_batch_size,
+                    max_batch_tokens,
+                    request_timeout_secs,
+                    batch_policy.clone(),
+                )
+            })
+            .collect();
 
         let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
 
-        let staged_batch: Vec<Arc<Mutex<HashMap<crate::context::ContextId, std::collections::VecDeque<StagedEntry>>>>> =
-            (0..num_devices).map(|_| Arc::new(Mutex::new(HashMap::new()))).collect();
+        let staged_batch: Vec<Arc<Mutex<HashMap<crate::context::ContextId, VecDeque<StagedEntry>>>>> =
+            (0..num_drivers)
+                .map(|_| Arc::new(Mutex::new(HashMap::new())))
+                .collect();
         speculator::register_model(model_idx, &staged_batch, speculation_depth);
+
         InferenceService {
             model_idx,
-            num_devices,
+            num_drivers,
             schedulers,
             scheduler_stats,
             speculation_depth,
@@ -201,7 +220,7 @@ impl InferenceService {
         }
     }
 
-    /// Aggregate stats from all per-device schedulers.
+    /// Aggregate stats from all per-driver schedulers.
     fn aggregate_stats(&self) -> InferenceStats {
         let mut total_batches = 0u64;
         let mut total_tokens = 0u64;
@@ -239,7 +258,6 @@ impl InferenceService {
             avg_batch_latency_us: avg_latency,
         }
     }
-
 }
 
 // =============================================================================
@@ -252,17 +270,19 @@ enum Message {
     /// Submit a pre-resolved forward pass to the scheduler.
     /// All context operations must be done by the caller before sending this.
     Submit {
-        request: ForwardPassRequest,
-        device_idx: usize,
+        request: pie_bridge::ForwardRequest,
+        driver_idx: usize,
         physical_page_ids: Vec<PhysicalPageId>,
         /// Pages the ctx has reserved beyond the active prefix.
         /// Passed to the chain extender so it can extend across the
         /// full reserved range without re-allocating.
         extra_pages: Vec<PhysicalPageId>,
         last_page_len: u32,
-        response: oneshot::Sender<ForwardPassOutput>,
+        response: oneshot::Sender<pie_bridge::ForwardResponse>,
     },
-    GetStats { response: oneshot::Sender<InferenceStats> },
+    GetStats {
+        response: oneshot::Sender<InferenceStats>,
+    },
     /// Drop the speculation chain for a ctx (called from
     /// `api::context::destroy`). Empties the per-device chain
     /// queue if present.
@@ -271,15 +291,26 @@ enum Message {
     },
 }
 
-
 impl ServiceHandler for InferenceService {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Submit { request, device_idx, physical_page_ids, extra_pages, last_page_len, response } => {
-                let idx = device_idx.min(self.num_devices.saturating_sub(1));
-                let ctx_id = request.context_id;
+            Message::Submit {
+                request,
+                driver_idx,
+                physical_page_ids,
+                extra_pages,
+                last_page_len,
+                response,
+            } => {
+                let idx = driver_idx.min(self.num_drivers.saturating_sub(1));
+
+                // Per-request shape stores the ctx_id in
+                // `context_ids[0]`. Default to 0 if missing — only
+                // happens for malformed requests, in which case the
+                // speculator path is a no-op.
+                let ctx_id = request.context_ids.first().copied().unwrap_or(0);
 
                 // Staged self-staging path: check staged_batch for a
                 // hit, submit cold otherwise, and chain-extend up to
@@ -292,8 +323,8 @@ impl ServiceHandler for InferenceService {
                 let staged_entry = self.staged_batch[idx].lock().ok().and_then(|mut sb| {
                     if let Some(deque) = sb.get_mut(&ctx_id) {
                         if let Some(front) = deque.front() {
-                            let req_token = request.tokens.first().copied();
-                            let req_pos = request.positions.first().copied();
+                            let req_token = request.token_ids.first().copied();
+                            let req_pos = request.position_ids.first().copied();
                             if Some(front.anchor_token) == req_token
                                 && Some(front.anchor_pos) == req_pos
                             {
@@ -315,9 +346,9 @@ impl ServiceHandler for InferenceService {
 
                 if let Some(entry) = staged_entry {
                     // HIT: forward the staged rx; the chain
-                    // extender that pushed this entry is still alive
-                    // and will keep extending. No re-spawn here (it
-                    // would duplicate the chain).
+                    // extender that pushed this entry is still
+                    // alive and will keep extending. No re-spawn
+                    // here (it would duplicate the chain).
                     tokio::spawn(async move {
                         if let Ok(output) = entry.output_rx.await {
                             let _ = response.send(output);
@@ -362,4 +393,3 @@ impl ServiceHandler for InferenceService {
         }
     }
 }
-

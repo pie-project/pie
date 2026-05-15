@@ -178,10 +178,7 @@ fn test_regex_group_with_quantifier() {
 #[test]
 fn test_regex_mixed_quantifiers() {
     // (a|b)?[a-z]+(abc)*
-    assert!(is_regex_accept_string(
-        r"(a|b)?[a-z]+(abc)*",
-        "adddabcabc"
-    ));
+    assert!(is_regex_accept_string(r"(a|b)?[a-z]+(abc)*", "adddabcabc"));
     assert!(is_regex_accept_string(r"(a|b)?[a-z]+(abc)*", "z"));
 }
 

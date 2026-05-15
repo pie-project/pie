@@ -86,7 +86,7 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
         }
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => {
-            let c: CudaNativeDriverOptions = m
+            let mut c: CudaNativeDriverOptions = m
                 .driver
                 .options
                 .clone()
@@ -98,11 +98,8 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
                     m.name
                 )
             })?;
-            Ok(DriverOptions::CudaNative {
-                opts: c,
-                device: device.clone(),
-                hf_repo: m.hf_repo.clone(),
-            })
+            c.device = device.clone();
+            Ok(DriverOptions::CudaNative(c))
         }
         Flavor::Dummy => {
             let d: DummyDriverOptions = m

@@ -38,7 +38,7 @@ struct SpecExpansionInputs {
 struct SpecExpansion {
     bool has_drafts = false;
 
-    // Spec-expanded copies of the BPIQ wire arrays. Populated only when
+    // Spec-expanded copies of the wire arrays. Populated only when
     // `has_drafts` is true; otherwise default-constructed and ignored.
     std::vector<std::uint32_t> tokens;
     std::vector<std::uint32_t> positions;

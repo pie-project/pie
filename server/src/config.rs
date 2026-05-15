@@ -426,6 +426,15 @@ pub struct DriverConfig {
     pub activation_dtype: String,
     #[serde(default = "default_random_seed")]
     pub random_seed: u64,
+    /// Channel-level wait strategy: busy-spin for `spin_budget_us` µs
+    /// before falling back to the cross-process kernel park primitive
+    /// (Linux `futex(2)`, Windows `WaitOnAddress`, macOS `__ulock_wait`
+    /// for shmem; `Condvar::wait` for in-proc). `0` = always park;
+    /// higher trades one busy-spinning core for sub-µs wake latency.
+    /// Default 100 — catches back-to-back fires within a generation
+    /// step while staying invisible on a GPU-bound workload.
+    #[serde(default = "default_spin_budget_us")]
+    pub spin_budget_us: u64,
     /// Driver-specific knobs. Embedded drivers parse this into typed
     /// option structs; Python drivers receive the raw table after
     /// standalone-only `venv` / `python` keys are stripped.
@@ -535,6 +544,11 @@ fn default_activation_dtype() -> String {
 }
 fn default_random_seed() -> u64 {
     42
+}
+/// Default busy-spin budget (µs) before the driver-side channel falls
+/// back to parking. Matches `pie::driver::InProcChannel::new()`.
+fn default_spin_budget_us() -> u64 {
+    100
 }
 
 /// Accept either a single string or a list of strings, matching
@@ -682,6 +696,11 @@ pub struct CudaNativeDriverOptions {
     pub max_num_kv_pages: u32,
     pub swap_pool_size: u32,
     pub weight_dtype: String,
+    /// CUDA device string, e.g. `"cuda:0"`. Populated by the caller
+    /// from `model.driver.device`; set on the C++ side via
+    /// `cudaSetDevice` (see `driver/cuda/src/engine.cpp`).
+    #[serde(skip)]
+    pub device: String,
     #[serde(skip)]
     pub verbose: bool,
     /// Runtime quantization mode applied after weight load. Empty = none;
@@ -705,6 +724,7 @@ impl Default for CudaNativeDriverOptions {
             max_num_kv_pages: 1024,
             swap_pool_size: 0,
             weight_dtype: "bfloat16".to_string(),
+            device: String::new(),
             verbose: false,
             runtime_quant: String::new(),
             ready_timeout_s: 600.0,

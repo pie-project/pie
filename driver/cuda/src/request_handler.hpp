@@ -1,10 +1,10 @@
 #pragma once
 
-// Single-request handler for the BPIQ `fire_batch` shmem method.
-// Lifted from `main.cpp` so the entry point stays focused on init and
-// the dispatch loop. Body is unchanged from its lambda incarnation;
-// follow-up refactors (spec expansion, sampling dispatch, msgpack
-// sub-passes) split this further.
+// Single-request handler for the `fire_batch` inproc method. Lifted from
+// `main.cpp` so the entry point stays focused on init and the dispatch
+// loop. Body is unchanged from its lambda incarnation; follow-up
+// refactors (spec expansion, sampling dispatch, sub-passes) split this
+// further.
 
 #include <cstddef>
 #include <cstdint>
@@ -17,9 +17,10 @@
 
 #include "distributed.hpp"
 #include "forward_graph.hpp"
+#include <pie_bridge/inproc_server.hpp>
 #include "model/llama_like.hpp"
-#include "response_writer.hpp"
 #include "persistent_inputs.hpp"
+#include <pie_bridge/response_builder.hpp>
 #include "slot_allocator.hpp"
 
 namespace pie_cuda_driver {
@@ -27,8 +28,6 @@ namespace pie_cuda_driver {
 class Engine;
 class KvCache;
 class AttentionWorkspace;
-struct SlotRequest;
-class Responder;
 
 namespace model {
 struct Qwen3Weights;
@@ -161,17 +160,24 @@ struct ForwardContext {
     // is_fresh flags via NCCL broadcast (see tp_broadcast_inputs).
     // Inert on archs that don't use a linear-attention state cache.
     SlotAllocator slot_alloc;
+
+    // Response-view builder. Reused fire-to-fire — the builder owns the
+    // concat scratch the `PieForwardResponseView` slices point into. The
+    // view stays valid until the next `build()` call, which is long
+    // enough for the `send_response` that immediately follows.
+    pie_driver::ResponseBuilder response_builder;
 };
 
-// Decode a `fire_batch` BPIQ payload, run the forward pass + sampling
-// pipeline, and write a BPIS response into `response`. Returns the
-// number of bytes written (0 on error). `handled` is the cumulative
-// fire_batch counter — used as the PRNG offset and to gate logging
-// cadence.
-std::size_t handle_fire_batch(
-    const SlotRequest& req,
-    std::span<std::uint8_t> response,
-    Responder& responder,
+// Run the forward pass + sampling pipeline on one forward-pass request
+// and fill out `out_resp` via `ctx.response_builder`. `req_id` is the
+// per-fire identifier used in error logging; `handled` is the
+// cumulative fire counter used as PRNG offset and logging-cadence gate.
+// The caller's inproc transport hands `out_resp` to `send_response`
+// immediately after this returns.
+void handle_fire_batch(
+    std::uint32_t req_id,
+    const pie_driver::PieForwardRequestView& view,
+    pie_driver::PieForwardResponseView& out_resp,
     ForwardContext& ctx,
     std::uint64_t handled);
 

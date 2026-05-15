@@ -35,7 +35,10 @@ pub fn spawn(enable_auth: bool, authorized_users_path: &Path) {
 
 pub async fn user_exists(username: String) -> Result<bool> {
     let (tx, rx) = oneshot::channel();
-    SERVICE.send(Message::UserExists { username, response: tx })?;
+    SERVICE.send(Message::UserExists {
+        username,
+        response: tx,
+    })?;
     Ok(rx.await?)
 }
 
@@ -57,13 +60,21 @@ pub async fn verify_signature(
     signature: Vec<u8>,
 ) -> Result<bool> {
     let (tx, rx) = oneshot::channel();
-    SERVICE.send(Message::VerifySignature { username, challenge, signature, response: tx })?;
+    SERVICE.send(Message::VerifySignature {
+        username,
+        challenge,
+        signature,
+        response: tx,
+    })?;
     Ok(rx.await?)
 }
 
 pub async fn verify_internal_token(token: String) -> Result<bool> {
     let (tx, rx) = oneshot::channel();
-    SERVICE.send(Message::VerifyInternalToken { token, response: tx })?;
+    SERVICE.send(Message::VerifyInternalToken {
+        token,
+        response: tx,
+    })?;
     Ok(rx.await?)
 }
 
@@ -88,8 +99,7 @@ struct Auth {
 impl Auth {
     pub fn new(enable_auth: bool, authorized_users_path: &Path) -> Self {
         let authorized_users = if enable_auth {
-            AuthorizedUsers::load(authorized_users_path)
-                .expect("Failed to load authorized users")
+            AuthorizedUsers::load(authorized_users_path).expect("Failed to load authorized users")
         } else {
             AuthorizedUsers::default()
         };
@@ -121,7 +131,10 @@ impl Auth {
     }
 
     pub fn list_users(&self) -> Vec<String> {
-        self.authorized_users.iter().map(|(k, _)| k.clone()).collect()
+        self.authorized_users
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     pub fn insert_user(&mut self, username: &str) -> Result<()> {
@@ -142,7 +155,8 @@ impl Auth {
         key_name: String,
         public_key: PublicKey,
     ) -> Result<()> {
-        self.authorized_users.insert_key_for_user(username, key_name, public_key)?;
+        self.authorized_users
+            .insert_key_for_user(username, key_name, public_key)?;
         self.save();
         Ok(())
     }
@@ -235,7 +249,12 @@ impl ServiceHandler for Auth {
             Message::UserExists { username, response } => {
                 let _ = response.send(self.user_exists(&username));
             }
-            Message::VerifySignature { username, challenge, signature, response } => {
+            Message::VerifySignature {
+                username,
+                challenge,
+                signature,
+                response,
+            } => {
                 let _ = response.send(self.verify_signature(&username, &challenge, &signature));
             }
             Message::VerifyInternalToken { token, response } => {
@@ -247,10 +266,19 @@ impl ServiceHandler for Auth {
             Message::RemoveUser { username, response } => {
                 let _ = response.send(self.remove_user(&username));
             }
-            Message::InsertKey { username, key_name, public_key, response } => {
+            Message::InsertKey {
+                username,
+                key_name,
+                public_key,
+                response,
+            } => {
                 let _ = response.send(self.insert_key(&username, key_name, public_key));
             }
-            Message::RemoveKey { username, key_name, response } => {
+            Message::RemoveKey {
+                username,
+                key_name,
+                response,
+            } => {
                 let _ = response.send(self.remove_key(&username, &key_name));
             }
             Message::GenerateChallenge { response } => {

@@ -7,6 +7,13 @@ Backed by PyTorch + flashinfer; suitable for prototyping new kernels,
 sampling strategies, or model architectures without touching native code.
 For production, prefer the C++ drivers under `driver/{portable,cuda}/`.
 
+Shared Python scaffolding (worker loop, `Batch` wire model, shmem IPC,
+capabilities handshake, standalone launcher) lives in
+[`pie-driver-bridge`](../bridge_py/); this wheel only ships the
+flashinfer-based `Engine`, per-arch model code, and the `dev` driver's
+`worker_main` shim. `pie-driver-{sglang,vllm}` compose against the same
+bridge surface.
+
 ## Install
 
 ```sh

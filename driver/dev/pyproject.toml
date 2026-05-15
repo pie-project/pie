@@ -15,39 +15,20 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-# `pie-rpc` ships the `RpcServer` IPC primitive (cold-path channel back
-# to the Rust runtime). `DriverCapabilities` lives in
-# `pie_driver_dev.capabilities` (Phase 8 — the legacy `pie.capabilities`
-# / `pie.drivers` registry is gone, replaced by `python -m pie_driver_<type>`
-# discovery in the standalone).
+# `pie-bridge` is the PyO3 wheel that ships the canonical wire schema,
+# Method enum, DriverCapabilities, and ShmemServer (single source of
+# truth, mirrored from Rust). Per-driver scaffolding (worker loop,
+# launcher, Batch decoder, etc.) lives under `pie_driver_dev._bridge`
+# as a vendored copy of the legacy bridge_py Python — driver-
+# specific code stays per-driver per the bridge consolidation plan.
 dependencies = [
-    "pie-rpc",
+    "pie-bridge",
     "einops>=0.8.1",
     "huggingface_hub>=0.34.0",
-    "msgpack>=0.5",
-    # `msgspec` is the worker batch wire format (pie_driver_dev.message); the
-    # leader loop lazy-imports it on the first batch, so a missing install
-    # only trips after model load.
-    "msgspec>=0.18",
-    # vllm 0.16.0 pins numba==0.61.2 and the dev driver only uses `@njit`
-    # in batching / attention-metadata helpers (works on 0.61.x). Keeping
-    # the floor at 0.61 lets pie-driver-{vllm,sglang} co-resolve through
-    # `uv pip install` without needing the override-dependencies workaround.
-    "numba>=0.61",
-    # `psutil` is imported by `pie_driver_dev.utils` (RAM probe via
-    # `get_available_memory`) at module top — engine.py picks it up on
-    # boot, so a missing install crashes every worker before ready.
-    "psutil>=5.9",
     "safetensors>=0.6.2",
-    "tqdm>=4.67",
     "ztensor>=0.1.4",
-    # OpenTelemetry — `pie_driver_dev.telemetry` imports `opentelemetry.trace`
-    # at module top, which engine.py pulls in unconditionally. The runtime
-    # use is opt-in via `[telemetry] enabled = true`, but the imports run
-    # either way.
-    "opentelemetry-api>=1.30",
-    "opentelemetry-sdk>=1.30",
-    "opentelemetry-exporter-otlp>=1.30",
+    # `psutil` is imported by `utils.get_available_memory` (RAM probe).
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
@@ -95,7 +76,7 @@ url = "https://flashinfer.ai/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-pie-rpc = { path = "../../sdk/python-rpc", editable = true }
+pie-bridge = { path = "../bridge", editable = true }
 torch = [
     { index = "pytorch-cu126", extra = "cu126" },
     { index = "pytorch-cu128", extra = "cu128" },
@@ -124,6 +105,7 @@ package-dir = { "" = "src" }
 # unchanged inside the dev driver's source.
 packages = [
     "pie_driver_dev",
+    "pie_driver_dev._bridge",
     "pie_driver_dev.model",
     "pie_kernels",
     "pie_kernels.cuda",

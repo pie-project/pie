@@ -1,199 +1,36 @@
-"""Worker-internal runtime configuration.
+"""Native driver runtime + TOML configs.
 
-Two layers, mirroring the universal/driver-specific split established by the
-driver-config redesign:
+`NativeRuntimeConfig` extends bridge's `RuntimeConfig` with native-only
+knobs (KV page size, batch limits, adapter pool sizing, weight dtype +
+quantization, dummy-mode flag) and overrides the universal `device` and
+`activation_dtype` properties to return torch types. Model code under
+`pie_driver_dev/model/` keeps reading `runtime_config.device`
+(`torch.device`) and `runtime_config.activation_dtype` (`torch.dtype`)
+unchanged.
 
-  * `RuntimeConfig` — universal, every driver consumes it. Identity, devices,
-    dtype, telemetry, swap budget, and the engine-computed `max_num_kv_pages`.
-    Vllm uses only this.
-
-  * `NativeRuntimeConfig(RuntimeConfig)` — pie native's runtime config. Adds
-    fields that only native consumes (KV page size, batch limits, adapter
-    pool sizing, weight dtype + quantization, CUDA-graph capture toggle, the
-    dummy-mode flag). Native model code reads `runtime_config.X` against this
-    subclass with no awareness of the split.
-
-  * `NativeDriverConfig` — TOML-shape `[model.X.driver.native]` block. The
-    user-facing config; gets merged into `NativeRuntimeConfig.from_args`.
-
-Vllm's analogue lives in `pie_driver_vllm.config.VllmDriverConfig`.
+`NativeDriverConfig` is the TOML-shape `[model.driver.options]` block
+(with `type = "dev"`), merged into `NativeRuntimeConfig.from_args` by
+the worker.
 """
 
 from __future__ import annotations
 
-import os
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 import torch
 
+from ._bridge.config import RuntimeConfig, _resolve_universal_kwargs
 
-# Valid weight dtype categories — only consulted by NativeRuntimeConfig.
+
+# Valid weight dtype categories.
 FLOAT_DTYPES = {"float32", "float16", "bfloat16", "auto"}
 QUANT_DTYPES = {"int4", "int8", "float8"}
-
-
-def _get_pie_home() -> Path:
-    if pie_home := os.environ.get("PIE_HOME"):
-        return Path(pie_home)
-    return Path.home() / ".pie"
-
-
-def get_program_dir() -> Path:
-    return _get_pie_home() / "programs"
-
-
-def get_adapter_dir() -> Path:
-    return _get_pie_home() / "adapters"
-
-
-# ---------------------------------------------------------------------------
-# Universal runtime config (every driver consumes this)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class RuntimeConfig:
-    """Universal worker-internal config — what every driver needs.
-
-    Driver-specific runtime knobs (gpu_mem_utilization, weight_dtype, batch
-    limits, etc.) live on the driver's own subclass / config, not here.
-    """
-
-    # Identity
-    hf_repo: str
-    cache_dir: str
-    adapter_path: str
-
-    # Topology
-    devices: list[torch.device]
-    rank: int
-    tensor_parallel_size: int     # 1 = DP only, >1 = TP within a group
-
-    # Universal precision/seed
-    activation_dtype: torch.dtype
-    random_seed: int
-
-    # Telemetry
-    telemetry_enabled: bool
-    telemetry_endpoint: str
-    telemetry_service_name: str
-
-    # CPU swap budget in bytes. Both drivers respect it (0 = disabled).
-    swap_budget_bytes: int = 0
-
-    # Engine-computed at load time. None pre-load; set by the engine.
-    max_num_kv_pages: int | None = None
-
-    # NOTE: `kv_page_size` and `max_dist_size` are NativeRuntimeConfig-only.
-    # The shared RPC worker (`_handle_fire_batch`) falls back to
-    # `engine.capabilities().kv_page_size` for drivers (vllm/sglang) that
-    # don't carry them on their config — see pie_driver_dev/worker.py.
-
-    # ---------- properties ----------
-    @property
-    def device(self) -> torch.device:
-        return self.devices[self.rank]
-
-    @property
-    def world_size(self) -> int:
-        return len(self.devices)
-
-    @property
-    def num_groups(self) -> int:
-        return max(1, self.world_size // self.tensor_parallel_size)
-
-    @classmethod
-    def from_args(
-        cls,
-        hf_repo: str,
-        *,
-        device: str | None = None,
-        devices: list[str] | None = None,
-        rank: int = 0,
-        tensor_parallel_size: int = 1,
-        activation_dtype: str = "bfloat16",
-        random_seed: int = 42,
-        telemetry_enabled: bool = False,
-        telemetry_endpoint: str = "http://localhost:4317",
-        telemetry_service_name: str = "pie",
-        cpu_mem_budget_in_gb: int = 0,
-        # Subclass-only kwargs are accepted via **extras and ignored here so
-        # callers can pass a single merged dict.
-        **_extras,
-    ) -> "RuntimeConfig":
-        return cls(**_resolve_universal_kwargs(
-            hf_repo=hf_repo, device=device, devices=devices, rank=rank,
-            tensor_parallel_size=tensor_parallel_size,
-            activation_dtype=activation_dtype, random_seed=random_seed,
-            telemetry_enabled=telemetry_enabled,
-            telemetry_endpoint=telemetry_endpoint,
-            telemetry_service_name=telemetry_service_name,
-            cpu_mem_budget_in_gb=cpu_mem_budget_in_gb,
-        ))
-
-    def print(self) -> None:
-        print("--- Configuration ---")
-        for k, v in asdict(self).items():
-            print(f"{k}: {v}")
-        print("----------------------")
-
-
-def _resolve_universal_kwargs(
-    *,
-    hf_repo: str,
-    device: str | None,
-    devices: list[str] | None,
-    rank: int,
-    tensor_parallel_size: int,
-    activation_dtype: str,
-    random_seed: int,
-    telemetry_enabled: bool,
-    telemetry_endpoint: str,
-    telemetry_service_name: str,
-    cpu_mem_budget_in_gb: int,
-) -> dict:
-    """Convert string-shaped kwargs to typed values for RuntimeConfig.
-
-    Shared helper used by both `RuntimeConfig.from_args` and the
-    `NativeRuntimeConfig.from_args` subclass override.
-    """
-    if devices is not None:
-        resolved_devices = [torch.device(d) for d in devices]
-    elif device is not None:
-        resolved_devices = [torch.device(device)]
-    elif torch.cuda.is_available():
-        resolved_devices = [torch.device("cuda:0")]
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        resolved_devices = [torch.device("mps")]
-    else:
-        resolved_devices = [torch.device("cpu")]
-
-    return dict(
-        hf_repo=hf_repo,
-        cache_dir=str(get_program_dir()),
-        adapter_path=str(get_adapter_dir()),
-        devices=resolved_devices,
-        rank=rank,
-        tensor_parallel_size=tensor_parallel_size,
-        activation_dtype=getattr(torch, activation_dtype, torch.bfloat16),
-        random_seed=random_seed,
-        telemetry_enabled=telemetry_enabled,
-        telemetry_endpoint=telemetry_endpoint,
-        telemetry_service_name=telemetry_service_name,
-        swap_budget_bytes=cpu_mem_budget_in_gb * (1 << 30),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Native runtime config — what pie's own model code reads
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class NativeRuntimeConfig(RuntimeConfig):
     """Native driver's runtime config — extends `RuntimeConfig` with
-    native-only knobs.
+    native-only knobs and torch-typed device/dtype properties.
 
     Field names match pie's existing internal vocabulary (kv_page_size,
     gpu_mem_utilization, etc.) so model code under `pie_driver_dev/model/`
@@ -219,6 +56,15 @@ class NativeRuntimeConfig(RuntimeConfig):
 
     # Set by the dummy driver to skip real weight loading
     dummy_mode: bool = False
+
+    # ---------- torch-typed property overrides ----------
+    @property
+    def device(self) -> torch.device:
+        return torch.device(self.devices[self.rank])
+
+    @property
+    def activation_dtype(self) -> torch.dtype:
+        return getattr(torch, self._activation_dtype_str)
 
     # ---------- native-only properties ----------
     @property
@@ -279,6 +125,16 @@ class NativeRuntimeConfig(RuntimeConfig):
                 f"Invalid weight_dtype: '{weight_dtype}'. "
                 f"Expected one of: {sorted(FLOAT_DTYPES | QUANT_DTYPES)}"
             )
+
+        # Pre-resolve devices when not explicitly supplied — flavor-side
+        # torch probing belongs here, not in bridge.
+        if devices is None and device is None:
+            if torch.cuda.is_available():
+                device = "cuda:0"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
 
         universal = _resolve_universal_kwargs(
             hf_repo=hf_repo, device=device, devices=devices, rank=rank,

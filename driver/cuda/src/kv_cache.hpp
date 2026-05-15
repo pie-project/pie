@@ -2,7 +2,7 @@
 
 // Paged KV cache pool. One pair of [num_pages, page_size, num_kv_heads,
 // head_dim] tensors per layer. The runtime hands us page-index lists in
-// each BPIQ request; we read/write through that translation.
+// each wire request; we read/write through that translation.
 
 #include <cstdint>
 #include <vector>

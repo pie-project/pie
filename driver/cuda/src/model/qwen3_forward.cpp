@@ -26,17 +26,22 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     const int N  = max_tokens;
 
     Qwen3Workspace ws;
-    ws.y        = DeviceTensor::allocate(DType::BF16, {N, H});
-    ws.norm_x   = DeviceTensor::allocate(DType::BF16, {N, H});
-    ws.q        = DeviceTensor::allocate(DType::BF16, {N, Hq});
-    ws.k        = DeviceTensor::allocate(DType::BF16, {N, Hk});
-    ws.v        = DeviceTensor::allocate(DType::BF16, {N, Hk});
-    ws.attn_out = DeviceTensor::allocate(DType::BF16, {N, Hq});
-    ws.norm_y   = DeviceTensor::allocate(DType::BF16, {N, H});
-    ws.gate     = DeviceTensor::allocate(DType::BF16, {N, I});
-    ws.up       = DeviceTensor::allocate(DType::BF16, {N, I});
-    ws.logits   = DeviceTensor::allocate(DType::BF16, {N, V});
-    ws.probs    = DeviceTensor::allocate(DType::FP32, {N, V});
+    ws.y             = DeviceTensor::allocate(DType::BF16, {N, H});
+    ws.norm_x        = DeviceTensor::allocate(DType::BF16, {N, H});
+    // Fused QKV / gate-up matmul outputs. Always allocated — costs ~12 MiB
+    // at N=10240 for Qwen3 dims and lets the forward dispatch decide per
+    // layer whether to use the fused or unfused projection.
+    ws.qkv_fused     = DeviceTensor::allocate(DType::BF16, {N, Hq + 2 * Hk});
+    ws.gate_up_fused = DeviceTensor::allocate(DType::BF16, {N, 2 * I});
+    ws.q             = DeviceTensor::allocate(DType::BF16, {N, Hq});
+    ws.k             = DeviceTensor::allocate(DType::BF16, {N, Hk});
+    ws.v             = DeviceTensor::allocate(DType::BF16, {N, Hk});
+    ws.attn_out      = DeviceTensor::allocate(DType::BF16, {N, Hq});
+    ws.norm_y        = DeviceTensor::allocate(DType::BF16, {N, H});
+    ws.gate          = DeviceTensor::allocate(DType::BF16, {N, I});
+    ws.up            = DeviceTensor::allocate(DType::BF16, {N, I});
+    ws.logits        = DeviceTensor::allocate(DType::BF16, {N, V});
+    ws.probs         = DeviceTensor::allocate(DType::FP32, {N, V});
 
     // Padded q/k/v/attn_out only when head_dim != head_dim_kernel
     // (currently only Phi-3 at 96 → 128). Empty allocations otherwise

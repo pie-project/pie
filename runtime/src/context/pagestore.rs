@@ -1,4 +1,4 @@
-//! PageStore — Per-Device CAS Cache + Physical Page Pools (Radix Trie v2).
+//! PageStore — Per-Driver CAS Cache + Physical Page Pools (Radix Trie v2).
 //!
 //! Content-addressed storage for KV cache pages using a compressed Radix
 //! Trie (Patricia Trie) with **path-inclusive refcounting**.
@@ -11,7 +11,7 @@
 //!   shared nodes; suspending one doesn't evict pages needed by the other.
 //! - **O(depth) operations**: all operations traverse the trie path once.
 //!
-//! Each model device gets its own `PageStore` — no cross-device coordination.
+//! Each model driver gets its own `PageStore` — no cross-driver coordination.
 //! Owned exclusively by the `ContextManager` actor (no interior mutability).
 
 use std::hash::{Hash, Hasher};
@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 use ahash::AHasher;
 use rustc_hash::FxHashMap;
 
-use crate::inference::brle::Brle;
+use pie_bridge::Brle;
 
 // =============================================================================
 // Types
@@ -67,11 +67,15 @@ impl PagePool {
     }
 
     fn alloc_n(&mut self, n: usize) -> Option<Vec<PhysicalPageId>> {
-        if self.free.len() < n { return None; }
+        if self.free.len() < n {
+            return None;
+        }
         let start = self.free.len() - n;
         self.alloc_total += n;
         let pages = self.free.split_off(start);
-        for &p in &pages { self.free_set.remove(&p); }
+        for &p in &pages {
+            self.free_set.remove(&p);
+        }
         Some(pages)
     }
 
@@ -86,8 +90,13 @@ impl PagePool {
         }
         for &id in ids {
             if !self.free_set.insert(id) {
-                tracing::error!("[DOUBLE_FREE] page={} tag={} free.len={} total={}",
-                    id, tag, self.free.len(), self.total);
+                tracing::error!(
+                    "[DOUBLE_FREE] page={} tag={} free.len={} total={}",
+                    id,
+                    tag,
+                    self.free.len(),
+                    self.total
+                );
             }
             self.free.push(id);
         }
@@ -95,17 +104,37 @@ impl PagePool {
         if !self.over_logged && self.free.len() > self.total {
             self.over_logged = true;
             let last_ids: Vec<_> = ids.iter().take(5).collect();
-            tracing::error!("[FIRST_OVER] tag={} free.len={} total={} ids={:?} | reclaim={} release={} working={} alloc={}",
-                tag, self.free.len(), self.total, last_ids,
-                self.free_reclaim, self.free_release, self.free_working, self.alloc_total);
+            tracing::error!(
+                "[FIRST_OVER] tag={} free.len={} total={} ids={:?} | reclaim={} release={} working={} alloc={}",
+                tag,
+                self.free.len(),
+                self.total,
+                last_ids,
+                self.free_reclaim,
+                self.free_release,
+                self.free_working,
+                self.alloc_total
+            );
         }
     }
-    fn free(&mut self, id: PhysicalPageId) { self.free_tagged(&[id], "single"); }
-    fn free_batch(&mut self, ids: &[PhysicalPageId]) { self.free_tagged(ids, "batch"); }
-    fn used(&self) -> usize { self.total - self.free.len() }
-    fn available(&self) -> usize { self.free.len() }
-    fn pool_stats(&self) -> (usize, usize) { (self.alloc_total, self.free_total) }
-    fn tag_stats(&self) -> (usize, usize, usize) { (self.free_reclaim, self.free_release, self.free_working) }
+    fn free(&mut self, id: PhysicalPageId) {
+        self.free_tagged(&[id], "single");
+    }
+    fn free_batch(&mut self, ids: &[PhysicalPageId]) {
+        self.free_tagged(ids, "batch");
+    }
+    fn used(&self) -> usize {
+        self.total - self.free.len()
+    }
+    fn available(&self) -> usize {
+        self.free.len()
+    }
+    fn pool_stats(&self) -> (usize, usize) {
+        (self.alloc_total, self.free_total)
+    }
+    fn tag_stats(&self) -> (usize, usize, usize) {
+        (self.free_reclaim, self.free_release, self.free_working)
+    }
 }
 
 // =============================================================================
@@ -147,7 +176,12 @@ impl TrieNode {
         let mut pages = self.prefix.len();
         let mut rc_sum = self.refcount;
         let mut nodes = if self.prefix_hashes.is_empty() { 0 } else { 1 };
-        let mut rc0_interior = if self.refcount == 0 && !self.children.is_empty() && !self.prefix_hashes.is_empty() { 1 } else { 0 };
+        let mut rc0_interior =
+            if self.refcount == 0 && !self.children.is_empty() && !self.prefix_hashes.is_empty() {
+                1
+            } else {
+                0
+            };
         for child in self.children.values() {
             let (p, r, n, z) = child.trie_stats();
             pages += p;
@@ -205,7 +239,9 @@ impl TrieNode {
         phys: &[PhysicalPageId],
         reclaimed_pages: &mut Vec<PhysicalPageId>,
     ) {
-        if suffix.is_empty() { return; }
+        if suffix.is_empty() {
+            return;
+        }
 
         if prefix.is_empty() {
             self.insert_suffix(suffix, phys, reclaimed_pages);
@@ -235,8 +271,10 @@ impl TrieNode {
             // Prefix not in trie — broken invariant. The caller claims to own
             // this prefix, but it doesn't exist. Log and bail in release,
             // panic in debug.
-            debug_assert!(false,
-                "navigate_and_extend: prefix not in trie (first hash={first})");
+            debug_assert!(
+                false,
+                "navigate_and_extend: prefix not in trie (first hash={first})"
+            );
             tracing::error!("BUG: navigate_and_extend called with prefix not in trie");
         }
     }
@@ -264,12 +302,15 @@ impl TrieNode {
                 // already in the trie — reclaim them.
                 reclaimed_pages.extend_from_slice(&phys[..common]);
                 if common < suffix.len() {
-                    child.children.insert(suffix[common], TrieNode {
-                        prefix_hashes: suffix[common..].to_vec(),
-                        prefix: phys[common..].to_vec(),
-                        refcount: 1,
-                        children: FxHashMap::default(),
-                    });
+                    child.children.insert(
+                        suffix[common],
+                        TrieNode {
+                            prefix_hashes: suffix[common..].to_vec(),
+                            prefix: phys[common..].to_vec(),
+                            refcount: 1,
+                            children: FxHashMap::default(),
+                        },
+                    );
                 }
             } else if common < suffix.len() {
                 // Full prefix match — the common portion's physical pages are
@@ -283,12 +324,15 @@ impl TrieNode {
                 reclaimed_pages.extend_from_slice(phys);
             }
         } else {
-            self.children.insert(first, TrieNode {
-                prefix_hashes: suffix.to_vec(),
-                prefix: phys.to_vec(),
-                refcount: 1,
-                children: FxHashMap::default(),
-            });
+            self.children.insert(
+                first,
+                TrieNode {
+                    prefix_hashes: suffix.to_vec(),
+                    prefix: phys.to_vec(),
+                    refcount: 1,
+                    children: FxHashMap::default(),
+                },
+            );
         }
     }
 
@@ -300,7 +344,9 @@ impl TrieNode {
         };
         // Safety: we just checked children.len() == 1.
         let sole_gc = child.children.values().next().unwrap();
-        if sole_gc.refcount != child.refcount { return; }
+        if sole_gc.refcount != child.refcount {
+            return;
+        }
         let (_, sole) = child.children.drain().next().unwrap();
         child.prefix_hashes.extend(sole.prefix_hashes);
         child.prefix.extend(sole.prefix);
@@ -314,12 +360,10 @@ impl TrieNode {
     /// Decrement rc on every node along the path matching `hashes`.
     /// Evict nodes that reach rc=0 and have no children. Cascade upward.
     /// Returns (freed_page_count, should_remove_self).
-    fn release_path(
-        &mut self,
-        hashes: &[PageHash],
-        pool: &mut PagePool,
-    ) -> (usize, bool) {
-        if hashes.is_empty() { return (0, false); }
+    fn release_path(&mut self, hashes: &[PageHash], pool: &mut PagePool) -> (usize, bool) {
+        if hashes.is_empty() {
+            return (0, false);
+        }
 
         let first = hashes[0];
         let (child_freed, remove_child) = match self.children.get_mut(&first) {
@@ -335,9 +379,7 @@ impl TrieNode {
                 } else if hashes.len() > node_len {
                     // Full match of node — decrement rc, recurse.
                     child.refcount = child.refcount.saturating_sub(1);
-                    let (deeper_freed, _) = child.release_path(
-                        &hashes[node_len..], pool,
-                    );
+                    let (deeper_freed, _) = child.release_path(&hashes[node_len..], pool);
                     let evictable = child.refcount == 0 && child.children.is_empty();
                     let freed = if evictable {
                         pool.free_tagged(&child.prefix, "release_child_evict");
@@ -375,9 +417,8 @@ impl TrieNode {
             self.children = sole.children;
         }
 
-        let remove_self = self.refcount == 0
-            && self.children.is_empty()
-            && !self.prefix_hashes.is_empty();
+        let remove_self =
+            self.refcount == 0 && self.children.is_empty() && !self.prefix_hashes.is_empty();
 
         // NOTE: Do NOT free self.prefix here even if remove_self is true.
         // The CALLER is responsible for freeing our pages (via the
@@ -393,7 +434,9 @@ impl TrieNode {
     // =========================================================================
 
     fn prefix_match_len(&self, hashes: &[PageHash]) -> usize {
-        if hashes.is_empty() { return 0; }
+        if hashes.is_empty() {
+            return 0;
+        }
         match self.children.get(&hashes[0]) {
             Some(child) => {
                 let matched = child.match_len(hashes);
@@ -412,7 +455,9 @@ impl TrieNode {
     }
 
     fn collect_physical(&self, hashes: &[PageHash], out: &mut Vec<PhysicalPageId>) {
-        if hashes.is_empty() { return; }
+        if hashes.is_empty() {
+            return;
+        }
         if let Some(child) = self.children.get(&hashes[0]) {
             let consumed = child.match_len(hashes);
             out.extend_from_slice(&child.prefix[..consumed]);
@@ -427,7 +472,9 @@ impl TrieNode {
     // =========================================================================
 
     fn count_reclaimable_path(&self, hashes: &[PageHash]) -> usize {
-        if hashes.is_empty() { return 0; }
+        if hashes.is_empty() {
+            return 0;
+        }
         match self.children.get(&hashes[0]) {
             Some(child) => {
                 let node_len = child.prefix_hashes.len();
@@ -457,7 +504,9 @@ impl TrieNode {
     /// Returns `true` if this subtree is fully reclaimable (node + all children
     /// along the path would be freed), so parent nodes can include themselves.
     fn would_free_hashes(&self, hashes: &[PageHash], out: &mut Vec<PageHash>) -> bool {
-        if hashes.is_empty() { return true; }
+        if hashes.is_empty() {
+            return true;
+        }
         if let Some(child) = self.children.get(&hashes[0]) {
             let node_len = child.prefix_hashes.len();
             if hashes.len() < node_len {
@@ -489,7 +538,9 @@ impl TrieNode {
     /// Shapley effective pages along a chain: sum of `prefix.len() / refcount`
     /// per trie node touched by the path.
     fn effective_pages_path(&self, hashes: &[PageHash]) -> f64 {
-        if hashes.is_empty() { return 0.0; }
+        if hashes.is_empty() {
+            return 0.0;
+        }
         match self.children.get(&hashes[0]) {
             Some(child) => {
                 let matched = child.match_len(hashes);
@@ -513,7 +564,9 @@ impl TrieNode {
 
     /// Bump rc along the path (fork). Split-on-fork for partial hash matches.
     fn fork_path(&mut self, hashes: &[PageHash]) {
-        if hashes.is_empty() { return; }
+        if hashes.is_empty() {
+            return;
+        }
         if let Some(child) = self.children.get_mut(&hashes[0]) {
             let matched = child.match_len(hashes);
             let node_len = child.prefix_hashes.len();
@@ -531,7 +584,11 @@ impl TrieNode {
         }
     }
 
-    fn collect_phys_with_info(&self, out: &mut Vec<(PhysicalPageId, usize, usize, usize)>, depth: usize) {
+    fn collect_phys_with_info(
+        &self,
+        out: &mut Vec<(PhysicalPageId, usize, usize, usize)>,
+        depth: usize,
+    ) {
         for &page in &self.prefix {
             out.push((page, self.refcount, self.prefix.len(), depth));
         }
@@ -547,7 +604,9 @@ impl TrieNode {
 fn common_prefix_len(a: &[PageHash], b: &[PageHash]) -> usize {
     let len = a.len().min(b.len());
     for i in 0..len {
-        if a[i] != b[i] { return i; }
+        if a[i] != b[i] {
+            return i;
+        }
     }
     len
 }
@@ -556,7 +615,7 @@ fn common_prefix_len(a: &[PageHash], b: &[PageHash]) -> usize {
 // PageStore
 // =============================================================================
 
-/// Per-device page cache backed by a Radix Trie with path-inclusive refcounting.
+/// Per-driver page cache backed by a Radix Trie with path-inclusive refcounting.
 ///
 /// Manages a single physical page pool (GPU or CPU — the PageStore is tier-agnostic)
 /// and a CAS trie for content-addressed committed page sharing.
@@ -576,22 +635,32 @@ impl PageStore {
         }
     }
 
-    pub fn page_size(&self) -> usize { self.page_size }
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
 
     pub fn stats(&self) -> (usize, usize) {
         (self.pool.used(), self.pool.total)
     }
 
-    pub fn available(&self) -> usize { self.pool.available() }
+    pub fn available(&self) -> usize {
+        self.pool.available()
+    }
 
     /// Returns (total_pages_in_trie, total_rc_sum, node_count, rc0_interior_nodes)
     pub fn trie_stats(&self) -> (usize, usize, usize, usize) {
         self.root.trie_stats()
     }
 
-    pub fn total_pages(&self) -> usize { self.pool.total }
-    pub fn pool_stats(&self) -> (usize, usize) { self.pool.pool_stats() }
-    pub fn tag_stats(&self) -> (usize, usize, usize) { self.pool.tag_stats() }
+    pub fn total_pages(&self) -> usize {
+        self.pool.total
+    }
+    pub fn pool_stats(&self) -> (usize, usize) {
+        self.pool.pool_stats()
+    }
+    pub fn tag_stats(&self) -> (usize, usize, usize) {
+        self.pool.tag_stats()
+    }
 
     /// Audit: count pages that exist in both trie AND the free set.
     /// These are phantom pages — they've been freed to the pool but still appear
@@ -605,7 +674,9 @@ impl PageStore {
                 phantoms.push((page, rc, prefix_len, depth));
             }
         }
-        let desc: Vec<String> = phantoms.iter().take(10)
+        let desc: Vec<String> = phantoms
+            .iter()
+            .take(10)
             .map(|(p, rc, plen, d)| format!("{}(rc={},n={},d={})", p, rc, plen, d))
             .collect();
         (phantoms.len(), desc.join(" "))
@@ -641,10 +712,13 @@ impl PageStore {
         new_phys: &[PhysicalPageId],
     ) {
         debug_assert_eq!(new_hashes.len(), new_phys.len());
-        if new_hashes.is_empty() { return; }
+        if new_hashes.is_empty() {
+            return;
+        }
 
         let mut reclaimed_pages = Vec::new();
-        self.root.navigate_and_extend(prefix, new_hashes, new_phys, &mut reclaimed_pages);
+        self.root
+            .navigate_and_extend(prefix, new_hashes, new_phys, &mut reclaimed_pages);
 
         if !reclaimed_pages.is_empty() {
             self.pool.free_tagged(&reclaimed_pages, "reclaim");
@@ -669,21 +743,27 @@ impl PageStore {
     /// Used when a new context shares an existing prefix (restore, dedup).
     /// This is the ONLY operation that increases rc on existing nodes.
     pub fn fork(&mut self, hashes: &[PageHash]) {
-        if hashes.is_empty() { return; }
+        if hashes.is_empty() {
+            return;
+        }
         self.root.fork_path(hashes);
     }
 
     /// Decrement refcount along the entire path. Evict nodes that reach rc=0
     /// and have no children. Returns the number of GPU pages freed.
     pub fn release(&mut self, hashes: &[PageHash]) -> usize {
-        if hashes.is_empty() { return 0; }
+        if hashes.is_empty() {
+            return 0;
+        }
         let (freed, _) = self.root.release_path(hashes, &mut self.pool);
         freed
     }
 
     /// Estimate how many GPU pages would be freed by `release(hashes)`.
     pub fn count_reclaimable(&self, hashes: &[PageHash]) -> usize {
-        if hashes.is_empty() { return 0; }
+        if hashes.is_empty() {
+            return 0;
+        }
         self.root.count_reclaimable_path(hashes)
     }
 
@@ -693,7 +773,9 @@ impl PageStore {
     /// Read-only, O(depth). Used to identify which pages to D2H copy to CPU
     /// before calling `release()`, solving the D2H-before-release ordering problem.
     pub fn would_free(&self, hashes: &[PageHash]) -> Vec<PageHash> {
-        if hashes.is_empty() { return Vec::new(); }
+        if hashes.is_empty() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         self.root.would_free_hashes(hashes, &mut out);
         out
@@ -713,8 +795,6 @@ impl PageStore {
         out
     }
 
-
-
     pub fn debug_info(&self, hashes: &[PageHash]) -> String {
         let prefix = self.prefix_len(hashes);
         format!("trie_v2: prefix_len={prefix}/{}", hashes.len())
@@ -729,7 +809,9 @@ impl PageStore {
     ///
     /// Returns the fractional effective page count.
     pub fn effective_pages(&self, hashes: &[PageHash]) -> f64 {
-        if hashes.is_empty() { return 0.0; }
+        if hashes.is_empty() {
+            return 0.0;
+        }
         self.root.effective_pages_path(hashes)
     }
 }
@@ -800,13 +882,18 @@ impl FlatPageStore {
     /// Look up physical page IDs for hashes present in the store.
     /// Returns a vec of page IDs for hashes that are found; missing hashes are skipped.
     pub fn physical_ids(&self, hashes: &[PageHash]) -> Vec<PhysicalPageId> {
-        hashes.iter().filter_map(|h| self.map.get(h).map(|&(p, _)| p)).collect()
+        hashes
+            .iter()
+            .filter_map(|h| self.map.get(h).map(|&(p, _)| p))
+            .collect()
     }
 
     /// Count consecutive hashes (from the start) present in the CPU store.
     pub fn prefix_len(&self, hashes: &[PageHash]) -> usize {
         for (i, h) in hashes.iter().enumerate() {
-            if !self.map.contains_key(h) { return i; }
+            if !self.map.contains_key(h) {
+                return i;
+            }
         }
         hashes.len()
     }
@@ -863,8 +950,9 @@ impl FlatPageStore {
 // =============================================================================
 
 pub fn compute_last_page_len(total_kv: u32, num_pages: u32, page_size: u32) -> u32 {
-    if num_pages == 0 { 0 }
-    else {
+    if num_pages == 0 {
+        0
+    } else {
         let r = total_kv % page_size;
         if r == 0 { page_size } else { r }
     }
@@ -889,8 +977,12 @@ pub fn compute_page_hashes(
 
         let mut hasher = AHasher::default();
         chunk.hash(&mut hasher);
-        for pos in chunk_pos { pos.hash(&mut hasher); }
-        for mask in chunk_masks { mask.hash(&mut hasher); }
+        for pos in chunk_pos {
+            pos.hash(&mut hasher);
+        }
+        for mask in chunk_masks {
+            mask.hash(&mut hasher);
+        }
         // Include adapter_seed so ZO-perturbed pages with different seeds
         // produce different hashes and are not incorrectly shared via dedup.
         adapter_seed.hash(&mut hasher);
@@ -916,7 +1008,9 @@ pub fn compute_page_hashes(
 mod tests {
     use super::*;
 
-    fn h(v: u64) -> PageHash { v }
+    fn h(v: u64) -> PageHash {
+        v
+    }
 
     // =========================================================================
     // PagePool
@@ -985,7 +1079,10 @@ mod tests {
         store.extend(&[h(1), h(2)], &[h(3)], &[30]);
         store.extend(&[h(1), h(2), h(3)], &[h(4)], &[40]);
 
-        assert_eq!(store.physical_ids(&[h(1), h(2), h(3), h(4)]), vec![10, 20, 30, 40]);
+        assert_eq!(
+            store.physical_ids(&[h(1), h(2), h(3), h(4)]),
+            vec![10, 20, 30, 40]
+        );
     }
 
     // =========================================================================
@@ -1217,13 +1314,23 @@ mod tests {
         // All physical IDs must be valid pool-allocated pages (non-zero unless
         // pool legitimately allocated page 0, which it can).
         // More importantly, the page counts must match.
-        assert_eq!(phys_a[2], pa3[0], "Context A's 3rd page should be its allocated page");
-        assert_eq!(phys_b[2], pb3[0], "Context B's 3rd page should be its allocated page");
+        assert_eq!(
+            phys_a[2], pa3[0],
+            "Context A's 3rd page should be its allocated page"
+        );
+        assert_eq!(
+            phys_b[2], pb3[0],
+            "Context B's 3rd page should be its allocated page"
+        );
 
         // Release context A — context B's pages must survive
         store.release(&[h(1), h(2), h(100)]);
         let phys_b_after = store.physical_ids(&[h(1), h(2), h(200)]);
-        assert_eq!(phys_b_after.len(), 3, "Context B should still have 3 pages after A released");
+        assert_eq!(
+            phys_b_after.len(),
+            3,
+            "Context B should still have 3 pages after A released"
+        );
         assert_eq!(phys_b_after[2], pb3[0]);
     }
 
@@ -1239,7 +1346,7 @@ mod tests {
 
         store.commit_batch(&hashes[..1], &pages[..1]);
         for i in 1..10 {
-            store.extend(&hashes[..i], &hashes[i..i+1], &pages[i..i+1]);
+            store.extend(&hashes[..i], &hashes[i..i + 1], &pages[i..i + 1]);
         }
 
         // Verify full chain lookup
@@ -1290,13 +1397,21 @@ mod tests {
         // Verify every context's physical_ids
         for (i, (chain, expected_phys)) in handles.iter().enumerate() {
             let actual = store.physical_ids(chain);
-            assert_eq!(actual.len(), chain.len(),
+            assert_eq!(
+                actual.len(),
+                chain.len(),
                 "Context {} physical_ids length mismatch: expected {}, got {}",
-                i, chain.len(), actual.len());
+                i,
+                chain.len(),
+                actual.len()
+            );
             // The prompt phys might differ (dedup), but suffix phys must match
             for j in 2..chain.len() {
-                assert_eq!(actual[j], expected_phys[j],
-                    "Context {} page {} mismatch", i, j);
+                assert_eq!(
+                    actual[j], expected_phys[j],
+                    "Context {} page {} mismatch",
+                    i, j
+                );
             }
         }
     }
@@ -1329,12 +1444,15 @@ mod tests {
         assert_eq!(store.physical_ids(&full_chain_a).len(), 5);
 
         // SUSPEND A: retain prefix, release full chain
-        store.fork(&prompt);  // fork the prefix
+        store.fork(&prompt); // fork the prefix
         store.release(&full_chain_a);
 
         // B should still be alive
-        assert_eq!(store.physical_ids(&chain_b).len(), 3,
-            "Context B should survive after A suspended");
+        assert_eq!(
+            store.physical_ids(&chain_b).len(),
+            3,
+            "Context B should survive after A suspended"
+        );
 
         // RESTORE A: retain prefix again (re-join), extend with suffix
         store.fork(&prompt);
@@ -1347,8 +1465,13 @@ mod tests {
 
         // Verify restored chain
         let phys_a = store.physical_ids(&full_chain_a);
-        assert_eq!(phys_a.len(), 5,
-            "Restored A should have 5 pages, got {}: {:?}", phys_a.len(), phys_a);
+        assert_eq!(
+            phys_a.len(),
+            5,
+            "Restored A should have 5 pages, got {}: {:?}",
+            phys_a.len(),
+            phys_a
+        );
     }
 
     /// Simulate the exact pattern that causes the bug:
@@ -1392,9 +1515,13 @@ mod tests {
         // Verify B's full chain
         let chain_b = [h(1), h(2), h(20), h(21), h(22)];
         let phys_b = store.physical_ids(&chain_b);
-        assert_eq!(phys_b.len(), 5,
+        assert_eq!(
+            phys_b.len(),
+            5,
             "Context B should have 5 pages after A released, got {}: {:?}",
-            phys_b.len(), phys_b);
+            phys_b.len(),
+            phys_b
+        );
     }
 
     /// Simulate many suspend/restore cycles on overlapping contexts.
@@ -1437,9 +1564,14 @@ mod tests {
         // Remaining 4 should still work
         for ctx in 4..8 {
             let phys = store.physical_ids(&chains[ctx]);
-            assert_eq!(phys.len(), 7,
+            assert_eq!(
+                phys.len(),
+                7,
                 "Chain {} should have 7 pages after suspensions, got {}: {:?}",
-                ctx, phys.len(), phys);
+                ctx,
+                phys.len(),
+                phys
+            );
         }
 
         // Restore the first 4: retain prefix + extend with new pages
@@ -1458,9 +1590,14 @@ mod tests {
         // but the LENGTH must be correct)
         for (i, chain) in chains.iter().enumerate() {
             let phys = store.physical_ids(chain);
-            assert_eq!(phys.len(), 7,
+            assert_eq!(
+                phys.len(),
+                7,
                 "After restore, chain {} should have 7 pages, got {}: {:?}",
-                i, phys.len(), phys);
+                i,
+                phys.len(),
+                phys
+            );
         }
     }
 
@@ -1503,9 +1640,13 @@ mod tests {
 
         // A's pages must survive! Release of [H1, H99] should NOT affect [H1, H2]
         let phys_a2 = store.physical_ids(&[h(1), h(2)]);
-        assert_eq!(phys_a2.len(), 2,
+        assert_eq!(
+            phys_a2.len(),
+            2,
             "A should still have 2 pages after B released, got {}: {:?}",
-            phys_a2.len(), phys_a2);
+            phys_a2.len(),
+            phys_a2
+        );
 
         // Release A
         store.release(&[h(1), h(2)]);
@@ -1536,13 +1677,24 @@ mod tests {
         store.extend(&[h(1), h(50)], &[h(60)], &pc3);
 
         // Verify both chains
-        assert_eq!(store.physical_ids(&[h(1), h(2), h(3)]).len(), 3, "A chain len");
-        assert_eq!(store.physical_ids(&[h(1), h(50), h(60)]).len(), 3, "C chain len");
+        assert_eq!(
+            store.physical_ids(&[h(1), h(2), h(3)]).len(),
+            3,
+            "A chain len"
+        );
+        assert_eq!(
+            store.physical_ids(&[h(1), h(50), h(60)]).len(),
+            3,
+            "C chain len"
+        );
 
         // Release C: should NOT affect A
         store.release(&[h(1), h(50), h(60)]);
-        assert_eq!(store.physical_ids(&[h(1), h(2), h(3)]).len(), 3,
-            "A should survive after C released");
+        assert_eq!(
+            store.physical_ids(&[h(1), h(2), h(3)]).len(),
+            3,
+            "A should survive after C released"
+        );
 
         // Release A
         store.release(&[h(1), h(2), h(3)]);
@@ -1563,15 +1715,21 @@ mod tests {
 
         // Query with different second hash: [H1, H99, ...]
         // Should match only 1 (H1), not 3
-        assert_eq!(store.prefix_len(&[h(1), h(99), h(999)]), 1,
-            "prefix_len should stop at H99 divergence");
+        assert_eq!(
+            store.prefix_len(&[h(1), h(99), h(999)]),
+            1,
+            "prefix_len should stop at H99 divergence"
+        );
 
         // Full match
         assert_eq!(store.prefix_len(&[h(1), h(2), h(3)]), 3);
 
         // Partial match, same prefix then diverge
-        assert_eq!(store.prefix_len(&[h(1), h(2), h(99)]), 2,
-            "prefix_len should stop at H99 divergence after matching H1,H2");
+        assert_eq!(
+            store.prefix_len(&[h(1), h(2), h(99)]),
+            2,
+            "prefix_len should stop at H99 divergence after matching H1,H2"
+        );
     }
 
     // =========================================================================
@@ -1618,7 +1776,12 @@ mod tests {
         store.extend(&[h(1), h(2)], &[h(3)], &[30]);
         // Sole holder → all 3 pages should be would-free, including interior [H1,H2].
         let wf = store.would_free(&[h(1), h(2), h(3)]);
-        assert_eq!(wf.len(), 3, "interior + leaf should both be would-free: got {:?}", wf);
+        assert_eq!(
+            wf.len(),
+            3,
+            "interior + leaf should both be would-free: got {:?}",
+            wf
+        );
         assert!(wf.contains(&h(3)), "leaf H3 must be present");
         assert!(wf.contains(&h(1)), "interior H1 must be present");
         assert!(wf.contains(&h(2)), "interior H2 must be present");

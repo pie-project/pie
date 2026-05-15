@@ -41,7 +41,7 @@ class VllmDriverConfig:
 
     # ---- Speculative decoding (NGRAM, driver-supplied drafts) ----
     # When True, VllmEngine.spec_step proposes linear draft continuations.
-    # Verification + splice run in the shared `pie_driver_dev.batching.Batch`
+    # Verification + splice run in the shared `._bridge.batching.Batch`
     # path; the engine only owns drafting. Field names mirror
     # SGLangDriverConfig so configs port across drivers.
     spec_ngram_enabled: bool = False

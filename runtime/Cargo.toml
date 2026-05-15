@@ -2,20 +2,18 @@
 name = "pie"
 version = "0.3.0"
 edition = "2024"
-authors = ["In Gim <in.gim@icloud.com>"]
+authors = ["In Gim <in.gim@yale.edu>"]
 description = "Programmable Inference Engine (Pie)"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [lib]
 name = "pie"
-# After Phase 8 the runtime is consumed only as an `rlib` by Rust
-# binaries (`server`, `pie-rpc`); the maturin `cdylib` for
-# `pie._runtime` is gone with the rest of the legacy Python server.
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
+pie-bridge = { path = "../driver/bridge" }
 pie-client = { path = "../client/rust" }
 tokio = { version = "1.38", features = ["full"] }
 tokio-util = "0.7"
@@ -78,11 +76,7 @@ unicode-normalization = "0.1"
 smallvec = "1"
 lru = "0.16.3"
 ahash = "0.8.12"
-libc = "0.2"
 ipnet = "2"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -99,6 +93,10 @@ harness = false
 
 [[bench]]
 name = "page_trim_bench"
+harness = false
+
+[[bench]]
+name = "driver_channel"
 harness = false
 
 #[profile.release]

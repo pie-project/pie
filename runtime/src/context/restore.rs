@@ -22,24 +22,18 @@
 //! If the context was re-suspended mid-replay (`pending_suspend`), it is
 //! re-suspended instead.
 
-use super::{
-    ContextId, ContextManager, State, SERVICES,
-    Record,
-};
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
+use super::{ContextId, ContextManager, Record, SERVICES, State};
+use crate::driver::{self, DriverId};
 use crate::inference;
-use crate::inference::request::ForwardPassRequest;
-use crate::device::{self, DeviceId};
 
 // =============================================================================
 // Restore methods on ContextManager
 // =============================================================================
 
-
 impl ContextManager {
-
     /// Admission check: can this context be restored?
-    /// Checks that the device has enough free GPU pages for the context's
+    /// Checks that the driver has enough free GPU pages for the context's
     /// working pages (recomputed) plus replay pages plus deferred alloc requirements.
     pub(crate) fn can_restore(&mut self, ctx_id: ContextId) -> bool {
         let ctx = match self.contexts.get(&ctx_id) {
@@ -47,12 +41,12 @@ impl ContextManager {
             _ => return false,
         };
 
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
+        let driver_idx = ctx.driver.unwrap_or(0) as usize;
         let mut required = ctx.suspended_working_count;
 
         // Pages needing replay: check prefix match, count missing suffix
         if !ctx.committed_hashes.is_empty() {
-            let prefix_len = self.gpu_stores[dev_idx].prefix_len(&ctx.committed_hashes);
+            let prefix_len = self.gpu_stores[driver_idx].prefix_len(&ctx.committed_hashes);
             let replay_pages = ctx.committed_hashes.len().saturating_sub(prefix_len);
             required += replay_pages;
         }
@@ -63,7 +57,7 @@ impl ContextManager {
         let deferred_pages: usize = ctx.deferred_ops.iter().map(|op| op.num_pages).sum();
         required += deferred_pages;
 
-        if self.gpu_stores[dev_idx].available() < required {
+        if self.gpu_stores[driver_idx].available() < required {
             return false;
         }
 
@@ -83,14 +77,16 @@ impl ContextManager {
     ///
     /// If no replay is needed, deferred ops fire immediately.
     pub(crate) fn restore(&mut self, ctx_id: ContextId) -> anyhow::Result<()> {
-        let ctx = self.contexts.get(&ctx_id)
+        let ctx = self
+            .contexts
+            .get(&ctx_id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
 
         if !ctx.is_off_gpu() {
             return Ok(());
         }
 
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
+        let driver_idx = ctx.driver.unwrap_or(0) as usize;
         let working_count = ctx.suspended_working_count;
         let committed_hashes = ctx.committed_hashes.clone();
         let cpu_working_pages = ctx.cpu_working_pages.clone();
@@ -98,13 +94,14 @@ impl ContextManager {
         // Phase 1: Restore working pages.
         // If CPU-stashed, H2D copy; otherwise allocate fresh for replay.
         if working_count > 0 {
-            let gpu_pages = self.gpu_stores[dev_idx].alloc(working_count)
+            let gpu_pages = self.gpu_stores[driver_idx]
+                .alloc(working_count)
                 .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working re-alloc"))?;
 
             if !cpu_working_pages.is_empty() && cpu_working_pages.len() == working_count {
                 // H2D copy from CPU stash.
-                let _ = device::copy_h2d(dev_idx as DeviceId, &gpu_pages, &cpu_working_pages);
-                self.cpu_stores[dev_idx].free(&cpu_working_pages);
+                let _ = driver::copy_h2d(driver_idx as DriverId, &gpu_pages, &cpu_working_pages);
+                self.cpu_stores[driver_idx].free(&cpu_working_pages);
             }
 
             if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
@@ -116,7 +113,7 @@ impl ContextManager {
 
         // Phase 2: Acquire refcounts for GPU-resident committed prefix.
         let prefix_len = if !committed_hashes.is_empty() {
-            let dev = &mut self.gpu_stores[dev_idx];
+            let dev = &mut self.gpu_stores[driver_idx];
             let prefix_len = dev.prefix_len(&committed_hashes);
             if prefix_len > 0 {
                 dev.fork(&committed_hashes[..prefix_len]);
@@ -133,44 +130,60 @@ impl ContextManager {
 
         let has_replay = if suffix_count > 0 {
             // Check how many suffix pages are on CPU.
-            let cpu_prefix = self.cpu_stores[dev_idx].prefix_len(suffix_hashes);
+            let cpu_prefix = self.cpu_stores[driver_idx].prefix_len(suffix_hashes);
 
             if cpu_prefix > 0 {
                 // CPU-warm restore: H2D copy for CPU-resident portion.
                 let cpu_hashes = &suffix_hashes[..cpu_prefix];
-                let cpu_phys = self.cpu_stores[dev_idx].physical_ids(cpu_hashes);
+                let cpu_phys = self.cpu_stores[driver_idx].physical_ids(cpu_hashes);
 
-                let gpu_pages = self.gpu_stores[dev_idx].alloc(cpu_prefix)
+                let gpu_pages = self.gpu_stores[driver_idx]
+                    .alloc(cpu_prefix)
                     .ok_or_else(|| anyhow::anyhow!("No GPU pages for CPU-cache restore"))?;
 
-                let _ = device::copy_h2d(dev_idx as DeviceId, &gpu_pages, &cpu_phys);
+                let _ = driver::copy_h2d(driver_idx as DriverId, &gpu_pages, &cpu_phys);
 
                 // Register in GPU trie.
                 let prefix = &committed_hashes[..prefix_len];
-                self.gpu_stores[dev_idx].extend(prefix, cpu_hashes, &gpu_pages);
+                self.gpu_stores[driver_idx].extend(prefix, cpu_hashes, &gpu_pages);
 
                 // Release from CPU store (rc--, free at rc=0).
-                self.cpu_stores[dev_idx].release(cpu_hashes);
+                self.cpu_stores[driver_idx].release(cpu_hashes);
 
                 // Remaining suffix (if any) needs replay.
                 let remaining = suffix_count - cpu_prefix;
                 if remaining > 0 {
-                    let replay_pages = self.gpu_stores[dev_idx].alloc(remaining)
+                    let replay_pages = self.gpu_stores[driver_idx]
+                        .alloc(remaining)
                         .ok_or_else(|| anyhow::anyhow!("No GPU pages for replay suffix"))?;
-                    self.spawn_replay_passes(ctx_id, dev_idx, prefix_len + cpu_prefix, replay_pages)?
+                    self.spawn_replay_passes(
+                        ctx_id,
+                        driver_idx,
+                        prefix_len + cpu_prefix,
+                        replay_pages,
+                    )?
                 } else {
                     // All suffix restored from CPU. Still need replay for working pages.
-                    self.spawn_replay_passes(ctx_id, dev_idx, committed_hashes.len(), Vec::new())?
+                    self.spawn_replay_passes(
+                        ctx_id,
+                        driver_idx,
+                        committed_hashes.len(),
+                        Vec::new(),
+                    )?
                 }
             } else {
                 // Cold restore: no CPU pages, allocate and replay everything.
-                let suffix_pages = self.gpu_stores[dev_idx].alloc(suffix_count)
-                    .ok_or_else(|| anyhow::anyhow!("No GPU pages for replay but admission check passed"))?;
-                self.spawn_replay_passes(ctx_id, dev_idx, prefix_len, suffix_pages)?
+                let suffix_pages =
+                    self.gpu_stores[driver_idx]
+                        .alloc(suffix_count)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("No GPU pages for replay but admission check passed")
+                        })?;
+                self.spawn_replay_passes(ctx_id, driver_idx, prefix_len, suffix_pages)?
             }
         } else {
             // No suffix to restore — only working pages need replay.
-            self.spawn_replay_passes(ctx_id, dev_idx, committed_hashes.len(), Vec::new())?
+            self.spawn_replay_passes(ctx_id, driver_idx, committed_hashes.len(), Vec::new())?
         };
 
         // Set context state.
@@ -182,7 +195,8 @@ impl ContextManager {
                 ctx.state = State::Active;
             }
             // Refresh cached effective_pages now that committed chain is on GPU.
-            ctx.cached_effective_pages = self.gpu_stores[dev_idx].effective_pages(&ctx.committed_hashes);
+            ctx.cached_effective_pages =
+                self.gpu_stores[driver_idx].effective_pages(&ctx.committed_hashes);
         }
 
         // If no replays needed, fire deferred ops immediately.
@@ -205,11 +219,13 @@ impl ContextManager {
     pub(crate) fn spawn_replay_passes(
         &mut self,
         ctx_id: ContextId,
-        dev_idx: usize,
+        driver_idx: usize,
         prefix_len: usize,
         suffix_pages: Vec<PhysicalPageId>,
     ) -> anyhow::Result<bool> {
-        let ctx = self.contexts.get(&ctx_id)
+        let ctx = self
+            .contexts
+            .get(&ctx_id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let lineage = ctx.lineage.clone();
         let committed_hashes = ctx.committed_hashes.clone();
@@ -227,13 +243,16 @@ impl ContextManager {
         let suffix_count = committed_len - prefix_len;
         if suffix_count > 0 {
             let suffix_hashes = &committed_hashes[prefix_len..];
-            anyhow::ensure!(suffix_pages.len() == suffix_count,
-                "suffix page count mismatch: got {}, need {suffix_count}", suffix_pages.len());
+            anyhow::ensure!(
+                suffix_pages.len() == suffix_count,
+                "suffix page count mismatch: got {}, need {suffix_count}",
+                suffix_pages.len()
+            );
             let suffix_phys = suffix_pages;
 
             // Register suffix pages in PageStore — navigate through the retained
             // prefix so the trie correctly chains the suffix as children.
-            self.gpu_stores[dev_idx].extend(
+            self.gpu_stores[driver_idx].extend(
                 &committed_hashes[..prefix_len],
                 suffix_hashes,
                 &suffix_phys,
@@ -241,20 +260,26 @@ impl ContextManager {
         }
 
         // Build the full physical page table (prefix + suffix).
-        let full_committed_phys = self.gpu_stores[dev_idx].physical_ids(&committed_hashes);
+        let full_committed_phys = self.gpu_stores[driver_idx].physical_ids(&committed_hashes);
 
         // Build forward pass requests from the lineage (for tokens/positions/masks).
         let prefix_tokens = prefix_len * page_size;
         let committed_tokens = committed_len * page_size;
         let mut kv_so_far = prefix_tokens as u32;
 
-        let mut requests: Vec<(ForwardPassRequest, Vec<PhysicalPageId>, u32)> = Vec::new();
+        let mut requests: Vec<(pie_bridge::ForwardRequest, Vec<PhysicalPageId>, u32)> = Vec::new();
         let mut token_offset = 0usize;
         let mut pages_emitted = prefix_len;
 
         for record in &lineage {
             match record {
-                Record::Fill { tokens, positions, mask, adapter, adapter_seed } => {
+                Record::Fill {
+                    tokens,
+                    positions,
+                    mask,
+                    adapter,
+                    adapter_seed,
+                } => {
                     let record_end = token_offset + tokens.len();
 
                     if record_end <= prefix_tokens {
@@ -286,29 +311,30 @@ impl ContextManager {
                     let num_input = aligned_len as u32;
                     let total_kv = kv_so_far + num_input;
                     let total_pages_for_fwd = phys_ids.len() as u32;
-                    let last_page_len = compute_last_page_len(total_kv, total_pages_for_fwd, page_size as u32);
+                    let last_page_len =
+                        compute_last_page_len(total_kv, total_pages_for_fwd, page_size as u32);
 
-                    let fwd_req = ForwardPassRequest {
-                        context_id: 0,
-                        tokens: suffix_tokens[..aligned_len].to_vec(),
-                        positions: suffix_positions[..aligned_len].to_vec(),
-                        speculative_tokens: Vec::new(),
-                        speculative_positions: Vec::new(),
-                        output_speculative_tokens: false,
-                        masks: suffix_masks[..aligned_len].to_vec(),
-                        // Replay reproduces a previously-executed prefix whose
-                        // masks were already in the lineage. We can't
-                        // distinguish user-supplied from synthesized in the
-                        // lineage, so we conservatively force the prefill
-                        // kernel (which honors `custom_mask`) to preserve the
-                        // original semantics regardless.
-                        has_user_mask: true,
-                        logit_mask: None,
-                        sampling_indices: Vec::new(),
-                        samplers: Vec::new(),
-                        adapter_id: *adapter,
-                        adapter_seed: *adapter_seed,
-                    };
+                    // Replay reproduces a previously-executed prefix whose
+                    // masks were already in the lineage. We can't
+                    // distinguish user-supplied from synthesized in the
+                    // lineage, so we conservatively force the prefill
+                    // kernel (which honors `custom_mask`) to preserve the
+                    // original semantics regardless.
+                    let fwd_req = crate::inference::request::new_per_request(
+                        0,
+                        suffix_tokens[..aligned_len].to_vec(),
+                        suffix_positions[..aligned_len].to_vec(),
+                        suffix_masks[..aligned_len].to_vec(),
+                        true, // has_user_mask
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                        *adapter,
+                        *adapter_seed,
+                    );
 
                     requests.push((fwd_req, phys_ids, last_page_len));
                     kv_so_far += num_input;
@@ -337,17 +363,30 @@ impl ContextManager {
                 }
 
                 // Try to merge into the last committed suffix request.
-                let merged = if let Some((last_req, last_phys, _last_page_len)) = requests.last_mut() {
-                    if last_req.adapter_id == adapter && last_req.adapter_seed == adapter_seed {
-                        last_req.tokens.extend_from_slice(&tokens);
-                        last_req.positions.extend_from_slice(&positions);
+                let adapter_i64 = adapter.map(|id| id as i64).unwrap_or(-1);
+                let adapter_seed_i64 = adapter_seed.unwrap_or(-1);
+                let merged = if let Some((last_req, last_phys, _last_page_len)) =
+                    requests.last_mut()
+                {
+                    let last_binding = &last_req.adapter_bindings[0];
+                    if last_binding.adapter_id == adapter_i64
+                        && last_binding.seed == adapter_seed_i64
+                    {
+                        // Extend tokens, positions, masks. Update per-request
+                        // indptr tails so the value stays a valid per-request
+                        // ForwardRequest.
+                        last_req.token_ids.extend_from_slice(&tokens);
+                        last_req.position_ids.extend_from_slice(&positions);
                         last_req.masks.extend_from_slice(&masks);
+                        *last_req.qo_indptr.last_mut().unwrap() = last_req.token_ids.len() as u32;
+                        *last_req.mask_indptr.last_mut().unwrap() = last_req.masks.len() as u32;
                         last_phys.extend_from_slice(&working_pages[..num_replay_pages]);
 
                         let num_input = num_replay_tokens as u32;
                         kv_so_far += num_input;
                         let total_pages_for_fwd = last_phys.len() as u32;
-                        *_last_page_len = compute_last_page_len(kv_so_far, total_pages_for_fwd, page_size as u32);
+                        *_last_page_len =
+                            compute_last_page_len(kv_so_far, total_pages_for_fwd, page_size as u32);
 
                         true
                     } else {
@@ -364,26 +403,27 @@ impl ContextManager {
                     let num_input = num_replay_tokens as u32;
                     let total_kv = kv_so_far + num_input;
                     let total_pages_for_fwd = phys_ids.len() as u32;
-                    let last_page_len = compute_last_page_len(total_kv, total_pages_for_fwd, page_size as u32);
+                    let last_page_len =
+                        compute_last_page_len(total_kv, total_pages_for_fwd, page_size as u32);
 
-                    let fwd_req = ForwardPassRequest {
-                        context_id: 0,
+                    // See restore.rs head: replay forces prefill kernel
+                    // because the lineage doesn't tell us whether masks
+                    // were originally user-supplied or synthesized.
+                    let fwd_req = crate::inference::request::new_per_request(
+                        0,
                         tokens,
                         positions,
-                        speculative_tokens: Vec::new(),
-                        speculative_positions: Vec::new(),
-                        output_speculative_tokens: false,
                         masks,
-                        // See restore.rs head: replay forces prefill kernel
-                        // because the lineage doesn't tell us whether masks
-                        // were originally user-supplied or synthesized.
-                        has_user_mask: true,
-                        logit_mask: None,
-                        sampling_indices: Vec::new(),
-                        samplers: Vec::new(),
-                        adapter_id: adapter,
+                        true, // has_user_mask
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                        adapter,
                         adapter_seed,
-                    };
+                    );
 
                     requests.push((fwd_req, phys_ids, last_page_len));
                 }
@@ -397,19 +437,26 @@ impl ContextManager {
         // Spawn a task that submits forward passes sequentially, then
         // sends ReplayComplete to unpin the context.
         let model_idx = self.model_idx;
-        let device_id = dev_idx;
+        let driver_id = driver_idx;
 
         tokio::spawn(async move {
             for (fwd_req, phys_ids, last_page_len) in requests {
                 let result = inference::submit(
-                    model_idx, fwd_req,
-                    device_id, phys_ids,
+                    model_idx,
+                    fwd_req,
+                    driver_id,
+                    phys_ids,
                     Vec::new(),
                     last_page_len,
-                ).await;
+                )
+                .await;
 
                 if let Err(e) = result {
-                    tracing::error!(ctx = ctx_id, device = device_id, "replay forward pass failed: {e:#}");
+                    tracing::error!(
+                        ctx = ctx_id,
+                        driver = driver_id,
+                        "replay forward pass failed: {e:#}"
+                    );
                     break; // Later chunks depend on this one's KV data
                 }
             }
@@ -424,16 +471,18 @@ impl ContextManager {
     /// Fire all of a context's deferred operations.
     /// Called when replay completes or when the context is restored without replay.
     pub(crate) fn fire_deferred_ops(&mut self, ctx_id: ContextId) {
-        let mut ops = self.contexts.get_mut(&ctx_id)
+        let mut ops = self
+            .contexts
+            .get_mut(&ctx_id)
             .map(|c| std::mem::take(&mut c.deferred_ops))
             .unwrap_or_default();
         while !ops.is_empty() {
             let num_pages = ops[0].num_pages;
-            let device = ops[0].device;
+            let driver_idx = ops[0].driver;
             if num_pages == 0 {
                 let op = ops.remove(0);
                 (op.on_alloc)(self, Vec::new());
-            } else if let Some(pages) = self.gpu_stores[device].alloc(num_pages) {
+            } else if let Some(pages) = self.gpu_stores[driver_idx].alloc(num_pages) {
                 let op = ops.remove(0);
                 (op.on_alloc)(self, pages);
             } else {

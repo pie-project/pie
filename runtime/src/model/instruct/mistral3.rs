@@ -9,16 +9,13 @@
 //!
 //! Reference: Mistral V3 Jinja chat template.
 
-use std::sync::Arc;
 use crate::inference::structured::grammar::Grammar;
-use crate::model::instruct::{
-    ChatDecoder,
-    Instruct,
-    ReasoningDecoder,
-    ToolDecoder, ToolEvent, ToolGrammar,
-};
 use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder};
+use crate::model::instruct::{
+    ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
+};
 use crate::model::tokenizer::Tokenizer;
+use std::sync::Arc;
 
 static TEMPLATE: &str = r#"
 {#- Default system message if no system prompt is passed. #}
@@ -132,7 +129,6 @@ static TEMPLATE: &str = r#"
 {%- endfor %}
 "#;
 
-
 // =============================================================================
 // MistralInstruct
 // =============================================================================
@@ -206,7 +202,7 @@ impl Instruct for MistralInstruct {
     }
 
     fn cue(&self) -> Vec<u32> {
-        Vec::new() 
+        Vec::new()
     }
 
     fn seal(&self) -> Vec<u32> {
@@ -232,7 +228,10 @@ impl Instruct for MistralInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
+        Box::new(GenericChatDecoder::new(
+            self.tokenizer.clone(),
+            self.stop_ids.clone(),
+        ))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
@@ -256,7 +255,8 @@ impl Instruct for MistralInstruct {
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
-                let name = parsed.get("function")
+                let name = parsed
+                    .get("function")
                     .and_then(|f| f.get("name"))
                     .or_else(|| parsed.get("name"))
                     .and_then(|n| n.as_str());
@@ -269,7 +269,7 @@ impl Instruct for MistralInstruct {
             return None;
         }
         let name_alt = names.join(" | ");
-        
+
         let grammar = format!(
             r#"root ::= tool-call+
 tool-call ::= "[TOOL_CALLS]" tool-name "[ARGS]" json-object
@@ -287,7 +287,10 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
             name_alt = name_alt
         );
         let parsed = Grammar::from_ebnf(&grammar, "root").ok()?;
-        Some(ToolGrammar { source: grammar, grammar: Arc::new(parsed) })
+        Some(ToolGrammar {
+            source: grammar,
+            grammar: Arc::new(parsed),
+        })
     }
 }
 
@@ -314,12 +317,13 @@ impl ToolDecoder for MistralToolDecoder {
     fn feed(&mut self, tokens: &[u32]) -> ToolEvent {
         let text = self.tokenizer.decode(tokens, false);
         self.accumulated.push_str(&text);
-        
+
         loop {
             match self.state {
                 ToolState::Outside => {
                     if let Some(pos) = self.accumulated.find("[TOOL_CALLS]") {
-                        self.accumulated = self.accumulated[pos + "[TOOL_CALLS]".len()..].to_string();
+                        self.accumulated =
+                            self.accumulated[pos + "[TOOL_CALLS]".len()..].to_string();
                         self.state = ToolState::InsideName;
                         continue;
                     }
@@ -342,20 +346,20 @@ impl ToolDecoder for MistralToolDecoder {
                 ToolState::InsideArgs => {
                     // Check for next marker
                     let mut end_pos = None;
-                    
+
                     if let Some(pos) = self.accumulated.find("[TOOL_CALLS]") {
                         end_pos = Some(pos);
                     } else if let Some(pos) = self.accumulated.find("</s>") {
-                         end_pos = Some(pos);
+                        end_pos = Some(pos);
                     }
 
                     if let Some(pos) = end_pos {
                         let args = self.accumulated[..pos].trim().to_string();
                         // Keep marker for next iteration/state check logic if needed.
-                        self.accumulated = self.accumulated[pos..].to_string(); 
-                        
+                        self.accumulated = self.accumulated[pos..].to_string();
+
                         if let Some(name) = self.current_name.take() {
-                            self.state = ToolState::Outside; 
+                            self.state = ToolState::Outside;
                             return ToolEvent::Call(name, args);
                         }
                     }
@@ -375,8 +379,8 @@ impl ToolDecoder for MistralToolDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::model::tokenizer::Tokenizer;
+    use std::sync::Arc;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
@@ -385,17 +389,40 @@ mod tests {
 
     fn mistral() -> MistralInstruct {
         let tok = make_tok(&[
-            "<s>", "</s>", " ",
-            "[INST]", "[/INST]",
-            "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]",
-            "[AVAILABLE_TOOLS]", "[/AVAILABLE_TOOLS]",
-            "[TOOL_CALLS]", "[ARGS]",
-            "[TOOL_RESULTS]", "[/TOOL_RESULTS]",
-            "Hello", "world",
-            "func", "{", "}", ":", "\"", "arg",
-            "name", "f", "Hi", "result", ",", "[", "]",
-            "INST", "SYSTEM_PROMPT", "AVAILABLE_TOOLS",
-            "TOOL_CALLS", "ARGS", "TOOL_RESULTS",
+            "<s>",
+            "</s>",
+            " ",
+            "[INST]",
+            "[/INST]",
+            "[SYSTEM_PROMPT]",
+            "[/SYSTEM_PROMPT]",
+            "[AVAILABLE_TOOLS]",
+            "[/AVAILABLE_TOOLS]",
+            "[TOOL_CALLS]",
+            "[ARGS]",
+            "[TOOL_RESULTS]",
+            "[/TOOL_RESULTS]",
+            "Hello",
+            "world",
+            "func",
+            "{",
+            "}",
+            ":",
+            "\"",
+            "arg",
+            "name",
+            "f",
+            "Hi",
+            "result",
+            ",",
+            "[",
+            "]",
+            "INST",
+            "SYSTEM_PROMPT",
+            "AVAILABLE_TOOLS",
+            "TOOL_CALLS",
+            "ARGS",
+            "TOOL_RESULTS",
             r#"[{"name":"f"}]"#, // Add complex token to handle non-splitting mock tokenizer
         ]);
         MistralInstruct::new(tok)
@@ -432,7 +459,7 @@ mod tests {
         let text = inst.tokenizer.decode(&tokens, false);
         assert_eq!(text, "[TOOL_RESULTS]result[/TOOL_RESULTS]");
     }
-    
+
     #[test]
     fn grammar_generation() {
         let inst = mistral();
@@ -465,7 +492,7 @@ mod tests {
     fn tool_decoder_parses_call() {
         let inst = mistral();
         let mut dec = inst.tool_decoder();
-        dec.feed(&[9]);  // [TOOL_CALLS]
+        dec.feed(&[9]); // [TOOL_CALLS]
         dec.feed(&[22]); // "f"
         dec.feed(&[10]); // [ARGS]
         let event = dec.feed(&[16, 17, 1]); // "{}" + "</s>"

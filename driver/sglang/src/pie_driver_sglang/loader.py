@@ -20,17 +20,14 @@ from typing import Any
 
 import torch
 
-from pie_driver_dev.config import RuntimeConfig
+from ._bridge.config import RuntimeConfig
 
 from .config import SGLangDriverConfig
 
 
-# Map pie's RuntimeConfig.activation_dtype (torch.dtype) to sglang's string form.
-_DTYPE_TO_STR = {
-    torch.bfloat16: "bfloat16",
-    torch.float16: "float16",
-    torch.float32: "float32",
-}
+# `RuntimeConfig.activation_dtype` is a string identifier; sglang accepts
+# the same vocabulary verbatim. This set gates the supported values.
+_SUPPORTED_DTYPES = {"bfloat16", "float16", "float32"}
 
 
 def _resolve_hf_snapshot_dir(hf_repo: str) -> str | None:
@@ -98,20 +95,20 @@ def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriver
     """
     from sglang.srt.server_args import ServerArgs
 
-    if config.activation_dtype not in _DTYPE_TO_STR:
+    if config.activation_dtype not in _SUPPORTED_DTYPES:
         raise ValueError(
             f"Unsupported activation_dtype for sglang driver: {config.activation_dtype}. "
-            f"Expected one of {list(_DTYPE_TO_STR)}."
+            f"Expected one of {sorted(_SUPPORTED_DTYPES)}."
         )
 
     # sglang's `device` is the device kind (cuda/cpu/...), not the index.
     # The index flows through `gpu_id` to ModelRunner.
-    device_kind = "cuda" if str(config.device).startswith("cuda") else str(config.device)
+    device_kind = "cuda" if config.device.startswith("cuda") else config.device
 
     server_kwargs = dict(
         model_path=config.hf_repo,
         skip_tokenizer_init=True,        # pie owns tokenization
-        dtype=_DTYPE_TO_STR[config.activation_dtype],
+        dtype=config.activation_dtype,
         device=device_kind,
         tp_size=config.tensor_parallel_size,
         random_seed=config.random_seed,
@@ -153,7 +150,7 @@ def load_sglang_model(
             log_queue.put({"message": msg, "level": level})
 
     # Pin the device for this rank.
-    device_str = str(config.device)
+    device_str = config.device
     if device_str.startswith("cuda"):
         torch.cuda.set_device(device_str)
         gpu_id = int(device_str.split(":")[1]) if ":" in device_str else 0

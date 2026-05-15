@@ -78,6 +78,11 @@ public:
 
     cublasHandle_t handle() const noexcept { return h_; }
     void set_stream(cudaStream_t s);
+    // Stream currently bound to the cublas handle. Used by per-arch
+    // forward bodies so their loose `<<<grid, block, 0, s>>>` kernel
+    // launches stay on the same stream as cublas — required for CUDA
+    // graph capture to record every kernel.
+    cudaStream_t stream() const noexcept;
 
 private:
     cublasHandle_t h_ = nullptr;

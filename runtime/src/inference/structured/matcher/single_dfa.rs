@@ -128,8 +128,11 @@ impl SingleDfaEngine {
 
         if need_trie_walk {
             self.fill_bitmask_trie_walk(
-                compiled, tokenizer_info, bitmask,
-                scratch_stack, scratch_prefix,
+                compiled,
+                tokenizer_info,
+                bitmask,
+                scratch_stack,
+                scratch_prefix,
             );
         }
 

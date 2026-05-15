@@ -73,14 +73,12 @@ pub fn manifest_url(registry_url: &str, name: &ProgramName) -> String {
 impl Manifest {
     /// Parse a manifest from TOML content string.
     pub fn parse(content: &str) -> Result<Self> {
-        toml::from_str(content)
-            .map_err(|e| anyhow!("Failed to parse manifest TOML: {}", e))
+        toml::from_str(content).map_err(|e| anyhow!("Failed to parse manifest TOML: {}", e))
     }
 
     /// Serialize manifest to TOML string.
     pub fn to_toml(&self) -> Result<String> {
-        toml::to_string_pretty(self)
-            .map_err(|e| anyhow!("Failed to serialize manifest: {}", e))
+        toml::to_string_pretty(self).map_err(|e| anyhow!("Failed to serialize manifest: {}", e))
     }
 
     /// Get program name (name + version).
@@ -111,9 +109,9 @@ impl Manifest {
     pub async fn from_url(registry_url: &str, name: &ProgramName) -> Result<Self> {
         let url = manifest_url(registry_url, name);
 
-        let response = reqwest::get(&url).await.map_err(|e| {
-            anyhow!("Failed to fetch manifest from {}: {}", url, e)
-        })?;
+        let response = reqwest::get(&url)
+            .await
+            .map_err(|e| anyhow!("Failed to fetch manifest from {}: {}", url, e))?;
 
         if !response.status().is_success() {
             bail!(
@@ -123,9 +121,10 @@ impl Manifest {
             );
         }
 
-        let manifest_content = response.text().await.map_err(|e| {
-            anyhow!("Failed to read manifest response: {}", e)
-        })?;
+        let manifest_content = response
+            .text()
+            .await
+            .map_err(|e| anyhow!("Failed to read manifest response: {}", e))?;
 
         Self::parse(&manifest_content)
     }
@@ -161,30 +160,36 @@ bar = "0.2.0"
     #[test]
     fn test_parse_canonical_manifest() {
         let manifest = Manifest::parse(CANONICAL_MANIFEST).unwrap();
-        
+
         assert_eq!(manifest.package.name, "text-completion");
         assert_eq!(manifest.package.version, "0.1.0");
-        assert_eq!(manifest.package.description, Some("Text completion inferlet".to_string()));
+        assert_eq!(
+            manifest.package.description,
+            Some("Text completion inferlet".to_string())
+        );
         assert_eq!(manifest.package.authors, vec!["Alice <alice@example.com>"]);
-        assert_eq!(manifest.package.repository, Some("https://github.com/pie-project/pie".to_string()));
+        assert_eq!(
+            manifest.package.repository,
+            Some("https://github.com/pie-project/pie".to_string())
+        );
         assert_eq!(manifest.package.readme, Some("README.md".to_string()));
-        
+
         assert_eq!(manifest.runtime.get("core"), Some(&"0.2.0".to_string()));
         assert_eq!(manifest.runtime.get("mcp"), Some(&"0.2.0".to_string()));
-        
+
         assert_eq!(manifest.parameters.len(), 3);
         assert!(manifest.parameters.contains_key("prompt"));
         assert!(manifest.parameters.contains_key("max_tokens"));
         assert!(manifest.parameters.contains_key("temperature"));
-        
+
         let prompt = &manifest.parameters["prompt"];
         assert_eq!(prompt.param_type, ParameterType::String);
         assert!(!prompt.optional);
-        
+
         let max_tokens = &manifest.parameters["max_tokens"];
         assert_eq!(max_tokens.param_type, ParameterType::Int);
         assert!(max_tokens.optional);
-        
+
         assert_eq!(manifest.dependencies.len(), 2);
         assert_eq!(manifest.dependencies.get("foo"), Some(&"0.1.0".to_string()));
         assert_eq!(manifest.dependencies.get("bar"), Some(&"0.2.0".to_string()));
@@ -198,7 +203,7 @@ name = "minimal"
 version = "1.0.0"
 "#;
         let manifest = Manifest::parse(minimal).unwrap();
-        
+
         assert_eq!(manifest.package.name, "minimal");
         assert_eq!(manifest.package.version, "1.0.0");
         assert!(manifest.package.description.is_none());
@@ -213,7 +218,7 @@ version = "1.0.0"
         let manifest = Manifest::parse(CANONICAL_MANIFEST).unwrap();
         let serialized = manifest.to_toml().unwrap();
         let reparsed = Manifest::parse(&serialized).unwrap();
-        
+
         // With PartialEq, we can assert full equality
         assert_eq!(manifest, reparsed);
     }
@@ -222,7 +227,7 @@ version = "1.0.0"
     fn test_program_name() {
         let manifest = Manifest::parse(CANONICAL_MANIFEST).unwrap();
         let name = manifest.program_name();
-        
+
         assert_eq!(name.name, "text-completion");
         assert_eq!(name.version, "0.1.0");
     }
@@ -231,7 +236,7 @@ version = "1.0.0"
     fn test_dependency_names() {
         let manifest = Manifest::parse(CANONICAL_MANIFEST).unwrap();
         let deps = manifest.dependency_names();
-        
+
         assert_eq!(deps.len(), 2);
         assert!(deps.iter().any(|d| d.name == "foo" && d.version == "0.1.0"));
         assert!(deps.iter().any(|d| d.name == "bar" && d.version == "0.2.0"));

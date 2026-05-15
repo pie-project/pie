@@ -154,13 +154,17 @@ impl PublicKey {
                 let point_bytes = ecdsa_public.as_ref();
                 let public_key = p256::PublicKey::from_sec1_bytes(point_bytes)
                     .map_err(|e| anyhow::anyhow!("Invalid P-256 public key: {e}"))?;
-                Ok(Self::EcdsaP256(p256::ecdsa::VerifyingKey::from(&public_key)))
+                Ok(Self::EcdsaP256(p256::ecdsa::VerifyingKey::from(
+                    &public_key,
+                )))
             }
             EcdsaCurve::NistP384 => {
                 let point_bytes = ecdsa_public.as_ref();
                 let public_key = p384::PublicKey::from_sec1_bytes(point_bytes)
                     .map_err(|e| anyhow::anyhow!("Invalid P-384 public key: {e}"))?;
-                Ok(Self::EcdsaP384(p384::ecdsa::VerifyingKey::from(&public_key)))
+                Ok(Self::EcdsaP384(p384::ecdsa::VerifyingKey::from(
+                    &public_key,
+                )))
             }
             EcdsaCurve::NistP521 => {
                 bail!("ECDSA P-521 curve is not supported")
@@ -221,8 +225,7 @@ impl PublicKey {
                 use rsa::pkcs1v15::Signature;
                 let verifying_key =
                     rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(rsa_key.clone());
-                let sig = Signature::try_from(signature)
-                    .context("Invalid RSA signature format")?;
+                let sig = Signature::try_from(signature).context("Invalid RSA signature format")?;
                 RsaVerifier::verify(&verifying_key, message, &sig)
                     .map_err(|_| anyhow::anyhow!("RSA signature verification failed"))
             }
@@ -269,8 +272,7 @@ mod tests {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
         let verifying_key = signing_key.verifying_key();
         let ssh_ed25519 =
-            ssh_key::public::Ed25519PublicKey::try_from(verifying_key.as_bytes().as_ref())
-                .unwrap();
+            ssh_key::public::Ed25519PublicKey::try_from(verifying_key.as_bytes().as_ref()).unwrap();
         let ssh_pub = SshPublicKey::from(ssh_ed25519);
         (signing_key, ssh_pub.to_openssh().unwrap())
     }

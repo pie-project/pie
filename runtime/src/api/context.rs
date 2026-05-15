@@ -40,7 +40,11 @@ impl pie::core::context::HostContext for InstanceState {
 
         match context::create(model_id, process_id).await {
             Ok(context_id) => {
-                let ctx = Context { context_id, model_id, spec: OnceLock::new() };
+                let ctx = Context {
+                    context_id,
+                    model_id,
+                    spec: OnceLock::new(),
+                };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -63,7 +67,11 @@ impl pie::core::context::HostContext for InstanceState {
         };
         match context::fork(model_id, snapshot_id, process_id).await {
             Ok(context_id) => {
-                let ctx = Context { context_id, model_id, spec: OnceLock::new() };
+                let ctx = Context {
+                    context_id,
+                    model_id,
+                    spec: OnceLock::new(),
+                };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -82,18 +90,18 @@ impl pie::core::context::HostContext for InstanceState {
 
         match context::take(model_id, username, name, process_id).await {
             Ok(context_id) => {
-                let ctx = Context { context_id, model_id, spec: OnceLock::new() };
+                let ctx = Context {
+                    context_id,
+                    model_id,
+                    spec: OnceLock::new(),
+                };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
         }
     }
 
-    async fn delete(
-        &mut self,
-        model: Resource<Model>,
-        name: String,
-    ) -> Result<Result<(), String>> {
+    async fn delete(&mut self, model: Resource<Model>, name: String) -> Result<Result<(), String>> {
         let model = self.ctx().table.get(&model)?;
         let model_id = model.model_id;
         let username = self.get_username();
@@ -104,10 +112,7 @@ impl pie::core::context::HostContext for InstanceState {
         }
     }
 
-    async fn fork(
-        &mut self,
-        this: Resource<Context>,
-    ) -> Result<Result<Resource<Context>, String>> {
+    async fn fork(&mut self, this: Resource<Context>) -> Result<Result<Resource<Context>, String>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
@@ -115,18 +120,18 @@ impl pie::core::context::HostContext for InstanceState {
 
         match context::fork(model_id, context_id, process_id).await {
             Ok(new_context_id) => {
-                let new_ctx = Context { context_id: new_context_id, model_id, spec: OnceLock::new() };
+                let new_ctx = Context {
+                    context_id: new_context_id,
+                    model_id,
+                    spec: OnceLock::new(),
+                };
                 Ok(Ok(self.ctx().table.push(new_ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
         }
     }
 
-    async fn save(
-        &mut self,
-        this: Resource<Context>,
-        name: String,
-    ) -> Result<Result<(), String>> {
+    async fn save(&mut self, this: Resource<Context>, name: String) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
@@ -138,10 +143,7 @@ impl pie::core::context::HostContext for InstanceState {
         }
     }
 
-    async fn snapshot(
-        &mut self,
-        this: Resource<Context>,
-    ) -> Result<Result<String, String>> {
+    async fn snapshot(&mut self, this: Resource<Context>) -> Result<Result<String, String>> {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
@@ -198,7 +200,10 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = ctx.model_id;
 
         if let Some(m) = crate::model::get_model(model_id) {
-            let model = Model { model_id, model: m.clone() };
+            let model = Model {
+                model_id,
+                model: m.clone(),
+            };
             return Ok(self.ctx().table.push(model)?);
         }
 
@@ -221,7 +226,8 @@ impl pie::core::context::HostContext for InstanceState {
         num_pages: u32,
     ) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
-        match context::commit_working_pages(ctx.model_id, ctx.context_id, num_pages as usize).await {
+        match context::commit_working_pages(ctx.model_id, ctx.context_id, num_pages as usize).await
+        {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
@@ -233,13 +239,18 @@ impl pie::core::context::HostContext for InstanceState {
         num_pages: u32,
     ) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
-        match context::reserve_working_pages(ctx.model_id, ctx.context_id, num_pages as usize).await {
+        match context::reserve_working_pages(ctx.model_id, ctx.context_id, num_pages as usize).await
+        {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
     }
 
-    async fn release_working_pages(&mut self, this: Resource<Context>, num_pages: u32) -> Result<()> {
+    async fn release_working_pages(
+        &mut self,
+        this: Resource<Context>,
+        num_pages: u32,
+    ) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         context::release_working_pages(ctx.model_id, ctx.context_id, num_pages as usize)?;
         Ok(())
@@ -247,10 +258,17 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn working_page_token_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::working_page_token_count(ctx.model_id, ctx.context_id))
+        Ok(context::working_page_token_count(
+            ctx.model_id,
+            ctx.context_id,
+        ))
     }
 
-    async fn truncate_working_page_tokens(&mut self, this: Resource<Context>, num_tokens: u32) -> Result<()> {
+    async fn truncate_working_page_tokens(
+        &mut self,
+        this: Resource<Context>,
+        num_tokens: u32,
+    ) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
         let current = context::working_page_token_count(ctx.model_id, ctx.context_id);
         let new_count = current.saturating_sub(num_tokens);
@@ -258,10 +276,7 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(())
     }
 
-    async fn suspend(
-        &mut self,
-        this: Resource<Context>,
-    ) -> Result<Result<(), String>> {
+    async fn suspend(&mut self, this: Resource<Context>) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
         let (model_id, context_id) = (ctx.model_id, ctx.context_id);
         // Eviction safety: drop the speculation chain BEFORE the

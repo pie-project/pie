@@ -2,132 +2,239 @@
 //!
 //! Three policies live here, in order of increasing patience:
 //!
-//!   - `GreedyPolicy`   — fire immediately, zero state.
-//!   - `EagerPolicy`    — cohort cap (`pinned_count`) + `last_latency`
-//!                        safety bound, no GPU-busy gate.
-//!   - `AdaptivePolicy` — hot-cohort fast path on top of the eager
-//!                        firing rule, plus a GPU-busy gate. Default.
+//!   - `GreedyPolicy` — fire immediately, zero waiting.
+//!   - `EagerPolicy` — wait for the *peer cohort* to gather, then fire
+//!     even if the GPU is still finishing the previous batch (the
+//!     scheduler's semaphore handles GPU contention).
+//!   - `AdaptivePolicy` (default) — wait for the peer cohort *and* the
+//!     GPU before firing. Kept in `Wait` while the GPU is busy so
+//!     incoming arrivals during decode keep growing the next batch.
 //!
-//! Selection via the per-model `[model.scheduler].batch_policy` field
-//! in TOML (default = `adaptive`). The validator in `server/config.rs`
-//! restricts the value to one of `adaptive | eager | greedy`, so the
-//! selector below panics on anything else (defense-in-depth — the
-//! string never reaches it unless config validation is bypassed).
+//! Selection via the per-model `[model.scheduler].policy` field in
+//! the TOML config (default = `adaptive`). The other two are retained
+//! as references: greedy for sanity-checking the scheduler itself,
+//! eager as a slightly simpler alternative that's marginally faster
+//! in pure steady-state and marginally slower under bursty / churning
+//! workloads.
 //!
-//! ## Why `AdaptivePolicy` is a hybrid
+//! ## Design history (why these are what they are)
 //!
-//! It combines two signals:
+//! Pie performs **iteration-level batching**: each in-flight context
+//! re-submits a forward-pass request after every token. The scheduler
+//! accumulates these into a batch and the policy decides when to fire.
 //!
-//!   - **Hot drain** (the just-fired cohort has re-queued) — fast
-//!     path when most pinned ctxs ARE the previously-fired cohort.
-//!     A clean drain says "everyone we expect to be here, is here".
-//!   - **Pinned-count cap** (`B >= pinned_count(device)`) — the
-//!     fallback when the hot cohort is a small subset of pinned
-//!     ctxs (e.g., a few fast ctxs cycling while many slow ones are
-//!     mid-WASM). Without this gate, the hot cohort would re-cycle
-//!     a tiny batch indefinitely while the cold tail keeps missing
-//!     the train.
+//! An earlier version of this file used `AdaptiveThroughputPolicy`,
+//! which fired when `idle > ref_l/B` (where `ref_l` was a leaky-max
+//! of observed batch latencies, decayed by `0.9999` per batch). The
+//! intuition was: bigger batches need shorter waits because they're
+//! already "full enough". That policy had three failure modes that
+//! showed up clearly under benchmark:
 //!
-//! When the hot cohort drains but `B < pinned_count`, we wait up to
-//! `last_latency` for the rest — the same budget Eager uses. When
-//! the hot cohort can't drain at all (some ctxs got terminated or
-//! stuck mid-CPU), the `hot_window` (default 5 ms, env-tunable via
-//! `PIE_HOT_WINDOW_MS`) safety bound fires.
+//!   1. **Low-RPS over-wait.** With a single in-flight context, B=1
+//!      and `ref_l/B = ref_l`. The 50 ms `max_wait_time` cap fires
+//!      the batch every iteration, paying ~50 ms of pure waiting per
+//!      token. Per-request latency at RPS=1 was ~3× a no-wait
+//!      baseline.
+//!
+//!   2. **Idle-phase pathology under churn.** `ref_l` is a max-ratchet,
+//!      so once a high-RPS phase elevates it, decay is glacial
+//!      (half-life ~7000 batches). A subsequent idle phase still has
+//!      `ref_l` at the old peak, so every B=1 batch waits its full
+//!      50 ms cap. Idle-phase p50 of 995 ms vs 541 ms for the new
+//!      policy under a 0.5↔64 RPS churn pattern.
+//!
+//!   3. **Premature mid-burst fire.** As B ramps up during peer
+//!      accumulation, `ref_l/B` shrinks aggressively. A 0.5 ms gap
+//!      between two peer arrivals at B=4 trips `idle > ref_l/B` and
+//!      the batch fires fragmented (`B=4` fired with `pinned=13` in
+//!      instrumented runs). Stragglers go in the next batch and pay
+//!      an extra full iteration of latency.
+//!
+//! Several intermediate fixes were tried — adding a "cohort cap"
+//! (`B >= pinned_count → fire`), faster `DECAY`, idle-based grace
+//! periods, λ-tracking — and the path through them led to the
+//! present design, which is **simpler than any intermediate**:
+//!
+//!   - The cohort cap alone fixes (1) and (2).
+//!   - Removing the `idle > ref_l/B` rule entirely fixes (3).
+//!   - That removal also drops the need for `DECAY` smoothing,
+//!     since the latency value is no longer used as a
+//!     sensitivity-amplified budget.
+//!
+//! That cohort-cap-plus-bound design is `EagerPolicy` below. Adding
+//! a GPU-busy gate on top — keeping the policy in `Wait` while the
+//! driver is occupied — yields `AdaptivePolicy`. The gate has a small
+//! consistent benefit under churn (~20 ms p50 improvement on average,
+//! up to ~50 ms on saturated bursts) at the cost of a similarly small
+//! steady-state regression. Promoted to default because the workloads
+//! Pie targets are bursty.
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use super::scheduler::{Decision, SchedulingPolicy};
 
 // =============================================================================
-// AdaptivePolicy — default. Hot drain + pinned_count cap + GPU-busy gate.
+// AdaptivePolicy — the default. Cohort cap + GPU-busy gate + safety bound.
 // =============================================================================
 //
-// Firing rule (in evaluation order):
+// **Firing rule** (in evaluation order):
 //
-//   1. `B >= max_batch_size`                       — structural device limit.
-//   2. `last_latency == 0`                         — cold start; fire to make
-//                                                    progress.
-//   3. `in_flight`                                 — GPU occupied; wait. The
-//                                                    scheduler's tokio::select
-//                                                    wakes us on completion.
-//   4. `pending_hot.is_empty()` AND
-//      (`pinned_count == 0` OR `B >= pinned_count`)
-//                                                  — hot cohort drained AND
-//                                                    every pinned ctx is in
-//                                                    the batch; fire.
-//   5. `pending_hot.is_empty()` AND
-//      `elapsed >= last_latency`                   — adaptive safety bound;
-//                                                    cold tail isn't coming.
-//   6. `!pending_hot.is_empty()` AND
-//      `elapsed >= hot_window`                     — hot safety bound; some hot
-//                                                    ctx is stuck/terminated.
-//   otherwise: `Wait(remaining budget)`.
+//   1. `B >= max_batch_size`              — structural driver limit.
+//   2. `last_latency == 0`                — cold start, no measurement
+//                                           yet; fire to make progress.
+//   3. `in_flight`                        — GPU is occupied by the
+//                                           previous batch. Wait.
+//                                           Arrivals during the wait
+//                                           grow this batch.
+//   4. `B >= pinned_count(driver_idx)`        — every active peer is in
+//                                           the batch (cohort cap).
+//                                           Fire.
+//   5. `start.elapsed() >= last_latency`  — safety bound. Waiting
+//                                           longer than one batch's
+//                                           compute time costs more
+//                                           in queue delay than any
+//                                           plausible saving from a
+//                                           larger batch.
+//   otherwise: `Wait(last_latency - start.elapsed())`
 //
-// The `pinned_count == 0` clause in step 4 is a defensive "no info,
-// fire" path: covers the brief window where ctxs unpin between
-// batches, and lets the unit tests (which don't go through the real
-// pin() path) exercise the hot-drain logic.
+// Conditions (3)–(5) all act as wait gates: we fire only when the
+// GPU is free *and* either the cohort is full or the safety bound
+// has elapsed.
+//
+// **Why the cohort cap is load-bearing.** In iteration-level
+// batching, `pinned_count(driver_idx)` is the count of currently-active
+// contexts on that driver. After a batch fires, every one of those
+// contexts will eventually submit its next forward-pass request.
+// Once we have all of them in the accumulator (`B == pinned_count`),
+// waiting longer can't produce a bigger batch from existing peers —
+// it can only catch brand-new contexts that pin during the wait. At
+// realistic Poisson arrival rates that's rarely worth one extra
+// batch's worth of delay for the existing peers. So: fire.
+//
+// `pinned_count` over-counts if a peer's inferlet is mid-CPU-work
+// (pinned but not currently submitting). The safety bound is the
+// fallback for that case.
+//
+// **Why the GPU-busy gate (vs `EagerPolicy`).** Without the gate,
+// the cohort-full condition can fire while the previous batch is
+// still on the driver. The scheduler then enters its `Fire` branch
+// and blocks on `acquire_owned().await` for the in-flight permit.
+// During that block the scheduler stops draining the request
+// channel, so any arrivals queued during that window fall into the
+// *next* batch. With the gate, the policy stays in `Wait` until the
+// GPU is free; the scheduler's `tokio::select` keeps absorbing
+// arrivals into the *current* batch right up to the moment of fire.
+//
+// **Why `last_latency` (not `ref_l` with smoothing).** The original
+// policy used a leaky-max of recent batch latencies. The smoothing
+// served two purposes: (a) damping spikes, (b) preventing a death
+// spiral where a single small batch shrinks the budget so far that
+// all subsequent batches are also small. With the cohort cap as the
+// primary fire mechanism, neither problem materializes:
+//
+//   - The bound only fires when `B < pinned_count` — i.e., when
+//     peers are stuck. In that regime, firing fast IS correct;
+//     there's nothing to wait for.
+//   - When the bound *does* fire, the resulting batch's actual
+//     decode time becomes the next `last_latency`. The value
+//     re-calibrates within 1–2 batches.
+//
+// Empirically validated under: steady RPS sweeps {1,4,16,64},
+// symmetric churn (32↔1), severe idle↔burst churn (0.5↔64), and
+// rapid 2-second bursts. No spiral or runaway observed.
 
 pub(super) struct AdaptivePolicy {
     max_batch_size: usize,
-    device_idx: usize,
-    /// Contexts in the previously-fired batch that haven't re-queued
-    /// yet. Drained by `on_arrival`.
-    pending_hot: HashSet<u64>,
-    /// Safety bound for waiting on the hot drain (default 5 ms).
-    hot_window: Duration,
-    /// `Some(t)` while a batch is accumulating; `None` after fire.
+    /// Index of the driver this policy is scheduling for. Used to
+    /// read `pinned_count` (lock-free atomic, updated on context
+    /// pin/unpin).
+    driver_idx: usize,
+    /// `Some(t)` while a batch is accumulating; `None` after fire
+    /// and before the next first arrival.
     batch_start_time: Option<Instant>,
     /// Most recent batch's compute time, in seconds. Updated on
-    /// `on_complete`. Zero until the second batch completes (the
-    /// first is skipped due to CUDA/warmup overhead).
+    /// `on_complete`. Used as the absolute upper bound on how long
+    /// to wait when `B < pinned_count`. Zero until the second batch
+    /// completes (the first is skipped due to CUDA/warmup overhead).
     last_latency: f64,
+    /// Total batches the policy has seen complete. Used to skip the
+    /// first batch's `on_complete` (warmup latency is
+    /// unrepresentative).
     batches_completed: usize,
-    /// Set in `on_fired`, cleared in `on_complete`.
+    /// Set in `on_fired` and cleared in `on_complete` — true while
+    /// the driver is executing a batch.
     in_flight: bool,
+    /// Maximum `pinned_count` observed since the last fire. The cohort
+    /// cap uses this instead of the instantaneous `pinned_count` so a
+    /// transient drop — every inferlet calls `unpin()` immediately
+    /// after its forward returns and `pin()` again before the next
+    /// step, so `pinned_count` briefly goes through every value in
+    /// `[0, R]` between fires — doesn't cause us to fire with a
+    /// partial cohort. Reset on `on_fired`. Effective only while
+    /// `in_flight == false` (when we're accumulating the next batch).
+    cohort_high_water: usize,
+    /// Highest batch size that has fired since the policy was created.
+    /// Used as the cohort target so the scheduler waits for the
+    /// expected steady-state cohort to assemble even when the first
+    /// inferlet to arrive happens to be the one that just re-pinned
+    /// (a race vs the other 7+ inferlets still going through their
+    /// post-fire CPU step). Without this, the cohort cap fires at
+    /// B=1 because `pinned_count == 1` at that exact moment. Persists
+    /// across fires; only ratchets upward.
+    fired_high_water: usize,
 }
 
 impl AdaptivePolicy {
-    pub fn new(max_batch_size: usize, device_idx: usize, hot_window: Duration) -> Self {
+    pub fn new(max_batch_size: usize, driver_idx: usize) -> Self {
         Self {
             max_batch_size,
-            device_idx,
-            pending_hot: HashSet::new(),
-            hot_window,
+            driver_idx,
             batch_start_time: None,
             last_latency: 0.0,
             batches_completed: 0,
             in_flight: false,
+            cohort_high_water: 0,
+            fired_high_water: 0,
         }
     }
 }
 
 impl SchedulingPolicy for AdaptivePolicy {
-    fn on_arrival(&mut self, ctx_id: u64) {
+    fn on_arrival(&mut self) {
         if self.batch_start_time.is_none() {
             self.batch_start_time = Some(Instant::now());
         }
-        self.pending_hot.remove(&ctx_id);
     }
 
     fn on_complete(&mut self, latency: Duration) {
         self.batches_completed += 1;
+        // Skip the first batch: CUDA graph capture, kernel-cache
+        // warmup, and one-shot allocations make its latency
+        // unrepresentative of steady-state. After that, just take
+        // the latest value — no smoothing, no decay.
         if self.batches_completed > 1 {
             self.last_latency = latency.as_secs_f64();
         }
         self.in_flight = false;
     }
 
-    fn on_fired(&mut self, fired_ctx_ids: &[u64]) {
+    fn on_fired(&mut self, fired_size: usize) {
         self.batch_start_time = None;
         self.in_flight = true;
-        self.pending_hot.clear();
-        self.pending_hot.extend(fired_ctx_ids.iter().copied());
+        // Reset per-batch high-water; next batch starts fresh.
+        self.cohort_high_water = 0;
+        // Ratchet the persistent fired-cohort estimate. Once we've
+        // seen a fire at B=R, future fires should aim for at least R
+        // before tripping the cohort cap. This counters the race
+        // described on `fired_high_water` above.
+        if fired_size > self.fired_high_water {
+            self.fired_high_water = fired_size;
+        }
     }
 
-    fn decide(&self, current_batch_size: usize) -> Decision {
-        // (1) Structural cap.
+    fn decide(&mut self, current_batch_size: usize) -> Decision {
+        // (1) Structural cap. Always fires, even when in_flight,
+        //     because the batch can't grow further.
         if current_batch_size >= self.max_batch_size {
             return Decision::Fire;
         }
@@ -135,76 +242,88 @@ impl SchedulingPolicy for AdaptivePolicy {
         if self.last_latency == 0.0 {
             return Decision::Fire;
         }
-        // (3) GPU-busy gate. Park until on_complete wakes us via
-        //     the scheduler's tokio::select.
+        // (3) GPU-busy gate. While the GPU is occupied, never fire
+        //     — let the scheduler stay in its Wait branch and keep
+        //     growing this batch with incoming requests.
         if self.in_flight {
-            return Decision::Wait(Duration::MAX);
+            return Decision::Wait(Duration::from_secs(60));
         }
-
-        let elapsed = self
-            .batch_start_time
-            .map(|t| t.elapsed())
-            .unwrap_or_default();
-        let last = Duration::from_secs_f64(self.last_latency);
-
-        if self.pending_hot.is_empty() {
-            // Hot cohort drained (or never existed). Fall back to
-            // pinned-count cohort cap + last_latency safety bound.
-            let active = crate::context::pinned_count(self.device_idx);
-            if active == 0 || current_batch_size >= active {
-                return Decision::Fire;
-            }
-            if elapsed >= last {
-                return Decision::Fire;
-            }
-            return Decision::Wait(last - elapsed);
+        // GPU is free below this point.
+        // (4) Cohort cap. The target is `max(this-batch high-water,
+        //     last fired R)`:
+        //   - The per-batch high-water absorbs the case where the
+        //     pinned_count climbs through intermediate values as
+        //     inferlets re-pin between fires.
+        //   - `fired_high_water` is the running max across all prior
+        //     fires; it stops us from firing a partial batch when the
+        //     FIRST inferlet to re-pin wins the race against the
+        //     other 7+ inferlets still finishing their post-fire CPU
+        //     step. Without it, `B = pinned_count = 1` at that moment
+        //     trips the cap and we fire at B=1.
+        let active = crate::context::pinned_count(self.driver_idx);
+        if active > self.cohort_high_water {
+            self.cohort_high_water = active;
         }
-
-        // Hot cohort still draining. Bounded by hot_window.
-        if elapsed >= self.hot_window {
+        let target = self.cohort_high_water.max(self.fired_high_water);
+        if target > 0 && current_batch_size >= target {
             return Decision::Fire;
         }
-        Decision::Wait(self.hot_window - elapsed)
+        // (5) Safety bound — never wait longer than one previous
+        //     batch's compute time.
+        let Some(start) = self.batch_start_time else {
+            // Defensive: batch_start_time should always be Some when
+            // decide is called (set on first on_arrival).
+            return Decision::Fire;
+        };
+        let elapsed = start.elapsed().as_secs_f64();
+        if elapsed >= self.last_latency {
+            return Decision::Fire;
+        }
+        Decision::Wait(Duration::from_secs_f64(self.last_latency - elapsed))
     }
 }
 
 // =============================================================================
-// EagerPolicy — cohort cap (`pinned_count`) + safety bound, no GPU-busy gate.
+// EagerPolicy — cohort cap + safety bound, no GPU-busy gate.
 // =============================================================================
 //
-// Same firing logic as `AdaptivePolicy` minus the hot-cohort drain
-// signal AND the GPU-busy gate: fires as soon as the cohort is full
-// or the latency budget elapses, even mid-flight. The scheduler's
-// semaphore handles GPU contention by blocking in the `Fire` branch.
+// Same firing logic as `AdaptivePolicy` minus the GPU-busy gate:
+// fires as soon as the cohort is ready, even if the previous batch
+// is still on the driver. The scheduler's semaphore handles GPU
+// contention by blocking in the `Fire` branch.
 //
-// Slightly faster in pure steady-state (no GPU-busy waiting overhead,
-// no hot-cohort hysteresis), slightly slower under churn — because
-// arrivals during the semaphore-acquire fall into the next batch
-// rather than the current one. Use when your workload skews
-// steady-state rather than bursty.
+// Slightly faster than `AdaptivePolicy` in pure steady-state (no
+// GPU-busy waiting overhead, ~10 ms p50 improvement at
+// RPS={1,4,16,64}), slightly slower under churn (~20 ms p50
+// degradation on average, up to ~50 ms on saturated bursts —
+// because arrivals during the semaphore-acquire fall into the next
+// batch instead of the current one). Use this if your workload
+// skews steady-state rather than bursty.
 
 pub(super) struct EagerPolicy {
     max_batch_size: usize,
-    device_idx: usize,
+    driver_idx: usize,
     batch_start_time: Option<Instant>,
     last_latency: f64,
     batches_completed: usize,
+    cohort_high_water: usize,
 }
 
 impl EagerPolicy {
-    pub fn new(max_batch_size: usize, device_idx: usize) -> Self {
+    pub fn new(max_batch_size: usize, driver_idx: usize) -> Self {
         Self {
             max_batch_size,
-            device_idx,
+            driver_idx,
             batch_start_time: None,
             last_latency: 0.0,
             batches_completed: 0,
+            cohort_high_water: 0,
         }
     }
 }
 
 impl SchedulingPolicy for EagerPolicy {
-    fn on_arrival(&mut self, _ctx_id: u64) {
+    fn on_arrival(&mut self) {
         if self.batch_start_time.is_none() {
             self.batch_start_time = Some(Instant::now());
         }
@@ -217,16 +336,21 @@ impl SchedulingPolicy for EagerPolicy {
         }
     }
 
-    fn on_fired(&mut self, _fired_ctx_ids: &[u64]) {
+    fn on_fired(&mut self, _fired_size: usize) {
         self.batch_start_time = None;
+        self.cohort_high_water = 0;
     }
 
-    fn decide(&self, current_batch_size: usize) -> Decision {
+    fn decide(&mut self, current_batch_size: usize) -> Decision {
         if current_batch_size >= self.max_batch_size {
             return Decision::Fire;
         }
-        let active = crate::context::pinned_count(self.device_idx);
-        if active > 0 && current_batch_size >= active {
+        let active = crate::context::pinned_count(self.driver_idx);
+        if active > self.cohort_high_water {
+            self.cohort_high_water = active;
+        }
+        let target = self.cohort_high_water;
+        if target > 0 && current_batch_size >= target {
             return Decision::Fire;
         }
         if self.last_latency == 0.0 {
@@ -247,11 +371,18 @@ impl SchedulingPolicy for EagerPolicy {
 // GreedyPolicy — fire immediately. Zero state.
 // =============================================================================
 //
-// Retained as a reference baseline. Useful for:
-//   - Debugging the scheduler itself: swap in greedy, see whether
-//     the symptom persists. If it doesn't, the policy is the cause.
+// Retained as a reference baseline. Useful when:
+//   - Debugging the scheduler itself: any non-trivial policy bug
+//     looks like a scheduler bug. Swap in greedy and see if the
+//     symptom persists; if not, the policy is the cause.
 //   - Workloads where you genuinely want zero coalescing (RPS=1,
-//     latency above all else, single interactive session).
+//     latency above all else, or a single interactive session).
+//
+// At any RPS > 1, greedy produces small B=1–2 batches and pays
+// per-batch fixed overhead on every token — measured p50 stays at
+// ~1100–1250 ms regardless of load (vs 350–800 ms for adaptive
+// across the same range). Throughput at saturation suffers
+// correspondingly (~6% below adaptive at RPS=64 in our matrix).
 
 pub(super) struct GreedyPolicy;
 
@@ -262,37 +393,16 @@ impl GreedyPolicy {
 }
 
 impl SchedulingPolicy for GreedyPolicy {
-    fn on_arrival(&mut self, _ctx_id: u64) {}
+    fn on_arrival(&mut self) {}
     fn on_complete(&mut self, _latency: Duration) {}
-    fn on_fired(&mut self, _fired_ctx_ids: &[u64]) {}
-    fn decide(&self, _current_batch_size: usize) -> Decision {
+    fn on_fired(&mut self, _fired_size: usize) {}
+
+    fn decide(&mut self, _current_batch_size: usize) -> Decision {
+        // The scheduler only calls `decide` when the batch is
+        // non-empty, and the BatchAccumulator already enforces
+        // `max_batch_size` upstream of the policy. So: just fire,
+        // every time.
         Decision::Fire
-    }
-}
-
-// =============================================================================
-// Selector
-// =============================================================================
-
-/// Build the scheduling policy named in `[model.scheduler].batch_policy`.
-///
-/// Panics on unknown names. The validator in `server/config.rs`
-/// restricts the value at config-parse time, so this is reachable
-/// only if validation is bypassed.
-pub(super) fn make_policy(
-    name: &str,
-    max_batch_size: usize,
-    device_idx: usize,
-    hot_window: Duration,
-) -> Box<dyn SchedulingPolicy> {
-    match name {
-        "adaptive" => Box::new(AdaptivePolicy::new(max_batch_size, device_idx, hot_window)),
-        "eager" => Box::new(EagerPolicy::new(max_batch_size, device_idx)),
-        "greedy" => Box::new(GreedyPolicy::new()),
-        other => panic!(
-            "unknown batch_policy {:?} (expected one of 'adaptive' | 'eager' | 'greedy')",
-            other
-        ),
     }
 }
 
@@ -300,87 +410,80 @@ pub(super) fn make_policy(
 mod tests {
     use super::*;
 
-    // ---- AdaptivePolicy ------------------------------------------------------
+    // ---- AdaptivePolicy -----------------------------------------------------
 
     #[test]
     fn adaptive_cold_start_fires() {
-        let policy = AdaptivePolicy::new(512, 0, Duration::from_millis(5));
+        let mut policy = AdaptivePolicy::new(512, 0);
+        // No batches completed yet — last_latency = 0; fire to make
+        // progress.
         assert!(matches!(policy.decide(1), Decision::Fire));
     }
 
     #[test]
     fn adaptive_fires_at_max_batch_size_even_when_in_flight() {
-        let mut policy = AdaptivePolicy::new(512, 0, Duration::from_millis(5));
+        let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_complete(Duration::from_millis(500)); // skipped
         policy.on_complete(Duration::from_millis(20));
-        policy.on_fired(&[1, 2, 3]);
-        // Structural cap fires unconditionally.
+        policy.on_fired(0);
+        // The structural cap fires unconditionally.
         assert!(matches!(policy.decide(512), Decision::Fire));
     }
 
     #[test]
     fn adaptive_waits_while_gpu_busy() {
-        let mut policy = AdaptivePolicy::new(512, 0, Duration::from_millis(5));
+        let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_complete(Duration::from_millis(500));
         policy.on_complete(Duration::from_millis(20));
-        policy.on_fired(&[1, 2, 3]);
+        policy.on_fired(0);
+        // Even at large B (cohort cap would normally fire), we wait
+        // because the GPU is occupied.
         assert!(matches!(policy.decide(100), Decision::Wait(_)));
     }
 
     #[test]
-    fn adaptive_fires_when_cohort_reformed() {
-        // No pinned ctxs in tests → step 4's `active == 0` clause
-        // fires as soon as pending_hot drains.
-        let mut policy = AdaptivePolicy::new(512, 0, Duration::from_millis(5));
+    fn adaptive_resumes_after_complete() {
+        let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_complete(Duration::from_millis(500));
         policy.on_complete(Duration::from_millis(20));
-        policy.on_fired(&[1, 2, 3]);
-        policy.on_complete(Duration::from_millis(20)); // GPU free
-        policy.on_arrival(1);
+        policy.on_fired(0);
         assert!(matches!(policy.decide(1), Decision::Wait(_)));
-        policy.on_arrival(2);
-        assert!(matches!(policy.decide(2), Decision::Wait(_)));
-        policy.on_arrival(3);
-        assert!(matches!(policy.decide(3), Decision::Fire));
-    }
-
-    #[test]
-    fn adaptive_new_arrival_is_ignored_for_cohort_gate() {
-        let mut policy = AdaptivePolicy::new(512, 0, Duration::from_millis(5));
-        policy.on_complete(Duration::from_millis(500));
         policy.on_complete(Duration::from_millis(20));
-        policy.on_fired(&[1, 2, 3]);
-        policy.on_complete(Duration::from_millis(20));
-        // A brand-new context arrives — it isn't in pending_hot, so
-        // pending_hot is still {1,2,3} and the policy keeps waiting.
-        policy.on_arrival(99);
-        assert!(matches!(policy.decide(1), Decision::Wait(_)));
-    }
-
-    #[test]
-    fn adaptive_safety_bound_fires_after_window() {
-        let mut policy = AdaptivePolicy::new(512, 0, Duration::from_millis(5));
-        policy.on_complete(Duration::from_millis(500));
-        policy.on_complete(Duration::from_millis(20));
-        policy.on_fired(&[1, 2, 3]);
-        policy.on_complete(Duration::from_millis(20));
-        // Only one hot ctx returns; the window elapses while we wait.
-        policy.on_arrival(1);
-        std::thread::sleep(Duration::from_millis(8));
+        // GPU free, no batch_start_time → Fire (defensive).
         assert!(matches!(policy.decide(1), Decision::Fire));
     }
 
-    // ---- EagerPolicy ---------------------------------------------------------
+    #[test]
+    fn adaptive_skips_first_batch_in_latency_update() {
+        let mut policy = AdaptivePolicy::new(512, 0);
+        policy.on_complete(Duration::from_millis(500));
+        assert_eq!(
+            policy.last_latency, 0.0,
+            "first batch is skipped (CUDA/warmup overhead inflates it)"
+        );
+    }
+
+    #[test]
+    fn adaptive_last_latency_tracks_most_recent_completed_batch() {
+        let mut policy = AdaptivePolicy::new(512, 0);
+        policy.on_complete(Duration::from_millis(500)); // skipped
+        policy.on_complete(Duration::from_millis(30));
+        assert!((policy.last_latency - 0.030).abs() < 1e-6);
+        policy.on_complete(Duration::from_millis(5));
+        assert!((policy.last_latency - 0.005).abs() < 1e-6);
+    }
+
+    // ---- EagerPolicy --------------------------------------------------------
 
     #[test]
     fn eager_cold_start_fires() {
-        let policy = EagerPolicy::new(512, 0);
+        let mut policy = EagerPolicy::new(512, 0);
         assert!(matches!(policy.decide(1), Decision::Fire));
     }
 
     #[test]
     fn eager_fires_at_max_batch_size() {
-        let policy = EagerPolicy::new(512, 0);
+        let mut policy = EagerPolicy::new(512, 0);
         assert!(matches!(policy.decide(512), Decision::Fire));
     }
 
@@ -391,21 +494,13 @@ mod tests {
         assert_eq!(policy.last_latency, 0.0);
     }
 
-    // ---- GreedyPolicy --------------------------------------------------------
+    // ---- GreedyPolicy -------------------------------------------------------
 
     #[test]
     fn greedy_always_fires() {
-        let policy = GreedyPolicy::new();
+        let mut policy = GreedyPolicy::new();
         assert!(matches!(policy.decide(1), Decision::Fire));
         assert!(matches!(policy.decide(100), Decision::Fire));
         assert!(matches!(policy.decide(512), Decision::Fire));
-    }
-
-    // ---- Selector ------------------------------------------------------------
-
-    #[test]
-    #[should_panic(expected = "unknown batch_policy")]
-    fn selector_panics_on_unknown() {
-        let _ = make_policy("nonsense", 512, 0, Duration::from_millis(5));
     }
 }

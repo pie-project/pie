@@ -12,7 +12,7 @@
 //! │                                                              │
 //! │  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐ │
 //! │  │PageStore  │  │ ProcessEntry│  │alloc_queue│  │restore_queue│
-//! │  │(per device)│  │(scheduling)│  │  (FIFO)   │  │(pri heap) │ │
+//! │  │(per driver)│  │(scheduling)│  │  (FIFO)   │  │(pri heap) │ │
 //! │  └──────────┘  └───────────┘  └───────────┘  └───────────┘ │
 //! └──────────────────────────────────────────────────────────────┘
 //!         ▲                                      │
@@ -77,31 +77,34 @@
 // Radix Trie with path-inclusive refcounting — handles incremental
 // commits and dedup correctly, all operations O(depth).
 pub mod pagestore;
+mod restore;
 pub(crate) mod sched;
 mod snapshot;
-mod restore;
 
-use std::collections::{HashMap, VecDeque, BinaryHeap};
+use anyhow::{Context as _, Result};
+use dashmap::DashMap;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::time::Instant;
-use dashmap::DashMap;
 use tokio::sync::oneshot;
-use anyhow::{Result, Context as _};
 
-
-use crate::service::{ServiceArray, ServiceHandler};
 use crate::adapter::AdapterId;
-use crate::inference::brle::Brle;
+use crate::driver::{self, DriverId};
 use crate::process::ProcessId;
-use crate::device::{self, DeviceId};
+use crate::service::{ServiceArray, ServiceHandler};
+use pie_bridge::Brle;
 
-use pagestore::{PhysicalPageId, PageHash, PageStore, FlatPageStore};
-use sched::{AuctionResult, ProcessEntry, PendingAlloc};
+use pagestore::{FlatPageStore, PageHash, PageStore, PhysicalPageId};
+use sched::{AuctionResult, PendingAlloc, ProcessEntry};
 
 // =============================================================================
 // Public Types
 // =============================================================================
 
+/// Stable per-context identifier. Survives swap / restore — backends that
+/// maintain per-context scratch (n-gram drafter history, etc.) should key on
+/// this rather than on volatile KV-page indices. Pie-internal — the wire
+/// schema carries it as plain `[uint64]` in `ForwardRequest.context_ids`.
 pub type ContextId = u64;
 
 /// Entry in the restore priority queue (BinaryHeap).
@@ -135,8 +138,11 @@ impl Ord for RestoreEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Non-defaulted (false=0) sorts HIGHER than defaulted (true=1).
         // In a max-heap, we want non-defaulted first.
-        other.defaulted.cmp(&self.defaulted)
-            .then_with(|| self.bid.partial_cmp(&other.bid).unwrap_or(std::cmp::Ordering::Equal))
+        other.defaulted.cmp(&self.defaulted).then_with(|| {
+            self.bid
+                .partial_cmp(&other.bid)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 }
 
@@ -151,28 +157,31 @@ static PAGE_SIZES: LazyLock<boxcar::Vec<usize>> = LazyLock::new(boxcar::Vec::new
 // Lock-free read caches — written by the actor, read directly by callers.
 // ---------------------------------------------------------------------------
 
-/// Per-context snapshot: device + page counts.  Single DashMap lookup
+/// Per-context snapshot: driver + page counts.  Single DashMap lookup
 /// instead of four separate maps.
 pub(crate) static CACHED_CONTEXT_INFO: LazyLock<DashMap<(usize, ContextId), CachedContextInfo>> =
     LazyLock::new(DashMap::new);
 
 /// Per-model market data: clearing prices, dividend rate, balances.
 /// Indexed by `model_idx` (the spawn order).
-pub(crate) static MARKET: LazyLock<boxcar::Vec<Market>> =
-    LazyLock::new(boxcar::Vec::new);
+pub(crate) static MARKET: LazyLock<boxcar::Vec<Market>> = LazyLock::new(boxcar::Vec::new);
 
-/// Real-time pinned context count per device (max 8 devices).
+/// Real-time pinned context count per driver (max 8 drivers).
 /// Updated atomically on every pin/unpin — readable without actor overhead.
 static PINNED_COUNTS: [std::sync::atomic::AtomicUsize; 8] = [
-    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
-    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
-    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
-    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
 ];
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CachedContextInfo {
-    pub device: usize,
+    pub driver: usize,
     /// Visible working pages — what the SDK's `working_page_count()` returns.
     pub working_pages: u32,
     pub committed_pages: u32,
@@ -182,12 +191,12 @@ pub(crate) struct CachedContextInfo {
 }
 
 pub(crate) struct Market {
-    /// Per-device clearing prices.  Key = device ordinal.
+    /// Per-driver clearing prices.  Key = driver ordinal.
     pub clearing_prices: DashMap<usize, f64>,
-    /// Per-device tick latency EWA (seconds, α=0.1).  Key = device ordinal.
+    /// Per-driver tick latency EWA (seconds, α=0.1).  Key = driver ordinal.
     pub tick_latency_ewa: DashMap<usize, f64>,
-    /// Sum of `dividend_per_endowment` across all devices.
-    pub dividend_rate: std::sync::atomic::AtomicU64,  // f64 bits via to/from_bits
+    /// Sum of `dividend_per_endowment` across all drivers.
+    pub dividend_rate: std::sync::atomic::AtomicU64, // f64 bits via to/from_bits
     /// Per-process credit balances (market wallet, unit: pages).
     pub balances: DashMap<ProcessId, f64>,
     /// Per-process endowments (fixed at creation, unit: pages).
@@ -197,11 +206,11 @@ pub(crate) struct Market {
     pub tokens_remaining: DashMap<ProcessId, Option<usize>>,
     /// Default credit endowment (pages) for new processes.
     pub default_credit: usize,
-    /// Per-device GPU-resident Active context count (updated each tick).
+    /// Per-driver GPU-resident Active context count (updated each tick).
     pub gpu_active: DashMap<usize, usize>,
-    /// Per-device GPU-resident Pinned context count (updated each tick).
+    /// Per-driver GPU-resident Pinned context count (updated each tick).
     pub gpu_pinned: DashMap<usize, usize>,
-    /// Per-device count of contexts charged rent this tick (= batch size).
+    /// Per-driver count of contexts charged rent this tick (= batch size).
     pub gpu_charged: DashMap<usize, usize>,
 }
 
@@ -222,14 +231,17 @@ impl Market {
     }
 
     pub(crate) fn get_dividend_rate(&self) -> f64 {
-        f64::from_bits(self.dividend_rate.load(std::sync::atomic::Ordering::Relaxed))
+        f64::from_bits(
+            self.dividend_rate
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     pub(crate) fn set_dividend_rate(&self, rate: f64) {
-        self.dividend_rate.store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.dividend_rate
+            .store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 }
-
 
 // =============================================================================
 // Public API
@@ -244,7 +256,7 @@ impl Market {
 /// - `admission_oversubscription_factor`: admission gate — `Σ endowment` must not
 ///   exceed `total_pages × factor`.
 /// - `restore_pause_at_utilization`: the restore loop pauses when any
-///   device's GPU page utilization exceeds this fraction.
+///   driver's GPU page utilization exceeds this fraction.
 pub fn spawn(
     page_size: usize,
     num_gpu_pages: Vec<usize>,
@@ -256,56 +268,110 @@ pub fn spawn(
 ) -> usize {
     PAGE_SIZES.push(page_size);
     MARKET.push(Market::new(default_endowment_pages));
-    SERVICES.spawn(move || ContextManager::new(
-        SERVICES.len().saturating_sub(1),
-        page_size,
-        &num_gpu_pages,
-        &num_cpu_pages,
-        default_endowment_pages,
-        default_token_limit,
-        admission_oversubscription_factor,
-        restore_pause_at_utilization,
-    )).expect("Failed to spawn context manager")
+    SERVICES
+        .spawn(move || {
+            ContextManager::new(
+                SERVICES.len().saturating_sub(1),
+                page_size,
+                &num_gpu_pages,
+                &num_cpu_pages,
+                default_endowment_pages,
+                default_token_limit,
+                admission_oversubscription_factor,
+                restore_pause_at_utilization,
+            )
+        })
+        .expect("Failed to spawn context manager")
 }
 
 // ---------- Actor-routed ----------
 
 pub async fn lookup(model_idx: usize, username: String, name: String) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Lookup { username, name, response: tx })?;
-    rx.await.context("context::lookup: actor dropped response")?
+    SERVICES.send(
+        model_idx,
+        Message::Lookup {
+            username,
+            name,
+            response: tx,
+        },
+    )?;
+    rx.await
+        .context("context::lookup: actor dropped response")?
 }
 
-pub async fn take(model_idx: usize, username: String, name: String, owner: ProcessId) -> Result<ContextId> {
+pub async fn take(
+    model_idx: usize,
+    username: String,
+    name: String,
+    owner: ProcessId,
+) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Take { username, name, owner, response: tx })?;
+    SERVICES.send(
+        model_idx,
+        Message::Take {
+            username,
+            name,
+            owner,
+            response: tx,
+        },
+    )?;
     rx.await.context("context::take: actor dropped response")?
 }
 
 pub async fn create(model_idx: usize, owner: ProcessId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Create { owner, response: tx })?;
-    rx.await.context("context::create: actor dropped response")?
+    SERVICES.send(
+        model_idx,
+        Message::Create {
+            owner,
+            response: tx,
+        },
+    )?;
+    rx.await
+        .context("context::create: actor dropped response")?
 }
 
 /// Save a context under a name. If `name` is None, auto-generates a snapshot name.
 /// Returns the name used (only meaningful when auto-generated).
-pub async fn save(model_idx: usize, id: ContextId, username: String, name: Option<String>) -> Result<Option<String>> {
+pub async fn save(
+    model_idx: usize,
+    id: ContextId,
+    username: String,
+    name: Option<String>,
+) -> Result<Option<String>> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Save { id, username, name, response: tx })?;
+    SERVICES.send(
+        model_idx,
+        Message::Save {
+            id,
+            username,
+            name,
+            response: tx,
+        },
+    )?;
     rx.await.context("context::save: actor dropped response")?
 }
 
 pub async fn delete(model_idx: usize, username: String, name: String) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Delete { username, name, response: tx })?;
-    rx.await.context("context::delete: actor dropped response")?
+    SERVICES.send(
+        model_idx,
+        Message::Delete {
+            username,
+            name,
+            response: tx,
+        },
+    )?;
+    rx.await
+        .context("context::delete: actor dropped response")?
 }
 
 pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Destroy { id, response: tx })?;
-    rx.await.context("context::destroy: actor dropped response")?
+    rx.await
+        .context("context::destroy: actor dropped response")?
 }
 
 /// Register a process across all models.
@@ -319,18 +385,24 @@ pub async fn register_process(pid: ProcessId, token_budget: Option<usize>) -> Re
     let mut admitted: Vec<usize> = Vec::new();
     for model_idx in 0..SERVICES.len() {
         let (tx, rx) = oneshot::channel();
-        SERVICES.send(model_idx, Message::RegisterProcess {
-            pid, token_budget, response: tx,
-        })?;
-        match rx.await.context("register_process: actor dropped response")? {
+        SERVICES.send(
+            model_idx,
+            Message::RegisterProcess {
+                pid,
+                token_budget,
+                response: tx,
+            },
+        )?;
+        match rx
+            .await
+            .context("register_process: actor dropped response")?
+        {
             Ok(()) => admitted.push(model_idx),
             Err(e) => {
                 for m in admitted {
                     let _ = SERVICES.send(m, Message::UnregisterProcess { pid });
                 }
-                return Err(e.context(format!(
-                    "register_process failed on model {model_idx}"
-                )));
+                return Err(e.context(format!("register_process failed on model {model_idx}")));
             }
         }
     }
@@ -347,20 +419,47 @@ pub fn unregister_process(pid: ProcessId) {
 
 pub async fn fork(model_idx: usize, id: ContextId, owner: ProcessId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Fork { id, owner, response: tx })?;
+    SERVICES.send(
+        model_idx,
+        Message::Fork {
+            id,
+            owner,
+            response: tx,
+        },
+    )?;
     rx.await.context("context::fork: actor dropped response")?
 }
 
 pub async fn commit_working_pages(model_idx: usize, id: ContextId, num_pages: usize) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::CommitWorkingPages { id, num_pages, response: tx })?;
-    rx.await.context("context::commit_working_pages: actor dropped response")?
+    SERVICES.send(
+        model_idx,
+        Message::CommitWorkingPages {
+            id,
+            num_pages,
+            response: tx,
+        },
+    )?;
+    rx.await
+        .context("context::commit_working_pages: actor dropped response")?
 }
 
-pub async fn reserve_working_pages(model_idx: usize, id: ContextId, num_pages: usize) -> Result<()> {
+pub async fn reserve_working_pages(
+    model_idx: usize,
+    id: ContextId,
+    num_pages: usize,
+) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::ReserveWorkingPages { id, num_pages, response: tx })?;
-    rx.await.context("context::reserve_working_pages: actor dropped response")?
+    SERVICES.send(
+        model_idx,
+        Message::ReserveWorkingPages {
+            id,
+            num_pages,
+            response: tx,
+        },
+    )?;
+    rx.await
+        .context("context::reserve_working_pages: actor dropped response")?
 }
 
 pub fn release_working_pages(model_idx: usize, id: ContextId, num_pages: usize) -> Result<()> {
@@ -372,7 +471,14 @@ pub fn release_working_pages(model_idx: usize, id: ContextId, num_pages: usize) 
 /// The context is non-evictable until `unpin`.
 pub async fn pin(model_idx: usize, id: ContextId, num_input_tokens: u32) -> Result<PinnedContext> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Pin { id, num_input_tokens, response: tx })?;
+    SERVICES.send(
+        model_idx,
+        Message::Pin {
+            id,
+            num_input_tokens,
+            response: tx,
+        },
+    )?;
     rx.await.context("context::pin: actor dropped response")?
 }
 
@@ -394,77 +500,88 @@ pub async fn debug_context_state(model_idx: usize, id: ContextId) -> String {
     rx.await.unwrap_or_else(|_| "MISSING".to_string())
 }
 
-
 // ---------- Market (broadcast to all models) ----------
 
-/// Execute one market tick on all models for a specific device.
+/// Execute one market tick on all models for a specific driver.
 /// Called per batch completion from the inference scheduler.
 /// `batch_ctx_ids` lists the context IDs that were in the just-completed batch;
 /// only these contexts are charged rent (prevents stale-unpin overcollection).
-pub fn tick(device: usize, latency_secs: f64, batch_ctx_ids: Vec<ContextId>) {
+pub fn tick(driver_idx: usize, latency_secs: f64, batch_ctx_ids: Vec<ContextId>) {
     for model_idx in 0..SERVICES.len() {
-        let _ = SERVICES.send(model_idx, Message::Tick { device, latency_secs, batch_ctx_ids: batch_ctx_ids.clone() });
+        let _ = SERVICES.send(
+            model_idx,
+            Message::Tick {
+                driver_idx,
+                latency_secs,
+                batch_ctx_ids: batch_ctx_ids.clone(),
+            },
+        );
     }
 }
 
-/// Count GPU-resident contexts on a device: (active, pinned).
+/// Count GPU-resident contexts on a driver: (active, pinned).
 /// Reads from `MARKET` cache published each tick — lock-free, O(1).
-pub fn resident_count(device: usize) -> (usize, usize) {
+pub fn resident_count(driver_idx: usize) -> (usize, usize) {
     // Sum across all models (usually just one).
     let mut active = 0usize;
     let mut pinned = 0usize;
     for model_idx in 0..MARKET.count() {
         if let Some(market) = MARKET.get(model_idx) {
-            active += market.gpu_active.get(&device).map(|v| *v).unwrap_or(0);
-            pinned += market.gpu_pinned.get(&device).map(|v| *v).unwrap_or(0);
+            active += market.gpu_active.get(&driver_idx).map(|v| *v).unwrap_or(0);
+            pinned += market.gpu_pinned.get(&driver_idx).map(|v| *v).unwrap_or(0);
         }
     }
     (active, pinned)
 }
 
-/// Real-time pinned context count for a device.
+/// Real-time pinned context count for a driver.
 /// Updated atomically on every pin/unpin — no actor overhead.
-pub fn pinned_count(device: usize) -> usize {
-    if device < PINNED_COUNTS.len() {
-        PINNED_COUNTS[device].load(std::sync::atomic::Ordering::Relaxed)
+pub fn pinned_count(driver_idx: usize) -> usize {
+    if driver_idx < PINNED_COUNTS.len() {
+        PINNED_COUNTS[driver_idx].load(std::sync::atomic::Ordering::Relaxed)
     } else {
         0
     }
 }
 
-/// Get clearing price for a device from a specific model's context manager.
+/// Get clearing price for a driver from a specific model's context manager.
 /// Reads directly from the lock-free cache (zero actor overhead).
-pub fn get_clearing_price(model_idx: usize, device: usize) -> f64 {
-    MARKET.get(model_idx)
-        .and_then(|m| m.clearing_prices.get(&device).map(|v| *v))
+pub fn get_clearing_price(model_idx: usize, driver_idx: usize) -> f64 {
+    MARKET
+        .get(model_idx)
+        .and_then(|m| m.clearing_prices.get(&driver_idx).map(|v| *v))
         .unwrap_or(0.0)
 }
 
-/// Get EWA-smoothed tick latency (seconds, α=0.1) for a device.
+/// Get EWA-smoothed tick latency (seconds, α=0.1) for a driver.
 /// Reads directly from the lock-free cache (zero actor overhead).
-pub fn get_tick_latency(model_idx: usize, device: usize) -> f64 {
-    MARKET.get(model_idx)
-        .and_then(|m| m.tick_latency_ewa.get(&device).map(|v| *v))
+pub fn get_tick_latency(model_idx: usize, driver_idx: usize) -> f64 {
+    MARKET
+        .get(model_idx)
+        .and_then(|m| m.tick_latency_ewa.get(&driver_idx).map(|v| *v))
         .unwrap_or(0.0)
 }
 
 /// Get dividend rate from a specific model's context manager.
 pub fn get_dividend_rate(model_idx: usize) -> f64 {
-    MARKET.get(model_idx)
+    MARKET
+        .get(model_idx)
         .map(|m| m.get_dividend_rate())
         .unwrap_or(0.0)
 }
 
 /// Get a process's credit balance.
 pub fn get_balance(model_idx: usize, pid: ProcessId) -> f64 {
-    MARKET.get(model_idx)
+    MARKET
+        .get(model_idx)
         .and_then(|m| m.balances.get(&pid).map(|v| *v))
         .unwrap_or(0.0)
 }
 
 /// Get a process's endowment (fixed at creation, used for dividend weighting).
 pub fn get_endowment(model_idx: usize, pid: ProcessId) -> f64 {
-    MARKET.get(model_idx)
+    MARKET
+        .get(model_idx)
         .and_then(|m| m.endowments.get(&pid).map(|v| *v))
         .unwrap_or(0.0)
 }
@@ -473,20 +590,31 @@ pub fn get_endowment(model_idx: usize, pid: ProcessId) -> f64 {
 /// Returns `None` for unknown processes or processes with no cap.
 /// `Some(n)` means the process is capped and has `n` tokens left.
 pub fn get_tokens_remaining(model_idx: usize, pid: ProcessId) -> Option<usize> {
-    MARKET.get(model_idx)
+    MARKET
+        .get(model_idx)
         .and_then(|m| m.tokens_remaining.get(&pid).map(|v| *v))
         .flatten()
 }
 
-/// Get the device index assigned to a specific context.
-pub fn get_device(model_idx: usize, id: ContextId) -> usize {
-    CACHED_CONTEXT_INFO.get(&(model_idx, id)).map(|v| v.device).unwrap_or(0)
+/// Get the driver index assigned to a specific context.
+pub fn get_driver(model_idx: usize, id: ContextId) -> usize {
+    CACHED_CONTEXT_INFO
+        .get(&(model_idx, id))
+        .map(|v| v.driver)
+        .unwrap_or(0)
 }
 
 /// Set a context's bid (willingness to pay per page per step).
 pub async fn bid(model_idx: usize, id: ContextId, bid: f64) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Bid { id, bid, response: tx })?;
+    SERVICES.send(
+        model_idx,
+        Message::Bid {
+            id,
+            bid,
+            response: tx,
+        },
+    )?;
     rx.await.context("context::bid: actor dropped response")?
 }
 
@@ -494,7 +622,8 @@ pub async fn bid(model_idx: usize, id: ContextId, bid: f64) -> Result<()> {
 pub async fn suspend(model_idx: usize, id: ContextId) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Suspend { id, response: tx })?;
-    rx.await.context("context::suspend: actor dropped response")?
+    rx.await
+        .context("context::suspend: actor dropped response")?
 }
 
 // ---------- Direct (no actor) ----------
@@ -505,27 +634,61 @@ pub fn tokens_per_page(model_idx: usize) -> u32 {
 
 /// Default endowment (in pages) for new processes on a model.
 pub fn default_endowment(model_idx: usize) -> f64 {
-    MARKET.get(model_idx).map(|m| m.default_credit as f64).unwrap_or(0.0)
+    MARKET
+        .get(model_idx)
+        .map(|m| m.default_credit as f64)
+        .unwrap_or(0.0)
 }
 
 // ---------- DashMap-cached reads (zero actor overhead) ----------
 
 pub fn committed_page_count(model_idx: usize, id: ContextId) -> u32 {
-    CACHED_CONTEXT_INFO.get(&(model_idx, id)).map(|v| v.committed_pages).unwrap_or(0)
+    CACHED_CONTEXT_INFO
+        .get(&(model_idx, id))
+        .map(|v| v.committed_pages)
+        .unwrap_or(0)
 }
 
 pub fn working_page_count(model_idx: usize, id: ContextId) -> u32 {
-    CACHED_CONTEXT_INFO.get(&(model_idx, id)).map(|v| v.working_pages).unwrap_or(0)
+    CACHED_CONTEXT_INFO
+        .get(&(model_idx, id))
+        .map(|v| v.working_pages)
+        .unwrap_or(0)
 }
 
 pub fn working_page_token_count(model_idx: usize, id: ContextId) -> u32 {
-    CACHED_CONTEXT_INFO.get(&(model_idx, id)).map(|v| v.working_tokens).unwrap_or(0)
+    CACHED_CONTEXT_INFO
+        .get(&(model_idx, id))
+        .map(|v| v.working_tokens)
+        .unwrap_or(0)
 }
 
-pub async fn truncate_working_page_tokens(model_idx: usize, id: ContextId, count: u32) -> Result<()> {
+/// Look up the driver index a ctx is bound to (the device in pre-bridge
+/// terminology). Returns 0 if the ctx isn't in the cache — used by the
+/// speculator to resolve its per-(model, driver) deque.
+pub fn get_device(model_idx: usize, id: ContextId) -> usize {
+    CACHED_CONTEXT_INFO
+        .get(&(model_idx, id))
+        .map(|v| v.driver)
+        .unwrap_or(0)
+}
+
+pub async fn truncate_working_page_tokens(
+    model_idx: usize,
+    id: ContextId,
+    count: u32,
+) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::TruncateWorkingPageTokens { id, count, response: tx })?;
-    rx.await.context("context::truncate_working_page_tokens: actor dropped response")?
+    SERVICES.send(
+        model_idx,
+        Message::TruncateWorkingPageTokens {
+            id,
+            count,
+            response: tx,
+        },
+    )?;
+    rx.await
+        .context("context::truncate_working_page_tokens: actor dropped response")?
 }
 
 /// Fire-and-forget: queues a lineage append on the context actor's
@@ -536,13 +699,25 @@ pub async fn truncate_working_page_tokens(model_idx: usize, id: ContextId, count
 /// are naturally ordered behind this append — the state remains
 /// consistent for every actor-side reader.
 pub fn append_working_page_tokens(
-    model_idx: usize, id: ContextId, tokens: Vec<u32>,
-    positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
+    model_idx: usize,
+    id: ContextId,
+    tokens: Vec<u32>,
+    positions: Vec<u32>,
+    masks: Vec<Brle>,
+    adapter: Option<AdapterId>,
     adapter_seed: Option<i64>,
 ) {
-    let _ = SERVICES.send(model_idx, Message::AppendWorkingPageTokens {
-        id, tokens, positions, masks, adapter, adapter_seed,
-    });
+    let _ = SERVICES.send(
+        model_idx,
+        Message::AppendWorkingPageTokens {
+            id,
+            tokens,
+            positions,
+            masks,
+            adapter,
+            adapter_seed,
+        },
+    );
 }
 
 // =============================================================================
@@ -551,7 +726,7 @@ pub fn append_working_page_tokens(
 
 #[derive(Debug)]
 pub struct PinnedContext {
-    pub device: DeviceId,
+    pub driver: DriverId,
     /// Active pages: committed + the working prefix needed to cover
     /// `kv_len + num_input_tokens`. The kernel reads
     /// `total_kv = (pages.len()-1)*page_size + last_page_len`, so
@@ -590,7 +765,6 @@ pub(crate) enum Record {
     },
 }
 
-
 // =============================================================================
 // Context — lives in local HashMap on ContextManager (actor-only)
 // =============================================================================
@@ -612,8 +786,8 @@ pub(crate) enum State {
 pub(crate) struct Context {
     /// Process that owns this context (None for named snapshots).
     pub owner: Option<ProcessId>,
-    /// Device this context is on (None if fully evicted).
-    pub device: Option<DeviceId>,
+    /// Driver this context is on (None if fully evicted).
+    pub driver: Option<DriverId>,
     /// Physical page IDs for uncommitted (working) pages.
     /// On GPU when Active/Pinned, empty when Suspended.
     pub working_pages: Vec<PhysicalPageId>,
@@ -663,7 +837,7 @@ impl Context {
     pub(crate) fn new(owner: Option<ProcessId>) -> Self {
         Context {
             owner,
-            device: None,
+            driver: None,
             working_pages: Vec::new(),
             suspended_working_count: 0,
             committed_hashes: Vec::new(),
@@ -682,23 +856,39 @@ impl Context {
         }
     }
 
-    pub fn is_active(&self) -> bool { self.state == State::Active }
-    pub fn is_suspended(&self) -> bool { self.state == State::Suspended }
-    pub fn is_stashed(&self) -> bool { self.state == State::Stashed }
-    pub fn is_pinned(&self) -> bool { self.state == State::Pinned }
+    pub fn is_active(&self) -> bool {
+        self.state == State::Active
+    }
+    pub fn is_suspended(&self) -> bool {
+        self.state == State::Suspended
+    }
+    pub fn is_stashed(&self) -> bool {
+        self.state == State::Stashed
+    }
+    pub fn is_pinned(&self) -> bool {
+        self.state == State::Pinned
+    }
     /// True when the context is off GPU (Stashed or Suspended).
-    pub fn is_off_gpu(&self) -> bool { matches!(self.state, State::Stashed | State::Suspended) }
+    pub fn is_off_gpu(&self) -> bool {
+        matches!(self.state, State::Stashed | State::Suspended)
+    }
 
     /// Tip of the committed hash chain (last element), or None if empty.
-    pub fn committed_tip(&self) -> Option<PageHash> { self.committed_hashes.last().copied() }
+    pub fn committed_tip(&self) -> Option<PageHash> {
+        self.committed_hashes.last().copied()
+    }
     /// Number of committed pages.
-    pub fn committed_len(&self) -> usize { self.committed_hashes.len() }
+    pub fn committed_len(&self) -> usize {
+        self.committed_hashes.len()
+    }
 
     /// Number of working pages whose KV data can be recomputed from
     /// `working_page_tokens` via a replay forward pass.
     /// Remaining pages (if any) are empty capacity reservations.
     pub fn recomputable_working_pages(&self, page_size: usize) -> usize {
-        if page_size == 0 { return 0; }
+        if page_size == 0 {
+            return 0;
+        }
         (self.working_page_tokens.len() + page_size - 1) / page_size
     }
 }
@@ -772,10 +962,10 @@ pub(crate) struct SchedCounters {
 
 #[derive(Debug)]
 pub(crate) struct ContextManager {
-    /// Per-device GPU page stores (radix trie). Indexed by device ordinal.
+    /// Per-driver GPU page stores (radix trie). Indexed by driver ordinal.
     /// Manages committed KV-cache pages with refcounted prefix sharing.
     pub(crate) gpu_stores: Vec<PageStore>,
-    /// Per-device CPU page stores (flat map). Indexed by device ordinal.
+    /// Per-driver CPU page stores (flat map). Indexed by driver ordinal.
     /// Holds stashed pages for suspended contexts (D2H copies).
     pub(crate) cpu_stores: Vec<FlatPageStore>,
     /// Tokens per KV-cache page. Used to convert token budgets to credit endowments.
@@ -788,14 +978,14 @@ pub(crate) struct ContextManager {
     next_id: u64,
     /// Per-process state: credit balance, endowment, owned context IDs.
     pub(crate) processes: HashMap<ProcessId, ProcessEntry>,
-    /// Per-context state: pages, device, bid, lineage, suspension info.
+    /// Per-context state: pages, driver, bid, lineage, suspension info.
     pub(crate) contexts: HashMap<ContextId, Context>,
     /// FIFO queue: contexts with pending deferred allocs waiting for free GPU pages.
     pub(crate) alloc_queue: VecDeque<ContextId>,
     /// Restore queue: suspended contexts waiting for restoration, served by highest bid.
     /// Uses a max-heap with lazy deletion — stale entries filtered on pop.
     pub(crate) restore_queue: BinaryHeap<RestoreEntry>,
-    /// Per-device auction results from the last tick (clearing price, revenue, dividend rate).
+    /// Per-driver auction results from the last tick (clearing price, revenue, dividend rate).
     pub(crate) auction_results: Vec<AuctionResult>,
     /// Default credit endowment (pages) for new processes that do not
     /// declare an explicit token_budget at admission. Pure market weight —
@@ -809,17 +999,17 @@ pub(crate) struct ContextManager {
     /// At 1.0 strictly bound by physical capacity; > 1.0 allows overbook.
     pub(crate) admission_oversubscription_factor: f64,
     /// Hard admission gate for the restore loop: pause restoring suspended
-    /// contexts when any device's page utilization exceeds this fraction.
+    /// contexts when any driver's page utilization exceeds this fraction.
     /// Prevents the evict→restore→re-evict thrash cascade.
     pub(crate) restore_pause_at_utilization: f64,
     /// Diagnostic counters for scheduler health.
     pub(crate) sched_counters: SchedCounters,
-    /// Round-robin counter for new-context device assignment. Used when
-    /// `least_loaded_device()` would otherwise tie (which it does for
+    /// Round-robin counter for new-context driver assignment. Used when
+    /// `least_loaded_driver()` would otherwise tie (which it does for
     /// every burst-arriving context until at least one of them allocates
     /// pages — `available()` doesn't reflect in-flight allocations). Without
-    /// this, every burst pins to the same device and DP collapses to DP=1.
-    next_device_rr: usize,
+    /// this, every burst pins to the same driver and DP collapses to DP=1.
+    next_driver_rr: usize,
 }
 
 impl ContextManager {
@@ -833,15 +1023,21 @@ impl ContextManager {
         admission_oversubscription_factor: f64,
         restore_pause_at_utilization: f64,
     ) -> Self {
-        let gpu_stores: Vec<_> = num_gpu_pages.iter()
+        let gpu_stores: Vec<_> = num_gpu_pages
+            .iter()
             .map(|&n| PageStore::new(page_size, n))
             .collect();
-        let cpu_stores: Vec<_> = num_cpu_pages.iter()
+        let cpu_stores: Vec<_> = num_cpu_pages
+            .iter()
             .map(|&n| FlatPageStore::new(n))
             .collect();
         ContextManager {
-            gpu_stores, cpu_stores, page_size, model_idx,
-            snapshots: HashMap::new(), next_id: 1,
+            gpu_stores,
+            cpu_stores,
+            page_size,
+            model_idx,
+            snapshots: HashMap::new(),
+            next_id: 1,
             processes: HashMap::new(),
             contexts: HashMap::new(),
             alloc_queue: VecDeque::new(),
@@ -852,7 +1048,7 @@ impl ContextManager {
             admission_oversubscription_factor,
             restore_pause_at_utilization,
             sched_counters: SchedCounters::default(),
-            next_device_rr: 0,
+            next_driver_rr: 0,
         }
     }
 
@@ -861,7 +1057,7 @@ impl ContextManager {
     /// Any gap = leaked pages.
     #[allow(dead_code, unused_variables)]
     pub(crate) fn page_audit(&self) {
-        for (dev_idx, dev) in self.gpu_stores.iter().enumerate() {
+        for (driver_idx, dev) in self.gpu_stores.iter().enumerate() {
             let free = dev.available();
             let total = dev.total_pages();
             let (trie_pages, trie_rc, trie_nodes, rc0_interior) = dev.trie_stats();
@@ -869,15 +1065,17 @@ impl ContextManager {
             let mut working_active = 0usize;
             let mut working_pinned = 0usize;
             let mut working_suspended = 0usize; // should be 0 (suspended = CPU)
-            let mut committed_active = 0usize;  // committed hashes held by active contexts
+            let mut committed_active = 0usize; // committed hashes held by active contexts
             let mut committed_pinned = 0usize;
             let mut n_active = 0usize;
             let mut n_pinned = 0usize;
             let mut n_suspended = 0usize;
 
             for ctx in self.contexts.values() {
-                let ctx_dev = ctx.device.unwrap_or(0) as usize;
-                if ctx_dev != dev_idx { continue; }
+                let ctx_driver = ctx.driver.unwrap_or(0) as usize;
+                if ctx_driver != driver_idx {
+                    continue;
+                }
                 match ctx.state {
                     State::Active => {
                         working_active += ctx.working_pages.len();
@@ -897,8 +1095,16 @@ impl ContextManager {
             }
 
             let accounted = free + trie_pages + working_active + working_pinned;
-            let leaked = if total > accounted { total - accounted } else { 0 };
-            let over = if accounted > total { accounted - total } else { 0 };
+            let leaked = if total > accounted {
+                total - accounted
+            } else {
+                0
+            };
+            let over = if accounted > total {
+                accounted - total
+            } else {
+                0
+            };
             let (alloc_tot, free_tot) = dev.pool_stats();
             let (f_reclaim, f_release, f_working) = dev.tag_stats();
 
@@ -907,7 +1113,7 @@ impl ContextManager {
             //      pool: alloc={} free={} net={} | tags: reclaim={} release={} working={} | \\
             //      ctxs: active={} pinned={} suspended={} | commit_active={} commit_pinned={} | \\
             //      trie: rc={} nodes={} rc0_int={} | rq={} aq={}",
-            //     dev_idx, total, free, trie_pages, working_active, working_pinned,
+            //     driver_idx, total, free, trie_pages, working_active, working_pinned,
             //     accounted, leaked, over,
             //     alloc_tot, free_tot, alloc_tot as isize - free_tot as isize,
             //     f_reclaim, f_release, f_working,
@@ -921,30 +1127,44 @@ impl ContextManager {
             if over > 0 {
                 let (phantom_count, phantom_desc) = dev.phantom_audit();
                 if phantom_count > 0 {
-                    tracing::error!("[PHANTOM_AUDIT] dev={} phantom_count={} pages=[{}]",
-                        dev_idx, phantom_count, phantom_desc);
+                    tracing::error!(
+                        "[PHANTOM_AUDIT] dev={} phantom_count={} pages=[{}]",
+                        driver_idx,
+                        phantom_count,
+                        phantom_desc
+                    );
                 }
             }
         }
     }
 
     fn next_id(&mut self) -> ContextId {
-        let id = self.next_id; self.next_id += 1; id
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
-    /// Pick a device for a brand-new context.
+    /// Pick a driver for a brand-new context.
     ///
     /// `available()` reflects only *allocated* pages, not pages claimed by
     /// concurrently-arriving contexts that haven't allocated yet. For a
     /// burst of N contexts admitted back-to-back (e.g. a benchmark firing
     /// `launch_process` async tasks in parallel), every call sees the same
     /// `available()` and `max_by_key` deterministically returns the same
-    /// device — collapsing DP to a single GPU. We tiebreak with a
-    /// round-robin counter so bursty arrivals spread across devices.
-    fn least_loaded_device(&mut self) -> usize {
-        // Find the maximum `available()` and tally how many devices share it.
-        let max_avail = self.gpu_stores.iter().map(|d| d.available()).max().unwrap_or(0);
-        let tied: Vec<usize> = self.gpu_stores.iter().enumerate()
+    /// driver — collapsing DP to a single driver. We tiebreak with a
+    /// round-robin counter so bursty arrivals spread across drivers.
+    fn least_loaded_driver(&mut self) -> usize {
+        // Find the maximum `available()` and tally how many drivers share it.
+        let max_avail = self
+            .gpu_stores
+            .iter()
+            .map(|d| d.available())
+            .max()
+            .unwrap_or(0);
+        let tied: Vec<usize> = self
+            .gpu_stores
+            .iter()
+            .enumerate()
             .filter(|(_, d)| d.available() == max_avail)
             .map(|(i, _)| i)
             .collect();
@@ -954,9 +1174,9 @@ impl ContextManager {
         if tied.len() == 1 {
             return tied[0];
         }
-        // On ties, round-robin among the tied devices.
-        let pick = tied[self.next_device_rr % tied.len()];
-        self.next_device_rr = self.next_device_rr.wrapping_add(1);
+        // On ties, round-robin among the tied drivers.
+        let pick = tied[self.next_driver_rr % tied.len()];
+        self.next_driver_rr = self.next_driver_rr.wrapping_add(1);
         pick
     }
 
@@ -965,7 +1185,7 @@ impl ContextManager {
     pub(crate) fn create(&mut self, owner: ProcessId) -> Result<ContextId> {
         let id = self.next_id();
         let mut ctx = Context::new(Some(owner));
-        ctx.device = Some(self.least_loaded_device());
+        ctx.driver = Some(self.least_loaded_driver());
 
         self.contexts.insert(id, ctx);
 
@@ -977,10 +1197,12 @@ impl ContextManager {
     }
 
     pub(crate) fn destroy(&mut self, id: ContextId) -> Result<()> {
-        let ctx = self.contexts.remove(&id)
+        let ctx = self
+            .contexts
+            .remove(&id)
             .ok_or_else(|| anyhow::anyhow!("Context {id} not found"))?;
 
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
+        let driver_idx = ctx.driver.unwrap_or(0) as usize;
 
         if let Some(pid) = ctx.owner {
             if let Some(proc) = self.processes.get_mut(&pid) {
@@ -995,23 +1217,23 @@ impl ContextManager {
 
         // Release committed chain (skip if already released during suspension)
         if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {
-            self.gpu_stores[dev_idx].release(&ctx.committed_hashes);
+            self.gpu_stores[driver_idx].release(&ctx.committed_hashes);
         }
 
         // Free working pages (GPU when Active/Pinned; empty when Suspended).
         if !ctx.working_pages.is_empty() {
-            self.gpu_stores[dev_idx].free(&ctx.working_pages);
+            self.gpu_stores[driver_idx].free(&ctx.working_pages);
         }
 
         // Free CPU working pages stash (if suspended with CPU stash).
         if !ctx.cpu_working_pages.is_empty() {
-            self.cpu_stores[dev_idx].free(&ctx.cpu_working_pages);
+            self.cpu_stores[driver_idx].free(&ctx.cpu_working_pages);
         }
 
         // Release CPU-resident committed pages (suspended contexts may have
         // had their committed pages stashed to CPU via would_free + cpu.insert).
         if ctx.is_off_gpu() && !ctx.committed_hashes.is_empty() {
-            self.cpu_stores[dev_idx].release(&ctx.committed_hashes);
+            self.cpu_stores[driver_idx].release(&ctx.committed_hashes);
         }
 
         self.snapshots.retain(|_, v| *v != id);
@@ -1020,10 +1242,6 @@ impl ContextManager {
         self.drain_queues();
         Ok(())
     }
-
-    
-
-    
 
     // ==================== Page Management ====================
 
@@ -1046,7 +1264,10 @@ impl ContextManager {
     ) {
         let ctx = match self.contexts.get(&id) {
             Some(c) => c,
-            None => { let _ = response.send(Err(anyhow::anyhow!("Context not found"))); return; }
+            None => {
+                let _ = response.send(Err(anyhow::anyhow!("Context not found")));
+                return;
+            }
         };
         let physical = ctx.working_pages.len();
 
@@ -1056,12 +1277,12 @@ impl ContextManager {
         }
 
         let needed = target - physical;
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
+        let driver_idx = ctx.driver.unwrap_or(0) as usize;
 
-        self.when_allocated(id, dev_idx, needed, move |mgr, pages| {
+        self.when_allocated(id, driver_idx, needed, move |mgr, pages| {
             if let Some(ctx) = mgr.contexts.get_mut(&id) {
                 ctx.working_pages.extend_from_slice(&pages);
-                ctx.device = Some(dev_idx);
+                ctx.driver = Some(driver_idx);
             }
             mgr.publish_context_counts(id);
             let _ = response.send(Ok(()));
@@ -1069,23 +1290,32 @@ impl ContextManager {
     }
 
     pub(crate) fn release_working_pages(&mut self, id: ContextId, num_pages: usize) -> Result<()> {
-        let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        if num_pages == 0 { return Ok(()); }
+        let ctx = self
+            .contexts
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+        if num_pages == 0 {
+            return Ok(());
+        }
         if num_pages > ctx.working_pages.len() {
-            anyhow::bail!("release: requested {num_pages}, have {}", ctx.working_pages.len());
+            anyhow::bail!(
+                "release: requested {num_pages}, have {}",
+                ctx.working_pages.len()
+            );
         }
 
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
+        let driver_idx = ctx.driver.unwrap_or(0) as usize;
         let start = ctx.working_pages.len() - num_pages;
         let to_free: Vec<_> = ctx.working_pages.drain(start..).collect();
 
         // Truncate working page tokens
         let tokens_to_remove = num_pages * self.page_size;
         let len = ctx.working_page_tokens.len();
-        ctx.working_page_tokens.truncate(len.saturating_sub(tokens_to_remove));
+        ctx.working_page_tokens
+            .truncate(len.saturating_sub(tokens_to_remove));
 
         if !ctx.is_off_gpu() {
-            self.gpu_stores[dev_idx].free(&to_free);
+            self.gpu_stores[driver_idx].free(&to_free);
         }
         self.publish_context_counts(id);
         self.drain_queues();
@@ -1094,8 +1324,13 @@ impl ContextManager {
 
     pub(crate) fn commit_working_pages(&mut self, id: ContextId, num_pages: usize) -> Result<()> {
         let page_size = self.page_size;
-        let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        if num_pages == 0 { return Ok(()); }
+        let ctx = self
+            .contexts
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+        if num_pages == 0 {
+            return Ok(());
+        }
 
         // Suspended contexts have empty working_pages but track the count
         // in suspended_working_count (working pages are recomputed on restore).
@@ -1110,12 +1345,19 @@ impl ContextManager {
 
         let total_tokens = num_pages * page_size;
         if total_tokens > ctx.working_page_tokens.len() {
-            anyhow::bail!("commit: need {total_tokens} tokens, have {}", ctx.working_page_tokens.len());
+            anyhow::bail!(
+                "commit: need {total_tokens} tokens, have {}",
+                ctx.working_page_tokens.len()
+            );
         }
 
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
+        let driver_idx = ctx.driver.unwrap_or(0) as usize;
         let prev_hash = ctx.committed_tip().unwrap_or(0);
-        let pages = ctx.working_pages.get(..num_pages).map(|s| s.to_vec()).unwrap_or_default();
+        let pages = ctx
+            .working_pages
+            .get(..num_pages)
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
 
         // Extract token data for the pages being committed.
         let mut tokens = Vec::with_capacity(total_tokens);
@@ -1131,7 +1373,11 @@ impl ContextManager {
         if let Some(max_committed) = ctx.max_committed_position {
             for &pos in &positions {
                 if pos <= max_committed {
-                    anyhow::bail!("Position {} must be > max committed position {}", pos, max_committed);
+                    anyhow::bail!(
+                        "Position {} must be > max committed position {}",
+                        pos,
+                        max_committed
+                    );
                 }
             }
         }
@@ -1140,9 +1386,16 @@ impl ContextManager {
 
         // Compute content-based hashes (includes adapter_seed so ZO-perturbed
         // pages are not shared with unperturbed or differently-seeded pages).
-        let hashes = pagestore::compute_page_hashes(page_size, &tokens, &positions, &masks, prev_hash, lineage_adapter_seed);
+        let hashes = pagestore::compute_page_hashes(
+            page_size,
+            &tokens,
+            &positions,
+            &masks,
+            prev_hash,
+            lineage_adapter_seed,
+        );
         let existing_prefix = ctx.committed_hashes.clone();
-        let dev = &mut self.gpu_stores[dev_idx];
+        let dev = &mut self.gpu_stores[driver_idx];
 
         // Commit: physical (GPU promotion + dedup) or logical (metadata only).
         if ctx.is_off_gpu() {
@@ -1156,7 +1409,9 @@ impl ContextManager {
         }
 
         // Update context state.
-        let ctx = self.contexts.get_mut(&id)
+        let ctx = self
+            .contexts
+            .get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context lost during commit"))?;
         if ctx.is_off_gpu() {
             ctx.suspended_working_count = ctx.suspended_working_count.saturating_sub(num_pages);
@@ -1165,25 +1420,48 @@ impl ContextManager {
         }
         ctx.working_page_tokens.drain(..total_tokens);
         ctx.committed_hashes.extend_from_slice(&hashes);
-        ctx.max_committed_position = positions.iter().copied().max()
+        ctx.max_committed_position = positions
+            .iter()
+            .copied()
+            .max()
             .or(ctx.max_committed_position);
 
         // Refresh cached effective_pages after chain extension.
         if !ctx.is_off_gpu() {
-            ctx.cached_effective_pages = self.gpu_stores[dev_idx].effective_pages(&ctx.committed_hashes);
+            ctx.cached_effective_pages =
+                self.gpu_stores[driver_idx].effective_pages(&ctx.committed_hashes);
         }
 
         // Append to lineage (merge with last record if same adapter AND seed).
-        if let Some(Record::Fill { tokens: t, positions: p, mask: m, adapter: a, adapter_seed: s }) = ctx.lineage.last_mut() {
+        if let Some(Record::Fill {
+            tokens: t,
+            positions: p,
+            mask: m,
+            adapter: a,
+            adapter_seed: s,
+        }) = ctx.lineage.last_mut()
+        {
             if *a == lineage_adapter && *s == lineage_adapter_seed {
                 t.extend_from_slice(&tokens);
                 p.extend_from_slice(&positions);
                 m.extend_from_slice(&masks);
             } else {
-                ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter, adapter_seed: lineage_adapter_seed });
+                ctx.lineage.push(Record::Fill {
+                    tokens,
+                    positions,
+                    mask: masks,
+                    adapter: lineage_adapter,
+                    adapter_seed: lineage_adapter_seed,
+                });
             }
         } else {
-            ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter, adapter_seed: lineage_adapter_seed });
+            ctx.lineage.push(Record::Fill {
+                tokens,
+                positions,
+                mask: masks,
+                adapter: lineage_adapter,
+                adapter_seed: lineage_adapter_seed,
+            });
         }
 
         self.drain_queues();
@@ -1208,33 +1486,32 @@ impl ContextManager {
                 // the owning process has exhausted its compute budget. The
                 // actual debit happens on append_working_page_tokens after
                 // the pass completes; this pre-check prevents overdraft.
-                if num_input_tokens > 0
-                    && !mgr.has_token_budget(id, num_input_tokens as usize)
-                {
+                if num_input_tokens > 0 && !mgr.has_token_budget(id, num_input_tokens as usize) {
                     anyhow::bail!(
                         "pin: token budget exhausted for context {id} \
                          (requested {num_input_tokens} tokens)"
                     );
                 }
 
-                let ctx = mgr.contexts.get_mut(&id)
+                let ctx = mgr
+                    .contexts
+                    .get_mut(&id)
                     .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
                 if ctx.is_off_gpu() {
                     anyhow::bail!("pin: context is suspended (cannot pin)");
                 }
-                let dev_idx = ctx.device.unwrap_or(0) as usize;
+                let driver_idx = ctx.driver.unwrap_or(0) as usize;
                 let committed_hashes = ctx.committed_hashes.clone();
                 let working = ctx.working_pages.clone();
-                let kv_len = (ctx.committed_len() * mgr.page_size
-                    + ctx.working_page_tokens.len()) as u32;
+                let kv_len =
+                    (ctx.committed_len() * mgr.page_size + ctx.working_page_tokens.len()) as u32;
                 ctx.state = State::Pinned;
-                PINNED_COUNTS[dev_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                PINNED_COUNTS[driver_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 let mut committed_pages = Vec::new();
                 if !committed_hashes.is_empty() {
-                    committed_pages.extend(
-                        mgr.gpu_stores[dev_idx].physical_ids(&committed_hashes),
-                    );
+                    committed_pages
+                        .extend(mgr.gpu_stores[driver_idx].physical_ids(&committed_hashes));
                 }
 
                 let page_size = mgr.page_size as u32;
@@ -1248,15 +1525,13 @@ impl ContextManager {
                     .min(working.len());
                 let mut pages = committed_pages;
                 pages.extend(working[..active_working].iter().copied());
-                let extra_pages: Vec<PhysicalPageId> =
-                    working[active_working..].to_vec();
+                let extra_pages: Vec<PhysicalPageId> = working[active_working..].to_vec();
 
                 let num_pages = pages.len() as u32;
-                let last_page_len = pagestore::compute_last_page_len(
-                    total_kv, num_pages, page_size,
-                );
+                let last_page_len =
+                    pagestore::compute_last_page_len(total_kv, num_pages, page_size);
                 Ok(PinnedContext {
-                    device: dev_idx as DeviceId,
+                    driver: driver_idx as DriverId,
                     pages,
                     extra_pages,
                     kv_len,
@@ -1272,7 +1547,11 @@ impl ContextManager {
     /// executes the deferred suspension and enqueues for restoration.
     pub(crate) fn unpin(&mut self, id: ContextId) {
         let (pending, replay, dev) = match self.contexts.get(&id) {
-            Some(ctx) if ctx.is_pinned() => (ctx.pending_suspend, ctx.pending_replay, ctx.device.unwrap_or(0) as usize),
+            Some(ctx) if ctx.is_pinned() => (
+                ctx.pending_suspend,
+                ctx.pending_replay,
+                ctx.driver.unwrap_or(0) as usize,
+            ),
             _ => return,
         };
 
@@ -1302,7 +1581,6 @@ impl ContextManager {
         }
     }
 
-
     /// Central queue drain: called after any event that frees GPU pages.
     ///
     /// Phase 1: alloc_queue (FIFO) — invoke deferred GPU operation callbacks.
@@ -1313,14 +1591,19 @@ impl ContextManager {
         // Phase 1: alloc_queue FIFO — serve deferred ops for head context.
         while let Some(&front_ctx_id) = self.alloc_queue.front() {
             // Skip stale entries (destroyed contexts or empty deferred_ops).
-            let front_op = match self.contexts.get(&front_ctx_id)
+            let front_op = match self
+                .contexts
+                .get(&front_ctx_id)
                 .and_then(|c| c.deferred_ops.first())
             {
                 Some(op) => op,
-                None => { self.alloc_queue.pop_front(); continue; }
+                None => {
+                    self.alloc_queue.pop_front();
+                    continue;
+                }
             };
-            let (dev_idx, n) = (front_op.device, front_op.num_pages);
-            if n > 0 && self.gpu_stores[dev_idx].available() < n {
+            let (driver_idx, n) = (front_op.driver, front_op.num_pages);
+            if n > 0 && self.gpu_stores[driver_idx].available() < n {
                 break;
             }
             let ctx_id = self.alloc_queue.pop_front().unwrap();
@@ -1333,7 +1616,7 @@ impl ContextManager {
             return;
         }
 
-        // Hard admission control: don't restore when any device is near
+        // Hard admission control: don't restore when any driver is near
         // page capacity. This prevents over-admission that causes the
         // thrashing cascade (evict→restore→re-evict cycle). Processes
         // wait here until running processes complete and free pages,
@@ -1347,7 +1630,7 @@ impl ContextManager {
             return;
         }
 
-        let num_devices = self.gpu_stores.len();
+        let num_drivers = self.gpu_stores.len();
         let max_rejections = self.restore_queue.len();
         let mut rejections = 0;
         let mut re_enqueue = Vec::new();
@@ -1356,20 +1639,23 @@ impl ContextManager {
             let ctx_id = entry.ctx_id;
 
             // Lazy deletion: skip stale entries (destroyed or already restored).
-            let is_off_gpu = self.contexts.get(&ctx_id)
-                .map(|c| c.is_off_gpu()).unwrap_or(false);
+            let is_off_gpu = self
+                .contexts
+                .get(&ctx_id)
+                .map(|c| c.is_off_gpu())
+                .unwrap_or(false);
             if !is_off_gpu {
                 continue;
             }
 
             // Per-restore placement evaluation (§4.3): check if a different
-            // device would be cheaper before restoring.
-            if num_devices > 1 {
+            // driver would be cheaper before restoring.
+            if num_drivers > 1 {
                 if let Some(ctx) = self.contexts.get(&ctx_id) {
-                    let best = self.best_device_for(ctx);
-                    if best != ctx.device.unwrap_or(0) as usize {
+                    let best = self.best_driver_for(ctx);
+                    if best != ctx.driver.unwrap_or(0) as usize {
                         if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                            ctx.device = Some(best);
+                            ctx.driver = Some(best);
                         }
                     }
                 }
@@ -1403,22 +1689,24 @@ impl ContextManager {
 
     // ==================== Extracted handle() helpers ====================
 
-
     pub(crate) fn stats(&self) -> Vec<(usize, usize)> {
         self.gpu_stores.iter().map(|d| d.stats()).collect()
     }
 
-    /// Publish the per-context counts + device to the global cache.
+    /// Publish the per-context counts + driver to the global cache.
     /// Called after any mutation that changes working pages, committed pages,
-    /// working page tokens, or device assignment.
+    /// working page tokens, or driver assignment.
     pub(crate) fn publish_context_counts(&self, id: ContextId) {
         if let Some(ctx) = self.contexts.get(&id) {
-            CACHED_CONTEXT_INFO.insert((self.model_idx, id), CachedContextInfo {
-                device: ctx.device.unwrap_or(0) as usize,
-                working_pages: ctx.working_pages.len() as u32,
-                committed_pages: ctx.committed_len() as u32,
-                working_tokens: ctx.working_page_tokens.len() as u32,
-            });
+            CACHED_CONTEXT_INFO.insert(
+                (self.model_idx, id),
+                CachedContextInfo {
+                    driver: ctx.driver.unwrap_or(0) as usize,
+                    working_pages: ctx.working_pages.len() as u32,
+                    committed_pages: ctx.committed_len() as u32,
+                    working_tokens: ctx.working_page_tokens.len() as u32,
+                },
+            );
         }
     }
 
@@ -1428,7 +1716,9 @@ impl ContextManager {
     }
 
     pub(crate) fn truncate_working_page_tokens(&mut self, id: ContextId, count: u32) -> Result<()> {
-        let ctx = self.contexts.get_mut(&id)
+        let ctx = self
+            .contexts
+            .get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let max = ctx.working_page_tokens.len();
         if count as usize > max {
@@ -1439,8 +1729,13 @@ impl ContextManager {
     }
 
     pub(crate) fn append_working_page_tokens(
-        &mut self, id: ContextId, tokens: Vec<u32>, positions: Vec<u32>,
-        masks: Vec<Brle>, adapter: Option<AdapterId>, adapter_seed: Option<i64>,
+        &mut self,
+        id: ContextId,
+        tokens: Vec<u32>,
+        positions: Vec<u32>,
+        masks: Vec<Brle>,
+        adapter: Option<AdapterId>,
+        adapter_seed: Option<i64>,
     ) -> Result<()> {
         let n = tokens.len();
         if positions.len() != n {
@@ -1449,13 +1744,20 @@ impl ContextManager {
         if !masks.is_empty() && masks.len() != n {
             anyhow::bail!("masks length {} != n {}", masks.len(), n);
         }
-        let ctx = self.contexts.get_mut(&id)
+        let ctx = self
+            .contexts
+            .get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let owner = ctx.owner;
         for (i, token) in tokens.into_iter().enumerate() {
             ctx.working_page_tokens.push(TokenInfo {
-                token, position: positions[i],
-                mask: if masks.is_empty() { Brle::new(0) } else { masks[i].clone() },
+                token,
+                position: positions[i],
+                mask: if masks.is_empty() {
+                    Brle::new(0)
+                } else {
+                    masks[i].clone()
+                },
                 adapter,
                 adapter_seed,
             });
@@ -1482,47 +1784,120 @@ impl ContextManager {
 
 #[derive(Debug)]
 pub(crate) enum Message {
-    Lookup { username: String, name: String, response: oneshot::Sender<Result<ContextId>> },
-    Create { owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
-    Save { id: ContextId, username: String, name: Option<String>, response: oneshot::Sender<Result<Option<String>>> },
-    Delete { username: String, name: String, response: oneshot::Sender<Result<()>> },
-    Destroy { id: ContextId, response: oneshot::Sender<Result<()>> },
-    Fork { id: ContextId, owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
-    Take { username: String, name: String, owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
-    CommitWorkingPages { id: ContextId, num_pages: usize, response: oneshot::Sender<Result<()>> },
-    ReserveWorkingPages { id: ContextId, num_pages: usize, response: oneshot::Sender<Result<()>> },
-    ReleaseWorkingPages { id: ContextId, num_pages: usize },
-    Pin { id: ContextId, num_input_tokens: u32, response: oneshot::Sender<Result<PinnedContext>> },
-    Unpin { id: ContextId },
-    ReplayComplete { id: ContextId },
-    GetStats { response: oneshot::Sender<Vec<(usize, usize)>> },
+    Lookup {
+        username: String,
+        name: String,
+        response: oneshot::Sender<Result<ContextId>>,
+    },
+    Create {
+        owner: ProcessId,
+        response: oneshot::Sender<Result<ContextId>>,
+    },
+    Save {
+        id: ContextId,
+        username: String,
+        name: Option<String>,
+        response: oneshot::Sender<Result<Option<String>>>,
+    },
+    Delete {
+        username: String,
+        name: String,
+        response: oneshot::Sender<Result<()>>,
+    },
+    Destroy {
+        id: ContextId,
+        response: oneshot::Sender<Result<()>>,
+    },
+    Fork {
+        id: ContextId,
+        owner: ProcessId,
+        response: oneshot::Sender<Result<ContextId>>,
+    },
+    Take {
+        username: String,
+        name: String,
+        owner: ProcessId,
+        response: oneshot::Sender<Result<ContextId>>,
+    },
+    CommitWorkingPages {
+        id: ContextId,
+        num_pages: usize,
+        response: oneshot::Sender<Result<()>>,
+    },
+    ReserveWorkingPages {
+        id: ContextId,
+        num_pages: usize,
+        response: oneshot::Sender<Result<()>>,
+    },
+    ReleaseWorkingPages {
+        id: ContextId,
+        num_pages: usize,
+    },
+    Pin {
+        id: ContextId,
+        num_input_tokens: u32,
+        response: oneshot::Sender<Result<PinnedContext>>,
+    },
+    Unpin {
+        id: ContextId,
+    },
+    ReplayComplete {
+        id: ContextId,
+    },
+    GetStats {
+        response: oneshot::Sender<Vec<(usize, usize)>>,
+    },
 
     // Actor-routed write APIs
-    TruncateWorkingPageTokens { id: ContextId, count: u32, response: oneshot::Sender<Result<()>> },
+    TruncateWorkingPageTokens {
+        id: ContextId,
+        count: u32,
+        response: oneshot::Sender<Result<()>>,
+    },
     /// Fire-and-forget lineage append. Errors are logged at the
     /// handler, not propagated — see `context::append_working_page_tokens`.
     AppendWorkingPageTokens {
-        id: ContextId, tokens: Vec<u32>, positions: Vec<u32>,
-        masks: Vec<Brle>, adapter: Option<AdapterId>, adapter_seed: Option<i64>,
+        id: ContextId,
+        tokens: Vec<u32>,
+        positions: Vec<u32>,
+        masks: Vec<Brle>,
+        adapter: Option<AdapterId>,
+        adapter_seed: Option<i64>,
     },
 
-    DebugState { id: ContextId, response: oneshot::Sender<String> },
+    DebugState {
+        id: ContextId,
+        response: oneshot::Sender<String>,
+    },
 
     RegisterProcess {
         pid: ProcessId,
         token_budget: Option<usize>,
         response: oneshot::Sender<Result<()>>,
     },
-    UnregisterProcess { pid: ProcessId },
+    UnregisterProcess {
+        pid: ProcessId,
+    },
 
     // ── Market messages ────────────────────────────────────────
-    /// Execute one market tick for a single device.
+    /// Execute one market tick for a single driver.
     /// `batch_ctx_ids` = context IDs from the just-completed batch.
-    Tick { device: usize, latency_secs: f64, batch_ctx_ids: Vec<ContextId> },
+    Tick {
+        driver_idx: usize,
+        latency_secs: f64,
+        batch_ctx_ids: Vec<ContextId>,
+    },
     /// Set a context's bid (willingness to pay per page per step).
-    Bid { id: ContextId, bid: f64, response: oneshot::Sender<Result<()>> },
+    Bid {
+        id: ContextId,
+        bid: f64,
+        response: oneshot::Sender<Result<()>>,
+    },
     /// Suspend a context (program-initiated).
-    Suspend { id: ContextId, response: oneshot::Sender<Result<()>> },
+    Suspend {
+        id: ContextId,
+        response: oneshot::Sender<Result<()>>,
+    },
 }
 
 impl ServiceHandler for ContextManager {
@@ -1531,22 +1906,42 @@ impl ServiceHandler for ContextManager {
     async fn handle(&mut self, msg: Message) {
         let _t = Instant::now();
         match msg {
-            Message::Lookup { username, name, response } => {
-                let result = self.snapshots.get(&(username, name))
+            Message::Lookup {
+                username,
+                name,
+                response,
+            } => {
+                let result = self
+                    .snapshots
+                    .get(&(username, name))
                     .copied()
                     .ok_or_else(|| anyhow::anyhow!("Snapshot not found"));
                 let _ = response.send(result);
             }
-            Message::Take { username, name, owner, response } => {
+            Message::Take {
+                username,
+                name,
+                owner,
+                response,
+            } => {
                 self.take(username, name, owner, response);
             }
             Message::Create { owner, response } => {
                 let _ = response.send(self.create(owner));
             }
-            Message::Save { id, username, name, response } => {
+            Message::Save {
+                id,
+                username,
+                name,
+                response,
+            } => {
                 let _ = response.send(self.save(id, username, name));
             }
-            Message::Delete { username, name, response } => {
+            Message::Delete {
+                username,
+                name,
+                response,
+            } => {
                 let _ = response.send(self.delete(username, name));
             }
             Message::Destroy { id, response } => {
@@ -1555,16 +1950,28 @@ impl ServiceHandler for ContextManager {
                 self.sched_counters.destroy_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.destroy_count += 1;
             }
-            Message::Fork { id, owner, response } => {
+            Message::Fork {
+                id,
+                owner,
+                response,
+            } => {
                 self.fork(id, owner, response);
             }
-            Message::CommitWorkingPages { id, num_pages, response } => {
+            Message::CommitWorkingPages {
+                id,
+                num_pages,
+                response,
+            } => {
                 let t0 = Instant::now();
                 let _ = response.send(self.commit_working_pages(id, num_pages));
                 self.sched_counters.commit_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.commit_count += 1;
             }
-            Message::ReserveWorkingPages { id, num_pages, response } => {
+            Message::ReserveWorkingPages {
+                id,
+                num_pages,
+                response,
+            } => {
                 let t0 = Instant::now();
                 // WIT semantics: "reserve N additional pages." Dispatch
                 // through `ensure_working_pages` with target =
@@ -1588,7 +1995,11 @@ impl ServiceHandler for ContextManager {
                 self.sched_counters.release_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.release_count += 1;
             }
-            Message::Pin { id, num_input_tokens, response } => {
+            Message::Pin {
+                id,
+                num_input_tokens,
+                response,
+            } => {
                 let t0 = Instant::now();
                 self.pin(id, num_input_tokens, response);
                 self.sched_counters.pin_us += t0.elapsed().as_micros() as u64;
@@ -1609,13 +2020,31 @@ impl ServiceHandler for ContextManager {
             Message::GetStats { response } => {
                 let _ = response.send(self.stats());
             }
-            Message::TruncateWorkingPageTokens { id, count, response } => {
+            Message::TruncateWorkingPageTokens {
+                id,
+                count,
+                response,
+            } => {
                 let _ = response.send(self.truncate_working_page_tokens(id, count));
                 self.publish_context_counts(id);
             }
-            Message::AppendWorkingPageTokens { id, tokens, positions, masks, adapter, adapter_seed } => {
+            Message::AppendWorkingPageTokens {
+                id,
+                tokens,
+                positions,
+                masks,
+                adapter,
+                adapter_seed,
+            } => {
                 let t0 = Instant::now();
-                if let Err(e) = self.append_working_page_tokens(id, tokens, positions, masks, adapter, adapter_seed) {
+                if let Err(e) = self.append_working_page_tokens(
+                    id,
+                    tokens,
+                    positions,
+                    masks,
+                    adapter,
+                    adapter_seed,
+                ) {
                     tracing::warn!("append_working_page_tokens for ctx {id}: {e:#}");
                 }
                 self.publish_context_counts(id);
@@ -1625,7 +2054,11 @@ impl ServiceHandler for ContextManager {
             Message::DebugState { id, response } => {
                 let _ = response.send(self.debug_state(id));
             }
-            Message::RegisterProcess { pid, token_budget, response } => {
+            Message::RegisterProcess {
+                pid,
+                token_budget,
+                response,
+            } => {
                 let t0 = Instant::now();
                 let result = self.register_process(pid, token_budget);
                 let _ = response.send(result);
@@ -1640,9 +2073,13 @@ impl ServiceHandler for ContextManager {
             }
 
             // ── Market handlers ────────────────────────────────────
-            Message::Tick { device, latency_secs, batch_ctx_ids } => {
+            Message::Tick {
+                driver_idx,
+                latency_secs,
+                batch_ctx_ids,
+            } => {
                 let t0 = Instant::now();
-                self.tick(device, latency_secs, &batch_ctx_ids);
+                self.tick(driver_idx, latency_secs, &batch_ctx_ids);
                 self.sched_counters.tick_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.tick_count += 1;
                 self.sched_counters.ticks += 1;

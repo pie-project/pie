@@ -15,8 +15,7 @@ use instruct::Instruct;
 use tokenizer::Tokenizer;
 
 /// Global cache for models (keyed by ModelId).
-static MODELS: LazyLock<boxcar::Vec<Arc<Model>>> =
-    LazyLock::new(|| boxcar::Vec::new());
+static MODELS: LazyLock<boxcar::Vec<Arc<Model>>> = LazyLock::new(|| boxcar::Vec::new());
 
 /// Type alias for model identifiers.
 pub type ModelId = usize;
@@ -52,7 +51,10 @@ pub fn register(
 
 /// Returns a list of all registered model names.
 pub fn models() -> Vec<String> {
-    MODELS.iter().map(|(_, model)| model.name().to_string()).collect()
+    MODELS
+        .iter()
+        .map(|(_, model)| model.name().to_string())
+        .collect()
 }
 
 /// Gets cached model by model ID.
@@ -73,9 +75,7 @@ pub struct Model {
 
 impl std::fmt::Debug for Model {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Model")
-            .field("name", &self.name)
-            .finish()
+        f.debug_struct("Model").field("name", &self.name).finish()
     }
 }
 

@@ -5,15 +5,10 @@
 //! trailing newline; the caller should prepend it to the first user turn.
 //! No thinking or tool-use support.
 
-use std::sync::Arc;
-use crate::model::instruct::{
-    ChatDecoder,
-    Instruct,
-    ReasoningDecoder,
-    ToolDecoder,
-};
 use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
+use crate::model::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use crate::model::tokenizer::Tokenizer;
+use std::sync::Arc;
 
 pub struct GemmaInstruct {
     tokenizer: Arc<Tokenizer>,
@@ -100,7 +95,10 @@ impl Instruct for GemmaInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
+        Box::new(GenericChatDecoder::new(
+            self.tokenizer.clone(),
+            self.stop_ids.clone(),
+        ))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
@@ -115,8 +113,8 @@ impl Instruct for GemmaInstruct {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::model::tokenizer::Tokenizer;
+    use std::sync::Arc;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
@@ -125,8 +123,14 @@ mod tests {
 
     fn gemma() -> GemmaInstruct {
         let tok = make_tok(&[
-            "<start_of_turn>", "<end_of_turn>", "<eos>", "<bos>",
-            "user", "model", "\n", "Hello",
+            "<start_of_turn>",
+            "<end_of_turn>",
+            "<eos>",
+            "<bos>",
+            "user",
+            "model",
+            "\n",
+            "Hello",
         ]);
         GemmaInstruct::new(tok)
     }

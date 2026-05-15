@@ -24,13 +24,13 @@
 //! unaware of speculation — it just runs forward passes.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use tokio::sync::oneshot;
 
-use crate::context::{ContextId, pagestore::PhysicalPageId};
-use crate::inference::request::{ForwardPassOutput, ForwardPassRequest, Sampler, SlotOutput};
+use crate::context::pagestore::PhysicalPageId;
+use crate::context::ContextId;
 use crate::inference::scheduler::SchedulerHandle;
 
 /// A pre-fired forward pass for a ctx, sitting in the per-ctx
@@ -45,7 +45,7 @@ pub(crate) struct StagedEntry {
     /// Future fire's output for this ctx. The scheduler holds the
     /// matching `Sender`; when the kernel finishes and the output
     /// is delivered, this receiver resolves.
-    pub output_rx: oneshot::Receiver<ForwardPassOutput>,
+    pub output_rx: oneshot::Receiver<pie_bridge::ForwardResponse>,
 }
 
 /// Per-model speculator state.
@@ -60,21 +60,20 @@ struct ModelEntry {
 
 /// Per-model registry. The lock-free `try_hit` accesses this
 /// without going through the inference actor.
-static REGISTRY: LazyLock<Mutex<Vec<ModelEntry>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+static REGISTRY: LazyLock<Mutex<Vec<ModelEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Total number of `try_hit` calls that successfully claimed a
 /// staged entry. Surfaced via `model_status.bypass_hits` for
 /// observability. Increments are per call, not per token.
 pub static BYPASS_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Total number of chain stages the speculator submitted to the
-/// scheduler. Excludes the initial cold submit (which the actor
-/// does, not the speculator). Diagnostic only.
+/// Total number of chain extenders that successfully submitted a
+/// staged forward pass to the scheduler. Surfaced via
+/// `model_status.chain_submits`.
 pub static CHAIN_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Total number of times `try_hit` cleared a deque due to a
-/// fingerprint mismatch (chain invalidated). Diagnostic only.
+/// Total number of staged chains dropped due to anchor mismatch.
+/// Surfaced via `model_status.chain_drops`.
 pub static CHAIN_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Register the staged batches for a model with the global
@@ -88,7 +87,10 @@ pub(crate) fn register_model(
 ) {
     if let Ok(mut reg) = REGISTRY.lock() {
         while reg.len() <= model_idx {
-            reg.push(ModelEntry { speculation_depth: 0, devices: Vec::new() });
+            reg.push(ModelEntry {
+                speculation_depth: 0,
+                devices: Vec::new(),
+            });
         }
         reg[model_idx] = ModelEntry {
             speculation_depth,
@@ -143,16 +145,14 @@ pub fn lookup_for_ctx(model_idx: usize, device_idx: usize) -> Option<StagedBatch
 pub fn try_hit(
     spec: &StagedBatch,
     ctx_id: ContextId,
-    request: &ForwardPassRequest,
-) -> Option<oneshot::Receiver<ForwardPassOutput>> {
+    request: &pie_bridge::ForwardRequest,
+) -> Option<oneshot::Receiver<pie_bridge::ForwardResponse>> {
     let mut sb = spec.0.lock().ok()?;
     let deque = sb.get_mut(&ctx_id)?;
     let front = deque.front()?;
-    let req_token = request.tokens.first().copied();
-    let req_pos = request.positions.first().copied();
-    if Some(front.anchor_token) == req_token
-        && Some(front.anchor_pos) == req_pos
-    {
+    let req_token = request.token_ids.first().copied();
+    let req_pos = request.position_ids.first().copied();
+    if Some(front.anchor_token) == req_token && Some(front.anchor_pos) == req_pos {
         let entry = deque.pop_front()?;
         BYPASS_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
         Some(entry.output_rx)
@@ -173,8 +173,12 @@ pub fn try_hit(
 /// the staged_batch entry NOW so a later hit-check never forwards
 /// stale predictions.
 pub fn invalidate_ctx(model_idx: usize, ctx_id: ContextId) {
-    let Ok(reg) = REGISTRY.lock() else { return; };
-    let Some(model) = reg.get(model_idx) else { return; };
+    let Ok(reg) = REGISTRY.lock() else {
+        return;
+    };
+    let Some(model) = reg.get(model_idx) else {
+        return;
+    };
     for sb_arc in &model.devices {
         if let Ok(mut sb) = sb_arc.lock() {
             sb.remove(&ctx_id);
@@ -209,12 +213,12 @@ pub fn invalidate_ctx(model_idx: usize, ctx_id: ContextId) {
 ///   - Ctx's deque is already at `max_queue_depth` entries
 ///   - `sched_rx` errored (scheduler dropped the channel)
 pub(crate) fn spawn_extend_chain(
-    sched_rx: oneshot::Receiver<ForwardPassOutput>,
-    response: oneshot::Sender<ForwardPassOutput>,
+    sched_rx: oneshot::Receiver<pie_bridge::ForwardResponse>,
+    response: oneshot::Sender<pie_bridge::ForwardResponse>,
     scheduler_handle: SchedulerHandle,
     staged_batch_arc: Arc<Mutex<HashMap<ContextId, VecDeque<StagedEntry>>>>,
     model_idx: usize,
-    prev_request: ForwardPassRequest,
+    prev_request: pie_bridge::ForwardRequest,
     all_pages: Vec<PhysicalPageId>,
     cur_page_idx: usize,
     cur_last_page_len: u32,
@@ -225,7 +229,10 @@ pub(crate) fn spawn_extend_chain(
             Ok(o) => o,
             Err(_) => return,
         };
-        let ctx_id = prev_request.context_id;
+        let ctx_id = match prev_request.context_ids.first() {
+            Some(&id) => id,
+            None => return,
+        };
 
         // Orphan-stage gate. If the receiver of our `response`
         // channel is gone, this stage's StagedEntry was dropped
@@ -261,24 +268,16 @@ pub(crate) fn spawn_extend_chain(
                 (cur_page_idx + 1, 1)
             };
             if next_page_idx < all_pages.len() {
-                let next_pages: Vec<PhysicalPageId> =
-                    all_pages[..=next_page_idx].to_vec();
+                let next_pages: Vec<PhysicalPageId> = all_pages[..=next_page_idx].to_vec();
                 let should_extend = match staged_batch_arc.lock() {
-                    Ok(sb) => {
-                        sb.get(&ctx_id).map_or(0, |d| d.len()) < max_queue_depth
-                    }
+                    Ok(sb) => sb.get(&ctx_id).map_or(0, |d| d.len()) < max_queue_depth,
                     Err(_) => false,
                 };
                 if should_extend {
                     let (sched_tx_next, sched_rx_next) = oneshot::channel();
                     let (final_tx_next, final_rx_next) = oneshot::channel();
                     if scheduler_handle
-                        .submit(
-                            next_req.clone(),
-                            sched_tx_next,
-                            next_pages,
-                            next_lpl,
-                        )
+                        .submit(next_req.clone(), sched_tx_next, next_pages, next_lpl)
                         .is_ok()
                     {
                         CHAIN_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -337,13 +336,15 @@ pub enum SkipReason {
 /// Stochastic samplers (temperature > 0, no seed) are accepted: the
 /// chain's pre-fired sample is itself a draw from the requested
 /// distribution, which is exactly what the inferlet asked for.
-pub fn evaluate_request_shape(req: &ForwardPassRequest) -> Result<(), SkipReason> {
+pub fn evaluate_request_shape(req: &pie_bridge::ForwardRequest) -> Result<(), SkipReason> {
+    use pie_bridge::Sampler;
+
     // Structural shape: exactly one sampling slot at the last input
     // position, with a sampler attached.
     if req.sampling_indices.len() != 1 || req.samplers.len() != 1 {
         return Err(SkipReason::NotDecodeShape);
     }
-    let last_input_pos = req.positions.len().saturating_sub(1) as u32;
+    let last_input_pos = req.position_ids.len().saturating_sub(1) as u32;
     if req.sampling_indices[0] != last_input_pos {
         return Err(SkipReason::NotDecodeShape);
     }
@@ -366,7 +367,7 @@ pub fn evaluate_request_shape(req: &ForwardPassRequest) -> Result<(), SkipReason
         | Sampler::TopKTopP { .. } => {}
     }
 
-    if req.logit_mask.is_some() {
+    if !req.logit_masks.is_empty() {
         return Err(SkipReason::LogitMaskPresent);
     }
     if req.has_user_mask {
@@ -376,11 +377,11 @@ pub fn evaluate_request_shape(req: &ForwardPassRequest) -> Result<(), SkipReason
     Ok(())
 }
 
-/// Build the next-cycle ForwardPassRequest from a just-completed
-/// request + output, ready to submit as a pre-staged speculation
-/// fire. Returns `None` if the input isn't spec-eligible (failed
-/// `evaluate_request_shape`) or the output has no leading `Token`
-/// slot. On success, also returns the `(anchor_token, anchor_pos)`
+/// Build the next-cycle ForwardRequest from a just-completed
+/// per-request request + response, ready to submit as a pre-staged
+/// speculation fire. Returns `None` if the input isn't spec-eligible
+/// (failed `evaluate_request_shape`) or the response has no first
+/// token. On success, also returns the `(anchor_token, anchor_pos)`
 /// pair used for fingerprint matching when the inferlet's actual
 /// next call arrives.
 ///
@@ -393,32 +394,39 @@ pub fn evaluate_request_shape(req: &ForwardPassRequest) -> Result<(), SkipReason
 ///     specific request, not the chain — propagating them would
 ///     amount to predicting the inferlet's draft strategy)
 pub fn build_next_request(
-    prev_req: &ForwardPassRequest,
-    prev_output: &ForwardPassOutput,
-) -> Option<(ForwardPassRequest, u32, u32)> {
+    prev_req: &pie_bridge::ForwardRequest,
+    prev_resp: &pie_bridge::ForwardResponse,
+) -> Option<(pie_bridge::ForwardRequest, u32, u32)> {
     if evaluate_request_shape(prev_req).is_err() {
         return None;
     }
-    let sampled_token = match prev_output.slots.first()? {
-        SlotOutput::Token(t) => *t,
-        _ => return None,
-    };
-    let last_pos = *prev_req.positions.last()?;
+    let sampled_token = *prev_resp.tokens.first()?;
+    let last_pos = *prev_req.position_ids.last()?;
     let next_pos = last_pos.checked_add(1)?;
-    let next_req = ForwardPassRequest {
-        context_id: prev_req.context_id,
-        tokens: vec![sampled_token],
-        positions: vec![next_pos],
-        speculative_tokens: vec![],
-        speculative_positions: vec![],
-        output_speculative_tokens: false,
-        masks: vec![],
-        has_user_mask: false,
-        logit_mask: None,
+    let context_id = *prev_req.context_ids.first()?;
+    let next_req = pie_bridge::ForwardRequest {
+        token_ids: vec![sampled_token],
+        position_ids: vec![next_pos],
+        kv_page_indices: Vec::new(),
+        kv_page_indptr: vec![0],
+        kv_last_page_lens: Vec::new(),
+        qo_indptr: vec![0, 1],
+        masks: Vec::new(),
+        mask_indptr: vec![0, 0],
+        logit_masks: Vec::new(),
+        logit_mask_indptr: vec![0, 0],
         sampling_indices: vec![0],
+        sampling_indptr: vec![0, 1],
         samplers: prev_req.samplers.clone(),
-        adapter_id: prev_req.adapter_id,
-        adapter_seed: prev_req.adapter_seed,
+        sampler_indptr: vec![0, 1],
+        adapter_bindings: prev_req.adapter_bindings.clone(),
+        spec_token_ids: Vec::new(),
+        spec_position_ids: Vec::new(),
+        spec_indptr: vec![0, 0],
+        output_spec_flags: vec![false],
+        context_ids: vec![context_id],
+        single_token_mode: true,
+        has_user_mask: false,
     };
     Some((next_req, sampled_token, next_pos))
 }
@@ -426,31 +434,59 @@ pub fn build_next_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pie_bridge::Sampler;
 
     fn req_with(
         positions: Vec<u32>,
         sampling_indices: Vec<u32>,
         samplers: Vec<Sampler>,
-    ) -> ForwardPassRequest {
-        ForwardPassRequest {
-            context_id: 0,
-            tokens: vec![0; positions.len()],
-            positions,
-            speculative_tokens: vec![],
-            speculative_positions: vec![],
-            output_speculative_tokens: false,
-            masks: vec![],
-            has_user_mask: false,
-            logit_mask: None,
+    ) -> pie_bridge::ForwardRequest {
+        let n = positions.len() as u32;
+        let n_sampling = sampling_indices.len() as u32;
+        let n_samplers = samplers.len() as u32;
+        pie_bridge::ForwardRequest {
+            token_ids: vec![0; positions.len()],
+            position_ids: positions,
+            kv_page_indices: Vec::new(),
+            kv_page_indptr: vec![0],
+            kv_last_page_lens: Vec::new(),
+            qo_indptr: vec![0, n],
+            masks: Vec::new(),
+            mask_indptr: vec![0, 0],
+            logit_masks: Vec::new(),
+            logit_mask_indptr: vec![0, 0],
             sampling_indices,
+            sampling_indptr: vec![0, n_sampling],
             samplers,
-            adapter_id: None,
-            adapter_seed: None,
+            sampler_indptr: vec![0, n_samplers],
+            adapter_bindings: vec![pie_bridge::AdapterBinding {
+                adapter_id: -1,
+                seed: -1,
+            }],
+            spec_token_ids: Vec::new(),
+            spec_position_ids: Vec::new(),
+            spec_indptr: vec![0, 0],
+            output_spec_flags: vec![false],
+            context_ids: vec![0],
+            single_token_mode: true,
+            has_user_mask: false,
         }
     }
 
     fn argmax() -> Sampler {
-        Sampler::Multinomial { temperature: 0.0, seed: None }
+        Sampler::Multinomial {
+            temperature: 0.0,
+            seed: 0,
+        }
+    }
+
+    fn token_resp(token: u32) -> pie_bridge::ForwardResponse {
+        pie_bridge::ForwardResponse {
+            num_requests: 1,
+            tokens: vec![token],
+            tokens_indptr: vec![0, 1],
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -466,7 +502,10 @@ mod tests {
         let req = req_with(
             vec![10],
             vec![0],
-            vec![Sampler::Multinomial { temperature: 0.7, seed: None }],
+            vec![Sampler::Multinomial {
+                temperature: 0.7,
+                seed: 0,
+            }],
         );
         assert_eq!(evaluate_request_shape(&req), Ok(()));
     }
@@ -486,27 +525,21 @@ mod tests {
     #[test]
     fn build_next_request_decode() {
         let req = req_with(vec![10], vec![0], vec![argmax()]);
-        let out = ForwardPassOutput {
-            slots: vec![SlotOutput::Token(42)],
-            spec_tokens: vec![],
-            spec_positions: vec![],
-        };
-        let (next, anchor_token, anchor_pos) =
-            build_next_request(&req, &out).expect("eligible");
+        let resp = token_resp(42);
+        let (next, anchor_token, anchor_pos) = build_next_request(&req, &resp).expect("eligible");
         assert_eq!(anchor_token, 42);
         assert_eq!(anchor_pos, 11);
-        assert_eq!(next.tokens, vec![42]);
-        assert_eq!(next.positions, vec![11]);
+        assert_eq!(next.token_ids, vec![42]);
+        assert_eq!(next.position_ids, vec![11]);
     }
 
     #[test]
-    fn build_next_request_none_on_non_token_slot() {
+    fn build_next_request_none_on_empty_tokens() {
         let req = req_with(vec![10], vec![0], vec![argmax()]);
-        let out = ForwardPassOutput {
-            slots: vec![SlotOutput::Entropy(1.5)],
-            spec_tokens: vec![],
-            spec_positions: vec![],
+        let resp = pie_bridge::ForwardResponse {
+            num_requests: 1,
+            ..Default::default()
         };
-        assert!(build_next_request(&req, &out).is_none());
+        assert!(build_next_request(&req, &resp).is_none());
     }
 }

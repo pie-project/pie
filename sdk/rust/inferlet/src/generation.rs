@@ -418,9 +418,21 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         let n_pending = pending.len() as u32;
         let n_drafted = drafts.len() as u32;
 
-        if n_pending == 0 && n_drafted == 0 && user_cleared_sampler && extra_probes.is_empty() {
-            // Truly nothing to do — no input, no sampler, no probes.
-            // Mark done so collect_* sugars terminate cleanly.
+        if n_pending == 0 && n_drafted == 0 {
+            // No input, no drafts — there are no query positions for a
+            // sampler to land on. Firing in this state would produce a
+            // wire request with `qo_indptr=[0,0]` plus a sampler slot
+            // pointing at a non-existent query position; the driver
+            // would either crash (portable's old behavior) or return
+            // an empty response (cuda's short-circuit), and the SDK
+            // loop would just call us again with the same empty state.
+            //
+            // Mark done so `Generator::next()` returns `None` and the
+            // inferlet's `while let Some(step) = g.next()?` loop
+            // terminates cleanly. Reached when a prior step's response
+            // didn't yield an accepted token (e.g., a driver error
+            // returned an empty slot list), so this also acts as a
+            // fail-stop against a runaway empty-response loop.
             parent.done = true;
             return Ok(Output::new(RawOutput {
                 slots: Vec::new(),

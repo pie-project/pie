@@ -4,5 +4,5 @@
 //! inferlet-provided implementations of chat, tool-use, and reasoning.
 
 pub mod chat;
-pub mod tool_use;
 pub mod reasoning;
+pub mod tool_use;

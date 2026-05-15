@@ -1,7 +1,7 @@
 """Worker entry point for the vllm driver.
 
 Delegates the universal lifecycle (distributed init, group setup, ready-queue
-handshake, leader/follower dispatch) to `pie_driver_dev.worker.run_worker`, then
+handshake, leader/follower dispatch) to `._bridge.worker.run_worker`, then
 plugs in vllm-specific engine construction.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 
 # Re-export for parity with other workers (server.py imports this).
-from pie_driver_dev.worker import calculate_topology  # noqa: F401
+from ._bridge.worker import calculate_topology  # noqa: F401
 
 
 def worker_main(
@@ -28,7 +28,8 @@ def worker_main(
     `driver_config` is `VllmDriverConfig` as a dict; vllm's own knobs live
     on the typed dataclass and never leak into pie's `RuntimeConfig`.
     """
-    from pie_driver_dev.worker import run_worker
+    from ._bridge.worker import run_worker
+    from . import utils as runtime_ops
     from .config import VllmDriverConfig
     from .engine import VllmEngine
 
@@ -44,4 +45,5 @@ def worker_main(
         group_id_base=group_id_base,
         ready_queue=ready_queue,
         build_engine=lambda cfg: VllmEngine.load(cfg, vllm_cfg),
+        runtime_ops=runtime_ops,
     )

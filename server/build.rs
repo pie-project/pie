@@ -32,6 +32,17 @@ fn main() {
     build_dummy();
 }
 
+/// Read `DEP_PIE_BRIDGE_INCLUDE` — the directory where `pie-bridge`'s
+/// build.rs writes the cbindgen-generated `pie_bridge.h`. Pass-through to
+/// CMake via `-DPIE_BRIDGE_INCLUDE_DIR=...` so each C++ driver backend
+/// can pick the header up with `target_include_directories`.
+fn pie_bridge_include_dir() -> PathBuf {
+    let dir = std::env::var("DEP_PIE_BRIDGE_INCLUDE")
+        .expect("pie-bridge's build.rs did not emit cargo:include — \
+                 check that `links = \"pie_bridge\"` is set in driver/bridge/Cargo.toml");
+    PathBuf::from(dir)
+}
+
 // -----------------------------------------------------------------------------
 // driver/dummy — Rust staticlib, no cmake step
 // -----------------------------------------------------------------------------
@@ -96,7 +107,8 @@ fn build_portable() {
     };
     cfg.out_dir(portable_out_dir);
     cfg.build_target("pie_driver_portable_lib")
-        .define("BUILD_SHARED_LIBS", "OFF");
+        .define("BUILD_SHARED_LIBS", "OFF")
+        .define("PIE_BRIDGE_INCLUDE_DIR", pie_bridge_include_dir());
     enable_position_independent_archives(&mut cfg);
     // CMake caches option values under OUT_DIR. Define every backend flag
     // explicitly so flipping PIE_PORTABLE_* between builds cannot leave stale
@@ -245,8 +257,33 @@ fn build_cuda() {
     // configurations from clobbering each other in multi-driver builds.
     cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("cuda"));
     cfg.build_target("pie_driver_cuda_lib")
-        .define("BUILD_SHARED_LIBS", "OFF");
+        .define("BUILD_SHARED_LIBS", "OFF")
+        .define("PIE_BRIDGE_INCLUDE_DIR", pie_bridge_include_dir());
     enable_position_independent_archives(&mut cfg);
+
+    // nvcc discovery. CMake reads `CMAKE_CUDA_COMPILER` / `CUDACXX` to
+    // locate nvcc; some toolchains install CUDA under `/usr/local/cuda`
+    // without adding `/usr/local/cuda/bin` to the build user's PATH.
+    // Probe standard locations and hand CMake the explicit path so
+    // workspace builds work without the user having to source CUDA's
+    // env script first.
+    println!("cargo:rerun-if-env-changed=CUDACXX");
+    println!("cargo:rerun-if-env-changed=CMAKE_CUDA_COMPILER");
+    if std::env::var_os("CUDACXX").is_none()
+        && std::env::var_os("CMAKE_CUDA_COMPILER").is_none()
+    {
+        for candidate in [
+            "/usr/local/cuda/bin/nvcc",
+            "/usr/local/cuda-12/bin/nvcc",
+            "/usr/local/cuda-12.8/bin/nvcc",
+            "/opt/cuda/bin/nvcc",
+        ] {
+            if Path::new(candidate).exists() {
+                cfg.define("CMAKE_CUDA_COMPILER", candidate);
+                break;
+            }
+        }
+    }
 
     // CUDA architecture. driver/cuda's `DetectCudaArchitecture.cmake`
     // shells out to `nvidia-smi` if `CMAKE_CUDA_ARCHITECTURES` isn't

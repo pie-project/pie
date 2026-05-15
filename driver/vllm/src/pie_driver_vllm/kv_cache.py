@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pie_driver_dev.config import RuntimeConfig
+from ._bridge.config import RuntimeConfig
 
 if TYPE_CHECKING:
     from .loader import LoadedModel

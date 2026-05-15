@@ -112,8 +112,9 @@ impl Linker {
         //    across the main program and its direct dependencies. Also tracks
         //    whether any Python component in the graph was snapshotted — that
         //    determines which shared-module variant we use for instantiation.
-        let (dependency_components, python_runtime, any_snapshotted) =
-            self.resolve_dependencies_and_runtime(program_name, &main).await?;
+        let (dependency_components, python_runtime, any_snapshotted) = self
+            .resolve_dependencies_and_runtime(program_name, &main)
+            .await?;
         let component = main.component;
 
         // 3. Gate shared Python runtime loading by whether anything in the graph
@@ -144,14 +145,14 @@ impl Linker {
             &self.policy,
             token_budget,
             py_runtime_dir_for_state,
-        ).await?;
+        )
+        .await?;
         let mut store = Store::new(&self.engine, inst_state);
 
         // 5. Create and configure linker
         let mut linker = WasmLinker::<InstanceState>::new(&self.engine);
 
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-            .expect("Failed to link WASI");
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
 
         // wasi:http operates above wasi:sockets and bypasses the per-socket
         // policy hook (it uses the host's hyper stack with its own DNS).
@@ -268,9 +269,23 @@ impl ServiceHandler for Linker {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Instantiate { process_id, username, program_name, capture_outputs, token_budget, response } => {
+            Message::Instantiate {
+                process_id,
+                username,
+                program_name,
+                capture_outputs,
+                token_budget,
+                response,
+            } => {
                 let _ = response.send(
-                    self.instantiate(process_id, username, &program_name, capture_outputs, token_budget).await
+                    self.instantiate(
+                        process_id,
+                        username,
+                        &program_name,
+                        capture_outputs,
+                        token_budget,
+                    )
+                    .await,
                 );
             }
         }
