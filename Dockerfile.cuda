@@ -1,0 +1,72 @@
+# Pie server with the native CUDA driver.
+
+FROM nvidia/cuda:12.9.0-devel-ubuntu24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+# Do not apt-install libnccl* — the CUDA devel base pins the right version,
+# and the nvidia apt repo will try to upgrade to a newer CUDA branch.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git \
+        build-essential cmake ninja-build pkg-config \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal
+
+WORKDIR /workspace
+COPY . .
+
+# No GPU at build time, so target SM 8.0–9.0 (Ampere/Ada/Hopper) explicitly.
+ARG CMAKE_CUDA_ARCHITECTURES="80;86;89;90"
+ENV CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}
+
+RUN cargo install --path server --root /usr/local \
+        --no-default-features --features driver-cuda
+
+# Bake a Docker-tuned config. The stub libcuda symlink lets `pie config init`
+# load the binary at build time; the NVIDIA Container Toolkit injects the
+# real libcuda.so.1 at `docker run` and shadows the stub.
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
+           /usr/local/cuda/lib64/stubs/libcuda.so.1 \
+ && export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+ && CFG=/workspace/runtime/docker_config.toml \
+ && pie config init --path $CFG --force \
+ && pie config set server.host 0.0.0.0 --path $CFG \
+ && pie config set server.python_snapshot false --path $CFG
+
+RUN strip /usr/local/bin/pie
+
+
+FROM builder AS development
+
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["pie", "serve", "--config", "/workspace/runtime/docker_config.toml"]
+
+
+FROM nvidia/cuda:12.9.0-runtime-ubuntu24.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIE_HOME=/root/.cache/pie
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/pie /usr/local/bin/pie
+COPY --from=builder /workspace/runtime/docker_config.toml /workspace/runtime/docker_config.toml
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+VOLUME ["/root/.cache/pie", "/root/.cache/huggingface"]
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["pie", "serve", "--config", "/workspace/runtime/docker_config.toml"]
