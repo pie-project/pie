@@ -30,10 +30,15 @@
 #include "aux_server.hpp"
 #include "config.hpp"
 #include "forward.hpp"
+#include "gguf_tokenizer.hpp"
 #include "hf_config.hpp"
 #include "model.hpp"
 #include "shmem_ipc.hpp"
 #include "shmem_schema.hpp"
+
+#include <filesystem>
+#include <random>
+#include <unistd.h>
 
 namespace {
 
@@ -281,6 +286,30 @@ int run_impl(int argc,
                   << ", backend=" << model.backend_name() << ")\n";
     }
 
+    // For GGUF inputs the server-side bootstrap expects `tokenizer.json`
+    // adjacent to `snapshot_dir`. GGUF embeds the tokenizer in KV
+    // metadata instead, so mint a HF-format `tokenizer.json` (plus
+    // `tokenizer_config.json` for the chat template) into a unique temp
+    // dir, then report that dir as `snapshot_dir` in caps. Safetensors
+    // path is untouched.
+    std::string effective_snapshot_dir = cfg.model.hf_path;
+    {
+        const std::filesystem::path src(cfg.model.hf_path);
+        if (std::filesystem::is_regular_file(src) && src.extension() == ".gguf") {
+            std::random_device rd;
+            const auto rand_tag = std::to_string(rd()) + "-" + std::to_string(rd());
+            const auto tmpdir = std::filesystem::temp_directory_path() /
+                ("pie-gguf-tokenizer-" + std::to_string(::getpid()) + "-" + rand_tag);
+            std::filesystem::create_directories(tmpdir);
+            pie_portable_driver::emit_tokenizer_files(src, tmpdir);
+            effective_snapshot_dir = tmpdir.string();
+            if (cfg.runtime.verbose) {
+                std::cerr << "[pie-driver-portable] minted tokenizer.json from GGUF KVs to "
+                          << effective_snapshot_dir << "\n";
+            }
+        }
+    }
+
     // ---- Allocate forward engine + paged KV pool. ---------------------------
     // The runtime owns page allocation; we report total_pages and page_size
     // in the READY handshake and honor the page IDs the runtime sends in
@@ -419,7 +448,7 @@ int run_impl(int argc,
         {"vocab_size",       h.vocab_size},
         {"max_model_len",    max_model_len},
         {"activation_dtype", model.activation_dtype_str()},
-        {"snapshot_dir",     cfg.model.hf_path},
+        {"snapshot_dir",     effective_snapshot_dir},
         {"shmem_name",       cfg.shmem.name},
     };
     // Hand caps to the host. The standalone executable's default
