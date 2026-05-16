@@ -429,6 +429,26 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             }));
         }
 
+        // No input + sampler still attached: the SDK once advertised this
+        // as a "no-input bootstrap" path that samples from the last cached
+        // KV position without growing the working tail (see the comment
+        // below). The portable driver's `plan_single_request` rejects
+        // zero-token requests, and silent failure here lets `collect_*`
+        // spin forever firing empty batches once the previous step's
+        // sample came back empty (e.g. grammar mask exhaustion). Fail
+        // loudly so the caller sees the real problem instead of an
+        // infinite retry loop.
+        if n_pending == 0 && n_drafted == 0 && extra_probes.is_empty() {
+            parent.done = true;
+            return Err(
+                "GenStep::execute: no input tokens and no probes — previous \
+                 step likely sampled zero tokens (constraint mask exhausted, \
+                 or driver returned empty response). Refusing to fire a \
+                 zero-input forward pass that the driver would reject."
+                    .to_string(),
+            );
+        }
+
         // Reserve pages for pending (drafts share the working tail —
         // their commit/truncate happens after we know what was accepted).
         // No-input bootstrap path skips reservation: the host samples from
