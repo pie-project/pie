@@ -12,12 +12,7 @@ use ratatui::text::{Line, Span};
 
 const BRAILLE_BASE: u32 = 0x2800;
 /// Bit at row r, col c. Row 0 = top, row 3 = bottom; col 0 = left.
-const BRAILLE_DOTS: [[u32; 2]; 4] = [
-    [0x01, 0x08],
-    [0x02, 0x10],
-    [0x04, 0x20],
-    [0x40, 0x80],
-];
+const BRAILLE_DOTS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 #[derive(Debug, Clone)]
 pub struct Series<'a> {
@@ -77,8 +72,7 @@ pub fn render(
         for (i, &value) in display.iter().enumerate() {
             let col = start_col + i;
             let normalized = normalize(value, s.min_val, s.max_val);
-            let dot_row =
-                ((1.0 - normalized) * (total_dot_rows as f64 - 1.0)).round() as i32;
+            let dot_row = ((1.0 - normalized) * (total_dot_rows as f64 - 1.0)).round() as i32;
             let dot_row = dot_row.clamp(0, total_dot_rows as i32 - 1);
 
             // Mark this cell. Lower-index series claims first.
@@ -93,7 +87,11 @@ pub fn render(
             // still empty.
             if let Some(p) = prev_row {
                 if (dot_row - p).abs() > 1 {
-                    let (lo, hi) = if dot_row < p { (dot_row, p) } else { (p, dot_row) };
+                    let (lo, hi) = if dot_row < p {
+                        (dot_row, p)
+                    } else {
+                        (p, dot_row)
+                    };
                     for r in lo..=hi {
                         let idx = r as usize * data_points_needed + col;
                         if grid[idx] == -1 {
@@ -210,7 +208,12 @@ mod tests {
         // Last row has a non-empty span (the dot landed somewhere).
         let nonempty: usize = out
             .iter()
-            .map(|line| line.spans.iter().filter(|s| !s.content.trim().is_empty()).count())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .filter(|s| !s.content.trim().is_empty())
+                    .count()
+            })
             .sum();
         assert!(nonempty > 0);
     }

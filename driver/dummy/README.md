@@ -36,11 +36,15 @@ device = ["cpu"]
 vocab_size = 151936
 arch_name = "qwen3"
 kv_page_size = 16
-max_num_kv_pages = 256
+max_forward_tokens = 4096
+max_forward_requests = 128
 ```
 
 `hf_repo` must still resolve to a repo or local snapshot with a tokenizer.
 Only weight loading and compute are skipped.
+The dummy driver derives its synthetic KV page pool from the configured
+forward limits and reports the computed `total_pages` in its capability
+handshake.
 
 ## Behavior
 

@@ -175,7 +175,9 @@ fn draw_config_panel(f: &mut ratatui::Frame, area: Rect, cfg: &DisplayConfig) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{k:<10} "),
-                Style::default().fg(theme::PRIMARY).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::PRIMARY)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(v, value_style),
         ]));
@@ -184,7 +186,12 @@ fn draw_config_panel(f: &mut ratatui::Frame, area: Rect, cfg: &DisplayConfig) {
     item("port", cfg.port.to_string(), false);
     item(
         "auth",
-        if cfg.auth_enabled { "enabled" } else { "disabled" }.to_string(),
+        if cfg.auth_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+        .to_string(),
         false,
     );
     item("repo", cfg.hf_repo.clone(), true);
@@ -192,7 +199,7 @@ fn draw_config_panel(f: &mut ratatui::Frame, area: Rect, cfg: &DisplayConfig) {
     item("tp_size", cfg.tensor_parallel_size.to_string(), false);
     item("dtype", cfg.activation_dtype.clone(), false);
     item("kv_page", cfg.kv_page_size.to_string(), false);
-    item("batch", cfg.max_batch_tokens.to_string(), false);
+    item("profile", cfg.memory_profile.clone(), false);
 
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -229,7 +236,14 @@ fn draw_graphs(f: &mut ratatui::Frame, area: Rect, snap: &Snapshot) {
 fn draw_graph_legend(f: &mut ratatui::Frame, area: Rect, snap: &Snapshot) {
     let m = &snap.metrics;
     let row1 = Line::from(vec![
-        legend_cell("◇ TPUT", format_tput(m.token_throughput), theme::GRAPH_TPUT, &snap.token_tput_history, "t/s", false),
+        legend_cell(
+            "◇ TPUT",
+            format_tput(m.token_throughput),
+            theme::GRAPH_TPUT,
+            &snap.token_tput_history,
+            "t/s",
+            false,
+        ),
         Span::raw("    "),
         legend_cell(
             "◆ KV",
@@ -355,7 +369,9 @@ fn draw_workers(f: &mut ratatui::Frame, area: Rect, m: &SystemMetrics) {
         }
         lines.push(Line::from(Span::styled(
             format!("GRP{}", tp.tp_id),
-            Style::default().fg(theme::PRIMARY).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::PRIMARY)
+                .add_modifier(Modifier::BOLD),
         )));
         for gpu in &tp.gpus {
             let color = theme::util_color(gpu.utilization);
@@ -371,10 +387,7 @@ fn draw_workers(f: &mut ratatui::Frame, area: Rect, m: &SystemMetrics) {
                     Style::default().fg(color),
                 ),
                 Span::styled(
-                    format!(
-                        "  {:.1}/{:.0}G",
-                        gpu.memory_used_gb, gpu.memory_total_gb
-                    ),
+                    format!("  {:.1}/{:.0}G", gpu.memory_used_gb, gpu.memory_total_gb),
                     Style::default().fg(theme::TEXT_MUTED),
                 ),
             ]));
@@ -417,10 +430,7 @@ fn draw_inferlets(f: &mut ratatui::Frame, area: Rect, m: &SystemMetrics) {
                     Style::default().fg(theme::SUCCESS),
                 ))
             } else {
-                Cell::from(Span::styled(
-                    "○ idle",
-                    Style::default().fg(theme::TEXT_DIM),
-                ))
+                Cell::from(Span::styled("○ idle", Style::default().fg(theme::TEXT_DIM)))
             };
             let kv_cell = if inf.kv_cache <= 0.0 {
                 Cell::from(Span::styled("—", Style::default().fg(theme::TEXT_DIM)))
@@ -429,10 +439,7 @@ fn draw_inferlets(f: &mut ratatui::Frame, area: Rect, m: &SystemMetrics) {
                 let bar = theme::ascii_bar(inf.kv_cache, 8);
                 Cell::from(Line::from(vec![
                     Span::styled(bar, Style::default().fg(color)),
-                    Span::styled(
-                        format!(" {:.0}%", inf.kv_cache),
-                        Style::default().fg(color),
-                    ),
+                    Span::styled(format!(" {:.0}%", inf.kv_cache), Style::default().fg(color)),
                 ]))
             };
             Row::new(vec![
@@ -466,9 +473,7 @@ fn draw_inferlets(f: &mut ratatui::Frame, area: Rect, m: &SystemMetrics) {
         Constraint::Ratio(1, 8),
         Constraint::Ratio(2, 8),
     ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(block);
+    let table = Table::new(rows, widths).header(header).block(block);
     f.render_widget(table, area);
 }
 

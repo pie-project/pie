@@ -88,8 +88,8 @@ device = ["auto"]
 ipc_profile = "balanced" # "low_latency", "balanced", or "low_power"
 
 [model.driver.options]
-max_batch_tokens = 10240
-max_batch_size = 512
+max_forward_tokens = 10240
+max_forward_requests = 512
 "#;
 
 #[cfg(feature = "driver-cuda")]
@@ -102,9 +102,8 @@ activation_dtype = "bfloat16"
 ipc_profile = "balanced" # "low_latency", "balanced", or "low_power"
 
 [model.driver.options]
-gpu_mem_utilization = 0.85
-max_batch_tokens = 10240
-max_batch_size = 512
+gpu_mem_utilization = 0.90
+memory_profile = "balanced"
 "#;
 
 const DUMMY_DRIVER_BLOCK: &str = r#"

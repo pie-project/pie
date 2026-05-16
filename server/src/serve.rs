@@ -369,16 +369,14 @@ fn start_embedded_group(
     })?;
     let caps = primary.caps.clone();
     if let Some(shmem_name) = primary.shmem_name.as_deref() {
-        let channel = pie::driver::ShmemChannel::open(
-            shmem_name,
-            m.driver.effective_spin_budget_us(),
-        )
-        .with_context(|| {
-            format!(
-                "opening shmem channel for embedded driver ({}) group {group_idx}",
-                flavor.as_str(),
-            )
-        })?;
+        let channel =
+            pie::driver::ShmemChannel::open(shmem_name, m.driver.effective_spin_budget_us())
+                .with_context(|| {
+                    format!(
+                        "opening shmem channel for embedded driver ({}) group {group_idx}",
+                        flavor.as_str(),
+                    )
+                })?;
         pie::driver::install_channel(driver_idx, Arc::new(channel));
     }
     let handshake = GroupHandshake { caps };

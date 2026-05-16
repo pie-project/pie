@@ -50,9 +50,8 @@ device = "{device}"
 dtype = "bfloat16"
 [batching]
 kv_page_size = 32
-max_num_kv_pages = 1024
-max_batch_tokens = 4096
-max_batch_size = 8
+gpu_mem_utilization = 0.90
+memory_profile = "balanced"
 """
 
 

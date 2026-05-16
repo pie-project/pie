@@ -5,7 +5,7 @@
 //! needs in lieu of model introspection. The standalone server emits
 //! this file via `embedded_driver::write_dummy_startup_toml`.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer};
 use std::path::Path;
 
@@ -29,11 +29,11 @@ pub struct ShmemConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DummyConfig {
     pub kv_page_size: u32,
-    pub max_num_kv_pages: u32,
-    pub max_batch_tokens: u32,
-    pub max_batch_size: u32,
+    pub max_forward_tokens: u32,
+    pub max_forward_requests: u32,
     pub vocab_size: u32,
     pub arch_name: String,
     pub max_model_len: u32,
@@ -46,6 +46,19 @@ pub struct DummyConfig {
     /// to find the tokenizer.
     #[serde(default)]
     pub snapshot_dir: String,
+}
+
+impl DummyConfig {
+    pub fn derived_total_pages(&self) -> u32 {
+        let forward_pages = pages_for_tokens(self.max_forward_tokens, self.kv_page_size);
+        let context_pages = pages_for_tokens(self.max_model_len, self.kv_page_size);
+        let request_pages = self.max_forward_requests.saturating_mul(2);
+        256.max(forward_pages).max(context_pages).max(request_pages)
+    }
+}
+
+fn pages_for_tokens(tokens: u32, page_size: u32) -> u32 {
+    tokens.saturating_add(page_size - 1) / page_size
 }
 
 fn default_activation_dtype() -> String {
@@ -102,6 +115,19 @@ pub fn load(path: &Path) -> Result<Config> {
         std::fs::read_to_string(path).with_context(|| format!("read startup TOML {path:?}"))?;
     let cfg: Config =
         toml::from_str(&text).with_context(|| format!("parse startup TOML {path:?}"))?;
+    ensure!(cfg.dummy.kv_page_size > 0, "dummy.kv_page_size must be > 0");
+    ensure!(
+        cfg.dummy.max_forward_tokens > 0,
+        "dummy.max_forward_tokens must be > 0"
+    );
+    ensure!(
+        cfg.dummy.max_forward_requests > 0,
+        "dummy.max_forward_requests must be > 0"
+    );
+    ensure!(
+        cfg.dummy.max_model_len > 0,
+        "dummy.max_model_len must be > 0"
+    );
     Ok(cfg)
 }
 
@@ -120,9 +146,8 @@ resp_buf = 4194304
 
 [dummy]
 kv_page_size = 16
-max_num_kv_pages = 256
-max_batch_tokens = 4096
-max_batch_size = 128
+max_forward_tokens = 4096
+max_forward_requests = 128
 vocab_size = 32000
 arch_name = "qwen3"
 max_model_len = 4096
@@ -133,6 +158,7 @@ snapshot_dir = "/tmp/snap"
         assert_eq!(cfg.shmem.spin_budget_us, 1_000);
         assert_eq!(cfg.dummy.vocab_size, 32000);
         assert_eq!(cfg.dummy.arch_name, "qwen3");
+        assert_eq!(cfg.dummy.derived_total_pages(), 256);
     }
 
     #[test]
@@ -147,14 +173,35 @@ spin_budget_us = "18446744073709551615"
 
 [dummy]
 kv_page_size = 16
-max_num_kv_pages = 256
-max_batch_tokens = 4096
-max_batch_size = 128
+max_forward_tokens = 4096
+max_forward_requests = 128
 vocab_size = 32000
 arch_name = "qwen3"
 max_model_len = 4096
 "#;
         let cfg: Config = toml::from_str(txt).unwrap();
         assert_eq!(cfg.shmem.spin_budget_us, u64::MAX);
+    }
+
+    #[test]
+    fn rejects_legacy_page_count_key() {
+        let txt = r#"
+[shmem]
+name = "/pie_shmem_g0"
+num_slots = 8
+req_buf = 4194304
+resp_buf = 4194304
+
+[dummy]
+kv_page_size = 16
+max_num_kv_pages = 256
+max_forward_tokens = 4096
+max_forward_requests = 128
+vocab_size = 32000
+arch_name = "qwen3"
+max_model_len = 4096
+"#;
+        let err = toml::from_str::<Config>(txt).unwrap_err().to_string();
+        assert!(err.contains("max_num_kv_pages"), "got: {err}");
     }
 }

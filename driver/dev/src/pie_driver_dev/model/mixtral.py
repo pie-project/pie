@@ -146,7 +146,7 @@ class ModelConfig(ModelConfigBase):
             top_k=int(spec["num_experts_per_tok"]),
         )
 
-    def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
+    def eval_total_pages(self, runtime_config: RuntimeConfig) -> int:
         available = get_available_memory(devices=runtime_config.devices, rank=runtime_config.rank)
         usable = available * runtime_config.gpu_mem_utilization
         elem = torch.empty((), dtype=runtime_config.activation_dtype).element_size()
@@ -399,7 +399,7 @@ def create_kv_cache(model_config: ModelConfig, runtime_config: RuntimeConfig) ->
     return [
         torch.zeros(
             (
-                runtime_config.max_num_kv_pages + 1,
+                runtime_config.total_pages + 1,
                 2,
                 runtime_config.kv_page_size,
                 local_kv,

@@ -27,11 +27,16 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
+use anyhow::Result;
 use tokio::sync::oneshot;
 
-use crate::context::ContextId;
 use crate::context::pagestore::PhysicalPageId;
+use crate::context::ContextId;
 use crate::inference::scheduler::SchedulerHandle;
+
+fn trace_spec_enabled() -> bool {
+    std::env::var_os("PIE_TRACE_SPEC").is_some()
+}
 
 /// A pre-fired forward pass for a ctx, sitting in the per-ctx
 /// chain queue waiting for the inferlet's matching `execute()` call.
@@ -45,7 +50,7 @@ pub(crate) struct StagedEntry {
     /// Future fire's output for this ctx. The scheduler holds the
     /// matching `Sender`; when the kernel finishes and the output
     /// is delivered, this receiver resolves.
-    pub output_rx: oneshot::Receiver<pie_bridge::ForwardResponse>,
+    pub output_rx: oneshot::Receiver<Result<pie_bridge::ForwardResponse>>,
 }
 
 /// Per-model speculator state.
@@ -146,7 +151,7 @@ pub fn try_hit(
     spec: &StagedBatch,
     ctx_id: ContextId,
     request: &pie_bridge::ForwardRequest,
-) -> Option<oneshot::Receiver<pie_bridge::ForwardResponse>> {
+) -> Option<oneshot::Receiver<Result<pie_bridge::ForwardResponse>>> {
     let mut sb = spec.0.lock().ok()?;
     let deque = sb.get_mut(&ctx_id)?;
     let front = deque.front()?;
@@ -155,8 +160,26 @@ pub fn try_hit(
     if Some(front.anchor_token) == req_token && Some(front.anchor_pos) == req_pos {
         let entry = deque.pop_front()?;
         BYPASS_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace_spec_enabled() {
+            eprintln!(
+                "[pie-spec] hit ctx={ctx_id} anchor=({},{}) remaining_depth={}",
+                entry.anchor_token,
+                entry.anchor_pos,
+                deque.len()
+            );
+        }
         Some(entry.output_rx)
     } else {
+        if trace_spec_enabled() {
+            eprintln!(
+                "[pie-spec] miss ctx={ctx_id} req=({:?},{:?}) front=({},{}) drop_depth={}",
+                req_token,
+                req_pos,
+                front.anchor_token,
+                front.anchor_pos,
+                deque.len()
+            );
+        }
         deque.clear();
         CHAIN_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         None
@@ -213,8 +236,8 @@ pub fn invalidate_ctx(model_idx: usize, ctx_id: ContextId) {
 ///   - Ctx's deque is already at `max_queue_depth` entries
 ///   - `sched_rx` errored (scheduler dropped the channel)
 pub(crate) fn spawn_extend_chain(
-    sched_rx: oneshot::Receiver<pie_bridge::ForwardResponse>,
-    response: oneshot::Sender<pie_bridge::ForwardResponse>,
+    sched_rx: oneshot::Receiver<Result<pie_bridge::ForwardResponse>>,
+    response: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
     scheduler_handle: SchedulerHandle,
     staged_batch_arc: Arc<Mutex<HashMap<ContextId, VecDeque<StagedEntry>>>>,
     model_idx: usize,
@@ -226,8 +249,15 @@ pub(crate) fn spawn_extend_chain(
 ) {
     tokio::spawn(async move {
         let output = match sched_rx.await {
-            Ok(o) => o,
-            Err(_) => return,
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                let _ = response.send(Err(e));
+                return;
+            }
+            Err(_) => {
+                let _ = response.send(Err(anyhow::anyhow!("scheduler dropped staged response")));
+                return;
+            }
         };
         let ctx_id = match prev_request.context_ids.first() {
             Some(&id) => id,
@@ -252,7 +282,7 @@ pub(crate) fn spawn_extend_chain(
         // try_hit (deque empty), go through the actor, and land
         // here again — same forwarding, no chain ever forms.
         if !is_spec_enabled(model_idx) {
-            let _ = response.send(output);
+            let _ = response.send(Ok(output));
             return;
         }
 
@@ -276,11 +306,18 @@ pub(crate) fn spawn_extend_chain(
                 if should_extend {
                     let (sched_tx_next, sched_rx_next) = oneshot::channel();
                     let (final_tx_next, final_rx_next) = oneshot::channel();
+                    let next_pages_len = next_pages.len();
                     if scheduler_handle
                         .submit(next_req.clone(), sched_tx_next, next_pages, next_lpl)
                         .is_ok()
                     {
                         CHAIN_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if trace_spec_enabled() {
+                            eprintln!(
+                                "[pie-spec] submit ctx={ctx_id} anchor=({anchor_token},{anchor_pos}) pages={} last_page_len={next_lpl}",
+                                next_pages_len
+                            );
+                        }
                         if let Ok(mut sb) = staged_batch_arc.lock() {
                             sb.entry(ctx_id).or_default().push_back(StagedEntry {
                                 anchor_token,
@@ -307,7 +344,7 @@ pub(crate) fn spawn_extend_chain(
 
         // Forward this stage's output to its claimant (inferlet
         // or the upstream forwarder spawned by `try_hit`).
-        let _ = response.send(output);
+        let _ = response.send(Ok(output));
     });
 }
 
@@ -389,7 +426,8 @@ pub fn evaluate_request_shape(req: &pie_bridge::ForwardRequest) -> Result<(), Sk
 ///   - is a single-token decode at `last_pos + 1` with input =
 ///     the sampled token
 ///   - carries the same samplers / adapter as the prior call
-///   - has no custom masks (kernel synthesizes causal)
+///   - carries a generated causal mask row, matching the normal API
+///     request shape if this decode is later batched with masked prefills
 ///   - has no speculative drafts (those are a property of the
 ///     specific request, not the chain — propagating them would
 ///     amount to predicting the inferlet's draft strategy)
@@ -404,6 +442,7 @@ pub fn build_next_request(
     let last_pos = *prev_req.position_ids.last()?;
     let next_pos = last_pos.checked_add(1)?;
     let context_id = *prev_req.context_ids.first()?;
+    let causal_mask = pie_bridge::Brle::all_true((next_pos + 1) as usize);
     let next_req = pie_bridge::ForwardRequest {
         token_ids: vec![sampled_token],
         position_ids: vec![next_pos],
@@ -411,8 +450,8 @@ pub fn build_next_request(
         kv_page_indptr: vec![0],
         kv_last_page_lens: Vec::new(),
         qo_indptr: vec![0, 1],
-        masks: Vec::new(),
-        mask_indptr: vec![0, 0],
+        masks: vec![causal_mask],
+        mask_indptr: vec![0, 1],
         logit_masks: Vec::new(),
         logit_mask_indptr: vec![0, 0],
         sampling_indices: vec![0],
@@ -428,6 +467,13 @@ pub fn build_next_request(
         single_token_mode: true,
         has_user_mask: false,
     };
+    if trace_spec_enabled() {
+        eprintln!(
+            "[pie-spec] build ctx={context_id} sampled_token={sampled_token} last_pos={last_pos} next_pos={next_pos} mask_bits={} samplers={}",
+            next_pos + 1,
+            next_req.samplers.len()
+        );
+    }
     Some((next_req, sampled_token, next_pos))
 }
 
@@ -534,6 +580,9 @@ mod tests {
         assert_eq!(anchor_pos, 11);
         assert_eq!(next.token_ids, vec![42]);
         assert_eq!(next.position_ids, vec![11]);
+        assert_eq!(next.masks.len(), 1);
+        assert_eq!(next.masks[0].buffer, vec![0, 12]);
+        assert_eq!(next.mask_indptr, vec![0, 1]);
     }
 
     #[test]

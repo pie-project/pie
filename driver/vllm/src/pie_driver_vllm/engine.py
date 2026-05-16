@@ -450,9 +450,9 @@ class VllmEngine:
         mc = vc.model_config
         cc = vc.cache_config
 
-        if self.config.max_num_kv_pages is None:
+        if self.config.total_pages is None:
             raise RuntimeError(
-                "config.max_num_kv_pages was not set by the loader — KV cache "
+                "config.total_pages was not set by the loader — KV cache "
                 "allocation must run before capabilities() is called."
             )
         if not self.snapshot_dir:
@@ -465,23 +465,29 @@ class VllmEngine:
                 "torch.dtype with a 'torch.' prefix."
             )
 
-        # vllm expresses batch limits as max_num_seqs / max_num_batched_tokens.
-        # Capabilities normalizes them to max_batch_size / max_batch_tokens
-        # for pie's runtime side. If max_num_batched_tokens is None (vllm
-        # default), use scheduler_config's resolved value.
-        max_batch_size = int(self.driver_config.max_num_seqs)
-        max_batch_tokens = self.driver_config.max_num_batched_tokens
-        if max_batch_tokens is None:
-            max_batch_tokens = int(vc.scheduler_config.max_num_batched_tokens)
+        # vllm expresses forward limits as max_num_seqs /
+        # max_num_batched_tokens. If max_num_batched_tokens is None
+        # (vllm default), use scheduler_config's resolved value.
+        max_forward_requests = int(self.driver_config.max_num_seqs)
+        max_forward_tokens = self.driver_config.max_num_batched_tokens
+        if max_forward_tokens is None:
+            max_forward_tokens = int(vc.scheduler_config.max_num_batched_tokens)
         else:
-            max_batch_tokens = int(max_batch_tokens)
+            max_forward_tokens = int(max_forward_tokens)
+        unconstrained = (1 << 32) - 1
 
         return DriverCapabilities(
-            total_pages=int(self.config.max_num_kv_pages),
+            total_pages=int(self.config.total_pages),
             kv_page_size=int(cc.block_size),
             swap_pool_size=int(self.swap_pool_size),
-            max_batch_tokens=max_batch_tokens,
-            max_batch_size=max_batch_size,
+            max_forward_tokens=max_forward_tokens,
+            max_forward_requests=max_forward_requests,
+            max_page_refs=int(self.config.total_pages),
+            max_logit_rows=unconstrained,
+            max_prob_rows=unconstrained,
+            max_custom_mask_bytes=unconstrained,
+            max_sampler_rows=unconstrained,
+            max_logprob_labels=unconstrained,
             arch_name=self.arch_type,
             vocab_size=int(mc.get_vocab_size()),
             max_model_len=int(mc.max_model_len),

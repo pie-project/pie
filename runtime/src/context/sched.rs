@@ -32,7 +32,7 @@ use crate::driver::{self, DriverId};
 use crate::process::ProcessId;
 
 use super::pagestore::PhysicalPageId;
-use super::{Context, ContextId, ContextManager, MARKET, RestoreEntry, State};
+use super::{Context, ContextId, ContextManager, RestoreEntry, State, MARKET};
 
 // =============================================================================
 // ProcessEntry — Wallet + Ownership
@@ -220,6 +220,7 @@ impl ContextManager {
 
         // Destroy all owned contexts
         for ctx_id in &proc.context_ids {
+            crate::inference::invalidate_speculation_for_ctx(self.model_idx, *ctx_id);
             if let Some(ctx) = self.contexts.remove(ctx_id) {
                 let driver_idx = ctx.driver.unwrap_or(0) as usize;
                 if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {

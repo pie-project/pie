@@ -60,9 +60,8 @@ impl Handler {
             let s_lo: u32 = fr.sampler_indptr[req_idx].into();
             let s_hi: u32 = fr.sampler_indptr[req_idx + 1].into();
 
-            let allowed = brle_for_request(fr, req_idx).and_then(|brle| {
-                AllowedRuns::parse(&brle, self.vocab_size)
-            });
+            let allowed = brle_for_request(fr, req_idx)
+                .and_then(|brle| AllowedRuns::parse(&brle, self.vocab_size));
 
             for slot in s_lo as usize..s_hi as usize {
                 let sampler = &fr.samplers[slot];

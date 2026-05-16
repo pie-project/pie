@@ -281,8 +281,14 @@ impl MockBackend {
             });
             let id = register_driver(DriverSpec {
                 num_kv_pages: 64,
-                max_batch_size: 32,
-                max_batch_tokens: 4096,
+                limits: pie::driver::SchedulerLimits {
+                    max_forward_requests: 32,
+                    max_forward_tokens: 4096,
+                    max_page_refs: 64,
+                    max_sampler_rows: usize::MAX,
+                    max_custom_mask_bytes: usize::MAX,
+                    max_logprob_labels: usize::MAX,
+                },
             });
             install_channel(id, channel);
             driver_ids.push(id);

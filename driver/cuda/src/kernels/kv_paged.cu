@@ -10,7 +10,7 @@ namespace {
 // destination row.
 //
 // Linear scan to find the request index — `R` is small (≤ batch_size, which
-// is bounded by max_batch_size, ≤ a few hundred). A binary search would be
+// is bounded by max_forward_requests, ≤ a few hundred). A binary search would be
 // nice, but the scan is fine in the M1.4 reference path.
 __device__ __forceinline__ int find_request(const std::uint32_t* qo_indptr,
                                             int R, int token_idx) {

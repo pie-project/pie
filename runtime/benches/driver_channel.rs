@@ -182,14 +182,22 @@ fn touch_samplers(items: &[PieSamplerDesc], sampler_indptr: &[u32], scratch: &mu
     for (i, s) in items.iter().enumerate() {
         scratch.sampler_types[i] = new_to_old_sampler_kind(s.kind);
         scratch.sampler_temperatures[i] = s.temperature;
-        scratch.sampler_top_k[i] = s.k;
-        if s.kind == 3 {
-            scratch.sampler_min_p[i] = s.p;
-        } else {
-            scratch.sampler_top_p[i] = s.p;
+        scratch.sampler_top_p[i] = 1.0;
+        match s.kind {
+            1 => scratch.sampler_top_k[i] = s.k,
+            2 => scratch.sampler_top_p[i] = s.p,
+            3 => scratch.sampler_min_p[i] = s.p,
+            4 => {
+                scratch.sampler_top_k[i] = s.k;
+                scratch.sampler_top_p[i] = s.p;
+            }
+            6 => scratch.sampler_top_k[i] = s.num_tokens,
+            _ => {}
         }
         scratch.sampler_seeds[i] = s.seed;
-        if s.kind == 9 {
+        if s.kind == 8 {
+            scratch.sampler_label_ids.push(s.token_id);
+        } else if s.kind == 9 {
             scratch
                 .sampler_label_ids
                 .extend_from_slice(slice_from_raw(s.token_ids_ptr, s.token_ids_len));

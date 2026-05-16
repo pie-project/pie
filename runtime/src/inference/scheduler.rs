@@ -13,9 +13,7 @@ use anyhow::Result;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::context::pagestore::PhysicalPageId;
-use crate::driver::DriverId;
-
-use crate::driver;
+use crate::driver::{self, DriverId, SchedulerLimits};
 
 use super::adaptive_policy::{AdaptivePolicy, EagerPolicy, GreedyPolicy};
 use super::request;
@@ -73,8 +71,8 @@ pub struct SchedulerStats {
     /// Total request count across all batches (sum of batch sizes).
     /// Divide by `total_batches` for mean batch size in requests.
     pub total_requests_processed: AtomicU64,
-    /// Largest batch size (in requests) ever fired by this scheduler.
-    pub max_batch_size_observed: AtomicU64,
+    /// Largest forward request count ever fired by this scheduler.
+    pub max_forward_requests_observed: AtomicU64,
     /// Coarse histogram of batch sizes. Buckets:
     /// [0]=1, [1]=2-3, [2]=4-7, [3]=8-15, [4]=16-31,
     /// [5]=32-63, [6]=64-127, [7]=128+.
@@ -90,9 +88,75 @@ pub struct SchedulerStats {
 /// A forward pass request bundled with its response channel and physical pages.
 struct PendingRequest {
     request: pie_bridge::ForwardRequest,
-    response_tx: oneshot::Sender<pie_bridge::ForwardResponse>,
+    response_tx: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestCapacityUsage {
+    forward_tokens: usize,
+    page_refs: usize,
+    sampler_rows: usize,
+    logprob_labels: usize,
+    user_custom_mask_bytes: usize,
+    spec_custom_mask_bytes: usize,
+    has_spec_drafts: bool,
+}
+
+fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapacityUsage {
+    let input_tokens = req.request.token_ids.len();
+    let spec_tokens = req.request.spec_token_ids.len();
+    let forward_tokens = input_tokens.saturating_add(spec_tokens);
+    let mut sampler_rows = req.request.sampling_indices.len();
+    if spec_tokens > 0 {
+        sampler_rows = sampler_rows.saturating_add(spec_tokens.saturating_add(1));
+    }
+    let page_refs = req.physical_page_ids.len();
+    let spec_custom_mask_bytes =
+        packed_mask_bytes(forward_tokens, page_refs, req.last_page_len, page_size);
+    let user_custom_mask_bytes = if req.request.has_user_mask && input_tokens > 1 {
+        packed_mask_bytes(input_tokens, page_refs, req.last_page_len, page_size)
+    } else {
+        0
+    };
+
+    RequestCapacityUsage {
+        forward_tokens,
+        page_refs,
+        sampler_rows,
+        logprob_labels: request_logprob_labels(&req.request),
+        user_custom_mask_bytes,
+        spec_custom_mask_bytes,
+        has_spec_drafts: spec_tokens > 0,
+    }
+}
+
+fn packed_mask_bytes(
+    query_tokens: usize,
+    page_refs: usize,
+    last_page_len: u32,
+    page_size: u32,
+) -> usize {
+    if query_tokens == 0 || page_refs == 0 || page_size == 0 {
+        return 0;
+    }
+    let kv_len = page_refs
+        .saturating_sub(1)
+        .saturating_mul(page_size as usize)
+        .saturating_add(last_page_len as usize);
+    query_tokens.saturating_mul(kv_len).saturating_add(7) / 8
+}
+
+fn request_logprob_labels(req: &pie_bridge::ForwardRequest) -> usize {
+    req.samplers
+        .iter()
+        .map(|s| match s {
+            pie_bridge::Sampler::Logprob { .. } => 1,
+            pie_bridge::Sampler::Logprobs { token_ids } => token_ids.len(),
+            _ => 0,
+        })
+        .sum()
 }
 
 // =============================================================================
@@ -106,27 +170,137 @@ struct PendingRequest {
 struct BatchAccumulator {
     requests: Vec<PendingRequest>,
     total_tokens: usize,
-    max_batch_size: usize,
-    max_batch_tokens: usize,
+    total_pages: usize,
+    total_sampler_rows: usize,
+    total_logprob_labels: usize,
+    total_user_custom_mask_bytes: usize,
+    total_spec_custom_mask_bytes: usize,
+    has_spec_drafts: bool,
+    page_size: u32,
+    limits: SchedulerLimits,
 }
 
 impl BatchAccumulator {
-    fn new(max_batch_size: usize, max_batch_tokens: usize) -> Self {
+    fn new(limits: SchedulerLimits, page_size: u32) -> Self {
         Self {
             requests: Vec::new(),
             total_tokens: 0,
-            max_batch_size,
-            max_batch_tokens,
+            total_pages: 0,
+            total_sampler_rows: 0,
+            total_logprob_labels: 0,
+            total_user_custom_mask_bytes: 0,
+            total_spec_custom_mask_bytes: 0,
+            has_spec_drafts: false,
+            page_size,
+            limits,
         }
     }
 
     fn push(&mut self, req: PendingRequest) {
-        self.total_tokens += req.request.token_ids.len();
+        let usage = request_capacity_usage(&req, self.page_size);
+        self.total_tokens = self.total_tokens.saturating_add(usage.forward_tokens);
+        self.total_pages = self.total_pages.saturating_add(usage.page_refs);
+        self.total_sampler_rows = self.total_sampler_rows.saturating_add(usage.sampler_rows);
+        self.total_logprob_labels = self
+            .total_logprob_labels
+            .saturating_add(usage.logprob_labels);
+        self.total_user_custom_mask_bytes = self
+            .total_user_custom_mask_bytes
+            .saturating_add(usage.user_custom_mask_bytes);
+        self.total_spec_custom_mask_bytes = self
+            .total_spec_custom_mask_bytes
+            .saturating_add(usage.spec_custom_mask_bytes);
+        self.has_spec_drafts |= usage.has_spec_drafts;
         self.requests.push(req);
     }
 
+    fn single_request_limit_error(&self, req: &PendingRequest) -> Option<String> {
+        let usage = request_capacity_usage(req, self.page_size);
+        if usage.forward_tokens > self.limits.max_forward_tokens {
+            return Some(format!(
+                "forward request has {} forward tokens, exceeding driver limit {}",
+                usage.forward_tokens, self.limits.max_forward_tokens
+            ));
+        }
+
+        if usage.page_refs > self.limits.max_page_refs {
+            return Some(format!(
+                "forward request has {} page refs, exceeding driver limit {}",
+                usage.page_refs, self.limits.max_page_refs
+            ));
+        }
+
+        if usage.sampler_rows > self.limits.max_sampler_rows {
+            return Some(format!(
+                "forward request has {} sampler rows, exceeding driver limit {}",
+                usage.sampler_rows, self.limits.max_sampler_rows
+            ));
+        }
+
+        if usage.logprob_labels > self.limits.max_logprob_labels {
+            return Some(format!(
+                "forward request has {} logprob labels, exceeding driver limit {}",
+                usage.logprob_labels, self.limits.max_logprob_labels
+            ));
+        }
+
+        let custom_mask_bytes = if usage.has_spec_drafts {
+            usage.spec_custom_mask_bytes
+        } else {
+            usage.user_custom_mask_bytes
+        };
+        if custom_mask_bytes > self.limits.max_custom_mask_bytes {
+            return Some(format!(
+                "forward request needs {custom_mask_bytes} custom mask bytes, exceeding driver limit {}",
+                self.limits.max_custom_mask_bytes
+            ));
+        }
+
+        if self.limits.max_forward_requests == 0 {
+            return Some("driver max forward requests is zero".to_string());
+        }
+
+        None
+    }
+
+    fn would_exceed(&self, req: &PendingRequest) -> bool {
+        if self.requests.is_empty() {
+            return false;
+        }
+        let usage = request_capacity_usage(req, self.page_size);
+        let next_has_spec = self.has_spec_drafts || usage.has_spec_drafts;
+        let next_custom_mask_bytes = if next_has_spec {
+            self.total_spec_custom_mask_bytes
+                .saturating_add(usage.spec_custom_mask_bytes)
+        } else {
+            self.total_user_custom_mask_bytes
+                .saturating_add(usage.user_custom_mask_bytes)
+        };
+        self.requests.len() + 1 > self.limits.max_forward_requests
+            || self.total_tokens.saturating_add(usage.forward_tokens)
+                > self.limits.max_forward_tokens
+            || self.total_pages.saturating_add(usage.page_refs) > self.limits.max_page_refs
+            || self.total_sampler_rows.saturating_add(usage.sampler_rows)
+                > self.limits.max_sampler_rows
+            || self
+                .total_logprob_labels
+                .saturating_add(usage.logprob_labels)
+                > self.limits.max_logprob_labels
+            || next_custom_mask_bytes > self.limits.max_custom_mask_bytes
+    }
+
     fn is_full(&self) -> bool {
-        self.requests.len() >= self.max_batch_size || self.total_tokens >= self.max_batch_tokens
+        let active_custom_mask_bytes = if self.has_spec_drafts {
+            self.total_spec_custom_mask_bytes
+        } else {
+            self.total_user_custom_mask_bytes
+        };
+        self.requests.len() >= self.limits.max_forward_requests
+            || self.total_tokens >= self.limits.max_forward_tokens
+            || self.total_pages >= self.limits.max_page_refs
+            || self.total_sampler_rows >= self.limits.max_sampler_rows
+            || self.total_logprob_labels >= self.limits.max_logprob_labels
+            || active_custom_mask_bytes >= self.limits.max_custom_mask_bytes
     }
 
     fn is_empty(&self) -> bool {
@@ -143,7 +317,184 @@ impl BatchAccumulator {
 
     fn take(&mut self) -> Vec<PendingRequest> {
         self.total_tokens = 0;
+        self.total_pages = 0;
+        self.total_sampler_rows = 0;
+        self.total_logprob_labels = 0;
+        self.total_user_custom_mask_bytes = 0;
+        self.total_spec_custom_mask_bytes = 0;
+        self.has_spec_drafts = false;
         std::mem::take(&mut self.requests)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits(max_requests: usize, max_tokens: usize, max_pages: usize) -> SchedulerLimits {
+        SchedulerLimits {
+            max_forward_requests: max_requests,
+            max_forward_tokens: max_tokens,
+            max_page_refs: max_pages,
+            max_sampler_rows: usize::MAX,
+            max_custom_mask_bytes: usize::MAX,
+            max_logprob_labels: usize::MAX,
+        }
+    }
+
+    fn pending(tokens: usize, page_refs: usize) -> PendingRequest {
+        let (tx, _rx) = oneshot::channel();
+        PendingRequest {
+            request: pie_bridge::ForwardRequest {
+                token_ids: vec![0; tokens],
+                ..Default::default()
+            },
+            response_tx: tx,
+            physical_page_ids: vec![0; page_refs],
+            last_page_len: 1,
+        }
+    }
+
+    fn with_spec(mut req: PendingRequest, spec_tokens: usize) -> PendingRequest {
+        req.request.spec_token_ids = vec![1; spec_tokens];
+        req.request.spec_position_ids = vec![1; spec_tokens];
+        req.request.spec_indptr = vec![0, spec_tokens as u32];
+        req
+    }
+
+    fn with_sampler_rows(mut req: PendingRequest, sampler_rows: usize) -> PendingRequest {
+        req.request.sampling_indices = vec![0; sampler_rows];
+        req
+    }
+
+    #[test]
+    fn accumulator_splits_by_forward_tokens() {
+        let mut batch = BatchAccumulator::new(limits(8, 6, 100), 16);
+        batch.push(pending(4, 1));
+        assert!(!batch.would_exceed(&pending(2, 1)));
+        assert!(batch.would_exceed(&pending(3, 1)));
+    }
+
+    #[test]
+    fn accumulator_splits_by_forward_requests() {
+        let mut batch = BatchAccumulator::new(limits(2, 100, 100), 16);
+        batch.push(pending(1, 1));
+        assert!(!batch.would_exceed(&pending(1, 1)));
+        batch.push(pending(1, 1));
+        assert!(batch.is_full());
+        assert!(batch.would_exceed(&pending(1, 1)));
+    }
+
+    #[test]
+    fn accumulator_splits_by_page_refs() {
+        let mut batch = BatchAccumulator::new(limits(8, 100, 5), 16);
+        batch.push(pending(1, 3));
+        assert!(!batch.would_exceed(&pending(1, 2)));
+        assert!(batch.would_exceed(&pending(1, 3)));
+    }
+
+    #[test]
+    fn accumulator_rejects_single_request_over_limit() {
+        let batch = BatchAccumulator::new(limits(8, 6, 5), 16);
+        assert!(batch.single_request_limit_error(&pending(7, 1)).is_some());
+        assert!(batch.single_request_limit_error(&pending(1, 6)).is_some());
+        assert!(batch.single_request_limit_error(&pending(6, 5)).is_none());
+    }
+
+    #[test]
+    fn accumulator_counts_speculative_tokens() {
+        let mut batch = BatchAccumulator::new(limits(8, 6, 100), 16);
+        batch.push(with_spec(pending(4, 1), 2));
+        assert!(batch.is_full());
+        assert!(batch.would_exceed(&pending(1, 1)));
+
+        let batch = BatchAccumulator::new(limits(8, 6, 100), 16);
+        assert!(
+            batch
+                .single_request_limit_error(&with_spec(pending(5, 1), 2))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn accumulator_splits_by_sampler_rows() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_sampler_rows = 3;
+        let mut batch = BatchAccumulator::new(capped, 16);
+        batch.push(with_sampler_rows(pending(1, 1), 2));
+        assert!(!batch.would_exceed(&with_sampler_rows(pending(1, 1), 1)));
+        assert!(batch.would_exceed(&with_sampler_rows(pending(1, 1), 2)));
+        assert!(
+            batch
+                .single_request_limit_error(&with_sampler_rows(pending(1, 1), 4))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn accumulator_counts_spec_verification_sampler_rows() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_sampler_rows = 3;
+        let batch = BatchAccumulator::new(capped, 16);
+        let req = with_spec(with_sampler_rows(pending(1, 1), 1), 2);
+        assert!(batch.single_request_limit_error(&req).is_some());
+    }
+
+    #[test]
+    fn accumulator_splits_by_custom_mask_bytes() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_custom_mask_bytes = 31;
+        let mut batch = BatchAccumulator::new(capped, 16);
+
+        // 2 query rows x 64 KV positions = 128 bits = 16 bytes.
+        let mut user_mask = pending(2, 4);
+        user_mask.last_page_len = 16;
+        user_mask.request.has_user_mask = true;
+        batch.push(user_mask);
+
+        let mut next = pending(2, 4);
+        next.last_page_len = 16;
+        next.request.has_user_mask = true;
+        assert!(batch.would_exceed(&next));
+    }
+
+    #[test]
+    fn adding_spec_request_counts_existing_requests_for_spec_mask_path() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_custom_mask_bytes = 31;
+        let mut batch = BatchAccumulator::new(capped, 16);
+
+        let mut existing = pending(2, 4);
+        existing.last_page_len = 16;
+        batch.push(existing);
+
+        let mut spec = with_spec(pending(1, 4), 1);
+        spec.last_page_len = 16;
+        assert!(batch.would_exceed(&spec));
+    }
+
+    #[test]
+    fn accumulator_rejects_logprob_label_over_limit() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_logprob_labels = 2;
+        let batch = BatchAccumulator::new(capped, 16);
+        let mut req = pending(1, 1);
+        req.request.samplers = vec![pie_bridge::Sampler::Logprobs {
+            token_ids: vec![1, 2, 3],
+        }];
+        assert!(batch.single_request_limit_error(&req).is_some());
+    }
+
+    #[test]
+    fn taking_batch_does_not_drop_stashed_request_shape() {
+        let mut batch = BatchAccumulator::new(limits(8, 6, 5), 16);
+        batch.push(pending(4, 2));
+        let stashed = pending(4, 4);
+        assert!(batch.would_exceed(&stashed));
+        let fired = batch.take();
+        assert_eq!(fired.len(), 1);
+        assert!(batch.is_empty());
+        assert!(!batch.would_exceed(&stashed));
     }
 }
 
@@ -163,7 +514,7 @@ impl SchedulerHandle {
     pub fn submit(
         &self,
         request: pie_bridge::ForwardRequest,
-        response_tx: oneshot::Sender<pie_bridge::ForwardResponse>,
+        response_tx: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
@@ -199,8 +550,7 @@ impl BatchScheduler {
         driver_id: DriverId,
         driver_idx: usize,
         page_size: u32,
-        max_batch_size: usize,
-        max_batch_tokens: usize,
+        limits: SchedulerLimits,
         request_timeout_secs: u64,
         batch_policy: String,
     ) -> Self {
@@ -211,8 +561,7 @@ impl BatchScheduler {
             driver_idx,
             rx,
             page_size,
-            max_batch_size,
-            max_batch_tokens,
+            limits,
             request_timeout_secs,
             batch_policy,
             stats.clone(),
@@ -230,7 +579,7 @@ impl BatchScheduler {
     pub fn submit(
         &self,
         request: pie_bridge::ForwardRequest,
-        response_tx: oneshot::Sender<pie_bridge::ForwardResponse>,
+        response_tx: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
@@ -261,8 +610,7 @@ impl BatchScheduler {
         driver_idx: usize,
         mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
         page_size: u32,
-        max_batch_size: usize,
-        max_batch_tokens: usize,
+        limits: SchedulerLimits,
         request_timeout_secs: u64,
         batch_policy: String,
         stats: Arc<SchedulerStats>,
@@ -270,14 +618,14 @@ impl BatchScheduler {
         let request_timeout = Duration::from_secs(request_timeout_secs);
 
         // Per-driver state
-        let mut batch = BatchAccumulator::new(max_batch_size, max_batch_tokens);
+        let mut batch = BatchAccumulator::new(limits, page_size);
         // Policy selection from config — see `adaptive_policy.rs` for the
         // design rationale. The per-model `[model.scheduler].batch_policy`
         // setting picks one of "adaptive", "eager", "greedy".
         let mut policy: Box<dyn SchedulingPolicy> = match batch_policy.as_str() {
             "greedy" => Box::new(GreedyPolicy::new()),
-            "eager" => Box::new(EagerPolicy::new(max_batch_size, driver_idx)),
-            "adaptive" => Box::new(AdaptivePolicy::new(max_batch_size, driver_idx)),
+            "eager" => Box::new(EagerPolicy::new(limits.max_forward_requests, driver_idx)),
+            "adaptive" => Box::new(AdaptivePolicy::new(limits.max_forward_requests, driver_idx)),
             other => panic!(
                 "Unknown scheduler.batch_policy {other:?}; expected one of \
                 'adaptive' | 'eager' | 'greedy'"
@@ -288,13 +636,14 @@ impl BatchScheduler {
 
         // Channel for batch completion latency feedback to the policy.
         let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
+        let mut next_pending: Option<PendingRequest> = None;
 
         // Per-fire wall timing instrumentation. Gated on PIE_TIMING.
         let timing_on = std::env::var_os("PIE_TIMING").is_some();
         let mut last_fire_time: Option<Instant> = None;
         let mut sched_fire_count: u64 = 0;
 
-        loop {
+        'run_loop: loop {
             // Drain completed batch latencies (non-blocking)
             while let Ok(latency) = latency_rx.try_recv() {
                 policy.on_complete(latency);
@@ -302,17 +651,40 @@ impl BatchScheduler {
             let t_loop_top = Instant::now();
 
             // Wait for first request if batch is empty
-            if batch.is_empty() {
-                let Some(pending) = req_rx.recv().await else {
-                    break;
+            while batch.is_empty() {
+                let pending = if let Some(pending) = next_pending.take() {
+                    pending
+                } else {
+                    let Some(pending) = req_rx.recv().await else {
+                        break 'run_loop;
+                    };
+                    pending
                 };
+                if let Some(msg) = batch.single_request_limit_error(&pending) {
+                    pending.response_tx.send(Err(anyhow::anyhow!(msg))).ok();
+                    continue;
+                }
                 policy.on_arrival();
                 batch.push(pending);
             }
             let t_first_arrival = Instant::now();
 
-            // Accumulate more requests (non-blocking)
-            while let Ok(pending) = req_rx.try_recv() {
+            // Accumulate more requests (non-blocking). If a request is
+            // already stashed for the next batch, fire the current batch
+            // before reading more; overwriting the stash would drop that
+            // request's response channel.
+            while next_pending.is_none() {
+                let Ok(pending) = req_rx.try_recv() else {
+                    break;
+                };
+                if let Some(msg) = batch.single_request_limit_error(&pending) {
+                    pending.response_tx.send(Err(anyhow::anyhow!(msg))).ok();
+                    continue;
+                }
+                if batch.would_exceed(&pending) {
+                    next_pending = Some(pending);
+                    break;
+                }
                 policy.on_arrival();
                 batch.push(pending);
                 if batch.is_full() {
@@ -322,7 +694,12 @@ impl BatchScheduler {
             let t_accumulated = Instant::now();
 
             // Ask the policy what to do
-            match policy.decide(batch.len()) {
+            let decision = if next_pending.is_some() {
+                Decision::Fire
+            } else {
+                policy.decide(batch.len())
+            };
+            match decision {
                 Decision::Fire => {
                     // Acquire a permit (may wait if at in-flight limit)
                     // if in_flight.available_permits() == 0 {
@@ -405,7 +782,7 @@ impl BatchScheduler {
                             .total_requests_processed
                             .fetch_add(batch_size, Relaxed);
                         stats_clone
-                            .max_batch_size_observed
+                            .max_forward_requests_observed
                             .fetch_max(batch_size, Relaxed);
                         let bucket = match batch_size {
                             0 | 1 => 0,
@@ -434,6 +811,14 @@ impl BatchScheduler {
                         _ = tokio::time::sleep(wait_duration) => {}
                         maybe_req = req_rx.recv() => {
                             if let Some(pending) = maybe_req {
+                                if let Some(msg) = batch.single_request_limit_error(&pending) {
+                                    pending.response_tx.send(Err(anyhow::anyhow!(msg))).ok();
+                                    continue;
+                                }
+                                if batch.would_exceed(&pending) {
+                                    next_pending = Some(pending);
+                                    continue;
+                                }
                                 policy.on_arrival();
                                 batch.push(pending);
                             } else {
@@ -498,38 +883,39 @@ impl BatchScheduler {
             Ok(batch_resp) => {
                 let n_results = batch_resp.num_requests as usize;
                 if n_results != requests.len() {
-                    tracing::warn!(
+                    let msg = format!(
+                        "batch response count mismatch from driver {driver_id}: \
+                         expected {}, got {n_results}",
+                        requests.len()
+                    );
+                    tracing::error!(
                         driver = driver_id,
                         expected = requests.len(),
                         got = n_results,
-                        "Batch response count mismatch — some requests may get no output",
+                        "Batch response count mismatch",
                     );
+                    for req in requests {
+                        req.response_tx.send(Err(anyhow::anyhow!(msg.clone()))).ok();
+                    }
+                    return;
                 }
 
                 for (r, req) in requests.into_iter().enumerate() {
-                    if r < n_results {
-                        // Extract this request's slice from the batched
-                        // response. The api layer (build_wit_output)
-                        // walks samplers + the single-request response
-                        // to construct the WIT Output.
-                        let per_req = request::extract_per_request(&batch_resp, r);
-                        req.response_tx.send(per_req).ok();
-                    } else {
-                        tracing::warn!(
-                            driver = driver_id,
-                            "Fewer results than requests — sending empty"
-                        );
-                        req.response_tx
-                            .send(pie_bridge::ForwardResponse::default())
-                            .ok();
-                    }
+                    // Extract this request's slice from the batched
+                    // response. The api layer (build_wit_output)
+                    // walks samplers + the single-request response
+                    // to construct the WIT Output.
+                    let per_req = request::extract_per_request(&batch_resp, r);
+                    req.response_tx.send(Ok(per_req)).ok();
                 }
             }
             Err(e) => {
                 tracing::error!("fire_batch failed for driver {}: {:?}", driver_id, e);
                 for req in requests {
                     req.response_tx
-                        .send(pie_bridge::ForwardResponse::default())
+                        .send(Err(anyhow::anyhow!(
+                            "fire_batch failed for driver {driver_id}: {e:#}"
+                        )))
                         .ok();
                 }
             }

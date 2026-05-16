@@ -102,9 +102,8 @@ pub fn build(
 
 fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::ModelConfig {
     // Arch + kv_page_size + tokenizer come from group 0; all groups
-    // serve the same model so they agree. Per-group caps differ only
-    // in `total_pages` / `swap_pool_size` (potentially) — those flow
-    // through the per-driver entries.
+    // serve the same model so they agree. Per-group caps can differ in
+    // memory-derived capacities — those flow through the per-driver entries.
     let group0_caps = &hs.groups[0].caps;
     let tokenizer_path = PathBuf::from(&group0_caps.snapshot_dir).join("tokenizer.json");
 
@@ -114,8 +113,14 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
         .map(|g| pie::bootstrap::DriverConfig {
             total_pages: g.caps.total_pages as usize,
             cpu_pages: g.caps.swap_pool_size as usize,
-            max_batch_tokens: g.caps.max_batch_tokens as usize,
-            max_batch_size: g.caps.max_batch_size as usize,
+            limits: pie::driver::SchedulerLimits {
+                max_forward_requests: g.caps.max_forward_requests as usize,
+                max_forward_tokens: g.caps.max_forward_tokens as usize,
+                max_page_refs: g.caps.max_page_refs as usize,
+                max_sampler_rows: g.caps.max_sampler_rows as usize,
+                max_custom_mask_bytes: g.caps.max_custom_mask_bytes as usize,
+                max_logprob_labels: g.caps.max_logprob_labels as usize,
+            },
         })
         .collect();
 
@@ -146,8 +151,14 @@ mod tests {
             total_pages: 1024,
             kv_page_size: 32,
             swap_pool_size: 0,
-            max_batch_tokens: 10240,
-            max_batch_size: 512,
+            max_forward_tokens: 4096,
+            max_forward_requests: 512,
+            max_page_refs: 262144,
+            max_logit_rows: 4096,
+            max_prob_rows: 4096,
+            max_custom_mask_bytes: 8 * 1024 * 1024,
+            max_sampler_rows: 4096,
+            max_logprob_labels: 4096,
             arch_name: "qwen3".into(),
             vocab_size: 151936,
             max_model_len: 4096,
@@ -191,6 +202,7 @@ device = ["cpu"]
         );
         assert_eq!(m.drivers.len(), 1);
         assert_eq!(m.drivers[0].total_pages, 1024);
+        assert_eq!(m.drivers[0].limits.max_page_refs, 262144);
         assert_eq!(m.scheduler.batch_policy, "adaptive");
     }
 

@@ -61,9 +61,8 @@ random_seed = 42
 ipc_profile = "balanced"
 
 [model.driver.options]
-gpu_mem_utilization = 0.85
-max_batch_tokens = 10240
-max_batch_size = 512
+gpu_mem_utilization = 0.90
+memory_profile = "balanced"
 ```
 
 `[model.driver].type` is a discriminator. Embedded drivers (`portable`, `cuda_native`, `dummy`) run inside the `pie` process. Python drivers (`dev`, `vllm`, `sglang`) run as supervised subprocesses. Driver-specific knobs live in `[model.driver.options]`; see the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang)) for what each backend accepts.

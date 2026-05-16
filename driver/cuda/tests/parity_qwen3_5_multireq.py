@@ -144,8 +144,8 @@ async def run_test(args) -> int:
                     device=args.device.split(","),
                     tensor_parallel_size=args.tp_size,
                     options={
-                        "max_batch_size": args.max_batch_size,
-                        "max_num_kv_pages": args.kv_pages,
+                        "gpu_mem_utilization": args.gpu_mem_util,
+                        "memory_profile": args.memory_profile,
                     },
                 ),
             ),
@@ -196,14 +196,13 @@ async def run_test(args) -> int:
         for i, text in enumerate(stress_outputs):
             print(f"  [{i}] {len(text)} chars", flush=True)
 
-        # Phase 2c: eviction pass — submit more prompts than max_slots
-        # so the LRU forces slot reassignment partway through. Tests
-        # that reset_slot correctly zeros the victim's state before
-        # the new context's prefill consumes it. With max_slots=N and
-        # 2N+ concurrent contexts, at least N evictions must occur.
-        eviction_n = args.max_batch_size * 2 + 8
-        print(f"[parity-multireq] eviction pass ({eviction_n} contexts vs "
-              f"{args.max_batch_size} slots)...", flush=True)
+        # Phase 2c: high-fanout pass. The CUDA planner now derives slot
+        # count, so this cannot force an exact eviction count; it still
+        # keeps many contexts live concurrently and exercises reassignment
+        # on constrained cards.
+        eviction_n = args.max_forward_requests * 2 + 8
+        print(f"[parity-multireq] high-fanout pass ({eviction_n} contexts)...",
+              flush=True)
         # Use distinct, easy-to-evaluate prompts so each output is
         # independently verifiable. Cycle through the base prompt list.
         evict_prompts = [
@@ -311,10 +310,8 @@ def main() -> int:
                          "allocator + broadcast wiring under TP>1 by running "
                          "the same sequential-vs-concurrent comparison.")
     ap.add_argument("--max-tokens", type=int, default=40)
-    ap.add_argument("--max-batch-size", type=int, default=32,
-                    help="Driver max_batch_size + slot allocator capacity. "
-                         "32 is enough to fit the sequential-pass-then-"
-                         "concurrent-pass slot demand without eviction.")
+    ap.add_argument("--max-forward-requests", type=int, default=32,
+                    help="Request fanout used by the eviction stress pass.")
     ap.add_argument("--prefix-chars", type=int, default=20,
                     help="How many leading output chars must agree between "
                          "sequential and concurrent runs for a prompt to "
@@ -322,7 +319,9 @@ def main() -> int:
                          "flashinfer's R-dependent decode reductions can "
                          "produce bf16 argmax flips that aren't multi-req "
                          "bugs.")
-    ap.add_argument("--kv-pages", type=int, default=2048)
+    ap.add_argument("--gpu-mem-util", type=float, default=0.90)
+    ap.add_argument("--memory-profile", default="balanced",
+                    choices=["latency", "balanced", "throughput", "capacity"])
     args = ap.parse_args()
     return asyncio.run(run_test(args))
 

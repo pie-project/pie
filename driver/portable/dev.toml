@@ -18,17 +18,17 @@ hf_path = "/path/to/huggingface/snapshot"
 # Informational max position. Real KV capacity is total_pages × kv_page_size.
 
 # KV cache / batching — Pie's runtime owns page allocation. We allocate a
-# global pool of `max_num_kv_pages` pages of `kv_page_size` token slots each
+# global pool of `total_pages` pages of `kv_page_size` token slots each
 # and report those values in the READY capabilities. The runtime then hands
 # us `kv_page_indices` per request in every wire payload; we honor them.
 #
-# Total KV memory per layer = max_num_kv_pages × kv_page_size × n_kv_heads
+# Total KV memory per layer = total_pages × kv_page_size × n_kv_heads
 #                             × head_dim × 2 (K+V) × dtype_size.
 # For Qwen3-0.6B with 1024 pages × 32 / F16 KV that's ~3.5 GiB across
 # 28 layers — ~32k token slots flexibly shared across all in-flight
 # contexts.
 [batching]
 kv_page_size = 32
-max_num_kv_pages = 4096
-max_batch_tokens = 10240
-max_batch_size = 512
+total_pages = 4096
+max_forward_tokens = 10240
+max_forward_requests = 512

@@ -41,9 +41,9 @@ class NativeRuntimeConfig(RuntimeConfig):
     gpu_mem_utilization: float = 0.8
     kv_page_size: int = 16
 
-    # Batching limits the native scheduler / kernels enforce
-    max_batch_tokens: int = 10240
-    max_batch_size: int = 512
+    # Forward limits the native scheduler / kernels enforce
+    max_forward_tokens: int = 10240
+    max_forward_requests: int = 512
     max_dist_size: int = 32
     max_num_embeds: int = 128
 
@@ -110,8 +110,8 @@ class NativeRuntimeConfig(RuntimeConfig):
         # native-specific
         gpu_mem_utilization: float = 0.8,
         kv_page_size: int = 16,
-        max_batch_tokens: int = 10240,
-        max_batch_size: int = 512,
+        max_forward_tokens: int = 10240,
+        max_forward_requests: int = 512,
         max_dist_size: int = 32,
         max_num_embeds: int = 128,
         max_num_adapters: int = 32,
@@ -149,8 +149,8 @@ class NativeRuntimeConfig(RuntimeConfig):
             **universal,
             gpu_mem_utilization=gpu_mem_utilization,
             kv_page_size=kv_page_size,
-            max_batch_tokens=max_batch_tokens,
-            max_batch_size=max_batch_size,
+            max_forward_tokens=max_forward_tokens,
+            max_forward_requests=max_forward_requests,
             max_dist_size=max_dist_size,
             max_num_embeds=max_num_embeds,
             max_num_adapters=max_num_adapters,
@@ -172,8 +172,8 @@ class NativeDriverConfig:
     """
 
     gpu_mem_utilization: float = 0.8
-    max_batch_tokens: int = 10240
-    max_batch_size: int = 512
+    max_forward_tokens: int = 10240
+    max_forward_requests: int = 512
     max_dist_size: int = 32
     max_num_embeds: int = 128
     max_num_adapters: int = 32

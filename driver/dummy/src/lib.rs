@@ -23,8 +23,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 use crate::handler::Handler;
-use pie_bridge::SCHEMA_HASH;
 use pie_bridge::ArchivedRequestPayload;
+use pie_bridge::SCHEMA_HASH;
 use pie_bridge::ipc::ShmemServer;
 use pie_bridge::wire::parse_request;
 
@@ -117,13 +117,21 @@ fn run_impl(
     }
     let _clear = ClearOnDrop(server_ptr);
 
-    // Capability handshake (unchanged from prior).
+    let total_pages = cfg.dummy.derived_total_pages();
+
+    // Capability handshake.
     let caps = serde_json::json!({
-        "total_pages":      cfg.dummy.max_num_kv_pages,
+        "total_pages":      total_pages,
         "kv_page_size":     cfg.dummy.kv_page_size,
         "swap_pool_size":   0u32,
-        "max_batch_tokens": cfg.dummy.max_batch_tokens,
-        "max_batch_size":   cfg.dummy.max_batch_size,
+        "max_forward_tokens": cfg.dummy.max_forward_tokens,
+        "max_forward_requests": cfg.dummy.max_forward_requests,
+        "max_page_refs": total_pages,
+        "max_logit_rows": u32::MAX,
+        "max_prob_rows": u32::MAX,
+        "max_custom_mask_bytes": u32::MAX,
+        "max_sampler_rows": u32::MAX,
+        "max_logprob_labels": u32::MAX,
         "arch_name":        cfg.dummy.arch_name,
         "vocab_size":       cfg.dummy.vocab_size,
         "max_model_len":    cfg.dummy.max_model_len,
@@ -158,17 +166,19 @@ fn run_impl(
             Ok(frame) => {
                 let driver_id: u32 = frame.driver_id.into();
                 match &frame.payload {
-                    ArchivedRequestPayload::Forward(fr) => match handler.handle_forward(driver_id, fr) {
-                        Ok(resp) => {
-                            if let Err(e) = lease.commit(&resp) {
-                                eprintln!("[pie-driver-dummy] commit failed: {e:#}");
+                    ArchivedRequestPayload::Forward(fr) => {
+                        match handler.handle_forward(driver_id, fr) {
+                            Ok(resp) => {
+                                if let Err(e) = lease.commit(&resp) {
+                                    eprintln!("[pie-driver-dummy] commit failed: {e:#}");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[pie-driver-dummy] handle_forward failed: {e:#}");
+                                let _ = lease.commit_status(-1);
                             }
                         }
-                        Err(e) => {
-                            eprintln!("[pie-driver-dummy] handle_forward failed: {e:#}");
-                            let _ = lease.commit_status(-1);
-                        }
-                    },
+                    }
                     ArchivedRequestPayload::Health => {
                         let _ = lease.commit_status(0);
                     }
@@ -209,7 +219,9 @@ fn parse_argv_for_config(argc: c_int, argv: *mut *mut c_char) -> Result<PathBuf>
     while let Some(arg) = iter.next() {
         match *arg {
             "-c" | "--config" => {
-                let val = iter.next().ok_or_else(|| anyhow!("--config needs a value"))?;
+                let val = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--config needs a value"))?;
                 return Ok(PathBuf::from(val));
             }
             _ if arg.starts_with("--config=") => {

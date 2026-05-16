@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -287,8 +288,7 @@ int run_impl(int argc,
     // The runtime owns page allocation; we report total_pages and page_size
     // in the READY handshake and honor the page IDs the runtime sends in
     // every wire request.
-    std::int32_t total_pages =
-        static_cast<std::int32_t>(cfg.batching.max_num_kv_pages);
+    std::int32_t total_pages = static_cast<std::int32_t>(cfg.batching.total_pages);
     const std::int32_t page_size =
         static_cast<std::int32_t>(cfg.batching.kv_page_size);
     const std::int32_t requested_pages = total_pages;
@@ -394,16 +394,22 @@ int run_impl(int argc,
                 static_cast<std::int64_t>(total_pages) *
                     static_cast<std::int64_t>(page_size)));
     nlohmann::json caps = {
-        {"total_pages",      total_pages},
-        {"kv_page_size",     page_size},
-        {"swap_pool_size",   cpu_pages},
-        {"max_batch_tokens", cfg.batching.max_batch_tokens},
-        {"max_batch_size",   cfg.batching.max_batch_size},
-        {"arch_name",        model.arch_name_pie()},
-        {"vocab_size",       h.vocab_size},
-        {"max_model_len",    max_model_len},
-        {"activation_dtype", model.activation_dtype_str()},
-        {"snapshot_dir",     cfg.model.hf_path},
+        {"total_pages",            total_pages},
+        {"kv_page_size",           page_size},
+        {"swap_pool_size",         cpu_pages},
+        {"max_forward_tokens",     cfg.batching.max_forward_tokens},
+        {"max_forward_requests",   cfg.batching.max_forward_requests},
+        {"max_page_refs",          total_pages},
+        {"max_logit_rows",         std::numeric_limits<std::uint32_t>::max()},
+        {"max_prob_rows",          std::numeric_limits<std::uint32_t>::max()},
+        {"max_custom_mask_bytes",  std::numeric_limits<std::uint32_t>::max()},
+        {"max_sampler_rows",       std::numeric_limits<std::uint32_t>::max()},
+        {"max_logprob_labels",     std::numeric_limits<std::uint32_t>::max()},
+        {"arch_name",              model.arch_name_pie()},
+        {"vocab_size",             h.vocab_size},
+        {"max_model_len",          max_model_len},
+        {"activation_dtype",       model.activation_dtype_str()},
+        {"snapshot_dir",           cfg.model.hf_path},
     };
     // Hand caps to the host. The standalone executable's default
     // callback writes `READY <json>` to stdout (the Python wrapper greps

@@ -49,7 +49,7 @@ class SGLangDriverConfig:
 
     # Override the largest CUDA-graph batch-size bin sglang captures. None
     # = sglang's auto-pick, which on a 4090 caps around 24. Bumping this
-    # to match `max_batch_size` lets the scheduler use captured graphs at
+    # to match `max_forward_requests` lets the scheduler use captured graphs at
     # high concurrency instead of falling back to eager kernel launches.
     cuda_graph_max_bs: int | None = None
 

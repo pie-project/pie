@@ -447,7 +447,9 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         {
             (
                 false,
-                rx.await.map_err(|_| anyhow::anyhow!("staged rx dropped")),
+                rx.await
+                    .map_err(|_| anyhow::anyhow!("staged rx dropped"))
+                    .and_then(|result| result),
             )
         } else {
             // Cold path: pin, validate page capacity, submit.

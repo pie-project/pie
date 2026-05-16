@@ -114,7 +114,7 @@ class SGLangEngine:
         # swap RPC handlers see the canonical (num_blocks, 2, page_size,
         # h, d) layout.
         kv_cache_at_layer, num_blocks = _rebind_pool_buffers(loaded, config)
-        config.max_num_kv_pages = num_blocks
+        config.total_pages = num_blocks
 
         forward_pass = SGLangForwardPass(
             runner=loaded.runner,
@@ -409,23 +409,33 @@ class SGLangEngine:
         runner = self.forward_pass.runner
         sglang_mc = runner.model_config
 
-        if self.config.max_num_kv_pages is None:
+        if self.config.total_pages is None:
             raise RuntimeError(
-                "config.max_num_kv_pages was not set by the loader — KV cache "
+                "config.total_pages was not set by the loader — KV cache "
                 "rebind must run before capabilities() is called."
             )
         if not self.snapshot_dir:
             raise RuntimeError("snapshot_dir is empty; loader did not resolve it.")
 
+        max_forward_tokens = int(runner.max_total_num_tokens)
+        max_forward_requests = int(runner.max_running_requests)
+        unconstrained = (1 << 32) - 1
+
         return DriverCapabilities(
-            total_pages=int(self.config.max_num_kv_pages),
+            total_pages=int(self.config.total_pages),
             kv_page_size=int(runner.page_size),
             swap_pool_size=int(self.swap_pool_size),
-            # sglang sets these on `ModelRunner` after `init_memory_pool` —
-            # they're load-bearing for pie's scheduler so fail loudly if
-            # they're missing rather than defaulting silently.
-            max_batch_tokens=int(runner.max_total_num_tokens),
-            max_batch_size=int(runner.max_running_requests),
+            # sglang sets these on `ModelRunner` after `init_memory_pool`.
+            # They are load-bearing for pie's scheduler, so fail loudly if
+            # they are missing rather than defaulting silently.
+            max_forward_tokens=max_forward_tokens,
+            max_forward_requests=max_forward_requests,
+            max_page_refs=int(self.config.total_pages),
+            max_logit_rows=unconstrained,
+            max_prob_rows=unconstrained,
+            max_custom_mask_bytes=unconstrained,
+            max_sampler_rows=unconstrained,
+            max_logprob_labels=unconstrained,
             arch_name=self.arch_type,
             vocab_size=int(sglang_mc.vocab_size),
             max_model_len=int(sglang_mc.context_len),

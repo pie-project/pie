@@ -164,7 +164,7 @@ class ModelConfig(ModelConfigBase):
     def num_full_attention_layers(self) -> int:
         return sum(1 for i in range(self.num_layers) if self.is_full_attention(i))
 
-    def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
+    def eval_total_pages(self, runtime_config: RuntimeConfig) -> int:
         """Sized for full-attn layers only; linear-attn layers carry tiny placeholder caches."""
         avail = get_available_memory(devices=runtime_config.devices, rank=runtime_config.rank)
         # Reserve ~10% of the budget for SSM state and conv state.
@@ -707,7 +707,7 @@ def create_kv_cache(model_config: ModelConfig, runtime_config: RuntimeConfig) ->
     return [
         torch.zeros(
             (
-                runtime_config.max_num_kv_pages + 1,
+                runtime_config.total_pages + 1,
                 2,
                 runtime_config.kv_page_size,
                 local_kv_heads,

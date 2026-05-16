@@ -199,7 +199,7 @@ class ModelConfig(ModelConfigBase):
         #      return self.num_q_heads
         return self.num_kv_heads
 
-    def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
+    def eval_total_pages(self, runtime_config: RuntimeConfig) -> int:
         """Evaluate the maximum number of KV pages based on available memory."""
         available_bytes = get_available_memory(
             devices=runtime_config.devices,
@@ -892,7 +892,7 @@ def create_kv_cache(
     return [
         torch.zeros(
             (
-                runtime_config.max_num_kv_pages + 1,  # +1 for scratch/padding page
+                runtime_config.total_pages + 1,  # +1 for scratch/padding page
                 2,
                 runtime_config.kv_page_size,
                 local_num_kv_heads,

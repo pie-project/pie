@@ -125,7 +125,7 @@ fn display_config_from(cfg: &config::Config) -> Result<DisplayConfig> {
         tensor_parallel_size: m.driver.tensor_parallel_size,
         activation_dtype: m.driver.activation_dtype.clone(),
         kv_page_size: extract_kv_page_size(m).unwrap_or(0),
-        max_batch_tokens: extract_max_batch_tokens(m).unwrap_or(0),
+        memory_profile: extract_memory_profile(m).unwrap_or_else(|| "balanced".to_string()),
     })
 }
 
@@ -137,10 +137,10 @@ fn extract_kv_page_size(m: &config::ModelConfig) -> Option<u32> {
         .map(|n| n as u32)
 }
 
-fn extract_max_batch_tokens(m: &config::ModelConfig) -> Option<u32> {
+fn extract_memory_profile(m: &config::ModelConfig) -> Option<String> {
     m.driver
         .options
-        .get("max_batch_tokens")?
-        .as_integer()
-        .map(|n| n as u32)
+        .get("memory_profile")?
+        .as_str()
+        .map(str::to_string)
 }

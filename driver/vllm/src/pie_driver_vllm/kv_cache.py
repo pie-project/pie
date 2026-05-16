@@ -101,7 +101,7 @@ def allocate_and_bind_kv_cache(
         device=device,
         gpu_mem_utilization=driver_config.gpu_memory_utilization,
     )
-    config.max_num_kv_pages = num_blocks
+    config.total_pages = num_blocks
     # vLLM's FlexAttention metadata builder asserts `cache_config.num_gpu_blocks`
     # is set; pie manages its own KV pool, so we sync the count over here so
     # backends that consult vllm_config see the right value.

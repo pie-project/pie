@@ -7,7 +7,7 @@
 // across a single request's lifetime (prefill → all decodes → free).
 //
 // Eviction is LRU within the configured capacity (max_slots, set to the
-// driver's max_batch_size). When acquire() reassigns a slot, it returns
+// driver's max_forward_requests). When acquire() reassigns a slot, it returns
 // is_fresh=true so the caller can zero that slot's state via
 // Qwen3_5StateCache::reset_slot before the layer body consumes it. A
 // returning evicted request will, by the runtime's own invariants, fire
@@ -46,7 +46,7 @@ public:
     //   non-`in_use_this_fire` slot, returns it, is_fresh=true.
     //
     // Throws on `max_slots == 0` or "every slot already in use this
-    // fire" (the caller should size capacity ≥ max_batch_size so this
+    // fire" (the caller should size capacity ≥ max_forward_requests so this
     // never happens — but the throw makes the invariant violation
     // visible rather than silently corrupting state).
     Acquired acquire(std::uint64_t ctx_id);

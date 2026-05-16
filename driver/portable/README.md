@@ -42,9 +42,9 @@ device = ["cpu"]
 activation_dtype = "bfloat16"
 
 [model.driver.options]
-max_batch_tokens = 10240
-max_batch_size = 512
-max_num_kv_pages = 1024
+max_forward_tokens = 10240
+max_forward_requests = 512
+total_pages = 1024
 ```
 
 The driver prefers the best compiled ggml backend and falls back to CPU.

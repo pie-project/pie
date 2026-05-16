@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import inspect
 import json
 import socket
 import time
@@ -65,24 +66,25 @@ def build_config(args: argparse.Namespace):
     if args.driver == "dev":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
-            "max_batch_size": args.max_batch_size,
+            "max_forward_tokens": args.max_forward_tokens,
+            "max_forward_requests": args.max_forward_requests,
             "cpu_mem_budget_in_gb": args.cpu_mem_budget,
         }
     elif args.driver == "cuda_native":
         driver_options = {
-            "max_batch_size": args.max_batch_size,
-            "max_batch_tokens": args.max_batch_tokens,
-            "max_num_kv_pages": args.kv_pages,
+            "gpu_mem_utilization": args.gpu_mem_util,
+            "memory_profile": args.memory_profile,
         }
     elif args.driver == "portable":
         driver_options = {
-            "max_batch_size": args.max_batch_size,
-            "max_num_kv_pages": args.kv_pages,
+            "max_forward_tokens": args.max_forward_tokens,
+            "max_forward_requests": args.max_forward_requests,
+            "total_pages": args.kv_pages,
         }
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
-            "max_num_seqs": args.max_batch_size,
+            "max_num_seqs": args.max_forward_requests,
         }
         if getattr(args, "venv", None):
             driver_options["venv"] = args.venv
@@ -102,13 +104,26 @@ def build_config(args: argparse.Namespace):
     else:
         driver_options = {}
 
+    max_concurrent_processes = args.num_requests if args.mode == "tput" else 1
     scheduler = args.batch_policy or ("greedy" if args.mode == "latency" else "adaptive")
+    scheduler_kwargs = {
+        "batch_policy": scheduler,
+        "default_token_limit": args.default_token_limit,
+        "default_endowment_pages": args.default_endowment_pages,
+        "admission_oversubscription_factor": args.admission_oversubscription_factor,
+    }
+    if (
+        args.speculation_depth is not None
+        and "speculation_depth" in inspect.signature(SchedulerConfig).parameters
+    ):
+        scheduler_kwargs["speculation_depth"] = args.speculation_depth
+
     cfg = Config(
         server=ServerConfig(
             host="127.0.0.1",
             port=0,
             verbose=True,
-            max_concurrent_processes=args.concurrency if args.mode == "tput" else 1,
+            max_concurrent_processes=max_concurrent_processes,
         ),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
@@ -120,13 +135,7 @@ def build_config(args: argparse.Namespace):
             ModelConfig(
                 name="default",
                 hf_repo=args.model,
-                scheduler=SchedulerConfig(
-                    batch_policy=scheduler,
-                    default_token_limit=args.default_token_limit,
-                    default_endowment_pages=args.default_endowment_pages,
-                    admission_oversubscription_factor=args.admission_oversubscription_factor,
-                    speculation_depth=args.speculation_depth,
-                ),
+                scheduler=SchedulerConfig(**scheduler_kwargs),
                 driver=DriverConfig(
                     type=args.driver,
                     device=device,
@@ -136,7 +145,11 @@ def build_config(args: argparse.Namespace):
             )
         ],
     )
-    config_blob = {"driver": args.driver, "scheduler": scheduler, **driver_options}
+    config_blob = {
+        "driver": args.driver,
+        "scheduler": scheduler,
+        **driver_options,
+    }
     if args.speculation_depth is not None:
         # Surface for the summary's "spec chain yield" derived stat —
         # yield = hits / (attempted × depth).
@@ -193,8 +206,19 @@ async def cli_pie_client(args: argparse.Namespace):
             txt = line.decode("utf-8", errors="replace")
             server_lines.append(txt)
             del server_lines[:-200]
-            # Surface per-fire timing the moment it lands; otherwise mute.
-            if txt.startswith("[fire ") or txt.startswith("[sched-fire ") or txt.startswith("[outer-fire "):
+            # Surface per-fire timing and server diagnostics the moment
+            # they land; otherwise keep the server log buffered for
+            # startup/failure messages.
+            if (
+                txt.startswith("[fire ")
+                or txt.startswith("[sched-fire ")
+                or txt.startswith("[outer-fire ")
+                or " WARN " in txt
+                or " ERROR " in txt
+                or "Batch response count mismatch" in txt
+                or "fire_batch failed" in txt
+                or "exceeds workspace" in txt
+            ):
                 sys.stderr.write(txt)
                 sys.stderr.flush()
 
@@ -307,13 +331,7 @@ async def run(args: argparse.Namespace):
         if args.mode == "latency":
             results = [await one(start_idx + i) for i in range(n)]
         else:
-            sem = asyncio.Semaphore(args.concurrency)
-
-            async def guarded(i: int) -> RequestResult:
-                async with sem:
-                    return await one(start_idx + i)
-
-            results = await asyncio.gather(*(guarded(i) for i in range(n)))
+            results = await asyncio.gather(*(one(start_idx + i) for i in range(n)))
         wall = time.perf_counter() - start
 
         # Pull speculation counters out of the server's model status
@@ -342,7 +360,7 @@ async def run(args: argparse.Namespace):
                     ("default.chain_submits", "chain submits"),
                     ("default.chain_drops", "chain drops"),
                     ("default.total_requests_processed", "total requests"),
-                    ("default.max_batch_size_observed", "max batch size"),
+                    ("default.max_forward_requests_observed", "max forward requests"),
                     ("default.batch_size_hist", "batch size hist"),
                 ):
                     if key in model_status:
@@ -385,12 +403,17 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--driver", default="cuda_native",
                         choices=["dev", "cuda_native", "portable", "vllm", "sglang", "dummy"])
-        sp.add_argument("--max-batch-size", type=int, default=512)
-        sp.add_argument("--max-batch-tokens", type=int, default=10_240)
+        sp.add_argument("--max-forward-requests", type=int, default=512)
+        sp.add_argument("--max-forward-tokens", type=int, default=10_240)
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
         sp.add_argument("--admission-oversubscription-factor", type=float, default=1000.0)
         sp.add_argument("--cpu-mem-budget", type=int, default=0)
+        sp.add_argument(
+            "--memory-profile",
+            default="balanced",
+            choices=["latency", "balanced", "throughput", "capacity"],
+        )
         sp.add_argument("--kv-pages", type=int, default=2048)
         sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)

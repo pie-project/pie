@@ -647,7 +647,7 @@ mod unix_impl {
 
         fn fixture_caps_json() -> &'static str {
             // Single-line — the handshake protocol is line-delimited JSON.
-            r#"{"total_pages":1024,"kv_page_size":32,"swap_pool_size":0,"max_batch_tokens":10240,"max_batch_size":512,"arch_name":"qwen3","vocab_size":151936,"max_model_len":4096,"activation_dtype":"bfloat16","snapshot_dir":"/tmp/snap","shmem_name":"/pie_shmem_g0"}"#
+            r#"{"total_pages":1024,"kv_page_size":32,"swap_pool_size":0,"max_forward_tokens":10240,"max_forward_requests":512,"max_page_refs":1024,"max_logit_rows":4294967295,"max_prob_rows":4294967295,"max_custom_mask_bytes":4294967295,"max_sampler_rows":4294967295,"max_logprob_labels":4294967295,"arch_name":"qwen3","vocab_size":151936,"max_model_len":4096,"activation_dtype":"bfloat16","snapshot_dir":"/tmp/snap","shmem_name":"/pie_shmem_g0"}"#
         }
 
         #[test]

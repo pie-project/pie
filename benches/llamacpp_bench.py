@@ -50,7 +50,7 @@ async def maybe_server(args: argparse.Namespace):
             "--host", "127.0.0.1",
             "--port", str(args.port),
             "--ctx-size", str(args.max_model_len),
-            "--parallel", str(args.concurrency),
+            "--parallel", str(args.num_requests if args.mode == "tput" else 1),
             "--n-gpu-layers", "all",
             "--flash-attn", "off",
         ]
@@ -119,13 +119,9 @@ async def run(args: argparse.Namespace):
         if args.mode == "latency":
             results = [await one(p, c) for p, c in zip(run_prompts, run_counts)]
         else:
-            sem = asyncio.Semaphore(args.concurrency)
-
-            async def guarded(p: str, c: int) -> RequestResult:
-                async with sem:
-                    return await one(p, c)
-
-            results = await asyncio.gather(*(guarded(p, c) for p, c in zip(run_prompts, run_counts)))
+            results = await asyncio.gather(
+                *(one(p, c) for p, c in zip(run_prompts, run_counts))
+            )
         wall = time.perf_counter() - start
 
     summary = summarize(

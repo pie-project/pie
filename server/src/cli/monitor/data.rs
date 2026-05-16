@@ -82,5 +82,5 @@ pub struct DisplayConfig {
     pub tensor_parallel_size: u32,
     pub activation_dtype: String,
     pub kv_page_size: u32,
-    pub max_batch_tokens: u32,
+    pub memory_profile: String,
 }

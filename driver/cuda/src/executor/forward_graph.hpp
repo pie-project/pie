@@ -1,13 +1,15 @@
 #pragma once
 
-// CUDA-graph cache for the decode forward pass.
+// CUDA-graph cache for the decode forward body.
 //
 // Why: every fire_batch in a steady decode workload issues the same ~420
 // kernel launches per layer × 28 layers + embed/lm_head/etc. Per-launch
 // overhead dominates at small batch sizes. Capturing the launch sequence
 // once into a `cudaGraphExec_t` and replaying it on subsequent fires of
-// the same shape collapses N CPU-side launch invocations into a single
-// `cudaGraphLaunch`.
+// the same shape collapses N CPU-side forward launch invocations into a
+// single `cudaGraphLaunch`. Sampling/probe response work is intentionally
+// outside the graph because sampler layouts vary independently from the
+// forward shape.
 //
 // Constraints (correctness — gibberish if violated):
 //   1. **Pointer stability.** All kernel arguments (`pi.tokens`, `ws.*`,
@@ -56,8 +58,9 @@ struct ForwardGraphKeyHash {
 };
 
 // Cache of executable graphs keyed by shape. Owned by Executor;
-// graphs are destroyed in the destructor. Bounded LRU is overkill at the
-// shapes we see — a few buckets suffice; we let it grow unbounded.
+// graphs are destroyed in the destructor. Wide, page-limited serving can
+// create many decode batch sizes, and cudaGraphExec_t objects retain
+// device-side resources, so keep this bounded.
 class ForwardGraphCache {
 public:
     ForwardGraphCache() = default;
@@ -75,12 +78,24 @@ public:
 
     // Stores a captured graph. Caller transfers ownership.
     void put(const ForwardGraphKey& key, cudaGraphExec_t exec) {
-        execs_[key] = exec;
+        if (auto it = execs_.find(key); it != execs_.end()) {
+            cudaGraphExecDestroy(it->second);
+            it->second = exec;
+            return;
+        }
+
+        if (execs_.size() >= kMaxEntries && !execs_.empty()) {
+            auto victim = execs_.begin();
+            cudaGraphExecDestroy(victim->second);
+            execs_.erase(victim);
+        }
+        execs_.emplace(key, exec);
     }
 
     std::size_t size() const noexcept { return execs_.size(); }
 
 private:
+    static constexpr std::size_t kMaxEntries = 32;
     std::unordered_map<ForwardGraphKey, cudaGraphExec_t,
                        ForwardGraphKeyHash> execs_;
 };

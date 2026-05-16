@@ -5,7 +5,8 @@ Benchmark runners for Pie and baseline engines.
 Modes:
 
 - `latency`: sequential requests, useful for single-request latency.
-- `tput`: concurrent requests, useful for saturated throughput.
+- `tput`: launches `--num-requests` requests together, useful for
+  saturated throughput.
 
 Pie runs use the `text-completion-bench` inferlet so the runner can record
 actual prompt/output token counts.
@@ -52,7 +53,6 @@ uv --project sdk/python-server run python benches/pie_bench.py tput \
   --device cuda:0 \
   --max-tokens 128 \
   --num-requests 512 \
-  --concurrency 128 \
   --warmup 16
 ```
 
@@ -117,7 +117,7 @@ The bench summary surfaces the relevant counters from the server's
 
 ### Sample numbers (Qwen3-0.6B, RTX 4090)
 
-**Low-concurrency latency mode, W=10ms** (4 reqs × 64 tokens,
+**Sequential latency mode, W=10ms** (4 reqs × 64 tokens,
 `latency --requests 4 --max-tokens 64 --wasm-delay-us 10000`):
 
 | Mode                    | mean lat | tok/s | hits |
@@ -129,8 +129,8 @@ The bench summary surfaces the relevant counters from the server's
 Depth-4 is 14.7% faster than no-spec; chain firing overlaps with
 the 10ms WASM gap between calls.
 
-**High-concurrency throughput mode, W=0** (256 reqs × 256 tokens,
-`tput --num-requests 256 --concurrency 64 --max-tokens 256`):
+**Many-request throughput mode, W=0** (256 reqs × 256 tokens,
+`tput --num-requests 256 --max-tokens 256`):
 
 | Mode                    | wall    | tok/s  | hit rate |
 |---                      | ---:    | ---:   | ---:     |
@@ -139,7 +139,7 @@ the 10ms WASM gap between calls.
 | depth 4 (async chain)   | 6.17 s  | 10623  | 74.6%    |
 
 Depth-1 is 17.3% faster than no-spec; depth-4 is +6.2%. At high
-concurrency the GPU is already saturated by real fires, so the
+request counts the GPU is already saturated by real fires, so the
 extra chain kernels at depth-4 compete with real work — depth-1
 hits the sweet spot. Depth-4 still beats no-spec because its 74.6%
 hit rate skips real kernels often enough to outweigh the extra
@@ -150,7 +150,7 @@ chain work.
 | Workload                       | Recommended | Why                                   |
 |--                              | ---:        | --                                    |
 | Single-ctx, W>0 (agent loops)  | 4 (up to 64)| GPU idle in WASM gap; deep chain fills it |
-| Many-ctx, high concurrency     | 1           | GPU already saturated; extra kernels hurt |
+| Many-ctx, high request count   | 1           | GPU already saturated; extra kernels hurt |
 | Single-ctx, W≈0 (chat completion) | 1 or off | No WASM slack to hide chain behind    |
 
 ### Correctness verification

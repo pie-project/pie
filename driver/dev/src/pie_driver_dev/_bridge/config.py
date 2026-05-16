@@ -1,7 +1,7 @@
 """Worker-internal runtime configuration.
 
 Bridge owns only the universal `RuntimeConfig`: identity, devices, dtype,
-telemetry, swap budget, and the engine-computed `max_num_kv_pages`. Each
+telemetry, swap budget, and the engine-computed `total_pages`. Each
 flavor wheel ships its own subclass for flavor-specific knobs and torch
 typing (see `pie_driver_dev.config.NativeRuntimeConfig`). Bridge stays
 torch-free; the storage fields hold device / dtype as strings, and the
@@ -73,7 +73,7 @@ class RuntimeConfig:
     swap_budget_bytes: int = 0
 
     # Engine-computed at load time. None pre-load; set by the engine.
-    max_num_kv_pages: int | None = None
+    total_pages: int | None = None
 
     # NOTE: `kv_page_size` and `max_dist_size` are
     # `NativeRuntimeConfig`-only (see `pie_driver_dev.config`). The shared

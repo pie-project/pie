@@ -120,4 +120,3 @@ fn smoke_ffi(flavor: Flavor) -> Result<()> {
     println!("\n[smoke] driver entry returned rc={rc}");
     Ok(())
 }
-

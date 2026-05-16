@@ -476,7 +476,7 @@ impl DriverConfig {
                     })?;
             }
             DriverKind::CudaNative => {
-                let _: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
+                let opts: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
                     .try_into()
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -484,6 +484,7 @@ impl DriverConfig {
                             self.kind,
                         )
                     })?;
+                opts.validate()?;
             }
             DriverKind::Dummy => {
                 let _: DummyDriverOptions = toml::Value::Table(self.options.clone())
@@ -504,6 +505,20 @@ impl DriverConfig {
 }
 
 fn validate_subprocess_driver_options(options: &toml::Table, kind: DriverKind) -> Result<()> {
+    for key in [
+        "max_num_kv_pages",
+        "max_batch_tokens",
+        "max_batch_size",
+        "linear_attn_max_slots",
+    ] {
+        ensure!(
+            !options.contains_key(key),
+            "invalid [model.driver.options] for driver type {:?}: \
+             `{key}` is not accepted; drivers compute KV pages and report \
+             `total_pages` plus scheduling capacity in capabilities",
+            kind,
+        );
+    }
     for key in ["venv", "python"] {
         if let Some(value) = options.get(key) {
             ensure!(
@@ -630,9 +645,9 @@ where
 #[serde(default, deny_unknown_fields)]
 pub struct PortableDriverOptions {
     pub kv_page_size: u32,
-    pub max_num_kv_pages: u32,
-    pub max_batch_tokens: u32,
-    pub max_batch_size: u32,
+    pub total_pages: u32,
+    pub max_forward_tokens: u32,
+    pub max_forward_requests: u32,
     pub cpu_pages: u32,
     #[serde(skip)]
     pub device: String,
@@ -649,9 +664,9 @@ impl Default for PortableDriverOptions {
     fn default() -> Self {
         Self {
             kv_page_size: 32,
-            max_num_kv_pages: 1024,
-            max_batch_tokens: 10240,
-            max_batch_size: 512,
+            total_pages: 1024,
+            max_forward_tokens: 10240,
+            max_forward_requests: 512,
             cpu_pages: 0,
             device: "auto".to_string(),
             verbose: false,
@@ -665,7 +680,8 @@ impl Default for PortableDriverOptions {
 /// `[model.driver.options]` for `type = "dummy"`. The dummy driver
 /// fabricates everything the portable driver would otherwise read from
 /// model weights — `vocab_size` and `arch_name` are required because no
-/// safe default exists. Page geometry and timeouts have generic defaults.
+/// safe default exists. Page geometry and timeouts have generic defaults;
+/// the driver derives its synthetic KV page pool from these limits.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DummyDriverOptions {
@@ -684,12 +700,10 @@ pub struct DummyDriverOptions {
 
     #[serde(default = "default_kv_page_size")]
     pub kv_page_size: u32,
-    #[serde(default = "default_max_num_kv_pages")]
-    pub max_num_kv_pages: u32,
-    #[serde(default = "default_max_batch_tokens")]
-    pub max_batch_tokens: u32,
-    #[serde(default = "default_max_batch_size")]
-    pub max_batch_size: u32,
+    #[serde(default = "default_max_forward_tokens")]
+    pub max_forward_tokens: u32,
+    #[serde(default = "default_max_forward_requests")]
+    pub max_forward_requests: u32,
     #[serde(default = "default_max_model_len")]
     pub max_model_len: u32,
     #[serde(default = "default_dummy_ready_timeout_s")]
@@ -699,13 +713,10 @@ pub struct DummyDriverOptions {
 fn default_kv_page_size() -> u32 {
     16
 }
-fn default_max_num_kv_pages() -> u32 {
-    256
-}
-fn default_max_batch_tokens() -> u32 {
+fn default_max_forward_tokens() -> u32 {
     4096
 }
-fn default_max_batch_size() -> u32 {
+fn default_max_forward_requests() -> u32 {
     128
 }
 fn default_max_model_len() -> u32 {
@@ -727,10 +738,8 @@ pub struct CudaNativeDriverOptions {
     pub binary_path: String,
 
     pub gpu_mem_utilization: f64,
+    pub memory_profile: CudaMemoryProfile,
     pub kv_page_size: u32,
-    pub max_batch_tokens: u32,
-    pub max_batch_size: u32,
-    pub max_num_kv_pages: u32,
     pub swap_pool_size: u32,
     pub weight_dtype: String,
     /// CUDA device string, e.g. `"cuda:0"`. Populated by the caller
@@ -750,15 +759,23 @@ pub struct CudaNativeDriverOptions {
     pub shutdown_timeout_s: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaMemoryProfile {
+    Latency,
+    #[default]
+    Balanced,
+    Throughput,
+    Capacity,
+}
+
 impl Default for CudaNativeDriverOptions {
     fn default() -> Self {
         Self {
             binary_path: String::new(),
-            gpu_mem_utilization: 0.85,
+            gpu_mem_utilization: 0.90,
+            memory_profile: CudaMemoryProfile::Balanced,
             kv_page_size: 32,
-            max_batch_tokens: 10240,
-            max_batch_size: 512,
-            max_num_kv_pages: 1024,
             swap_pool_size: 0,
             weight_dtype: "bfloat16".to_string(),
             device: String::new(),
@@ -767,6 +784,22 @@ impl Default for CudaNativeDriverOptions {
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
         }
+    }
+}
+
+impl CudaNativeDriverOptions {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.gpu_mem_utilization.is_finite()
+                && self.gpu_mem_utilization > 0.0
+                && self.gpu_mem_utilization <= 1.0,
+            "model.driver.options.gpu_mem_utilization must be finite and in (0.0, 1.0]"
+        );
+        ensure!(
+            self.kv_page_size > 0,
+            "model.driver.options.kv_page_size must be > 0"
+        );
+        Ok(())
     }
 }
 
@@ -794,6 +827,66 @@ device = ["cpu"]
         assert_eq!(cfg.models[0].driver.ipc_profile, IpcProfile::Balanced);
         assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 1_000);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    #[test]
+    fn rejects_legacy_portable_kv_page_knob() {
+        let stale = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "portable"
+device = ["cpu"]
+
+[model.driver.options]
+max_num_kv_pages = 1024
+"#;
+        let cfg: Config = toml::from_str(stale).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_num_kv_pages"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_legacy_dummy_kv_page_knob() {
+        let stale = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "dummy"
+device = ["cpu"]
+
+[model.driver.options]
+vocab_size = 151936
+arch_name = "qwen3"
+max_num_kv_pages = 1024
+"#;
+        let cfg: Config = toml::from_str(stale).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_num_kv_pages"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_legacy_subprocess_kv_page_knob() {
+        let stale = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "vllm"
+device = ["cuda:0"]
+
+[model.driver.options]
+max_num_kv_pages = 1024
+"#;
+        let cfg: Config = toml::from_str(stale).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_num_kv_pages"), "got: {err}");
+        assert!(err.contains("total_pages"), "got: {err}");
     }
 
     #[test]
@@ -916,7 +1009,8 @@ type = "cuda_native"
 device = ["cuda:0"]
 
 [model.driver.options]
-max_num_kv_pages = 2048
+gpu_mem_utilization = 0.90
+memory_profile = "balanced"
 runtime_quant = "fp8"
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
@@ -924,7 +1018,8 @@ runtime_quant = "fp8"
         assert_eq!(cfg.models[0].driver.kind, DriverKind::CudaNative);
         let opts: CudaNativeDriverOptions =
             cfg.models[0].driver.options.clone().try_into().unwrap();
-        assert_eq!(opts.max_num_kv_pages, 2048);
+        assert_eq!(opts.gpu_mem_utilization, 0.90);
+        assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
         assert_eq!(opts.kv_page_size, 32); // default
@@ -945,11 +1040,49 @@ device = ["cuda:0"]
         cfg.validate().unwrap();
         let opts: CudaNativeDriverOptions =
             cfg.models[0].driver.options.clone().try_into().unwrap();
-        // Defaults match pie_driver_cuda_native/config.py.
-        assert_eq!(opts.max_num_kv_pages, 1024);
         assert_eq!(opts.swap_pool_size, 0);
-        assert_eq!(opts.gpu_mem_utilization, 0.85);
+        assert_eq!(opts.gpu_mem_utilization, 0.90);
+        assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
         assert_eq!(opts.ready_timeout_s, 600.0);
+    }
+
+    #[test]
+    fn rejects_invalid_cuda_memory_profile() {
+        let cuda = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+memory_profile = "aggressive"
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("memory_profile"), "got: {err}");
+        assert!(err.contains("aggressive"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_cuda_option() {
+        let cuda = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+manual_capacity = 1
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("manual_capacity"), "got: {err}");
     }
 
     #[test]

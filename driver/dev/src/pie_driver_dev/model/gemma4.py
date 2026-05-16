@@ -231,7 +231,7 @@ class ModelConfig(ModelConfigBase):
             f"No source layer found for shared layer {layer_idx} of type {target_type}"
         )
 
-    def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
+    def eval_total_pages(self, runtime_config: RuntimeConfig) -> int:
         available_bytes = get_available_memory(
             devices=runtime_config.devices,
             rank=runtime_config.rank,
@@ -1076,7 +1076,7 @@ def create_kv_cache(
             continue
         kv_cache[i] = torch.zeros(
             (
-                runtime_config.max_num_kv_pages + 1,
+                runtime_config.total_pages + 1,
                 2,
                 runtime_config.kv_page_size,
                 cfg.num_kv_heads,

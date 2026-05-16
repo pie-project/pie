@@ -96,7 +96,6 @@ def main():
     args = p.parse_args()
     args.mode = "latency"  # pie_bench.build_config uses this
     args.num_requests = 1
-    args.concurrency = 1
     args.warmup = 0
 
     asyncio.run(run(args))

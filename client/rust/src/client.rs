@@ -100,7 +100,11 @@ impl Process {
     pub async fn transfer_file(&self, blob: &[u8]) -> Result<()> {
         let file_hash = hash_blob(blob);
         let total_size = blob.len();
-        let total_chunks = if total_size == 0 { 1 } else { total_size.div_ceil(CHUNK_SIZE_BYTES) };
+        let total_chunks = if total_size == 0 {
+            1
+        } else {
+            total_size.div_ceil(CHUNK_SIZE_BYTES)
+        };
 
         for chunk_index in 0..total_chunks {
             let start = chunk_index * CHUNK_SIZE_BYTES;
@@ -313,17 +317,18 @@ impl Client {
         wasm_path: Option<&Path>,
         manifest_path: Option<&Path>,
     ) -> Result<bool> {
-        use std::sync::LazyLock;
         use regex::Regex;
+        use std::sync::LazyLock;
 
-        static RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"^([a-zA-Z0-9][a-zA-Z0-9_-]*)@(\d+\.\d+\.\d+)$").unwrap()
-        });
+        static RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"^([a-zA-Z0-9][a-zA-Z0-9_-]*)@(\d+\.\d+\.\d+)$").unwrap());
 
-        let caps = RE.captures(inferlet)
-            .ok_or_else(|| anyhow!(
-                "Invalid program identifier '{}': expected 'name@major.minor.patch'", inferlet
-            ))?;
+        let caps = RE.captures(inferlet).ok_or_else(|| {
+            anyhow!(
+                "Invalid program identifier '{}': expected 'name@major.minor.patch'",
+                inferlet
+            )
+        })?;
         let name = caps[1].to_string();
         let version = caps[2].to_string();
 
@@ -333,7 +338,10 @@ impl Client {
                     .with_context(|| format!("Failed to read WASM file: {:?}", wasm_p))?;
                 let manifest_content = fs::read_to_string(manifest_p)
                     .with_context(|| format!("Failed to read manifest file: {:?}", manifest_p))?;
-                (Some(hash_blob(&wasm_bytes)), Some(hash_blob(manifest_content.as_bytes())))
+                (
+                    Some(hash_blob(&wasm_bytes)),
+                    Some(hash_blob(manifest_content.as_bytes())),
+                )
             }
             (None, None) => (None, None),
             _ => anyhow::bail!("wasm_path and manifest_path must both be provided or both be None"),
@@ -365,7 +373,12 @@ impl Client {
     }
 
     /// Upload a program to the server.
-    pub async fn add_program(&self, wasm_path: &Path, manifest_path: &Path, force_overwrite: bool) -> Result<()> {
+    pub async fn add_program(
+        &self,
+        wasm_path: &Path,
+        manifest_path: &Path,
+        force_overwrite: bool,
+    ) -> Result<()> {
         let blob = fs::read(wasm_path)
             .with_context(|| format!("Failed to read WASM file: {:?}", wasm_path))?;
         let manifest = fs::read_to_string(manifest_path)
@@ -377,7 +390,11 @@ impl Client {
         self.inner.pending_requests.insert(*corr_id_guard, tx);
 
         let total_size = blob.len();
-        let total_chunks = if total_size == 0 { 1 } else { total_size.div_ceil(CHUNK_SIZE_BYTES) };
+        let total_chunks = if total_size == 0 {
+            1
+        } else {
+            total_size.div_ceil(CHUNK_SIZE_BYTES)
+        };
 
         for chunk_index in 0..total_chunks {
             let start = chunk_index * CHUNK_SIZE_BYTES;
@@ -451,7 +468,9 @@ impl Client {
         }
 
         let (tx, rx) = mpsc::channel(64);
-        self.inner.process_event_tx.insert(process_id.to_string(), tx);
+        self.inner
+            .process_event_tx
+            .insert(process_id.to_string(), tx);
 
         Ok(Process {
             id: process_id.to_string(),
@@ -475,8 +494,15 @@ impl Client {
         let msg = ClientMessage::ListProcesses { corr_id: 0 };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
         if ok {
-            let ids: Vec<String> = result.split(',')
-                .map(|s| s.trim().trim_matches('"').trim_matches('[').trim_matches(']').to_string())
+            let ids: Vec<String> = result
+                .split(',')
+                .map(|s| {
+                    s.trim()
+                        .trim_matches('"')
+                        .trim_matches('[')
+                        .trim_matches(']')
+                        .to_string()
+                })
                 .filter(|s| !s.is_empty())
                 .collect();
             Ok(ids)
@@ -517,15 +543,15 @@ impl Client {
         // the server actually came up.
         match transport {
             "stdio" => {
-                let cmd = command.context(
-                    "register_mcp_server(stdio): `command` is required",
-                )?;
+                let cmd = command.context("register_mcp_server(stdio): `command` is required")?;
                 let args_vec = args.clone().unwrap_or_default();
                 self.inner
                     .mcp_bridge
                     .register_stdio(name, cmd, &args_vec)
                     .await
-                    .with_context(|| format!("Local registration of MCP server '{}' failed", name))?;
+                    .with_context(|| {
+                        format!("Local registration of MCP server '{}' failed", name)
+                    })?;
             }
             other => {
                 anyhow::bail!(
@@ -557,17 +583,22 @@ impl Client {
 // =============================================================================
 
 /// Routes incoming server messages to the appropriate handler.
-async fn handle_server_message(
-    msg: ServerMessage,
-    inner: &Arc<ClientInner>,
-) {
+async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
     match msg {
-        ServerMessage::Response { corr_id, ok, result } => {
+        ServerMessage::Response {
+            corr_id,
+            ok,
+            result,
+        } => {
             if let Some((_, sender)) = inner.pending_requests.remove(&corr_id) {
                 sender.send((ok, result)).ok();
             }
         }
-        ServerMessage::ProcessEvent { process_id, event, value } => {
+        ServerMessage::ProcessEvent {
+            process_id,
+            event,
+            value,
+        } => {
             if let Some(sender) = inner.process_event_tx.get(&process_id) {
                 let process_event = match event.as_str() {
                     "stdout" => ProcessEvent::Stdout(value),
@@ -615,7 +646,7 @@ async fn handle_server_message(
             if let Some(state_mutex) = inner.pending_downloads.get(&file_hash) {
                 let mut state = state_mutex.lock().await;
                 state.buffer.extend_from_slice(&chunk_data);
-                drop(state);        // release Mutex guard
+                drop(state); // release Mutex guard
             }
             // DashMap Ref dropped here (end of `if let` scope)
 
@@ -645,14 +676,13 @@ async fn handle_server_message(
             // Run the relay off the reader task so a slow MCP server can't
             // block other server messages.
             tokio::spawn(async move {
-                let (ok, result) = relay_mcp_request(
-                    &inner_for_task,
-                    server_name,
-                    method,
-                    params,
-                )
-                .await;
-                let response = ClientMessage::McpResponse { corr_id, ok, result };
+                let (ok, result) =
+                    relay_mcp_request(&inner_for_task, server_name, method, params).await;
+                let response = ClientMessage::McpResponse {
+                    corr_id,
+                    ok,
+                    result,
+                };
                 if let Ok(encoded) = rmp_serde::encode::to_vec_named(&response) {
                     inner_for_task
                         .ws_writer_tx
@@ -676,16 +706,24 @@ async fn relay_mcp_request(
 ) -> (bool, String) {
     let server = match inner.mcp_bridge.get(&server_name) {
         Some(s) => s,
-        None => return (false, format!("MCP server '{}' is not registered locally", server_name)),
+        None => {
+            return (
+                false,
+                format!("MCP server '{}' is not registered locally", server_name),
+            );
+        }
     };
     // The runtime sends params as a JSON-encoded string. Parse it back so we
     // can embed a real JSON value in the JSON-RPC envelope.
-    let params_value: serde_json::Value = serde_json::from_str(&params)
-        .unwrap_or(serde_json::Value::Object(Default::default()));
+    let params_value: serde_json::Value =
+        serde_json::from_str(&params).unwrap_or(serde_json::Value::Object(Default::default()));
     match server.call(&method, params_value).await {
         Ok(result_value) => match serde_json::to_string(&result_value) {
             Ok(s) => (true, s),
-            Err(e) => (false, encode_error(-32603, &format!("Result serialize: {}", e), None)),
+            Err(e) => (
+                false,
+                encode_error(-32603, &format!("Result serialize: {}", e), None),
+            ),
         },
         Err(e) => (false, encode_error(e.code, &e.message, e.data)),
     }
@@ -696,7 +734,10 @@ async fn relay_mcp_request(
 fn encode_error(code: i64, message: &str, data: Option<serde_json::Value>) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert("code".into(), serde_json::Value::Number(code.into()));
-    obj.insert("message".into(), serde_json::Value::String(message.to_string()));
+    obj.insert(
+        "message".into(),
+        serde_json::Value::String(message.to_string()),
+    );
     if let Some(d) = data {
         obj.insert("data".into(), d);
     }

@@ -18,7 +18,7 @@ pub mod structured;
 use tokio::sync::oneshot;
 
 use crate::context::pagestore::PhysicalPageId;
-use crate::driver::DriverId;
+use crate::driver::{DriverId, SchedulerLimits};
 use crate::service::{ServiceArray, ServiceHandler};
 use anyhow::Result;
 use scheduler::BatchScheduler;
@@ -40,7 +40,7 @@ pub struct InferenceStats {
     pub total_batches: u64,
     pub total_tokens_processed: u64,
     pub total_requests_processed: u64,
-    pub max_batch_size_observed: u64,
+    pub max_forward_requests_observed: u64,
     /// Histogram buckets (1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, 128+).
     pub batch_size_hist: [u64; 8],
     pub last_batch_latency_us: u64,
@@ -73,7 +73,7 @@ pub async fn spawn(
         let info = crate::driver::get_spec(driver_idx)
             .await
             .unwrap_or_else(|e| panic!("Failed to get driver info for index {driver_idx}: {e}"));
-        driver_batch_limits.push((info.max_batch_size, info.max_batch_tokens));
+        driver_batch_limits.push(info.scheduler_limits());
     }
 
     let model_idx = SERVICES.len();
@@ -123,9 +123,8 @@ pub async fn submit(
             response: tx,
         },
     )?;
-    Ok(rx
-        .await
-        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?)
+    rx.await
+        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?
 }
 
 /// Returns aggregated inference stats for a model (lock-free, non-blocking).
@@ -178,7 +177,7 @@ impl InferenceService {
     fn new(
         model_idx: usize,
         driver_ids: Vec<DriverId>,
-        driver_batch_limits: Vec<(usize, usize)>,
+        driver_batch_limits: Vec<SchedulerLimits>,
         page_size: u32,
         request_timeout_secs: u64,
         batch_policy: String,
@@ -189,13 +188,12 @@ impl InferenceService {
             .iter()
             .enumerate()
             .map(|(driver_idx, &driver_id)| {
-                let (max_batch_size, max_batch_tokens) = driver_batch_limits[driver_idx];
+                let limits = driver_batch_limits[driver_idx];
                 BatchScheduler::new(
                     driver_id,
                     driver_idx,
                     page_size,
-                    max_batch_size,
-                    max_batch_tokens,
+                    limits,
                     request_timeout_secs,
                     batch_policy.clone(),
                 )
@@ -226,7 +224,7 @@ impl InferenceService {
         let mut total_batches = 0u64;
         let mut total_tokens = 0u64;
         let mut total_requests = 0u64;
-        let mut max_batch_size = 0u64;
+        let mut max_forward_requests = 0u64;
         let mut hist = [0u64; 8];
         let mut last_latency = 0u64;
         let mut cumulative_latency = 0u64;
@@ -235,7 +233,8 @@ impl InferenceService {
             total_batches += s.total_batches.load(Relaxed);
             total_tokens += s.total_tokens_processed.load(Relaxed);
             total_requests += s.total_requests_processed.load(Relaxed);
-            max_batch_size = max_batch_size.max(s.max_batch_size_observed.load(Relaxed));
+            max_forward_requests =
+                max_forward_requests.max(s.max_forward_requests_observed.load(Relaxed));
             for (dst, src) in hist.iter_mut().zip(s.batch_size_hist.iter()) {
                 *dst += src.load(Relaxed);
             }
@@ -253,7 +252,7 @@ impl InferenceService {
             total_batches,
             total_tokens_processed: total_tokens,
             total_requests_processed: total_requests,
-            max_batch_size_observed: max_batch_size,
+            max_forward_requests_observed: max_forward_requests,
             batch_size_hist: hist,
             last_batch_latency_us: last_latency,
             avg_batch_latency_us: avg_latency,
@@ -279,7 +278,7 @@ enum Message {
         /// full reserved range without re-allocating.
         extra_pages: Vec<PhysicalPageId>,
         last_page_len: u32,
-        response: oneshot::Sender<pie_bridge::ForwardResponse>,
+        response: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
     },
     GetStats {
         response: oneshot::Sender<InferenceStats>,

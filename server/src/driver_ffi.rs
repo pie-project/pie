@@ -213,13 +213,23 @@ pub unsafe fn run_inproc(
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => Ok(unsafe {
             pie_driver_cuda_run_inproc(
-                argc, argv, install_signal_handlers, ready_cb, ready_ctx, vtable,
+                argc,
+                argv,
+                install_signal_handlers,
+                ready_cb,
+                ready_ctx,
+                vtable,
             )
         }),
         #[cfg(feature = "driver-portable")]
         Flavor::Portable => Ok(unsafe {
             pie_driver_portable_run_inproc(
-                argc, argv, install_signal_handlers, ready_cb, ready_ctx, vtable,
+                argc,
+                argv,
+                install_signal_handlers,
+                ready_cb,
+                ready_ctx,
+                vtable,
             )
         }),
         _ => Err("in-process driver entry not supported for this flavor"),

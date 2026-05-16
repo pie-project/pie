@@ -31,7 +31,7 @@ class ModelConfig(ABC):
         pass
 
     @abstractmethod
-    def eval_max_num_kv_pages(self, runtime_config: "RuntimeConfig") -> int:
+    def eval_total_pages(self, runtime_config: "RuntimeConfig") -> int:
         """Evaluate the maximum number of KV pages based on available memory."""
         pass
 

@@ -71,8 +71,8 @@ impl Session {
                         serde_json::Value::from(inf.total_requests_processed),
                     );
                     stats.insert(
-                        format!("{}.max_batch_size_observed", model_name),
-                        serde_json::Value::from(inf.max_batch_size_observed),
+                        format!("{}.max_forward_requests_observed", model_name),
+                        serde_json::Value::from(inf.max_forward_requests_observed),
                     );
                     stats.insert(
                         format!("{}.batch_size_hist", model_name),

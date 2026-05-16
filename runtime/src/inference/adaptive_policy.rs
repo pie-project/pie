@@ -79,7 +79,7 @@ use super::scheduler::{Decision, SchedulingPolicy};
 //
 // **Firing rule** (in evaluation order):
 //
-//   1. `B >= max_batch_size`              — structural driver limit.
+//   1. `B >= max_forward_requests`              — structural driver limit.
 //   2. `last_latency == 0`                — cold start, no measurement
 //                                           yet; fire to make progress.
 //   3. `in_flight`                        — GPU is occupied by the
@@ -144,7 +144,7 @@ use super::scheduler::{Decision, SchedulingPolicy};
 // rapid 2-second bursts. No spiral or runaway observed.
 
 pub(super) struct AdaptivePolicy {
-    max_batch_size: usize,
+    max_forward_requests: usize,
     /// Index of the driver this policy is scheduling for. Used to
     /// read `pinned_count` (lock-free atomic, updated on context
     /// pin/unpin).
@@ -185,9 +185,9 @@ pub(super) struct AdaptivePolicy {
 }
 
 impl AdaptivePolicy {
-    pub fn new(max_batch_size: usize, driver_idx: usize) -> Self {
+    pub fn new(max_forward_requests: usize, driver_idx: usize) -> Self {
         Self {
-            max_batch_size,
+            max_forward_requests,
             driver_idx,
             batch_start_time: None,
             last_latency: 0.0,
@@ -232,10 +232,10 @@ impl SchedulingPolicy for AdaptivePolicy {
         }
     }
 
-    fn decide(&mut self, current_batch_size: usize) -> Decision {
+    fn decide(&mut self, current_forward_requests: usize) -> Decision {
         // (1) Structural cap. Always fires, even when in_flight,
         //     because the batch can't grow further.
-        if current_batch_size >= self.max_batch_size {
+        if current_forward_requests >= self.max_forward_requests {
             return Decision::Fire;
         }
         // (2) Cold start.
@@ -265,7 +265,7 @@ impl SchedulingPolicy for AdaptivePolicy {
             self.cohort_high_water = active;
         }
         let target = self.cohort_high_water.max(self.fired_high_water);
-        if target > 0 && current_batch_size >= target {
+        if target > 0 && current_forward_requests >= target {
             return Decision::Fire;
         }
         // (5) Safety bound — never wait longer than one previous
@@ -301,7 +301,7 @@ impl SchedulingPolicy for AdaptivePolicy {
 // skews steady-state rather than bursty.
 
 pub(super) struct EagerPolicy {
-    max_batch_size: usize,
+    max_forward_requests: usize,
     driver_idx: usize,
     batch_start_time: Option<Instant>,
     last_latency: f64,
@@ -310,9 +310,9 @@ pub(super) struct EagerPolicy {
 }
 
 impl EagerPolicy {
-    pub fn new(max_batch_size: usize, driver_idx: usize) -> Self {
+    pub fn new(max_forward_requests: usize, driver_idx: usize) -> Self {
         Self {
-            max_batch_size,
+            max_forward_requests,
             driver_idx,
             batch_start_time: None,
             last_latency: 0.0,
@@ -341,8 +341,8 @@ impl SchedulingPolicy for EagerPolicy {
         self.cohort_high_water = 0;
     }
 
-    fn decide(&mut self, current_batch_size: usize) -> Decision {
-        if current_batch_size >= self.max_batch_size {
+    fn decide(&mut self, current_forward_requests: usize) -> Decision {
+        if current_forward_requests >= self.max_forward_requests {
             return Decision::Fire;
         }
         let active = crate::context::pinned_count(self.driver_idx);
@@ -350,7 +350,7 @@ impl SchedulingPolicy for EagerPolicy {
             self.cohort_high_water = active;
         }
         let target = self.cohort_high_water;
-        if target > 0 && current_batch_size >= target {
+        if target > 0 && current_forward_requests >= target {
             return Decision::Fire;
         }
         if self.last_latency == 0.0 {
@@ -397,10 +397,10 @@ impl SchedulingPolicy for GreedyPolicy {
     fn on_complete(&mut self, _latency: Duration) {}
     fn on_fired(&mut self, _fired_size: usize) {}
 
-    fn decide(&mut self, _current_batch_size: usize) -> Decision {
+    fn decide(&mut self, _current_forward_requests: usize) -> Decision {
         // The scheduler only calls `decide` when the batch is
         // non-empty, and the BatchAccumulator already enforces
-        // `max_batch_size` upstream of the policy. So: just fire,
+        // `max_forward_requests` upstream of the policy. So: just fire,
         // every time.
         Decision::Fire
     }
@@ -421,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_fires_at_max_batch_size_even_when_in_flight() {
+    fn adaptive_fires_at_max_forward_requests_even_when_in_flight() {
         let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_complete(Duration::from_millis(500)); // skipped
         policy.on_complete(Duration::from_millis(20));
@@ -482,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn eager_fires_at_max_batch_size() {
+    fn eager_fires_at_max_forward_requests() {
         let mut policy = EagerPolicy::new(512, 0);
         assert!(matches!(policy.decide(512), Decision::Fire));
     }

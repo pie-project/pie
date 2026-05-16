@@ -21,7 +21,6 @@ ROOT = Path(__file__).resolve().parents[1]
 @dataclass(frozen=True)
 class Scenario:
     label: str
-    concurrency: int
     wasm_delay_us: int
     spec: str  # "off" or "on"
     depth: int
@@ -31,27 +30,27 @@ class Scenario:
 
 
 SCENARIOS: list[Scenario] = [
-    # W=0: saturated GPU, increasing concurrency
-    Scenario("c1_W0",   1,     0, "off", 1,   4, 256,  0),
-    Scenario("c1_W0",   1,     0, "on",  1,   4, 256,  0),
-    Scenario("c4_W0",   4,     0, "off", 1,  16, 256,  4),
-    Scenario("c4_W0",   4,     0, "on",  1,  16, 256,  4),
-    Scenario("c16_W0",  16,    0, "off", 1,  64, 256,  8),
-    Scenario("c16_W0",  16,    0, "on",  1,  64, 256,  8),
-    Scenario("c64_W0",  64,    0, "off", 1, 256, 256, 16),
-    Scenario("c64_W0",  64,    0, "on",  1, 256, 256, 16),
-    Scenario("c64_W0",  64,    0, "on",  4, 256, 256, 16),
-    Scenario("c128_W0", 128,   0, "off", 1, 256, 256, 16),
-    Scenario("c128_W0", 128,   0, "on",  1, 256, 256, 16),
-    Scenario("c128_W0", 128,   0, "on",  4, 256, 256, 16),
+    # W=0: saturated GPU, increasing request count.
+    Scenario("n1_W0",       0, "off", 1,   1, 256,  0),
+    Scenario("n1_W0",       0, "on",  1,   1, 256,  0),
+    Scenario("n4_W0",       0, "off", 1,   4, 256,  4),
+    Scenario("n4_W0",       0, "on",  1,   4, 256,  4),
+    Scenario("n16_W0",      0, "off", 1,  16, 256,  8),
+    Scenario("n16_W0",      0, "on",  1,  16, 256,  8),
+    Scenario("n64_W0",      0, "off", 1,  64, 256, 16),
+    Scenario("n64_W0",      0, "on",  1,  64, 256, 16),
+    Scenario("n64_W0",      0, "on",  4,  64, 256, 16),
+    Scenario("n128_W0",     0, "off", 1, 128, 256, 16),
+    Scenario("n128_W0",     0, "on",  1, 128, 256, 16),
+    Scenario("n128_W0",     0, "on",  4, 128, 256, 16),
     # W=10ms: idle GPU between calls, deep chains shine
-    Scenario("c1_W10",  1, 10000, "off",  1,  4, 64,  0),
-    Scenario("c1_W10",  1, 10000, "on",   1,  4, 64,  0),
-    Scenario("c1_W10",  1, 10000, "on",   4,  4, 64,  0),
-    Scenario("c1_W10",  1, 10000, "on",  16,  4, 64,  0),
-    Scenario("c4_W10",  4, 10000, "off",  1, 16, 64,  4),
-    Scenario("c4_W10",  4, 10000, "on",   1, 16, 64,  4),
-    Scenario("c4_W10",  4, 10000, "on",   4, 16, 64,  4),
+    Scenario("n1_W10",  10000, "off",  1, 1, 64, 0),
+    Scenario("n1_W10",  10000, "on",   1, 1, 64, 0),
+    Scenario("n1_W10",  10000, "on",   4, 1, 64, 0),
+    Scenario("n1_W10",  10000, "on",  16, 1, 64, 0),
+    Scenario("n4_W10",  10000, "off",  1, 4, 64, 4),
+    Scenario("n4_W10",  10000, "on",   1, 4, 64, 4),
+    Scenario("n4_W10",  10000, "on",   4, 4, 64, 4),
 ]
 
 
@@ -69,15 +68,10 @@ def run_scenario(s: Scenario, model: str, iter_idx: int, args: argparse.Namespac
         "--model", model,
         "--device", args.device,
         "--num-requests", str(s.num_requests),
-        "--concurrency", str(s.concurrency),
         "--max-tokens", str(s.max_tokens),
         "--warmup", str(s.warmup),
         "--wasm-delay-us", str(s.wasm_delay_us),
         "--speculation-depth", str(cfg_depth),
-        "--max-batch-size", str(args.max_batch_size),
-        "--max-batch-tokens", str(args.max_batch_tokens),
-        "--kv-pages", str(args.kv_pages),
-        "--max-model-len", str(args.max_model_len),
         "--pie-bin", str(ROOT / "target" / "release" / "pie"),
         "--json-out", str(json_out),
     ]
@@ -122,10 +116,6 @@ def main() -> None:
     p.add_argument("--out-csv", default=str(ROOT / "benches" / "spec_on_off_sweep.csv"))
     p.add_argument("--json-dir", default="/tmp/benches-spec-on-off")
     p.add_argument("--iters", type=int, default=1)
-    p.add_argument("--max-batch-size", type=int, default=512)
-    p.add_argument("--max-batch-tokens", type=int, default=10240)
-    p.add_argument("--kv-pages", type=int, default=2048)
-    p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--filter", help="run only scenarios whose label contains this", default=None)
     args = p.parse_args()
 
@@ -139,13 +129,13 @@ def main() -> None:
 
     with out_csv.open("a") as f:
         if write_header:
-            f.write("label,concurrency,wasm_delay_us,spec,depth,iter,wall_s,tok_per_s,mean_lat_ms,p99_lat_ms,bypass_hits,status\n")
+            f.write("label,num_requests,wasm_delay_us,spec,depth,iter,wall_s,tok_per_s,mean_lat_ms,p99_lat_ms,bypass_hits,status\n")
             f.flush()
         for s in selected:
             for it in range(1, args.iters + 1):
                 r = run_scenario(s, args.model, it, args)
                 f.write(
-                    f"{s.label},{s.concurrency},{s.wasm_delay_us},{s.spec},{s.depth},{it},"
+                    f"{s.label},{s.num_requests},{s.wasm_delay_us},{s.spec},{s.depth},{it},"
                     f"{r.get('wall_s', '')},{r.get('tok_per_s', '')},"
                     f"{r.get('mean_lat_ms', '')},{r.get('p99_lat_ms', '')},"
                     f"{r.get('bypass_hits', '')},{r['status']}\n"

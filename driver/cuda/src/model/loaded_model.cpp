@@ -1470,8 +1470,6 @@ LoadedModelCapabilities LoadedModel::capabilities() const {
     c.total_pages = 0;  // populated in M1.2.2 once kv_cache lands
     c.kv_page_size = static_cast<int>(boot_.batching.kv_page_size);
     c.swap_pool_size = 0;
-    c.max_batch_tokens = static_cast<int>(boot_.batching.max_batch_tokens);
-    c.max_batch_size = static_cast<int>(boot_.batching.max_batch_size);
     // The runtime's `model::instruct::create` dispatches on the
     // PIE-arch key ("llama3", "gemma3", …) not HF's `architectures[0]`
     // ("LlamaForCausalLM") nor the raw HF model_type ("llama",

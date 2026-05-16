@@ -8,8 +8,10 @@
 #include <cstring>
 #include <condition_variable>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -45,6 +47,123 @@ struct TpCpuGate {
 
 std::mutex g_tp_cpu_gates_mu;
 std::unordered_map<std::string, std::shared_ptr<TpCpuGate>> g_tp_cpu_gates;
+
+std::uint64_t splitmix64(std::uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+std::uint64_t initial_sampling_seed() {
+    std::uint64_t seed =
+        static_cast<std::uint64_t>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    seed ^= reinterpret_cast<std::uintptr_t>(&seed);
+    try {
+        std::random_device rd;
+        seed ^= static_cast<std::uint64_t>(rd()) << 32;
+        seed ^= static_cast<std::uint64_t>(rd());
+    } catch (...) {
+        // Some libstdc++/container combinations can throw when entropy is
+        // unavailable. The clock/address mix above is still enough to avoid
+        // a fixed sampler sequence across server starts.
+    }
+    return splitmix64(seed);
+}
+
+std::uint32_t fresh_sampling_seed() {
+    static std::atomic<std::uint64_t> counter{initial_sampling_seed()};
+    std::uint64_t x = splitmix64(counter.fetch_add(
+        0x9E3779B97F4A7C15ULL, std::memory_order_relaxed));
+    std::uint32_t seed = static_cast<std::uint32_t>(x ^ (x >> 32));
+    return seed == 0 ? 1u : seed;
+}
+
+float bf16_to_float(std::uint16_t v) {
+    std::uint32_t bits = static_cast<std::uint32_t>(v) << 16;
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+std::int32_t masked_argmax_bf16(
+    const std::uint16_t* row,
+    int vocab_size,
+    std::span<const std::uint32_t> mask_runs)
+{
+    bool allow = false;
+    std::uint64_t pos = 0;
+    float best_val = -std::numeric_limits<float>::infinity();
+    std::int32_t best_idx = -1;
+
+    for (std::size_t i = 0; i < mask_runs.size() && pos < static_cast<std::uint64_t>(vocab_size);
+         ++i) {
+        const std::uint64_t run_len = mask_runs[i];
+        const std::uint64_t end =
+            std::min<std::uint64_t>(pos + run_len, static_cast<std::uint64_t>(vocab_size));
+        if (allow) {
+            for (std::uint64_t j = pos; j < end; ++j) {
+                const auto idx = static_cast<std::int32_t>(j);
+                const float val = bf16_to_float(row[idx]);
+                if (val > best_val || (val == best_val && idx < best_idx)) {
+                    best_val = val;
+                    best_idx = idx;
+                }
+            }
+        }
+        pos = end;
+        allow = !allow;
+    }
+
+    return best_idx;
+}
+
+void apply_logit_mask_overrides(
+    model::Qwen3Workspace& ws,
+    std::vector<std::int32_t>& all_sampled,
+    std::span<const std::uint32_t> logit_masks,
+    std::span<const std::uint32_t> logit_mask_indptr,
+    std::span<const std::uint32_t> qo_indptr,
+    std::span<const std::uint32_t> sampling_indptr,
+    std::span<const std::uint32_t> sampling_indices,
+    std::span<const std::uint32_t> per_slot_type,
+    int R,
+    int N,
+    int vocab_size)
+{
+    if (logit_masks.empty()) return;
+    if (logit_mask_indptr.size() < static_cast<std::size_t>(R + 1)) return;
+    if (qo_indptr.size() < static_cast<std::size_t>(R + 1)) return;
+    if (sampling_indptr.size() < static_cast<std::size_t>(R + 1)) return;
+
+    const auto* logits_u16 = static_cast<const std::uint16_t*>(ws.logits.data());
+    std::vector<std::uint16_t> row_bf16(static_cast<std::size_t>(vocab_size));
+
+    for (int r = 0; r < R; ++r) {
+        const std::uint32_t mask_lo = logit_mask_indptr[r];
+        const std::uint32_t mask_hi = logit_mask_indptr[r + 1];
+        if (mask_hi <= mask_lo || mask_hi > logit_masks.size()) continue;
+
+        const auto runs = logit_masks.subspan(mask_lo, mask_hi - mask_lo);
+        const std::uint32_t qo_lo = qo_indptr[r];
+        for (std::uint32_t k = sampling_indptr[r]; k < sampling_indptr[r + 1]; ++k) {
+            if (k >= per_slot_type.size() || !is_token_sampler(per_slot_type[k])) continue;
+            const std::uint32_t row = qo_lo + sampling_indices[k];
+            if (row >= static_cast<std::uint32_t>(N)) continue;
+
+            CUDA_CHECK(cudaMemcpy(row_bf16.data(),
+                                  logits_u16 + static_cast<long long>(row) * vocab_size,
+                                  sizeof(std::uint16_t) * static_cast<std::size_t>(vocab_size),
+                                  cudaMemcpyDeviceToHost));
+            const std::int32_t masked = masked_argmax_bf16(
+                row_bf16.data(), vocab_size, runs);
+            if (masked >= 0) {
+                all_sampled[row] = masked;
+            }
+        }
+    }
+}
 
 std::shared_ptr<TpCpuGate> tp_cpu_gate_for(const std::string& key) {
     std::lock_guard<std::mutex> lk(g_tp_cpu_gates_mu);
@@ -264,6 +383,14 @@ void handle_fire_batch(
             const auto sptr_trace = view.sampling_indptr.as<std::uint32_t>();
             const auto types_trace = view.sampler_types.as<std::uint32_t>();
             const auto temp_trace = view.sampler_temperatures.as<float>();
+            const auto topk_trace = view.sampler_top_k.as<std::uint32_t>();
+            const auto topp_trace = view.sampler_top_p.as<float>();
+            const auto minp_trace = view.sampler_min_p.as<float>();
+            const auto seed_trace = view.sampler_seeds.as<std::uint32_t>();
+            const auto spec_tok_trace = view.spec_token_ids.as<std::uint32_t>();
+            const auto spec_pos_trace = view.spec_position_ids.as<std::uint32_t>();
+            const auto spec_indptr_trace = view.spec_indptr.as<std::uint32_t>();
+            const auto ctx_trace = view.context_ids.as<std::uint64_t>();
             std::cerr << "[cuda-trace] req: tokens=[";
             for (auto t : tok_view_orig) std::cerr << t << ",";
             std::cerr << "] positions=[";
@@ -278,12 +405,28 @@ void handle_fire_batch(
             for (auto s : types_trace) std::cerr << s << ",";
             std::cerr << "] sampler_temps=[";
             for (auto s : temp_trace) std::cerr << s << ",";
+            std::cerr << "] sampler_top_k=[";
+            for (auto s : topk_trace) std::cerr << s << ",";
+            std::cerr << "] sampler_top_p=[";
+            for (auto s : topp_trace) std::cerr << s << ",";
+            std::cerr << "] sampler_min_p=[";
+            for (auto s : minp_trace) std::cerr << s << ",";
+            std::cerr << "] sampler_seeds=[";
+            for (auto s : seed_trace) std::cerr << s << ",";
             std::cerr << "] kv_pages=[";
             for (auto k : kvpi_view) std::cerr << k << ",";
             std::cerr << "] kv_indptr=[";
             for (auto k : kvpp_view) std::cerr << k << ",";
             std::cerr << "] kv_last_lens=[";
             for (auto k : kvlpl_view_orig) std::cerr << k << ",";
+            std::cerr << "] spec_tokens=[";
+            for (auto k : spec_tok_trace) std::cerr << k << ",";
+            std::cerr << "] spec_positions=[";
+            for (auto k : spec_pos_trace) std::cerr << k << ",";
+            std::cerr << "] spec_indptr=[";
+            for (auto k : spec_indptr_trace) std::cerr << k << ",";
+            std::cerr << "] context_ids=[";
+            for (auto k : ctx_trace) std::cerr << k << ",";
             std::cerr << "]\n";
         }
         const auto sidx_view_orig  = view.sampling_indices.as<std::uint32_t>();
@@ -302,6 +445,8 @@ void handle_fire_batch(
         const auto types_view_orig = view.sampler_types.as<std::uint32_t>();
         const auto seed_view_orig  = view.sampler_seeds.as<std::uint32_t>();
         const auto rns_view_orig   = view.request_num_samplers.as<std::uint32_t>();
+        const auto logit_masks_view = view.logit_masks.as<std::uint32_t>();
+        const auto logit_mask_indptr_view = view.logit_mask_indptr.as<std::uint32_t>();
 
         // Spec-decoding fields. When non-empty for some request, splice
         // drafts into the forward and append a verification block to
@@ -505,16 +650,11 @@ void handle_fire_batch(
         }
 
         // ── Sample-plan construction (hoisted) ──────────────────
-        // The body call below is wrapped in a CUDA-graph capture region
-        // when `forward_fn.graph_safe`. For the captured graph to
-        // include the sampling kernel + scatter (so we don't pay
-        // per-fire kernel-launch overhead on the sampling step either),
-        // the per-row sampler params must be uploaded to `pi.sample_*`
-        // BEFORE we begin capture. So: build the host-side plan here,
-        // then upload via cudaMemcpyAsync on the default stream — same
-        // pattern as `pi.tokens.copy_from_host` for the wire payload.
-        // Legacy-default-stream semantics keep the captured kernel
-        // (on `cstream`) ordered after the upload.
+        // Sampling stays outside the CUDA graph because sampler/probe
+        // layouts can vary even when the decode shape is identical. Build
+        // the per-row plan before forward so the common response path can
+        // upload stable device inputs once and launch sampling after the
+        // forward body has produced logits.
         const auto outspec_view = view.output_spec_flags.as<std::uint8_t>();
         bool need_msgpack = false;
         for (auto t : types_view) {
@@ -570,14 +710,17 @@ void handle_fire_batch(
                         ? static_cast<std::int32_t>(h_top_k[s_idx]) : 0;
                     const std::int32_t Tk =
                         (Tk_raw == 0) ? engine.hf_config().vocab_size : Tk_raw;
-                    const std::uint32_t s = (s_idx < seed_view.size()) ? h_seed[s_idx] : 0u;
+                    std::uint32_t s = (s_idx < seed_view.size()) ? h_seed[s_idx] : 0u;
                     per_slot_temp[k] = T;
                     per_slot_top_p[k] = Tp;
                     per_slot_min_p[k] = Mp;
                     per_slot_top_k[k] = Tk;
-                    per_slot_seed[k] = s;
                     const bool is_token = pie_cuda_driver::is_token_sampler(type);
                     if (is_token) {
+                        if (T > 0.f && s == 0u) {
+                            s = fresh_sampling_seed();
+                        }
+                        per_slot_seed[k] = s;
                         if ((Tk_raw > 0 || Tp < 1.f) && T > 0.f) any_topk_topp = true;
                         const std::uint32_t row = qo_lo + h_sidx[k];
                         if (row < static_cast<std::uint32_t>(N)) {
@@ -587,6 +730,8 @@ void handle_fire_batch(
                             h_per_min_p[row] = Mp;
                             h_per_seed[row]  = s;
                         }
+                    } else {
+                        per_slot_seed[k] = s;
                     }
                 }
                 sampler_off += ns;
@@ -629,21 +774,19 @@ void handle_fire_batch(
         }
         if (tm_on) tm.t_after_prepare_us = fire_now_us();
 
-        // ── Upload sampling inputs (must precede capture) ──────
-        // Per-row sampler params land in `pi.sample_*`. We do this on
-        // the default stream so the captured body's sampling kernel —
-        // launched on `cstream` — sees the fresh values via legacy
-        // default-stream ordering. Doing the upload INSIDE capture
-        // would dangling-reference the host-side `h_per_*` vectors on
-        // replay (they're per-fire stack locals).
+        // ── Upload sampling inputs (must precede sampling launch) ──
+        // Per-row sampler params land in `pi.sample_*`. Sampling runs after
+        // forward, but the upload is kept here so the response path can use
+        // the same prepared device buffers for captured and uncaptured
+        // forward bodies.
         upload_sampling_inputs(pi, sample_plan, N, /*stream=*/nullptr);
         if (tm_on) tm.t_after_uploads_us = fire_now_us();
 
         // ── Forward pass ────────────────────────────────────────
-        // Graph-capture path activates only when the arch declares
-        // itself graph-safe. The flag is the per-arch flip set in
-        // main.cpp once the dispatch upgrades to graph-stable kernel
-        // args (currently none — see ForwardFn::graph_safe).
+        // Graph-capture path activates only when the arch declares itself
+        // graph-safe. Today that means llama-like pure decode, where the
+        // per-fire attention plan is prepared before capture/replay and the
+        // captured body observes stable device pointers.
         const bool try_graphs =
             executor.graph_cache != nullptr && is_pure_decode && !have_custom_mask
             && forward_fn.graph_safe;
@@ -651,11 +794,12 @@ void handle_fire_batch(
             const ForwardGraphKey key{R};
             cudaGraphExec_t exec = executor.graph_cache->get(key);
             if (exec == nullptr) {
-                // First fire of this shape: capture. Body writes its
-                // output to `ws` workspace buffers + `cache.k/v` pages.
-                // Persistent inputs (pi.*) provide stable kernel-arg
-                // pointers; the next replay reads new contents from the
-                // same addresses, refreshed by `prepare` above.
+                // First fire of this shape: capture the forward body.
+                // Body writes its output to `ws` workspace buffers +
+                // `cache.k/v` pages. Persistent inputs (pi.*) provide
+                // stable kernel-arg pointers; the next replay reads new
+                // contents from the same addresses, refreshed by `prepare`
+                // above.
                 //
                 // Bind cuBLAS to `cstream` for the duration of capture
                 // so its kernel launches are recorded onto the captured
@@ -663,15 +807,15 @@ void handle_fire_batch(
                 // Relaxed mode allows cross-stream operations during
                 // capture but only operations on the captured stream
                 // (or streams joined to it) make it into the graph.
+                //
+                // The per-fire persistent inputs were uploaded on the
+                // default stream above. Capture uses a nonblocking stream,
+                // so start recording with no in-flight default-stream writes
+                // to the stable device buffers. The capture only records the
+                // graph; the exec is launched below for this same fire.
+                CUDA_CHECK(cudaStreamSynchronize(nullptr));
                 cudaStream_t cstream = nullptr;
                 CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
-                // Upload sampling params on `cstream` so the cudaMemcpyAsync
-                // calls inside `dispatch_sampling` are recorded into the
-                // graph rather than slipping onto the default stream.
-                // For replay, the host-side handler re-uploads via the
-                // same dispatch_sampling call on the same stream — the
-                // captured memcpy nodes copy from the same host pointers
-                // each time, which CUDA Graph handles via pinned-staging.
                 cublas.set_stream(cstream);
                 CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
                 forward_fn.body(
@@ -685,16 +829,6 @@ void handle_fire_batch(
                     use_slots ? slot_ids_h.data() : nullptr,
                     use_slots ? is_fresh_h.data() : nullptr,
                     use_slots ? pi.slot_ids.data() : nullptr);
-                // Sampling kernel + on-device scatter live inside the
-                // captured graph. `pi.sample_*` were uploaded on the
-                // default stream just before this block; legacy-default-
-                // stream semantics order them before the captured
-                // kernel even though the upload itself is not captured.
-                launch_sampling_kernel(
-                    ws, pi.sampled.data(), pi, sample_plan,
-                    N, num_sampling, engine.hf_config().vocab_size,
-                    /*prng_offset=*/static_cast<std::uint64_t>(handled),
-                    /*stream=*/cstream);
                 cudaGraph_t graph = nullptr;
                 CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
                 cublas.set_stream(nullptr);
@@ -707,9 +841,8 @@ void handle_fire_batch(
                     std::cerr << "[pie-driver-cuda] graph captured: R=" << R
                               << " (cache size=" << sz << ")\n";
                 }
-            } else {
-                CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
             }
+            CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
         } else {
             forward_fn.body(
                 ws, kv_cache, attn_ws, cublas,
@@ -725,15 +858,20 @@ void handle_fire_batch(
                 use_slots ? slot_ids_h.data() : nullptr,
                 use_slots ? is_fresh_h.data() : nullptr,
                 use_slots ? pi.slot_ids.data() : nullptr);
-            launch_sampling_kernel(
-                ws, pi.sampled.data(), pi, sample_plan,
-                N, num_sampling, engine.hf_config().vocab_size,
-                /*prng_offset=*/static_cast<std::uint64_t>(handled),
-                /*stream=*/cublas.stream());
         }
+        // Sampling is deliberately outside the CUDA graph. The forward
+        // graph key is only `R`; sampler/probe layouts vary independently
+        // (for example top-p token-only decode vs. argmax + rich probes).
+        // Running the current fire's sampling kernel after the graph launch
+        // keeps that R-only key valid.
+        launch_sampling_kernel(
+            ws, pi.sampled.data(), pi, sample_plan,
+            N, num_sampling, engine.hf_config().vocab_size,
+            /*prng_offset=*/static_cast<std::uint64_t>(handled),
+            /*stream=*/cublas.stream());
 
         // Sample plan was built above the prepare hook (hoisted so the
-        // sampling kernel can run inside the captured graph). The host
+        // sampling uploads are ready before the forward graph launch). The host
         // variables (`need_msgpack`, `per_slot_*`, `any_topk_topp`,
         // `h_per_*`, `h_sample_idx`) are still in scope here for the
         // response builder.
@@ -753,6 +891,16 @@ void handle_fire_batch(
                                    cublas.stream()));
         CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
         if (tm_on) tm.t_after_sync_us = fire_now_us();
+
+        // CUDA's fast token samplers do not yet consume BRLE logit masks.
+        // When constrained decoding supplies one, keep correctness by
+        // overriding token-sampler rows with a host-side masked argmax. This
+        // path is cold and only runs for constrained requests; normal decode
+        // and benchmark traffic keep the GPU sampler result.
+        apply_logit_mask_overrides(
+            ws, all_sampled, logit_masks_view, logit_mask_indptr_view,
+            qo_view, sptr_view, sidx_view, std::span<const std::uint32_t>(per_slot_type),
+            R, N, engine.hf_config().vocab_size);
 
         // Flat-path arrays: token sampler is the only slot type allowed
         // here (need_msgpack would have flipped otherwise), so counts
@@ -778,7 +926,6 @@ void handle_fire_batch(
             for (auto t : sampled_tokens) std::cerr << ' ' << t;
             std::cerr << '\n';
         }
-
         // Single structured response. The fast path (need_msgpack ==
         // false) populates only `tokens`; rich paths additionally fill
         // dists/logits/logprobs/entropies via the per-sampler sub-passes.
@@ -897,9 +1044,9 @@ void handle_fire_batch(
 //
 //   * No shmem decode — the inputs arrive via NCCL broadcast from rank 0.
 //   * No sampling — only rank 0 owns the response buffer + sampler RNG.
-//   * No graph capture — the broadcast issues an h2d memcpy (`d_hdr`)
-//     and the body's all-reduces aren't graph-captured today; staying
-//     out of the graph path keeps semantics simple.
+//   * Graph capture/replay mirrors rank 0 for graph-safe pure decode so
+//     NCCL collectives inside the body enter capture or replay on every
+//     rank in the same order.
 //
 // The loop blocks on `ncclBroadcast` for the header. NCCL serialises ops
 // per-comm, so a follower naturally idles until rank 0 issues the
@@ -1053,9 +1200,8 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
                 cudaGraphDestroy(graph);
                 cudaStreamDestroy(cstream);
                 executor.graph_cache->put(key, exec);
-            } else {
-                CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
             }
+            CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
         } else {
             executor.forward_fn.body(
                 executor.ws, executor.kv_cache, executor.attn_ws, executor.cublas,

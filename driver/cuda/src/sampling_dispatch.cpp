@@ -60,6 +60,16 @@ void upload_sampling_inputs(
         for (int i = 0; i < N; ++i) {
             h_seed64[i] = static_cast<std::uint64_t>(plan.seed[i]);
         }
+        // flashinfer's TopKTopPSamplingFromProb currently reads seed_arr[0]
+        // once per launch, while top-k/top-p arrays are indexed by row. Put
+        // the first sampled row's resolved seed in slot 0 so prefill samples
+        // whose row index is not zero still get the per-fire fresh seed.
+        if (!plan.sample_idx.empty()) {
+            const int first_row = plan.sample_idx[0];
+            if (first_row >= 0 && first_row < N) {
+                h_seed64[0] = static_cast<std::uint64_t>(plan.seed[first_row]);
+            }
+        }
         upload_async<float>        (pi.sample_temp,    plan.temp,        stream);
         upload_async<float>        (pi.sample_top_p,   plan.top_p,       stream);
         upload_async<std::int32_t> (pi.sample_top_k,   plan.top_k,       stream);

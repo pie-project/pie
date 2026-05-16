@@ -11,6 +11,6 @@ hf_path = "/root/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6c
 
 [batching]
 kv_page_size = 32
-max_num_kv_pages = 64
-max_batch_tokens = 2048
-max_batch_size = 16
+total_pages = 64
+max_forward_tokens = 2048
+max_forward_requests = 16

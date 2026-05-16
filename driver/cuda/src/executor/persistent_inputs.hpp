@@ -39,8 +39,8 @@ struct PersistentInputs {
     DeviceBuffer<std::uint32_t> kv_page_indptr;   // R+1
     DeviceBuffer<std::uint32_t> kv_last_page_lens;// R
 
-    // Page-id list (capacity = total kv-cache pages — the absolute
-    // upper bound on how many pages a single fire could reference).
+    // Page-id list (capacity = planner's max_page_refs, independent of
+    // the total KV-cache page count).
     DeviceBuffer<std::uint32_t> kv_page_indices;
 
     // Custom mask. `mask` is a packed bitmap; capacity is the worst

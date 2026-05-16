@@ -122,7 +122,7 @@ class PieClient:
         ):
             pass
         finally:
-            self._fail_pending_requests(ConnectionError("WebSocket connection closed"))
+            self._fail_connection_waiters(ConnectionError("WebSocket connection closed"))
 
     async def _process_server_message(self, message: dict):
         """Route incoming server messages based on their type."""
@@ -208,7 +208,12 @@ class PieClient:
                 await self.listener_task
             except asyncio.CancelledError:
                 pass
-        self._fail_pending_requests(ConnectionError("WebSocket connection closed"))
+        self._fail_connection_waiters(ConnectionError("WebSocket connection closed"))
+
+    def _fail_connection_waiters(self, exc: Exception):
+        """Reject all waiters that depend on the websocket staying open."""
+        self._fail_pending_requests(exc)
+        self._fail_process_event_queues(exc)
 
     def _fail_pending_requests(self, exc: Exception):
         """Reject all requests still waiting for a server response."""
@@ -217,6 +222,14 @@ class PieClient:
         for _, future in pending:
             if not future.done():
                 future.set_exception(exc)
+
+    def _fail_process_event_queues(self, exc: Exception):
+        """Wake process recv() waiters when the connection goes away."""
+        message = str(exc) or exc.__class__.__name__
+        queues = list(self.process_event_queues.items())
+        self.process_event_queues.clear()
+        for _, queue in queues:
+            queue.put_nowait((Event.Error.value, message))
 
     def _get_next_corr_id(self):
         """Generate a unique correlation ID for a request."""

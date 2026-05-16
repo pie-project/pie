@@ -11,6 +11,6 @@ hf_path = "/root/.cache/huggingface/hub/models--google--gemma-4-E2B-it/snapshots
 
 [batching]
 kv_page_size = 32
-max_num_kv_pages = 256
-max_batch_tokens = 4096
-max_batch_size = 64
+total_pages = 256
+max_forward_tokens = 4096
+max_forward_requests = 64

@@ -21,10 +21,11 @@ def run(args: argparse.Namespace):
     prompts, prompt_counts = hf_chat_prompts_and_counts(
         args.model, args.system, make_prompts(args, n + args.warmup)
     )
+    max_num_seqs = args.num_requests if args.mode == "tput" else 1
     llm = LLM(
         model=args.model,
         gpu_memory_utilization=args.gpu_mem_util,
-        max_num_seqs=args.concurrency if args.mode == "tput" else 1,
+        max_num_seqs=max_num_seqs,
         tensor_parallel_size=args.tp_size,
         max_model_len=args.max_model_len,
         enable_prefix_caching=False,
@@ -77,7 +78,7 @@ def run(args: argparse.Namespace):
         wall_s=wall,
         config={
             "enable_prefix_caching": False,
-            "max_num_seqs": args.concurrency if args.mode == "tput" else 1,
+            "max_num_seqs": max_num_seqs,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,

@@ -1,6 +1,6 @@
 //! Driver capability handshake — NOT a rkyv wire type.
 //!
-//! Each driver advertises its capabilities (page geometry, batching limits,
+//! Each driver advertises its capabilities (page geometry, forward limits,
 //! tokenizer arch, etc.) at startup via a JSON blob delivered to the runtime.
 //! The runtime parses it into [`DriverCapabilities`] for scheduling and
 //! batching decisions. The shape is wire-stable — fields appear verbatim
@@ -22,10 +22,22 @@ pub struct DriverCapabilities {
     pub kv_page_size: u32,
     /// Number of CPU-resident swap-pool pages (0 if no swap support).
     pub swap_pool_size: u32,
-    /// Maximum tokens accepted per forward-pass batch.
-    pub max_batch_tokens: u32,
-    /// Maximum requests accepted per forward-pass batch.
-    pub max_batch_size: u32,
+    /// Maximum forward-pass tokens accepted in one driver fire.
+    pub max_forward_tokens: u32,
+    /// Maximum forward-pass requests accepted in one driver fire.
+    pub max_forward_requests: u32,
+    /// Maximum page references accepted in one driver fire.
+    pub max_page_refs: u32,
+    /// Maximum logits rows the driver can return in one fire.
+    pub max_logit_rows: u32,
+    /// Maximum probability rows the driver can return in one fire.
+    pub max_prob_rows: u32,
+    /// Maximum custom-mask bytes accepted in one fire.
+    pub max_custom_mask_bytes: u32,
+    /// Maximum sampler rows accepted in one fire.
+    pub max_sampler_rows: u32,
+    /// Maximum logprob label count accepted in one fire.
+    pub max_logprob_labels: u32,
     /// Architecture name (e.g. `llama3`, `qwen3`) — used for tokenizer dispatch.
     pub arch_name: String,
     /// Vocabulary size — pinned by the loaded model.

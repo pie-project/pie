@@ -106,8 +106,7 @@ pub struct ModelConfig {
 pub struct DriverConfig {
     pub total_pages: usize,
     pub cpu_pages: usize,
-    pub max_batch_tokens: usize,
-    pub max_batch_size: usize,
+    pub limits: crate::driver::SchedulerLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -228,8 +227,7 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             .map(|d| {
                 driver::register_driver(driver::DriverSpec {
                     num_kv_pages: d.total_pages,
-                    max_batch_size: d.max_batch_size,
-                    max_batch_tokens: d.max_batch_tokens,
+                    limits: d.limits,
                 })
             })
             .collect();
@@ -296,13 +294,18 @@ fn verify_config(config: &Config) -> Result<()> {
                 model.name
             );
             ensure!(
-                dev.max_batch_size > 0,
-                "Model {:?} driver {i}: max_batch_size must be > 0",
+                dev.limits.max_forward_tokens > 0,
+                "Model {:?} driver {i}: max_forward_tokens must be > 0",
                 model.name
             );
             ensure!(
-                dev.max_batch_tokens > 0,
-                "Model {:?} driver {i}: max_batch_tokens must be > 0",
+                dev.limits.max_forward_requests > 0,
+                "Model {:?} driver {i}: max_forward_requests must be > 0",
+                model.name
+            );
+            ensure!(
+                dev.limits.max_page_refs > 0,
+                "Model {:?} driver {i}: max_page_refs must be > 0",
                 model.name
             );
         }

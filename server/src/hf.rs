@@ -67,8 +67,7 @@ fn parse_repo_id(s: &str) -> Result<(String, String)> {
 }
 
 async fn download_snapshot(owner: &str, name: &str) -> Result<PathBuf> {
-    let client = hf_hub::HFClient::new()
-        .map_err(|e| anyhow!("init HF client: {e}"))?;
+    let client = hf_hub::HFClient::new().map_err(|e| anyhow!("init HF client: {e}"))?;
     let repo = client.model(owner.to_string(), name.to_string());
 
     // Touch the cache once locally first to print a helpful "downloading"

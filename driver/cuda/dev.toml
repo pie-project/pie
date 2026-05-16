@@ -19,9 +19,9 @@ hf_repo = "Qwen/Qwen3-0.6B"
 device = "cuda:0"
 dtype = "bfloat16"
 
-# KV cache / batching — same knobs the Python driver exposes.
+# Memory planner. Manual batch/KV sizing is derived at startup after
+# weights load.
 [batching]
 kv_page_size = 32
-max_num_kv_pages = 1024
-max_batch_tokens = 10240
-max_batch_size = 512
+gpu_mem_utilization = 0.90
+memory_profile = "balanced"

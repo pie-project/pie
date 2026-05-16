@@ -40,8 +40,24 @@ pub type DriverId = usize;
 #[derive(Debug, Clone)]
 pub struct DriverSpec {
     pub num_kv_pages: usize,
-    pub max_batch_size: usize,
-    pub max_batch_tokens: usize,
+    pub limits: SchedulerLimits,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerLimits {
+    pub max_forward_requests: usize,
+    pub max_forward_tokens: usize,
+    pub max_page_refs: usize,
+    pub max_sampler_rows: usize,
+    pub max_custom_mask_bytes: usize,
+    pub max_logprob_labels: usize,
+}
+
+impl DriverSpec {
+    /// Scheduler-facing limits published by the driver's capacity handshake.
+    pub fn scheduler_limits(&self) -> SchedulerLimits {
+        self.limits
+    }
 }
 
 /// Driver-bound request. The payload is the wire-canonical
@@ -58,6 +74,33 @@ pub struct DriverSpec {
 pub struct DriverRequest {
     pub driver_id: DriverId,
     pub payload: pie_bridge::RequestPayload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduler_limits_use_forward_limits() {
+        let spec = DriverSpec {
+            num_kv_pages: 1024,
+            limits: SchedulerLimits {
+                max_forward_requests: 64,
+                max_forward_tokens: 2048,
+                max_page_refs: 262144,
+                max_sampler_rows: 2048,
+                max_custom_mask_bytes: 8 * 1024 * 1024,
+                max_logprob_labels: 512,
+            },
+        };
+
+        let limits = spec.scheduler_limits();
+        assert_eq!(limits.max_forward_requests, 64);
+        assert_eq!(limits.max_forward_tokens, 2048);
+        assert_eq!(limits.max_page_refs, 262144);
+        assert_eq!(limits.max_sampler_rows, 2048);
+        assert_eq!(limits.max_logprob_labels, 512);
+    }
 }
 
 /// Driver response. The payload is the wire-canonical

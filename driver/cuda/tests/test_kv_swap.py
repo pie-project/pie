@@ -43,9 +43,8 @@ def main() -> int:
         'device = "cuda:0"\ndtype = "bfloat16"\n'
         '[batching]\n'
         'kv_page_size = 32\n'
-        'max_num_kv_pages = 32\n'
-        'max_batch_tokens = 1024\n'
-        'max_batch_size = 8\n'
+        'gpu_mem_utilization = 0.90\n'
+        'memory_profile = "capacity"\n'
         'swap_pool_size = 16\n'
     )
     toml_path = Path("/tmp/kvswap_test.toml")

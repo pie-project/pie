@@ -383,22 +383,37 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         const std::uint8_t k = s.kind;
         arenas.sampler_types[i] = (k < 11) ? kNewToOldSamplerKind[k] : 0;
         arenas.sampler_temperatures[i] = s.temperature;
-        arenas.sampler_top_k[i] = s.k;
-        // Driver-side split: MinP variants store p in `min_p`; everyone
-        // else (TopP / TopKTopP) stores p in `top_p`.
-        if (k == 3 /*MinP*/) {
-            arenas.sampler_min_p[i] = s.p;
-            arenas.sampler_top_p[i] = 0.0f;
-        } else {
-            arenas.sampler_min_p[i] = 0.0f;
-            arenas.sampler_top_p[i] = s.p;
+        arenas.sampler_top_k[i] = 0;
+        arenas.sampler_top_p[i] = 1.0f;
+        arenas.sampler_min_p[i] = 0.0f;
+        switch (k) {
+            case 1: // TopK
+                arenas.sampler_top_k[i] = s.k;
+                break;
+            case 2: // TopP
+                arenas.sampler_top_p[i] = s.p;
+                break;
+            case 3: // MinP
+                arenas.sampler_min_p[i] = s.p;
+                break;
+            case 4: // TopKTopP
+                arenas.sampler_top_k[i] = s.k;
+                arenas.sampler_top_p[i] = s.p;
+                break;
+            case 6: // Dist
+                arenas.sampler_top_k[i] = s.num_tokens;
+                break;
+            default:
+                break;
         }
         // Sentinel: s.seed == 0 → no caller-provided seed (driver-side
         // dispatch treats 0 the same way the old `seed_has==false`
         // branch did).
         arenas.sampler_seeds[i] = s.seed;
-        // Logprobs.token_ids → concatenate, record offset.
-        if (k == 9 /*Logprobs*/) {
+        // Logprob.token_id / Logprobs.token_ids → concatenate, record offset.
+        if (k == 8 /*Logprob*/) {
+            arenas.sampler_label_ids.push_back(s.token_id);
+        } else if (k == 9 /*Logprobs*/) {
             const std::uint32_t* tids = s.token_ids_ptr;
             const std::size_t tlen = s.token_ids_len;
             arenas.sampler_label_ids.insert(arenas.sampler_label_ids.end(), tids, tids + tlen);

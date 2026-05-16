@@ -49,7 +49,7 @@ class DummyModelConfig:
             dim_ffn=spec.get("dim_ffn", 8192),
         )
 
-    def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
+    def eval_total_pages(self, runtime_config: RuntimeConfig) -> int:
         """
         Return a large number of KV pages for dummy mode.
 
@@ -279,7 +279,7 @@ def create_kv_cache(
 
     # Allocate KV cache with the same page count the Rust scheduler manages.
     # Use CPU tensors to avoid wasting GPU memory — dummy transform is a no-op.
-    num_pages = (runtime_config.max_num_kv_pages or 0) + 1
+    num_pages = (runtime_config.total_pages or 0) + 1
     kv_cache_at_layer = []
     for _ in range(num_layers):
         # Shape must match real models: [num_pages, 2, page_size, kv_heads, dim_head]

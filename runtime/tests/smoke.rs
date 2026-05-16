@@ -46,7 +46,7 @@ fn all_devices_reachable() {
         for i in 0..4 {
             let spec = pie::driver::get_spec(i).await.unwrap();
             assert_eq!(spec.num_kv_pages, 64);
-            assert_eq!(spec.max_batch_size, 32);
+            assert_eq!(spec.limits.max_forward_requests, 32);
         }
     });
 }

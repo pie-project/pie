@@ -47,8 +47,6 @@ struct LoadedModelCapabilities {
     int total_pages = 0;          // populated when KV cache lands (M1.2.2/3)
     int kv_page_size = 0;
     int swap_pool_size = 0;
-    int max_batch_tokens = 0;
-    int max_batch_size = 0;
     std::string arch_name;
     int vocab_size = 0;
     int max_model_len = 0;
