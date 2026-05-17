@@ -16,20 +16,20 @@ const char* load_op_kind_name(LoadOpKind kind) noexcept {
     case LoadOpKind::Slice: return "Slice";
     case LoadOpKind::Shard: return "Shard";
     case LoadOpKind::RowRangeShard: return "RowRangeShard";
-    case LoadOpKind::MoeGateUpShard: return "MoeGateUpShard";
-    case LoadOpKind::MoeDownShard: return "MoeDownShard";
+    case LoadOpKind::GroupedSliceConcat: return "GroupedSliceConcat";
+    case LoadOpKind::GroupedSlice: return "GroupedSlice";
     case LoadOpKind::Cast: return "Cast";
     case LoadOpKind::Concat: return "Concat";
-    case LoadOpKind::PackRows: return "PackRows";
+    case LoadOpKind::AxisConcat: return "AxisConcat";
     case LoadOpKind::View: return "View";
     case LoadOpKind::Alias: return "Alias";
     case LoadOpKind::Drop: return "Drop";
     case LoadOpKind::QuantizeRuntime: return "QuantizeRuntime";
     case LoadOpKind::Dequantize: return "Dequantize";
-    case LoadOpKind::SplitInterleaved: return "SplitInterleaved";
-    case LoadOpKind::RepackQuant: return "RepackQuant";
-    case LoadOpKind::FuseMoeExperts: return "FuseMoeExperts";
-    case LoadOpKind::AttachQuantMeta: return "AttachQuantMeta";
+    case LoadOpKind::Deinterleave: return "Deinterleave";
+    case LoadOpKind::RepackLayout: return "RepackLayout";
+    case LoadOpKind::StackGroups: return "StackGroups";
+    case LoadOpKind::BindMetadata: return "BindMetadata";
     case LoadOpKind::Materialize: return "Materialize";
     }
     return "?";
@@ -39,9 +39,8 @@ const char* tensor_layout_kind_name(TensorLayoutKind kind) noexcept {
     switch (kind) {
     case TensorLayoutKind::Dense: return "dense";
     case TensorLayoutKind::RowPacked: return "row-packed";
-    case TensorLayoutKind::PackedQkv: return "packed-qkv";
-    case TensorLayoutKind::PackedGateUp: return "packed-gate-up";
-    case TensorLayoutKind::FusedMoeExperts: return "fused-moe-experts";
+    case TensorLayoutKind::AxisConcatenated: return "axis-concatenated";
+    case TensorLayoutKind::Grouped: return "grouped";
     case TensorLayoutKind::QuantPacked: return "quant-packed";
     case TensorLayoutKind::View: return "view";
     }
@@ -134,34 +133,34 @@ LoadOp make_slice_op(
     };
 }
 
-LoadOp make_pack_rows_op(
+LoadOp make_axis_concat_op(
     std::string output_name,
     int shard_axis,
-    std::vector<PackedRowSource> row_sources)
+    std::vector<TensorSourceRef> sources)
 {
     return LoadOp{
-        .kind = LoadOpKind::PackRows,
-        .payload = PackRowsPayload{
+        .kind = LoadOpKind::AxisConcat,
+        .payload = AxisConcatPayload{
             .output_name = std::move(output_name),
             .shard_axis = shard_axis,
-            .row_sources = std::move(row_sources),
+            .sources = std::move(sources),
         },
     };
 }
 
-LoadOp make_fuse_moe_experts_op(
+LoadOp make_stack_groups_op(
     std::string output_name,
     std::string secondary_output_name,
     std::vector<std::string> inputs,
-    std::vector<PackedRowSource> row_sources)
+    std::vector<TensorSourceRef> sources)
 {
     return LoadOp{
-        .kind = LoadOpKind::FuseMoeExperts,
-        .payload = FuseMoeExpertsPayload{
+        .kind = LoadOpKind::StackGroups,
+        .payload = StackGroupsPayload{
             .output_name = std::move(output_name),
             .secondary_output_name = std::move(secondary_output_name),
             .inputs = std::move(inputs),
-            .row_sources = std::move(row_sources),
+            .sources = std::move(sources),
         },
     };
 }
@@ -170,7 +169,7 @@ namespace {
 
 const std::string kEmptyString;
 const std::vector<std::string> kEmptyInputs;
-const std::vector<PackedRowSource> kEmptyRowSources;
+const std::vector<TensorSourceRef> kEmptySources;
 
 template <typename Payload>
 const std::string& output_of(const Payload& payload) {
@@ -210,7 +209,7 @@ const char* quant_granularity_name(QuantGranularity granularity) noexcept {
 
 bool op_produces_tensor(LoadOpKind kind) noexcept {
     return kind != LoadOpKind::Drop &&
-           kind != LoadOpKind::AttachQuantMeta;
+           kind != LoadOpKind::BindMetadata;
 }
 
 void json_string(std::ostream& out, const std::string& value) {
@@ -330,13 +329,13 @@ std::int64_t load_op_slice_length(const LoadOp& op) {
     return 0;
 }
 
-const std::vector<PackedRowSource>& load_op_row_sources(const LoadOp& op) {
+const std::vector<TensorSourceRef>& load_op_sources(const LoadOp& op) {
     return std::visit(
-        [](const auto& payload) -> const std::vector<PackedRowSource>& {
-            if constexpr (requires { payload.row_sources; }) {
-                return payload.row_sources;
+        [](const auto& payload) -> const std::vector<TensorSourceRef>& {
+            if constexpr (requires { payload.sources; }) {
+                return payload.sources;
             } else {
-                return kEmptyRowSources;
+                return kEmptySources;
             }
         },
         op.payload);
@@ -457,39 +456,39 @@ void validate_load_plan(const LoadPlan& plan) {
              op.kind == LoadOpKind::Copy ||
              op.kind == LoadOpKind::Shard ||
              op.kind == LoadOpKind::RowRangeShard ||
-             op.kind == LoadOpKind::MoeGateUpShard ||
-             op.kind == LoadOpKind::MoeDownShard) &&
+             op.kind == LoadOpKind::GroupedSliceConcat ||
+             op.kind == LoadOpKind::GroupedSlice) &&
             load_op_raw_name(op).empty()) {
             throw std::runtime_error(
                 "load plan: op for '" + load_op_output(op) +
                 "' has empty raw tensor name");
         }
-        if (op.kind == LoadOpKind::PackRows) {
-            if (load_op_row_sources(op).empty()) {
+        if (op.kind == LoadOpKind::AxisConcat) {
+            if (load_op_sources(op).empty()) {
                 throw std::runtime_error(
-                    "load plan: PackRows op for '" + load_op_output(op) +
-                    "' has no row sources");
+                    "load plan: AxisConcat op for '" + load_op_output(op) +
+                    "' has no sources");
             }
             std::unordered_set<std::string> view_names;
-            for (const auto& src : load_op_row_sources(op)) {
+            for (const auto& src : load_op_sources(op)) {
                 if (src.raw_name.empty() || src.view_name.empty()) {
                     throw std::runtime_error(
-                        "load plan: PackRows op for '" + load_op_output(op) +
+                        "load plan: AxisConcat op for '" + load_op_output(op) +
                         "' has an empty raw/view source");
                 }
                 if (!view_names.insert(src.view_name).second) {
                     throw std::runtime_error(
-                        "load plan: PackRows op for '" + load_op_output(op) +
+                        "load plan: AxisConcat op for '" + load_op_output(op) +
                         "' has duplicate view '" + src.view_name + "'");
                 }
                 if (!plan.tensors.contains(src.view_name)) {
                     throw std::runtime_error(
-                        "load plan: PackRows op for '" + load_op_output(op) +
+                        "load plan: AxisConcat op for '" + load_op_output(op) +
                         "' has no TensorSpec for view '" + src.view_name + "'");
                 }
                 if (!produced.insert(src.view_name).second) {
                     throw std::runtime_error(
-                        "load plan: duplicate PackRows view output '" +
+                        "load plan: duplicate AxisConcat view output '" +
                         src.view_name + "'");
                 }
             }
@@ -501,8 +500,8 @@ void validate_load_plan(const LoadPlan& plan) {
              op.kind == LoadOpKind::Alias ||
              op.kind == LoadOpKind::QuantizeRuntime ||
              op.kind == LoadOpKind::Dequantize ||
-             op.kind == LoadOpKind::RepackQuant ||
-             op.kind == LoadOpKind::SplitInterleaved ||
+             op.kind == LoadOpKind::RepackLayout ||
+             op.kind == LoadOpKind::Deinterleave ||
              op.kind == LoadOpKind::Materialize) &&
             load_op_inputs(op).empty()) {
             throw std::runtime_error(
@@ -514,21 +513,21 @@ void validate_load_plan(const LoadPlan& plan) {
                 "load plan: Dequantize op for '" + load_op_output(op) +
                 "' requires weight and scale inputs");
         }
-        if (op.kind == LoadOpKind::SplitInterleaved &&
+        if (op.kind == LoadOpKind::Deinterleave &&
             load_op_secondary_output(op).empty()) {
             throw std::runtime_error(
-                "load plan: SplitInterleaved op for '" + load_op_output(op) +
+                "load plan: Deinterleave op for '" + load_op_output(op) +
                 "' requires a secondary output name");
         }
-        if (op.kind == LoadOpKind::RepackQuant) {
+        if (op.kind == LoadOpKind::RepackLayout) {
             if (load_op_inputs(op).size() < 2) {
                 throw std::runtime_error(
-                    "load plan: RepackQuant op for '" + load_op_output(op) +
+                    "load plan: RepackLayout op for '" + load_op_output(op) +
                     "' requires weight and metadata inputs");
             }
             if (load_op_secondary_output(op).empty()) {
                 throw std::runtime_error(
-                    "load plan: RepackQuant op for '" + load_op_output(op) +
+                    "load plan: RepackLayout op for '" + load_op_output(op) +
                     "' requires a secondary output name");
             }
             const auto spec_it = plan.tensors.find(load_op_output(op));
@@ -536,58 +535,58 @@ void validate_load_plan(const LoadPlan& plan) {
                 !spec_it->second.quant.zero_point_tensor.empty() &&
                 !produced.insert(spec_it->second.quant.zero_point_tensor).second) {
                 throw std::runtime_error(
-                    "load plan: duplicate RepackQuant zero-point output '" +
+                    "load plan: duplicate RepackLayout zero-point output '" +
                     spec_it->second.quant.zero_point_tensor + "'");
             }
         }
-        if (op.kind == LoadOpKind::FuseMoeExperts) {
+        if (op.kind == LoadOpKind::StackGroups) {
             if (load_op_secondary_output(op).empty()) {
                 throw std::runtime_error(
-                    "load plan: FuseMoeExperts op for '" + load_op_output(op) +
+                    "load plan: StackGroups op for '" + load_op_output(op) +
                     "' requires a secondary output name");
             }
             const bool has_input_triples =
                 !load_op_inputs(op).empty() && load_op_inputs(op).size() % 3 == 0;
             const bool has_raw_triples =
-                !load_op_row_sources(op).empty() && load_op_row_sources(op).size() % 3 == 0;
+                !load_op_sources(op).empty() && load_op_sources(op).size() % 3 == 0;
             if (has_input_triples == has_raw_triples) {
                 throw std::runtime_error(
-                    "load plan: FuseMoeExperts op for '" + load_op_output(op) +
+                    "load plan: StackGroups op for '" + load_op_output(op) +
                     "' expects either input tensor triples or raw source triples");
             }
             if (has_raw_triples) {
-                for (const auto& src : load_op_row_sources(op)) {
+                for (const auto& src : load_op_sources(op)) {
                     if (src.raw_name.empty() || src.view_name.empty()) {
                         throw std::runtime_error(
-                            "load plan: FuseMoeExperts op for '" +
+                            "load plan: StackGroups op for '" +
                             load_op_output(op) + "' has empty raw source metadata");
                     }
                 }
             }
         }
-        if (op.kind == LoadOpKind::AttachQuantMeta) {
+        if (op.kind == LoadOpKind::BindMetadata) {
             const auto spec_it = plan.tensors.find(load_op_output(op));
             if (spec_it == plan.tensors.end()) {
                 throw std::runtime_error(
-                    "load plan: AttachQuantMeta has no TensorSpec for '" +
+                    "load plan: BindMetadata has no TensorSpec for '" +
                     load_op_output(op) + "'");
             }
             const auto& spec = spec_it->second;
             if (!produced.contains(load_op_output(op))) {
                 throw std::runtime_error(
-                    "load plan: AttachQuantMeta runs before weight tensor '" +
+                    "load plan: BindMetadata runs before weight tensor '" +
                     load_op_output(op) + "' is produced");
             }
             if (!produced.contains(spec.quant.scale_tensor)) {
                 throw std::runtime_error(
-                    "load plan: AttachQuantMeta for '" + load_op_output(op) +
+                    "load plan: BindMetadata for '" + load_op_output(op) +
                     "' runs before scale tensor '" +
                     spec.quant.scale_tensor + "' is produced");
             }
             if (!spec.quant.zero_point_tensor.empty() &&
                 !produced.contains(spec.quant.zero_point_tensor)) {
                 throw std::runtime_error(
-                    "load plan: AttachQuantMeta for '" + load_op_output(op) +
+                    "load plan: BindMetadata for '" + load_op_output(op) +
                     "' runs before zero-point tensor '" +
                     spec.quant.zero_point_tensor + "' is produced");
             }
@@ -605,9 +604,8 @@ std::string describe_load_plan(const LoadPlan& plan) {
         << " MiB"
         << ", peak~=" << (plan.memory.estimated_peak_bytes / (1024 * 1024))
         << " MiB";
-    if (plan.packed_qkv_groups > 0 || plan.packed_gate_up_groups > 0) {
-        out << ", packed groups: qkv=" << plan.packed_qkv_groups
-            << ", gate/up=" << plan.packed_gate_up_groups;
+    if (plan.axis_concat_groups > 0) {
+        out << ", axis_concat_groups=" << plan.axis_concat_groups;
     }
     return out.str();
 }
@@ -649,14 +647,14 @@ std::string dump_load_plan_json(const LoadPlan& plan) {
             << ",\"rows\":" << load_op_rows(op)
             << ",\"slice_start\":" << load_op_slice_start(op)
             << ",\"slice_length\":" << load_op_slice_length(op);
-        if (!load_op_row_sources(op).empty()) {
-            out << ",\"row_sources\":[";
-            for (std::size_t j = 0; j < load_op_row_sources(op).size(); ++j) {
+        if (!load_op_sources(op).empty()) {
+            out << ",\"sources\":[";
+            for (std::size_t j = 0; j < load_op_sources(op).size(); ++j) {
                 if (j) out << ',';
                 out << "{\"raw_name\":";
-                json_string(out, load_op_row_sources(op)[j].raw_name);
+                json_string(out, load_op_sources(op)[j].raw_name);
                 out << ",\"view_name\":";
-                json_string(out, load_op_row_sources(op)[j].view_name);
+                json_string(out, load_op_sources(op)[j].view_name);
                 out << '}';
             }
             out << ']';

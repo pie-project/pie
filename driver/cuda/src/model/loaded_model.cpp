@@ -14,6 +14,7 @@
 #include "loader/load_plan.hpp"
 #include "loader/materializer.hpp"
 #include "loader/model_schema.hpp"
+#include "loader/physical_load_plan.hpp"
 
 namespace pie_cuda_driver {
 
@@ -205,6 +206,8 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
     LoadPlan load_plan =
         build_model_load_plan(e.hf_, boot_cfg, loader, tp_size, load_target);
+    PhysicalLoadPlan physical_plan =
+        build_physical_load_plan(load_plan, loader, tp_rank, tp_size);
     if (const char* dump_path = std::getenv("PIE_CUDA_LOAD_PLAN_DUMP");
         dump_path && dump_path[0] != '\0') {
         std::ofstream out(dump_path);
@@ -213,11 +216,13 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                 "engine: failed to open PIE_CUDA_LOAD_PLAN_DUMP path: " +
                 std::string(dump_path));
         }
-        out << dump_load_plan_json(load_plan);
+        out << dump_load_plan_json(load_plan, physical_plan);
     }
     if (verbose) {
         std::cerr << "[pie-driver-cuda] load compiler: "
                   << describe_load_plan(load_plan) << "\n";
+        std::cerr << "[pie-driver-cuda] physical load compiler: "
+                  << describe_physical_load_plan(physical_plan) << "\n";
     }
     Materializer materializer(loader, e.weights_, tp_rank, tp_size, tp_comm);
     const MaterializedLoadPlan materialized = materializer.run(load_plan);
@@ -239,11 +244,9 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                          100.0 * mib_after / std::max(mib_before, 1.0))
                   << "% of original)\n";
     }
-    if (verbose && (materialized.packed_qkv_groups > 0 ||
-                    materialized.packed_gate_up_groups > 0)) {
+    if (verbose && materialized.axis_concat_groups > 0) {
         std::cerr << "[pie-driver-cuda] load plan: "
-                  << materialized.packed_qkv_groups << " qkv groups, "
-                  << materialized.packed_gate_up_groups << " gate/up groups"
+                  << materialized.axis_concat_groups << " AxisConcat groups"
                   << " (raw projection weights exposed as non-owning views)\n";
     }
 

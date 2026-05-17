@@ -215,13 +215,13 @@ bool try_add_packed_qkv(
     }
     if (!can_pack_2d_bf16_group(loader, {raw_q, raw_k, raw_v})) return false;
 
-    plan.ops.push_back(make_pack_rows_op(
+    plan.ops.push_back(make_axis_concat_op(
         runtime_prefix + ".self_attn.qkv_proj.fused.weight",
         /*shard_axis=*/0,
         {{raw_q, runtime_prefix + ".self_attn.q_proj.weight"},
          {raw_k, runtime_prefix + ".self_attn.k_proj.weight"},
          {raw_v, runtime_prefix + ".self_attn.v_proj.weight"}}));
-    ++plan.packed_qkv_groups;
+    ++plan.axis_concat_groups;
 
     const auto& qi = loader.info(raw_q);
     const auto& ki = loader.info(raw_k);
@@ -234,7 +234,7 @@ bool try_add_packed_qkv(
         runtime_prefix + ".self_attn.qkv_proj.fused.weight";
     register_tensor_spec(
         plan, packed_name, qi.dtype, {q_rows + k_rows + v_rows, cols},
-        TensorLayoutKind::PackedQkv, TensorOwnershipKind::Owned,
+        TensorLayoutKind::AxisConcatenated, TensorOwnershipKind::Owned,
         TensorParallelKind::Column);
     register_tensor_spec(
         plan, runtime_prefix + ".self_attn.q_proj.weight", qi.dtype,
@@ -285,12 +285,12 @@ bool try_add_packed_gate_up(
     }
     if (!can_pack_2d_bf16_group(loader, {raw_gate, raw_up})) return false;
 
-    plan.ops.push_back(make_pack_rows_op(
+    plan.ops.push_back(make_axis_concat_op(
         runtime_prefix + ".mlp.gate_up_proj.fused.weight",
         /*shard_axis=*/0,
         {{raw_gate, runtime_prefix + ".mlp.gate_proj.weight"},
          {raw_up, runtime_prefix + ".mlp.up_proj.weight"}}));
-    ++plan.packed_gate_up_groups;
+    ++plan.axis_concat_groups;
 
     const auto& gi = loader.info(raw_gate);
     const auto& ui = loader.info(raw_up);
@@ -301,7 +301,7 @@ bool try_add_packed_gate_up(
         runtime_prefix + ".mlp.gate_up_proj.fused.weight";
     register_tensor_spec(
         plan, packed_name, gi.dtype, {gate_rows + up_rows, cols},
-        TensorLayoutKind::PackedGateUp, TensorOwnershipKind::Owned,
+        TensorLayoutKind::AxisConcatenated, TensorOwnershipKind::Owned,
         TensorParallelKind::Column);
     register_tensor_spec(
         plan, runtime_prefix + ".mlp.gate_proj.weight", gi.dtype,
@@ -432,7 +432,7 @@ void add_runtime_quantized_copy(
         LoadOpKind::QuantizeRuntime, logical.runtime_name,
         {tmp_name}, scale_name));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::AttachQuantMeta, logical.runtime_name));
+        LoadOpKind::BindMetadata, logical.runtime_name));
     plan.ops.push_back(make_tensor_op(
         LoadOpKind::Drop, tmp_name + ".__drop", {tmp_name}));
 
@@ -584,7 +584,7 @@ bool try_add_compressed_fp8_weight(
         }
 
         plan.ops.push_back(make_tensor_op(
-            LoadOpKind::AttachQuantMeta, logical.runtime_name));
+            LoadOpKind::BindMetadata, logical.runtime_name));
     } else {
         const std::string weight_tmp =
             logical.runtime_name + ".__compressed_fp8_source";
@@ -824,7 +824,7 @@ bool try_add_compressed_int8_weight(
     }
 
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::AttachQuantMeta, logical.runtime_name));
+        LoadOpKind::BindMetadata, logical.runtime_name));
     return true;
 }
 
@@ -973,11 +973,11 @@ void add_awq_marlin_repack_ops(
     plan.ops.push_back(make_raw_load_op(
         LoadOpKind::Copy, tmp_scales, raw_scales, shard_plan.scale_axis));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::RepackQuant, canonical_w,
+        LoadOpKind::RepackLayout, canonical_w,
         {tmp_qw, tmp_qz, tmp_scales}, canonical_s,
         shard_plan.canonical_axis));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::AttachQuantMeta, canonical_w));
+        LoadOpKind::BindMetadata, canonical_w));
     plan.ops.push_back(make_tensor_op(
         LoadOpKind::Drop, canonical_w + ".__drop_awq_sources",
         {tmp_qw, tmp_qz, tmp_scales}));
@@ -1165,11 +1165,11 @@ bool try_add_gptq_marlin_repack_weight(
         LoadOpKind::Copy, tmp_scales, raw_scales,
         shard_plan.scale_axis));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::RepackQuant, canonical_w,
+        LoadOpKind::RepackLayout, canonical_w,
         {tmp_qw, tmp_scales}, canonical_s,
         shard_plan.canonical_axis));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::AttachQuantMeta, canonical_w));
+        LoadOpKind::BindMetadata, canonical_w));
     plan.ops.push_back(make_tensor_op(
         LoadOpKind::Drop, canonical_w + ".__drop_gptq_sources",
         {tmp_qw, tmp_scales}));
@@ -1735,7 +1735,7 @@ bool try_add_per_expert_moe_fusion(
             logical.runtime_name + "'");
     }
 
-    std::vector<PackedRowSource> fuse_sources;
+    std::vector<TensorSourceRef> fuse_sources;
     fuse_sources.reserve(static_cast<std::size_t>(expert_count) * 3);
 
     std::vector<std::int64_t> gate_shape0;
@@ -1809,15 +1809,15 @@ bool try_add_per_expert_moe_fusion(
     register_tensor_spec(
         plan, gate_up_name, DType::BF16,
         {E, 2 * gate_shape0[0], gate_shape0[1]},
-        TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Owned,
+        TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
     register_tensor_spec(
         plan, down_name, DType::BF16,
         {E, down_shape0[0], down_shape0[1]},
-        TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Owned,
+        TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
 
-    plan.ops.push_back(make_fuse_moe_experts_op(
+    plan.ops.push_back(make_stack_groups_op(
         gate_up_name, down_name, {}, std::move(fuse_sources)));
     return true;
 }
@@ -1945,7 +1945,7 @@ void push_dequant_op(
         LoadOpKind::Dequantize, output_name, {blocks_name, scales_name}));
 }
 
-void push_split_interleaved_op(
+void push_deinterleave_op(
     LoadPlan& plan,
     const std::string& first_output,
     const std::string& second_output,
@@ -1953,7 +1953,7 @@ void push_split_interleaved_op(
     int shard_axis)
 {
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::SplitInterleaved, first_output, {input},
+        LoadOpKind::Deinterleave, first_output, {input},
         second_output, shard_axis));
 }
 
@@ -2108,7 +2108,7 @@ void lower_mxfp4_expert_group_routed_dequant(
     register_tensor_spec(
         plan, bias_name, DType::BF16,
         sharded_shape(group.bias.shape, bias_shard_axis, tp_size, bias_name),
-        TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Owned,
+        TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
 
     push_copy_op(plan, group.raw_blocks, weight_name, group.shard_axis);
@@ -2116,7 +2116,7 @@ void lower_mxfp4_expert_group_routed_dequant(
     push_copy_op(plan, group.raw_bias, bias_name, bias_shard_axis);
 
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::AttachQuantMeta, weight_name));
+        LoadOpKind::BindMetadata, weight_name));
 }
 
 void lower_mxfp4_gate_up_group_to_bf16(
@@ -2144,19 +2144,19 @@ void lower_mxfp4_gate_up_group_to_bf16(
 
     register_tensor_spec(
         plan, gate_w, DType::BF16, expert_w_shape,
-        TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Owned,
+        TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
     register_tensor_spec(
         plan, up_w, DType::BF16, expert_w_shape,
-        TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Owned,
+        TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
     register_tensor_spec(
         plan, bf16_tmp, DType::BF16, full_bf16_shape,
-        TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Temporary,
+        TensorLayoutKind::Grouped, TensorOwnershipKind::Temporary,
         TensorParallelKind::Expert);
 
     push_dequant_op(plan, bf16_tmp, blocks_tmp, scales_tmp);
-    push_split_interleaved_op(
+    push_deinterleave_op(
         plan, gate_w, up_w, bf16_tmp, group.shard_axis);
 
     const std::string bias_tmp = group.group_prefix + ".__gate_up_bias";
@@ -2167,13 +2167,13 @@ void lower_mxfp4_gate_up_group_to_bf16(
         TensorParallelKind::Expert);
     register_tensor_spec(
         plan, gate_b, DType::BF16, expert_b_shape,
-        TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Owned,
+        TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
     register_tensor_spec(
         plan, up_b, DType::BF16, expert_b_shape,
-        TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Owned,
+        TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
-    push_split_interleaved_op(
+    push_deinterleave_op(
         plan, gate_b, up_b, bias_tmp, group.shard_axis);
 
     push_drop_op(
@@ -2201,7 +2201,7 @@ void lower_mxfp4_down_group_to_bf16(
 
     register_tensor_spec(
         plan, down_w, DType::BF16, {group.experts, group.out_dim, I_local},
-        TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Owned,
+        TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
     if (tp_size == 1) {
         push_dequant_op(plan, down_w, blocks_tmp, scales_tmp);
@@ -2209,7 +2209,7 @@ void lower_mxfp4_down_group_to_bf16(
         const std::string bf16_tmp = group.group_prefix + ".__mxfp4_bf16";
         register_tensor_spec(
             plan, bf16_tmp, DType::BF16, full_bf16_shape,
-            TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Temporary,
+            TensorLayoutKind::Grouped, TensorOwnershipKind::Temporary,
             TensorParallelKind::Expert);
         push_dequant_op(plan, bf16_tmp, blocks_tmp, scales_tmp);
 
@@ -2221,7 +2221,7 @@ void lower_mxfp4_down_group_to_bf16(
     push_copy_op(plan, group.raw_bias, down_b);
     register_tensor_spec(
         plan, down_b, DType::BF16, group.bias.shape,
-        TensorLayoutKind::FusedMoeExperts, TensorOwnershipKind::Owned,
+        TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
 
     std::vector<std::string> drop_inputs = {blocks_tmp, scales_tmp};
@@ -2722,7 +2722,7 @@ LoadPlan build_model_load_plan(
         if (schema.shard_fused_moe_experts_for_tp &&
             ends_with(name, ".mlp.experts.gate_up_proj")) {
             LoadOp op = make_raw_load_op(
-                LoadOpKind::MoeGateUpShard, /*output_name=*/{},
+                LoadOpKind::GroupedSliceConcat, /*output_name=*/{},
                 raw_name);
             const auto& info = loader.info(raw_name);
             auto shape = info.shape;
@@ -2734,7 +2734,7 @@ LoadPlan build_model_load_plan(
             shape[1] /= tp_size;
             add_owned_producer(
                 plan, std::move(op), name, info.dtype, shape,
-                TensorLayoutKind::FusedMoeExperts,
+                TensorLayoutKind::Grouped,
                 TensorParallelKind::Expert);
             consumed_raw.insert(raw_name);
             continue;
@@ -2742,7 +2742,7 @@ LoadPlan build_model_load_plan(
         if (schema.shard_fused_moe_experts_for_tp &&
             ends_with(name, ".mlp.experts.down_proj")) {
             LoadOp op = make_raw_load_op(
-                LoadOpKind::MoeDownShard, /*output_name=*/{},
+                LoadOpKind::GroupedSlice, /*output_name=*/{},
                 raw_name);
             const auto& info = loader.info(raw_name);
             auto shape = info.shape;
@@ -2754,7 +2754,7 @@ LoadPlan build_model_load_plan(
             shape[2] /= tp_size;
             add_owned_producer(
                 plan, std::move(op), name, info.dtype, shape,
-                TensorLayoutKind::FusedMoeExperts,
+                TensorLayoutKind::Grouped,
                 TensorParallelKind::Expert);
             consumed_raw.insert(raw_name);
             continue;
@@ -2921,7 +2921,7 @@ LoadPlan build_model_load_plan(
         has_per_expert_moe_sources && !lowered_per_expert_moe_fusion) {
         throw std::runtime_error(
             "load schema: per-expert MoE checkpoint layout requires "
-            "FuseMoeExperts IR lowering, but no complete expert group was "
+            "StackGroups IR lowering, but no complete expert group was "
             "scheduled");
     }
     finalize_memory_plan(plan);

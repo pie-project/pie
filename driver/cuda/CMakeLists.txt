@@ -81,9 +81,11 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/bound_model.cpp
   ../common/src/safetensors_manifest.cpp
   src/loader/hf_config.cpp
+  src/loader/byte_source.cpp
   src/loader/load_plan.cpp
   src/loader/materializer.cpp
   src/loader/model_schema.cpp
+  src/loader/physical_load_plan.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
   src/model/qwen3_forward.cpp
@@ -229,7 +231,8 @@ target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
 add_executable(test_load_plan
   tests/test_load_plan.cpp
   src/loader/load_plan.cpp
-  src/loader/model_schema.cpp)
+  src/loader/model_schema.cpp
+  src/loader/physical_load_plan.cpp)
 target_include_directories(test_load_plan PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)

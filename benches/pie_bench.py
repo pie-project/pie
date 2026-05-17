@@ -427,7 +427,6 @@ def build_parser() -> argparse.ArgumentParser:
                  "batching for Phase B-hot experiments.",
         )
         sp.add_argument("--vllm-attention-backend", default=None)
-        sp.add_argument("--sglang-attention-backend", default=None)
         sp.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
         sp.add_argument("--venv", default=None,

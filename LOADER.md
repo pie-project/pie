@@ -26,8 +26,9 @@ SafetensorsLoader
   -> Logical tensor graph
   -> Load IR
   -> target-aware lowering and optimization passes
+  -> PhysicalLoadPlan / ByteRangeWrite compiler
   -> memory plan
-  -> Materializer
+  -> Materializer + CheckpointByteSource
   -> WeightStore / LoadedModel
   -> BoundCudaModel
 ```
@@ -188,20 +189,20 @@ Copy
 Slice
 Shard
 RowRangeShard
-MoeGateUpShard
-MoeDownShard
+GroupedSliceConcat
+GroupedSlice
 Cast
 Concat
-PackRows
+AxisConcat
 View
 Alias
 Drop
 QuantizeRuntime
 Dequantize
-SplitInterleaved
-RepackQuant
-AttachQuantMeta
-FuseMoeExperts
+Deinterleave
+RepackLayout
+BindMetadata
+StackGroups
 Materialize
 ```
 
@@ -213,22 +214,63 @@ Slice
 Shard
 Cast
 Concat
-PackRows
+AxisConcat
 View
 Alias
 Drop
 QuantizeRuntime
 Dequantize
-SplitInterleaved
-RepackQuant
-AttachQuantMeta
-FuseMoeExperts
+Deinterleave
+RepackLayout
+BindMetadata
+StackGroups
 Materialize
 ```
 
-Architecture-specific names such as `PackQKV`, `PackGateUp`, or
-`FuseExperts` may exist as high-level lowering helpers, but their semantics
-should reduce to generic layout operations.
+Architecture-specific names such as `QKV`, `GateUp`, or `MoE` exist only as
+schema semantics and diagnostics. The executable IR uses generic layout terms:
+`AxisConcat`, `GroupedSlice`, `StackGroups`, `Deinterleave`, and
+`BindMetadata`.
+
+### PhysicalLoadPlan
+
+`PhysicalLoadPlan` is the physical byte-mapping layer between semantic IR and
+materialization. It lowers copy-expressible logical ops into:
+
+```text
+ByteRangeWrite {
+  raw checkpoint tensor
+  optional rectangular slices
+  destination runtime tensor
+  destination byte offset
+  compact destination shape
+  exact byte count
+  exact source range count
+}
+```
+
+Non-copy operations lower to:
+
+```text
+TiledTransform {
+  kind = Cast | Dequantize
+  inputs
+  output
+  tile byte budget
+  scratch byte estimate
+}
+```
+
+The same physical plan can execute with different byte sources:
+
+```text
+MmapByteSource: mmap + cudaMemcpy/cudaMemcpy2D into final VRAM
+GdsByteSource: cuFileRead into final VRAM, future backend
+```
+
+The current CUDA implementation uses `MmapByteSource`. GDS is deliberately a
+backend swap after the byte-source interface has stabilized, not a semantic IR
+change.
 
 ### Planner
 
@@ -344,9 +386,8 @@ Important layout kinds:
 
 ```text
 Dense
-PackedQkv
-PackedGateUp
-FusedMoeExperts
+AxisConcatenated
+Grouped
 QuantPacked
 View
 ```
@@ -447,7 +488,7 @@ The quantized tensor replaces the original runtime tensor name.
 
 Offline INT4 checkpoints should lower to either:
 
-- `RepackQuant` into Marlin-compatible storage, or
+- `RepackLayout` into Marlin-compatible storage, or
 - `Dequantize` into BF16 when correctness or kernel support requires eager
   fallback.
 
@@ -485,8 +526,8 @@ Packed MXFP4 MoE runtime lowering:
 Copy packed blocks into final QuantPacked expert tensor
 Copy E8M0 block scales into final scale tensor
 Shard packed rows or block groups when tensor parallelism requires it
-RepackQuant to backend layout when the selected kernel requires a swizzle
-AttachQuantMeta
+RepackLayout to backend layout when the selected kernel requires a swizzle
+BindMetadata
 Expose final packed expert tensors and fused expert biases
 ```
 
@@ -503,7 +544,7 @@ BF16 fallback lowering:
 Copy packed blocks
 Copy E8M0 block scales
 Dequantize MXFP4 blocks to temporary BF16 tensor
-SplitInterleaved gate/up rows into final expert tensors
+Deinterleave gate/up rows into final expert tensors
 Slice tensor-parallel bands when needed
 Drop packed blocks, scales, and temporary BF16 tensors
 ```
@@ -583,8 +624,8 @@ Last updated: 2026-05-17.
   can identify semantic groups before lowering selects physical ops.
 - `LoadPlan` contains typed runtime tensor specs.
 - `LoadOp` uses typed payload families instead of a flat overloaded field bag.
-  Constructors build raw-load, row-range, tensor, slice, pack-rows, and
-  fuse-MoE payloads; validation and materialization consume those payloads via
+  Constructors build raw-load, row-range, tensor, slice, axis-concat, and
+  stack-groups payloads; validation and materialization consume those payloads via
   typed accessors.
 - `LoadPlan` contains explicit executable operations for:
   - GPTQ/AWQ dequantization and Marlin repack
@@ -593,18 +634,36 @@ Last updated: 2026-05-17.
   - eager FP8 and MXFP4 BF16 fallbacks
   - packed MXFP4 runtime loading
   - Qwen per-expert MoE fusion
+- The core IR uses generic operation names in C++ types, dumps, and
+  diagnostics: `AxisConcat`, `GroupedSliceConcat`, `GroupedSlice`,
+  `StackGroups`, `Deinterleave`, `RepackLayout`, and `BindMetadata`.
+  Architecture-specific terms such as QKV, gate/up, and MoE remain schema
+  semantics, not executable IR terms.
 - `LoadPlan` tracks persistent, temporary, and estimated peak memory.
 - Dense Llama-like Qwen/Qwen2/Llama/Mistral/Olmo loading can plan packed QKV
   and packed gate/up tensors.
 - Packed QKV and packed gate/up expose compatibility names as views.
-- `PackRows` materialization streams sources into final storage rather than
+- `PhysicalLoadPlan` lowers copy-expressible ops into exact `ByteRangeWrite`
+  records with destination tensor, destination offset, compact slice shape,
+  byte count, and source range count.
+- `MmapByteSource` owns the current mmap + CUDA-copy physical IO path. The
+  materializer consumes `CheckpointByteSource`, so GDS can be added as a new
+  backend without touching schema lowering.
+- `AxisConcat` materialization streams sources into final storage rather than
   keeping all packed inputs alive at once.
-- `FuseMoeExperts` can stream per-expert checkpoint rows directly into final
+- `StackGroups` can stream per-expert checkpoint rows directly into final
   fused expert tensors instead of staging checkpoint-shaped source tensors.
-- Raw `Copy`, `Shard`, `Read`, `RowRangeShard`, `MoeGateUpShard`, and
-  `MoeDownShard` ops copy checkpoint bytes directly into final or planned
-  temporary destinations. BF16 dense Qwen-style packed plans no longer create
-  full checkpoint-shaped device buffers for projection tensors before packing.
+- Raw `Copy`, `Shard`, `Read`, `RowRangeShard`, `GroupedSliceConcat`, and
+  `GroupedSlice` ops lower to generic physical byte writes and
+  copy checkpoint bytes directly into final or planned temporary destinations.
+  BF16 dense Qwen-style packed plans no longer create full checkpoint-shaped
+  device buffers for projection tensors before packing.
+- `raw Copy -> Cast -> Drop` sequences execute through a tiled raw-cast path:
+  checkpoint bytes stream through bounded scratch and are cast directly into
+  the final runtime tensor, avoiding a full source tensor in the `WeightStore`.
+- FP8 and MXFP4 BF16 fallback dequantization execute the output transform in
+  bounded tiles. Native MXFP4 remains a backend adapter target; Pie does not
+  grow a custom in-tree MXFP4 GEMM.
 - `WeightStore` stores `TensorRecord { spec, tensor }`, counts only owned
   resident tensors for memory accounting, and rejects erasing a backing tensor
   while a registered view or alias still depends on it.
@@ -613,16 +672,16 @@ Last updated: 2026-05-17.
 - Materialization validates produced tensor dtype, shape, and view backings
   against the plan.
 - The materializer supports generic `Read`, `Copy`, `Shard`, `RowRangeShard`,
-  `MoeGateUpShard`, `MoeDownShard`, `Slice`, `Cast`, `Concat`, `PackRows`,
-  `View`, `Alias`, `Drop`, `QuantizeRuntime`, `Dequantize`,
-  `SplitInterleaved`, `RepackQuant`, `AttachQuantMeta`, `FuseMoeExperts`,
-  and `Materialize` operations.
+  `GroupedSliceConcat`, `GroupedSlice`, `Slice`, `Cast`, `Concat`,
+  `AxisConcat`, `View`, `Alias`, `Drop`, `QuantizeRuntime`, `Dequantize`,
+  `Deinterleave`, `RepackLayout`, `BindMetadata`, `StackGroups`, and
+  `Materialize` operations.
 - FP16/FP32 checkpoint tensors lower into scheduled `Copy -> Cast -> Drop`
   sequences when the runtime representation is BF16. The same producer helper
   covers normal copies, Phi-3 row-range shards, and Qwen MoE direct expert
   shard ops; canonical quant scale tensors that must remain FP32 are left
   untouched.
-- `RepackQuant` is a first-class scheduled materializer operation for
+- `RepackLayout` is a first-class scheduled materializer operation for
   symmetric GPTQ int4 checkpoints that target Marlin W4A16 storage.
 - AWQ int4 checkpoints and GPTQ int4 fallback variants, including GPTQ
   act-order, lower into scheduled
@@ -634,7 +693,7 @@ Last updated: 2026-05-17.
   qweight/g_idx, preserving the checkpoint's global group ids without an
   ad-hoc remap.
 - Runtime `fp8` and `int8` quantization for supported dense projection
-  weights lowers into explicit `Copy -> QuantizeRuntime -> AttachQuantMeta
+  weights lowers into explicit `Copy -> QuantizeRuntime -> BindMetadata
   -> Drop` op sequences. Temporary BF16/FP16/FP32 source tensors are not
   registered as final runtime tensors.
 - `QuantizeRuntime` materialization computes per-row absmax scales, performs
@@ -647,7 +706,7 @@ Last updated: 2026-05-17.
   scheduled `Copy(weight/scale) -> Dequantize -> Drop` into BF16 runtime
   weights; the binder no longer performs this fallback.
 - Symmetric compressed-tensors INT8 weights lower into scheduled
-  `Copy(weight) -> Copy/Cast(scale) -> AttachQuantMeta` plans. The final
+  `Copy(weight) -> Copy/Cast(scale) -> BindMetadata` plans. The final
   runtime tensor is `QuantPacked` INT8 with canonical scale metadata; variants
   that require zero-points or unsupported layouts remain rejected before
   materialization.
@@ -656,7 +715,7 @@ Last updated: 2026-05-17.
   BF16.
 - Symmetric GPTQ int4 checkpoints with `desc_act=false` and no zero-points
   lower into scheduled
-  `Copy(qweight/scales) -> RepackQuant -> AttachQuantMeta -> Drop`. The final
+  `Copy(qweight/scales) -> RepackLayout -> BindMetadata -> Drop`. The final
   runtime tensor is Marlin-packed `INT4_PACKED` with a BF16 canonical
   `weight_scale_inv` side tensor. Tensor-parallel plans slice local GPTQ
   qweight and scale temporaries before repacking: column-parallel projections
@@ -669,7 +728,7 @@ Last updated: 2026-05-17.
   template kernels are expensive to compile.
 - AWQ int4 checkpoints now share the target-aware int4 architecture. On
   Marlin-capable targets they lower to scheduled
-  `Copy(qweight/qzeros/scales) -> RepackQuant -> AttachQuantMeta -> Drop`
+  `Copy(qweight/qzeros/scales) -> RepackLayout -> BindMetadata -> Drop`
   plans that produce Marlin-packed INT4 runtime tensors with canonical BF16
   scale and INT32 zero-point side tensors. On non-Marlin targets they lower to
   scheduled BF16 `Dequantize`.
@@ -690,11 +749,13 @@ Last updated: 2026-05-17.
   capability and should bind to FlashInfer/TRT-LLM, CUTLASS, or Marlin rather
   than an architecture-local custom GEMM.
 - `PIE_CUDA_LOAD_PLAN_DUMP=/path/to/plan.json` writes a JSON plan artifact with
-  ops, tensor specs, and memory estimates.
+  semantic ops, tensor specs, physical byte writes, tiled transforms, and
+  semantic/physical memory estimates.
 - The planner computes persistent bytes from final owned tensors and computes
-  temporary high-water bytes with a last-use scan over the executable op stream,
-  while preserving conservative scratch estimates for operations that allocate
-  unregistered scratch.
+  semantic temporary high-water bytes over the executable op stream.
+- The physical planner computes resident temporary high-water from the actual
+  materializer lifetime protocol, including `Drop` ops, raw-copy-to-cast
+  fusion, and bounded transform scratch.
 - Qwen3-32B starts successfully with the CUDA native driver.
 - The BF16 CUDA native e2e smoke matrix covers dense Qwen3, Qwen3 MoE,
   Qwen3.6 dense, Qwen3.6 MoE, Gemma4 dense, and Gemma4 MoE checkpoints.
@@ -716,7 +777,7 @@ Last updated: 2026-05-17.
 - CPU-only load-plan tests cover dense Qwen packed QKV/gate-up lowering,
   scheduled runtime INT8 quantization, scheduled FP16/FP32-to-BF16 casts,
   Phi-3 tensor-parallel row-range sharding, symmetric GPTQ lowering into
-  scheduled `RepackQuant`, and GPTQ tensor-parallel local slicing for column-
+  scheduled `RepackLayout`, and GPTQ tensor-parallel local slicing for column-
   and row-parallel projections. They also cover AWQ Marlin repack and BF16
   fallback, asymmetric GPTQ and GPTQ act-order dequant fallbacks,
   compressed-tensors INT8 metadata attachment, scheduled Qwen per-expert MoE
@@ -735,18 +796,22 @@ Last updated: 2026-05-17.
   compressed-tensors sub-modes still need schema and backend coverage.
 - MoE fused expert loading has scheduled schema support for current Qwen
   per-expert checkpoint layouts and GPT-OSS packed MXFP4 layouts. Future MoE
-  variants should reuse the same generic `FuseMoeExperts`, quant metadata, and
+  variants should reuse the same generic `StackGroups`, quant metadata, and
   backend-selection machinery rather than adding architecture-local transforms.
-- Memory planning now performs last-use analysis for scheduled temporary
-  tensors. Runtime backend scratch, such as GPT-OSS routed-expert MXFP4
-  dequant scratch, is tracked outside load-plan temporary high-water marks and
-  should be reported explicitly as runtime scratch.
+- Semantic memory planning tracks scheduled temporary tensors. Runtime backend
+  scratch, such as GPT-OSS routed-expert MXFP4 dequant scratch, is tracked
+  outside load-plan temporary high-water marks and should be reported
+  explicitly as runtime scratch.
 - `LogicalTensorGraph` exists, but current lowering still infers many roles
   from suffix conventions. Future schema adapters should declare roles and
   groups directly instead of relying on inference.
 
 ### Not Yet Implemented
 
+- `GdsByteSource` / GPUDirect Storage. The stable interface is now
+  `CheckpointByteSource`; GDS should be added as a physical backend after
+  validating alignment, filesystem, and unaligned safetensors offset fallback
+  behavior.
 - True hardware-native MXFP4 MoE GEMM kernels. The current packed runtime
   backend keeps MXFP4 as the final loaded representation and dequantizes only
   routed experts into bounded BF16 scratch before GEMM.
@@ -765,16 +830,16 @@ Required plan tests:
 - Qwen MoE TP emits expert-aware sharding.
 - Runtime `fp8` and `int8` emit `QuantizeRuntime` op sequences for supported
   dense projection weights.
-- Symmetric GPTQ emits scheduled `RepackQuant` on Marlin-capable targets and
+- Symmetric GPTQ emits scheduled `RepackLayout` on Marlin-capable targets and
   scheduled BF16 `Dequantize` on non-Marlin targets with qzeros metadata. AWQ
-  emits scheduled `RepackQuant` on Marlin-capable targets and scheduled BF16
+  emits scheduled `RepackLayout` on Marlin-capable targets and scheduled BF16
   `Dequantize` on non-Marlin targets. GPTQ act-order TP keeps full scale/zero
   metadata for row-parallel shards so `g_idx` remains valid without rewriting.
 - Compressed-tensors FP8 and symmetric INT8 emit scale normalization and quant
   metadata attachment.
 - GPT-OSS MXFP4 emits target-dependent plans: packed-runtime targets produce
   `QuantPacked` MXFP4 tensors with attached scales; eager fallback targets
-  produce `Dequantize` and `SplitInterleaved` operations with no persistent raw
+  produce `Dequantize` and `Deinterleave` operations with no persistent raw
   block/scale tensors.
 - FP16/FP32 checkpoint tensors emit scheduled `Cast` ops, and quant scale
   tensors that must remain FP32 are not normalized.
@@ -826,25 +891,30 @@ Latest verification:
 - `cmake --build .tmp/cuda-load-plan-tests --target test_load_plan -j2`
 - `.tmp/cuda-load-plan-tests/bin/test_load_plan`
 - Synthetic load-plan tests include scheduled GPTQ symmetric int4
-  `RepackQuant` lowering with canonical BF16 scale metadata, tensor-parallel
+  `RepackLayout` lowering with canonical BF16 scale metadata, tensor-parallel
   local qweight/scale slicing, and no `OfflineGptqAwq` transform.
 - Synthetic load-plan tests include scheduled AWQ int4, asymmetric GPTQ int4,
   and GPTQ act-order BF16 fallback lowerings, including tensor-parallel local
   qweight, qzeros, scale, and g_idx handling with no `OfflineGptqAwq`
   transform. They also cover target-dependent symmetric GPTQ and AWQ:
-  Marlin-capable targets emit `RepackQuant`; non-Marlin targets emit scheduled
+  Marlin-capable targets emit `RepackLayout`; non-Marlin targets emit scheduled
   BF16 `Dequantize` when the checkpoint has qzeros metadata.
 - Current-turn verification: Qwen3-0.6B CUDA native one-token smoke completed
-  1/1 with 98.9 ms mean latency. Dumped plan: 171 `Copy`, 56 `PackRows`,
+  1/1 with 98.9 ms mean latency. Dumped plan: 171 `Copy`, 56 `AxisConcat`,
   persistent 1,433 MiB, temp 6 MiB, and zero post-load transforms.
 - Qwen3-32B direct CUDA native load after direct-to-final materialization:
   load compiler emitted 515 load ops and 835 runtime tensor specs, persistent
-  62,488 MiB, load-time temp <= 0 MiB, peak ~= 62,488 MiB, with 64 packed QKV
-  groups and 64 packed gate/up groups. The model loaded 835 tensors in about
-  5 seconds on the RTX PRO 6000 Blackwell Server Edition.
+  62,488 MiB, load-time temp <= 0 MiB, peak ~= 62,488 MiB, and 128
+  `AxisConcat` groups. The model loaded 835 tensors in about 5 seconds on the
+  RTX PRO 6000 Blackwell Server Edition.
+- Qwen3-32B physical load dump after the byte-plan compiler:
+  707 `ByteRangeWrite` records, 707 source ranges, 62,488 MiB checkpoint
+  bytes read, 62,488 MiB device bytes written, physical temp <= 0 MiB, and
+  physical peak ~= 62,488 MiB. The executable semantic ops are 387 `Copy` and
+  128 `AxisConcat`.
 - Synthetic load-plan tests include Qwen MoE TP expert sharding and GPT-OSS
   MXFP4 target selection: BF16 fallback emits `Dequantize` /
-  `SplitInterleaved` / `Slice` ops, while packed-runtime targets emit
+  `Deinterleave` / `Slice` ops, while packed-runtime targets emit
   `QuantPacked` MXFP4 tensors with attached scale metadata.
 - Fresh-cache selective download smoke:
   `HF_HOME=.tmp/hf-selective-qwen pie model download Qwen/Qwen3-0.6B`
@@ -859,13 +929,13 @@ Latest verification:
 - Qwen3-32B INT8 runtime-quant short latency smoke.
 - Qwen3-0.6B FP8 runtime-quant latency smoke on native-FP8 hardware.
 - Dumped Qwen3-0.6B INT8 plan: 196 `QuantizeRuntime` ops, 196
-  `AttachQuantMeta` ops, 196 `Drop` ops, 196 quantized runtime tensors, and no
+  `BindMetadata` ops, 196 `Drop` ops, 196 quantized runtime tensors, and no
   `RuntimeQuantize` transform.
 - Dumped RedHatAI/Qwen3-0.6B-FP8-dynamic plan: 196 compressed-FP8 E4M3
-  quantized runtime tensors, 196 `AttachQuantMeta` ops, canonical FP32 scale
+  quantized runtime tensors, 196 `BindMetadata` ops, canonical FP32 scale
   tensors, and no compressed-FP8 post-load transform.
 - Dumped openai/gpt-oss-20b packed-runtime plan: 459 `Copy` ops and
-  48 `AttachQuantMeta` ops, zero post-load transforms, persistent weight
+  48 `BindMetadata` ops, zero post-load transforms, persistent weight
   estimate 13,123 MiB, and load-time temporary estimate 0 MiB. Runtime MoE
   dispatch uses bounded BF16 scratch for only the routed MXFP4 experts.
 - Small real GPTQ/AWQ smokes:
@@ -875,12 +945,12 @@ Latest verification:
   non-Marlin release build.
 - Additional CUDA native one-token smokes on 2026-05-17:
   - `openai/gpt-oss-20b`: completed 1/1, 1 output token, 332.6 ms mean
-    latency. Packed-runtime plan: 459 `Copy`, 48 `AttachQuantMeta`,
+    latency. Packed-runtime plan: 459 `Copy`, 48 `BindMetadata`,
     persistent 13,123 MiB, load-time temp 0 MiB.
   - `microsoft/Phi-3-mini-4k-instruct`: completed 1/1, 1 output token,
     111.7 ms mean latency. Plan: 195 `Copy`; persistent 7,288 MiB.
   - `allenai/Olmo-3-7B-Instruct`: completed 1/1, 1 output token,
-    113.2 ms mean latency. Plan: 195 `Copy`, 64 `PackRows`; persistent
+    113.2 ms mean latency. Plan: 195 `Copy`, 64 `AxisConcat`; persistent
     13,919 MiB, temp 86 MiB.
   - `mistralai/Ministral-3-3B-Instruct-2512`: completed 1/1, 1 output token,
     110.1 ms mean latency. Plan: 600 `Copy`; persistent 3,654 MiB.
@@ -908,16 +978,17 @@ Latest verification:
 - Qwen3-32B latency/throughput comparison on the same host, using
   `max_model_len=1024`, `max_tokens=16`, 3 latency requests with 1 warmup, and
   16 throughput requests at concurrency 4:
-  - Pie CUDA native: 789.5 ms mean latency, 20.26 output tok/s latency run,
-    76.89 output tok/s throughput run.
-  - vLLM 0.10.2 with Torch 2.8.0+cu128 and Transformers 4.55.4: 747.6 ms mean
-    latency, 21.40 output tok/s latency run, 78.69 output tok/s throughput
-    run.
+  - Pie CUDA native: 788.9 ms mean latency, 20.28 output tok/s latency run,
+    76.95 output tok/s throughput run.
+  - vLLM 0.10.2 with Torch 2.8.0+cu128, Transformers 4.55.4, and
+    `VLLM_USE_FLASHINFER_SAMPLER=0` for CUDA 12.8/SM120 sampler
+    compatibility: 742.8 ms mean latency, 21.54 output tok/s latency run,
+    79.89 output tok/s throughput run.
   - SGLang local checkout with Torch 2.8.0+cu128, local SM120 `sgl-kernel`,
     Triton attention, PyTorch sampling, CUDA graphs disabled, piecewise CUDA
     graphs disabled, FlashInfer arch override `FLASHINFER_CUDA_ARCH_LIST=12.0a`,
-    and PDL disabled for CUDA 12.8/SM120 compatibility: 785.9 ms mean latency,
-    20.36 output tok/s latency run, 73.93 output tok/s throughput run.
+    and PDL disabled for CUDA 12.8/SM120 compatibility: 786.1 ms mean latency,
+    20.35 output tok/s latency run, 76.95 output tok/s throughput run.
 
 ## Paper Framing
 

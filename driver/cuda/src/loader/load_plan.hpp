@@ -13,9 +13,8 @@ enum class DType : std::uint8_t;
 enum class TensorLayoutKind {
     Dense,
     RowPacked,
-    PackedQkv,
-    PackedGateUp,
-    FusedMoeExperts,
+    AxisConcatenated,
+    Grouped,
     QuantPacked,
     View,
 };
@@ -85,24 +84,24 @@ enum class LoadOpKind {
     Slice,
     Shard,
     RowRangeShard,
-    MoeGateUpShard,
-    MoeDownShard,
+    GroupedSliceConcat,
+    GroupedSlice,
     Cast,
     Concat,
-    PackRows,
+    AxisConcat,
     View,
     Alias,
     Drop,
     QuantizeRuntime,
     Dequantize,
-    SplitInterleaved,
-    RepackQuant,
-    FuseMoeExperts,
-    AttachQuantMeta,
+    Deinterleave,
+    RepackLayout,
+    StackGroups,
+    BindMetadata,
     Materialize,
 };
 
-struct PackedRowSource {
+struct TensorSourceRef {
     std::string raw_name;
     std::string view_name;
 };
@@ -136,17 +135,17 @@ struct SlicePayload {
     int shard_axis = -1;
 };
 
-struct PackRowsPayload {
+struct AxisConcatPayload {
     std::string output_name;
     int shard_axis = -1;
-    std::vector<PackedRowSource> row_sources;
+    std::vector<TensorSourceRef> sources;
 };
 
-struct FuseMoeExpertsPayload {
+struct StackGroupsPayload {
     std::string output_name;
     std::string secondary_output_name;
     std::vector<std::string> inputs;
-    std::vector<PackedRowSource> row_sources;
+    std::vector<TensorSourceRef> sources;
 };
 
 using LoadOpPayload = std::variant<
@@ -154,8 +153,8 @@ using LoadOpPayload = std::variant<
     RowRangeShardPayload,
     TensorOpPayload,
     SlicePayload,
-    PackRowsPayload,
-    FuseMoeExpertsPayload>;
+    AxisConcatPayload,
+    StackGroupsPayload>;
 
 struct LoadOp {
     LoadOpKind kind = LoadOpKind::Copy;
@@ -166,14 +165,12 @@ struct LoadPlan {
     std::vector<LoadOp> ops;
     std::unordered_map<std::string, TensorSpec> tensors;
     LoadMemoryPlan memory;
-    std::size_t packed_qkv_groups = 0;
-    std::size_t packed_gate_up_groups = 0;
+    std::size_t axis_concat_groups = 0;
 };
 
 struct MaterializedLoadPlan {
     std::uint64_t loaded_bytes = 0;
-    std::size_t packed_qkv_groups = 0;
-    std::size_t packed_gate_up_groups = 0;
+    std::size_t axis_concat_groups = 0;
     std::size_t planned_tensor_count = 0;
     std::size_t runtime_quantized_weights = 0;
     std::uint64_t runtime_quant_bytes_before = 0;
@@ -207,15 +204,15 @@ LoadOp make_slice_op(
     std::int64_t slice_start,
     std::int64_t slice_length,
     int shard_axis = -1);
-LoadOp make_pack_rows_op(
+LoadOp make_axis_concat_op(
     std::string output_name,
     int shard_axis,
-    std::vector<PackedRowSource> row_sources);
-LoadOp make_fuse_moe_experts_op(
+    std::vector<TensorSourceRef> sources);
+LoadOp make_stack_groups_op(
     std::string output_name,
     std::string secondary_output_name,
     std::vector<std::string> inputs,
-    std::vector<PackedRowSource> row_sources = {});
+    std::vector<TensorSourceRef> sources = {});
 
 const std::string& load_op_output(const LoadOp& op);
 const std::string& load_op_secondary_output(const LoadOp& op);
@@ -227,7 +224,7 @@ std::int64_t load_op_row_offset(const LoadOp& op);
 std::int64_t load_op_rows(const LoadOp& op);
 std::int64_t load_op_slice_start(const LoadOp& op);
 std::int64_t load_op_slice_length(const LoadOp& op);
-const std::vector<PackedRowSource>& load_op_row_sources(const LoadOp& op);
+const std::vector<TensorSourceRef>& load_op_sources(const LoadOp& op);
 void set_load_op_output(LoadOp& op, std::string output_name);
 
 void validate_load_plan(const LoadPlan& plan);

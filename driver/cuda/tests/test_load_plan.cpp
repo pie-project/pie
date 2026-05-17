@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "loader/model_schema.hpp"
+#include "loader/physical_load_plan.hpp"
 
 namespace {
 
@@ -167,9 +168,8 @@ void test_dense_qwen_plan_packs_projection_groups() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_load_plan(plan);
 
-    CHECK_EQ(plan.packed_qkv_groups, std::size_t{1});
-    CHECK_EQ(plan.packed_gate_up_groups, std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::PackRows),
+    CHECK_EQ(plan.axis_concat_groups, std::size_t{2});
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::AxisConcat),
              std::size_t{2});
     CHECK_EQ(plan.memory.max_temporary_bytes, std::uint64_t{0});
     CHECK(!has_copy_output(plan, "model.layers.0.self_attn.q_proj.weight"));
@@ -182,7 +182,7 @@ void test_dense_qwen_plan_packs_projection_groups() {
         find_spec(plan, "model.layers.0.self_attn.qkv_proj.fused.weight");
     CHECK(qkv != nullptr);
     if (qkv != nullptr) {
-        CHECK(qkv->layout == pie_cuda_driver::TensorLayoutKind::PackedQkv);
+        CHECK(qkv->layout == pie_cuda_driver::TensorLayoutKind::AxisConcatenated);
         CHECK((qkv->shape == std::vector<std::int64_t>{16, 8}));
     }
     const auto* q_view =
@@ -196,6 +196,40 @@ void test_dense_qwen_plan_packs_projection_groups() {
     }
 }
 
+void test_physical_plan_lowers_packed_groups_to_byte_writes() {
+    auto hf = qwen3_config();
+    pie_cuda_driver::Config cfg{};
+    const auto meta = dense_llama_metadata();
+    const pie_cuda_driver::LoadTarget target{};
+    auto plan = pie_cuda_driver::build_model_load_plan(
+        hf, cfg, meta, /*tp_size=*/1, target);
+    auto physical = pie_cuda_driver::build_physical_load_plan(
+        plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
+
+    CHECK_EQ(physical.memory.max_copy_temporary_bytes, std::uint64_t{0});
+    CHECK(physical.memory.byte_write_count >= 5);
+    std::vector<const pie_cuda_driver::ByteRangeWrite*> qkv_writes;
+    for (const auto& write : physical.byte_writes) {
+        if (write.output_name ==
+            "model.layers.0.self_attn.qkv_proj.fused.weight") {
+            qkv_writes.push_back(&write);
+        }
+    }
+    CHECK_EQ(qkv_writes.size(), std::size_t{3});
+    if (qkv_writes.size() == 3) {
+        CHECK_EQ(qkv_writes[0]->dst_offset_bytes, std::uint64_t{0});
+        CHECK_EQ(qkv_writes[1]->dst_offset_bytes, std::uint64_t{128});
+        CHECK_EQ(qkv_writes[2]->dst_offset_bytes, std::uint64_t{192});
+        CHECK((qkv_writes[0]->dst_shape == std::vector<std::int64_t>{8, 8}));
+        CHECK((qkv_writes[1]->dst_shape == std::vector<std::int64_t>{4, 8}));
+        CHECK((qkv_writes[2]->dst_shape == std::vector<std::int64_t>{4, 8}));
+    }
+    const std::string dump =
+        pie_cuda_driver::dump_load_plan_json(plan, physical);
+    CHECK(dump.find("\"physical\"") != std::string::npos);
+    CHECK(dump.find("axis-concatenated") != std::string::npos);
+}
+
 void test_dense_schema_adapters_pack_mistral_olmo_variants() {
     const auto meta = dense_llama_metadata();
     pie_cuda_driver::Config cfg{};
@@ -207,9 +241,8 @@ void test_dense_schema_adapters_pack_mistral_olmo_variants() {
         auto plan = pie_cuda_driver::build_model_load_plan(
             hf, cfg, meta, /*tp_size=*/1, target);
         pie_cuda_driver::validate_load_plan(plan);
-        CHECK_EQ(plan.packed_qkv_groups, std::size_t{1});
-        CHECK_EQ(plan.packed_gate_up_groups, std::size_t{1});
-        CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::PackRows),
+        CHECK_EQ(plan.axis_concat_groups, std::size_t{2});
+        CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::AxisConcat),
                  std::size_t{2});
     }
 }
@@ -238,7 +271,7 @@ void test_runtime_int8_lowers_to_scheduled_quant_ops() {
 
     CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::QuantizeRuntime),
              std::size_t{7});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::AttachQuantMeta),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::BindMetadata),
              std::size_t{7});
     CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::Drop),
              std::size_t{7});
@@ -267,7 +300,7 @@ void test_compressed_tensors_int8_lowers_to_quant_packed() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_load_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::AttachQuantMeta),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::BindMetadata),
              std::size_t{1});
     const auto* q = find_spec(
         plan, "model.layers.0.self_attn.q_proj.weight");
@@ -313,6 +346,15 @@ void test_fp16_copy_lowers_to_scheduled_cast() {
     if (final != nullptr) {
         CHECK(final->dtype == DType::BF16);
         CHECK(final->ownership == pie_cuda_driver::TensorOwnershipKind::Owned);
+    }
+    const auto physical = pie_cuda_driver::build_physical_load_plan(
+        plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
+    CHECK_EQ(physical.tiled_transforms.size(), std::size_t{1});
+    if (!physical.tiled_transforms.empty()) {
+        CHECK(physical.tiled_transforms[0].kind ==
+              pie_cuda_driver::PhysicalTransformKind::Cast);
+        CHECK_EQ(physical.tiled_transforms[0].output_name,
+                 std::string("model.norm.weight"));
     }
 }
 
@@ -392,7 +434,7 @@ void test_phi3_fp16_row_range_shards_cast_to_bf16() {
     }
 }
 
-void test_gptq_symmetric_lowers_to_repack_quant() {
+void test_gptq_symmetric_lowers_to_repack_layout() {
     using pie_cuda_driver::DType;
     pie_cuda_driver::HfConfig hf{};
     hf.model_type = "qwen3";
@@ -416,9 +458,9 @@ void test_gptq_symmetric_lowers_to_repack_quant() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_load_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::RepackQuant),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::RepackLayout),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::AttachQuantMeta),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::BindMetadata),
              std::size_t{1});
     CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::Drop),
              std::size_t{1});
@@ -450,7 +492,7 @@ void test_gptq_symmetric_lowers_to_repack_quant() {
     }
 }
 
-void test_gptq_symmetric_tp_lowers_to_local_repack_quant() {
+void test_gptq_symmetric_tp_lowers_to_local_repack_layout() {
     using pie_cuda_driver::DType;
     pie_cuda_driver::HfConfig hf{};
     hf.model_type = "qwen3";
@@ -474,7 +516,7 @@ void test_gptq_symmetric_tp_lowers_to_local_repack_quant() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_load_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::RepackQuant),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::RepackLayout),
              std::size_t{2});
     const auto* q_tmp =
         find_spec(plan, "model.layers.0.self_attn.q_proj.weight.__gptq_qweight");
@@ -554,7 +596,7 @@ void test_gptq_symmetric_without_marlin_lowers_to_dequant() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_load_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::RepackQuant),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::RepackLayout),
              std::size_t{0});
     CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::Dequantize),
              std::size_t{1});
@@ -632,7 +674,7 @@ void test_awq_lowers_to_marlin_repack_when_target_supports_int4() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_load_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::RepackQuant),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::RepackLayout),
              std::size_t{1});
     CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::Dequantize),
              std::size_t{0});
@@ -760,7 +802,7 @@ void test_gptq_asymmetric_tp_lowers_to_local_dequant() {
 
     CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::Dequantize),
              std::size_t{2});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::RepackQuant),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::RepackLayout),
              std::size_t{0});
     const auto* q_tmp = find_spec(
         plan, "model.layers.0.self_attn.q_proj.weight.__gptq_qweight");
@@ -880,9 +922,9 @@ void test_qwen_moe_tp_uses_expert_shard_ops() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_load_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::MoeGateUpShard),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::GroupedSliceConcat),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::MoeDownShard),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::GroupedSlice),
              std::size_t{1});
     CHECK(!has_copy_output(plan, "model.layers.0.mlp.experts.gate_up_proj"));
     CHECK(!has_copy_output(plan, "model.layers.0.mlp.experts.down_proj"));
@@ -893,7 +935,7 @@ void test_qwen_moe_tp_uses_expert_shard_ops() {
     if (gate_up != nullptr) {
         CHECK((gate_up->shape == std::vector<std::int64_t>{2, 8, 8}));
         CHECK(gate_up->layout ==
-              pie_cuda_driver::TensorLayoutKind::FusedMoeExperts);
+              pie_cuda_driver::TensorLayoutKind::Grouped);
         CHECK(gate_up->parallel == pie_cuda_driver::TensorParallelKind::Expert);
     }
     const auto* down =
@@ -902,7 +944,7 @@ void test_qwen_moe_tp_uses_expert_shard_ops() {
     if (down != nullptr) {
         CHECK((down->shape == std::vector<std::int64_t>{2, 8, 8}));
         CHECK(down->layout ==
-              pie_cuda_driver::TensorLayoutKind::FusedMoeExperts);
+              pie_cuda_driver::TensorLayoutKind::Grouped);
         CHECK(down->parallel == pie_cuda_driver::TensorParallelKind::Expert);
     }
 }
@@ -928,7 +970,7 @@ void test_qwen_moe_per_expert_fusion_is_scheduled() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_load_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::FuseMoeExperts),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::StackGroups),
              std::size_t{1});
     const auto* gate_up =
         find_spec(plan, "model.layers.0.mlp.experts.gate_up_proj");
@@ -936,7 +978,7 @@ void test_qwen_moe_per_expert_fusion_is_scheduled() {
     if (gate_up != nullptr) {
         CHECK((gate_up->shape == std::vector<std::int64_t>{2, 16, 8}));
         CHECK(gate_up->layout ==
-              pie_cuda_driver::TensorLayoutKind::FusedMoeExperts);
+              pie_cuda_driver::TensorLayoutKind::Grouped);
         CHECK(gate_up->ownership ==
               pie_cuda_driver::TensorOwnershipKind::Owned);
     }
@@ -946,7 +988,7 @@ void test_qwen_moe_per_expert_fusion_is_scheduled() {
     if (down != nullptr) {
         CHECK((down->shape == std::vector<std::int64_t>{2, 8, 8}));
         CHECK(down->layout ==
-              pie_cuda_driver::TensorLayoutKind::FusedMoeExperts);
+              pie_cuda_driver::TensorLayoutKind::Grouped);
     }
     CHECK(!has_copy_output(
         plan, "model.layers.0.mlp.experts.0.gate_proj.weight"));
@@ -1052,7 +1094,7 @@ void test_gpt_oss_mxfp4_fallback_emits_dequantized_experts() {
 
     CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::Dequantize),
              std::size_t{2});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::SplitInterleaved),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::Deinterleave),
              std::size_t{2});
     CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::Slice),
              std::size_t{1});
@@ -1066,7 +1108,7 @@ void test_gpt_oss_mxfp4_fallback_emits_dequantized_experts() {
         CHECK(gate->dtype == pie_cuda_driver::DType::BF16);
         CHECK((gate->shape == std::vector<std::int64_t>{2, 2, 32}));
         CHECK(gate->layout ==
-              pie_cuda_driver::TensorLayoutKind::FusedMoeExperts);
+              pie_cuda_driver::TensorLayoutKind::Grouped);
     }
     const auto* up =
         find_spec(plan, "model.layers.0.mlp.experts.up_proj.weight");
@@ -1081,7 +1123,7 @@ void test_gpt_oss_mxfp4_fallback_emits_dequantized_experts() {
         CHECK(down->dtype == pie_cuda_driver::DType::BF16);
         CHECK((down->shape == std::vector<std::int64_t>{2, 8, 16}));
         CHECK(down->layout ==
-              pie_cuda_driver::TensorLayoutKind::FusedMoeExperts);
+              pie_cuda_driver::TensorLayoutKind::Grouped);
     }
     CHECK(find_spec(
         plan, "model.layers.0.mlp.experts.gate_up_proj.weight") == nullptr);
@@ -1099,7 +1141,7 @@ void test_gpt_oss_mxfp4_native_emits_quant_packed_experts() {
 
     CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::Dequantize),
              std::size_t{0});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::AttachQuantMeta),
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::BindMetadata),
              std::size_t{2});
 
     const auto* gate_up =
@@ -1177,6 +1219,7 @@ void test_fp8_scale_inv_lowers_to_scheduled_dequant() {
 
 int main() {
     test_dense_qwen_plan_packs_projection_groups();
+    test_physical_plan_lowers_packed_groups_to_byte_writes();
     test_dense_schema_adapters_pack_mistral_olmo_variants();
     test_dump_plan_has_no_post_load_transform_channel();
     test_runtime_int8_lowers_to_scheduled_quant_ops();
@@ -1184,8 +1227,8 @@ int main() {
     test_fp16_copy_lowers_to_scheduled_cast();
     test_phi3_tp_uses_row_range_shards_for_fused_tensors();
     test_phi3_fp16_row_range_shards_cast_to_bf16();
-    test_gptq_symmetric_lowers_to_repack_quant();
-    test_gptq_symmetric_tp_lowers_to_local_repack_quant();
+    test_gptq_symmetric_lowers_to_repack_layout();
+    test_gptq_symmetric_tp_lowers_to_local_repack_layout();
     test_gptq_symmetric_without_marlin_lowers_to_dequant();
     test_awq_lowers_to_scheduled_dequant();
     test_awq_lowers_to_marlin_repack_when_target_supports_int4();
