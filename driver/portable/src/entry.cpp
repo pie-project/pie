@@ -37,7 +37,6 @@
 #include "shmem_schema.hpp"
 
 #include <filesystem>
-#include <random>
 #include <unistd.h>
 
 namespace {
@@ -286,25 +285,20 @@ int run_impl(int argc,
                   << ", backend=" << model.backend_name() << ")\n";
     }
 
-    // For GGUF inputs the server-side bootstrap expects `tokenizer.json`
-    // adjacent to `snapshot_dir`. GGUF embeds the tokenizer in KV
-    // metadata instead, so mint a HF-format `tokenizer.json` (plus
-    // `tokenizer_config.json` for the chat template) into a unique temp
-    // dir, then report that dir as `snapshot_dir` in caps. Safetensors
-    // path is untouched.
+    // GGUF embeds the tokenizer in KV; emit HF-format files to a temp
+    // dir and report that as `snapshot_dir` so the server-side
+    // `Tokenizer::from_file(snapshot_dir / "tokenizer.json")` works.
     std::string effective_snapshot_dir = cfg.model.hf_path;
     {
         const std::filesystem::path src(cfg.model.hf_path);
         if (std::filesystem::is_regular_file(src) && src.extension() == ".gguf") {
-            std::random_device rd;
-            const auto rand_tag = std::to_string(rd()) + "-" + std::to_string(rd());
             const auto tmpdir = std::filesystem::temp_directory_path() /
-                ("pie-gguf-tokenizer-" + std::to_string(::getpid()) + "-" + rand_tag);
+                ("pie-gguf-tokenizer-" + std::to_string(::getpid()));
             std::filesystem::create_directories(tmpdir);
             pie_portable_driver::emit_tokenizer_files(src, tmpdir);
             effective_snapshot_dir = tmpdir.string();
             if (cfg.runtime.verbose) {
-                std::cerr << "[pie-driver-portable] minted tokenizer.json from GGUF KVs to "
+                std::cerr << "[pie-driver-portable] minted tokenizer.json to "
                           << effective_snapshot_dir << "\n";
             }
         }

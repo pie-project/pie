@@ -35,10 +35,6 @@ struct GgufHandle {
     GgufHandle& operator=(const GgufHandle&) = delete;
 };
 
-bool has_key(gguf_context* ctx, const char* k) {
-    return gguf_find_key(ctx, k) >= 0;
-}
-
 std::string get_str(gguf_context* ctx, const char* k) {
     const std::int64_t id = gguf_find_key(ctx, k);
     if (id < 0) {
@@ -54,7 +50,6 @@ std::string get_str_or(gguf_context* ctx, const char* k, std::string fb) {
     return std::string(gguf_get_val_str(ctx, id));
 }
 
-// Read a uint32-ish scalar that may be encoded as u32/u64/i32 in GGUF.
 std::int64_t get_int_or(gguf_context* ctx, const char* k, std::int64_t fb) {
     const std::int64_t id = gguf_find_key(ctx, k);
     if (id < 0) return fb;
@@ -115,32 +110,15 @@ std::vector<std::int32_t> get_i32_array_or_empty(gguf_context* ctx, const char* 
     return out;
 }
 
-// ---------------------------------------------------------------------
-// Pre-tokenizer regex table.
-//
-// Mirrors llama.cpp's `llm_tokenizer_bpe` switch in
-// `src/llama-vocab.cpp`. Where llama.cpp keeps a comment with the
-// "original regex from tokenizer.json", that's the one we emit — it is
-// the canonical form HF's `tokenizers` crate accepts (the "adapted"
-// llama.cpp form rewrites `(?i:...)` into `(?:...)` etc. for its
-// internal regex engine; HF's onig-based Split supports both, but the
-// originals match what shipped tokenizer.json files actually contain).
-// ---------------------------------------------------------------------
-
+// Mirrors llama.cpp's `llm_tokenizer_bpe` switch (src/llama-vocab.cpp);
+// emits the "original tokenizer.json" regex form (the commented-out one
+// upstream) — that's what HF's `tokenizers` crate consumes verbatim.
 struct PreSpec {
-    std::vector<std::string> regex_exprs;  // in order
-    bool needs_nfc_normalizer = false;     // emit a top-level NFC normalizer
+    std::vector<std::string> regex_exprs;
+    bool needs_nfc_normalizer = false;  // qwen-family tokenizer.json sets NFC.
+    bool ignore_merges = false;          // upstream sets true for llama3, youtu, tekken.
 };
 
-// Returns a non-null PreSpec for known `pre` values, or throws.
-// Coverage notes (mirroring the `if-else` ladder in llama-vocab.cpp):
-//   * Most BPE families share one of a handful of regexes; we
-//     deduplicate at construction.
-//   * We default `needs_nfc_normalizer` to false. The Qwen-family
-//     reference tokenizer.json includes NFC normalization upfront;
-//     Llama-3 family does not. Other families overwhelmingly follow
-//     the Llama convention (no normalizer); we add NFC only where the
-//     upstream tokenizer.json is known to.
 PreSpec resolve_pre_spec(const std::string& pre) {
     // ---- shared regex strings (matches llama.cpp's grouping) -----------
     static const std::string kLlama3 =
@@ -160,10 +138,6 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         "\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     static const std::string kGpt2 =
         "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)";
-    static const std::string kStarcoder =
-        // STARCODER / REFACT / COMMAND_R / SMOLLM / CODESHELL / EXAONE / MINERVA
-        // share: { "\\p{N}", kGpt2 }
-        "";  // placeholder, actual builder below
     static const std::string kJais2 =
         "(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
         "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|"
@@ -206,18 +180,17 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         "\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]?|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+";
 
     static const std::string kDefault0 = "[\\p{P}\\$\\+<=>\\^~\\|]+";
-    static const std::string kDefault1 = kFalcon1;  // same regex
     static const std::string kDefault2 = "\\p{N}+";
     static const std::string kDefault3 = "[0-9][0-9][0-9]";
 
     PreSpec spec;
 
-    // ---- llama3 family -----------------------------------------------
     if (pre == "llama3" || pre == "llama-v3" || pre == "llama-bpe" ||
         pre == "falcon3" || pre == "falcon-h1" || pre == "pixtral" ||
         pre == "midm-2.0" || pre == "lfm2" || pre == "jina-v5-nano" ||
         pre == "dbrx" || pre == "smaug-bpe") {
         spec.regex_exprs = {kLlama3};
+        spec.ignore_merges = true;
         return spec;
     }
     if (pre == "jais-2") {
@@ -225,7 +198,6 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         return spec;
     }
 
-    // ---- DeepSeek family ---------------------------------------------
     if (pre == "deepseek-llm") {
         spec.regex_exprs = {
             "[\\r\\n]",
@@ -266,16 +238,15 @@ PreSpec resolve_pre_spec(const std::string& pre) {
             "(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
             "\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
         };
+        spec.ignore_merges = true;
         return spec;
     }
 
-    // ---- Falcon ------------------------------------------------------
     if (pre == "falcon") {
         spec.regex_exprs = {kFalcon0, kFalcon1, kFalcon2};
         return spec;
     }
 
-    // ---- MPT / Starcoder family (single GPT-2-style regex) -----------
     if (pre == "mpt") { spec.regex_exprs = {kGpt2}; return spec; }
     if (pre == "starcoder" || pre == "refact" || pre == "command-r" ||
         pre == "smollm" || pre == "codeshell" || pre == "exaone" ||
@@ -284,12 +255,10 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         return spec;
     }
 
-    // ---- gpt-2 lookalikes (single regex, GPT-2 family) ---------------
     if (pre == "gpt-2" || pre == "phi-2" || pre == "jina-es" ||
         pre == "jina-de" || pre == "gigachat" || pre == "jina-v2-es" ||
         pre == "jina-v2-de" || pre == "a.x-4.0" || pre == "mellum" ||
-        pre == "modern-bert" ||
-        pre == "mpt-redpajama" /* historical alias */ ||
+        pre == "modern-bert" || pre == "exaone4" ||
         pre == "olmo" || pre == "jais" || pre == "trillion" ||
         pre == "granite-docling" ||
         pre == "jina-v1-en" || pre == "jina-v2-code" || pre == "roberta-bpe") {
@@ -297,9 +266,8 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         return spec;
     }
 
-    // ---- Qwen family (NFC normalizer + qwen2-style regex) ------------
     if (pre == "qwen2" || pre == "deepseek-r1-qwen" ||
-        pre == "kormo" || pre == "f2llmv2" ||
+        pre == "kormo" || pre == "f2llmv2" || pre == "megrez" ||
         pre == "stablelm2" || pre == "hunyuan" || pre == "solar-open") {
         spec.regex_exprs = {kQwen2};
         spec.needs_nfc_normalizer = true;
@@ -311,7 +279,6 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         return spec;
     }
 
-    // ---- Poro / Bloom / GPT3-Finnish (single token regex) ------------
     if (pre == "poro-chat" || pre == "bloom" || pre == "gpt3-finnish") {
         spec.regex_exprs = {kPoro};
         return spec;
@@ -321,12 +288,13 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         return spec;
     }
 
-    if (pre == "chatglm-bpe") {  // CHATGLM4
+    if (pre == "chatglm-bpe" || pre == "glm4") {
         spec.regex_exprs = {kChatGLM4};
         return spec;
     }
     if (pre == "tekken") {
         spec.regex_exprs = {kTekken};
+        spec.ignore_merges = true;
         return spec;
     }
     if (pre == "chameleon") {
@@ -340,11 +308,12 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         };
         return spec;
     }
-    if (pre == "gpt-4o" || pre == "minimax-m2") {
+    if (pre == "gpt-4o" || pre == "minimax-m2" ||
+        pre == "llama4" || pre == "kanana2") {
         spec.regex_exprs = {kGpt4o};
         return spec;
     }
-    if (pre == "tiny-aya") {
+    if (pre == "tiny_aya") {
         spec.regex_exprs = {
             "\\d{1,3}(?=(?:\\d{3})*\\b)",
             "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*"
@@ -363,7 +332,7 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         spec.regex_exprs = {"\\p{N}+", "(?=(\\d{3})+(?!\\d))"};
         return spec;
     }
-    if (pre == "bailingmoe") {
+    if (pre == "bailingmoe" || pre == "bailingmoe2" || pre == "llada-moe") {
         spec.regex_exprs = {kBailingMoe};
         return spec;
     }
@@ -372,7 +341,7 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         return spec;
     }
     if (pre == "grok-2") {
-        spec.regex_exprs = {kQwen2};  // identical to QWEN2 case
+        spec.regex_exprs = {kQwen2};
         return spec;
     }
     if (pre == "afmoe") {
@@ -390,16 +359,13 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         return spec;
     }
     if (pre == "gemma4") {
-        // SPM-style BPE: tokenize after metaspace replacement; only split
-        // on newlines. We'd handle the byte-encoding off by setting
-        // `use_regex=false` on ByteLevel and using a Metaspace decoder
-        // instead — but pie's Gemma path isn't on GGUF yet, so emit the
-        // regex and let the user file an issue if it tokenizes wrong.
+        // SPM-style BPE; emits a newline-only split. Best-effort — Gemma4
+        // GGUFs need a Metaspace decoder this code path doesn't yet build.
         spec.regex_exprs = {"[^\\n]+|[\\n]+"};
         return spec;
     }
     if (pre == "default") {
-        spec.regex_exprs = {kDefault0, kDefault1, kDefault2, kDefault3};
+        spec.regex_exprs = {kDefault0, kFalcon1, kDefault2, kDefault3};
         return spec;
     }
 
@@ -408,19 +374,9 @@ PreSpec resolve_pre_spec(const std::string& pre) {
         "'. Update the regex table in driver/portable/src/gguf_tokenizer.cpp.");
 }
 
-// Split a "left right" merge entry into [left, right] using the LAST
-// whitespace as the separator. Some token strings contain spaces (e.g.
-// "Ġ Ġ" — two space-prefixed tokens), so splitting on the FIRST space
-// would produce the wrong pair; in BPE serialization the convention is
-// that the rightmost space is the separator. (HF's own writer joins via
-// `" "` between two byte-encoded tokens, neither of which can contain
-// a literal space in the encoded form unless the encoding produced one
-// — so split on the single space between them.)
-//
-// In practice GGUF stores merges as `left + " " + right` exactly; the
-// last-space rule keeps us safe for the corner case where ByteLevel
-// encoding produces tokens with a literal space inside (which doesn't
-// happen for the GPT-2 byte mapping — space becomes `Ġ`).
+// GGUF merges are stored as `left + " " + right`; split on the last
+// space so byte-level tokens that happen to contain a space don't trip
+// the splitter.
 std::pair<std::string, std::string> split_merge(const std::string& m) {
     const auto pos = m.rfind(' ');
     if (pos == std::string::npos) {
@@ -446,13 +402,9 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
     // -- Required scalars ------------------------------------------------
     const std::string model_type = get_str(ctx, "tokenizer.ggml.model");
     if (model_type != "gpt2") {
-        // SPM ("llama"), WordPiece ("bert"), Unigram ("t5"), and RWKV
-        // are not yet supported. Surface clearly — the user is hitting
-        // a GGUF whose tokenizer family pie can't synthesize yet.
         throw std::runtime_error(
             "gguf_tokenizer: tokenizer.ggml.model='" + model_type +
-            "' is not yet supported (need: 'gpt2'). "
-            "SPM/WordPiece/Unigram conversion is a separate follow-up.");
+            "' not supported (need 'gpt2'; SPM/WordPiece/Unigram are TODO).");
     }
     const std::string pre = get_str_or(ctx, "tokenizer.ggml.pre", "default");
     const PreSpec pre_spec = resolve_pre_spec(pre);
@@ -486,17 +438,17 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
         merges_arr.push_back(json::array({a, b}));
     }
 
-    // -- Build added_tokens -----------------------------------------------
-    // GGUF token_type values (from gguf-py):
-    //   1=NORMAL, 2=UNKNOWN, 3=CONTROL, 4=USER_DEFINED, 5=UNUSED, 6=BYTE
-    // Anything not NORMAL/UNUSED/BYTE should be exposed as a special added
-    // token so HF Tokenizer treats it atomically.
+    // token_type values: 2=UNKNOWN, 3=CONTROL, 4=USER_DEFINED.
+    auto is_control_type = [&](std::int64_t id) {
+        if (id < 0 || static_cast<std::size_t>(id) >= token_types.size()) return false;
+        const auto t = token_types[static_cast<std::size_t>(id)];
+        return t == 2 || t == 3 || t == 4;
+    };
     std::unordered_set<std::int64_t> added_ids;
     json added_tokens = json::array();
     auto push_added = [&](std::int64_t id, bool special) {
         if (id < 0 || static_cast<std::size_t>(id) >= tokens.size()) return;
-        if (added_ids.count(id)) return;
-        added_ids.insert(id);
+        if (!added_ids.insert(id).second) return;
         added_tokens.push_back({
             {"id", id},
             {"content", tokens[static_cast<std::size_t>(id)]},
@@ -507,20 +459,25 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
             {"special", special},
         });
     };
-    if (!token_types.empty() && token_types.size() == tokens.size()) {
+    if (token_types.size() == tokens.size()) {
         for (std::size_t i = 0; i < tokens.size(); ++i) {
-            const auto t = token_types[i];
-            if (t == 3 /*CONTROL*/ || t == 4 /*USER_DEFINED*/ || t == 2 /*UNKNOWN*/) {
-                push_added(static_cast<std::int64_t>(i), /*special=*/true);
+            if (is_control_type(static_cast<std::int64_t>(i))) {
+                push_added(static_cast<std::int64_t>(i), true);
             }
         }
     }
-    // Always-include canonical special IDs even when token_type didn't flag them.
-    push_added(bos_id, true);
-    push_added(eos_id, true);
-    push_added(pad_id, true);
-    push_added(unk_id, true);
-    push_added(sep_id, true);
+    // Canonical special IDs: mark special only when token_type agrees (or
+    // is absent). Skip otherwise so a NORMAL token doesn't get mis-flagged.
+    auto push_canonical = [&](std::int64_t id) {
+        if (id < 0) return;
+        const bool special = token_types.empty() || is_control_type(id);
+        push_added(id, special);
+    };
+    push_canonical(bos_id);
+    push_canonical(eos_id);
+    push_canonical(pad_id);
+    push_canonical(unk_id);
+    push_canonical(sep_id);
 
     // -- Pre-tokenizer ----------------------------------------------------
     json pre_tokenizers = json::array();
@@ -550,17 +507,13 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
         normalizer = {{"type", "NFC"}};
     }
 
-    // -- Post-processor + decoder (ByteLevel pass-through) ---------------
     json byte_level_pp = {
         {"type",             "ByteLevel"},
         {"add_prefix_space", false},
         {"trim_offsets",     false},
         {"use_regex",        false},
     };
-    json decoder = byte_level_pp;
-    json post_processor = byte_level_pp;
 
-    // -- BPE model body ---------------------------------------------------
     json model_body = {
         {"type",                      "BPE"},
         {"dropout",                   nullptr},
@@ -569,7 +522,7 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
         {"end_of_word_suffix",        nullptr},
         {"fuse_unk",                  false},
         {"byte_fallback",             false},
-        {"ignore_merges",             true},
+        {"ignore_merges",             pre_spec.ignore_merges},
         {"vocab",                     vocab},
         {"merges",                    merges_arr},
     };
@@ -582,8 +535,8 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
         {"added_tokens",   added_tokens},
         {"normalizer",     normalizer},
         {"pre_tokenizer",  pre_tokenizer},
-        {"post_processor", post_processor},
-        {"decoder",        decoder},
+        {"post_processor", byte_level_pp},
+        {"decoder",        byte_level_pp},
         {"model",          model_body},
     };
 
@@ -597,7 +550,6 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
         f << tok.dump(/*indent=*/-1);
     }
 
-    // -- tokenizer_config.json (chat template, special tokens) -----------
     json tok_cfg = json::object();
     if (!chat_template.empty()) {
         tok_cfg["chat_template"] = chat_template;
