@@ -4,11 +4,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <iostream>
-#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 
 #include "cuda_check.hpp"
 #include "kernels/dequant_fp8.hpp"
@@ -61,11 +58,6 @@ void gemm_bf16_impl(
     int M, int N, int K,
     float beta)
 {
-    // P1.2 attempt routed this through cublasLtMatmul; the Lt heuristic
-    // returned the same `gemvx` algo cuBLAS picks on its own, so the
-    // change was a wash. We keep the Lt scaffold (defined further down)
-    // for future epilogue-fusion work but route bf16 gemms back through
-    // the simpler GemmEx path here.
     const float alpha = 1.f;
     const auto status = cublasGemmEx(
               handle,
@@ -77,7 +69,7 @@ void gemm_bf16_impl(
               &beta,
               /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
               CUBLAS_COMPUTE_32F,
-              CUBLAS_GEMM_DEFAULT);
+              CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
@@ -110,7 +102,7 @@ void gemm_batched_bf16_impl(
               /*C=*/y_ptrs_dev,   CUDA_R_16BF, /*ldc=*/N,
               batch_count,
               CUBLAS_COMPUTE_32F,
-              CUBLAS_GEMM_DEFAULT);
+              CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
@@ -320,143 +312,6 @@ void gemm_fp8_dequant_then_bf16_fallback(
             bf16_w, scale, weight_elems, stream);
     }
     gemm_bf16_impl(cublas_handle, act, bf16_w, y, M, N, K, beta);
-}
-
-// ── cuBLASLt BF16 path (P1.2) ─────────────────────────────────────────
-//
-// Same row-major y[M,N] = act[M,K] @ W[N,K]^T problem as `gemm_bf16_impl`,
-// but routed through cuBLASLt with `cublasLtMatmulAlgoGetHeuristic` so
-// the engine picks a small-tile tensor-core kernel for decode-shaped
-// matmuls (small batch, wide MN). Heuristic queries are cached by shape
-// + beta — the shape set per layer is fixed at boot, so steady-state has
-// zero heuristic calls.
-
-struct LtBf16AlgoKey {
-    int M, N, K;
-    bool beta_one;
-    bool operator==(const LtBf16AlgoKey& o) const noexcept {
-        return M == o.M && N == o.N && K == o.K && beta_one == o.beta_one;
-    }
-};
-
-struct LtBf16AlgoKeyHash {
-    std::size_t operator()(const LtBf16AlgoKey& k) const noexcept {
-        // FNV-1a-ish — only a few keys per process (one per matmul
-        // shape per arch), so collision resistance doesn't matter.
-        std::size_t h = 1469598103934665603ULL;
-        for (auto v : {k.M, k.N, k.K, k.beta_one ? 1 : 0}) {
-            h ^= static_cast<std::size_t>(v);
-            h *= 1099511628211ULL;
-        }
-        return h;
-    }
-};
-
-struct LtBf16AlgoCache {
-    // The cached algo descriptor is portable across calls of the same
-    // shape; cuBLASLt internally owns no per-call state.
-    std::unordered_map<LtBf16AlgoKey, cublasLtMatmulAlgo_t, LtBf16AlgoKeyHash> map;
-    std::mutex mu;
-};
-
-LtBf16AlgoCache& bf16_algo_cache_() {
-    static LtBf16AlgoCache c;
-    return c;
-}
-
-void gemm_bf16_lt_impl(
-    cublasHandle_t handle,
-    const void* act, const void* W, void* y,
-    int M, int N, int K,
-    float beta)
-{
-    auto& ctx = LtCtx::instance();
-    ctx.ensure_init();
-
-    // Inherit the stream from the legacy cuBLAS handle so call-site
-    // ordering is preserved (everything in the forward pass shares one
-    // stream today; defensive in case that changes).
-    cudaStream_t stream = nullptr;
-    if (handle) {
-        // cublasGetStream is the documented way to extract the stream
-        // from the legacy handle. Errors here are non-fatal — null stream
-        // means the default stream, which is what we want anyway.
-        cublasGetStream(handle, &stream);
-    }
-
-    const float alpha = 1.f;
-
-    // Same row-major-as-col-major reinterpretation: A=W (op_T),
-    // B=act (op_N), C=y (col-major NxM, ld=N).
-    LtMatmulDesc desc(CUBLAS_COMPUTE_32F, CUDA_R_32F);
-    const cublasOperation_t op_t = CUBLAS_OP_T;
-    const cublasOperation_t op_n = CUBLAS_OP_N;
-    desc.set(CUBLASLT_MATMUL_DESC_TRANSA, op_t);
-    desc.set(CUBLASLT_MATMUL_DESC_TRANSB, op_n);
-
-    // A: W stored row-major [N, K] = col-major [K, N], lda=K.
-    LtMatrixLayout A(CUDA_R_16BF, /*rows=*/K, /*cols=*/N, /*ld=*/K);
-    // B: act stored row-major [M, K] = col-major [K, M], ldb=K.
-    LtMatrixLayout B(CUDA_R_16BF, /*rows=*/K, /*cols=*/M, /*ld=*/K);
-    // C/D: y stored row-major [M, N] = col-major [N, M], ldc=N.
-    LtMatrixLayout C(CUDA_R_16BF, /*rows=*/N, /*cols=*/M, /*ld=*/N);
-
-    const bool beta_one = (beta != 0.f);
-    LtBf16AlgoKey key{M, N, K, beta_one};
-
-    cublasLtMatmulAlgo_t algo;
-    bool have_algo = false;
-    auto& cache = bf16_algo_cache_();
-    {
-        std::lock_guard<std::mutex> g(cache.mu);
-        auto it = cache.map.find(key);
-        if (it != cache.map.end()) {
-            algo = it->second;
-            have_algo = true;
-        }
-    }
-
-    if (!have_algo) {
-        LtMatmulPref pref;
-        pref.set(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, ctx.workspace_bytes);
-
-        cublasLtMatmulHeuristicResult_t result{};
-        int returned = 0;
-        const auto hs = cublasLtMatmulAlgoGetHeuristic(
-            ctx.handle, desc.d, A.d, B.d, C.d, C.d, pref.d,
-            /*requestedAlgoCount=*/1, &result, &returned);
-        if (hs != CUBLAS_STATUS_SUCCESS || returned == 0) {
-            // No suitable algo (rare — e.g. unusual K). Fall back to the
-            // legacy gemm path so we never silently emit no-op.
-            const auto status = cublasGemmEx(
-                handle, op_t, op_n, /*m=*/N, /*n=*/M, /*k=*/K,
-                &alpha, W, CUDA_R_16BF, K, act, CUDA_R_16BF, K,
-                &beta,  y, CUDA_R_16BF, N,
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                throw std::runtime_error(
-                    "cuBLASLt heuristic + GemmEx fallback both failed for "
-                    "M=" + std::to_string(M) + " N=" + std::to_string(N) +
-                    " K=" + std::to_string(K));
-            }
-            return;
-        }
-        algo = result.algo;
-        std::lock_guard<std::mutex> g(cache.mu);
-        cache.map[key] = algo;
-    }
-
-    LT_CHECK(cublasLtMatmul(
-        ctx.handle, desc.d,
-        &alpha,
-        W,   A.d,
-        act, B.d,
-        &beta,
-        y,   C.d,
-        y,   C.d,
-        &algo,
-        ctx.workspace, ctx.workspace_bytes,
-        stream));
 }
 
 void gemm_fp8_e4m3_w_bf16_act_impl(

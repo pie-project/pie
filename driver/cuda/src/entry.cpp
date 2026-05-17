@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -37,6 +38,7 @@
 #include "attention_workspace.hpp"
 #include "brle.hpp"
 #include "config.hpp"
+#include "custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "model/loaded_model.hpp"
 #include "kernels/argmax.hpp"
@@ -154,6 +156,7 @@ struct PlannedForwardLimits {
 };
 
 struct CudaMemoryPlan {
+    int kv_page_size = 0;
     int max_workspace_tokens = 0;
     int max_requests = 0;
     int max_page_refs = 0;
@@ -166,6 +169,7 @@ struct CudaMemoryPlan {
 };
 
 void min_into(CudaMemoryPlan& dst, const CudaMemoryPlan& src) {
+    dst.kv_page_size = std::min(dst.kv_page_size, src.kv_page_size);
     dst.max_workspace_tokens = std::min(dst.max_workspace_tokens,
                                         src.max_workspace_tokens);
     dst.max_requests = std::min(dst.max_requests, src.max_requests);
@@ -254,8 +258,10 @@ std::size_t workspace_bytes(const pie_cuda_driver::HfConfig& cfg,
     bytes += bf16(n * cfg.vocab_size);               // logits
     bytes += fp32(n * cfg.vocab_size);               // probs
     if (cfg.head_dim != cfg.head_dim_kernel) {
-        const int Hq_pad = cfg.num_attention_heads * cfg.head_dim_kernel;
-        const int Hk_pad = cfg.num_key_value_heads * cfg.head_dim_kernel;
+        const int q_heads = max_Hq / std::max(1, cfg.head_dim);
+        const int kv_heads = max_Hk / std::max(1, cfg.head_dim);
+        const int Hq_pad = q_heads * cfg.head_dim_kernel;
+        const int Hk_pad = kv_heads * cfg.head_dim_kernel;
         bytes += bf16(n * Hq_pad);
         bytes += bf16(n * Hk_pad);
         bytes += bf16(n * Hk_pad);
@@ -388,16 +394,20 @@ std::size_t persistent_input_bytes(int N, int R, int max_page_refs,
     return bytes;
 }
 
-std::size_t kv_page_bytes_homogeneous(const pie_cuda_driver::HfConfig& cfg) {
+std::size_t kv_page_bytes_homogeneous(const pie_cuda_driver::HfConfig& cfg,
+                                      int tp_size) {
+    const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
     return static_cast<std::size_t>(cfg.num_hidden_layers) * 2 *
-           cfg.num_key_value_heads * cfg.head_dim_kernel * 2;
+           kv_heads * cfg.head_dim_kernel * 2;
 }
 
 std::size_t kv_page_bytes_per_layer(
     const pie_cuda_driver::HfConfig& cfg,
     const std::vector<int>& per_layer_head_dim,
-    const std::vector<int>& kv_source_layer) {
+    const std::vector<int>& kv_source_layer,
+    int tp_size) {
     std::size_t per_token = 0;
+    const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
     for (int i = 0; i < cfg.num_hidden_layers; ++i) {
         const bool is_source = kv_source_layer.empty() || kv_source_layer[i] == i;
         if (!is_source) continue;
@@ -405,9 +415,135 @@ std::size_t kv_page_bytes_per_layer(
             ? cfg.head_dim_kernel
             : per_layer_head_dim[i];
         per_token += static_cast<std::size_t>(2) *
-                     cfg.num_key_value_heads * hd * 2;
+                     kv_heads * hd * 2;
     }
     return per_token;
+}
+
+bool is_auto_memory_profile(const std::string& profile) {
+    return profile == "auto";
+}
+
+std::vector<std::string> planner_policy_profiles(const std::string& profile) {
+    if (!is_auto_memory_profile(profile)) {
+        return {profile};
+    }
+    // `auto` is not a fifth concrete layout. It evaluates the concrete
+    // policy families and chooses by the unified objective below.
+    return {"latency", "balanced", "throughput", "capacity"};
+}
+
+int derive_kv_page_size_for_profile(const std::string& profile, int tp_size) {
+    // FlashInfer paged attention supports 16/32/64-token pages for the CUDA
+    // backends we use. vLLM keeps 16 as its general default; SGLang picks by
+    // backend. Pie's balanced/throughput/capacity profiles benefit from fewer
+    // page refs and lower scheduler/metadata pressure, while latency keeps the
+    // finer 16-token granularity for short and mixed workloads.
+    if (profile == "latency") {
+        return 16;
+    }
+    if (profile == "throughput") {
+        return std::max(1, tp_size) == 1 ? 32 : 16;
+    }
+    return 32;
+}
+
+int derive_kv_page_size(const pie_cuda_driver::Config& cfg,
+                        const pie_cuda_driver::HfConfig& /*hf*/,
+                        const cudaDeviceProp& /*prop*/) {
+    return derive_kv_page_size_for_profile(
+        is_auto_memory_profile(cfg.batching.memory_profile)
+            ? "throughput"
+            : cfg.batching.memory_profile,
+        std::max(1, cfg.distributed.tp_size));
+}
+
+std::vector<int> derive_kv_page_size_candidates(
+    const pie_cuda_driver::Config& cfg,
+    const pie_cuda_driver::HfConfig& /*hf*/,
+    const cudaDeviceProp& /*prop*/) {
+    std::vector<int> xs;
+    const int tp_size = std::max(1, cfg.distributed.tp_size);
+    for (const auto& profile : planner_policy_profiles(cfg.batching.memory_profile)) {
+        xs.push_back(derive_kv_page_size_for_profile(profile, tp_size));
+    }
+    xs.push_back(16);
+    xs.push_back(32);
+    std::sort(xs.begin(), xs.end());
+    xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+    return xs;
+}
+
+double log2_ratio(int value, int target) {
+    const double v = static_cast<double>(std::max(1, value));
+    const double t = static_cast<double>(std::max(1, target));
+    return std::log2(v / t);
+}
+
+double target_saturation_score(int value, int target) {
+    const double capped = static_cast<double>(
+        std::min(std::max(1, value), std::max(1, target)));
+    const double t = static_cast<double>(std::max(1, target));
+    return std::log2(capped + 1.0) / std::log2(t + 1.0);
+}
+
+int profile_decode_target(const std::string& profile,
+                          const pie_cuda_driver::Config& cfg,
+                          const cudaDeviceProp& prop) {
+    // Decode throughput has a real knee: below it we leave SMs underfed,
+    // above it we often inflate attention/KV pressure without increasing
+    // useful device occupancy. TP halves per-rank matmul work, so TP=2 needs
+    // roughly twice the active request count to hit the same per-rank knee.
+    const int tp = std::max(1, cfg.distributed.tp_size);
+    const int sm_factor = tp == 1 ? 2 : 4;
+    int target = clamp_pow2_nearest(
+        prop.multiProcessorCount * sm_factor, 64, 2048);
+    if (profile == "latency") {
+        target = std::max(32, target / 2);
+    }
+    return target;
+}
+
+int profile_decode_target(const pie_cuda_driver::Config& cfg,
+                          const cudaDeviceProp& prop) {
+    return profile_decode_target(
+        is_auto_memory_profile(cfg.batching.memory_profile)
+            ? "throughput"
+            : cfg.batching.memory_profile,
+        cfg,
+        prop);
+}
+
+int profile_prefill_target(const std::string& profile,
+                           const pie_cuda_driver::Config& cfg,
+                           const cudaDeviceProp& prop) {
+    const int tp = std::max(1, cfg.distributed.tp_size);
+    const int tp_factor = std::min(tp, 2);
+    const int sm_factor = profile == "throughput" ? 32 : 16;
+    const int max_target = profile == "throughput" ? 4096 : 8192;
+    int target = clamp_pow2_nearest(
+        prop.multiProcessorCount * sm_factor * tp_factor, 512, max_target);
+    if (profile == "latency" || profile == "capacity") {
+        target = std::max(512, target / 2);
+    }
+    return target;
+}
+
+int profile_prefill_target(const pie_cuda_driver::Config& cfg,
+                           const cudaDeviceProp& prop) {
+    return profile_prefill_target(
+        is_auto_memory_profile(cfg.batching.memory_profile)
+            ? "throughput"
+            : cfg.batching.memory_profile,
+        cfg,
+        prop);
+}
+
+void uniq_clip_desc(std::vector<int>& xs, int cap) {
+    for (int& x : xs) x = std::max(1, std::min(x, cap));
+    std::sort(xs.begin(), xs.end());
+    xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+    std::reverse(xs.begin(), xs.end());
 }
 
 CudaMemoryPlan plan_cuda_memory(
@@ -447,42 +583,19 @@ CudaMemoryPlan plan_cuda_memory(
     }
     const std::size_t budget = usable - current_used - safety;
 
-    const int decode_knee = clamp_pow2_nearest(prop.multiProcessorCount * 4, 256, 2048);
-    const int prefill_knee = clamp_pow2_nearest(prop.multiProcessorCount * 16, 1024, 8192);
+    const int tp_size = std::max(1, cfg.distributed.tp_size);
+    const bool auto_profile = is_auto_memory_profile(cfg.batching.memory_profile);
+    const std::vector<std::string> policy_profiles =
+        planner_policy_profiles(cfg.batching.memory_profile);
+    const std::vector<int> kv_page_sizes =
+        derive_kv_page_size_candidates(cfg, hf, prop);
 
-    std::vector<int> Ns = {
-        2 * prefill_knee,
-        prefill_knee,
-        std::max(1, prefill_knee / 2),
-        1024,
-        512,
-    };
-    std::vector<int> Rs = {
-        2 * decode_knee,
-        decode_knee,
-        std::max(1, decode_knee / 2),
-        256,
-        128,
-        64,
-        32,
-    };
-    auto uniq_clip = [](std::vector<int>& xs, int cap) {
-        for (int& x : xs) x = std::max(1, std::min(x, cap));
-        std::sort(xs.begin(), xs.end());
-        xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
-        std::reverse(xs.begin(), xs.end());
-    };
-    uniq_clip(Ns, 8192);
-    uniq_clip(Rs, 4096);
-
-    const std::size_t per_page_token_bytes =
+    const std::size_t per_kv_token_bytes =
         is_gemma4_arch
             ? kv_page_bytes_per_layer(hf, gemma4_per_layer_head_dim,
-                                      gemma4_kv_source_layer)
-            : kv_page_bytes_homogeneous(hf);
-    const std::size_t per_page_bytes =
-        per_page_token_bytes * static_cast<std::size_t>(cfg.batching.kv_page_size);
-    if (per_page_bytes == 0) {
+                                      gemma4_kv_source_layer, tp_size)
+            : kv_page_bytes_homogeneous(hf, tp_size);
+    if (per_kv_token_bytes == 0) {
         throw std::runtime_error("cuda memory planner: computed zero KV page bytes");
     }
 
@@ -508,13 +621,65 @@ CudaMemoryPlan plan_cuda_memory(
 
     struct Candidate {
         CudaMemoryPlan plan;
+        std::string policy_profile;
+        int decode_target = 0;
+        int prefill_target = 0;
         double score = -std::numeric_limits<double>::infinity();
     };
     std::vector<Candidate> candidates;
 
-    for (int N : Ns) {
-        for (int R0 : Rs) {
-            if (R0 > N) continue;
+    for (const auto& policy_profile : policy_profiles) {
+    const int decode_target = profile_decode_target(policy_profile, cfg, prop);
+    const int prefill_target = profile_prefill_target(policy_profile, cfg, prop);
+
+    std::vector<int> Ns = {
+        2 * prefill_target,
+        prefill_target,
+        std::max(1, prefill_target / 2),
+        1024,
+        512,
+    };
+    if (policy_profile == "throughput") {
+        Ns.push_back(4 * prefill_target);
+    }
+    if (policy_profile == "capacity") {
+        Ns.push_back(std::max(1, prefill_target / 4));
+    }
+    if (auto_profile) {
+        Ns.push_back(4 * prefill_target);
+        Ns.push_back(std::max(1, prefill_target / 4));
+    }
+    std::vector<int> Rs = {
+        2 * decode_target,
+        decode_target,
+        std::max(1, decode_target / 2),
+        256,
+        128,
+        64,
+        32,
+    };
+    if (policy_profile == "throughput" || auto_profile) {
+        Rs.push_back(4 * decode_target);
+    }
+    if (policy_profile == "latency") {
+        Rs.push_back(std::max(1, decode_target / 4));
+    }
+    uniq_clip_desc(Ns, 8192);
+    uniq_clip_desc(Rs, 4096);
+    if ((policy_profile == "throughput" || auto_profile) && tp_size == 1) {
+        Rs.erase(
+            std::remove_if(Rs.begin(), Rs.end(),
+                           [decode_target](int r) { return r > decode_target; }),
+            Rs.end());
+    }
+
+    for (int kv_page_size : kv_page_sizes) {
+        const std::size_t per_page_bytes =
+            per_kv_token_bytes * static_cast<std::size_t>(kv_page_size);
+        if (per_page_bytes == 0) continue;
+        for (int N : Ns) {
+            for (int R0 : Rs) {
+                if (R0 > N) continue;
             const int max_page_refs = std::max(262144, R0 * 512);
             const int max_custom_mask_bytes =
                 std::max(8 * 1024 * 1024,
@@ -533,7 +698,8 @@ CudaMemoryPlan plan_cuda_memory(
             if (is_gemma4_arch && hf.gemma4_enable_moe) {
                 arena += gemma4_moe_workspace_bytes(hf, N);
             }
-            arena += 64ull * 1024 * 1024; // AttentionWorkspace float section
+            const std::size_t attn_float_bytes = 80ull * 1024 * 1024;
+            arena += attn_float_bytes;     // AttentionWorkspace float section
             arena += 8ull * 1024 * 1024;  // AttentionWorkspace int section
             arena += persistent_input_bytes(N, R0, max_page_refs,
                                             max_custom_mask_bytes);
@@ -557,12 +723,17 @@ CudaMemoryPlan plan_cuda_memory(
             const int kv_pages = static_cast<int>(remaining / per_page_bytes);
             if (kv_pages <= 0) continue;
             const std::size_t kv_tokens =
-                static_cast<std::size_t>(kv_pages) * cfg.batching.kv_page_size;
+                static_cast<std::size_t>(kv_pages) * kv_page_size;
+            const double active_kv_horizon =
+                (!auto_profile && policy_profile == "latency") ? 256.0 : 608.0;
             const std::size_t min_kv_tokens = std::max<std::size_t>(
-                32768, static_cast<std::size_t>(2) * R * 512);
+                32768,
+                static_cast<std::size_t>(
+                    std::ceil(static_cast<double>(R) * active_kv_horizon)));
             if (kv_tokens < min_kv_tokens) continue;
 
             CudaMemoryPlan p;
+            p.kv_page_size = kv_page_size;
             p.max_workspace_tokens = N;
             p.max_requests = R;
             p.max_page_refs = std::max(262144, R * 512);
@@ -583,33 +754,99 @@ CudaMemoryPlan plan_cuda_memory(
             };
 
             const double prefill_score =
-                std::log2(static_cast<double>(N) + 1.0) /
-                std::log2(static_cast<double>(2 * prefill_knee) + 1.0);
+                target_saturation_score(N, prefill_target);
             const double decode_score =
-                std::log2(static_cast<double>(R) + 1.0) /
-                std::log2(static_cast<double>(2 * decode_knee) + 1.0);
+                target_saturation_score(R, decode_target);
+            const double decode_shape_penalty =
+                std::abs(log2_ratio(R, decode_target));
+            const double prefill_shape_penalty =
+                std::abs(log2_ratio(N, prefill_target));
+            const double prefill_overshoot_penalty =
+                std::max(0.0, log2_ratio(N, prefill_target));
             const double kv_score =
                 std::log1p(static_cast<double>(kv_tokens) / 65536.0);
+            const double kv_headroom =
+                static_cast<double>(kv_tokens) /
+                std::max(1.0, static_cast<double>(R) * active_kv_horizon);
+            const double kv_headroom_score = std::log1p(kv_headroom);
+            const double min_headroom =
+                auto_profile ? 1.0 :
+                policy_profile == "capacity" ? 1.0 :
+                policy_profile == "throughput" ? 1.0 :
+                1.25;
+            const double kv_headroom_penalty =
+                kv_headroom < min_headroom ? (min_headroom - kv_headroom) : 0.0;
             const double pressure =
                 static_cast<double>(arena + state_bytes) /
                 static_cast<double>(budget);
-            double score = 0.0;
-            const auto& profile = cfg.batching.memory_profile;
-            if (profile == "capacity") {
-                score = kv_score * 10.0 - static_cast<double>(arena) /
-                        static_cast<double>(1024ull * 1024ull * 1024ull);
-            } else if (profile == "throughput") {
-                score = prefill_score * 4.0 + decode_score * 4.0 +
-                        kv_score - pressure;
-            } else if (profile == "latency") {
-                score = prefill_score + decode_score * 0.75 + kv_score * 2.0 -
-                        static_cast<double>(R) / std::max(1, N) - pressure * 2.0;
+            double page_score = 0.0;
+            if (policy_profile == "latency") {
+                page_score = (kv_page_size == 16) ? 0.20 : -0.20;
+            } else if (policy_profile == "throughput" || auto_profile) {
+                page_score =
+                    (tp_size == 1)
+                        ? ((kv_page_size == 32) ? 0.25 : 0.0)
+                        : ((kv_page_size == 16) ? 0.25 : 0.0);
             } else {
-                score = prefill_score * 2.0 + decode_score * 2.0 +
-                        kv_score * 1.25 - pressure;
+                page_score = (kv_page_size == 32) ? 0.15 : 0.0;
             }
-            candidates.push_back(Candidate{p, score});
+            double score = 0.0;
+            const auto& profile = policy_profile;
+            if (auto_profile) {
+                const double cohort_score =
+                    target_saturation_score(R, decode_target);
+                const double kv_residency_score =
+                    std::log1p(kv_headroom) +
+                    std::log1p(static_cast<double>(kv_tokens) / 131072.0);
+                const double arena_mib =
+                    static_cast<double>(arena) /
+                    static_cast<double>(1024ull * 1024ull);
+                const double arena_penalty =
+                    arena_mib / 1024.0 + pressure * 0.75;
+                score = cohort_score * 6.0 +
+                        decode_score * 4.0 +
+                        prefill_score * 2.0 +
+                        kv_residency_score * 4.0 +
+                        page_score -
+                        decode_shape_penalty * 6.0 -
+                        prefill_overshoot_penalty * 0.75 -
+                        prefill_shape_penalty * 0.5 -
+                        kv_headroom_penalty * 4.0 -
+                        arena_penalty;
+            } else if (profile == "capacity") {
+                score = kv_score * 9.0 + kv_headroom_score * 4.0 +
+                        decode_score * 2.5 + page_score -
+                        decode_shape_penalty * 8.0 -
+                        prefill_shape_penalty * 2.0 -
+                        kv_headroom_penalty * 4.0 -
+                        static_cast<double>(arena) /
+                            static_cast<double>(512ull * 1024ull * 1024ull);
+            } else if (profile == "throughput") {
+                score = prefill_score * 3.0 + decode_score * 5.0 +
+                        kv_score * 1.25 + kv_headroom_score * 2.0 +
+                        page_score -
+                        decode_shape_penalty * 4.0 -
+                        prefill_shape_penalty * 0.75 -
+                        kv_headroom_penalty * 3.0 - pressure;
+            } else if (profile == "latency") {
+                score = prefill_score + decode_score * 1.5 +
+                        kv_score * 1.25 + kv_headroom_score + page_score -
+                        decode_shape_penalty * 2.0 -
+                        static_cast<double>(R) / std::max(1, N) -
+                        pressure * 2.0;
+            } else {
+                score = prefill_score * 1.5 + decode_score * 3.0 +
+                        kv_score * 3.0 + kv_headroom_score * 2.0 +
+                        page_score -
+                        decode_shape_penalty * 4.0 -
+                        prefill_shape_penalty -
+                        kv_headroom_penalty * 3.0 - pressure * 2.0;
+            }
+            candidates.push_back(Candidate{
+                p, policy_profile, decode_target, prefill_target, score});
+            }
         }
+    }
     }
 
     if (candidates.empty()) {
@@ -622,12 +859,22 @@ CudaMemoryPlan plan_cuda_memory(
             return a.score < b.score;
         });
     CudaMemoryPlan best_plan = tp_min_plan(cfg, best_it->plan);
+    const std::string best_policy_profile = best_it->policy_profile;
+    const int selected_decode_target = best_it->decode_target;
+    const int selected_prefill_target = best_it->prefill_target;
     if (verbose) {
         const auto& p = best_plan;
         std::cerr << "[pie-driver-cuda] memory planner: profile="
                   << cfg.batching.memory_profile
+                  << " resolved_profile=" << best_policy_profile
                   << " util=" << cfg.batching.gpu_mem_utilization
                   << " total=" << (total_bytes / (1024 * 1024)) << " MiB"
+                  << " sm=" << prop.multiProcessorCount
+                  << " tp=" << tp_size
+                  << " decode_target=" << selected_decode_target
+                  << " prefill_target=" << selected_prefill_target
+                  << " page_size=" << p.kv_page_size
+                  << " (auto)"
                   << " used_after_weights=" << (current_used / (1024 * 1024))
                   << " MiB safety=" << (safety / (1024 * 1024)) << " MiB"
                   << " budget=" << (budget / (1024 * 1024)) << " MiB"
@@ -636,6 +883,9 @@ CudaMemoryPlan plan_cuda_memory(
                   << " page_refs=" << p.max_page_refs
                   << " arena=" << (p.arena_bytes / (1024 * 1024)) << " MiB"
                   << " kv_pages=" << p.kv_pages
+                  << " kv_tokens="
+                  << (static_cast<std::size_t>(p.kv_pages) *
+                      p.kv_page_size)
                   << " state_slots=" << p.state_slots
                   << "\n";
     }
@@ -694,7 +944,8 @@ int run_parity(const pie_cuda_driver::Config& cfg,
     } else if (is_qwen3_5_moe) {
         weights_qwen3_5_moe = pie_cuda_driver::model::bind_qwen3_5_moe(engine);
     } else {
-        weights = pie_cuda_driver::model::bind_llama_like(engine);
+        weights = pie_cuda_driver::model::bind_llama_like(
+            engine, /*drop_fused_originals=*/false);
     }
 
     // Read tokens from disk.
@@ -755,7 +1006,12 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             return 5;
         }
         const int prefill_N  = decode_after_prefill ? (N - 1) : N;
-        const int page_size  = static_cast<int>(cfg.batching.kv_page_size);
+        int parity_dev_id = 0;
+        CUDA_CHECK(cudaGetDevice(&parity_dev_id));
+        cudaDeviceProp parity_prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&parity_prop, parity_dev_id));
+        const int page_size = derive_kv_page_size(
+            cfg, engine.hf_config(), parity_prop);
         const int total_pages = (N + page_size - 1) / page_size;
 
         auto cache = pie_cuda_driver::KvCache::allocate(
@@ -1081,6 +1337,9 @@ int run_impl(int argc,
                    "the TP group. Only required when tp_size > 1.");
 
     CLI11_PARSE(app, argc, argv);
+    if (std::getenv("PIE_DISABLE_CUDA_GRAPHS")) {
+        use_cuda_graphs = false;
+    }
 
     auto cfg = pie_cuda_driver::load_config(config_path);
     if (cli_tp_size >= 1) cfg.distributed.tp_size = cli_tp_size;
@@ -1321,16 +1580,25 @@ int run_impl(int argc,
     // and dual head_dim (sliding=256 vs full=512), so ws.q/k/v need
     // the full-attention sizing. Other archs use the single config
     // values.
-    int max_mlp_intermediate = engine.hf_config().intermediate_size;
-    int max_Hq = engine.hf_config().num_attention_heads * engine.hf_config().head_dim;
-    int max_Hk = engine.hf_config().num_key_value_heads * engine.hf_config().head_dim;
+    const int local_tp_size = std::max(1, cfg.distributed.tp_size);
+    const int local_q_heads =
+        engine.hf_config().num_attention_heads / local_tp_size;
+    const int local_kv_heads =
+        engine.hf_config().num_key_value_heads / local_tp_size;
+    int max_mlp_intermediate =
+        engine.hf_config().intermediate_size / local_tp_size;
+    int max_Hq = local_q_heads * engine.hf_config().head_dim;
+    int max_Hk = local_kv_heads * engine.hf_config().head_dim;
     if (is_gemma4_arch) {
         for (int v : weights_gemma4.per_layer_intermediate) {
-            if (v > max_mlp_intermediate) max_mlp_intermediate = v;
+            // Gemma-4 binds this from the already-loaded projection shape,
+            // so it is already per-rank under TP.
+            const int local_v = v;
+            if (local_v > max_mlp_intermediate) max_mlp_intermediate = local_v;
         }
         for (int d : weights_gemma4.per_layer_head_dim) {
-            const int Hq = engine.hf_config().num_attention_heads * d;
-            const int Hk = engine.hf_config().num_key_value_heads * d;
+            const int Hq = local_q_heads * d;
+            const int Hk = local_kv_heads * d;
             if (Hq > max_Hq) max_Hq = Hq;
             if (Hk > max_Hk) max_Hk = Hk;
         }
@@ -1339,7 +1607,8 @@ int run_impl(int argc,
         // uniform across layers on gemma3n, so KV cache can use the
         // standard allocator.
         for (int v : weights_gemma3n.per_layer_intermediate) {
-            if (v > max_mlp_intermediate) max_mlp_intermediate = v;
+            const int local_v = v / local_tp_size;
+            if (local_v > max_mlp_intermediate) max_mlp_intermediate = local_v;
         }
     }
 
@@ -1361,12 +1630,19 @@ int run_impl(int argc,
 
     const int qwen3_5_linear_layers = static_cast<int>(std::count(
         qwen3_5_layer_is_linear.begin(), qwen3_5_layer_is_linear.end(), true));
+
     const CudaMemoryPlan mem_plan = plan_cuda_memory(
         cfg, engine.hf_config(), max_mlp_intermediate, max_Hq, max_Hk,
         is_gemma4_arch, weights_gemma4.per_layer_head_dim,
         weights_gemma4.kv_source_layer, is_qwen3_5_arch,
         is_qwen3_5_moe_arch, qwen3_5_linear_layers, verbose);
     const int max_workspace_tokens = mem_plan.max_workspace_tokens;
+    const int runtime_kv_pages =
+        mem_plan.kv_pages > 1 ? mem_plan.kv_pages - 1 : mem_plan.kv_pages;
+    const int physical_kv_pages =
+        mem_plan.kv_pages > 1 ? runtime_kv_pages + 1 : mem_plan.kv_pages;
+    const int graph_pad_page =
+        mem_plan.kv_pages > 1 ? runtime_kv_pages : -1;
 
     auto ws = pie_cuda_driver::model::Qwen3Workspace::allocate_full(
         engine.hf_config(), max_workspace_tokens,
@@ -1376,19 +1652,21 @@ int run_impl(int argc,
         is_gemma4_arch
             ? pie_cuda_driver::KvCache::allocate_per_layer(
                   engine.hf_config().num_hidden_layers,
-                  mem_plan.kv_pages,
-                  static_cast<int>(cfg.batching.kv_page_size),
-                  engine.hf_config().num_key_value_heads,
+                  physical_kv_pages,
+                  mem_plan.kv_page_size,
+                  local_kv_heads,
                   weights_gemma4.per_layer_head_dim,
                   weights_gemma4.kv_source_layer)
             : pie_cuda_driver::KvCache::allocate(
                   engine.hf_config().num_hidden_layers,
-                  mem_plan.kv_pages,
-                  static_cast<int>(cfg.batching.kv_page_size),
-                  engine.hf_config().num_key_value_heads,
+                  physical_kv_pages,
+                  mem_plan.kv_page_size,
+                  local_kv_heads,
                   engine.hf_config().head_dim_kernel);
 
-    auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate();
+    const std::size_t attn_float_workspace_bytes = 80ull * 1024 * 1024;
+    auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate(
+        attn_float_workspace_bytes, 8ull * 1024 * 1024);
 
     // Plan-state holders used by the prepare/body split for graph-friendly
     // dispatch. Allocated unconditionally — empty on archs that don't use
@@ -1460,8 +1738,8 @@ int run_impl(int argc,
     auto swap_pool = pie_cuda_driver::SwapPool::allocate(
         engine.hf_config().num_hidden_layers,
         static_cast<int>(cfg.batching.swap_pool_size),
-        static_cast<int>(cfg.batching.kv_page_size),
-        engine.hf_config().num_key_value_heads,
+        mem_plan.kv_page_size,
+        local_kv_heads,
         engine.hf_config().head_dim_kernel);
 
     pie_cuda_driver::ops::CublasHandle cublas;
@@ -1474,9 +1752,31 @@ int run_impl(int argc,
         /*max_kv_pages=*/mem_plan.max_page_refs,
         mem_plan.capacity.max_custom_mask_bytes);
 
+    pie_cuda_driver::CustomAllReduce custom_ar;
+    const bool disable_custom_ar = std::getenv("PIE_DISABLE_CUSTOM_AR") != nullptr;
+    if (tp_comm_ptr != nullptr && vtable_opt != nullptr &&
+        cfg.distributed.tp_size == 2 && !disable_custom_ar) {
+        custom_ar = pie_cuda_driver::CustomAllReduce(
+            *tp_comm_ptr, /*same_process=*/true,
+            /*max_bytes=*/8 * 1024 * 1024,
+            /*rank_data_bytes=*/8 * 1024 * 1024,
+            /*fusion_max_tokens=*/mem_plan.max_requests,
+            /*fusion_hidden=*/engine.hf_config().hidden_size);
+        custom_ar.register_buffer(*tp_comm_ptr, ws.norm_x.data(),
+                                  ws.norm_x.nbytes());
+        tp_comm_ptr->set_custom_all_reduce(&custom_ar);
+    } else if (verbose && disable_custom_ar) {
+        std::cerr << "[pie-driver-cuda] custom allreduce disabled by "
+                  << "PIE_DISABLE_CUSTOM_AR\n";
+    }
+
     if (verbose) {
         std::cerr << "[pie-driver-cuda] kv_cache: "
-                  << kv_cache.num_pages() << " pages × "
+                  << runtime_kv_pages << " runtime pages";
+        if (graph_pad_page >= 0) {
+            std::cerr << " (+1 graph pad page)";
+        }
+        std::cerr << " × "
                   << kv_cache.page_size() << " tokens; "
                   << "workspace tokens=" << max_workspace_tokens
                   << "; max requests=" << mem_plan.max_requests
@@ -1553,10 +1853,15 @@ int run_impl(int argc,
         const bool gqa_in_decode_set = (gqa == 1 || gqa == 2 || gqa == 3
                                         || gqa == 4 || gqa == 8);
         fwd_cfg.force_prefill_path = !gqa_in_decode_set;
+        if (std::getenv("PIE_FORCE_PREFILL_DECODE")) {
+            fwd_cfg.force_prefill_path = true;
+        }
+        fwd_cfg.decode_plan_cuda_graph = use_cuda_graphs;
         // Tensor-parallel state. tp_comm == nullptr at tp_size == 1
         // keeps the original single-GPU branches in the forward kernels.
         fwd_cfg.tp_size = cfg.distributed.tp_size;
         fwd_cfg.tp_comm = tp_comm_ptr;
+        fwd_cfg.emit_logits = (cfg.distributed.tp_rank == 0);
 
         // Gemma-2 / Gemma-3 forward knobs. `query_pre_attn_scalar` and
         // `final_logit_softcapping` come straight from the HF config —
@@ -1648,7 +1953,10 @@ int run_impl(int argc,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
-            const std::int32_t* slot_ids_d) {
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* /*logit_row_indices_d*/,
+            int /*num_logit_rows*/,
+            bool /*tp_greedy_argmax*/) {
             pie_cuda_driver::model::gemma4_forward_paged(
                 weights_gemma4, engine.hf_config(), gemma4_fwd_cfg,
                 ws, gemma4_moe_ws, cache, attn_ws, cublas,
@@ -1681,7 +1989,10 @@ int run_impl(int argc,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
-            const std::int32_t* slot_ids_d) {
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* /*logit_row_indices_d*/,
+            int /*num_logit_rows*/,
+            bool /*tp_greedy_argmax*/) {
             pie_cuda_driver::model::gemma3n_forward_paged(
                 weights_gemma3n, engine.hf_config(), gemma3n_fwd_cfg,
                 ws, cache, attn_ws, cublas,
@@ -1706,7 +2017,10 @@ int run_impl(int argc,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
-            const std::int32_t* slot_ids_d) {
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* /*logit_row_indices_d*/,
+            int /*num_logit_rows*/,
+            bool /*tp_greedy_argmax*/) {
             pie_cuda_driver::model::gemma2_forward_paged(
                 weights_gemma, engine.hf_config(), gemma_fwd_cfg,
                 ws, cache, attn_ws, cublas,
@@ -1736,7 +2050,10 @@ int run_impl(int argc,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
-            const std::int32_t* slot_ids_d) {
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* /*logit_row_indices_d*/,
+            int /*num_logit_rows*/,
+            bool /*tp_greedy_argmax*/) {
             pie_cuda_driver::model::mixtral_forward_paged(
                 weights_mixtral, engine.hf_config(), fwd_cfg,
                 num_experts, top_k,
@@ -1784,7 +2101,10 @@ int run_impl(int argc,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
-            const std::int32_t* slot_ids_d) {
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* /*logit_row_indices_d*/,
+            int /*num_logit_rows*/,
+            bool /*tp_greedy_argmax*/) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
             const auto& hf_q = engine.hf_config();
             const int gqa_q = hf_q.num_attention_heads /
@@ -1843,7 +2163,10 @@ int run_impl(int argc,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
-            const std::int32_t* slot_ids_d) {
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* /*logit_row_indices_d*/,
+            int /*num_logit_rows*/,
+            bool /*tp_greedy_argmax*/) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
             const auto& hf_q = engine.hf_config();
             const int gqa_q = hf_q.num_attention_heads /
@@ -1877,6 +2200,10 @@ int run_impl(int argc,
         // device offsets, so the captured kernel reads fresh data through
         // its stable pointer args.
         forward_fn.graph_safe = true;
+        forward_fn.supports_compact_logits = true;
+        forward_fn.supports_tp_greedy_argmax =
+            cfg.distributed.tp_size > 1 &&
+            weights_llama.lm_head_tp_shard != nullptr;
         forward_fn.prepare = [&engine, &kv_cache, &fwd_cfg, &llama_plan](
             pie_cuda_driver::AttentionWorkspace& attn_ws,
             const std::uint32_t* kv_page_indptr_h,
@@ -1884,6 +2211,10 @@ int run_impl(int argc,
             pie_cuda_driver::model::prepare_llama_like_decode_plan(
                 llama_plan, attn_ws, kv_cache, engine.hf_config(),
                 fwd_cfg, kv_page_indptr_h, R, is_pure_decode);
+        };
+        forward_fn.graph_layout = [&llama_plan]() {
+            return pie_cuda_driver::model::llama_like_decode_graph_layout(
+                llama_plan);
         };
         forward_fn.body = [&engine, &weights_llama, fwd_cfg, &llama_plan](
             pie_cuda_driver::model::Qwen3Workspace& ws,
@@ -1900,20 +2231,29 @@ int run_impl(int argc,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
-            const std::int32_t* slot_ids_d) {
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* logit_row_indices_d,
+            int num_logit_rows,
+            bool tp_greedy_argmax) {
             pie_cuda_driver::model::llama_like_forward_paged(
                 weights_llama, engine.hf_config(), fwd_cfg, llama_plan,
                 ws, cache, attn_ws, cublas,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, is_pure_decode, mask_d, mask_indptr_d);
+                N, R, is_pure_decode,
+                logit_row_indices_d, num_logit_rows,
+                tp_greedy_argmax,
+                mask_d, mask_indptr_d);
         };
     }
 
     pie_cuda_driver::Executor executor{
         engine, ws, kv_cache, attn_ws, cublas,
-        max_workspace_tokens, persistent_inputs, verbose, std::move(forward_fn),
+        max_workspace_tokens,
+        mem_plan.max_requests,
+        graph_pad_page,
+        persistent_inputs, verbose, std::move(forward_fn),
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
@@ -1941,7 +2281,12 @@ int run_impl(int argc,
     // state; posting that idle receive while the leader is still allocating can
     // show as a persistent 100% GPU-util spin and has reproduced startup
     // wedges. Rendezvous on CPU after all persistent allocations are complete,
-    // then publish rank-0 readiness and let followers enter the NCCL loop.
+    // then pre-capture any graph-safe decode lattice before rank 0 publishes
+    // readiness and followers enter the NCCL loop.
+    tp_startup_cpu_barrier(cfg);
+    if (use_cuda_graphs) {
+        pie_cuda_driver::capture_forward_graph_lattice(executor);
+    }
     tp_startup_cpu_barrier(cfg);
 
     if (is_tp_follower) {
@@ -1962,11 +2307,11 @@ int run_impl(int argc,
         // KV cache. Only rank 0 reports — the wrapper expects exactly
         // one READY per TP group.
         auto c = engine.capabilities();
-        c.total_pages = kv_cache.num_pages();
+        c.total_pages = runtime_kv_pages;
         c.swap_pool_size = swap_pool.num_pages();
         nlohmann::json caps = {
             {"total_pages",            c.total_pages},
-            {"kv_page_size",           c.kv_page_size},
+            {"kv_page_size",           mem_plan.kv_page_size},
             {"swap_pool_size",         c.swap_pool_size},
             {"max_forward_tokens",     mem_plan.capacity.max_forward_tokens},
             {"max_forward_requests",   mem_plan.capacity.max_forward_requests},

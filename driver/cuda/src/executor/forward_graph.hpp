@@ -45,15 +45,52 @@ namespace pie_cuda_driver {
 // affect graph topology.
 struct ForwardGraphKey {
     int num_requests;
+    std::uint8_t variant = 0;
 
     bool operator==(const ForwardGraphKey& o) const noexcept {
-        return num_requests == o.num_requests;
+        return num_requests == o.num_requests && variant == o.variant;
     }
 };
 
+// vLLM-style decode graph lattice. Runtime batches are padded upward to
+// one of these request counts before graph capture/replay:
+//   1, 2, 4, then multiples of 8 up to 256, then multiples of 16.
+// The planner's max request count is also a legal bucket even when it is
+// off-lattice, matching vLLM's "append max if it fits" behavior.
+constexpr int forward_graph_request_bucket(int requests,
+                                           int max_requests) noexcept {
+    if (requests <= 0 || max_requests <= 0 || requests > max_requests) {
+        return 0;
+    }
+
+    int bucket = requests;
+    if (requests <= 1) {
+        bucket = 1;
+    } else if (requests <= 2) {
+        bucket = 2;
+    } else if (requests <= 4) {
+        bucket = 4;
+    } else if (requests < 256) {
+        bucket = ((requests + 7) / 8) * 8;
+    } else {
+        bucket = ((requests + 15) / 16) * 16;
+    }
+
+    return bucket <= max_requests ? bucket : max_requests;
+}
+
+static_assert(forward_graph_request_bucket(1, 512) == 1);
+static_assert(forward_graph_request_bucket(3, 512) == 4);
+static_assert(forward_graph_request_bucket(5, 512) == 8);
+static_assert(forward_graph_request_bucket(255, 512) == 256);
+static_assert(forward_graph_request_bucket(257, 512) == 272);
+static_assert(forward_graph_request_bucket(506, 512) == 512);
+static_assert(forward_graph_request_bucket(129, 130) == 130);
+
 struct ForwardGraphKeyHash {
     std::size_t operator()(const ForwardGraphKey& k) const noexcept {
-        return static_cast<std::size_t>(k.num_requests);
+        return static_cast<std::size_t>(k.num_requests) ^
+               (static_cast<std::size_t>(k.variant) << 24);
     }
 };
 
@@ -95,7 +132,7 @@ public:
     std::size_t size() const noexcept { return execs_.size(); }
 
 private:
-    static constexpr std::size_t kMaxEntries = 32;
+    static constexpr std::size_t kMaxEntries = 128;
     std::unordered_map<ForwardGraphKey, cudaGraphExec_t,
                        ForwardGraphKeyHash> execs_;
 };

@@ -146,7 +146,7 @@ Driver discriminator + universal driver fields:
 | `tensor_parallel_size` | `1` | TP world size. |
 | `activation_dtype` | `"bfloat16"` | Activation dtype for forward passes. |
 | `random_seed` | `42` | Seed used by samplers and dropout-free stochastic ops. |
-| `ipc_profile` | `"balanced"` | IPC wait profile. `low_latency` uses the polling in-process channel for embedded CUDA/portable drivers and busy-spins on shmem; `balanced` spins for 1000 us then parks; `low_power` parks immediately. |
+| `ipc_profile` | driver-dependent | IPC wait profile. Omitted CUDA uses `latency`; omitted non-CUDA uses `balanced`. `latency` uses the polling in-process channel for embedded CUDA/portable drivers and busy-spins on shmem; `balanced` spins for 1000 us then parks; `power` parks immediately. |
 | `spin_budget_us` | unset | Expert override for the profile's busy-spin window in microseconds. Leave unset unless tuning latency/CPU tradeoffs directly. |
 
 ### `[model.driver.options]`

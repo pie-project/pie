@@ -19,6 +19,21 @@ void launch_rmsnorm_bf16(
     float eps,
     cudaStream_t stream);
 
+// Fused pre-norm TP helper:
+//   hidden = round_bf16(hidden + residual)
+//   norm_out = rmsnorm(hidden, weight)
+// The hidden update matches launch_residual_add_bf16's bf16 rounding before
+// the norm pass, so it is numerically equivalent to the two-kernel sequence.
+void launch_residual_add_rmsnorm_bf16(
+    void* hidden,          // [num_rows, hidden_size] bf16, in-place
+    const void* residual,  // [num_rows, hidden_size] bf16
+    const void* weight,    // [hidden_size]
+    void* norm_out,        // [num_rows, hidden_size] bf16
+    int num_rows,
+    int hidden_size,
+    float eps,
+    cudaStream_t stream);
+
 // Gemma family RMSNorm — applies `(1 + w) * x_hat` instead of `w * x_hat`.
 // HF stores Gemma's RMSNorm gamma centered at zero; this lets the loaded
 // tensor be inspected/initialized like a residual gate, but downstream

@@ -1,15 +1,21 @@
 #include "model/llama_like.hpp"
 
+#include <cstdlib>
+#include <cstdint>
+
 #include <cuda_runtime.h>
 
+#include "custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/embed.hpp"
+#include "kernels/gather_rows.hpp"
 #include "kernels/head_dim_pad.hpp"
 #include "kernels/kv_paged.hpp"
 #include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
+#include "kernels/sample_temp.hpp"
 #include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
 #include "ops/attention_flashinfer.hpp"
@@ -92,7 +98,15 @@ void prepare_llama_like_decode_plan(
     ops::plan_attention_flashinfer_decode_bf16(
         *state.decode_plan, kv_page_indptr_h, num_requests,
         num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
-        cache.page_size(), attn_ws, /*stream=*/nullptr);
+        cache.page_size(), attn_ws, /*stream=*/nullptr,
+        fwd_cfg.decode_plan_cuda_graph);
+}
+
+std::uint8_t llama_like_decode_graph_layout(
+    const LlamaLikePlanState& state)
+{
+    if (!state.decode_plan) return 0;
+    return ops::decode_plan_graph_layout(*state.decode_plan);
 }
 
 void llama_like_forward_paged(
@@ -115,6 +129,9 @@ void llama_like_forward_paged(
     int N,
     int R,
     bool is_pure_decode,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows,
+    bool tp_greedy_argmax,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d)
 {
@@ -177,6 +194,9 @@ void llama_like_forward_paged(
         plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;
 
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
+    bool have_next_attn_norm = false;
+    bool have_final_norm = false;
+    const void* final_norm_buf = nullptr;
 
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
@@ -186,10 +206,13 @@ void llama_like_forward_paged(
         //                     to attn_out *before* the residual add.
         const void* qkv_in = ws.y.data();
         if (!post_norm) {
-            kernels::launch_rmsnorm_bf16(
-                ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
-                N, H, eps, stream);
+            if (!have_next_attn_norm) {
+                kernels::launch_rmsnorm_bf16(
+                    ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
+                    N, H, eps, stream);
+            }
             qkv_in = ws.norm_x.data();
+            have_next_attn_norm = false;
         }
 
         // QKV: fused path when the bind helper materialised
@@ -248,17 +271,37 @@ void llama_like_forward_paged(
                     N * num_heads_local, d, eps, stream);
             }
         };
-        if (fwd_cfg.use_qk_norm && layer.q_norm) {
-            rmsnorm_qk(ws.q.data(), layer.q_norm, num_q_heads_local, Hq);
-        }
-        if (fwd_cfg.use_qk_norm && layer.k_norm) {
-            rmsnorm_qk(ws.k.data(), layer.k_norm, num_kv_heads_local, Hk);
-        }
+        const bool q_norm_is_per_head =
+            layer.q_norm && layer.q_norm->shape().size() == 1 &&
+            layer.q_norm->shape()[0] == d;
+        const bool k_norm_is_per_head =
+            layer.k_norm && layer.k_norm->shape().size() == 1 &&
+            layer.k_norm->shape()[0] == d;
+        const bool fuse_qk_norm_rope =
+            std::getenv("PIE_DISABLE_QK_ROPE_FUSION") == nullptr &&
+            T == 1 &&
+            fwd_cfg.use_qk_norm &&
+            q_norm_is_per_head && k_norm_is_per_head &&
+            fwd_cfg.rope_kind == RopeKind::Standard;
+        if (fuse_qk_norm_rope) {
+            kernels::launch_qk_rmsnorm_rope_bf16(
+                ws.q.data(), ws.k.data(),
+                layer.q_norm->data(), layer.k_norm->data(),
+                positions, N, num_q_heads_local, num_kv_heads_local, d,
+                cfg.rope_theta, eps, stream);
+        } else {
+            if (fwd_cfg.use_qk_norm && layer.q_norm) {
+                rmsnorm_qk(ws.q.data(), layer.q_norm, num_q_heads_local, Hq);
+            }
+            if (fwd_cfg.use_qk_norm && layer.k_norm) {
+                rmsnorm_qk(ws.k.data(), layer.k_norm, num_kv_heads_local, Hk);
+            }
 
-        apply_rope(fwd_cfg, cfg,
-                   ws.q.data(), ws.k.data(), positions,
-                   N, num_q_heads_local, num_kv_heads_local, d,
-                   stream);
+            apply_rope(fwd_cfg, cfg,
+                       ws.q.data(), ws.k.data(), positions,
+                       N, num_q_heads_local, num_kv_heads_local, d,
+                       stream);
+        }
 
         // Pad Q/K/V to `dk` when the model's head_dim isn't a flashinfer
         // dispatch value. The padded buffers are zero on the trailing
@@ -285,11 +328,19 @@ void llama_like_forward_paged(
             attn_out_buf = ws.attn_out_padded.data();
         }
 
-        kernels::launch_write_kv_to_pages_bf16(
-            cache.k(L), cache.v(L),
-            const_cast<void*>(attn_k), const_cast<void*>(attn_v),
-            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, cache.page_size(), num_kv_heads_local, dk, stream);
+        if (is_pure_decode) {
+            kernels::launch_write_kv_decode_to_pages_bf16(
+                cache.k(L), cache.v(L),
+                const_cast<void*>(attn_k), const_cast<void*>(attn_v),
+                kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                R, cache.page_size(), num_kv_heads_local, dk, stream);
+        } else {
+            kernels::launch_write_kv_to_pages_bf16(
+                cache.k(L), cache.v(L),
+                const_cast<void*>(attn_k), const_cast<void*>(attn_v),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                N, R, cache.page_size(), num_kv_heads_local, dk, stream);
+        }
 
         // Per-layer sliding-window dispatch (OLMo-3, Mistral). When
         // `per_layer_window_left` is empty we fall back to the global
@@ -335,6 +386,7 @@ void llama_like_forward_paged(
                 N, num_q_heads_local, d, dk, stream);
         }
 
+        bool have_mlp_norm = false;
         if (!post_norm) {
             // o_proj is row-parallel: each rank's GEMM produces a partial
             // [N, H] contribution. Single-GPU fuses it into y as a
@@ -349,10 +401,20 @@ void llama_like_forward_paged(
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.attn_out.data(), make_weight_view(layer.o_proj, layer.o_proj_quant),
                     ws.norm_x.data(), N, H, Hq, /*beta=*/0.f);
-                tp->all_reduce_bf16(ws.norm_x.data(),
-                    static_cast<std::size_t>(N) * H, ncclSum, stream);
-                kernels::launch_residual_add_bf16(
-                    ws.y.data(), ws.norm_x.data(), N * H, stream);
+                auto* fused_ar = tp->custom_all_reduce();
+                if (fused_ar != nullptr &&
+                    fused_ar->can_fuse_residual_rmsnorm(N, H, stream)) {
+                    fused_ar->all_reduce_residual_rmsnorm_bf16(
+                        ws.norm_x.data(), ws.y.data(), layer.mlp_norm->data(),
+                        ws.norm_y.data(), N, H, eps, stream);
+                } else {
+                    tp->all_reduce_bf16_out(ws.norm_x.data(), ws.norm_y.data(),
+                        static_cast<std::size_t>(N) * H, ncclSum, stream);
+                    kernels::launch_residual_add_rmsnorm_bf16(
+                        ws.y.data(), ws.norm_y.data(), layer.mlp_norm->data(),
+                        ws.norm_y.data(), N, H, eps, stream);
+                }
+                have_mlp_norm = true;
             }
         } else {
             // Post-norm: o_proj writes to norm_x (a scratch we own here),
@@ -374,9 +436,11 @@ void llama_like_forward_paged(
         // MLP block.
         const void* mlp_in = ws.y.data();
         if (!post_norm) {
-            kernels::launch_rmsnorm_bf16(
-                ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
-                N, H, eps, stream);
+            if (!have_mlp_norm) {
+                kernels::launch_rmsnorm_bf16(
+                    ws.y.data(), layer.mlp_norm->data(), ws.norm_y.data(),
+                    N, H, eps, stream);
+            }
             mlp_in = ws.norm_y.data();
         }
 
@@ -387,10 +451,8 @@ void llama_like_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 mlp_in, ops::WeightView(*layer.gate_up_proj_fused),
                 ws.gate_up_fused.data(), N, 2 * I, H);
-            kernels::launch_split_gate_up_bf16(
-                ws.gate_up_fused.data(),
-                ws.gate.data(), ws.up.data(),
-                N, I, stream);
+            kernels::launch_chunked_swiglu_bf16(
+                ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
         } else {
             ops::gemm_act_x_w(cublas.handle(),
                 mlp_in, make_weight_view(layer.gate_proj, layer.gate_proj_quant),
@@ -398,10 +460,10 @@ void llama_like_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 mlp_in, make_weight_view(layer.up_proj, layer.up_proj_quant),
                 ws.up.data(),   N, I, H);
+            kernels::launch_swiglu_bf16(
+                ws.gate.data(), ws.up.data(), ws.gate.data(),
+                N * I, stream);
         }
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
 
         if (!post_norm) {
             // down_proj is row-parallel: same all-reduce + residual-add
@@ -416,10 +478,29 @@ void llama_like_forward_paged(
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.gate.data(), make_weight_view(layer.down_proj, layer.down_proj_quant),
                     ws.norm_x.data(), N, H, I, /*beta=*/0.f);
-                tp->all_reduce_bf16(ws.norm_x.data(),
-                    static_cast<std::size_t>(N) * H, ncclSum, stream);
-                kernels::launch_residual_add_bf16(
-                    ws.y.data(), ws.norm_x.data(), N * H, stream);
+                auto* fused_ar = tp->custom_all_reduce();
+                if (fused_ar != nullptr &&
+                    fused_ar->can_fuse_residual_rmsnorm(N, H, stream)) {
+                    if (L + 1 < cfg.num_hidden_layers) {
+                        fused_ar->all_reduce_residual_rmsnorm_bf16(
+                            ws.norm_x.data(), ws.y.data(),
+                            w.layers[L + 1].attn_norm->data(),
+                            ws.norm_x.data(), N, H, eps, stream);
+                        have_next_attn_norm = true;
+                    } else {
+                        fused_ar->all_reduce_residual_rmsnorm_bf16(
+                            ws.norm_x.data(), ws.y.data(),
+                            w.final_norm->data(),
+                            ws.norm_y.data(), N, H, eps, stream);
+                        have_final_norm = true;
+                        final_norm_buf = ws.norm_y.data();
+                    }
+                } else {
+                    tp->all_reduce_bf16_out(ws.norm_x.data(), ws.norm_y.data(),
+                        static_cast<std::size_t>(N) * H, ncclSum, stream);
+                    kernels::launch_residual_add_bf16(
+                        ws.y.data(), ws.norm_y.data(), N * H, stream);
+                }
             }
         } else {
             // Post-norm MLP: down_proj → norm_x scratch, norm_mlp, += y.
@@ -438,12 +519,93 @@ void llama_like_forward_paged(
         }
     }
 
-    kernels::launch_rmsnorm_bf16(
-        ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
-        N, H, eps, stream);
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), *w.lm_head, ws.logits.data(),
-        N, V, H);
+    const bool use_tp_greedy =
+        tp_greedy_argmax && T > 1 && tp != nullptr &&
+        w.lm_head_tp_shard != nullptr &&
+        w.lm_head_tp_shard->shape().size() == 2 &&
+        w.lm_head_tp_shard->shape()[0] > 0 &&
+        T <= 8;
+    if (use_tp_greedy) {
+        const bool compact_logits =
+            logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+            num_logit_rows < N;
+        const int V_local = static_cast<int>(w.lm_head_tp_shard->shape()[0]);
+        const void* final_act = final_norm_buf;
+        int lm_head_rows = N;
+        if (compact_logits) {
+            if (have_final_norm) {
+                kernels::launch_gather_bf16_rows(
+                    static_cast<const std::uint16_t*>(final_norm_buf),
+                    logit_row_indices_d,
+                    static_cast<std::uint16_t*>(ws.norm_x.data()),
+                    num_logit_rows, H, stream);
+                final_act = ws.norm_x.data();
+            } else {
+                kernels::launch_gather_bf16_rows(
+                    static_cast<const std::uint16_t*>(ws.y.data()),
+                    logit_row_indices_d,
+                    static_cast<std::uint16_t*>(ws.norm_x.data()),
+                    num_logit_rows, H, stream);
+                kernels::launch_rmsnorm_bf16(
+                    ws.norm_x.data(), w.final_norm->data(), ws.norm_y.data(),
+                    num_logit_rows, H, eps, stream);
+                final_act = ws.norm_y.data();
+            }
+            lm_head_rows = num_logit_rows;
+        } else if (!have_final_norm) {
+            kernels::launch_rmsnorm_bf16(
+                ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
+                N, H, eps, stream);
+            final_act = ws.norm_x.data();
+        }
+        ops::gemm_act_x_w(cublas.handle(),
+            final_act, *w.lm_head_tp_shard, ws.logits.data(),
+            lm_head_rows, V_local, H);
+        kernels::launch_argmax_bf16_pair_with_offset(
+            ws.logits.data(),
+            reinterpret_cast<std::uint64_t*>(ws.greedy_pairs.data()),
+            lm_head_rows, V_local, w.lm_head_tp_vocab_offset, stream);
+        tp->all_gather_bytes(
+            ws.greedy_pairs.data(), ws.greedy_pairs_all.data(),
+            static_cast<std::size_t>(lm_head_rows) * sizeof(std::uint64_t),
+            stream);
+    } else if (fwd_cfg.emit_logits) {
+        const bool compact_logits =
+            logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+            num_logit_rows < N;
+        const void* lm_head_input =
+            have_final_norm ? final_norm_buf : ws.norm_y.data();
+        int lm_head_rows = N;
+        if (compact_logits) {
+            if (have_final_norm) {
+                kernels::launch_gather_bf16_rows(
+                    static_cast<const std::uint16_t*>(final_norm_buf),
+                    logit_row_indices_d,
+                    static_cast<std::uint16_t*>(ws.norm_x.data()),
+                    num_logit_rows, H, stream);
+                lm_head_input = ws.norm_x.data();
+            } else {
+                kernels::launch_gather_bf16_rows(
+                    static_cast<const std::uint16_t*>(ws.y.data()),
+                    logit_row_indices_d,
+                    static_cast<std::uint16_t*>(ws.norm_x.data()),
+                    num_logit_rows, H, stream);
+                kernels::launch_rmsnorm_bf16(
+                    ws.norm_x.data(), w.final_norm->data(), ws.norm_y.data(),
+                    num_logit_rows, H, eps, stream);
+                lm_head_input = ws.norm_y.data();
+            }
+            lm_head_rows = num_logit_rows;
+        } else if (!have_final_norm) {
+            kernels::launch_rmsnorm_bf16(
+                ws.y.data(), w.final_norm->data(), ws.norm_y.data(),
+                N, H, eps, stream);
+            lm_head_input = ws.norm_y.data();
+        }
+        ops::gemm_act_x_w(cublas.handle(),
+            lm_head_input, *w.lm_head, ws.logits.data(),
+            lm_head_rows, V, H);
+    }
 }
 
 }  // namespace pie_cuda_driver::model

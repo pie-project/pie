@@ -96,6 +96,11 @@ public:
     // Throws if `name` is already registered.
     void insert(std::string name, DeviceTensor tensor);
 
+    // Drop a tensor from the resident weight pool. Used after bind-time
+    // synthesis installs a fused replacement and the original projection
+    // shards are no longer referenced by the selected forward path.
+    void erase(const std::string& name);
+
     // Attach quantization metadata for an already-inserted weight. The
     // weight tensor must be in `weights_`; the scale / zero_point tensors
     // referenced by `meta` must also already be inserted (so that name

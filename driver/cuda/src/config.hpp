@@ -25,9 +25,8 @@ struct ModelConfig {
 };
 
 struct BatchingConfig {
-    std::uint32_t kv_page_size = 32;
     double gpu_mem_utilization = 0.90;
-    std::string memory_profile = "balanced";
+    std::string memory_profile = "auto";
     // Pinned host KV slots for swap-out. 0 = swap disabled.
     std::uint32_t swap_pool_size = 0;
 };
@@ -71,7 +70,6 @@ inline Config load_config(const std::filesystem::path& path) {
     }
     if (auto b = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {
-            "kv_page_size",
             "gpu_mem_utilization",
             "memory_profile",
             "swap_pool_size",
@@ -90,14 +88,6 @@ inline Config load_config(const std::filesystem::path& path) {
                     "config: unknown [batching] key: " + std::string{name});
             }
         }
-        const auto kv_page_size =
-            (*b)["kv_page_size"].value_or<int64_t>(c.batching.kv_page_size);
-        if (kv_page_size <= 0 ||
-            kv_page_size > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::runtime_error(
-                "config: [batching].kv_page_size must be in [1, u32::MAX]");
-        }
-        c.batching.kv_page_size = static_cast<std::uint32_t>(kv_page_size);
         c.batching.gpu_mem_utilization =
             (*b)["gpu_mem_utilization"].value_or<double>(
                 static_cast<double>(c.batching.gpu_mem_utilization));
@@ -133,13 +123,14 @@ inline Config load_config(const std::filesystem::path& path) {
         throw std::runtime_error(
             "config: [batching].gpu_mem_utilization must be in (0.0, 1.0]");
     }
-    if (c.batching.memory_profile != "latency" &&
+    if (c.batching.memory_profile != "auto" &&
+        c.batching.memory_profile != "latency" &&
         c.batching.memory_profile != "balanced" &&
         c.batching.memory_profile != "throughput" &&
         c.batching.memory_profile != "capacity") {
         throw std::runtime_error(
-            "config: [batching].memory_profile must be one of latency, "
-            "balanced, throughput, capacity");
+            "config: [batching].memory_profile must be one of auto, "
+            "latency, balanced, throughput, capacity");
     }
     if (c.distributed.tp_size < 1) {
         throw std::runtime_error("config: [distributed].tp_size must be >= 1");

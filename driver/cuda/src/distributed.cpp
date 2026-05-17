@@ -1,6 +1,8 @@
 #include "distributed.hpp"
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "cuda_check.hpp"
@@ -49,7 +51,8 @@ NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
     // persistent 100% GPU-utilization spin. Use NCCL's blocking mode so idle
     // collectives sleep instead of burning a device while rank 0 is between
     // requests or still publishing readiness.
-    config.blocking = 1;
+    const char* blocking_env = std::getenv("PIE_NCCL_BLOCKING");
+    config.blocking = (blocking_env && std::string(blocking_env) == "0") ? 0 : 1;
     NCCL_CHECK(ncclCommInitRankConfig(&comm_, world_size, uid, rank, &config));
 }
 
@@ -72,18 +75,21 @@ NcclComm& NcclComm::operator=(NcclComm&& o) noexcept {
 
 void NcclComm::all_reduce_bf16(void* sendrecv, std::size_t count,
                                ncclRedOp_t op, cudaStream_t stream) {
-    // Fast path: NVLink P2P custom all-reduce for small bf16 sums when
-    // the caller has registered the buffer's base address with the
-    // CustomAllReduce instance. Anything outside that window (large
-    // payload, non-sum op, or unregistered buffer) falls back to NCCL.
+    NCCL_CHECK(ncclAllReduce(sendrecv, sendrecv, count, ncclBfloat16, op,
+                             comm_, stream));
+}
+
+void NcclComm::all_reduce_bf16_out(const void* send, void* recv,
+                                   std::size_t count, ncclRedOp_t op,
+                                   cudaStream_t stream) {
     if (custom_ar_ != nullptr && op == ncclSum) {
         const std::size_t bytes = count * sizeof(std::uint16_t);
-        if (custom_ar_->can_handle(bytes)) {
-            custom_ar_->all_reduce_bf16(sendrecv, count, stream);
+        if (custom_ar_->can_handle(send, bytes, stream)) {
+            custom_ar_->all_reduce_bf16(send, recv, count, stream);
             return;
         }
     }
-    NCCL_CHECK(ncclAllReduce(sendrecv, sendrecv, count, ncclBfloat16, op,
+    NCCL_CHECK(ncclAllReduce(send, recv, count, ncclBfloat16, op,
                              comm_, stream));
 }
 

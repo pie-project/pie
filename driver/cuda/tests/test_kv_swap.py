@@ -42,7 +42,6 @@ def main() -> int:
         f'hf_repo = "Qwen/Qwen3-0.6B"\nsnapshot_dir = "{snap}"\n'
         'device = "cuda:0"\ndtype = "bfloat16"\n'
         '[batching]\n'
-        'kv_page_size = 32\n'
         'gpu_mem_utilization = 0.90\n'
         'memory_profile = "capacity"\n'
         'swap_pool_size = 16\n'

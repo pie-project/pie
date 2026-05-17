@@ -581,14 +581,19 @@ class Engine:
             getattr(self.model_config, "num_vocabs", None)
             or getattr(self.model_config, "vocab_size", 0)
         )
+        total_pages = int(self.config.total_pages or 0)
+        max_forward_tokens = max(
+            1, min(10240, total_pages * int(self.config.kv_page_size))
+        )
+        max_forward_requests = max(1, min(512, max_forward_tokens))
         unconstrained = (1 << 32) - 1
         return DriverCapabilities(
-            total_pages=int(self.config.total_pages or 0),
+            total_pages=total_pages,
             kv_page_size=int(self.config.kv_page_size),
             swap_pool_size=int(self.swap_pool_size),
-            max_forward_tokens=int(self.config.max_forward_tokens or 0),
-            max_forward_requests=int(self.config.max_forward_requests or 0),
-            max_page_refs=int(self.config.total_pages or 0),
+            max_forward_tokens=max_forward_tokens,
+            max_forward_requests=max_forward_requests,
+            max_page_refs=total_pages,
             max_logit_rows=unconstrained,
             max_prob_rows=unconstrained,
             max_custom_mask_bytes=unconstrained,

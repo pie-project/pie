@@ -10,7 +10,7 @@ sidebar_position: 4
 The vLLM driver is a prototype. Interfaces, defaults, and capabilities change frequently.
 :::
 
-`type = "vllm"`. A subprocess Python driver that delegates the forward pass to vLLM. Pie wraps vLLM's `EngineArgs`; field names match vLLM exactly, so values pass through unchanged.
+`type = "vllm"`. A subprocess Python driver that delegates the forward pass to vLLM. Pie wraps a curated subset of vLLM's `EngineArgs`; memory and batch capacity are resolved by the driver and reported back through `DriverCapabilities`.
 
 Use this driver to run a model that the embedded [`cuda_native` and `dev`](./cuda) drivers do not yet implement, or to run against vLLM's attention kernels.
 
@@ -45,9 +45,6 @@ activation_dtype = "bfloat16"
 venv = "/home/me/.pie/venvs/vllm"
 attention_backend       = "FLASHINFER"   # FLASH_ATTN / TRITON_ATTN / FLEX_ATTENTION / …
 gpu_memory_utilization  = 0.9
-max_num_seqs            = 256
-# max_num_batched_tokens  = 8192         # default: vllm picks
-# block_size              = 16           # default: vllm picks per attention backend
 enforce_eager           = false          # disable CUDA graphs
 
 # n-gram speculative decoding (driver-side drafts)
@@ -61,14 +58,16 @@ spec_ngram_max_n        = 4
 |---|---|---|
 | `attention_backend` | unset | `FLASHINFER` / `FLASH_ATTN` / `TRITON_ATTN` / `FLEX_ATTENTION` / etc. Unset lets vLLM auto-pick per platform. |
 | `gpu_memory_utilization` | `0.9` | Fraction of free GPU memory for KV cache + activations. |
-| `max_num_seqs` | `256` | Max concurrent sequences in a batch. |
-| `max_num_batched_tokens` | unset | Max tokens (across all sequences) in a batch. Unset uses vLLM's default. |
-| `block_size` | unset | KV cache block size override. Unset lets vLLM pick based on the attention backend's allowed sizes (FlashInfer: 16/32/64; FlashAttention: 16/32). |
 | `enforce_eager` | `false` | Disable `torch.compile` and CUDA graphs. |
 | `spec_ngram_enabled` | `false` | Enable n-gram speculative decoding. The driver maintains a per-session token history, proposes linear draft continuations, and the runtime verifies them in the shared batch path. The inferlet opts in to receiving drafts by calling `output_speculative_tokens(true)`; otherwise drafts are dropped. |
 | `spec_ngram_num_drafts` | `4` | Drafts proposed per accepted iteration. |
 | `spec_ngram_min_n` | `2` | n-gram match window minimum. |
 | `spec_ngram_max_n` | `4` | n-gram match window maximum. |
+
+The vLLM driver uses vLLM's resolved attention block size and scheduler limits,
+then reports them in `DriverCapabilities` during startup. Pie config does not
+accept manual vLLM batch-capacity overrides such as `max_num_seqs` or
+`max_num_batched_tokens`.
 
 ## Supported architectures
 

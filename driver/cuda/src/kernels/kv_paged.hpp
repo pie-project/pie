@@ -30,4 +30,18 @@ void launch_write_kv_to_pages_bf16(
     int head_dim,
     cudaStream_t stream);
 
+void launch_write_kv_decode_to_pages_bf16(
+    void* k_pages,
+    void* v_pages,
+    const void* k_curr,
+    const void* v_curr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    int num_requests,
+    int page_size,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

@@ -64,6 +64,40 @@ __global__ void write_kv_kernel(
     }
 }
 
+__global__ void write_kv_decode_kernel(
+    const __nv_bfloat16* __restrict__ k_curr,
+    const __nv_bfloat16* __restrict__ v_curr,
+    __nv_bfloat16* __restrict__ k_pages,
+    __nv_bfloat16* __restrict__ v_pages,
+    const std::uint32_t* __restrict__ kv_page_indices,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    const std::uint32_t* __restrict__ kv_last_page_lens,
+    int page_size,
+    int h_kv,
+    int d)
+{
+    const int r = blockIdx.x;
+    const int pages_first = kv_page_indptr[r];
+    const int pages_last  = kv_page_indptr[r + 1];
+    const int num_pages_r = pages_last - pages_first;
+    const int abs_kv_pos =
+        (num_pages_r - 1) * page_size + static_cast<int>(kv_last_page_lens[r]) - 1;
+    const int page_in_req = abs_kv_pos / page_size;
+    const int offset_in_page = abs_kv_pos % page_size;
+    const int actual_page =
+        static_cast<int>(kv_page_indices[pages_first + page_in_req]);
+
+    const long long row = h_kv * d;
+    const long long src = static_cast<long long>(r) * row;
+    const long long dst =
+        ((static_cast<long long>(actual_page) * page_size) + offset_in_page) * row;
+
+    for (int i = threadIdx.x; i < row; i += blockDim.x) {
+        k_pages[dst + i] = k_curr[src + i];
+        v_pages[dst + i] = v_curr[src + i];
+    }
+}
+
 }  // namespace
 
 void launch_write_kv_to_pages_bf16(
@@ -88,6 +122,28 @@ void launch_write_kv_to_pages_bf16(
         static_cast<__nv_bfloat16*>(v_pages),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
         num_requests, page_size, num_kv_heads, head_dim);
+}
+
+void launch_write_kv_decode_to_pages_bf16(
+    void* k_pages, void* v_pages,
+    const void* k_curr, const void* v_curr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    int num_requests,
+    int page_size,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    write_kv_decode_kernel<<<num_requests, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(k_curr),
+        static_cast<const __nv_bfloat16*>(v_curr),
+        static_cast<__nv_bfloat16*>(k_pages),
+        static_cast<__nv_bfloat16*>(v_pages),
+        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+        page_size, num_kv_heads, head_dim);
 }
 
 }  // namespace pie_cuda_driver::kernels

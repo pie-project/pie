@@ -365,8 +365,8 @@ Executor::Executor(Model& model,
         const std::int32_t conv_dim =
             2 * h.qwen35_linear_num_k_heads * h.qwen35_linear_k_head_dim
             +     h.qwen35_linear_num_v_heads * h.qwen35_linear_v_head_dim;
-        // n_slots: use the configured max_forward_requests, capped at 64 so we
-        // don't burn arbitrary GPU RAM on idle slots.
+        // Keep recurrent-state slots bounded so we don't burn arbitrary GPU RAM
+        // on idle slots.
         const std::int32_t n_slots = 64;
         state_ = std::make_unique<StateCache>(
             model.backend(), n_slots, linear_layers,

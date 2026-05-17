@@ -10,7 +10,7 @@ sidebar_position: 5
 The SGLang driver is a prototype. Interfaces, defaults, and capabilities change frequently.
 :::
 
-`type = "sglang"`. A subprocess Python driver that delegates the forward pass to SGLang. Pie wraps SGLang's `ServerArgs`; field names match SGLang exactly, so values pass through unchanged.
+`type = "sglang"`. A subprocess Python driver that delegates the forward pass to SGLang. Pie wraps a curated subset of SGLang's `ServerArgs`; memory and batch capacity are resolved by the driver and reported back through `DriverCapabilities`.
 
 Use this driver to run a model that the embedded [`cuda_native` and `dev`](./cuda) drivers do not yet implement, or to run against SGLang's attention kernels and its n-gram speculative decoding.
 
@@ -45,12 +45,9 @@ activation_dtype = "bfloat16"
 venv = "/home/me/.pie/venvs/sglang"
 attention_backend       = "triton"       # triton / flashinfer / fa3 / fa4 / …
 mem_fraction_static     = 0.65
-page_size               = 16
 disable_radix_cache     = true
 disable_cuda_graph      = false
 # cuda_graph_max_bs       = 256          # default: sglang auto-picks
-# max_running_requests    = 256          # default: sglang auto-picks
-# max_total_tokens        = 65536        # default: sglang auto-picks
 # chunked_prefill_size    = 8192         # default: sglang auto-picks
 kv_cache_dtype          = "auto"
 trust_remote_code       = true
@@ -70,12 +67,9 @@ spec_ngram_capacity     = 1_000_000
 |---|---|---|
 | `attention_backend` | `"triton"` | `triton` / `flashinfer` / `flex_attention` / `fa3` / `fa4` / `aiter` / `wave` / `torch_native` / etc. `triton` works on any NVIDIA SM 7.5+ and is stable across SGLang versions. |
 | `mem_fraction_static` | `0.65` | Fraction of free GPU memory reserved for KV cache + activations. Lower than SGLang's standalone `0.88` because Pie's KV-rebind allocates a parallel tensor in Pie's canonical layout. |
-| `page_size` | `16` | KV cache page size override. Unset lets SGLang pick. |
 | `disable_radix_cache` | `true` | Disable SGLang's radix cache. Pie's scheduler owns prefix sharing, so the default avoids duplicated caching work. |
 | `disable_cuda_graph` | `false` | Run eager (no `torch.compile`, no CUDA graphs). |
 | `cuda_graph_max_bs` | unset | Override the largest CUDA-graph batch-size bin SGLang captures. Unset uses SGLang's auto-pick. |
-| `max_running_requests` | unset | Cap on simultaneously-running requests. Unset uses SGLang's auto-pick based on `max_total_tokens`. |
-| `max_total_tokens` | unset | Cap on total tokens (across requests) per `fire_batch`. Unset uses SGLang's auto-pick. |
 | `chunked_prefill_size` | unset | Chunked-prefill size override. |
 | `kv_cache_dtype` | `"auto"` | KV cache element dtype. `auto` inherits the activation dtype. |
 | `trust_remote_code` | `true` | Trust user-supplied remote code in HF repos (needed for some models). |
@@ -85,6 +79,11 @@ spec_ngram_capacity     = 1_000_000
 | `spec_ngram_num_drafts` | `4` | Drafts proposed per accepted iteration. |
 | `spec_ngram_max_depth` | `18` | Maximum n-gram trie depth. |
 | `spec_ngram_capacity` | `1_000_000` | Approximate node budget for the trie. |
+
+The SGLang driver uses SGLang's resolved page size and scheduler limits, then
+reports them in `DriverCapabilities` during startup. Pie config does not accept
+manual SGLang batch-capacity overrides such as `max_running_requests` or
+`max_total_tokens`.
 
 ## Supported architectures
 

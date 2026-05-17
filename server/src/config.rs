@@ -428,11 +428,11 @@ pub struct DriverConfig {
     pub activation_dtype: String,
     #[serde(default = "default_random_seed")]
     pub random_seed: u64,
-    /// IPC wait profile. `balanced` is the default hybrid path;
-    /// `low_latency` busy-polls for fastest wakeups; `low_power`
-    /// parks immediately whenever no work is ready.
-    #[serde(default)]
-    pub ipc_profile: IpcProfile,
+    /// IPC wait profile. When omitted, CUDA defaults to `latency`;
+    /// other drivers default to the hybrid `balanced` path.
+    /// `power` parks immediately whenever no work is ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_profile: Option<IpcProfile>,
     /// Expert override for the profile's busy-spin window, in µs.
     ///
     /// Leave unset for the profile default. `0` parks immediately;
@@ -447,13 +447,20 @@ pub struct DriverConfig {
 }
 
 impl DriverConfig {
+    pub fn effective_ipc_profile(&self) -> IpcProfile {
+        self.ipc_profile.unwrap_or(match self.kind {
+            DriverKind::CudaNative => IpcProfile::Latency,
+            _ => IpcProfile::Balanced,
+        })
+    }
+
     pub fn effective_spin_budget_us(&self) -> u64 {
         self.spin_budget_us
-            .unwrap_or_else(|| self.ipc_profile.default_spin_budget_us())
+            .unwrap_or_else(|| self.effective_ipc_profile().default_spin_budget_us())
     }
 
     pub fn use_inproc_polling_channel(&self) -> bool {
-        self.ipc_profile == IpcProfile::LowLatency
+        self.effective_ipc_profile() == IpcProfile::Latency
     }
 
     fn validate(&self) -> Result<()> {
@@ -510,12 +517,20 @@ fn validate_subprocess_driver_options(options: &toml::Table, kind: DriverKind) -
         "max_batch_tokens",
         "max_batch_size",
         "linear_attn_max_slots",
+        "total_pages",
+        "cpu_pages",
+        "max_forward_tokens",
+        "max_forward_requests",
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "max_running_requests",
+        "max_total_tokens",
     ] {
         ensure!(
             !options.contains_key(key),
             "invalid [model.driver.options] for driver type {:?}: \
-             `{key}` is not accepted; drivers compute KV pages and report \
-             `total_pages` plus scheduling capacity in capabilities",
+             `{key}` is not accepted; drivers compute KV pages and scheduling \
+             capacity in capabilities",
             kind,
         );
     }
@@ -537,20 +552,20 @@ pub enum IpcProfile {
     /// Lowest wake latency. Uses the polling in-process channel for
     /// embedded drivers and unbounded busy-spin for shmem drivers
     /// unless `spin_budget_us` overrides it.
-    LowLatency,
+    Latency,
     /// Hybrid spin-then-park path. Good default for GPU-bound work.
     #[default]
     Balanced,
     /// Park immediately after an empty poll. Minimizes idle CPU.
-    LowPower,
+    Power,
 }
 
 impl IpcProfile {
     pub fn default_spin_budget_us(self) -> u64 {
         match self {
-            Self::LowLatency => u64::MAX,
+            Self::Latency => u64::MAX,
             Self::Balanced => default_spin_budget_us(),
-            Self::LowPower => 0,
+            Self::Power => 0,
         }
     }
 }
@@ -644,11 +659,6 @@ where
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PortableDriverOptions {
-    pub kv_page_size: u32,
-    pub total_pages: u32,
-    pub max_forward_tokens: u32,
-    pub max_forward_requests: u32,
-    pub cpu_pages: u32,
     #[serde(skip)]
     pub device: String,
     #[serde(skip)]
@@ -663,11 +673,6 @@ pub struct PortableDriverOptions {
 impl Default for PortableDriverOptions {
     fn default() -> Self {
         Self {
-            kv_page_size: 32,
-            total_pages: 1024,
-            max_forward_tokens: 10240,
-            max_forward_requests: 512,
-            cpu_pages: 0,
             device: "auto".to_string(),
             verbose: false,
             ready_timeout_s: 120.0,
@@ -698,30 +703,10 @@ pub struct DummyDriverOptions {
     #[serde(default)]
     pub arch_name: Option<String>,
 
-    #[serde(default = "default_kv_page_size")]
-    pub kv_page_size: u32,
-    #[serde(default = "default_max_forward_tokens")]
-    pub max_forward_tokens: u32,
-    #[serde(default = "default_max_forward_requests")]
-    pub max_forward_requests: u32,
-    #[serde(default = "default_max_model_len")]
-    pub max_model_len: u32,
     #[serde(default = "default_dummy_ready_timeout_s")]
     pub ready_timeout_s: f64,
 }
 
-fn default_kv_page_size() -> u32 {
-    16
-}
-fn default_max_forward_tokens() -> u32 {
-    4096
-}
-fn default_max_forward_requests() -> u32 {
-    128
-}
-fn default_max_model_len() -> u32 {
-    4096
-}
 fn default_dummy_ready_timeout_s() -> f64 {
     5.0
 }
@@ -739,7 +724,6 @@ pub struct CudaNativeDriverOptions {
 
     pub gpu_mem_utilization: f64,
     pub memory_profile: CudaMemoryProfile,
-    pub kv_page_size: u32,
     pub swap_pool_size: u32,
     pub weight_dtype: String,
     /// CUDA device string, e.g. `"cuda:0"`. Populated by the caller
@@ -762,8 +746,9 @@ pub struct CudaNativeDriverOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CudaMemoryProfile {
-    Latency,
     #[default]
+    Auto,
+    Latency,
     Balanced,
     Throughput,
     Capacity,
@@ -774,8 +759,7 @@ impl Default for CudaNativeDriverOptions {
         Self {
             binary_path: String::new(),
             gpu_mem_utilization: 0.90,
-            memory_profile: CudaMemoryProfile::Balanced,
-            kv_page_size: 32,
+            memory_profile: CudaMemoryProfile::Auto,
             swap_pool_size: 0,
             weight_dtype: "bfloat16".to_string(),
             device: String::new(),
@@ -794,10 +778,6 @@ impl CudaNativeDriverOptions {
                 && self.gpu_mem_utilization > 0.0
                 && self.gpu_mem_utilization <= 1.0,
             "model.driver.options.gpu_mem_utilization must be finite and in (0.0, 1.0]"
-        );
-        ensure!(
-            self.kv_page_size > 0,
-            "model.driver.options.kv_page_size must be > 0"
         );
         Ok(())
     }
@@ -824,9 +804,85 @@ device = ["cpu"]
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.models[0].driver.kind, DriverKind::Portable);
         assert_eq!(cfg.models[0].driver.device, vec!["cpu".to_string()]);
-        assert_eq!(cfg.models[0].driver.ipc_profile, IpcProfile::Balanced);
+        assert_eq!(
+            cfg.models[0].driver.effective_ipc_profile(),
+            IpcProfile::Balanced
+        );
         assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 1_000);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    #[test]
+    fn cuda_tp_defaults_to_latency_ipc() {
+        let text = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+tensor_parallel_size = 2
+
+[model.driver.options]
+gpu_mem_utilization = 0.90
+memory_profile = "balanced"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.models[0].driver.effective_ipc_profile(),
+            IpcProfile::Latency
+        );
+        assert!(cfg.models[0].driver.use_inproc_polling_channel());
+    }
+
+    #[test]
+    fn cuda_single_rank_defaults_to_latency_ipc() {
+        let text = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+gpu_mem_utilization = 0.90
+memory_profile = "balanced"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.models[0].driver.effective_ipc_profile(),
+            IpcProfile::Latency
+        );
+        assert!(cfg.models[0].driver.use_inproc_polling_channel());
+    }
+
+    #[test]
+    fn cuda_latency_profile_defaults_to_latency_ipc() {
+        let text = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+gpu_mem_utilization = 0.90
+memory_profile = "latency"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.models[0].driver.effective_ipc_profile(),
+            IpcProfile::Latency
+        );
+        assert!(cfg.models[0].driver.use_inproc_polling_channel());
     }
 
     #[test]
@@ -886,36 +942,71 @@ max_num_kv_pages = 1024
         let cfg: Config = toml::from_str(stale).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("max_num_kv_pages"), "got: {err}");
-        assert!(err.contains("total_pages"), "got: {err}");
+        assert!(err.contains("capabilities"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_public_driver_capacity_knobs() {
+        for (ty, key) in [
+            ("portable", "total_pages"),
+            ("portable", "cpu_pages"),
+            ("portable", "max_forward_tokens"),
+            ("portable", "max_forward_requests"),
+            ("dummy", "max_forward_tokens"),
+            ("dummy", "max_forward_requests"),
+            ("dummy", "max_model_len"),
+            ("dev", "max_forward_tokens"),
+            ("dev", "max_forward_requests"),
+            ("vllm", "max_num_seqs"),
+            ("vllm", "max_num_batched_tokens"),
+            ("sglang", "max_running_requests"),
+            ("sglang", "max_total_tokens"),
+        ] {
+            let mut options = String::new();
+            if ty == "dummy" {
+                options.push_str("vocab_size = 151936\narch_name = \"qwen3\"\n");
+            }
+            options.push_str(&format!("{key} = 1\n"));
+            let text = format!(
+                "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
+                 type = \"{ty}\"\ndevice = [\"cpu\"]\n[model.driver.options]\n{options}"
+            );
+            let cfg: Config = toml::from_str(&text).unwrap();
+            let err = match cfg.validate() {
+                Ok(()) => panic!("type={ty} key={key} unexpectedly accepted"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains(key), "type={ty} key={key} got: {err}");
+        }
     }
 
     #[test]
     fn parses_ipc_profiles_and_spin_override() {
-        let low_latency = r#"
+        let latency = r#"
 [[model]]
 name = "m"
 hf_repo = "x"
 [model.driver]
 type = "portable"
 device = "cpu"
-ipc_profile = "low_latency"
+ipc_profile = "latency"
 "#;
-        let cfg: Config = toml::from_str(low_latency).unwrap();
-        assert_eq!(cfg.models[0].driver.ipc_profile, IpcProfile::LowLatency);
+        let cfg: Config = toml::from_str(latency).unwrap();
+        assert_eq!(cfg.models[0].driver.ipc_profile, Some(IpcProfile::Latency));
         assert!(cfg.models[0].driver.use_inproc_polling_channel());
         assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), u64::MAX);
 
-        let low_power = r#"
+        let power = r#"
 [[model]]
 name = "m"
 hf_repo = "x"
 [model.driver]
 type = "portable"
 device = "cpu"
-ipc_profile = "low_power"
+ipc_profile = "power"
 "#;
-        let cfg: Config = toml::from_str(low_power).unwrap();
-        assert_eq!(cfg.models[0].driver.ipc_profile, IpcProfile::LowPower);
+        let cfg: Config = toml::from_str(power).unwrap();
+        assert_eq!(cfg.models[0].driver.ipc_profile, Some(IpcProfile::Power));
         assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 0);
 
         let override_spin = r#"
@@ -925,7 +1016,7 @@ hf_repo = "x"
 [model.driver]
 type = "portable"
 device = "cpu"
-ipc_profile = "low_latency"
+ipc_profile = "latency"
 spin_budget_us = 25
 "#;
         let cfg: Config = toml::from_str(override_spin).unwrap();
@@ -1022,7 +1113,6 @@ runtime_quant = "fp8"
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
-        assert_eq!(opts.kv_page_size, 32); // default
     }
 
     #[test]

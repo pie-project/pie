@@ -12,8 +12,3 @@ spin_us = 0
 [model]
 hf_path = "/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754"
 
-[batching]
-kv_page_size = 32
-total_pages = 64
-max_forward_tokens = 1024
-max_forward_requests = 4

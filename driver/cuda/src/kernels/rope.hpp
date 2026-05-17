@@ -26,6 +26,23 @@ void launch_rope_bf16(
     float theta,
     cudaStream_t stream);
 
+// Fused per-head Q/K RMSNorm + standard RoPE. This matches models such as
+// Qwen3 where q_norm/k_norm have shape [head_dim] and RoPE is the standard
+// first-half/second-half pairing.
+void launch_qk_rmsnorm_rope_bf16(
+    void* q,
+    void* k,
+    const void* q_weight,
+    const void* k_weight,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    float eps,
+    cudaStream_t stream);
+
 // YaRN (Llama-3 / OLMo / Mistral-3 / GPT-OSS) RoPE scaling. Frequency
 // per pair is modified by a piecewise-linear interpolation between
 // `low_freq_factor` and `high_freq_factor` (in units of cycles / window),

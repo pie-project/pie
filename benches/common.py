@@ -185,6 +185,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--unique-prompts", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--warmup", type=int, default=2)
+    p.add_argument(
+        "--warmup-max-tokens",
+        type=int,
+        default=None,
+        help="Override max_tokens only for warmup requests.",
+    )
     p.add_argument("--json-out", default=None)
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)

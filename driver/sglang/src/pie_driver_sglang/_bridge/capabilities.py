@@ -45,9 +45,7 @@ class DriverCapabilities:
     total_pages: int
 
     # Block size in tokens that the chosen attention kernel actually uses.
-    # The user's `ModelConfig.kv_page_size` is a *preference*; the driver
-    # may resolve to a different value (e.g., FlashInfer requires 16/32/64).
-    # Forwarded to Rust as ModelConfig.kv_page_size.
+    # Resolved by the driver and forwarded to Rust as ModelConfig.kv_page_size.
     kv_page_size: int
 
     # Pinned host-side KV slot count for swap-out. 0 = swap disabled.

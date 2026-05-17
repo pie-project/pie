@@ -323,6 +323,7 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     // schema's `mask_indptr` / `logit_mask_indptr` are per-REQUEST
     // partitions of Vec<Brle> — we don't use them here; the per-row
     // layout is reconstructed directly from the Brle vector.
+    arenas.flattened_masks.clear();
     arenas.mask_byte_indptr.clear();
     arenas.mask_byte_indptr.reserve(f.masks_len + 1);
     arenas.mask_byte_indptr.push_back(0);
@@ -336,6 +337,7 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.flattened_masks = slice_from(arenas.flattened_masks.data(), arenas.flattened_masks.size());
     out.mask_indptr     = slice_from(arenas.mask_byte_indptr.data(), arenas.mask_byte_indptr.size());
 
+    arenas.logit_masks_flat.clear();
     arenas.logit_mask_byte_indptr.clear();
     arenas.logit_mask_byte_indptr.reserve(f.logit_mask_indptr_len);
     arenas.logit_mask_byte_indptr.push_back(0);

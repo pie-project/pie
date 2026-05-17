@@ -40,11 +40,8 @@ The development binary lands at `build/bin/pie_driver_portable`.
 type = "portable"
 device = ["cpu"]
 activation_dtype = "bfloat16"
-
-[model.driver.options]
-max_forward_tokens = 10240
-max_forward_requests = 512
-total_pages = 1024
 ```
 
-The driver prefers the best compiled ggml backend and falls back to CPU.
+The driver prefers the best compiled ggml backend and falls back to CPU. KV
+pages, page size, and forward limits are derived at startup and reported in
+`DriverCapabilities`.

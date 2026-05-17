@@ -24,7 +24,6 @@
 //! At all times: `Σ balance_i = Σ endowment_i − M(t)`, where M(t) is cumulative
 //! make cost. Rent revenue is exactly redistributed as dividends.
 
-use std::cmp::Ordering;
 use std::fmt;
 use std::time::Instant;
 
@@ -32,7 +31,33 @@ use crate::driver::{self, DriverId};
 use crate::process::ProcessId;
 
 use super::pagestore::PhysicalPageId;
-use super::{Context, ContextId, ContextManager, RestoreEntry, State, MARKET};
+use super::{Context, ContextId, ContextManager, MARKET, RestoreEntry, State};
+
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionDenied {
+    pub endowment_pages: f64,
+    pub total_after: f64,
+    pub cap: f64,
+    pub total_capacity: f64,
+    pub oversubscription_factor: f64,
+}
+
+impl fmt::Display for AdmissionDenied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "admission denied: Σ endowment would become {} after adding {}, \
+             exceeding capacity × factor ({} × {} = {})",
+            self.total_after,
+            self.endowment_pages,
+            self.total_capacity,
+            self.oversubscription_factor,
+            self.cap,
+        )
+    }
+}
+
+impl std::error::Error for AdmissionDenied {}
 
 // =============================================================================
 // ProcessEntry — Wallet + Ownership
@@ -178,13 +203,14 @@ impl ContextManager {
         let total_capacity: f64 = self.gpu_stores.iter().map(|s| s.total_pages() as f64).sum();
         let cap = total_capacity * self.admission_oversubscription_factor;
         if sigma_e + endowment_pages > cap {
-            anyhow::bail!(
-                "admission denied: Σ endowment ({sigma_e} + {endowment_pages} = \
-                 {}) would exceed capacity × factor ({total_capacity} × \
-                 {} = {cap})",
-                sigma_e + endowment_pages,
-                self.admission_oversubscription_factor,
-            );
+            return Err(AdmissionDenied {
+                endowment_pages,
+                total_after: sigma_e + endowment_pages,
+                cap,
+                total_capacity,
+                oversubscription_factor: self.admission_oversubscription_factor,
+            }
+            .into());
         }
 
         let mut entry = ProcessEntry::new();

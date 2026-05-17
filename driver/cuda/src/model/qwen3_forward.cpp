@@ -1,5 +1,7 @@
 #include "model/qwen3_forward.hpp"
 
+#include <algorithm>
+
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
@@ -42,14 +44,25 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     ws.up            = DeviceTensor::allocate(DType::BF16, {N, I});
     ws.logits        = DeviceTensor::allocate(DType::BF16, {N, V});
     ws.probs         = DeviceTensor::allocate(DType::FP32, {N, V});
+    // Tiny scratch for TP greedy decode. The current launcher supports
+    // up to 8 ranks here; larger TP groups fall back to the full-logits
+    // path before touching these buffers.
+    ws.greedy_values = DeviceTensor::allocate(DType::FP32, {N});
+    ws.greedy_tokens = DeviceTensor::allocate(DType::INT32, {N});
+    ws.greedy_values_all = DeviceTensor::allocate(DType::FP32, {8, N});
+    ws.greedy_tokens_all = DeviceTensor::allocate(DType::INT32, {8, N});
+    ws.greedy_pairs = DeviceTensor::allocate(DType::INT64, {N});
+    ws.greedy_pairs_all = DeviceTensor::allocate(DType::INT64, {8, N});
 
     // Padded q/k/v/attn_out only when head_dim != head_dim_kernel
     // (currently only Phi-3 at 96 → 128). Empty allocations otherwise
     // — the forward path detects the empty-state and aliases the
     // packed buffers.
     if (cfg.head_dim != cfg.head_dim_kernel) {
-        const int Hq_pad = cfg.num_attention_heads * cfg.head_dim_kernel;
-        const int Hk_pad = cfg.num_key_value_heads * cfg.head_dim_kernel;
+        const int q_heads = Hq / std::max(1, cfg.head_dim);
+        const int kv_heads = Hk / std::max(1, cfg.head_dim);
+        const int Hq_pad = q_heads * cfg.head_dim_kernel;
+        const int Hk_pad = kv_heads * cfg.head_dim_kernel;
         ws.q_padded        = DeviceTensor::allocate(DType::BF16, {N, Hq_pad});
         ws.k_padded        = DeviceTensor::allocate(DType::BF16, {N, Hk_pad});
         ws.v_padded        = DeviceTensor::allocate(DType::BF16, {N, Hk_pad});
@@ -273,11 +286,19 @@ void qwen3_forward_paged(
             cfg.rope_theta, stream);
 
         // 6. Write current K/V into the page table for this layer.
-        kernels::launch_write_kv_to_pages_bf16(
-            cache.k(L), cache.v(L),
-            ws.k.data(), ws.v.data(),
-            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+        if (is_pure_decode) {
+            kernels::launch_write_kv_decode_to_pages_bf16(
+                cache.k(L), cache.v(L),
+                ws.k.data(), ws.v.data(),
+                kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+        } else {
+            kernels::launch_write_kv_to_pages_bf16(
+                cache.k(L), cache.v(L),
+                ws.k.data(), ws.v.data(),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+        }
 
         // 7. Paged attention. flashinfer decode for pure-decode batches,
         // flashinfer prefill (causal) otherwise. The naive paged kernel is

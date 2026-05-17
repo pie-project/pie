@@ -22,6 +22,5 @@ dtype = "bfloat16"
 # Memory planner. Manual batch/KV sizing is derived at startup after
 # weights load.
 [batching]
-kv_page_size = 32
 gpu_mem_utilization = 0.90
 memory_profile = "balanced"

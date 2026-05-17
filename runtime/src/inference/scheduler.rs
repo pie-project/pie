@@ -10,13 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::context::pagestore::PhysicalPageId;
 use crate::driver::{self, DriverId, SchedulerLimits};
 
 use super::adaptive_policy::{AdaptivePolicy, EagerPolicy, GreedyPolicy};
-use super::request;
+use super::{ForwardOutput, request};
 
 // =============================================================================
 // Scheduling Policy Trait
@@ -88,7 +88,7 @@ pub struct SchedulerStats {
 /// A forward pass request bundled with its response channel and physical pages.
 struct PendingRequest {
     request: pie_bridge::ForwardRequest,
-    response_tx: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
+    response_tx: oneshot::Sender<Result<ForwardOutput>>,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
 }
@@ -514,7 +514,7 @@ impl SchedulerHandle {
     pub fn submit(
         &self,
         request: pie_bridge::ForwardRequest,
-        response_tx: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
+        response_tx: oneshot::Sender<Result<ForwardOutput>>,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
@@ -579,7 +579,7 @@ impl BatchScheduler {
     pub fn submit(
         &self,
         request: pie_bridge::ForwardRequest,
-        response_tx: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
+        response_tx: oneshot::Sender<Result<ForwardOutput>>,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
@@ -640,6 +640,7 @@ impl BatchScheduler {
 
         // Per-fire wall timing instrumentation. Gated on PIE_TIMING.
         let timing_on = std::env::var_os("PIE_TIMING").is_some();
+        let trace_batches = std::env::var_os("PIE_TRACE_BATCHES").is_some();
         let mut last_fire_time: Option<Instant> = None;
         let mut sched_fire_count: u64 = 0;
 
@@ -712,6 +713,30 @@ impl BatchScheduler {
                         .await
                         .expect("semaphore closed");
                     let t_permit = Instant::now();
+
+                    // The policy may decide to fire while the previous GPU
+                    // batch is still in flight. Do one last non-blocking
+                    // drain after the permit opens so requests that arrived
+                    // during that wait are coalesced into this batch instead
+                    // of being stranded behind a tiny stale fire.
+                    let mut post_permit_added = 0usize;
+                    while next_pending.is_none() && !batch.is_full() {
+                        let Ok(pending) = req_rx.try_recv() else {
+                            break;
+                        };
+                        if let Some(msg) = batch.single_request_limit_error(&pending) {
+                            pending.response_tx.send(Err(anyhow::anyhow!(msg))).ok();
+                            continue;
+                        }
+                        if batch.would_exceed(&pending) {
+                            next_pending = Some(pending);
+                            break;
+                        }
+                        policy.on_arrival();
+                        batch.push(pending);
+                        post_permit_added += 1;
+                    }
+
                     let fire_n = sched_fire_count;
                     sched_fire_count += 1;
                     let log_outer = timing_on && fire_n >= 50 && fire_n % 50 == 0;
@@ -723,7 +748,8 @@ impl BatchScheduler {
                             "[outer-fire {} B={}] fire_to_fire={}us \
                              loop_top_after_prev={}us \
                              recv_first_req={}us accumulate_more={}us \
-                             permit_wait_after_decide={}us",
+                             permit_wait_after_decide={}us \
+                             post_permit_added={}",
                             fire_n,
                             batch.len(),
                             fire_to_fire,
@@ -733,12 +759,34 @@ impl BatchScheduler {
                             (t_first_arrival - t_loop_top).as_micros(),
                             (t_accumulated - t_first_arrival).as_micros(),
                             (t_permit - t_before_permit).as_micros(),
+                            post_permit_added,
                         );
                     }
                     last_fire_time = Some(t_permit);
 
                     let total_tokens = batch.total_tokens();
                     let requests_to_fire = batch.take();
+                    if trace_batches {
+                        let first = requests_to_fire.first();
+                        let last = requests_to_fire.last();
+                        let first_ctx = first
+                            .and_then(|r| r.request.context_ids.first().copied())
+                            .unwrap_or(0);
+                        let last_ctx = last
+                            .and_then(|r| r.request.context_ids.first().copied())
+                            .unwrap_or(0);
+                        let first_pos = first
+                            .and_then(|r| r.request.position_ids.first().copied())
+                            .unwrap_or(0);
+                        let last_pos = last
+                            .and_then(|r| r.request.position_ids.first().copied())
+                            .unwrap_or(0);
+                        eprintln!(
+                            "[sched-batch dev={driver_idx} fire={fire_n} B={} tokens={} first=({first_ctx},{first_pos}) last=({last_ctx},{last_pos})",
+                            requests_to_fire.len(),
+                            total_tokens,
+                        );
+                    }
                     policy.on_fired(requests_to_fire.len());
 
                     // Collect batch context IDs for accurate rent charging.
@@ -763,9 +811,11 @@ impl BatchScheduler {
                             driver_id,
                             page_size,
                             timeout,
+                            Some(permit),
                         )
                         .await;
                         let latency = start.elapsed();
+                        latency_tx_clone.send(latency).ok();
 
                         // Advance market clock for this driver: prices, rent, dividends.
                         // Pass batch context IDs so tick only charges contexts
@@ -801,9 +851,6 @@ impl BatchScheduler {
                         stats_clone
                             .cumulative_latency_us
                             .fetch_add(latency.as_micros() as u64, Relaxed);
-
-                        latency_tx_clone.send(latency).ok();
-                        drop(permit); // release in-flight slot
                     });
                 }
                 Decision::Wait(wait_duration) => {
@@ -838,7 +885,15 @@ impl BatchScheduler {
         // Shutdown: fire remaining batch
         if !batch.is_empty() {
             let requests = batch.take();
-            Self::execute_batch(driver_idx, requests, driver_id, page_size, request_timeout).await;
+            Self::execute_batch(
+                driver_idx,
+                requests,
+                driver_id,
+                page_size,
+                request_timeout,
+                None,
+            )
+            .await;
         }
     }
 
@@ -848,7 +903,8 @@ impl BatchScheduler {
         requests: Vec<PendingRequest>,
         driver_id: DriverId,
         page_size: u32,
-        timeout: Duration,
+        _timeout: Duration,
+        mut permit: Option<OwnedSemaphorePermit>,
     ) {
         // Per-stage timing for the Rust side of the inter-fire path.
         // Driver-side timing already lives in `request_handler.cpp`; this
@@ -856,21 +912,28 @@ impl BatchScheduler {
         // msgpack / shmem-roundtrip / response-distribution.
         let timing_on = std::env::var_os("PIE_TIMING").is_some();
         static FIRE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let fire_n = FIRE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fire_n = FIRE_COUNT.fetch_add(1, Relaxed);
         let log_this = timing_on && fire_n >= 50 && fire_n % 50 == 0;
         let t0 = std::time::Instant::now();
         let r = requests.len();
 
         // Build batched request — a single `pie_bridge::ForwardRequest`
         // populated by folding each per-request shape into the batch.
+        let elide_decode_masks = requests.iter().all(|req| {
+            req.request.single_token_mode
+                && !req.request.has_user_mask
+                && req.request.token_ids.len() <= 1
+                && req.request.spec_token_ids.is_empty()
+        });
         let mut batch_req = request::new_batched_forward_request();
         for req in &requests {
-            request::append_request(
+            request::append_request_with_options(
                 &mut batch_req,
                 &req.request,
                 &req.physical_page_ids,
                 req.last_page_len,
                 page_size,
+                elide_decode_masks,
             );
         }
         let t_build = std::time::Instant::now();
@@ -878,6 +941,7 @@ impl BatchScheduler {
         // Send via driver service (typed call handles serialization + timeout)
         let result = driver::fire_batch(driver_idx, batch_req).await;
         let t_resp = std::time::Instant::now();
+        drop(permit.take());
 
         match result {
             Ok(batch_resp) => {
@@ -900,13 +964,47 @@ impl BatchScheduler {
                     return;
                 }
 
-                for (r, req) in requests.into_iter().enumerate() {
-                    // Extract this request's slice from the batched
-                    // response. The api layer (build_wit_output)
-                    // walks samplers + the single-request response
-                    // to construct the WIT Output.
-                    let per_req = request::extract_per_request(&batch_resp, r);
-                    req.response_tx.send(Ok(per_req)).ok();
+                let token_payload_only = batch_resp.dists_ids.is_empty()
+                    && batch_resp.dists_probs.is_empty()
+                    && batch_resp.logits_bytes.is_empty()
+                    && batch_resp.logprobs_values.is_empty()
+                    && batch_resp.entropies.is_empty()
+                    && batch_resp.tokens_indptr.len() >= requests.len() + 1;
+
+                if token_payload_only {
+                    for (r, req) in requests.into_iter().enumerate() {
+                        let lo = batch_resp.tokens_indptr[r] as usize;
+                        let hi = batch_resp.tokens_indptr[r + 1] as usize;
+                        let output = if hi == lo + 1 {
+                            ForwardOutput::Token(batch_resp.tokens[lo])
+                        } else {
+                            ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
+                        };
+                        req.response_tx.send(Ok(output)).ok();
+                    }
+                    let t_done = std::time::Instant::now();
+                    if log_this {
+                        eprintln!(
+                            "[sched-fire {} R={}] build={}us roundtrip={}us distribute={}us TOTAL={}us",
+                            fire_n,
+                            r,
+                            (t_build - t0).as_micros(),
+                            (t_resp - t_build).as_micros(),
+                            (t_done - t_resp).as_micros(),
+                            (t_done - t0).as_micros(),
+                        );
+                    }
+                } else {
+                    for (r, req) in requests.into_iter().enumerate() {
+                        // Extract this request's slice from the batched
+                        // response. The api layer (build_wit_output)
+                        // walks samplers + the single-request response
+                        // to construct the WIT Output.
+                        let per_req = request::extract_per_request(&batch_resp, r);
+                        req.response_tx
+                            .send(Ok(ForwardOutput::Response(per_req)))
+                            .ok();
+                    }
                 }
             }
             Err(e) => {

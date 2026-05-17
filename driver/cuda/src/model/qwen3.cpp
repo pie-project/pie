@@ -91,9 +91,58 @@ const DeviceTensor* fuse_two_rowwise_bf16(
     return &engine.get(fused_name);
 }
 
+// Helper: register a non-owning sub-view into an already-loaded row-major
+// weight. `row_offset` is in rows; the slice is contiguous along the
+// leading axis.
+void register_row_slice(
+    LoadedModel& e,
+    const std::string& fused_name,
+    const std::string& slice_name,
+    std::int64_t row_offset, std::int64_t rows, std::int64_t cols,
+    DType dtype)
+{
+    const auto& fused = e.get(fused_name);
+    if (fused.dtype() != dtype) {
+        throw std::runtime_error(
+            "register_row_slice: dtype mismatch on '" + fused_name + "'");
+    }
+    const std::int64_t element_bytes = static_cast<std::int64_t>(dtype_bytes(dtype));
+    auto* base = static_cast<std::uint8_t*>(const_cast<void*>(fused.data()));
+    auto* slice_ptr = base + row_offset * cols * element_bytes;
+    e.insert(slice_name,
+             DeviceTensor::view(slice_ptr, dtype, {rows, cols}));
+}
+
+void install_tp_lm_head_shard(LoadedModel& engine, Qwen3Weights& w) {
+    const auto& dist = engine.distributed();
+    if (dist.tp_size <= 1 || w.lm_head == nullptr || w.lm_head->dtype() != DType::BF16 ||
+        w.lm_head->shape().size() != 2) {
+        return;
+    }
+    const auto& shape = w.lm_head->shape();
+    const std::int64_t vocab = shape[0];
+    const std::int64_t hidden = shape[1];
+    if (vocab <= 0 || hidden <= 0 || vocab % dist.tp_size != 0) {
+        return;
+    }
+
+    const std::int64_t rows = vocab / dist.tp_size;
+    const std::int64_t row_offset = rows * dist.tp_rank;
+    const std::string backing =
+        engine.has("lm_head.weight") ? "lm_head.weight" : "model.embed_tokens.weight";
+    const std::string shard_name =
+        "__pie.tp_lm_head_shard.rank" + std::to_string(dist.tp_rank) + ".weight";
+    if (!engine.has(shard_name)) {
+        register_row_slice(engine, backing, shard_name,
+                           row_offset, rows, hidden, DType::BF16);
+    }
+    w.lm_head_tp_shard = &engine.get(shard_name);
+    w.lm_head_tp_vocab_offset = static_cast<int>(row_offset);
+}
+
 }  // namespace
 
-Qwen3Weights bind_llama_like(LoadedModel& engine) {
+Qwen3Weights bind_llama_like(LoadedModel& engine, bool drop_fused_originals) {
     const auto& cfg = engine.hf_config();
 
     Qwen3Weights w;
@@ -109,6 +158,7 @@ Qwen3Weights bind_llama_like(LoadedModel& engine) {
     } else {
         throw std::runtime_error("llama-like: lm_head missing and tie_word_embeddings=false");
     }
+    install_tp_lm_head_shard(engine, w);
 
     w.layers.resize(static_cast<std::size_t>(cfg.num_hidden_layers));
     for (int i = 0; i < cfg.num_hidden_layers; ++i) {
@@ -117,10 +167,18 @@ Qwen3Weights bind_llama_like(LoadedModel& engine) {
         L.attn_norm = &must(engine, p + "input_layernorm.weight");
         L.mlp_norm  = &must(engine, p + "post_attention_layernorm.weight");
 
-        L.q_proj = &must(engine, p + "self_attn.q_proj.weight");
-        L.k_proj = &must(engine, p + "self_attn.k_proj.weight");
-        L.v_proj = &must(engine, p + "self_attn.v_proj.weight");
-        L.o_proj = &must(engine, p + "self_attn.o_proj.weight");
+        const std::string q_name = p + "self_attn.q_proj.weight";
+        const std::string k_name = p + "self_attn.k_proj.weight";
+        const std::string v_name = p + "self_attn.v_proj.weight";
+        const std::string o_name = p + "self_attn.o_proj.weight";
+        const std::string gate_name = p + "mlp.gate_proj.weight";
+        const std::string up_name = p + "mlp.up_proj.weight";
+        const std::string down_name = p + "mlp.down_proj.weight";
+
+        L.q_proj = &must(engine, q_name);
+        L.k_proj = &must(engine, k_name);
+        L.v_proj = &must(engine, v_name);
+        L.o_proj = &must(engine, o_name);
 
         // QKV biases (Qwen-2 / OLMo-3 / GPT-OSS). HF stores them on the
         // same module as the weight, so the convention is `*_proj.bias`.
@@ -137,19 +195,19 @@ Qwen3Weights bind_llama_like(LoadedModel& engine) {
             L.k_norm = &must(engine, p + "self_attn.k_norm.weight");
         }
 
-        L.gate_proj = &must(engine, p + "mlp.gate_proj.weight");
-        L.up_proj   = &must(engine, p + "mlp.up_proj.weight");
-        L.down_proj = &must(engine, p + "mlp.down_proj.weight");
+        L.gate_proj = &must(engine, gate_name);
+        L.up_proj   = &must(engine, up_name);
+        L.down_proj = &must(engine, down_name);
 
         // Pull QuantMeta side-map entries — one per projection. Stays
         // empty for unquantized models (the common case).
-        L.q_proj_quant    = engine.quant_meta(p + "self_attn.q_proj.weight");
-        L.k_proj_quant    = engine.quant_meta(p + "self_attn.k_proj.weight");
-        L.v_proj_quant    = engine.quant_meta(p + "self_attn.v_proj.weight");
-        L.o_proj_quant    = engine.quant_meta(p + "self_attn.o_proj.weight");
-        L.gate_proj_quant = engine.quant_meta(p + "mlp.gate_proj.weight");
-        L.up_proj_quant   = engine.quant_meta(p + "mlp.up_proj.weight");
-        L.down_proj_quant = engine.quant_meta(p + "mlp.down_proj.weight");
+        L.q_proj_quant    = engine.quant_meta(q_name);
+        L.k_proj_quant    = engine.quant_meta(k_name);
+        L.v_proj_quant    = engine.quant_meta(v_name);
+        L.o_proj_quant    = engine.quant_meta(o_name);
+        L.gate_proj_quant = engine.quant_meta(gate_name);
+        L.up_proj_quant   = engine.quant_meta(up_name);
+        L.down_proj_quant = engine.quant_meta(down_name);
 
         // P1.1 — Fuse Q/K/V and gate/up projections at bind time so the
         // forward path can issue one wide gemm per group instead of three
@@ -182,6 +240,14 @@ Qwen3Weights bind_llama_like(LoadedModel& engine) {
                     engine, *L.q_proj, *L.k_proj, *L.v_proj, fused_name);
             }
             L.qkv_proj_fused = &engine.get(fused_name);
+            if (drop_fused_originals) {
+                engine.erase(q_name);
+                engine.erase(k_name);
+                engine.erase(v_name);
+                L.q_proj = nullptr;
+                L.k_proj = nullptr;
+                L.v_proj = nullptr;
+            }
         }
         if (!gu_quantized && gu_bf16) {
             const std::string fused_name = p + "mlp.gate_up_proj.fused.weight";
@@ -190,39 +256,17 @@ Qwen3Weights bind_llama_like(LoadedModel& engine) {
                     engine, *L.gate_proj, *L.up_proj, fused_name);
             }
             L.gate_up_proj_fused = &engine.get(fused_name);
+            if (drop_fused_originals) {
+                engine.erase(gate_name);
+                engine.erase(up_name);
+                L.gate_proj = nullptr;
+                L.up_proj = nullptr;
+            }
         }
     }
 
     return w;
 }
-
-namespace {
-
-// Helper: register a non-owning sub-view into an already-loaded fused
-// weight. `row_offset` is in elements (not bytes); `rows` is the slice
-// height. The slice is contiguous along the leading axis (HF stores
-// projection weights as row-major `[out_dim, in_dim]`, which is the
-// flashinfer/cublas convention used downstream).
-void register_row_slice(
-    LoadedModel& e,
-    const std::string& fused_name,
-    const std::string& slice_name,
-    std::int64_t row_offset, std::int64_t rows, std::int64_t cols,
-    DType dtype)
-{
-    const auto& fused = e.get(fused_name);
-    if (fused.dtype() != dtype) {
-        throw std::runtime_error(
-            "register_row_slice: dtype mismatch on '" + fused_name + "'");
-    }
-    const std::int64_t element_bytes = static_cast<std::int64_t>(dtype_bytes(dtype));
-    auto* base = static_cast<std::uint8_t*>(const_cast<void*>(fused.data()));
-    auto* slice_ptr = base + row_offset * cols * element_bytes;
-    e.insert(slice_name,
-             DeviceTensor::view(slice_ptr, dtype, {rows, cols}));
-}
-
-}  // namespace
 
 Qwen3Weights bind_phi3(LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
@@ -284,6 +328,7 @@ Qwen3Weights bind_olmo3(LoadedModel& engine) {
         throw std::runtime_error(
             "olmo3: lm_head missing and tie_word_embeddings=false");
     }
+    install_tp_lm_head_shard(engine, w);
 
     w.layers.resize(static_cast<std::size_t>(cfg.num_hidden_layers));
     for (int i = 0; i < cfg.num_hidden_layers; ++i) {

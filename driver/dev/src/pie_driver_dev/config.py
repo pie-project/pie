@@ -1,7 +1,7 @@
 """Native driver runtime + TOML configs.
 
 `NativeRuntimeConfig` extends bridge's `RuntimeConfig` with native-only
-knobs (KV page size, batch limits, adapter pool sizing, weight dtype +
+state (resolved KV page size, adapter pool sizing, weight dtype +
 quantization, dummy-mode flag) and overrides the universal `device` and
 `activation_dtype` properties to return torch types. Model code under
 `pie_driver_dev/model/` keeps reading `runtime_config.device`
@@ -25,6 +25,12 @@ from ._bridge.config import RuntimeConfig, _resolve_universal_kwargs
 # Valid weight dtype categories.
 FLOAT_DTYPES = {"float32", "float16", "bfloat16", "auto"}
 QUANT_DTYPES = {"int4", "int8", "float8"}
+DEFAULT_KV_PAGE_SIZE = 16
+
+
+def derive_kv_page_size() -> int:
+    """Return the dev driver's resolved FlashInfer page size."""
+    return DEFAULT_KV_PAGE_SIZE
 
 
 @dataclass
@@ -39,11 +45,8 @@ class NativeRuntimeConfig(RuntimeConfig):
 
     # Memory + KV layout
     gpu_mem_utilization: float = 0.8
-    kv_page_size: int = 16
+    kv_page_size: int = DEFAULT_KV_PAGE_SIZE
 
-    # Forward limits the native scheduler / kernels enforce
-    max_forward_tokens: int = 10240
-    max_forward_requests: int = 512
     max_dist_size: int = 32
     max_num_embeds: int = 128
 
@@ -109,9 +112,6 @@ class NativeRuntimeConfig(RuntimeConfig):
         cpu_mem_budget_in_gb: int = 0,
         # native-specific
         gpu_mem_utilization: float = 0.8,
-        kv_page_size: int = 16,
-        max_forward_tokens: int = 10240,
-        max_forward_requests: int = 512,
         max_dist_size: int = 32,
         max_num_embeds: int = 128,
         max_num_adapters: int = 32,
@@ -148,9 +148,7 @@ class NativeRuntimeConfig(RuntimeConfig):
         return cls(
             **universal,
             gpu_mem_utilization=gpu_mem_utilization,
-            kv_page_size=kv_page_size,
-            max_forward_tokens=max_forward_tokens,
-            max_forward_requests=max_forward_requests,
+            kv_page_size=derive_kv_page_size(),
             max_dist_size=max_dist_size,
             max_num_embeds=max_num_embeds,
             max_num_adapters=max_num_adapters,
@@ -172,12 +170,9 @@ class NativeDriverConfig:
     """
 
     gpu_mem_utilization: float = 0.8
-    max_forward_tokens: int = 10240
-    max_forward_requests: int = 512
     max_dist_size: int = 32
     max_num_embeds: int = 128
     max_num_adapters: int = 32
     max_adapter_rank: int = 8
-    kv_page_size: int = 16
     weight_dtype: str = "auto"
     cpu_mem_budget_in_gb: int = 0

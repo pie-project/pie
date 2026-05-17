@@ -110,7 +110,7 @@ pub async fn submit(
     physical_page_ids: Vec<PhysicalPageId>,
     extra_pages: Vec<PhysicalPageId>,
     last_page_len: u32,
-) -> Result<pie_bridge::ForwardResponse> {
+) -> Result<ForwardOutput> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(
         model_idx,
@@ -125,6 +125,31 @@ pub async fn submit(
     )?;
     rx.await
         .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?
+}
+
+/// Internal forward result shape passed from the scheduler to a waiting
+/// inferlet. Normal decode returns a single token per request; carrying that
+/// directly avoids allocating a one-request `ForwardResponse` for every token.
+#[derive(Debug)]
+pub enum ForwardOutput {
+    Token(u32),
+    Tokens(Vec<u32>),
+    Response(pie_bridge::ForwardResponse),
+}
+
+impl ForwardOutput {
+    pub(crate) fn first_token(&self) -> Option<u32> {
+        match self {
+            Self::Token(t) => Some(*t),
+            Self::Tokens(tokens) => tokens.first().copied(),
+            Self::Response(resp) => resp.tokens.first().copied(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_response(resp: pie_bridge::ForwardResponse) -> Self {
+        Self::Response(resp)
+    }
 }
 
 /// Returns aggregated inference stats for a model (lock-free, non-blocking).
@@ -278,7 +303,7 @@ enum Message {
         /// full reserved range without re-allocating.
         extra_pages: Vec<PhysicalPageId>,
         last_page_len: u32,
-        response: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
+        response: oneshot::Sender<Result<ForwardOutput>>,
     },
     GetStats {
         response: oneshot::Sender<InferenceStats>,

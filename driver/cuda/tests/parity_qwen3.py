@@ -47,7 +47,6 @@ def write_dev_toml(path: Path, hf_repo: str, snapshot_dir: Path) -> None:
         'device = "cuda:0"\n'
         'dtype = "bfloat16"\n'
         '[batching]\n'
-        'kv_page_size = 32\n'
         'gpu_mem_utilization = 0.90\n'
         'memory_profile = "balanced"\n'
     )

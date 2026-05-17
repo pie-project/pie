@@ -71,6 +71,7 @@ struct LlamaLikeForwardCfg {
     // fastdiv for group_size and accepts arbitrary values; cost is
     // ~1.3× per-step latency vs the dedicated decode kernel.
     bool force_prefill_path = false;
+    bool decode_plan_cuda_graph = true;
 
     // Tensor-parallel state. `tp_size = 1` (default) keeps the original
     // single-GPU forward; `tp_size > 1` activates the sharded GEMM dims
@@ -78,6 +79,12 @@ struct LlamaLikeForwardCfg {
     // down_proj). `tp_comm` must be non-null whenever tp_size > 1.
     int tp_size = 1;
     NcclComm* tp_comm = nullptr;
+
+    // TP followers do not sample or build responses. After the final layer
+    // all-reduce there are no more collectives, so they can skip the rank-0
+    // logits tail.
+    bool emit_logits = true;
+
 };
 
 // Persistent decode-plan cache. Owned in main.cpp's serving setup so the
@@ -103,6 +110,9 @@ void prepare_llama_like_decode_plan(
     int num_requests,
     bool is_pure_decode);
 
+std::uint8_t llama_like_decode_graph_layout(
+    const LlamaLikePlanState& state);
+
 // Same call signature as `qwen3_forward_paged`, plus a `cfg` knob block
 // and an externally-owned `LlamaLikePlanState`. The body never plans —
 // it only reads `state.decode_plan` (already populated by the prepare
@@ -127,6 +137,9 @@ void llama_like_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::int32_t* logit_row_indices_d = nullptr,
+    int num_logit_rows = 0,
+    bool tp_greedy_argmax = false,
     const std::uint8_t* custom_mask_d = nullptr,
     const std::int32_t* custom_mask_indptr_d = nullptr);
 

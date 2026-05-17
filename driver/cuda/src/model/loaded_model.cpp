@@ -29,7 +29,7 @@ namespace {
 // fully replicated (norms, biases on row-parallel projections, embedding,
 // etc). Convention follows pie_driver/model/qwen3.py:
 //
-//   * column-parallel (axis=0): Q/K/V projections, MLP gate/up, lm_head
+//   * column-parallel (axis=0): Q/K/V projections, MLP gate/up
 //   * row-parallel    (axis=1): attn O proj, MLP down_proj
 //   * replicated     (axis=-1): norms, embed (we keep embed full to avoid
 //                               an all_gather on the embed output).
@@ -48,8 +48,8 @@ int llama_like_shard_axis(const std::string& name) {
     // (Qwen3-0.6B, most small Llamas) reuse `embed_tokens.weight` for the
     // output projection and don't ship a separate `lm_head.weight`; for
     // untied models the weight is duplicated on every rank, which costs
-    // memory but spares an all-gather/all-reduce on every fire. Revisit if
-    // the lm_head footprint dominates on large models.
+    // memory but avoids a full-vocab gather on every fire. The gather path
+    // was slower than replicated rank-0 logits on L40 TP=2.
     //
     // GPT-OSS attention sinks (`.sinks`) are per-head [num_attention_heads]
     // — they shard along the head axis exactly like q/k/v biases.
@@ -1468,7 +1468,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 LoadedModelCapabilities LoadedModel::capabilities() const {
     LoadedModelCapabilities c;
     c.total_pages = 0;  // populated in M1.2.2 once kv_cache lands
-    c.kv_page_size = static_cast<int>(boot_.batching.kv_page_size);
+    c.kv_page_size = 0; // populated by the CUDA memory plan in entry.cpp
     c.swap_pool_size = 0;
     // The runtime's `model::instruct::create` dispatches on the
     // PIE-arch key ("llama3", "gemma3", …) not HF's `architectures[0]`
@@ -1512,6 +1512,11 @@ void LoadedModel::insert(std::string name, DeviceTensor tensor) {
     if (!inserted) {
         throw std::runtime_error("engine: weight already registered: " + it->first);
     }
+}
+
+void LoadedModel::erase(const std::string& name) {
+    quant_meta_.erase(name);
+    weights_.erase(name);
 }
 
 void LoadedModel::replace(std::string name, DeviceTensor tensor) {

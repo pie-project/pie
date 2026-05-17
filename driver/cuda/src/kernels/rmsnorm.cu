@@ -53,6 +53,50 @@ __global__ void rmsnorm_bf16_kernel(
     }
 }
 
+template <int BLOCK>
+__global__ void residual_add_rmsnorm_bf16_kernel(
+    __nv_bfloat16* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ norm_out,
+    int hidden_size,
+    float eps)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    __nv_bfloat16* hr = hidden + row * hidden_size;
+    const __nv_bfloat16* rr = residual + row * hidden_size;
+    __nv_bfloat16* nr = norm_out + row * hidden_size;
+
+    float local = 0.f;
+    for (int i = tid; i < hidden_size; i += BLOCK) {
+        const float sum = __bfloat162float(hr[i]) + __bfloat162float(rr[i]);
+        const __nv_bfloat16 rounded = __float2bfloat16(sum);
+        hr[i] = rounded;
+        const float v = __bfloat162float(rounded);
+        local += v * v;
+    }
+
+    __shared__ float buf[BLOCK];
+    buf[tid] = local;
+    __syncthreads();
+
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) buf[tid] += buf[tid + off];
+        __syncthreads();
+    }
+
+    const float inv_rms =
+        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+
+    for (int i = tid; i < hidden_size; i += BLOCK) {
+        const float xv = __bfloat162float(hr[i]);
+        const float wv = __bfloat162float(weight[i]);
+        nr[i] = __float2bfloat16(xv * inv_rms * wv);
+    }
+}
+
 }  // namespace
 
 void launch_rmsnorm_bf16(
@@ -67,6 +111,27 @@ void launch_rmsnorm_bf16(
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<__nv_bfloat16*>(y),
         hidden, eps);
+}
+
+void launch_residual_add_rmsnorm_bf16(
+    void* hidden,
+    const void* residual,
+    const void* weight,
+    void* norm_out,
+    int num_rows,
+    int hidden_size,
+    float eps,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid(num_rows);
+    dim3 block(BLOCK);
+    residual_add_rmsnorm_bf16_kernel<BLOCK><<<grid, block, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(hidden),
+        static_cast<const __nv_bfloat16*>(residual),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_bfloat16*>(norm_out),
+        hidden_size, eps);
 }
 
 void launch_rmsnorm_gemma_bf16(

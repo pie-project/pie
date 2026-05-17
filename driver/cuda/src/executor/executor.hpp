@@ -71,6 +71,8 @@ struct ForwardFn {
     // satisfy that yet — left here as the explicit flip we'll set
     // alongside the graph-safe attention dispatch refactor.
     bool graph_safe = false;
+    bool supports_tp_greedy_argmax = false;
+    bool supports_compact_logits = false;
 
     using BodyFn = std::function<void(
         model::Qwen3Workspace&,
@@ -92,7 +94,10 @@ struct ForwardFn {
         const std::int32_t*  /* custom_mask_indptr_d (nullable) */,
         const std::int32_t*  /* slot_ids_h     host, len R, nullable */,
         const std::uint8_t*  /* is_fresh_h     host, len R, nullable */,
-        const std::int32_t*  /* slot_ids_d     device, len R, nullable */
+        const std::int32_t*  /* slot_ids_d     device, len R, nullable */,
+        const std::int32_t*  /* logit_row_indices_d device, nullable */,
+        int                  /* num_logit_rows */,
+        bool                 /* tp_greedy_argmax */
     )>;
 
     using PrepareFn = std::function<void(
@@ -102,9 +107,12 @@ struct ForwardFn {
         bool                 /* is_pure_decode */
     )>;
 
+    using GraphLayoutFn = std::function<std::uint8_t()>;
+
     // Empty by default → executor falls back to "direct call only;
     // no graph capture" mode for this arch.
     PrepareFn prepare;
+    GraphLayoutFn graph_layout;
     BodyFn    body;
 
     // Convenience: `forward_fn = [...]` assigns the lambda as the body.
@@ -133,6 +141,11 @@ struct Executor {
     AttentionWorkspace& attn_ws;
     ops::CublasHandle& cublas;
     int max_workspace_tokens;
+    int max_forward_requests;
+    // Private physical KV page used only for CUDA-graph padding rows.
+    // This page is not reported in DriverCapabilities.total_pages, so the
+    // runtime never assigns it to a context.
+    int graph_pad_page = -1;
     // Pre-allocated input buffers — refreshed per fire via memcpy
     // rather than re-allocated. See `persistent_inputs.hpp`.
     PersistentInputs& inputs;
@@ -180,6 +193,10 @@ void handle_fire_batch(
     pie_driver::PieForwardResponseView& out_resp,
     Executor& executor,
     std::uint64_t handled);
+
+// Pre-capture the pure-decode CUDA graph lattice for graph-safe forwards.
+// Returns the number of graph execs inserted into `executor.graph_cache`.
+std::size_t capture_forward_graph_lattice(Executor& executor);
 
 // TP-follower service loop. Called only on TP ranks > 0. Mirrors
 // `handle_fire_batch` minus shmem decode, sampling, and response: the

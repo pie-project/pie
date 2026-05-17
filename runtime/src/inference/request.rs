@@ -299,17 +299,49 @@ pub fn append_request(
     last_page_len: u32,
     page_size: u32,
 ) {
+    append_request_with_options(
+        batch,
+        req,
+        physical_page_ids,
+        last_page_len,
+        page_size,
+        false,
+    );
+}
+
+/// Append a per-request [`pie_bridge::ForwardRequest`] with caller-selected
+/// decode mask elision. `elide_decode_masks` is only valid when the entire
+/// batch is pure single-token decode; mixed prefill/decode batches need one
+/// flattened mask row per query row for the bridge's custom-mask view.
+pub fn append_request_with_options(
+    batch: &mut pie_bridge::ForwardRequest,
+    req: &pie_bridge::ForwardRequest,
+    physical_page_ids: &[PhysicalPageId],
+    last_page_len: u32,
+    page_size: u32,
+    elide_decode_masks: bool,
+) {
     // Tokens and positions
     batch.token_ids.extend(&req.token_ids);
     batch.position_ids.extend(&req.position_ids);
 
-    let trim = TrimPlan::compute(
-        &req.masks,
-        physical_page_ids.len() as u32,
-        last_page_len,
-        page_size,
-        req.token_ids.len() as u32,
-    );
+    let elide_decode_mask = elide_decode_masks
+        && req.single_token_mode
+        && !req.has_user_mask
+        && req.token_ids.len() <= 1
+        && req.spec_token_ids.is_empty();
+
+    let trim = if elide_decode_mask {
+        None
+    } else {
+        TrimPlan::compute(
+            &req.masks,
+            physical_page_ids.len() as u32,
+            last_page_len,
+            page_size,
+            req.token_ids.len() as u32,
+        )
+    };
 
     // KV cache layout.
     emit_kv_pages(batch, physical_page_ids, trim.as_ref());
@@ -319,8 +351,16 @@ pub fn append_request(
     batch.kv_last_page_lens.push(last_page_len);
     batch.qo_indptr.push(batch.token_ids.len() as u32);
 
-    // Attention masks.
-    emit_attention_masks(batch, &req.masks, trim.as_ref());
+    // Attention masks. The runtime synthesizes causal masks for every
+    // request so context lineage remains explicit, but pure single-token
+    // decode does not need to send those masks to the driver: decode kernels
+    // use KV lengths/page metadata directly and `single_token_mode` keeps the
+    // custom-mask path disabled.
+    if elide_decode_mask {
+        batch.mask_indptr.push(batch.masks.len() as u32);
+    } else {
+        emit_attention_masks(batch, &req.masks, trim.as_ref());
+    }
 
     // Logit mask. Per-request: each request contributes 0 or 1 Brle
     // entries (carried in `req.logit_masks`).
@@ -379,6 +419,24 @@ pub fn extract_per_request(
 
     // Tokens: one indptr range per request.
     let (tok_lo, tok_hi) = indptr_range(&fr.tokens_indptr, r);
+
+    // Hot path for normal generation: token samples only, no probe payloads.
+    // Avoid allocating several empty indptr vectors for every request in
+    // every decode batch.
+    let token_payload_only = fr.dists_ids.is_empty()
+        && fr.dists_probs.is_empty()
+        && fr.logits_bytes.is_empty()
+        && fr.logprobs_values.is_empty()
+        && fr.entropies.is_empty();
+    if token_payload_only {
+        if tok_hi == tok_lo + 1 {
+            out.tokens = vec![fr.tokens[tok_lo]];
+        } else {
+            out.tokens = fr.tokens[tok_lo..tok_hi].to_vec();
+        }
+        return out;
+    }
+
     out.tokens = fr.tokens[tok_lo..tok_hi].to_vec();
     out.tokens_indptr = vec![0, (tok_hi - tok_lo) as u32];
 

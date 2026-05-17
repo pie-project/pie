@@ -29,6 +29,11 @@ using DecodePlanCachePtr = std::unique_ptr<DecodePlanCache, DecodePlanCacheDelet
 
 DecodePlanCachePtr make_decode_plan();
 
+// Compact graph-layout class for the most recent decode plan. CUDA graph
+// replay records the host-side dispatch branch, so changes such as
+// non-partitioned -> split-KV need distinct graph keys.
+std::uint8_t decode_plan_graph_layout(const DecodePlanCache& cache);
+
 // Compute decode plan once per fire. Stores results in `cache` and the
 // workspace's int/float buffers (so per-layer dispatch can read them).
 void plan_attention_flashinfer_decode_bf16(
@@ -40,7 +45,8 @@ void plan_attention_flashinfer_decode_bf16(
     int head_dim,
     int page_size,
     AttentionWorkspace& workspace,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool enable_cuda_graph = true);
 
 // Per-layer dispatch reusing the cached plan. `q`/`k_pages`/`v_pages`/`o`
 // vary per layer; everything else comes from the cache + workspace.

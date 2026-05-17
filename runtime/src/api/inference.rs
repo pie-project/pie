@@ -4,6 +4,7 @@ use crate::api::adapter::Adapter;
 use crate::api::context::Context;
 use crate::api::model::Model;
 use crate::api::pie;
+use crate::inference::ForwardOutput;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::grammar::Grammar as InternalGrammar;
 use crate::inference::structured::json_schema::{
@@ -46,7 +47,7 @@ pub struct ForwardPass {
 #[derive(Debug)]
 pub struct FutureOutput {
     result: Option<pie::core::inference::Output>,
-    rx: Option<oneshot::Receiver<pie_bridge::ForwardResponse>>,
+    rx: Option<oneshot::Receiver<ForwardOutput>>,
     /// Samplers from the originating request — cloned before draining
     /// `pass.req` at execute() time so we can reconstruct the WIT
     /// per-slot output list against this slot order.
@@ -63,7 +64,7 @@ impl Pollable for FutureOutput {
         if let Some(rx) = self.rx.take() {
             match rx.await {
                 Ok(resp) => {
-                    self.result = Some(build_wit_output(&resp, &self.samplers));
+                    self.result = Some(build_wit_output(resp, &self.samplers));
                     self.done = true;
                 }
                 Err(_) => {
@@ -93,11 +94,10 @@ impl Pollable for FutureOutput {
 /// inferlet's sampler count); in that case all slots collapse to
 /// `Token` entries.
 fn build_wit_output(
-    resp: &pie_bridge::ForwardResponse,
+    output: ForwardOutput,
     samplers: &[pie_bridge::Sampler],
 ) -> pie::core::inference::Output {
     use pie::core::inference::SlotOutput as WitSlot;
-    use pie_bridge::Sampler;
 
     // Spec channel: pie historically returned `spec_tokens` /
     // `spec_positions` inline; the schema's ForwardResponse doesn't
@@ -105,27 +105,72 @@ fn build_wit_output(
     let spec_tokens: Vec<u32> = Vec::new();
     let spec_positions: Vec<u32> = Vec::new();
 
-    let expected_token_slots = samplers
-        .iter()
-        .filter(|s| {
-            matches!(
-                s,
-                Sampler::Multinomial { .. }
-                    | Sampler::TopK { .. }
-                    | Sampler::TopP { .. }
-                    | Sampler::MinP { .. }
-                    | Sampler::TopKTopP { .. }
-            )
-        })
-        .count();
+    match output {
+        ForwardOutput::Token(token) => {
+            return pie::core::inference::Output {
+                slots: vec![WitSlot::Token(token)],
+                spec_tokens,
+                spec_positions,
+            };
+        }
+        ForwardOutput::Tokens(tokens) => {
+            let slots = tokens.into_iter().map(WitSlot::Token).collect();
+            return pie::core::inference::Output {
+                slots,
+                spec_tokens,
+                spec_positions,
+            };
+        }
+        ForwardOutput::Response(resp) => build_wit_output_from_response(resp, samplers),
+    }
+}
 
-    let tokens: Vec<u32> = resp.tokens.clone();
-    let is_spec_walk = !tokens.is_empty()
-        && tokens.len() != expected_token_slots
-        && resp.dists_ids.is_empty()
+fn build_wit_output_from_response(
+    resp: pie_bridge::ForwardResponse,
+    samplers: &[pie_bridge::Sampler],
+) -> pie::core::inference::Output {
+    use pie::core::inference::SlotOutput as WitSlot;
+    use pie_bridge::Sampler;
+
+    let spec_tokens: Vec<u32> = Vec::new();
+    let spec_positions: Vec<u32> = Vec::new();
+
+    let token_payload_only = resp.dists_ids.is_empty()
+        && resp.dists_probs.is_empty()
         && resp.logits_bytes.is_empty()
         && resp.logprobs_values.is_empty()
         && resp.entropies.is_empty();
+
+    let mut expected_token_slots = 0usize;
+    let mut all_samplers_token = true;
+    for sampler in samplers {
+        let is_token = matches!(
+            sampler,
+            Sampler::Multinomial { .. }
+                | Sampler::TopK { .. }
+                | Sampler::TopP { .. }
+                | Sampler::MinP { .. }
+                | Sampler::TopKTopP { .. }
+        );
+        if is_token {
+            expected_token_slots += 1;
+        } else {
+            all_samplers_token = false;
+        }
+    }
+
+    let tokens = resp.tokens;
+    let is_spec_walk =
+        token_payload_only && !tokens.is_empty() && tokens.len() != expected_token_slots;
+
+    if token_payload_only && (all_samplers_token || is_spec_walk) {
+        let slots = tokens.into_iter().map(WitSlot::Token).collect();
+        return pie::core::inference::Output {
+            slots,
+            spec_tokens,
+            spec_positions,
+        };
+    }
 
     if is_spec_walk {
         let slots = tokens.into_iter().map(WitSlot::Token).collect();
@@ -241,9 +286,9 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     async fn new(&mut self, model: Resource<Model>) -> Result<Resource<ForwardPass>> {
         let model = self.ctx().table.get(&model)?;
         // Initialize the accumulator with the per-request invariants:
-        // single adapter binding (-1 sentinels = unbound), and a default
-        // `output_speculative_tokens = true` written into the single
-        // entry of `output_spec_flags`.
+        // single adapter binding (-1 sentinels = unbound), and no
+        // speculative side-channel output unless the caller explicitly
+        // enables it via `output_speculative_tokens(true)`.
         let pass = ForwardPass {
             model_id: model.model_id,
             context_id: None,
@@ -254,7 +299,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                     adapter_id: -1,
                     seed: -1,
                 }],
-                output_spec_flags: vec![true],
+                output_spec_flags: vec![false],
                 ..Default::default()
             },
         };
@@ -542,7 +587,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             context::unpin(model_id, context_id);
         }
         let future_output = FutureOutput {
-            result: Some(build_wit_output(&output, &samplers_for_output)),
+            result: Some(build_wit_output(output, &samplers_for_output)),
             rx: None,
             samplers: samplers_for_output,
             done: true,

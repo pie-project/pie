@@ -310,7 +310,7 @@ fn parse_caps_json(json: &str) -> Result<DriverCapabilities> {
 ///
 /// The driver consumes:
 ///   - `[model]` — local snapshot dir + GGML offload knobs.
-///   - `[batching]` — KV page geometry + per-batch budgets.
+///   - `[runtime]` — logging / diagnostic flags.
 ///
 /// Cold-path RPC (page copies, adapter loads) is no longer wired
 /// through this TOML — it now travels through direct `extern "C"`
@@ -329,22 +329,6 @@ pub fn write_startup_toml(
     insert_str(&mut model, "backend", &options.device);
     insert_table(&mut doc, "model", model);
 
-    let mut batching = toml::Table::new();
-    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
-    insert_int(&mut batching, "total_pages", options.total_pages);
-    insert_int(
-        &mut batching,
-        "max_forward_tokens",
-        options.max_forward_tokens,
-    );
-    insert_int(
-        &mut batching,
-        "max_forward_requests",
-        options.max_forward_requests,
-    );
-    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
-    insert_table(&mut doc, "batching", batching);
-
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", options.verbose);
     insert_table(&mut doc, "runtime", runtime);
@@ -352,11 +336,11 @@ pub fn write_startup_toml(
     write_toml_table(out_path, doc)
 }
 
-/// Read `vocab_size` + `architectures[0]` out of `<snapshot>/config.json`.
+/// Read model facts out of `<snapshot>/config.json`.
 /// Used by [`write_dummy_startup_toml`] when the user didn't explicitly
 /// specify them in `[model.driver.options]`. Mirrors the legacy Python
 /// dummy driver's `hf_utils.load_hf_config()`-based discovery.
-fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String)> {
+fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
     let path = snapshot_dir.join("config.json");
     let text = std::fs::read_to_string(&path).map_err(|e| anyhow!("read {path:?}: {e}"))?;
     let v: serde_json::Value =
@@ -374,13 +358,22 @@ fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String)> {
         .and_then(|a| a.as_str())
         .ok_or_else(|| anyhow!("`architectures[0]` missing from {path:?}"))?;
     // "Qwen3ForCausalLM" → "qwen3" — same heuristic the Python wrapper used.
-    let arch_name = raw_arch
-        .to_lowercase()
+    let raw_arch_lower = raw_arch.to_lowercase();
+    let arch_name = raw_arch_lower
         .strip_suffix("forcausallm")
-        .unwrap_or(&raw_arch.to_lowercase())
+        .unwrap_or(&raw_arch_lower)
         .to_string();
 
-    Ok((vocab_size, arch_name))
+    let max_model_len = v
+        .get("max_position_embeddings")
+        .or_else(|| v.get("max_sequence_length"))
+        .or_else(|| v.get("model_max_length"))
+        .or_else(|| v.get("context_length"))
+        .or_else(|| v.get("n_positions"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(4096) as u32;
+
+    Ok((vocab_size, arch_name, max_model_len))
 }
 
 /// Write the dummy driver's startup TOML. Shape mirrors `driver/dummy/src/config.rs`:
@@ -400,18 +393,25 @@ pub fn write_dummy_startup_toml(
     group_id: usize,
     spin_budget_us: u64,
 ) -> Result<()> {
-    let (vocab_size, arch_name) = match (opts.vocab_size, opts.arch_name.as_deref()) {
-        (Some(v), Some(a)) => (v, a.to_string()),
+    let (vocab_size, arch_name, max_model_len) = match (opts.vocab_size, opts.arch_name.as_deref())
+    {
+        (Some(v), Some(a)) => {
+            let (_, _, auto_len) =
+                read_hf_config_defaults(snapshot_dir).unwrap_or_else(|_| (v, a.to_string(), 4096));
+            (v, a.to_string(), auto_len)
+        }
         (v_opt, a_opt) => {
-            let (auto_v, auto_a) = read_hf_config_defaults(snapshot_dir).with_context(|| {
-                format!(
-                    "auto-discovering vocab_size + arch_name for dummy driver. \
+            let (auto_v, auto_a, auto_len) =
+                read_hf_config_defaults(snapshot_dir).with_context(|| {
+                    format!(
+                        "auto-discovering vocab_size + arch_name for dummy driver. \
                      Set them explicitly in [model.driver.options] to skip this lookup."
-                )
-            })?;
+                    )
+                })?;
             (
                 v_opt.unwrap_or(auto_v),
                 a_opt.map(str::to_string).unwrap_or(auto_a),
+                auto_len,
             )
         }
     };
@@ -424,16 +424,9 @@ pub fn write_dummy_startup_toml(
     );
 
     let mut dummy = toml::Table::new();
-    insert_int(&mut dummy, "kv_page_size", opts.kv_page_size);
-    insert_int(&mut dummy, "max_forward_tokens", opts.max_forward_tokens);
-    insert_int(
-        &mut dummy,
-        "max_forward_requests",
-        opts.max_forward_requests,
-    );
     insert_int(&mut dummy, "vocab_size", vocab_size);
     insert_str(&mut dummy, "arch_name", arch_name);
-    insert_int(&mut dummy, "max_model_len", opts.max_model_len);
+    insert_int(&mut dummy, "max_model_len", max_model_len);
     insert_str(&mut dummy, "activation_dtype", activation_dtype);
     insert_int(&mut dummy, "random_seed", random_seed as i64);
     insert_str(&mut dummy, "snapshot_dir", path_string(snapshot_dir));
@@ -445,7 +438,7 @@ pub fn write_dummy_startup_toml(
 /// Write the cuda driver's startup TOML. Schema mirrors
 /// `driver/cuda/src/config.hpp`: `[model]` with
 /// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional `runtime_quant`,
-/// `[batching]` with KV-page geometry plus `swap_pool_size`, and
+/// `[batching]` with memory planner knobs plus `swap_pool_size`, and
 /// `[runtime]` with the server verbosity flag.
 ///
 /// `[distributed]` is emitted only for TP launches; single-rank uses the
@@ -469,7 +462,6 @@ pub(crate) fn write_cuda_startup_toml(
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
-    insert_int(&mut batching, "kv_page_size", opts.kv_page_size);
     batching.insert(
         "gpu_mem_utilization".into(),
         toml::Value::Float(opts.gpu_mem_utilization),
@@ -969,10 +961,6 @@ mod tests {
         let opts = DummyDriverOptions {
             vocab_size: Some(32000),
             arch_name: Some("qwen3".to_string()),
-            kv_page_size: 16,
-            max_forward_tokens: 4096,
-            max_forward_requests: 128,
-            max_model_len: 4096,
             ready_timeout_s: 5.0,
         };
 
@@ -985,6 +973,9 @@ mod tests {
             Some("18446744073709551615"),
         );
         assert!(val["dummy"].get("max_num_kv_pages").is_none());
+        assert!(val["dummy"].get("kv_page_size").is_none());
+        assert!(val["dummy"].get("max_forward_tokens").is_none());
+        assert!(val["dummy"].get("max_forward_requests").is_none());
     }
 
     #[test]
@@ -1009,9 +1000,10 @@ mod tests {
             val.get("aux_ipc").is_none(),
             "portable no longer emits [aux_ipc]"
         );
-        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
-        assert_eq!(val["batching"]["total_pages"].as_integer().unwrap(), 1024);
-        assert!(val["batching"].get("max_num_kv_pages").is_none());
+        assert!(
+            val.get("batching").is_none(),
+            "portable capacities are derived by the driver"
+        );
         assert_eq!(
             val["model"]["hf_path"].as_str().unwrap(),
             snap.to_str().unwrap()
@@ -1046,7 +1038,7 @@ mod tests {
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:0");
         assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
         assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
-        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
+        assert!(val["batching"].get("kv_page_size").is_none());
         assert_eq!(
             val["batching"]["gpu_mem_utilization"].as_float().unwrap(),
             0.90
@@ -1055,7 +1047,7 @@ mod tests {
             val["batching"]["memory_profile"].as_str().unwrap(),
             "balanced"
         );
-        assert_eq!(val["batching"].as_table().unwrap().len(), 4);
+        assert_eq!(val["batching"].as_table().unwrap().len(), 3);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
     }

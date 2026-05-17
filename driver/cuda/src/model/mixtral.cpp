@@ -238,10 +238,17 @@ void mixtral_forward_paged(
             N, num_q_heads_local, num_kv_heads_local, d,
             cfg.rope_theta, stream);
 
-        kernels::launch_write_kv_to_pages_bf16(
-            cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
-            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, cache.page_size(), num_kv_heads_local, d, stream);
+        if (use_decode_path) {
+            kernels::launch_write_kv_decode_to_pages_bf16(
+                cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
+                kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                R, cache.page_size(), num_kv_heads_local, d, stream);
+        } else {
+            kernels::launch_write_kv_to_pages_bf16(
+                cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                N, R, cache.page_size(), num_kv_heads_local, d, stream);
+        }
 
         // Only ask flashinfer for lse on layers that actually use sinks.
         // Saves a per-layer kernel write on plain Mixtral, and on

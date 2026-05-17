@@ -124,17 +124,8 @@ fn display_config_from(cfg: &config::Config) -> Result<DisplayConfig> {
         device: m.driver.device.clone(),
         tensor_parallel_size: m.driver.tensor_parallel_size,
         activation_dtype: m.driver.activation_dtype.clone(),
-        kv_page_size: extract_kv_page_size(m).unwrap_or(0),
         memory_profile: extract_memory_profile(m).unwrap_or_else(|| "balanced".to_string()),
     })
-}
-
-fn extract_kv_page_size(m: &config::ModelConfig) -> Option<u32> {
-    m.driver
-        .options
-        .get("kv_page_size")?
-        .as_integer()
-        .map(|n| n as u32)
 }
 
 fn extract_memory_profile(m: &config::ModelConfig) -> Option<String> {

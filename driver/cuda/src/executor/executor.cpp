@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 
 #include "attention_workspace.hpp"
 #include "brle.hpp"
+#include "custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
 #include "distributed.hpp"
@@ -31,6 +33,7 @@
 #include "model/qwen3.hpp"
 #include "model/qwen3_forward.hpp"
 #include "ops/gemm.hpp"
+#include "kernels/sample_temp.hpp"
 #include "sampler_type.hpp"
 #include "sampling_dispatch.hpp"
 #include "spec_expansion.hpp"
@@ -47,6 +50,26 @@ struct TpCpuGate {
 
 std::mutex g_tp_cpu_gates_mu;
 std::unordered_map<std::string, std::shared_ptr<TpCpuGate>> g_tp_cpu_gates;
+
+void tp_graph_capture_barrier(const Executor& executor) {
+    if (executor.tp_comm == nullptr) return;
+    if (executor.tp_cpu_gate_key.empty()) return;
+    const int world = executor.tp_comm->world_size();
+    if (world <= 1) return;
+
+    static std::mutex registry_mu;
+    static std::unordered_map<std::string, std::shared_ptr<std::barrier<>>>
+        registry;
+
+    std::shared_ptr<std::barrier<>> b;
+    {
+        std::lock_guard<std::mutex> lk(registry_mu);
+        auto& entry = registry[executor.tp_cpu_gate_key + ":graph_capture"];
+        if (!entry) entry = std::make_shared<std::barrier<>>(world);
+        b = entry;
+    }
+    b->arrive_and_wait();
+}
 
 std::uint64_t splitmix64(std::uint64_t x) {
     x += 0x9E3779B97F4A7C15ULL;
@@ -78,6 +101,67 @@ std::uint32_t fresh_sampling_seed() {
         0x9E3779B97F4A7C15ULL, std::memory_order_relaxed));
     std::uint32_t seed = static_cast<std::uint32_t>(x ^ (x >> 32));
     return seed == 0 ? 1u : seed;
+}
+
+std::vector<int> forward_graph_request_lattice(int max_requests) {
+    std::vector<int> out;
+    if (max_requests <= 0) return out;
+    for (int r = 1; r <= max_requests; ++r) {
+        const int bucket = forward_graph_request_bucket(r, max_requests);
+        if (bucket <= 0) continue;
+        if (out.empty() || out.back() != bucket) out.push_back(bucket);
+        if (bucket == max_requests) break;
+        r = bucket;
+    }
+    return out;
+}
+
+cudaGraphExec_t capture_forward_graph_exec(
+    Executor& executor,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int N,
+    int R,
+    bool is_pure_decode,
+    const std::int32_t* slot_ids_h,
+    const std::uint8_t* is_fresh_h,
+    const std::int32_t* slot_ids_d,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows,
+    bool tp_greedy_argmax)
+{
+    auto& pi = executor.inputs;
+
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    cudaStream_t cstream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
+    executor.cublas.set_stream(cstream);
+    CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
+    executor.forward_fn.body(
+        executor.ws, executor.kv_cache, executor.attn_ws, executor.cublas,
+        reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
+        reinterpret_cast<const std::int32_t*>(pi.positions.data()),
+        pi.qo_indptr.data(), pi.kv_page_indices.data(),
+        pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
+        qo_indptr_h, kv_page_indptr_h,
+        N, R, is_pure_decode, nullptr, nullptr,
+        slot_ids_h, is_fresh_h, slot_ids_d,
+        logit_row_indices_d, num_logit_rows, tp_greedy_argmax);
+    cudaGraph_t graph = nullptr;
+    CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
+    if (executor.tp_comm != nullptr &&
+        executor.tp_comm->custom_all_reduce() != nullptr) {
+        executor.tp_comm->custom_all_reduce()
+            ->register_graph_buffers(*executor.tp_comm);
+    }
+    executor.cublas.set_stream(nullptr);
+
+    cudaGraphExec_t exec = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    CUDA_CHECK(cudaGraphUpload(exec, nullptr));
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(cstream);
+    return exec;
 }
 
 float bf16_to_float(std::uint16_t v) {
@@ -215,9 +299,14 @@ struct TpFireHeader {
     // existing payload broadcasts. Inert (0) for archs that don't use
     // a state cache — followers skip those broadcasts.
     std::int32_t has_slot_ids;
+    // 1 = llama-like TP greedy decode fast path. Followers use this to
+    // capture/replay the same forward variant as rank 0.
+    std::int32_t tp_greedy_argmax;
+    // Number of compact logit rows in pi.sample_idx.
+    std::int32_t logit_rows;
 };
-static_assert(sizeof(TpFireHeader) == 8 * sizeof(std::int32_t),
-              "TpFireHeader must pack into exactly 8 ints");
+static_assert(sizeof(TpFireHeader) == 10 * sizeof(std::int32_t),
+              "TpFireHeader must pack into exactly 10 ints");
 constexpr std::int32_t TP_FIRE_MAGIC = 0x55504954;  // 'TPIU' tag
 constexpr std::int32_t TP_STOP_MAGIC = 0x504F5453;  // 'STOP' tag
 
@@ -241,6 +330,8 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                          int kv_indices_count,
                          int mask_bytes, int mask_indptr_count,
                          bool has_slot_ids,
+                         bool tp_greedy_argmax,
+                         int logit_rows,
                          cudaStream_t stream)
 {
     auto* d_hdr = tp_hdr_dev_buf();
@@ -248,6 +339,8 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
         TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
         kv_indices_count, mask_bytes, mask_indptr_count,
         has_slot_ids ? 1 : 0,
+        tp_greedy_argmax ? 1 : 0,
+        logit_rows,
     };
     // Header goes first (synchronous from the followers' POV — they need
     // to parse sizes before posting matching payload broadcasts).
@@ -302,6 +395,11 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                                  static_cast<std::size_t>(R), ncclChar, 0,
                                  comm.comm(), stream));
     }
+    if (logit_rows > 0) {
+        NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
+                                 static_cast<std::size_t>(logit_rows) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+    }
     NCCL_CHECK(ncclGroupEnd());
 }
 
@@ -324,6 +422,86 @@ struct FireTiming {
     int N;
 };
 
+struct ForwardInputViews {
+    std::span<const std::uint32_t> tokens;
+    std::span<const std::uint32_t> positions;
+    std::span<const std::uint32_t> qo_indptr;
+    std::span<const std::uint32_t> kv_page_indices;
+    std::span<const std::uint32_t> kv_page_indptr;
+    std::span<const std::uint32_t> kv_last_page_lens;
+    int total_tokens = 0;
+    int num_requests = 0;
+    bool padded = false;
+
+    std::vector<std::uint32_t> tokens_storage;
+    std::vector<std::uint32_t> positions_storage;
+    std::vector<std::uint32_t> qo_indptr_storage;
+    std::vector<std::uint32_t> kv_page_indices_storage;
+    std::vector<std::uint32_t> kv_page_indptr_storage;
+    std::vector<std::uint32_t> kv_last_page_lens_storage;
+};
+
+ForwardInputViews make_forward_input_views(
+    std::span<const std::uint32_t> tokens,
+    std::span<const std::uint32_t> positions,
+    std::span<const std::uint32_t> qo_indptr,
+    std::span<const std::uint32_t> kv_page_indices,
+    std::span<const std::uint32_t> kv_page_indptr,
+    std::span<const std::uint32_t> kv_last_page_lens,
+    int real_requests,
+    int graph_requests,
+    int graph_pad_page)
+{
+    ForwardInputViews out{
+        tokens,
+        positions,
+        qo_indptr,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
+        static_cast<int>(tokens.size()),
+        real_requests,
+        false,
+    };
+
+    if (graph_requests <= real_requests) return out;
+
+    const int pad = graph_requests - real_requests;
+    out.tokens_storage.assign(tokens.begin(), tokens.end());
+    out.positions_storage.assign(positions.begin(), positions.end());
+    out.qo_indptr_storage.assign(qo_indptr.begin(), qo_indptr.end());
+    out.kv_page_indices_storage.assign(kv_page_indices.begin(),
+                                       kv_page_indices.end());
+    out.kv_page_indptr_storage.assign(kv_page_indptr.begin(),
+                                      kv_page_indptr.end());
+    out.kv_last_page_lens_storage.assign(kv_last_page_lens.begin(),
+                                         kv_last_page_lens.end());
+
+    for (int i = 0; i < pad; ++i) {
+        out.tokens_storage.push_back(0);
+        out.positions_storage.push_back(static_cast<std::uint32_t>(i));
+        out.qo_indptr_storage.push_back(
+            out.qo_indptr_storage.back() + 1u);
+        out.kv_page_indices_storage.push_back(
+            static_cast<std::uint32_t>(graph_pad_page));
+        out.kv_page_indptr_storage.push_back(
+            static_cast<std::uint32_t>(out.kv_page_indices_storage.size()));
+        out.kv_last_page_lens_storage.push_back(
+            static_cast<std::uint32_t>(i + 1));
+    }
+
+    out.tokens = out.tokens_storage;
+    out.positions = out.positions_storage;
+    out.qo_indptr = out.qo_indptr_storage;
+    out.kv_page_indices = out.kv_page_indices_storage;
+    out.kv_page_indptr = out.kv_page_indptr_storage;
+    out.kv_last_page_lens = out.kv_last_page_lens_storage;
+    out.total_tokens = graph_requests;
+    out.num_requests = graph_requests;
+    out.padded = true;
+    return out;
+}
+
 inline std::uint64_t fire_now_us() noexcept {
     using namespace std::chrono;
     return duration_cast<microseconds>(
@@ -333,6 +511,100 @@ inline std::uint64_t fire_now_us() noexcept {
 inline bool fire_timing_enabled() {
     static const bool enabled = std::getenv("PIE_TIMING") != nullptr;
     return enabled;
+}
+
+std::size_t capture_forward_graph_lattice(Executor& executor) {
+    if (executor.graph_cache == nullptr) return 0;
+    if (!executor.forward_fn.graph_safe || !executor.forward_fn.body) return 0;
+    if (!executor.forward_fn.prepare) return 0;
+
+    const int max_requests =
+        std::min(executor.max_forward_requests, executor.max_workspace_tokens);
+    if (max_requests <= 0) return 0;
+
+    auto buckets = forward_graph_request_lattice(max_requests);
+    if (buckets.empty()) return 0;
+
+    auto& pi = executor.inputs;
+    const int num_pages = std::max(1, executor.kv_cache.num_pages());
+    std::size_t captured = 0;
+    const bool tp_greedy_argmax =
+        executor.tp_comm != nullptr &&
+        executor.tp_comm->world_size() <= 8 &&
+        executor.forward_fn.supports_tp_greedy_argmax;
+    const bool log_rank =
+        executor.verbose &&
+        (executor.tp_comm == nullptr || executor.tp_comm->rank() == 0);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::size_t free_before = 0;
+    std::size_t total_before = 0;
+    if (log_rank) {
+        CUDA_CHECK(cudaMemGetInfo(&free_before, &total_before));
+    }
+
+    for (int R : buckets) {
+        const int N = R;
+        std::vector<std::uint32_t> tokens(static_cast<std::size_t>(N), 0u);
+        std::vector<std::uint32_t> positions(static_cast<std::size_t>(N), 0u);
+        std::vector<std::uint32_t> qo(static_cast<std::size_t>(R) + 1);
+        std::vector<std::uint32_t> kvpp(static_cast<std::size_t>(R) + 1);
+        std::vector<std::uint32_t> kvlpl(static_cast<std::size_t>(R), 1u);
+        std::vector<std::uint32_t> kvpi(static_cast<std::size_t>(R));
+
+        for (int r = 0; r <= R; ++r) {
+            qo[static_cast<std::size_t>(r)] = static_cast<std::uint32_t>(r);
+            kvpp[static_cast<std::size_t>(r)] = static_cast<std::uint32_t>(r);
+        }
+        for (int r = 0; r < R; ++r) {
+            kvpi[static_cast<std::size_t>(r)] =
+                static_cast<std::uint32_t>(r % num_pages);
+        }
+
+        pi.tokens.copy_from_host(std::span<const std::uint32_t>(tokens));
+        pi.positions.copy_from_host(std::span<const std::uint32_t>(positions));
+        pi.qo_indptr.copy_from_host(std::span<const std::uint32_t>(qo));
+        pi.kv_page_indices.copy_from_host(std::span<const std::uint32_t>(kvpi));
+        pi.kv_page_indptr.copy_from_host(std::span<const std::uint32_t>(kvpp));
+        pi.kv_last_page_lens.copy_from_host(std::span<const std::uint32_t>(kvlpl));
+
+        executor.forward_fn.prepare(
+            executor.attn_ws, kvpp.data(), R, /*is_pure_decode=*/true);
+        const std::uint8_t graph_layout =
+            executor.forward_fn.graph_layout ? executor.forward_fn.graph_layout() : 0u;
+        const std::uint8_t graph_variant =
+            static_cast<std::uint8_t>((tp_greedy_argmax ? 1u : 0u) |
+                                      (graph_layout << 1));
+        const ForwardGraphKey key{R, graph_variant};
+        if (executor.graph_cache->get(key) != nullptr) continue;
+
+        tp_graph_capture_barrier(executor);
+        cudaGraphExec_t exec = capture_forward_graph_exec(
+            executor, qo.data(), kvpp.data(), N, R, /*is_pure_decode=*/true,
+            /*slot_ids_h=*/nullptr, /*is_fresh_h=*/nullptr,
+            /*slot_ids_d=*/nullptr, /*logit_row_indices_d=*/nullptr,
+            /*num_logit_rows=*/0, tp_greedy_argmax);
+        executor.graph_cache->put(key, exec);
+        ++captured;
+        tp_graph_capture_barrier(executor);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    if (log_rank) {
+        std::size_t free_after = 0;
+        std::size_t total_after = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_after, &total_after));
+        const std::size_t graph_bytes =
+            free_before > free_after ? (free_before - free_after) : 0;
+        const auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::cerr << "[pie-driver-cuda] CUDA graph upfront capture: "
+                  << captured << " decode graphs"
+                  << " (cache size=" << executor.graph_cache->size()
+                  << ", graph_mem~" << (graph_bytes / (1024 * 1024))
+                  << " MiB"
+                  << ", " << dt << " ms)\n";
+    }
+    return captured;
 }
 
 void handle_fire_batch(
@@ -357,6 +629,8 @@ void handle_fire_batch(
     auto& pi                   = executor.inputs;  // persistent input slabs
     auto& forward_fn           = executor.forward_fn;
     const int max_workspace_tokens = executor.max_workspace_tokens;
+    const int max_forward_requests = executor.max_forward_requests;
+    const int graph_pad_page = executor.graph_pad_page;
 
     // Track whether the custom-mask path was populated this fire so the
     // forward kernel knows whether to consume `pi.custom_mask`. Sizes are
@@ -526,16 +800,45 @@ void handle_fire_batch(
             if (h_qo[r + 1] - h_qo[r] != 1u) is_pure_decode = false;
         }
 
+        bool graph_shape_ok =
+            executor.graph_cache != nullptr && is_pure_decode &&
+            forward_fn.graph_safe;
+        int graph_requests = R;
+        if (graph_shape_ok) {
+            const int bucket =
+                forward_graph_request_bucket(R, max_forward_requests);
+            const int pad = bucket - R;
+            const bool exact_bucket = (bucket == R);
+            const bool can_pad =
+                bucket > R &&
+                graph_pad_page >= 0 &&
+                bucket <= max_workspace_tokens &&
+                pad <= page_size &&
+                kvpi_view.size() + static_cast<std::size_t>(pad) <=
+                    pi.kv_page_indices.size();
+            graph_shape_ok = bucket > 0 && (exact_bucket || can_pad);
+            if (graph_shape_ok) graph_requests = bucket;
+        }
+
+        ForwardInputViews forward_inputs = make_forward_input_views(
+            tok_view, pos_view, qo_view, kvpi_view, kvpp_view, kvlpl_view,
+            R, graph_requests, graph_pad_page);
+        const int forward_N = forward_inputs.total_tokens;
+        const int forward_R = forward_inputs.num_requests;
+        const std::uint32_t* h_qo_forward = forward_inputs.qo_indptr.data();
+        const std::uint32_t* h_kvpp_forward =
+            forward_inputs.kv_page_indptr.data();
+
         if (tm_on) tm.t_after_parse_us = fire_now_us();
         // Refill persistent device buffers with this fire's wire inputs.
         // Same device addresses every fire — required for graph-replay
         // safety; cheap (single async memcpy each) on its own.
-        pi.tokens.copy_from_host(tok_view);
-        pi.positions.copy_from_host(pos_view);
-        pi.qo_indptr.copy_from_host(qo_view);
-        pi.kv_page_indices.copy_from_host(kvpi_view);
-        pi.kv_page_indptr.copy_from_host(kvpp_view);
-        pi.kv_last_page_lens.copy_from_host(kvlpl_view);
+        pi.tokens.copy_from_host(forward_inputs.tokens);
+        pi.positions.copy_from_host(forward_inputs.positions);
+        pi.qo_indptr.copy_from_host(forward_inputs.qo_indptr);
+        pi.kv_page_indices.copy_from_host(forward_inputs.kv_page_indices);
+        pi.kv_page_indptr.copy_from_host(forward_inputs.kv_page_indptr);
+        pi.kv_last_page_lens.copy_from_host(forward_inputs.kv_last_page_lens);
 
         // BRLE attention masks. For prefill batches that aren't pure
         // causal, decode + upload a packed bitmap and route through the
@@ -632,21 +935,6 @@ void handle_fire_batch(
             executor.slot_alloc.end_of_fire();
             pi.slot_ids.copy_from_host(std::span<const std::int32_t>(slot_ids_h));
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
-        }
-
-        // TP fan-out. Rank 0 broadcasts the per-fire payload (header +
-        // refilled persistent_inputs) to every follower so they can run
-        // the same forward kernels against an identical view of inputs.
-        // The all-reduces inside `forward_fn.body` then synchronise the
-        // ranks layer-by-layer.
-        if (executor.tp_comm != nullptr) {
-            tp_cpu_gate_notify(executor.tp_cpu_gate_key);
-            tp_broadcast_inputs(*executor.tp_comm, pi,
-                                N, R, is_pure_decode,
-                                static_cast<int>(kvpi_view.size()),
-                                mask_bytes, mask_indptr_count,
-                                /*has_slot_ids=*/use_slots,
-                                /*stream=*/nullptr);
         }
 
         // ── Sample-plan construction (hoisted) ──────────────────
@@ -753,6 +1041,54 @@ void handle_fire_batch(
             }
         }
 
+        bool sample_rows_are_dense = (num_sampling == N);
+        if (sample_rows_are_dense) {
+            for (int i = 0; i < N; ++i) {
+                if (h_sample_idx[i] != i) {
+                    sample_rows_are_dense = false;
+                    break;
+                }
+            }
+        }
+        bool all_rows_greedy = true;
+        for (int i = 0; i < N; ++i) {
+            if (h_per_temp[i] > 0.f) {
+                all_rows_greedy = false;
+                break;
+            }
+        }
+        bool all_slots_token = true;
+        for (auto type : per_slot_type) {
+            if (!pie_cuda_driver::is_token_sampler(type)) {
+                all_slots_token = false;
+                break;
+            }
+        }
+        const bool compact_logit_rows =
+            executor.forward_fn.supports_compact_logits &&
+            !is_pure_decode &&
+            !have_custom_mask &&
+            !need_msgpack &&
+            !has_spec_drafts &&
+            logit_masks_view.empty() &&
+            !any_topk_topp &&
+            all_slots_token &&
+            num_sampling > 0 &&
+            num_sampling < N;
+        const bool tp_greedy_argmax =
+            executor.tp_comm != nullptr &&
+            executor.tp_comm->world_size() <= 8 &&
+            forward_fn.supports_tp_greedy_argmax &&
+            !have_custom_mask &&
+            !need_msgpack &&
+            !has_spec_drafts &&
+            logit_masks_view.empty() &&
+            !any_topk_topp &&
+            all_slots_token &&
+            all_rows_greedy &&
+            is_pure_decode &&
+            sample_rows_are_dense;
+
         const SamplingPlan sample_plan{
             any_topk_topp,
             std::span<const float>(h_per_temp),
@@ -763,6 +1099,31 @@ void handle_fire_batch(
             std::span<const std::int32_t>(h_sample_idx),
         };
 
+        if (compact_logit_rows) {
+            CUDA_CHECK(cudaMemcpyAsync(pi.sample_idx.data(), h_sample_idx.data(),
+                                       sizeof(std::int32_t) * num_sampling,
+                                       cudaMemcpyHostToDevice, nullptr));
+        }
+
+        // TP fan-out. Rank 0 broadcasts the per-fire payload (header +
+        // refilled persistent_inputs) to every follower so they can run
+        // the same forward kernels against an identical view of inputs.
+        // The all-reduces inside `forward_fn.body` then synchronise the
+        // ranks layer-by-layer. The header includes the forward variant so
+        // CUDA graph capture/replay stays lockstep across ranks.
+        if (executor.tp_comm != nullptr) {
+            tp_cpu_gate_notify(executor.tp_cpu_gate_key);
+            tp_broadcast_inputs(*executor.tp_comm, pi,
+                                forward_N, forward_R, is_pure_decode,
+                                static_cast<int>(
+                                    forward_inputs.kv_page_indices.size()),
+                                mask_bytes, mask_indptr_count,
+                                /*has_slot_ids=*/use_slots,
+                                tp_greedy_argmax,
+                                /*logit_rows=*/compact_logit_rows ? num_sampling : 0,
+                                /*stream=*/nullptr);
+        }
+
         // ── prepare hook ────────────────────────────────────────
         // Always run the per-arch prepare phase first (when present).
         // For graph-capable archs this updates pinned host / device
@@ -770,7 +1131,8 @@ void handle_fire_batch(
         // capture region so the host work re-runs every fire.
         if (tm_on) tm.t_after_views_us = fire_now_us();
         if (forward_fn.prepare) {
-            forward_fn.prepare(attn_ws, h_kvpp, R, is_pure_decode);
+            forward_fn.prepare(attn_ws, h_kvpp_forward, forward_R,
+                               is_pure_decode);
         }
         if (tm_on) tm.t_after_prepare_us = fire_now_us();
 
@@ -779,7 +1141,9 @@ void handle_fire_batch(
         // forward, but the upload is kept here so the response path can use
         // the same prepared device buffers for captured and uncaptured
         // forward bodies.
-        upload_sampling_inputs(pi, sample_plan, N, /*stream=*/nullptr);
+        if (!tp_greedy_argmax) {
+            upload_sampling_inputs(pi, sample_plan, N, /*stream=*/nullptr);
+        }
         if (tm_on) tm.t_after_uploads_us = fire_now_us();
 
         // ── Forward pass ────────────────────────────────────────
@@ -788,10 +1152,14 @@ void handle_fire_batch(
         // per-fire attention plan is prepared before capture/replay and the
         // captured body observes stable device pointers.
         const bool try_graphs =
-            executor.graph_cache != nullptr && is_pure_decode && !have_custom_mask
-            && forward_fn.graph_safe;
+            graph_shape_ok && !have_custom_mask;
+        const std::uint8_t graph_layout =
+            forward_fn.graph_layout ? forward_fn.graph_layout() : 0u;
+        const std::uint8_t graph_variant =
+            static_cast<std::uint8_t>((tp_greedy_argmax ? 1u : 0u) |
+                                      (graph_layout << 1));
         if (try_graphs) {
-            const ForwardGraphKey key{R};
+            const ForwardGraphKey key{forward_R, graph_variant};
             cudaGraphExec_t exec = executor.graph_cache->get(key);
             if (exec == nullptr) {
                 // First fire of this shape: capture the forward body.
@@ -813,32 +1181,24 @@ void handle_fire_batch(
                 // so start recording with no in-flight default-stream writes
                 // to the stable device buffers. The capture only records the
                 // graph; the exec is launched below for this same fire.
-                CUDA_CHECK(cudaStreamSynchronize(nullptr));
-                cudaStream_t cstream = nullptr;
-                CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
-                cublas.set_stream(cstream);
-                CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
-                forward_fn.body(
-                    ws, kv_cache, attn_ws, cublas,
-                    reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
-                    reinterpret_cast<const std::int32_t*>(pi.positions.data()),
-                    pi.qo_indptr.data(), pi.kv_page_indices.data(),
-                    pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
-                    h_qo, h_kvpp,
-                    N, R, is_pure_decode, nullptr, nullptr,
+                exec = capture_forward_graph_exec(
+                    executor, h_qo_forward, h_kvpp_forward,
+                    forward_N, forward_R, is_pure_decode,
                     use_slots ? slot_ids_h.data() : nullptr,
                     use_slots ? is_fresh_h.data() : nullptr,
-                    use_slots ? pi.slot_ids.data() : nullptr);
-                cudaGraph_t graph = nullptr;
-                CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
-                cublas.set_stream(nullptr);
-                CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
-                cudaGraphDestroy(graph);
-                cudaStreamDestroy(cstream);
+                    use_slots ? pi.slot_ids.data() : nullptr,
+                    compact_logit_rows ? pi.sample_idx.data() : nullptr,
+                    compact_logit_rows ? num_sampling : 0,
+                    tp_greedy_argmax);
                 executor.graph_cache->put(key, exec);
                 const auto sz = executor.graph_cache->size();
                 if (executor.verbose && (sz <= 4 || sz % 16 == 0)) {
-                    std::cerr << "[pie-driver-cuda] graph captured: R=" << R
+                    std::cerr << "[pie-driver-cuda] graph captured: R="
+                              << forward_R
+                              << (forward_inputs.padded ? " padded" : "")
+                              << " real_R=" << R
+                              << " variant=" << static_cast<int>(graph_variant)
+                              << " layout=" << static_cast<int>(graph_layout)
                               << " (cache size=" << sz << ")\n";
                 }
             }
@@ -850,25 +1210,47 @@ void handle_fire_batch(
                 reinterpret_cast<const std::int32_t*>(pi.positions.data()),
                 pi.qo_indptr.data(), pi.kv_page_indices.data(),
                 pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
-                /*qo_indptr_h=*/h_qo,
-                /*kv_page_indptr_h=*/h_kvpp,
-                N, R, is_pure_decode,
+                /*qo_indptr_h=*/h_qo_forward,
+                /*kv_page_indptr_h=*/h_kvpp_forward,
+                forward_N, forward_R, is_pure_decode,
                 have_custom_mask ? pi.custom_mask.data()        : nullptr,
                 have_custom_mask ? pi.custom_mask_indptr.data() : nullptr,
                 use_slots ? slot_ids_h.data() : nullptr,
                 use_slots ? is_fresh_h.data() : nullptr,
-                use_slots ? pi.slot_ids.data() : nullptr);
+                use_slots ? pi.slot_ids.data() : nullptr,
+                compact_logit_rows ? pi.sample_idx.data() : nullptr,
+                compact_logit_rows ? num_sampling : 0,
+                tp_greedy_argmax);
         }
         // Sampling is deliberately outside the CUDA graph. The forward
         // graph key is only `R`; sampler/probe layouts vary independently
         // (for example top-p token-only decode vs. argmax + rich probes).
         // Running the current fire's sampling kernel after the graph launch
         // keeps that R-only key valid.
-        launch_sampling_kernel(
-            ws, pi.sampled.data(), pi, sample_plan,
-            N, num_sampling, engine.hf_config().vocab_size,
-            /*prng_offset=*/static_cast<std::uint64_t>(handled),
-            /*stream=*/cublas.stream());
+        if (tp_greedy_argmax) {
+            kernels::launch_select_global_argmax_pairs(
+                reinterpret_cast<const std::uint64_t*>(ws.greedy_pairs_all.data()),
+                reinterpret_cast<std::int32_t*>(pi.sampled.data()),
+                N, executor.tp_comm->world_size(), cublas.stream());
+        } else {
+            if (compact_logit_rows) {
+                kernels::launch_sample_temp_bf16_compact_scatter(
+                    ws.logits.data(),
+                    pi.sample_idx.data(),
+                    pi.sample_temp.data(),
+                    pi.sample_min_p.data(),
+                    pi.sample_seed.data(),
+                    reinterpret_cast<std::int32_t*>(pi.sampled.data()),
+                    num_sampling, engine.hf_config().vocab_size,
+                    cublas.stream());
+            } else {
+                launch_sampling_kernel(
+                    ws, pi.sampled.data(), pi, sample_plan,
+                    N, num_sampling, engine.hf_config().vocab_size,
+                    /*prng_offset=*/static_cast<std::uint64_t>(handled),
+                    /*stream=*/cublas.stream());
+            }
+        }
 
         // Sample plan was built above the prepare hook (hoisted so the
         // sampling uploads are ready before the forward graph launch). The host
@@ -1086,6 +1468,8 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         const int N = hdr.total_tokens;
         const int R = hdr.num_requests;
         const bool is_pure_decode = (hdr.is_pure_decode != 0);
+        const bool tp_greedy_argmax = (hdr.tp_greedy_argmax != 0);
+        const int logit_rows = hdr.logit_rows;
 
         // 2. Receive payloads. Mirror order in `tp_broadcast_inputs`,
         //    grouped so NCCL submits the batch as a single op.
@@ -1135,6 +1519,11 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
                                      static_cast<std::size_t>(R),
                                      ncclChar, 0, comm.comm(), stream));
         }
+        if (logit_rows > 0) {
+            NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
+                                     static_cast<std::size_t>(logit_rows) * 4,
+                                     ncclChar, 0, comm.comm(), stream));
+        }
         NCCL_CHECK(ncclGroupEnd());
 
         // 3. Pull the host views of qo/kv_page indptrs for the per-arch
@@ -1176,29 +1565,24 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         const bool try_graphs =
             executor.graph_cache != nullptr && is_pure_decode && !have_custom_mask
             && executor.forward_fn.graph_safe;
+        const std::uint8_t graph_layout =
+            executor.forward_fn.graph_layout ? executor.forward_fn.graph_layout() : 0u;
+        const std::uint8_t graph_variant =
+            static_cast<std::uint8_t>((tp_greedy_argmax ? 1u : 0u) |
+                                      (graph_layout << 1));
         if (try_graphs) {
-            const ForwardGraphKey key{R};
+            const ForwardGraphKey key{R, graph_variant};
             cudaGraphExec_t exec = executor.graph_cache->get(key);
             if (exec == nullptr) {
-                cudaStream_t cstream = nullptr;
-                CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
-                CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
-                executor.forward_fn.body(
-                    executor.ws, executor.kv_cache, executor.attn_ws, executor.cublas,
-                    reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
-                    reinterpret_cast<const std::int32_t*>(pi.positions.data()),
-                    pi.qo_indptr.data(), pi.kv_page_indices.data(),
-                    pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
-                    h_qo.data(), h_kvpp.data(),
-                    N, R, is_pure_decode, nullptr, nullptr,
+                exec = capture_forward_graph_exec(
+                    executor, h_qo.data(), h_kvpp.data(),
+                    N, R, is_pure_decode,
                     have_slot_ids ? h_slot_ids.data() : nullptr,
                     have_slot_ids ? h_is_fresh.data() : nullptr,
-                    have_slot_ids ? pi.slot_ids.data() : nullptr);
-                cudaGraph_t graph = nullptr;
-                CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
-                CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
-                cudaGraphDestroy(graph);
-                cudaStreamDestroy(cstream);
+                    have_slot_ids ? pi.slot_ids.data() : nullptr,
+                    logit_rows > 0 ? pi.sample_idx.data() : nullptr,
+                    logit_rows,
+                    tp_greedy_argmax);
                 executor.graph_cache->put(key, exec);
             }
             CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
@@ -1215,7 +1599,10 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
                 have_custom_mask ? pi.custom_mask_indptr.data() : nullptr,
                 have_slot_ids ? h_slot_ids.data() : nullptr,
                 have_slot_ids ? h_is_fresh.data() : nullptr,
-                have_slot_ids ? pi.slot_ids.data() : nullptr);
+                have_slot_ids ? pi.slot_ids.data() : nullptr,
+                logit_rows > 0 ? pi.sample_idx.data() : nullptr,
+                logit_rows,
+                tp_greedy_argmax);
         }
     }
 }
@@ -1224,7 +1611,7 @@ void tp_send_shutdown(NcclComm& comm, const std::string& cpu_gate_key) {
     tp_cpu_gate_notify(cpu_gate_key);
     auto* d_hdr = tp_hdr_dev_buf();
     cudaStream_t stream = nullptr;
-    TpFireHeader hdr{TP_STOP_MAGIC, 0, 0, 0, 0, 0, 0, 0};
+    TpFireHeader hdr{TP_STOP_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     CUDA_CHECK(cudaMemcpyAsync(d_hdr, &hdr, sizeof(hdr),
                                cudaMemcpyHostToDevice, stream));
     NCCL_CHECK(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,
