@@ -775,11 +775,15 @@ pub struct CudaNativeDriverOptions {
     pub device: String,
     #[serde(skip)]
     pub verbose: bool,
-    /// Runtime quantization mode applied after weight load. Empty = none;
-    /// `"fp8"` enables per-tensor symmetric FP8_E4M3 on every llama-like
-    /// projection weight. Currently only honored for model_type=qwen3 by
-    /// the C++ side.
+    /// Runtime quantization mode applied during CUDA load-plan
+    /// materialization. Empty = none; `"fp8"` and `"int8"` enable
+    /// per-channel symmetric quantization for supported projection weights.
     pub runtime_quant: String,
+    /// GPT-OSS MXFP4 MoE policy. `"auto"` selects the best registered
+    /// backend; `"routed_dequant"`/`"packed"` keep MXFP4 resident and
+    /// dequantize routed experts at runtime; `"bf16"`/`"dequant"` eagerly
+    /// materialize BF16 experts; `"native"` requires true MXFP4 GEMM kernels.
+    pub mxfp4_moe: String,
 
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
@@ -808,6 +812,7 @@ impl Default for CudaNativeDriverOptions {
             device: String::new(),
             verbose: false,
             runtime_quant: String::new(),
+            mxfp4_moe: "auto".to_string(),
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
         }
@@ -825,6 +830,20 @@ impl CudaNativeDriverOptions {
         ensure!(
             self.kv_page_size > 0,
             "model.driver.options.kv_page_size must be > 0"
+        );
+        const MXFP4: &[&str] = &[
+            "auto",
+            "routed_dequant",
+            "packed",
+            "bf16",
+            "dequant",
+            "eager_bf16",
+            "native",
+        ];
+        ensure!(
+            self.mxfp4_moe.is_empty() || MXFP4.contains(&self.mxfp4_moe.as_str()),
+            "model.driver.options.mxfp4_moe must be one of {:?}",
+            MXFP4
         );
         Ok(())
     }
@@ -1039,6 +1058,7 @@ device = ["cuda:0"]
 gpu_mem_utilization = 0.90
 memory_profile = "balanced"
 runtime_quant = "fp8"
+mxfp4_moe = "routed_dequant"
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
@@ -1048,6 +1068,7 @@ runtime_quant = "fp8"
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
         assert_eq!(opts.runtime_quant, "fp8");
+        assert_eq!(opts.mxfp4_moe, "routed_dequant");
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
         assert_eq!(opts.kv_page_size, 32); // default
         assert_eq!(opts.kv_cache_dtype, "auto"); // default
@@ -1071,6 +1092,7 @@ device = ["cuda:0"]
         assert_eq!(opts.swap_pool_size, 0);
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
+        assert_eq!(opts.mxfp4_moe, "auto");
         assert_eq!(opts.ready_timeout_s, 600.0);
         assert_eq!(opts.kv_cache_dtype, "auto");
     }
@@ -1133,6 +1155,25 @@ manual_capacity = 1
         let cfg: Config = toml::from_str(cuda).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("manual_capacity"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_invalid_cuda_mxfp4_policy() {
+        let cuda = r#"
+[[model]]
+name = "default"
+hf_repo = "openai/gpt-oss-20b"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+mxfp4_moe = "mystery"
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("mxfp4_moe"), "got: {err}");
     }
 
     #[test]

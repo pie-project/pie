@@ -266,6 +266,20 @@ fn build_cuda() {
         .define("PIE_BRIDGE_INCLUDE_DIR", pie_bridge_include_dir());
     enable_position_independent_archives(&mut cfg);
 
+    // Optional Marlin W4A16 support. Keep it off by default because the
+    // vendored template kernels add substantial build time, but let Cargo
+    // builds opt into the same CMake path used by standalone driver builds.
+    println!("cargo:rerun-if-env-changed=PIE_CUDA_BUILD_MARLIN");
+    if let Ok(value) = std::env::var("PIE_CUDA_BUILD_MARLIN") {
+        let enabled = matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        );
+        if enabled {
+            cfg.define("PIE_CUDA_BUILD_MARLIN", "ON");
+        }
+    }
+
     // nvcc discovery. CMake reads `CMAKE_CUDA_COMPILER` / `CUDACXX` to
     // locate nvcc; some toolchains install CUDA under `/usr/local/cuda`
     // without adding `/usr/local/cuda/bin` to the build user's PATH.

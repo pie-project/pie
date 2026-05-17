@@ -136,8 +136,6 @@ void llama_like_forward_paged(
     const int d  = cfg.head_dim;
     const int dk = cfg.head_dim_kernel;            // padded HEAD_DIM the
                                                    // attention kernel runs at
-    const int Hq_kern = num_q_heads_local * dk;
-    const int Hk_kern = num_kv_heads_local * dk;
     const bool head_dim_padded = (d != dk);
     const float eps = cfg.rms_norm_eps;
     // Inherit the stream bound to `cublas` so manual kernel launches stay

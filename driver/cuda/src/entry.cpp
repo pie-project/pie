@@ -43,6 +43,7 @@
 #include "kernels/sample_flashinfer.hpp"
 #include "kernels/sample_temp.hpp"
 #include "kv_cache.hpp"
+#include "model/bound_model.hpp"
 #include "model/gemma2.hpp"
 #include "model/gemma3n.hpp"
 #include "model/gemma4.hpp"
@@ -99,6 +100,34 @@ void stop_servers() {
 
 void on_signal(int) {
     if (auto* server = g_signal_server.load()) server->stop();
+}
+
+pie_cuda_driver::model::RopeKind rope_kind_from_config(
+    const pie_cuda_driver::HfConfig& hf) {
+    using RopeScaling = pie_cuda_driver::HfConfig::RopeScaling;
+    using RopeKind = pie_cuda_driver::model::RopeKind;
+    switch (hf.rope_scaling_kind) {
+    case RopeScaling::Llama3:
+        return RopeKind::YaRN;
+    case RopeScaling::OriginalYaRN:
+        return RopeKind::YaRNOriginal;
+    case RopeScaling::None:
+        return RopeKind::Standard;
+    }
+    return RopeKind::Standard;
+}
+
+void apply_rope_config(
+    pie_cuda_driver::model::LlamaLikeForwardCfg& fwd_cfg,
+    const pie_cuda_driver::HfConfig& hf) {
+    fwd_cfg.rope_kind                  = rope_kind_from_config(hf);
+    fwd_cfg.yarn_factor                = hf.rope_factor;
+    fwd_cfg.yarn_low_freq_factor       = hf.rope_low_freq_factor;
+    fwd_cfg.yarn_high_freq_factor      = hf.rope_high_freq_factor;
+    fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
+    fwd_cfg.yarn_beta_fast             = hf.rope_beta_fast;
+    fwd_cfg.yarn_beta_slow             = hf.rope_beta_slow;
+    fwd_cfg.yarn_attention_factor      = hf.rope_attention_factor;
 }
 
 // All TP ranks in one DP group are threads in the same pie-server
@@ -814,13 +843,7 @@ int run_parity(const pie_cuda_driver::Config& cfg,
         if (is_gpt_oss) {
             const auto& hf = engine.hf_config();
             fwd_cfg.use_qkv_bias = hf.attention_bias;
-            fwd_cfg.rope_kind    = hf.has_rope_scaling
-                ? pie_cuda_driver::model::RopeKind::YaRN
-                : pie_cuda_driver::model::RopeKind::Standard;
-            fwd_cfg.yarn_factor                = hf.rope_factor;
-            fwd_cfg.yarn_low_freq_factor       = hf.rope_low_freq_factor;
-            fwd_cfg.yarn_high_freq_factor      = hf.rope_high_freq_factor;
-            fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
+            apply_rope_config(fwd_cfg, hf);
             fwd_cfg.sliding_window             = hf.sliding_window;
             for (const auto& t : hf.layer_types) {
                 fwd_cfg.per_layer_window_left.push_back(
@@ -1119,9 +1142,10 @@ int run_impl(int argc,
     if (verbose) {
         std::cerr << "[pie-driver-cuda] config loaded\n"
                   << "  model.snap_dir  = " << cfg.model.snapshot_dir << "\n"
-                  << "  model.device    = " << cfg.model.device << "\n"
-                  << "  model.dtype     = " << cfg.model.dtype << "\n"
-                  << "  tp_size         = " << cfg.distributed.tp_size << "\n"
+	                  << "  model.device    = " << cfg.model.device << "\n"
+	                  << "  model.dtype     = " << cfg.model.dtype << "\n"
+	                  << "  model.mxfp4_moe = " << cfg.model.mxfp4_moe << "\n"
+	                  << "  tp_size         = " << cfg.distributed.tp_size << "\n"
                   << "  tp_rank         = " << cfg.distributed.tp_rank << "\n";
     }
 
@@ -1240,72 +1264,25 @@ int run_impl(int argc,
             return 2;
         }
     }
-    const std::string& mt_for_bind = engine.hf_config().model_type;
+    // Centralized bound-model selection. The forward setup below keeps local
+    // references for now so the rest of the serving path stays unchanged.
+    auto bound_model = pie_cuda_driver::model::bind_cuda_model(engine, verbose);
+    auto& weights_llama = bound_model.llama;
+    auto& weights_gemma = bound_model.gemma;
+    auto& weights_gemma4 = bound_model.gemma4;
+    auto& weights_gemma3n = bound_model.gemma3n;
+    auto& weights_mixtral = bound_model.mixtral;
+    auto& weights_qwen3_5 = bound_model.qwen3_5;
+    auto& weights_qwen3_5_moe = bound_model.qwen3_5_moe;
 
-    // Per-arch weights live in their own struct shape. We hold one of
-    // them on the stack; only the one matching `mt_for_bind` is
-    // populated. The dispatch below wraps the right (weights, cfg,
-    // forward function) triple into a single `ForwardFn` closure.
-    pie_cuda_driver::model::Qwen3Weights   weights_llama;
-    pie_cuda_driver::model::Gemma2Weights  weights_gemma;
-    pie_cuda_driver::model::Gemma4Weights  weights_gemma4;
-    pie_cuda_driver::model::Gemma3nWeights weights_gemma3n;
-    pie_cuda_driver::model::MixtralWeights weights_mixtral;
-    pie_cuda_driver::model::Qwen3_5Weights weights_qwen3_5;
-    pie_cuda_driver::model::Qwen3_5MoeWeights weights_qwen3_5_moe;
-    const bool is_gemma_arch =
-        (mt_for_bind == "gemma2" || mt_for_bind == "gemma3" ||
-         mt_for_bind == "gemma3_text");
-    const bool is_gemma4_arch =
-        (mt_for_bind == "gemma4" || mt_for_bind == "gemma4_text");
-    const bool is_gemma3n_arch =
-        (mt_for_bind == "gemma3n" || mt_for_bind == "gemma3n_text");
-    const bool is_gpt_oss_arch = (mt_for_bind == "gpt_oss");
-    const bool is_mixtral_arch =
-        (mt_for_bind == "mixtral") || is_gpt_oss_arch;  // both use mixtral fwd
-    const bool is_qwen3_5_arch =
-        (mt_for_bind == "qwen3_5" || mt_for_bind == "qwen3_5_text");
-    // Qwen3-MoE (Qwen3-30B-A3B, model_type="qwen3_moe") and Qwen3.5/3.6-MoE
-    // (model_type="qwen3_5_moe[_text]") share the bind + forward path —
-    // engine.cpp::is_qwen3_5_moe_arch groups them, qwen3_5_moe.cpp branches
-    // internally on model_type for the layer_types/shared-expert quirks.
-    const bool is_qwen3_5_moe_arch =
-        (mt_for_bind == "qwen3_5_moe" || mt_for_bind == "qwen3_5_moe_text"
-         || mt_for_bind == "qwen3_moe");
+    const bool is_gemma_arch = bound_model.is_gemma();
+    const bool is_gemma4_arch = bound_model.is_gemma4();
+    const bool is_gemma3n_arch = bound_model.is_gemma3n();
+    const bool is_mixtral_arch = bound_model.is_mixtral();
+    const bool is_qwen3_5_arch = bound_model.is_qwen3_5();
+    const bool is_qwen3_5_moe_arch = bound_model.is_qwen3_5_moe();
 
-    if (mt_for_bind == "phi3") {
-        weights_llama = pie_cuda_driver::model::bind_phi3(engine);
-    } else if (mt_for_bind == "olmo2" || mt_for_bind == "olmo3") {
-        weights_llama = pie_cuda_driver::model::bind_olmo3(engine);
-    } else if (mt_for_bind == "mistral3" || mt_for_bind == "ministral3") {
-        weights_llama = pie_cuda_driver::model::bind_mistral3(engine);
-    } else if (mt_for_bind == "gemma2") {
-        weights_gemma = pie_cuda_driver::model::bind_gemma2(engine);
-    } else if (mt_for_bind == "gemma3" || mt_for_bind == "gemma3_text") {
-        weights_gemma = pie_cuda_driver::model::bind_gemma3(engine);
-    } else if (is_gemma4_arch) {
-        weights_gemma4 = pie_cuda_driver::model::bind_gemma4(engine);
-    } else if (is_gemma3n_arch) {
-        weights_gemma3n = pie_cuda_driver::model::bind_gemma3n(engine);
-    } else if (is_gpt_oss_arch) {
-        weights_mixtral = pie_cuda_driver::model::bind_gpt_oss(engine);
-    } else if (mt_for_bind == "mixtral") {
-        weights_mixtral = pie_cuda_driver::model::bind_mixtral(engine);
-    } else if (is_qwen3_5_arch) {
-        weights_qwen3_5 = pie_cuda_driver::model::bind_qwen3_5(engine);
-    } else if (is_qwen3_5_moe_arch) {
-        weights_qwen3_5_moe = pie_cuda_driver::model::bind_qwen3_5_moe(engine);
-    } else {
-        weights_llama = pie_cuda_driver::model::bind_llama_like(engine);
-    }
-    const std::size_t num_layers_bound =
-        is_gemma4_arch    ? weights_gemma4.layers.size()
-      : is_gemma3n_arch   ? weights_gemma3n.layers.size()
-      : is_gemma_arch     ? weights_gemma.layers.size()
-      : is_mixtral_arch   ? weights_mixtral.layers.size()
-      : is_qwen3_5_arch   ? weights_qwen3_5.layers.size()
-      : is_qwen3_5_moe_arch ? weights_qwen3_5_moe.layers.size()
-                            : weights_llama.layers.size();
+    const std::size_t num_layers_bound = bound_model.num_layers();
     if (verbose) {
         std::cerr << "[pie-driver-cuda] schema bound: "
                   << num_layers_bound << " layers ("
@@ -1541,13 +1518,7 @@ int run_impl(int argc,
         if (is_olmo_post_norm) {
             fwd_cfg.use_qk_norm = true;
         }
-        fwd_cfg.rope_kind = hf.has_rope_scaling
-            ? pie_cuda_driver::model::RopeKind::YaRN
-            : pie_cuda_driver::model::RopeKind::Standard;
-        fwd_cfg.yarn_factor               = hf.rope_factor;
-        fwd_cfg.yarn_low_freq_factor      = hf.rope_low_freq_factor;
-        fwd_cfg.yarn_high_freq_factor     = hf.rope_high_freq_factor;
-        fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
+        apply_rope_config(fwd_cfg, hf);
         fwd_cfg.sliding_window            = hf.sliding_window;
         // flashinfer's decode kernel (DISPATCH_GQA_GROUP_SIZE in
         // utils.cuh) instantiates GQA group sizes {1, 2, 3, 4, 8}.
@@ -1597,11 +1568,17 @@ int run_impl(int argc,
         }
 
         if (verbose) {
+            const char* rope_name =
+                (fwd_cfg.rope_kind == pie_cuda_driver::model::RopeKind::YaRN)
+                    ? "yarn"
+                    : (fwd_cfg.rope_kind ==
+                       pie_cuda_driver::model::RopeKind::YaRNOriginal)
+                          ? "yarn-original"
+                          : "standard";
             std::cerr << "[pie-driver-cuda] model_type=" << mt
                       << " use_qk_norm=" << fwd_cfg.use_qk_norm
                       << " use_qkv_bias=" << fwd_cfg.use_qkv_bias
-                      << " rope=" << (fwd_cfg.rope_kind ==
-                           pie_cuda_driver::model::RopeKind::YaRN ? "yarn" : "standard")
+                      << " rope=" << rope_name
                       << "\n";
         }
     }

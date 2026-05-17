@@ -17,13 +17,19 @@ struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
-    // Runtime quantization mode applied after weight load. Empty (default)
-    // = no quantization. Recognised values:
-    //   * "fp8"  — per-tensor symmetric FP8_E4M3 on every projection
-    //              weight (Q/K/V/O/gate/up/down). Norms, biases,
-    //              embeddings, lm_head stay in their native dtype.
-    // M3 will add `"int4"` for offline GPTQ/AWQ; M2 may add `"int8"`.
+    // Runtime quantization mode applied during load-plan materialization.
+    // Empty (default) = no quantization. Recognised values:
+    //   * "fp8"  — per-channel symmetric FP8_E4M3 for projection weights.
+    //   * "int8" — per-channel symmetric INT8 for projection weights.
+    // Norms, biases, embeddings, and lm_head stay in their native dtype.
     std::string runtime_quant;
+    // GPT-OSS MXFP4 MoE load/runtime policy. "auto" selects the best
+    // registered backend for this build. Recognised values:
+    //   * "auto" / "routed_dequant" / "packed" — keep MXFP4 resident and
+    //     dequantize only routed experts into bounded BF16 runtime scratch.
+    //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
+    //   * "native" — require a true MXFP4 MoE GEMM backend.
+    std::string mxfp4_moe = "auto";
 };
 
 struct BatchingConfig {
@@ -72,6 +78,7 @@ inline Config load_config(const std::filesystem::path& path) {
         c.model.device        = (*m)["device"].value_or(c.model.device);
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
         c.model.runtime_quant = (*m)["runtime_quant"].value_or(std::string{});
+        c.model.mxfp4_moe     = (*m)["mxfp4_moe"].value_or(c.model.mxfp4_moe);
     }
     if (auto b = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {

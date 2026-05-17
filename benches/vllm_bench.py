@@ -21,7 +21,13 @@ def run(args: argparse.Namespace):
     prompts, prompt_counts = hf_chat_prompts_and_counts(
         args.model, args.system, make_prompts(args, n + args.warmup)
     )
-    max_num_seqs = args.num_requests if args.mode == "tput" else 1
+    max_num_seqs = args.concurrency if args.mode == "tput" else 1
+    llm_kwargs = {}
+    if args.attention_backend:
+        llm_kwargs["attention_config"] = {"backend": args.attention_backend}
+    if args.enforce_eager:
+        llm_kwargs["enforce_eager"] = True
+
     llm = LLM(
         model=args.model,
         gpu_memory_utilization=args.gpu_mem_util,
@@ -29,6 +35,7 @@ def run(args: argparse.Namespace):
         tensor_parallel_size=args.tp_size,
         max_model_len=args.max_model_len,
         enable_prefix_caching=False,
+        **llm_kwargs,
     )
     sampling = SamplingParams(
         temperature=args.temperature,
@@ -79,6 +86,8 @@ def run(args: argparse.Namespace):
         config={
             "enable_prefix_caching": False,
             "max_num_seqs": max_num_seqs,
+            "attention_backend": args.attention_backend,
+            "enforce_eager": args.enforce_eager,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
@@ -91,6 +100,9 @@ def run(args: argparse.Namespace):
 def main() -> None:
     parser = argparse.ArgumentParser(description="vLLM canonical latency/throughput benchmark")
     add_mode_subcommands(parser)
+    for sp in parser._subparsers._group_actions[0].choices.values():
+        sp.add_argument("--attention-backend", default=None)
+        sp.add_argument("--enforce-eager", action="store_true")
     args = parser.parse_args()
     summary, results = run(args)
     finish(summary, results, args.json_out)

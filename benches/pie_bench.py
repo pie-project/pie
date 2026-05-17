@@ -88,6 +88,10 @@ def build_config(args: argparse.Namespace):
             "memory_profile": args.memory_profile,
             "kv_cache_dtype": args.kv_cache_dtype,
         }
+        if args.runtime_quant:
+            driver_options["runtime_quant"] = args.runtime_quant
+        if args.mxfp4_moe:
+            driver_options["mxfp4_moe"] = args.mxfp4_moe
     elif args.driver == "portable":
         driver_options = {
             "max_forward_tokens": args.max_forward_tokens,
@@ -118,7 +122,7 @@ def build_config(args: argparse.Namespace):
     else:
         driver_options = {}
 
-    max_concurrent_processes = args.num_requests if args.mode == "tput" else 1
+    max_concurrent_processes = args.concurrency if args.mode == "tput" else 1
     scheduler = args.batch_policy or ("greedy" if args.mode == "latency" else "adaptive")
     scheduler_kwargs = {
         "batch_policy": scheduler,
@@ -430,6 +434,12 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--kv-pages", type=int, default=2048)
         sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
+        sp.add_argument("--runtime-quant", choices=["fp8", "int8"], default=None)
+        sp.add_argument(
+            "--mxfp4-moe",
+            choices=["auto", "routed_dequant", "packed", "bf16", "dequant", "eager_bf16", "native"],
+            default=None,
+        )
         sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
         sp.add_argument(
@@ -455,7 +465,6 @@ def build_parser() -> argparse.ArgumentParser:
                  "batching for Phase B-hot experiments.",
         )
         sp.add_argument("--vllm-attention-backend", default=None)
-        sp.add_argument("--sglang-attention-backend", default=None)
         sp.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
         sp.add_argument("--venv", default=None,
