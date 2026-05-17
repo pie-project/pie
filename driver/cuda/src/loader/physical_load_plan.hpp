@@ -14,6 +14,23 @@ enum class PhysicalTransformKind {
     Dequantize,
 };
 
+enum class PhysicalOpActionKind {
+    ByteRangeWrite,
+    TiledTransform,
+    DeviceTransform,
+    Metadata,
+    View,
+    Lifetime,
+};
+
+struct PhysicalOpCoverage {
+    std::size_t op_index = 0;
+    std::string op_kind;
+    PhysicalOpActionKind action = PhysicalOpActionKind::DeviceTransform;
+    std::uint64_t byte_writes = 0;
+    std::uint64_t tiled_transforms = 0;
+};
+
 // A physical checkpoint-to-device copy. The source is a safetensors tensor
 // plus optional row-major rectangular slices; the destination is an offset
 // inside a planned runtime tensor allocation.
@@ -57,12 +74,20 @@ struct PhysicalLoadMemoryPlan {
     std::uint64_t byte_write_count = 0;
     std::uint64_t byte_range_count = 0;
     std::uint64_t tiled_transform_count = 0;
+    std::uint64_t optimized_byte_write_count = 0;
+    std::uint64_t coalesced_byte_write_count = 0;
 };
 
 struct PhysicalLoadPlan {
     std::vector<ByteRangeWrite> byte_writes;
     std::vector<TiledTransform> tiled_transforms;
+    std::vector<PhysicalOpCoverage> coverage;
     PhysicalLoadMemoryPlan memory;
+};
+
+struct PhysicalLoadOptimizerConfig {
+    bool enabled = true;
+    bool coalesce_adjacent = true;
 };
 
 std::vector<ByteRangeWrite> lower_byte_writes_for_op(
@@ -78,9 +103,14 @@ PhysicalLoadPlan build_physical_load_plan(
     const TensorMetadataSource& metadata,
     int tp_rank,
     int tp_size,
-    std::uint64_t transform_tile_bytes = 64ull * 1024ull * 1024ull);
+    std::uint64_t transform_tile_bytes = 64ull * 1024ull * 1024ull,
+    PhysicalLoadOptimizerConfig optimizer = {});
 
+const char* physical_op_action_kind_name(PhysicalOpActionKind kind) noexcept;
 const char* physical_transform_kind_name(PhysicalTransformKind kind) noexcept;
+void validate_physical_load_plan(
+    const LoadPlan& semantic_plan,
+    const PhysicalLoadPlan& physical_plan);
 std::string describe_physical_load_plan(const PhysicalLoadPlan& plan);
 std::string dump_physical_load_plan_json(const PhysicalLoadPlan& plan);
 std::string dump_load_plan_json(

@@ -40,6 +40,13 @@ struct TensorSlice {
     std::int64_t length = 0;
 };
 
+struct TensorStorageInfo {
+    std::filesystem::path path;
+    std::uint64_t file_offset = 0;
+    std::uint64_t nbytes = 0;
+    std::uint32_t shard_id = 0;
+};
+
 class TensorMetadataSource {
 public:
     virtual ~TensorMetadataSource() = default;
@@ -80,6 +87,10 @@ public:
     bool contains(const std::string& name) const noexcept override {
         return index_.find(name) != index_.end();
     }
+
+    /// Physical storage location for a checkpoint tensor. `file_offset` is an
+    /// absolute byte offset into `path`, suitable for pread/cuFileRead.
+    TensorStorageInfo storage_info(const std::string& name) const;
 
     /// Copy a full checkpoint tensor into caller-owned device storage.
     void copy_to_device(

@@ -174,6 +174,17 @@ const TensorInfo& SafetensorsLoader::info(const std::string& name) const {
     return it->second;
 }
 
+TensorStorageInfo SafetensorsLoader::storage_info(const std::string& name) const {
+    const auto& ti = info(name);
+    const auto& shard = shards_.at(ti.shard_id);
+    return TensorStorageInfo{
+        .path = shard.path,
+        .file_offset = shard.data_section_offset + ti.data_offset,
+        .nbytes = ti.nbytes,
+        .shard_id = ti.shard_id,
+    };
+}
+
 void SafetensorsLoader::copy_to_device(
     const std::string& name,
     void* dst,

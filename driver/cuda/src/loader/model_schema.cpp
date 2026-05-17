@@ -183,138 +183,146 @@ void add_owned_producer(
     estimate_temporary_bytes(plan, tensor_nbytes(source_dtype, shape));
 }
 
-bool try_add_packed_qkv(
+bool try_add_packed_axis_group(
     LoadPlan& plan,
     const TensorMetadataSource& loader,
-    const std::string& raw_name,
-    const std::string& runtime_name,
+    const LogicalTensorGroup& group,
     std::unordered_set<std::string>& consumed_raw,
     int tp_size)
 {
-    constexpr const char* q_suffix = ".self_attn.q_proj.weight";
-    constexpr const char* k_suffix = ".self_attn.k_proj.weight";
-    constexpr const char* v_suffix = ".self_attn.v_proj.weight";
-
-    const char* matched = nullptr;
-    if (ends_with(runtime_name, q_suffix)) matched = q_suffix;
-    if (ends_with(runtime_name, k_suffix)) matched = k_suffix;
-    if (ends_with(runtime_name, v_suffix)) matched = v_suffix;
-    if (matched == nullptr) return false;
-
-    const std::string raw_prefix =
-        raw_name.substr(0, raw_name.size() - std::strlen(matched));
-    const std::string runtime_prefix =
-        runtime_name.substr(0, runtime_name.size() - std::strlen(matched));
-
-    const std::string raw_q = raw_prefix + ".self_attn.q_proj.weight";
-    const std::string raw_k = raw_prefix + ".self_attn.k_proj.weight";
-    const std::string raw_v = raw_prefix + ".self_attn.v_proj.weight";
-    if (consumed_raw.contains(raw_q) || consumed_raw.contains(raw_k) ||
-        consumed_raw.contains(raw_v)) {
-        return true;
+    const bool is_qkv = group.kind == LogicalTensorGroupKind::PackedQkv;
+    const bool is_gate_up = group.kind == LogicalTensorGroupKind::PackedGateUp;
+    if (!is_qkv && !is_gate_up) return false;
+    const std::size_t expected = is_qkv ? 3 : 2;
+    if (group.raw_names.size() != expected ||
+        group.runtime_names.size() != expected) {
+        throw std::runtime_error(
+            "load schema: packed logical group has wrong arity at '" +
+            group.runtime_base + "'");
     }
-    if (!can_pack_2d_bf16_group(loader, {raw_q, raw_k, raw_v})) return false;
+    for (const auto& raw : group.raw_names) {
+        if (consumed_raw.contains(raw)) return true;
+    }
+    if (!can_pack_2d_bf16_group(loader, group.raw_names)) return false;
+
+    const std::string packed_name = is_qkv
+        ? group.runtime_base + ".qkv_proj.fused.weight"
+        : group.runtime_base + ".gate_up_proj.fused.weight";
+    std::vector<TensorSourceRef> sources;
+    sources.reserve(expected);
+    for (std::size_t i = 0; i < expected; ++i) {
+        sources.push_back({group.raw_names[i], group.runtime_names[i]});
+    }
 
     plan.ops.push_back(make_axis_concat_op(
-        runtime_prefix + ".self_attn.qkv_proj.fused.weight",
-        /*shard_axis=*/0,
-        {{raw_q, runtime_prefix + ".self_attn.q_proj.weight"},
-         {raw_k, runtime_prefix + ".self_attn.k_proj.weight"},
-         {raw_v, runtime_prefix + ".self_attn.v_proj.weight"}}));
+        packed_name, /*shard_axis=*/0, std::move(sources)));
     ++plan.axis_concat_groups;
 
-    const auto& qi = loader.info(raw_q);
-    const auto& ki = loader.info(raw_k);
-    const auto& vi = loader.info(raw_v);
-    const std::int64_t q_rows = qi.shape[0] / tp_size;
-    const std::int64_t k_rows = ki.shape[0] / tp_size;
-    const std::int64_t v_rows = vi.shape[0] / tp_size;
-    const std::int64_t cols = qi.shape[1];
-    const std::string packed_name =
-        runtime_prefix + ".self_attn.qkv_proj.fused.weight";
+    std::int64_t rows = 0;
+    std::int64_t cols = -1;
+    for (std::size_t i = 0; i < expected; ++i) {
+        const auto& info = loader.info(group.raw_names[i]);
+        if (cols < 0) cols = info.shape[1];
+        rows += info.shape[0] / tp_size;
+    }
+
     register_tensor_spec(
-        plan, packed_name, qi.dtype, {q_rows + k_rows + v_rows, cols},
-        TensorLayoutKind::AxisConcatenated, TensorOwnershipKind::Owned,
-        TensorParallelKind::Column);
-    register_tensor_spec(
-        plan, runtime_prefix + ".self_attn.q_proj.weight", qi.dtype,
-        {q_rows, cols}, TensorLayoutKind::View,
-        TensorOwnershipKind::BorrowedView, TensorParallelKind::Column,
-        packed_name);
-    register_tensor_spec(
-        plan, runtime_prefix + ".self_attn.k_proj.weight", ki.dtype,
-        {k_rows, cols}, TensorLayoutKind::View,
-        TensorOwnershipKind::BorrowedView, TensorParallelKind::Column,
-        packed_name);
-    register_tensor_spec(
-        plan, runtime_prefix + ".self_attn.v_proj.weight", vi.dtype,
-        {v_rows, cols}, TensorLayoutKind::View,
-        TensorOwnershipKind::BorrowedView, TensorParallelKind::Column,
-        packed_name);
-    consumed_raw.insert(raw_q);
-    consumed_raw.insert(raw_k);
-    consumed_raw.insert(raw_v);
+        plan, packed_name, loader.info(group.raw_names[0]).dtype,
+        {rows, cols}, TensorLayoutKind::AxisConcatenated,
+        TensorOwnershipKind::Owned, TensorParallelKind::Column);
+    for (std::size_t i = 0; i < expected; ++i) {
+        const auto& info = loader.info(group.raw_names[i]);
+        register_tensor_spec(
+            plan, group.runtime_names[i], info.dtype,
+            {info.shape[0] / tp_size, info.shape[1]},
+            TensorLayoutKind::View, TensorOwnershipKind::BorrowedView,
+            TensorParallelKind::Column, packed_name);
+        consumed_raw.insert(group.raw_names[i]);
+    }
     return true;
 }
 
-bool try_add_packed_gate_up(
+const std::string& group_runtime_name_for_role(
+    const LogicalTensorGroup& group,
+    LogicalTensorRole role)
+{
+    for (std::size_t i = 0; i < group.runtime_roles.size(); ++i) {
+        if (group.runtime_roles[i] == role && i < group.runtime_names.size()) {
+            return group.runtime_names[i];
+        }
+    }
+    throw std::runtime_error(
+        "load schema: logical group '" + group.runtime_base +
+        "' does not declare expected runtime role");
+}
+
+bool try_add_row_range_split_group(
     LoadPlan& plan,
+    const HfConfig& hf,
     const TensorMetadataSource& loader,
-    const std::string& raw_name,
-    const std::string& runtime_name,
+    const LogicalTensorGroup& group,
     std::unordered_set<std::string>& consumed_raw,
     int tp_size)
 {
-    constexpr const char* gate_suffix = ".mlp.gate_proj.weight";
-    constexpr const char* up_suffix = ".mlp.up_proj.weight";
-
-    const char* matched = nullptr;
-    if (ends_with(runtime_name, gate_suffix)) matched = gate_suffix;
-    if (ends_with(runtime_name, up_suffix)) matched = up_suffix;
-    if (matched == nullptr) return false;
-
-    const std::string raw_prefix =
-        raw_name.substr(0, raw_name.size() - std::strlen(matched));
-    const std::string runtime_prefix =
-        runtime_name.substr(0, runtime_name.size() - std::strlen(matched));
-
-    const std::string raw_gate = raw_prefix + ".mlp.gate_proj.weight";
-    const std::string raw_up = raw_prefix + ".mlp.up_proj.weight";
-    if (consumed_raw.contains(raw_gate) || consumed_raw.contains(raw_up)) {
-        return true;
+    if (group.kind != LogicalTensorGroupKind::RowRangeSplit) return false;
+    if (group.raw_names.size() != 1 || group.raw_roles.size() != 1) {
+        throw std::runtime_error(
+            "load schema: row-range split group has wrong source arity at '" +
+            group.runtime_base + "'");
     }
-    if (!can_pack_2d_bf16_group(loader, {raw_gate, raw_up})) return false;
+    const std::string& raw_name = group.raw_names[0];
+    if (consumed_raw.contains(raw_name)) return true;
+    const TensorInfo& info = loader.info(raw_name);
+    const LogicalTensorRole fused_role = group.raw_roles[0];
 
-    plan.ops.push_back(make_axis_concat_op(
-        runtime_prefix + ".mlp.gate_up_proj.fused.weight",
-        /*shard_axis=*/0,
-        {{raw_gate, runtime_prefix + ".mlp.gate_proj.weight"},
-         {raw_up, runtime_prefix + ".mlp.up_proj.weight"}}));
-    ++plan.axis_concat_groups;
+    struct SplitPart {
+        LogicalTensorRole role;
+        std::int64_t offset;
+        std::int64_t rows;
+    };
+    std::vector<SplitPart> parts;
+    if (fused_role == LogicalTensorRole::AttentionQkv) {
+        const std::int64_t Hq =
+            static_cast<std::int64_t>(hf.num_attention_heads) * hf.head_dim;
+        const std::int64_t Hk =
+            static_cast<std::int64_t>(hf.num_key_value_heads) * hf.head_dim;
+        parts = {
+            {LogicalTensorRole::AttentionQ, 0, Hq},
+            {LogicalTensorRole::AttentionK, Hq, Hk},
+            {LogicalTensorRole::AttentionV, Hq + Hk, Hk},
+        };
+    } else if (fused_role == LogicalTensorRole::MlpGateUp) {
+        const std::int64_t I = hf.intermediate_size;
+        parts = {
+            {LogicalTensorRole::MlpGate, 0, I},
+            {LogicalTensorRole::MlpUp, I, I},
+        };
+    } else {
+        return false;
+    }
 
-    const auto& gi = loader.info(raw_gate);
-    const auto& ui = loader.info(raw_up);
-    const std::int64_t gate_rows = gi.shape[0] / tp_size;
-    const std::int64_t up_rows = ui.shape[0] / tp_size;
-    const std::int64_t cols = gi.shape[1];
-    const std::string packed_name =
-        runtime_prefix + ".mlp.gate_up_proj.fused.weight";
-    register_tensor_spec(
-        plan, packed_name, gi.dtype, {gate_rows + up_rows, cols},
-        TensorLayoutKind::AxisConcatenated, TensorOwnershipKind::Owned,
-        TensorParallelKind::Column);
-    register_tensor_spec(
-        plan, runtime_prefix + ".mlp.gate_proj.weight", gi.dtype,
-        {gate_rows, cols}, TensorLayoutKind::View,
-        TensorOwnershipKind::BorrowedView, TensorParallelKind::Column,
-        packed_name);
-    register_tensor_spec(
-        plan, runtime_prefix + ".mlp.up_proj.weight", ui.dtype,
-        {up_rows, cols}, TensorLayoutKind::View,
-        TensorOwnershipKind::BorrowedView, TensorParallelKind::Column,
-        packed_name);
-    consumed_raw.insert(raw_gate);
-    consumed_raw.insert(raw_up);
+    if (info.shape.size() != 2) {
+        throw std::runtime_error(
+            "load schema: row-range split expects 2-D source at '" +
+            raw_name + "'");
+    }
+    for (const auto& part : parts) {
+        if (part.rows % tp_size != 0) {
+            throw std::runtime_error(
+                "load schema: row-range split output is not divisible by "
+                "tp_size at '" + raw_name + "'");
+        }
+        const std::string& output_name =
+            group_runtime_name_for_role(group, part.role);
+        LoadOp op = make_row_range_shard_op(
+            /*output_name=*/{}, raw_name, part.offset, part.rows);
+        add_owned_producer(
+            plan, std::move(op), output_name, info.dtype,
+            {part.rows / tp_size, info.shape[1]},
+            TensorLayoutKind::Dense, TensorParallelKind::Column);
+    }
+
+    consumed_raw.insert(raw_name);
     return true;
 }
 
@@ -1693,46 +1701,31 @@ bool try_add_per_expert_moe_fusion(
     LoadPlan& plan,
     const HfConfig& hf,
     const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const LogicalTensorGroup& group,
     std::unordered_set<std::string>& consumed_raw,
     int tp_size)
 {
-    PerExpertMoeName runtime;
-    if (!try_parse_per_expert_moe_weight(logical.runtime_name, runtime)) {
-        return false;
-    }
-    PerExpertMoeName raw;
-    if (!try_parse_per_expert_moe_weight(logical.raw_name, raw)) {
+    if (group.kind != LogicalTensorGroupKind::PerExpertMoe) return false;
+    if (group.raw_names.empty() || group.raw_names.size() % 3 != 0 ||
+        group.raw_roles.size() != group.raw_names.size() ||
+        group.runtime_names.size() != 2) {
         throw std::runtime_error(
-            "load schema: raw/runtime MoE expert names disagree for '" +
-            logical.raw_name + "'");
+            "load schema: per-expert MoE group has wrong arity at '" +
+            group.runtime_base + "'");
     }
-
-    const std::string raw_gate0 = per_expert_raw_name(raw.base, 0, "gate");
+    const std::string& raw_gate0 = group.raw_names[0];
     if (consumed_raw.contains(raw_gate0)) return true;
 
-    int expert_count = hf.num_experts;
-    if (expert_count <= 0) {
-        expert_count = 0;
-        for (;;) {
-            const std::string gate =
-                per_expert_raw_name(raw.base, expert_count, "gate");
-            const std::string up =
-                per_expert_raw_name(raw.base, expert_count, "up");
-            const std::string down =
-                per_expert_raw_name(raw.base, expert_count, "down");
-            if (!loader.contains(gate) ||
-                !loader.contains(up) ||
-                !loader.contains(down)) {
-                break;
-            }
-            ++expert_count;
-        }
-    }
+    int expert_count = static_cast<int>(group.raw_names.size() / 3);
     if (expert_count <= 0) {
         throw std::runtime_error(
             "load schema: could not determine MoE expert count for '" +
-            logical.runtime_name + "'");
+            group.runtime_base + "'");
+    }
+    if (hf.num_experts > 0 && hf.num_experts != expert_count) {
+        throw std::runtime_error(
+            "load schema: per-expert MoE group count disagrees with config at '" +
+            group.runtime_base + "'");
     }
 
     std::vector<TensorSourceRef> fuse_sources;
@@ -1741,15 +1734,23 @@ bool try_add_per_expert_moe_fusion(
     std::vector<std::int64_t> gate_shape0;
     std::vector<std::int64_t> down_shape0;
     for (int e = 0; e < expert_count; ++e) {
-        const std::string raw_gate = per_expert_raw_name(raw.base, e, "gate");
-        const std::string raw_up = per_expert_raw_name(raw.base, e, "up");
-        const std::string raw_down = per_expert_raw_name(raw.base, e, "down");
+        const std::size_t base = static_cast<std::size_t>(e) * 3;
+        if (group.raw_roles[base] != LogicalTensorRole::MoeExpertGate ||
+            group.raw_roles[base + 1] != LogicalTensorRole::MoeExpertUp ||
+            group.raw_roles[base + 2] != LogicalTensorRole::MoeExpertDown) {
+            throw std::runtime_error(
+                "load schema: per-expert MoE source roles are not gate/up/down "
+                "triples at '" + group.runtime_base + "'");
+        }
+        const std::string& raw_gate = group.raw_names[base];
+        const std::string& raw_up = group.raw_names[base + 1];
+        const std::string& raw_down = group.raw_names[base + 2];
         if (!loader.contains(raw_gate) ||
             !loader.contains(raw_up) ||
             !loader.contains(raw_down)) {
             throw std::runtime_error(
                 "load schema: incomplete per-expert MoE group under '" +
-                raw.base + ".experts' at expert " + std::to_string(e));
+                group.runtime_base + "' at expert " + std::to_string(e));
         }
 
         const TensorInfo& gate_info = loader.info(raw_gate);
@@ -1760,7 +1761,7 @@ bool try_add_per_expert_moe_fusion(
             down_info.shape.size() != 2) {
             throw std::runtime_error(
                 "load schema: per-expert MoE fusion expects 2-D expert "
-                "weights under '" + raw.base + ".experts'");
+                "weights under '" + group.runtime_base + "'");
         }
 
         const auto local_gate_shape =
@@ -1774,7 +1775,7 @@ bool try_add_per_expert_moe_fusion(
             local_down_shape[1] != local_gate_shape[0]) {
             throw std::runtime_error(
                 "load schema: per-expert MoE gate/up/down shapes do not "
-                "align under '" + raw.base + ".experts'");
+                "align under '" + group.runtime_base + "'");
         }
         if (e == 0) {
             gate_shape0 = local_gate_shape;
@@ -1783,7 +1784,7 @@ bool try_add_per_expert_moe_fusion(
                    local_down_shape != down_shape0) {
             throw std::runtime_error(
                 "load schema: per-expert MoE shapes are not uniform under '" +
-                raw.base + ".experts'");
+                group.runtime_base + "'");
         }
 
         if (gate_info.dtype != DType::BF16 ||
@@ -1791,7 +1792,7 @@ bool try_add_per_expert_moe_fusion(
             down_info.dtype != DType::BF16) {
             throw std::runtime_error(
                 "load schema: direct MoE expert fusion currently requires "
-                "bf16 sources under '" + raw.base + ".experts'");
+                "bf16 sources under '" + group.runtime_base + "'");
         }
 
         fuse_sources.push_back({raw_gate, "gate"});
@@ -1803,8 +1804,10 @@ bool try_add_per_expert_moe_fusion(
         consumed_raw.insert(raw_down);
     }
 
-    const std::string gate_up_name = runtime.base + ".experts.gate_up_proj";
-    const std::string down_name = runtime.base + ".experts.down_proj";
+    const std::string& gate_up_name =
+        group_runtime_name_for_role(group, LogicalTensorRole::MoeExpertsGateUp);
+    const std::string& down_name =
+        group_runtime_name_for_role(group, LogicalTensorRole::MoeExpertsDown);
     const std::int64_t E = expert_count;
     register_tensor_spec(
         plan, gate_up_name, DType::BF16,
@@ -1969,39 +1972,54 @@ void push_drop_op(
 bool try_describe_gpt_oss_mxfp4_group(
     const HfConfig& hf,
     const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const LogicalTensorGroup& logical_group,
     int tp_size,
     Mxfp4ExpertGroup& out)
 {
     if (hf.model_type != "gpt_oss" || hf.quant_method != "mxfp4") return false;
+    if (logical_group.kind != LogicalTensorGroupKind::GptOssMxfp4) return false;
+    if (logical_group.raw_names.size() != 3 ||
+        logical_group.runtime_names.size() != 3 ||
+        logical_group.raw_roles.size() != 3 ||
+        logical_group.runtime_roles.size() != 3 ||
+        logical_group.raw_roles[0] != LogicalTensorRole::QuantPackedData ||
+        logical_group.raw_roles[1] != LogicalTensorRole::QuantScale ||
+        logical_group.raw_roles[2] != LogicalTensorRole::Bias) {
+        throw std::runtime_error(
+            "load schema: GPT-OSS MXFP4 group has wrong declaration at '" +
+            logical_group.runtime_base + "'");
+    }
 
-    constexpr const char* gate_blocks_suffix =
-        ".mlp.experts.gate_up_proj_blocks";
-    constexpr const char* down_blocks_suffix =
-        ".mlp.experts.down_proj_blocks";
-    const bool is_gate_up = ends_with(logical.runtime_name, gate_blocks_suffix);
-    const bool is_down = ends_with(logical.runtime_name, down_blocks_suffix);
-    if (!is_gate_up && !is_down) return false;
+    const bool is_gate_up =
+        logical_group.runtime_base.find(".gate_up_proj") != std::string::npos;
+    const bool is_down =
+        logical_group.runtime_base.find(".down_proj") != std::string::npos;
+    if (!is_gate_up && !is_down) {
+        throw std::runtime_error(
+            "load schema: GPT-OSS MXFP4 group has unknown projection at '" +
+            logical_group.runtime_base + "'");
+    }
 
-    const char* suffix = is_gate_up ? gate_blocks_suffix : down_blocks_suffix;
     Mxfp4ExpertGroup group;
     group.projection = is_gate_up
         ? Mxfp4ExpertProjection::GateUpInterleaved
         : Mxfp4ExpertProjection::Down;
-    group.raw_base =
-        logical.raw_name.substr(0, logical.raw_name.size() - std::strlen(suffix));
-    group.runtime_base =
-        logical.runtime_name.substr(
-            0, logical.runtime_name.size() - std::strlen(suffix));
+    group.raw_base = logical_group.raw_names[0].substr(
+        0, logical_group.raw_names[0].size() - std::strlen("_blocks"));
+    const std::string marker =
+        is_gate_up ? ".mlp.experts.gate_up_proj" : ".mlp.experts.down_proj";
+    const auto marker_pos = logical_group.runtime_base.rfind(marker);
+    if (marker_pos == std::string::npos) {
+        throw std::runtime_error(
+            "load schema: GPT-OSS MXFP4 group base is inconsistent at '" +
+            logical_group.runtime_base + "'");
+    }
+    group.runtime_base = logical_group.runtime_base.substr(0, marker_pos);
     group.stem = is_gate_up ? "gate_up_proj" : "down_proj";
-    group.raw_blocks =
-        group.raw_base + ".mlp.experts." + group.stem + "_blocks";
-    group.raw_scales =
-        group.raw_base + ".mlp.experts." + group.stem + "_scales";
-    group.raw_bias =
-        group.raw_base + ".mlp.experts." + group.stem + "_bias";
-    group.group_prefix =
-        group.runtime_base + ".mlp.experts." + group.stem;
+    group.raw_blocks = logical_group.raw_names[0];
+    group.raw_scales = logical_group.raw_names[1];
+    group.raw_bias = logical_group.raw_names[2];
+    group.group_prefix = logical_group.runtime_base;
 
     if (!loader.contains(group.raw_blocks) ||
         !loader.contains(group.raw_scales) ||
@@ -2275,42 +2293,18 @@ void mark_mxfp4_group_consumed(
     consumed_raw.insert(group.raw_bias);
 }
 
-bool is_gpt_oss_mxfp4_companion(
-    const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical)
-{
-    if (hf.model_type != "gpt_oss" || hf.quant_method != "mxfp4") return false;
-    constexpr const char* gate_prefix = ".mlp.experts.gate_up_proj_";
-    constexpr const char* down_prefix = ".mlp.experts.down_proj_";
-    const bool expert_tensor =
-        logical.raw_name.find(gate_prefix) != std::string::npos ||
-        logical.raw_name.find(down_prefix) != std::string::npos;
-    if (!expert_tensor) return false;
-    if (!ends_with(logical.raw_name, "_scales") &&
-        !ends_with(logical.raw_name, "_bias")) {
-        return false;
-    }
-    const std::string blocks_name = ends_with(logical.raw_name, "_scales")
-        ? logical.raw_name.substr(0, logical.raw_name.size() -
-                                      std::strlen("_scales")) + "_blocks"
-        : logical.raw_name.substr(0, logical.raw_name.size() -
-                                      std::strlen("_bias")) + "_blocks";
-    return loader.contains(blocks_name);
-}
-
 bool try_add_gpt_oss_mxfp4_expert(
     LoadPlan& plan,
     const HfConfig& hf,
     const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const LogicalTensorGroup& logical_group,
     std::unordered_set<std::string>& consumed_raw,
     int tp_size,
     Mxfp4MoeLowering lowering)
 {
     Mxfp4ExpertGroup group;
     if (!try_describe_gpt_oss_mxfp4_group(
-            hf, loader, logical, tp_size, group)) {
+            hf, loader, logical_group, tp_size, group)) {
         return false;
     }
     if (consumed_raw.contains(group.raw_blocks)) return true;
@@ -2378,6 +2372,12 @@ LogicalTensorRole infer_logical_tensor_role(const std::string& name) {
     if (ends_with(name, ".experts.down_proj")) {
         return LogicalTensorRole::MoeExpertsDown;
     }
+    if (ends_with(name, "_blocks")) {
+        return LogicalTensorRole::QuantPackedData;
+    }
+    if (ends_with(name, "_bias") || ends_with(name, ".bias")) {
+        return LogicalTensorRole::Bias;
+    }
     if (ends_with(name, ".gate_proj.weight")) {
         return LogicalTensorRole::MoeExpertGate;
     }
@@ -2417,7 +2417,9 @@ void add_logical_group_once(
     LogicalTensorGroupKind kind,
     std::string runtime_base,
     std::vector<std::string> raw_names,
-    std::vector<std::string> runtime_names)
+    std::vector<std::string> runtime_names,
+    std::vector<LogicalTensorRole> raw_roles = {},
+    std::vector<LogicalTensorRole> runtime_roles = {})
 {
     const std::string key =
         std::to_string(static_cast<int>(kind)) + ":" + runtime_base;
@@ -2427,6 +2429,8 @@ void add_logical_group_once(
         .runtime_base = std::move(runtime_base),
         .raw_names = std::move(raw_names),
         .runtime_names = std::move(runtime_names),
+        .raw_roles = std::move(raw_roles),
+        .runtime_roles = std::move(runtime_roles),
     });
 }
 
@@ -2468,7 +2472,13 @@ void discover_logical_tensor_groups(
                     runtime_base + ".self_attn", raw_names,
                     {runtime_base + q_suffix,
                      runtime_base + k_suffix,
-                     runtime_base + v_suffix});
+                     runtime_base + v_suffix},
+                    {LogicalTensorRole::AttentionQ,
+                     LogicalTensorRole::AttentionK,
+                     LogicalTensorRole::AttentionV},
+                    {LogicalTensorRole::AttentionQ,
+                     LogicalTensorRole::AttentionK,
+                     LogicalTensorRole::AttentionV});
             }
         }
 
@@ -2492,15 +2502,95 @@ void discover_logical_tensor_groups(
                     graph, seen, LogicalTensorGroupKind::PackedGateUp,
                     runtime_base + ".mlp", raw_names,
                     {runtime_base + gate_suffix,
-                     runtime_base + up_suffix});
+                     runtime_base + up_suffix},
+                    {LogicalTensorRole::MlpGate,
+                     LogicalTensorRole::MlpUp},
+                    {LogicalTensorRole::MlpGate,
+                     LogicalTensorRole::MlpUp});
+            }
+        }
+
+        if (logical.role == LogicalTensorRole::AttentionQkv) {
+            constexpr const char* qkv_suffix = ".self_attn.qkv_proj.weight";
+            if (ends_with(logical.runtime_name, qkv_suffix)) {
+                const std::string runtime_base =
+                    logical.runtime_name.substr(
+                        0, logical.runtime_name.size() - std::strlen(qkv_suffix));
+                add_logical_group_once(
+                    graph, seen, LogicalTensorGroupKind::RowRangeSplit,
+                    logical.runtime_name,
+                    {logical.raw_name},
+                    {runtime_base + ".self_attn.q_proj.weight",
+                     runtime_base + ".self_attn.k_proj.weight",
+                     runtime_base + ".self_attn.v_proj.weight"},
+                    {LogicalTensorRole::AttentionQkv},
+                    {LogicalTensorRole::AttentionQ,
+                     LogicalTensorRole::AttentionK,
+                     LogicalTensorRole::AttentionV});
+            }
+        }
+
+        if (logical.role == LogicalTensorRole::MlpGateUp) {
+            constexpr const char* gate_up_suffix = ".mlp.gate_up_proj.weight";
+            if (ends_with(logical.runtime_name, gate_up_suffix)) {
+                const std::string runtime_base =
+                    logical.runtime_name.substr(
+                        0, logical.runtime_name.size() -
+                               std::strlen(gate_up_suffix));
+                add_logical_group_once(
+                    graph, seen, LogicalTensorGroupKind::RowRangeSplit,
+                    logical.runtime_name,
+                    {logical.raw_name},
+                    {runtime_base + ".mlp.gate_proj.weight",
+                     runtime_base + ".mlp.up_proj.weight"},
+                    {LogicalTensorRole::MlpGateUp},
+                    {LogicalTensorRole::MlpGate,
+                     LogicalTensorRole::MlpUp});
             }
         }
 
         PerExpertMoeName expert;
-        if (try_parse_per_expert_moe_weight(logical.runtime_name, expert)) {
+        PerExpertMoeName raw_expert;
+        if (try_parse_per_expert_moe_weight(logical.runtime_name, expert) &&
+            try_parse_per_expert_moe_weight(logical.raw_name, raw_expert)) {
+            int expert_count = hf.num_experts;
+            if (expert_count <= 0) {
+                expert_count = 0;
+                for (;;) {
+                    const std::string gate =
+                        per_expert_raw_name(raw_expert.base, expert_count, "gate");
+                    const std::string up =
+                        per_expert_raw_name(raw_expert.base, expert_count, "up");
+                    const std::string down =
+                        per_expert_raw_name(raw_expert.base, expert_count, "down");
+                    if (!loader.contains(gate) ||
+                        !loader.contains(up) ||
+                        !loader.contains(down)) {
+                        break;
+                    }
+                    ++expert_count;
+                }
+            }
+            std::vector<std::string> raw_names;
+            std::vector<LogicalTensorRole> raw_roles;
+            raw_names.reserve(static_cast<std::size_t>(std::max(expert_count, 0)) * 3);
+            raw_roles.reserve(raw_names.capacity());
+            for (int e = 0; e < expert_count; ++e) {
+                raw_names.push_back(per_expert_raw_name(raw_expert.base, e, "gate"));
+                raw_roles.push_back(LogicalTensorRole::MoeExpertGate);
+                raw_names.push_back(per_expert_raw_name(raw_expert.base, e, "up"));
+                raw_roles.push_back(LogicalTensorRole::MoeExpertUp);
+                raw_names.push_back(per_expert_raw_name(raw_expert.base, e, "down"));
+                raw_roles.push_back(LogicalTensorRole::MoeExpertDown);
+            }
             add_logical_group_once(
                 graph, seen, LogicalTensorGroupKind::PerExpertMoe,
-                expert.base + ".experts", {}, {});
+                expert.base + ".experts", std::move(raw_names),
+                {expert.base + ".experts.gate_up_proj",
+                 expert.base + ".experts.down_proj"},
+                std::move(raw_roles),
+                {LogicalTensorRole::MoeExpertsGateUp,
+                 LogicalTensorRole::MoeExpertsDown});
         }
 
         if (ends_with(logical.runtime_name, ".experts.gate_up_proj") ||
@@ -2510,7 +2600,10 @@ void discover_logical_tensor_groups(
                 logical.runtime_name.substr(0, experts_pos);
             add_logical_group_once(
                 graph, seen, LogicalTensorGroupKind::FusedMoeExperts,
-                runtime_base + ".experts", {}, {});
+                runtime_base + ".experts", {}, {},
+                {},
+                {LogicalTensorRole::MoeExpertsGateUp,
+                 LogicalTensorRole::MoeExpertsDown});
         }
 
         if (hf.model_type == "gpt_oss" &&
@@ -2518,12 +2611,27 @@ void discover_logical_tensor_groups(
                        ".mlp.experts.gate_up_proj_blocks") ||
              ends_with(logical.runtime_name,
                        ".mlp.experts.down_proj_blocks"))) {
+            const std::string raw_base =
+                logical.raw_name.substr(
+                    0, logical.raw_name.rfind("_blocks"));
             const std::string runtime_base =
                 logical.runtime_name.substr(
                     0, logical.runtime_name.rfind("_blocks"));
             add_logical_group_once(
                 graph, seen, LogicalTensorGroupKind::GptOssMxfp4,
-                runtime_base, {logical.raw_name}, {logical.runtime_name});
+                runtime_base,
+                {raw_base + "_blocks",
+                 raw_base + "_scales",
+                 raw_base + "_bias"},
+                {runtime_base + ".weight",
+                 runtime_base + ".weight_scale",
+                 runtime_base + ".bias"},
+                {LogicalTensorRole::QuantPackedData,
+                 LogicalTensorRole::QuantScale,
+                 LogicalTensorRole::Bias},
+                {LogicalTensorRole::QuantPackedData,
+                 LogicalTensorRole::QuantScale,
+                 LogicalTensorRole::Bias});
         }
 
         if (logical.checkpoint_dtype == DType::FP8_E4M3 &&
@@ -2570,6 +2678,7 @@ LogicalTensorGraph build_logical_tensor_graph(
             .role = infer_logical_tensor_role(runtime_name),
             .checkpoint_dtype = info.dtype,
             .checkpoint_shape = info.shape,
+            .shard_axis = llama_like_shard_axis(runtime_name),
         });
     }
     discover_logical_tensor_groups(graph, hf, loader);
@@ -2667,6 +2776,34 @@ LoadPlan build_model_load_plan(
     const ModelSchema schema = resolve_model_schema(hf, boot_cfg, tp_size);
     const LogicalTensorGraph logical_graph =
         build_logical_tensor_graph(hf, loader);
+    std::unordered_map<std::string, const LogicalTensorGroup*> packed_group_by_raw;
+    packed_group_by_raw.reserve(logical_graph.groups.size() * 3);
+    std::unordered_map<std::string, const LogicalTensorGroup*> row_split_group_by_raw;
+    row_split_group_by_raw.reserve(logical_graph.groups.size());
+    std::unordered_map<std::string, const LogicalTensorGroup*> per_expert_group_by_raw;
+    per_expert_group_by_raw.reserve(logical_graph.groups.size() * 3);
+    std::unordered_map<std::string, const LogicalTensorGroup*> mxfp4_group_by_raw;
+    mxfp4_group_by_raw.reserve(logical_graph.groups.size() * 3);
+    for (const auto& group : logical_graph.groups) {
+        if (group.kind == LogicalTensorGroupKind::PackedQkv ||
+            group.kind == LogicalTensorGroupKind::PackedGateUp) {
+            for (const auto& raw : group.raw_names) {
+                packed_group_by_raw.emplace(raw, &group);
+            }
+        } else if (group.kind == LogicalTensorGroupKind::RowRangeSplit) {
+            for (const auto& raw : group.raw_names) {
+                row_split_group_by_raw.emplace(raw, &group);
+            }
+        } else if (group.kind == LogicalTensorGroupKind::PerExpertMoe) {
+            for (const auto& raw : group.raw_names) {
+                per_expert_group_by_raw.emplace(raw, &group);
+            }
+        } else if (group.kind == LogicalTensorGroupKind::GptOssMxfp4) {
+            for (const auto& raw : group.raw_names) {
+                mxfp4_group_by_raw.emplace(raw, &group);
+            }
+        }
+    }
     const bool has_per_expert_moe_sources =
         schema.fuse_per_expert_moe_after_load &&
         logical_graph_has_group(
@@ -2715,12 +2852,13 @@ LoadPlan build_model_load_plan(
                 hf, loader, logical, lower_awq_marlin_repack)) {
             continue;
         }
-        if (is_gpt_oss_mxfp4_companion(hf, loader, logical)) {
+        if (mxfp4_group_by_raw.contains(raw_name) &&
+            raw_name != mxfp4_group_by_raw.at(raw_name)->raw_names.front()) {
             continue;
         }
 
         if (schema.shard_fused_moe_experts_for_tp &&
-            ends_with(name, ".mlp.experts.gate_up_proj")) {
+            logical.role == LogicalTensorRole::MoeExpertsGateUp) {
             LoadOp op = make_raw_load_op(
                 LoadOpKind::GroupedSliceConcat, /*output_name=*/{},
                 raw_name);
@@ -2740,7 +2878,7 @@ LoadPlan build_model_load_plan(
             continue;
         }
         if (schema.shard_fused_moe_experts_for_tp &&
-            ends_with(name, ".mlp.experts.down_proj")) {
+            logical.role == LogicalTensorRole::MoeExpertsDown) {
             LoadOp op = make_raw_load_op(
                 LoadOpKind::GroupedSlice, /*output_name=*/{},
                 raw_name);
@@ -2760,90 +2898,44 @@ LoadPlan build_model_load_plan(
             continue;
         }
 
-        if (schema.unfuse_phi3_for_tp &&
-            ends_with(name, ".self_attn.qkv_proj.weight")) {
-            const std::string prefix = name.substr(
-                0, name.size() - std::string(".self_attn.qkv_proj.weight").size());
-            const std::int64_t Hq =
-                static_cast<std::int64_t>(hf.num_attention_heads) * hf.head_dim;
-            const std::int64_t Hk =
-                static_cast<std::int64_t>(hf.num_key_value_heads) * hf.head_dim;
-
-            const std::string q_name = prefix + ".self_attn.q_proj.weight";
-            LoadOp q = make_row_range_shard_op(
-                /*output_name=*/{}, raw_name, /*row_offset=*/0, Hq);
-            add_owned_producer(
-                plan, std::move(q), q_name, loader.info(raw_name).dtype,
-                {Hq / tp_size, loader.info(raw_name).shape[1]},
-                TensorLayoutKind::Dense, TensorParallelKind::Column);
-
-            const std::string k_name = prefix + ".self_attn.k_proj.weight";
-            LoadOp k = make_row_range_shard_op(
-                /*output_name=*/{}, raw_name, Hq, Hk);
-            add_owned_producer(
-                plan, std::move(k), k_name, loader.info(raw_name).dtype,
-                {Hk / tp_size, loader.info(raw_name).shape[1]},
-                TensorLayoutKind::Dense, TensorParallelKind::Column);
-
-            const std::string v_name = prefix + ".self_attn.v_proj.weight";
-            LoadOp v = make_row_range_shard_op(
-                /*output_name=*/{}, raw_name, Hq + Hk, Hk);
-            add_owned_producer(
-                plan, std::move(v), v_name, loader.info(raw_name).dtype,
-                {Hk / tp_size, loader.info(raw_name).shape[1]},
-                TensorLayoutKind::Dense, TensorParallelKind::Column);
-
-            consumed_raw.insert(raw_name);
-            continue;
-        }
-        if (schema.unfuse_phi3_for_tp &&
-            ends_with(name, ".mlp.gate_up_proj.weight")) {
-            const std::string prefix = name.substr(
-                0, name.size() - std::string(".mlp.gate_up_proj.weight").size());
-            const std::int64_t I = hf.intermediate_size;
-
-            const std::string gate_name = prefix + ".mlp.gate_proj.weight";
-            LoadOp gate = make_row_range_shard_op(
-                /*output_name=*/{}, raw_name, /*row_offset=*/0, I);
-            add_owned_producer(
-                plan, std::move(gate), gate_name, loader.info(raw_name).dtype,
-                {I / tp_size, loader.info(raw_name).shape[1]},
-                TensorLayoutKind::Dense, TensorParallelKind::Column);
-
-            const std::string up_name = prefix + ".mlp.up_proj.weight";
-            LoadOp up = make_row_range_shard_op(
-                /*output_name=*/{}, raw_name, I, I);
-            add_owned_producer(
-                plan, std::move(up), up_name, loader.info(raw_name).dtype,
-                {I / tp_size, loader.info(raw_name).shape[1]},
-                TensorLayoutKind::Dense, TensorParallelKind::Column);
-
-            consumed_raw.insert(raw_name);
-            continue;
+        if (schema.unfuse_phi3_for_tp) {
+            const auto split_it = row_split_group_by_raw.find(raw_name);
+            if (split_it != row_split_group_by_raw.end() &&
+                try_add_row_range_split_group(
+                    plan, hf, loader, *split_it->second,
+                    consumed_raw, tp_size)) {
+                continue;
+            }
         }
 
-        if (schema.pack_dense_qkv_and_gate_up &&
-            try_add_packed_qkv(plan, loader, raw_name, name, consumed_raw, tp_size)) {
-            continue;
+        if (const auto mxfp4_it = mxfp4_group_by_raw.find(raw_name);
+            mxfp4_it != mxfp4_group_by_raw.end()) {
+            if (try_add_gpt_oss_mxfp4_expert(
+                    plan, hf, loader, *mxfp4_it->second, consumed_raw, tp_size,
+                    target.mxfp4_moe)) {
+                continue;
+            }
         }
-        if (schema.pack_dense_qkv_and_gate_up &&
-            try_add_packed_gate_up(plan, loader, raw_name, name, consumed_raw, tp_size)) {
-            continue;
+
+        if (schema.pack_dense_qkv_and_gate_up) {
+            const auto group_it = packed_group_by_raw.find(raw_name);
+            if (group_it != packed_group_by_raw.end() &&
+                try_add_packed_axis_group(
+                    plan, loader, *group_it->second, consumed_raw, tp_size)) {
+                continue;
+            }
         }
 
         if (schema.fuse_per_expert_moe_after_load &&
+            per_expert_group_by_raw.contains(raw_name) &&
             try_add_per_expert_moe_fusion(
-                plan, hf, loader, logical, consumed_raw, tp_size)) {
+                plan, hf, loader, *per_expert_group_by_raw.at(raw_name),
+                consumed_raw, tp_size)) {
             lowered_per_expert_moe_fusion = true;
             continue;
         }
 
-        const int axis = (tp_size > 1) ? llama_like_shard_axis(name) : -1;
-        if (try_add_gpt_oss_mxfp4_expert(
-                plan, hf, loader, logical, consumed_raw, tp_size,
-                target.mxfp4_moe)) {
-            continue;
-        }
+        const int axis = (tp_size > 1) ? logical.shard_axis : -1;
         if (try_add_compressed_fp8_weight(
                 plan, hf, loader, logical, loader.info(raw_name),
                 axis, tp_size, target.fp8_native)) {

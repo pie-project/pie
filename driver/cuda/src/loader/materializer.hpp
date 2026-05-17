@@ -5,6 +5,8 @@
 
 namespace pie_cuda_driver {
 
+class CheckpointByteSource;
+struct PhysicalLoadPlan;
 class SafetensorsLoader;
 class NcclComm;
 
@@ -15,7 +17,9 @@ public:
         WeightStore& weights,
         int tp_rank,
         int tp_size,
-        NcclComm* tp_comm = nullptr) noexcept;
+        NcclComm* tp_comm = nullptr,
+        CheckpointByteSource* byte_source = nullptr,
+        const PhysicalLoadPlan* physical_plan = nullptr) noexcept;
 
     MaterializedLoadPlan run(const LoadPlan& plan);
 
@@ -26,6 +30,8 @@ private:
     int tp_rank_ = 0;
     int tp_size_ = 1;
     NcclComm* tp_comm_ = nullptr;
+    CheckpointByteSource* byte_source_ = nullptr;
+    const PhysicalLoadPlan* physical_plan_ = nullptr;
 };
 
 MaterializedLoadPlan materialize_load_plan(
@@ -34,6 +40,8 @@ MaterializedLoadPlan materialize_load_plan(
     WeightStore& weights,
     int tp_rank,
     int tp_size,
-    NcclComm* tp_comm = nullptr);
+    NcclComm* tp_comm = nullptr,
+    CheckpointByteSource* byte_source = nullptr,
+    const PhysicalLoadPlan* physical_plan = nullptr);
 
 }  // namespace pie_cuda_driver

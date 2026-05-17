@@ -238,10 +238,17 @@ target_include_directories(test_load_plan PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 target_link_libraries(test_load_plan PRIVATE tomlplusplus::tomlplusplus)
 
+add_executable(test_loader_golden tests/test_loader_golden.cpp)
+target_include_directories(test_loader_golden PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+target_link_libraries(test_loader_golden PRIVATE pie_driver_cuda_lib)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME driver_common COMMAND test_driver_common)
 add_test(NAME load_plan COMMAND test_load_plan)
+add_test(NAME loader_golden COMMAND test_loader_golden)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
@@ -249,6 +256,7 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
   zstd
   nlohmann_json::nlohmann_json
   rt
+  dl
   CUDA::cudart
   CUDA::cublas
   CUDA::cublasLt

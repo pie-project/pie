@@ -457,6 +457,12 @@ pub(crate) fn write_cuda_startup_toml(
     if !opts.mxfp4_moe.is_empty() && opts.mxfp4_moe != "auto" {
         insert_str(&mut model, "mxfp4_moe", opts.mxfp4_moe.clone());
     }
+    if opts.checkpoint_io != "auto" {
+        insert_str(&mut model, "checkpoint_io", opts.checkpoint_io.clone());
+    }
+    if !opts.physical_load_optimizer {
+        insert_bool(&mut model, "physical_load_optimizer", false);
+    }
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -1011,6 +1017,8 @@ mod tests {
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:0");
         assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
         assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
+        assert!(val["model"].get("checkpoint_io").is_none()); // auto omitted
+        assert!(val["model"].get("physical_load_optimizer").is_none()); // true omitted
         assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
         assert_eq!(
             val["batching"]["max_num_kv_pages"].as_integer().unwrap(),
@@ -1067,6 +1075,27 @@ mod tests {
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(val["model"]["mxfp4_moe"].as_str().unwrap(), "bf16");
+    }
+
+    #[test]
+    fn cuda_startup_toml_emits_physical_loader_policy_when_non_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.device = "cuda:0".to_string();
+        opts.checkpoint_io = "gds".to_string();
+        opts.physical_load_optimizer = false;
+
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(val["model"]["checkpoint_io"].as_str().unwrap(), "gds");
+        assert_eq!(
+            val["model"]["physical_load_optimizer"].as_bool().unwrap(),
+            false
+        );
     }
 
     #[test]

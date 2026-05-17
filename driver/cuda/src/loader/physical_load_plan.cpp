@@ -5,6 +5,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <pie_driver_common/shard_plan.hpp>
 
@@ -596,6 +597,71 @@ void json_slices(std::ostream& out, const std::vector<TensorSlice>& slices) {
     out << ']';
 }
 
+PhysicalOpActionKind classify_unwritten_op(LoadOpKind kind) noexcept {
+    switch (kind) {
+    case LoadOpKind::Cast:
+    case LoadOpKind::Dequantize:
+        return PhysicalOpActionKind::TiledTransform;
+    case LoadOpKind::View:
+    case LoadOpKind::Alias:
+        return PhysicalOpActionKind::View;
+    case LoadOpKind::Drop:
+        return PhysicalOpActionKind::Lifetime;
+    case LoadOpKind::BindMetadata:
+        return PhysicalOpActionKind::Metadata;
+    default:
+        return PhysicalOpActionKind::DeviceTransform;
+    }
+}
+
+bool can_coalesce_adjacent_byte_writes(
+    const ByteRangeWrite& a,
+    const ByteRangeWrite& b)
+{
+    if (!a.contiguous || !b.contiguous) return false;
+    if (a.op_index != b.op_index ||
+        a.raw_name != b.raw_name ||
+        a.output_name != b.output_name ||
+        a.dst_offset_bytes + a.bytes != b.dst_offset_bytes) {
+        return false;
+    }
+    if (a.slices.size() != 1 || b.slices.size() != 1 ||
+        a.slices[0].axis != 0 || b.slices[0].axis != 0) {
+        return false;
+    }
+    if (a.slices[0].start + a.slices[0].length != b.slices[0].start) {
+        return false;
+    }
+    if (a.dst_shape.size() != b.dst_shape.size() || a.dst_shape.empty()) {
+        return false;
+    }
+    for (std::size_t i = 1; i < a.dst_shape.size(); ++i) {
+        if (a.dst_shape[i] != b.dst_shape[i]) return false;
+    }
+    return true;
+}
+
+void optimize_byte_writes(std::vector<ByteRangeWrite>& writes)
+{
+    if (writes.size() < 2) return;
+    std::vector<ByteRangeWrite> optimized;
+    optimized.reserve(writes.size());
+    for (const auto& write : writes) {
+        if (!optimized.empty() &&
+            can_coalesce_adjacent_byte_writes(optimized.back(), write)) {
+            auto& prev = optimized.back();
+            prev.slices[0].length += write.slices[0].length;
+            prev.dst_shape[0] += write.dst_shape[0];
+            prev.bytes += write.bytes;
+            prev.range_count = 1;
+            prev.contiguous = true;
+            continue;
+        }
+        optimized.push_back(write);
+    }
+    writes.swap(optimized);
+}
+
 }  // namespace
 
 std::vector<ByteRangeWrite> lower_byte_writes_for_op(
@@ -637,7 +703,8 @@ PhysicalLoadPlan build_physical_load_plan(
     const TensorMetadataSource& metadata,
     int tp_rank,
     int tp_size,
-    std::uint64_t transform_tile_bytes)
+    std::uint64_t transform_tile_bytes,
+    PhysicalLoadOptimizerConfig optimizer)
 {
     validate_load_plan(plan);
     PhysicalLoadPlan physical;
@@ -648,6 +715,17 @@ PhysicalLoadPlan build_physical_load_plan(
         const LoadOp& op = plan.ops[i];
         auto writes = lower_byte_writes_for_op(
             op, i, plan, metadata, tp_rank, tp_size);
+        const std::uint64_t unoptimized_op_write_count =
+            static_cast<std::uint64_t>(writes.size());
+        if (optimizer.enabled && optimizer.coalesce_adjacent) {
+            optimize_byte_writes(writes);
+        }
+        const std::uint64_t op_write_count =
+            static_cast<std::uint64_t>(writes.size());
+        if (unoptimized_op_write_count > op_write_count) {
+            physical.memory.coalesced_byte_write_count +=
+                unoptimized_op_write_count - op_write_count;
+        }
         for (const auto& write : writes) {
             physical.memory.checkpoint_read_bytes += write.bytes;
             physical.memory.device_write_bytes += write.bytes;
@@ -687,8 +765,25 @@ PhysicalLoadPlan build_physical_load_plan(
                 std::max(physical.memory.max_transform_scratch_bytes, scratch);
             physical.memory.tiled_transform_count += 1;
         }
+
+        PhysicalOpCoverage coverage{
+            .op_index = i,
+            .op_kind = load_op_kind_name(op.kind),
+            .action = op_write_count > 0
+                ? PhysicalOpActionKind::ByteRangeWrite
+                : classify_unwritten_op(op.kind),
+            .byte_writes = op_write_count,
+            .tiled_transforms =
+                (op.kind == LoadOpKind::Cast ||
+                 op.kind == LoadOpKind::Dequantize)
+                    ? 1u
+                    : 0u,
+        };
+        physical.coverage.push_back(std::move(coverage));
     }
 
+    physical.memory.optimized_byte_write_count =
+        static_cast<std::uint64_t>(physical.byte_writes.size());
     const PhysicalTempUsage temp_usage =
         compute_physical_temp_usage(plan, transform_tile_bytes);
     physical.memory.max_copy_temporary_bytes =
@@ -698,7 +793,20 @@ PhysicalLoadPlan build_physical_load_plan(
     physical.memory.max_temporary_bytes = temp_usage.max_total_temporary_bytes;
     physical.memory.estimated_peak_bytes =
         physical.memory.persistent_bytes + physical.memory.max_temporary_bytes;
+    validate_physical_load_plan(plan, physical);
     return physical;
+}
+
+const char* physical_op_action_kind_name(PhysicalOpActionKind kind) noexcept {
+    switch (kind) {
+    case PhysicalOpActionKind::ByteRangeWrite: return "ByteRangeWrite";
+    case PhysicalOpActionKind::TiledTransform: return "TiledTransform";
+    case PhysicalOpActionKind::DeviceTransform: return "DeviceTransform";
+    case PhysicalOpActionKind::Metadata: return "Metadata";
+    case PhysicalOpActionKind::View: return "View";
+    case PhysicalOpActionKind::Lifetime: return "Lifetime";
+    }
+    return "?";
 }
 
 const char* physical_transform_kind_name(PhysicalTransformKind kind) noexcept {
@@ -707,6 +815,54 @@ const char* physical_transform_kind_name(PhysicalTransformKind kind) noexcept {
     case PhysicalTransformKind::Dequantize: return "Dequantize";
     }
     return "?";
+}
+
+void validate_physical_load_plan(
+    const LoadPlan& semantic_plan,
+    const PhysicalLoadPlan& physical_plan)
+{
+    if (physical_plan.coverage.size() != semantic_plan.ops.size()) {
+        throw std::runtime_error(
+            "physical load plan: coverage table does not match semantic op count");
+    }
+    std::unordered_set<std::size_t> covered;
+    covered.reserve(physical_plan.coverage.size());
+    for (const auto& coverage : physical_plan.coverage) {
+        if (coverage.op_index >= semantic_plan.ops.size()) {
+            throw std::runtime_error(
+                "physical load plan: coverage op index out of range");
+        }
+        if (!covered.insert(coverage.op_index).second) {
+            throw std::runtime_error(
+                "physical load plan: duplicate coverage for op " +
+                std::to_string(coverage.op_index));
+        }
+        const auto& semantic = semantic_plan.ops[coverage.op_index];
+        if (coverage.op_kind != load_op_kind_name(semantic.kind)) {
+            throw std::runtime_error(
+                "physical load plan: coverage kind mismatch for op " +
+                std::to_string(coverage.op_index));
+        }
+        switch (coverage.action) {
+        case PhysicalOpActionKind::ByteRangeWrite:
+            if (coverage.byte_writes == 0) {
+                throw std::runtime_error(
+                    "physical load plan: byte-write op has no byte writes");
+            }
+            break;
+        case PhysicalOpActionKind::TiledTransform:
+            if (coverage.tiled_transforms == 0) {
+                throw std::runtime_error(
+                    "physical load plan: tiled transform op has no transform record");
+            }
+            break;
+        case PhysicalOpActionKind::DeviceTransform:
+        case PhysicalOpActionKind::Metadata:
+        case PhysicalOpActionKind::View:
+        case PhysicalOpActionKind::Lifetime:
+            break;
+        }
+    }
 }
 
 std::string describe_physical_load_plan(const PhysicalLoadPlan& plan) {
@@ -719,6 +875,9 @@ std::string describe_physical_load_plan(const PhysicalLoadPlan& plan) {
         << (plan.memory.max_temporary_bytes / (1024 * 1024)) << " MiB"
         << ", physical_peak~="
         << (plan.memory.estimated_peak_bytes / (1024 * 1024)) << " MiB";
+    if (plan.memory.coalesced_byte_write_count > 0) {
+        out << ", coalesced_writes=" << plan.memory.coalesced_byte_write_count;
+    }
     if (plan.memory.tiled_transform_count > 0) {
         out << ", tiled_transforms=" << plan.memory.tiled_transform_count
             << ", transform_scratch<="
@@ -746,6 +905,10 @@ std::string dump_physical_load_plan_json(const PhysicalLoadPlan& plan) {
         << "\"device_write_bytes\":" << plan.memory.device_write_bytes << ','
         << "\"byte_write_count\":" << plan.memory.byte_write_count << ','
         << "\"byte_range_count\":" << plan.memory.byte_range_count << ','
+        << "\"optimized_byte_write_count\":"
+        << plan.memory.optimized_byte_write_count << ','
+        << "\"coalesced_byte_write_count\":"
+        << plan.memory.coalesced_byte_write_count << ','
         << "\"tiled_transform_count\":"
         << plan.memory.tiled_transform_count
         << "},\"byte_writes\":[";
@@ -787,6 +950,19 @@ std::string dump_physical_load_plan_json(const PhysicalLoadPlan& plan) {
             << ",\"output_bytes\":" << tx.output_bytes
             << ",\"tile_bytes\":" << tx.tile_bytes
             << ",\"scratch_bytes\":" << tx.scratch_bytes
+            << '}';
+    }
+    out << "],\"coverage\":[";
+    for (std::size_t i = 0; i < plan.coverage.size(); ++i) {
+        const auto& coverage = plan.coverage[i];
+        if (i) out << ',';
+        out << "{\"op_index\":" << coverage.op_index
+            << ",\"op_kind\":";
+        json_string(out, coverage.op_kind);
+        out << ",\"action\":";
+        json_string(out, physical_op_action_kind_name(coverage.action));
+        out << ",\"byte_writes\":" << coverage.byte_writes
+            << ",\"tiled_transforms\":" << coverage.tiled_transforms
             << '}';
     }
     out << "]}";

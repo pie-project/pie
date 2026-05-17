@@ -47,6 +47,58 @@ std::uint64_t shape_nbytes(
     return n * static_cast<std::uint64_t>(dtype_bytes(dtype));
 }
 
+struct CudaLoadMemoryTelemetry {
+    std::uint64_t total = 0;
+    std::uint64_t free_before = 0;
+    std::uint64_t min_free = 0;
+    std::uint64_t free_after = 0;
+    std::size_t samples = 0;
+
+    void sample() noexcept
+    {
+        std::size_t free_bytes = 0;
+        std::size_t total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+            return;
+        }
+        if (samples == 0) {
+            free_before = static_cast<std::uint64_t>(free_bytes);
+            min_free = free_before;
+            total = static_cast<std::uint64_t>(total_bytes);
+        } else {
+            min_free = std::min<std::uint64_t>(
+                min_free,
+                static_cast<std::uint64_t>(free_bytes));
+            total = std::max<std::uint64_t>(
+                total,
+                static_cast<std::uint64_t>(total_bytes));
+        }
+        free_after = static_cast<std::uint64_t>(free_bytes);
+        ++samples;
+    }
+};
+
+void sample_cuda_load_memory(void* context) noexcept
+{
+    static_cast<CudaLoadMemoryTelemetry*>(context)->sample();
+}
+
+class ScopedDeviceTensorMemoryCallback {
+public:
+    explicit ScopedDeviceTensorMemoryCallback(CudaLoadMemoryTelemetry& telemetry)
+    {
+        set_device_tensor_memory_callback(sample_cuda_load_memory, &telemetry);
+    }
+    ~ScopedDeviceTensorMemoryCallback()
+    {
+        set_device_tensor_memory_callback(nullptr, nullptr);
+    }
+
+    ScopedDeviceTensorMemoryCallback(const ScopedDeviceTensorMemoryCallback&) = delete;
+    ScopedDeviceTensorMemoryCallback& operator=(
+        const ScopedDeviceTensorMemoryCallback&) = delete;
+};
+
 std::uint64_t materialize_byte_writes_for_op(
     const LoadOp& op,
     std::size_t op_index,
@@ -1520,13 +1572,17 @@ Materializer::Materializer(
     WeightStore& weights,
     int tp_rank,
     int tp_size,
-    NcclComm* tp_comm) noexcept
+    NcclComm* tp_comm,
+    CheckpointByteSource* byte_source,
+    const PhysicalLoadPlan* physical_plan) noexcept
     : loader_(loader),
       weights_(weights),
       builder_(weights),
       tp_rank_(tp_rank),
       tp_size_(tp_size),
-      tp_comm_(tp_comm)
+      tp_comm_(tp_comm),
+      byte_source_(byte_source),
+      physical_plan_(physical_plan)
 {}
 
 MaterializedLoadPlan Materializer::run(const LoadPlan& plan)
@@ -1536,7 +1592,18 @@ MaterializedLoadPlan Materializer::run(const LoadPlan& plan)
     MaterializedLoadPlan result;
     result.axis_concat_groups = plan.axis_concat_groups;
     result.planned_tensor_count = plan.tensors.size();
-    MmapByteSource byte_source(loader_);
+    if (physical_plan_ != nullptr) {
+        result.planned_physical_peak_bytes =
+            physical_plan_->memory.estimated_peak_bytes;
+        result.planned_physical_temp_bytes =
+            physical_plan_->memory.max_temporary_bytes;
+    }
+    CudaLoadMemoryTelemetry cuda_memory;
+    cuda_memory.sample();
+    ScopedDeviceTensorMemoryCallback memory_callback(cuda_memory);
+    MmapByteSource mmap_byte_source(loader_);
+    CheckpointByteSource& byte_source =
+        byte_source_ != nullptr ? *byte_source_ : mmap_byte_source;
 
     for (std::size_t op_index = 0; op_index < plan.ops.size(); ++op_index) {
         const auto& op = plan.ops[op_index];
@@ -1553,6 +1620,7 @@ MaterializedLoadPlan Materializer::run(const LoadPlan& plan)
                 tp_size_,
                 64ull * 1024ull * 1024ull);
             op_index += 2;
+            cuda_memory.sample();
             continue;
         }
         switch (op.kind) {
@@ -1652,10 +1720,21 @@ MaterializedLoadPlan Materializer::run(const LoadPlan& plan)
             }
             break;
         }
+        cuda_memory.sample();
     }
 
     validate_materialized_tensors(plan, weights_);
     builder_.finalize();
+    cuda_memory.sample();
+    result.cuda_total_bytes = cuda_memory.total;
+    result.cuda_free_before_bytes = cuda_memory.free_before;
+    result.cuda_min_free_bytes = cuda_memory.min_free;
+    result.cuda_free_after_bytes = cuda_memory.free_after;
+    result.cuda_memory_samples = cuda_memory.samples;
+    if (cuda_memory.free_before >= cuda_memory.min_free) {
+        result.cuda_actual_peak_delta_bytes =
+            cuda_memory.free_before - cuda_memory.min_free;
+    }
 
     return result;
 }
@@ -1666,9 +1745,13 @@ MaterializedLoadPlan materialize_load_plan(
     WeightStore& weights,
     int tp_rank,
     int tp_size,
-    NcclComm* tp_comm)
+    NcclComm* tp_comm,
+    CheckpointByteSource* byte_source,
+    const PhysicalLoadPlan* physical_plan)
 {
-    return Materializer(loader, weights, tp_rank, tp_size, tp_comm).run(plan);
+    return Materializer(
+        loader, weights, tp_rank, tp_size, tp_comm,
+        byte_source, physical_plan).run(plan);
 }
 
 }  // namespace pie_cuda_driver

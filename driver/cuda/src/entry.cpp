@@ -626,6 +626,9 @@ int run_impl(int argc,
 	                  << "  model.device    = " << cfg.model.device << "\n"
 	                  << "  model.dtype     = " << cfg.model.dtype << "\n"
 	                  << "  model.mxfp4_moe = " << cfg.model.mxfp4_moe << "\n"
+	                  << "  model.checkpoint_io = " << cfg.model.checkpoint_io << "\n"
+	                  << "  model.physical_load_optimizer = "
+	                  << (cfg.model.physical_load_optimizer ? "true" : "false") << "\n"
 	                  << "  tp_size         = " << cfg.distributed.tp_size << "\n"
                   << "  tp_rank         = " << cfg.distributed.tp_rank << "\n";
     }

@@ -38,13 +38,16 @@ enum class LogicalTensorRole {
     MoeExpertDown,
     MoeExpertsGateUp,
     MoeExpertsDown,
+    QuantPackedData,
     QuantScale,
     QuantZeroPoint,
+    Bias,
 };
 
 enum class LogicalTensorGroupKind {
     PackedQkv,
     PackedGateUp,
+    RowRangeSplit,
     PerExpertMoe,
     FusedMoeExperts,
     GptOssMxfp4,
@@ -79,6 +82,9 @@ struct LogicalTensor {
     LogicalTensorRole role = LogicalTensorRole::Unknown;
     DType checkpoint_dtype;
     std::vector<std::int64_t> checkpoint_shape;
+    // Tensor-parallel shard axis declared by the schema adapter. Lowering
+    // consumes this value directly instead of reparsing architecture suffixes.
+    int shard_axis = -1;
 };
 
 struct LogicalTensorGroup {
@@ -86,6 +92,10 @@ struct LogicalTensorGroup {
     std::string runtime_base;
     std::vector<std::string> raw_names;
     std::vector<std::string> runtime_names;
+    // Adapters declare the semantic role of each source and runtime output.
+    // Lowering uses these roles instead of reparsing architecture suffixes.
+    std::vector<LogicalTensorRole> raw_roles;
+    std::vector<LogicalTensorRole> runtime_roles;
 };
 
 struct LogicalTensorGraph {

@@ -175,6 +175,14 @@ struct MaterializedLoadPlan {
     std::size_t runtime_quantized_weights = 0;
     std::uint64_t runtime_quant_bytes_before = 0;
     std::uint64_t runtime_quant_bytes_after = 0;
+    std::uint64_t planned_physical_peak_bytes = 0;
+    std::uint64_t planned_physical_temp_bytes = 0;
+    std::uint64_t cuda_total_bytes = 0;
+    std::uint64_t cuda_free_before_bytes = 0;
+    std::uint64_t cuda_min_free_bytes = 0;
+    std::uint64_t cuda_free_after_bytes = 0;
+    std::uint64_t cuda_actual_peak_delta_bytes = 0;
+    std::size_t cuda_memory_samples = 0;
 };
 
 const char* load_op_kind_name(LoadOpKind kind) noexcept;

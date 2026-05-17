@@ -11,6 +11,7 @@
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
+#include "loader/byte_source.hpp"
 #include "loader/load_plan.hpp"
 #include "loader/materializer.hpp"
 #include "loader/model_schema.hpp"
@@ -207,7 +208,13 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     LoadPlan load_plan =
         build_model_load_plan(e.hf_, boot_cfg, loader, tp_size, load_target);
     PhysicalLoadPlan physical_plan =
-        build_physical_load_plan(load_plan, loader, tp_rank, tp_size);
+        build_physical_load_plan(
+            load_plan, loader, tp_rank, tp_size,
+            64ull * 1024ull * 1024ull,
+            PhysicalLoadOptimizerConfig{
+                .enabled = boot_cfg.model.physical_load_optimizer,
+                .coalesce_adjacent = true,
+            });
     if (const char* dump_path = std::getenv("PIE_CUDA_LOAD_PLAN_DUMP");
         dump_path && dump_path[0] != '\0') {
         std::ofstream out(dump_path);
@@ -224,7 +231,18 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         std::cerr << "[pie-driver-cuda] physical load compiler: "
                   << describe_physical_load_plan(physical_plan) << "\n";
     }
-    Materializer materializer(loader, e.weights_, tp_rank, tp_size, tp_comm);
+    auto byte_source = make_checkpoint_byte_source(
+        parse_checkpoint_io_policy(boot_cfg.model.checkpoint_io),
+        loader,
+        verbose);
+    if (verbose) {
+        std::cerr << "[pie-driver-cuda] checkpoint byte source: "
+                  << byte_source->name()
+                  << " (policy=" << boot_cfg.model.checkpoint_io << ")\n";
+    }
+    Materializer materializer(
+        loader, e.weights_, tp_rank, tp_size, tp_comm,
+        byte_source.get(), &physical_plan);
     const MaterializedLoadPlan materialized = materializer.run(load_plan);
     CUDA_CHECK(cudaDeviceSynchronize());
     if (verbose && materialized.runtime_quantized_weights > 0) {
@@ -248,6 +266,25 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         std::cerr << "[pie-driver-cuda] load plan: "
                   << materialized.axis_concat_groups << " AxisConcat groups"
                   << " (raw projection weights exposed as non-owning views)\n";
+    }
+    if (verbose && materialized.cuda_memory_samples > 0) {
+        const auto to_mib = [](std::uint64_t bytes) {
+            return bytes / (1024ull * 1024ull);
+        };
+        std::cerr << "[pie-driver-cuda] load memory high-water: planned_peak~"
+                  << to_mib(materialized.planned_physical_peak_bytes)
+                  << " MiB, planned_temp<="
+                  << to_mib(materialized.planned_physical_temp_bytes)
+                  << " MiB, actual_cuda_delta~"
+                  << to_mib(materialized.cuda_actual_peak_delta_bytes)
+                  << " MiB, free "
+                  << to_mib(materialized.cuda_free_before_bytes)
+                  << " -> min "
+                  << to_mib(materialized.cuda_min_free_bytes)
+                  << " -> "
+                  << to_mib(materialized.cuda_free_after_bytes)
+                  << " MiB across "
+                  << materialized.cuda_memory_samples << " samples\n";
     }
 
     e.weights_.validate_quant_metadata();

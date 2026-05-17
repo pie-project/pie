@@ -7,6 +7,27 @@
 
 namespace pie_cuda_driver {
 
+namespace {
+
+thread_local DeviceTensorMemoryCallback g_memory_callback = nullptr;
+thread_local void* g_memory_callback_context = nullptr;
+
+void sample_memory_callback() noexcept {
+    if (g_memory_callback != nullptr) {
+        g_memory_callback(g_memory_callback_context);
+    }
+}
+
+}  // namespace
+
+void set_device_tensor_memory_callback(
+    DeviceTensorMemoryCallback callback,
+    void* context) noexcept
+{
+    g_memory_callback = callback;
+    g_memory_callback_context = context;
+}
+
 DType dtype_from_safetensors(const std::string& s) {
     if (s == "BF16") return DType::BF16;
     if (s == "F16")  return DType::FP16;
@@ -39,6 +60,7 @@ DeviceTensor DeviceTensor::allocate(DType dtype, std::vector<std::int64_t> shape
     t.nbytes_ = t.numel_ * dtype_bytes(dtype);
     if (t.nbytes_ > 0) {
         CUDA_CHECK(cudaMalloc(&t.ptr_, t.nbytes_));
+        sample_memory_callback();
     }
     t.owns_memory_ = true;
     return t;
@@ -62,11 +84,13 @@ DeviceTensor DeviceTensor::view(void* ptr, DType dtype,
 
 void DeviceTensor::free_() noexcept {
     if (ptr_ && owns_memory_) {
+        sample_memory_callback();
         // Best-effort free; never throw from a destructor.
         if (cudaFree(ptr_) != cudaSuccess) {
             // Pre-shutdown errors are common (driver torn down). Stay quiet
             // unless we're mid-run.
         }
+        sample_memory_callback();
     }
     ptr_ = nullptr;
 }

@@ -134,6 +134,15 @@ bool has_group(const pie_cuda_driver::LogicalTensorGraph& graph,
         [kind](const auto& group) { return group.kind == kind; });
 }
 
+const pie_cuda_driver::LogicalTensorGroup* find_group(
+    const pie_cuda_driver::LogicalTensorGraph& graph,
+    pie_cuda_driver::LogicalTensorGroupKind kind) {
+    const auto it = std::find_if(
+        graph.groups.begin(), graph.groups.end(),
+        [kind](const auto& group) { return group.kind == kind; });
+    return it == graph.groups.end() ? nullptr : &*it;
+}
+
 pie_cuda_driver::HfConfig qwen3_config() {
     pie_cuda_driver::HfConfig hf{};
     hf.model_type = "qwen3";
@@ -230,6 +239,46 @@ void test_physical_plan_lowers_packed_groups_to_byte_writes() {
     CHECK(dump.find("axis-concatenated") != std::string::npos);
 }
 
+void test_physical_compiler_covers_every_semantic_op() {
+    auto hf = qwen3_config();
+    pie_cuda_driver::Config cfg{};
+    cfg.model.runtime_quant = "int8";
+    const auto meta = dense_llama_metadata();
+    pie_cuda_driver::LoadTarget target{};
+    auto plan = pie_cuda_driver::build_model_load_plan(
+        hf, cfg, meta, /*tp_size=*/1, target);
+    auto physical = pie_cuda_driver::build_physical_load_plan(
+        plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
+    pie_cuda_driver::validate_physical_load_plan(plan, physical);
+
+    CHECK_EQ(physical.coverage.size(), plan.ops.size());
+    CHECK(std::any_of(
+        physical.coverage.begin(), physical.coverage.end(),
+        [](const auto& coverage) {
+            return coverage.action ==
+                   pie_cuda_driver::PhysicalOpActionKind::ByteRangeWrite;
+        }));
+    CHECK(std::any_of(
+        physical.coverage.begin(), physical.coverage.end(),
+        [](const auto& coverage) {
+            return coverage.action ==
+                   pie_cuda_driver::PhysicalOpActionKind::DeviceTransform;
+        }));
+    CHECK(std::any_of(
+        physical.coverage.begin(), physical.coverage.end(),
+        [](const auto& coverage) {
+            return coverage.action ==
+                   pie_cuda_driver::PhysicalOpActionKind::Metadata;
+        }));
+
+    const std::string dump =
+        pie_cuda_driver::dump_load_plan_json(plan, physical);
+    CHECK(dump.find("\"coverage\"") != std::string::npos);
+    CHECK(dump.find("ByteRangeWrite") != std::string::npos);
+    CHECK(dump.find("DeviceTransform") != std::string::npos);
+    CHECK(dump.find("Metadata") != std::string::npos);
+}
+
 void test_dense_schema_adapters_pack_mistral_olmo_variants() {
     const auto meta = dense_llama_metadata();
     pie_cuda_driver::Config cfg{};
@@ -244,6 +293,40 @@ void test_dense_schema_adapters_pack_mistral_olmo_variants() {
         CHECK_EQ(plan.axis_concat_groups, std::size_t{2});
         CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::AxisConcat),
                  std::size_t{2});
+    }
+}
+
+void test_qwen36_dense_linear_attention_plan() {
+    using pie_cuda_driver::DType;
+    auto hf = qwen3_config();
+    hf.model_type = "qwen3_5";
+    FakeMetadata meta = dense_llama_metadata();
+    meta.add("model.layers.0.linear_attn.in_proj_z.weight", DType::BF16, {8, 8});
+    meta.add("model.layers.0.linear_attn.in_proj_b.weight", DType::BF16, {8, 8});
+    meta.add("model.layers.0.linear_attn.in_proj_a.weight", DType::BF16, {8, 8});
+    meta.add("model.layers.0.linear_attn.out_proj.weight", DType::BF16, {8, 8});
+    meta.add("model.layers.0.linear_attn.dt_bias", DType::BF16, {8});
+    meta.add("model.layers.0.linear_attn.A_log", DType::BF16, {8});
+
+    pie_cuda_driver::Config cfg{};
+    const pie_cuda_driver::LoadTarget target{};
+    auto plan = pie_cuda_driver::build_model_load_plan(
+        hf, cfg, meta, /*tp_size=*/2, target);
+    pie_cuda_driver::validate_load_plan(plan);
+
+    const auto* z = find_spec(
+        plan, "model.layers.0.linear_attn.in_proj_z.weight");
+    CHECK(z != nullptr);
+    if (z != nullptr) {
+        CHECK((z->shape == std::vector<std::int64_t>{4, 8}));
+        CHECK(z->parallel == pie_cuda_driver::TensorParallelKind::Column);
+    }
+    const auto* out = find_spec(
+        plan, "model.layers.0.linear_attn.out_proj.weight");
+    CHECK(out != nullptr);
+    if (out != nullptr) {
+        CHECK((out->shape == std::vector<std::int64_t>{8, 4}));
+        CHECK(out->parallel == pie_cuda_driver::TensorParallelKind::Row);
     }
 }
 
@@ -1057,6 +1140,65 @@ void test_gemma4_schema_adapter_declares_fused_expert_groups() {
         graph, pie_cuda_driver::LogicalTensorGroupKind::FusedMoeExperts));
 }
 
+void test_qwen36_moe_plan_shards_fused_experts() {
+    using pie_cuda_driver::DType;
+    pie_cuda_driver::HfConfig hf{};
+    hf.model_type = "qwen3_5_moe";
+
+    FakeMetadata meta;
+    meta.add("model.layers.0.mlp.experts.gate_up_proj", DType::BF16, {2, 16, 8});
+    meta.add("model.layers.0.mlp.experts.down_proj", DType::BF16, {2, 8, 8});
+
+    pie_cuda_driver::Config cfg{};
+    const pie_cuda_driver::LoadTarget target{};
+    auto plan = pie_cuda_driver::build_model_load_plan(
+        hf, cfg, meta, /*tp_size=*/2, target);
+    pie_cuda_driver::validate_load_plan(plan);
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::GroupedSliceConcat),
+             std::size_t{1});
+    CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::GroupedSlice),
+             std::size_t{1});
+
+    const auto* gate_up =
+        find_spec(plan, "model.layers.0.mlp.experts.gate_up_proj");
+    CHECK(gate_up != nullptr);
+    if (gate_up != nullptr) {
+        CHECK((gate_up->shape == std::vector<std::int64_t>{2, 8, 8}));
+    }
+    const auto* down =
+        find_spec(plan, "model.layers.0.mlp.experts.down_proj");
+    CHECK(down != nullptr);
+    if (down != nullptr) {
+        CHECK((down->shape == std::vector<std::int64_t>{2, 8, 4}));
+    }
+}
+
+void test_gemma4_dense_and_moe_plan_coverage() {
+    using pie_cuda_driver::DType;
+    pie_cuda_driver::Config cfg{};
+    const pie_cuda_driver::LoadTarget target{};
+
+    auto dense_hf = qwen3_config();
+    dense_hf.model_type = "gemma4";
+    const auto dense_meta = dense_llama_metadata();
+    auto dense_plan = pie_cuda_driver::build_model_load_plan(
+        dense_hf, cfg, dense_meta, /*tp_size=*/1, target);
+    pie_cuda_driver::validate_load_plan(dense_plan);
+    CHECK(find_spec(dense_plan, "model.layers.0.self_attn.q_proj.weight") != nullptr);
+
+    pie_cuda_driver::HfConfig moe_hf{};
+    moe_hf.model_type = "gemma4";
+    moe_hf.gemma4_enable_moe = true;
+    FakeMetadata moe_meta;
+    moe_meta.add("model.layers.0.experts.gate_up_proj", DType::BF16, {2, 16, 8});
+    moe_meta.add("model.layers.0.experts.down_proj", DType::BF16, {2, 8, 16});
+    auto moe_plan = pie_cuda_driver::build_model_load_plan(
+        moe_hf, cfg, moe_meta, /*tp_size=*/1, target);
+    pie_cuda_driver::validate_load_plan(moe_plan);
+    CHECK(find_spec(moe_plan, "model.layers.0.experts.gate_up_proj") != nullptr);
+    CHECK(find_spec(moe_plan, "model.layers.0.experts.down_proj") != nullptr);
+}
+
 FakeMetadata gpt_oss_mxfp4_metadata() {
     using pie_cuda_driver::DType;
     FakeMetadata meta;
@@ -1081,6 +1223,57 @@ pie_cuda_driver::HfConfig gpt_oss_mxfp4_config() {
     hf.quant_method = "mxfp4";
     hf.hidden_size = 8;
     return hf;
+}
+
+void test_logical_schema_adapters_declare_group_roles() {
+    {
+        auto hf = qwen3_config();
+        const auto meta = dense_llama_metadata();
+        const auto graph = pie_cuda_driver::build_logical_tensor_graph(hf, meta);
+        const auto* qkv = find_group(
+            graph, pie_cuda_driver::LogicalTensorGroupKind::PackedQkv);
+        CHECK(qkv != nullptr);
+        if (qkv != nullptr) {
+            CHECK((qkv->raw_roles == std::vector<pie_cuda_driver::LogicalTensorRole>{
+                pie_cuda_driver::LogicalTensorRole::AttentionQ,
+                pie_cuda_driver::LogicalTensorRole::AttentionK,
+                pie_cuda_driver::LogicalTensorRole::AttentionV}));
+            CHECK((qkv->runtime_roles == qkv->raw_roles));
+        }
+    }
+    {
+        pie_cuda_driver::HfConfig hf{};
+        hf.model_type = "phi3";
+        FakeMetadata meta;
+        meta.add("model.layers.0.self_attn.qkv_proj.weight",
+                 pie_cuda_driver::DType::BF16, {24, 8});
+        const auto graph = pie_cuda_driver::build_logical_tensor_graph(hf, meta);
+        const auto* split = find_group(
+            graph, pie_cuda_driver::LogicalTensorGroupKind::RowRangeSplit);
+        CHECK(split != nullptr);
+        if (split != nullptr) {
+            CHECK((split->raw_roles == std::vector<pie_cuda_driver::LogicalTensorRole>{
+                pie_cuda_driver::LogicalTensorRole::AttentionQkv}));
+            CHECK((split->runtime_roles == std::vector<pie_cuda_driver::LogicalTensorRole>{
+                pie_cuda_driver::LogicalTensorRole::AttentionQ,
+                pie_cuda_driver::LogicalTensorRole::AttentionK,
+                pie_cuda_driver::LogicalTensorRole::AttentionV}));
+        }
+    }
+    {
+        auto hf = gpt_oss_mxfp4_config();
+        const auto meta = gpt_oss_mxfp4_metadata();
+        const auto graph = pie_cuda_driver::build_logical_tensor_graph(hf, meta);
+        const auto* mxfp4 = find_group(
+            graph, pie_cuda_driver::LogicalTensorGroupKind::GptOssMxfp4);
+        CHECK(mxfp4 != nullptr);
+        if (mxfp4 != nullptr) {
+            CHECK((mxfp4->raw_roles == std::vector<pie_cuda_driver::LogicalTensorRole>{
+                pie_cuda_driver::LogicalTensorRole::QuantPackedData,
+                pie_cuda_driver::LogicalTensorRole::QuantScale,
+                pie_cuda_driver::LogicalTensorRole::Bias}));
+        }
+    }
 }
 
 void test_gpt_oss_mxfp4_fallback_emits_dequantized_experts() {
@@ -1220,7 +1413,9 @@ void test_fp8_scale_inv_lowers_to_scheduled_dequant() {
 int main() {
     test_dense_qwen_plan_packs_projection_groups();
     test_physical_plan_lowers_packed_groups_to_byte_writes();
+    test_physical_compiler_covers_every_semantic_op();
     test_dense_schema_adapters_pack_mistral_olmo_variants();
+    test_qwen36_dense_linear_attention_plan();
     test_dump_plan_has_no_post_load_transform_channel();
     test_runtime_int8_lowers_to_scheduled_quant_ops();
     test_compressed_tensors_int8_lowers_to_quant_packed();
@@ -1239,6 +1434,9 @@ int main() {
     test_qwen_moe_per_expert_fusion_is_scheduled();
     test_mixtral_schema_adapter_marks_and_shards_expert_weights();
     test_gemma4_schema_adapter_declares_fused_expert_groups();
+    test_qwen36_moe_plan_shards_fused_experts();
+    test_gemma4_dense_and_moe_plan_coverage();
+    test_logical_schema_adapters_declare_group_roles();
     test_gpt_oss_mxfp4_fallback_emits_dequantized_experts();
     test_gpt_oss_mxfp4_native_emits_quant_packed_experts();
     test_gpt_oss_mxfp4_true_native_gemm_requires_backend();

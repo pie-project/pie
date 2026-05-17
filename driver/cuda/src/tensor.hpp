@@ -75,6 +75,15 @@ inline const char* dtype_name(DType d) {
 // Parse the safetensors dtype string ("BF16", "F16", "F32", "I8", "U8", …).
 DType dtype_from_safetensors(const std::string& s);
 
+using DeviceTensorMemoryCallback = void (*)(void* context);
+
+// Thread-local hook used by the loader to capture CUDA memory high-water
+// during materialization, including transient transform scratch allocated
+// inside helper kernels. Passing nullptr clears the callback.
+void set_device_tensor_memory_callback(
+    DeviceTensorMemoryCallback callback,
+    void* context) noexcept;
+
 class DeviceTensor {
 public:
     DeviceTensor() = default;

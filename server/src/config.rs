@@ -750,6 +750,13 @@ pub struct CudaNativeDriverOptions {
     /// dequantize routed experts at runtime; `"bf16"`/`"dequant"` eagerly
     /// materialize BF16 experts; `"native"` requires true MXFP4 GEMM kernels.
     pub mxfp4_moe: String,
+    /// CUDA checkpoint IO backend for physical materialization. `"auto"`
+    /// uses GPUDirect Storage when available and falls back to mmap;
+    /// `"mmap"` forces mmap + cudaMemcpy; `"gds"` requires cuFile.
+    pub checkpoint_io: String,
+    /// Enables the physical load optimizer and coverage validator in the
+    /// CUDA loader. This is a target policy knob, not an environment toggle.
+    pub physical_load_optimizer: bool,
 
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
@@ -770,6 +777,8 @@ impl Default for CudaNativeDriverOptions {
             verbose: false,
             runtime_quant: String::new(),
             mxfp4_moe: "auto".to_string(),
+            checkpoint_io: "auto".to_string(),
+            physical_load_optimizer: true,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
         }
@@ -791,6 +800,12 @@ impl CudaNativeDriverOptions {
             self.mxfp4_moe.is_empty() || MXFP4.contains(&self.mxfp4_moe.as_str()),
             "model.driver.options.mxfp4_moe must be one of {:?}",
             MXFP4
+        );
+        const CHECKPOINT_IO: &[&str] = &["auto", "mmap", "gds"];
+        ensure!(
+            CHECKPOINT_IO.contains(&self.checkpoint_io.as_str()),
+            "model.driver.options.checkpoint_io must be one of {:?}",
+            CHECKPOINT_IO
         );
         Ok(())
     }
@@ -945,6 +960,8 @@ device = ["cuda:0"]
 max_num_kv_pages = 2048
 runtime_quant = "fp8"
 mxfp4_moe = "routed_dequant"
+checkpoint_io = "gds"
+physical_load_optimizer = false
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
@@ -954,6 +971,8 @@ mxfp4_moe = "routed_dequant"
         assert_eq!(opts.max_num_kv_pages, 2048);
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.mxfp4_moe, "routed_dequant");
+        assert_eq!(opts.checkpoint_io, "gds");
+        assert!(!opts.physical_load_optimizer);
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
         assert_eq!(opts.kv_page_size, 32); // default
     }
@@ -978,6 +997,8 @@ device = ["cuda:0"]
         assert_eq!(opts.swap_pool_size, 0);
         assert_eq!(opts.gpu_mem_utilization, 0.85);
         assert_eq!(opts.mxfp4_moe, "auto");
+        assert_eq!(opts.checkpoint_io, "auto");
+        assert!(opts.physical_load_optimizer);
         assert_eq!(opts.ready_timeout_s, 600.0);
     }
 
@@ -998,6 +1019,25 @@ mxfp4_moe = "mystery"
         let cfg: Config = toml::from_str(cuda).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("mxfp4_moe"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_invalid_cuda_checkpoint_io_policy() {
+        let cuda = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-32B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+checkpoint_io = "network"
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("checkpoint_io"), "got: {err}");
     }
 
     #[test]

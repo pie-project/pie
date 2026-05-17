@@ -265,12 +265,14 @@ The same physical plan can execute with different byte sources:
 
 ```text
 MmapByteSource: mmap + cudaMemcpy/cudaMemcpy2D into final VRAM
-GdsByteSource: cuFileRead into final VRAM, future backend
+GdsByteSource: cuFileRead into final VRAM for direct contiguous writes
 ```
 
-The current CUDA implementation uses `MmapByteSource`. GDS is deliberately a
-backend swap after the byte-source interface has stabilized, not a semantic IR
-change.
+The CUDA implementation supports both `MmapByteSource` and `GdsByteSource`.
+`[model].checkpoint_io = "auto"` selects GDS when libcufile is available and
+falls back to mmap for unsupported non-contiguous writes. Explicit
+`checkpoint_io = "gds"` fails loudly if a physical write cannot be served
+directly by cuFile. GDS is a byte-source backend, not a semantic IR change.
 
 ### Planner
 
@@ -617,11 +619,12 @@ Last updated: 2026-05-17.
   allocation, layout, and lifetime decisions live in the materializer.
 - `ModelSchema` exists as a first explicit schema resolution layer.
 - `LogicalTensorGraph` is a distinct checkpoint-binding stage that records raw
-  checkpoint names, runtime names, inferred semantic roles, dtype, and shape
-  before load-plan lowering.
+  checkpoint names, runtime names, adapter-declared semantic roles, dtype,
+  shape, and tensor-parallel shard axes before load-plan lowering.
   It also records logical tensor groups such as packed QKV, packed gate/up,
-  per-expert MoE, fused MoE, GPT-OSS MXFP4, and FP8+scale pairs so adapters
-  can identify semantic groups before lowering selects physical ops.
+  row-range splits, per-expert MoE, fused MoE, GPT-OSS MXFP4, and FP8+scale
+  pairs. Groups carry source and runtime roles, so lowering consumes declared
+  group structure instead of reparsing QKV/GateUp/Phi-3/GPT-OSS suffixes.
 - `LoadPlan` contains typed runtime tensor specs.
 - `LoadOp` uses typed payload families instead of a flat overloaded field bag.
   Constructors build raw-load, row-range, tensor, slice, axis-concat, and
@@ -646,9 +649,19 @@ Last updated: 2026-05-17.
 - `PhysicalLoadPlan` lowers copy-expressible ops into exact `ByteRangeWrite`
   records with destination tensor, destination offset, compact slice shape,
   byte count, and source range count.
-- `MmapByteSource` owns the current mmap + CUDA-copy physical IO path. The
-  materializer consumes `CheckpointByteSource`, so GDS can be added as a new
-  backend without touching schema lowering.
+- `CheckpointByteSource` is the stable physical IO interface. `MmapByteSource`
+  owns the mmap + CUDA-copy path; `GdsByteSource` dynamically loads libcufile
+  and issues `cuFileRead` directly into planned destination allocations for
+  contiguous full-tensor and leading-axis slice writes.
+- The physical compiler validates coverage for every semantic op. Copy-like
+  ops lower to `ByteRangeWrite`; `Cast` and `Dequantize` lower to typed
+  `TiledTransform`; view, lifetime, metadata, and device-transform ops are
+  explicitly classified. Plan construction fails if any semantic op lacks a
+  physical action.
+- The physical optimizer currently coalesces adjacent compatible byte writes
+  and records optimized/coalesced write counts in plan dumps. This is the
+  first optimizing compiler pass; the interface is ready for alignment-aware
+  GDS batching and transform fusion passes.
 - `AxisConcat` materialization streams sources into final storage rather than
   keeping all packed inputs alive at once.
 - `StackGroups` can stream per-expert checkpoint rows directly into final
@@ -751,11 +764,26 @@ Last updated: 2026-05-17.
 - `PIE_CUDA_LOAD_PLAN_DUMP=/path/to/plan.json` writes a JSON plan artifact with
   semantic ops, tensor specs, physical byte writes, tiled transforms, and
   semantic/physical memory estimates.
+- `[model].checkpoint_io = "auto" | "mmap" | "gds"` controls checkpoint byte
+  source policy. `[model].physical_load_optimizer = true | false` controls
+  physical optimizer passes. GPT-OSS MXFP4 policy is expressed as target
+  policy through `[model].mxfp4_moe`, not hidden env-var behavior.
 - The planner computes persistent bytes from final owned tensors and computes
   semantic temporary high-water bytes over the executable op stream.
 - The physical planner computes resident temporary high-water from the actual
   materializer lifetime protocol, including `Drop` ops, raw-copy-to-cast
   fusion, and bounded transform scratch.
+- The materializer samples CUDA memory during load through a device-allocation
+  callback, and reports planned physical peak/temp versus actual CUDA
+  high-water memory.
+- Golden CUDA materialization tests cover exact `AxisConcat`,
+  `GroupedSliceConcat`, `GroupedSlice`, `StackGroups`, `Cast`, `Dequantize`,
+  and `BindMetadata` behavior on small real safetensors fixtures.
+- Synthetic architecture plan tests cover Qwen dense/MoE, Qwen3.6 dense/MoE,
+  Gemma4 dense/MoE, GPT-OSS MXFP4, Mixtral, Ministral, Phi-3, and OLMo-3.
+- `benches/run_loader_evidence.py` is the one-command evidence harness for
+  loader tests plus Pie/vLLM/SGLang latency, throughput, startup, plan dumps,
+  and Pie load-memory telemetry.
 - Qwen3-32B starts successfully with the CUDA native driver.
 - The BF16 CUDA native e2e smoke matrix covers dense Qwen3, Qwen3 MoE,
   Qwen3.6 dense, Qwen3.6 MoE, Gemma4 dense, and Gemma4 MoE checkpoints.
@@ -802,20 +830,18 @@ Last updated: 2026-05-17.
   scratch, such as GPT-OSS routed-expert MXFP4 dequant scratch, is tracked
   outside load-plan temporary high-water marks and should be reported
   explicitly as runtime scratch.
-- `LogicalTensorGraph` exists, but current lowering still infers many roles
-  from suffix conventions. Future schema adapters should declare roles and
-  groups directly instead of relying on inference.
+- Native transform fusion is still conservative: the physical compiler records
+  tiled `Cast`/`Dequantize` actions and the materializer executes bounded
+  transform paths, but deeper source-read plus transform fusion is still a
+  future optimizer pass.
 
 ### Not Yet Implemented
 
-- `GdsByteSource` / GPUDirect Storage. The stable interface is now
-  `CheckpointByteSource`; GDS should be added as a physical backend after
-  validating alignment, filesystem, and unaligned safetensors offset fallback
-  behavior.
 - True hardware-native MXFP4 MoE GEMM kernels. The current packed runtime
   backend keeps MXFP4 as the final loaded representation and dequantizes only
   routed experts into bounded BF16 scratch before GEMM.
-- Complete schema adapters for every architecture in the tree.
+- Future architecture adapters for checkpoint formats not yet in the local
+  claim set.
 
 ## Test and Evaluation Plan
 
@@ -877,6 +903,29 @@ Useful metrics for the system paper:
 
 Latest verification:
 
+- North-star implementation pass on 2026-05-17:
+  `cmake --build driver/cuda/build --target pie_driver_cuda test_loader_golden -j 8`,
+  `ctest --test-dir driver/cuda/build --output-on-failure`,
+  `cargo test -p pie-server cuda -- --nocapture`,
+  `cargo build -p pie-server --release --no-default-features --features driver-cuda`,
+  and `python3 -m py_compile benches/run_loader_evidence.py benches/pie_bench.py benches/sglang_bench.py benches/vllm_bench.py`
+  all pass.
+- One-command evidence:
+  `benches/run_loader_evidence.py --model Qwen/Qwen3-32B --engines pie,vllm,sglang --modes latency,tput --requests 1 --num-requests 2 --concurrency 2 --max-tokens 8 --warmup 0 --max-model-len 512 --checkpoint-io auto`.
+  Artifact: `.tmp/loader_evidence/qwen32b-final/evidence.json`.
+- Qwen3-32B Pie loader telemetry from that artifact:
+  GDS selected under `checkpoint_io=auto`; physical plan had 707
+  `ByteRangeWrite` records, 62,488 MiB checkpoint/device bytes, planned
+  physical temp <= 0 MiB, planned peak ~= 62,488 MiB, actual CUDA delta
+  ~= 62,490 MiB, and free-memory high-water 96,704 -> 34,214 -> 34,214 MiB
+  across 1,032 samples.
+- Qwen3-32B short benchmark from that artifact:
+  Pie latency 493.0 ms p50 / 16.23 output tok/s and throughput 18.69 output
+  tok/s; vLLM latency 445.9 ms p50 / 17.94 output tok/s and throughput
+  31.09 output tok/s; SGLang latency 884.3 ms p50 / 9.05 output tok/s and
+  throughput 16.11 output tok/s with Triton attention, PyTorch sampling, CUDA
+  graphs disabled, `FLASHINFER_CUDA_ARCH_LIST=12.0a`, and
+  `SGLANG_DISABLE_PDL=1`.
 - Current implementation pass:
   `c++ -std=c++20 ... driver/cuda/tests/test_load_plan.cpp ...` and
   `cargo build -p pie-server --release --no-default-features --features driver-cuda`.

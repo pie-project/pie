@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import socket
 import time
 import tomllib
@@ -78,6 +79,8 @@ def build_config(args: argparse.Namespace):
             driver_options["runtime_quant"] = args.runtime_quant
         if args.mxfp4_moe:
             driver_options["mxfp4_moe"] = args.mxfp4_moe
+        if args.checkpoint_io:
+            driver_options["checkpoint_io"] = args.checkpoint_io
     elif args.driver == "portable":
         driver_options = {
             "max_batch_size": args.max_batch_size,
@@ -186,6 +189,11 @@ async def cli_pie_client(args: argparse.Namespace):
     server_lines: list[str] = startup_lines
     drain_task: asyncio.Task[None] | None = None
     token: str | None = None
+    server_log_file = None
+    if server_log_path := os.environ.get("PIE_BENCH_SERVER_LOG"):
+        path = Path(server_log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        server_log_file = path.open("w", encoding="utf-8")
 
     async def drain_stdout() -> None:
         assert proc.stdout is not None
@@ -197,6 +205,9 @@ async def cli_pie_client(args: argparse.Namespace):
             txt = line.decode("utf-8", errors="replace")
             server_lines.append(txt)
             del server_lines[:-200]
+            if server_log_file is not None:
+                server_log_file.write(txt)
+                server_log_file.flush()
             # Surface per-fire timing the moment it lands; otherwise mute.
             if txt.startswith("[fire ") or txt.startswith("[sched-fire ") or txt.startswith("[outer-fire "):
                 sys.stderr.write(txt)
@@ -217,6 +228,9 @@ async def cli_pie_client(args: argparse.Namespace):
                 )
             text = line.decode("utf-8", errors="replace")
             startup_lines.append(text)
+            if server_log_file is not None:
+                server_log_file.write(text)
+                server_log_file.flush()
             marker = "internal token: "
             if marker in text:
                 token = text.split(marker, 1)[1].strip()
@@ -251,6 +265,8 @@ async def cli_pie_client(args: argparse.Namespace):
             drain_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await drain_task
+        if server_log_file is not None:
+            server_log_file.close()
 
 
 def pie_client(args: argparse.Namespace):
@@ -401,6 +417,12 @@ def build_parser() -> argparse.ArgumentParser:
             "--mxfp4-moe",
             choices=["auto", "routed_dequant", "packed", "bf16", "dequant", "eager_bf16", "native"],
             default=None,
+        )
+        sp.add_argument(
+            "--checkpoint-io",
+            choices=["auto", "mmap", "gds"],
+            default=None,
+            help="CUDA loader checkpoint IO policy for cuda_native.",
         )
         sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
