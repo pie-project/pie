@@ -56,6 +56,16 @@ cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 
+set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce.cu)
+foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX REPLACE "[-+].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120")
+    set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce_stub.cpp)
+  endif()
+endforeach()
+if(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE MATCHES "stub")
+  message(STATUS "Disabling FlashInfer custom all-reduce for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 
 # pie_driver_cuda — native CUDA backend. Built two ways from the same
 # translation units:
@@ -135,7 +145,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/brle.cpp
   src/swap_pool.cpp
   src/distributed.cpp
-  src/custom_all_reduce.cu
+  ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   src/ops/attention_flashinfer.cu
 )
 
